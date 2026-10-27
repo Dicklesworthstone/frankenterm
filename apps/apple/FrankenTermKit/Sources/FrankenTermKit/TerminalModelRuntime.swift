@@ -30,6 +30,7 @@ public protocol TerminalSessionModel: AnyObject, Sendable {
     func feed(_ bytes: Data) throws
     func resize(_ geometry: TerminalSessionGeometry) throws
     func encode(_ intent: TerminalKeyboardIntent, maximumBytes: Int) throws -> Data
+    func encodePointer(_ event: TerminalPointerEvent, maximumBytes: Int) throws -> Data
     func preparePaste(_ text: String, maximumBytes: Int) throws -> TerminalPreparedPaste
     func copyReply() throws -> TerminalModelReply?
     func settleReply(sequence: UInt64, disposition: TerminalModelReplyDisposition) throws
@@ -40,6 +41,12 @@ public protocol TerminalSessionModel: AnyObject, Sendable {
     /// Idempotent; finishes model ownership without replaying outstanding bytes.
     /// Failure must retain ownership for a later close attempt.
     func close() throws
+}
+
+public extension TerminalSessionModel {
+    func encodePointer(_ event: TerminalPointerEvent, maximumBytes: Int) throws -> Data {
+        throw TerminalModelError.unsupported
+    }
 }
 
 public enum TerminalModelPresentation: Sendable {
@@ -73,7 +80,7 @@ public struct TerminalModelAccounting: Equatable, Sendable {
 /// waiting consumer, keyboard transaction and presentation request. During an awaited
 /// reply/delivery handoff, read-only encoding may inspect already-applied modes.
 /// All egress still enters the same coordinator.
-public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalSessionConsumer {
+public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalPointerEncoding, TerminalSessionConsumer {
     public nonisolated let source: TerminalSource
     public nonisolated let supportsPaste = true
     private let model: any TerminalSessionModel
@@ -187,6 +194,17 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalSession
                        maximumBytes: Int) async throws -> Data {
         try requireInput(source, maximumBytes: maximumBytes)
         let bytes = try model.encode(intent, maximumBytes: maximumBytes)
+        guard bytes.count <= maximumBytes else { throw TerminalModelError.capacity }
+        try Task.checkCancellation()
+        return bytes
+    }
+
+    public func encodePointer(_ event: TerminalPointerEvent, source: TerminalSource,
+                              maximumBytes: Int) async throws -> Data {
+        try requireInput(source, maximumBytes: maximumBytes)
+        guard event.source == source else { throw TerminalInputError.stale }
+        guard visible, viewportTop == nil else { throw TerminalModelError.stale }
+        let bytes = try model.encodePointer(event, maximumBytes: maximumBytes)
         guard bytes.count <= maximumBytes else { throw TerminalModelError.capacity }
         try Task.checkCancellation()
         return bytes

@@ -1115,6 +1115,9 @@ pub const RENDER_FRAME_FLAG_HISTORY: u32 = 16;
 /// viewport may end before the continuation, so consumers must also validate
 /// adjacent row/source/geometry witnesses before joining copied text.
 pub const RENDER_FRAME_FLAG_SOFT_WRAPS: u32 = 32;
+/// The canonical terminal currently requests mouse reports. This is a display
+/// hint for gesture arbitration, never input authority or an encoding mode.
+pub const RENDER_FRAME_FLAG_MOUSE_GRABBED: u32 = 64;
 
 /// These witnesses are supplied by the immutable session owner, not by remote
 /// terminal output. UUID bytes use RFC UUID order, not a platform GUID layout.
@@ -1335,7 +1338,7 @@ fn put_color(bytes: &mut [u8], at: usize, color: MirrorColor) {
 /// Links identify frame-local URI entries, not OSC 8 remote authority.
 ///
 /// Header offsets: magic0, version-u16@4, header-size-u16@6, total-u32@8,
-/// flags-u32@12 (full=1/reverse=2/alternate=4/synchronized=8/history=16/soft-wraps=32), channelUUID@16,
+/// flags-u32@12 (full=1/reverse=2/alternate=4/synchronized=8/history=16/soft-wraps=32/mouse-grabbed=64), channelUUID@16,
 /// transportUUID@32, route-revision-u64@48, terminal-sequence-u64@56,
 /// geometry/palette/font/frame revisions-u64@64/72/80/88, rows/cols-u32@96/100,
 /// viewport/cursor stable rows-i64@104/112, cursor-column/shape-u32@120/124,
@@ -1500,6 +1503,7 @@ fn encode_frame(
         | if term.get_reverse_video() { 2 } else { 0 }
         | if term.is_alt_screen_active() { 4 } else { 0 }
         | if term.synchronized_output() { 8 } else { 0 }
+        | if term.is_mouse_grabbed() { RENDER_FRAME_FLAG_MOUSE_GRABBED } else { 0 }
         | RENDER_FRAME_FLAG_HISTORY
         | RENDER_FRAME_FLAG_SOFT_WRAPS;
     put_u32(&mut bytes, 12, flags);

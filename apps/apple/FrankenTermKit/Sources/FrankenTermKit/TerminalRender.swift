@@ -179,6 +179,9 @@ public struct TerminalRenderFrame: Equatable, Sendable {
     public let history: TerminalRenderHistory?
     public var reverseVideo: Bool { flags & 2 != 0 }
     public var alternateScreen: Bool { flags & 4 != 0 }
+    /// Current canonical mouse-grab hint. Old captures omit the flag; pointer
+    /// encoding still samples the model's actual modes at input admission.
+    public var mouseGrabbed: Bool { flags & 64 != 0 }
     /// Whether this frame shows the live screen rather than earlier history.
     public var isLive: Bool { history.map { viewportFirst == $0.live } ?? true }
     /// The viewport one line per row for VoiceOver and UI automation, without
@@ -200,7 +203,7 @@ public struct TerminalRenderFrame: Equatable, Sendable {
         let reportsSoftWraps = read.u32(12) & 32 != 0
         guard Array(bytes[0..<4]) == [70, 84, 83, 70], read.u16(4) == 1,
               read.u16(6) == 256, Int(read.u32(8)) == bytes.count,
-              read.u32(12) & 1 != 0, read.u32(12) & ~UInt32(63) == 0,
+              read.u32(12) & 1 != 0, read.u32(12) & ~UInt32(127) == 0,
               reportsHistory || bytes[176..<192].allSatisfy({ $0 == 0 }),
               reportsSoftWraps || bytes[192..<256].allSatisfy({ $0 == 0 })
         else { throw TerminalRenderError.malformed }

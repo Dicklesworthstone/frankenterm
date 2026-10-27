@@ -109,6 +109,68 @@ final class NativeTerminalModelTests: XCTestCase {
         XCTAssertEqual(try model.encode(.key(up, .press), maximumBytes: 64), Data("\u{1b}OA".utf8))
     }
 
+    func testMouseClickSamplesCurrentModesAndPreservesReplyAndWholeGestureAdmission() async throws {
+        let (model, source) = try await makeModel()
+        defer { try? model.close() }
+        let original = try frame(model, source)
+        XCTAssertFalse(original.mouseGrabbed)
+        let ungrabbed = try TerminalPointerEvent(action: .click, column: 2, row: 1, frame: original)
+        XCTAssertEqual(try model.encodePointer(ungrabbed, maximumBytes: 64), Data())
+        try model.feed(Data("\u{1b}[?1000h\u{1b}[?1006h\u{1b}[6n".utf8))
+        let grabbed = try frame(model, source)
+        XCTAssertTrue(grabbed.mouseGrabbed)
+        let event = try TerminalPointerEvent(action: .click, column: 2, row: 1, frame: grabbed)
+        let expected = Data("\u{1b}[<0;3;2M\u{1b}[<0;3;2m".utf8)
+        XCTAssertThrowsError(try model.encodePointer(event, maximumBytes: expected.count - 1)) {
+            XCTAssertEqual($0 as? TerminalModelError, .capacity)
+        }
+        XCTAssertEqual(try model.encodePointer(event, maximumBytes: 64), expected)
+        XCTAssertEqual(try model.encodePointer(event, maximumBytes: 64), expected, "pure encoding owns no held button")
+        let reply = try XCTUnwrap(model.copyReply())
+        XCTAssertEqual(reply.bytes, Data("\u{1b}[1;1R".utf8), "mouse input never consumes a parser reply")
+        try model.settleReply(sequence: reply.sequence, disposition: .accepted)
+        XCTAssertNil(try model.copyReply())
+
+        let (other, otherSource) = try await makeModel()
+        defer { try? other.close() }
+        let foreign = try TerminalPointerEvent(action: .click, column: 2, row: 1, frame: frame(other, otherSource))
+        XCTAssertThrowsError(try model.encodePointer(foreign, maximumBytes: 64)) {
+            XCTAssertEqual($0 as? TerminalInputError, .stale)
+        }
+        try model.feed(Data("\u{1b}[?1000l".utf8))
+        XCTAssertEqual(try model.encodePointer(event, maximumBytes: 64), Data(),
+                       "a captured grab hint cannot override the program's current mode")
+        XCTAssertFalse(try frame(model, source).mouseGrabbed)
+    }
+
+    func testMousePixelsStaleGeometryAndAlternateScreenWheelUseCanonicalState() async throws {
+        let (model, source) = try await makeModel()
+        defer { try? model.close() }
+        try model.feed(Data("\u{1b}[?1000h\u{1b}[?1016h".utf8))
+        let old = try TerminalPointerEvent(action: .click, column: 2, row: 1, frame: frame(model, source))
+        XCTAssertThrowsError(try model.encodePointer(old, maximumBytes: 64)) {
+            XCTAssertEqual($0 as? TerminalModelError, .unsupported, "pixel geometry must not be guessed")
+        }
+        try model.resize(.init(columns: 20, rows: 5, pixelWidth: 200, pixelHeight: 100))
+        XCTAssertThrowsError(try model.encodePointer(old, maximumBytes: 64)) {
+            XCTAssertEqual($0 as? TerminalModelError, .stale)
+        }
+        let pixels = try TerminalPointerEvent(action: .click, column: 2, row: 1, frame: frame(model, source))
+        XCTAssertEqual(try model.encodePointer(pixels, maximumBytes: 64),
+                       Data("\u{1b}[<0;26;31M\u{1b}[<0;26;31m".utf8))
+        try model.feed(Data("\u{1b}[?1000l\u{1b}[?1049h\u{1b}[?1h".utf8))
+        let alternate = try frame(model, source)
+        XCTAssertTrue(alternate.alternateScreen); XCTAssertFalse(alternate.mouseGrabbed)
+        let wheel = try TerminalPointerEvent(action: .wheel(steps: -2), column: 0, row: 0, frame: alternate)
+        XCTAssertEqual(try model.encodePointer(wheel, maximumBytes: 64),
+                       Data(String(repeating: "\u{1b}OA", count: 6).utf8),
+                       "wheel fallback uses the current application cursor-key mode")
+        try model.feed(Data("\u{1b}[?2026h".utf8))
+        XCTAssertThrowsError(try model.encodePointer(wheel, maximumBytes: 64)) {
+            XCTAssertEqual($0 as? TerminalModelError, .stale, "retained synchronized output is not a live click target")
+        }
+    }
+
     func testPastePreparationFollowsBracketedPasteMode() async throws {
         let (model, _) = try await makeModel()
         defer { try? model.close() }

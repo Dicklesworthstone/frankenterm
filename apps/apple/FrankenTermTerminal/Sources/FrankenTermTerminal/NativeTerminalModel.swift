@@ -180,6 +180,24 @@ public final class NativeTerminalModel: TerminalSessionModel, @unchecked Sendabl
         }
     }
 
+    public func encodePointer(_ event: TerminalPointerEvent, maximumBytes: Int) throws -> Data {
+        try Self.requireCapacity(maximumBytes)
+        guard event.source == source else { throw TerminalInputError.stale }
+        let action: UInt32, steps: Int32
+        switch event.action {
+        case .click: action = 0; steps = 0
+        case .wheel(let count):
+            guard count != 0, (-32...32).contains(count) else { throw TerminalModelError.invalid }
+            action = 1; steps = Int32(count)
+        }
+        return try withHandle { session in
+            try Self.output(capacity: maximumBytes) { bytes, count, written in
+                ft_terminal_v1_encode_mouse(session, action, steps, event.column, event.row,
+                    UInt32(event.modifiers.rawValue), event.geometryRevision, bytes, count, written)
+            }
+        }
+    }
+
     public func copyReply() throws -> TerminalModelReply? {
         try withHandle { session in
             var sequence: UInt64 = 0

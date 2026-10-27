@@ -286,6 +286,37 @@ final class NativeTerminalInputTests: XCTestCase {
         XCTAssertFalse(view.canBecomeFirstResponder)
         XCTAssertFalse(view.hasText)
     }
+    func testIntentionalKeyboardHideSealsCompositionBeforeOneReactivationRequest() async throws {
+        let (coordinator, transport, source, view) = try await setup()
+        let (window, holder) = keyboardWindow(view)
+        defer { window.isHidden = true }
+        var events: [String] = []
+        view.onRetired = { events.append("retired") }
+        view.onKeyboardDismissed = {
+            XCTAssertFalse(view.session.acceptsInput)
+            XCTAssertFalse(view.isFirstResponder)
+            events.append("dismissed")
+        }
+        view.setMarkedText("private draft", selectedRange: NSRange(location: 13, length: 0))
+        let hide = try XCTUnwrap(accessoryButton(view, "Hide keyboard"))
+        hide.sendActions(for: .touchUpInside)
+        view.hideKeyboard(); view.unmarkText(); view.insertText("late")
+        await view.session.waitUntilSuspended(); try await drain(coordinator, source)
+        XCTAssertEqual(events, ["retired", "dismissed"], "one intentional action requests one fresh focus")
+        XCTAssertFalse(holder.isHolding, "hiding the keyboard is not a handoff to the keyboard holder")
+        let output = await transport.bytes()
+        XCTAssertTrue(output.isEmpty, "hiding does not commit IME text or admit a late responder callback")
+    }
+    func testOrdinaryResponderRetirementNeverRequestsHiddenKeyboardReactivation() async throws {
+        let (_, _, _, view) = try await setup()
+        var requests = 0
+        view.onKeyboardDismissed = { requests += 1 }
+        view.retire(); view.hideKeyboard(); view.requestKeyboard(false)
+        await view.session.waitUntilSuspended()
+        XCTAssertEqual(requests, 0)
+        XCTAssertFalse(view.canBecomeFirstResponder)
+        XCTAssertFalse(view.session.acceptsInput)
+    }
     func testPasteNeedsSourceBoundConfirmationAndDoesNotAppendReturn() async throws {
         let (coordinator, transport, source, view) = try await setup()
         var offered: TerminalPasteReview?

@@ -82,6 +82,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// A touch begun before a lifecycle or machine transition cannot become a
     /// fresh navigation request merely because the same screen returns later.
     @ObservationIgnored private var canvasGeneration = UUID()
+    @ObservationIgnored private var keyboardPresentation: (id: UUID, selection: TerminalNavigationSelection, visible: Bool)?
     /// A retained scene can reopen at another machine. Its previous selection
     /// must not create a terminal before the requested focus handoff commits.
     @ObservationIgnored private var appearanceSelection: String?
@@ -1068,15 +1069,30 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
 
     /// Re-establishes the keyboard after its input generation ended (dismissed
     /// keyboard, an alert, scene deactivation). Never reconnects anything.
-    func activateKeyboard() async {
-        guard !closed, onScreen, !overviewBlocksInput, !groupAppearanceBlocksInput,
+    func activateKeyboard(showKeyboard: Bool = true, source: TerminalSource? = nil) async {
+        guard !Task.isCancelled, !closed, onScreen, foreground, !overviewBlocksInput, !groupAppearanceBlocksInput,
               selectedSession?.keyboardActivationBlocked != true,
-              navigation.phase == .inactive, let selection = navigation.navigation.selection,
-              selection.paneID != nil, sessions[selection.machineID]?.phase == .live else { return }
+              let selection = navigation.navigation.selection, selection.paneID != nil,
+              sessions[selection.machineID]?.phase == .live,
+              source == nil || bindings[selection.machineID]?.source == source,
+              showKeyboard || selectedSession?.terminal?.isSceneActive == true else { return }
+        if navigation.phase == .ready, owner.keyboard?.acceptsInput == true {
+            if showKeyboard { selectedSession?.terminal?.requestKeyboard(true) }
+            return
+        }
+        guard navigation.phase == .inactive else { return }
+        let generation = canvasGeneration, activity = selectedSession?.terminal?.sceneActivityGeneration
         await owner.joinSealed()
-        guard !closed, foreground, !overviewBlocksInput, !groupAppearanceBlocksInput,
+        guard !Task.isCancelled, !closed, onScreen, foreground, canvasGeneration == generation,
+              !overviewBlocksInput, !groupAppearanceBlocksInput,
               navigation.navigation.selection == selection,
-              selectedSession?.keyboardActivationBlocked != true else { return }
+              selectedSession?.keyboardActivationBlocked != true,
+              source == nil || bindings[selection.machineID]?.source == source,
+              showKeyboard || (selectedSession?.terminal?.isSceneActive == true
+                  && selectedSession?.terminal?.sceneActivityGeneration == activity) else { return }
+        let request = UUID()
+        keyboardPresentation = (request, selection, showKeyboard)
+        defer { if keyboardPresentation?.id == request { keyboardPresentation = nil } }
         do { try await navigation.activateSelection() } catch { report(error) }
     }
 
@@ -1162,7 +1178,8 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         guard !overviewBlocksInput, !groupAppearanceBlocksInput,
               navigation.phase == .ready, let selection, selection.paneID != nil,
               let keyboard = owner.keyboard else { return }
-        sessions[selection.machineID]?.install(keyboard)
+        let visible = keyboardPresentation.flatMap { $0.selection == selection ? $0.visible : nil } ?? true
+        sessions[selection.machineID]?.install(keyboard, showKeyboard: visible)
     }
 
     private func isVisible(_ machineID: String) -> Bool {

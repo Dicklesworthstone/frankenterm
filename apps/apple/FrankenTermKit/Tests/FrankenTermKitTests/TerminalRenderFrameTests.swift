@@ -178,8 +178,38 @@ final class TerminalRenderFrameTests: XCTestCase {
         var unflagged = fixture(); i64(-10, at: 176, in: &unflagged)
         assertRejected(unflagged, source: source, "history bytes need their flag")
         XCTAssertNil(TerminalRenderFrame.history(ofEncoded: unflagged))
-        var unknown = data; u32(1 | 16 | 64, at: 12, in: &unknown)
+        var unknown = data; u32(1 | 16 | 128, at: 12, in: &unknown)
         assertRejected(unknown, source: source, "unknown flags are still refused")
+    }
+
+    func testMouseGrabFlagPreservesOldFramesAndPointerEventsRequireLiveBoundedGeometry() async throws {
+        let source = try await source()
+        let original = try TerminalRenderFrame.decode(fixture(), expectedSource: source)
+        XCTAssertFalse(original.mouseGrabbed, "old frames do not claim a mouse grab")
+        var data = fixture(); u32(1 | 64, at: 12, in: &data)
+        let grabbed = try TerminalRenderFrame.decode(data, expectedSource: source)
+        XCTAssertTrue(grabbed.mouseGrabbed)
+        XCTAssertEqual(grabbed.lines, original.lines)
+        let click = try TerminalPointerEvent(action: .click, column: 3, row: 1, frame: grabbed)
+        XCTAssertEqual(click.source, source); XCTAssertEqual(click.geometryRevision, grabbed.geometryRevision)
+        XCTAssertEqual(click.column, 3); XCTAssertEqual(click.row, 1)
+        for (column, row) in [(-1, 0), (grabbed.columns, 0), (0, -1), (0, grabbed.rows)] {
+            XCTAssertThrowsError(try TerminalPointerEvent(action: .click, column: column, row: row, frame: grabbed))
+        }
+        for steps in [Int.min, -33, 0, 33, Int.max] {
+            XCTAssertThrowsError(try TerminalPointerEvent(action: .wheel(steps: steps), column: 0, row: 0, frame: grabbed))
+        }
+        for steps in [-32, -1, 1, 32] {
+            XCTAssertNoThrow(try TerminalPointerEvent(action: .wheel(steps: steps), column: 0, row: 0, frame: grabbed))
+        }
+        var history = data; u32(1 | 16 | 64, at: 12, in: &history)
+        i64(-10, at: 176, in: &history); i64(0, at: 184, in: &history)
+        let inspected = try TerminalRenderFrame.decode(history, expectedSource: source)
+        XCTAssertTrue(inspected.mouseGrabbed)
+        XCTAssertThrowsError(try TerminalPointerEvent(action: .click, column: 0, row: 0, frame: inspected))
+        var retained = data; u32(1 | 8 | 64, at: 12, in: &retained)
+        XCTAssertThrowsError(try TerminalPointerEvent(action: .click, column: 0, row: 0,
+            frame: TerminalRenderFrame.decode(retained, expectedSource: source)))
     }
 
     func testSoftWrapBitmapRequiresItsFlagAndOnlyAddressesCapturedRows() async throws {
