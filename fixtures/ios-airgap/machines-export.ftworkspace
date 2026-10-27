@@ -3,7 +3,7 @@
   "format": "ftworkspace",
   "required_capabilities": [],
   "source": {
-    "configuration_revision": "sha256:c26013973a731a236d13a9136e58481f64d854454273997fa8e73b63d193f5ee",
+    "configuration_revision": "sha256:4b1ca6b6c22da221f0956ee064cd84c756ac08247c1f26597779fbfb37f8e8e6",
     "exporter_id": "frankenterm.machines",
     "kind": "machines_toml"
   },

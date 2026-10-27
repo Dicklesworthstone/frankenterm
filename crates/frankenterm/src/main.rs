@@ -76268,13 +76268,10 @@ fn handle_mobile_command(command: &MobileCommands) -> anyhow::Result<()> {
             check,
         } => {
             let path = inventory_path(inventory);
-            let source =
-                std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
             let context = context_for(&path);
             let inventory = MachineInventory::load(&path)?;
             let sources = mobile_export::SshSources::from_disk(&inventory, &context);
-            let export =
-                mobile_export::export(&inventory, &source, group.as_deref(), &sources, &context)?;
+            let export = mobile_export::export(&inventory, group.as_deref(), &sources, &context)?;
             for note in &export.notes {
                 eprintln!("note: {}", note);
             }

@@ -1609,10 +1609,12 @@ impl EndpointRecords {
     }
 }
 
-/// The phone's workspace for the inventory, or for one group of it.
+/// The phone's workspace for the inventory, or for one group of it. Its
+/// revision identifies the resolved public configuration, not just the raw
+/// inventory file: SSH policy, trust, identities and external theme changes
+/// must change the witness even when `machines.toml` itself is unchanged.
 pub fn export(
     inventory: &MachineInventory,
-    source: &[u8],
     group: Option<&str>,
     sources: &SshSources,
     context: &InventoryContext,
@@ -1878,33 +1880,19 @@ pub fn export(
         Some(group) => format!("w.{}.{}", inventory.workspace_id, group),
         None => format!("w.{}", inventory.workspace_id),
     };
-    let revision = Sha256::digest(source)
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect::<String>();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let bundle_id = format!(
-        "b.{}",
-        short_digest(&format!("{}:{}:{}", revision, nanos, std::process::id()))
-    );
     let machine_count = machines.len();
     let route_count = routes.len();
     anyhow::ensure!(
         records.credentials.len() <= 256,
         "the complete workspace exceeds the phone's 256-credential limit; select a smaller group"
     );
-    let document = json!({
+    let mut document = json!({
         "format": "ftworkspace",
         "version": 1,
-        "bundle_id": bundle_id,
         "required_capabilities": [],
         "source": {
             "exporter_id": EXPORTER_ID,
             "kind": "machines_toml",
-            "configuration_revision": format!("sha256:{}", revision),
         },
         "workspace": {
             "id": workspace_id,
@@ -1922,6 +1910,31 @@ pub fn export(
             },
         },
     });
+    // Hash exactly the public projection, before adding this self-reference
+    // and the fresh per-export bundle identity. Object keys are recursively
+    // sorted even if another workspace crate enables serde_json's
+    // preserve_order feature; array order carries route/group semantics.
+    // Private paths and portability diagnostics stay in the local companion
+    // envelope. Neither they nor raw source comments enter this public witness.
+    document.sort_all_objects();
+    let mut digest = Sha256::new();
+    digest.update(b"frankenterm.mobile-export.public-configuration.v1\0");
+    digest.update(serde_json::to_vec(&document)?);
+    let revision = digest
+        .finalize()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<String>();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    document["source"]["configuration_revision"] = json!(format!("sha256:{}", revision));
+    document["bundle_id"] = json!(format!(
+        "b.{}",
+        short_digest(&format!("{}:{}:{}", revision, nanos, std::process::id()))
+    ));
+    document.sort_all_objects();
     Ok(MobileExport {
         document,
         machines: machine_count,
@@ -1947,7 +1960,7 @@ pub fn load_companion_source(path: &Path) -> anyhow::Result<Value> {
     };
     let inventory = MachineInventory::parse(text, &context)?;
     let sources = SshSources::from_disk(&inventory, &context);
-    let export = export(&inventory, &bytes, None, &sources, &context)?;
+    let export = export(&inventory, None, &sources, &context)?;
     Ok(companion_source(&export, path))
 }
 
@@ -2112,14 +2125,7 @@ ssh = "jumped"
     fn an_inventory_exports_routes_trust_identities_and_resolved_themes() {
         let inventory = MachineInventory::parse(INVENTORY, &context()).unwrap();
         let config = "Host css\n  HostName css.example\n  User ubuntu\n  IdentityFile ~/.ssh/trj_ed25519\nHost jumped\n  HostName inner\n  User u\n  ProxyJump bastion\n";
-        let export = export(
-            &inventory,
-            INVENTORY.as_bytes(),
-            None,
-            &sources(Some(config)),
-            &context(),
-        )
-        .unwrap();
+        let export = export(&inventory, None, &sources(Some(config)), &context()).unwrap();
         let doc = &export.document;
         assert_eq!(doc["format"], "ftworkspace");
         assert_eq!(doc["source"]["exporter_id"], EXPORTER_ID);
@@ -2266,13 +2272,183 @@ socket = "/run/frankenterm.sock"
 
     fn jump_export(sources: &SshSources) -> anyhow::Result<MobileExport> {
         let inventory = MachineInventory::parse(JUMP_INVENTORY, &context()).unwrap();
-        export(
-            &inventory,
-            JUMP_INVENTORY.as_bytes(),
-            None,
-            sources,
-            &context(),
-        )
+        export(&inventory, None, sources, &context())
+    }
+
+    #[test]
+    fn public_revision_is_stable_across_exports_and_local_source_relocation() {
+        let baseline = jump_export(&jump_sources()).unwrap();
+        let repeated = jump_export(&jump_sources()).unwrap();
+        assert_eq!(
+            baseline.document["source"]["configuration_revision"],
+            repeated.document["source"]["configuration_revision"]
+        );
+
+        let mut relocated = jump_sources();
+        relocated.config = Some(format!(
+            "# PRIVATE_SOURCE_SENTINEL\n{}",
+            JUMP_CONFIG.replace(
+                "IdentityFile ~/.ssh/app",
+                "IdentityFile ~/.ssh/renamed-private-key"
+            )
+        ));
+        relocated.public_keys.insert(
+            context().home.join(".ssh/renamed-private-key.pub"),
+            fake_key(4),
+        );
+        relocated.public_keys.insert(
+            context().home.join(".ssh/unused.pub"),
+            "UNSELECTED_SOURCE_SENTINEL".into(),
+        );
+        let annotated = format!("# PRIVATE_INVENTORY_SENTINEL\n{}", JUMP_INVENTORY);
+        let inventory = MachineInventory::parse(&annotated, &context()).unwrap();
+        let moved = export(&inventory, None, &relocated, &context()).unwrap();
+        assert_ne!(baseline.identity_files, moved.identity_files);
+        assert_eq!(baseline.document["workspace"], moved.document["workspace"]);
+        assert_eq!(
+            baseline.document["source"]["configuration_revision"],
+            moved.document["source"]["configuration_revision"],
+            "local private-file mappings and unexported text are not public configuration"
+        );
+        let public = serde_json::to_string(&moved.document).unwrap();
+        for forbidden in [
+            "/home/me/",
+            "renamed-private-key",
+            "PRIVATE_SOURCE_SENTINEL",
+            "PRIVATE_INVENTORY_SENTINEL",
+            "UNSELECTED_SOURCE_SENTINEL",
+            "identity_files",
+        ] {
+            assert!(!public.contains(forbidden), "{}", forbidden);
+        }
+    }
+
+    #[test]
+    fn public_revision_changes_with_resolved_endpoints_hops_and_authentication() {
+        let baseline = jump_export(&jump_sources()).unwrap();
+        for (before, after) in [
+            ("HostName service.internal", "HostName changed.internal"),
+            ("Port 2224", "Port 2225"),
+            ("User deploy", "User replacement"),
+            (
+                "ProxyJump first,second,third",
+                "ProxyJump third,second,first",
+            ),
+            (
+                "Host app\n",
+                "Host app\n PreferredAuthentications password,publickey\n",
+            ),
+            (
+                "Host first\n",
+                "Host first\n PreferredAuthentications publickey,password\n",
+            ),
+            ("Host app\n", "Host app\n Ciphers aes256-ctr\n"),
+        ] {
+            let mut changed = jump_sources();
+            changed.config = Some(JUMP_CONFIG.replace(before, after));
+            let result = jump_export(&changed).unwrap();
+            assert_ne!(
+                baseline.document["workspace"], result.document["workspace"],
+                "{}",
+                after
+            );
+            assert_ne!(
+                baseline.document["source"]["configuration_revision"],
+                result.document["source"]["configuration_revision"],
+                "unchanged inventory bytes cannot hide effective SSH changes: {}",
+                after
+            );
+        }
+    }
+
+    #[test]
+    fn public_revision_changes_with_pins_revocations_identities_and_missing_policy() {
+        let baseline = jump_export(&jump_sources()).unwrap();
+        for change in ["pin", "revocation", "identity", "unavailable trust"] {
+            let mut changed = jump_sources();
+            match change {
+                "pin" => supply(
+                    &mut changed,
+                    "/trust/app",
+                    format!("[service.internal]:2224 {}\n", fake_key(71)),
+                ),
+                "revocation" => supply(
+                    &mut changed,
+                    "/trust/app",
+                    format!("@revoked [service.internal]:2224 {}\n", fake_key(44)),
+                ),
+                "identity" => {
+                    changed
+                        .public_keys
+                        .insert(context().home.join(".ssh/app.pub"), fake_key(72));
+                }
+                "unavailable trust" => {
+                    changed
+                        .known_hosts
+                        .insert(PathBuf::from("/trust/app"), KnownHostsSource::Unavailable);
+                }
+                _ => unreachable!(),
+            }
+            let result = jump_export(&changed).unwrap();
+            assert_ne!(
+                baseline.document["source"]["configuration_revision"],
+                result.document["source"]["configuration_revision"],
+                "{}",
+                change
+            );
+        }
+    }
+
+    #[test]
+    fn public_revision_covers_resolved_themes_and_group_order_and_selection() {
+        let inventory = MachineInventory::parse(INVENTORY, &context()).unwrap();
+        let sources = sources(Some("Host css\n User ubuntu\n HostName css.example\n"));
+        let baseline = export(&inventory, None, &sources, &context()).unwrap();
+        for change in ["palette", "indexed palette", "font", "group order"] {
+            let mut changed = inventory.clone();
+            match change {
+                "palette" => {
+                    changed.machines[0].theme.palette.background =
+                        crate::machines::Rgba::parse("#123456").unwrap();
+                }
+                "indexed palette" => {
+                    changed.machines[0]
+                        .theme
+                        .palette
+                        .indexed
+                        .insert(201, crate::machines::Rgba::parse("#654321").unwrap());
+                }
+                "font" => {
+                    changed.machines[0].theme.font = Some(crate::machines::ThemeFont {
+                        family: "Portable Mono".into(),
+                        size: Some(14.5),
+                    });
+                }
+                "group order" => changed.groups[0].machines.reverse(),
+                _ => unreachable!(),
+            }
+            let result = export(&changed, None, &sources, &context()).unwrap();
+            assert_ne!(
+                baseline.document["source"]["configuration_revision"],
+                result.document["source"]["configuration_revision"],
+                "{}",
+                change
+            );
+        }
+        let mut selection = inventory.clone();
+        let mut group = inventory.groups[0].clone();
+        group.id = "only_css".into();
+        group.machines = vec!["css".into()];
+        selection.groups.push(group);
+        let selected = export(&selection, Some("only_css"), &sources, &context()).unwrap();
+        assert_eq!(
+            selected.document["workspace"]["groups"][0]["machine_order"],
+            json!(["m.css"])
+        );
+        assert_ne!(
+            baseline.document["source"]["configuration_revision"],
+            selected.document["source"]["configuration_revision"]
+        );
     }
 
     fn exported_route<'a>(export: &'a MobileExport, id: &str) -> &'a Value {
@@ -2826,7 +3002,7 @@ socket = "/run/frankenterm.sock"
             JUMP_INVENTORY
         );
         let inventory = MachineInventory::parse(&text, &context()).unwrap();
-        let export = export(&inventory, text.as_bytes(), None, &sources, &context()).unwrap();
+        let export = export(&inventory, None, &sources, &context()).unwrap();
         assert_eq!(export.machines, 1);
         assert_eq!(export.routes, 1);
         assert_eq!(
@@ -2931,7 +3107,7 @@ socket = "/run/frankenterm.sock"
             "/trust/second",
             format!("SHARED. {}\n", fake_key(42)),
         );
-        let before = export(&inventory, text.as_bytes(), None, &sources, &context()).unwrap();
+        let before = export(&inventory, None, &sources, &context()).unwrap();
         let first = exported_route(&before, "r.left.ssh")["jump_routes"][0]
             .as_str()
             .unwrap();
@@ -2953,14 +3129,7 @@ socket = "/run/frankenterm.sock"
             "/trust/second",
             format!("@revoked shared {}\n", fake_key(41)),
         );
-        let selected = export(
-            &inventory,
-            text.as_bytes(),
-            Some("selected"),
-            &sources,
-            &context(),
-        )
-        .unwrap();
+        let selected = export(&inventory, Some("selected"), &sources, &context()).unwrap();
         assert_eq!(selected.machines, 1);
         assert_eq!(selected.routes, 2);
         let first = exported_route(&selected, "r.left.ssh")["jump_routes"][0]
@@ -2977,7 +3146,7 @@ socket = "/run/frankenterm.sock"
             .config
             .as_ref()
             .map(|text| text.replace("Host right\n", "Host right\n Port invalid\n"));
-        let refused = export(&inventory, text.as_bytes(), None, &sources, &context()).unwrap();
+        let refused = export(&inventory, None, &sources, &context()).unwrap();
         assert_eq!(
             refused.machines, 1,
             "the invalid destination is omitted atomically"
@@ -2997,14 +3166,7 @@ socket = "/run/frankenterm.sock"
             PathBuf::from("/trust/second"),
             KnownHostsSource::Unavailable,
         );
-        let selected = export(
-            &inventory,
-            text.as_bytes(),
-            Some("selected"),
-            &sources,
-            &context(),
-        )
-        .unwrap();
+        let selected = export(&inventory, Some("selected"), &sources, &context()).unwrap();
         let first = exported_route(&selected, "r.left.ssh")["jump_routes"][0]
             .as_str()
             .unwrap();
@@ -3025,7 +3187,7 @@ socket = "/run/frankenterm.sock"
         }
         let inventory = MachineInventory::parse(&text, &context()).unwrap();
         let sources = jump_sources();
-        let complete = export(&inventory, text.as_bytes(), None, &sources, &context()).unwrap();
+        let complete = export(&inventory, None, &sources, &context()).unwrap();
         assert_eq!(complete.routes, 256);
         assert_eq!(
             complete.document["workspace"]["host_trust"]
@@ -3043,7 +3205,7 @@ socket = "/run/frankenterm.sock"
         assert_eq!(ids.len(), 256);
         text.push_str("[[machines.overflow.routes]]\nid = \"ssh\"\nssh = \"app\"\n");
         let inventory = MachineInventory::parse(&text, &context()).unwrap();
-        let result = export(&inventory, text.as_bytes(), None, &sources, &context());
+        let result = export(&inventory, None, &sources, &context());
         assert!(
             result.is_err(),
             "an extra graph cannot be partially exported"
@@ -3099,14 +3261,7 @@ socket = "/run/frankenterm.sock"
                 Some(KnownHostsSource::Present(_))
             ));
         }
-        let export = export(
-            &inventory,
-            JUMP_INVENTORY.as_bytes(),
-            None,
-            &snapshot,
-            &context,
-        )
-        .unwrap();
+        let export = export(&inventory, None, &snapshot, &context).unwrap();
         assert_eq!(export.routes, 5);
         assert_eq!(export.identity_files.len(), 4);
         assert!(export.identity_files.values().all(|path| !path.exists()));
@@ -3127,14 +3282,7 @@ socket = "/run/frankenterm.sock"
         );
         let snapshot = SshSources::from_disk(&inventory, &context);
         assert!(snapshot.public_keys.is_empty());
-        let password_export = super::export(
-            &inventory,
-            JUMP_INVENTORY.as_bytes(),
-            None,
-            &snapshot,
-            &context,
-        )
-        .unwrap();
+        let password_export = super::export(&inventory, None, &snapshot, &context).unwrap();
         assert!(password_export.identity_files.is_empty());
         assert_eq!(
             password_export.document["workspace"]["credentials"],
@@ -3175,7 +3323,7 @@ ssh = "bad"
         sources
             .public_keys
             .insert(PathBuf::from("/home/me/.ssh/id_ecdsa.pub"), fake_key(7));
-        let export = export(&inventory, text.as_bytes(), None, &sources, &context()).unwrap();
+        let export = export(&inventory, None, &sources, &context()).unwrap();
         let routes = export.document["workspace"]["routes"].as_array().unwrap();
         assert_eq!(
             routes.len(),
@@ -3235,7 +3383,7 @@ ssh = "bad"
         }
         text.push_str("]\n");
         let inventory = MachineInventory::parse(&text, &context()).unwrap();
-        let export = export(&inventory, text.as_bytes(), None, &sources, &context()).unwrap();
+        let export = export(&inventory, None, &sources, &context()).unwrap();
         let route = &export.document["workspace"]["routes"][0];
         assert_eq!(route["credential_refs"].as_array().unwrap().len(), 8);
         let messages: Vec<String> = export.notes.iter().map(ToString::to_string).collect();
@@ -3254,7 +3402,7 @@ ssh = "bad"
         let mut bare = sources(None);
         bare.public_keys.clear();
         bare.known_hosts.clear();
-        let export = export(&inventory, b"x", Some("fleet"), &bare, &context()).unwrap();
+        let export = export(&inventory, Some("fleet"), &bare, &context()).unwrap();
         assert_eq!(export.document["workspace"]["id"], "w.machines.fleet");
         let messages: Vec<String> = export.notes.iter().map(ToString::to_string).collect();
         assert!(
@@ -3278,7 +3426,7 @@ ssh = "bad"
             "{:?}",
             messages
         );
-        assert!(super::export(&inventory, b"x", Some("nope"), &bare, &context()).is_err());
+        assert!(super::export(&inventory, Some("nope"), &bare, &context()).is_err());
     }
 
     const TRUST_INVENTORY: &str = r#"
@@ -3298,14 +3446,7 @@ ssh = "right"
 
     fn trust_export(sources: &SshSources) -> MobileExport {
         let inventory = MachineInventory::parse(TRUST_INVENTORY, &context()).unwrap();
-        export(
-            &inventory,
-            TRUST_INVENTORY.as_bytes(),
-            None,
-            sources,
-            &context(),
-        )
-        .unwrap()
+        export(&inventory, None, sources, &context()).unwrap()
     }
 
     fn route_trust<'a>(export: &'a MobileExport, route: &str) -> &'a Value {
@@ -3393,14 +3534,7 @@ ssh = "right"
 
         let mut inventory = MachineInventory::parse(TRUST_INVENTORY, &context()).unwrap();
         inventory.machines.reverse();
-        let reversed = export(
-            &inventory,
-            TRUST_INVENTORY.as_bytes(),
-            None,
-            &sources,
-            &context(),
-        )
-        .unwrap();
+        let reversed = export(&inventory, None, &sources, &context()).unwrap();
         assert_eq!(
             after.document["workspace"]["host_trust"],
             reversed.document["workspace"]["host_trust"]
@@ -3424,14 +3558,7 @@ ssh = "right"
             format!("box ssh-ed25519 {}\n", ED25519),
         );
         let only_left = |sources: &SshSources| {
-            export(
-                &inventory,
-                inventory_text.as_bytes(),
-                Some("only_left"),
-                sources,
-                &context(),
-            )
-            .unwrap()
+            export(&inventory, Some("only_left"), sources, &context()).unwrap()
         };
         let unconfigured = only_left(&sources);
         assert_eq!(unconfigured.machines, 1);
@@ -3763,14 +3890,7 @@ ssh = "right"
             snapshot.known_hosts.get(&global),
             Some(KnownHostsSource::Present(_))
         ));
-        let export = export(
-            &inventory,
-            TRUST_INVENTORY.as_bytes(),
-            None,
-            &snapshot,
-            &context,
-        )
-        .unwrap();
+        let export = export(&inventory, None, &snapshot, &context).unwrap();
         for route in ["r.left.ssh", "r.right.ssh"] {
             let trust = route_trust(&export, route);
             assert!(trust["pins"].as_array().unwrap().is_empty());
@@ -3918,15 +4038,17 @@ ssh = "right"
         // do not make an implicit SSH default redefine their method policy.
         // That includes dark's alias, which otherwise has no Host block.
         let config = "Host css\n  HostName css.example\n  User ubuntu\n  IdentityFile ~/.ssh/trj_ed25519\n  PreferredAuthentications publickey\nHost jumped\n  PreferredAuthentications publickey\n";
-        let mut document = export(
-            &inventory,
-            INVENTORY.as_bytes(),
-            None,
-            &sources(Some(config)),
-            &context(),
-        )
-        .unwrap()
-        .document;
+        let mut document = export(&inventory, None, &sources(Some(config)), &context())
+            .unwrap()
+            .document;
+        // Independently computed with Python hashlib over the fixture's
+        // sorted compact public JSON, excluding bundle_id and this revision,
+        // prefixed by b"frankenterm.mobile-export.public-configuration.v1\0".
+        // Only this witness changed; the cross-language workspace is intact.
+        assert_eq!(
+            document["source"]["configuration_revision"],
+            "sha256:4b1ca6b6c22da221f0956ee064cd84c756ac08247c1f26597779fbfb37f8e8e6"
+        );
         // The only per-run field.
         document["bundle_id"] = json!("b.fixture");
         let mut bytes = serde_json::to_vec_pretty(&document).unwrap();
