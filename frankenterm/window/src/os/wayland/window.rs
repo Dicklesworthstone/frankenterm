@@ -697,27 +697,21 @@ impl WindowOps for WaylandWindow {
                         .as_ref()
                         .map(|window| window.wl_surface().id());
 
-                    {
+                    let text_input_resets = {
                         let mut state = connection.wayland_state.borrow_mut();
                         let authority_cleanup = state
                             .clear_destroyed_window_authorities(window_id, surface_id.as_ref());
-                        if authority_cleanup.keyboard {
-                            if let (Some(text_input), Some(keyboard)) =
-                                (&state.text_input, &state.keyboard)
-                            {
-                                if let Some(input) = text_input.get_text_input_for_keyboard(keyboard)
-                                {
-                                    input.disable();
-                                    input.commit();
-                                }
-                            }
-                        }
+                        let resets = state.retire_text_input_for_window_close(
+                            authority_cleanup.keyboard,
+                            surface_id.as_ref(),
+                        );
                         if let Some(surface_id) = surface_id.as_ref() {
-                            if let Some(text_input) = &state.text_input {
-                                text_input.forget_surface_id(surface_id);
-                            }
                             state.surface_to_pending.remove(surface_id);
                         }
+                        resets
+                    };
+                    for reset in text_input_resets {
+                        reset.apply();
                     }
 
                     // Publish destroyed input authority before dispatching Destroyed,
@@ -1704,8 +1698,6 @@ impl WaylandWindowInner {
         if keyboard_surface_id.as_ref() == Some(&surface_id)
             && self.text_cursor.map(|prior| prior != rect).unwrap_or(true)
         {
-            self.text_cursor.replace(rect);
-
             // The cursor rectangle is in surface-local coordinates.
             let (x, y, width, height) = match self.fractional_scale() {
                 Some(scale) => fractional_scale::buffer_rect_to_surface(rect, scale),
@@ -1726,6 +1718,9 @@ impl WaylandWindowInner {
                 if let Some(input) = text_input.get_text_input_for_surface(&surface) {
                     input.set_cursor_rectangle(x, y, width, height);
                     input.commit();
+                    // An update withheld until protocol Enter must be retried
+                    // even if the cursor rectangle has not changed.
+                    self.text_cursor.replace(rect);
                 }
             }
         }
@@ -1884,6 +1879,23 @@ impl WaylandWindowInner {
         if self.invalidated {
             self.request_paint("frame callback");
         }
+    }
+
+    pub(super) fn has_text_input_surface(
+        &self,
+        surface_id: &wayland_client::backend::ObjectId,
+    ) -> bool {
+        self.window
+            .as_ref()
+            .is_some_and(|window| window.wl_surface().id() == *surface_id)
+    }
+
+    pub(super) fn reset_text_input(&mut self) {
+        // Enter and committed enable/disable invalidate compositor cursor
+        // state, so the next update must resend even an unchanged rectangle.
+        self.text_cursor.take();
+        self.events
+            .dispatch(WindowEvent::AdviseDeadKeyStatus(crate::DeadKeyStatus::None));
     }
 
     pub(crate) fn emit_focus(&mut self, mapper: Option<&mut KeyboardWithFallback>, focused: bool) {

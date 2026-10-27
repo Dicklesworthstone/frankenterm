@@ -91,9 +91,7 @@ impl SeatHandler for WaylandState {
                     self.disable_current_keyboard_text_input();
                     self.emit_keyboard_focus_lost();
                     if let Some(keyboard) = self.keyboard.take() {
-                        if let Some(text_input) = &self.text_input {
-                            text_input.forget_keyboard(&keyboard);
-                        }
+                        self.forget_text_input_keyboard(&keyboard);
                         keyboard.release();
                     }
                     self.keyboard_mapper.take();
@@ -123,9 +121,7 @@ impl SeatHandler for WaylandState {
             self.disable_current_keyboard_text_input();
             self.emit_keyboard_focus_lost();
             if let Some(keyboard) = self.keyboard.take() {
-                if let Some(text_input) = &self.text_input {
-                    text_input.forget_keyboard(&keyboard);
-                }
+                self.forget_text_input_keyboard(&keyboard);
                 keyboard.release();
             }
             self.keyboard_mapper.take();
@@ -149,19 +145,14 @@ impl SeatHandler for WaylandState {
             self.primary_selection_source.take();
         }
 
-        if let Some(text_input) = &self.text_input {
-            text_input.forget_seat(&seat);
-        }
+        self.forget_text_input_seat(&seat);
     }
 }
 
 impl WaylandState {
     fn disable_current_keyboard_text_input(&self) {
-        if let (Some(text_input), Some(keyboard)) = (&self.text_input, &self.keyboard) {
-            if let Some(input) = text_input.get_text_input_for_keyboard(keyboard) {
-                input.disable();
-                input.commit();
-            }
+        if let Some(keyboard) = &self.keyboard {
+            self.disable_keyboard_text_input(keyboard);
         }
     }
 

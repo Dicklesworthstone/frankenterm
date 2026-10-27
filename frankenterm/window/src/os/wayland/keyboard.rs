@@ -15,12 +15,7 @@ fn cancel_window_key_repeat(state: &WaylandState, window_id: usize) {
 }
 
 fn disable_text_input_for_keyboard(state: &WaylandState, keyboard: &WlKeyboard) {
-    if let Some(text_input) = &state.text_input {
-        if let Some(input) = text_input.get_text_input_for_keyboard(keyboard) {
-            input.disable();
-            input.commit();
-        }
-    }
+    state.disable_keyboard_text_input(keyboard);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -123,13 +118,9 @@ impl Dispatch<WlKeyboard, KeyboardData> for WaylandState {
                 state.keyboard_window_id = route.focused;
                 event_window_id = route.dispatch_to;
                 if entered_window_id.is_some() {
-                    if let Some(text_input) = &state.text_input {
-                        if let Some(input) = text_input.get_text_input_for_keyboard(keyboard) {
-                            input.enable();
-                            input.commit();
-                        }
-                        text_input.advise_surface(surface, keyboard);
-                    }
+                    // Protocol text-input Enter may precede or follow this
+                    // event. Enable only when both authorities name this surface.
+                    state.advise_keyboard_text_input(surface, keyboard);
                 } else {
                     disable_text_input_for_keyboard(state, keyboard);
                     log::warn!("{:?}, no known surface", event);
