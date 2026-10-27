@@ -213,7 +213,7 @@ struct MobileSSHKeyboardInteractiveSheet: View {
                     Text(verbatim: request.authorization.presentedHostKey.fingerprint)
                         .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
                 }
-                Section("Server challenge · Round \(request.challenge.round)") {
+                Section {
                     if !request.challenge.name.isEmpty { Text(verbatim: request.challenge.name) }
                     if !request.challenge.instruction.isEmpty { Text(verbatim: request.challenge.instruction) }
                     ForEach(request.challenge.prompts.indices, id: \.self) { index in
@@ -237,6 +237,8 @@ struct MobileSSHKeyboardInteractiveSheet: View {
                             .accessibilityIdentifier("ssh.interactive.response.\(index)")
                         }
                     }
+                } header: {
+                    Text("Server challenge · Round \(request.challenge.round)")
                 } footer: {
                     Text("The challenge text comes from this verified server. Responses are sent only for this sign-in and are not saved. Continue also acknowledges an informational round with no fields.")
                 }
