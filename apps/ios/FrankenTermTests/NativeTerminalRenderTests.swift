@@ -41,10 +41,11 @@ final class NativeTerminalRenderTests: XCTestCase {
     /// Feeds `output` to the real engine, draws its frame through Metal in the
     /// host app's window, and returns a 1x snapshot plus the drawn caret.
     private func render(_ output: String, name: String,
-                        configuration: NativeTerminalRenderConfiguration = .init()) async throws -> (Snapshot, NativeTerminalCaret?) {
+                        configuration: NativeTerminalRenderConfiguration = .init(),
+                        columns: UInt32 = 40, rows: UInt32 = 12) async throws -> (Snapshot, NativeTerminalCaret?) {
         let coordinator = try TerminalInputCoordinator()
         let source = try await coordinator.attach(InertTransport())
-        let model = try NativeTerminalModel(source: source, geometry: .init(columns: 40, rows: 12), scrollbackRows: 16)
+        let model = try NativeTerminalModel(source: source, geometry: .init(columns: columns, rows: rows), scrollbackRows: 16)
         self.model = model
         try model.feed(Data(output.utf8))
         let frame = try model.captureFrame(viewportTop: nil)
@@ -104,6 +105,29 @@ final class NativeTerminalRenderTests: XCTestCase {
         XCTAssertGreaterThan(green, 200, "SGR 42 background cells were not drawn")
         XCTAssertGreaterThan(blue, 200, "SGR 44 background cells were not drawn")
         XCTAssertGreaterThan(light, 50, "default-foreground glyphs were not rasterized")
+    }
+
+    func testKeepDesktopSizeFitsTheWholeRemoteGridWithCaretAndPointerInTheSameCells() async throws {
+        var configuration = NativeTerminalRenderConfiguration()
+        configuration.fitsRemoteGrid = true
+        let (shot, caret) = try await render("\u{1b}[1;31mDesktop grid\u{1b}[0m\u{1b}[60;180H",
+            name: "observer-full-desktop-grid", configuration: configuration, columns: 180, rows: 60)
+        let view = try XCTUnwrap(view), projection = try XCTUnwrap(view.pointerProjection)
+        let rect = try XCTUnwrap(caret?.rect)
+        XCTAssertEqual(projection.frame.columns, 180); XCTAssertEqual(projection.frame.rows, 60)
+        XCTAssertEqual(view.configuration.fontPointSize, configuration.fontPointSize,
+            "Fitting must preserve the person's preferred font for a later interactive session")
+        XCTAssertGreaterThan(projection.cellSize.width, 0); XCTAssertGreaterThan(projection.cellSize.height, 0)
+        XCTAssertLessThanOrEqual(projection.cellSize.width * 180, view.bounds.width + 0.01)
+        XCTAssertLessThanOrEqual(projection.cellSize.height * 60, view.bounds.height + 0.01)
+        XCTAssertGreaterThan(rect.minX, 0); XCTAssertGreaterThan(rect.minY, 0)
+        XCTAssertLessThanOrEqual(rect.maxX, CGFloat(shot.width) + 0.01)
+        XCTAssertLessThanOrEqual(rect.maxY, CGFloat(shot.height) + 0.01)
+        XCTAssertEqual(rect.width, projection.cellSize.width, accuracy: 0.01)
+        XCTAssertEqual(rect.height, projection.cellSize.height, accuracy: 0.01)
+        let cell = try XCTUnwrap(projection.frame.columns == 180 ? caret : nil)
+        XCTAssertEqual(cell.rect.minX, projection.cellSize.width * 179, accuracy: 0.01)
+        XCTAssertEqual(cell.rect.minY, projection.cellSize.height * 59, accuracy: 0.01)
     }
 
     func testAccessibleOutputHasSeparateLinesAndDoesNotExposeConcealedText() async throws {

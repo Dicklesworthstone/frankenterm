@@ -44,11 +44,16 @@ public protocol TerminalInputWriter: Sendable {
     /// Synchronous, bounded, and side-effect-free. Reject stale UI admission;
     /// cleanup for previously admitted keys deliberately bypasses this check.
     func validateInputAdmission() throws
+    /// Connection-wide restrictions still apply to source-owned cleanup. This
+    /// must not require the old pane to remain selected: a release may belong
+    /// to an earlier visit whose admitted input is still being delivered.
+    func validateCleanupAdmission() throws
     func writeSome(_ bytes: Data) async throws -> TerminalTransportWrite
 }
 
 public extension TerminalInputWriter {
     func validateInputAdmission() throws {}
+    func validateCleanupAdmission() throws {}
 }
 
 public protocol TerminalByteTransport: AnyObject, TerminalInputWriter {
@@ -406,6 +411,7 @@ public actor TerminalInputCoordinator {
     }
     private func enqueue(_ connection: Connection, kind: TerminalInputKind, bytes: Data, writer: any TerminalInputWriter,
                          pastePayload: Range<Int>? = nil, bracketed: Bool = false) throws -> TerminalInputReceipt {
+        if kind == .cleanup { try writer.validateCleanupAdmission() }
         try checkCapacity(connection, kind: kind, byteCount: bytes.count)
         let inputCharge = kind == .cleanup ? 0 : bytes.count
         let cleanupCharge = kind == .cleanup ? bytes.count : (kind == .paste ? Self.pasteCleanupReservation : 0)

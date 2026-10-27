@@ -292,17 +292,20 @@ public actor WorkspaceSSHConnectionManager {
                         routeID: String, credentialID: String, confirmedByUser: Bool,
                         connectionTimeout: Duration = .seconds(15),
                         authenticationTimeout: Duration = .seconds(60),
-                        attachMux: Bool = true) async throws -> WorkspaceSSHConnection {
+                        attachMux: Bool = true, muxAccessMode: TerminalMuxAccessMode = .interactive,
+                        requiresExistingMux: Bool = false) async throws -> WorkspaceSSHConnection {
         try await connect(workspaceID: workspaceID, expectedRevision: expectedRevision, machineID: machineID,
             routeID: routeID, authentication: .publicKey(credentialID), confirmedByUser: confirmedByUser,
-            connectionTimeout: connectionTimeout, authenticationTimeout: authenticationTimeout, attachMux: attachMux)
+            connectionTimeout: connectionTimeout, authenticationTimeout: authenticationTimeout, attachMux: attachMux,
+            muxAccessMode: muxAccessMode, requiresExistingMux: requiresExistingMux)
     }
 
     public func connect(workspaceID: UUID, expectedRevision: UUID, machineID: String,
                         routeID: String, authentication: WorkspaceSSHAuthenticationChoice, confirmedByUser: Bool,
                         connectionTimeout: Duration = .seconds(15),
                         authenticationTimeout: Duration = .seconds(60),
-                        attachMux: Bool = true) async throws -> WorkspaceSSHConnection {
+                        attachMux: Bool = true, muxAccessMode: TerminalMuxAccessMode = .interactive,
+                        requiresExistingMux: Bool = false) async throws -> WorkspaceSSHConnection {
         guard confirmedByUser else { throw WorkspaceNetworkError.confirmationRequired }
         guard foreground else { throw WorkspaceSSHConnectionError.offline }
         guard retiringWorkspaces[workspaceID] == nil else { throw WorkspaceSSHConnectionError.stale }
@@ -330,7 +333,8 @@ public actor WorkspaceSSHConnectionManager {
                 store: store, broker: broker, passwordPrompter: passwordPrompter,
                 keyboardInteractivePrompter: keyboardInteractivePrompter, journal: journal, networkActivity: networkActivity,
                 connectionTimeout: connectionTimeout, authenticationTimeout: authenticationTimeout,
-                liveness: liveness, muxClientFactory: muxClientFactory, attachMux: attachMux)
+                liveness: liveness, muxClientFactory: muxClientFactory, attachMux: attachMux,
+                muxAccessMode: muxAccessMode, requiresExistingMux: requiresExistingMux)
             do {
                 try Task.checkCancellation()
                 return WorkspaceSSHConnection(native: native, journal: journal, coordinator: coordinator,

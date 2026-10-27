@@ -63,6 +63,7 @@ for name, result, args in [
     ("ssh_message_channel_request_reply_success", I, [P]),
     ("ssh_message_channel_request_pty_term", C.c_char_p, [P]),
     ("ssh_message_channel_request_pty_width", I, [P]), ("ssh_message_channel_request_pty_height", I, [P]),
+    ("ssh_message_channel_request_command", C.c_char_p, [P]),
     ("ssh_channel_read_nonblocking", I, [P, P, C.c_uint32, I]),
     ("ssh_channel_write", I, [P, P, C.c_uint32]), ("ssh_channel_write_stderr", I, [P, P, C.c_uint32]),
     ("ssh_channel_send_eof", I, [P]), ("ssh_channel_close", I, [P]), ("ssh_channel_free", None, [P]),
@@ -166,7 +167,7 @@ class LoopbackServer:
     def __init__(self, key, reject=False, family=socket.AF_INET, completion="unknown",
                  auth_mode="normal", connections=1, host_key=None, host_signature=None,
                  forward_to=None, forward_host="target.internal.invalid", password=None, user_signature=None,
-                 interactive_rounds=None):
+                 interactive_rounds=None, allow_exec=False):
         if not isinstance(connections, int) or not 1 <= connections <= 8:
             raise ValueError("test connection count must be bounded")
         if host_signature not in (None, "rsa-sha2-256", "rsa-sha2-512", "ssh-rsa"):
@@ -177,6 +178,7 @@ class LoopbackServer:
             raise ValueError("test password must be bounded synthetic bytes")
         self.public = public_blob(key)
         self.password = password
+        self.allow_exec = allow_exec
         if interactive_rounds is not None:
             if not 1 <= len(interactive_rounds) <= 8:
                 raise ValueError("test interactive rounds must be bounded")
@@ -426,6 +428,10 @@ class LoopbackServer:
                         SERVER.ssh_message_channel_request_reply_success(message)
                     elif kind == 3 and subtype == 3:
                         self.events.append(("shell",))
+                        SERVER.ssh_message_channel_request_reply_success(message)
+                        break
+                    elif kind == 3 and subtype == 2 and self.allow_exec:
+                        self.events.append(("exec", SERVER.ssh_message_channel_request_command(message)))
                         SERVER.ssh_message_channel_request_reply_success(message)
                         break
                     else:

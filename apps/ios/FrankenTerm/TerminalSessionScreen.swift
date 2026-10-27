@@ -546,6 +546,10 @@ final class TerminalSessionController {
     /// This session showed the machine's mux panes, so a retry after it
     /// drops attaches to them again rather than waiting for New Session.
     @ObservationIgnored private(set) var attachedToMux = false
+    /// A local restriction, fixed before opening the SSH command channel.
+    let muxAccessMode: TerminalMuxAccessMode
+    private(set) var requiresExistingMux: Bool
+    var isViewingOnly: Bool { connection?.muxControl?.accessMode == .viewOnly }
     let target: TerminalSessionTarget
     /// The scene's hook for phase and settlement changes: it starts the next
     /// background connection and reconnects dropped sessions from here.
@@ -608,8 +612,10 @@ final class TerminalSessionController {
     init(target: TerminalSessionTarget, connections: MobileConnections, focus: any TerminalSessionFocus,
          reconnectingFrom previous: TerminalSessionController? = nil,
          retryingAfterPasswordHop retried: TerminalSessionController? = nil,
-         inputDelivery: TerminalInputDelivery = .init()) {
+         inputDelivery: TerminalInputDelivery = .init(),
+         muxAccessMode: TerminalMuxAccessMode = .interactive, requiresExistingMux: Bool = false) {
         self.target = target; self.connections = connections; self.focus = focus
+        self.muxAccessMode = muxAccessMode; self.requiresExistingMux = requiresExistingMux
         self.inputDelivery = inputDelivery
         unansweredInput = TerminalUnansweredInput(workspace: target.workspaceID.uuidString, machine: target.machineID)
         basePalette = target.basePalette
@@ -704,12 +710,12 @@ final class TerminalSessionController {
         interactionProblem = nil; clipboard?.requestCopy()
     }
     func paste() {
-        guard !stopped, phase == .live, presentationVisible, !clipboardIsPresenting, !localInputNeedsDecision else { return }
+        guard !isViewingOnly, !stopped, phase == .live, presentationVisible, !clipboardIsPresenting, !localInputNeedsDecision else { return }
         connection?.muxControl?.inputRouting.discardPointers()
         interactionProblem = nil; clipboard?.requestPaste()
     }
     func composeCommand() {
-        guard !stopped, phase == .live, presentationVisible, !clipboardIsPresenting,
+        guard !isViewingOnly, !stopped, phase == .live, presentationVisible, !clipboardIsPresenting,
               !overviewBlocking, !paneNavigationBusy else { return }
         connection?.muxControl?.inputRouting.discardPointers()
         interactionProblem = nil; clipboard?.requestCommandDraft()
@@ -722,7 +728,7 @@ final class TerminalSessionController {
                                           destination: TerminalMuxInputRouting.Destination?) async throws -> TerminalCommandDraftDestination {
         func checkDestination() throws {
             try Task.checkCancellation()
-            guard !stopped, phase == .live, presentationVisible, !overviewBlocking,
+            guard !isViewingOnly, !stopped, phase == .live, presentationVisible, !overviewBlocking,
                   terminal === view, pump?.source == source, displayedMuxDestination == destination,
                   clipboard?.isPresenting == true, clipboard?.blocksKeyboardActivation == false,
                   paneHandoff == nil, requestedMuxPane == nil,
@@ -1061,7 +1067,7 @@ final class TerminalSessionController {
             [weak self, weak control] state, routing in
             guard let self, let control, !self.stopped, self.connection?.muxControl === control else { return }
             self.muxState = state
-            self.terminal?.remoteMouseGrabbed = state.mouseGrabbed
+            self.terminal?.remoteMouseGrabbed = state.mouseGrabbed && control.accessMode.permitsInput
             if let notice = state.notice, self.noticedMux !== control {
                 self.noticedMux = control
                 self.interactionProblem = notice
@@ -1263,6 +1269,7 @@ final class TerminalSessionController {
             let pump: TerminalSessionPump
             do { pump = try await attempt.openTerminal(geometry: geometry) }
             catch let failure as TerminalMuxError {
+                guard !requiresExistingMux else { throw failure }
                 // No mux answered, it speaks a protocol this app does not (a
                 // newer desktop's), or it has no panes: the machine gets a
                 // shell of its own on one of its direct SSH routes instead, as
@@ -1296,6 +1303,10 @@ final class TerminalSessionController {
             if unansweredInput.takeFromEarlierLaunch(), !inputDelivery.unanswered { inputDelivery.endedUnanswered() }
             if let control = connection.muxControl {
                 attachedToMux = true
+                // Once the person has attached to an existing shared terminal,
+                // retries must keep that intent. A missing mux cannot turn
+                // an observation reconnect into a newly created SSH shell.
+                requiresExistingMux = true
                 // The last connection to this pane, perhaps before a relaunch,
                 // ended before its server confirmed input sent to it.
                 if control.current.inputUnconfirmed, !inputDelivery.unanswered { inputDelivery.endedUnanswered() }
@@ -1431,7 +1442,8 @@ final class TerminalSessionController {
             try checkLive()
             var configuration = Self.renderConfiguration
             configuration.fontRevision = appliedFontRevision
-            let view = try await NativeTerminalView(session: keyboard, configuration: configuration)
+            configuration.fitsRemoteGrid = isViewingOnly
+            let view = try await NativeTerminalView(session: keyboard, configuration: configuration, readOnly: isViewingOnly)
             terminal = view
             try checkLive()
             displayedMuxDestination = expectedMux
@@ -1449,7 +1461,7 @@ final class TerminalSessionController {
             }
             view.onHistoryViewportRequest = { [weak self] top in self?.selectHistory(top) }
             view.onKeyboardRequest = { [weak self] in
-                guard let focus = self?.focus else { return }
+                guard self?.isViewingOnly == false, let focus = self?.focus else { return }
                 Task { await focus.activateKeyboard() }
             }
             view.onFontSizeChange = { [weak self] size in self?.focus?.fontSizeChanged(size) }
@@ -1458,16 +1470,18 @@ final class TerminalSessionController {
             if let control = connection?.muxControl, let expectedMux {
                 // The immutable view/visit pair survives a delayed callback;
                 // it must never be replaced with the newly selected pane.
-                view.onRemoteScroll = { [weak self, weak control, weak view] steps, column, row in
-                    guard let self, let control, let view else { return }
-                    self.submitPointer(.wheel(steps: steps, column: column, row: row),
-                        destination: expectedMux, control: control, view: view)
-                }
-                view.remoteMouseGrabbed = control.current.mouseGrabbed
-                view.onRemoteClick = { [weak self, weak control, weak view] column, row in
-                    guard let self, let control, let view else { return }
-                    self.submitPointer(.click(column: column, row: row),
-                        destination: expectedMux, control: control, view: view)
+                view.remoteMouseGrabbed = control.current.mouseGrabbed && control.accessMode.permitsInput
+                if control.accessMode.permitsInput {
+                    view.onRemoteScroll = { [weak self, weak control, weak view] steps, column, row in
+                        guard let self, let control, let view else { return }
+                        self.submitPointer(.wheel(steps: steps, column: column, row: row),
+                            destination: expectedMux, control: control, view: view)
+                    }
+                    view.onRemoteClick = { [weak self, weak control, weak view] column, row in
+                        guard let self, let control, let view else { return }
+                        self.submitPointer(.click(column: column, row: row),
+                            destination: expectedMux, control: control, view: view)
+                    }
                 }
             } else {
                 view.onRemoteScroll = { [weak self, weak view] steps, column, row in
@@ -1634,7 +1648,8 @@ final class TerminalSessionController {
                 let connected = try await connections.manager.connect(workspaceID: target.workspaceID,
                     expectedRevision: target.revision, machineID: target.machineID, routeID: candidate.id,
                     authentication: attempt.selection.authentication, confirmedByUser: true,
-                    attachMux: !shellOnly && (!candidate.requiresAuthenticationPrompt || candidate.mux))
+                    attachMux: requiresExistingMux || (!shellOnly && (!candidate.requiresAuthenticationPrompt || candidate.mux)),
+                    muxAccessMode: muxAccessMode, requiresExistingMux: requiresExistingMux)
                 // Retain the owner before any following operation can throw.
                 // performStart checks cancellation before opening the channel.
                 connection = connected
@@ -1798,7 +1813,7 @@ final class TerminalSessionController {
     /// canonical application. There is no timer, optimistic model resize, or
     /// generation-less retry that can target a replacement terminal.
     private func propose(_ viewport: NativeTerminalViewport) {
-        guard !stopped, phase == .live, let resize, viewport.source == resize.source,
+        guard !isViewingOnly, !stopped, phase == .live, let resize, viewport.source == resize.source,
               viewport.revision > lastViewportRevision,
               let rows = UInt32(exactly: viewport.rows),
               // At most TerminalSessionGeometry.maximumShownCells: the model

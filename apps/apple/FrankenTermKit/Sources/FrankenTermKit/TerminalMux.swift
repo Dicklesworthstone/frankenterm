@@ -353,6 +353,14 @@ extension TerminalMuxClient {
     public func unansweredInput(pane: Int) throws -> Bool { false }
 }
 
+/// A phone-local restriction for one connection, not a server controller lease.
+/// Changing it requires a new connection after the previous owner has settled.
+public enum TerminalMuxAccessMode: String, Equatable, Sendable {
+    case viewOnly, interactive
+    public var permitsInput: Bool { self == .interactive }
+    public var controlsSize: Bool { self == .interactive }
+}
+
 public enum TerminalMuxError: Error, Equatable, Sendable, LocalizedError {
     /// Nothing answered at the machine's mux socket.
     case unavailable
@@ -377,7 +385,8 @@ public enum TerminalMuxError: Error, Equatable, Sendable, LocalizedError {
 public final class TerminalMuxControl: @unchecked Sendable {
     /// Separate from titles/search state: exact input destinations are invalidated
     /// only by selection, registration loss and connection retirement.
-    public let inputRouting = TerminalMuxInputRouting()
+    public let inputRouting: TerminalMuxInputRouting
+    public let accessMode: TerminalMuxAccessMode
     public struct SearchQuery: Equatable, Sendable {
         public let text: String
         public let caseSensitive: Bool, regex: Bool
@@ -456,7 +465,10 @@ public final class TerminalMuxControl: @unchecked Sendable {
 
     /// `settle`: how long after a pane leaves the screen its output is taken
     /// for the redraw at its own size rather than news.
-    public init(settle: Duration = .seconds(3)) { self.settle = settle }
+    public init(settle: Duration = .seconds(3), accessMode: TerminalMuxAccessMode = .interactive) {
+        self.settle = settle; self.accessMode = accessMode
+        inputRouting = TerminalMuxInputRouting(permitsInput: accessMode.permitsInput)
+    }
 
     public var current: State { lock.withLock { state } }
 

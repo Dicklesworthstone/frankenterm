@@ -39,6 +39,9 @@ public final class TerminalMuxInputRouting: @unchecked Sendable {
         public let retired: Bool
     }
     private let lock = NSLock()
+    /// Viewing readiness is independent of input permission. A view-only
+    /// connection can navigate and consume frames without admitting effects.
+    public let permitsInput: Bool
     private let owner = UUID()
     private var registrations: [Int: UUID] = [:]
     private var paneOrder: [Int] = []
@@ -51,7 +54,7 @@ public final class TerminalMuxInputRouting: @unchecked Sendable {
     private var pointerWaker: (@Sendable () -> Void)?
     private static let maximumPanes = 4096
 
-    public init() {}
+    public init(permitsInput: Bool = true) { self.permitsInput = permitsInput }
     public var current: State { lock.withLock { snapshot() } }
     private func snapshot() -> State {
         State(revision: revision, destination: destination, ready: ready, retired: retired)
@@ -93,6 +96,7 @@ public final class TerminalMuxInputRouting: @unchecked Sendable {
     /// and a reentrant notification cannot deadlock the control owner.
     func admitPointer(_ action: PointerAction, destination selected: Destination)
         throws -> (accepted: Bool, wake: (@Sendable () -> Void)?) {
+        guard permitsInput else { throw TerminalInputError.unavailable }
         let column: Int, row: Int
         switch action {
         case .click(let x, let y): column = x; row = y
@@ -129,7 +133,7 @@ public final class TerminalMuxInputRouting: @unchecked Sendable {
     /// Wheel batches are split without moving a later click ahead of their tail.
     public func takePointer() -> PointerInput? {
         lock.withLock {
-            guard !retired, ready, let first = pointers.first,
+            guard permitsInput, !retired, ready, let first = pointers.first,
                   first.destination == destination,
                   registrations[first.destination.paneID] == first.destination.registration else {
                 pointers.removeAll(); return nil
@@ -243,6 +247,7 @@ public final class TerminalMuxInputRouting: @unchecked Sendable {
         }
     }
     public func validateAdmission(_ selected: Destination) throws {
+        guard permitsInput else { throw TerminalInputError.unavailable }
         try lock.withLock {
             guard !retired, ready, destination == selected,
                   registrations[selected.paneID] == selected.registration else { throw TerminalInputError.stale }
@@ -251,6 +256,7 @@ public final class TerminalMuxInputRouting: @unchecked Sendable {
     /// Previously admitted input and cleanup stay deliverable to their original
     /// live registration, even while another pane is shown. No current-pane lookup.
     public func validateDelivery(_ selected: Destination) throws {
+        guard permitsInput else { throw TerminalInputError.unavailable }
         try lock.withLock {
             guard !retired, selected.owner == owner,
                   registrations[selected.paneID] == selected.registration else { throw TerminalInputError.stale }

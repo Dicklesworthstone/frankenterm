@@ -51,6 +51,7 @@ public struct NativeTerminalCaret {
 @MainActor
 public final class NativeTerminalInputView: UIView, UITextInput {
     public let session: TerminalKeyboardSession
+    public let isReadOnly: Bool
     public var onFailure: (@MainActor (Error) -> Void)?
     public var onPasteReview: (@MainActor (TerminalPasteReview) -> Void)?
     public var onRetired: (@MainActor () -> Void)?
@@ -74,11 +75,11 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     public var isEditable: Bool { acceptsKeys && hasGeometry }
     /// Keys need no caret: the key row stays usable while the live screen is
     /// redrawn, and its keys are admitted like typing (see `typed`).
-    private var acceptsKeys: Bool { session.acceptsInput && !retiring && !ordinaryInputBlocked }
+    private var acceptsKeys: Bool { !isReadOnly && session.acceptsInput && !retiring && !ordinaryInputBlocked }
     /// Review keeps its exact focus alive while withholding ordinary typing.
     /// Only confirmPaste may use this separate admission while a panel covers
     /// the terminal; a new source/geometry still invalidates the candidate.
-    public var canReviewPaste: Bool { session.acceptsPaste && hasGeometry && !retiring }
+    public var canReviewPaste: Bool { !isReadOnly && session.acceptsPaste && hasGeometry && !retiring }
     public var autocapitalizationType: UITextAutocapitalizationType = .none
     public var autocorrectionType: UITextAutocorrectionType = .no
     public var spellCheckingType: UITextSpellCheckingType = .no
@@ -131,8 +132,8 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     public var canCopySelection: (@MainActor () -> Bool)?
     public var copySelection: (@MainActor () -> Void)?
 
-    public init(session: TerminalKeyboardSession) throws {
-        self.session = session
+    public init(session: TerminalKeyboardSession, readOnly: Bool = false) throws {
+        self.session = session; isReadOnly = readOnly
         super.init(frame: .zero)
         isOpaque = false; backgroundColor = .clear
         accessibilityLabel = "Terminal keyboard"
@@ -151,11 +152,11 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     public required init?(coder: NSCoder) { fatalError("Use init(session:)") }
     deinit { NotificationCenter.default.removeObserver(self) }
 
-    public override var canBecomeFirstResponder: Bool { session.acceptsInput && hasGeometry && !retiring }
+    public override var canBecomeFirstResponder: Bool { !isReadOnly && session.acceptsInput && hasGeometry && !retiring }
     public override var inputAccessoryView: UIView? { accessory }
     // A remote shell may contain text even though our local composition is
     // empty. Keep the software Backspace enabled without mirroring that shell.
-    public var hasText: Bool { session.acceptsInput && !ordinaryInputBlocked }
+    public var hasText: Bool { !isReadOnly && session.acceptsInput && !ordinaryInputBlocked }
 
     /// Install before restoring first responder for a command's Review step.
     /// Pending paste candidates also impose this hold automatically. Releasing
@@ -1040,7 +1041,7 @@ public final class NativeTerminalView: UIView {
     private var pinchEngaged = false
 
     public init(session: TerminalKeyboardSession, bundle: Bundle = .main,
-                configuration: NativeTerminalRenderConfiguration = .init()) async throws {
+                configuration: NativeTerminalRenderConfiguration = .init(), readOnly: Bool = false) async throws {
         guard let source = session.originalFocus.source, session.acceptsInput else {
             throw TerminalKeyboardError.unavailable
         }
@@ -1051,7 +1052,7 @@ public final class NativeTerminalView: UIView {
             throw TerminalKeyboardError.unavailable
         }
         let input: NativeTerminalInputView
-        do { input = try NativeTerminalInputView(session: session) }
+        do { input = try NativeTerminalInputView(session: session, readOnly: readOnly) }
         catch { renderer.retire(); throw error }
         self.source = source; self.renderer = renderer; self.input = input
         super.init(frame: .zero)
@@ -1666,8 +1667,8 @@ public final class NativeTerminalView: UIView {
     }
     public func requestKeyboard(_ visible: Bool) {
         guard !retired else { return }
-        wantsKeyboard = visible
-        if !visible || sceneActive { input.requestKeyboard(visible) }
+        wantsKeyboard = visible && !input.isReadOnly
+        if !wantsKeyboard || sceneActive { input.requestKeyboard(wantsKeyboard) }
     }
     /// The caller owns the coordinator and creates the replacement focus only
     /// after the previous generation's asynchronous cleanup has settled.
@@ -1675,7 +1676,7 @@ public final class NativeTerminalView: UIView {
         guard !retired, session.acceptsInput else { throw TerminalKeyboardError.unavailable }
         guard session.originalFocus.source == source else { throw TerminalInputError.stale }
         guard input.session.phase == .retired else { throw TerminalKeyboardError.transitionInProgress }
-        let replacement = try NativeTerminalInputView(session: session)
+        let replacement = try NativeTerminalInputView(session: session, readOnly: input.isReadOnly)
         if let appearance = lastAppearance {
             replacement.updateAppearance(font: appearance.font, foreground: appearance.foreground)
         }
