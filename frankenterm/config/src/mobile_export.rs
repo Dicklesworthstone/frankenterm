@@ -12,10 +12,10 @@
 use crate::machines::{
     InventoryContext, Machine, MachineInventory, MachineRoute, MachineTheme, RouteTarget,
 };
-use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
+use base64::Engine;
 use hmac::{Hmac, KeyInit, Mac};
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1618,13 +1618,11 @@ pub fn export(
     context: &InventoryContext,
 ) -> anyhow::Result<MobileExport> {
     let groups: Vec<_> = match group {
-        Some(id) => vec![
-            inventory
-                .groups
-                .iter()
-                .find(|g| g.id == id)
-                .ok_or_else(|| anyhow::anyhow!("no group named {:?} in the inventory", id))?,
-        ],
+        Some(id) => vec![inventory
+            .groups
+            .iter()
+            .find(|g| g.id == id)
+            .ok_or_else(|| anyhow::anyhow!("no group named {:?} in the inventory", id))?],
         None => inventory.groups.iter().collect(),
     };
     let wanted: BTreeSet<&str> = groups
@@ -1839,14 +1837,12 @@ pub fn export(
                     .as_str()
                     .is_some_and(|value| fingerprints.contains(value))
             });
-            trust["revoked_keys"] = json!(
-                revoked
-                    .iter()
-                    .map(|key| {
-                        json!({"algorithm": key.algorithm, "fingerprint": key.fingerprint()})
-                    })
-                    .collect::<Vec<_>>()
-            );
+            trust["revoked_keys"] = json!(revoked
+                .iter()
+                .map(|key| {
+                    json!({"algorithm": key.algorithm, "fingerprint": key.fingerprint()})
+                })
+                .collect::<Vec<_>>());
         }
         if unresolved_scopes.contains(scope) {
             trust["required_capabilities"] = json!([UNRESOLVED_POLICY]);
@@ -2184,11 +2180,9 @@ ssh = "jumped"
         assert_eq!(routes[0]["credential_refs"], routes[2]["credential_refs"]);
         let trust = workspace["host_trust"].as_array().unwrap();
         assert_eq!(trust.len(), 2);
-        assert!(
-            trust
-                .iter()
-                .all(|t| t["pins"].as_array().unwrap().len() == 1)
-        );
+        assert!(trust
+            .iter()
+            .all(|t| t["pins"].as_array().unwrap().len() == 1));
 
         let theme = &workspace["themes"][0];
         assert_eq!(theme["background"], "#0A0E14");
@@ -2605,12 +2599,10 @@ socket = "/run/frankenterm.sock"
             note.message
                 .contains("other configured authentication methods")
         }));
-        assert!(
-            !export
-                .notes
-                .iter()
-                .any(|note| note.message.contains("cannot sign in"))
-        );
+        assert!(!export
+            .notes
+            .iter()
+            .any(|note| note.message.contains("cannot sign in")));
         sources.config = Some(
             sources
                 .config
@@ -2618,12 +2610,10 @@ socket = "/run/frankenterm.sock"
                 .replace("password,publickey", "publickey"),
         );
         let export = jump_export(&sources).unwrap();
-        assert!(
-            export
-                .notes
-                .iter()
-                .any(|note| note.message.contains("cannot sign in"))
-        );
+        assert!(export
+            .notes
+            .iter()
+            .any(|note| note.message.contains("cannot sign in")));
     }
 
     #[test]
@@ -2756,11 +2746,9 @@ socket = "/run/frankenterm.sock"
             export.routes, 5,
             "the explicit preceding hop overrides second's proxy"
         );
-        assert!(
-            !serde_json::to_string(&export.document)
-                .unwrap()
-                .contains("must-not-execute")
-        );
+        assert!(!serde_json::to_string(&export.document)
+            .unwrap()
+            .contains("must-not-execute"));
         sources.config = Some(JUMP_CONFIG.replace(
             "Host first\n",
             "Host first\n ProxyCommand touch /must-not-execute\n",
@@ -3060,13 +3048,11 @@ socket = "/run/frankenterm.sock"
             result.is_err(),
             "an extra graph cannot be partially exported"
         );
-        assert!(
-            result
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("256-route limit")
-        );
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("256-route limit"));
     }
 
     #[test]
@@ -3103,11 +3089,9 @@ socket = "/run/frankenterm.sock"
         let inventory = MachineInventory::parse(JUMP_INVENTORY, &context).unwrap();
         let snapshot = SshSources::from_disk(&inventory, &context);
         for alias in ["first", "second", "third", "app"] {
-            assert!(
-                snapshot
-                    .public_keys
-                    .contains_key(&context.home.join(format!(".ssh/{}.pub", alias)))
-            );
+            assert!(snapshot
+                .public_keys
+                .contains_key(&context.home.join(format!(".ssh/{}.pub", alias))));
             assert!(matches!(
                 snapshot
                     .known_hosts
@@ -3398,12 +3382,10 @@ ssh = "right"
             let trust = route_trust(&after, route);
             assert_eq!(trust["revoked_keys"][0]["fingerprint"], FINGERPRINT);
         }
-        assert!(
-            route_trust(&after, "r.left.ssh")["pins"]
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
+        assert!(route_trust(&after, "r.left.ssh")["pins"]
+            .as_array()
+            .unwrap()
+            .is_empty());
         assert_eq!(
             route_trust(&after, "r.right.ssh")["pins"][0]["fingerprint"],
             other_fingerprint
@@ -3576,12 +3558,10 @@ ssh = "right"
             format!("@revoked box ssh-ed25519 {}\n", ED25519),
         );
         let export = trust_export(&sources);
-        assert!(
-            route_trust(&export, "r.left.ssh")["pins"]
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
+        assert!(route_trust(&export, "r.left.ssh")["pins"]
+            .as_array()
+            .unwrap()
+            .is_empty());
         assert_eq!(
             route_trust(&export, "r.left.ssh")["revoked_keys"][0]["fingerprint"],
             FINGERPRINT
@@ -3659,12 +3639,10 @@ ssh = "right"
                 route_trust(&after, route)["revoked_keys"][0]["fingerprint"],
                 FINGERPRINT
             );
-            assert!(
-                route_trust(&after, route)["pins"]
-                    .as_array()
-                    .unwrap()
-                    .is_empty()
-            );
+            assert!(route_trust(&after, route)["pins"]
+                .as_array()
+                .unwrap()
+                .is_empty());
         }
         assert_eq!(
             canonical_host("[2001:0db8:0:0:0:0:0:1]"),
@@ -3747,7 +3725,7 @@ ssh = "right"
         assert_eq!(read_source(&file, 8), KnownHostsSource::Unavailable);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::{PermissionsExt, symlink};
+            use std::os::unix::fs::{symlink, PermissionsExt};
             let link = directory.path().join("linked_hosts");
             symlink(&file, &link).unwrap();
             assert_eq!(read_source(&link, 8), KnownHostsSource::Unavailable);
@@ -3903,11 +3881,9 @@ ssh = "right"
         );
         assert!(themes.len() > 1000);
         assert_eq!(themes[0]["name"], "FrankenTerm Azure");
-        assert!(
-            themes
-                .iter()
-                .all(|t| t["ansi"].as_array().unwrap().len() == 16)
-        );
+        assert!(themes
+            .iter()
+            .all(|t| t["ansi"].as_array().unwrap().len() == 16));
     }
 
     /// The app and Kit read these files; they must be what this code writes.
@@ -3938,9 +3914,10 @@ ssh = "right"
     #[test]
     fn the_kit_fixture_is_this_exporters_output() {
         let inventory = MachineInventory::parse(INVENTORY, &context()).unwrap();
-        // This cross-language fixture deliberately models a key-only route;
-        // do not make an implicit SSH default redefine its method policy.
-        let config = "Host css\n  HostName css.example\n  User ubuntu\n  IdentityFile ~/.ssh/trj_ed25519\n  PreferredAuthentications publickey\n";
+        // This cross-language fixture deliberately models key-only routes;
+        // do not make an implicit SSH default redefine their method policy.
+        // That includes dark's alias, which otherwise has no Host block.
+        let config = "Host css\n  HostName css.example\n  User ubuntu\n  IdentityFile ~/.ssh/trj_ed25519\n  PreferredAuthentications publickey\nHost jumped\n  PreferredAuthentications publickey\n";
         let mut document = export(
             &inventory,
             INVENTORY.as_bytes(),
