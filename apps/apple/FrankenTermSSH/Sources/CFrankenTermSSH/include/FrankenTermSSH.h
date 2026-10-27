@@ -20,6 +20,7 @@ enum {
     FTSSH_OK = 0, FTSSH_AGAIN = 1, FTSSH_SIGNATURE_NEEDED = 2, FTSSH_EOF = 3,
     FTSSH_YIELD = 4, FTSSH_PASSWORD_NEEDED = 5,
     FTSSH_INTERACTIVE_NEEDED = 6, FTSSH_INTERACTIVE_FINISHED = 7,
+    FTSSH_AUTH_PARTIAL_REQUIRED = 8,
     FTSSH_INVALID = -1000, FTSSH_STATE = -1001, FTSSH_LIMIT = -1002,
     FTSSH_IO = -1003, FTSSH_NEGOTIATION = -1004, FTSSH_HOST_REJECTED = -1005,
     FTSSH_AUTH_REJECTED = -1006, FTSSH_CHALLENGE = -1007, FTSSH_CHANNEL = -1008,
@@ -81,6 +82,24 @@ int ftssh_approve_host_key(ftssh_session *session, const uint8_t *key, size_t le
  * libssh2 cannot expose the offered algorithm before its signing callback. */
 int ftssh_begin_authentication(ftssh_session *session, const char *user, size_t user_length,
                              const uint8_t *public_blob, size_t blob_length);
+/* Available only with the versioned FrankenTerm libssh2 evidence extension.
+ * An unpatched backend remains usable for the other explicit auth methods. */
+int ftssh_supports_publickey_interactive(void);
+/* Explicitly authorize this key followed, if required, by keyboard-interactive.
+ * One finite monotonic deadline (1..120000 ms) covers signing and every MFA
+ * round. The key may authenticate completely. Otherwise authentication_step
+ * returns AUTH_PARTIAL_REQUIRED only for fresh, bounded, actual SIGNED-key
+ * partial success that advertises keyboard-interactive. No method inference,
+ * unsigned partial success, key enumeration, or password fallback is allowed.
+ * The caller must also authorize the second factor for this exact identity. */
+int ftssh_begin_publickey_interactive_authentication(ftssh_session *session,
+    const char *user, size_t user_length, const uint8_t *public_blob, size_t blob_length,
+    uint32_t timeout_milliseconds);
+/* Consume AUTH_PARTIAL_REQUIRED once and transfer to the same bounded native
+ * worker used by keyboard-interactive. Retains the exact account, approved
+ * peer, connection and original deadline. No new none/method probe is sent.
+ * A partial handle cannot open any channel or start another auth method. */
+int ftssh_continue_interactive_authentication(ftssh_session *session);
 /* Select password authentication only after the same exact host approval.
  * No secret is requested or transmitted until authentication_step has checked
  * the server's complete bounded method list and returned PASSWORD_NEEDED.
@@ -140,8 +159,10 @@ int ftssh_finish_interactive_authentication(ftssh_session *session);
  * FTSSH_AUTH_REJECTED means the server explicitly refused the unsigned public
  * key offer before entering the signing callback. Only that result permits an
  * owner to consider another explicitly configured identity on a new connection.
- * FTSSH_AUTH_FAILED is terminal: libssh2 cannot distinguish signed rejection
- * from partial authentication or some protocol failures. It NEVER permits key
+ * This proof requires the versioned backend; stock ambiguity is AUTH_FAILED.
+ * FTSSH_AUTH_FAILED is terminal: an ordinary key-only call does not continue
+ * partial authentication. Only the explicitly combined API can return
+ * AUTH_PARTIAL_REQUIRED with validated backend evidence. Failure NEVER permits key
  * fallback. No publickey method, or success without the selected key's signature,
  * is FTSSH_UNSUPPORTED. Every authentication failure terminates this handle;
  * no shell is opened. For a selected password, PASSWORD_NEEDED requests one

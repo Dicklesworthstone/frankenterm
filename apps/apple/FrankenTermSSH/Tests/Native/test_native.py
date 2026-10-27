@@ -87,6 +87,9 @@ for name, result, args in [
     ("ftssh_copy_host_key", I, [P, P, Z, C.POINTER(Z)]), ("ftssh_copy_method", I, [P, I, P, Z]),
     ("ftssh_approve_host_key", I, [P, P, Z]),
     ("ftssh_begin_authentication", I, [P, P, Z, P, Z]), ("ftssh_authentication_step", I, [P]),
+    ("ftssh_supports_publickey_interactive", I, []),
+    ("ftssh_begin_publickey_interactive_authentication", I, [P, P, Z, P, Z, C.c_uint32]),
+    ("ftssh_continue_interactive_authentication", I, [P]),
     ("ftssh_begin_password_authentication", I, [P, P, Z]), ("ftssh_supply_password", I, [P, P, Z]),
     ("ftssh_begin_interactive_authentication", I, [P, P, Z, C.c_uint32]),
     ("ftssh_copy_interactive_challenge", I, [P, P, Z, C.POINTER(Z), C.POINTER(C.c_uint32)]),
@@ -288,7 +291,14 @@ class LoopbackServer:
             password_method = self.auth_mode == "publickeyDisabled" or (
                 self.password is not None and self.auth_mode != "passwordDisabled")
             interactive_method = self.interactive_rounds is not None and self.auth_mode != "interactiveDisabled"
-            SERVER.ssh_set_auth_methods(session, 16 if interactive_method else 2 if password_method else 4)
+            publickey_interactive = self.auth_mode.startswith("publickeyInteractive") or (
+                self.interactive_rounds is not None and self.auth_mode in (
+                    "rejectSignature", "unsignedSuccess", "unsignedPartial", "disconnectSignature"))
+            # KI is deliberately absent before the key factor. The client must
+            # use the actual signed failure's new method list for continuation.
+            SERVER.ssh_set_auth_methods(session, 4 if publickey_interactive else
+                                        16 if interactive_method else 2 if password_method else 4)
+            key_factor_accepted = False
             interactive_round = 0
             if verification_observer is not None:
                 SERVER.ssh_set_blocking(session, 0)
@@ -309,6 +319,10 @@ class LoopbackServer:
                         SERVER.ssh_message_service_reply_success(message)
                     elif kind == 1 and subtype == 1:
                         self.events.append(("authentication-methods", SERVER.ssh_message_auth_user(message)))
+                        if key_factor_accepted:
+                            self.events.append(("unexpected-method-probe",))
+                            control.shutdown(socket.SHUT_RDWR)
+                            return
                         if self.auth_mode == "noneSucceeds":
                             SERVER.ssh_message_auth_reply_success(message, 0)
                         else:
@@ -356,7 +370,7 @@ class LoopbackServer:
                                 SERVER.ssh_message_reply_default(message)
                                 continue
                             if interactive_round == len(self.interactive_rounds):
-                                if self.auth_mode == "interactivePartial":
+                                if self.auth_mode in ("interactivePartial", "publickeyInteractivePartial"):
                                     SERVER.ssh_set_auth_methods(session, 4)
                                     SERVER.ssh_message_auth_reply_success(message, 1)
                                 else:
@@ -364,10 +378,11 @@ class LoopbackServer:
                                 continue
                         else:
                             self.events.append(("interactive-request", user))
-                            if not interactive_method or user != b"operator" or self.reject:
+                            if (not interactive_method or user != b"operator" or self.reject or
+                                    (publickey_interactive and not key_factor_accepted)):
                                 SERVER.ssh_message_reply_default(message)
                                 continue
-                            if self.auth_mode == "interactiveImmediateSuccess":
+                            if self.auth_mode in ("interactiveImmediateSuccess", "publickeyInteractiveImmediateSuccess"):
                                 SERVER.ssh_message_auth_reply_success(message, 0)
                                 continue
                             interactive_round = 0
@@ -398,11 +413,20 @@ class LoopbackServer:
                         elif state == 0:
                             if self.auth_mode == "unsignedSuccess":
                                 SERVER.ssh_message_auth_reply_success(message, 0)
+                            elif self.auth_mode == "unsignedPartial":
+                                SERVER.ssh_set_auth_methods(session, 16)
+                                SERVER.ssh_message_auth_reply_success(message, 1)
                             else:
                                 SERVER.ssh_message_auth_reply_pk_ok_simple(message)
                         elif state == 1:
                             if self.auth_mode == "rejectSignature":
                                 SERVER.ssh_message_reply_default(message)
+                            elif publickey_interactive:
+                                key_factor_accepted = True
+                                methods = (2 if self.auth_mode == "publickeyInteractiveNoKI" else
+                                           18 if self.auth_mode == "publickeyInteractiveAlternatives" else 16)
+                                SERVER.ssh_set_auth_methods(session, methods)
+                                SERVER.ssh_message_auth_reply_success(message, 1)
                             elif self.auth_mode == "partial":
                                 SERVER.ssh_set_auth_methods(session, 2)
                                 SERVER.ssh_message_auth_reply_success(message, 1)
@@ -655,13 +679,17 @@ class NativeSSHTests(unittest.TestCase):
         self.assertEqual(function(handle, buffer, cap, C.byref(count)), 0)
         return buffer.raw[:count.value]
 
-    def authenticate(self, handle, server, key, terminal=(0,)):
+    def authenticate(self, handle, server, key, terminal=(0,), interactive_timeout=None, signing_delay=0):
         self.advance(handle, DRIVER.ftssh_handshake)
         actual = self.data(handle, DRIVER.ftssh_copy_host_key)
         self.assertEqual(actual, server.host_blob)
         self.assertEqual(DRIVER.ftssh_approve_host_key(handle, server.host_blob, len(server.host_blob)), 0)
         blob = public_blob(key)
-        self.assertEqual(DRIVER.ftssh_begin_authentication(handle, b"operator", 8, blob, len(blob)), 0)
+        if interactive_timeout is None:
+            self.assertEqual(DRIVER.ftssh_begin_authentication(handle, b"operator", 8, blob, len(blob)), 0)
+        else:
+            self.assertEqual(DRIVER.ftssh_begin_publickey_interactive_authentication(
+                handle, b"operator", 8, blob, len(blob), interactive_timeout), 0)
         outcome = self.advance(handle, DRIVER.ftssh_authentication_step, (2, -1006) + terminal)
         if outcome != 2:
             return outcome
@@ -677,6 +705,8 @@ class NativeSSHTests(unittest.TestCase):
             self.assertEqual(DRIVER.ftssh_authentication_step(handle), 2)
             self.assertEqual(self.data(handle, DRIVER.ftssh_copy_challenge, 1536), challenge)
         signed = signature(key, challenge)
+        if signing_delay:
+            time.sleep(signing_delay)
         self.assertEqual(DRIVER.ftssh_supply_signature(handle, signed, len(signed)), 0)
         self.assertEqual(DRIVER.ftssh_supply_signature(handle, signed, len(signed)), -1001)
         return self.advance(handle, DRIVER.ftssh_authentication_step, terminal)
@@ -725,6 +755,209 @@ class NativeSSHTests(unittest.TestCase):
     def finish_interactive(self, handle, expected=0):
         self.assertEqual(self.advance(handle, DRIVER.ftssh_authentication_step, (7,), timeout=5), 7)
         self.assertEqual(DRIVER.ftssh_finish_interactive_authentication(handle), expected)
+
+    def test_combined_authentication_requires_approval_and_matching_backend(self):
+        handle, server, key = self.start(auth_mode="publickeyInteractive",
+                                        interactive_rounds=[self.interactive_round()])
+        blob = public_blob(key)
+        self.assertEqual(DRIVER.ftssh_begin_publickey_interactive_authentication(
+            handle, b"operator", 8, blob, len(blob), 3000), -1001)
+        self.assertEqual(DRIVER.ftssh_continue_interactive_authentication(handle), -1001)
+        self.advance(handle, DRIVER.ftssh_handshake)
+        self.assertEqual(DRIVER.ftssh_approve_host_key(handle, server.host_blob, len(server.host_blob)), 0)
+        for timeout in [0, 120001]:
+            self.assertEqual(DRIVER.ftssh_begin_publickey_interactive_authentication(
+                handle, b"operator", 8, blob, len(blob), timeout), -1000)
+        expected = 0 if DRIVER.ftssh_supports_publickey_interactive() else -1010
+        self.assertEqual(DRIVER.ftssh_begin_publickey_interactive_authentication(
+            handle, b"operator", 8, blob, len(blob), 3000), expected)
+        self.assertEqual(DRIVER.ftssh_close(handle), 0)
+        self.assertTrue(server.done.wait(2))
+        self.assertFalse(any(event[0] in ("authentication", "interactive-request") for event in server.events))
+
+    @unittest.skipUnless(DRIVER.ftssh_supports_publickey_interactive(), "patched backend required")
+    def test_signed_publickey_partial_success_continues_to_real_multiround_terminal(self):
+        choices = [
+            (ed25519.Ed25519PrivateKey.generate(), None, "publickeyInteractive"),
+            (ec.generate_private_key(ec.SECP256R1()), None, "publickeyInteractive"),
+            (rsa_client_key(2048), "rsa-sha2-256", "publickeyInteractive"),
+            (rsa_client_key(2048), "rsa-sha2-512", "publickeyInteractive"),
+            (ed25519.Ed25519PrivateKey.generate(), None, "publickeyInteractiveAlternatives"),
+        ]
+        for key, algorithm, mode in choices:
+            with self.subTest(algorithm=algorithm or type(key).__name__, mode=mode):
+                rounds = [self.interactive_round([], [], instruction=b"Confirm this sign-in"),
+                          self.interactive_round([b"654321"], [(b"One-time code: ", False)])]
+                handle, server, _ = self.start(key=key, user_signature=algorithm, auth_mode=mode,
+                                              interactive_rounds=rounds)
+                self.assertEqual(self.authenticate(handle, server, key, terminal=(8,), interactive_timeout=3000), 8)
+                self.assertEqual(DRIVER.ftssh_begin_shell(handle, 80, 24, 0, 0), -1001)
+                self.assertEqual(DRIVER.ftssh_begin_forward(handle, b"target", 6, 22), -1001)
+                self.assertEqual(DRIVER.ftssh_begin_password_authentication(handle, b"operator", 8), -1001)
+                self.assertEqual(DRIVER.ftssh_begin_interactive_authentication(handle, b"changed", 7, 3000), -1001)
+                self.assertEqual(DRIVER.ftssh_continue_interactive_authentication(handle), 0)
+                self.assertEqual(DRIVER.ftssh_continue_interactive_authentication(handle), -1001)
+                for number, challenge in enumerate(rounds, 1):
+                    self.interactive_challenge(handle, number, challenge)
+                    self.answer_interactive(handle, number, challenge["responses"])
+                self.finish_interactive(handle)
+                self.assertEqual(DRIVER.ftssh_begin_shell(handle, 80, 24, 0, 0), 0)
+                self.advance(handle, DRIVER.ftssh_shell_step)
+                self.assertEqual(DRIVER.ftssh_close(handle), 0)
+                self.assertTrue(server.done.wait(2))
+                self.assertEqual([e[1] for e in server.events if e[0] == "authentication"], [0, 1])
+                self.assertEqual([e[1] for e in server.events if e[0] == "authentication-methods"], [b"operator"])
+                self.assertEqual([e[1] for e in server.events if e[0] == "interactive-request"], [b"operator"])
+                self.assertFalse(any(e[0] in ("unexpected-method-probe", "password-authentication") for e in server.events))
+                self.assertTrue(any(e[0] == "shell" for e in server.events))
+
+    @unittest.skipUnless(DRIVER.ftssh_supports_publickey_interactive(), "patched backend required")
+    def test_combined_authentication_accepts_complete_key_success_without_prompt(self):
+        handle, server, key = self.start()
+        self.assertEqual(self.authenticate(handle, server, key, interactive_timeout=3000), 0)
+        self.assertEqual(DRIVER.ftssh_continue_interactive_authentication(handle), -1001)
+        self.assertEqual(DRIVER.ftssh_begin_shell(handle, 80, 24, 0, 0), 0)
+        self.advance(handle, DRIVER.ftssh_shell_step)
+        self.assertFalse(any(e[0] == "interactive-request" for e in server.events))
+
+    @unittest.skipUnless(DRIVER.ftssh_supports_publickey_interactive(), "patched backend required")
+    def test_only_proven_signed_partial_success_can_start_second_factor(self):
+        cases = [
+            ("rejectSignature", False, -1011, [0, 1]),
+            ("unsignedSuccess", False, -1010, [0]),
+            ("unsignedPartial", False, -1011, [0]),
+            ("publickeyInteractiveNoKI", False, -1010, [0, 1]),
+            ("publickeyInteractive", True, -1006, [0]),
+            ("noneSucceeds", False, -1010, []),
+            ("publickeyDisabled", False, -1010, []),
+            ("disconnectSignature", False, -1003, [0, 1]),
+        ]
+        for mode, reject, expected, states in cases:
+            with self.subTest(mode=mode):
+                handle, server, key = self.start(auth_mode=mode, reject=reject,
+                                                interactive_rounds=[self.interactive_round()])
+                self.assertEqual(self.authenticate(handle, server, key, terminal=(expected,),
+                                                   interactive_timeout=3000), expected)
+                self.assertEqual(DRIVER.ftssh_continue_interactive_authentication(handle), expected)
+                self.assertEqual(DRIVER.ftssh_begin_shell(handle, 80, 24, 0, 0), expected)
+                self.assertEqual(DRIVER.ftssh_close(handle), 0)
+                self.assertTrue(server.done.wait(2))
+                self.assertEqual([e[1] for e in server.events if e[0] == "authentication"], states)
+                self.assertFalse(any(e[0] in ("interactive-request", "channel", "pty", "shell") for e in server.events))
+
+    def test_key_only_api_never_uses_signed_partial_to_prompt_or_retry(self):
+        handle, server, key = self.start(auth_mode="publickeyInteractive",
+                                        interactive_rounds=[self.interactive_round()])
+        self.assertEqual(self.authenticate(handle, server, key, terminal=(-1011,)), -1011)
+        self.assertEqual(DRIVER.ftssh_continue_interactive_authentication(handle), -1011)
+        self.assertEqual(DRIVER.ftssh_close(handle), 0)
+        self.assertTrue(server.done.wait(2))
+        self.assertEqual([e[1] for e in server.events if e[0] == "authentication"], [0, 1])
+        self.assertFalse(any(e[0] in ("interactive-request", "channel", "pty", "shell") for e in server.events))
+
+    @unittest.skipUnless(DRIVER.ftssh_supports_publickey_interactive(), "patched backend required")
+    def test_second_factor_failure_partial_and_challengeless_success_are_terminal(self):
+        for mode, answer, expected in [
+                ("publickeyInteractive", b"wrong", -1013),
+                ("publickeyInteractivePartial", b"123456", -1013),
+                ("publickeyInteractiveImmediateSuccess", None, -1010)]:
+            with self.subTest(mode=mode):
+                challenge = self.interactive_round([b"123456"], [(b"Code: ", False)])
+                handle, server, key = self.start(auth_mode=mode, interactive_rounds=[challenge])
+                self.assertEqual(self.authenticate(handle, server, key, terminal=(8,), interactive_timeout=3000), 8)
+                self.assertEqual(DRIVER.ftssh_continue_interactive_authentication(handle), 0)
+                if answer is not None:
+                    self.interactive_challenge(handle, 1, challenge)
+                    self.answer_interactive(handle, 1, [answer])
+                self.finish_interactive(handle, expected)
+                self.assertEqual(DRIVER.ftssh_begin_shell(handle, 80, 24, 0, 0), expected)
+                self.assertEqual(DRIVER.ftssh_continue_interactive_authentication(handle), expected)
+                self.assertEqual(DRIVER.ftssh_close(handle), 0)
+                self.assertTrue(server.done.wait(2))
+                self.assertEqual([e[1] for e in server.events if e[0] == "authentication"], [0, 1])
+                self.assertEqual(len([e for e in server.events if e[0] == "interactive-request"]), 1)
+                self.assertFalse(any(e[0] in ("channel", "pty", "shell") for e in server.events))
+
+    @unittest.skipUnless(DRIVER.ftssh_supports_publickey_interactive(), "patched backend required")
+    def test_signing_and_interactive_prompt_share_one_native_deadline(self):
+        challenge = self.interactive_round()
+        handle, server, key = self.start(auth_mode="publickeyInteractive", interactive_rounds=[challenge])
+        started = time.monotonic()
+        self.assertEqual(self.authenticate(handle, server, key, terminal=(8,), interactive_timeout=1600,
+                                           signing_delay=0.9), 8)
+        self.assertEqual(DRIVER.ftssh_continue_interactive_authentication(handle), 0)
+        self.interactive_challenge(handle, 1, challenge)
+        while True:
+            status = DRIVER.ftssh_authentication_step(handle)
+            if status == 7:
+                break
+            self.assertIn(status, (1, 6))
+            self.assertLess(time.monotonic() - started, 3)
+            self.wait(handle)
+        self.assertEqual(DRIVER.ftssh_finish_interactive_authentication(handle), -1014)
+        self.assertLess(time.monotonic() - started, 2.25)
+        self.assertFalse(any(e[0] == "interactive-response" for e in server.events))
+
+    @unittest.skipUnless(DRIVER.ftssh_supports_publickey_interactive(), "patched backend required")
+    def test_expired_partial_proof_cannot_start_a_new_factor_or_deadline(self):
+        handle, server, key = self.start(auth_mode="publickeyInteractive",
+                                        interactive_rounds=[self.interactive_round()])
+        self.assertEqual(self.authenticate(handle, server, key, terminal=(8,), interactive_timeout=200), 8)
+        time.sleep(0.25)
+        self.assertEqual(DRIVER.ftssh_continue_interactive_authentication(handle), -1014)
+        self.assertEqual(DRIVER.ftssh_begin_interactive_authentication(handle, b"operator", 8, 3000), -1014)
+        self.assertEqual(DRIVER.ftssh_close(handle), 0)
+        self.assertTrue(server.done.wait(2))
+        self.assertFalse(any(e[0] == "interactive-request" for e in server.events))
+
+    @unittest.skipUnless(DRIVER.ftssh_supports_publickey_interactive(), "patched backend required")
+    def test_combined_prompt_cancellation_keeps_native_ownership_until_join(self):
+        challenge = self.interactive_round()
+        handle, server, key = self.start(auth_mode="publickeyInteractive", interactive_rounds=[challenge])
+        self.assertEqual(self.authenticate(handle, server, key, terminal=(8,), interactive_timeout=3000), 8)
+        self.assertEqual(DRIVER.ftssh_continue_interactive_authentication(handle), 0)
+        self.interactive_challenge(handle, 1, challenge)
+        pointer = handle.value
+        self.assertEqual(DRIVER.ftssh_close(handle), 1)
+        self.assertEqual(DRIVER.ftssh_destroy(C.byref(handle)), 1)
+        self.assertEqual(handle.value, pointer)
+        self.finish_interactive(handle, -1009)
+        self.assertEqual(DRIVER.ftssh_close(handle), 0)
+        self.assertTrue(server.done.wait(2))
+        self.assertFalse(any(e[0] in ("interactive-response", "channel", "pty", "shell") for e in server.events))
+
+    @unittest.skipUnless(DRIVER.ftssh_supports_publickey_interactive(), "patched backend required")
+    def test_combined_authentication_owns_adopted_destination_and_transit_chain(self):
+        for mfa_hop in [False, True]:
+            with self.subTest(mfa_hop=mfa_hop):
+                keys = [ed25519.Ed25519PrivateKey.generate(), ed25519.Ed25519PrivateKey.generate()]
+                challenge = self.interactive_round([b"654321"], [(b"Code: ", False)])
+                destination = LoopbackServer(keys[1], auth_mode="normal" if mfa_hop else "publickeyInteractive",
+                                             interactive_rounds=None if mfa_hop else [challenge])
+                hop = LoopbackServer(keys[0], auth_mode="publickeyInteractive" if mfa_hop else "normal",
+                                     interactive_rounds=[challenge] if mfa_hop else None, forward_to=destination.address)
+                self.servers.extend([hop, destination])
+                sock = socket.create_connection(hop.address, timeout=3)
+                sock.settimeout(None)
+                handle = P()
+                self.assertEqual(DRIVER.ftssh_create(sock.fileno(), 2 * 1024 * 1024, C.byref(handle)), 0)
+                sock.detach(); self.handles.append(handle)
+                for index, peer in enumerate([hop, destination]):
+                    if peer.interactive_rounds:
+                        self.assertEqual(self.authenticate(handle, peer, keys[index], terminal=(8,),
+                                                           interactive_timeout=3000), 8)
+                        self.assertEqual(DRIVER.ftssh_continue_interactive_authentication(handle), 0)
+                        self.interactive_challenge(handle, 1, challenge)
+                        self.answer_interactive(handle, 1, challenge["responses"])
+                        self.finish_interactive(handle)
+                    else:
+                        self.assertEqual(self.authenticate(handle, peer, keys[index]), 0)
+                    if index == 0:
+                        handle = self.forwarded(handle, destination)
+                self.assertEqual(DRIVER.ftssh_begin_shell(handle, 80, 24, 0, 0), 0)
+                self.advance(handle, DRIVER.ftssh_shell_step)
+                self.assertFalse(any(e[0] in ("channel", "pty", "shell") for e in hop.events))
+                self.assertFalse(any(e[0] == "unexpected-method-probe" for peer in [hop, destination] for e in peer.events))
 
     def test_interactive_multiple_rounds_echo_and_information_reach_a_real_terminal(self):
         rounds = [
@@ -1579,8 +1812,9 @@ class NativeSSHTests(unittest.TestCase):
 
     def test_server_rejection_never_requests_a_signature_or_a_shell(self):
         handle, server, key = self.start(reject=True)
-        self.assertEqual(self.authenticate(handle, server, key), -1006)
-        self.assertEqual(DRIVER.ftssh_begin_shell(handle, 80, 24, 0, 0), -1006)
+        expected = -1006 if DRIVER.ftssh_supports_publickey_interactive() else -1011
+        self.assertEqual(self.authenticate(handle, server, key, terminal=(expected,)), expected)
+        self.assertEqual(DRIVER.ftssh_begin_shell(handle, 80, 24, 0, 0), expected)
         self.assertEqual(DRIVER.ftssh_close(handle), 0)
         self.assertTrue(server.done.wait(2))
         self.assertEqual([e[1] for e in server.events if e[0] == "authentication"], [0])
