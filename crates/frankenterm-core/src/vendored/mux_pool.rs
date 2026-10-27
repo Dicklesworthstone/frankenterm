@@ -110,7 +110,9 @@ impl From<MuxPoolError> for crate::web::terminal_projection::TerminalProjectionE
     fn from(error: MuxPoolError) -> Self {
         match error {
             MuxPoolError::Pool(error) => Self::Pool(error),
-            MuxPoolError::Mux(error) | MuxPoolError::IndeterminateMutation(error) => Self::Native(error),
+            MuxPoolError::Mux(error) | MuxPoolError::IndeterminateMutation(error) => {
+                Self::Native(error)
+            }
         }
     }
 }
@@ -4757,29 +4759,43 @@ mod tests {
                 .get_pane_identity_with_cx(&cx, 7)
                 .await
                 .expect_err("cancelled identity discovery must not connect or retry");
-            assert!(matches!(identity_error, MuxPoolError::Pool(PoolError::Cancelled)));
+            assert!(matches!(
+                identity_error,
+                MuxPoolError::Pool(PoolError::Cancelled)
+            ));
 
             #[cfg(feature = "web")]
             {
                 let identity = codec::PaneIdentityV1 {
                     session_incarnation: mux::MuxSessionIncarnation::from_bytes([0x11; 16]),
                     durable_pane_id: [0x22; 16],
-                    pane_registration: codec::ReliablePaneRegistrationIdentityV1::from_bytes([0x33; 16]),
+                    pane_registration: codec::ReliablePaneRegistrationIdentityV1::from_bytes(
+                        [0x33; 16],
+                    ),
                 };
                 let scope = crate::web::terminal_projection::scope_for_identity(
                     frankenterm_terminal_wire::Id::new("cancelled-pool-fixture").unwrap(),
                     &identity,
                     frankenterm_terminal_wire::WireU64(1),
-                ).unwrap();
+                )
+                .unwrap();
                 let snapshot_error = pool
                     .get_terminal_snapshot_with_cx(
-                        &cx, 7, &identity, scope, frankenterm_terminal_wire::WireU64(1),
+                        &cx,
+                        7,
+                        &identity,
+                        scope,
+                        frankenterm_terminal_wire::WireU64(1),
                     )
                     .await
-                    .expect_err("cancelled snapshot must not acquire a connection or start a transaction");
+                    .expect_err(
+                        "cancelled snapshot must not acquire a connection or start a transaction",
+                    );
                 assert!(matches!(
                     snapshot_error,
-                    crate::web::terminal_projection::TerminalProjectionError::Pool(PoolError::Cancelled)
+                    crate::web::terminal_projection::TerminalProjectionError::Pool(
+                        PoolError::Cancelled
+                    )
                 ));
             }
 

@@ -1,9 +1,7 @@
 //! Server-Sent Events endpoint surface for Wave 4B migration.
 
 use super::error::json_err;
-use super::extractors::{
-    parse_u64, redact_json_value, request_runtime_limits, require_event_bus,
-};
+use super::extractors::{parse_u64, redact_json_value, request_runtime_limits, require_event_bus};
 use super::{
     STREAM_CHANNEL_BUFFER, STREAM_MAX_CONSECUTIVE_DROPS, STREAM_SCHEMA_VERSION, WebRuntimeLimits,
 };
@@ -602,8 +600,8 @@ where
         let mut previous = *after_id;
         let valid_page = page_len <= EVENT_STREAM_REPLAY_PAGE_SIZE
             && rows.iter().all(|row| {
-                let valid = row.id > previous
-                    && pane_filter.is_none_or(|pane_id| row.pane_id == pane_id);
+                let valid =
+                    row.id > previous && pane_filter.is_none_or(|pane_id| row.pane_id == pane_id);
                 previous = row.id;
                 valid
             });
@@ -801,15 +799,7 @@ pub(super) fn handle_stream_events(
             // No SSE id on non-event frames: a sequence number here would
             // overwrite the client's Last-Event-ID with a non-event id.
             if let Some(event) = frame_to_sse_with_event_id("ready", None, ready) {
-                if !send_replay_sse(
-                    &child_cx,
-                    &tx,
-                    event,
-                    &mut next_emit_at,
-                    min_interval,
-                )
-                .await
-                {
+                if !send_replay_sse(&child_cx, &tx, event, &mut next_emit_at, min_interval).await {
                     return;
                 }
             }
@@ -1430,7 +1420,10 @@ mod tests {
             ));
             let mut poll_cx = Context::from_waker(Waker::noop());
             assert!(send.as_mut().poll(&mut poll_cx).is_pending());
-            assert!(matches!(rx.poll_recv(&cx, &mut poll_cx), Poll::Ready(Ok(_))));
+            assert!(matches!(
+                rx.poll_recv(&cx, &mut poll_cx),
+                Poll::Ready(Ok(_))
+            ));
             assert_eq!(send.as_mut().poll(&mut poll_cx), Poll::Ready(true));
             let Poll::Ready(Ok(delivered)) = rx.poll_recv(&cx, &mut poll_cx) else {
                 panic!("retained frame must be delivered after capacity is available");

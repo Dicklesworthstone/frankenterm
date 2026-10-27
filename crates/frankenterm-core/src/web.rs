@@ -30,9 +30,9 @@ mod openapi;
 mod router;
 mod server;
 mod sse;
-mod ui_assets;
 #[cfg(all(feature = "vendored", unix))]
 pub mod terminal_projection;
+mod ui_assets;
 pub mod websocket;
 
 pub use extractors::redact_depth_limit_hit_count;

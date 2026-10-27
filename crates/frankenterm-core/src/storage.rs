@@ -7748,7 +7748,13 @@ impl StorageHandle {
         Self::checkpoint_storage_operation(cx, "create_workflow")?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
-            .send_with_cx(cx, WriteCommand::CreateWorkflow { workflow, respond: tx })
+            .send_with_cx(
+                cx,
+                WriteCommand::CreateWorkflow {
+                    workflow,
+                    respond: tx,
+                },
+            )
             .await
             .map_err(|error| Self::writer_send_error("create_workflow", error))?;
         Self::recv_writer_response(rx).await
@@ -22696,7 +22702,9 @@ fn create_workflow_backend(backend: &dyn StorageBackend, workflow: &WorkflowReco
                 )
                 .map_err(|error| storage_backend_error("Check new workflow identity", error))?;
             if existing.is_some() {
-                return Err(StorageError::Database("workflow_execution_already_exists".into()).into());
+                return Err(
+                    StorageError::Database("workflow_execution_already_exists".into()).into(),
+                );
             }
             upsert_workflow_backend(backend, workflow)
         },
@@ -22737,7 +22745,9 @@ fn query_workflow_budget_backend(
         .map_err(|_| workflow_budget_storage_error("workflow_budget_invalid_payload"))?;
     budget.validate().map_err(workflow_budget_storage_error)?;
     if u64::try_from(revision).ok() != Some(budget.revision) || started_at != budget.started_at_ms {
-        return Err(workflow_budget_storage_error("workflow_budget_identity_mismatch"));
+        return Err(workflow_budget_storage_error(
+            "workflow_budget_identity_mismatch",
+        ));
     }
     Ok(Some(budget))
 }
@@ -22753,7 +22763,9 @@ fn create_workflow_budget_backend(
         || budget.retries != 0
         || budget.phase != WorkflowAttemptPhase::Ready
     {
-        return Err(workflow_budget_storage_error("workflow_budget_invalid_initial_state"));
+        return Err(workflow_budget_storage_error(
+            "workflow_budget_invalid_initial_state",
+        ));
     }
     let payload = serde_json::to_string(budget)
         .map_err(|_| workflow_budget_storage_error("workflow_budget_invalid_payload"))?;
@@ -22773,7 +22785,9 @@ fn create_workflow_budget_backend(
         )
         .map_err(|error| storage_backend_error("Create workflow budget", error))?;
     if created.is_none() {
-        return Err(workflow_budget_storage_error("workflow_budget_initialization_refused"));
+        return Err(workflow_budget_storage_error(
+            "workflow_budget_initialization_refused",
+        ));
     }
     Ok(())
 }
@@ -22812,7 +22826,10 @@ fn compare_exchange_workflow_budget_backend(
                         ToSqlValue::Integer(u64_to_i64(next.revision, "workflow budget revision")?),
                         ToSqlValue::Text(&payload),
                         ToSqlValue::Text(workflow_id),
-                        ToSqlValue::Integer(u64_to_i64(expected_revision, "workflow budget revision")?),
+                        ToSqlValue::Integer(u64_to_i64(
+                            expected_revision,
+                            "workflow budget revision",
+                        )?),
                         ToSqlValue::Integer(next.started_at_ms),
                     ],
                 )
@@ -22830,7 +22847,10 @@ fn compare_exchange_workflow_budget_backend(
                      wait_condition = CASE WHEN ?4 = 1 THEN NULL ELSE wait_condition END
                      WHERE id = ?3 AND status IN ('running', 'waiting') RETURNING id",
                     &[
-                        ToSqlValue::Integer(usize_to_i64(next.current_step, "workflow budget step")?),
+                        ToSqlValue::Integer(usize_to_i64(
+                            next.current_step,
+                            "workflow budget step",
+                        )?),
                         ToSqlValue::Integer(next.last_observed_at_ms),
                         ToSqlValue::Text(workflow_id),
                         ToSqlValue::Integer(i64::from(next.phase == WorkflowAttemptPhase::Ready)),
@@ -22838,7 +22858,9 @@ fn compare_exchange_workflow_budget_backend(
                 )
                 .map_err(|error| storage_backend_error("Advance workflow budget cursor", error))?;
             if cursor.is_none() {
-                return Err(workflow_budget_storage_error("workflow_budget_cursor_conflict"));
+                return Err(workflow_budget_storage_error(
+                    "workflow_budget_cursor_conflict",
+                ));
             }
             Ok(true)
         },

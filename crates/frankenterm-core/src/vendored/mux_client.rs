@@ -2529,9 +2529,12 @@ impl DirectMuxClient {
             ))
         })?;
         let response = self
-            .send_request_with_cx(cx, Pdu::GetPaneIdentityV1(codec::GetPaneIdentityV1 {
-                pane_id: native_pane_id,
-            }))
+            .send_request_with_cx(
+                cx,
+                Pdu::GetPaneIdentityV1(codec::GetPaneIdentityV1 {
+                    pane_id: native_pane_id,
+                }),
+            )
             .await?;
         let result = match response {
             Pdu::GetPaneIdentityV1Response(response) => {
@@ -7679,31 +7682,52 @@ mod tests {
             let identity = codec::PaneIdentityV1 {
                 session_incarnation: mux::MuxSessionIncarnation::from_bytes([0x13; 16]),
                 durable_pane_id: [0x26; 16],
-                pane_registration: codec::ReliablePaneRegistrationIdentityV1::from_bytes([0x39; 16]),
+                pane_registration: codec::ReliablePaneRegistrationIdentityV1::from_bytes(
+                    [0x39; 16],
+                ),
             };
             let (_dir, path, server) = text_read_server(1, move |_, request| {
                 let Pdu::GetPaneIdentityV1(request) = request else {
                     panic!("identity fixture received an unrelated request");
                 };
-                Some(Pdu::GetPaneIdentityV1Response(codec::GetPaneIdentityV1Response {
-                    pane_id: if request.pane_id == 10 { 11 } else { request.pane_id },
-                    outcome: match request.pane_id {
-                        7 | 10 => codec::PaneIdentityOutcomeV1::Available {
-                            identity, render_facts: None,
+                Some(Pdu::GetPaneIdentityV1Response(
+                    codec::GetPaneIdentityV1Response {
+                        pane_id: if request.pane_id == 10 {
+                            11
+                        } else {
+                            request.pane_id
                         },
-                        8 => codec::PaneIdentityOutcomeV1::Unavailable,
-                        9 => codec::PaneIdentityOutcomeV1::PaneGone,
-                        _ => panic!("unexpected pane"),
+                        outcome: match request.pane_id {
+                            7 | 10 => codec::PaneIdentityOutcomeV1::Available {
+                                identity,
+                                render_facts: None,
+                            },
+                            8 => codec::PaneIdentityOutcomeV1::Unavailable,
+                            9 => codec::PaneIdentityOutcomeV1::PaneGone,
+                            _ => panic!("unexpected pane"),
+                        },
                     },
-                }))
-            }).await;
-            let mut client = DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path)).await.unwrap();
+                ))
+            })
+            .await;
+            let mut client = DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                .await
+                .unwrap();
             for (pane_id, expected) in [
-                (7, codec::PaneIdentityOutcomeV1::Available { identity, render_facts: None }),
+                (
+                    7,
+                    codec::PaneIdentityOutcomeV1::Available {
+                        identity,
+                        render_facts: None,
+                    },
+                ),
                 (8, codec::PaneIdentityOutcomeV1::Unavailable),
                 (9, codec::PaneIdentityOutcomeV1::PaneGone),
             ] {
-                let response = client.get_pane_identity_with_cx(&cx, pane_id).await.unwrap();
+                let response = client
+                    .get_pane_identity_with_cx(&cx, pane_id)
+                    .await
+                    .unwrap();
                 assert_eq!(response.pane_id as u64, pane_id);
                 assert_eq!(response.outcome, expected);
             }
@@ -7712,7 +7736,10 @@ mod tests {
                 Err(DirectMuxError::AlignedUnexpectedResponse { .. })
             ));
             drop(client);
-            timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
+            timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
         });
     }
 
@@ -7724,18 +7751,40 @@ mod tests {
                 let Pdu::ListPanes(_) = request else {
                     panic!("unsupported identity request reached the socket");
                 };
-                (Vec::new(), Some(Pdu::ListPanesResponse(ListPanesResponse {
-                    tabs: Vec::new(), tab_titles: Vec::new(),
-                    window_titles: HashMap::new(), floating_panes: Vec::new(),
-                })), Vec::new())
-            }).await;
-            let mut client = DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path)).await.unwrap();
+                (
+                    Vec::new(),
+                    Some(Pdu::ListPanesResponse(ListPanesResponse {
+                        tabs: Vec::new(),
+                        tab_titles: Vec::new(),
+                        window_titles: HashMap::new(),
+                        floating_panes: Vec::new(),
+                    })),
+                    Vec::new(),
+                )
+            })
+            .await;
+            let mut client = DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                .await
+                .unwrap();
             let error = client.get_pane_identity_with_cx(&cx, 7).await.unwrap_err();
-            assert!(matches!(error, DirectMuxError::OutboundPduRequiresCodec { .. }));
+            assert!(matches!(
+                error,
+                DirectMuxError::OutboundPduRequiresCodec { .. }
+            ));
             assert!(!client.is_connection_poisoned());
-            assert!(client.list_panes_with_cx(&cx).await.unwrap().tabs.is_empty());
+            assert!(
+                client
+                    .list_panes_with_cx(&cx)
+                    .await
+                    .unwrap()
+                    .tabs
+                    .is_empty()
+            );
             drop(client);
-            timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
+            timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
         });
     }
 

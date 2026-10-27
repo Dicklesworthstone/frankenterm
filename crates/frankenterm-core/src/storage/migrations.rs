@@ -6965,7 +6965,10 @@ mod tests {
         assert!(initialize_schema(&conn).is_err());
         assert_eq!(get_user_version(&conn).unwrap(), 47);
         assert!(!table_exists(&conn, "workflow_execution_budgets").unwrap());
-        assert!(conn.is_autocommit(), "failed migration must release its lock");
+        assert!(
+            conn.is_autocommit(),
+            "failed migration must release its lock"
+        );
 
         conn.execute_batch("DROP TRIGGER reject_workflow_budget_migration_receipt")
             .expect("release fixture migration failure");

@@ -1926,7 +1926,10 @@ impl WeztermClient {
             }
             Err(error) => {
                 self.mux_circuit_record_error(&error);
-                Err(Self::mux_cancelled_error("pane_native_identity_with_cx", error))
+                Err(Self::mux_cancelled_error(
+                    "pane_native_identity_with_cx",
+                    error,
+                ))
             }
         }
     }
@@ -6414,20 +6417,26 @@ mod tests {
             let identity = codec::PaneIdentityV1 {
                 session_incarnation: mux::MuxSessionIncarnation::from_bytes([0x11; 16]),
                 durable_pane_id: [0x22; 16],
-                pane_registration: codec::ReliablePaneRegistrationIdentityV1::from_bytes([0x33; 16]),
+                pane_registration: codec::ReliablePaneRegistrationIdentityV1::from_bytes(
+                    [0x33; 16],
+                ),
             };
             let scope = crate::web::terminal_projection::scope_for_identity(
                 frankenterm_terminal_wire::Id::new("unconfigured-native-fixture").unwrap(),
                 &identity,
                 frankenterm_terminal_wire::WireU64(1),
-            ).unwrap();
+            )
+            .unwrap();
             for explicit_socket in [false, true] {
                 let client = if explicit_socket {
                     isolated_cli_client_with_socket("/tmp/frankenterm-unconfigured-native.sock")
                 } else {
                     isolated_cli_client()
-                }.with_circuit_breaker_config(CircuitBreakerConfig::new(
-                    1, 1, Duration::from_secs(60),
+                }
+                .with_circuit_breaker_config(CircuitBreakerConfig::new(
+                    1,
+                    1,
+                    Duration::from_secs(60),
                 ));
                 assert!(client.mux_pool.is_none());
                 // A mistaken CLI fallback must fail this test without ever
@@ -6437,7 +6446,9 @@ mod tests {
                 let identity_error = client
                     .pane_native_identity_with_cx(&cx, 7)
                     .await
-                    .expect_err("a capture UUID or CLI listing cannot substitute for native identity");
+                    .expect_err(
+                        "a capture UUID or CLI listing cannot substitute for native identity",
+                    );
                 assert!(matches!(
                     identity_error,
                     crate::Error::Wezterm(WeztermError::CommandFailed(ref detail))

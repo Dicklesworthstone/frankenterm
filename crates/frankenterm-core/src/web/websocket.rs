@@ -29,7 +29,9 @@ impl TerminalWireSession {
         asset: Sha256,
         capabilities: Capabilities,
     ) -> Result<Self, WireError> {
-        Ok(Self { inner: ServerSession::new(host, session, asset, capabilities)? })
+        Ok(Self {
+            inner: ServerSession::new(host, session, asset, capabilities)?,
+        })
     }
 
     pub fn negotiate(&mut self, hello: &[u8]) -> Result<Vec<u8>, WireError> {
@@ -50,12 +52,20 @@ impl TerminalWireSession {
 
     /// Package a coherent mux-owned image before any frame is sent. The caller
     /// still owns identity, permission, and coherent native snapshot capture.
-    pub fn encode_snapshot(&self, snapshot: FrozenSnapshot) -> Result<SnapshotPublication, WireError> {
+    pub fn encode_snapshot(
+        &self,
+        snapshot: FrozenSnapshot,
+    ) -> Result<SnapshotPublication, WireError> {
         self.inner.encode_snapshot(snapshot)
     }
 
     /// Install only an identity verified by the actual mux/grant owner.
-    pub fn bind_scope(&mut self, scope: Scope, dimensions: Dimensions, delivered: WireU64) -> Result<(), WireError> {
+    pub fn bind_scope(
+        &mut self,
+        scope: Scope,
+        dimensions: Dimensions,
+        delivered: WireU64,
+    ) -> Result<(), WireError> {
         self.inner.bind_scope(scope, dimensions, delivered)
     }
 
@@ -64,17 +74,31 @@ impl TerminalWireSession {
     }
 
     /// Mirror an actual resize without discarding delivery or lease watermarks.
-    pub fn update_dimensions(&mut self, scope: &Scope, dimensions: Dimensions) -> Result<(), WireError> {
+    pub fn update_dimensions(
+        &mut self,
+        scope: &Scope,
+        dimensions: Dimensions,
+    ) -> Result<(), WireError> {
         self.inner.update_dimensions(scope, dimensions)
     }
 
     /// Encoding is not delivery. The transport owner records complete delivery.
-    pub fn record_delivery(&mut self, scope: &Scope, previous: WireU64, sequence: WireU64) -> Result<(), WireError> {
+    pub fn record_delivery(
+        &mut self,
+        scope: &Scope,
+        previous: WireU64,
+        sequence: WireU64,
+    ) -> Result<(), WireError> {
         self.inner.record_delivery(scope, previous, sequence)
     }
 
     /// This mirrors an actual authority decision; it does not grant a lease.
-    pub fn record_lease(&mut self, scope: &Scope, fence: WireU64, active: bool) -> Result<(), WireError> {
+    pub fn record_lease(
+        &mut self,
+        scope: &Scope,
+        fence: WireU64,
+        active: bool,
+    ) -> Result<(), WireError> {
         self.inner.record_lease(scope, fence, active)
     }
 }
