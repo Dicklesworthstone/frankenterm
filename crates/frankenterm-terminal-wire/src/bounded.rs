@@ -225,6 +225,11 @@ impl<T, const MAX: usize> BoundedVec<T, MAX> {
         &self.0
     }
 
+    /// Move the admitted elements without cloning their owned payloads.
+    pub fn into_vec(self) -> Vec<T> {
+        self.0
+    }
+
     pub fn len(&self) -> usize {
         self.0.len()
     }

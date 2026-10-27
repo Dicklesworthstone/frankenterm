@@ -329,6 +329,12 @@ impl ServerSession {
         encode_server(&frame)
     }
 
+    /// Prepare a complete bounded snapshot from an image captured by the real
+    /// terminal owner. This does not advance the delivered or applied baseline.
+    pub fn encode_snapshot(&self, snapshot: crate::FrozenSnapshot) -> Result<crate::SnapshotPublication, WireError> {
+        crate::snapshot::prepare_snapshot(self, &self.session, snapshot)
+    }
+
     pub fn bind_scope(&mut self, scope: Scope, dimensions: Dimensions, delivered: WireU64) -> Result<(), WireError> {
         self.state.as_mut().ok_or(WireError::NotNegotiated)?.bind(scope, dimensions, delivered)
     }

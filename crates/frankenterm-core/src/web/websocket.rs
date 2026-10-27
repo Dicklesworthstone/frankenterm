@@ -5,8 +5,8 @@
 //! returned requirement, and fence the actual pane/control effect.
 
 use frankenterm_terminal_wire::{
-    Capabilities, ClientMessage, Dimensions, Id, RequiredAuthority, Scope,
-    ServerMessage, ServerSession, Sha256, WireError, WireU64,
+    Capabilities, ClientMessage, Dimensions, FrozenSnapshot, Id, RequiredAuthority, Scope,
+    ServerMessage, ServerSession, Sha256, SnapshotPublication, WireError, WireU64,
 };
 
 /// A request that passed wire/identity checks, still requiring real grants.
@@ -46,6 +46,12 @@ impl TerminalWireSession {
 
     pub fn encode_response(&self, message: ServerMessage) -> Result<Vec<u8>, WireError> {
         self.inner.encode_response(message)
+    }
+
+    /// Package a coherent mux-owned image before any frame is sent. The caller
+    /// still owns identity, permission, and coherent native snapshot capture.
+    pub fn encode_snapshot(&self, snapshot: FrozenSnapshot) -> Result<SnapshotPublication, WireError> {
+        self.inner.encode_snapshot(snapshot)
     }
 
     /// Install only an identity verified by the actual mux/grant owner.
