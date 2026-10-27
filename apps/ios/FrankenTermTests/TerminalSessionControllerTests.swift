@@ -1237,6 +1237,9 @@ final class TerminalSessionControllerTests: XCTestCase {
         let message = try XCTUnwrap(first.inputDelivery.message(machine: first.target.machineName))
         XCTAssertTrue(message.contains("before Alpha answered it. It may or may not have arrived."), message)
         await assertReleased(first, connections: live.connections)
+        // This launch told it; a later launch does not tell it again.
+        XCTAssertFalse(TerminalUnansweredInput(workspace: first.target.workspaceID.uuidString, machine: "alpha",
+                                               launch: "later").takeFromEarlierLaunch(), "told by this launch only")
 
         // The next session keeps the notice and types nothing again.
         try await relay.up()

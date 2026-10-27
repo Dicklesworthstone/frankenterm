@@ -101,3 +101,44 @@ public struct TerminalInputDelivery: Hashable, Sendable {
         return sentences.joined(separator: " ")
     }
 }
+
+/// Input on one machine that left this phone and has had no answer yet, kept
+/// where the next launch finds it if iOS ends this one first (plan 11.8). A
+/// session marks it as its input leaves and clears it at the machine's next
+/// output, so a kill at any moment leaves it as true as it was. Only which
+/// launch and session marked it is kept, never what was typed.
+public final class TerminalUnansweredInput: @unchecked Sendable {
+    public static let thisLaunch = UUID().uuidString
+    private let lock = NSLock()
+    private let defaults: UserDefaults
+    private let key: String
+    private let launch: String
+    /// This session's own mark: a later session on the machine may hold it.
+    private let mark: String
+
+    public init(workspace: String, machine: String, defaults: UserDefaults = .standard,
+                launch: String = TerminalUnansweredInput.thisLaunch) {
+        self.defaults = defaults
+        key = "frankenterm.input.unanswered.\(workspace).\(machine)"
+        self.launch = launch
+        mark = "\(launch) \(UUID().uuidString)"
+    }
+
+    /// Whether this session's input awaits the machine's answer now.
+    public func set(_ awaiting: Bool) {
+        lock.withLock {
+            if awaiting { defaults.set(mark, forKey: key) }
+            else if defaults.string(forKey: key) == mark { defaults.removeObject(forKey: key) }
+        }
+    }
+
+    /// Whether an earlier launch ended with input on this machine unanswered.
+    /// Reading it clears it: the screen tells it once.
+    public func takeFromEarlierLaunch() -> Bool {
+        lock.withLock {
+            guard let stored = defaults.string(forKey: key), !stored.hasPrefix(launch + " ") else { return false }
+            defaults.removeObject(forKey: key)
+            return true
+        }
+    }
+}

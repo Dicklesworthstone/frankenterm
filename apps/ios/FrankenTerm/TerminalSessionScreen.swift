@@ -215,6 +215,8 @@ final class TerminalSessionController {
     /// session on this machine keeps it until they dismiss it: a new live
     /// frame says nothing about whether the earlier input arrived.
     private(set) var inputDelivery: TerminalInputDelivery
+    /// The same, kept for the next launch if iOS ends this one (plan 11.8).
+    @ObservationIgnored private let unansweredInput: TerminalUnansweredInput
     private(set) var interactionProblem: String?
     private(set) var localInputRecovery: TerminalKeyboardRecovery?
     private(set) var resolvingLocalInput = false
@@ -297,6 +299,7 @@ final class TerminalSessionController {
          inputDelivery: TerminalInputDelivery = .init()) {
         self.target = target; self.connections = connections; self.focus = focus
         self.inputDelivery = inputDelivery
+        unansweredInput = TerminalUnansweredInput(workspace: target.workspaceID.uuidString, machine: target.machineID)
         basePalette = target.basePalette
         route = target.routes[0]
         retriesDrop = previous?.dropped == true
@@ -955,6 +958,9 @@ final class TerminalSessionController {
             }
             let connection = attempt
             self.pump = pump
+            // An earlier launch ended, killed by iOS or the person, before
+            // the machine answered input sent to it.
+            if unansweredInput.takeFromEarlierLaunch(), !inputDelivery.unanswered { inputDelivery.endedUnanswered() }
             if let control = connection.muxControl {
                 attachedToMux = true
                 // The last connection to this pane, perhaps before a relaunch,
@@ -987,9 +993,11 @@ final class TerminalSessionController {
                     self.unseenShellOutput = true
                 }
             }
+            let unansweredInput = unansweredInput
             let runtime = TerminalModelRuntime(model: model, coordinator: coordinator,
                                                delivery: presenter, initiallyVisible: false,
-                                               hiddenOutput: hiddenOutput)
+                                               hiddenOutput: hiddenOutput,
+                                               awaitingAnswer: { unansweredInput.set($0) })
             self.runtime = runtime; unadoptedModel = nil
             let source = pump.source
             let resize = TerminalViewportResize(source: source, initial: geometry) { geometry in
@@ -1551,8 +1559,11 @@ final class TerminalSessionController {
             if dropped, !attachedToMux, !inputDelivery.unanswered, await runtime.inputAwaitsAnswer() {
                 inputDelivery.endedUnanswered()
             }
-            do { try await runtime.close(); self.runtime = nil }
-            catch { failure = failure ?? error }
+            do {
+                try await runtime.close(); self.runtime = nil
+                // This launch tells its own drops; the mark is for the next.
+                unansweredInput.set(false)
+            } catch { failure = failure ?? error }
         }
         if let model = unadoptedModel {
             do { try model.close(); unadoptedModel = nil }

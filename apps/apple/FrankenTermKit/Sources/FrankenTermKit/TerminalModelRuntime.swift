@@ -104,6 +104,8 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalSession
     private var hiddenAt: ContinuousClock.Instant?
     /// The person's input left this phone after the machine's last output.
     private var inputUnanswered = false
+    /// Hears each change of `inputUnanswered`, to keep it past a killed launch.
+    private let awaitingAnswer: (@Sendable (Bool) -> Void)?
     private var visibilityGeneration = UUID()
     private var viewportTop: Int64?
     private let historyOwner = UUID()
@@ -112,11 +114,13 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalSession
 
     public init(model: any TerminalSessionModel, coordinator: TerminalInputCoordinator,
                 delivery: any TerminalModelDelivery, initiallyVisible: Bool = true,
-                hiddenOutput: (@Sendable () -> Void)? = nil, hiddenOutputSettle: Duration = .seconds(3)) {
+                hiddenOutput: (@Sendable () -> Void)? = nil, hiddenOutputSettle: Duration = .seconds(3),
+                awaitingAnswer: (@Sendable (Bool) -> Void)? = nil) {
         self.model = model; source = model.source
         self.coordinator = coordinator; self.delivery = delivery
         visible = initiallyVisible; shownOnce = initiallyVisible
         self.hiddenOutput = hiddenOutput; self.hiddenOutputSettle = hiddenOutputSettle
+        self.awaitingAnswer = awaitingAnswer
     }
 
     public func accounting() -> TerminalModelAccounting {
@@ -226,7 +230,7 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalSession
         if let geometry = update.resized { try model.resize(geometry) }
         if !update.output.isEmpty {
             try model.feed(update.output)
-            inputUnanswered = false
+            if inputUnanswered { inputUnanswered = false; awaitingAnswer?(false) }
             if !visible, shownOnce, !hiddenOutputReported,
                hiddenAt.map({ ContinuousClock.now - $0 >= hiddenOutputSettle }) ?? true {
                 hiddenOutputReported = true; hiddenOutput?()
@@ -244,8 +248,9 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalSession
             throw TerminalModelError.invalid
         }
         try await acquireOperation(.consumer); defer { finishOperation() }
-        if outcomes.contains(where: { ($0.kind == .encodedInput || $0.kind == .paste) && $0.disposition == .transportAccepted }) {
-            inputUnanswered = true
+        if !inputUnanswered,
+           outcomes.contains(where: { ($0.kind == .encodedInput || $0.kind == .paste) && $0.disposition == .transportAccepted }) {
+            inputUnanswered = true; awaitingAnswer?(true)
         }
         if !outcomes.isEmpty { try await delivery.receive(outcomes, source: source) }
         // No cancellation check after successful delivery: the pump must be

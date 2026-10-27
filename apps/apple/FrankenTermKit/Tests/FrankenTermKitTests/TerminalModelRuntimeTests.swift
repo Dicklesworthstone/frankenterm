@@ -636,7 +636,10 @@ final class TerminalModelRuntimeTests: XCTestCase, @unchecked Sendable {
     func testInputAwaitsAnAnswerUntilTheMachinesNextOutput() async throws {
         let (coordinator, _, source) = try await source()
         let model = OwnedModelFixture(source: source)
-        let runtime = TerminalModelRuntime(model: model, coordinator: coordinator, delivery: ModelRuntimeDelivery())
+        final class Changes: @unchecked Sendable { let lock = NSLock(); var values: [Bool] = [] }
+        let changes = Changes()
+        let runtime = TerminalModelRuntime(model: model, coordinator: coordinator, delivery: ModelRuntimeDelivery(),
+                                           awaitingAnswer: { value in changes.lock.withLock { changes.values.append(value) } })
         let stream = try await coordinator.makeStream(sceneID: UUID())
         let focus = try await coordinator.changeFocus(stream, to: source)
         func deliver() async throws {
@@ -663,6 +666,8 @@ final class TerminalModelRuntimeTests: XCTestCase, @unchecked Sendable {
         try await runtime.receive(.init(output: Data("lost\r\n".utf8)), source: source)
         awaits = await runtime.inputAwaitsAnswer()
         XCTAssertFalse(awaits, "the machine's output answers it")
+        try await runtime.receive(.init(output: Data("more\r\n".utf8)), source: source)
+        XCTAssertEqual(changes.lock.withLock { changes.values }, [true, false], "each change is heard once")
         try await runtime.close()
     }
 

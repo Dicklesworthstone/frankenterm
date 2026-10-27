@@ -484,6 +484,36 @@ final class TerminalInputTests: XCTestCase, @unchecked Sendable {
                        "Some input was stopped after only part of it was sent. Nothing is sent again by itself: check the screen before you type it again.")
     }
 
+    /// A launch that ends, killed, with input unanswered leaves it for the
+    /// next launch to tell once. Its own sessions never read it back, and a
+    /// session clears only its own mark.
+    func testUnansweredInputOutlivesAKilledLaunchAndIsToldOnce() throws {
+        let suite = "frankenterm.tests.unanswered.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        func session(_ launch: String, _ machine: String = "alpha") -> TerminalUnansweredInput {
+            TerminalUnansweredInput(workspace: "w", machine: machine, defaults: defaults, launch: launch)
+        }
+
+        let killed = session("first")
+        killed.set(true)
+        XCTAssertFalse(session("first").takeFromEarlierLaunch(), "the launch that marked it is not an earlier one")
+        XCTAssertFalse(session("second", "beta").takeFromEarlierLaunch(), "another machine's input is not this one's")
+        let next = session("second")
+        XCTAssertTrue(next.takeFromEarlierLaunch(), "the next launch finds it")
+        XCTAssertFalse(session("second").takeFromEarlierLaunch(), "told once")
+
+        // Answered input leaves nothing behind.
+        let answered = session("second")
+        answered.set(true); answered.set(false)
+        XCTAssertFalse(session("third").takeFromEarlierLaunch())
+
+        // An ending session clears only its own mark, not a later session's.
+        let ended = session("third"), later = session("third")
+        ended.set(true); later.set(true); ended.set(false)
+        XCTAssertTrue(session("fourth").takeFromEarlierLaunch(), "the later session's input still awaits an answer")
+    }
+
     func testInvalidTransportCountsCloseWithoutInventingAcceptedBytes() async throws {
         for result in [TerminalTransportWrite.accepted(0), .accepted(-1), .accepted(Int.max), .failed] {
             let (coordinator, transport, source, focus) = try await setup()

@@ -664,6 +664,45 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         XCTAssertTrue(savedWorkspace(app, inputs).waitForExistence(timeout: 20), "the next test starts on the workspace list")
     }
 
+    /// iOS can end the whole app, not just a connection, before the machine
+    /// answers what was typed. The killed launch cannot say so; the next one
+    /// does, once, and sends nothing again.
+    @MainActor
+    func test5BAKilledLaunchTellsInputThatHadNoAnswer() throws {
+        let inputs = try inputs()
+        var app = launch()
+        // The previous test leaves the workspace list on screen.
+        var terminal = connect(app, inputs)
+        // A silent read: what is typed next leaves the phone, and the machine
+        // answers nothing.
+        app.typeText("echo QUIET-$((5*5)); read -s FT_QUIET\n")
+        waitFor("QUIET-25", in: terminal, timeout: 30, "the shell is reading")
+        app.typeText("unanswered")
+        never("unanswered", in: terminal, timeout: 3, "a silent read echoes nothing")
+        app.terminate()
+
+        app = launch()
+        terminal = reopen(app, inputs)
+        let notice = app.descendants(matching: .any)["terminal.input.delivery"]
+        XCTAssertTrue(notice.waitForExistence(timeout: 30), "the next launch tells the input that had no answer")
+        let told = notice.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "It may or may not have arrived.")).firstMatch
+        XCTAssertTrue(told.exists, "it says the input may or may not have arrived")
+        snapshot("k1-told")
+        notice.buttons["Dismiss"].tap()
+        XCTAssertTrue(notice.waitForNonExistence(timeout: 5), "dismissed, it is gone")
+        app.typeText("echo FRESH-$((6*7))\n")
+        waitFor("FRESH-42", in: terminal, timeout: 30, "the new session runs commands")
+        never("unanswered", in: terminal, "nothing typed before is sent again")
+        XCTAssertFalse(notice.exists, "told once")
+
+        let list = app.buttons["Add machines"]
+        for _ in 0..<3 where !list.exists {
+            app.navigationBars.buttons.element(boundBy: 0).tap()
+            _ = list.waitForExistence(timeout: 5)
+        }
+        XCTAssertTrue(savedWorkspace(app, inputs).waitForExistence(timeout: 20), "the next test starts on the workspace list")
+    }
+
     /// Stop trusting the server's host key from Keys while connected: the
     /// session ends, the key shows as blocked, and the machine no longer
     /// offers Connect. Runs last: the block stays saved in this simulator.
