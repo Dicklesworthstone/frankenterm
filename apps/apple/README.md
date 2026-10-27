@@ -38,6 +38,29 @@ It offers live fountain-coded QR playback with periodic source replay, targeted 
 
 **Encrypt Only for This Phone** adds the plan's recipient-bound mode. The phone displays a public, single-part `FTREQ1:UR:BYTES/` request. The Mac accepts it through a dedicated camera scanner or an explicitly selected local QR image, shows the recipient comparison, and requires confirmation against the phone before export. The fixed RFC 9180 Base-mode X25519/HKDF-SHA256/ChaCha20-Poly1305 suite encrypts to that ephemeral request. The phone then collects the ordinary encrypted animation or opens its local `.ftairgap` file, decrypts with its matching in-memory key, and still requires envelope comparison and source/contents review. Code mode remains the default and works without a Mac camera. Recipient-bound recordings are not independent recovery backups: losing the phone's active request key requires a new request and a newly encrypted export.
 
+### Jump hosts in this Mac's machine inventory
+
+The default Mac source, `ft mobile source`, and `ft mobile export` now carry
+`ProxyJump` chains from the machine inventory's SSH aliases. Up to three concrete
+configured aliases retain their own endpoint, account, public identities, host
+pins, revocations and mandatory policy. A first hop can contribute its configured
+prefix; the explicit preceding chain overrides proxy settings on later hops.
+Mux routes retain the same chain. Transit records cannot create terminal sessions.
+
+`ProxyJump` and `ProxyCommand` use their first effective assignment. Active proxy
+commands, inline jump account/port syntax, unknown aliases, cycles and excessive
+chains cannot become direct fallback routes or partly exported graphs. Group
+selection preserves known denials from other resolved routes in the same trust
+scope. Discovery reads bounded public key and trust files; the companion's existing
+reviewed sealing flow remains responsible for private keys. The complete export
+is limited to 256 routes and 256 credentials, including jump dependencies.
+
+Seven Rust regression tests cover complete chains, proxy precedence, atomic
+refusal, per-hop policies, denial propagation, graph limits and on-disk public
+source discovery. This implementation passed scoped rustfmt parsing/formatting
+and diff checks; these new Rust tests have not yet run through RCH in this session.
+The source is the existing inventory snapshot, not a new running-GUI snapshot API.
+
 ## Retained output and session completion
 
 **Search Output** searches canonical rows already retained by the selected terminal, using literal, case-sensitive text on physical screen rows. It neither reads the network nor sends a command. Reads do not move the selected viewport. Search is bounded to 4,096 rows, 4 MiB, 256 pages and 128 matches; the screen reports a reached limit or history changing during the scan. Concealed cells are excluded. Selecting a result revalidates its exact source, geometry, screen, row sequence and matched bytes in the same model transaction that navigates to it. Expired matches remain observations and cannot jump to unrelated output.

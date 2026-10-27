@@ -2,12 +2,12 @@
 //! document (`ftworkspace` version 1). The phone imports it as is, or the Mac
 //! companion seals it together with the private keys the user selects.
 //!
-//! Exported: machines, groups, fully resolved themes, SSH routes, the public
-//! identities named by each route (`<identity>.pub`, never the private file)
-//! and each endpoint's host keys from `known_hosts`, hashed entries included.
-//! Not exported: desktop-only decoration, and mux routes until the phone can
-//! attach to mux panes. Everything left out is reported, never dropped
-//! silently.
+//! Exported: machines, groups, fully resolved themes, SSH routes with up to
+//! three configured jump hosts, public identities (`<identity>.pub`, never
+//! the private file), and each endpoint's host keys from `known_hosts`.
+//! Mux routes use the same SSH graph to attach to existing panes. Unsupported
+//! routes remain on the desktop with an explanation; unresolved trust policy
+//! remains an explicit blocker in the exported document.
 
 use crate::machines::{
     InventoryContext, Machine, MachineInventory, MachineRoute, MachineTheme, RouteTarget,
@@ -27,6 +27,9 @@ use std::path::{Component, Path, PathBuf};
 const MAX_SOURCE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SOURCE_FILES: usize = 64;
 const MAX_SOURCE_LINES: usize = 16_384;
+const MAX_PUBLIC_KEY_FILES: usize = 256;
+const MAX_JUMP_HOPS: usize = 3;
+const MAX_EXPORTED_ROUTES: usize = 256;
 /// The phone's SSH driver runs remote commands up to this size.
 const MAX_REMOTE_COMMAND_BYTES: usize = 1024;
 const UNRESOLVED_POLICY: &str = "ssh_config.unresolved_policy";
@@ -196,9 +199,18 @@ impl SshSources {
                         ..
                     } => {
                         if let Some(resolver) = resolver.as_ref() {
-                            let options = resolver.config.for_host(alias);
-                            identities.extend(split_paths(options.get("identityfile"), context));
-                            known_files.extend(resolver.trust_files(&options).0);
+                            // The first listed hop can itself contribute a
+                            // prefix. Freeze every dependency's public identity
+                            // and exact trust sources before constructing any
+                            // route; an invalid graph contributes no prefix.
+                            let mut aliases = resolver.jump_chain(alias).unwrap_or_default();
+                            aliases.push(alias.clone());
+                            for name in aliases {
+                                let options = resolver.config.for_host(&name);
+                                identities
+                                    .extend(split_paths(options.get("identityfile"), context));
+                                known_files.extend(resolver.trust_files(&options).0);
+                            }
                         }
                     }
                     MachineRoute::FrankenTermMux { .. } => {}
@@ -228,21 +240,29 @@ impl SshSources {
                 (path, source)
             })
             .collect();
+        let mut remaining_public_bytes = MAX_SOURCE_BYTES;
+        let public_keys = identities
+            .into_iter()
+            .map(|identity| public_key_path(&identity))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .take(MAX_PUBLIC_KEY_FILES)
+            .filter_map(|public| {
+                match read_source(&public, remaining_public_bytes.min(64 * 1024)) {
+                    KnownHostsSource::Present(text) => {
+                        remaining_public_bytes -= text.len();
+                        Some((public, text))
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
         Self {
             config,
             system_config,
             known_hosts,
             default_known_hosts,
-            public_keys: identities
-                .into_iter()
-                .filter_map(|path| {
-                    let public = public_key_path(&path);
-                    match read_source(&public, 64 * 1024) {
-                        KnownHostsSource::Present(text) => Some((public, text)),
-                        _ => None,
-                    }
-                })
-                .collect(),
+            public_keys,
         }
     }
 }
@@ -250,10 +270,79 @@ impl SshSources {
 struct AliasResolver {
     config: frankenterm_ssh::Config,
     trust_lists: BTreeMap<String, Option<Vec<PathBuf>>>,
+    proxies: BTreeMap<String, ProxySetting>,
+    aliases: BTreeSet<String>,
     incomplete: bool,
 }
 
+enum ProxySetting {
+    Jump(String),
+    Command { disabled: bool },
+}
+
 impl AliasResolver {
+    /// Match OpenSSH's explicit ordered prefix: only the first named jump
+    /// inherits its configured proxy chain. The preceding -J list overrides
+    /// any proxy configuration on later jumps. All hops must be concrete
+    /// configured aliases, with no inline account/port or token expansion.
+    fn jump_chain(&self, alias: &str) -> Result<Vec<String>, &'static str> {
+        fn expand(
+            resolver: &AliasResolver,
+            alias: &str,
+            path: &BTreeSet<String>,
+            remaining: usize,
+        ) -> Result<Vec<String>, &'static str> {
+            if path.contains(alias) {
+                return Err("the chain returns to an earlier alias");
+            }
+            let options = resolver.config.for_host(alias);
+            let Some(token) = options.get("frankenterm_proxy") else {
+                return Ok(Vec::new());
+            };
+            let value = match resolver.proxies.get(token) {
+                Some(ProxySetting::Jump(value)) => value,
+                Some(ProxySetting::Command { .. }) => return Ok(Vec::new()),
+                None => return Err("its exact proxy setting could not be preserved"),
+            };
+            if value.eq_ignore_ascii_case("none") {
+                return Ok(Vec::new());
+            }
+            let hops: Vec<String> = value.split(',').map(str::to_string).collect();
+            if hops.iter().any(|name| {
+                name.is_empty()
+                    || name.len() > 255
+                    || name.starts_with('-')
+                    || name.eq_ignore_ascii_case("none")
+                    || !name.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_')
+                    })
+            }) {
+                return Err("only comma-separated configured aliases are supported");
+            }
+            if hops.iter().any(|name| !resolver.aliases.contains(name)) {
+                return Err("a hop has no concrete Host declaration");
+            }
+            let unique: BTreeSet<_> = hops.iter().collect();
+            if unique.len() != hops.len()
+                || hops.iter().any(|name| name == alias || path.contains(name))
+            {
+                return Err("the chain repeats or returns to an earlier alias");
+            }
+            if hops.len() > remaining {
+                return Err("the complete chain exceeds three jump hosts");
+            }
+            let mut path = path.clone();
+            path.insert(alias.to_string());
+            let mut chain = expand(resolver, &hops[0], &path, remaining - hops.len())?;
+            chain.extend(hops);
+            if chain.iter().collect::<BTreeSet<_>>().len() != chain.len() {
+                return Err("the chain repeats a host alias");
+            }
+            Ok(chain)
+        }
+        expand(self, alias, &BTreeSet::new(), MAX_JUMP_HOPS)
+    }
+
     fn trust_files(&self, options: &frankenterm_ssh::ConfigMap) -> (Vec<PathBuf>, bool) {
         let mut files = Vec::new();
         let mut incomplete = self.incomplete;
@@ -383,6 +472,7 @@ fn alias_resolver(config: Option<&str>, home: &Path) -> Option<AliasResolver> {
         return None;
     }
     let mut trust_lists = BTreeMap::new();
+    let mut proxies = BTreeMap::new();
     let mut passive = String::new();
     let mut incomplete = false;
     for line in text.lines() {
@@ -400,10 +490,42 @@ fn alias_resolver(config: Option<&str>, home: &Path) -> Option<AliasResolver> {
                     passive.push_str("Host __frankenterm_unresolved_match__\n");
                     continue;
                 }
+                "frankenterm_proxy" => {
+                    // This private parser slot cannot be selected by source
+                    // text to bypass a real ProxyCommand/ProxyJump directive.
+                    incomplete = true;
+                    continue;
+                }
                 "userknownhostsfile" | "globalknownhostsfile" => {
                     let token = format!("__frankenterm_known_hosts_{}__", trust_lists.len());
                     trust_lists.insert(token.clone(), known_host_paths(value, home));
                     passive.push_str(&format!("{} {}\n", keyword, token));
+                    continue;
+                }
+                "proxyjump" | "proxycommand" => {
+                    // Preserve the reviewed proxy spelling behind an opaque
+                    // token rather than giving executable values to the
+                    // general resolver or accepting a partial argument list.
+                    // Both directives share one first-assignment slot: the
+                    // first matching ProxyCommand/ProxyJump wins in OpenSSH.
+                    let token = format!("__frankenterm_proxy_{}__", proxies.len());
+                    let words = configuration_words(value);
+                    let setting = if keyword.eq_ignore_ascii_case("proxyjump") {
+                        ProxySetting::Jump(
+                            words
+                                .filter(|words| words.len() == 1)
+                                .map(|words| words[0].clone())
+                                .unwrap_or_default(),
+                        )
+                    } else {
+                        ProxySetting::Command {
+                            disabled: words.is_some_and(|words| {
+                                words.len() == 1 && words[0].eq_ignore_ascii_case("none")
+                            }),
+                        }
+                    };
+                    proxies.insert(token.clone(), setting);
+                    passive.push_str(&format!("frankenterm_proxy {}\n", token));
                     continue;
                 }
                 _ => {}
@@ -462,9 +584,16 @@ fn alias_resolver(config: Option<&str>, home: &Path) -> Option<AliasResolver> {
     environment.insert("HOME".to_string(), home.to_string_lossy().into_owned());
     resolver.assign_environment(environment);
     resolver.add_config_string(&passive);
+    let aliases = resolver
+        .enumerate_hosts()
+        .into_iter()
+        .filter(|host| host != "__frankenterm_unresolved_match__")
+        .collect();
     Some(AliasResolver {
         config: resolver,
         trust_lists,
+        proxies,
+        aliases,
         incomplete,
     })
 }
@@ -796,15 +925,104 @@ struct Endpoint {
     unresolved_policy: bool,
 }
 
+struct EndpointSources<'a> {
+    ssh: &'a SshSources,
+    resolver: Option<&'a AliasResolver>,
+    inventory: &'a InventoryContext,
+}
+
+struct ResolvedRoute {
+    id: String,
+    endpoint: Endpoint,
+    keys: HostKeys,
+    jump_routes: Vec<String>,
+    destination: bool,
+}
+
+/// Resolve the entire graph before publishing any transit record. Available
+/// endpoints of a refused graph still contribute their known denials, but a
+/// malformed or unavailable hop cannot produce a direct or partial fallback.
+fn resolve_route(
+    machine: &Machine,
+    route: &str,
+    target: &RouteTarget,
+    sources: &EndpointSources<'_>,
+    notes: &mut Vec<ExportNote>,
+) -> (Vec<ResolvedRoute>, bool) {
+    let mut exportable = true;
+    let chain = match (target, sources.resolver) {
+        (RouteTarget::Alias(alias), Some(resolver)) => match resolver.jump_chain(alias) {
+            Ok(chain) => chain,
+            Err(reason) => {
+                notes.push(ExportNote {
+                    machine: machine.id.clone(),
+                    route: Some(route.to_string()),
+                    message: format!(
+                        "uses proxyjump in ~/.ssh/config but {}; the complete route was not exported",
+                        reason
+                    ),
+                });
+                exportable = false;
+                Vec::new()
+            }
+        },
+        _ => Vec::new(),
+    };
+    let mut records = Vec::new();
+    let mut jumps = Vec::new();
+    for (index, alias) in chain.iter().enumerate() {
+        let hop_name = format!("{} via {}", route, alias);
+        let Some(endpoint) = resolve_endpoint(
+            machine,
+            &hop_name,
+            &RouteTarget::Alias(alias.clone()),
+            sources,
+            index > 0,
+            notes,
+        ) else {
+            exportable = false;
+            continue;
+        };
+        // Keep the trust/file policy local to this originating route. The same
+        // host in another chain must not borrow its pins or proxy context.
+        let id = format!(
+            "j.{}",
+            short_digest(&format!("{}\0{}\0{}", machine.id, route, alias))
+        );
+        jumps.push(id.clone());
+        records.push(ResolvedRoute {
+            id,
+            endpoint,
+            keys: HostKeys::default(),
+            jump_routes: Vec::new(),
+            destination: false,
+        });
+    }
+    if let Some(endpoint) = resolve_endpoint(machine, route, target, sources, false, notes) {
+        records.push(ResolvedRoute {
+            id: format!("r.{}.{}", machine.id, route),
+            endpoint,
+            keys: HostKeys::default(),
+            jump_routes: jumps,
+            destination: true,
+        });
+    } else {
+        exportable = false;
+    }
+    (records, exportable)
+}
+
 fn resolve_endpoint(
     machine: &Machine,
     route: &str,
     target: &RouteTarget,
-    sources: &SshSources,
-    resolver: Option<&AliasResolver>,
-    context: &InventoryContext,
+    resolution: &EndpointSources<'_>,
+    proxy_overridden: bool,
     notes: &mut Vec<ExportNote>,
 ) -> Option<Endpoint> {
+    let sources = resolution.ssh;
+    let resolver = resolution.resolver;
+    let context = resolution.inventory;
     let note = |notes: &mut Vec<ExportNote>, message: String| {
         notes.push(ExportNote {
             machine: machine.id.clone(),
@@ -843,17 +1061,20 @@ fn resolve_endpoint(
                 }
             };
             let options = resolver.config.for_host(alias);
-            for unsupported in ["proxyjump", "proxycommand"] {
-                if options.get(unsupported).is_some_and(|v| v != "none") {
-                    note(
-                        notes,
-                        format!(
-                            "uses {} in ~/.ssh/config, which the phone cannot run; not exported",
-                            unsupported
-                        ),
-                    );
-                    return None;
-                }
+            if !proxy_overridden
+                && options.get("frankenterm_proxy").is_some_and(|token| {
+                    matches!(
+                        resolver.proxies.get(token),
+                        None | Some(ProxySetting::Command { disabled: false })
+                    )
+                })
+            {
+                note(
+                    notes,
+                    "uses proxycommand in ~/.ssh/config, which the phone cannot run; not exported"
+                        .into(),
+                );
+                return None;
             }
             let port = match options.get("port").map(|p| p.parse::<u16>()) {
                 None => 22,
@@ -1049,6 +1270,131 @@ fn endpoint_keys(
     (keys, unresolved_policy)
 }
 
+#[derive(Default)]
+struct EndpointRecords {
+    credentials: BTreeMap<String, Value>,
+    trusts: BTreeMap<String, Value>,
+    trust_scopes: BTreeMap<String, (String, u16)>,
+    identity_files: BTreeMap<String, PathBuf>,
+}
+
+impl EndpointRecords {
+    fn record(
+        &mut self,
+        machine: &Machine,
+        route_name: &str,
+        resolved: &ResolvedRoute,
+        sources: &SshSources,
+        context: &InventoryContext,
+        notes: &mut Vec<ExportNote>,
+    ) -> Value {
+        let endpoint = &resolved.endpoint;
+        let mut credential_ids = Vec::new();
+        let defaults = default_identities(context);
+        for identity in &endpoint.identities {
+            let public = public_key_path(identity);
+            let key = match sources.public_keys.get(&public).and_then(|text| {
+                text.lines()
+                    .find(|l| !l.trim().is_empty())
+                    .and_then(PublicKey::parse_line)
+            }) {
+                Some(key) => key,
+                // OpenSSH skips absent default identities silently too.
+                None if defaults.contains(identity) => continue,
+                None => {
+                    notes.push(ExportNote {
+                        machine: machine.id.clone(),
+                        route: Some(route_name.to_string()),
+                        message: format!(
+                            "no readable public key at {}; that identity is not offered",
+                            public.display()
+                        ),
+                    });
+                    continue;
+                }
+            };
+            let fingerprint = key.fingerprint();
+            let id = format!("c.{}", short_digest(&fingerprint));
+            if credential_ids.contains(&id) {
+                continue;
+            }
+            if credential_ids.len() == 8 {
+                notes.push(ExportNote {
+                    machine: machine.id.clone(),
+                    route: Some(route_name.to_string()),
+                    message: format!(
+                        "the phone offers at most 8 identities per route; {} is not offered",
+                        identity.display()
+                    ),
+                });
+                continue;
+            }
+            self.credentials.entry(id.clone()).or_insert_with(|| {
+                json!({
+                    "id": id,
+                    "algorithm": key.algorithm,
+                    "public_fingerprint": fingerprint,
+                    "requirement": "matching_private_key",
+                    "private_material": "not_included",
+                })
+            });
+            self.identity_files.entry(id.clone()).or_insert_with(|| {
+                if identity.extension().is_some_and(|ext| ext == "pub") {
+                    identity.with_extension("")
+                } else {
+                    identity.clone()
+                }
+            });
+            credential_ids.push(id);
+        }
+        if credential_ids.is_empty() {
+            notes.push(ExportNote {
+                machine: machine.id.clone(),
+                route: Some(route_name.to_string()),
+                message: "no public key is available, so the phone cannot sign in on this route"
+                    .into(),
+            });
+        }
+        // Trust belongs to the route's selected file policy. Sharing an
+        // endpoint must never borrow another route's positive allowlist.
+        let trust_id = format!("h.{}", short_digest(&resolved.id));
+        self.trust_scopes
+            .insert(trust_id.clone(), endpoint_trust_scope(endpoint));
+        let pin =
+            |key: &PublicKey| json!({"algorithm": key.algorithm, "fingerprint": key.fingerprint()});
+        let mut trust = json!({
+            "id": trust_id,
+            "host": endpoint.host,
+            "port": endpoint.port,
+            "claimed_source": "known_hosts",
+            "pins": resolved.keys.pins.iter().map(pin).collect::<Vec<_>>(),
+            "revoked_keys": [],
+        });
+        if let Some(alias) = &endpoint.host_key_alias {
+            trust["host_key_alias"] = json!(alias);
+        }
+        self.trusts.insert(trust_id.clone(), trust);
+        let mut record = json!({
+            "id": resolved.id,
+            "mode": "direct_ssh",
+            "host": endpoint.host,
+            "port": endpoint.port,
+            "user": endpoint.user,
+            "credential_refs": credential_ids,
+            "authentication_methods": ["publickey"],
+            "host_trust_ref": trust_id,
+            "jump_routes": resolved.jump_routes,
+        });
+        if resolved.destination {
+            record["session_creation"] = json!("on_select");
+        }
+        if let Some(alias) = &endpoint.host_key_alias {
+            record["host_key_alias"] = json!(alias);
+        }
+        record
+    }
+}
+
 /// The phone's workspace for the inventory, or for one group of it.
 pub fn export(
     inventory: &MachineInventory,
@@ -1076,17 +1422,15 @@ pub fn export(
         &sources.system_config,
         &context.home,
     );
+    let endpoint_sources = EndpointSources {
+        ssh: sources,
+        resolver: resolver.as_ref(),
+        inventory: context,
+    };
     let mut notes = Vec::new();
-    let (mut machines, mut routes, mut credentials, mut trusts, mut themes) = (
-        Vec::new(),
-        Vec::new(),
-        BTreeMap::new(),
-        BTreeMap::new(),
-        Vec::new(),
-    );
+    let (mut machines, mut routes, mut themes) = (Vec::new(), Vec::new(), Vec::new());
+    let mut records = EndpointRecords::default();
     let mut exported = BTreeSet::new();
-    let mut identity_files = BTreeMap::new();
-    let mut trust_scopes = BTreeMap::new();
     let mut revoked_by_scope: BTreeMap<(String, u16), Vec<PublicKey>> = BTreeMap::new();
     let mut unresolved_scopes = BTreeSet::new();
     let mut resolved_routes = BTreeMap::new();
@@ -1100,18 +1444,22 @@ pub fn export(
                 continue;
             };
             let mut route_notes = Vec::new();
-            if let Some(endpoint) = resolve_endpoint(
-                machine,
-                id,
-                target,
-                sources,
-                resolver.as_ref(),
-                context,
-                &mut route_notes,
-            ) {
-                let (keys, unresolved) =
-                    endpoint_keys(machine, id, &endpoint, sources, &mut route_notes);
-                let scope = endpoint_trust_scope(&endpoint);
+            let (mut family, exportable) =
+                resolve_route(machine, id, target, &endpoint_sources, &mut route_notes);
+            for resolved in &mut family {
+                let name = if resolved.destination {
+                    id.clone()
+                } else {
+                    format!("{} via {}", id, resolved.endpoint.host)
+                };
+                let (keys, unresolved) = endpoint_keys(
+                    machine,
+                    &name,
+                    &resolved.endpoint,
+                    sources,
+                    &mut route_notes,
+                );
+                let scope = endpoint_trust_scope(&resolved.endpoint);
                 let revoked = revoked_by_scope.entry(scope.clone()).or_default();
                 for key in &keys.revoked {
                     if !revoked.contains(key) {
@@ -1121,9 +1469,10 @@ pub fn export(
                 if unresolved {
                     unresolved_scopes.insert(scope);
                 }
-                if wanted.contains(machine.id.as_str()) {
-                    resolved_routes.insert((machine.id.clone(), id.clone()), (endpoint, keys));
-                }
+                resolved.keys = keys;
+            }
+            if exportable && wanted.contains(machine.id.as_str()) {
+                resolved_routes.insert((machine.id.clone(), id.clone()), family);
             }
             if wanted.contains(machine.id.as_str()) {
                 notes.extend(route_notes);
@@ -1145,114 +1494,29 @@ pub fn export(
             let MachineRoute::Ssh { id: route_name, .. } = route else {
                 continue;
             };
-            let (endpoint, keys) =
-                match resolved_routes.remove(&(machine.id.clone(), route_name.clone())) {
-                    Some(resolved) => resolved,
-                    None => continue,
+            let family = match resolved_routes.remove(&(machine.id.clone(), route_name.clone())) {
+                Some(resolved) => resolved,
+                None => continue,
+            };
+            anyhow::ensure!(
+                routes.len() + family.len() <= MAX_EXPORTED_ROUTES,
+                "the complete workspace exceeds the phone's {}-route limit; select a smaller group",
+                MAX_EXPORTED_ROUTES
+            );
+            for resolved in family {
+                let name = if resolved.destination {
+                    route_name.clone()
+                } else {
+                    format!("{} via {}", route_name, resolved.endpoint.host)
                 };
-            let mut credential_ids = Vec::new();
-            let defaults = default_identities(context);
-            for identity in &endpoint.identities {
-                let public = public_key_path(identity);
-                let key = match sources.public_keys.get(&public).and_then(|text| {
-                    text.lines()
-                        .find(|l| !l.trim().is_empty())
-                        .and_then(PublicKey::parse_line)
-                }) {
-                    Some(key) => key,
-                    // OpenSSH skips absent default identities silently too.
-                    None if defaults.contains(identity) => continue,
-                    None => {
-                        notes.push(ExportNote {
-                            machine: machine.id.clone(),
-                            route: Some(route_name.clone()),
-                            message: format!(
-                                "no readable public key at {}; that identity is not offered",
-                                public.display()
-                            ),
-                        });
-                        continue;
-                    }
-                };
-                let fingerprint = key.fingerprint();
-                let id = format!("c.{}", short_digest(&fingerprint));
-                if credential_ids.contains(&id) {
-                    continue;
+                let record =
+                    records.record(machine, &name, &resolved, sources, context, &mut notes);
+                if resolved.destination {
+                    exported_ssh.insert(route_name.clone(), record.clone());
+                    route_ids.push(resolved.id);
                 }
-                if credential_ids.len() == 8 {
-                    notes.push(ExportNote {
-                        machine: machine.id.clone(),
-                        route: Some(route_name.clone()),
-                        message: format!(
-                            "the phone offers at most 8 identities per route; {} is not offered",
-                            identity.display()
-                        ),
-                    });
-                    continue;
-                }
-                credentials.entry(id.clone()).or_insert_with(|| {
-                    json!({
-                        "id": id,
-                        "algorithm": key.algorithm,
-                        "public_fingerprint": fingerprint,
-                        "requirement": "matching_private_key",
-                        "private_material": "not_included",
-                    })
-                });
-                identity_files.entry(id.clone()).or_insert_with(|| {
-                    if identity.extension().is_some_and(|ext| ext == "pub") {
-                        identity.with_extension("")
-                    } else {
-                        identity.clone()
-                    }
-                });
-                credential_ids.push(id);
+                routes.push(record);
             }
-            if credential_ids.is_empty() {
-                notes.push(ExportNote {
-                    machine: machine.id.clone(),
-                    route: Some(route_name.clone()),
-                    message:
-                        "no public key is available, so the phone cannot sign in on this route"
-                            .into(),
-                });
-            }
-            let id = format!("r.{}.{}", machine.id, route_name);
-            // Trust belongs to the route's selected file policy. Sharing an
-            // endpoint must never borrow another route's positive allowlist.
-            let trust_id = format!("h.{}", short_digest(&id));
-            trust_scopes.insert(trust_id.clone(), endpoint_trust_scope(&endpoint));
-            let pin = |key: &PublicKey| json!({"algorithm": key.algorithm, "fingerprint": key.fingerprint()});
-            let mut trust = json!({
-                "id": trust_id,
-                "host": endpoint.host,
-                "port": endpoint.port,
-                "claimed_source": "known_hosts",
-                "pins": keys.pins.iter().map(pin).collect::<Vec<_>>(),
-                "revoked_keys": [],
-            });
-            if let Some(alias) = &endpoint.host_key_alias {
-                trust["host_key_alias"] = json!(alias);
-            }
-            trusts.insert(trust_id.clone(), trust);
-            let mut record = json!({
-                "id": id,
-                "mode": "direct_ssh",
-                "host": endpoint.host,
-                "port": endpoint.port,
-                "user": endpoint.user,
-                "credential_refs": credential_ids,
-                "authentication_methods": ["publickey"],
-                "host_trust_ref": trust_id,
-                "jump_routes": [],
-                "session_creation": "on_select",
-            });
-            if let Some(alias) = &endpoint.host_key_alias {
-                record["host_key_alias"] = json!(alias);
-            }
-            exported_ssh.insert(route_name.clone(), record.clone());
-            routes.push(record);
-            route_ids.push(id);
         }
         // A mux route becomes one phone route per exported SSH route in its
         // `via` order: the same sign-in, then the command the desktop runs
@@ -1302,6 +1566,11 @@ pub fn export(
                 if let Some(fields) = record.as_object_mut() {
                     fields.remove("session_creation");
                 }
+                anyhow::ensure!(
+                    routes.len() < MAX_EXPORTED_ROUTES,
+                    "the complete workspace exceeds the phone's {}-route limit; select a smaller group",
+                    MAX_EXPORTED_ROUTES
+                );
                 routes.push(record);
                 mux_ids.push(id);
             }
@@ -1346,8 +1615,8 @@ pub fn export(
     // Denials and unresolved required trust are monotonic for one canonical
     // host-key scope, across every selected route and source spelling. Apply
     // them after collecting all routes, independently of inventory order.
-    for (trust_id, trust) in &mut trusts {
-        let scope = &trust_scopes[trust_id];
+    for (trust_id, trust) in &mut records.trusts {
+        let scope = &records.trust_scopes[trust_id];
         if let Some(revoked) = revoked_by_scope.get(scope) {
             let fingerprints: BTreeSet<String> =
                 revoked.iter().map(PublicKey::fingerprint).collect();
@@ -1413,6 +1682,10 @@ pub fn export(
     );
     let machine_count = machines.len();
     let route_count = routes.len();
+    anyhow::ensure!(
+        records.credentials.len() <= 256,
+        "the complete workspace exceeds the phone's 256-credential limit; select a smaller group"
+    );
     let document = json!({
         "format": "ftworkspace",
         "version": 1,
@@ -1429,8 +1702,8 @@ pub fn export(
             "groups": group_records,
             "machines": machines,
             "routes": routes,
-            "credentials": credentials.into_values().collect::<Vec<_>>(),
-            "host_trust": trusts.into_values().collect::<Vec<_>>(),
+            "credentials": records.credentials.into_values().collect::<Vec<_>>(),
+            "host_trust": records.trusts.into_values().collect::<Vec<_>>(),
             "themes": themes,
             "preferences": {
                 "initial_group_ref": initial_group_id,
@@ -1444,7 +1717,7 @@ pub fn export(
         machines: machine_count,
         routes: route_count,
         notes,
-        identity_files,
+        identity_files: records.identity_files,
     })
 }
 
@@ -1745,6 +2018,567 @@ ssh = "jumped"
         blob.extend_from_slice(&[0, 0, 0, 32]);
         blob.extend_from_slice(&[seed; 32]);
         format!("ssh-ed25519 {} k{}", STANDARD.encode(blob), seed)
+    }
+
+    const JUMP_INVENTORY: &str = r#"
+version = 1
+[machines.app]
+[[machines.app.routes]]
+id = "ssh"
+ssh = "app"
+[[machines.app.routes]]
+id = "mux"
+kind = "frankenterm_mux"
+via = "ssh"
+socket = "/run/frankenterm.sock"
+"#;
+
+    const JUMP_CONFIG: &str = "Host app\n HostName service.internal\n Port 2224\n User deploy\n IdentityFile ~/.ssh/app\n UserKnownHostsFile /trust/app\n ProxyJump first,second,third\nHost first\n HostName outer.example\n Port 2221\n User gateway\n IdentityFile ~/.ssh/first\n HostKeyAlias outer-key\n UserKnownHostsFile /trust/first\nHost second\n HostName middle.internal\n User transit\n IdentityFile ~/.ssh/second\n UserKnownHostsFile /trust/second\nHost third\n HostName inner.internal\n Port 2223\n User jump\n IdentityFile ~/.ssh/third\n UserKnownHostsFile /trust/third\nHost *\n GlobalKnownHostsFile none\n";
+
+    fn jump_sources() -> SshSources {
+        let mut sources = sources(Some(JUMP_CONFIG));
+        for (seed, alias, lookup) in [
+            (1, "first", "outer-key"),
+            (2, "second", "middle.internal"),
+            (3, "third", "[inner.internal]:2223"),
+            (4, "app", "[service.internal]:2224"),
+        ] {
+            sources.public_keys.insert(
+                context().home.join(format!(".ssh/{}.pub", alias)),
+                fake_key(seed),
+            );
+            supply(
+                &mut sources,
+                &format!("/trust/{}", alias),
+                format!("{} {}\n", lookup, fake_key(seed + 40)),
+            );
+        }
+        sources
+    }
+
+    fn jump_export(sources: &SshSources) -> anyhow::Result<MobileExport> {
+        let inventory = MachineInventory::parse(JUMP_INVENTORY, &context()).unwrap();
+        export(
+            &inventory,
+            JUMP_INVENTORY.as_bytes(),
+            None,
+            sources,
+            &context(),
+        )
+    }
+
+    fn exported_route<'a>(export: &'a MobileExport, id: &str) -> &'a Value {
+        export.document["workspace"]["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|route| route["id"] == id)
+            .unwrap()
+    }
+
+    #[test]
+    fn three_hop_inventory_export_preserves_ordered_endpoints_identity_trust_and_mux() {
+        let export = jump_export(&jump_sources()).unwrap();
+        let workspace = &export.document["workspace"];
+        assert_eq!(
+            export.machines, 1,
+            "transit hosts are not selectable machines"
+        );
+        assert_eq!(
+            export.routes, 5,
+            "three transit hosts, destination, and mux"
+        );
+        assert!(export.notes.is_empty(), "{:?}", export.notes);
+        let destination = exported_route(&export, "r.app.ssh");
+        let jumps = destination["jump_routes"].as_array().unwrap();
+        assert_eq!(jumps.len(), 3);
+        assert_eq!(destination["session_creation"], "on_select");
+        let mux = exported_route(&export, "r.app.mux");
+        assert_eq!(mux["jump_routes"], destination["jump_routes"]);
+        assert_eq!(mux["mode"], "frankenterm_mux");
+        assert_eq!(mux["attach_policy"], "existing_only");
+        assert!(mux.get("session_creation").is_none());
+        assert_eq!(
+            workspace["machines"][0]["route_refs"],
+            json!(["r.app.mux", "r.app.ssh"])
+        );
+
+        let expected = [
+            ("first", "outer.example", 2221, "gateway", 1),
+            ("second", "middle.internal", 22, "transit", 2),
+            ("third", "inner.internal", 2223, "jump", 3),
+            ("app", "service.internal", 2224, "deploy", 4),
+        ];
+        for (index, (alias, host, port, user, seed)) in expected.iter().copied().enumerate() {
+            let route = if index < 3 {
+                let route = exported_route(&export, jumps[index].as_str().unwrap());
+                assert!(route.get("session_creation").is_none());
+                assert_eq!(route["jump_routes"], json!([]));
+                route
+            } else {
+                destination
+            };
+            assert_eq!(route["host"], host);
+            assert_eq!(route["port"], port);
+            assert_eq!(route["user"], user);
+            assert_eq!(route["authentication_methods"], json!(["publickey"]));
+            let credential_ids = route["credential_refs"].as_array().unwrap();
+            assert_eq!(credential_ids.len(), 1);
+            let credential = workspace["credentials"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|credential| credential["id"] == credential_ids[0])
+                .unwrap();
+            assert_eq!(
+                credential["public_fingerprint"],
+                PublicKey::parse_line(&fake_key(seed))
+                    .unwrap()
+                    .fingerprint()
+            );
+            assert_eq!(
+                export.identity_files[credential_ids[0].as_str().unwrap()],
+                context().home.join(format!(".ssh/{}", alias))
+            );
+            let trust = route_trust(&export, route["id"].as_str().unwrap());
+            assert_eq!(trust["host"], host);
+            assert_eq!(trust["port"], port);
+            assert_eq!(trust["pins"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                trust["pins"][0]["fingerprint"],
+                PublicKey::parse_line(&fake_key(seed + 40))
+                    .unwrap()
+                    .fingerprint()
+            );
+            assert!(trust["required_capabilities"].is_null());
+        }
+        assert_eq!(workspace["credentials"].as_array().unwrap().len(), 4);
+        assert_eq!(workspace["host_trust"].as_array().unwrap().len(), 4);
+        let outer = exported_route(&export, jumps[0].as_str().unwrap());
+        assert_eq!(outer["host_key_alias"], "outer-key");
+        assert_eq!(
+            route_trust(&export, outer["id"].as_str().unwrap())["host_key_alias"],
+            "outer-key"
+        );
+        let public = serde_json::to_string(&export.document).unwrap();
+        assert!(!public.contains("/trust/") && !public.contains(".ssh/"));
+        let source = companion_source(&export, Path::new("/config/machines.toml"));
+        assert_eq!(source["identity_files"].as_object().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn proxyjump_expands_only_the_first_hops_configured_prefix_and_honors_proxy_precedence() {
+        for (text, expected) in [
+            (
+                "Host app\n ProxyJump third\nHost third\n ProxyJump second\nHost second\n ProxyJump first\nHost first\n",
+                vec!["first", "second", "third"],
+            ),
+            (
+                "Host app\n ProxyJump second,third\nHost second\n ProxyJump first\nHost first\nHost third\n ProxyJump nonexistent\n",
+                vec!["first", "second", "third"],
+            ),
+            (
+                "Host app\n ProxyJump first\n ProxyCommand touch /must-not-execute\nHost first\n",
+                vec!["first"],
+            ),
+            (
+                "Host app\n ProxyCommand none\n ProxyJump nonexistent\n",
+                vec![],
+            ),
+            (
+                "Host app\n ProxyJump NONE\n ProxyCommand touch /must-not-execute\n",
+                vec![],
+            ),
+        ] {
+            let resolver = alias_resolver(Some(text), &context().home).unwrap();
+            assert_eq!(resolver.jump_chain("app").unwrap(), expected, "{}", text);
+        }
+        let mut sources = jump_sources();
+        sources.config = Some(JUMP_CONFIG.replace(
+            "Host second\n",
+            "Host second\n ProxyCommand touch /must-not-execute\n ProxyJump nonexistent\n",
+        ));
+        let export = jump_export(&sources).unwrap();
+        assert_eq!(
+            export.routes, 5,
+            "the explicit preceding hop overrides second's proxy"
+        );
+        assert!(
+            !serde_json::to_string(&export.document)
+                .unwrap()
+                .contains("must-not-execute")
+        );
+        sources.config = Some(JUMP_CONFIG.replace(
+            "Host first\n",
+            "Host first\n ProxyCommand touch /must-not-execute\n",
+        ));
+        assert!(
+            jump_export(&sources).is_err(),
+            "the first hop cannot run a proxy command"
+        );
+        sources.config = Some(JUMP_CONFIG.replace(
+            "Host app\n",
+            "Host app\n ProxyCommand touch /must-not-execute\n",
+        ));
+        assert!(
+            jump_export(&sources).is_err(),
+            "a destination's earlier proxy command wins"
+        );
+        sources.config = Some(JUMP_CONFIG.replace(
+            "Host app\n",
+            "Host app\n frankenterm_proxy __frankenterm_proxy_1__\n ProxyCommand touch /must-not-execute\n",
+        ));
+        assert!(
+            jump_export(&sources).is_err(),
+            "source text cannot inject the resolver's private proxy slot"
+        );
+    }
+
+    #[test]
+    fn invalid_jump_graphs_never_export_a_direct_fallback_or_partial_transit_chain() {
+        for value in [
+            "missing",
+            "first,missing",
+            "first,second,third,fourth",
+            "first,first",
+            "app",
+            "first,app",
+            "first,,second",
+            "first,",
+            ",first",
+            "user@first",
+            "first:2222",
+            "ssh://first",
+            "first,none",
+            "-first",
+            "%j",
+            "${JUMP}",
+            "first, second",
+        ] {
+            let config = format!(
+                "Host app\n ProxyJump {}\nHost first second third fourth\n User u\n",
+                value
+            );
+            let resolver = alias_resolver(Some(&config), &context().home).unwrap();
+            assert!(resolver.jump_chain("app").is_err(), "{}", value);
+            let mut sources = jump_sources();
+            sources.config = Some(config);
+            assert!(jump_export(&sources).is_err(), "{}", value);
+        }
+        for config in [
+            "Host app\n ProxyJump first\nHost first\n ProxyJump app\n",
+            "Host app\n ProxyJump first,second\nHost first\n ProxyJump second\nHost second\n",
+            "Host app\n ProxyJump second,third\nHost second\n ProxyJump first\nHost first\n ProxyJump fourth\nHost third fourth\n",
+            "Host app\n ProxyJump first\nHost fir*\n User u\n",
+        ] {
+            let resolver = alias_resolver(Some(config), &context().home).unwrap();
+            assert!(resolver.jump_chain("app").is_err(), "{}", config);
+        }
+        let mut sources = jump_sources();
+        sources.config = Some(JUMP_CONFIG.replace("Port 2223", "Port invalid"));
+        assert!(
+            jump_export(&sources).is_err(),
+            "an invalid endpoint rejects the whole graph"
+        );
+        let text = format!(
+            "{}\n[[machines.safe.routes]]\nid = \"ssh\"\nhost = \"100.91.120.17\"\nuser = \"ubuntu\"\nidentity_file = \"~/.ssh/trj_ed25519\"\n",
+            JUMP_INVENTORY
+        );
+        let inventory = MachineInventory::parse(&text, &context()).unwrap();
+        let export = export(&inventory, text.as_bytes(), None, &sources, &context()).unwrap();
+        assert_eq!(export.machines, 1);
+        assert_eq!(export.routes, 1);
+        assert_eq!(
+            export.document["workspace"]["routes"][0]["id"],
+            "r.safe.ssh"
+        );
+        assert_eq!(
+            export.document["workspace"]["host_trust"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            export.identity_files.len(),
+            1,
+            "refused transit keys cannot enter the companion's sealing list"
+        );
+    }
+
+    #[test]
+    fn a_transit_hosts_required_policy_and_revocations_survive_in_the_workspace() {
+        for policy in [
+            "HostKeyAlgorithms ssh-ed25519",
+            "RevokedHostKeys /must-not-read",
+            "KnownHostsCommand touch /must-not-execute",
+            "CertificateFile ~/.ssh/second-cert.pub",
+            "PubkeyAuthentication no",
+        ] {
+            let mut sources = jump_sources();
+            sources.config =
+                Some(JUMP_CONFIG.replace("Host second\n", &format!("Host second\n {}\n", policy)));
+            let export = jump_export(&sources).unwrap();
+            let route = exported_route(&export, "r.app.ssh");
+            let hop = route["jump_routes"][1].as_str().unwrap();
+            assert_eq!(
+                route_trust(&export, hop)["required_capabilities"],
+                json!([UNRESOLVED_POLICY]),
+                "{}",
+                policy
+            );
+            assert!(route_trust(&export, "r.app.ssh")["required_capabilities"].is_null());
+        }
+        let mut sources = jump_sources();
+        supply(
+            &mut sources,
+            "/trust/second",
+            format!(
+                "middle.internal {}\n@revoked middle.internal {}\n",
+                fake_key(42),
+                fake_key(42)
+            ),
+        );
+        let export = jump_export(&sources).unwrap();
+        let hop = exported_route(&export, "r.app.ssh")["jump_routes"][1]
+            .as_str()
+            .unwrap();
+        let trust = route_trust(&export, hop);
+        assert!(trust["pins"].as_array().unwrap().is_empty());
+        assert_eq!(trust["revoked_keys"].as_array().unwrap().len(), 1);
+        sources.known_hosts.insert(
+            PathBuf::from("/trust/second"),
+            KnownHostsSource::Unavailable,
+        );
+        let export = jump_export(&sources).unwrap();
+        let hop = exported_route(&export, "r.app.ssh")["jump_routes"][1]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            route_trust(&export, hop)["required_capabilities"],
+            json!([UNRESOLVED_POLICY])
+        );
+    }
+
+    #[test]
+    fn selecting_a_group_cannot_discard_an_unselected_jump_hosts_same_scope_denial() {
+        let text = format!(
+            "{}\n[groups.selected]\nmachines = [\"left\"]\n",
+            TRUST_INVENTORY
+        );
+        let inventory = MachineInventory::parse(&text, &context()).unwrap();
+        let mut sources = sources(Some(
+            "Host left\n HostName left.internal\n ProxyJump first\n UserKnownHostsFile /trust/left\nHost right\n HostName right.internal\n ProxyJump second\n UserKnownHostsFile /trust/right\nHost first\n HostName shared\n UserKnownHostsFile /trust/first\nHost second\n HostName SHARED.\n UserKnownHostsFile /trust/second\nHost *\n User u\n IdentityFile ~/.ssh/trj_ed25519\n GlobalKnownHostsFile none\n",
+        ));
+        supply(
+            &mut sources,
+            "/trust/left",
+            format!("left.internal {}\n", fake_key(11)),
+        );
+        supply(
+            &mut sources,
+            "/trust/right",
+            format!("right.internal {}\n", fake_key(12)),
+        );
+        supply(
+            &mut sources,
+            "/trust/first",
+            format!("shared {}\n", fake_key(41)),
+        );
+        supply(
+            &mut sources,
+            "/trust/second",
+            format!("SHARED. {}\n", fake_key(42)),
+        );
+        let before = export(&inventory, text.as_bytes(), None, &sources, &context()).unwrap();
+        let first = exported_route(&before, "r.left.ssh")["jump_routes"][0]
+            .as_str()
+            .unwrap();
+        let second = exported_route(&before, "r.right.ssh")["jump_routes"][0]
+            .as_str()
+            .unwrap();
+        let left = route_trust(&before, first);
+        let right = route_trust(&before, second);
+        assert_ne!(left["id"], right["id"]);
+        assert_eq!(left["pins"].as_array().unwrap().len(), 1);
+        assert_eq!(right["pins"].as_array().unwrap().len(), 1);
+        assert_ne!(
+            left["pins"], right["pins"],
+            "positive pins remain route-specific"
+        );
+
+        supply(
+            &mut sources,
+            "/trust/second",
+            format!("@revoked shared {}\n", fake_key(41)),
+        );
+        let selected = export(
+            &inventory,
+            text.as_bytes(),
+            Some("selected"),
+            &sources,
+            &context(),
+        )
+        .unwrap();
+        assert_eq!(selected.machines, 1);
+        assert_eq!(selected.routes, 2);
+        let first = exported_route(&selected, "r.left.ssh")["jump_routes"][0]
+            .as_str()
+            .unwrap();
+        let trust = route_trust(&selected, first);
+        assert!(trust["pins"].as_array().unwrap().is_empty());
+        assert_eq!(
+            trust["revoked_keys"][0]["fingerprint"],
+            PublicKey::parse_line(&fake_key(41)).unwrap().fingerprint()
+        );
+
+        sources.config = sources
+            .config
+            .as_ref()
+            .map(|text| text.replace("Host right\n", "Host right\n Port invalid\n"));
+        let refused = export(&inventory, text.as_bytes(), None, &sources, &context()).unwrap();
+        assert_eq!(
+            refused.machines, 1,
+            "the invalid destination is omitted atomically"
+        );
+        let first = exported_route(&refused, "r.left.ssh")["jump_routes"][0]
+            .as_str()
+            .unwrap();
+        assert!(
+            route_trust(&refused, first)["pins"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "its resolved transit host still contributes a denial"
+        );
+
+        sources.known_hosts.insert(
+            PathBuf::from("/trust/second"),
+            KnownHostsSource::Unavailable,
+        );
+        let selected = export(
+            &inventory,
+            text.as_bytes(),
+            Some("selected"),
+            &sources,
+            &context(),
+        )
+        .unwrap();
+        let first = exported_route(&selected, "r.left.ssh")["jump_routes"][0]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            route_trust(&selected, first)["required_capabilities"],
+            json!([UNRESOLVED_POLICY])
+        );
+    }
+
+    #[test]
+    fn route_limit_counts_complete_transit_graphs_and_never_merges_their_trust() {
+        let mut text = "version = 1\n".to_string();
+        for index in 0..64 {
+            text.push_str(&format!(
+                "[[machines.m{}.routes]]\nid = \"ssh\"\nssh = \"app\"\n",
+                index
+            ));
+        }
+        let inventory = MachineInventory::parse(&text, &context()).unwrap();
+        let sources = jump_sources();
+        let complete = export(&inventory, text.as_bytes(), None, &sources, &context()).unwrap();
+        assert_eq!(complete.routes, 256);
+        assert_eq!(
+            complete.document["workspace"]["host_trust"]
+                .as_array()
+                .unwrap()
+                .len(),
+            256
+        );
+        let ids: BTreeSet<_> = complete.document["workspace"]["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|route| route["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 256);
+        text.push_str("[[machines.overflow.routes]]\nid = \"ssh\"\nssh = \"app\"\n");
+        let inventory = MachineInventory::parse(&text, &context()).unwrap();
+        let result = export(&inventory, text.as_bytes(), None, &sources, &context());
+        assert!(
+            result.is_err(),
+            "an extra graph cannot be partially exported"
+        );
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("256-route limit")
+        );
+    }
+
+    #[test]
+    fn disk_snapshot_collects_every_hops_public_key_and_effective_trust_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::create_dir_all(home.join("trust")).unwrap();
+        // Disable any machine-specific system proxy default after the
+        // fixture's explicit destination chain has already won precedence.
+        let config = format!(
+            "{} ProxyCommand none\n",
+            JUMP_CONFIG.replace("/trust/", "~/trust/")
+        );
+        write_source(&home.join(".ssh/config"), config);
+        for (seed, alias, lookup) in [
+            (1, "first", "outer-key"),
+            (2, "second", "middle.internal"),
+            (3, "third", "[inner.internal]:2223"),
+            (4, "app", "[service.internal]:2224"),
+        ] {
+            // There is deliberately no private file: passive discovery needs
+            // only the .pub, and supplies a path for later companion review.
+            write_source(&home.join(format!(".ssh/{}.pub", alias)), fake_key(seed));
+            write_source(
+                &home.join(format!("trust/{}", alias)),
+                format!("{} {}\n", lookup, fake_key(seed + 40)),
+            );
+        }
+        let context = InventoryContext {
+            directory: directory.path().to_path_buf(),
+            home,
+        };
+        let inventory = MachineInventory::parse(JUMP_INVENTORY, &context).unwrap();
+        let snapshot = SshSources::from_disk(&inventory, &context);
+        for alias in ["first", "second", "third", "app"] {
+            assert!(
+                snapshot
+                    .public_keys
+                    .contains_key(&context.home.join(format!(".ssh/{}.pub", alias)))
+            );
+            assert!(matches!(
+                snapshot
+                    .known_hosts
+                    .get(&context.home.join(format!("trust/{}", alias))),
+                Some(KnownHostsSource::Present(_))
+            ));
+        }
+        let export = export(
+            &inventory,
+            JUMP_INVENTORY.as_bytes(),
+            None,
+            &snapshot,
+            &context,
+        )
+        .unwrap();
+        assert_eq!(export.routes, 5);
+        assert_eq!(export.identity_files.len(), 4);
+        assert!(export.identity_files.values().all(|path| !path.exists()));
+        for trust in export.document["workspace"]["host_trust"]
+            .as_array()
+            .unwrap()
+        {
+            assert_eq!(trust["pins"].as_array().unwrap().len(), 1);
+        }
     }
 
     #[test]
