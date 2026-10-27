@@ -142,6 +142,7 @@ public actor WorkspaceNativeSSHInteractiveAuthentication: NativeSSHInteractiveAu
     private nonisolated let retirement = WorkspaceNativeSSHAuthentication.Retirement()
     private nonisolated let broker: SSHAuthenticationBroker
     private nonisolated let transportID: UUID
+    private nonisolated let publicKeyPrerequisite: WorkspaceNativeSSHAuthentication?
     private let attemptID = UUID()
     private let prompter: any WorkspaceSSHKeyboardInteractivePrompting
     private let workspaceID: UUID, revision: UUID
@@ -155,11 +156,13 @@ public actor WorkspaceNativeSSHInteractiveAuthentication: NativeSSHInteractiveAu
 
     public init(broker: SSHAuthenticationBroker, prompter: any WorkspaceSSHKeyboardInteractivePrompting,
                 workspaceID: UUID, revision: UUID, routeID: String, transportID: UUID,
-                endpoint: NativeSSHEndpoint, transitForRouteID: String? = nil, allowedJumpRouteIDs: [String] = []) {
+                endpoint: NativeSSHEndpoint, transitForRouteID: String? = nil, allowedJumpRouteIDs: [String] = [],
+                continuingPublicKey: WorkspaceNativeSSHAuthentication? = nil) {
         self.broker = broker; self.prompter = prompter
         self.workspaceID = workspaceID; self.revision = revision; self.routeID = routeID
         self.transportID = transportID; self.endpoint = endpoint
         self.transitForRouteID = transitForRouteID; self.allowedJumpRouteIDs = allowedJumpRouteIDs
+        publicKeyPrerequisite = continuingPublicKey
     }
 
     public func account(for peer: NativeSSHPeer) async throws -> NativeSSHInteractiveAccount {
@@ -180,6 +183,7 @@ public actor WorkspaceNativeSSHInteractiveAuthentication: NativeSSHInteractiveAu
     private func selectAccount(for peer: NativeSSHPeer) async throws -> NativeSSHInteractiveAccount {
         do {
             let host = try validatePeer(peer)
+            try await validatePrerequisite(peer: peer)
             let selected = try await broker.keyboardInteractiveIdentity(workspaceID: workspaceID,
                 expectedRevision: revision, routeID: routeID, presentedHostKey: host,
                 transitForRouteID: transitForRouteID)
@@ -187,6 +191,7 @@ public actor WorkspaceNativeSSHInteractiveAuthentication: NativeSSHInteractiveAu
                 try checkCurrent()
                 try validateRoute(selected.authorization)
                 let account = try NativeSSHInteractiveAccount(user: selected.authorization.user)
+                try await validatePrerequisite(peer: peer, account: account)
                 self.selected = selected; selectedPeer = peer; selectedAccount = account; phase = .selected
                 return account
             } catch {
@@ -206,9 +211,16 @@ public actor WorkspaceNativeSSHInteractiveAuthentication: NativeSSHInteractiveAu
             prompts: try challenge.prompts.map { try .init(text: $0.text, echo: $0.echo) })
         phase = .requesting
         let id = UUID()
+        // The broker may queue this round behind another foreground prompt.
+        // Revalidate the first factor at actual UI admission, not only before
+        // entering that queue, and again before accepting its answers.
+        let roundPrompter = PrerequisitePrompter(base: prompter) {
+            try await self.validatePrerequisite(peer: peer, account: challenge.account)
+        }
         let work = Task {
-            try await broker.keyboardInteractiveResponses(for: selected, transportID: transportID,
-                attemptID: attemptID, challenge: typed, prompter: prompter)
+            try await validatePrerequisite(peer: peer, account: challenge.account)
+            return try await broker.keyboardInteractiveResponses(for: selected, transportID: transportID,
+                attemptID: attemptID, challenge: typed, prompter: roundPrompter)
         }
         retirement.install(id) { work.cancel() }
         defer { retirement.finish(id) }
@@ -221,6 +233,7 @@ public actor WorkspaceNativeSSHInteractiveAuthentication: NativeSSHInteractiveAu
             }
             try checkCurrent()
             try await broker.validateKeyboardInteractiveAttempt(selected)
+            try await validatePrerequisite(peer: peer, account: challenge.account)
             try checkCurrent()
             lastRound = challenge.round; phase = .supplied
             return answers
@@ -233,6 +246,7 @@ public actor WorkspaceNativeSSHInteractiveAuthentication: NativeSSHInteractiveAu
               peer == selectedPeer, account == selectedAccount, let selected else { throw SSHAuthenticationError.stale }
         _ = try validatePeer(peer)
         try validateRoute(selected.authorization)
+        try await validatePrerequisite(peer: peer, account: account)
         if phase == .authenticated { try await broker.validate(selected) }
         else { try await broker.validateKeyboardInteractiveAttempt(selected) }
         try checkCurrent()
@@ -240,8 +254,11 @@ public actor WorkspaceNativeSSHInteractiveAuthentication: NativeSSHInteractiveAu
 
     func authenticationCompleted() async throws {
         try checkCurrent()
-        guard phase == .supplied, let selected else { throw SSHAuthenticationError.stale }
+        guard phase == .supplied, let selected, let selectedPeer, let selectedAccount else {
+            throw SSHAuthenticationError.stale
+        }
         try await broker.validateKeyboardInteractiveAttempt(selected)
+        try await validatePrerequisite(peer: selectedPeer, account: selectedAccount)
         try checkCurrent()
         phase = .authenticated
         await broker.finishKeyboardInteractiveAttempt(selected)
@@ -255,6 +272,7 @@ public actor WorkspaceNativeSSHInteractiveAuthentication: NativeSSHInteractiveAu
 
     public nonisolated func cancel(transportID: UUID) {
         guard transportID == self.transportID, retirement.retire() else { return }
+        publicKeyPrerequisite?.cancel(transportID: transportID)
         Task {
             await broker.cancel(transportID: transportID)
             await retireAttempt()
@@ -265,6 +283,32 @@ public actor WorkspaceNativeSSHInteractiveAuthentication: NativeSSHInteractiveAu
         if let selected { await broker.finishKeyboardInteractiveAttempt(selected) }
     }
     private func checkCurrent() throws { try Task.checkCancellation(); try retirement.check() }
+
+    /// A continued exchange retains the exact signed credential as part of its
+    /// live authority. Revoking it must invalidate this login even while the
+    /// route still independently permits keyboard-interactive authentication.
+    private func validatePrerequisite(peer: NativeSSHPeer, account: NativeSSHInteractiveAccount? = nil) async throws {
+        try checkCurrent()
+        try await publicKeyPrerequisite?.validateInteractiveContinuation(peer: peer, account: account,
+            workspaceID: workspaceID, revision: revision, routeID: routeID,
+            transitForRouteID: transitForRouteID, allowedJumpRouteIDs: allowedJumpRouteIDs)
+        try checkCurrent()
+    }
+
+    private struct PrerequisitePrompter: WorkspaceSSHKeyboardInteractivePrompting {
+        let base: any WorkspaceSSHKeyboardInteractivePrompting
+        let validate: @Sendable () async throws -> Void
+        func responses(for request: WorkspaceSSHKeyboardInteractiveRequest) async throws -> [Data] {
+            try await validate()
+            var answers = try await base.responses(for: request)
+            defer {
+                for index in answers.indices { answers[index].resetBytes(in: 0..<answers[index].count) }
+            }
+            try await validate()
+            return answers
+        }
+        func cancel(requestID: UUID) { base.cancel(requestID: requestID) }
+    }
 
     private func validatePeer(_ peer: NativeSSHPeer) throws -> WorkspaceDocument.HostKey {
         guard peer.transportID == transportID, peer.endpoint == endpoint else { throw SSHAuthenticationError.stale }
@@ -291,8 +335,10 @@ public actor WorkspaceNativeSSHInteractiveAuthentication: NativeSSHInteractiveAu
 public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, WorkspaceNativeSSHAuthority {
     /// This is the implemented adapter profile, not Apple-device qualification.
     /// Unknown mandatory policies remain blocked by WorkspaceStore. RSA hosts
-    /// and credentials require SHA-2 signatures; certificates and key-to-MFA
-    /// continuation are not enabled. Each supported method permits three jumps. A mux route
+    /// and credentials require SHA-2 signatures; certificates are not enabled.
+    /// Key-to-MFA continuation additionally requires a patched native backend,
+    /// actual server partial success, and explicit keyboard-interactive policy.
+    /// Each supported method permits three jumps. A mux route
     /// authenticates like a direct one; only the destination channel differs.
     public static let routeSupport = WorkspaceDocument.RouteSupport(
         routeModes: ["direct_ssh", "frankenterm_mux"], authenticationMethods: [.publicKey, .password, .keyboardInteractive],
@@ -453,6 +499,18 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
         _ = try validatePeer(peer); try validateRoute(selected.authorization)
         try await broker.validate(selected)
         try checkCurrent()
+    }
+
+    fileprivate func validateInteractiveContinuation(peer: NativeSSHPeer, account: NativeSSHInteractiveAccount?,
+        workspaceID: UUID, revision: UUID, routeID: String, transitForRouteID: String?, allowedJumpRouteIDs: [String]) async throws {
+        try checkCurrent()
+        guard phase == .signed, peer == selectedPeer, let selectedIdentity,
+              self.workspaceID == workspaceID, self.revision == revision, self.routeID == routeID,
+              self.transitForRouteID == transitForRouteID, self.allowedJumpRouteIDs == allowedJumpRouteIDs,
+              account.map({ $0.user.utf8.elementsEqual(selectedIdentity.user.utf8) }) ?? true else {
+            throw SSHAuthenticationError.stale
+        }
+        try await validate(peer: peer, identity: selectedIdentity)
     }
 
     public nonisolated func cancel(transportID: UUID) {

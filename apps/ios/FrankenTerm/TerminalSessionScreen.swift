@@ -352,6 +352,9 @@ final class MobileConnections {
 struct TerminalSessionRoute: Hashable, Sendable {
     let id: String, credentialIDs: [String], host: String, port: UInt16
     var authenticationChoices: [WorkspaceSSHAuthenticationChoice]? = nil
+    /// A key-first choice can still require a foreground second factor. This
+    /// permission never infers partial success or changes candidate ordering.
+    var allowsKeyboardInteractiveContinuation = false
     var promptingJump = false
     var mux = false
     var sessionCreation: TerminalSessionCreation = .onSelect
@@ -365,7 +368,9 @@ struct TerminalSessionRoute: Hashable, Sendable {
     var choices: [WorkspaceSSHAuthenticationChoice] {
         authenticationChoices ?? credentialIDs.map(WorkspaceSSHAuthenticationChoice.publicKey)
     }
-    var requiresAuthenticationPrompt: Bool { promptingJump || choices.contains(where: \.requiresForegroundPrompt) }
+    var requiresAuthenticationPrompt: Bool {
+        allowsKeyboardInteractiveContinuation || promptingJump || choices.contains(where: \.requiresForegroundPrompt)
+    }
 }
 
 /// A machine to open and its ready routes, the chosen or preferred one first.
@@ -1123,7 +1128,7 @@ final class TerminalSessionController {
     func setPresentationVisible(_ visible: Bool) {
         let visible = visible && !stopped
         presentationVisible = visible
-        // A pending password belongs to this visible destination. Returning to
+        // Pending authentication belongs to this visible destination. Returning to
         // the same tab later must not revive its old prompt or queued attempt.
         if !visible, target.requiresAuthenticationPrompt, phase == .connecting { requestStop() }
         if visible { unseenShellOutput = false }

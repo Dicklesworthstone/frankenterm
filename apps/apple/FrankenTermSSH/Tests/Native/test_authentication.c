@@ -76,10 +76,12 @@ static void test_method_tokens(void) {
     assert(authentication_method(over_limit, "publickey") == FTSSH_LIMIT);
 }
 
-static void test_refusal_requires_unsigned_offer_evidence(void) {
+static void test_unproven_unsigned_failure_is_terminal(void) {
     ftssh_session session = authentication();
-    assert(authentication_result(&session, LIBSSH2_ERROR_AUTHENTICATION_FAILED, 0, 1) == FTSSH_AUTH_REJECTED);
-    assert(session.phase == FAILED && session.terminal_error == FTSSH_AUTH_REJECTED);
+    /* A generic library return code has no proof of the partial-success byte.
+     * Actual fresh unsigned-refusal evidence is tested with the real server. */
+    assert(authentication_result(&session, LIBSSH2_ERROR_AUTHENTICATION_FAILED, 0, 1) == FTSSH_AUTH_FAILED);
+    assert(session.phase == FAILED && session.terminal_error == FTSSH_AUTH_FAILED);
     session = authentication();
     assert(authentication_result(&session, LIBSSH2_ERROR_AUTHENTICATION_FAILED, 0, 0) == FTSSH_AUTH_FAILED);
     session = authentication(); session.auth_methods_checked = 0;
@@ -151,12 +153,50 @@ static void test_progress_and_success_require_signature(void) {
     assert(session.phase == AUTHENTICATED);
 }
 
+static void test_combined_deadline_and_partial_phase_are_native_boundaries(void) {
+    ftssh_session session = authentication();
+    session.publickey_interactive = 1; session.authentication_deadline = 1;
+    assert(ftssh_authentication_step(&session) == FTSSH_AUTH_TIMEOUT);
+    assert(session.phase == FAILED);
+    session = authentication(); session.publickey_interactive = 1; session.authentication_deadline = 1;
+    uint8_t bytes[16] = {0}; size_t length = 0;
+    assert(ftssh_copy_challenge(&session, bytes, sizeof(bytes), &length) == FTSSH_AUTH_TIMEOUT);
+    session = authentication(); session.publickey_interactive = 1; session.authentication_deadline = 1;
+    assert(ftssh_supply_signature(&session, bytes, sizeof(bytes)) == FTSSH_AUTH_TIMEOUT);
+    session = authentication(); session.publickey_interactive = 1; session.authentication_deadline = 1;
+    session.sign_callback_entered = session.signature_consumed = 1;
+    assert(authentication_result(&session, 0, 1, 1) == FTSSH_AUTH_TIMEOUT);
+
+    session = authentication(); session.phase = PARTIAL_AUTH;
+    assert(ftssh_continue_interactive_authentication(&session) == FTSSH_STATE);
+    assert(ftssh_begin_shell(&session, 80, 24, 0, 0) == FTSSH_STATE);
+    assert(ftssh_begin_forward(&session, "target", 6, 22) == FTSSH_STATE);
+    assert(ftssh_begin_password_authentication(&session, "operator", 8) == FTSSH_STATE);
+    assert(ftssh_begin_interactive_authentication(&session, "operator", 8, 3000) == FTSSH_STATE);
+    session.publickey_interactive = session.partial_ready = 1;
+    session.authentication_deadline = 1;
+    assert(ftssh_continue_interactive_authentication(&session) == FTSSH_AUTH_TIMEOUT);
+    assert(!session.partial_ready && session.phase == FAILED);
+
+    session = authentication(); session.phase = PARTIAL_AUTH;
+    session.publickey_interactive = session.partial_ready = 1;
+    session.authentication_deadline = monotonic_milliseconds() + 3000;
+    memcpy(session.user, "operator", 9);
+    unsigned int workers = atomic_load(&global_interactive_workers);
+    /* No allocation budget: continuation must consume its proof, remain
+     * unauthenticated, and leave no worker or global admission charge. */
+    assert(ftssh_continue_interactive_authentication(&session) == FTSSH_LIMIT);
+    assert(session.phase == FAILED && !session.partial_ready && !session.interactive);
+    assert(atomic_load(&global_interactive_workers) == workers);
+}
+
 int main(void) {
     test_authentication_allocations_are_erased_before_free();
     test_method_tokens();
-    test_refusal_requires_unsigned_offer_evidence();
+    test_unproven_unsigned_failure_is_terminal();
     test_non_refusal_failures_and_callback_evidence();
     test_progress_and_success_require_signature();
+    test_combined_deadline_and_partial_phase_are_native_boundaries();
     puts("authentication boundary assertions passed");
     return 0;
 }

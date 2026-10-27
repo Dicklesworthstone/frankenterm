@@ -29,7 +29,7 @@
  * The library owns callback signatures through the same supplied allocator.
  * No global signal handler, key-file loading, shell command or trace is used.
  */
-enum phase { HANDSHAKE, PEER, APPROVED, AUTH, AUTHENTICATED, FORWARD_OPENING, FORWARD_READY,
+enum phase { HANDSHAKE, PEER, APPROVED, AUTH, PARTIAL_AUTH, AUTHENTICATED, FORWARD_OPENING, FORWARD_READY,
              OPENING, PTY, SHELL, LIVE, FAILED, CLOSED };
 enum { EGRESS_CAPACITY = 65536, EGRESS_RESERVE = 49152 };
 struct interactive_worker;
@@ -57,6 +57,8 @@ struct ftssh_session {
     uint8_t password[FTSSH_PASSWORD_CAPACITY];
     size_t password_length;
     int password_authentication, password_supplied;
+    int publickey_interactive, partial_ready;
+    uint64_t authentication_deadline, publickey_attempt_baseline;
     int signature_consumed, resize_pending;
     int auth_methods_checked, sign_callback_entered, sign_error, socket_failed;
     /* The server sent a disconnect message: it answered, unlike a transport
@@ -100,6 +102,7 @@ static const size_t global_limit = 16u * 1024u * 1024u;
 static pthread_once_t initialization = PTHREAD_ONCE_INIT;
 static int initialized;
 static void initialize(void) { initialized = libssh2_init(0); }
+static uint64_t monotonic_milliseconds(void);
 
 static int reserve(size_t amount) {
     size_t previous = atomic_load(&global_allocated);
@@ -252,7 +255,14 @@ static void clear_password(ftssh_session *s) {
 }
 static int fail(ftssh_session *s, int code) {
     clear_password(s);
+    s->partial_ready = 0;
     s->phase = FAILED; s->terminal_error = code; return code;
+}
+static int publickey_deadline(ftssh_session *s) {
+    if(!s->publickey_interactive) return FTSSH_OK;
+    uint64_t now = monotonic_milliseconds();
+    if(!now) return fail(s, FTSSH_IO);
+    return now >= s->authentication_deadline ? fail(s, FTSSH_AUTH_TIMEOUT) : FTSSH_OK;
 }
 static int check(ftssh_session *s, int expected) {
     if(!s) return FTSSH_INVALID;
@@ -434,7 +444,29 @@ int ftssh_begin_authentication(ftssh_session *s, const char *user, size_t user_l
     memcpy(s->user, user, user_length); s->user[user_length] = 0;
     memcpy(s->public_blob, blob, length); s->public_length = length;
     s->rsa_signature_length = rsa_signature_length;
+#if defined(LIBSSH2_FRANKENTERM_AUTH_EVIDENCE_VERSION) && LIBSSH2_FRANKENTERM_AUTH_EVIDENCE_VERSION == 1
+    s->publickey_attempt_baseline = libssh2_frankenterm_publickey_attempt(s->ssh);
+#endif
     s->phase = AUTH; return FTSSH_OK;
+}
+int ftssh_supports_publickey_interactive(void) {
+#if defined(LIBSSH2_FRANKENTERM_AUTH_EVIDENCE_VERSION) && LIBSSH2_FRANKENTERM_AUTH_EVIDENCE_VERSION == 1
+    return libssh2_frankenterm_auth_evidence_version() == 1;
+#else
+    return 0;
+#endif
+}
+int ftssh_begin_publickey_interactive_authentication(ftssh_session *s,
+    const char *user, size_t user_length, const uint8_t *blob, size_t length,
+    uint32_t timeout_milliseconds) {
+    int rc = check(s, APPROVED); if(rc) return rc;
+    if(!timeout_milliseconds || timeout_milliseconds > 120000) return FTSSH_INVALID;
+    if(!ftssh_supports_publickey_interactive()) return FTSSH_UNSUPPORTED;
+    uint64_t now = monotonic_milliseconds(); if(!now) return FTSSH_IO;
+    rc = ftssh_begin_authentication(s, user, user_length, blob, length); if(rc) return rc;
+    s->publickey_interactive = 1;
+    s->authentication_deadline = now + timeout_milliseconds;
+    return FTSSH_OK;
 }
 int ftssh_begin_password_authentication(ftssh_session *s, const char *user, size_t user_length) {
     int rc = check(s, APPROVED); if(rc) return rc;
@@ -461,6 +493,8 @@ static int sign_callback(LIBSSH2_SESSION *ssh, unsigned char **signature, size_t
     ftssh_session *s = *abstract;
     s->sign_callback_entered = 1;
     *signature = NULL; *signature_length = 0;
+    int timeout = publickey_deadline(s);
+    if(timeout) { s->sign_error = timeout; return LIBSSH2_ERROR_INVAL; }
     const uint8_t *cursor = data, *sid; size_t left = length, sid_length;
     if(length > sizeof(s->challenge) || !field(&cursor, &left, &sid, &sid_length) ||
        !(sid_length == 32 || sid_length == 48 || sid_length == 64) || !left || *cursor++ != 50) return reject_challenge(s);
@@ -528,6 +562,7 @@ static int authentication_result(ftssh_session *s, int rc, int authenticated, in
      * Preserve evidence from our own callbacks instead of guessing from it. */
     if(s->socket_failed) return fail(s, FTSSH_IO);
     if(s->sign_error) return fail(s, s->sign_error);
+    int timeout = publickey_deadline(s); if(timeout) return timeout;
     if(authenticated && (!offered || !s->sign_callback_entered || !s->signature_consumed))
         return fail(s, FTSSH_UNSUPPORTED);
     if(rc == LIBSSH2_ERROR_EAGAIN)
@@ -535,12 +570,34 @@ static int authentication_result(ftssh_session *s, int rc, int authenticated, in
     if(!rc && authenticated) {
         s->phase = AUTHENTICATED; return FTSSH_OK;
     }
-    /* In libssh2 1.11.1 userauth.c, AUTHENTICATION_FAILED is the explicit
-     * USERAUTH_FAILURE response to the unsigned offer. PUBLICKEY_UNVERIFIED
-     * also covers signed failure/partial success, and is never retry evidence. */
-    if(offered && s->auth_methods_checked && rc == LIBSSH2_ERROR_AUTHENTICATION_FAILED &&
-       !s->rsa_signature_length && !s->sign_callback_entered && !s->challenge_length && !s->signature_consumed)
-        return fail(s, FTSSH_AUTH_REJECTED);
+#if defined(LIBSSH2_FRANKENTERM_AUTH_EVIDENCE_VERSION) && LIBSSH2_FRANKENTERM_AUTH_EVIDENCE_VERSION == 1
+    if(s->publickey_interactive && offered && s->auth_methods_checked &&
+       rc == LIBSSH2_ERROR_PUBLICKEY_UNVERIFIED && !authenticated &&
+       s->sign_callback_entered && s->signature_consumed && s->challenge_length) {
+        char methods[LIBSSH2_FRANKENTERM_AUTH_METHODS_MAX + 1];
+        size_t length = 0; int partial = 0; libssh2_uint64_t attempt = 0;
+        int evidence = libssh2_frankenterm_publickey_failure(s->ssh, &attempt, &partial,
+                                                           methods, sizeof(methods), &length);
+        if(evidence == 1 && partial && attempt > s->publickey_attempt_baseline &&
+           attempt == libssh2_frankenterm_publickey_attempt(s->ssh) && length < sizeof(methods)) {
+            int method = authentication_method(methods, "keyboard-interactive");
+            if(method) return fail(s, method);
+            s->partial_ready = 1; s->phase = PARTIAL_AUTH;
+            return FTSSH_AUTH_PARTIAL_REQUIRED;
+        }
+        return fail(s, FTSSH_AUTH_FAILED);
+    }
+    /* Stock AUTHENTICATION_FAILED also covers malformed and partial=true
+     * unsigned replies. Only the versioned, consuming proof can justify
+     * trying another identity; an unpatched backend fails terminally. */
+    if(ftssh_supports_publickey_interactive() && offered && s->auth_methods_checked &&
+       rc == LIBSSH2_ERROR_AUTHENTICATION_FAILED && !s->rsa_signature_length &&
+       !s->sign_callback_entered && !s->challenge_length && !s->signature_consumed) {
+        libssh2_uint64_t attempt = libssh2_frankenterm_publickey_unsigned_refusal(s->ssh);
+        if(attempt > s->publickey_attempt_baseline &&
+           attempt == libssh2_frankenterm_publickey_attempt(s->ssh)) return fail(s, FTSSH_AUTH_REJECTED);
+    }
+#endif
     /* RSA's public API does not reveal which unsigned algorithm was offered.
      * A refusal can therefore mean missing SHA-2 support, not a refused key;
      * it cannot authorize automatic iteration over other private identities. */
@@ -802,13 +859,9 @@ static void interactive_dispose(ftssh_session *s, struct interactive_worker *wor
     void *context = s; release(worker, &context);
     atomic_fetch_sub(&global_interactive_workers, 1);
 }
-int ftssh_begin_interactive_authentication(ftssh_session *s, const char *user, size_t user_length,
-                                         uint32_t timeout_milliseconds) {
-    int rc = check(s, APPROVED); if(rc) return rc;
-    if(!user || !user_length || user_length > 256 || !timeout_milliseconds || timeout_milliseconds > 120000)
-        return FTSSH_INVALID;
-    for(size_t i = 0; i < user_length; i++) if((unsigned char)user[i] < 32 || user[i] == 127) return FTSSH_INVALID;
-    uint64_t now = monotonic_milliseconds(); if(!now) return FTSSH_IO;
+static int start_interactive_worker(ftssh_session *s, const char *user, size_t user_length,
+                                    uint64_t deadline) {
+    int rc, previous_phase = s->phase;
     unsigned int count = atomic_load(&global_interactive_workers);
     do { if(count >= 2) return FTSSH_LIMIT; }
     while(!atomic_compare_exchange_weak(&global_interactive_workers, &count, count + 1));
@@ -823,23 +876,43 @@ int ftssh_begin_interactive_authentication(ftssh_session *s, const char *user, s
     if(!owned_pipe(worker->notification) || !owned_pipe(worker->control)) {
         interactive_dispose(s, worker); return FTSSH_IO;
     }
-    worker->session = s; worker->deadline_milliseconds = now + timeout_milliseconds;
+    worker->session = s; worker->deadline_milliseconds = deadline;
     pthread_attr_t attributes;
     if(pthread_attr_init(&attributes)) { interactive_dispose(s, worker); return FTSSH_LIMIT; }
     rc = pthread_attr_setstacksize(&attributes, 512u * 1024u);
     if(!rc) {
-        memcpy(s->user, user, user_length); s->user[user_length] = 0;
+        if(user != s->user) memcpy(s->user, user, user_length);
+        s->user[user_length] = 0;
         s->phase = AUTH; s->interactive = worker;
         for(ftssh_session *p = s; p; p = p->parent) p->worker_owner = worker;
         rc = pthread_create(&worker->thread, &attributes, interactive_run, worker);
     }
     pthread_attr_destroy(&attributes);
     if(rc) {
-        s->phase = APPROVED; s->interactive = NULL;
+        s->phase = previous_phase; s->interactive = NULL;
         for(ftssh_session *p = s; p; p = p->parent) p->worker_owner = NULL;
         interactive_dispose(s, worker); return FTSSH_LIMIT;
     }
     return FTSSH_OK;
+}
+int ftssh_begin_interactive_authentication(ftssh_session *s, const char *user, size_t user_length,
+                                         uint32_t timeout_milliseconds) {
+    int rc = check(s, APPROVED); if(rc) return rc;
+    if(!user || !user_length || user_length > 256 || !timeout_milliseconds || timeout_milliseconds > 120000)
+        return FTSSH_INVALID;
+    for(size_t i = 0; i < user_length; i++) if((unsigned char)user[i] < 32 || user[i] == 127) return FTSSH_INVALID;
+    uint64_t now = monotonic_milliseconds(); if(!now) return FTSSH_IO;
+    return start_interactive_worker(s, user, user_length, now + timeout_milliseconds);
+}
+int ftssh_continue_interactive_authentication(ftssh_session *s) {
+    int rc = check(s, PARTIAL_AUTH); if(rc) return rc;
+    if(!s->publickey_interactive || !s->partial_ready || !s->auth_methods_checked) return FTSSH_STATE;
+    rc = publickey_deadline(s); if(rc) return rc;
+    /* The signed failure's method list already proves KI is available. A new
+     * "none" request would be a different attempt and could reset the factor. */
+    s->partial_ready = 0;
+    rc = start_interactive_worker(s, s->user, strlen(s->user), s->authentication_deadline);
+    return rc ? fail(s, rc) : FTSSH_OK;
 }
 int ftssh_copy_interactive_challenge(ftssh_session *s, uint8_t *output, size_t capacity,
                                    size_t *length, uint32_t *round) {
@@ -905,6 +978,7 @@ int ftssh_authentication_step(ftssh_session *s) {
         pthread_mutex_unlock(&worker->lock); return status;
     }
     int rc = check(s, AUTH); if(rc) return rc;
+    rc = publickey_deadline(s); if(rc) return rc;
     rc = prepare_egress(s); if(rc) return rc;
     if(!s->auth_methods_checked) {
         s->receive_budget = 32768; s->limited_receive = 1;
@@ -937,6 +1011,7 @@ int ftssh_authentication_step(ftssh_session *s) {
 }
 int ftssh_copy_challenge(ftssh_session *s, uint8_t *out, size_t capacity, size_t *length) {
     int rc = check(s, AUTH); if(rc) return rc;
+    rc = publickey_deadline(s); if(rc) return rc;
     if(!out || !length) return FTSSH_INVALID;
     *length = 0;
     if(!s->challenge_length || s->signature_consumed) return FTSSH_STATE;
@@ -945,6 +1020,7 @@ int ftssh_copy_challenge(ftssh_session *s, uint8_t *out, size_t capacity, size_t
 }
 int ftssh_supply_signature(ftssh_session *s, const uint8_t *blob, size_t length) {
     int rc = check(s, AUTH); if(rc) return rc;
+    rc = publickey_deadline(s); if(rc) return rc;
     if(!blob || !length || length > FTSSH_SIGNATURE_CAPACITY) return FTSSH_INVALID;
     if(!s->challenge_length || s->signature_length || s->signature_consumed) return FTSSH_STATE;
     const uint8_t *cursor = blob, *payload; size_t left = length, n;

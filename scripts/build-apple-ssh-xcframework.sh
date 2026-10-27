@@ -6,9 +6,11 @@
 # apps/apple/FrankenTermSSH/Artifacts/CLibssh2.xcframework, built here for iOS
 # devices (arm64), the arm64 iOS simulator and Apple-silicon macOS.
 #
-# Sources are the exact copies Cargo.lock already pins and checksums: libssh2
+# Sources begin with the copies Cargo.lock already pins and checksums: libssh2
 # from the libssh2-sys crate and OpenSSL from the openssl-src crate (fetched
-# with `cargo fetch --locked` if absent). Each is built with its own upstream
+# with `cargo fetch --locked` if absent). A source-hash-checked libssh2 patch
+# exposes the final signed-key partial-success evidence needed for MFA; the
+# registry copy is never modified. Each is built with its own upstream
 # build system (OpenSSL Configure, libssh2 CMake), static only, with the
 # OpenSSL crypto backend that the driver's Ed25519/ECDSA/curve25519 profile
 # needs. Each slice's libssh2.a and libcrypto.a are merged into one archive so
@@ -32,7 +34,7 @@ ARTIFACTS="$ROOT/apps/apple/FrankenTermSSH/Artifacts"
 OUTPUT="$ARTIFACTS/CLibssh2.xcframework"
 JOBS="$(sysctl -n hw.ncpu)"
 
-for tool in xcodebuild xcrun cmake perl libtool make; do
+for tool in xcodebuild xcrun cmake perl libtool make patch shasum; do
     command -v "$tool" >/dev/null || { echo "error: $tool is required" >&2; exit 1; }
 done
 
@@ -53,10 +55,14 @@ crate_source() {
     echo "$path"
 }
 
-LIBSSH2_SRC="$(crate_source libssh2-sys)/libssh2"
+LIBSSH2_UPSTREAM="$(crate_source libssh2-sys)/libssh2"
 OPENSSL_SRC="$(crate_source openssl-src)/openssl"
-[ -f "$LIBSSH2_SRC/CMakeLists.txt" ] || { echo "error: $LIBSSH2_SRC lacks CMakeLists.txt" >&2; exit 1; }
+[ -f "$LIBSSH2_UPSTREAM/CMakeLists.txt" ] || { echo "error: $LIBSSH2_UPSTREAM lacks CMakeLists.txt" >&2; exit 1; }
 [ -x "$OPENSSL_SRC/Configure" ] || { echo "error: $OPENSSL_SRC lacks Configure" >&2; exit 1; }
+LIBSSH2_SRC="$(bash "$SCRIPT_DIR/prepare-libssh2-auth-source.sh" "$LIBSSH2_UPSTREAM" "$BUILD/sources")"
+# Keep CMake caches tied to the precise prepared source, including upgrades
+# from a previous unpatched artifact in this same build directory.
+LIBSSH2_BUILD="$BUILD/$(basename "$LIBSSH2_SRC")"
 echo "==> libssh2 $(awk -F'"' '/#define LIBSSH2_VERSION /{print $2}' "$LIBSSH2_SRC/include/libssh2.h") from $LIBSSH2_SRC"
 echo "==> OpenSSL $(awk -F= '/^MAJOR|^MINOR|^PATCH/{printf "%s.", $2}' "$OPENSSL_SRC/VERSION.dat" | sed 's/\.$//') from $OPENSSL_SRC"
 
@@ -79,7 +85,7 @@ build_slice() {
     # sysroot, so OPENSSL_ROOT_DIR alone is ignored there.
     local system_arg=()
     [ -n "$system" ] && system_arg=(-DCMAKE_SYSTEM_NAME="$system")
-    cmake -S "$LIBSSH2_SRC" -B "$BUILD/libssh2/$slice" -DCMAKE_BUILD_TYPE=Release \
+    cmake -S "$LIBSSH2_SRC" -B "$LIBSSH2_BUILD/$slice" -DCMAKE_BUILD_TYPE=Release \
         ${system_arg[@]+"${system_arg[@]}"} -DCMAKE_OSX_SYSROOT="$sysroot" -DCMAKE_OSX_ARCHITECTURES=arm64 \
         -DCMAKE_OSX_DEPLOYMENT_TARGET="${min_flag#*=}" \
         -DCRYPTO_BACKEND=OpenSSL -DOPENSSL_USE_STATIC_LIBS=TRUE \
@@ -87,8 +93,8 @@ build_slice() {
         -DOPENSSL_SSL_LIBRARY="$prefix/lib/libssl.a" \
         -DBUILD_SHARED_LIBS=OFF -DBUILD_STATIC_LIBS=ON -DBUILD_EXAMPLES=OFF -DBUILD_TESTING=OFF \
         -DENABLE_ZLIB_COMPRESSION=OFF -DCMAKE_INSTALL_PREFIX="$prefix" >/dev/null
-    cmake --build "$BUILD/libssh2/$slice" -j "$JOBS" >/dev/null
-    cmake --install "$BUILD/libssh2/$slice" >/dev/null
+    cmake --build "$LIBSSH2_BUILD/$slice" -j "$JOBS" >/dev/null
+    cmake --install "$LIBSSH2_BUILD/$slice" >/dev/null
     mkdir -p "$BUILD/merged/$slice"
     libtool -static -o "$BUILD/merged/$slice/libssh2-openssl.a" "$prefix/lib/libssh2.a" "$prefix/lib/libcrypto.a" 2>/dev/null
 }
