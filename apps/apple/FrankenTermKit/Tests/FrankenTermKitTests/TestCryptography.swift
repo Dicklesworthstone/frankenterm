@@ -153,6 +153,41 @@ struct TestCryptography: AirGapCryptography {
             _ = SHA512(input, count, output)
         })
     }
+    /// Independent OpenSSL oracle for protected PKCS#8 source files. The
+    /// production implementation uses the maintained Swift crypto dependency.
+    func pbkdf2(passphrase: Data, salt: Data, iterations: UInt32,
+                prf: PKCS8PBKDF2PRF, outputByteCount: Int) throws -> Data {
+        guard (1...1024).contains(passphrase.count), (8...64).contains(salt.count),
+              (1...1_000_000).contains(iterations), [16, 24, 32].contains(outputByteCount) else {
+            throw FTError.limit("test.pkcs8_kdf")
+        }
+        try Task.checkCancellation()
+        let digest: OpaquePointer?
+        switch prf {
+        case .hmacSHA1: digest = EVP_sha1()
+        case .hmacSHA256: digest = EVP_sha256()
+        case .hmacSHA384: digest = EVP_sha384()
+        case .hmacSHA512: digest = EVP_sha512()
+        }
+        var result = Data(count: outputByteCount)
+        let status = result.withUnsafeMutableBytes { output in
+            passphrase.withUnsafeBytes { password in
+                salt.withUnsafeBytes { saltBytes in
+                    PKCS5_PBKDF2_HMAC(password.bindMemory(to: CChar.self).baseAddress, Int32(passphrase.count),
+                        saltBytes.bindMemory(to: UInt8.self).baseAddress, Int32(salt.count), Int32(iterations),
+                        digest, Int32(outputByteCount), output.bindMemory(to: UInt8.self).baseAddress)
+                }
+            }
+        }
+        do {
+            guard status == 1 else { throw FTError.authentication }
+            try Task.checkCancellation()
+            return result
+        } catch {
+            result.resetBytes(in: 0..<result.count)
+            throw error
+        }
+    }
     func decryptAESCTR(_ ciphertext: Data, key: Data, iv: Data) throws -> Data {
         try decryptSourceAES(ciphertext, key: key, iv: iv, cbc: false)
     }

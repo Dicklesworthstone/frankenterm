@@ -2633,8 +2633,8 @@ final class WorkspaceKeyImportController: Identifiable {
         fileRequest = nil; selection = nil
     }
 
-    func unlock(_ passphrase: Data) {
-        guard !isWorking, !isRetired, let request = passphraseRequest,
+    func unlock(requestID: UUID, passphrase: Data) {
+        guard !isWorking, !isRetired, let request = passphraseRequest, request.id == requestID,
               let selection, let worker, (1...OpenSSHSourceKey.maximumPassphraseBytes).contains(passphrase.count) else { return }
         message = nil
         start { [self] in
@@ -2718,8 +2718,20 @@ final class WorkspaceKeyImportController: Identifiable {
     }
 
     static func describe(_ error: Error) -> String {
-        if let error = error as? FTError, error == .unsupported("source_key.encrypted_pem") {
-            return "This encrypted PEM format is not supported. Source unlocking accepts protected OpenSSH files; SEC1 and PKCS#8 ECDSA files must already be clear."
+        if let error = error as? FTError {
+            if error == .unsupported("source_key.encrypted_pem") {
+                return "This older encrypted PEM format is not supported. Choose a matching protected OpenSSH key or a PKCS#8 key protected with PBES2, PBKDF2 and AES-CBC."
+            }
+            if [.unsupported("source_key.pkcs8_encryption"), .unsupported("source_key.pkcs8_kdf"),
+                .unsupported("source_key.pkcs8_prf"), .unsupported("source_key.pkcs8_cipher")].contains(error) {
+                return "This PKCS#8 file uses unsupported protection. Supported files use PBES2, PBKDF2 with HMAC-SHA1, SHA256, SHA384 or SHA512, and AES-CBC with 128-, 192- or 256-bit keys."
+            }
+            if error == .limit("source_key.pbkdf2_parameters") {
+                return "This PKCS#8 file exceeds the supported unlock limits: 1–1,000,000 PBKDF2 iterations and an 8–64 byte salt. Choose another matching supported key file."
+            }
+            if error == .limit("source_key.pkcs8_der") {
+                return "This encrypted PKCS#8 file exceeds the supported single-key size. Choose another matching supported key file."
+            }
         }
         if error is FTError || error is OpenSSHSourceKeyError || error is WorkspaceStoreError
             || error is SSHAuthenticationError { return error.localizedDescription }
@@ -2780,19 +2792,29 @@ private struct WorkspaceKeyImportSheet: View {
                         }
                         if let request = controller.passphraseRequest, !controller.isFinished {
                             Section {
-                                SecureField("Key File Passphrase", text: $passphrase)
+                                SecureField("Key File Passphrase", text: passphraseBinding(requestID: request.id))
                                     .textInputAutocapitalization(.never).autocorrectionDisabled()
                                     .textContentType(.password).submitLabel(.done)
-                                    .onSubmit(unlock)
+                                    .privacySensitive().disabled(controller.isWorking)
+                                    .onSubmit { unlock(requestID: request.id) }
+                                if case .encryptedPKCS8 = request.protection {
+                                    Text("This file keeps its public identity encrypted too. After unlocking, its key must match the saved algorithm and fingerprint above before it can be imported.")
+                                        .font(.callout)
+                                }
                                 if passphraseLimit {
                                     Text("The passphrase is limited to \(OpenSSHSourceKey.maximumPassphraseBytes) UTF-8 bytes.")
                                         .font(.caption).foregroundStyle(.secondary)
                                 }
-                                Button("Unlock Selected Key", action: unlock)
+                                Button("Unlock Selected Key") { unlock(requestID: request.id) }
                                     .disabled(passphrase.isEmpty || controller.isWorking)
                                 Text("\(request.attemptsRemaining) attempts remaining. The passphrase is used only to unlock this selected file on the phone.")
                                     .font(.caption)
-                            } header: { Text("Encrypted OpenSSH Key") }
+                            } header: {
+                                switch request.protection {
+                                case .openSSH: Text("Encrypted OpenSSH Key")
+                                case .encryptedPKCS8: Text("Encrypted PKCS#8 Key")
+                                }
+                            }
                         }
                         if controller.isReady {
                             Section {
@@ -2811,7 +2833,7 @@ private struct WorkspaceKeyImportSheet: View {
                                 }.disabled(!controller.canChooseFile)
                                     .accessibilityIdentifier("keys.import.choose")
                             } footer: {
-                                Text("Choose a local SSH private-key file for this exact fingerprint. OpenSSH Ed25519, ECDSA P-256/P-384/P-521, and RSA (2048–8192 bits) are supported, including bcrypt with AES-CTR or AES-CBC (128, 192, or 256 bits). Clear ECDSA SEC1/PKCS#8 and RSA PKCS#1/PKCS#8 PEM files are also supported. RSA connections use SHA-2 signatures.")
+                                Text("Choose a local SSH private-key file for this exact fingerprint. OpenSSH Ed25519, ECDSA P-256/P-384/P-521, and RSA (2048–8192 bits) are supported, including bcrypt with AES-CTR or AES-CBC. ECDSA and RSA PKCS#8 files protected with PBES2, PBKDF2 and AES-CBC can also be unlocked here. Clear ECDSA SEC1/PKCS#8 and RSA PKCS#1/PKCS#8 files are supported. RSA connections use SHA-2 signatures.")
                             }
                         }
                     }
@@ -2834,19 +2856,27 @@ private struct WorkspaceKeyImportSheet: View {
         }
         .task { controller.prepare() }
         .onChange(of: controller.passphraseRequest?.id) { _, _ in passphrase = ""; passphraseLimit = false }
-        .onChange(of: passphrase) { old, value in
-            if value.utf8.count > OpenSSHSourceKey.maximumPassphraseBytes {
-                passphrase = old; passphraseLimit = true
-            }
-        }
         .onDisappear { passphrase = ""; controller.cancel() }
     }
 
-    private func unlock() {
-        guard !passphrase.isEmpty, passphrase.utf8.count <= OpenSSHSourceKey.maximumPassphraseBytes else { return }
+    private func passphraseBinding(requestID: UUID) -> Binding<String> {
+        Binding(get: {
+            controller.passphraseRequest?.id == requestID && !controller.isRetired ? passphrase : ""
+        }, set: { value in
+            guard controller.passphraseRequest?.id == requestID, !controller.isRetired, !controller.isWorking else { return }
+            guard value.utf8.count <= OpenSSHSourceKey.maximumPassphraseBytes else {
+                passphraseLimit = true; return
+            }
+            passphrase = value; passphraseLimit = false
+        })
+    }
+
+    private func unlock(requestID: UUID) {
+        guard controller.passphraseRequest?.id == requestID, !controller.isWorking, !controller.isRetired,
+              !passphrase.isEmpty, passphrase.utf8.count <= OpenSSHSourceKey.maximumPassphraseBytes else { return }
         let bytes = Data(passphrase.utf8)
         passphrase = ""; passphraseLimit = false
-        controller.unlock(bytes)
+        controller.unlock(requestID: requestID, passphrase: bytes)
     }
 }
 

@@ -57,6 +57,10 @@ public protocol AirGapCryptography: SSHIdentityCryptography {
     func open(_ ciphertextAndTag: Data, secret: Data, salt: Data, nonce: Data, aad: Data) throws -> Data
     /// Bounded OpenSSH source-key work only; separate from FTAG's encryption.
     func bcryptPBKDF(passphrase: Data, salt: Data, rounds: UInt32, outputByteCount: Int) throws -> Data
+    /// Bounded RFC 8018 PBKDF2 for existing encrypted PKCS#8 source files.
+    /// This does not select a new encryption profile or change FTAG's KDF.
+    func pbkdf2(passphrase: Data, salt: Data, iterations: UInt32,
+                prf: PKCS8PBKDF2PRF, outputByteCount: Int) throws -> Data
     /// AES-CTR has no authentication tag. The complete decrypted OpenSSH container
     /// and its derived public identity must validate before any key is accepted.
     func decryptAESCTR(_ ciphertext: Data, key: Data, iv: Data) throws -> Data
@@ -71,6 +75,14 @@ extension AirGapCryptography {
     /// treat a copied source scalar or public point as a validated native key.
     public func importECDSAPrivateScalar(_ der: Data, curve: SSHECDSACurve) throws -> Data {
         throw FTError.unsupported("source_key.pem_profile")
+    }
+
+    /// The pinned maintained implementation is shared by Apple products and
+    /// Linux tests; a provider may override it for independent vectors/faults.
+    public func pbkdf2(passphrase: Data, salt: Data, iterations: UInt32,
+                       prf: PKCS8PBKDF2PRF, outputByteCount: Int) throws -> Data {
+        try PKCS8SourcePrimitives.pbkdf2(passphrase: passphrase, salt: salt, iterations: iterations,
+                                        prf: prf, outputByteCount: outputByteCount)
     }
 }
 

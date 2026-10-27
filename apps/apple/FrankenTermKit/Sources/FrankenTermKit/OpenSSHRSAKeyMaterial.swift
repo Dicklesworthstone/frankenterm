@@ -152,6 +152,14 @@ struct LegacyRSASourceKey: Sendable, CustomDebugStringConvertible {
         key = try parts.validatedKey()
     }
 
+    /// Normalize decrypted DER in memory without creating a plaintext PEM
+    /// string or changing the selected source file.
+    init(pkcs8DER: Data) throws {
+        var parts = try Self.components(der: pkcs8DER, pkcs8: true)
+        defer { parts.erasePrivateBytes() }
+        key = try parts.validatedKey()
+    }
+
     /// Passive discovery may copy the public n/e embedded in a clear legacy
     /// container, exactly as it copies an OpenSSH public header. This path does
     /// not construct a private key, perform RSA arithmetic, derive an identity,
@@ -184,6 +192,11 @@ struct LegacyRSASourceKey: Sendable, CustomDebugStringConvertible {
               var der = Data(base64Encoded: encoded), !der.isEmpty, der.count <= Self.maximumDERBytes,
               der.base64EncodedString() == encoded else { throw FTError.malformed("source_key.der") }
         defer { der.resetBytes(in: 0..<der.count) }
+        return try components(der: der, pkcs8: pkcs8)
+    }
+
+    private static func components(der: Data, pkcs8: Bool) throws -> RSAPrivateComponents {
+        guard !der.isEmpty, der.count <= Self.maximumDERBytes else { throw FTError.limit("source_key.der") }
         if pkcs8 {
             var document = RSADERReader(der)
             var root = RSADERReader(try document.read(tag: 0x30))
