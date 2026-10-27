@@ -467,7 +467,12 @@ final class TerminalSessionControllerTests: XCTestCase {
             }
             try await Task.sleep(for: .milliseconds(50))
         }
-        XCTFail("the native input view never became editable")
+        // Which of the two conditions failed, so a rare miss names its cause.
+        let frame = terminal.renderer.admittedFrame, keyboard = terminal.input.session
+        XCTFail("the native input view never became editable (keyboard \(keyboard.phase), "
+            + "last failure \(String(describing: keyboard.lastFailure)), live \(String(describing: frame?.isLive)), "
+            + "cursor \(String(describing: frame?.cursor)), viewport \(String(describing: frame.map { ($0.viewportFirst, $0.rows, $0.columns) })), "
+            + "bounds \(terminal.bounds.size))")
     }
 
     func testTerminalUsesTheBundledDesktopFontWithItsLicenses() {
