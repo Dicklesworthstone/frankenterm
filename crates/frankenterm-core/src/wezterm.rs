@@ -1891,6 +1891,91 @@ impl WeztermClient {
         Ok(pane)
     }
 
+    /// Obtain the durable mux UUID and exact current live registration.
+    ///
+    /// This is a direct-mux-only read: legacy CLI metadata and capture UUIDs
+    /// cannot establish live attachment authority. `None` means the backend
+    /// has no durable identity; a vanished pane is a `PaneNotFound` error.
+    /// The caller supplies authenticated host/route authority separately and
+    /// must revalidate this identity at the actual read or effect boundary.
+    #[cfg(all(feature = "vendored", unix))]
+    pub async fn pane_native_identity_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+    ) -> Result<Option<codec::PaneIdentityV1>> {
+        let Some(pool) = self.mux_pool.as_ref() else {
+            return Err(WeztermError::CommandFailed(
+                "native pane identity requires a direct mux connection".to_string(),
+            )
+            .into());
+        };
+        if !self.mux_circuit_guard() {
+            return Err(WeztermError::CircuitOpen { retry_after_ms: 0 }.into());
+        }
+        match pool.get_pane_identity_with_cx(cx, pane_id).await {
+            Ok(response) => {
+                self.mux_circuit_record_success();
+                match response.outcome {
+                    codec::PaneIdentityOutcomeV1::Available { identity, .. } => Ok(Some(identity)),
+                    codec::PaneIdentityOutcomeV1::Unavailable => Ok(None),
+                    codec::PaneIdentityOutcomeV1::PaneGone => {
+                        Err(WeztermError::PaneNotFound(pane_id).into())
+                    }
+                }
+            }
+            Err(error) => {
+                self.mux_circuit_record_error(&error);
+                Err(Self::mux_cancelled_error("pane_native_identity_with_cx", error))
+            }
+        }
+    }
+
+    /// Read the existing native pane into one complete browser-protocol image.
+    ///
+    /// The caller must have a view grant for this authenticated host and exact
+    /// registration before calling. The entire read leases one mux connection
+    /// and retains the expected identity through every fence; a same-number
+    /// replacement cannot become the source. This never spawns a pane,
+    /// reparses captured text, or falls back to a different CLI connection.
+    #[cfg(all(feature = "web", feature = "vendored", unix))]
+    pub async fn terminal_snapshot_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        expected_identity: &codec::PaneIdentityV1,
+        scope: frankenterm_terminal_wire::Scope,
+        snapshot_id: frankenterm_terminal_wire::WireU64,
+    ) -> std::result::Result<
+        frankenterm_terminal_wire::FrozenSnapshot,
+        crate::web::terminal_projection::TerminalProjectionError,
+    > {
+        use crate::web::terminal_projection::TerminalProjectionError;
+
+        let pool = self
+            .mux_pool
+            .as_ref()
+            .ok_or(TerminalProjectionError::BackendUnavailable)?;
+        if !self.mux_circuit_guard() {
+            return Err(TerminalProjectionError::CircuitOpen);
+        }
+        match pool
+            .get_terminal_snapshot_with_cx(cx, pane_id, expected_identity, scope, snapshot_id)
+            .await
+        {
+            Ok(snapshot) => {
+                self.mux_circuit_record_success();
+                Ok(snapshot)
+            }
+            Err(TerminalProjectionError::Native(error)) => {
+                let error = crate::vendored::MuxPoolError::Mux(error);
+                self.mux_circuit_record_error(&error);
+                Err(error.into())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Get text content from a pane
     ///
     /// # Arguments
@@ -3786,6 +3871,7 @@ impl WeztermClient {
             Some("ListPanes" | "ListPanesCoherent" | "ListPanesOrderedV1" | "GetPaneDomainsV1") => {
                 MuxOperation::ListPanes
             }
+            Some("GetPaneIdentityV1") => MuxOperation::ReadPaneIdentity,
             Some("GetPaneTieredScrollbackStatusesV1") => MuxOperation::ReadTieredScrollbackStatus,
             Some("EvictPaneWarmScrollbackV1") => MuxOperation::EvictWarmScrollback,
             Some("SpawnV2") => MuxOperation::Spawn,
@@ -6318,6 +6404,55 @@ mod tests {
     fn isolated_cli_client_with_socket(socket_path: impl Into<String>) -> WeztermClient {
         WeztermClient::with_socket(socket_path)
             .with_circuit_breaker_config(CircuitBreakerConfig::default())
+    }
+
+    #[cfg(all(feature = "web", feature = "vendored", unix))]
+    #[test]
+    fn native_identity_and_snapshot_without_pool_refuse_before_cli_fallback() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let identity = codec::PaneIdentityV1 {
+                session_incarnation: mux::MuxSessionIncarnation::from_bytes([0x11; 16]),
+                durable_pane_id: [0x22; 16],
+                pane_registration: codec::ReliablePaneRegistrationIdentityV1::from_bytes([0x33; 16]),
+            };
+            let scope = crate::web::terminal_projection::scope_for_identity(
+                frankenterm_terminal_wire::Id::new("unconfigured-native-fixture").unwrap(),
+                &identity,
+                frankenterm_terminal_wire::WireU64(1),
+            ).unwrap();
+            for explicit_socket in [false, true] {
+                let client = if explicit_socket {
+                    isolated_cli_client_with_socket("/tmp/frankenterm-unconfigured-native.sock")
+                } else {
+                    isolated_cli_client()
+                }.with_circuit_breaker_config(CircuitBreakerConfig::new(
+                    1, 1, Duration::from_secs(60),
+                ));
+                assert!(client.mux_pool.is_none());
+                // A mistaken CLI fallback must fail this test without ever
+                // launching a subprocess against the operator's environment.
+                client.circuit_record_mutation_evidence(CliMutationCircuitEvidence::BackendFailure);
+                assert_eq!(client.circuit_status().state, CircuitStateKind::Open);
+                let identity_error = client
+                    .pane_native_identity_with_cx(&cx, 7)
+                    .await
+                    .expect_err("a capture UUID or CLI listing cannot substitute for native identity");
+                assert!(matches!(
+                    identity_error,
+                    crate::Error::Wezterm(WeztermError::CommandFailed(ref detail))
+                        if detail == "native pane identity requires a direct mux connection"
+                ));
+                assert!(matches!(
+                    client.terminal_snapshot_with_cx(
+                        &cx, 7, &identity, scope.clone(), frankenterm_terminal_wire::WireU64(1),
+                    ).await,
+                    Err(crate::web::terminal_projection::TerminalProjectionError::BackendUnavailable)
+                ));
+                assert_eq!(client.circuit_status().state, CircuitStateKind::Open);
+                assert_eq!(client.circuit_status().consecutive_failures, 1);
+            }
+        });
     }
 
     #[test]

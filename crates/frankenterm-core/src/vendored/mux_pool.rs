@@ -105,6 +105,16 @@ impl MuxPoolError {
     }
 }
 
+#[cfg(feature = "web")]
+impl From<MuxPoolError> for crate::web::terminal_projection::TerminalProjectionError {
+    fn from(error: MuxPoolError) -> Self {
+        match error {
+            MuxPoolError::Pool(error) => Self::Pool(error),
+            MuxPoolError::Mux(error) | MuxPoolError::IndeterminateMutation(error) => Self::Native(error),
+        }
+    }
+}
+
 /// Recovery settings for mux protocol errors.
 #[derive(Debug, Clone)]
 pub struct MuxRecoveryConfig {
@@ -885,6 +895,65 @@ impl MuxPool {
             Box::pin(async move { client.list_panes_with_cx(&op_cx).await })
         })
         .await
+    }
+
+    /// Read the mux-owned durable identity and current registration for one
+    /// pane. Numeric IDs, legacy listings, and capture UUIDs cannot substitute
+    /// for this response. The caller must still bind the result to its
+    /// authenticated host and recheck it when reading or acting on the pane.
+    pub async fn get_pane_identity_with_cx(
+        &self,
+        cx: &Cx,
+        pane_id: u64,
+    ) -> Result<codec::GetPaneIdentityV1Response, MuxPoolError> {
+        let op_cx = cx.clone();
+        self.execute_with_recovery_with_cx(cx, "get_pane_identity", move |client| {
+            let op_cx = op_cx.clone();
+            Box::pin(async move { client.get_pane_identity_with_cx(&op_cx, pane_id).await })
+        })
+        .await
+    }
+
+    /// Lease one connection for a complete native-to-browser snapshot.
+    ///
+    /// The client owns the finite read/retry deadline and exact identity
+    /// checks. The pool does not start another transaction after that budget
+    /// expires or silently replace its source after a transport failure.
+    #[cfg(feature = "web")]
+    pub async fn get_terminal_snapshot_with_cx(
+        &self,
+        cx: &Cx,
+        pane_id: u64,
+        expected_identity: &codec::PaneIdentityV1,
+        scope: frankenterm_terminal_wire::Scope,
+        snapshot_id: frankenterm_terminal_wire::WireU64,
+    ) -> Result<
+        frankenterm_terminal_wire::FrozenSnapshot,
+        crate::web::terminal_projection::TerminalProjectionError,
+    > {
+        use crate::web::terminal_projection::TerminalProjectionError;
+
+        Self::checkpoint_cx(cx)?;
+        let (mut client, _guard) = self.acquire_client_with_cx(cx).await?;
+        Self::checkpoint_cx(cx)?;
+        let result = client
+            .get_terminal_snapshot_with_cx(cx, pane_id, expected_identity, scope, snapshot_id)
+            .await;
+        if let Err(error) = Self::checkpoint_cx(cx) {
+            drop(client);
+            return Err(error.into());
+        }
+        if let Err(TerminalProjectionError::Native(error)) = &result {
+            let decision = mux_recovery_decision(error);
+            self.record_permanent_failure(decision);
+            self.return_client_after_error(cx, client, decision).await;
+        } else {
+            self.return_client_with_cx(cx, client).await;
+        }
+        // Cleanup can wait for the idle-queue lock. A cancellation during
+        // that await must not publish a completed but now-unwanted screen.
+        Self::checkpoint_cx(cx)?;
+        result
     }
 
     /// Spawn a new mux pane/tab through a pooled connection.
@@ -4684,11 +4753,42 @@ mod tests {
                 .expect_err("pre-cancelled list_panes_with_cx should fail");
             assert!(matches!(err, MuxPoolError::Pool(PoolError::Cancelled)));
 
+            let identity_error = pool
+                .get_pane_identity_with_cx(&cx, 7)
+                .await
+                .expect_err("cancelled identity discovery must not connect or retry");
+            assert!(matches!(identity_error, MuxPoolError::Pool(PoolError::Cancelled)));
+
+            #[cfg(feature = "web")]
+            {
+                let identity = codec::PaneIdentityV1 {
+                    session_incarnation: mux::MuxSessionIncarnation::from_bytes([0x11; 16]),
+                    durable_pane_id: [0x22; 16],
+                    pane_registration: codec::ReliablePaneRegistrationIdentityV1::from_bytes([0x33; 16]),
+                };
+                let scope = crate::web::terminal_projection::scope_for_identity(
+                    frankenterm_terminal_wire::Id::new("cancelled-pool-fixture").unwrap(),
+                    &identity,
+                    frankenterm_terminal_wire::WireU64(1),
+                ).unwrap();
+                let snapshot_error = pool
+                    .get_terminal_snapshot_with_cx(
+                        &cx, 7, &identity, scope, frankenterm_terminal_wire::WireU64(1),
+                    )
+                    .await
+                    .expect_err("cancelled snapshot must not acquire a connection or start a transaction");
+                assert!(matches!(
+                    snapshot_error,
+                    crate::web::terminal_projection::TerminalProjectionError::Pool(PoolError::Cancelled)
+                ));
+            }
+
             let stats = pool.stats().await;
             assert_eq!(stats.pool.total_acquired, 0);
             assert_eq!(stats.pool.total_timeouts, 0);
             assert_eq!(stats.connections_created, 0);
             assert_eq!(stats.connections_failed, 0);
+            assert_eq!(stats.recovery_attempts, 0);
         });
     }
 

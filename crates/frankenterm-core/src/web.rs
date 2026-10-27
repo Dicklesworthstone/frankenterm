@@ -31,6 +31,8 @@ mod router;
 mod server;
 mod sse;
 mod ui_assets;
+#[cfg(all(feature = "vendored", unix))]
+pub mod terminal_projection;
 pub mod websocket;
 
 pub use extractors::redact_depth_limit_hit_count;

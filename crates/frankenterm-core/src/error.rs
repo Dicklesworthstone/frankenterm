@@ -523,6 +523,7 @@ pub enum MuxOperation {
     ProtocolHandshake,
     ClientRegistration,
     ListPanes,
+    ReadPaneIdentity,
     ReadTieredScrollbackStatus,
     EvictWarmScrollback,
     Spawn,
@@ -578,6 +579,7 @@ impl MuxOperation {
             Self::ProtocolHandshake => "protocol_handshake",
             Self::ClientRegistration => "client_registration",
             Self::ListPanes => "list_panes",
+            Self::ReadPaneIdentity => "read_pane_identity",
             Self::ReadTieredScrollbackStatus => "read_tiered_scrollback_status",
             Self::EvictWarmScrollback => "evict_warm_scrollback",
             Self::Spawn => "spawn",
@@ -631,6 +633,7 @@ impl MuxOperation {
     pub fn from_cli_operation(operation: &'static str) -> Self {
         match operation {
             "list_panes" | "list_panes_with_cx" => Self::ListPanes,
+            "get_pane_identity" | "pane_native_identity_with_cx" => Self::ReadPaneIdentity,
             "get_text" | "get_lines" | "get_text_with_cx" => Self::ReadPaneText,
             "capture_selection_anchor" => Self::CaptureSelectionAnchor,
             "resolve_selection_anchor" => Self::ResolveSelectionAnchor,

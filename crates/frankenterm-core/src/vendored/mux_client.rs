@@ -2,6 +2,9 @@
 // deeply-nested async call chains.
 #![allow(clippy::large_futures)]
 
+#[cfg(feature = "web")]
+mod terminal_snapshot;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -6527,6 +6530,8 @@ fn bonus_lines_to_text(lines: codec::SerializedLines) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "web")]
+    include!("mux_client/terminal_snapshot_tests.rs");
     use crate::runtime_async::unix as compat_unix;
     use crate::runtime_async::{CompatRuntime, Mutex, RuntimeBuilder, sleep};
     use codec::{PduWireIdent, Ping};
