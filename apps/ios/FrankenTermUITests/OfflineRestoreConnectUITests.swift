@@ -129,6 +129,20 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         return completed
     }
 
+    /// After a hardware-key switch. In the simulator the key hides the software
+    /// keyboard and the next terminal brings it back, which can resize the
+    /// shell on screen a few times; its resize trap's lines then scroll its
+    /// earlier output away. The machine's selected chip and any line only its
+    /// shell prints (`-<who>`) prove the switch.
+    @MainActor
+    private func waitForSwitch(_ app: XCUIApplication, to machine: String, who: String,
+                               in terminal: XCUIElement, _ message: String) {
+        let selected = app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@ AND selected == true",
+                                                        "\(machine), ")).firstMatch
+        XCTAssertTrue(selected.waitForExistence(timeout: 10), "\(message): its chip is selected")
+        waitFor("-\(who)", in: terminal, timeout: 10, message)
+    }
+
     /// Fails if `marker` shows up within `timeout`.
     private func never(_ marker: String, in terminal: XCUIElement, timeout: TimeInterval = 2, _ message: String) {
         let shown = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value CONTAINS %@", marker), object: terminal)
@@ -404,10 +418,10 @@ final class OfflineRestoreConnectUITests: XCTestCase {
 
         // A hardware keyboard switches too: ⇧⌘] and ⇧⌘[ step through the strip.
         app.typeKey("]", modifierFlags: [.command, .shift])
-        waitFor("WHO-second-4", in: screen, timeout: 10, "⇧⌘] shows the next machine")
+        waitForSwitch(app, to: second, who: "second", in: screen, "⇧⌘] shows the next machine")
         XCTAssertFalse(self.screen(screen).contains("AGAIN-first-6"), "the next machine has its own screen")
         app.typeKey("[", modifierFlags: [.command, .shift])
-        waitFor("AGAIN-first-6", in: screen, timeout: 10, "⇧⌘[ comes back to the first machine")
+        waitForSwitch(app, to: inputs.machine, who: "first", in: screen, "⇧⌘[ comes back to the first machine")
         app.typeText("echo KEYS-$FT_WHO-$((4+4))\n")
         waitFor("KEYS-first-8", in: screen, timeout: 30, "typing after a keyboard switch reaches the machine on screen")
         // A hardware key hides the software keyboard, which resizes the
@@ -422,7 +436,7 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         app.typeText("sleep 6; echo AWAY-$FT_WHO-$((5+5))\n")
         waitFor("sleep 6; echo AWAY", in: screen, timeout: 10, "the command is running before the switch")
         app.typeKey("]", modifierFlags: [.command, .shift])
-        waitFor("WHO-second-4", in: screen, timeout: 10, "⇧⌘] shows the next machine")
+        waitForSwitch(app, to: second, who: "second", in: screen, "⇧⌘] shows the next machine")
         let marked = chip(app, inputs.machine, "connected, new output")
         XCTAssertTrue(marked.waitForExistence(timeout: 20), "the first machine printed while away and is marked")
         XCTAssertFalse(chip(app, second, "connected, new output").exists, "the machine on screen is never marked")
@@ -451,11 +465,11 @@ final class OfflineRestoreConnectUITests: XCTestCase {
 
         // ⌘J does the same from a hardware keyboard, here to the second machine.
         app.typeKey("]", modifierFlags: [.command, .shift])
-        waitFor("WHO-second-4", in: screen, timeout: 10, "⇧⌘] shows the second machine")
+        waitForSwitch(app, to: second, who: "second", in: screen, "⇧⌘] shows the second machine")
         app.typeText("sleep 6; echo LATER-$FT_WHO-$((6+6))\n")
         waitFor("sleep 6; echo LATER", in: screen, timeout: 10, "the command is running before the switch")
         app.typeKey("[", modifierFlags: [.command, .shift])
-        waitFor("AWAY-first-10", in: screen, timeout: 10, "⇧⌘[ shows the first machine")
+        waitForSwitch(app, to: inputs.machine, who: "first", in: screen, "⇧⌘[ shows the first machine")
         XCTAssertTrue(chip(app, second, "connected, new output").waitForExistence(timeout: 20),
                       "the second machine printed while away and is marked")
         app.typeKey("j", modifierFlags: .command)
