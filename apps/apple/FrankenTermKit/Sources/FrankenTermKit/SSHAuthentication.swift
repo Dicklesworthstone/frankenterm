@@ -28,13 +28,14 @@ public enum SSHAuthenticationError: Error, Equatable, Sendable, LocalizedError {
 /// A bounded canonical public identity, never private material or authority to
 /// use it. The same parser binds imported credentials, host pins and SSH offers.
 public struct SSHPublicIdentity: Sendable, Equatable {
+    /// Complete raw-key profile shared by parsing, signing admission and
+    /// protected-item metadata: an 8192-bit RSA modulus and 64-bit exponent,
+    /// including their mpint sign bytes, algorithm name and SSH lengths.
+    public static let maximumBlobBytes = 1053
     public let blob: Data, algorithm: String, fingerprint: String
 
     public init(blob: Data) throws {
-        // An 8192-bit RSA modulus needs 1024 magnitude bytes and one mpint
-        // sign byte. The exponent is at most 64 bits; all three SSH strings
-        // together fit in 1053 bytes. User-authentication keeps its own cap.
-        guard (1...1053).contains(blob.count) else { throw SSHAuthenticationError.invalidChallenge }
+        guard (1...Self.maximumBlobBytes).contains(blob.count) else { throw SSHAuthenticationError.invalidChallenge }
         var reader = ByteCursor(blob)
         guard let algorithm = String(data: try reader.sshString(cap: 64), encoding: .ascii) else {
             throw SSHAuthenticationError.invalidChallenge
@@ -110,7 +111,9 @@ public struct SSHUserAuthenticationChallenge: Sendable, CustomDebugStringConvert
         // exchange identifiers and arbitrary-size signing inputs are not enabled.
         guard [32, 48, 64].contains(sessionIdentifier.count), !user.isEmpty, user.utf8.count <= 256,
               !user.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
-              !publicBlob.isEmpty, publicBlob.count <= 1053 else { throw SSHAuthenticationError.invalidChallenge }
+              !publicBlob.isEmpty, publicBlob.count <= SSHPublicIdentity.maximumBlobBytes else {
+            throw SSHAuthenticationError.invalidChallenge
+        }
         let identity = try SSHPublicIdentity(blob: publicBlob)
         let algorithm: String
         if identity.algorithm == "ssh-rsa" {
@@ -840,7 +843,8 @@ public actor SSHAuthenticationBroker {
                         transitForRouteID: String? = nil) async throws -> SSHAuthenticationRequest {
         // Bound input before retaining it across the first suspension point.
         _ = try WorkspaceDocument.identifier(routeID); _ = try WorkspaceDocument.identifier(credentialID)
-        guard [32, 48, 64].contains(sessionIdentifier.count), (1...1053).contains(publicBlob.count),
+        guard [32, 48, 64].contains(sessionIdentifier.count),
+              (1...SSHPublicIdentity.maximumBlobBytes).contains(publicBlob.count),
               signatureAlgorithm.map({ $0.utf8.count <= 64 }) ?? true else {
             throw SSHAuthenticationError.invalidChallenge
         }

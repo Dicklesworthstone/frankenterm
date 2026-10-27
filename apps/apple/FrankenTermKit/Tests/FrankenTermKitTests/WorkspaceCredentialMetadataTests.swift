@@ -132,6 +132,13 @@ final class WorkspaceCredentialMetadataTests: XCTestCase {
         }
         return result
     }
+    private func rsaKeys() throws -> [Key] {
+        try RSAFixtures.load().keys.map { fixture in
+            let record = try PrivateKeyRecord.fromPEM(Data(fixture.clearPEM.utf8), credentialID: "key", using: crypto)
+            XCTAssertEqual(record.publicBlob, fixture.publicBlob)
+            return .init(record: record, algorithm: fixture.algorithm, fingerprint: fixture.fingerprint)
+        }
+    }
     private func document(_ data: Data, change: (inout [String: Any], inout [String: Any]) -> Void) throws -> WorkspaceDocument {
         var root = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         var workspace = try XCTUnwrap(root["workspace"] as? [String: Any])
@@ -157,7 +164,7 @@ final class WorkspaceCredentialMetadataTests: XCTestCase {
     }
 
     func testPublishedMetadataFormatRoundtripsEveryIndependentlyDerivedKeyFamily() throws {
-        for key in try keys() {
+        for key in try keys() + rsaKeys() {
             let identity = try SSHUserAuthenticationSigner.publicIdentity(privateContainer: key.record.container)
             XCTAssertEqual(identity.blob, key.record.publicBlob); XCTAssertEqual(identity.algorithm, key.algorithm)
             XCTAssertEqual(identity.fingerprint, key.fingerprint)
@@ -173,12 +180,66 @@ final class WorkspaceCredentialMetadataTests: XCTestCase {
         }
     }
 
+    func testMetadataAcceptsTheCompleteRSAPublicProfileAndRejectsTrailingBytes() throws {
+        // Exercise the admitted 8192-bit modulus and 64-bit exponent boundary.
+        // This is public parser material only; no private key or authorization
+        // is inferred from these structurally valid integers.
+        let exponent = Data([0]) + Data(repeating: 0xff, count: 8)
+        let modulus = Data([0]) + Data(repeating: 0xff, count: 1024)
+        let blob = ssh(Data("ssh-rsa".utf8)) + ssh(exponent) + ssh(modulus)
+        let identity = try SSHPublicIdentity(blob: blob)
+        let metadata = WorkspaceCredentialMetadata(identity: identity)
+        XCTAssertEqual(blob.count, 1053)
+        XCTAssertEqual(try WorkspaceCredentialMetadata(fingerprintBytes: metadata.fingerprintBytes,
+            publicComment: metadata.publicComment), metadata)
+        XCTAssertEqual(try XCTUnwrap(metadata.publicComment).utf8.count, WorkspaceCredentialMetadata.maximumCommentBytes)
+        XCTAssertThrowsError(try WorkspaceCredentialMetadata(fingerprintBytes: metadata.fingerprintBytes,
+            publicComment: WorkspaceCredentialMetadata.commentPrefix + (blob + Data([0])).base64EncodedString()))
+    }
+
+    func testAuthenticatedRSARestorePublishesPublicMetadataAndSurvivesRelaunch() async throws {
+        for key in try rsaKeys() {
+            let workspace = try document(sampleManifest(fingerprint: key.fingerprint)) { _, workspace in
+                workspace["credentials"] = [["id": "key", "algorithm": key.algorithm, "public_fingerprint": key.fingerprint,
+                    "requirement": "matching_private_key", "private_material": "not_included"]]
+            }
+            let archive = try AirGapArchive(workspace: workspace, keys: [key.record], using: crypto)
+            let exported = try FTAG.seal(archive, using: crypto)
+            let restored = try FTAG.open(exported.envelope, code: exported.code, using: crypto)
+            let persistence = StoreTestPersistence(), vault = MetadataTestVault(legacy: false)
+            let store = WorkspaceStore(persistence: persistence, vault: vault)
+            let digest = crypto.sha256(exported.envelope)
+            let receipt = try await store.install(restored, envelopeDigest: digest,
+                expectedRevision: nil, sourceAndContentsConfirmed: true)
+            let binding = try XCTUnwrap(receipt.workspace.bindings.first)
+            XCTAssertTrue(receipt.missingCredentialIDs.isEmpty)
+            XCTAssertTrue(receipt.workspace.connectLater)
+            XCTAssertFalse(receipt.cleanupPending)
+            XCTAssertEqual(try vault.fingerprint(account: binding.account), key.fingerprint)
+            XCTAssertEqual(try vault.publicIdentity(account: binding.account)?.blob, key.record.publicBlob)
+            XCTAssertEqual(vault.creates, 1)
+            XCTAssertNil(persistence.bytes(.journal))
+
+            let relaunched = WorkspaceStore(persistence: persistence, vault: vault)
+            let loaded = try await relaunched.loadWithCredentialAvailability()
+            let saved = try XCTUnwrap(loaded.first)
+            XCTAssertEqual(saved.workspace.revision, receipt.workspace.revision)
+            XCTAssertTrue(saved.workspace.connectLater)
+            XCTAssertEqual(saved.credentialIDs, ["key"])
+            let repeated = try await relaunched.install(restored, envelopeDigest: digest,
+                expectedRevision: saved.workspace.revision, sourceAndContentsConfirmed: true)
+            XCTAssertEqual(repeated.workspace.revision, receipt.workspace.revision)
+            XCTAssertEqual(repeated.workspace.bindings, receipt.workspace.bindings)
+            XCTAssertEqual(vault.creates, 1)
+        }
+    }
+
     func testMalformedPresentMetadataNeverBecomesLegacyOrChangesIdentity() throws {
         let key = try keys()[0], prefix = WorkspaceCredentialMetadata.commentPrefix
         let encoded = key.record.publicBlob.base64EncodedString()
         for comment in ["", "ft-ssh-public-v2:" + encoded, prefix, prefix + encoded + "=",
                         prefix + encoded + "\n", prefix + String(encoded.dropLast()),
-                        prefix + Data(repeating: 0, count: 513).base64EncodedString(),
+                        prefix + Data(repeating: 0, count: 1054).base64EncodedString(),
                         prefix + (key.record.publicBlob + Data([0])).base64EncodedString()] {
             XCTAssertThrowsError(try WorkspaceCredentialMetadata(fingerprintBytes: Data(key.fingerprint.utf8), publicComment: comment))
         }
@@ -192,7 +253,7 @@ final class WorkspaceCredentialMetadataTests: XCTestCase {
     }
 
     func testExactReviewedReimportEnrichesAllFamiliesWithoutReplacingProtectedItemsOrRevision() async throws {
-        for key in try keys() {
+        for key in try keys() + rsaKeys() {
             let f = try await fixture(key: key), catalog = f.persistence.bytes(.catalog)
             let original = try XCTUnwrap(f.vault.snapshot(f.account))
             XCTAssertNil(try f.vault.publicIdentity(account: f.account))

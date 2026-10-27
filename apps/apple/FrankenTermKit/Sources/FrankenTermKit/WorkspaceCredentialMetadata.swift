@@ -7,7 +7,12 @@ import Foundation
 /// reason to fall back to private-key access or to overwrite existing metadata.
 struct WorkspaceCredentialMetadata: Equatable, Sendable {
     static let commentPrefix = "ft-ssh-public-v1:"
-    static let maximumCommentBytes = commentPrefix.utf8.count + 4 * ((512 + 2) / 3)
+    // Match the complete raw-public-key profile accepted by SSHPublicIdentity:
+    // an 8192-bit RSA modulus with its sign byte, an eight-byte exponent with
+    // its sign byte, the algorithm name, and three SSH string lengths. The
+    // previous 512-byte allowance rejected valid 4096/8192-bit identities after
+    // the private item had been staged, preventing workspace publication.
+    static let maximumCommentBytes = commentPrefix.utf8.count + 4 * ((SSHPublicIdentity.maximumBlobBytes + 2) / 3)
     let fingerprint: String
     let identity: SSHPublicIdentity?
 
