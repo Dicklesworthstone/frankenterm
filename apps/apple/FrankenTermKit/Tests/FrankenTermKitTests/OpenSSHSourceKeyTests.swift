@@ -11,8 +11,12 @@ final class OpenSSHSourceKeyTests: XCTestCase {
 
     func testIndependentEncryptedAndClearKeysAgreeForEverySupportedFamily() async throws {
         let fixtures = try SourceKeyFixtures.load()
-        XCTAssertEqual(fixtures.pairs.count, 6)
+        XCTAssertEqual(fixtures.pairs.count, 22)
         XCTAssertEqual(Set(fixtures.pairs.map(\.algorithm)).count, 4)
+        let addedProfiles = Set(["aes192-ctr", "aes128-cbc", "aes192-cbc", "aes256-cbc"])
+        for algorithm in Set(fixtures.pairs.map(\.algorithm)) {
+            XCTAssertTrue(addedProfiles.isSubset(of: Set(fixtures.pairs.filter { $0.algorithm == algorithm }.map(\.cipher))))
+        }
         for fixture in fixtures.pairs {
             let source = try OpenSSHSourceKey(pem: Data(fixture.encryptedPEM.utf8))
             XCTAssertEqual(source.algorithm, fixture.algorithm, fixture.id)
@@ -29,6 +33,51 @@ final class OpenSSHSourceKeyTests: XCTestCase {
             XCTAssertFalse(clear.isEncrypted)
             XCTAssertNil(clear.bcryptRounds)
             XCTAssertEqual(try clear.unlock(credentialID: "key", using: crypto).container, independent.container)
+        }
+    }
+
+    func testEveryNewSourceProfileMigratesThroughTheAuthenticatedArchive() async throws {
+        let fixtures = try SourceKeyFixtures.load()
+        let profiles = Set(["aes192-ctr", "aes128-cbc", "aes192-cbc", "aes256-cbc"])
+        let additions = fixtures.pairs.filter { profiles.contains($0.cipher) }
+        XCTAssertEqual(additions.count, 16)
+        for fixture in additions {
+            let workspace = try workspace(for: fixture)
+            let source = try OpenSSHSourceKey(pem: Data(fixture.encryptedPEM.utf8))
+            let key = try source.unlock(passphrase: Data(fixtures.passphrase.utf8),
+                                        credentialID: workspace.credentials[0].id, using: crypto)
+            let archive = try AirGapArchive(workspace: workspace, keys: [key], using: crypto)
+            let export = try FTAG.seal(archive, using: crypto)
+            let restored = try FTAG.open(export.envelope, code: export.code, using: crypto)
+            XCTAssertEqual(restored.workspace.raw, workspace.raw, fixture.id)
+            XCTAssertEqual(restored.keys.count, 1, fixture.id)
+            XCTAssertEqual(restored.keys[0].container, key.container, fixture.id)
+            XCTAssertEqual(restored.keys[0].publicBlob, key.publicBlob, fixture.id)
+            let clear = try SourceKeyWire(container: restored.keys[0].container)
+            XCTAssertEqual(clear.cipher, Data("none".utf8), fixture.id)
+            XCTAssertEqual(clear.kdf, Data("none".utf8), fixture.id)
+        }
+    }
+
+    func testNewSourceProfilesRejectWrongPassphraseAndAlteredIdentityBeforeExport() async throws {
+        let fixtures = try SourceKeyFixtures.load()
+        let additions = fixtures.pairs.filter { $0.cipher == "aes192-ctr" || $0.cipher.hasSuffix("-cbc") }
+        XCTAssertEqual(additions.count, 16)
+        for fixture in additions {
+            let original = try SourceKeyWire(pem: Data(fixture.encryptedPEM.utf8))
+            let source = try OpenSSHSourceKey(pem: original.pem())
+            XCTAssertThrowsError(try source.unlock(passphrase: Data("wrong-public-test-passphrase".utf8),
+                                                   credentialID: "key", using: crypto), fixture.id) {
+                XCTAssertEqual($0 as? OpenSSHSourceKeyError, .incorrectPassphraseOrDamagedKey)
+            }
+            var identity = original; identity.publicBlob[identity.publicBlob.count - 1] ^= 1
+            var corrupted = original; corrupted.privatePart[0] ^= 1
+            for altered in [identity, corrupted] {
+                XCTAssertThrowsError(try OpenSSHSourceKey(pem: altered.pem()).unlock(
+                    passphrase: Data(fixtures.passphrase.utf8), credentialID: "key", using: crypto), fixture.id) {
+                    XCTAssertEqual($0 as? OpenSSHSourceKeyError, .incorrectPassphraseOrDamagedKey)
+                }
+            }
         }
     }
 
@@ -122,7 +171,7 @@ final class OpenSSHSourceKeyTests: XCTestCase {
         let fixture = try SourceKeyFixtures.load().pairs[0]
         let original = try SourceKeyWire(pem: Data(fixture.encryptedPEM.utf8))
         var variants: [SourceKeyWire] = []
-        var value = original; value.cipher = Data("aes256-cbc".utf8); variants.append(value)
+        var value = original; value.cipher = Data("aes256-gcm@openssh.com".utf8); variants.append(value)
         value = original; value.kdf = Data("argon2".utf8); variants.append(value)
         value = original; value.cipher = Data("none".utf8); variants.append(value)
         value = original; value.keyCount = 0; variants.append(value)
@@ -256,27 +305,46 @@ final class OpenSSHSourceKeyTests: XCTestCase {
         XCTAssertTrue(coordinatedCancelled)
     }
 
-    func testAESCTRMatchesIndependentNISTVectorsForBothAdmittedKeySizes() async throws {
-        // NIST SP 800-38A Appendix F.5, first two blocks of CTR-AES128/256.
+    func testAESCTRMatchesIndependentNISTVectorsForAllAdmittedKeySizes() async throws {
+        // NIST SP 800-38A Appendix F.5, first two blocks of CTR-AES128/192/256.
         let clear = try Data(ftHex: "6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51")
         let iv = try Data(ftHex: "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff")
         for (key, cipher) in [
             ("2b7e151628aed2a6abf7158809cf4f3c", "874d6191b620e3261bef6864990db6ce9806f66b7970fdff8617187bb9fffdff"),
+            ("8e73b0f7da0e6452c810f32b809079e562f8ead2522c6b7b", "1abc932417521ca24f2b0459fe7e6e0b090339ec0aa6faefd5ccc2c6f4ce8e94"),
             ("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4", "601ec313775789a5b7a7f504bbf3d228f443e3ca4d62b59aca84e990cacaf5c5")
         ] {
             XCTAssertEqual(try crypto.decryptAESCTR(Data(ftHex: cipher), key: Data(ftHex: key), iv: iv), clear)
         }
     }
 
+    func testAESCBCUsesIndependentNISTVectorsWithoutPKCS7Unpadding() async throws {
+        // NIST SP 800-38A Appendix F.2.1/3/5. CBC is a source-file profile;
+        // FTAG continues to authenticate the entire archive with ChaCha20-Poly1305.
+        let clear = try Data(ftHex: "6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51")
+        let iv = try Data(ftHex: "000102030405060708090a0b0c0d0e0f")
+        for (key, cipher) in [
+            ("2b7e151628aed2a6abf7158809cf4f3c", "7649abac8119b246cee98e9b12e9197d5086cb9b507219ee95db113a917678b2"),
+            ("8e73b0f7da0e6452c810f32b809079e562f8ead2522c6b7b", "4f021db243bc633d7178183a9fa071e8b4d9ada9ad7dedf4e5e738763f69145a"),
+            ("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4", "f58c4c04d6e5f1ba779eabfb5f7bfbd69cfc4e967edb808d679f777bc6702c7d")
+        ] {
+            for bytes in [16, 32] {
+                XCTAssertEqual(try crypto.decryptAESCBC(Data(try Data(ftHex: cipher).prefix(bytes)),
+                    key: Data(ftHex: key), iv: iv), Data(clear.prefix(bytes)))
+            }
+        }
+    }
+
     func testBcryptLayoutsMatchIndependentPublishedOpenBSDVector() async throws {
         // OpenBSD regress/lib/libutil/bcrypt_pbkdf/bcrypt_pbkdf_test.c, blob
         // ad3330bd9560358b952316df97f93d0f5184ceec. The published 256-byte result
-        // interleaves eight blocks. Column 0 gives output32; the first 24 rows
-        // of columns 0/1 give output48. These are not production-generated goldens.
+        // interleaves eight blocks. Column 0 gives output32; the first 20/24 rows
+        // of columns 0/1 give output40/48. These are not production-generated goldens.
         let pass = try Data(ftHex: "0db3ac94b3ee53284f4a22893b3c24ae")
         let salt = try Data(ftHex: "3a62f0f0dbcef823cfcc854856ea1028")
         for (count, expected) in [
             (32, "204438175eee7ce136c91b49a67923ff9988c989613180333f97684bc78093e8"),
+            (40, "2054440338de170a5ea4ee237c86e1dc368fc9e71bbf490ea678792e238eff4499708873c9bf89a7"),
             (48, "2054440338de170a5ea4ee237c86e1dc368fc9e71bbf490ea678792e238eff4499708873c9bf89a7616731a1800133b4")
         ] {
             XCTAssertEqual(try crypto.bcryptPBKDF(passphrase: pass, salt: salt, rounds: 8, outputByteCount: count), try Data(ftHex: expected))
@@ -302,8 +370,15 @@ final class OpenSSHSourceKeyTests: XCTestCase {
         for count in [0, 15, 17, FTLimit.key + 16] {
             XCTAssertThrowsError(try crypto.decryptAESCTR(Data(repeating: 0, count: count), key: Data(repeating: 0, count: 32), iv: salt))
         }
-        XCTAssertThrowsError(try crypto.decryptAESCTR(salt, key: Data(repeating: 0, count: 24), iv: salt))
+        XCTAssertThrowsError(try crypto.decryptAESCTR(salt, key: Data(repeating: 0, count: 31), iv: salt))
         XCTAssertThrowsError(try crypto.decryptAESCTR(salt, key: salt, iv: Data(repeating: 0, count: 15)))
+        for count in [0, 15, 17, FTLimit.key + 16] {
+            XCTAssertThrowsError(try crypto.decryptAESCBC(Data(repeating: 0, count: count), key: Data(repeating: 0, count: 24), iv: salt))
+        }
+        for count in [0, 15, 17, 23, 25, 31, 33] {
+            XCTAssertThrowsError(try crypto.decryptAESCBC(salt, key: Data(repeating: 0, count: count), iv: salt))
+        }
+        XCTAssertThrowsError(try crypto.decryptAESCBC(salt, key: salt, iv: Data(repeating: 0, count: 15)))
     }
 
     private func request<C: AirGapCryptography>(_ selection: OpenSSHSourceKeyUnlocker<C>.Selection) throws -> OpenSSHSourceKeyUnlocker<C>.Request {
@@ -391,4 +466,5 @@ private struct DeniedSourceCryptography: AirGapCryptography {
     func ecdsaPublicKey(scalar: Data, curve: SSHECDSACurve) throws -> Data { try base.ecdsaPublicKey(scalar: scalar, curve: curve) }
     func bcryptPBKDF(passphrase: Data, salt: Data, rounds: UInt32, outputByteCount: Int) throws -> Data { throw SourceProbeError.unexpectedNativeWork }
     func decryptAESCTR(_ ciphertext: Data, key: Data, iv: Data) throws -> Data { throw SourceProbeError.unexpectedNativeWork }
+    func decryptAESCBC(_ ciphertext: Data, key: Data, iv: Data) throws -> Data { throw SourceProbeError.unexpectedNativeWork }
 }

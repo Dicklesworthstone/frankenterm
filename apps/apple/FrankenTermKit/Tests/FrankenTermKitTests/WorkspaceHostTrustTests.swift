@@ -209,13 +209,14 @@ final class WorkspaceHostTrustTests: XCTestCase {
         var oldCatalog = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(persistence.bytes(.catalog))) as? [String: Any])
         oldCatalog["version"] = 2; oldCatalog.removeValue(forKey: "hostRevocations")
         oldCatalog.removeValue(forKey: "scopedHostRevocations"); oldCatalog.removeValue(forKey: "hostRequirements")
+        oldCatalog.removeValue(forKey: "machineConnectionPreferences")
         persistence.seed(try JSONSerialization.data(withJSONObject: oldCatalog, options: [.sortedKeys]), slot: .catalog)
 
         let reopened = WorkspaceStore(persistence: persistence, vault: vault)
         let loaded = try await reopened.load()
         XCTAssertEqual(loaded.first?.revision, first.revision)
         let migrated = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(persistence.bytes(.catalog))) as? [String: Any])
-        XCTAssertEqual(migrated["version"] as? Int, 4)
+        XCTAssertEqual(migrated["version"] as? Int, 5)
         XCTAssertEqual((migrated["hostRevocations"] as? [Any])?.count, 1)
         let next = try await install(archive("new-positive", trustID: "renamed"), in: reopened, identity: 2, replacing: first)
         let pin = try WorkspaceDocument.HostKey(algorithm: "ssh-ed25519", fingerprint: hostFingerprint)
@@ -242,7 +243,7 @@ final class WorkspaceHostTrustTests: XCTestCase {
         XCTAssertEqual(loaded.first?.envelopeDigest, second.envelopeDigest)
         let migratedBytes = try XCTUnwrap(persistence.bytes(.catalog))
         let migrated = try XCTUnwrap(JSONSerialization.jsonObject(with: migratedBytes) as? [String: Any])
-        XCTAssertEqual(migrated["version"] as? Int, 4)
+        XCTAssertEqual(migrated["version"] as? Int, 5)
         XCTAssertEqual(try JSONSerialization.data(withJSONObject: XCTUnwrap(migrated["acceptedImports"]), options: [.sortedKeys]),
                        try JSONSerialization.data(withJSONObject: XCTUnwrap(legacy["acceptedImports"]), options: [.sortedKeys]))
         XCTAssertEqual(try JSONSerialization.data(withJSONObject: XCTUnwrap(migrated["hostRevocations"]), options: [.sortedKeys]),
@@ -301,7 +302,7 @@ final class WorkspaceHostTrustTests: XCTestCase {
             let decision = try await recovered.verifyHostKey(workspaceID: first.id, routeID: "route", presented: pin, support: support)
             XCTAssertEqual(decision, .revoked)
             let catalog = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(persistence.bytes(.catalog))) as? [String: Any])
-            XCTAssertEqual(catalog["version"] as? Int, 4)
+            XCTAssertEqual(catalog["version"] as? Int, 5)
             XCTAssertEqual((catalog["hostRevocations"] as? [Any])?.count, 1)
             XCTAssertEqual(vault.count, 1)
             XCTAssertEqual(try vault.fingerprint(account: retained.account), retained.fingerprint)

@@ -170,6 +170,20 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         return navigationMachineIDs.compactMap { known[$0] }
     }
 
+    /// Group warm-up follows the phone's saved choice, including in a scene
+    /// kept alive behind its workspace page. Existing owners and deliberate
+    /// Connect actions keep their authority; this setting never disconnects.
+    func setAutomaticConnection(_ enabled: Bool, machineID: String) {
+        setAutomaticConnections([machineID: enabled])
+    }
+
+    func setAutomaticConnections(_ values: [String: Bool]) {
+        guard !closed else { return }
+        do { try connectionIntent.setAutomaticConnections(values) }
+        catch { report(error); return }
+        reconcile()
+    }
+
     // MARK: Fleet overview
 
     func beginOverview() {

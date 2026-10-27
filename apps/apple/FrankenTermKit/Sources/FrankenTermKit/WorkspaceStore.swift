@@ -137,10 +137,22 @@ public struct WorkspaceImportAssessment: Sendable {
     public let requiresSourceAssociation: Bool
 }
 
+/// Phone-local choices are separate from the imported manifest and its trust
+/// revision. A new export cannot silently replace an explicit local choice.
+/// Missing entries follow the imported default; they never approve networking.
+public struct WorkspaceConnectionPreferences: Equatable, Sendable {
+    public let autoConnectOverrides: [String: Bool]
+
+    public func automaticallyConnect(_ machine: WorkspaceDocument.Machine) -> Bool {
+        autoConnectOverrides[machine.id] ?? machine.autoConnect
+    }
+}
+
 /// One revision-consistent snapshot of actual protected-key availability and
 /// mandatory local trust policy for the native browser and future transports.
 public struct WorkspaceLocalState: Sendable {
     public let workspace: InstalledWorkspace
+    public let connectionPreferences: WorkspaceConnectionPreferences
     public let credentialIDs: Set<String>
     public let revokedHostKeysByTrustScope: [String: Set<WorkspaceDocument.HostKey>]
     /// Refused host keys whose block could not be saved: this run of the app
@@ -183,24 +195,31 @@ public actor WorkspaceStore {
         let scope: String
         let capability: String
     }
+    private struct MachineConnectionPreference: Codable {
+        let workspaceID: UUID
+        let machineID: String
+        let autoConnect: Bool
+    }
     private struct Catalog: Codable {
-        var version = 4
+        var version = 5
         var workspaces: [InstalledWorkspace] = []
         var revokedFingerprints: Set<String> = []
         var acceptedImports: [AcceptedImport] = []
         var hostRevocations: Set<HostRevocation> = []
         var scopedHostRevocations: Set<ScopedHostRevocation> = []
         var hostRequirements: Set<HostRequirement> = []
+        var machineConnectionPreferences: [MachineConnectionPreference] = []
         var needsSanitizedPublication = false
 
         init() {}
         private enum CodingKeys: String, CodingKey {
             case version, workspaces, revokedFingerprints, acceptedImports, hostRevocations, scopedHostRevocations, hostRequirements
+            case machineConnectionPreferences
         }
         init(from decoder: Decoder) throws {
             let fields = try decoder.container(keyedBy: CodingKeys.self)
             let storedVersion = try fields.decode(Int.self, forKey: .version)
-            guard (1...4).contains(storedVersion) else { throw WorkspaceStoreError.corruptStore }
+            guard (1...5).contains(storedVersion) else { throw WorkspaceStoreError.corruptStore }
             workspaces = try fields.decode([InstalledWorkspace].self, forKey: .workspaces)
             revokedFingerprints = try fields.decode(Set<String>.self, forKey: .revokedFingerprints)
             guard workspaces.count <= 32, revokedFingerprints.count <= 4096 else { throw WorkspaceStoreError.corruptStore }
@@ -228,7 +247,7 @@ public actor WorkspaceStore {
             if storedVersion >= 3 {
                 hostRevocations = try fields.decode(Set<HostRevocation>.self, forKey: .hostRevocations)
             } else if fields.contains(.hostRevocations) { throw WorkspaceStoreError.corruptStore }
-            if storedVersion == 4 {
+            if storedVersion >= 4 {
                 scopedHostRevocations = try fields.decode(Set<ScopedHostRevocation>.self, forKey: .scopedHostRevocations)
                 hostRequirements = try fields.decode(Set<HostRequirement>.self, forKey: .hostRequirements)
             } else {
@@ -251,7 +270,15 @@ public actor WorkspaceStore {
             guard hostRevocations.count <= WorkspaceStore.hostRevocationLimit,
                   scopedHostRevocations.count <= WorkspaceStore.scopedHostRevocationLimit,
                   hostRequirements.count <= WorkspaceStore.hostRequirementLimit else { throw WorkspaceStoreError.corruptStore }
-            needsSanitizedPublication = storedVersion != 4
+            if storedVersion == 5 {
+                machineConnectionPreferences = try fields.decode([MachineConnectionPreference].self, forKey: .machineConnectionPreferences)
+            } else {
+                guard !fields.contains(.machineConnectionPreferences) else { throw WorkspaceStoreError.corruptStore }
+            }
+            guard machineConnectionPreferences.count <= WorkspaceStore.connectionPreferenceLimit else {
+                throw WorkspaceStoreError.corruptStore
+            }
+            needsSanitizedPublication = storedVersion != 5
             // Older catalogs could retain opaque desktop annotations. Reuse the
             // wire validator so neither migration nor re-export can preserve an
             // untyped private value in this public configuration store.
@@ -296,6 +323,7 @@ public actor WorkspaceStore {
     static let hostRevocationLimit = 4096
     private static let scopedHostRevocationLimit = 16384
     private static let hostRequirementLimit = 16384
+    private static let connectionPreferenceLimit = 4096
 
     public init(persistence: any WorkspacePersistence, vault: any WorkspaceCredentialVault) {
         self.persistence = persistence; self.vault = vault
@@ -329,7 +357,9 @@ public actor WorkspaceStore {
                 let available = try availableCredentials(workspace, catalog: catalog)
                 let refused = hostRevocations(workspace.id, document: document, catalog: catalog)
                 let saved = hostRevocations(workspace.id, document: document, catalog: catalog, savedOnly: true)
-                return .init(workspace: workspace, credentialIDs: available, revokedHostKeysByTrustScope: refused,
+                return .init(workspace: workspace,
+                      connectionPreferences: connectionPreferences(workspace.id, catalog: catalog),
+                      credentialIDs: available, revokedHostKeysByTrustScope: refused,
                       unsavedHostKeysByTrustScope: refused.reduce(into: [:]) { unsaved, scope in
                           let keys = scope.value.subtracting(saved[scope.key] ?? [])
                           if !keys.isEmpty { unsaved[scope.key] = keys }
@@ -339,6 +369,53 @@ public actor WorkspaceStore {
                           findings: workspace.findings, catalog: catalog, support: support))
             }
         }
+    }
+
+    /// Changes only the phone's future group warm-up preference. It grants no
+    /// credential or terminal authority and does not revoke a live connection.
+    /// `nil` deliberately restores the imported default. Keep choices for a
+    /// temporarily absent machine, so removing/reintroducing its stable ID in
+    /// later exports cannot erase the user's override.
+    @discardableResult
+    public func setMachineAutoConnect(workspaceID: UUID, expectedRevision: UUID,
+                                      machineID: String, enabled: Bool?) throws -> WorkspaceConnectionPreferences {
+        try Task.checkCancellation()
+        return try persistence.withExclusiveAccess {
+            var catalog = try readCatalog()
+            try recover(catalog: &catalog)
+            guard let saved = catalog.workspaces.first(where: { $0.id == workspaceID }),
+                  saved.revision == expectedRevision else { throw WorkspaceStoreError.staleReview }
+            guard try saved.document().machines.contains(where: { $0.id == machineID }) else { throw FTError.stale }
+            let index = catalog.machineConnectionPreferences.firstIndex {
+                $0.workspaceID == workspaceID && $0.machineID == machineID
+            }
+            if let enabled {
+                let value = MachineConnectionPreference(workspaceID: workspaceID, machineID: machineID, autoConnect: enabled)
+                if let index {
+                    if catalog.machineConnectionPreferences[index].autoConnect == enabled {
+                        return connectionPreferences(workspaceID, catalog: catalog)
+                    }
+                    catalog.machineConnectionPreferences[index] = value
+                } else {
+                    guard catalog.machineConnectionPreferences.count < Self.connectionPreferenceLimit else {
+                        throw FTError.limit("store.connection_preferences")
+                    }
+                    catalog.machineConnectionPreferences.append(value)
+                }
+            } else if let index {
+                catalog.machineConnectionPreferences.remove(at: index)
+            } else { return connectionPreferences(workspaceID, catalog: catalog) }
+            try Task.checkCancellation()
+            // A thrown publication may already have written. The caller must
+            // reload actual state before retrying, just like other catalog edits.
+            try persistence.write(encode(catalog, limit: Self.catalogLimit), to: .catalog)
+            return connectionPreferences(workspaceID, catalog: catalog)
+        }
+    }
+
+    private func connectionPreferences(_ workspaceID: UUID, catalog: Catalog) -> WorkspaceConnectionPreferences {
+        .init(autoConnectOverrides: Dictionary(uniqueKeysWithValues: catalog.machineConnectionPreferences
+            .filter { $0.workspaceID == workspaceID }.map { ($0.machineID, $0.autoConnect) }))
     }
 
     /// All readiness decisions describe the same durable revision and actual
@@ -1154,17 +1231,26 @@ public actor WorkspaceStore {
     }
     private func readCatalog() throws -> Catalog {
         guard let data = try persistence.read(.catalog, limit: Self.catalogLimit) else { return Catalog() }
-        guard let catalog = try? JSONDecoder().decode(Catalog.self, from: data), catalog.version == 4,
+        guard let catalog = try? JSONDecoder().decode(Catalog.self, from: data), catalog.version == 5,
               catalog.workspaces.count <= 32, catalog.revokedFingerprints.count <= 4096,
               catalog.revokedFingerprints.allSatisfy({ (try? WorkspaceDocument.fingerprint($0)) != nil }),
               catalog.acceptedImports.count <= Self.importHistoryLimit, catalog.hostRevocations.count <= Self.hostRevocationLimit,
               catalog.scopedHostRevocations.count <= Self.scopedHostRevocationLimit,
               catalog.hostRequirements.count <= Self.hostRequirementLimit,
+              catalog.machineConnectionPreferences.count <= Self.connectionPreferenceLimit,
               Set(catalog.workspaces.map(\.id)).count == catalog.workspaces.count,
               Set(catalog.workspaces.map(\.revision)).count == catalog.workspaces.count else { throw WorkspaceStoreError.corruptStore }
         var namespaces = Set<[String]>()
         var accountIdentities: [String: [String]] = [:]
         let workspaceIDs = Set(catalog.workspaces.map(\.id))
+        var preferenceIDs = Set<[String]>()
+        for preference in catalog.machineConnectionPreferences {
+            guard workspaceIDs.contains(preference.workspaceID),
+                  (try? WorkspaceDocument.identifier(preference.machineID)) != nil,
+                  preferenceIDs.insert([preference.workspaceID.uuidString, preference.machineID]).inserted else {
+                throw WorkspaceStoreError.corruptStore
+            }
+        }
         var bundleIDs = Set<[String]>(), transferIDs = Set<Data>(), digests = Set<Data>()
         for export in catalog.acceptedImports {
             guard (try? WorkspaceDocument.identifier(export.exporterID)) != nil,

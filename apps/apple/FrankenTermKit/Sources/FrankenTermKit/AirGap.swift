@@ -56,6 +56,10 @@ public protocol AirGapCryptography: SSHIdentityCryptography {
     /// AES-CTR has no authentication tag. The complete decrypted OpenSSH container
     /// and its derived public identity must validate before any key is accepted.
     func decryptAESCTR(_ ciphertext: Data, key: Data, iv: Data) throws -> Data
+    /// OpenSSH's CBC source profile uses the same bounded AES key sizes and
+    /// 16-byte IV, with no PKCS#7 padding. Its checkints, private-derived public
+    /// identity and incremental OpenSSH padding must all validate after decryption.
+    func decryptAESCBC(_ ciphertext: Data, key: Data, iv: Data) throws -> Data
 }
 
 #if canImport(CryptoKit)

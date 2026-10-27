@@ -69,6 +69,9 @@ final class MobileWorkspaceModel {
     var workspaces: [InstalledWorkspace] = []
     var availableCredentials: [UUID: Set<String>] = [:]
     var localPolicies: [UUID: WorkspaceLocalState] = [:]
+    var connectionPreferenceMessage: String?
+    private var connectionPreferenceBusy = false
+    @ObservationIgnored private var connectionPreferenceUpdate: Task<Void, Never>?
     var locallyRevokedFingerprints: Set<String> = []
     var unconfirmedCredentialRevocations: Set<String> = []
     var credentialMessage: String?
@@ -85,7 +88,7 @@ final class MobileWorkspaceModel {
     /// Import settlement retains its own reservation across scene transitions
     /// and any older callback that releases the shared operation flag.
     var busy: Bool {
-        get { operationBusy || credentialImportOperation != nil || isReadingRecording }
+        get { operationBusy || credentialImportOperation != nil || isReadingRecording || connectionPreferenceBusy }
         set { operationBusy = newValue }
     }
     private(set) var isReadingRecording = false
@@ -896,6 +899,9 @@ final class MobileWorkspaceModel {
         }
         availableCredentials = Dictionary(uniqueKeysWithValues: snapshot.map { ($0.workspace.id, $0.credentialIDs) })
         localPolicies = Dictionary(uniqueKeysWithValues: snapshot.map { ($0.workspace.id, $0) })
+        for local in snapshot {
+            applyConnectionPreferences(local.connectionPreferences, workspace: local.workspace)
+        }
         locallyRevokedFingerprints = revoked
         restoreLiveScreen()
         if let importing = credentialImport, !importing.isCommitting, !importing.isFinished,
@@ -909,6 +915,54 @@ final class MobileWorkspaceModel {
                 setThemeChoices(themes.distinguishingMachines(), for: saved.id)
             }
         }
+    }
+
+    func automaticallyConnect(_ machine: WorkspaceDocument.Machine, workspaceID: UUID) -> Bool {
+        localPolicies[workspaceID]?.connectionPreferences.automaticallyConnect(machine) ?? machine.autoConnect
+    }
+
+    /// The saved choice is independent of the imported default and of live
+    /// authentication. A preference write keeps the workspace revision, so no
+    /// session is torn down merely to stop future automatic group connections.
+    func setMachineAutoConnect(_ enabled: Bool?, workspaceID: UUID, machineID: String) {
+        guard active, !busy, !showRestore, let store,
+              let local = localPolicies[workspaceID],
+              let document = try? local.workspace.document(),
+              let machine = document.machines.first(where: { $0.id == machineID }) else { return }
+        connectionPreferenceBusy = true; connectionPreferenceMessage = nil
+        workspaceRefreshEpoch = UUID(); workspaceRefresh?.cancel()
+        // Stop unsent warm-up immediately when switching off. An admitted
+        // attempt remains owned, and failures below reload the actual choice.
+        if !(enabled ?? machine.autoConnect) {
+            liveScenes[workspaceID]?.setAutomaticConnection(false, machineID: machineID)
+        }
+        connectionPreferenceUpdate = Task { [self] in
+            defer { connectionPreferenceBusy = false; connectionPreferenceUpdate = nil }
+            do {
+                let preferences = try await store.setMachineAutoConnect(workspaceID: workspaceID,
+                    expectedRevision: local.workspace.revision, machineID: machineID, enabled: enabled)
+                applyConnectionPreferences(preferences, workspace: local.workspace)
+            } catch {
+                connectionPreferenceMessage = "This preference could not be confirmed as saved. \(error.localizedDescription)"
+            }
+            // A failed atomic write may already have published. Show only the
+            // read-back state; never flip the switch by guessing at rollback.
+            if active {
+                do { try await refreshWorkspaces(using: store, epoch: epoch) }
+                catch {
+                    availableCredentials = [:]; localPolicies = [:]
+                    connectionPreferenceMessage = "Connection preferences could not be refreshed. Reopen the workspace before changing them again. \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    private func applyConnectionPreferences(_ preferences: WorkspaceConnectionPreferences, workspace: InstalledWorkspace) {
+        guard let scene = liveScenes[workspace.id], scene.revision == workspace.revision,
+              let document = try? workspace.document() else { return }
+        scene.setAutomaticConnections(Dictionary(uniqueKeysWithValues: document.machines.map {
+            ($0.id, preferences.automaticallyConnect($0))
+        }))
     }
 
     func beginCredentialImport(workspaceID: UUID, credentialID: String) {
@@ -2735,7 +2789,7 @@ private struct WorkspaceKeyImportSheet: View {
                                 }.disabled(!controller.canChooseFile)
                                     .accessibilityIdentifier("keys.import.choose")
                             } footer: {
-                                Text("Choose a local OpenSSH private-key file for this exact fingerprint. Ed25519 and ECDSA P-256, P-384 and P-521 keys are supported, including files protected with bcrypt and AES-CTR.")
+                                Text("Choose a local OpenSSH private-key file for this exact fingerprint. Ed25519 and ECDSA P-256, P-384 and P-521 keys are supported, including files protected with bcrypt and AES-CTR or AES-CBC (128, 192, or 256 bits).")
                             }
                         }
                     }
@@ -3016,6 +3070,24 @@ private struct MachineWorkspaceView: View {
                         HStack(spacing: 0) { ForEach(0..<16) { index in Color(ftHex: theme?.ansi[index] ?? "#000000") } }
                             .frame(height: 10).clipShape(Capsule()).accessibilityHidden(true)
                         connectSection(machine, theme: theme)
+                        VStack(alignment: .leading, spacing: 8) {
+                            Toggle("Connect with Group", isOn: Binding(
+                                get: { model.automaticallyConnect(machine, workspaceID: workspaceID) },
+                                set: { model.setMachineAutoConnect($0, workspaceID: workspaceID, machineID: machine.id) }))
+                                .disabled(model.busy || !model.active || model.localPolicies[workspaceID] == nil)
+                                .tint(Color(ftHex: theme?.accent ?? "#3B82F6"))
+                                .accessibilityIdentifier("machine.autoconnect.\(machine.id)")
+                            Text("Connect this machine when an automatic group opens. Saved on this phone across imports. Existing sessions stay connected, and Connect is always available.")
+                                .font(.caption).opacity(0.75)
+                            if model.localPolicies[workspaceID]?.connectionPreferences.autoConnectOverrides[machine.id] != nil {
+                                Button("Use Workspace Default (\(machine.autoConnect ? "On" : "Off"))") {
+                                    model.setMachineAutoConnect(nil, workspaceID: workspaceID, machineID: machine.id)
+                                }.font(.caption).disabled(model.busy || !model.active)
+                            }
+                            if let message = model.connectionPreferenceMessage {
+                                Text(message).font(.caption).accessibilityIdentifier("machine.autoconnect.error")
+                            }
+                        }
                         DisclosureGroup("Routes") {
                             VStack(alignment: .leading, spacing: 14) {
                                 ForEach(machine.routeIDs, id: \.self) { id in
@@ -3143,6 +3215,9 @@ private struct MachineWorkspaceView: View {
               model.connections != nil, let local = model.localPolicies[workspaceID],
               sceneMachine(machine, local: local).target?.attemptOrder().first != nil else { return }
         returnHandled = true
+        // A remembered screen is not a new Connect action. An explicit local
+        // off choice also holds when this was the last machine on screen.
+        guard local.connectionPreferences.autoConnectOverrides[id] != false else { return }
         terminal = OpenTerminal(machineID: id, local: local)
     }
 
@@ -3160,6 +3235,7 @@ private struct MachineWorkspaceView: View {
                   let local = model.localPolicies[workspaceID] else { return }
             guard let machine = document.machines.first(where: { $0.id == closed.machineID }), model.connections != nil,
                   !document.credentials.contains(where: { model.unconfirmedCredentialRevocations.contains($0.fingerprint) }),
+                  local.connectionPreferences.autoConnectOverrides[closed.machineID] != false,
                   sceneMachine(machine, local: local).target?.attemptOrder().first != nil else { terminal = nil; return }
             terminal = OpenTerminal(machineID: closed.machineID, local: local)
         }
@@ -3223,10 +3299,14 @@ private struct MachineWorkspaceView: View {
 
     private func sceneMachine(_ machine: WorkspaceDocument.Machine, local: WorkspaceLocalState) -> SceneMachine {
         let theme = theme(for: machine)
+        let preferences: WorkspaceConnectionPreferences
+        if let latest = model.localPolicies[workspaceID], latest.workspace.revision == local.workspace.revision {
+            preferences = latest.connectionPreferences
+        } else { preferences = local.connectionPreferences }
         func scene(_ target: TerminalSessionTarget?) -> SceneMachine {
             .init(id: machine.id, name: machine.name, target: target,
                   unavailable: "None of this machine's SSH routes is ready on this device. Open the machine from the workspace to see what each route needs.",
-                  theme: theme, autoConnect: machine.autoConnect)
+                  theme: theme, autoConnect: preferences.automaticallyConnect(machine))
         }
         // Every ready route, the preferred one first: mux routes attach to the
         // machine's existing panes, direct-SSH routes to its mux if one answers.

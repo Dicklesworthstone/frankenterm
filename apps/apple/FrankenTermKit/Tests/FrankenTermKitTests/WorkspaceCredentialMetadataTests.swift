@@ -91,6 +91,9 @@ private struct MisreportingPointCryptography: AirGapCryptography {
     func decryptAESCTR(_ ciphertext: Data, key: Data, iv: Data) throws -> Data {
         try base.decryptAESCTR(ciphertext, key: key, iv: iv)
     }
+    func decryptAESCBC(_ ciphertext: Data, key: Data, iv: Data) throws -> Data {
+        try base.decryptAESCBC(ciphertext, key: key, iv: iv)
+    }
 }
 
 @MainActor

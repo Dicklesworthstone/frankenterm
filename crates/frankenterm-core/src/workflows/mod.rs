@@ -647,8 +647,6 @@ mod tests {
     fn workflow_config_defaults() {
         let config = WorkflowConfig::default();
         assert_eq!(config.default_wait_timeout_ms, 30_000);
-        assert_eq!(config.max_step_retries, 3);
-        assert_eq!(config.retry_delay_ms, 1_000);
     }
 
     // ========================================================================
@@ -1609,22 +1607,13 @@ steps:
             runner.register_workflow(Arc::clone(&workflow));
 
             let execution_id = generate_workflow_id(workflow.name());
-            runner
-                .engine
-                .start_with_id(
-                    &storage,
-                    execution_id.clone(),
-                    workflow.name(),
-                    pane_id,
-                    None,
-                    None,
-                )
+            let cx = crate::cx::for_testing();
+            let ManualWorkflowRunOutcome::Ran(result) = runner
+                .run_workflow_manual_with_cx(&cx, pane_id, workflow, &execution_id, None)
                 .await
-                .unwrap();
-
-            let result = runner
-                .run_workflow(pane_id, workflow, &execution_id, 0)
-                .await;
+            else {
+                panic!("manual workflow must start with its durable budget");
+            };
             assert!(result.is_aborted(), "Expected policy-gated abort");
 
             let logs = storage.get_step_logs(&execution_id).await.unwrap();
@@ -1700,22 +1689,13 @@ steps:
             runner.register_workflow(Arc::clone(&workflow));
 
             let execution_id = generate_workflow_id(workflow.name());
-            runner
-                .engine
-                .start_with_id(
-                    &storage,
-                    execution_id.clone(),
-                    workflow.name(),
-                    pane_id,
-                    None,
-                    None,
-                )
+            let cx = crate::cx::for_testing();
+            let ManualWorkflowRunOutcome::Ran(result) = runner
+                .run_workflow_manual_with_cx(&cx, pane_id, workflow, &execution_id, None)
                 .await
-                .unwrap();
-
-            let result = runner
-                .run_workflow(pane_id, workflow, &execution_id, 0)
-                .await;
+            else {
+                panic!("manual workflow must start with its durable budget");
+            };
             assert!(result.is_aborted(), "Expected policy-gated abort");
 
             let events = sink.recorder_events();

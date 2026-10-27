@@ -744,34 +744,47 @@ fn text_from_semantic_zone_lines(logical_lines: &[LogicalLine], zone: &SemanticZ
     text
 }
 
-/// Result of one successful typed guardian output delivery.
+/// Result of one successful typed guardian output poll.
 ///
 /// A checkpoint publisher may perform bounded disk and transport I/O. It must
 /// wait for `replay_page_acknowledged` so that work cannot hold an
 /// unacknowledged replay snapshot open between records from the same page.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct GuardianLiveOutputDelivery {
-    replay_page_acknowledged: bool,
+pub enum GuardianLiveOutputDelivery {
+    /// One record was delivered; its replay page still has buffered records.
+    BufferedWithinReplayPage,
+    /// The last record in the page was delivered and its Ack completed.
+    ReplayPageAcknowledged,
+    /// An authenticated completion was acknowledged without delivering a
+    /// record. The caller can advance checkpoint and reanchor work before
+    /// starting another bounded replay poll.
+    IdleAfterReplayCompletion,
 }
 
 impl GuardianLiveOutputDelivery {
     #[must_use]
     pub const fn buffered_within_replay_page() -> Self {
-        Self {
-            replay_page_acknowledged: false,
-        }
+        Self::BufferedWithinReplayPage
     }
 
     #[must_use]
     pub const fn replay_page_acknowledged() -> Self {
-        Self {
-            replay_page_acknowledged: true,
-        }
+        Self::ReplayPageAcknowledged
+    }
+
+    #[must_use]
+    pub const fn idle_after_replay_completion() -> Self {
+        Self::IdleAfterReplayCompletion
     }
 
     #[must_use]
     pub const fn has_durable_replay_page_ack(self) -> bool {
-        self.replay_page_acknowledged
+        !matches!(self, Self::BufferedWithinReplayPage)
+    }
+
+    #[must_use]
+    pub const fn is_idle(self) -> bool {
+        matches!(self, Self::IdleAfterReplayCompletion)
     }
 }
 
@@ -779,11 +792,14 @@ impl GuardianLiveOutputDelivery {
 ///
 /// Guardian-backed panes use a record-aware reader so authenticated journal
 /// metadata cannot be flattened away before the live parser registers its
-/// exact receipt. Implementations must invoke `deliver` exactly once for the
-/// next record and must not acknowledge that record or its replay page unless
-/// the callback returns success. The returned delivery state must distinguish
-/// a record buffered inside an open replay page from the page-terminal record
-/// whose durable Ack completed before return.
+/// exact receipt. Implementations must invoke `deliver` exactly once for a
+/// record and must not acknowledge that record or its replay page unless the
+/// callback returns success. After an authenticated empty completion and Ack,
+/// they return `IdleAfterReplayCompletion` without invoking `deliver`; they
+/// must not wait indefinitely for output while hiding this idle progress.
+/// The returned delivery state distinguishes an idle poll from a record
+/// buffered inside an open replay page and the page-terminal record whose
+/// durable Ack completed before return.
 pub trait GuardianLiveOutputReader: Send {
     /// True only when the last failure was a transport exchange whose exact
     /// request remains retained. Parser delivery and authenticated failures

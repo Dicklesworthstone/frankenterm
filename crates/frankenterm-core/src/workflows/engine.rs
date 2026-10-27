@@ -282,9 +282,9 @@ impl WorkflowEngine {
 
     /// Cx-first variant of [`start_with_id`] (ft-xbnl0.2.2).
     ///
-    /// Tick 189 (ft-xbnl0.2.3): threads cx into the inner
-    /// `upsert_workflow_with_cx` storage call rather than delegating to the
-    /// ambient-cx `start_with_id`. Legacy `start_with_id` preserved.
+    /// Uses create-only storage admission: a repeated execution ID returns an
+    /// error without resetting the original execution or its budget authority.
+    /// The caller's Cx is threaded through the creation commit point.
     pub async fn start_with_id_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -311,7 +311,7 @@ impl WorkflowEngine {
             completed_at: None,
         };
 
-        storage.upsert_workflow_with_cx(cx, record).await?;
+        storage.create_workflow_with_cx(cx, record).await?;
 
         cx.checkpoint()
             .map_err(|e| workflow_checkpoint_cancelled_error("workflow.start_with_id_cx", e))?;
@@ -347,8 +347,19 @@ impl WorkflowEngine {
             return Ok(None);
         }
 
-        let step_logs = storage.get_step_logs_with_cx(cx, execution_id).await?;
-        let next_step = resolve_resume_step(&record, &step_logs)?;
+        // New executions resume only from their committed admission cursor.
+        // Logs can be ahead of or behind a crash boundary and cannot refund a
+        // retry or authorize another attempt. Legacy rows retain read-only
+        // inspection; the runner refuses their missing budget before effects.
+        let next_step = if let Some(budget) = storage
+            .get_workflow_budget_with_cx(cx, execution_id)
+            .await?
+        {
+            budget.current_step
+        } else {
+            let step_logs = storage.get_step_logs_with_cx(cx, execution_id).await?;
+            resolve_resume_step(&record, &step_logs)?
+        };
 
         let execution = WorkflowExecution {
             id: record.id,
@@ -370,7 +381,9 @@ impl WorkflowEngine {
 
     /// Resume a workflow execution from storage
     ///
-    /// Loads the workflow record and step logs to determine the next step.
+    /// Loads the workflow record and authoritative budget cursor. Legacy
+    /// records retain log-based inspection, but the runner refuses to execute
+    /// them without an original budget.
     /// Returns None if the workflow doesn't exist or is already terminal.
     pub async fn resume(
         &self,

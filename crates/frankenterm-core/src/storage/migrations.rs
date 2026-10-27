@@ -2234,6 +2234,21 @@ pub(crate) static MIGRATIONS: &[Migration] = &[
         // Removing the target would lose identity for unobserved or deleted panes.
         down_sql: None,
     },
+    Migration {
+        version: 48,
+        description: "Persist authoritative workflow retry and total-deadline budgets",
+        up_sql: "
+        CREATE TABLE IF NOT EXISTS workflow_execution_budgets (
+            workflow_id TEXT PRIMARY KEY NOT NULL REFERENCES workflow_executions(id) ON DELETE CASCADE,
+            revision INTEGER NOT NULL CHECK(revision >= 0),
+            budget_json TEXT NOT NULL
+        );
+        ",
+        // Deliberately do not backfill legacy executions: neither their step
+        // logs nor their timestamps establish consumed retry/deadline authority.
+        // Downgrade would erase admitted attempts and permit their replay.
+        down_sql: None,
+    },
 ];
 
 // =============================================================================
@@ -6242,8 +6257,10 @@ pub(crate) fn build_migration_plan(from_version: i32, to_version: i32) -> Result
     // weakening retained-size authority for live sessions; v44 protects the
     // trigger-invalidated recovery-usability cache and its durable bounded
     // cursor; v45 protects pending recorder deliveries; v46 protects connector
-    // dispatch ownership and durable ingress. The newest forward-only migration
-    // crossed by the requested path determines its downgrade floor.
+    // dispatch ownership and durable ingress; v47 protects audit target identity;
+    // v48 protects workflow attempt ownership and retry/deadline authority. The
+    // newest forward-only migration crossed by the requested path determines
+    // its downgrade floor.
     let mut steps = Vec::new();
     for migration in MIGRATIONS.iter().rev() {
         if migration.version <= to_version || migration.version > from_version {
@@ -6912,6 +6929,175 @@ mod tests {
     use super::*;
 
     #[test]
+    fn workflow_budget_migration_is_atomic_and_does_not_refund_legacy_executions() {
+        let conn = Connection::open_in_memory().expect("open workflow budget fixture");
+        initialize_schema(&conn).expect("initialize canonical schema");
+        let fresh_ddl = load_schema_object_sql(&conn, "table", "workflow_execution_budgets")
+            .expect("read fresh budget schema")
+            .expect("fresh budget table exists");
+
+        // Reconstruct the v47 shape in this owned fixture. Existing execution
+        // timestamps and logs are not sufficient to infer a safe retry budget.
+        conn.execute_batch(
+            "DROP TABLE workflow_execution_budgets;
+             DELETE FROM schema_version WHERE version = 48;
+             INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed)
+                 VALUES (7, 'local', 100, 100, 1);
+             INSERT INTO workflow_executions
+                 (id, workflow_name, pane_id, current_step, status, started_at, updated_at)
+                 VALUES ('legacy-running', 'retrying', 7, 2, 'running', 100, 900),
+                        ('legacy-waiting', 'retrying', 7, 2, 'waiting', 100, 900),
+                        ('legacy-completed', 'retrying', 7, 3, 'completed', 100, 900);
+             INSERT INTO workflow_step_logs
+                 (workflow_id, step_index, step_name, result_type,
+                  result_data, started_at, completed_at, duration_ms)
+                 VALUES ('legacy-running', 2, 'retrying', 'retry',
+                         '{\"delay_ms\":1000}', 800, 900, 100);
+             CREATE TRIGGER reject_workflow_budget_migration_receipt
+                 BEFORE INSERT ON schema_version WHEN new.version = 48 BEGIN
+                     SELECT RAISE(ABORT, 'fixture rejects budget migration receipt');
+                 END;",
+        )
+        .expect("seed pre-budget executions");
+        set_user_version(&conn, 47).expect("stamp v47 fixture");
+        ensure_ft_meta(&conn, 47).expect("stamp v47 metadata");
+
+        assert!(initialize_schema(&conn).is_err());
+        assert_eq!(get_user_version(&conn).unwrap(), 47);
+        assert!(!table_exists(&conn, "workflow_execution_budgets").unwrap());
+        assert!(conn.is_autocommit(), "failed migration must release its lock");
+
+        conn.execute_batch("DROP TRIGGER reject_workflow_budget_migration_receipt")
+            .expect("release fixture migration failure");
+        initialize_schema(&conn).expect("upgrade v47 workflow fixture");
+        initialize_schema(&conn).expect("repeat current-schema open");
+        assert_eq!(get_user_version(&conn).unwrap(), SCHEMA_VERSION);
+        let upgraded_ddl = load_schema_object_sql(&conn, "table", "workflow_execution_budgets")
+            .expect("read upgraded budget schema")
+            .expect("upgraded budget table exists");
+        assert_eq!(
+            compact_schema_sql(&upgraded_ddl),
+            compact_schema_sql(&fresh_ddl)
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM workflow_execution_budgets",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+            "legacy executions must have no fabricated retry or deadline authority"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM workflow_executions
+                 WHERE started_at = 100 AND updated_at = 900
+                   AND ((id = 'legacy-running' AND status = 'running' AND current_step = 2)
+                     OR (id = 'legacy-waiting' AND status = 'waiting' AND current_step = 2)
+                     OR (id = 'legacy-completed' AND status = 'completed' AND current_step = 3))",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            3,
+            "migration preserves legacy execution evidence for terminal settlement"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT result_data FROM workflow_step_logs WHERE workflow_id = 'legacy-running'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            r#"{"delay_ms":1000}"#
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM schema_version WHERE version = 48",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        ensure_no_foreign_key_violations(&conn, "workflow budget migration").unwrap();
+    }
+
+    #[test]
+    fn workflow_budget_schema_enforces_ownership_and_retains_revision_payload() {
+        let conn = Connection::open_in_memory().expect("open workflow budget schema fixture");
+        initialize_schema(&conn).expect("initialize canonical schema");
+        conn.execute_batch(
+            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed)
+                 VALUES (7, 'local', 1, 1, 1);
+             INSERT INTO workflow_executions
+                 (id, workflow_name, pane_id, status, started_at, updated_at)
+                 VALUES ('owned', 'retrying', 7, 'running', 1, 1);",
+        )
+        .expect("seed budget owner");
+        let payload = r#"{"opaque_budget":"retained verbatim"}"#;
+        conn.execute(
+            "INSERT INTO workflow_execution_budgets (workflow_id, revision, budget_json)
+                 VALUES ('owned', 0, ?1)",
+            [payload],
+        )
+        .expect("persist initial budget");
+        conn.execute(
+            "UPDATE workflow_execution_budgets SET revision = ?1 WHERE workflow_id = 'owned'",
+            [i64::MAX],
+        )
+        .expect("persist maximum storage revision without truncation");
+        let stored: (i64, String) = conn
+            .query_row(
+                "SELECT revision, budget_json FROM workflow_execution_budgets
+                     WHERE workflow_id = 'owned'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, (i64::MAX, payload.to_string()));
+
+        for invalid_sql in [
+            "INSERT INTO workflow_execution_budgets VALUES (NULL, 0, '{}')",
+            "INSERT INTO workflow_execution_budgets VALUES ('missing', 0, '{}')",
+            "INSERT INTO workflow_execution_budgets VALUES ('owned', 0, '{}')",
+            "UPDATE workflow_execution_budgets SET revision = -1 WHERE workflow_id = 'owned'",
+            "UPDATE workflow_execution_budgets SET revision = NULL WHERE workflow_id = 'owned'",
+            "UPDATE workflow_execution_budgets SET budget_json = NULL WHERE workflow_id = 'owned'",
+        ] {
+            assert!(
+                conn.execute(invalid_sql, []).is_err(),
+                "accepted {invalid_sql}"
+            );
+        }
+        conn.execute("DELETE FROM workflow_executions WHERE id = 'owned'", [])
+            .expect("delete owned fixture execution");
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM workflow_execution_budgets",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+            "execution deletion must not leave reusable orphan budget authority"
+        );
+    }
+
+    #[test]
+    fn workflow_budget_migration_refuses_authority_erasing_downgrade() {
+        let migration = migration_for_version(48).expect("workflow budget migration exists");
+        assert!(migration.down_sql.is_none());
+        let error = build_migration_plan(48, 47).expect_err("budget authority is forward-only");
+        assert!(
+            error
+                .to_string()
+                .contains("Rollback not supported for migration v48")
+        );
+    }
+
+    #[test]
     fn audit_target_migration_backfills_atomically_and_is_idempotent() {
         for starting_version in [0, 46] {
             let conn = Connection::open_in_memory().unwrap();
@@ -6953,7 +7139,7 @@ mod tests {
 
             initialize_schema(&conn).unwrap();
             initialize_schema(&conn).unwrap();
-            assert_eq!(get_user_version(&conn).unwrap(), 47);
+            assert_eq!(get_user_version(&conn).unwrap(), SCHEMA_VERSION);
             let target: i64 = conn
                 .query_row(
                     "SELECT target_pane_id FROM audit_actions WHERE id = 91",

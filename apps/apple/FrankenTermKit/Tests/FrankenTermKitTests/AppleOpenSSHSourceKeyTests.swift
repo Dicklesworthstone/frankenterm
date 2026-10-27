@@ -52,17 +52,18 @@ final class AppleOpenSSHSourceKeyTests: XCTestCase {
     func testNativeBcryptPublishedVectorsRemainIndependentAcrossConcurrentCalls() async throws {
         // OpenBSD bcrypt_pbkdf_test.c, blob ad3330bd9560358b952316df97f93d0f5184ceec:
         // the published 256-byte vector has stride eight. Column zero is its
-        // 32-byte result; interleaved columns zero/one (24 bytes each) give 48.
+        // 32-byte result; interleaved columns zero/one (20/24 bytes each) give 40/48.
         // This preserves production admission bounds without regenerating a
         // golden value using the implementation under test.
         let passphrase = try Data(ftHex: "0db3ac94b3ee53284f4a22893b3c24ae")
         let salt = try Data(ftHex: "3a62f0f0dbcef823cfcc854856ea1028")
         let expected = [
             32: try Data(ftHex: "204438175eee7ce136c91b49a67923ff9988c989613180333f97684bc78093e8"),
+            40: try Data(ftHex: "2054440338de170a5ea4ee237c86e1dc368fc9e71bbf490ea678792e238eff4499708873c9bf89a7"),
             48: try Data(ftHex: "2054440338de170a5ea4ee237c86e1dc368fc9e71bbf490ea678792e238eff4499708873c9bf89a7616731a1800133b4")
         ]
         try await withThrowingTaskGroup(of: (Int, Data).self) { group in
-            for count in [32, 48, 48, 32] {
+            for count in [32, 40, 48, 48, 40, 32] {
                 group.addTask {
                     let result = try AppleCryptography().bcryptPBKDF(passphrase: passphrase, salt: salt,
                                                                    rounds: 8, outputByteCount: count)
@@ -74,17 +75,18 @@ final class AppleOpenSSHSourceKeyTests: XCTestCase {
                 XCTAssertEqual(result, expected[count])
                 completed += 1
             }
-            XCTAssertEqual(completed, 4)
+            XCTAssertEqual(completed, 6)
         }
     }
 
-    func testCommonCryptoUsesNISTBigEndianCounterModeForBothKeySizes() async throws {
-        // NIST SP 800-38A, F.5.1 and F.5.5. The second block crosses the initial
+    func testCommonCryptoUsesNISTBigEndianCounterModeForAllKeySizes() async throws {
+        // NIST SP 800-38A, F.5.1/3/5. The second block crosses the initial
         // IV's low-byte boundary, detecting the wrong counter increment order.
         let iv = try Data(ftHex: "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff")
         let clear = try Data(ftHex: "6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51")
         let vectors = [
             ("2b7e151628aed2a6abf7158809cf4f3c", "874d6191b620e3261bef6864990db6ce9806f66b7970fdff8617187bb9fffdff"),
+            ("8e73b0f7da0e6452c810f32b809079e562f8ead2522c6b7b", "1abc932417521ca24f2b0459fe7e6e0b090339ec0aa6faefd5ccc2c6f4ce8e94"),
             ("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4", "601ec313775789a5b7a7f504bbf3d228f443e3ca4d62b59aca84e990cacaf5c5")
         ]
         for (key, ciphertext) in vectors {
@@ -92,10 +94,26 @@ final class AppleOpenSSHSourceKeyTests: XCTestCase {
         }
     }
 
+    func testCommonCryptoUsesNISTCBCWithoutRemovingOpenSSHPadding() async throws {
+        let iv = try Data(ftHex: "000102030405060708090a0b0c0d0e0f")
+        let clear = try Data(ftHex: "6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51")
+        for (key, ciphertext) in [
+            ("2b7e151628aed2a6abf7158809cf4f3c", "7649abac8119b246cee98e9b12e9197d5086cb9b507219ee95db113a917678b2"),
+            ("8e73b0f7da0e6452c810f32b809079e562f8ead2522c6b7b", "4f021db243bc633d7178183a9fa071e8b4d9ada9ad7dedf4e5e738763f69145a"),
+            ("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4", "f58c4c04d6e5f1ba779eabfb5f7bfbd69cfc4e967edb808d679f777bc6702c7d")
+        ] {
+            for bytes in [16, 32] {
+                XCTAssertEqual(try AppleCryptography().decryptAESCBC(Data(try Data(ftHex: ciphertext).prefix(bytes)),
+                    key: Data(ftHex: key), iv: iv), Data(clear.prefix(bytes)))
+            }
+        }
+    }
+
     func testConcurrentNativeUnlocksPreserveEveryIndependentOpenSSHPrivateIdentity() async throws {
         let fixture = try fixtures(), passphrase = Data(fixture.passphrase.utf8)
         XCTAssertEqual(Set(fixture.pairs.map(\.algorithm)), Set(["ssh-ed25519"] + SSHECDSACurve.allCases.map(\.algorithm)))
-        XCTAssertEqual(Set(fixture.pairs.map(\.cipher)), Set(["aes128-ctr", "aes256-ctr"]))
+        XCTAssertEqual(Set(fixture.pairs.map(\.cipher)), Set(["aes128-ctr", "aes192-ctr", "aes256-ctr",
+                                                            "aes128-cbc", "aes192-cbc", "aes256-cbc"]))
         XCTAssertTrue(fixture.pairs.contains(where: { $0.rounds == OpenSSHSourceKey.maximumBcryptRounds }))
         try await withThrowingTaskGroup(of: (Int, PrivateKeyRecord).self) { group in
             for (index, pair) in fixture.pairs.enumerated() {

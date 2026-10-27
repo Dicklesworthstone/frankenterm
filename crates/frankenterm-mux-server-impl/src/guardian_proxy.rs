@@ -4932,6 +4932,12 @@ impl GuardianReplayTailReader {
                     if !remaining_idle_delay.is_zero() {
                         thread::sleep(remaining_idle_delay);
                     }
+                    // Yield one authenticated idle poll to the mux. Waiting
+                    // here for another record starves final-output checkpoints
+                    // and the next-anchor handoff while the pane is quiet (or
+                    // its bounded journal has paused output). The existing
+                    // server wait/client backoff still prevents busy polling.
+                    return Ok(());
                 }
                 GuardianReplayPageBodyDelivery::SnapshotExpired {
                     snapshot_id: expired,
@@ -5110,13 +5116,26 @@ impl GuardianLiveOutputReader for GuardianReplayTailReader {
                     GuardianLiveOutputDelivery::buffered_within_replay_page()
                 });
             }
+            let completing_idle_poll = self
+                .pending_ack
+                .is_some_and(|plan| plan.release_if_complete)
+                && self.pending_terminal_error.is_none();
             self.finish_delivered_page()
                 .map_err(|error| self.retain_transport_retry(error))?;
             if let Some(error) = self.pending_terminal_error.take() {
                 return Err(io::Error::from(error.into_proxy_error()));
             }
+            if completing_idle_poll {
+                // A lost completion Ack is retried under its original
+                // identity. Its eventual success must yield the same idle
+                // handoff, without opening another snapshot first.
+                return Ok(GuardianLiveOutputDelivery::idle_after_replay_completion());
+            }
             self.load_next_output_page()
                 .map_err(|error| self.retain_transport_retry(error))?;
+            if self.records.is_empty() {
+                return Ok(GuardianLiveOutputDelivery::idle_after_replay_completion());
+            }
         }
     }
 }
@@ -12016,6 +12035,153 @@ mod tests {
         }
     }
 
+    #[test]
+    fn idle_reader_stages_final_output_checkpoint_without_another_record() {
+        struct IdleReader(ChannelGuardianReader);
+
+        impl GuardianLiveOutputReader for IdleReader {
+            fn deliver_next_record(
+                &mut self,
+                deliver: &mut dyn FnMut(
+                    GuardianOutputSegmentIdentity,
+                    GuardianOutputAppendReceipt,
+                    Arc<[u8]>,
+                ) -> io::Result<()>,
+            ) -> io::Result<GuardianLiveOutputDelivery> {
+                match self.0.deliver_next_record(deliver) {
+                    Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                        Ok(GuardianLiveOutputDelivery::idle_after_replay_completion())
+                    }
+                    result => result,
+                }
+            }
+        }
+
+        let _global_state = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let (sender, receiver) = sync_channel(1);
+        let (delivered_sender, delivered_receiver) = sync_channel(1);
+        let (mut staging, mutation_state) = fake_staging([], 1);
+        let stage_state = Arc::new(Mutex::new(FakeCheckpointStageState::new([])));
+        staging.checkpoint_publisher = Some(Arc::new(GuardianCheckpointPublisher::with_transport(
+            identity(),
+            Arc::clone(&staging.actor),
+            Box::new(FakeCheckpointStageTransport {
+                state: Arc::clone(&stage_state),
+            }),
+        )));
+        let (genesis, canonical) = genesis_checkpoint_fixture();
+        let restored = GuardianRestoredTerminal::from_checkpoint(
+            identity().pane_id(),
+            genesis,
+            &canonical,
+            (640, 384),
+            test_terminal_config(),
+            TerminalCheckpointLimits::default(),
+        )
+        .unwrap();
+        let activated = staging
+            .activate_verified_restore(
+                restored,
+                Box::new(IdleReader(ChannelGuardianReader {
+                    receiver,
+                    delivered: delivered_sender,
+                })),
+            )
+            .unwrap();
+        let pane_id = alloc_pane_id().unwrap();
+        let pane: Arc<dyn Pane> = Arc::new(activated.into_local_pane(
+            pane_id,
+            0,
+            "guardian idle checkpoint fixture".to_string(),
+        ));
+        let mux = Arc::new(Mux::new(None));
+        mux.add_pane(&pane).unwrap();
+
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        let directory_file = File::open(directory.path()).unwrap();
+        let segment = GuardianOutputSegmentIdentity::new(identity().pane_id(), id(0x501), 1, None)
+            .unwrap();
+        let cipher = GuardianOutputCipher::try_from_key_slice(&[0x5a; 32]).unwrap();
+        let mut journal = GuardianOutputJournal::create_new_at(
+            &directory_file,
+            std::ffi::OsStr::new("guardian-idle-output.segment"),
+            segment,
+            cipher,
+            GuardianOutputJournalLimits::default(),
+        )
+        .unwrap();
+        journal.sync_parent_directory_and_activate().unwrap();
+        let payload = b"final-output-before-idle";
+        let receipt = journal.append_and_sync(payload).unwrap();
+        sender
+            .send((segment, receipt, Arc::<[u8]>::from(payload.as_slice())))
+            .unwrap();
+        delivered_receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        // No explicit checkpoint request and no second output record: the
+        // production reader's ordinary schedule must capture the final bytes
+        // when it receives idle progress. The fixture stops at Stage Seal;
+        // its mutation transport deliberately cannot fabricate an adoption.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let staged = loop {
+            while executor.try_tick().unwrap() {}
+            let state = stage_state.lock();
+            if state.completion_id.is_some() {
+                let descriptor = state.descriptor.unwrap();
+                assert!(matches!(
+                    descriptor.output_boundary(),
+                    GuardianCheckpointOutputBoundaryV1::Record {
+                        sequence,
+                        record_digest,
+                        cumulative_plaintext_bytes,
+                        ..
+                    } if sequence == receipt.sequence()
+                        && record_digest == receipt.record_digest()
+                        && cumulative_plaintext_bytes == receipt.cumulative_plaintext_bytes()
+                ));
+                break Zeroizing::new(state.payload.to_vec());
+            }
+            drop(state);
+            assert!(Instant::now() < deadline, "idle final-output capture did not reach Stage");
+            thread::sleep(Duration::from_millis(2));
+        };
+        let terminal = TerminalCheckpointV3::decode_canonical_json(
+            &staged,
+            TerminalCheckpointLimits::default(),
+        )
+        .unwrap()
+        .restore_inert(test_terminal_config())
+        .unwrap()
+        .into_live(Box::new(std::io::sink()))
+        .unwrap();
+        assert_eq!(
+            terminal.screen().lines_in_phys_range(0..1)[0].as_str().trim_end(),
+            "final-output-before-idle"
+        );
+
+        drop(sender);
+        mutation_state.lock().directives.push_back(FakeDirective::Observe(
+            ObservedChildState::Exited(0),
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            while executor.try_tick().unwrap() {}
+            let admission = executor.admission_snapshot();
+            if admission.active_tasks == 0 && admission.active_estimated_bytes == 0 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "idle checkpoint fixture alerts did not settle");
+            thread::yield_now();
+        }
+    }
+
     fn checkpoint_and_complete_pages(
         descriptor: GuardianCheckpointDescriptorV1,
         checkpoint: Zeroizing<Vec<u8>>,
@@ -14373,6 +14539,140 @@ mod tests {
     }
 
     #[test]
+    fn idle_tail_yields_for_checkpoint_and_reanchor_without_waiting_for_output() {
+        let fixture = capture_record_checkpoint_fixture();
+        let boundary = GuardianReplayBoundary::from_descriptor(fixture.descriptor)
+            .expect("derive quiet tail boundary");
+        let replay_state = Arc::new(Mutex::new(FakeReplayState {
+            pages: VecDeque::from([
+                tail_complete_page(fixture.descriptor),
+                tail_complete_page(fixture.descriptor),
+                tail_output_page(&fixture, b"after-idle"),
+            ]),
+            replay_io_failures: 0,
+            ack_io_failures: 0,
+            requests: Vec::new(),
+            acks: Vec::new(),
+        }));
+        let mut reader = GuardianReplayTailReader::new(
+            Box::new(FakeReplayTransport {
+                state: Arc::clone(&replay_state),
+            }),
+            identity(),
+            fixture.descriptor.checkpoint_id(),
+            fixture.descriptor.capture_generation(),
+            boundary,
+            TerminalCheckpointLimits::default(),
+        )
+        .expect("construct quiet tail reader");
+
+        for completed in 1..=2 {
+            let delivery = reader
+                .deliver_next_record(&mut |_, _, _| {
+                    panic!("an idle completion must not fabricate a parser record")
+                })
+                .expect("each empty completion yields to mux maintenance");
+            assert!(delivery.is_idle());
+            assert!(delivery.has_durable_replay_page_ack());
+            assert_eq!(reader.boundary, boundary);
+            assert!(reader.pending_replay.is_none());
+            assert!(reader.pending_ack.is_none());
+            assert!(reader.cursor.is_none());
+            let state = replay_state.lock();
+            assert_eq!(state.requests.len(), completed);
+            assert_eq!(state.acks.len(), completed);
+            assert!(state.acks.iter().all(|(_, ack)| ack.release_if_complete()));
+        }
+        assert_eq!(
+            reader.idle_poll_interval,
+            GUARDIAN_REPLAY_IDLE_POLL_MIN_INTERVAL.saturating_mul(4),
+            "yielding idle progress must retain bounded client backoff"
+        );
+
+        // The mux can now publish its final-output checkpoint, or pick up an
+        // existing root's adoption, before the reader opens another snapshot.
+        let adopted = GuardianCheckpointIdentityDigest::from_bytes([0x5a; 32]).unwrap();
+        reader.reanchor(adopted, 9);
+        let mut delivered = Vec::new();
+        let delivery = reader
+            .deliver_next_record(&mut |_, output, payload| {
+                assert_eq!(output.sequence(), fixture.receipt.sequence() + 1);
+                delivered.push(payload);
+                Ok(())
+            })
+            .expect("output after idle is delivered exactly once");
+        assert!(!delivery.is_idle());
+        assert!(delivery.has_durable_replay_page_ack());
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].as_ref(), b"after-idle");
+        assert_eq!(reader.idle_poll_interval, GUARDIAN_REPLAY_IDLE_POLL_MIN_INTERVAL);
+        let state = replay_state.lock();
+        assert_eq!(state.requests.len(), 3);
+        assert_eq!(state.acks.len(), 3);
+        assert!(matches!(
+            state.requests[2].1,
+            GuardianReplayRequestV1::Open {
+                selector: GuardianReplaySelectorV1::Resume {
+                    checkpoint_id,
+                    capture_generation: 9,
+                    ..
+                },
+                ..
+            } if checkpoint_id == adopted
+        ));
+    }
+
+    #[test]
+    fn idle_tail_rejects_a_completion_past_its_authenticated_parser_boundary() {
+        let fixture = capture_record_checkpoint_fixture();
+        let boundary = GuardianReplayBoundary::from_descriptor(fixture.descriptor)
+            .expect("derive quiet tail boundary");
+        let completion = GuardianReplayPageDelivery::new(
+            identity().pane_id(),
+            identity().generation(),
+            id(0x710),
+            [0x72; 32],
+            [0; 32],
+            0,
+            None,
+            GuardianReplayPageBodyDelivery::Complete {
+                checkpoint_id: fixture.descriptor.checkpoint_id(),
+                through_sequence: boundary.through_sequence().unwrap() + 1,
+                terminal_record_digest: boundary.previous_record_digest,
+                cumulative_plaintext_bytes: boundary.cumulative_plaintext_bytes,
+            },
+        )
+        .expect("construct unearned completion witness");
+        let replay_state = Arc::new(Mutex::new(FakeReplayState {
+            pages: VecDeque::from([completion]),
+            replay_io_failures: 0,
+            ack_io_failures: 0,
+            requests: Vec::new(),
+            acks: Vec::new(),
+        }));
+        let mut reader = GuardianReplayTailReader::new(
+            Box::new(FakeReplayTransport {
+                state: Arc::clone(&replay_state),
+            }),
+            identity(),
+            fixture.descriptor.checkpoint_id(),
+            fixture.descriptor.capture_generation(),
+            boundary,
+            TerminalCheckpointLimits::default(),
+        )
+        .expect("construct quiet tail reader");
+        let error = reader
+            .deliver_next_record(&mut |_, _, _| {
+                panic!("an invalid completion must not reach the parser")
+            })
+            .expect_err("unearned completion cannot authorize idle checkpoint work");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!reader.has_pending_transport_retry());
+        assert_eq!(reader.boundary, boundary);
+        assert!(replay_state.lock().acks.is_empty());
+    }
+
+    #[test]
     fn tail_reader_takes_a_new_anchor_only_at_its_next_open() {
         let fixture = capture_record_checkpoint_fixture();
         let boundary = GuardianReplayBoundary::from_descriptor(fixture.descriptor)
@@ -14459,12 +14759,16 @@ mod tests {
             assert_eq!(state.acks[0], state.acks[1]);
         }
 
-        let second_error = reader
-            .deliver_next_record(&mut |_, _, _| Ok(()))
-            .expect_err("fake source ends after the retained Ack succeeds");
-        assert_eq!(second_error.kind(), io::ErrorKind::InvalidData);
+        let resumed = reader
+            .deliver_next_record(&mut |_, _, _| {
+                panic!("completion Ack recovery cannot deliver parser bytes")
+            })
+            .expect("retained completion Ack yields idle progress once it succeeds");
+        assert!(resumed.is_idle());
+        assert!(resumed.has_durable_replay_page_ack());
         assert!(!reader.has_pending_transport_retry());
         let state = replay_state.lock();
+        assert_eq!(state.requests.len(), 1, "no snapshot opens before the idle handoff");
         assert_eq!(state.acks.len(), GUARDIAN_REPLAY_EXCHANGE_ATTEMPTS + 1);
         assert!(state.acks.iter().all(|ack| *ack == state.acks[0]));
     }

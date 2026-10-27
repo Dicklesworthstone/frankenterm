@@ -1,6 +1,6 @@
 import XCTest
 import UIKit
-import FrankenTermKit
+@testable import FrankenTermKit
 import FrankenTermTerminal
 
 // Hosted in the FrankenTerm app so the renderer loads the app's bundled
@@ -104,6 +104,37 @@ final class NativeTerminalRenderTests: XCTestCase {
         XCTAssertGreaterThan(green, 200, "SGR 42 background cells were not drawn")
         XCTAssertGreaterThan(blue, 200, "SGR 44 background cells were not drawn")
         XCTAssertGreaterThan(light, 50, "default-foreground glyphs were not rasterized")
+    }
+
+    func testAccessibleOutputHasSeparateLinesAndDoesNotExposeConcealedText() async throws {
+        _ = try await render("first line\r\nwide: 界 👩‍💻\r\n\u{1b}[8mprivate\u{1b}[0m\r\n$ ",
+                             name: "accessible-terminal-lines")
+        let view = try XCTUnwrap(view)
+        let reading = NativeTerminalAccessibility(view: view)
+        let elements = reading.elements().compactMap { $0 as? UIAccessibilityElement }
+        XCTAssertEqual(elements.first?.accessibilityLabel, "Terminal output")
+        XCTAssertGreaterThan(elements.count, 3)
+        let labels = elements.dropFirst().compactMap(\.accessibilityLabel)
+        XCTAssertTrue(labels.contains("first line"))
+        XCTAssertTrue(labels.contains("wide: 界 👩‍💻"))
+        XCTAssertFalse(labels.joined().contains("private"))
+        for element in elements.dropFirst() {
+            XCTAssertTrue(element.accessibilityTraits.contains(.staticText))
+            XCTAssertFalse(element.accessibilityTraits.contains(.updatesFrequently))
+            XCTAssertTrue(view.bounds.contains(element.accessibilityFrameInContainerSpace))
+            XCTAssertEqual(element.accessibilityCustomActions?.count, 3)
+        }
+        // UIKit can retain the old rotor/actions. Their capture path must honor
+        // the renderer's admission gate, even when invoked outside its getter.
+        view.setSceneActive(false)
+        XCTAssertTrue(reading.elements(refresh: true).isEmpty)
+        XCTAssertNil(view.accessibilityValue)
+        view.setSceneActive(true)
+        XCTAssertFalse(reading.elements().isEmpty)
+        // A paused reading snapshot owns only text. It can be discarded on
+        // scene deactivation without closing the terminal or feeding input.
+        reading.discard()
+        XCTAssertFalse(try XCTUnwrap(model).captureFrame(viewportTop: nil).isEmpty)
     }
 
     /// Summed glyph intensity per pixel column of row 0, cell 0 (cell geometry

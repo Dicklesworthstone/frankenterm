@@ -32,6 +32,7 @@ struct ScanCheckpointCryptography: AirGapCryptography {
     func ecdsaPublicKey(scalar: Data, curve: SSHECDSACurve) throws -> Data { throw FTError.unsupported("test.hash_only") }
     func bcryptPBKDF(passphrase: Data, salt: Data, rounds: UInt32, outputByteCount: Int) throws -> Data { throw FTError.unsupported("test.hash_only") }
     func decryptAESCTR(_ ciphertext: Data, key: Data, iv: Data) throws -> Data { throw FTError.unsupported("test.hash_only") }
+    func decryptAESCBC(_ ciphertext: Data, key: Data, iv: Data) throws -> Data { throw FTError.unsupported("test.hash_only") }
 }
 
 final class OpticalScanCheckpointTests: XCTestCase {

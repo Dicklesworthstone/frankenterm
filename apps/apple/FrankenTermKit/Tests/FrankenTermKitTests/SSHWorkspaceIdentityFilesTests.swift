@@ -67,7 +67,7 @@ final class SSHWorkspaceIdentityFilesTests: XCTestCase {
 
     func testAllSupportedClearAndEncryptedKeysSupplyPublicIdentityWithoutSidecars() async throws {
         let fixtures = try Fixtures.load()
-        XCTAssertEqual(fixtures.pairs.count, 6)
+        XCTAssertEqual(fixtures.pairs.count, 22)
         XCTAssertEqual(Set(fixtures.pairs.map(\.algorithm)).count, 4)
         var configuration = "", entries: [String: Data] = [:]
         for (index, fixture) in fixtures.pairs.enumerated() {
