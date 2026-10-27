@@ -6,6 +6,35 @@
 #include <openssl/obj_mac.h>
 #include <openssl/core_names.h>
 #include <openssl/params.h>
+#include <string.h>
+
+/* Independent native DER importer for clear SEC1/PKCS#8 source fixtures.
+ * Check the requested named curve and full key consistency before returning
+ * a fixed-width scalar. This test oracle never enters an Apple product. */
+static inline int ft_test_import_ecdsa_private_scalar(int curve_nid,
+    const unsigned char *der, size_t der_len, unsigned char *output, size_t output_len) {
+    size_t width = curve_nid == NID_X9_62_prime256v1 ? 32 :
+        curve_nid == NID_secp384r1 ? 48 : curve_nid == NID_secp521r1 ? 66 : 0;
+    if (!width || !der || !der_len || der_len > 1024 || !output || output_len != width) return 0;
+    const unsigned char *cursor = der;
+    EVP_PKEY *key = d2i_AutoPrivateKey(NULL, &cursor, (long)der_len);
+    EVP_PKEY_CTX *context = key ? EVP_PKEY_CTX_new_from_pkey(NULL, key, NULL) : NULL;
+    BIGNUM *scalar = NULL;
+    char group[80] = {0};
+    size_t group_len = 0;
+    int ok = key && context && cursor == der + der_len && EVP_PKEY_is_a(key, "EC") == 1 &&
+        EVP_PKEY_get_utf8_string_param(key, OSSL_PKEY_PARAM_GROUP_NAME, group, sizeof(group), &group_len) == 1 &&
+        group_len > 0 && group_len < sizeof(group) && OBJ_txt2nid(group) == curve_nid &&
+        EVP_PKEY_private_check(context) == 1 && EVP_PKEY_pairwise_check(context) == 1 &&
+        EVP_PKEY_get_bn_param(key, OSSL_PKEY_PARAM_PRIV_KEY, &scalar) == 1 && scalar &&
+        !BN_is_zero(scalar) && !BN_is_negative(scalar) &&
+        BN_bn2binpad(scalar, output, (int)output_len) == (int)output_len;
+    BN_clear_free(scalar);
+    EVP_PKEY_CTX_free(context);
+    EVP_PKEY_free(key);
+    if (!ok) OPENSSL_cleanse(output, output_len);
+    return ok;
+}
 
 /* Independent test oracle: only maintained OpenSSL group/scalar operations.
  * No EC_KEY deprecated API and no production dependency on OpenSSL. */

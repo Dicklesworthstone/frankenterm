@@ -121,6 +121,32 @@ struct TestCryptography: AirGapCryptography {
         }) == 1 else { throw FTError.malformed("test.ecdsa") }
         return result
     }
+    func importECDSAPrivateScalar(_ der: Data, curve: SSHECDSACurve) throws -> Data {
+        guard !der.isEmpty, der.count <= LegacyECDSASourceKey.maximumDERBytes else { throw FTError.limit("key.ecdsa_der") }
+        try Task.checkCancellation()
+        let nid: Int32
+        switch curve {
+        case .nistp256: nid = NID_X9_62_prime256v1
+        case .nistp384: nid = NID_secp384r1
+        case .nistp521: nid = NID_secp521r1
+        }
+        var result = Data(count: curve.scalarBytes)
+        let status = result.withUnsafeMutableBytes { output in
+            der.withUnsafeBytes { input in
+                ft_test_import_ecdsa_private_scalar(nid, input.bindMemory(to: UInt8.self).baseAddress, der.count,
+                    output.bindMemory(to: UInt8.self).baseAddress, curve.scalarBytes)
+            }
+        }
+        do {
+            guard status == 1 else { throw FTError.malformed("key.ecdsa_der") }
+            try curve.validateScalar(result)
+            try Task.checkCancellation()
+            return result
+        } catch {
+            result.resetBytes(in: 0..<result.count)
+            throw error
+        }
+    }
     func bcryptPBKDF(passphrase: Data, salt: Data, rounds: UInt32, outputByteCount: Int) throws -> Data {
         try OpenSSHSourcePrimitives.bcryptPBKDF(passphrase: passphrase, salt: salt, rounds: rounds,
                                               outputByteCount: outputByteCount, sha512: { output, input, count in

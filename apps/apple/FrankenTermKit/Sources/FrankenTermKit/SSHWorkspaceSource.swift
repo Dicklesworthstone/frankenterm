@@ -490,7 +490,8 @@ public struct SSHWorkspaceSource: Sendable {
 
     /// Freeze public identities for the selected destinations and jump hosts.
     /// Prefer the exact .pub sidecar; only its absence permits inspection of the
-    /// configured OpenSSH container's public header. An explicitly configured
+    /// configured OpenSSH header or clear ECDSA PEM's embedded public point.
+    /// An explicitly configured
     /// .pub reference never authorizes reading a sibling private file.
     ///
     /// This performs no unlock, KDF, agent query or private-key approval. The
@@ -527,6 +528,9 @@ public struct SSHWorkspaceSource: Sendable {
             } else if !explicitlyPublic, var pem = try read(identity) {
                 defer { pem.resetBytes(in: 0..<pem.count) }
                 if let source = try? OpenSSHSourceKey(pem: pem) { result[reference] = .present(source.publicBlob) }
+                else if let source = try? LegacyECDSASourceKey(pem: pem), let blob = source.embeddedPublicBlob {
+                    result[reference] = .present(blob)
+                }
                 else { result[reference] = .unavailable }
             } else { result[reference] = .missing }
         }

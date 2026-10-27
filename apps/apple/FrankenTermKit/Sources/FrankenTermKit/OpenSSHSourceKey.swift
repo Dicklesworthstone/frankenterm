@@ -62,6 +62,22 @@ public struct OpenSSHSourceKey: Sendable, CustomStringConvertible, CustomDebugSt
               let decoded = Data(base64Encoded: lines.dropFirst().dropLast().joined()), decoded.count <= FTLimit.key else {
             throw FTError.malformed("source_key.pem")
         }
+        try self.init(container: decoded)
+    }
+
+    /// Explicit source selection may normalize an existing clear SEC1/PKCS#8
+    /// ECDSA file. No source is rewritten, and the resulting private record
+    /// follows the same OpenSSH identity checks and FTAG protection as before.
+    public init<C: AirGapCryptography>(pem: Data, using crypto: C) throws {
+        if LegacyECDSASourceKey.recognizes(pem) {
+            let record = try LegacyECDSASourceKey(pem: pem).privateRecord(credentialID: "source-key", using: crypto)
+            try self.init(container: record.container)
+        } else {
+            try self.init(pem: pem)
+        }
+    }
+
+    private init(container decoded: Data) throws {
         container = decoded
         var reader = ByteCursor(decoded)
         guard try reader.take(15) == Data("openssh-key-v1\0".utf8) else { throw FTError.malformed("source_key.magic") }
@@ -189,7 +205,7 @@ public struct OpenSSHSourceKeyUnlocker<C: AirGapCryptography>: Sendable {
     public mutating func select(pem: Data, reference: WorkspaceDocument.Credential) throws -> Selection {
         pending = nil
         try Task.checkCancellation()
-        let source = try OpenSSHSourceKey(pem: pem)
+        let source = try OpenSSHSourceKey(pem: pem, using: crypto)
         guard source.algorithm == reference.algorithm, source.fingerprint(using: crypto) == reference.fingerprint else {
             throw OpenSSHSourceKeyError.identityMismatch
         }

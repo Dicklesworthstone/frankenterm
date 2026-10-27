@@ -45,6 +45,10 @@ public protocol SSHIdentityCryptography: Sendable {
 /// Trusted platform primitive boundary; no algorithm selection comes from JSON.
 /// Apple products use AppleCryptography. Linux tests use an independent oracle.
 public protocol AirGapCryptography: SSHIdentityCryptography {
+    /// Import one bounded, clear SEC1 or PKCS#8 key using the maintained
+    /// platform DER implementation. The caller separately checks the exact
+    /// named curve, canonical source structure and derived public binding.
+    func importECDSAPrivateScalar(_ der: Data, curve: SSHECDSACurve) throws -> Data
     /// OpenSSH known_hosts compatibility only: a 20-byte salt and a bounded
     /// exact lookup name. FTAG authentication continues to use its modern suite.
     func hmacSHA1(key: Data, message: Data) throws -> Data
@@ -60,6 +64,14 @@ public protocol AirGapCryptography: SSHIdentityCryptography {
     /// 16-byte IV, with no PKCS#7 padding. Its checkints, private-derived public
     /// identity and incremental OpenSSH padding must all validate after decryption.
     func decryptAESCBC(_ ciphertext: Data, key: Data, iv: Data) throws -> Data
+}
+
+extension AirGapCryptography {
+    /// A provider that has not implemented DER import must fail closed, never
+    /// treat a copied source scalar or public point as a validated native key.
+    public func importECDSAPrivateScalar(_ der: Data, curve: SSHECDSACurve) throws -> Data {
+        throw FTError.unsupported("source_key.pem_profile")
+    }
 }
 
 #if canImport(CryptoKit)
@@ -109,6 +121,21 @@ public struct AppleCryptography: AirGapCryptography {
             case .nistp521: return try P521.Signing.PrivateKey(rawRepresentation: scalar).publicKey.x963Representation
             }
         } catch { throw FTError.malformed("key.ecdsa_scalar") }
+    }
+    public func importECDSAPrivateScalar(_ der: Data, curve: SSHECDSACurve) throws -> Data {
+        guard !der.isEmpty, der.count <= LegacyECDSASourceKey.maximumDERBytes else { throw FTError.limit("key.ecdsa_der") }
+        try Task.checkCancellation()
+        let scalar: Data
+        do {
+            switch curve {
+            case .nistp256: scalar = try P256.Signing.PrivateKey(derRepresentation: der).rawRepresentation
+            case .nistp384: scalar = try P384.Signing.PrivateKey(derRepresentation: der).rawRepresentation
+            case .nistp521: scalar = try P521.Signing.PrivateKey(derRepresentation: der).rawRepresentation
+            }
+        } catch { throw FTError.malformed("key.ecdsa_der") }
+        try curve.validateScalar(scalar)
+        try Task.checkCancellation()
+        return scalar
     }
 }
 #endif
@@ -301,6 +328,9 @@ public struct PrivateKeyRecord: Sendable, CustomDebugStringConvertible {
         self.credentialID = credentialID; self.container = container; self.publicBlob = publicBlob; self.certificates = certificates
     }
     public static func fromPEM<C: AirGapCryptography>(_ pem: Data, credentialID: String, using crypto: C) throws -> PrivateKeyRecord {
+        if LegacyECDSASourceKey.recognizes(pem) {
+            return try LegacyECDSASourceKey(pem: pem).privateRecord(credentialID: credentialID, using: crypto)
+        }
         guard pem.count <= FTLimit.key, let text = String(data: pem, encoding: .utf8) else { throw FTError.limit("key.pem") }
         let lines = text.trimmingCharacters(in: .whitespacesAndNewlines).components(separatedBy: .newlines).filter { !$0.isEmpty }
         guard lines.count >= 3, lines.first == "-----BEGIN OPENSSH PRIVATE KEY-----", lines.last == "-----END OPENSSH PRIVATE KEY-----",

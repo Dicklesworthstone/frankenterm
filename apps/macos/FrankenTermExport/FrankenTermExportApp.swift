@@ -667,7 +667,7 @@ private final class MacExportModel {
         let panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
         panel.showsHiddenFiles = true
         panel.directoryURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".ssh")
-        panel.message = "Choose a user SSH config, then select its hosts. Local Include files, public identities, and each host's known-hosts files are read within fixed limits. When a .pub file is missing, the configured OpenSSH key's public header supplies its identity. Including or unlocking private keys requires a separate choice. Relative Include paths use ~/.ssh; commands and Match conditions are never executed."
+        panel.message = "Choose a user SSH config, then select its hosts. Local Include files, public identities, and each host's known-hosts files are read within fixed limits. When a .pub file is missing, a configured OpenSSH key's public header or a clear ECDSA PEM's embedded public point can supply its identity. Including or unlocking private keys requires a separate choice. Relative Include paths use ~/.ssh; commands and Match conditions are never executed."
         guard panel.runModal() == .OK, let url = panel.url, windowOpen, foreground, !busy else { return }
         retireSourceKeyPrompt(); retireSSHSelection(); invalidatePrepared()
         perform { [self] operation in
@@ -732,7 +732,7 @@ private final class MacExportModel {
             panel.directoryURL = privateHint.deletingLastPathComponent()
             panel.nameFieldStringValue = privateHint.lastPathComponent
         }
-        panel.message = "Choose the matching OpenSSH Ed25519 or ECDSA key (P-256, P-384, or P-521). Protected files using bcrypt and AES-CTR or AES-CBC (128, 192, or 256 bits) are unlocked locally after you enter their passphrase."
+        panel.message = "Choose the matching OpenSSH Ed25519 or ECDSA key, or a clear ECDSA SEC1/PKCS#8 PEM key (P-256, P-384, or P-521). Protected OpenSSH files using bcrypt and AES-CTR or AES-CBC (128, 192, or 256 bits) are unlocked locally after you enter their passphrase."
         guard panel.runModal() == .OK, let url = panel.url, windowOpen, foreground, !busy else { return }
         retireSourceKeyPrompt(); retireSSHSelection(); invalidatePrepared()
         let token = UUID(); sourceKeyOperation = token
@@ -1093,6 +1093,8 @@ private final class MacExportModel {
                 message = "This key's protection settings exceed the supported unlock limits (bcrypt rounds 1–64 and salt 16–64 bytes). Choose another matching supported source file or keep its public reference."
             } else if error == .unsupported("source_key.cipher") || error == .unsupported("source_key.kdf") {
                 message = "This protected key uses an unsupported format. Source unlocking supports OpenSSH bcrypt with AES-CTR or AES-CBC using 128-, 192-, or 256-bit keys."
+            } else if error == .unsupported("source_key.encrypted_pem") {
+                message = "This encrypted PEM format is not supported. Source unlocking accepts protected OpenSSH files; SEC1 and PKCS#8 ECDSA files must already be clear."
             } else if error == .limit("source_key.passphrase") {
                 message = "Enter a passphrase between 1 and 1,024 UTF-8 bytes."
             } else if error == .malformed("ssh.include_cycle") {
@@ -1465,7 +1467,7 @@ private struct MacExportView: View {
                     }
                     Text("One private record serves every selected reference to the same public key. Keeping a reference only removes any private material already loaded for that identity.")
                         .font(.caption).foregroundStyle(.secondary)
-                    Text("Supported source keys: OpenSSH Ed25519 and ECDSA P-256, P-384, or P-521, including passphrase protection using bcrypt and AES-CTR or AES-CBC (128, 192, or 256 bits). RSA, certificates, hardware keys, and capture from the running Mac workspace need additional support.")
+                    Text("Supported source keys: OpenSSH Ed25519 and ECDSA P-256, P-384, or P-521, plus clear ECDSA SEC1/PKCS#8 PEM files. Protected OpenSSH keys support bcrypt and AES-CTR or AES-CBC (128, 192, or 256 bits). RSA, certificates, hardware keys, and capture from the running Mac workspace need additional support.")
                         .font(.caption).foregroundStyle(.secondary)
                 }.frame(maxWidth: .infinity, alignment: .leading).padding(10)
             }

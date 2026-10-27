@@ -1,0 +1,89 @@
+{
+  "warning": "Deliberately public synthetic test identities. Never use these keys for authentication.",
+  "provenance": {
+    "openssl": "OpenSSL 3.0.13 30 Jan 2024 (Library: OpenSSL 3.0.13 30 Jan 2024)",
+    "commands": [
+      "openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:<named-curve> -pkeyopt ec_param_enc:named_curve",
+      "openssl ec -conv_form uncompressed < PKCS8",
+      "openssl ec -no_public < PKCS8",
+      "openssl pkcs8 -topk8 -nocrypt < SEC1-without-public",
+      "ssh-keygen -y -f /proc/self/fd/0 < each-PEM",
+      "openssl pkey -text -noout < PKCS8"
+    ],
+    "identity_check": "All four forms for each independently generated identity were parsed by ssh-keygen and produced exactly the same public blob. Fixed-width private scalar bytes were independently read by openssl pkey. The public-free forms contain no encoded public point."
+  },
+  "keys": [
+    {
+      "id": "nistp256-1",
+      "curve": "nistp256",
+      "algorithm": "ecdsa-sha2-nistp256",
+      "fingerprint": "SHA256:pX22zcfmZECqV6g3b0twI6w5Qcp6dE0q/lIPZkQ4X2k",
+      "publicKey": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBHoMCZYbOaynK2z5BQgMwikcYHqW57kZwYe4PbMWQXg6o1TlqOF9XTZPlqzUUQ0zPd09/PvtZancZ9mcnFim0yM=",
+      "scalarHex": "7dfa90477d1f8b33fc669765c8c754203926b9da54b65fed20043f4c03b85704",
+      "sec1PEM": "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIH36kEd9H4sz/GaXZcjHVCA5JrnaVLZf7SAEP0wDuFcEoAoGCCqGSM49\nAwEHoUQDQgAEegwJlhs5rKcrbPkFCAzCKRxgepbnuRnBh7g9sxZBeDqjVOWo4X1d\nNk+WrNRRDTM93T38++1lqdxn2ZycWKbTIw==\n-----END EC PRIVATE KEY-----\n",
+      "pkcs8PEM": "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgffqQR30fizP8Zpdl\nyMdUIDkmudpUtl/tIAQ/TAO4VwShRANCAAR6DAmWGzmspyts+QUIDMIpHGB6lue5\nGcGHuD2zFkF4OqNU5ajhfV02T5as1FENMz3dPfz77WWp3GfZnJxYptMj\n-----END PRIVATE KEY-----\n",
+      "sec1WithoutPublicPEM": "-----BEGIN EC PRIVATE KEY-----\nMDECAQEEIH36kEd9H4sz/GaXZcjHVCA5JrnaVLZf7SAEP0wDuFcEoAoGCCqGSM49\nAwEH\n-----END EC PRIVATE KEY-----\n",
+      "pkcs8WithoutPublicPEM": "-----BEGIN PRIVATE KEY-----\nMEECAQAwEwYHKoZIzj0CAQYIKoZIzj0DAQcEJzAlAgEBBCB9+pBHfR+LM/xml2XI\nx1QgOSa52lS2X+0gBD9MA7hXBA==\n-----END PRIVATE KEY-----\n"
+    },
+    {
+      "id": "nistp256-2",
+      "curve": "nistp256",
+      "algorithm": "ecdsa-sha2-nistp256",
+      "fingerprint": "SHA256:leptoE4jnaGI05D+MxCNAcJ4kjZ3dl01sOtGmmjxzVM",
+      "publicKey": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBAwKnywNQpFF7UmpF7EmacNbvXOT+BqTJSFkeJQMM6xxE5E9tN/chCcwbS8UqKOjhNrrxrW4FpQ6Qo7GasD5FDM=",
+      "scalarHex": "df6130bb28da5c995102fc7d9f34df191d411c6513d7cfb8f8d30df42c5cfa56",
+      "sec1PEM": "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIN9hMLso2lyZUQL8fZ803xkdQRxlE9fPuPjTDfQsXPpWoAoGCCqGSM49\nAwEHoUQDQgAEDAqfLA1CkUXtSakXsSZpw1u9c5P4GpMlIWR4lAwzrHETkT2039yE\nJzBtLxSoo6OE2uvGtbgWlDpCjsZqwPkUMw==\n-----END EC PRIVATE KEY-----\n",
+      "pkcs8PEM": "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg32EwuyjaXJlRAvx9\nnzTfGR1BHGUT18+4+NMN9Cxc+lahRANCAAQMCp8sDUKRRe1JqRexJmnDW71zk/ga\nkyUhZHiUDDOscRORPbTf3IQnMG0vFKijo4Ta68a1uBaUOkKOxmrA+RQz\n-----END PRIVATE KEY-----\n",
+      "sec1WithoutPublicPEM": "-----BEGIN EC PRIVATE KEY-----\nMDECAQEEIN9hMLso2lyZUQL8fZ803xkdQRxlE9fPuPjTDfQsXPpWoAoGCCqGSM49\nAwEH\n-----END EC PRIVATE KEY-----\n",
+      "pkcs8WithoutPublicPEM": "-----BEGIN PRIVATE KEY-----\nMEECAQAwEwYHKoZIzj0CAQYIKoZIzj0DAQcEJzAlAgEBBCDfYTC7KNpcmVEC/H2f\nNN8ZHUEcZRPXz7j40w30LFz6Vg==\n-----END PRIVATE KEY-----\n"
+    },
+    {
+      "id": "nistp384-1",
+      "curve": "nistp384",
+      "algorithm": "ecdsa-sha2-nistp384",
+      "fingerprint": "SHA256:g/a7eO/bEj8Kkn+sbYfXobnJIlCeQWSC0YqZ55ly/Dc",
+      "publicKey": "ecdsa-sha2-nistp384 AAAAE2VjZHNhLXNoYTItbmlzdHAzODQAAAAIbmlzdHAzODQAAABhBKu9bgSclZC0GapsBhk4/FfM1GqEEB/Z2IWbccIJFkf+ZHRNiQILeMq9jmmnqRPg0OuY+71PFqDYhvGaiYPKEGdL5J5IrGr7VIZY7jf9asKfpHwTD8HURDV+UZJ5cO37ug==",
+      "scalarHex": "abab0d67b2c02cd8aefe9e2fa3eb5e49830fc8632c91e4972c8d8d14a5650830c97b6e5c1e0832c2b793b0b0b8f138cf",
+      "sec1PEM": "-----BEGIN EC PRIVATE KEY-----\nMIGkAgEBBDCrqw1nssAs2K7+ni+j615Jgw/IYyyR5JcsjY0UpWUIMMl7blweCDLC\nt5OwsLjxOM+gBwYFK4EEACKhZANiAASrvW4EnJWQtBmqbAYZOPxXzNRqhBAf2diF\nm3HCCRZH/mR0TYkCC3jKvY5pp6kT4NDrmPu9Txag2IbxmomDyhBnS+SeSKxq+1SG\nWO43/WrCn6R8Ew/B1EQ1flGSeXDt+7o=\n-----END EC PRIVATE KEY-----\n",
+      "pkcs8PEM": "-----BEGIN PRIVATE KEY-----\nMIG2AgEAMBAGByqGSM49AgEGBSuBBAAiBIGeMIGbAgEBBDCrqw1nssAs2K7+ni+j\n615Jgw/IYyyR5JcsjY0UpWUIMMl7blweCDLCt5OwsLjxOM+hZANiAASrvW4EnJWQ\ntBmqbAYZOPxXzNRqhBAf2diFm3HCCRZH/mR0TYkCC3jKvY5pp6kT4NDrmPu9Txag\n2IbxmomDyhBnS+SeSKxq+1SGWO43/WrCn6R8Ew/B1EQ1flGSeXDt+7o=\n-----END PRIVATE KEY-----\n",
+      "sec1WithoutPublicPEM": "-----BEGIN EC PRIVATE KEY-----\nMD4CAQEEMKurDWeywCzYrv6eL6PrXkmDD8hjLJHklyyNjRSlZQgwyXtuXB4IMsK3\nk7CwuPE4z6AHBgUrgQQAIg==\n-----END EC PRIVATE KEY-----\n",
+      "pkcs8WithoutPublicPEM": "-----BEGIN PRIVATE KEY-----\nME4CAQAwEAYHKoZIzj0CAQYFK4EEACIENzA1AgEBBDCrqw1nssAs2K7+ni+j615J\ngw/IYyyR5JcsjY0UpWUIMMl7blweCDLCt5OwsLjxOM8=\n-----END PRIVATE KEY-----\n"
+    },
+    {
+      "id": "nistp384-2",
+      "curve": "nistp384",
+      "algorithm": "ecdsa-sha2-nistp384",
+      "fingerprint": "SHA256:3sF1h1tOV7ApRSShHF4S6iAV+GNxS/wIyaeFC/0gV5A",
+      "publicKey": "ecdsa-sha2-nistp384 AAAAE2VjZHNhLXNoYTItbmlzdHAzODQAAAAIbmlzdHAzODQAAABhBPod3G/s+y4yfAO/kSivRb8zM1eykkzriK1VLDd/4ZKzWxNV4aPkI1VOJy9v4mEM0YilUGLVSyZVdK/FZ1rZqv+7N2vxGfBveN3If4Uc/o6qHSOOEd7UBnzpi37QNuCQxw==",
+      "scalarHex": "d935899547dce48b109fc68ecd4e98452f943ce59d3b82861a1bc95337606f9982a85f8e16db35e6fe6cf4cf152b8609",
+      "sec1PEM": "-----BEGIN EC PRIVATE KEY-----\nMIGkAgEBBDDZNYmVR9zkixCfxo7NTphFL5Q85Z07goYaG8lTN2BvmYKoX44W2zXm\n/mz0zxUrhgmgBwYFK4EEACKhZANiAAT6Hdxv7PsuMnwDv5Eor0W/MzNXspJM64it\nVSw3f+GSs1sTVeGj5CNVTicvb+JhDNGIpVBi1UsmVXSvxWda2ar/uzdr8Rnwb3jd\nyH+FHP6Oqh0jjhHe1AZ86Yt+0DbgkMc=\n-----END EC PRIVATE KEY-----\n",
+      "pkcs8PEM": "-----BEGIN PRIVATE KEY-----\nMIG2AgEAMBAGByqGSM49AgEGBSuBBAAiBIGeMIGbAgEBBDDZNYmVR9zkixCfxo7N\nTphFL5Q85Z07goYaG8lTN2BvmYKoX44W2zXm/mz0zxUrhgmhZANiAAT6Hdxv7Psu\nMnwDv5Eor0W/MzNXspJM64itVSw3f+GSs1sTVeGj5CNVTicvb+JhDNGIpVBi1Usm\nVXSvxWda2ar/uzdr8Rnwb3jdyH+FHP6Oqh0jjhHe1AZ86Yt+0DbgkMc=\n-----END PRIVATE KEY-----\n",
+      "sec1WithoutPublicPEM": "-----BEGIN EC PRIVATE KEY-----\nMD4CAQEEMNk1iZVH3OSLEJ/Gjs1OmEUvlDzlnTuChhobyVM3YG+ZgqhfjhbbNeb+\nbPTPFSuGCaAHBgUrgQQAIg==\n-----END EC PRIVATE KEY-----\n",
+      "pkcs8WithoutPublicPEM": "-----BEGIN PRIVATE KEY-----\nME4CAQAwEAYHKoZIzj0CAQYFK4EEACIENzA1AgEBBDDZNYmVR9zkixCfxo7NTphF\nL5Q85Z07goYaG8lTN2BvmYKoX44W2zXm/mz0zxUrhgk=\n-----END PRIVATE KEY-----\n"
+    },
+    {
+      "id": "nistp521-1",
+      "curve": "nistp521",
+      "algorithm": "ecdsa-sha2-nistp521",
+      "fingerprint": "SHA256:ZoKZvk4d3ncKODoa55lx639anvSUIhnTdbus0738XBs",
+      "publicKey": "ecdsa-sha2-nistp521 AAAAE2VjZHNhLXNoYTItbmlzdHA1MjEAAAAIbmlzdHA1MjEAAACFBAHKOvPXwb3kT0h/VJ9GvcfLH5BjwgCYjpcerEDZOZFygDAGMxAntlgJX6gaG1RfO2k5AY4HYnm44+sB9RnEzqtTlQCD4FxkrXdlG+C5mwVjtByvP6JR4BFhT0LeAs2B7AAToWmFu1IyQBq4A3ax1aDulRjBJrH7KngRIrlAo5BcUZcNgg==",
+      "scalarHex": "0135786b84dd3fd08b158110268b94432a573f92e6a3d6ca680a9b1d9f93cb6d66c5e8426c9984bf7d8e8a3ae862be404f91f0a92128b3fbcb478d3c52411147eaee",
+      "sec1PEM": "-----BEGIN EC PRIVATE KEY-----\nMIHcAgEBBEIBNXhrhN0/0IsVgRAmi5RDKlc/kuaj1spoCpsdn5PLbWbF6EJsmYS/\nfY6KOuhivkBPkfCpISiz+8tHjTxSQRFH6u6gBwYFK4EEACOhgYkDgYYABAHKOvPX\nwb3kT0h/VJ9GvcfLH5BjwgCYjpcerEDZOZFygDAGMxAntlgJX6gaG1RfO2k5AY4H\nYnm44+sB9RnEzqtTlQCD4FxkrXdlG+C5mwVjtByvP6JR4BFhT0LeAs2B7AAToWmF\nu1IyQBq4A3ax1aDulRjBJrH7KngRIrlAo5BcUZcNgg==\n-----END EC PRIVATE KEY-----\n",
+      "pkcs8PEM": "-----BEGIN PRIVATE KEY-----\nMIHuAgEAMBAGByqGSM49AgEGBSuBBAAjBIHWMIHTAgEBBEIBNXhrhN0/0IsVgRAm\ni5RDKlc/kuaj1spoCpsdn5PLbWbF6EJsmYS/fY6KOuhivkBPkfCpISiz+8tHjTxS\nQRFH6u6hgYkDgYYABAHKOvPXwb3kT0h/VJ9GvcfLH5BjwgCYjpcerEDZOZFygDAG\nMxAntlgJX6gaG1RfO2k5AY4HYnm44+sB9RnEzqtTlQCD4FxkrXdlG+C5mwVjtByv\nP6JR4BFhT0LeAs2B7AAToWmFu1IyQBq4A3ax1aDulRjBJrH7KngRIrlAo5BcUZcN\ngg==\n-----END PRIVATE KEY-----\n",
+      "sec1WithoutPublicPEM": "-----BEGIN EC PRIVATE KEY-----\nMFACAQEEQgE1eGuE3T/QixWBECaLlEMqVz+S5qPWymgKmx2fk8ttZsXoQmyZhL99\njoo66GK+QE+R8KkhKLP7y0eNPFJBEUfq7qAHBgUrgQQAIw==\n-----END EC PRIVATE KEY-----\n",
+      "pkcs8WithoutPublicPEM": "-----BEGIN PRIVATE KEY-----\nMGACAQAwEAYHKoZIzj0CAQYFK4EEACMESTBHAgEBBEIBNXhrhN0/0IsVgRAmi5RD\nKlc/kuaj1spoCpsdn5PLbWbF6EJsmYS/fY6KOuhivkBPkfCpISiz+8tHjTxSQRFH\n6u4=\n-----END PRIVATE KEY-----\n"
+    },
+    {
+      "id": "nistp521-2",
+      "curve": "nistp521",
+      "algorithm": "ecdsa-sha2-nistp521",
+      "fingerprint": "SHA256:fL5vtVxdldHPd4CBPVdzYhjXTZliAv6QDdD3gTUo+SA",
+      "publicKey": "ecdsa-sha2-nistp521 AAAAE2VjZHNhLXNoYTItbmlzdHA1MjEAAAAIbmlzdHA1MjEAAACFBACfNG62/sQJyyUHLLvrVX+artlXcfjkiwYohcgglv4OXGecYiA3EluHjhuyvcOFwmtHH0a4/MSRNUuHQdzMdZChsQG1lJDARpCOF1ANnIMUAFMUGQm0vvq57OrIIFEAOLgOq/5WRvbggyBrQWH/fDOXcU1+EOdpwtBt8CnFrbA65KDTnA==",
+      "scalarHex": "0044fb5acaab8716eb75d85aeb37e745ff10c10ab35ef7128f6c773b4320be74aca5081c1bfe43105400e48376676eaac3daedc8f0d3a1ba4e48fde4b84efbee9e00",
+      "sec1PEM": "-----BEGIN EC PRIVATE KEY-----\nMIHcAgEBBEIARPtayquHFut12FrrN+dF/xDBCrNe9xKPbHc7QyC+dKylCBwb/kMQ\nVADkg3ZnbqrD2u3I8NOhuk5I/eS4TvvungCgBwYFK4EEACOhgYkDgYYABACfNG62\n/sQJyyUHLLvrVX+artlXcfjkiwYohcgglv4OXGecYiA3EluHjhuyvcOFwmtHH0a4\n/MSRNUuHQdzMdZChsQG1lJDARpCOF1ANnIMUAFMUGQm0vvq57OrIIFEAOLgOq/5W\nRvbggyBrQWH/fDOXcU1+EOdpwtBt8CnFrbA65KDTnA==\n-----END EC PRIVATE KEY-----\n",
+      "pkcs8PEM": "-----BEGIN PRIVATE KEY-----\nMIHuAgEAMBAGByqGSM49AgEGBSuBBAAjBIHWMIHTAgEBBEIARPtayquHFut12Frr\nN+dF/xDBCrNe9xKPbHc7QyC+dKylCBwb/kMQVADkg3ZnbqrD2u3I8NOhuk5I/eS4\nTvvungChgYkDgYYABACfNG62/sQJyyUHLLvrVX+artlXcfjkiwYohcgglv4OXGec\nYiA3EluHjhuyvcOFwmtHH0a4/MSRNUuHQdzMdZChsQG1lJDARpCOF1ANnIMUAFMU\nGQm0vvq57OrIIFEAOLgOq/5WRvbggyBrQWH/fDOXcU1+EOdpwtBt8CnFrbA65KDT\nnA==\n-----END PRIVATE KEY-----\n",
+      "sec1WithoutPublicPEM": "-----BEGIN EC PRIVATE KEY-----\nMFACAQEEQgBE+1rKq4cW63XYWus350X/EMEKs173Eo9sdztDIL50rKUIHBv+QxBU\nAOSDdmduqsPa7cjw06G6Tkj95LhO++6eAKAHBgUrgQQAIw==\n-----END EC PRIVATE KEY-----\n",
+      "pkcs8WithoutPublicPEM": "-----BEGIN PRIVATE KEY-----\nMGACAQAwEAYHKoZIzj0CAQYFK4EEACMESTBHAgEBBEIARPtayquHFut12FrrN+dF\n/xDBCrNe9xKPbHc7QyC+dKylCBwb/kMQVADkg3ZnbqrD2u3I8NOhuk5I/eS4Tvvu\nngA=\n-----END PRIVATE KEY-----\n"
+    }
+  ]
+}

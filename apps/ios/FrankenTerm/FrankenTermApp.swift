@@ -2699,9 +2699,12 @@ final class WorkspaceKeyImportController: Identifiable {
     }
 
     static func describe(_ error: Error) -> String {
+        if let error = error as? FTError, error == .unsupported("source_key.encrypted_pem") {
+            return "This encrypted PEM format is not supported. Source unlocking accepts protected OpenSSH files; SEC1 and PKCS#8 ECDSA files must already be clear."
+        }
         if error is FTError || error is OpenSSHSourceKeyError || error is WorkspaceStoreError
             || error is SSHAuthenticationError { return error.localizedDescription }
-        return "The selected key file or protected storage could not be read. Choose a local OpenSSH private-key file and try again."
+        return "The selected key file or protected storage could not be read. Choose a local SSH private-key file and try again."
     }
 }
 
@@ -2789,7 +2792,7 @@ private struct WorkspaceKeyImportSheet: View {
                                 }.disabled(!controller.canChooseFile)
                                     .accessibilityIdentifier("keys.import.choose")
                             } footer: {
-                                Text("Choose a local OpenSSH private-key file for this exact fingerprint. Ed25519 and ECDSA P-256, P-384 and P-521 keys are supported, including files protected with bcrypt and AES-CTR or AES-CBC (128, 192, or 256 bits).")
+                                Text("Choose a local SSH private-key file for this exact fingerprint. OpenSSH Ed25519 and ECDSA P-256, P-384 and P-521 keys are supported, including bcrypt with AES-CTR or AES-CBC (128, 192, or 256 bits). Clear ECDSA SEC1/PKCS#8 PEM files are also supported.")
                             }
                         }
                     }
