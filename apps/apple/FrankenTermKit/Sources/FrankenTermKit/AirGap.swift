@@ -328,6 +328,9 @@ public struct PrivateKeyRecord: Sendable, CustomDebugStringConvertible {
         self.credentialID = credentialID; self.container = container; self.publicBlob = publicBlob; self.certificates = certificates
     }
     public static func fromPEM<C: AirGapCryptography>(_ pem: Data, credentialID: String, using crypto: C) throws -> PrivateKeyRecord {
+        if LegacyRSASourceKey.recognizes(pem) {
+            return try LegacyRSASourceKey(pem: pem).privateRecord(credentialID: credentialID, using: crypto)
+        }
         if LegacyECDSASourceKey.recognizes(pem) {
             return try LegacyECDSASourceKey(pem: pem).privateRecord(credentialID: credentialID, using: crypto)
         }
@@ -381,7 +384,8 @@ public struct PrivateKeyRecord: Sendable, CustomDebugStringConvertible {
         var publicReader = ByteCursor(publicBlob), privateReader = ByteCursor(privatePart)
         let algorithmBytes = try publicReader.sshString(cap: 64)
         guard let algorithm = String(data: algorithmBytes, encoding: .ascii),
-              algorithm == "ssh-ed25519" || SSHECDSACurve.allCases.contains(where: { $0.algorithm == algorithm }) else {
+              algorithm == "ssh-ed25519" || algorithm == "ssh-rsa" ||
+              SSHECDSACurve.allCases.contains(where: { $0.algorithm == algorithm }) else {
             throw FTError.unsupported("key.family")
         }
         guard try privateReader.uint(4) == privateReader.uint(4),
@@ -393,6 +397,10 @@ public struct PrivateKeyRecord: Sendable, CustomDebugStringConvertible {
             let privateKey = try privateReader.sshString(cap: 64)
             guard privateKey.count == 64, privateKey.suffix(32) == publicKey,
                   try crypto.ed25519PublicKey(seed: Data(privateKey.prefix(32))) == publicKey else { throw FTError.malformed("key.identity") }
+        } else if algorithm == "ssh-rsa" {
+            let identity = try SSHPublicIdentity(blob: publicBlob)
+            let material = try OpenSSHRSAKeyMaterial(reading: &privateReader)
+            guard material.publicBlob == identity.blob else { throw FTError.malformed("key.identity") }
         } else {
             guard let curve = SSHECDSACurve.allCases.first(where: { $0.algorithm == algorithm }) else { throw FTError.unsupported("key.family") }
             let curveName = Data(curve.rawValue.utf8)

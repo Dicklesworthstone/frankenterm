@@ -99,24 +99,37 @@ public struct SSHPublicIdentity: Sendable, Equatable {
 /// exchange signature, and must not substitute a later rekey's exchange hash.
 public struct SSHUserAuthenticationChallenge: Sendable, CustomDebugStringConvertible {
     public let sessionIdentifier: Data, user: String, publicBlob: Data, algorithm: String
-    public let fingerprint: String
+    /// The stable public-identity format is distinct from an RSA-SHA2 signature
+    /// algorithm. Changing the hash never changes a saved credential fingerprint.
+    public let publicKeyAlgorithm: String, fingerprint: String
     public var debugDescription: String { "SSHUserAuthenticationChallenge([redacted])" }
 
-    public init(sessionIdentifier: Data, user: String, publicBlob: Data) throws {
+    public init(sessionIdentifier: Data, user: String, publicBlob: Data,
+                signatureAlgorithm: String? = nil) throws {
         // Initial mobile profile uses SHA-2 session identifiers. Legacy SHA-1
         // exchange identifiers and arbitrary-size signing inputs are not enabled.
         guard [32, 48, 64].contains(sessionIdentifier.count), !user.isEmpty, user.utf8.count <= 256,
               !user.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
-              !publicBlob.isEmpty, publicBlob.count <= 512 else { throw SSHAuthenticationError.invalidChallenge }
+              !publicBlob.isEmpty, publicBlob.count <= 1053 else { throw SSHAuthenticationError.invalidChallenge }
         let identity = try SSHPublicIdentity(blob: publicBlob)
-        // Public RSA host support does not enable RSA credential offers or
-        // signing. Their negotiated algorithm/container path is separate.
-        guard identity.algorithm == "ssh-ed25519"
-            || SSHECDSACurve.allCases.contains(where: { $0.algorithm == identity.algorithm }) else {
-            throw SSHAuthenticationError.unsupportedAlgorithm
+        let algorithm: String
+        if identity.algorithm == "ssh-rsa" {
+            // RFC 8332 retains the ssh-rsa public blob but signs the exact
+            // negotiated SHA-2 name. There is no implicit SHA-1 or guessed hash.
+            guard let signatureAlgorithm,
+                  signatureAlgorithm == "rsa-sha2-256" || signatureAlgorithm == "rsa-sha2-512" else {
+                throw SSHAuthenticationError.unsupportedAlgorithm
+            }
+            algorithm = signatureAlgorithm
+        } else {
+            guard signatureAlgorithm == nil || signatureAlgorithm == identity.algorithm else {
+                throw SSHAuthenticationError.unsupportedAlgorithm
+            }
+            algorithm = identity.algorithm
         }
         self.sessionIdentifier = sessionIdentifier; self.user = user
-        self.publicBlob = publicBlob; self.algorithm = identity.algorithm
+        self.publicBlob = publicBlob; self.algorithm = algorithm
+        publicKeyAlgorithm = identity.algorithm
         fingerprint = identity.fingerprint
     }
 
@@ -186,6 +199,10 @@ public enum SSHUserAuthenticationSigner {
             defer { privateBytes.resetBytes(in: 0..<privateBytes.count) }
             payload = try Curve25519.Signing.PrivateKey(rawRepresentation: privateBytes.prefix(32)).signature(for: challenge.signedData)
             guard payload.count == 64 else { throw SSHAuthenticationError.unavailable }
+        } else if challenge.publicKeyAlgorithm == "ssh-rsa" {
+            let key = try OpenSSHRSAKeyMaterial(reading: &inner)
+            guard key.publicBlob == challenge.publicBlob else { throw SSHAuthenticationError.identityMismatch }
+            payload = try key.signature(for: challenge.signedData, algorithm: challenge.algorithm)
         } else {
             guard let curve = SSHECDSACurve.allCases.first(where: { $0.algorithm == challenge.algorithm }) else {
                 throw SSHAuthenticationError.unsupportedAlgorithm
@@ -296,6 +313,7 @@ public struct SSHAuthenticationRequest: Identifiable, Sendable, CustomDebugStrin
 public struct SSHAuthenticationSignature: Sendable, CustomDebugStringConvertible {
     public let requestID: UUID, transportID: UUID
     public let authorization: WorkspaceSSHAuthorization
+    public let algorithm: String
     public let sessionIdentifier: Data, publicBlob: Data, signatureBlob: Data
     public var debugDescription: String { "SSHAuthenticationSignature([redacted])" }
 }
@@ -606,10 +624,12 @@ public actor SSHAuthenticationBroker {
     public func prepare(workspaceID: UUID, expectedRevision: UUID, routeID: String, credentialID: String,
                         presentedHostKey: WorkspaceDocument.HostKey, transportID: UUID,
                         sessionIdentifier: Data, publicBlob: Data,
+                        signatureAlgorithm: String? = nil,
                         transitForRouteID: String? = nil) async throws -> SSHAuthenticationRequest {
         // Bound input before retaining it across the first suspension point.
         _ = try WorkspaceDocument.identifier(routeID); _ = try WorkspaceDocument.identifier(credentialID)
-        guard [32, 48, 64].contains(sessionIdentifier.count), (1...512).contains(publicBlob.count) else {
+        guard [32, 48, 64].contains(sessionIdentifier.count), (1...1053).contains(publicBlob.count),
+              signatureAlgorithm.map({ $0.utf8.count <= 64 }) ?? true else {
             throw SSHAuthenticationError.invalidChallenge
         }
         let id = try await acquireWorker(transportID: transportID)
@@ -620,8 +640,8 @@ public actor SSHAuthenticationBroker {
                 presentedHostKey: presentedHostKey, support: support, transitForRouteID: transitForRouteID)
             try checkCurrent(id)
             let challenge = try SSHUserAuthenticationChallenge(sessionIdentifier: sessionIdentifier,
-                                                               user: authorization.user, publicBlob: publicBlob)
-            guard challenge.algorithm == authorization.algorithm, challenge.fingerprint == authorization.fingerprint else {
+                user: authorization.user, publicBlob: publicBlob, signatureAlgorithm: signatureAlgorithm)
+            guard challenge.publicKeyAlgorithm == authorization.algorithm, challenge.fingerprint == authorization.fingerprint else {
                 throw SSHAuthenticationError.identityMismatch
             }
             pending?.authorization = authorization; pending?.challenge = challenge; pending?.preparing = false
@@ -647,10 +667,13 @@ public actor SSHAuthenticationBroker {
             try await signer.sign(requestID: requestID, authorization: authorization, challenge: challenge)
         } onCancel: { signer.cancel(requestID: requestID) }
         try checkCurrent(requestID)
-        guard !signature.isEmpty, signature.count <= 512 else { throw SSHAuthenticationError.unavailable }
+        // 8192-bit RSA contributes 1024 raw bytes plus two SSH strings and the
+        // rsa-sha2-512 name. No private material crosses this bounded result.
+        guard !signature.isEmpty, signature.count <= 1044 else { throw SSHAuthenticationError.unavailable }
         try await store.validateSSHAuthentication(authorization, support: support)
         try checkCurrent(requestID)
         return .init(requestID: requestID, transportID: selected.transportID, authorization: authorization,
+                     algorithm: challenge.algorithm,
                      sessionIdentifier: challenge.sessionIdentifier, publicBlob: challenge.publicBlob, signatureBlob: signature)
     }
 

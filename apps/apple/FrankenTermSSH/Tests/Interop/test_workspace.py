@@ -2,7 +2,7 @@
 
 Run with a built native driver and XCTest bundle, without rebuilding the package:
 python Tests/Interop/test_workspace.py /path/to/libftssh.so /path/to/FrankenTermSSHPackageTests.xctest
-Append /path/to/WorkspaceSSHProbe to also exercise all four key families,
+Append /path/to/WorkspaceSSHProbe to also exercise every supported key family,
 protected-worker cancellation and durable managed-session creation/retirement.
 Synthetic test keys only. No user Keychain, external destination or actual shell.
 """
@@ -332,9 +332,9 @@ class OrderedWorkspaceInteropTests(unittest.TestCase):
 
 @unittest.skipUnless(PROBE, "provide WorkspaceSSHProbe for protected-worker and journal scenarios")
 class ProtectedWorkspaceInteropTests(unittest.TestCase):
-    def run_probe(self, mode, key=None):
+    def run_probe(self, mode, key=None, user_signature=None):
         key = key or ed25519.Ed25519PrivateKey.generate()
-        server = fixture.LoopbackServer(key)
+        server = fixture.LoopbackServer(key, user_signature=user_signature)
         host = fixture.public_blob(ec.generate_private_key(ec.SECP256R1())) if mode == "wrongPin" else server.host_blob
         pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.OpenSSH, serialization.NoEncryption())
         request = {"pem": pem.decode()}
@@ -412,6 +412,18 @@ class ProtectedWorkspaceInteropTests(unittest.TestCase):
         for key in keys:
             with self.subTest(curve=getattr(key, "curve", None)):
                 self.run_probe("io", key)
+
+    def test_imported_rsa_credentials_use_each_sha2_digest_with_the_production_signer(self):
+        for bits in [2048, 4096, 8192]:
+            for algorithm in ["rsa-sha2-256", "rsa-sha2-512"]:
+                with self.subTest(bits=bits, algorithm=algorithm):
+                    self.run_probe("io", fixture.rsa_client_key(bits), user_signature=algorithm)
+
+    def test_rsa_protected_worker_cannot_publish_a_signature_after_policy_or_owner_changes(self):
+        key = fixture.rsa_client_key(2048)
+        for mode in ["wrongPin", "revokeKeyBefore", "revokeKeyDuring", "reimportDuring", "cancelDuring"]:
+            with self.subTest(mode=mode):
+                self.run_probe(mode, key, user_signature="rsa-sha2-512")
 
     def test_wrong_peer_revoked_identity_and_stale_revision_never_offer_a_key(self):
         for mode in ["wrongPin", "revokeKeyBefore", "revokeHostBefore", "staleRevision"]:

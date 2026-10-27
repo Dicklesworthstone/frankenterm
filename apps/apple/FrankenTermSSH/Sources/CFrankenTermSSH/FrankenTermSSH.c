@@ -43,9 +43,9 @@ struct ftssh_session {
     size_t egress_head, egress_count, egress_flight, write_receipt;
     int fd, phase, terminal_error, closing;
     size_t limit, allocated, peak;
-    char user[257], algorithm[65];
-    uint8_t public_blob[512], challenge[1024], signature[256];
-    size_t public_length, challenge_length, signature_length;
+    char user[257], algorithm[65], signature_algorithm[65];
+    uint8_t public_blob[FTSSH_PUBLIC_KEY_CAPACITY], challenge[FTSSH_CHALLENGE_CAPACITY], signature[1024];
+    size_t public_length, challenge_length, signature_length, rsa_signature_length;
     uint8_t password[FTSSH_PASSWORD_CAPACITY];
     size_t password_length;
     int password_authentication, password_supplied;
@@ -251,6 +251,15 @@ static int expected_field(const uint8_t **bytes, size_t *left, const void *expec
     const uint8_t *value; size_t n;
     return field(bytes, left, &value, &n) && n == length && equal(value, expected, n);
 }
+static int positive_mpint(const uint8_t **bytes, size_t *left, const uint8_t **value,
+                          size_t *length, size_t maximum) {
+    if(!field(bytes, left, value, length) || !*length || *length > maximum + 1 || (**value & 128)) return 0;
+    if(**value == 0) {
+        if(*length == 1 || !((*value)[1] & 128)) return 0;
+        (*value)++; (*length)--;
+    }
+    return *length <= maximum;
+}
 static int valid_geometry(uint32_t c, uint32_t r, uint32_t w, uint32_t h) {
     return c && r && c <= 512 && r <= 512 && c * r <= 65536 && w <= 65535 && h <= 65535;
 }
@@ -297,6 +306,7 @@ int ftssh_create(int fd, size_t maximum, ftssh_session **out) {
     const struct { int method; const char *allowed; } policies[] = {
         {LIBSSH2_METHOD_KEX, "curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521"},
         {LIBSSH2_METHOD_HOSTKEY, "ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,rsa-sha2-512,rsa-sha2-256"},
+        {LIBSSH2_METHOD_SIGN_ALGO, "rsa-sha2-512,rsa-sha2-256"},
         {LIBSSH2_METHOD_CRYPT_CS, "aes256-ctr,aes128-ctr"}, {LIBSSH2_METHOD_CRYPT_SC, "aes256-ctr,aes128-ctr"},
         {LIBSSH2_METHOD_MAC_CS, "hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com"},
         {LIBSSH2_METHOD_MAC_SC, "hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com"},
@@ -352,16 +362,27 @@ int ftssh_approve_host_key(ftssh_session *s, const uint8_t *key, size_t length) 
 int ftssh_begin_authentication(ftssh_session *s, const char *user, size_t user_length,
                               const uint8_t *blob, size_t length) {
     int rc = check(s, APPROVED); if(rc) return rc;
-    if(!user || !user_length || user_length > 256 || !blob || !length || length > 512) return FTSSH_INVALID;
+    if(!user || !user_length || user_length > 256 || !blob || !length || length > FTSSH_PUBLIC_KEY_CAPACITY) return FTSSH_INVALID;
     for(size_t i = 0; i < user_length; i++) if((unsigned char)user[i] < 32 || user[i] == 127) return FTSSH_INVALID;
     const uint8_t *cursor = blob, *algorithm; size_t left = length, n;
     if(!field(&cursor, &left, &algorithm, &n) || n >= sizeof(s->algorithm)) return FTSSH_INVALID;
-    if(!((n == 11 && equal(algorithm, (const uint8_t *)"ssh-ed25519", n)) ||
+    if(!((n == 7 && equal(algorithm, (const uint8_t *)"ssh-rsa", n)) ||
+         (n == 11 && equal(algorithm, (const uint8_t *)"ssh-ed25519", n)) ||
          (n == 19 && (equal(algorithm, (const uint8_t *)"ecdsa-sha2-nistp256", n) ||
                       equal(algorithm, (const uint8_t *)"ecdsa-sha2-nistp384", n) ||
                       equal(algorithm, (const uint8_t *)"ecdsa-sha2-nistp521", n))))) return FTSSH_UNSUPPORTED;
-    const uint8_t *point; size_t point_length;
-    if(n == 11) {
+    const uint8_t *point; size_t point_length, rsa_signature_length = 0;
+    if(n == 7) {
+        const uint8_t *exponent, *modulus; size_t exponent_length, modulus_length;
+        if(!positive_mpint(&cursor, &left, &exponent, &exponent_length, 8) ||
+           !positive_mpint(&cursor, &left, &modulus, &modulus_length, 1024) || left ||
+           !(exponent[exponent_length - 1] & 1) || !(modulus[modulus_length - 1] & 1) ||
+           (exponent_length == 1 && exponent[0] < 3)) return FTSSH_INVALID;
+        size_t bits = (modulus_length - 1) * 8;
+        for(unsigned int high = modulus[0]; high; high >>= 1) bits++;
+        if(bits < 2048 || bits > 8192) return FTSSH_UNSUPPORTED;
+        rsa_signature_length = modulus_length;
+    } else if(n == 11) {
         if(!field(&cursor, &left, &point, &point_length) || point_length != 32 || left) return FTSSH_INVALID;
     } else {
         /* Curve and uncompressed point length must agree with the algorithm.
@@ -374,6 +395,7 @@ int ftssh_begin_authentication(ftssh_session *s, const char *user, size_t user_l
     memcpy(s->algorithm, algorithm, n); s->algorithm[n] = 0;
     memcpy(s->user, user, user_length); s->user[user_length] = 0;
     memcpy(s->public_blob, blob, length); s->public_length = length;
+    s->rsa_signature_length = rsa_signature_length;
     s->phase = AUTH; return FTSSH_OK;
 }
 int ftssh_begin_password_authentication(ftssh_session *s, const char *user, size_t user_length) {
@@ -409,10 +431,27 @@ static int sign_callback(LIBSSH2_SESSION *ssh, unsigned char **signature, size_t
        !expected_field(&cursor, &left, "ssh-connection", 14) ||
        !expected_field(&cursor, &left, "publickey", 9) || !left || *cursor++ != 1) return reject_challenge(s);
     left--;
-    if(!expected_field(&cursor, &left, s->algorithm, strlen(s->algorithm)) ||
+    const uint8_t *selected_algorithm; size_t selected_length;
+    if(!field(&cursor, &left, &selected_algorithm, &selected_length) ||
+       !selected_length || selected_length >= sizeof(s->signature_algorithm) ||
        !expected_field(&cursor, &left, s->public_blob, s->public_length) || left) return reject_challenge(s);
+    if(s->rsa_signature_length) {
+        if(selected_length != 12 ||
+           !(equal(selected_algorithm, (const uint8_t *)"rsa-sha2-256", 12) ||
+             equal(selected_algorithm, (const uint8_t *)"rsa-sha2-512", 12))) {
+            /* Missing server-sig-algs leaves libssh2's unsigned offer at
+             * ssh-rsa despite SIGN_ALGO preferences. Never sign it. In
+             * particular do not return ALGO_UNSUPPORTED: libssh2 interprets
+             * that callback result as permission to retry its default method. */
+            s->sign_error = FTSSH_UNSUPPORTED; return LIBSSH2_ERROR_INVAL;
+        }
+    } else if(selected_length != strlen(s->algorithm) ||
+              !equal(selected_algorithm, (const uint8_t *)s->algorithm, selected_length)) return reject_challenge(s);
     if(s->challenge_length && (s->challenge_length != length || !equal(s->challenge, data, length))) return reject_challenge(s);
-    if(!s->challenge_length) { memcpy(s->challenge, data, length); s->challenge_length = length; }
+    if(!s->challenge_length) {
+        memcpy(s->challenge, data, length); s->challenge_length = length;
+        memcpy(s->signature_algorithm, selected_algorithm, selected_length); s->signature_algorithm[selected_length] = 0;
+    }
     if(s->signature_consumed) return reject_challenge(s);
     if(!s->signature_length) return LIBSSH2_ERROR_EAGAIN;
     void *context = s;
@@ -462,8 +501,11 @@ static int authentication_result(ftssh_session *s, int rc, int authenticated, in
      * USERAUTH_FAILURE response to the unsigned offer. PUBLICKEY_UNVERIFIED
      * also covers signed failure/partial success, and is never retry evidence. */
     if(offered && s->auth_methods_checked && rc == LIBSSH2_ERROR_AUTHENTICATION_FAILED &&
-       !s->sign_callback_entered && !s->challenge_length && !s->signature_consumed)
+       !s->rsa_signature_length && !s->sign_callback_entered && !s->challenge_length && !s->signature_consumed)
         return fail(s, FTSSH_AUTH_REJECTED);
+    /* RSA's public API does not reveal which unsigned algorithm was offered.
+     * A refusal can therefore mean missing SHA-2 support, not a refused key;
+     * it cannot authorize automatic iteration over other private identities. */
     switch(rc) {
     case LIBSSH2_ERROR_ALLOC: return fail(s, FTSSH_LIMIT);
     case LIBSSH2_ERROR_SOCKET_NONE: case LIBSSH2_ERROR_SOCKET_SEND:
@@ -533,13 +575,16 @@ int ftssh_copy_challenge(ftssh_session *s, uint8_t *out, size_t capacity, size_t
 }
 int ftssh_supply_signature(ftssh_session *s, const uint8_t *blob, size_t length) {
     int rc = check(s, AUTH); if(rc) return rc;
-    if(!blob || !length || length > 512) return FTSSH_INVALID;
+    if(!blob || !length || length > FTSSH_SIGNATURE_CAPACITY) return FTSSH_INVALID;
     if(!s->challenge_length || s->signature_length || s->signature_consumed) return FTSSH_STATE;
     const uint8_t *cursor = blob, *payload; size_t left = length, n;
-    if(!expected_field(&cursor, &left, s->algorithm, strlen(s->algorithm)) ||
+    if(!expected_field(&cursor, &left, s->signature_algorithm, strlen(s->signature_algorithm)) ||
        !field(&cursor, &left, &payload, &n) || left || !n || n > sizeof(s->signature)) return FTSSH_CHALLENGE;
-    if(strcmp(s->algorithm, "ssh-ed25519") == 0 && n != 64) return FTSSH_CHALLENGE;
-    if(strcmp(s->algorithm, "ssh-ed25519") != 0) {
+    if(s->rsa_signature_length) {
+        if(n != s->rsa_signature_length) return FTSSH_CHALLENGE;
+    } else if(strcmp(s->algorithm, "ssh-ed25519") == 0) {
+        if(n != 64) return FTSSH_CHALLENGE;
+    } else {
         const uint8_t *part = payload, *integer; size_t remaining = n, width;
         size_t maximum = s->algorithm[16] == '2' ? 32 : (s->algorithm[16] == '3' ? 48 : 66);
         for(int i = 0; i < 2; i++) {

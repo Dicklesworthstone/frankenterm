@@ -9,6 +9,9 @@ import array
 import ctypes as C
 import ctypes.util
 import fcntl
+from functools import lru_cache
+import json
+from pathlib import Path
 import select
 import socket
 import struct
@@ -18,7 +21,7 @@ import termios
 import time
 import unittest
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ed25519, ec
+from cryptography.hazmat.primitives.asymmetric import ed25519, ec, padding, rsa
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 
 P, I, Z = C.c_void_p, C.c_int, C.c_size_t
@@ -38,6 +41,7 @@ for name, result, args in [
     ("ssh_bind_options_set", I, [P, I, P]), ("ssh_bind_accept_fd", I, [P, P, I]),
     ("ssh_handle_key_exchange", I, [P]), ("ssh_set_auth_methods", None, [P, I]),
     ("ssh_get_error", C.c_char_p, [P]),
+    ("ssh_set_log_callback", I, [P]), ("ssh_set_log_level", I, [I]),
     ("ssh_pki_import_privkey_base64", I, [C.c_char_p, C.c_char_p, P, P, C.POINTER(P)]),
     ("ssh_pki_export_pubkey_base64", I, [P, C.POINTER(P)]),
     ("ssh_key_free", None, [P]), ("ssh_string_free_char", None, [P]),
@@ -101,6 +105,17 @@ def public_blob(key):
     return base64.b64decode(key.public_key().public_bytes(serialization.Encoding.OpenSSH, serialization.PublicFormat.OpenSSH).split()[1])
 
 
+@lru_cache(maxsize=3)
+def rsa_client_key(bits):
+    """Independent ssh-keygen/OpenSSL fixtures, shared with production import tests."""
+    path = Path(__file__).resolve().parents[5] / "fixtures" / "ios-airgap" / "rsa-source-keys.json"
+    record = next(item for item in json.loads(path.read_text())["keys"] if item["bits"] == bits)
+    key = serialization.load_pem_private_key(record["pkcs8PEM"].encode("ascii"), password=None)
+    if not isinstance(key, rsa.RSAPrivateKey) or key.key_size != bits:
+        raise ValueError("RSA test fixture does not match its named size")
+    return key
+
+
 def take_string(data):
     n = int.from_bytes(data[:4], "big")
     if len(data) < 4 or n > len(data) - 4:
@@ -111,6 +126,20 @@ def take_string(data):
 def signature(key, data):
     if isinstance(key, ed25519.Ed25519PrivateKey):
         algorithm, payload = b"ssh-ed25519", key.sign(data)
+    elif isinstance(key, rsa.RSAPrivateKey):
+        _, rest = take_string(data)
+        if not rest or rest[0] != 50:
+            raise ValueError("RSA fixture requires an SSH authentication preimage")
+        rest = rest[1:]
+        for _ in range(3):
+            _, rest = take_string(rest)
+        if not rest or rest[0] != 1:
+            raise ValueError("RSA fixture requires a signed authentication request")
+        algorithm, _ = take_string(rest[1:])
+        if algorithm not in (b"rsa-sha2-256", b"rsa-sha2-512"):
+            raise ValueError("RSA fixture never signs SHA-1 or an unknown algorithm")
+        digest = hashes.SHA256() if algorithm == b"rsa-sha2-256" else hashes.SHA512()
+        payload = key.sign(data, padding.PKCS1v15(), digest)
     else:
         profiles = {"secp256r1": (b"ecdsa-sha2-nistp256", hashes.SHA256()),
                     "secp384r1": (b"ecdsa-sha2-nistp384", hashes.SHA384()),
@@ -127,11 +156,13 @@ def signature(key, data):
 class LoopbackServer:
     def __init__(self, key, reject=False, family=socket.AF_INET, completion="unknown",
                  auth_mode="normal", connections=1, host_key=None, host_signature=None,
-                 forward_to=None, forward_host="target.internal.invalid", password=None):
+                 forward_to=None, forward_host="target.internal.invalid", password=None, user_signature=None):
         if not isinstance(connections, int) or not 1 <= connections <= 8:
             raise ValueError("test connection count must be bounded")
         if host_signature not in (None, "rsa-sha2-256", "rsa-sha2-512", "ssh-rsa"):
             raise ValueError("test host signature must be an exact supported fixture value")
+        if user_signature not in (None, "rsa-sha2-256", "rsa-sha2-512", "ssh-rsa"):
+            raise ValueError("test user signature must be an exact supported fixture value")
         if password is not None and (not isinstance(password, bytes) or not 1 <= len(password) <= 1024):
             raise ValueError("test password must be bounded synthetic bytes")
         self.public = public_blob(key)
@@ -139,6 +170,7 @@ class LoopbackServer:
         self.host_key = host_key or ec.generate_private_key(ec.SECP256R1())
         self.host_blob = public_blob(self.host_key)
         self.host_signature = host_signature
+        self.user_signature = user_signature
         if forward_to is not None and forward_to[0] not in ("127.0.0.1", "::1"):
             raise ValueError("test relay destination must be loopback")
         self.forward_to, self.forward_host = forward_to, forward_host
@@ -151,6 +183,7 @@ class LoopbackServer:
         self.control_flood_ready = threading.Event()
         self.release_completion = threading.Event()
         self.events, self.received, self.errors = [], bytearray(), []
+        self.invalid_signature = threading.Event()
         self.stop = threading.Event()
         self.done = threading.Event()
         self.listener = socket.socket(family, socket.SOCK_STREAM)
@@ -174,7 +207,20 @@ class LoopbackServer:
     def run_connection(self):
         session, server, key, channel = None, None, P(), None
         control = None
+        verification_observer = None
         try:
+            if self.auth_mode == "observeInvalidSignature":
+                # libssh drops cryptographically invalid USERAUTH packets
+                # before its public message queue. Observe only this fixed
+                # diagnostic on its thread-local public logging callback;
+                # no key, password, payload or arbitrary trace is retained.
+                @C.CFUNCTYPE(None, I, C.c_char_p, C.c_char_p, P)
+                def verification_observer(priority, function, message, userdata):
+                    if (function == b"ssh_packet_userauth_request" and message and
+                            b"Received an invalid signature from peer" in message):
+                        self.invalid_signature.set()
+                if SERVER.ssh_set_log_callback(verification_observer) or SERVER.ssh_set_log_level(3):
+                    raise RuntimeError("test verification observer failed")
             accept_deadline = time.monotonic() + 5
             while not self.stop.is_set():
                 try:
@@ -207,6 +253,12 @@ class LoopbackServer:
                 algorithm = C.c_char_p(self.host_signature.encode("ascii"))
                 if SERVER.ssh_bind_options_set(server, 18, algorithm) != 0:
                     raise RuntimeError("test host signature selection failed")
+            # The independent server both advertises this exact server-sig-algs
+            # list and validates user signatures against it (public option 17).
+            if self.user_signature is not None:
+                algorithm = C.c_char_p(self.user_signature.encode("ascii"))
+                if SERVER.ssh_bind_options_set(server, 17, algorithm) != 0:
+                    raise RuntimeError("test user signature selection failed")
             if SERVER.ssh_bind_accept_fd(server, session, sock.detach()) != 0:
                 raise RuntimeError("test accept failed")
             if SERVER.ssh_handle_key_exchange(session) != 0:
@@ -214,9 +266,18 @@ class LoopbackServer:
             password_method = self.auth_mode == "publickeyDisabled" or (
                 self.password is not None and self.auth_mode != "passwordDisabled")
             SERVER.ssh_set_auth_methods(session, 2 if password_method else 4)
+            if verification_observer is not None:
+                SERVER.ssh_set_blocking(session, 0)
             while not self.stop.is_set():
                 message = SERVER.ssh_message_get(session)
                 if not message:
+                    if verification_observer is not None:
+                        if self.invalid_signature.is_set():
+                            self.events.append(("invalid-signature",))
+                            control.shutdown(socket.SHUT_RDWR)
+                            return
+                        self.stop.wait(0.001)
+                        continue
                     return
                 try:
                     kind, subtype = SERVER.ssh_message_type(message), SERVER.ssh_message_subtype(message)
@@ -487,9 +548,11 @@ class NativeSSHTests(unittest.TestCase):
         for server in self.servers:
             server.close()
 
-    def start(self, key=None, reject=False, family=socket.AF_INET, completion="unknown", auth_mode="normal", password=None):
+    def start(self, key=None, reject=False, family=socket.AF_INET, completion="unknown", auth_mode="normal", password=None,
+              user_signature=None):
         key = key or ed25519.Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
-        server = LoopbackServer(key, reject, family, completion, auth_mode=auth_mode, password=password)
+        server = LoopbackServer(key, reject, family, completion, auth_mode=auth_mode, password=password,
+                                user_signature=user_signature)
         self.servers.append(server)
         sock = socket.socket(family, socket.SOCK_STREAM)
         sock.settimeout(3)
@@ -533,15 +596,17 @@ class NativeSSHTests(unittest.TestCase):
         outcome = self.advance(handle, DRIVER.ftssh_authentication_step, (2, -1006) + terminal)
         if outcome != 2:
             return outcome
-        challenge = self.data(handle, DRIVER.ftssh_copy_challenge, 1024)
+        challenge = self.data(handle, DRIVER.ftssh_copy_challenge, 1536)
         sid, rest = take_string(challenge)
         self.assertIn(len(sid), (32, 48, 64))
         algorithm, _ = take_string(blob)
+        if algorithm == b"ssh-rsa":
+            algorithm = (server.user_signature or "rsa-sha2-512").encode("ascii")
         expected = ssh_string(sid) + bytes([50]) + ssh_string(b"operator") + ssh_string(b"ssh-connection") + ssh_string(b"publickey") + b"\x01" + ssh_string(algorithm) + ssh_string(blob)
         self.assertEqual(challenge, expected)
         for _ in range(5):
             self.assertEqual(DRIVER.ftssh_authentication_step(handle), 2)
-            self.assertEqual(self.data(handle, DRIVER.ftssh_copy_challenge, 1024), challenge)
+            self.assertEqual(self.data(handle, DRIVER.ftssh_copy_challenge, 1536), challenge)
         signed = signature(key, challenge)
         self.assertEqual(DRIVER.ftssh_supply_signature(handle, signed, len(signed)), 0)
         self.assertEqual(DRIVER.ftssh_supply_signature(handle, signed, len(signed)), -1001)
@@ -557,6 +622,129 @@ class NativeSSHTests(unittest.TestCase):
 
     def password_events(self, server):
         return [event for event in server.events if event[0] == "password-authentication"]
+
+    def rsa_challenge(self, handle, server, key):
+        self.advance(handle, DRIVER.ftssh_handshake)
+        self.assertEqual(self.data(handle, DRIVER.ftssh_copy_host_key), server.host_blob)
+        self.assertEqual(DRIVER.ftssh_approve_host_key(handle, server.host_blob, len(server.host_blob)), 0)
+        blob = public_blob(key)
+        self.assertEqual(DRIVER.ftssh_begin_authentication(handle, b"operator", 8, blob, len(blob)), 0)
+        self.assertEqual(self.advance(handle, DRIVER.ftssh_authentication_step, (2,)), 2)
+        return self.data(handle, DRIVER.ftssh_copy_challenge, 1536)
+
+    def test_rsa_sha2_authentication_and_real_terminal_for_2048_4096_and_8192_bits(self):
+        for bits in [2048, 4096, 8192]:
+            for algorithm in ["rsa-sha2-256", "rsa-sha2-512"]:
+                with self.subTest(bits=bits, algorithm=algorithm):
+                    handle, server, key = self.start(rsa_client_key(bits), user_signature=algorithm)
+                    self.assertEqual(self.authenticate(handle, server, key), 0)
+                    self.assertEqual(DRIVER.ftssh_begin_shell(handle, 80, 24, 0, 0), 0)
+                    self.advance(handle, DRIVER.ftssh_shell_step)
+                    payload = "RSA SHA-2 → terminal 🦀\rEND-SESSION\r".encode()
+                    self.assertEqual(DRIVER.ftssh_admit_write(handle, payload, len(payload)), 0)
+                    received, eof = bytearray(), False
+                    deadline = time.monotonic() + 3
+                    while time.monotonic() < deadline:
+                        self.assertIn(DRIVER.ftssh_flush_write(handle), (0, 1))
+                        out, count = C.create_string_buffer(256), Z()
+                        rc = DRIVER.ftssh_read(handle, out, len(out), C.byref(count))
+                        self.assertIn(rc, (0, 1, 3))
+                        received += out.raw[:count.value]
+                        if rc == 3:
+                            eof = True
+                            break
+                        self.wait(handle)
+                    self.assertTrue(eof)
+                    self.assertEqual(received, b"ready\r\nstderr\r\n" + payload)
+                    self.assertEqual(server.received, payload)
+                    self.assertEqual([event[1] for event in server.events if event[0] == "authentication"], [0, 1])
+
+    def test_rsa_signature_must_match_negotiated_algorithm_and_exact_modulus_width(self):
+        handle, server, key = self.start(rsa_client_key(4096), user_signature="rsa-sha2-512")
+        challenge = self.rsa_challenge(handle, server, key)
+        signed = signature(key, challenge)
+        algorithm, rest = take_string(signed)
+        payload, trailing = take_string(rest)
+        self.assertEqual((algorithm, len(payload), trailing), (b"rsa-sha2-512", 512, b""))
+        malformed = [ssh_string(b"ssh-rsa") + ssh_string(payload),
+                     ssh_string(b"rsa-sha2-256") + ssh_string(payload),
+                     ssh_string(algorithm) + ssh_string(payload[:-1]),
+                     ssh_string(algorithm) + ssh_string(b"\0" + payload), signed + b"\0"]
+        for value in malformed:
+            self.assertEqual(DRIVER.ftssh_supply_signature(handle, value, len(value)), -1007)
+            self.assertEqual(DRIVER.ftssh_authentication_step(handle), 2)
+            self.assertEqual(self.data(handle, DRIVER.ftssh_copy_challenge, 1536), challenge)
+        self.assertEqual(DRIVER.ftssh_supply_signature(handle, signed, len(signed)), 0)
+        self.assertEqual(self.advance(handle, DRIVER.ftssh_authentication_step), 0)
+        self.assertEqual(DRIVER.ftssh_supply_signature(handle, signed, len(signed)), -1001)
+
+    def test_rsa_wrong_hash_is_rejected_by_independent_server_without_retry(self):
+        handle, server, key = self.start(rsa_client_key(2048), user_signature="rsa-sha2-512",
+                                         auth_mode="observeInvalidSignature")
+        challenge = self.rsa_challenge(handle, server, key)
+        # Correct key and length, deliberately wrong digest under the claimed
+        # algorithm. Only the independent SSH server verifies this signature.
+        payload = key.sign(challenge, padding.PKCS1v15(), hashes.SHA256())
+        signed = ssh_string(b"rsa-sha2-512") + ssh_string(payload)
+        self.assertEqual(DRIVER.ftssh_supply_signature(handle, signed, len(signed)), 0)
+        self.assertEqual(self.advance(handle, DRIVER.ftssh_authentication_step, (-1003,)), -1003)
+        self.assertTrue(server.invalid_signature.is_set())
+        self.assertIn(("invalid-signature",), server.events)
+        self.assertEqual(DRIVER.ftssh_begin_shell(handle, 80, 24, 0, 0), -1003)
+        self.assertEqual([event[1] for event in server.events if event[0] == "authentication"], [0])
+        self.assertEqual([event for event in server.events if event[0] in ("channel", "pty", "shell")], [])
+
+    def test_rsa_public_admission_rejects_noncanonical_sizes_exponents_and_certificates(self):
+        handle, server, _ = self.start(rsa_client_key(8192), user_signature="rsa-sha2-512")
+        self.advance(handle, DRIVER.ftssh_handshake)
+        self.assertEqual(DRIVER.ftssh_approve_host_key(handle, server.host_blob, len(server.host_blob)), 0)
+        _, rest = take_string(server.public)
+        exponent, rest = take_string(rest)
+        modulus, trailing = take_string(rest)
+        self.assertEqual(trailing, b"")
+        def blob(e, n, kind=b"ssh-rsa"):
+            return ssh_string(kind) + ssh_string(e) + ssh_string(n)
+        cases = [(blob(b"\0", modulus), -1000), (blob(b"\1", modulus), -1000),
+                 (blob(b"\2", modulus), -1000), (blob(b"\x80", modulus), -1000),
+                 (blob(b"\0" + exponent, modulus), -1000),
+                 (blob(b"\1" + b"\0" * 7 + b"\1", modulus), -1000),
+                 (blob(exponent, modulus[1:]), -1000), (blob(exponent, b"\0" + modulus), -1000),
+                 (blob(exponent, b"\0"), -1000), (blob(exponent, modulus[:-1] + b"\2"), -1000),
+                 (blob(exponent, b"\x40" + b"\0" * 254 + b"\1"), -1010),
+                 (server.public + b"\0", -1000),
+                 (blob(exponent, b"\0\x80" + b"\0" * 254 + b"\1",
+                       b"ssh-rsa-cert-v01@openssh.com"), -1010)]
+        for value, expected in cases:
+            self.assertEqual(DRIVER.ftssh_begin_authentication(handle, b"operator", 8, value, len(value)), expected)
+        # Largest canonical public encoding: a 64-bit positive exponent needs
+        # its sign byte, as does the 8192-bit modulus. Admission never offers it.
+        largest = blob(b"\0\x80" + b"\0" * 6 + b"\1", modulus)
+        self.assertEqual(len(largest), 1053)
+        self.assertEqual(DRIVER.ftssh_begin_authentication(handle, b"operator", 8, largest, len(largest)), 0)
+        self.assertEqual(DRIVER.ftssh_close(handle), 0)
+        self.assertTrue(server.done.wait(2))
+        self.assertEqual([event for event in server.events if event[0].startswith("authentication")], [])
+
+    def test_rsa_sha1_only_offer_never_requests_a_signature_or_opens_a_terminal(self):
+        handle, server, key = self.start(rsa_client_key(2048), user_signature="ssh-rsa")
+        self.assertEqual(self.authenticate(handle, server, key, (-1010,)), -1010)
+        challenge, count = C.create_string_buffer(1536), Z()
+        self.assertEqual(DRIVER.ftssh_copy_challenge(handle, challenge, len(challenge), C.byref(count)), -1010)
+        self.assertEqual(DRIVER.ftssh_begin_shell(handle, 80, 24, 0, 0), -1010)
+        self.assertEqual([event for event in server.events if event[0] == "authentication"], [])
+        self.assertEqual([event for event in server.events if event[0] in ("channel", "pty", "shell")], [])
+
+    def test_rsa_unsigned_refusal_is_terminal_without_unproven_algorithm_retry(self):
+        for algorithm in ["rsa-sha2-256", "rsa-sha2-512"]:
+            with self.subTest(algorithm=algorithm):
+                handle, server, key = self.start(rsa_client_key(2048), reject=True, user_signature=algorithm)
+                self.assertEqual(self.authenticate(handle, server, key, (-1011,)), -1011)
+                self.assertEqual(DRIVER.ftssh_authentication_step(handle), -1011)
+                self.assertEqual([event[1] for event in server.events if event[0] == "authentication"], [0])
+                self.assertEqual([event for event in server.events if event[0] in ("channel", "pty", "shell")], [])
+
+    def test_rsa_destination_uses_independent_authentication_through_a_key_hop(self):
+        self.exercise_forwarding_chain(1, destination_key=rsa_client_key(4096))
 
     def test_password_cannot_probe_or_submit_before_host_key_approval(self):
         handle, server, _ = self.start(password=b"test-password")
@@ -701,8 +889,8 @@ class NativeSSHTests(unittest.TestCase):
     def test_three_hops_preserve_backpressure_accounting_and_refuse_a_fourth_hop(self):
         self.exercise_forwarding_chain(3)
 
-    def forwarding_chain(self, hop_count):
-        destination_key = ed25519.Ed25519PrivateKey.generate()
+    def forwarding_chain(self, hop_count, destination_key=None):
+        destination_key = destination_key or ed25519.Ed25519PrivateKey.generate()
         destination = LoopbackServer(destination_key)
         peers, keys = [destination], [destination_key]
         for _ in range(hop_count):
@@ -732,8 +920,8 @@ class NativeSSHTests(unittest.TestCase):
         self.handles.append(child)
         return child
 
-    def exercise_forwarding_chain(self, hop_count):
-        child, peers, keys = self.forwarding_chain(hop_count)
+    def exercise_forwarding_chain(self, hop_count, destination_key=None):
+        child, peers, keys = self.forwarding_chain(hop_count, destination_key=destination_key)
         destination = peers[-1]
         for index, (peer, key) in enumerate(zip(peers, keys)):
             self.assertEqual(self.authenticate(child, peer, key), 0)

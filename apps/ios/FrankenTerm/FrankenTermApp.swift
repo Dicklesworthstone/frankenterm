@@ -2805,7 +2805,7 @@ private struct WorkspaceKeyImportSheet: View {
                                 }.disabled(!controller.canChooseFile)
                                     .accessibilityIdentifier("keys.import.choose")
                             } footer: {
-                                Text("Choose a local SSH private-key file for this exact fingerprint. OpenSSH Ed25519 and ECDSA P-256, P-384 and P-521 keys are supported, including bcrypt with AES-CTR or AES-CBC (128, 192, or 256 bits). Clear ECDSA SEC1/PKCS#8 PEM files are also supported.")
+                                Text("Choose a local SSH private-key file for this exact fingerprint. OpenSSH Ed25519, ECDSA P-256/P-384/P-521, and RSA (2048–8192 bits) are supported, including bcrypt with AES-CTR or AES-CBC (128, 192, or 256 bits). Clear ECDSA SEC1/PKCS#8 and RSA PKCS#1/PKCS#8 PEM files are also supported. RSA connections use SHA-2 signatures.")
                             }
                         }
                     }
