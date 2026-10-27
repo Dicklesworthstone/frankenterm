@@ -76,6 +76,323 @@ fn key_presses_match_the_desktop_encoding_in_both_dialects() {
 }
 
 #[test]
+fn reliable_input_and_registration_requests_match_the_canonical_codec() {
+    let client = wire::ClientId {
+        hostname: "frankenterm-mobile-fixed-test-id".to_owned(),
+        username: "mobile".to_owned(),
+        pid: 0,
+        epoch: 0,
+        id: 1,
+        ssh_auth_sock: None,
+    };
+    let canonical = mux::client::ClientId {
+        hostname: client.hostname.clone(),
+        username: client.username.clone(),
+        pid: client.pid,
+        epoch: client.epoch,
+        id: client.id,
+        ssh_auth_sock: None,
+    };
+    assert_eq!(
+        phone(
+            wire::ident::SET_CLIENT_ID,
+            2,
+            &wire::SetClientId {
+                client_id: client,
+                is_proxy: false
+            }
+        ),
+        desktop_current(
+            Pdu::SetClientId(codec::SetClientId {
+                client_id: canonical,
+                is_proxy: false
+            }),
+            2
+        ),
+    );
+    assert_eq!(
+        phone(
+            wire::ident::GET_PANE_IDENTITY,
+            3,
+            &wire::GetPaneIdentity { pane_id: 7 }
+        ),
+        desktop_current(
+            Pdu::GetPaneIdentityV1(codec::GetPaneIdentityV1 { pane_id: 7 }),
+            3
+        ),
+    );
+    assert_eq!(
+        wire::RELIABLE_WRITE_MIN_VERSION,
+        codec::RELIABLE_PANE_WRITE_V1_MIN_CODEC_VERSION
+    );
+    assert_eq!(
+        wire::MAX_RELIABLE_WRITE_BYTES,
+        codec::MAX_RELIABLE_PANE_WRITE_DATA_BYTES
+    );
+    assert_eq!(
+        wire::MAX_PANE_IDENTITY_RESPONSE_BYTES,
+        codec::MAX_PANE_IDENTITY_RESPONSE_DECOMPRESSED_BYTES
+    );
+    for registration in [None, Some([0x27; 16])] {
+        let event = termwiz::input::KeyEvent {
+            key: termwiz::input::KeyCode::UpArrow,
+            modifiers: termwiz::input::Modifiers::CTRL,
+        };
+        for (ours, theirs) in [
+            (
+                wire::ReliableKeyEventKind::KeyDown,
+                codec::ReliableKeyEventKindV1::KeyDown,
+            ),
+            (
+                wire::ReliableKeyEventKind::KeyUp,
+                codec::ReliableKeyEventKindV1::KeyUp,
+            ),
+        ] {
+            assert_eq!(
+                phone(
+                    wire::ident::RELIABLE_KEY_EVENT,
+                    4,
+                    &wire::ReliableKeyEvent {
+                        pane_id: 7,
+                        pane_registration: registration,
+                        event: event.clone(),
+                        input_serial: u64::MAX,
+                        kind: ours,
+                    }
+                ),
+                desktop_current(
+                    Pdu::ReliableKeyEventV1(codec::ReliableKeyEventV1 {
+                        pane_id: 7,
+                        pane_registration: registration
+                            .map(codec::ReliablePaneRegistrationIdentityV1::from_bytes),
+                        event: event.clone(),
+                        input_serial: InputSerial::from_millis_since_epoch(u64::MAX),
+                        kind: theirs,
+                    }),
+                    4
+                ),
+            );
+        }
+        let data = vec![0xa5; wire::MAX_RELIABLE_WRITE_BYTES];
+        assert_eq!(
+            phone(
+                wire::ident::RELIABLE_PANE_WRITE,
+                5,
+                &wire::ReliablePaneWrite {
+                    pane_id: 7,
+                    pane_registration: registration,
+                    input_serial: 123,
+                    data: &data,
+                }
+            ),
+            desktop_current(
+                Pdu::ReliablePaneWriteV1(codec::ReliablePaneWriteV1 {
+                    pane_id: 7,
+                    pane_registration: registration
+                        .map(codec::ReliablePaneRegistrationIdentityV1::from_bytes),
+                    input_serial: InputSerial::from_millis_since_epoch(123),
+                    data,
+                }),
+                5
+            ),
+        );
+    }
+}
+
+#[test]
+fn reliable_receipt_outcomes_preserve_canonical_discriminants_and_exact_bodies() {
+    use codec::{
+        ReliableKeyEventOutcomeV1 as Key, ReliableKeyEventRejectionV1 as Reject,
+        ReliableKeyEventRetryV1 as Retry,
+    };
+    let pressure = codec::ReliableInputSchedulerPressureV1 {
+        queue_id: 1,
+        scheduler_generation: 2,
+        active_tasks: 3,
+        task_capacity: 4,
+        active_estimated_bytes: 5,
+        estimated_byte_capacity: 6,
+        requested_estimated_bytes: 7,
+        retry_after_ns: 8,
+    };
+    let mobile_pressure = wire::ReliableInputSchedulerPressure {
+        queue_id: 1,
+        scheduler_generation: 2,
+        active_tasks: 3,
+        task_capacity: 4,
+        active_estimated_bytes: 5,
+        estimated_byte_capacity: 6,
+        requested_estimated_bytes: 7,
+        retry_after_ns: 8,
+    };
+    let retries = [
+        (
+            Retry::SchedulerFull(pressure),
+            wire::ReliableKeyRetry::SchedulerFull(mobile_pressure),
+        ),
+        (
+            Retry::SchedulerRetired(pressure),
+            wire::ReliableKeyRetry::SchedulerRetired(mobile_pressure),
+        ),
+        (
+            Retry::SchedulerUnavailable { retry_after_ns: 9 },
+            wire::ReliableKeyRetry::SchedulerUnavailable { retry_after_ns: 9 },
+        ),
+        (
+            Retry::DuplicatePending { retry_after_ns: 10 },
+            wire::ReliableKeyRetry::DuplicatePending { retry_after_ns: 10 },
+        ),
+        (
+            Retry::ClientRegistrationTransition { retry_after_ns: 11 },
+            wire::ReliableKeyRetry::ClientRegistrationTransition { retry_after_ns: 11 },
+        ),
+        (
+            Retry::PaneAuthorityRequired {
+                pane_registration: codec::ReliablePaneRegistrationIdentityV1::from_bytes([7; 16]),
+            },
+            wire::ReliableKeyRetry::PaneAuthorityRequired {
+                pane_registration: [7; 16],
+            },
+        ),
+    ];
+    let rejections = [
+        (
+            Reject::ClientLedgerUnavailable,
+            wire::ReliableKeyRejection::ClientLedgerUnavailable,
+        ),
+        (
+            Reject::IdentityAuthorityExhausted,
+            wire::ReliableKeyRejection::IdentityAuthorityExhausted,
+        ),
+        (
+            Reject::PaneUnavailable,
+            wire::ReliableKeyRejection::PaneUnavailable,
+        ),
+        (
+            Reject::PaneRegistrationMismatch,
+            wire::ReliableKeyRejection::PaneRegistrationMismatch,
+        ),
+        (Reject::StaleSerial, wire::ReliableKeyRejection::StaleSerial),
+        (
+            Reject::IdentityConflict,
+            wire::ReliableKeyRejection::IdentityConflict,
+        ),
+        (
+            Reject::OutcomeUnknown,
+            wire::ReliableKeyRejection::OutcomeUnknown,
+        ),
+        (
+            Reject::InvalidSchedulerConfiguration,
+            wire::ReliableKeyRejection::InvalidSchedulerConfiguration,
+        ),
+    ];
+    let key_outcomes = [
+        (Key::Applied, wire::ReliableKeyOutcome::Applied),
+        (
+            Key::DuplicateApplied,
+            wire::ReliableKeyOutcome::DuplicateApplied,
+        ),
+    ]
+    .into_iter()
+    .chain(retries.iter().map(|(canonical, mobile)| {
+        (
+            Key::Retry(*canonical),
+            wire::ReliableKeyOutcome::Retry(*mobile),
+        )
+    }))
+    .chain(rejections.iter().map(|(canonical, mobile)| {
+        (
+            Key::Rejected(*canonical),
+            wire::ReliableKeyOutcome::Rejected(*mobile),
+        )
+    }));
+    for (canonical, expected) in key_outcomes {
+        let body = varbincode::serialize(&codec::ReliableKeyEventV1Response {
+            pane_id: 12,
+            input_serial: InputSerial::from_millis_since_epoch(u64::MAX),
+            outcome: canonical,
+        })
+        .unwrap();
+        let decoded: wire::ReliableKeyResponse = wire::decode_input_receipt(&body).unwrap();
+        assert_eq!(
+            decoded,
+            wire::ReliableKeyResponse {
+                pane_id: 12,
+                input_serial: u64::MAX,
+                outcome: expected
+            }
+        );
+    }
+    use codec::{
+        ReliablePaneWriteOutcomeV1 as Write, ReliablePaneWriteRejectionV1 as WriteReject,
+        ReliablePaneWriteRetryV1 as WriteRetry,
+    };
+    let write_outcomes = [
+        (
+            Write::AppliedPrefix { bytes: 17 },
+            wire::ReliableWriteOutcome::AppliedPrefix { bytes: 17 },
+        ),
+        (
+            Write::DuplicateAppliedPrefix { bytes: 16_384 },
+            wire::ReliableWriteOutcome::DuplicateAppliedPrefix { bytes: 16_384 },
+        ),
+        (
+            Write::Indeterminate,
+            wire::ReliableWriteOutcome::Indeterminate,
+        ),
+        (
+            Write::Retry(WriteRetry::DefinitelyNotApplied {
+                retry_after_ns: 123,
+            }),
+            wire::ReliableWriteOutcome::Retry(wire::ReliableWriteRetry::DefinitelyNotApplied {
+                retry_after_ns: 123,
+            }),
+        ),
+        (
+            Write::Rejected(WriteReject::DefinitelyNotApplied),
+            wire::ReliableWriteOutcome::Rejected(
+                wire::ReliableWriteRejection::DefinitelyNotApplied,
+            ),
+        ),
+    ]
+    .into_iter()
+    .chain(retries.iter().map(|(canonical, mobile)| {
+        (
+            Write::Retry(WriteRetry::Input(*canonical)),
+            wire::ReliableWriteOutcome::Retry(wire::ReliableWriteRetry::Input(*mobile)),
+        )
+    }))
+    .chain(rejections.iter().map(|(canonical, mobile)| {
+        (
+            Write::Rejected(WriteReject::Input(*canonical)),
+            wire::ReliableWriteOutcome::Rejected(wire::ReliableWriteRejection::Input(*mobile)),
+        )
+    }));
+    for (canonical, expected) in write_outcomes {
+        let mut body = varbincode::serialize(&codec::ReliablePaneWriteV1Response {
+            pane_id: 12,
+            input_serial: InputSerial::from_millis_since_epoch(41),
+            outcome: canonical,
+        })
+        .unwrap();
+        let decoded: wire::ReliableWriteResponse = wire::decode_input_receipt(&body).unwrap();
+        assert_eq!(
+            decoded,
+            wire::ReliableWriteResponse {
+                pane_id: 12,
+                input_serial: 41,
+                outcome: expected
+            }
+        );
+        body.push(0);
+        assert!(
+            wire::decode_input_receipt::<wire::ReliableWriteResponse>(&body).is_err(),
+            "trailing data cannot acknowledge an effect"
+        );
+    }
+}
+
+#[test]
 fn wheel_notches_match_the_desktop_encoding_in_both_dialects() {
     use frankenterm_term::input::{MouseButton, MouseEvent, MouseEventKind};
     let ours = wire::SendMouseEvent {

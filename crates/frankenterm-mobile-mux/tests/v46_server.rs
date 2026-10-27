@@ -471,8 +471,8 @@ fn a_newer_server_that_still_accepts_this_apps_protocol_is_spoken_to() {
     harness.attach();
     assert!(harness.session.is_ready());
     assert_eq!(
-        &harness.server.requests[..2],
-        ["GetCodecVersion", "ListPanesCoherent"]
+        &harness.server.requests[..3],
+        ["GetCodecVersion", "SetClientId", "ListPanesCoherent"]
     );
     assert_mirrored(&mut harness);
     let pane = harness.server.pane_id;
@@ -573,8 +573,8 @@ fn a_current_mux_names_its_incarnation_before_its_first_pane_list() {
         harness.events
     );
     assert_eq!(
-        harness.server.requests[..2],
-        ["GetCodecVersion", "ListPanesCoherent"]
+        harness.server.requests[..3],
+        ["GetCodecVersion", "SetClientId", "ListPanesCoherent"]
     );
     assert_eq!(lists(&harness), 0, "the coherent list is the first list");
     assert_mirrored(&mut harness);
@@ -636,8 +636,13 @@ fn a_current_mux_without_a_coherent_list_is_listed_plainly() {
             .any(|event| matches!(event, Event::Incarnation { .. }))
     );
     assert_eq!(
-        harness.server.requests[..3],
-        ["GetCodecVersion", "ListPanesCoherent", "ListPanes"]
+        harness.server.requests[..4],
+        [
+            "GetCodecVersion",
+            "SetClientId",
+            "ListPanesCoherent",
+            "ListPanes"
+        ]
     );
     assert_mirrored(&mut harness);
     harness.server.remove_pane();
@@ -1163,7 +1168,11 @@ fn a_restore_is_restoring_until_the_server_answers_it() {
     harness.session.closed();
     harness.pump();
     assert!(!harness.session.restoring());
-    assert_eq!(restored_sizes(&harness), 1, "a dropped restore has no receipt");
+    assert_eq!(
+        restored_sizes(&harness),
+        1,
+        "a dropped restore has no receipt"
+    );
 }
 
 #[test]
@@ -1181,13 +1190,25 @@ fn a_rejected_restore_and_a_later_list_preserve_the_original_desktop_size() {
     harness.session.refresh_panes();
     harness.pump();
     assert!(harness.session.restoring());
-    assert_eq!((harness.session.panes()[0].size.rows, harness.session.panes()[0].size.cols), (10, 32));
+    assert_eq!(
+        (
+            harness.session.panes()[0].size.rows,
+            harness.session.panes()[0].size.cols
+        ),
+        (10, 32)
+    );
     let refusal = varbincode::serialize(&"Error: resize refused".to_owned()).unwrap();
-    harness.session.receive(&server_frame(0, rejected, &refusal, false));
+    harness
+        .session
+        .receive(&server_frame(0, rejected, &refusal, false));
     harness.pump();
     assert!(harness.session.is_ready());
     assert!(!harness.session.restoring());
-    assert_eq!(restored_sizes(&harness), 0, "an error is not successful restoration");
+    assert_eq!(
+        restored_sizes(&harness),
+        0,
+        "an error is not successful restoration"
+    );
 
     harness.session.restore_size(pane);
     harness.pump();
@@ -1270,10 +1291,19 @@ fn a_superseded_restore_reply_cannot_retire_a_newer_phone_size() {
         } else {
             Vec::new()
         };
-        harness.session.receive(&server_frame(reply, old, &body, false));
+        harness
+            .session
+            .receive(&server_frame(reply, old, &body, false));
         harness.pump();
-        assert!(harness.session.restoring(), "the newer restore is still pending");
-        assert_eq!(restored_sizes(&harness), 0, "a superseded answer cannot retire recovery");
+        assert!(
+            harness.session.restoring(),
+            "the newer restore is still pending"
+        );
+        assert_eq!(
+            restored_sizes(&harness),
+            0,
+            "a superseded answer cannot retire recovery"
+        );
 
         harness.hold_requests = false;
         harness.pump();
@@ -1296,7 +1326,9 @@ fn a_malformed_restore_acknowledgement_never_retires_recovery() {
     harness.pump();
     harness.session.restore_size(pane);
     let restore = queued_restore_serial(&mut harness);
-    harness.session.receive(&server_frame(10, restore, &[1], false));
+    harness
+        .session
+        .receive(&server_frame(10, restore, &[1], false));
     harness.pump();
     assert!(!harness.session.is_ready());
     assert_eq!(restored_sizes(&harness), 0);
@@ -1416,8 +1448,15 @@ fn a_size_left_by_a_dropped_connection_is_given_back_by_the_next() {
     harness.pump();
     let restored = harness.server.resizes.last().copied().expect("a restore");
     assert_eq!((restored.rows, restored.cols), (6, 20));
-    assert!(phone_sizes(&harness).is_empty(), "queueing emitted no retirement");
-    assert_eq!(restored_sizes(&harness), 1, "the successful answer retires the record");
+    assert!(
+        phone_sizes(&harness).is_empty(),
+        "queueing emitted no retirement"
+    );
+    assert_eq!(
+        restored_sizes(&harness),
+        1,
+        "the successful answer retires the record"
+    );
 
     // Once restored, a later list shows the desktop's size: nothing to adopt.
     harness.session.refresh_panes();
