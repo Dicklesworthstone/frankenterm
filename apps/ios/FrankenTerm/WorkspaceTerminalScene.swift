@@ -965,7 +965,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     private func permitsPreparation(_ machineID: String) -> Bool {
         // A password is a visible user action. Do not warm password machines
         // in other tabs or automatically prompt again after a connection drops.
-        if machines.first(where: { $0.id == machineID })?.target?.requiresPassword == true,
+        if machines.first(where: { $0.id == machineID })?.target?.requiresAuthenticationPrompt == true,
            !requestedConnections.contains(machineID) {
             guard onScreen, selectedMachineID == machineID, sessions[machineID] == nil else { return false }
         }

@@ -279,6 +279,79 @@ public protocol WorkspaceSSHPasswordPrompting: Sendable {
     func cancel(requestID: UUID)
 }
 
+/// Keyboard-interactive is a separately authorized SSH method. A password
+/// permission never authorizes server-provided questions or one-time codes.
+public struct WorkspaceSSHKeyboardInteractiveAuthorization: Equatable, Sendable, CustomDebugStringConvertible {
+    let storeOwner: UUID
+    public let workspaceID: UUID, workspaceRevision: UUID
+    public let routeID: String, host: String, port: UInt16, user: String
+    public let routeMode: String, jumpRouteIDs: [String], transitForRouteID: String?
+    public let presentedHostKey: WorkspaceDocument.HostKey
+    public var debugDescription: String { "WorkspaceSSHKeyboardInteractiveAuthorization([redacted])" }
+}
+
+/// The server's bounded questions, not trusted labels for the destination.
+/// Trusted machine, route, account and verified-host labels come from the
+/// request's authorization and must remain outside these server-owned strings.
+public struct SSHKeyboardInteractiveChallenge: Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible {
+    public static let maximumRounds: UInt32 = 4
+    public static let maximumPrompts = 8
+    public static let maximumResponseBytes = 1024
+    public static let maximumResponseTotalBytes = 8192
+
+    public struct Prompt: Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible {
+        public let text: String, echo: Bool
+        public var description: String { "SSHKeyboardInteractiveChallenge.Prompt([redacted])" }
+        public var debugDescription: String { description }
+        public init(text: String, echo: Bool) throws {
+            guard text.utf8.count <= 1024, !text.utf8.contains(0) else { throw SSHAuthenticationError.invalidChallenge }
+            self.text = text; self.echo = echo
+        }
+    }
+
+    public let round: UInt32
+    public let name: String, instruction: String
+    public let prompts: [Prompt]
+    public var description: String { "SSHKeyboardInteractiveChallenge([redacted])" }
+    public var debugDescription: String { description }
+
+    public init(round: UInt32, name: String, instruction: String, prompts: [Prompt]) throws {
+        guard (1...Self.maximumRounds).contains(round), prompts.count <= Self.maximumPrompts,
+              name.utf8.count <= 256, instruction.utf8.count <= 1024,
+              !name.utf8.contains(0), !instruction.utf8.contains(0) else {
+            throw SSHAuthenticationError.invalidChallenge
+        }
+        // Match the native encoding: two SSH strings, one count, then an
+        // echo byte and SSH string for each prompt. Bound before suspension.
+        let encodedBytes = 12 + name.utf8.count + instruction.utf8.count
+            + prompts.reduce(0) { $0 + 5 + $1.text.utf8.count }
+        guard encodedBytes <= 8192 else { throw SSHAuthenticationError.invalidChallenge }
+        self.round = round; self.name = name; self.instruction = instruction; self.prompts = prompts
+    }
+}
+
+public struct WorkspaceSSHKeyboardInteractiveIdentity: Sendable {
+    public let authorization: WorkspaceSSHKeyboardInteractiveAuthorization
+    fileprivate let brokerOwner: UUID, foregroundGeneration: UUID, passwordGeneration: UUID, attemptGeneration: UUID
+}
+
+public struct WorkspaceSSHKeyboardInteractiveRequest: Identifiable, Sendable, CustomStringConvertible, CustomDebugStringConvertible {
+    public let id: UUID, transportID: UUID, attemptID: UUID
+    public let authorization: WorkspaceSSHKeyboardInteractiveAuthorization
+    public let challenge: SSHKeyboardInteractiveChallenge
+    public var description: String { "WorkspaceSSHKeyboardInteractiveRequest([redacted])" }
+    public var debugDescription: String { description }
+}
+
+/// Every answer is transient, including an echo-enabled answer. Implementations
+/// present all prompts in one round, preserve echo flags, and explicitly confirm
+/// an informational zero-prompt round. Cancellation clears every editable answer
+/// and settles the request; no response may be cached for a subsequent round.
+public protocol WorkspaceSSHKeyboardInteractivePrompting: Sendable {
+    func responses(for request: WorkspaceSSHKeyboardInteractiveRequest) async throws -> [Data]
+    func cancel(requestID: UUID)
+}
+
 /// Implementations own one bounded authentication worker. A cancellation request
 /// must invalidate its prompt; sign must settle its worker before returning.
 /// There is no plaintext-key retrieval method on this boundary.
@@ -336,8 +409,17 @@ public actor SSHAuthenticationBroker {
         let expires: ContinuousClock.Instant
         var authorization: WorkspaceSSHAuthorization?
         var passwordPrompter: (any WorkspaceSSHPasswordPrompting)?
+        var keyboardInteractivePrompter: (any WorkspaceSSHKeyboardInteractivePrompting)?
+        var keyboardInteractiveGeneration: UUID?
         var challenge: SSHUserAuthenticationChallenge?
         var preparing = true, signing = false, cancelled = false
+    }
+    private struct KeyboardInteractiveAttempt {
+        let authorization: WorkspaceSSHKeyboardInteractiveAuthorization
+        let expires: ContinuousClock.Instant
+        var transportID: UUID?, attemptID: UUID?
+        var nextRound: UInt32 = 1
+        var responding = false
     }
     private struct Waiting {
         let request: Pending
@@ -351,6 +433,7 @@ public actor SSHAuthenticationBroker {
     private var foreground = false
     private var passwordGeneration = UUID()
     private var passwordForeground = false
+    private var keyboardInteractiveAttempts: [UUID: KeyboardInteractiveAttempt] = [:]
     private var pending: Pending?
     private var waiting: [Waiting] = []
     private var deadlineTask: Task<Void, Never>?
@@ -376,19 +459,28 @@ public actor SSHAuthenticationBroker {
     public var queuedRequests: Int { waiting.count }
 
     /// The app may keep authenticated terminals alive during its background
-    /// grace period. An editable password prompt never survives that boundary;
+    /// grace period. An editable password or keyboard-interactive prompt never survives that boundary;
     /// retiring its own epoch need not revoke those already-live transports.
     public func setPasswordForeground(_ active: Bool) {
         guard passwordForeground != active else { return }
         passwordForeground = active; passwordGeneration = UUID()
-        if !active, let pending, pending.passwordPrompter != nil { cancel(requestID: pending.id) }
+        if !active {
+            keyboardInteractiveAttempts.removeAll()
+            let retired = waiting.filter { $0.request.keyboardInteractiveGeneration != nil }
+            waiting.removeAll { $0.request.keyboardInteractiveGeneration != nil }
+            for waiter in retired { waiter.continuation.resume(throwing: SSHAuthenticationError.stale) }
+            if let pending, pending.passwordPrompter != nil || pending.keyboardInteractiveGeneration != nil {
+                cancel(requestID: pending.id)
+            }
+        }
     }
 
     /// One protected operation owns the signer, with a bounded FIFO shared by
     /// all scenes and connections. Waiting never opens a second prompt. The
     /// original foreground epoch and a 60-second lifetime cover both waiting
     /// and confirmation; queued work is never carried across suspend/resume.
-    private func acquireWorker(transportID: UUID) async throws -> UUID {
+    private func acquireWorker(transportID: UUID, expires: ContinuousClock.Instant? = nil,
+                               keyboardInteractiveGeneration: UUID? = nil) async throws -> UUID {
         try requireForeground()
         expireRequests()
         guard pending?.cancelled != true,
@@ -397,7 +489,8 @@ public actor SSHAuthenticationBroker {
             throw SSHAuthenticationError.busy
         }
         let request = Pending(id: UUID(), transportID: transportID,
-            foregroundGeneration: foregroundGeneration, expires: ContinuousClock.now + .seconds(60))
+            foregroundGeneration: foregroundGeneration, expires: expires ?? ContinuousClock.now + .seconds(60),
+            keyboardInteractiveGeneration: keyboardInteractiveGeneration)
         if pending == nil {
             pending = request; scheduleDeadline()
             return request.id
@@ -450,6 +543,7 @@ public actor SSHAuthenticationBroker {
     /// cannot indefinitely block every other machine. Native signing resources
     /// remain reserved after cancellation until their actual worker settles.
     func expireRequests(at now: ContinuousClock.Instant = .now) {
+        keyboardInteractiveAttempts = keyboardInteractiveAttempts.filter { now < $0.value.expires }
         var retained: [Waiting] = []
         for waiter in waiting {
             if !foreground || waiter.request.foregroundGeneration != foregroundGeneration || now >= waiter.request.expires {
@@ -464,6 +558,7 @@ public actor SSHAuthenticationBroker {
     private func scheduleDeadline() {
         guard deadlineTask == nil else { return }
         let deadlines = waiting.map(\.request.expires) + (pending.flatMap { $0.cancelled ? nil : $0.expires }.map { [$0] } ?? [])
+            + keyboardInteractiveAttempts.values.map(\.expires)
         guard let deadline = deadlines.min() else { return }
         deadlineTask = Task { [weak self] in
             do { try await ContinuousClock().sleep(until: deadline) }
@@ -574,6 +669,122 @@ public actor SSHAuthenticationBroker {
         guard passwordForeground, selected.passwordGeneration == passwordGeneration else { throw SSHAuthenticationError.stale }
     }
 
+    /// Admission uses the separately permitted keyboard-interactive method and
+    /// the actual verified peer. One bounded lifetime covers every round, even
+    /// while another machine owns the shared protected-prompt worker.
+    public func keyboardInteractiveIdentity(workspaceID: UUID, expectedRevision: UUID, routeID: String,
+                                            presentedHostKey: WorkspaceDocument.HostKey,
+                                            transitForRouteID: String? = nil) async throws -> WorkspaceSSHKeyboardInteractiveIdentity {
+        let lease = try foregroundLease()
+        guard passwordForeground else { throw SSHAuthenticationError.stale }
+        let promptEpoch = passwordGeneration
+        let authorization = try await store.authorizeSSHKeyboardInteractiveAuthentication(workspaceID: workspaceID,
+            expectedRevision: expectedRevision, routeID: routeID, presentedHostKey: presentedHostKey,
+            support: support, transitForRouteID: transitForRouteID)
+        try validateForeground(lease)
+        guard passwordForeground, passwordGeneration == promptEpoch else { throw SSHAuthenticationError.stale }
+        expireRequests()
+        guard keyboardInteractiveAttempts.count < maximumQueuedRequests else { throw SSHAuthenticationError.busy }
+        let generation = UUID()
+        keyboardInteractiveAttempts[generation] = .init(authorization: authorization,
+            expires: ContinuousClock.now + .seconds(60))
+        scheduleDeadline()
+        return .init(authorization: authorization, brokerOwner: owner, foregroundGeneration: foregroundGeneration,
+                     passwordGeneration: promptEpoch, attemptGeneration: generation)
+    }
+
+    /// A completed native login retains the normal foreground and policy
+    /// witness. This method never proves that the server accepted an answer.
+    public func validate(_ selected: WorkspaceSSHKeyboardInteractiveIdentity) async throws {
+        guard foreground, selected.brokerOwner == owner, selected.foregroundGeneration == foregroundGeneration else {
+            throw SSHAuthenticationError.stale
+        }
+        try Task.checkCancellation()
+        try await store.validateSSHKeyboardInteractiveAuthentication(selected.authorization, support: support)
+        guard foreground, selected.foregroundGeneration == foregroundGeneration else { throw SSHAuthenticationError.stale }
+        try Task.checkCancellation()
+    }
+
+    public func validateKeyboardInteractiveAttempt(_ selected: WorkspaceSSHKeyboardInteractiveIdentity) async throws {
+        try validateKeyboardInteractiveForeground(selected)
+        try await validate(selected)
+        try validateKeyboardInteractiveForeground(selected)
+    }
+
+    /// A native authentication attempt supplies one immutable ID. The first
+    /// round binds it and its transport to this broker-issued identity; later
+    /// rounds cannot change either, skip ahead, repeat, or reuse old responses.
+    public func keyboardInteractiveResponses(for selected: WorkspaceSSHKeyboardInteractiveIdentity,
+                                              transportID: UUID, attemptID: UUID,
+                                              challenge: SSHKeyboardInteractiveChallenge,
+                                              prompter: any WorkspaceSSHKeyboardInteractivePrompting) async throws -> [Data] {
+        try await validateKeyboardInteractiveAttempt(selected)
+        guard var attempt = keyboardInteractiveAttempts[selected.attemptGeneration], !attempt.responding else {
+            throw SSHAuthenticationError.busy
+        }
+        guard challenge.round == attempt.nextRound,
+              attempt.transportID == nil || attempt.transportID == transportID,
+              attempt.attemptID == nil || attempt.attemptID == attemptID else { throw SSHAuthenticationError.stale }
+        attempt.transportID = transportID; attempt.attemptID = attemptID; attempt.responding = true
+        keyboardInteractiveAttempts[selected.attemptGeneration] = attempt
+        var workerID: UUID?, completed = false
+        defer {
+            if !completed { keyboardInteractiveAttempts[selected.attemptGeneration] = nil }
+            if let workerID { releaseWorker(workerID) }
+        }
+        let id = try await acquireWorker(transportID: transportID, expires: attempt.expires,
+                                         keyboardInteractiveGeneration: selected.attemptGeneration)
+        workerID = id
+        try checkCurrent(id)
+        try await validateKeyboardInteractiveAttempt(selected)
+        try checkCurrent(id)
+        pending?.keyboardInteractivePrompter = prompter
+        let request = WorkspaceSSHKeyboardInteractiveRequest(id: id, transportID: transportID, attemptID: attemptID,
+            authorization: selected.authorization, challenge: challenge)
+        var answers = try await withTaskCancellationHandler {
+            try await prompter.responses(for: request)
+        } onCancel: { prompter.cancel(requestID: id) }
+        defer {
+            for index in answers.indices { answers[index].resetBytes(in: 0..<answers[index].count) }
+        }
+        try checkCurrent(id)
+        try validateKeyboardInteractiveForeground(selected)
+        guard answers.count == challenge.prompts.count,
+              answers.allSatisfy({ $0.count <= SSHKeyboardInteractiveChallenge.maximumResponseBytes && !$0.contains(0) }),
+              answers.reduce(0, { $0 + $1.count }) <= SSHKeyboardInteractiveChallenge.maximumResponseTotalBytes else {
+            throw SSHAuthenticationError.invalidChallenge
+        }
+        try await validateKeyboardInteractiveAttempt(selected)
+        try checkCurrent(id)
+        guard var current = keyboardInteractiveAttempts[selected.attemptGeneration], current.responding,
+              current.nextRound == challenge.round, current.transportID == transportID, current.attemptID == attemptID else {
+            throw SSHAuthenticationError.stale
+        }
+        current.nextRound += 1; current.responding = false
+        keyboardInteractiveAttempts[selected.attemptGeneration] = current
+        completed = true
+        return answers
+    }
+
+    /// Call after the native method completes, fails or is cancelled. Retiring
+    /// an attempt is idempotent and cannot dismiss another transport's prompt.
+    public func finishKeyboardInteractiveAttempt(_ selected: WorkspaceSSHKeyboardInteractiveIdentity) {
+        guard selected.brokerOwner == owner else { return }
+        keyboardInteractiveAttempts[selected.attemptGeneration] = nil
+        if let index = waiting.firstIndex(where: { $0.request.keyboardInteractiveGeneration == selected.attemptGeneration }) {
+            waiting.remove(at: index).continuation.resume(throwing: SSHAuthenticationError.stale)
+        }
+        if let pending, pending.keyboardInteractiveGeneration == selected.attemptGeneration { cancel(requestID: pending.id) }
+    }
+
+    private func validateKeyboardInteractiveForeground(_ selected: WorkspaceSSHKeyboardInteractiveIdentity) throws {
+        guard passwordForeground, selected.passwordGeneration == passwordGeneration,
+              let attempt = keyboardInteractiveAttempts[selected.attemptGeneration],
+              attempt.authorization == selected.authorization, ContinuousClock.now < attempt.expires else {
+            throw SSHAuthenticationError.stale
+        }
+    }
+
     /// Verify the real host and current route before reading or offering the
     /// selected public identity. This uses the same bounded worker as signing.
     public func publicIdentity(workspaceID: UUID, expectedRevision: UUID, routeID: String, credentialID: String,
@@ -615,6 +826,7 @@ public actor SSHAuthenticationBroker {
     }
 
     public func cancel(transportID: UUID) {
+        keyboardInteractiveAttempts = keyboardInteractiveAttempts.filter { $0.value.transportID != transportID }
         if let index = waiting.firstIndex(where: { $0.request.transportID == transportID }) {
             waiting.remove(at: index).continuation.resume(throwing: SSHAuthenticationError.stale)
         }
@@ -679,10 +891,12 @@ public actor SSHAuthenticationBroker {
 
     public func cancel(requestID: UUID) {
         guard pending?.id == requestID else { return }
+        if let generation = pending?.keyboardInteractiveGeneration { keyboardInteractiveAttempts[generation] = nil }
         if pending?.signing == true || pending?.preparing == true {
             pending?.cancelled = true
             signer.cancel(requestID: requestID)
             pending?.passwordPrompter?.cancel(requestID: requestID)
+            pending?.keyboardInteractivePrompter?.cancel(requestID: requestID)
             // Keep the sole worker reservation until confirm settles. Resume
             // cannot start another prompt while cancelled native I/O still owns it.
         } else { releaseWorker(requestID) }

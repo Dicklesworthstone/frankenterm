@@ -2602,7 +2602,7 @@ final class TerminalSessionControllerTests: XCTestCase {
             routeID: "route-alpha", presentedHostKey: WorkspaceDocument.HostKey(algorithm: identity.algorithm, fingerprint: identity.fingerprint))
         let prompt = MobileSSHPasswordPrompt()
         prompt.setActive(true)
-        prompt.setScope(.init(workspaceID: installed.id, revision: installed.revision, destinationRouteIDs: ["route-alpha"]))
+        prompt.setScope(.init(workspaceID: installed.id, revision: installed.revision, machineID: "machine-alpha", destinationRouteIDs: ["route-alpha"]))
         return (broker, selected, prompt)
     }
 
@@ -2624,9 +2624,9 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertEqual(request.authorization.user, "operator")
         XCTAssertEqual(request.authorization.presentedHostKey, selected.authorization.presentedHostKey)
         XCTAssertFalse(prompt.canSubmit)
-        prompt.editSecret("synthetic password")
+        prompt.editSecret("synthetic password", requestID: request.id)
         XCTAssertTrue(prompt.canSubmit)
-        prompt.editSecret(String(repeating: "x", count: 1025))
+        prompt.editSecret(String(repeating: "x", count: 1025), requestID: request.id)
         XCTAssertEqual(prompt.secret, "synthetic password", "Oversized editing must not retain the paste")
         prompt.submit(requestID: request.id)
         XCTAssertNil(prompt.request); XCTAssertTrue(prompt.secret.isEmpty)
@@ -2641,10 +2641,10 @@ final class TerminalSessionControllerTests: XCTestCase {
             let (broker, selected, prompt) = try await passwordPromptFixture()
             let task = Task { try await broker.password(for: selected, transportID: UUID(), prompter: prompt) }
             let request = try await waitForPasswordPrompt(prompt)
-            prompt.editSecret("must not leave")
+            prompt.editSecret("must not leave", requestID: request.id)
             if deactivate { prompt.setActive(false) }
             else { prompt.setScope(.init(workspaceID: selected.authorization.workspaceID,
-                revision: selected.authorization.workspaceRevision, destinationRouteIDs: ["route-beta"])) }
+                revision: selected.authorization.workspaceRevision, machineID: "machine-alpha", destinationRouteIDs: ["route-beta"])) }
             XCTAssertNil(prompt.request); XCTAssertTrue(prompt.secret.isEmpty)
             prompt.setActive(true)
             prompt.submit(requestID: request.id)
@@ -2656,22 +2656,160 @@ final class TerminalSessionControllerTests: XCTestCase {
         let (broker, selected, prompt) = try await passwordPromptFixture()
         let first = Task { try await broker.password(for: selected, transportID: UUID(), prompter: prompt) }
         let old = try await waitForPasswordPrompt(prompt)
-        prompt.editSecret("first"); prompt.submit(requestID: old.id)
+        prompt.editSecret("first", requestID: old.id); prompt.submit(requestID: old.id)
         _ = try await first.value
         let second = Task { try await broker.password(for: selected, transportID: UUID(), prompter: prompt) }
         let current = try await waitForPasswordPrompt(prompt)
         XCTAssertNotEqual(old.id, current.id)
         prompt.cancelNow(requestID: old.id)
         XCTAssertEqual(prompt.request?.id, current.id)
-        prompt.editSecret("second"); prompt.submit(requestID: current.id)
+        prompt.editSecret("second", requestID: current.id)
+        prompt.editSecret("stale edit", requestID: old.id)
+        XCTAssertEqual(prompt.secret, "second")
+        XCTAssertTrue(prompt.secretValue(requestID: old.id).isEmpty)
+        prompt.submit(requestID: current.id)
         let value = try await second.value
         XCTAssertEqual(value, Data("second".utf8))
+    }
+
+    private func interactivePromptFixture() async throws -> (SSHAuthenticationBroker, WorkspaceSSHKeyboardInteractiveIdentity, MobileSSHKeyboardInteractivePrompt) {
+        let crypto = AppleCryptography()
+        let point = try crypto.ed25519PublicKey(seed: Data(0..<32))
+        func field(_ value: Data) -> Data {
+            var length = UInt32(value.count).bigEndian
+            return withUnsafeBytes(of: &length) { Data($0) } + value
+        }
+        let host = try SSHPublicIdentity(blob: field(Data("ssh-ed25519".utf8)) + field(point))
+        let initial = try document(identity: host, host: host, port: 22, user: "operator")
+        var root = try XCTUnwrap(JSONSerialization.jsonObject(with: initial.raw) as? [String: Any])
+        var workspace = try XCTUnwrap(root["workspace"] as? [String: Any])
+        var routes = try XCTUnwrap(workspace["routes"] as? [[String: Any]])
+        for index in routes.indices {
+            routes[index]["authentication_methods"] = ["keyboard-interactive"]
+            routes[index]["credential_refs"] = [] as [String]
+        }
+        workspace["routes"] = routes; root["workspace"] = workspace
+        let source = try WorkspaceDocument(data: JSONSerialization.data(withJSONObject: root, options: [.sortedKeys]))
+        let archive = try AirGapArchive(workspace: source, keys: [], using: crypto)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("interactive-prompt-" + UUID().uuidString)
+        let vault = SceneMemoryVault()
+        let store = WorkspaceStore(persistence: try FileWorkspacePersistence(directory: directory), vault: vault)
+        let installed = try await store.install(archive, envelopeDigest: crypto.sha256(try archive.encoded()),
+            expectedRevision: nil, sourceAndContentsConfirmed: true).workspace
+        let broker = SSHAuthenticationBroker(store: store, signer: SceneMemorySigner(vault: vault),
+                                             support: WorkspaceNativeSSHAuthentication.routeSupport)
+        await broker.resume()
+        let selected = try await broker.keyboardInteractiveIdentity(workspaceID: installed.id, expectedRevision: installed.revision,
+            routeID: "route-alpha", presentedHostKey: WorkspaceDocument.HostKey(algorithm: host.algorithm, fingerprint: host.fingerprint))
+        let prompt = MobileSSHKeyboardInteractivePrompt()
+        prompt.setActive(true)
+        prompt.setScope(.init(workspaceID: installed.id, revision: installed.revision, machineID: "machine-alpha", destinationRouteIDs: ["route-alpha"]))
+        return (broker, selected, prompt)
+    }
+
+    private func waitForInteractivePrompt(_ prompt: MobileSSHKeyboardInteractivePrompt) async throws -> WorkspaceSSHKeyboardInteractiveRequest {
+        let deadline = ContinuousClock.now + .seconds(3)
+        while ContinuousClock.now < deadline {
+            if let request = prompt.request { return request }
+            await Task.yield()
+        }
+        XCTFail("The authorized keyboard-interactive prompt did not appear")
+        throw SSHAuthenticationError.unavailable
+    }
+
+    func testInteractiveEditorPreservesFieldsAndEchoPolicyAndClearsEveryResponse() async throws {
+        let (broker, selected, prompt) = try await interactivePromptFixture()
+        let transport = UUID(), attempt = UUID()
+        let challenge = try SSHKeyboardInteractiveChallenge(round: 1, name: "Verification", instruction: "Synthetic server instruction",
+            prompts: [.init(text: "Account label", echo: true), .init(text: "One-time code", echo: false)])
+        let task = Task {
+            try await broker.keyboardInteractiveResponses(for: selected, transportID: transport,
+                attemptID: attempt, challenge: challenge, prompter: prompt)
+        }
+        let request = try await waitForInteractivePrompt(prompt)
+        XCTAssertEqual(request.authorization.user, "operator")
+        XCTAssertEqual(request.authorization.presentedHostKey, selected.authorization.presentedHostKey)
+        XCTAssertEqual(request.challenge.prompts.map(\.echo), [true, false])
+        prompt.editAnswer("operator", index: 0, requestID: request.id); prompt.editAnswer("012345", index: 1, requestID: request.id)
+        prompt.editAnswer(String(repeating: "x", count: 1025), index: 1, requestID: request.id)
+        prompt.editAnswer("invalid\0value", index: 0, requestID: request.id)
+        XCTAssertEqual(prompt.answers, ["operator", "012345"])
+        XCTAssertTrue(prompt.canSubmit)
+        prompt.submit(requestID: request.id)
+        XCTAssertNil(prompt.request); XCTAssertTrue(prompt.answers.isEmpty)
+        let answers = try await task.value
+        XCTAssertEqual(answers, [Data("operator".utf8), Data("012345".utf8)])
+
+        // The next informational round still waits for explicit Continue, and
+        // dismissal of the previous sheet cannot cancel this replacement.
+        let notice = try SSHKeyboardInteractiveChallenge(round: 2, name: "Notice", instruction: "Confirm this sign-in", prompts: [])
+        let next = Task {
+            try await broker.keyboardInteractiveResponses(for: selected, transportID: transport,
+                attemptID: attempt, challenge: notice, prompter: prompt)
+        }
+        let current = try await waitForInteractivePrompt(prompt)
+        XCTAssertNotEqual(current.id, request.id)
+        prompt.cancelNow(requestID: request.id)
+        XCTAssertEqual(prompt.request?.id, current.id)
+        XCTAssertTrue(prompt.canSubmit)
+        prompt.submit(requestID: current.id)
+        let empty = try await next.value
+        XCTAssertTrue(empty.isEmpty)
+        let finalChallenge = try SSHKeyboardInteractiveChallenge(round: 3, name: "Confirm", instruction: "",
+            prompts: [.init(text: "Final code", echo: false)])
+        let last = Task {
+            try await broker.keyboardInteractiveResponses(for: selected, transportID: transport,
+                attemptID: attempt, challenge: finalChallenge, prompter: prompt)
+        }
+        let finalRequest = try await waitForInteractivePrompt(prompt)
+        prompt.editAnswer("new secret", index: 0, requestID: finalRequest.id)
+        prompt.editAnswer("stale visible edit", index: 0, requestID: request.id)
+        XCTAssertEqual(prompt.answers, ["new secret"])
+        XCTAssertTrue(prompt.answer(at: 0, requestID: request.id).isEmpty,
+                      "An old echo-enabled field must not expose a new hidden response")
+        prompt.submit(requestID: finalRequest.id)
+        let finalAnswers = try await last.value
+        XCTAssertEqual(finalAnswers, [Data("new secret".utf8)])
+        await broker.finishKeyboardInteractiveAttempt(selected)
+    }
+
+    func testInteractiveEditorRetiresAnswersOnInactivityAndMachineChange() async throws {
+        for change in 0...2 {
+            let (broker, selected, prompt) = try await interactivePromptFixture()
+            let challenge = try SSHKeyboardInteractiveChallenge(round: 1, name: "Verification", instruction: "",
+                prompts: [.init(text: "One-time code", echo: false)])
+            let task = Task {
+                try await broker.keyboardInteractiveResponses(for: selected, transportID: UUID(),
+                    attemptID: UUID(), challenge: challenge, prompter: prompt)
+            }
+            let request = try await waitForInteractivePrompt(prompt)
+            prompt.editAnswer("must not leave", index: 0, requestID: request.id)
+            if change == 0 { prompt.setActive(false) }
+            else { prompt.setScope(.init(workspaceID: selected.authorization.workspaceID,
+                revision: selected.authorization.workspaceRevision,
+                machineID: change == 2 ? "other-machine" : "machine-alpha",
+                destinationRouteIDs: change == 2 ? ["route-alpha"] : ["route-beta"])) }
+            XCTAssertNil(prompt.request); XCTAssertTrue(prompt.answers.isEmpty)
+            prompt.setActive(true)
+            prompt.submit(requestID: request.id)
+            do { _ = try await task.value; XCTFail("A retired round returned an answer") } catch {}
+            await broker.finishKeyboardInteractiveAttempt(selected)
+        }
+    }
+
+    func testInteractiveRoutesRequireForegroundPromptOwnership() {
+        let direct = TerminalSessionRoute(id: "route", credentialIDs: [], host: "destination.invalid", port: 22,
+            authenticationChoices: [.keyboardInteractive])
+        let jump = TerminalSessionRoute(id: "route", credentialIDs: ["key"], host: "destination.invalid", port: 22,
+            promptingJump: true)
+        XCTAssertTrue(direct.requiresAuthenticationPrompt)
+        XCTAssertTrue(jump.requiresAuthenticationPrompt)
     }
 
     func testPasswordHopKeyRefusalAdvancesOnlyOnExplicitRetryAndConsumesEachKeyOnce() async throws {
         let (connections, scene, original) = try dormantScene()
         let route = TerminalSessionRoute(id: "route", credentialIDs: ["first", "second", "third"],
-            host: "destination.invalid", port: 22, passwordJump: true, jumpHost: "jump.invalid")
+            host: "destination.invalid", port: 22, promptingJump: true, jumpHost: "jump.invalid")
         let target = TerminalSessionTarget(workspaceID: original.workspaceID, revision: original.revision,
             machineID: original.machineID, machineName: original.machineName, routes: [route])
         let first = TerminalSessionController(target: target, connections: connections, focus: scene)
@@ -2704,7 +2842,7 @@ final class TerminalSessionControllerTests: XCTestCase {
     func testPasswordHopRetryCannotSurviveCancellationOrWorkspaceRevisionChange() async throws {
         let (connections, scene, original) = try dormantScene()
         let route = TerminalSessionRoute(id: "route", credentialIDs: ["first", "second"],
-            host: "destination.invalid", port: 22, passwordJump: true)
+            host: "destination.invalid", port: 22, promptingJump: true)
         let target = TerminalSessionTarget(workspaceID: original.workspaceID, revision: original.revision,
             machineID: original.machineID, machineName: original.machineName, routes: [route])
         for cancel in [false, true] {

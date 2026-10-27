@@ -1047,7 +1047,34 @@ public actor WorkspaceStore {
     public func authorizeSSHPasswordAuthentication(workspaceID: UUID, expectedRevision: UUID,
         routeID: String, presentedHostKey: WorkspaceDocument.HostKey,
         support: WorkspaceDocument.RouteSupport, transitForRouteID: String? = nil) throws -> WorkspaceSSHPasswordAuthorization {
-        try persistence.withExclusiveAccess {
+        let selected = try authorizeSSHAccountAuthentication(method: .password, workspaceID: workspaceID,
+            expectedRevision: expectedRevision, routeID: routeID, presentedHostKey: presentedHostKey,
+            support: support, transitForRouteID: transitForRouteID)
+        return .init(storeOwner: sshAuthorizationOwner, workspaceID: workspaceID, workspaceRevision: selected.revision,
+            routeID: routeID, host: selected.route.host, port: selected.route.port, user: selected.route.user,
+            routeMode: selected.route.mode, jumpRouteIDs: selected.route.jumpRoutes,
+            transitForRouteID: transitForRouteID, presentedHostKey: presentedHostKey)
+    }
+
+    /// Keyboard-interactive has its own imported method authorization. Permission
+    /// to send a password never grants permission to answer this method's prompts.
+    public func authorizeSSHKeyboardInteractiveAuthentication(workspaceID: UUID, expectedRevision: UUID,
+        routeID: String, presentedHostKey: WorkspaceDocument.HostKey,
+        support: WorkspaceDocument.RouteSupport, transitForRouteID: String? = nil) throws -> WorkspaceSSHKeyboardInteractiveAuthorization {
+        let selected = try authorizeSSHAccountAuthentication(method: .keyboardInteractive, workspaceID: workspaceID,
+            expectedRevision: expectedRevision, routeID: routeID, presentedHostKey: presentedHostKey,
+            support: support, transitForRouteID: transitForRouteID)
+        return .init(storeOwner: sshAuthorizationOwner, workspaceID: workspaceID, workspaceRevision: selected.revision,
+            routeID: routeID, host: selected.route.host, port: selected.route.port, user: selected.route.user,
+            routeMode: selected.route.mode, jumpRouteIDs: selected.route.jumpRoutes,
+            transitForRouteID: transitForRouteID, presentedHostKey: presentedHostKey)
+    }
+
+    private func authorizeSSHAccountAuthentication(method: WorkspaceDocument.AuthenticationMethod,
+        workspaceID: UUID, expectedRevision: UUID, routeID: String, presentedHostKey: WorkspaceDocument.HostKey,
+        support: WorkspaceDocument.RouteSupport, transitForRouteID: String?) throws -> (route: WorkspaceDocument.Route, revision: UUID) {
+        guard method == .password || method == .keyboardInteractive else { throw SSHAuthenticationError.denied }
+        return try persistence.withExclusiveAccess {
             var catalog = try readCatalog()
             try recover(catalog: &catalog)
             guard let saved = catalog.workspaces.first(where: { $0.id == workspaceID }),
@@ -1055,7 +1082,7 @@ public actor WorkspaceStore {
             let document = try saved.document()
             guard let route = document.routes.first(where: { $0.id == routeID }),
                   transitForRouteID != nil || route.mode == "direct_ssh" || route.mode == "frankenterm_mux",
-                  route.authenticationMethods.contains(.password), support.authenticationMethods.contains(.password) else {
+                  route.authenticationMethods.contains(method), support.authenticationMethods.contains(method) else {
                 throw SSHAuthenticationError.denied
             }
             let available = try availableCredentials(saved, catalog: catalog)
@@ -1085,9 +1112,7 @@ public actor WorkspaceStore {
                 requiredHostCapabilitiesByTrustScope: hostRequirements(workspaceID, catalog: catalog))
             guard decision != .pinMismatch else { throw SSHAuthenticationError.hostKeyMismatch }
             guard decision == .trustedPin else { throw SSHAuthenticationError.denied }
-            return .init(storeOwner: sshAuthorizationOwner, workspaceID: workspaceID, workspaceRevision: saved.revision,
-                routeID: routeID, host: route.host, port: route.port, user: route.user, routeMode: route.mode,
-                jumpRouteIDs: route.jumpRoutes, transitForRouteID: transitForRouteID, presentedHostKey: presentedHostKey)
+            return (route, saved.revision)
         }
     }
 
@@ -1095,6 +1120,16 @@ public actor WorkspaceStore {
         support: WorkspaceDocument.RouteSupport) throws {
         guard authorization.storeOwner == sshAuthorizationOwner else { throw SSHAuthenticationError.stale }
         let current = try authorizeSSHPasswordAuthentication(workspaceID: authorization.workspaceID,
+            expectedRevision: authorization.workspaceRevision, routeID: authorization.routeID,
+            presentedHostKey: authorization.presentedHostKey, support: support,
+            transitForRouteID: authorization.transitForRouteID)
+        guard current == authorization else { throw SSHAuthenticationError.stale }
+    }
+
+    public func validateSSHKeyboardInteractiveAuthentication(_ authorization: WorkspaceSSHKeyboardInteractiveAuthorization,
+        support: WorkspaceDocument.RouteSupport) throws {
+        guard authorization.storeOwner == sshAuthorizationOwner else { throw SSHAuthenticationError.stale }
+        let current = try authorizeSSHKeyboardInteractiveAuthentication(workspaceID: authorization.workspaceID,
             expectedRevision: authorization.workspaceRevision, routeID: authorization.routeID,
             presentedHostKey: authorization.presentedHostKey, support: support,
             transitForRouteID: authorization.transitForRouteID)

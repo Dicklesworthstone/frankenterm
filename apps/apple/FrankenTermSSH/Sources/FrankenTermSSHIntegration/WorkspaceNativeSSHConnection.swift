@@ -66,6 +66,7 @@ public actor WorkspaceNativeSSHConnection {
                                routeID: String, authentication: WorkspaceSSHAuthenticationChoice, confirmedByUser: Bool,
                                store: WorkspaceStore, broker: SSHAuthenticationBroker,
                                passwordPrompter: (any WorkspaceSSHPasswordPrompting)? = nil,
+                               keyboardInteractivePrompter: (any WorkspaceSSHKeyboardInteractivePrompting)? = nil,
                                journal: TerminalSessionJournal? = nil,
                                networkActivity: WorkspaceNetworkActivity = .shared,
                                connectionTimeout: Duration = .seconds(15),
@@ -122,6 +123,10 @@ public actor WorkspaceNativeSSHConnection {
         guard passwordPrompter != nil || (authentication != .password && !hopChoices.contains(where: { $0.contains(.password) })) else {
             throw SSHAuthenticationError.unavailable
         }
+        guard keyboardInteractivePrompter != nil || (authentication != .keyboardInteractive
+            && !hopChoices.contains(where: { $0.contains(.keyboardInteractive) })) else {
+            throw SSHAuthenticationError.unavailable
+        }
         try await broker.validateForeground(foreground)
         try Task.checkCancellation()
         let session: NativeSSHSession
@@ -129,7 +134,7 @@ public actor WorkspaceNativeSSHConnection {
             session = try await connectThroughHops(hops, authenticationChoices: hopChoices,
                 destination: endpoint, destinationRouteID: routeID, workspaceID: workspaceID,
                 revision: expectedRevision, store: store, broker: broker, foreground: foreground,
-                passwordPrompter: passwordPrompter, lease: lease,
+                passwordPrompter: passwordPrompter, keyboardInteractivePrompter: keyboardInteractivePrompter, lease: lease,
                 connectionTimeout: connectionTimeout, authenticationTimeout: authenticationTimeout)
         } else {
             session = try await NativeSSHConnector.connect(to: endpoint, timeout: connectionTimeout, networkLifetime: lease)
@@ -139,7 +144,8 @@ public actor WorkspaceNativeSSHConnection {
             try Task.checkCancellation()
             let (peer, authority) = try await authenticate(session: session, choice: authentication,
                 route: route, workspaceID: workspaceID, revision: expectedRevision, broker: broker,
-                passwordPrompter: passwordPrompter, timeout: authenticationTimeout)
+                passwordPrompter: passwordPrompter, keyboardInteractivePrompter: keyboardInteractivePrompter,
+                timeout: authenticationTimeout)
             try await broker.validateForeground(foreground)
             try Task.checkCancellation()
             // This source never changes route revision in place. The complete
@@ -161,8 +167,8 @@ public actor WorkspaceNativeSSHConnection {
             // Keep exclusion until cancellation/readiness teardown has joined.
             withExtendedLifetime(lease) {}
             if (error as? NativeSSHError)?.isCredentialRefused == true,
-               hopChoices.contains(where: { $0.contains(.password) }) {
-                throw WorkspaceSSHConnectionError.passwordHopRetryRequired
+               hopChoices.contains(where: { $0.contains(where: \.requiresForegroundPrompt) }) {
+                throw WorkspaceSSHConnectionError.promptedHopRetryRequired
             }
             throw error
         }
@@ -177,10 +183,11 @@ public actor WorkspaceNativeSSHConnection {
         destination: NativeSSHEndpoint, destinationRouteID: String, workspaceID: UUID, revision: UUID,
         store: WorkspaceStore, broker: SSHAuthenticationBroker, foreground: SSHForegroundLease,
         passwordPrompter: (any WorkspaceSSHPasswordPrompting)?,
+        keyboardInteractivePrompter: (any WorkspaceSSHKeyboardInteractivePrompting)?,
         lease: WorkspaceNetworkLease, connectionTimeout: Duration, authenticationTimeout: Duration)
         async throws -> NativeSSHSession {
         var hadCredentialRefusal = false
-        var usedPassword = false
+        var usedPrompt = false
         do {
             guard (1...3).contains(hops.count), authenticationChoices.count == hops.count else {
                 throw SSHAuthenticationError.denied
@@ -222,10 +229,11 @@ public actor WorkspaceNativeSSHConnection {
                         }
                         guard let owner = session, owner.endpoint == endpoint else { throw SSHAuthenticationError.denied }
                         pending = (index, plan, attempt)
-                        if attempt.selection.authentication == .password { usedPassword = true }
+                        if attempt.selection.authentication.requiresForegroundPrompt { usedPrompt = true }
                         _ = try await authenticate(session: owner, choice: attempt.selection.authentication,
                             route: hop, workspaceID: workspaceID, revision: revision, broker: broker,
-                            passwordPrompter: passwordPrompter, transitForRouteID: destinationRouteID,
+                            passwordPrompter: passwordPrompter, keyboardInteractivePrompter: keyboardInteractivePrompter,
+                            transitForRouteID: destinationRouteID,
                             timeout: authenticationTimeout)
                         _ = try plan.connected(attempt)
                         pending = nil
@@ -246,7 +254,7 @@ public actor WorkspaceNativeSSHConnection {
                     await session?.close()
                     try Task.checkCancellation()
                     try await broker.validateForeground(foreground)
-                    if !usedPassword, (error as? NativeSSHError)?.isCredentialRefused == true, var refused = pending {
+                    if !usedPrompt, (error as? NativeSSHError)?.isCredentialRefused == true, var refused = pending {
                         hadCredentialRefusal = true
                         if try refused.plan.failed(.credentialRefused, attempt: refused.attempt) != nil {
                             candidateIndices[refused.index] += 1
@@ -260,14 +268,15 @@ public actor WorkspaceNativeSSHConnection {
             if Task.isCancelled { throw CancellationError() }
             // No answer from the hop stays that: the caller tries the next
             // route and says the jump host could not be reached.
-            if !hadCredentialRefusal, !usedPassword, let failure = error as? NativeSSHError, failure.isUnreachable { throw failure }
+            if !hadCredentialRefusal, !usedPrompt, let failure = error as? NativeSSHError, failure.isUnreachable { throw failure }
             throw NativeSSHError.jumpConnectionFailed
         }
     }
 
     private static func authenticate(session: NativeSSHSession, choice: WorkspaceSSHAuthenticationChoice,
         route: WorkspaceDocument.Route, workspaceID: UUID, revision: UUID, broker: SSHAuthenticationBroker,
-        passwordPrompter: (any WorkspaceSSHPasswordPrompting)?, transitForRouteID: String? = nil,
+        passwordPrompter: (any WorkspaceSSHPasswordPrompting)?,
+        keyboardInteractivePrompter: (any WorkspaceSSHKeyboardInteractivePrompting)?, transitForRouteID: String? = nil,
         timeout: Duration) async throws -> (NativeSSHPeer, any WorkspaceNativeSSHAuthority) {
         let endpoint = try NativeSSHEndpoint(host: route.host, port: route.port)
         switch choice {
@@ -282,6 +291,14 @@ public actor WorkspaceNativeSSHConnection {
                 workspaceID: workspaceID, revision: revision, routeID: route.id, transportID: session.transportID,
                 endpoint: endpoint, transitForRouteID: transitForRouteID, allowedJumpRouteIDs: route.jumpRoutes)
             let peer = try await session.authenticate(usingPassword: authority, timeout: timeout)
+            try await authority.authenticationCompleted()
+            return (peer, authority)
+        case .keyboardInteractive:
+            guard let keyboardInteractivePrompter else { throw SSHAuthenticationError.unavailable }
+            let authority = WorkspaceNativeSSHInteractiveAuthentication(broker: broker, prompter: keyboardInteractivePrompter,
+                workspaceID: workspaceID, revision: revision, routeID: route.id, transportID: session.transportID,
+                endpoint: endpoint, transitForRouteID: transitForRouteID, allowedJumpRouteIDs: route.jumpRoutes)
+            let peer = try await session.authenticate(usingInteractive: authority, timeout: timeout)
             try await authority.authenticationCompleted()
             return (peer, authority)
         }

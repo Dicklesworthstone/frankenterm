@@ -108,6 +108,40 @@ private final class DelayedSSHPasswordPrompt: WorkspaceSSHPasswordPrompting, @un
     }
 }
 
+private final class DelayedSSHKeyboardInteractivePrompt: WorkspaceSSHKeyboardInteractivePrompting, @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending: (WorkspaceSSHKeyboardInteractiveRequest, CheckedContinuation<[Data], Error>)?
+    private var observer: CheckedContinuation<Void, Never>?
+    private var callCount = 0, cancellationCount = 0
+    var calls: Int { lock.lock(); defer { lock.unlock() }; return callCount }
+    var cancellations: Int { lock.lock(); defer { lock.unlock() }; return cancellationCount }
+    var request: WorkspaceSSHKeyboardInteractiveRequest? { lock.lock(); defer { lock.unlock() }; return pending?.0 }
+    func responses(for request: WorkspaceSSHKeyboardInteractiveRequest) async throws -> [Data] {
+        try await withCheckedThrowingContinuation { continuation in
+            lock.lock()
+            guard pending == nil else { lock.unlock(); continuation.resume(throwing: SSHAuthenticationError.busy); return }
+            callCount += 1; pending = (request, continuation)
+            let observer = self.observer; self.observer = nil
+            lock.unlock(); observer?.resume()
+        }
+    }
+    func cancel(requestID: UUID) {
+        lock.lock(); defer { lock.unlock() }
+        if pending?.0.id == requestID { cancellationCount += 1 }
+    }
+    func waitUntilStarted() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if pending != nil { lock.unlock(); continuation.resume() }
+            else { observer = continuation; lock.unlock() }
+        }
+    }
+    func finish(_ answers: [Data]) {
+        lock.lock(); let selected = pending; pending = nil; lock.unlock()
+        selected?.1.resume(returning: answers)
+    }
+}
+
 @MainActor
 final class SSHAuthenticationBrokerTests: XCTestCase {
     private let crypto = TestCryptography()
@@ -863,7 +897,11 @@ final class SSHAuthenticationBrokerTests: XCTestCase {
             (["publickey", "password"], ["key"], [.publicKey("key")]),
             (["publickey", "password"], [], [.password]),
             (["password", "publickey"], ["key"], [.password]),
-            (["keyboard-interactive"], [], [])
+            (["keyboard-interactive"], [], [.keyboardInteractive]),
+            (["keyboard-interactive", "password"], [], [.keyboardInteractive]),
+            (["password", "keyboard-interactive"], [], [.password]),
+            (["publickey", "keyboard-interactive"], ["key"], [.publicKey("key")]),
+            (["publickey", "keyboard-interactive"], [], [.keyboardInteractive])
         ]
         for (methods, available, expected) in cases {
             let f = try await fixture { workspace in
@@ -873,5 +911,265 @@ final class SSHAuthenticationBrokerTests: XCTestCase {
             let route = try XCTUnwrap(f.archive.workspace.routes.first)
             XCTAssertEqual(WorkspaceSSHAuthenticationChoice.choices(for: route, usableCredentialIDs: available), expected)
         }
+    }
+
+    private var keyboardInteractiveSupport: WorkspaceDocument.RouteSupport {
+        .init(routeModes: ["direct_ssh"], authenticationMethods: [.publicKey, .password, .keyboardInteractive],
+              credentialAlgorithms: ["ssh-ed25519"], hostKeyAlgorithms: ["ssh-ed25519"], maximumJumpHops: 3)
+    }
+
+    private func keyboardInteractiveFixture() async throws -> Fixture {
+        try await fixture(includeKeys: false) { workspace in
+            var routes = workspace["routes"] as! [[String: Any]]
+            routes[0]["authentication_methods"] = ["keyboard-interactive"]
+            routes[0]["credential_refs"] = [] as [String]
+            workspace["routes"] = routes
+        }
+    }
+
+    private func keyboardInteractiveIdentity(_ broker: SSHAuthenticationBroker, _ f: Fixture) async throws
+        -> WorkspaceSSHKeyboardInteractiveIdentity {
+        try await broker.keyboardInteractiveIdentity(workspaceID: f.installed.id, expectedRevision: f.installed.revision,
+                                                      routeID: "route", presentedHostKey: f.pin)
+    }
+
+    func testKeyboardInteractiveMultipleRoundsPreserveQuestionsEchoAndExactAuthority() async throws {
+        let f = try await keyboardInteractiveFixture(), prompt = DelayedSSHKeyboardInteractivePrompt()
+        let signer = DelayedSSHSigner(f.key.container)
+        let broker = SSHAuthenticationBroker(store: f.store, signer: signer, support: keyboardInteractiveSupport)
+        await broker.resume()
+        let selected = try await keyboardInteractiveIdentity(broker, f), transport = UUID(), attempt = UUID()
+        let rounds = [
+            try SSHKeyboardInteractiveChallenge(round: 1, name: "Verification", instruction: "Enter both answers.",
+                prompts: [.init(text: "Account label:", echo: true), .init(text: "One-time code:", echo: false)]),
+            try SSHKeyboardInteractiveChallenge(round: 2, name: "Notice", instruction: "Confirm this sign-in.", prompts: []),
+            try SSHKeyboardInteractiveChallenge(round: 3, name: "", instruction: "", prompts: [.init(text: "Optional response:", echo: false)]),
+            try SSHKeyboardInteractiveChallenge(round: 4, name: "Final check", instruction: "", prompts: [.init(text: "Code:", echo: false)])
+        ]
+        let responses = [[Data("work-account".utf8), Data("123456".utf8)], [], [Data()], [Data("654321".utf8)]]
+        var priorRequestID: UUID?
+        for (challenge, answers) in zip(rounds, responses) {
+            let task = Task { try await broker.keyboardInteractiveResponses(for: selected, transportID: transport,
+                attemptID: attempt, challenge: challenge, prompter: prompt) }
+            await prompt.waitUntilStarted()
+            let request = try XCTUnwrap(prompt.request)
+            XCTAssertEqual(request.transportID, transport)
+            XCTAssertEqual(request.attemptID, attempt)
+            XCTAssertEqual(request.authorization, selected.authorization)
+            XCTAssertEqual(request.challenge, challenge)
+            XCTAssertNotEqual(request.id, priorRequestID)
+            priorRequestID = request.id
+            XCTAssertFalse(String(describing: request).contains("One-time"))
+            XCTAssertFalse(String(reflecting: challenge).contains("Verification"))
+            prompt.finish(answers)
+            let returned = try await task.value
+            XCTAssertEqual(returned, answers)
+        }
+        XCTAssertEqual(prompt.calls, 4)
+        XCTAssertEqual(signer.calls, 0)
+        await broker.finishKeyboardInteractiveAttempt(selected)
+        await expectFailure { try await broker.validateKeyboardInteractiveAttempt(selected) }
+        try await broker.validate(selected)
+    }
+
+    func testKeyboardInteractiveRejectsReplaySkippedRoundTransportAndAttemptChanges() async throws {
+        let f = try await keyboardInteractiveFixture(), prompt = DelayedSSHKeyboardInteractivePrompt()
+        let broker = SSHAuthenticationBroker(store: f.store, signer: ImmediateSSHSigner(container: f.key.container),
+                                              support: keyboardInteractiveSupport)
+        await broker.resume()
+        let selected = try await keyboardInteractiveIdentity(broker, f), transport = UUID(), attempt = UUID()
+        let first = try SSHKeyboardInteractiveChallenge(round: 1, name: "", instruction: "", prompts: [])
+        let second = try SSHKeyboardInteractiveChallenge(round: 2, name: "", instruction: "", prompts: [])
+        await expectFailure {
+            _ = try await broker.keyboardInteractiveResponses(for: selected, transportID: transport,
+                attemptID: attempt, challenge: second, prompter: prompt)
+        }
+        let task = Task { try await broker.keyboardInteractiveResponses(for: selected, transportID: transport,
+            attemptID: attempt, challenge: first, prompter: prompt) }
+        await prompt.waitUntilStarted()
+        await expectFailure {
+            _ = try await broker.keyboardInteractiveResponses(for: selected, transportID: transport,
+                attemptID: attempt, challenge: first, prompter: prompt)
+        }
+        prompt.finish([]); _ = try await task.value
+        for (nextTransport, nextAttempt, challenge) in [(transport, attempt, first), (UUID(), attempt, second), (transport, UUID(), second)] {
+            await expectFailure {
+                _ = try await broker.keyboardInteractiveResponses(for: selected, transportID: nextTransport,
+                    attemptID: nextAttempt, challenge: challenge, prompter: prompt)
+            }
+        }
+        XCTAssertEqual(prompt.calls, 1)
+        let next = Task { try await broker.keyboardInteractiveResponses(for: selected, transportID: transport,
+            attemptID: attempt, challenge: second, prompter: prompt) }
+        await prompt.waitUntilStarted(); prompt.finish([]); _ = try await next.value
+        await broker.finishKeyboardInteractiveAttempt(selected)
+    }
+
+    func testKeyboardInteractiveChallengeBoundsRejectBeforeAnyPrompt() throws {
+        let empty: [SSHKeyboardInteractiveChallenge.Prompt] = []
+        for round in [UInt32(0), 5, .max] {
+            XCTAssertThrowsError(try SSHKeyboardInteractiveChallenge(round: round, name: "", instruction: "", prompts: empty))
+        }
+        XCTAssertThrowsError(try SSHKeyboardInteractiveChallenge(round: 1, name: String(repeating: "é", count: 129), instruction: "", prompts: empty))
+        XCTAssertThrowsError(try SSHKeyboardInteractiveChallenge(round: 1, name: "", instruction: String(repeating: "x", count: 1025), prompts: empty))
+        XCTAssertThrowsError(try SSHKeyboardInteractiveChallenge.Prompt(text: String(repeating: "x", count: 1025), echo: false))
+        XCTAssertThrowsError(try SSHKeyboardInteractiveChallenge.Prompt(text: "code\0prompt", echo: false))
+        let short = try SSHKeyboardInteractiveChallenge.Prompt(text: "Code:", echo: false)
+        XCTAssertThrowsError(try SSHKeyboardInteractiveChallenge(round: 1, name: "", instruction: "", prompts: Array(repeating: short, count: 9)))
+        let long = try SSHKeyboardInteractiveChallenge.Prompt(text: String(repeating: "x", count: 1024), echo: false)
+        XCTAssertThrowsError(try SSHKeyboardInteractiveChallenge(round: 1, name: "", instruction: "", prompts: Array(repeating: long, count: 8)))
+    }
+
+    func testKeyboardInteractiveResponseShapeAndSecretBoundsRetireFailedAttempt() async throws {
+        for answers in [[], [Data("a".utf8), Data("b".utf8)], [Data(repeating: 65, count: 1025)], [Data([65, 0, 66])]] {
+            let f = try await keyboardInteractiveFixture(), prompt = DelayedSSHKeyboardInteractivePrompt()
+            let broker = SSHAuthenticationBroker(store: f.store, signer: ImmediateSSHSigner(container: f.key.container),
+                                                  support: keyboardInteractiveSupport)
+            await broker.resume()
+            let selected = try await keyboardInteractiveIdentity(broker, f)
+            let challenge = try SSHKeyboardInteractiveChallenge(round: 1, name: "", instruction: "",
+                prompts: [.init(text: "Code:", echo: false)])
+            let task = Task { try await broker.keyboardInteractiveResponses(for: selected, transportID: UUID(),
+                attemptID: UUID(), challenge: challenge, prompter: prompt) }
+            await prompt.waitUntilStarted(); prompt.finish(answers)
+            await expectFailure { _ = try await task.value }
+            await expectFailure { try await broker.validateKeyboardInteractiveAttempt(selected) }
+        }
+    }
+
+    func testKeyboardInteractiveForegroundDeadlineAndTransportCancellationRejectLateAnswers() async throws {
+        for reason in 0..<4 {
+            let f = try await keyboardInteractiveFixture(), prompt = DelayedSSHKeyboardInteractivePrompt()
+            let broker = SSHAuthenticationBroker(store: f.store, signer: ImmediateSSHSigner(container: f.key.container),
+                                                  support: keyboardInteractiveSupport)
+            await broker.resume()
+            let selected = try await keyboardInteractiveIdentity(broker, f), transport = UUID()
+            let challenge = try SSHKeyboardInteractiveChallenge(round: 1, name: "", instruction: "",
+                prompts: [.init(text: "Code:", echo: false)])
+            let task = Task { try await broker.keyboardInteractiveResponses(for: selected, transportID: transport,
+                attemptID: UUID(), challenge: challenge, prompter: prompt) }
+            await prompt.waitUntilStarted()
+            switch reason {
+            case 0: await broker.setPasswordForeground(false); await broker.setPasswordForeground(true)
+            case 1: await broker.expireRequests(at: .now + .seconds(61))
+            case 2: await broker.cancel(transportID: transport)
+            default: await broker.finishKeyboardInteractiveAttempt(selected)
+            }
+            XCTAssertEqual(prompt.cancellations, 1)
+            let held = await broker.isBusy
+            XCTAssertTrue(held, "Cancellation must wait for the prompt owner to settle")
+            prompt.finish([Data("late-code".utf8)])
+            await expectFailure { _ = try await task.value }
+            await expectFailure { try await broker.validateKeyboardInteractiveAttempt(selected) }
+            let released = await broker.isBusy
+            XCTAssertFalse(released)
+        }
+    }
+
+    func testKeyboardInteractiveReimportAndHostRevocationRejectLatePromptResults() async throws {
+        for replace in [false, true] {
+            let f = try await keyboardInteractiveFixture(), prompt = DelayedSSHKeyboardInteractivePrompt()
+            let broker = SSHAuthenticationBroker(store: f.store, signer: ImmediateSSHSigner(container: f.key.container),
+                                                  support: keyboardInteractiveSupport)
+            await broker.resume()
+            let selected = try await keyboardInteractiveIdentity(broker, f)
+            let challenge = try SSHKeyboardInteractiveChallenge(round: 1, name: "", instruction: "", prompts: [])
+            let task = Task { try await broker.keyboardInteractiveResponses(for: selected, transportID: UUID(),
+                attemptID: UUID(), challenge: challenge, prompter: prompt) }
+            await prompt.waitUntilStarted()
+            if replace {
+                let replacement = try AirGapArchive(workspace: f.archive.workspace.reissuingBundle(id: "interactive-replacement"),
+                                                    keys: [], using: crypto)
+                _ = try await f.store.install(replacement, envelopeDigest: Data(repeating: 8, count: 32),
+                    transferID: Data(repeating: 9, count: 16), expectedRevision: f.installed.revision,
+                    sourceAndContentsConfirmed: true, securityChangesConfirmed: true, associateWithExistingWorkspace: true)
+            } else { try await f.store.revokeHostLocally(workspaceID: f.installed.id, trustID: "trust", key: f.pin) }
+            prompt.finish([])
+            await expectFailure { _ = try await task.value }
+        }
+    }
+
+    func testKeyboardInteractiveAndKeyPromptsShareWorkerAndBackgroundRetiresQueuedRound() async throws {
+        let f = try await fixture { workspace in
+            var routes = workspace["routes"] as! [[String: Any]]
+            routes[0]["authentication_methods"] = ["publickey", "keyboard-interactive"]; workspace["routes"] = routes
+        }
+        let signer = DelayedSSHSigner(f.key.container), prompt = DelayedSSHKeyboardInteractivePrompt()
+        let broker = SSHAuthenticationBroker(store: f.store, signer: signer, support: keyboardInteractiveSupport)
+        await broker.resume()
+        let key = try await prepare(broker, f)
+        let signing = Task { try await broker.confirm(requestID: key.id) }
+        await signer.waitUntilStarted()
+        let selected = try await keyboardInteractiveIdentity(broker, f)
+        let challenge = try SSHKeyboardInteractiveChallenge(round: 1, name: "", instruction: "", prompts: [])
+        let interactive = Task { try await broker.keyboardInteractiveResponses(for: selected, transportID: UUID(),
+            attemptID: UUID(), challenge: challenge, prompter: prompt) }
+        await waitUntilQueued(1, broker: broker)
+        XCTAssertEqual(prompt.calls, 0)
+        await broker.setPasswordForeground(false)
+        await expectFailure { _ = try await interactive.value }
+        signer.finish(); _ = try await signing.value
+        XCTAssertEqual(prompt.calls, 0)
+    }
+
+    func testKeyboardInteractiveRequiresItsOwnMethodProfileAndExactHopGraph() async throws {
+        let ordinary = try await passwordFixture(), interactive = try await keyboardInteractiveFixture()
+        for (f, profile) in [(ordinary, keyboardInteractiveSupport), (interactive, passwordSupport)] {
+            await expectFailure {
+                _ = try await f.store.authorizeSSHKeyboardInteractiveAuthentication(workspaceID: f.installed.id,
+                    expectedRevision: f.installed.revision, routeID: "route", presentedHostKey: f.pin, support: profile)
+            }
+        }
+        for blocked in [false, true] {
+            let f = try await transitFixture { workspace in
+                var routes = workspace["routes"] as! [[String: Any]]
+                routes[1]["authentication_methods"] = ["keyboard-interactive"]; routes[1]["credential_refs"] = [] as [String]
+                if blocked { routes[0]["required_capabilities"] = ["unimplemented-security-policy"] }
+                workspace["routes"] = routes
+            }
+            let broker = SSHAuthenticationBroker(store: f.store, signer: ImmediateSSHSigner(container: f.key.container),
+                                                  support: keyboardInteractiveSupport)
+            await broker.resume()
+            if blocked {
+                await expectFailure {
+                    _ = try await broker.keyboardInteractiveIdentity(workspaceID: f.installed.id, expectedRevision: f.installed.revision,
+                        routeID: "hop", presentedHostKey: f.pin, transitForRouteID: "route")
+                }
+            } else {
+                let selected = try await broker.keyboardInteractiveIdentity(workspaceID: f.installed.id, expectedRevision: f.installed.revision,
+                    routeID: "hop", presentedHostKey: f.pin, transitForRouteID: "route")
+                XCTAssertEqual(selected.authorization.transitForRouteID, "route")
+                await expectFailure {
+                    _ = try await broker.keyboardInteractiveIdentity(workspaceID: f.installed.id, expectedRevision: f.installed.revision,
+                        routeID: "hop", presentedHostKey: f.pin, transitForRouteID: "hop")
+                }
+                await broker.finishKeyboardInteractiveAttempt(selected)
+            }
+        }
+    }
+
+    func testKeyboardInteractivePreparedAttemptsAreBoundedAndExpireBetweenRounds() async throws {
+        let f = try await keyboardInteractiveFixture()
+        let broker = SSHAuthenticationBroker(store: f.store, signer: ImmediateSSHSigner(container: f.key.container),
+                                              support: keyboardInteractiveSupport)
+        await broker.resume()
+        var selected: [WorkspaceSSHKeyboardInteractiveIdentity] = []
+        for _ in 0..<32 { selected.append(try await keyboardInteractiveIdentity(broker, f)) }
+        await expectFailure { _ = try await self.keyboardInteractiveIdentity(broker, f) }
+        await broker.finishKeyboardInteractiveAttempt(selected[0])
+        let replacement = try await keyboardInteractiveIdentity(broker, f)
+        let prompt = DelayedSSHKeyboardInteractivePrompt()
+        let challenge = try SSHKeyboardInteractiveChallenge(round: 1, name: "", instruction: "", prompts: [])
+        let task = Task { try await broker.keyboardInteractiveResponses(for: replacement, transportID: UUID(),
+            attemptID: UUID(), challenge: challenge, prompter: prompt) }
+        await prompt.waitUntilStarted(); prompt.finish([]); _ = try await task.value
+        // No prompt is open, but the entire attempt still expires. A server
+        // cannot retain prepared identities indefinitely between its rounds.
+        await broker.expireRequests(at: .now + .seconds(61))
+        await expectFailure { try await broker.validateKeyboardInteractiveAttempt(replacement) }
+        for identity in selected { await expectFailure { try await broker.validateKeyboardInteractiveAttempt(identity) } }
+        let fresh = try await keyboardInteractiveIdentity(broker, f)
+        try await broker.validateKeyboardInteractiveAttempt(fresh)
+        await broker.finishKeyboardInteractiveAttempt(fresh)
     }
 }
