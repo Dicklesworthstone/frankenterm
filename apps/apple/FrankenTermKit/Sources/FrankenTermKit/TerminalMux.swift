@@ -305,6 +305,11 @@ public protocol TerminalMuxClient: AnyObject, Sendable {
     /// Up to `limit` bytes to send next; returned bytes count as taken.
     func outgoing(limit: Int) throws -> Data
     func nextEvent() throws -> TerminalMuxEvent?
+    /// Advance the client's monotonic input clock and return the delay until
+    /// its next wake, or nil when no input timer is pending. The transport
+    /// folds this into its existing service wait; it must not start another
+    /// receive loop or replay bytes itself. A thrown failure stops egress.
+    func pollInputTimer() throws -> Duration?
     func refreshPanes() throws
     /// Draws the pane from scratch, then every change.
     func show(pane: Int) throws
@@ -341,6 +346,8 @@ public protocol TerminalMuxClient: AnyObject, Sendable {
 }
 
 extension TerminalMuxClient {
+    /// Protocol adapters with no internal input timers need no extra wake.
+    public func pollInputTimer() throws -> Duration? { nil }
     /// A client without a mouse ignores clicks.
     public func click(pane: Int, column: Int, row: Int) throws {}
     /// A client without a wheel ignores it.

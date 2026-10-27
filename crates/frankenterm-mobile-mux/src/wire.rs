@@ -167,6 +167,7 @@ pub const RELIABLE_WRITE_MIN_VERSION: usize = 64;
 pub const PANE_IDENTITY_MIN_VERSION: usize = 71;
 pub const MAX_PANE_IDENTITY_RESPONSE_BYTES: usize = 8 * 1024;
 pub const MAX_RELIABLE_WRITE_BYTES: usize = 16 * 1024;
+pub const MAX_RELIABLE_RETRY_DELAY_NS: u64 = 1_000_000_000;
 
 #[derive(Serialize)]
 pub struct ReliableKeyEvent {
@@ -213,6 +214,53 @@ pub enum ReliableKeyRetry {
     PaneAuthorityRequired { pane_registration: [u8; 16] },
 }
 
+impl ReliableKeyRetry {
+    /// Validate the canonical retry schema before granting any scheduling
+    /// authority. DuplicatePending may already have reached the pane; a new
+    /// registration cannot replace the one frozen at admission. Neither is
+    /// permission for this client's no-effect retry path.
+    pub fn no_effect_delay_ns(self) -> Result<Option<u64>, crate::Error> {
+        let delay = match self {
+            Self::SchedulerFull(pressure) | Self::SchedulerRetired(pressure) => {
+                if pressure.queue_id == 0
+                    || pressure.scheduler_generation == 0
+                    || pressure.task_capacity == 0
+                    || pressure.estimated_byte_capacity == 0
+                    || pressure.requested_estimated_bytes == 0
+                    || pressure.active_tasks > pressure.task_capacity
+                    || pressure.active_estimated_bytes > pressure.estimated_byte_capacity
+                {
+                    return Err(crate::Error::Frame(
+                        "invalid reliable input scheduler pressure",
+                    ));
+                }
+                pressure.retry_after_ns
+            }
+            Self::SchedulerUnavailable { retry_after_ns }
+            | Self::ClientRegistrationTransition { retry_after_ns } => retry_after_ns,
+            Self::DuplicatePending { retry_after_ns } => {
+                validate_retry_delay(retry_after_ns)?;
+                return Ok(None);
+            }
+            Self::PaneAuthorityRequired { pane_registration } => {
+                if pane_registration == [0; 16] {
+                    return Err(crate::Error::Frame("reserved reliable input registration"));
+                }
+                return Ok(None);
+            }
+        };
+        validate_retry_delay(delay)?;
+        Ok(Some(delay))
+    }
+}
+
+fn validate_retry_delay(delay_ns: u64) -> Result<(), crate::Error> {
+    if !(1..=MAX_RELIABLE_RETRY_DELAY_NS).contains(&delay_ns) {
+        return Err(crate::Error::Frame("invalid reliable input retry delay"));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 pub enum ReliableKeyRejection {
     ClientLedgerUnavailable,
@@ -244,6 +292,18 @@ pub struct ReliableKeyResponse {
 pub enum ReliableWriteRetry {
     Input(ReliableKeyRetry),
     DefinitelyNotApplied { retry_after_ns: u64 },
+}
+
+impl ReliableWriteRetry {
+    pub fn no_effect_delay_ns(self) -> Result<Option<u64>, crate::Error> {
+        match self {
+            Self::Input(retry) => retry.no_effect_delay_ns(),
+            Self::DefinitelyNotApplied { retry_after_ns } => {
+                validate_retry_delay(retry_after_ns)?;
+                Ok(Some(retry_after_ns))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]

@@ -130,6 +130,10 @@ fn reliable_input_and_registration_requests_match_the_canonical_codec() {
         codec::MAX_RELIABLE_PANE_WRITE_DATA_BYTES
     );
     assert_eq!(
+        wire::MAX_RELIABLE_RETRY_DELAY_NS,
+        codec::MAX_RELIABLE_KEY_EVENT_RETRY_AFTER_NS
+    );
+    assert_eq!(
         wire::MAX_PANE_IDENTITY_RESPONSE_BYTES,
         codec::MAX_PANE_IDENTITY_RESPONSE_DECOMPRESSED_BYTES
     );
@@ -389,6 +393,100 @@ fn reliable_receipt_outcomes_preserve_canonical_discriminants_and_exact_bodies()
             wire::decode_input_receipt::<wire::ReliableWriteResponse>(&body).is_err(),
             "trailing data cannot acknowledge an effect"
         );
+    }
+}
+
+#[test]
+fn retry_authority_validation_agrees_with_the_canonical_codec() {
+    use codec::{ReliableKeyEventOutcomeV1 as Outcome, ReliableKeyEventRetryV1 as Retry};
+    let valid = codec::ReliableInputSchedulerPressureV1 {
+        queue_id: 1,
+        scheduler_generation: 2,
+        active_tasks: 3,
+        task_capacity: 4,
+        active_estimated_bytes: 5,
+        estimated_byte_capacity: 6,
+        requested_estimated_bytes: 7,
+        retry_after_ns: 1,
+    };
+    let mut retries = Vec::new();
+    for field in 0..10 {
+        let mut pressure = valid;
+        match field {
+            0 => {}
+            1 => pressure.queue_id = 0,
+            2 => pressure.scheduler_generation = 0,
+            3 => pressure.task_capacity = 0,
+            4 => pressure.estimated_byte_capacity = 0,
+            5 => pressure.requested_estimated_bytes = 0,
+            6 => pressure.active_tasks = pressure.task_capacity + 1,
+            7 => pressure.active_estimated_bytes = pressure.estimated_byte_capacity + 1,
+            8 => pressure.retry_after_ns = 0,
+            _ => pressure.retry_after_ns = codec::MAX_RELIABLE_KEY_EVENT_RETRY_AFTER_NS + 1,
+        }
+        retries.extend([
+            Retry::SchedulerFull(pressure),
+            Retry::SchedulerRetired(pressure),
+        ]);
+    }
+    for delay in [0, 1, codec::MAX_RELIABLE_KEY_EVENT_RETRY_AFTER_NS, u64::MAX] {
+        retries.extend([
+            Retry::SchedulerUnavailable {
+                retry_after_ns: delay,
+            },
+            Retry::ClientRegistrationTransition {
+                retry_after_ns: delay,
+            },
+            Retry::DuplicatePending {
+                retry_after_ns: delay,
+            },
+        ]);
+        let reply = codec::ReliablePaneWriteV1Response {
+            pane_id: 7,
+            input_serial: InputSerial::from_millis_since_epoch(1),
+            outcome: codec::ReliablePaneWriteOutcomeV1::Retry(
+                codec::ReliablePaneWriteRetryV1::DefinitelyNotApplied {
+                    retry_after_ns: delay,
+                },
+            ),
+        };
+        let decoded: wire::ReliableWriteResponse =
+            wire::decode_input_receipt(&varbincode::serialize(&reply).unwrap()).unwrap();
+        let wire::ReliableWriteOutcome::Retry(mobile) = decoded.outcome else {
+            panic!("retry")
+        };
+        assert_eq!(
+            mobile.no_effect_delay_ns().is_ok(),
+            reply.validate().is_ok()
+        );
+    }
+    for registration in [[0; 16], [7; 16]] {
+        retries.push(Retry::PaneAuthorityRequired {
+            pane_registration: codec::ReliablePaneRegistrationIdentityV1::from_bytes(registration),
+        });
+    }
+    for retry in retries {
+        let reply = codec::ReliableKeyEventV1Response {
+            pane_id: 7,
+            input_serial: InputSerial::from_millis_since_epoch(1),
+            outcome: Outcome::Retry(retry),
+        };
+        let decoded: wire::ReliableKeyResponse =
+            wire::decode_input_receipt(&varbincode::serialize(&reply).unwrap()).unwrap();
+        let wire::ReliableKeyOutcome::Retry(mobile) = decoded.outcome else {
+            panic!("retry")
+        };
+        let decision = mobile.no_effect_delay_ns();
+        assert_eq!(decision.is_ok(), reply.validate().is_ok());
+        if matches!(
+            retry,
+            Retry::DuplicatePending { .. } | Retry::PaneAuthorityRequired { .. }
+        ) {
+            assert!(
+                !matches!(decision, Ok(Some(_))),
+                "valid syntax alone is not no-effect retry authority"
+            );
+        }
     }
 }
 

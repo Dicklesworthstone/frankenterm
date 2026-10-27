@@ -11,12 +11,31 @@ import CFrankenTermTerminal
 public final class NativeMuxClient: TerminalMuxClient, @unchecked Sendable {
     private let lock = NSLock()
     private var handle: UInt64
+    private let monotonicNanoseconds: @Sendable () throws -> UInt64
 
-    public init() throws {
+    public convenience init() throws {
+        let origin = ContinuousClock.now
+        try self.init(monotonicNanoseconds: {
+            let parts = origin.duration(to: .now).components
+            guard let seconds = UInt64(exactly: parts.seconds),
+                  let fractional = UInt64(exactly: parts.attoseconds / 1_000_000_000) else {
+                throw TerminalModelError.invalid
+            }
+            let whole = seconds.multipliedReportingOverflow(by: 1_000_000_000)
+            let value = whole.partialValue.addingReportingOverflow(fractional)
+            guard !whole.overflow, !value.overflow else { throw TerminalModelError.invalid }
+            return value.partialValue
+        })
+    }
+
+    /// A deterministic clock for bridge tests; production always uses the
+    /// connection's ContinuousClock origin above, never wall-clock time.
+    init(monotonicNanoseconds: @escaping @Sendable () throws -> UInt64) throws {
         var created: UInt64 = 0
         try Self.check(ft_mux_v1_create(&created))
         guard created != 0 else { throw TerminalModelError.invalid }
         handle = created
+        self.monotonicNanoseconds = monotonicNanoseconds
     }
 
     deinit { if handle != 0 { _ = ft_mux_v1_release(handle) } }
@@ -37,12 +56,40 @@ public final class NativeMuxClient: TerminalMuxClient, @unchecked Sendable {
         try lock.withLock { try Self.check(operation(handle)) }
     }
 
+    private func tickLocked(allowClosed: Bool = false) throws -> Duration? {
+        let now = try monotonicNanoseconds()
+        var hasWake: UInt32 = 0, wake: UInt64 = 0
+        let status = ft_mux_v1_tick(handle, now, &hasWake, &wake)
+        if allowClosed, status == UInt32(FT_TERMINAL_CLOSED) { return nil }
+        try Self.check(status)
+        guard hasWake <= 1 else { throw TerminalModelError.invalid }
+        if hasWake == 0 {
+            guard wake == 0 else { throw TerminalModelError.invalid }
+            return nil
+        }
+        guard wake >= now, let remaining = Int64(exactly: wake - now) else { throw TerminalModelError.invalid }
+        return .nanoseconds(remaining)
+    }
+
+    /// Input and receipt admission sample time inside the same lock as their
+    /// C operation, so an idle service turn cannot supply an old deadline.
+    private func timedCall(allowClosed: Bool = false, _ operation: (UInt64) -> UInt32) throws {
+        try lock.withLock {
+            _ = try tickLocked(allowClosed: allowClosed)
+            try Self.check(operation(handle))
+        }
+    }
+
+    public func pollInputTimer() throws -> Duration? {
+        try lock.withLock { try tickLocked() }
+    }
+
     public func receive(_ bytes: Data) throws {
         var offset = 0
         while offset < bytes.count {
             let count = min(bytes.count - offset, Int(FT_MUX_MAX_RECEIVE_BYTES))
             try bytes[bytes.startIndex + offset ..< bytes.startIndex + offset + count].withUnsafeBytes { buffer in
-                try call { ft_mux_v1_receive($0, buffer.bindMemory(to: UInt8.self).baseAddress, UInt32(count)) }
+                try timedCall { ft_mux_v1_receive($0, buffer.bindMemory(to: UInt8.self).baseAddress, UInt32(count)) }
             }
             offset += count
         }
@@ -55,7 +102,7 @@ public final class NativeMuxClient: TerminalMuxClient, @unchecked Sendable {
         let capacity = min(limit, Int(FT_MUX_MAX_COPY_BYTES))
         var bytes = Data(count: capacity), written: UInt32 = 0
         try bytes.withUnsafeMutableBytes { buffer in
-            try call { ft_mux_v1_outgoing($0, buffer.bindMemory(to: UInt8.self).baseAddress, UInt32(capacity), &written) }
+            try timedCall(allowClosed: true) { ft_mux_v1_outgoing($0, buffer.bindMemory(to: UInt8.self).baseAddress, UInt32(capacity), &written) }
         }
         guard written <= capacity else { throw TerminalModelError.invalid }
         bytes.count = Int(written)
@@ -145,7 +192,7 @@ public final class NativeMuxClient: TerminalMuxClient, @unchecked Sendable {
         guard !bytes.isEmpty else { return }
         guard bytes.count <= Int(FT_MUX_MAX_WRITE_BYTES) else { throw TerminalModelError.capacity }
         try bytes.withUnsafeBytes { buffer in
-            try call { ft_mux_v1_write($0, pane, buffer.bindMemory(to: UInt8.self).baseAddress, UInt32(bytes.count)) }
+            try timedCall { ft_mux_v1_write($0, pane, buffer.bindMemory(to: UInt8.self).baseAddress, UInt32(bytes.count)) }
         }
     }
 
@@ -156,7 +203,7 @@ public final class NativeMuxClient: TerminalMuxClient, @unchecked Sendable {
         guard !bytes.isEmpty else { return }
         guard bytes.count <= Int(FT_MUX_MAX_WRITE_BYTES) else { throw TerminalModelError.capacity }
         try bytes.withUnsafeBytes { buffer in
-            try call { ft_mux_v1_paste($0, pane, buffer.bindMemory(to: UInt8.self).baseAddress, UInt32(bytes.count)) }
+            try timedCall { ft_mux_v1_paste($0, pane, buffer.bindMemory(to: UInt8.self).baseAddress, UInt32(bytes.count)) }
         }
     }
 
@@ -187,7 +234,7 @@ public final class NativeMuxClient: TerminalMuxClient, @unchecked Sendable {
     public func click(pane: Int, column: Int, row: Int) throws {
         let pane = try Self.paneID(pane)
         guard (0...4096).contains(column), (0...4096).contains(row) else { throw TerminalModelError.invalid }
-        try call { ft_mux_v1_click($0, pane, UInt32(column), UInt32(row)) }
+        try timedCall { ft_mux_v1_click($0, pane, UInt32(column), UInt32(row)) }
     }
 
     public func adoptPhoneSize(pane: Int, desktop: TerminalMuxSize, rows: Int, columns: Int) throws -> Bool {
@@ -208,7 +255,7 @@ public final class NativeMuxClient: TerminalMuxClient, @unchecked Sendable {
         let pane = try Self.paneID(pane)
         guard steps != 0, let steps = Int32(exactly: max(-64, min(64, steps))),
               (0...4096).contains(column), (0...4096).contains(row) else { throw TerminalModelError.invalid }
-        try call { ft_mux_v1_wheel($0, pane, steps, UInt32(column), UInt32(row)) }
+        try timedCall { ft_mux_v1_wheel($0, pane, steps, UInt32(column), UInt32(row)) }
     }
 
     public func search(pane: Int, text: String, caseSensitive: Bool, regex: Bool) throws -> UInt64 {

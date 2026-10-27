@@ -8,6 +8,7 @@ use codec::{
     InputSerial, MuxWireDecodedPayload, MuxWireDialect, Pdu, ReliableKeyEventOutcomeV1,
     ReliableKeyEventV1Response, ReliablePaneWriteOutcomeV1, ReliablePaneWriteV1Response,
 };
+use frankenterm_mobile_mux::session::{INPUT_DEADLINE_NS, MAX_INPUT_RETRIES};
 use frankenterm_mobile_mux::{Event, Session, wire};
 use support::{Harness, server_frame};
 
@@ -18,6 +19,25 @@ fn current(version: usize) -> Harness {
     harness.attach();
     assert!(harness.session.is_ready(), "{:?}", harness.events);
     harness
+}
+
+fn timed_current() -> Harness {
+    let mut harness = current(71);
+    assert!(harness.session.advance_time(0));
+    harness
+}
+
+fn scheduler_pressure() -> codec::ReliableInputSchedulerPressureV1 {
+    codec::ReliableInputSchedulerPressureV1 {
+        queue_id: 1,
+        scheduler_generation: 2,
+        active_tasks: 3,
+        task_capacity: 3,
+        active_estimated_bytes: 10,
+        estimated_byte_capacity: 20,
+        requested_estimated_bytes: 7,
+        retry_after_ns: 2_000_000,
+    }
 }
 
 fn take_one(session: &mut Session) -> (u64, Pdu) {
@@ -685,4 +705,485 @@ fn identity_replies_cannot_exceed_their_canonical_body_bound() {
         harness.session.take_outgoing().is_empty(),
         "oversize identity cannot authorize a fallback probe"
     );
+}
+
+#[test]
+fn a_no_effect_write_retries_on_time_with_identical_identity_and_fifo_order() {
+    let mut harness = timed_current();
+    let pane = harness.server.pane_id;
+    harness.session.write(pane, b"abc");
+    let (rpc, pdu) = take_one(&mut harness.session);
+    let Pdu::ReliablePaneWriteV1(original) = pdu else {
+        panic!("reliable write")
+    };
+    write_reply(
+        &mut harness.session,
+        rpc,
+        &original,
+        ReliablePaneWriteOutcomeV1::Retry(codec::ReliablePaneWriteRetryV1::DefinitelyNotApplied {
+            retry_after_ns: 2_000_000,
+        }),
+    );
+    harness.session.write(pane, b"\x1b[A");
+    harness.session.paste(pane, "later");
+    harness.session.click(pane, 0, 0);
+    assert_eq!(harness.session.next_input_wake_ns(), Some(2_000_000));
+    assert!(harness.session.advance_time(1_999_999));
+    assert!(harness.session.take_outgoing().is_empty());
+    assert!(harness.session.advance_time(2_000_000));
+    let (retry_rpc, pdu) = take_one(&mut harness.session);
+    let Pdu::ReliablePaneWriteV1(retry) = pdu else {
+        panic!("same write, before any later effect")
+    };
+    assert_ne!(rpc, retry_rpc);
+    assert_eq!(retry, original, "only the transport RPC serial changes");
+    assert_eq!(
+        harness.session.next_input_wake_ns(),
+        Some(INPUT_DEADLINE_NS)
+    );
+    assert!(harness.session.advance_time(2_000_000));
+    assert!(
+        harness.session.take_outgoing().is_empty(),
+        "an equal tick cannot duplicate the retry"
+    );
+    write_reply(
+        &mut harness.session,
+        retry_rpc,
+        &retry,
+        ReliablePaneWriteOutcomeV1::AppliedPrefix { bytes: 3 },
+    );
+    let (key_rpc, pdu) = take_one(&mut harness.session);
+    let Pdu::ReliableKeyEventV1(key) = pdu else {
+        panic!("later key")
+    };
+    assert!(key.input_serial > retry.input_serial);
+    reply(
+        &mut harness.session,
+        97,
+        key_rpc,
+        &ReliableKeyEventV1Response {
+            pane_id: pane,
+            input_serial: key.input_serial,
+            outcome: ReliableKeyEventOutcomeV1::Applied,
+        },
+    );
+    let (paste_rpc, pdu) = take_one(&mut harness.session);
+    assert!(matches!(pdu, Pdu::SendPaste(_)));
+    reply(&mut harness.session, 10, paste_rpc, &codec::UnitResponse {});
+    for _ in 0..2 {
+        let (mouse_rpc, pdu) = take_one(&mut harness.session);
+        assert!(matches!(pdu, Pdu::SendMouseEvent(_)));
+        reply(&mut harness.session, 10, mouse_rpc, &codec::UnitResponse {});
+    }
+    assert!(!harness.session.unanswered_input(pane));
+    assert_eq!(harness.session.next_input_wake_ns(), None);
+}
+
+#[test]
+fn each_canonical_no_effect_key_retry_is_paced_and_keeps_its_registration() {
+    use codec::ReliableKeyEventRetryV1 as Retry;
+    for disposition in [
+        Retry::SchedulerFull(scheduler_pressure()),
+        Retry::SchedulerRetired(scheduler_pressure()),
+        Retry::SchedulerUnavailable {
+            retry_after_ns: 2_000_000,
+        },
+        Retry::ClientRegistrationTransition {
+            retry_after_ns: 2_000_000,
+        },
+    ] {
+        let mut harness = timed_current();
+        let pane = harness.server.pane_id;
+        harness.session.write(pane, b"\x1b[A");
+        let (rpc, pdu) = take_one(&mut harness.session);
+        let Pdu::ReliableKeyEventV1(original) = pdu else {
+            panic!("reliable key")
+        };
+        reply(
+            &mut harness.session,
+            97,
+            rpc,
+            &ReliableKeyEventV1Response {
+                pane_id: pane,
+                input_serial: original.input_serial,
+                outcome: ReliableKeyEventOutcomeV1::Retry(disposition),
+            },
+        );
+        assert_eq!(harness.session.next_input_wake_ns(), Some(2_000_000));
+        assert!(harness.session.advance_time(1_999_999));
+        assert!(harness.session.take_outgoing().is_empty());
+        assert!(harness.session.advance_time(2_000_000));
+        let (retry_rpc, pdu) = take_one(&mut harness.session);
+        let Pdu::ReliableKeyEventV1(retry) = pdu else {
+            panic!("same key")
+        };
+        assert_eq!(retry, original);
+        reply(
+            &mut harness.session,
+            97,
+            retry_rpc,
+            &ReliableKeyEventV1Response {
+                pane_id: pane,
+                input_serial: retry.input_serial,
+                outcome: ReliableKeyEventOutcomeV1::Applied,
+            },
+        );
+        assert!(harness.session.is_ready());
+        assert!(!harness.session.unanswered_input(pane));
+    }
+}
+
+#[test]
+fn retry_attempt_budget_and_admission_deadline_survive_a_duplicate_applied_prefix() {
+    let mut harness = timed_current();
+    let pane = harness.server.pane_id;
+    harness.session.write(pane, b"ab");
+    let (mut rpc, pdu) = take_one(&mut harness.session);
+    let Pdu::ReliablePaneWriteV1(original) = pdu else {
+        panic!("reliable write")
+    };
+    let mut last_wake = 0;
+    for _ in 0..MAX_INPUT_RETRIES {
+        write_reply(
+            &mut harness.session,
+            rpc,
+            &original,
+            ReliablePaneWriteOutcomeV1::Retry(
+                codec::ReliablePaneWriteRetryV1::DefinitelyNotApplied { retry_after_ns: 1 },
+            ),
+        );
+        let wake = harness.session.next_input_wake_ns().unwrap();
+        assert!(
+            wake >= last_wake + 1_000_000,
+            "tiny peer prompts must not busy-spin"
+        );
+        assert!(harness.session.advance_time(wake));
+        let (next_rpc, pdu) = take_one(&mut harness.session);
+        let Pdu::ReliablePaneWriteV1(retry) = pdu else {
+            panic!("same write")
+        };
+        assert_eq!(retry, original);
+        assert_eq!(
+            harness.session.next_input_wake_ns(),
+            Some(INPUT_DEADLINE_NS)
+        );
+        rpc = next_rpc;
+        last_wake = wake;
+    }
+    write_reply(
+        &mut harness.session,
+        rpc,
+        &original,
+        ReliablePaneWriteOutcomeV1::DuplicateAppliedPrefix { bytes: 1 },
+    );
+    let (suffix_rpc, pdu) = take_one(&mut harness.session);
+    let Pdu::ReliablePaneWriteV1(suffix) = pdu else {
+        panic!("reserved suffix")
+    };
+    assert_eq!(suffix.data, b"b");
+    assert!(suffix.input_serial > original.input_serial);
+    assert_eq!(
+        harness.session.next_input_wake_ns(),
+        Some(INPUT_DEADLINE_NS)
+    );
+    write_reply(
+        &mut harness.session,
+        suffix_rpc,
+        &suffix,
+        ReliablePaneWriteOutcomeV1::Retry(codec::ReliablePaneWriteRetryV1::DefinitelyNotApplied {
+            retry_after_ns: 1,
+        }),
+    );
+    assert_stopped(&mut harness.session, pane);
+}
+
+#[test]
+fn peer_delay_is_not_shortened_to_fit_the_original_deadline_after_a_partial_write() {
+    let mut harness = timed_current();
+    let pane = harness.server.pane_id;
+    harness.session.write(pane, b"ab");
+    let (rpc, pdu) = take_one(&mut harness.session);
+    let Pdu::ReliablePaneWriteV1(original) = pdu else {
+        panic!("reliable write")
+    };
+    assert!(harness.session.advance_time(4_000_000_000));
+    write_reply(
+        &mut harness.session,
+        rpc,
+        &original,
+        ReliablePaneWriteOutcomeV1::AppliedPrefix { bytes: 1 },
+    );
+    let (suffix_rpc, pdu) = take_one(&mut harness.session);
+    let Pdu::ReliablePaneWriteV1(suffix) = pdu else {
+        panic!("suffix")
+    };
+    assert_eq!(
+        harness.session.next_input_wake_ns(),
+        Some(INPUT_DEADLINE_NS)
+    );
+    write_reply(
+        &mut harness.session,
+        suffix_rpc,
+        &suffix,
+        ReliablePaneWriteOutcomeV1::Retry(codec::ReliablePaneWriteRetryV1::DefinitelyNotApplied {
+            retry_after_ns: 1_000_000_000,
+        }),
+    );
+    assert_stopped(&mut harness.session, pane);
+}
+
+#[test]
+fn missing_or_ambiguous_receipts_never_gain_retry_authority_from_a_clock() {
+    for outcome in [
+        ReliablePaneWriteOutcomeV1::Indeterminate,
+        ReliablePaneWriteOutcomeV1::Retry(codec::ReliablePaneWriteRetryV1::Input(
+            codec::ReliableKeyEventRetryV1::DuplicatePending {
+                retry_after_ns: 1_000_000,
+            },
+        )),
+        ReliablePaneWriteOutcomeV1::Retry(codec::ReliablePaneWriteRetryV1::Input(
+            codec::ReliableKeyEventRetryV1::PaneAuthorityRequired {
+                pane_registration: codec::ReliablePaneRegistrationIdentityV1::from_bytes(
+                    [0x55; 16],
+                ),
+            },
+        )),
+    ] {
+        let mut harness = timed_current();
+        let pane = harness.server.pane_id;
+        harness.session.write(pane, b"possibly applied");
+        let (rpc, pdu) = take_one(&mut harness.session);
+        let Pdu::ReliablePaneWriteV1(original) = pdu else {
+            panic!("write")
+        };
+        write_reply(&mut harness.session, rpc, &original, outcome);
+        assert_stopped(&mut harness.session, pane);
+    }
+    let mut harness = timed_current();
+    let pane = harness.server.pane_id;
+    harness.session.write(pane, b"lost ACK");
+    take_one(&mut harness.session);
+    assert!(harness.session.advance_time(INPUT_DEADLINE_NS - 1));
+    assert!(harness.session.take_outgoing().is_empty());
+    assert!(!harness.session.advance_time(INPUT_DEADLINE_NS));
+    assert_stopped(&mut harness.session, pane);
+}
+
+#[test]
+fn invalid_retry_pressure_or_delay_fails_before_scheduling() {
+    use codec::ReliableKeyEventRetryV1 as Retry;
+    let mut invalid = Vec::new();
+    for field in 0..9 {
+        let mut pressure = scheduler_pressure();
+        match field {
+            0 => pressure.queue_id = 0,
+            1 => pressure.scheduler_generation = 0,
+            2 => pressure.task_capacity = 0,
+            3 => pressure.estimated_byte_capacity = 0,
+            4 => pressure.requested_estimated_bytes = 0,
+            5 => pressure.active_tasks = pressure.task_capacity + 1,
+            6 => pressure.active_estimated_bytes = pressure.estimated_byte_capacity + 1,
+            7 => pressure.retry_after_ns = 0,
+            _ => pressure.retry_after_ns = wire::MAX_RELIABLE_RETRY_DELAY_NS + 1,
+        }
+        invalid.push(Retry::SchedulerFull(pressure));
+    }
+    invalid.push(Retry::SchedulerUnavailable { retry_after_ns: 0 });
+    invalid.push(Retry::ClientRegistrationTransition {
+        retry_after_ns: u64::MAX,
+    });
+    for disposition in invalid {
+        let mut harness = timed_current();
+        let pane = harness.server.pane_id;
+        harness.session.write(pane, b"\x1b[A");
+        let (rpc, pdu) = take_one(&mut harness.session);
+        let Pdu::ReliableKeyEventV1(key) = pdu else {
+            panic!("key")
+        };
+        reply(
+            &mut harness.session,
+            97,
+            rpc,
+            &ReliableKeyEventV1Response {
+                pane_id: pane,
+                input_serial: key.input_serial,
+                outcome: ReliableKeyEventOutcomeV1::Retry(disposition),
+            },
+        );
+        assert_stopped(&mut harness.session, pane);
+        assert_eq!(harness.session.next_input_wake_ns(), None);
+    }
+}
+
+#[test]
+fn monotonic_regression_overflow_or_close_cannot_release_a_waiting_retry() {
+    for failure in 0..3 {
+        let mut harness = timed_current();
+        let pane = harness.server.pane_id;
+        assert!(harness.session.advance_time(10));
+        harness.session.write(pane, b"pending");
+        let (rpc, pdu) = take_one(&mut harness.session);
+        let Pdu::ReliablePaneWriteV1(original) = pdu else {
+            panic!("write")
+        };
+        write_reply(
+            &mut harness.session,
+            rpc,
+            &original,
+            ReliablePaneWriteOutcomeV1::Retry(
+                codec::ReliablePaneWriteRetryV1::DefinitelyNotApplied {
+                    retry_after_ns: 1_000_000,
+                },
+            ),
+        );
+        match failure {
+            0 => assert!(!harness.session.advance_time(9)),
+            1 => harness.session.closed(),
+            _ => reply(
+                &mut harness.session,
+                37,
+                0,
+                &codec::PaneRemoved { pane_id: pane },
+            ),
+        }
+        assert!(!harness.session.advance_time(1_000_010));
+        assert_stopped(&mut harness.session, pane);
+    }
+    let mut harness = timed_current();
+    let pane = harness.server.pane_id;
+    assert!(
+        harness
+            .session
+            .advance_time(u64::MAX - INPUT_DEADLINE_NS + 1)
+    );
+    harness
+        .session
+        .write(pane, b"cannot allocate a wrapping deadline");
+    assert_stopped(&mut harness.session, pane);
+}
+
+#[test]
+fn a_new_clock_cannot_extend_an_operation_that_lacked_one_at_admission() {
+    let mut harness = current(71);
+    let pane = harness.server.pane_id;
+    harness
+        .session
+        .write(pane, b"admitted without a timer owner");
+    let (rpc, pdu) = take_one(&mut harness.session);
+    let Pdu::ReliablePaneWriteV1(original) = pdu else {
+        panic!("write")
+    };
+    assert!(harness.session.advance_time(0));
+    write_reply(
+        &mut harness.session,
+        rpc,
+        &original,
+        ReliablePaneWriteOutcomeV1::Retry(codec::ReliablePaneWriteRetryV1::DefinitelyNotApplied {
+            retry_after_ns: 1,
+        }),
+    );
+    assert_stopped(&mut harness.session, pane);
+}
+
+#[test]
+fn only_a_matching_current_receipt_can_schedule_or_settle_a_retry() {
+    let mut harness = timed_current();
+    let pane = harness.server.pane_id;
+    harness.session.write(pane, b"original");
+    let (rpc, pdu) = take_one(&mut harness.session);
+    let Pdu::ReliablePaneWriteV1(original) = pdu else {
+        panic!("write")
+    };
+    let disposition =
+        ReliablePaneWriteOutcomeV1::Retry(codec::ReliablePaneWriteRetryV1::DefinitelyNotApplied {
+            retry_after_ns: 1_000_000,
+        });
+    write_reply(&mut harness.session, rpc + 100, &original, disposition);
+    assert_eq!(
+        harness.session.next_input_wake_ns(),
+        Some(INPUT_DEADLINE_NS),
+        "unmatched RPC grants no retry"
+    );
+    write_reply(&mut harness.session, rpc, &original, disposition);
+    // The previous RPC has already settled with a no-effect result. A late
+    // contradictory success cannot release this or a following operation.
+    write_reply(
+        &mut harness.session,
+        rpc,
+        &original,
+        ReliablePaneWriteOutcomeV1::AppliedPrefix { bytes: 8 },
+    );
+    assert_eq!(harness.session.next_input_wake_ns(), Some(1_000_000));
+    assert!(harness.session.advance_time(1_000_000));
+    let (retry_rpc, pdu) = take_one(&mut harness.session);
+    let Pdu::ReliablePaneWriteV1(retry) = pdu else {
+        panic!("retry")
+    };
+    assert_eq!(retry, original);
+    reply(
+        &mut harness.session,
+        101,
+        retry_rpc,
+        &ReliablePaneWriteV1Response {
+            pane_id: pane,
+            input_serial: InputSerial::from_millis_since_epoch(retry.input_serial.get() + 1),
+            outcome: disposition,
+        },
+    );
+    assert_stopped(&mut harness.session, pane);
+}
+
+#[test]
+fn selecting_another_pane_during_pressure_cannot_retarget_or_overtake_input() {
+    let mut harness = timed_current();
+    let first = harness.server.pane_id;
+    harness.session.write(first, b"first");
+    let (rpc, pdu) = take_one(&mut harness.session);
+    let Pdu::ReliablePaneWriteV1(original) = pdu else {
+        panic!("write")
+    };
+    write_reply(
+        &mut harness.session,
+        rpc,
+        &original,
+        ReliablePaneWriteOutcomeV1::Retry(codec::ReliablePaneWriteRetryV1::DefinitelyNotApplied {
+            retry_after_ns: 1_000_000,
+        }),
+    );
+    harness.session.hide(first);
+    let second = first + 1;
+    harness.session.show(second);
+    let (identity_rpc, _) = take_one(&mut harness.session);
+    identity_reply(
+        &mut harness.session,
+        identity_rpc,
+        second,
+        harness.server.incarnation,
+        [0x55; 16],
+    );
+    assert!(matches!(
+        take_one(&mut harness.session).1,
+        Pdu::GetPaneRenderChanges(_)
+    ));
+    harness.session.write(second, b"second");
+    assert!(harness.session.take_outgoing().is_empty());
+    assert!(harness.session.advance_time(1_000_000));
+    let (retry_rpc, pdu) = take_one(&mut harness.session);
+    let Pdu::ReliablePaneWriteV1(retry) = pdu else {
+        panic!("first pane retains FIFO ownership")
+    };
+    assert_eq!(retry, original);
+    write_reply(
+        &mut harness.session,
+        retry_rpc,
+        &retry,
+        ReliablePaneWriteOutcomeV1::AppliedPrefix { bytes: 5 },
+    );
+    let (_, pdu) = take_one(&mut harness.session);
+    let Pdu::ReliablePaneWriteV1(later) = pdu else {
+        panic!("second pane follows")
+    };
+    assert_eq!(later.pane_id, second);
+    assert_eq!(later.pane_registration.unwrap().as_bytes(), [0x55; 16]);
+    assert_eq!(later.data, b"second");
 }

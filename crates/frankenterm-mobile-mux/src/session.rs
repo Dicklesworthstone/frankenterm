@@ -187,6 +187,12 @@ enum Request {
 
 /// The most wheel notches one [`Session::wheel`] call sends.
 pub const MAX_WHEEL_STEPS: u32 = 64;
+/// Reliable input retains one admission budget across retries and suffixes.
+pub const INPUT_DEADLINE_NS: u64 = 5_000_000_000;
+/// At most this many proven-no-effect retransmissions per admitted operation.
+pub const MAX_INPUT_RETRIES: u8 = 8;
+const MIN_INPUT_RETRY_DELAY_NS: u64 = 1_000_000;
+const MAX_INPUT_RETRY_BACKOFF_NS: u64 = 100_000_000;
 const MAX_INPUT_CALL_BYTES: usize = 64 * 1024;
 const MAX_QUEUED_INPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_QUEUED_INPUT_OPERATIONS: usize = 256;
@@ -234,6 +240,11 @@ struct OrderedInput {
     last_serial: u64,
     effect: OrderedEffect,
     in_flight: bool,
+    /// None means the owner has not supplied a clock. Such an operation may
+    /// complete normally, but cannot gain timed retry authority retroactively.
+    deadline_ns: Option<u64>,
+    retry_at_ns: Option<u64>,
+    retries: u8,
 }
 
 /// The pane id that opens PDUs 25, 30 and 37.
@@ -289,6 +300,7 @@ pub struct Session {
     input: PaneInput,
     authorities: HashMap<usize, PaneAuthority>,
     next_input_serial: u64,
+    monotonic_ns: Option<u64>,
     ordered_input: VecDeque<OrderedInput>,
     ordered_input_bytes: usize,
     /// Payloads are released on failure, but their uncertain disposition is
@@ -311,6 +323,55 @@ impl Session {
 
     pub fn is_ready(&self) -> bool {
         self.ready && !self.failed
+    }
+
+    /// Advance the owner's monotonic clock, in nanoseconds from any fixed
+    /// origin chosen for this connection. Call before admitting/receiving input
+    /// and at [`Session::next_input_wake_ns`]. Equal ticks are harmless; a
+    /// backward clock fails closed. There is no wall clock, timer or I/O here.
+    ///
+    /// False means the session ended; the owner must stop egress and drain its
+    /// failure event. Expiry never retries an unanswered/possibly applied RPC.
+    pub fn advance_time(&mut self, now_ns: u64) -> bool {
+        if self.failed {
+            return false;
+        }
+        if self.monotonic_ns.is_some_and(|previous| now_ns < previous) {
+            self.fail("the mux input clock moved backwards; input was not replayed".to_owned());
+            return false;
+        }
+        self.monotonic_ns = Some(now_ns);
+        if self
+            .ordered_input
+            .iter()
+            .any(|input| input.deadline_ns.is_some_and(|deadline| now_ns >= deadline))
+        {
+            self.fail(
+                "the mux input deadline expired; unconfirmed input was not replayed".to_owned(),
+            );
+            return false;
+        }
+        self.drive_input();
+        !self.failed
+    }
+
+    /// Earliest absolute wake in the same clock domain supplied to
+    /// [`Session::advance_time`]. Includes queued-operation expiry, so a paste
+    /// or mouse RPC ahead of reliable input cannot hide that input's deadline.
+    /// Only one owner timer is needed; the bounded FIFO remains authoritative.
+    pub fn next_input_wake_ns(&self) -> Option<u64> {
+        if self.failed {
+            return None;
+        }
+        self.ordered_input
+            .iter()
+            .filter_map(|input| input.deadline_ns)
+            .chain(
+                self.ordered_input
+                    .front()
+                    .and_then(|input| input.retry_at_ns),
+            )
+            .min()
     }
 
     pub fn panes(&self) -> &[PaneInfo] {
@@ -976,6 +1037,21 @@ impl Session {
             return false;
         }
         let count = effect.serials();
+        let deadline_ns = if matches!(effect, OrderedEffect::Bytes { .. } | OrderedEffect::Key(_)) {
+            match self.monotonic_ns {
+                Some(now) => match now.checked_add(INPUT_DEADLINE_NS) {
+                    Some(deadline) => Some(deadline),
+                    None => {
+                        self.interrupted_input.insert(pane_id);
+                        self.fail("mux input deadline overflow; input was not sent".to_owned());
+                        return false;
+                    }
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
         let Some(input_serial) = self.reserve_input_serials(count) else {
             self.interrupted_input.insert(pane_id);
             return false;
@@ -988,6 +1064,9 @@ impl Session {
             last_serial: self.next_input_serial,
             effect,
             in_flight: false,
+            deadline_ns,
+            retry_at_ns: None,
+            retries: 0,
         });
         true
     }
@@ -1004,6 +1083,12 @@ impl Session {
         };
         if input.in_flight {
             return;
+        }
+        if let Some(due) = input.retry_at_ns {
+            let Some(now) = self.monotonic_ns else { return };
+            if now < due {
+                return;
+            }
         }
         if !matches!(self.authorities.get(&input.pane_id),
             Some(PaneAuthority::Available(registration)) if *registration == input.registration)
@@ -1050,6 +1135,7 @@ impl Session {
             ),
         };
         input.in_flight = true;
+        input.retry_at_ns = None;
         self.send_encoded(
             ident,
             &body,
@@ -1065,6 +1151,45 @@ impl Session {
             self.ordered_input_bytes -= input.effect.charge();
         }
         self.drive_input();
+    }
+
+    fn schedule_input_retry(&mut self, peer_delay_ns: u64) -> Result<(), crate::Error> {
+        let Some(now) = self.monotonic_ns else {
+            self.fail(
+                "timed mux input retry requires an owner clock; input was not replayed".to_owned(),
+            );
+            return Ok(());
+        };
+        let Some(input) = self.ordered_input.front_mut() else {
+            return Err(crate::Error::Schema);
+        };
+        let Some(deadline) = input.deadline_ns else {
+            self.fail("mux input had no clock at admission; input was not replayed".to_owned());
+            return Ok(());
+        };
+        if input.retries >= MAX_INPUT_RETRIES {
+            self.fail(
+                "mux input retry budget exhausted; unconfirmed input was not replayed".to_owned(),
+            );
+            return Ok(());
+        }
+        // Amplify short prompts to avoid a busy loop; never shorten a valid
+        // authoritative delay. Retry count and deadline survive partial writes.
+        let base = peer_delay_ns.max(MIN_INPUT_RETRY_DELAY_NS);
+        let delay = base
+            .saturating_mul(1u64 << input.retries)
+            .min(MAX_INPUT_RETRY_BACKOFF_NS.max(base));
+        let Some(due) = now.checked_add(delay).filter(|due| *due < deadline) else {
+            self.fail(
+                "mux input retry would exceed its original deadline; input was not replayed"
+                    .to_owned(),
+            );
+            return Ok(());
+        };
+        input.retries += 1;
+        input.retry_at_ns = Some(due);
+        input.in_flight = false;
+        Ok(())
     }
 
     fn settle_key(&mut self, response: wire::ReliableKeyResponse) -> Result<(), crate::Error> {
@@ -1084,10 +1209,16 @@ impl Session {
             wire::ReliableKeyOutcome::Applied | wire::ReliableKeyOutcome::DuplicateApplied => {
                 self.finish_input()
             }
-            // No-effect pressure can be retried by a future explicitly timed
-            // driver. This client never ignores its delay, changes its target,
-            // or interprets a rejection as permission for a legacy send.
-            wire::ReliableKeyOutcome::Retry(_) | wire::ReliableKeyOutcome::Rejected(_) => {
+            wire::ReliableKeyOutcome::Retry(retry) => {
+                if let Some(delay) = retry.no_effect_delay_ns()? {
+                    return self.schedule_input_retry(delay);
+                }
+                self.fail(
+                    "the mux did not authorize a no-effect key retry; input was not replayed"
+                        .to_owned(),
+                );
+            }
+            wire::ReliableKeyOutcome::Rejected(_) => {
                 self.fail("the mux refused reliable key input; input was not replayed".to_owned());
             }
         }
@@ -1132,9 +1263,16 @@ impl Session {
                     self.drive_input();
                 }
             }
-            wire::ReliableWriteOutcome::Retry(_)
-            | wire::ReliableWriteOutcome::Rejected(_)
-            | wire::ReliableWriteOutcome::Indeterminate => {
+            wire::ReliableWriteOutcome::Retry(retry) => {
+                if let Some(delay) = retry.no_effect_delay_ns()? {
+                    return self.schedule_input_retry(delay);
+                }
+                self.fail(
+                    "the mux did not authorize a no-effect byte retry; input was not replayed"
+                        .to_owned(),
+                );
+            }
+            wire::ReliableWriteOutcome::Rejected(_) | wire::ReliableWriteOutcome::Indeterminate => {
                 self.fail(
                     "the mux did not confirm reliable byte input; input was not replayed"
                         .to_owned(),

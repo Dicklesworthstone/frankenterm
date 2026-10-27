@@ -257,6 +257,17 @@ uint32_t ft_mux_v1_release(uint64_t session);
 uint32_t ft_mux_v1_receive(uint64_t session, const uint8_t *bytes, uint32_t length);
 /* The channel closed; a FAILED event follows. */
 uint32_t ft_mux_v1_closed(uint64_t session);
+/* Advance this connection's monotonic nanosecond clock before input/receive
+ * and whenever the returned wake is due. Choose one fixed origin per handle;
+ * equal ticks are allowed, backwards time ends the session. *has_wake is 1
+ * when *wake_ns names the next absolute deadline in the same clock domain,
+ * otherwise both are zero. No timer/thread runs inside Rust. Reliable input
+ * retains its original 5-second admission budget and at most 8 retries;
+ * only validated, definitely-no-effect replies permit a timed same-operation
+ * retry. Missing replies never do. CLOSED means stop all owner egress, drain
+ * the FAILED event and close the channel; unanswered_input remains readable.
+ * Output pointers must be valid, aligned and nonoverlapping. */
+uint32_t ft_mux_v1_tick(uint64_t session, uint64_t now_ns, uint32_t *has_wake, uint64_t *wake_ns);
 /* Copies up to capacity of the bytes to send next; copied bytes are taken. */
 uint32_t ft_mux_v1_outgoing(uint64_t session, uint8_t *output, uint32_t capacity, uint32_t *written);
 uint32_t ft_mux_v1_next_event(uint64_t session, uint32_t *kind, uint64_t *pane_id,

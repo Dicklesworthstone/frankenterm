@@ -16,7 +16,7 @@
 use crate::native::NativeTerminalError as Error;
 use crate::native_ffi::{input_bytes, output_bytes, output_scalar, utf8};
 use frankenterm_mobile_mux::{Event, SearchQuery, Session};
-use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
+use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use std::convert::TryFrom;
 use std::panic::AssertUnwindSafe;
 use std::sync::{LazyLock, Mutex};
@@ -331,6 +331,40 @@ pub unsafe extern "C" fn ft_mux_v1_receive(session: u64, bytes: *const u8, lengt
 pub extern "C" fn ft_mux_v1_closed(session: u64) -> u32 {
     boundary(Some(session), |registry| {
         registry.session(session)?.closed();
+        Ok(())
+    })
+}
+
+/// Advance the caller's monotonic clock and report the next absolute input
+/// wake. As with the other scalar outputs, both pointers must be writable,
+/// aligned, and nonoverlapping. Validate them before changing session state.
+#[no_mangle]
+pub unsafe extern "C" fn ft_mux_v1_tick(
+    session: u64,
+    now_ns: u64,
+    has_wake: *mut u32,
+    wake_ns: *mut u64,
+) -> u32 {
+    boundary(Some(session), |registry| {
+        unsafe {
+            output_scalar(has_wake, 0)?;
+            output_scalar(wake_ns, 0)?;
+        }
+        let slot = registry.slot(session)?;
+        let state = slot.session.as_mut().ok_or(Error::Stale)?;
+        if !state.advance_time(now_ns) {
+            // Bytes already copied to the owner are its responsibility. Do
+            // not release any remaining local egress after deadline/clock
+            // failure; CLOSED tells the owner to stop sending and tear down.
+            slot.outgoing.clear();
+            return Err(Error::Closed);
+        }
+        if let Some(wake) = state.next_input_wake_ns() {
+            unsafe {
+                output_scalar(has_wake, 1)?;
+                output_scalar(wake_ns, wake)?;
+            }
+        }
         Ok(())
     })
 }
@@ -679,6 +713,43 @@ mod tests {
         assert_eq!(status, 0);
         output.truncate(written as usize);
         output
+    }
+
+    #[test]
+    fn clock_ticks_validate_outputs_before_mutation_and_fence_failed_egress() {
+        let mut session = 0;
+        // SAFETY: live local outputs, or an explicitly null output verified
+        // to be rejected before any state mutation.
+        unsafe {
+            assert_eq!(ft_mux_v1_create(&mut session), 0);
+            let (mut pending, mut wake) = (7u32, 7u64);
+            assert_eq!(
+                ft_mux_v1_tick(session, 10, &mut pending, std::ptr::null_mut()),
+                Error::Invalid as u32
+            );
+            assert_eq!(pending, 0);
+            assert_eq!(
+                ft_mux_v1_tick(session, 5, &mut pending, &mut wake),
+                0,
+                "the invalid call must not have advanced the clock to 10"
+            );
+            assert_eq!((pending, wake), (0, 0));
+            assert_eq!(ft_mux_v1_tick(session, 5, &mut pending, &mut wake), 0);
+            assert_eq!(
+                ft_mux_v1_tick(session, 4, &mut pending, &mut wake),
+                Error::Closed as u32
+            );
+            assert_eq!((pending, wake), (0, 0));
+            assert!(
+                take_outgoing(session).is_empty(),
+                "a backward tick cannot release queued bytes"
+            );
+            assert_eq!(ft_mux_v1_release(session), 0);
+            assert_eq!(
+                ft_mux_v1_tick(session, 6, &mut pending, &mut wake),
+                Error::Stale as u32
+            );
+        }
     }
 
     #[test]

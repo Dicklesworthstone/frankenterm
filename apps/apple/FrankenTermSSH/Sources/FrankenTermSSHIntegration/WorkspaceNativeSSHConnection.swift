@@ -758,8 +758,17 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
     /// read what arrived and apply its events.
     private func pumpMux(timeout: Duration, driver: NativeSSHDriver) async throws -> NativeSSHServiceEvent {
         guard let state = mux else { throw NativeSSHError.closed }
+        // The Rust lane owns retry identity and its immutable budget. Reuse
+        // this channel owner's service wake; no independent timer can race a
+        // close, consume another read, or retransmit a possibly applied RPC.
+        let sampled = ContinuousClock.now
+        let inputWake = try state.client.pollInputTimer()
+        let deadline = inputWake.map { sampled + min(timeout, max(.zero, $0)) }
+        // Polling can itself make a retry due. Flush after the poll, before
+        // sleeping; waiting until its admission deadline would strand it.
         try await flushMux(driver: driver)
-        let event = try await session.service(timeout: state.queries.waitTimeout(maximum: timeout), driver: driver)
+        let wait = min(timeout, deadline.map { max(.nanoseconds(1), ContinuousClock.now.duration(to: $0)) } ?? timeout)
+        let event = try await session.service(timeout: state.queries.waitTimeout(maximum: wait), driver: driver)
         // Even after close: it may be the answer close waits for.
         if !event.output.isEmpty { try state.client.receive(event.output) }
         guard !closed else { throw NativeSSHError.closed }
@@ -779,6 +788,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         guard let state = mux, !state.flushing else { return false }
         state.flushing = true
         defer { state.flushing = false }
+        _ = try state.client.pollInputTimer()
         for _ in 0..<4 {
             if state.outgoing.isEmpty {
                 state.outgoing = try state.client.outgoing(limit: NativeSSHSession.maximumWriteBytes)
