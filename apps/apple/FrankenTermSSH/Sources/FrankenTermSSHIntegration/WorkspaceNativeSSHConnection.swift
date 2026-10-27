@@ -609,6 +609,15 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
             queries = TerminalMuxQueryDriver(client: client, control: control)
             output = TerminalMuxOutputBuffer(geometry: geometry)
         }
+
+        /// A size event names only a numeric pane. Persist its current server
+        /// and topology witness here, where the authoritative list is owned.
+        func rememberPhoneSize(pane: Int, desktop: TerminalMuxSize?, rows: Int, columns: Int) {
+            guard let desktop, let listed = panes.first(where: { $0.paneId == pane }) else {
+                sizes.remove(pane: pane); return
+            }
+            sizes.set(pane: listed, incarnation: incarnation, desktop: desktop, rows: rows, columns: columns)
+        }
     }
 
     init(session: NativeSSHSession, identity: TerminalConnectionIdentity, broker: SSHAuthenticationBroker,
@@ -677,10 +686,12 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
             } else if unconfirmed {
                 control.recordInputUnconfirmed()
             }
-            // Panes an earlier connection left at the phone's size get the
-            // desktop's back; the one about to be shown is resized anyway, and
-            // keeps the desktop's size to give back when the phone looks away.
-            for (pane, record) in state.sizes.records.sorted(by: { $0.key < $1.key }) {
+            // Restore only the same pane on the same identified server run,
+            // still at the phone's size. Reused IDs after a restart, topology
+            // changes and legacy records cannot resize a replacement shell.
+            // The pane about to be shown keeps its desktop size for later.
+            for (pane, record) in state.sizes.records(matching: state.panes, incarnation: state.incarnation)
+                .sorted(by: { $0.key < $1.key }) {
                 guard try client.adoptPhoneSize(pane: pane, desktop: record.desktop,
                                                 rows: record.rows, columns: record.columns) else { continue }
                 if pane != first.paneId { try client.restoreSize(pane: pane) }
@@ -751,6 +762,10 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
             case .ready:
                 state.ready = true
             case .incarnation(let incarnation):
+                guard incarnation.count == 16,
+                      state.incarnation == nil || state.incarnation == incarnation else {
+                    throw TerminalMuxError.failed("The mux server identity changed. Reconnect before using its panes.")
+                }
                 state.incarnation = incarnation
             case .panes(let panes):
                 try state.control.inputRouting.replaceInventory(panes.map(\.paneId))
@@ -820,7 +835,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
             case .context(let pane, let context):
                 state.queries.receive(pane: pane, context: context)
             case .phoneSize(let pane, let desktop, let rows, let columns):
-                state.sizes.set(pane: pane, desktop: desktop, rows: rows, columns: columns)
+                state.rememberPhoneSize(pane: pane, desktop: desktop, rows: rows, columns: columns)
             case .mouseGrab(let pane, let grabbed):
                 guard state.panes.contains(where: { $0.paneId == pane }) else { continue }
                 state.grabs[pane] = grabbed ? true : nil
@@ -1178,7 +1193,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 switch event {
                 case .phoneSize(let pane, .none, _, _): restored.append(pane)
                 case .phoneSize(let pane, let desktop, let rows, let columns):
-                    state.sizes.set(pane: pane, desktop: desktop, rows: rows, columns: columns)
+                    state.rememberPhoneSize(pane: pane, desktop: desktop, rows: rows, columns: columns)
                 case .failed: failed = true
                 default: break
                 }
@@ -1201,7 +1216,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         settle()
         if !inputAnswered() { state.shownPane.markInputUnconfirmed(); state.control.recordInputUnconfirmed() }
         guard !failed, (try? state.client.restoring()) == false else { return }
-        for pane in restored { state.sizes.set(pane: pane, desktop: nil, rows: 0, columns: 0) }
+        for pane in restored { state.sizes.remove(pane: pane) }
     }
 
     func validateForeground() async throws {

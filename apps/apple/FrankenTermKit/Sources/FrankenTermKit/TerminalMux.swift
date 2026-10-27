@@ -113,15 +113,32 @@ public enum TerminalMuxEvent: Equatable, Sendable {
 }
 
 /// The panes a phone left at its own size on one machine, kept across
-/// connections: when a connection drops before giving a pane the desktop's
-/// size back, the next one does.
+/// connections. A later connection may restore a size only on the same
+/// identified server run and pane, still at exactly the phone's dimensions.
+/// A reused number or an unidentified legacy server grants no resize authority.
 public final class TerminalMuxPhoneSizes: @unchecked Sendable {
     public struct Record: Codable, Equatable, Sendable {
+        public let paneId: Int, tabId: Int, windowId: Int
+        public let incarnation: Data
         public let desktop: TerminalMuxSize
         public let rows: Int, columns: Int
+
+        fileprivate var isValid: Bool {
+            paneId >= 0 && tabId >= 0 && windowId >= 0 && incarnation.count == 16
+                && (1...512).contains(rows) && (1...512).contains(columns)
+                && (1...4096).contains(desktop.rows) && (1...4096).contains(desktop.cols)
+                && UInt32(exactly: desktop.pixelWidth) != nil && UInt32(exactly: desktop.pixelHeight) != nil
+                && UInt32(exactly: desktop.dpi) != nil
+        }
+
+        fileprivate func matches(_ pane: TerminalMuxPane, incarnation: Data) -> Bool {
+            self.incarnation == incarnation && paneId == pane.paneId && tabId == pane.tabId
+                && windowId == pane.windowId && rows == pane.size.rows && columns == pane.size.cols
+        }
     }
     /// More panes than any machine has; older entries beyond it are dropped.
     public static let maximumRecords = 256
+    public static let maximumEncodedBytes = 128 * 1024
     private let lock = NSLock()
     private let defaults: UserDefaults
     private let key: String
@@ -131,14 +148,41 @@ public final class TerminalMuxPhoneSizes: @unchecked Sendable {
         key = "frankenterm.mux.phoneSizes.\(workspace).\(machine)"
     }
 
-    public var records: [Int: Record] { lock.withLock { load() } }
+    /// Select against the current authoritative inventory before handing any
+    /// remembered size to the native client. The client still checks its own
+    /// current dimensions at adoption. Duplicate pane IDs are not authority.
+    public func records(matching panes: [TerminalMuxPane], incarnation: Data?) -> [Int: Record] {
+        guard let incarnation, incarnation.count == 16 else { return [:] }
+        var seen = Set<Int>()
+        guard panes.allSatisfy({ seen.insert($0.paneId).inserted }) else { return [:] }
+        return lock.withLock {
+            let stored = load()
+            var result: [Int: Record] = [:]
+            for pane in panes {
+                if let record = stored[pane.paneId], record.matches(pane, incarnation: incarnation) {
+                    result[pane.paneId] = record
+                }
+            }
+            return result
+        }
+    }
 
-    public func set(pane: Int, desktop: TerminalMuxSize?, rows: Int, columns: Int) {
+    public func set(pane: TerminalMuxPane, incarnation: Data?, desktop: TerminalMuxSize,
+                    rows: Int, columns: Int) {
         lock.withLock {
             var all = load()
-            if let desktop { all[pane] = Record(desktop: desktop, rows: rows, columns: columns) }
-            else { all[pane] = nil }
+            let record = incarnation.map {
+                Record(paneId: pane.paneId, tabId: pane.tabId, windowId: pane.windowId,
+                       incarnation: $0, desktop: desktop, rows: rows, columns: columns)
+            }
+            all[pane.paneId] = record.flatMap { $0.isValid ? $0 : nil }
             store(all)
+        }
+    }
+
+    public func remove(pane: Int) {
+        lock.withLock {
+            var all = load(); all[pane] = nil; store(all)
         }
     }
 
@@ -146,16 +190,25 @@ public final class TerminalMuxPhoneSizes: @unchecked Sendable {
 
     private func load() -> [Int: Record] {
         guard let data = defaults.data(forKey: key),
-              let decoded = try? JSONDecoder().decode([String: Record].self, from: data) else { return [:] }
-        return Dictionary(decoded.compactMap { key, value in Int(key).map { ($0, value) } },
-                          uniquingKeysWith: { first, _ in first })
+              data.count <= Self.maximumEncodedBytes,
+              let decoded = try? JSONDecoder().decode([String: Record].self, from: data),
+              decoded.count <= Self.maximumRecords else { return [:] }
+        var result: [Int: Record] = [:]
+        for (key, record) in decoded {
+            guard let pane = Int(key), key == String(pane), pane == record.paneId,
+                  record.isValid else { return [:] }
+            result[pane] = record
+        }
+        return result
     }
 
     private func store(_ all: [Int: Record]) {
         guard !all.isEmpty else { defaults.removeObject(forKey: key); return }
         let kept = all.sorted { $0.key < $1.key }.suffix(Self.maximumRecords)
         let encoded = Dictionary(kept.map { (String($0.key), $0.value) }, uniquingKeysWith: { first, _ in first })
-        if let data = try? JSONEncoder().encode(encoded) { defaults.set(data, forKey: key) }
+        if let data = try? JSONEncoder().encode(encoded), data.count <= Self.maximumEncodedBytes {
+            defaults.set(data, forKey: key)
+        }
     }
 }
 
