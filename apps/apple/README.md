@@ -282,7 +282,7 @@ xcodebuild test -project apps/apple/FrankenTerm.xcodeproj -scheme FrankenTerm \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro'
 ```
 
-The simulator build excludes x86_64 (both artifacts ship arm64 slices only). Preserve the tracked `Package.resolved` files: both Apple and Linux builds now resolve the RSA CryptoExtras dependency. Pass `--only-use-versions-from-resolved-file` to `swift build`/`swift test` and `-onlyUsePackageVersionsFromResolvedFile` to `xcodebuild` to retain the reviewed versions. Earlier Apple builds with a system-crypto-only dependency graph could remove those lockfiles; do not commit such deletions.
+The simulator build excludes x86_64 (both artifacts ship arm64 slices only). Preserve the tracked `Package.resolved` files: both Apple and Linux builds now resolve the RSA CryptoExtras dependency. The app project keeps its own, with the same pins, at `FrankenTerm.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved`; without it a pinned `xcodebuild` refuses to resolve. Pass `--only-use-versions-from-resolved-file` to `swift build`/`swift test` and `-onlyUsePackageVersionsFromResolvedFile` to `xcodebuild` to retain the reviewed versions. Earlier Apple builds with a system-crypto-only dependency graph could remove those lockfiles; do not commit such deletions.
 
 **UI journey runner notes.** `OfflineRestoreConnectUITests` skips unless it is given a real package and a reachable SSH server. Its first test always imports, so use a freshly created simulator for each run of the suite (a second import of the same transfer is a different flow); the tests after it reuse the workspace it restored, and each new launch returns to the terminal the previous test left on screen. Use only disposable keys:
 
