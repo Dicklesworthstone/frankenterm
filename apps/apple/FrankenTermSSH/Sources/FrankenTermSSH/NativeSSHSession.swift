@@ -142,14 +142,21 @@ public struct NativeSSHChallenge: Sendable {
               let keyAlgorithm = String(data: identity.publicKey.subdata(in: 4..<4 + Int(keyAlgorithmLength)), encoding: .ascii) else {
             throw NativeSSHError.invalidChallenge
         }
-        guard let algorithm = String(data: algorithmBytes, encoding: .ascii),
-              keyAlgorithm == "ssh-rsa"
-                ? ["rsa-sha2-256", "rsa-sha2-512"].contains(algorithm)
-                : (["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521"].contains(keyAlgorithm)
-                   && algorithm == keyAlgorithm),
+        let certificateSuffix = "-cert-v01@openssh.com"
+        let certificate = keyAlgorithm.hasSuffix(certificateSuffix)
+        let subjectAlgorithm = certificate ? String(keyAlgorithm.dropLast(certificateSuffix.count)) : keyAlgorithm
+        let permittedAlgorithms: [String]
+        if subjectAlgorithm == "ssh-rsa" {
+            permittedAlgorithms = ["rsa-sha2-256", "rsa-sha2-512"].map { $0 + (certificate ? certificateSuffix : "") }
+        } else if ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521"].contains(subjectAlgorithm) {
+            permittedAlgorithms = [keyAlgorithm]
+        } else {
+            throw NativeSSHError.invalidChallenge
+        }
+        guard let algorithm = String(data: algorithmBytes, encoding: .ascii), permittedAlgorithms.contains(algorithm),
               try field() == identity.publicKey, offset == bytes.count else { throw NativeSSHError.invalidChallenge }
         self.transportID = transportID; sessionIdentifier = session
-        self.identity = identity; publicKeyAlgorithm = keyAlgorithm; self.algorithm = algorithm; signedData = bytes
+        self.identity = identity; publicKeyAlgorithm = subjectAlgorithm; self.algorithm = algorithm; signedData = bytes
     }
 }
 
@@ -160,8 +167,17 @@ public struct NativeSSHChallenge: Sendable {
 public protocol NativeSSHAuthentication: Sendable {
     func identity(for peer: NativeSSHPeer) async throws -> NativeSSHIdentity
     func signature(for challenge: NativeSSHChallenge, peer: NativeSSHPeer) async throws -> Data
+    /// Rechecks time-sensitive credentials before signature admission and after
+    /// the server completes login. Established channels use validate instead.
+    func validateForAuthentication(peer: NativeSSHPeer, identity: NativeSSHIdentity) async throws
     func validate(peer: NativeSSHPeer, identity: NativeSSHIdentity) async throws
     func cancel(transportID: UUID)
+}
+
+public extension NativeSSHAuthentication {
+    func validateForAuthentication(peer: NativeSSHPeer, identity: NativeSSHIdentity) async throws {
+        try await validate(peer: peer, identity: identity)
+    }
 }
 
 /// A selected account is public policy, never a password or a synthetic key.
@@ -384,6 +400,15 @@ public actor NativeSSHSession {
                 try await interactive.validate(peer: peer, account: account)
             }
         }
+        func validateForAuthentication() async throws {
+            switch self {
+            case let .publicKey(authority, peer, identity): try await authority.validateForAuthentication(peer: peer, identity: identity)
+            case let .publicKeyAndInteractive(key, identity, interactive, account, peer):
+                try await interactive.validate(peer: peer, account: account)
+                try await key.validateForAuthentication(peer: peer, identity: identity)
+            case .password, .interactive: try await validate()
+            }
+        }
         func cancel() {
             switch self {
             case let .publicKey(authority, peer, _): authority.cancel(transportID: peer.transportID)
@@ -552,7 +577,7 @@ public actor NativeSSHSession {
                     if result == FTSSH_OK { break }
                     if result == FTSSH_AUTH_PARTIAL_REQUIRED {
                         guard signed, let continuation else { throw NativeSSHError.invalidChallenge }
-                        try await authority.validate(peer: found, identity: selected)
+                        try await authority.validateForAuthentication(peer: found, identity: selected)
                         try await validateForwardingPath()
                         try current(token, deadline)
                         // Retain and cancel this provider only after actual
@@ -570,8 +595,8 @@ public actor NativeSSHSession {
                         try current(token, deadline)
                         let signature = try await authority.signature(for: challenge, peer: found)
                         try current(token, deadline)
-                        try await authority.validate(peer: found, identity: selected)
                         try await validateForwardingPath()
+                        try await authority.validateForAuthentication(peer: found, identity: selected)
                         try current(token, deadline)
                         guard (1...Int(FTSSH_SIGNATURE_CAPACITY)).contains(signature.count) else { throw NativeSSHError.invalidChallenge }
                         try requireOK(signature.withUnsafeBytes {
@@ -588,8 +613,8 @@ public actor NativeSSHSession {
                 if let continuation, let continuedAccount {
                     completed = .publicKeyAndInteractive(authority, selected, continuation, continuedAccount, found)
                 } else { completed = .publicKey(authority, found, selected) }
-                try await completed.validate()
                 try await validateForwardingPath()
+                try await completed.validateForAuthentication()
                 try current(token, deadline)
                 authorization = completed; phase = .authenticated
                 return .init(peer: found, usedKeyboardInteractive: continuedAccount != nil)
@@ -736,8 +761,8 @@ public actor NativeSSHSession {
     private func performInteractive(using authority: any NativeSSHInteractiveAuthentication, peer: NativeSSHPeer,
                                     expectedUser: String?, firstFactor: ForwardingWitness?, operation token: UUID,
                                     deadline: ContinuousClock.Instant) async throws -> NativeSSHInteractiveAccount {
-        try await firstFactor?.validate()
         try await validateForwardingPath()
+        try await firstFactor?.validateForAuthentication()
         try current(token, deadline)
         let account = try await authority.account(for: peer)
         try current(token, deadline)
@@ -806,10 +831,10 @@ public actor NativeSSHSession {
     private func validateInteractive(_ authority: any NativeSSHInteractiveAuthentication, peer: NativeSSHPeer,
                                      account: NativeSSHInteractiveAccount, firstFactor: ForwardingWitness?,
                                      operation token: UUID, deadline: ContinuousClock.Instant) async throws {
-        try await firstFactor?.validate()
+        try await validateForwardingPath()
         try current(token, deadline)
         try await authority.validate(peer: peer, account: account)
-        try await validateForwardingPath()
+        try await firstFactor?.validateForAuthentication()
         try current(token, deadline)
     }
 

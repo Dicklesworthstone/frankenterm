@@ -92,6 +92,34 @@ public struct SSHWorkspaceSource: Sendable {
         }
     }
 
+    /// Explicit CertificateFile inputs, frozen independently of private keys.
+    /// Admission verifies the complete user certificate and its CA signature;
+    /// current validity and route restrictions are checked before authentication.
+    public struct PublicCertificateSnapshot: Sendable {
+        public enum File: Equatable, Sendable {
+            case present(Data), missing, unavailable
+        }
+        public let files: [String: File]
+
+        public init(files: [String: File]) throws {
+            guard files.count <= 256 else { throw FTError.limit("ssh.certificate_references") }
+            var normalized: [String: File] = [:], bytes = 0
+            for (reference, file) in files {
+                try Task.checkCancellation()
+                guard reference.utf8.count <= FTLimit.text, SSHWorkspaceSource.localReference(reference),
+                      !reference.split(separator: "/").contains("..") else { throw FTError.malformed("ssh.certificate.reference") }
+                switch file {
+                case .present(let data):
+                    guard data.count <= SSHWorkspaceSource.maximumSourceBytes - bytes else { throw FTError.limit("ssh.certificate.bytes") }
+                    bytes += data.count
+                    normalized[reference] = .present(try SSHWorkspaceSource.userCertificate(data).blob)
+                case .missing, .unavailable: normalized[reference] = file
+                }
+            }
+            self.files = normalized
+        }
+    }
+
     /// A frozen public trust inventory. An absent file differs from a file that
     /// could not be read: only the former proves there were no records to apply.
     /// References stay on the exporter; the workspace carries keys and policy.
@@ -137,7 +165,7 @@ public struct SSHWorkspaceSource: Sendable {
     }
     private struct Resolution {
         let options: [String: [String]]
-        let identities: [String]
+        let identities: [String], certificates: [String]
         var problems: [Problem]
     }
     private enum RouteContext: String {
@@ -191,6 +219,9 @@ public struct SSHWorkspaceSource: Sendable {
         func fingerprint<C: AirGapCryptography>(using crypto: C) -> String {
             "SHA256:" + crypto.sha256(blob).base64EncodedString().replacingOccurrences(of: "=", with: "")
         }
+    }
+    private struct CredentialCandidate {
+        let key: PublicKey, certificate: SSHUserCertificate?, reference: String?
     }
     private struct KnownHost {
         enum Names {
@@ -508,6 +539,53 @@ public struct SSHWorkspaceSource: Sendable {
         return result
     }
 
+    /// Only explicit CertificateFile declarations for the selected route graph.
+    /// No implicit -cert.pub paths, agent identities, or private files are read.
+    public func certificateFileReferences(for selectedAliases: [String]) throws -> [String] {
+        try validateSelection(selectedAliases)
+        var seen = Set<String>(), result: [String] = [], budget = MatchBudget()
+        for route in try plan(selectedAliases, budget: &budget) {
+            for reference in route.resolution.certificates where Self.localReference(reference) {
+                if seen.insert(reference).inserted { result.append(reference) }
+            }
+        }
+        guard result.count <= 256 else { throw FTError.limit("ssh.certificate_references") }
+        return result
+    }
+
+    /// Freeze exact public certificate files without probing a private sibling.
+    /// Missing, malformed, unsafe, or unreadable configured certificates remain
+    /// visible blockers for their own routes; unrelated routes can still export.
+    public func loadPublicCertificateFiles(for selectedAliases: [String],
+        homeDirectory: URL = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)) throws -> PublicCertificateSnapshot {
+        guard homeDirectory.isFileURL else { throw FTError.malformed("ssh.certificate.reference") }
+        let home = ConfigurationParser.physicalURL(homeDirectory, isDirectory: true) ?? homeDirectory.standardizedFileURL
+        var files: [String: PublicCertificateSnapshot.File] = [:], bytes = 0
+        for reference in try certificateFileReferences(for: selectedAliases) {
+            try Task.checkCancellation()
+            guard !reference.split(separator: "/").contains("..") else { throw FTError.unsupported("ssh.certificate.reference") }
+            let url = reference.hasPrefix("~/") ? home.appendingPathComponent(String(reference.dropFirst(2)))
+                : URL(fileURLWithPath: reference)
+            #if os(macOS) || os(iOS)
+            let access = url.startAccessingSecurityScopedResource()
+            defer { if access { url.stopAccessingSecurityScopedResource() } }
+            #endif
+            do {
+                if let data = try Self.readLocalSourceFile(url,
+                    remaining: min(FTLimit.key, Self.maximumSourceBytes - bytes), site: "ssh.certificate") {
+                    bytes += data.count
+                    if let certificate = try? Self.userCertificate(data) { files[reference] = .present(certificate.blob) }
+                    else { files[reference] = .unavailable }
+                } else { files[reference] = .missing }
+            } catch is CancellationError { throw CancellationError() }
+            catch let error as FTError {
+                if case .limit = error { throw error }
+                files[reference] = .unavailable
+            } catch { files[reference] = .unavailable }
+        }
+        return try PublicCertificateSnapshot(files: files)
+    }
+
     /// Freeze public identities for the selected destinations and jump hosts.
     /// Prefer the exact .pub sidecar; only its absence permits inspection of the
     /// configured OpenSSH header, clear ECDSA PEM's embedded public point, or
@@ -650,6 +728,7 @@ public struct SSHWorkspaceSource: Sendable {
     public func export<C: AirGapCryptography>(aliases selectedAliases: [String], workspaceName: String,
                                               defaultUser: String, publicKeys: [String: Data] = [:],
                                               publicIdentityFiles: PublicIdentitySnapshot? = nil,
+                                              publicCertificateFiles: PublicCertificateSnapshot? = nil,
                                               knownHosts: Data? = nil, knownHostFiles: KnownHostsSnapshot? = nil,
                                               registry: inout SSHWorkspaceRegistry,
                                               using crypto: C) throws -> SSHWorkspaceExport {
@@ -669,6 +748,15 @@ public struct SSHWorkspaceSource: Sendable {
                 case .unavailable: unavailableIdentities.insert(reference)
                 case .missing: break
                 }
+            }
+        }
+        var selectedCertificates: [String: SSHUserCertificate] = [:]
+        if let publicCertificateFiles {
+            let expected = Set(try certificateFileReferences(for: selectedAliases))
+            guard Set(publicCertificateFiles.files.keys).isSubset(of: expected) else { throw FTError.malformed("ssh.certificate.unselected_source") }
+            for (reference, file) in publicCertificateFiles.files {
+                try Task.checkCancellation()
+                if case .present(let data) = file { selectedCertificates[reference] = try Self.userCertificate(data) }
             }
         }
         if let knownHosts, knownHosts.count > Self.maximumSourceBytes { throw FTError.limit("ssh.known_hosts.bytes") }
@@ -723,6 +811,21 @@ public struct SSHWorkspaceSource: Sendable {
                 guard sourceBytes.count <= FTLimit.archive else { throw FTError.limit("ssh.source_snapshot") }
             }
         }
+        if let publicCertificateFiles {
+            sourceBytes += Data("file-scoped-user-certificates/v1\0".utf8)
+            sourceBytes.appendBE(UInt64(publicCertificateFiles.files.count), bytes: 4)
+            for reference in publicCertificateFiles.files.keys.sorted() {
+                guard let file = publicCertificateFiles.files[reference] else { throw FTError.stale }
+                sourceBytes.appendBE(UInt64(reference.utf8.count), bytes: 4); sourceBytes += Data(reference.utf8)
+                switch file {
+                case .present(let data):
+                    sourceBytes.append(1); sourceBytes.appendBE(UInt64(data.count), bytes: 4); sourceBytes += data
+                case .missing: sourceBytes.append(2)
+                case .unavailable: sourceBytes.append(3)
+                }
+                guard sourceBytes.count <= FTLimit.archive else { throw FTError.limit("ssh.source_snapshot") }
+            }
+        }
         guard sourceBytes.count <= FTLimit.archive else { throw FTError.limit("ssh.source_snapshot") }
         let revision = crypto.sha256(sourceBytes).ftHex.lowercased()
         let legacyKnown = try Self.knownHosts(knownHosts)
@@ -734,7 +837,7 @@ public struct SSHWorkspaceSource: Sendable {
         var credentials: [JSONValue] = [], order: [JSONValue] = []
         var emittedCredentials = Set<String>(), emittedTrusts = Set<String>(), references: [String: String] = [:]
         var portability = [AirGapArchive.Portability(entityID: registry.workspaceID, setting: "ssh_config.source_scope", disposition: 0,
-            reason: "Created from the selected SSH configuration and supplied public keys/known-hosts data. System configuration, agent inventory, live terminal themes, and implicit certificate files were not captured. Review this explicit route configuration before connecting.")]
+            reason: "Created from the selected SSH configuration and supplied public identities, explicit user certificates, and known-hosts data. System configuration, agent inventory, live terminal themes, and implicit certificate files were not captured. Review this explicit route configuration before connecting.")]
 
         for item in planned {
             let alias = item.key.target.alias
@@ -795,7 +898,7 @@ public struct SSHWorkspaceSource: Sendable {
                 }
             }
             let methods = Self.authentication(resolved.options, problems: &resolved.problems)
-            var credentialIDs: [JSONValue] = []
+            var rawCandidates: [CredentialCandidate] = [], rawBlobs = Set<Data>()
             for reference in resolved.identities {
                 guard Self.localReference(reference) else {
                     resolved.problems.append(Problem("identityfile", "An identity reference requires unsupported token, environment, relative-path, or home-directory resolution.")); continue
@@ -809,19 +912,56 @@ public struct SSHWorkspaceSource: Sendable {
                 guard let key = try? Self.publicKey(data) else {
                     resolved.problems.append(Problem("identityfile", "A supplied public identity is malformed or uses an unsupported key encoding. No partial identity was imported.")); continue
                 }
-                let fingerprint = key.fingerprint(using: crypto)
-                let credentialID = try workingRegistry.id("credential", key.algorithm + ":" + fingerprint)
-                if !credentialIDs.contains(.string(credentialID)) { credentialIDs.append(.string(credentialID)) }
-                if emittedCredentials.insert(credentialID).inserted {
-                    credentials.append(.object(["id": .string(credentialID), "algorithm": .string(key.algorithm),
-                        "public_fingerprint": .string(fingerprint), "requirement": .string("matching_private_key"),
-                        "private_material": .string("not_included")]))
-                    references[credentialID] = reference
+                if rawBlobs.insert(key.blob).inserted {
+                    rawCandidates.append(CredentialCandidate(key: key, certificate: nil, reference: reference))
                 }
                 let supportedRSA = key.algorithm == "ssh-rsa" && (try? SSHPublicIdentity(blob: key.blob)) != nil
                 if key.algorithm != "ssh-ed25519" && !supportedRSA && !SSHECDSACurve.allCases.contains(where: { $0.algorithm == key.algorithm }) {
                     resolved.problems.append(Problem("private_key_format", "This public identity was preserved, but its private-key profile or size is not supported by this build's optical exporter.", required: false))
                 }
+            }
+            // OpenSSH tries configured certificates first, then the separately
+            // configured raw identities. A certificate never invents a raw-key
+            // fallback or authorizes a guessed private filename.
+            var candidates: [CredentialCandidate] = [], certificateBlobs = Set<Data>()
+            for reference in resolved.certificates {
+                guard Self.localReference(reference) else {
+                    resolved.problems.append(Problem("certificatefile", "A certificate reference requires unsupported token, environment, relative-path, or home-directory resolution.")); continue
+                }
+                guard let certificate = selectedCertificates[reference] else {
+                    resolved.problems.append(Problem("certificatefile", "An explicitly configured user certificate is missing, unreadable, malformed, or was not supplied. Its authentication policy remains unresolved; raw-key fallback cannot bypass it.")); continue
+                }
+                guard certificateBlobs.insert(certificate.blob).inserted else { continue }
+                let key = PublicKey(algorithm: certificate.subject.algorithm, blob: certificate.subject.blob)
+                let privateReference = rawCandidates.first(where: { $0.key.blob == key.blob })?.reference
+                candidates.append(CredentialCandidate(key: key, certificate: certificate, reference: privateReference))
+            }
+            candidates += rawCandidates
+            if candidates.count > 8 {
+                candidates = []
+                resolved.problems.append(Problem("authentication_candidates", "The combined certificate and raw-key policy exceeds the eight-candidate limit. No partial prefix was exported; select a smaller explicit identity policy."))
+            }
+            var credentialIDs: [JSONValue] = []
+            for candidate in candidates {
+                let fingerprint = candidate.key.fingerprint(using: crypto)
+                let credentialID: String
+                if let certificate = candidate.certificate {
+                    credentialID = try workingRegistry.id("credential_certificate", certificate.fingerprint)
+                } else {
+                    credentialID = try workingRegistry.id("credential", candidate.key.algorithm + ":" + fingerprint)
+                }
+                credentialIDs.append(.string(credentialID))
+                if emittedCredentials.insert(credentialID).inserted {
+                    var credential: [String: JSONValue] = ["id": .string(credentialID), "algorithm": .string(candidate.key.algorithm),
+                        "public_fingerprint": .string(fingerprint), "requirement": .string("matching_private_key"),
+                        "private_material": .string("not_included")]
+                    if let certificate = candidate.certificate {
+                        credential["user_certificate"] = .string(certificate.blob.base64EncodedString())
+                        credential["required_capabilities"] = .array([.string(WorkspaceDocument.userCertificateCapability)])
+                    }
+                    credentials.append(.object(credential))
+                }
+                if references[credentialID] == nil, let reference = candidate.reference { references[credentialID] = reference }
             }
             if credentialIDs.isEmpty && methods.contains("publickey") {
                 resolved.problems.append(Problem("credentials", "No public-key candidate is available for this route. Supply a matching supported identity or deliberately configure an allowed interactive authentication method.", required: false))
@@ -927,7 +1067,7 @@ public struct SSHWorkspaceSource: Sendable {
             var options = base.options
             if let user = target.user { options["user"] = [user] }
             if let port = target.port { options["port"] = [String(port)] }
-            return Resolution(options: options, identities: base.identities, problems: base.problems)
+            return Resolution(options: options, identities: base.identities, certificates: base.certificates, problems: base.problems)
         }
         func expand(_ target: RouteTarget, path: Set<String>, remaining: Int) throws -> [RouteTarget] {
             guard !path.contains(target.cycleIdentity) else { throw JumpFailure.cycle }
@@ -1020,7 +1160,7 @@ public struct SSHWorkspaceSource: Sendable {
     }
 
     private func resolve(_ alias: String, budget: inout MatchBudget) throws -> Resolution {
-        var options: [String: [String]] = [:], identities: [String] = [], problems = globalProblems
+        var options: [String: [String]] = [:], identities: [String] = [], certificates: [String] = [], problems = globalProblems
         var selectedProxy = false, hasIdentityFile = false
         var matchedSections: [Int: Bool] = [:]
         for directive in directives {
@@ -1040,6 +1180,11 @@ public struct SSHWorkspaceSource: Sendable {
                 hasIdentityFile = true
                 if arguments.count != 1 { problems.append(Problem(key, "IdentityFile requires one bounded reference.")) }
                 else if let value = arguments.first, value != "none", !identities.contains(value) { identities.append(value) }
+                continue
+            }
+            if key == "certificatefile" {
+                if arguments.count != 1 { problems.append(Problem(key, "CertificateFile requires one bounded reference.")) }
+                else if let value = arguments.first, !certificates.contains(value) { certificates.append(value) }
                 continue
             }
             if key == "proxycommand" || key == "proxyjump" {
@@ -1080,15 +1225,19 @@ public struct SSHWorkspaceSource: Sendable {
             identities = ["~/.ssh/id_rsa", "~/.ssh/id_ecdsa", "~/.ssh/id_ecdsa_sk", "~/.ssh/id_ed25519", "~/.ssh/id_ed25519_sk", "~/.ssh/id_mldsa44_ed25519"]
             problems.append(Problem("default_identities", "No IdentityFile was configured. Standard OpenSSH public-key file candidates were suggested in documented order; only supplied, validated public identities are represented. Agent and implicit certificate inventories were not collected.", required: false))
         }
-        if options["pubkeyauthentication"] == ["no"] { identities = [] }
+        if options["pubkeyauthentication"] == ["no"] { identities = []; certificates = [] }
         if identities.count > 8 {
-            identities = []
+            identities = []; certificates = []
             problems.append(Problem("identityfile", "The route exceeds the eight-candidate identity limit. No partial prefix was exported; select a smaller explicit identity policy."))
+        }
+        if certificates.count > 8 {
+            identities = []; certificates = []
+            problems.append(Problem("certificatefile", "The route exceeds the eight-candidate certificate limit. No partial prefix was exported; select a smaller explicit identity policy."))
         }
         if let values = options["identitiesonly"], ![["yes"], ["no"]].contains(values) {
             problems.append(Problem("identitiesonly", "The identity restriction is invalid or unresolved."))
         }
-        return Resolution(options: options, identities: identities, problems: problems)
+        return Resolution(options: options, identities: identities, certificates: certificates, problems: problems)
     }
 
     private static func authentication(_ options: [String: [String]], problems: inout [Problem]) -> [String] {
@@ -1229,6 +1378,22 @@ public struct SSHWorkspaceSource: Sendable {
         }
         while p < pattern.count && pattern[p] == 42 { try budget.consume(); p += 1 }
         return p == pattern.count
+    }
+
+    private static func userCertificate(_ data: Data) throws -> SSHUserCertificate {
+        guard !data.isEmpty, data.count <= FTLimit.key else { throw FTError.limit("ssh.certificate_file") }
+        if data.first == 0 { return try SSHUserCertificate(blob: data) }
+        guard let text = String(data: data, encoding: .utf8) else { throw FTError.malformed("ssh.certificate_text") }
+        let lines = text.split(whereSeparator: { $0 == "\n" || $0 == "\r" }).filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        guard lines.count == 1 else { throw FTError.malformed("ssh.certificate_lines") }
+        let fields = lines[0].split(whereSeparator: { $0 == " " || $0 == "\t" })
+        guard fields.count >= 2, let blob = Data(base64Encoded: String(fields[1])),
+              blob.count <= SSHUserCertificate.maximumBlobBytes, blob.base64EncodedString() == fields[1] else {
+            throw FTError.malformed("ssh.certificate_base64")
+        }
+        let certificate = try SSHUserCertificate(blob: blob)
+        guard certificate.algorithm == fields[0] else { throw FTError.malformed("ssh.certificate_type") }
+        return certificate
     }
 
     private static func publicKey(_ data: Data) throws -> PublicKey {

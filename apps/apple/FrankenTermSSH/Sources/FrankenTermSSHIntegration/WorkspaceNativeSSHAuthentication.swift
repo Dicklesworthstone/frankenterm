@@ -291,7 +291,8 @@ public actor WorkspaceNativeSSHInteractiveAuthentication: NativeSSHInteractiveAu
         try checkCurrent()
         try await publicKeyPrerequisite?.validateInteractiveContinuation(peer: peer, account: account,
             workspaceID: workspaceID, revision: revision, routeID: routeID,
-            transitForRouteID: transitForRouteID, allowedJumpRouteIDs: allowedJumpRouteIDs)
+            transitForRouteID: transitForRouteID, allowedJumpRouteIDs: allowedJumpRouteIDs,
+            forAuthentication: phase != .authenticated)
         try checkCurrent()
     }
 
@@ -335,15 +336,17 @@ public actor WorkspaceNativeSSHInteractiveAuthentication: NativeSSHInteractiveAu
 public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, WorkspaceNativeSSHAuthority {
     /// This is the implemented adapter profile, not Apple-device qualification.
     /// Unknown mandatory policies remain blocked by WorkspaceStore. RSA hosts
-    /// and credentials require SHA-2 signatures; certificates are not enabled.
-    /// Key-to-MFA continuation additionally requires a patched native backend,
-    /// actual server partial success, and explicit keyboard-interactive policy.
-    /// Each supported method permits three jumps. A mux route
+    /// and credentials require SHA-2 signatures. User certificates additionally
+    /// require a verified issuer signature, subject and account binding, current
+    /// validity and route permissions. Key-to-MFA continuation additionally
+    /// requires a patched native backend, actual server partial success, and
+    /// explicit keyboard-interactive policy. Each supported method permits three jumps. A mux route
     /// authenticates like a direct one; only the destination channel differs.
     public static let routeSupport = WorkspaceDocument.RouteSupport(
         routeModes: ["direct_ssh", "frankenterm_mux"], authenticationMethods: [.publicKey, .password, .keyboardInteractive],
         credentialAlgorithms: ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521", "ssh-rsa"],
         hostKeyAlgorithms: ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521", "ssh-rsa"],
+        capabilities: [WorkspaceDocument.userCertificateCapability],
         maximumJumpHops: 3)
 
     fileprivate final class Retirement: @unchecked Sendable {
@@ -426,7 +429,9 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
             try await broker.validateForeground(foreground)
             try checkCurrent(); try validateRoute(value.authorization)
             guard value.authorization == authorization else { throw SSHAuthenticationError.stale }
-            let identity = try NativeSSHIdentity(user: authorization.user, publicKey: value.identity.blob)
+            try await broker.validateForAuthentication(value)
+            try checkCurrent()
+            let identity = try NativeSSHIdentity(user: authorization.user, publicKey: value.authenticationBlob)
             selected = value; selectedPeer = peer; selectedIdentity = identity; phase = .selected
             return identity
         } catch { cancel(transportID: transportID); throw error }
@@ -453,28 +458,28 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
     private func sign(_ challenge: NativeSSHChallenge, selected: WorkspaceSSHIdentity, peer: NativeSSHPeer) async throws -> Data {
         do {
             try checkCurrent()
-            try await broker.validate(selected)
+            try await broker.validateForAuthentication(selected)
             try checkCurrent()
             let typed = try SSHUserAuthenticationChallenge(sessionIdentifier: challenge.sessionIdentifier,
-                user: selected.authorization.user, publicBlob: selected.identity.blob,
+                user: selected.authorization.user, publicBlob: selected.authenticationBlob,
                 signatureAlgorithm: challenge.algorithm)
-            guard typed.algorithm == challenge.algorithm, typed.signedData == challenge.signedData else {
+            guard typed.authenticationAlgorithm == challenge.algorithm, typed.signedData == challenge.signedData else {
                 throw SSHAuthenticationError.invalidChallenge
             }
             let request = try await broker.prepare(workspaceID: workspaceID, expectedRevision: revision,
                 routeID: routeID, credentialID: credentialID, presentedHostKey: selected.authorization.presentedHostKey,
-                transportID: transportID, sessionIdentifier: challenge.sessionIdentifier, publicBlob: selected.identity.blob,
+                transportID: transportID, sessionIdentifier: challenge.sessionIdentifier, publicBlob: selected.authenticationBlob,
                 signatureAlgorithm: challenge.algorithm,
                 transitForRouteID: transitForRouteID)
             try checkCurrent()
             guard request.authorization == selected.authorization else { throw SSHAuthenticationError.stale }
             let result = try await broker.confirm(requestID: request.id)
             try checkCurrent()
-            try await broker.validate(selected)
+            try await broker.validateForAuthentication(selected)
             try checkCurrent()
             guard result.requestID == request.id, result.transportID == transportID,
                   result.authorization == selected.authorization, result.sessionIdentifier == challenge.sessionIdentifier,
-                  result.publicBlob == selected.identity.blob, result.algorithm == challenge.algorithm else {
+                  result.publicBlob == selected.authenticationBlob, result.algorithm == typed.algorithm else {
                 throw SSHAuthenticationError.stale
             }
             phase = .signed
@@ -490,6 +495,16 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
         try await validateCurrent()
     }
 
+    public func validateForAuthentication(peer: NativeSSHPeer, identity: NativeSSHIdentity) async throws {
+        try checkCurrent()
+        guard phase == .signed, let selected, peer == selectedPeer, identity == selectedIdentity else {
+            throw SSHAuthenticationError.stale
+        }
+        _ = try validatePeer(peer); try validateRoute(selected.authorization)
+        try await broker.validateForAuthentication(selected)
+        try checkCurrent()
+    }
+
     /// A live session owner repeats this before byte admission, service, and
     /// resize. Durable revocation/reimport must invalidate established access as
     /// well as future signatures; a successful login is not a permanent grant.
@@ -502,7 +517,8 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
     }
 
     fileprivate func validateInteractiveContinuation(peer: NativeSSHPeer, account: NativeSSHInteractiveAccount?,
-        workspaceID: UUID, revision: UUID, routeID: String, transitForRouteID: String?, allowedJumpRouteIDs: [String]) async throws {
+        workspaceID: UUID, revision: UUID, routeID: String, transitForRouteID: String?, allowedJumpRouteIDs: [String],
+        forAuthentication: Bool) async throws {
         try checkCurrent()
         guard phase == .signed, peer == selectedPeer, let selectedIdentity,
               self.workspaceID == workspaceID, self.revision == revision, self.routeID == routeID,
@@ -510,7 +526,8 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
               account.map({ $0.user.utf8.elementsEqual(selectedIdentity.user.utf8) }) ?? true else {
             throw SSHAuthenticationError.stale
         }
-        try await validate(peer: peer, identity: selectedIdentity)
+        if forAuthentication { try await validateForAuthentication(peer: peer, identity: selectedIdentity) }
+        else { try await validate(peer: peer, identity: selectedIdentity) }
     }
 
     public nonisolated func cancel(transportID: UUID) {

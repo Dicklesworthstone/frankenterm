@@ -25,11 +25,13 @@ final class SSHWorkspaceSourceTests: XCTestCase {
     private func records(_ result: SSHWorkspaceExport, _ name: String) throws -> [[String: JSONValue]] {
         try StrictJSON.decode(result.workspace.raw).object().required("workspace").object().required(name).array().map { try $0.object() }
     }
-    private func exported(_ text: String, aliases: [String]? = nil, keys: [String: Data] = [:], known: Data? = nil) throws -> SSHWorkspaceExport {
+    private func exported(_ text: String, aliases: [String]? = nil, keys: [String: Data] = [:],
+                          certificates: SSHWorkspaceSource.PublicCertificateSnapshot? = nil,
+                          known: Data? = nil) throws -> SSHWorkspaceExport {
         let input = try source(text)
         var registry = SSHWorkspaceRegistry()
         return try input.export(aliases: aliases ?? input.aliases, workspaceName: "Selected machines", defaultUser: "local-user",
-                                publicKeys: keys, knownHosts: known, registry: &registry, using: crypto)
+                                publicKeys: keys, publicCertificateFiles: certificates, knownHosts: known, registry: &registry, using: crypto)
     }
     private func destination(_ alias: String, in document: WorkspaceDocument) throws -> WorkspaceDocument.Route {
         let machine = try XCTUnwrap(document.machines.first { $0.name == alias })
@@ -564,6 +566,298 @@ final class SSHWorkspaceSourceTests: XCTestCase {
         let result = try exported("Host build\n", keys: ["~/.ssh/id_ed25519": try publicFile()])
         XCTAssertEqual(result.workspace.credentials.count, 1)
         XCTAssertTrue(result.portability.contains { $0.setting == "ssh_config.default_identities" && $0.disposition == 0 })
+    }
+
+    func testExplicitCertificateInventoryFollowsSelectedJumpGraphWithoutImplicitDiscovery() throws {
+        let input = try source("""
+        Host target
+          ProxyJump operator@gate:2200
+          CertificateFile ~/.ssh/target-cert.pub
+          CertificateFile ~/.ssh/target-cert.pub
+        Host gate
+          CertificateFile /selected/gate-cert.pub
+        Host unrelated
+          CertificateFile /unrelated/cert.pub
+        Host *
+          IdentityFile ~/.ssh/key
+          CertificateFile ~/.ssh/shared-cert.pub
+        """)
+        XCTAssertEqual(try input.certificateFileReferences(for: ["target"]),
+                       ["~/.ssh/target-cert.pub", "~/.ssh/shared-cert.pub", "/selected/gate-cert.pub"])
+        XCTAssertEqual(try input.identityFileReferences(for: ["target"]), ["~/.ssh/key"])
+        XCTAssertTrue(try source("Host target\nIdentityFile ~/.ssh/key\n").certificateFileReferences(for: ["target"]).isEmpty)
+        let disabled = try source("Host target\nPubkeyAuthentication no\nCertificateFile /must/not/read\nIdentityFile ~/.ssh/key\n")
+        XCTAssertTrue(try disabled.certificateFileReferences(for: ["target"]).isEmpty)
+        XCTAssertTrue(try disabled.identityFileReferences(for: ["target"]).isEmpty)
+        XCTAssertThrowsError(try input.certificateFileReferences(for: ["unknown"]))
+    }
+
+    func testCertificateFileLoaderFreezesOnlyExactPublicFilesAndKeepsUnsafeInputsUnavailable() throws {
+        let blob = try workspaceTestCertificate()
+        let certificate = try SSHUserCertificate(blob: blob)
+        let text = certificate.algorithm + " " + blob.base64EncodedString() + " public-certificate\n"
+        let home = try configurationFiles([
+            "config": "Host selected\nCertificateFile ~/.ssh/selected-cert.pub\nIdentityFile none\nHost absent\nCertificateFile ~/.ssh/missing.pub\nIdentityFile none\nHost unsafe\nCertificateFile ~/.ssh/linked.pub\nIdentityFile none\n",
+            "selected-cert.pub": text,
+            "selected-cert": "PRIVATE_SIBLING_MUST_NOT_BE_READ",
+            "missing": "PRIVATE_FALLBACK_MUST_NOT_BE_READ"
+        ])
+        try FileManager.default.createSymbolicLink(at: home.appendingPathComponent(".ssh/linked.pub"),
+                                                  withDestinationURL: home.appendingPathComponent(".ssh/selected-cert.pub"))
+        let input = try loadFiles(home)
+        let frozen = try input.loadPublicCertificateFiles(for: ["selected"], homeDirectory: home)
+        XCTAssertEqual(frozen.files, ["~/.ssh/selected-cert.pub": .present(blob)])
+        XCTAssertEqual(try input.loadPublicCertificateFiles(for: ["absent"], homeDirectory: home).files,
+                       ["~/.ssh/missing.pub": .missing], "No private sibling may substitute for a public certificate.")
+        XCTAssertEqual(try input.loadPublicCertificateFiles(for: ["unsafe"], homeDirectory: home).files,
+                       ["~/.ssh/linked.pub": .unavailable])
+        try Data("invalid certificate\n".utf8).write(to: home.appendingPathComponent(".ssh/selected-cert.pub"))
+        let changed = try input.loadPublicCertificateFiles(for: ["selected"], homeDirectory: home)
+        XCTAssertEqual(changed.files, ["~/.ssh/selected-cert.pub": .unavailable])
+        var registry = SSHWorkspaceRegistry()
+        let result = try input.export(aliases: ["selected"], workspaceName: "Frozen certificate", defaultUser: "operator",
+            publicCertificateFiles: frozen, registry: &registry, using: crypto)
+        XCTAssertEqual(result.workspace.credentials.first?.userCertificate?.blob, blob)
+        XCTAssertTrue(try destination("selected", in: result.workspace).requiredCapabilities.isEmpty)
+        let manifest = String(decoding: result.workspace.raw, as: UTF8.self)
+        XCTAssertFalse(manifest.contains("PRIVATE_")); XCTAssertFalse(manifest.contains("~/.ssh/"))
+    }
+
+    func testCertificateSnapshotsRejectUnselectedMalformedAndUnboundedInputs() throws {
+        let blob = try workspaceTestCertificate(), certificate = try SSHUserCertificate(blob: blob)
+        var corrupted = blob; corrupted[corrupted.count - 1] ^= 1
+        let wrongType = Data(("ssh-ed25519 " + blob.base64EncodedString()).utf8)
+        let text = certificate.algorithm + " " + blob.base64EncodedString()
+        for invalid in [corrupted, try publicFile(), wrongType, Data((text + "\n" + text).utf8),
+                        Data(repeating: 0, count: SSHUserCertificate.maximumBlobBytes + 1)] {
+            XCTAssertThrowsError(try SSHWorkspaceSource.PublicCertificateSnapshot(files: ["/selected/cert.pub": .present(invalid)]))
+        }
+        for path in ["relative.pub", "~other/cert.pub", "/selected/../cert.pub", "/selected/%h.pub", "/selected/${KEY}.pub"] {
+            XCTAssertThrowsError(try SSHWorkspaceSource.PublicCertificateSnapshot(files: [path: .missing]))
+        }
+        let files = Dictionary(uniqueKeysWithValues: (0...256).map { ("/selected/\($0).pub", SSHWorkspaceSource.PublicCertificateSnapshot.File.missing) })
+        XCTAssertThrowsError(try SSHWorkspaceSource.PublicCertificateSnapshot(files: files)) {
+            XCTAssertEqual($0 as? FTError, .limit("ssh.certificate_references"))
+        }
+        let unselected = try SSHWorkspaceSource.PublicCertificateSnapshot(files: ["/unselected/cert.pub": .present(blob)])
+        XCTAssertThrowsError(try exported("Host build\nCertificateFile /selected/cert.pub\nIdentityFile none\n", certificates: unselected)) {
+            XCTAssertEqual($0 as? FTError, .malformed("ssh.certificate.unselected_source"))
+        }
+    }
+
+    func testCertificateCandidatesPrecedeRawKeysWithoutInventingFallbackAndKeepStableIDs() throws {
+        let firstBlob = try workspaceTestCertificate(serial: 1), secondBlob = try workspaceTestCertificate(serial: 2)
+        let files = try SSHWorkspaceSource.PublicCertificateSnapshot(files: [
+            "/selected/first.pub": .present(firstBlob), "/selected/duplicate.pub": .present(firstBlob),
+            "/selected/second.pub": .present(secondBlob)
+        ])
+        let input = try source("""
+        Host build
+          User operator
+          CertificateFile /selected/first.pub
+          CertificateFile /selected/duplicate.pub
+          CertificateFile /selected/second.pub
+          IdentityFile ~/.ssh/key
+        """)
+        var registry = SSHWorkspaceRegistry()
+        let first = try input.export(aliases: ["build"], workspaceName: "Certificate candidates", defaultUser: "operator",
+            publicKeys: ["~/.ssh/key": try publicFile()], publicCertificateFiles: files, registry: &registry, using: crypto)
+        let route = try destination("build", in: first.workspace)
+        let credentials = try route.credentialIDs.map { id in try XCTUnwrap(first.workspace.credentials.first { $0.id == id }) }
+        XCTAssertEqual(credentials.count, 3)
+        XCTAssertEqual(credentials[0].userCertificate?.blob, firstBlob)
+        XCTAssertEqual(credentials[1].userCertificate?.blob, secondBlob)
+        XCTAssertNil(credentials[2].userCertificate)
+        XCTAssertEqual(Set(credentials.map(\.fingerprint)).count, 1)
+        XCTAssertEqual(Set(credentials.map(\.id)).count, 3)
+        XCTAssertEqual(credentials[0].requiredCapabilities, [WorkspaceDocument.userCertificateCapability])
+        XCTAssertEqual(credentials[1].requiredCapabilities, [WorkspaceDocument.userCertificateCapability])
+        XCTAssertTrue(credentials[2].requiredCapabilities.isEmpty)
+        XCTAssertTrue(credentials.allSatisfy { first.identityReferences[$0.id] == "~/.ssh/key" })
+        registry = try JSONDecoder().decode(SSHWorkspaceRegistry.self, from: JSONEncoder().encode(registry))
+        let again = try input.export(aliases: ["build"], workspaceName: "Renamed", defaultUser: "operator",
+            publicKeys: ["~/.ssh/key": try publicFile()], publicCertificateFiles: files, registry: &registry, using: crypto)
+        XCTAssertEqual(first.workspace.credentials.map(\.id), again.workspace.credentials.map(\.id))
+        let certOnly = try exported("Host build\nUser operator\nIdentityFile none\nCertificateFile /selected/first.pub\n",
+            certificates: SSHWorkspaceSource.PublicCertificateSnapshot(files: ["/selected/first.pub": .present(firstBlob)]))
+        XCTAssertEqual(certOnly.workspace.credentials.count, 1)
+        XCTAssertNotNil(certOnly.workspace.credentials[0].userCertificate)
+        XCTAssertTrue(certOnly.identityReferences.isEmpty)
+        let selection = try WorkspaceExportSelection(workspace: certOnly.workspace, groupIDs: [certOnly.workspace.initialGroupID])
+        let publicDocument = try selection.publicDocument(bundleID: "public-certificates")
+        XCTAssertEqual(publicDocument.credentials[0].userCertificate?.blob, firstBlob)
+        XCTAssertEqual(publicDocument.credentials[0].requiredCapabilities, [WorkspaceDocument.userCertificateCapability])
+    }
+
+    func testEveryConfiguredCertificateMustResolveAndSnapshotStatesChangeRevision() throws {
+        let blob = try workspaceTestCertificate(), renewed = try workspaceTestCertificate(serial: 2)
+        let input = try source("Host restricted\nCertificateFile /selected/cert.pub\nHost ordinary\nHost *\nIdentityFile ~/.ssh/key\n")
+        var registry = SSHWorkspaceRegistry(), revisions = Set<String>()
+        let states: [SSHWorkspaceSource.PublicCertificateSnapshot.File] = [.present(blob), .present(renewed), .missing, .unavailable]
+        for file in states {
+            let files = try SSHWorkspaceSource.PublicCertificateSnapshot(files: ["/selected/cert.pub": file])
+            let result = try input.export(aliases: ["restricted", "ordinary"], workspaceName: "Certificates", defaultUser: "operator",
+                publicKeys: ["~/.ssh/key": try publicFile()], publicCertificateFiles: files, registry: &registry, using: crypto)
+            revisions.insert(try XCTUnwrap(sourceRevision(result.workspace)).string())
+            let restricted = try destination("restricted", in: result.workspace)
+            XCTAssertTrue(try destination("ordinary", in: result.workspace).requiredCapabilities.isEmpty)
+            if case .present = file {
+                XCTAssertTrue(restricted.requiredCapabilities.isEmpty)
+                XCTAssertEqual(restricted.credentialIDs.count, 2)
+            } else {
+                XCTAssertEqual(restricted.requiredCapabilities, ["ssh_config.unresolved_policy"])
+                XCTAssertEqual(restricted.credentialIDs.count, 1, "A raw candidate can be retained, but unresolved certificate policy keeps it inert.")
+                XCTAssertTrue(result.portability.contains {
+                    $0.entityID == restricted.id && $0.setting == "ssh_config.certificatefile" && $0.disposition == 1
+                })
+            }
+        }
+        XCTAssertEqual(revisions.count, 4)
+        let missingSnapshot = try exported("Host build\nIdentityFile ~/.ssh/key\nCertificateFile /selected/cert.pub\n", keys: ["~/.ssh/key": try publicFile()])
+        XCTAssertEqual(missingSnapshot.workspace.routes[0].requiredCapabilities, ["ssh_config.unresolved_policy"])
+        for reference in ["relative.pub", "none", "/selected/%h.pub", "/selected/${KEY}.pub"] {
+            let result = try exported("Host build\nIdentityFile none\nCertificateFile \(reference)\n")
+            XCTAssertEqual(result.workspace.routes[0].requiredCapabilities, ["ssh_config.unresolved_policy"])
+        }
+    }
+
+    func testCombinedCertificateAndRawCandidateLimitNeverPublishesAPartialPrefix() throws {
+        let files = try SSHWorkspaceSource.PublicCertificateSnapshot(files: ["/selected/cert.pub": .present(workspaceTestCertificate())])
+        for count in [7, 8] {
+            let identities = (0..<count).map { "IdentityFile /selected/key-\($0)\n" }.joined()
+            let keys = try Dictionary(uniqueKeysWithValues: (0..<count).map { ("/selected/key-\($0)", try publicFile(UInt8($0))) })
+            let result = try exported("Host build\nCertificateFile /selected/cert.pub\n" + identities, keys: keys, certificates: files)
+            if count == 7 {
+                XCTAssertEqual(result.workspace.routes[0].credentialIDs.count, 8)
+                XCTAssertTrue(result.workspace.routes[0].requiredCapabilities.isEmpty)
+            } else {
+                XCTAssertTrue(result.workspace.routes[0].credentialIDs.isEmpty)
+                XCTAssertTrue(result.workspace.credentials.isEmpty)
+                XCTAssertTrue(result.identityReferences.isEmpty)
+                XCTAssertEqual(result.workspace.routes[0].requiredCapabilities, ["ssh_config.unresolved_policy"])
+                XCTAssertTrue(result.portability.contains { $0.setting == "ssh_config.authentication_candidates" && $0.disposition == 1 })
+            }
+        }
+        let tooMany = try source("Host build\nIdentityFile none\n" +
+            (0..<9).map { "CertificateFile /selected/cert-\($0).pub\n" }.joined())
+        XCTAssertTrue(try tooMany.certificateFileReferences(for: ["build"]).isEmpty)
+        let result = try exportSource(tooMany)
+        XCTAssertTrue(result.workspace.credentials.isEmpty)
+        XCTAssertEqual(result.workspace.routes[0].requiredCapabilities, ["ssh_config.unresolved_policy"])
+    }
+
+    func testOpenSSHCertificateFilesAndMatchingPrivatePickersExportEverySupportedSubjectFamily() throws {
+        let fixtures = try UserCertificateFixtures.load()
+        XCTAssertGreaterThan(fixtures.largeCertificate.certificateBlob.base64EncodedString().utf8.count, FTLimit.text)
+        for fixture in fixtures.certificates + [fixtures.largeCertificate] {
+            let certificates = try SSHWorkspaceSource.PublicCertificateSnapshot(files: [
+                "/selected/cert.pub": .present(Data(fixture.certificate.utf8))
+            ])
+            let identities = try SSHWorkspaceSource.PublicIdentitySnapshot(files: [
+                "/selected/key": .present(Data(fixture.publicKey.utf8))
+            ])
+            let input = try source("Host build\nUser operator\nCertificateFile /selected/cert.pub\nIdentityFile /selected/key\n")
+            var registry = SSHWorkspaceRegistry()
+            let result = try input.export(aliases: ["build"], workspaceName: "Certified source", defaultUser: "operator",
+                publicIdentityFiles: identities, publicCertificateFiles: certificates, registry: &registry, using: crypto)
+            let selection = try WorkspaceExportSelection(workspace: result.workspace, groupIDs: [result.workspace.initialGroupID],
+                                                          findings: result.portability)
+            let identity = try XCTUnwrap(selection.identities.first)
+            XCTAssertEqual(selection.identities.count, 1, fixture.id)
+            XCTAssertEqual(identity.credentialIDs.count, 2, fixture.id)
+            XCTAssertEqual(identity.algorithm, fixture.subjectAlgorithm)
+            let reference = try XCTUnwrap(result.workspace.credentials.first { $0.id == identity.credentialIDs[0] })
+            let key = try PrivateKeyRecord.fromPEM(Data(fixture.privatePEM.utf8), credentialID: reference.id, using: crypto)
+            XCTAssertEqual(key.publicBlob, fixture.publicBlob)
+            XCTAssertTrue(key.certificates.isEmpty, "The private file contains only the raw key; the selected manifest supplies its certificate.")
+            let archive = try selection.archive(including: [key], using: crypto)
+            let decoded = try AirGapArchive(data: archive.encoded(), using: crypto)
+            XCTAssertEqual(decoded.keys.count, 1)
+            XCTAssertEqual(decoded.keys[0].certificates, [fixture.certificateBlob])
+            XCTAssertEqual(decoded.workspace.credentials.compactMap(\.userCertificate).map(\.blob), [fixture.certificateBlob])
+            XCTAssertEqual(decoded.workspace.credentials.map(\.algorithm), [fixture.subjectAlgorithm, fixture.subjectAlgorithm])
+        }
+    }
+
+    func testCertificateImportPreservesValidityAndRestrictionsWithoutBypassingRequiredSourcePolicy() throws {
+        let fixtures = try UserCertificateFixtures.load()
+        let restricted = UserCertificateFixtures.blob(fixtures.restrictedCertificate)
+        let noPTY = UserCertificateFixtures.blob(fixtures.withoutPTYCertificate)
+        let expired = try workspaceTestCertificate(validAfter: 100, validBefore: 200)
+        let support = WorkspaceDocument.RouteSupport(routeModes: ["direct_ssh"], authenticationMethods: [.publicKey],
+            credentialAlgorithms: ["ssh-ed25519"], hostKeyAlgorithms: ["ssh-ed25519"],
+            capabilities: [WorkspaceDocument.userCertificateCapability])
+        for blob in [restricted, noPTY, expired] {
+            let files = try SSHWorkspaceSource.PublicCertificateSnapshot(files: ["/selected/cert.pub": .present(blob)])
+            let result = try exported("Host build\nUser operator\nIdentityFile none\nCertificateFile /selected/cert.pub\nPreferredAuthentications publickey\n",
+                certificates: files, known: Data(hostLine("build", seed: 8).utf8))
+            XCTAssertEqual(result.workspace.credentials[0].userCertificate?.blob, blob)
+            let route = result.workspace.routes[0]
+            let readiness = try result.workspace.readiness(forRouteID: route.id,
+                availableCredentialIDs: Set(route.credentialIDs), reviewedTrustIDs: Set(result.workspace.hostTrust.map(\.id)),
+                support: support, certificateTime: UserCertificateFixtures.now)
+            XCTAssertFalse(readiness.isLocallyReady)
+            XCTAssertTrue(readiness.usableCredentialIDs.isEmpty)
+            XCTAssertTrue(readiness.issues.contains(.credentialCertificateUnavailable))
+        }
+        let files = try SSHWorkspaceSource.PublicCertificateSnapshot(files: ["/selected/cert.pub": .present(workspaceTestCertificate())])
+        let policy = try exported("Host build\nIdentityFile none\nCertificateFile /selected/cert.pub\nRevokedHostKeys /required/revocations\n",
+                                  certificates: files)
+        XCTAssertEqual(policy.workspace.routes[0].requiredCapabilities, ["ssh_config.unresolved_policy"])
+        XCTAssertTrue(policy.portability.contains { $0.setting == "ssh_config.revokedhostkeys" && $0.disposition == 1 })
+    }
+
+    @MainActor
+    func testSelectedCertificatesAndJumpIdentityRestoreThroughFTAGIntoOneProtectedAccount() async throws {
+        let fixture = try XCTUnwrap(UserCertificateFixtures.load().certificates.first { $0.id == "ed25519" })
+        let input = try source("""
+        User operator
+        IdentityFile ~/.ssh/key
+        CertificateFile ~/.ssh/key-cert.pub
+        PreferredAuthentications publickey
+        Host target
+          ProxyJump operator@gate:2200
+        Host gate
+        """)
+        let files = try SSHWorkspaceSource.PublicCertificateSnapshot(files: ["~/.ssh/key-cert.pub": .present(Data(fixture.certificate.utf8))])
+        var registry = SSHWorkspaceRegistry()
+        let known = try hostLine("target", seed: 8) + hostLine("[gate]:2200", seed: 16)
+        let result = try input.export(aliases: ["target"], workspaceName: "Certified jump", defaultUser: "operator",
+            publicKeys: ["~/.ssh/key": Data(fixture.publicKey.utf8)], publicCertificateFiles: files,
+            knownHosts: Data(known.utf8), registry: &registry, using: crypto)
+        let reference = try XCTUnwrap(result.workspace.credentials.first { $0.userCertificate != nil })
+        let key = try PrivateKeyRecord.fromPEM(Data(fixture.privatePEM.utf8), credentialID: reference.id, using: crypto)
+        let selection = try WorkspaceExportSelection(workspace: result.workspace,
+            groupIDs: [result.workspace.initialGroupID], findings: result.portability)
+        let sealed = try FTAG.seal(selection.archive(including: [key], using: crypto), using: crypto)
+        let decoded = try FTAG.open(sealed.envelope, code: sealed.code, using: crypto)
+        XCTAssertEqual(decoded.keys.count, 1)
+        XCTAssertEqual(decoded.keys[0].certificates, [fixture.certificateBlob])
+        let disk = StoreTestPersistence(), vault = StoreTestVault(), store = WorkspaceStore(persistence: disk, vault: vault)
+        let receipt = try await store.install(decoded, envelopeDigest: crypto.sha256(sealed.envelope),
+            expectedRevision: nil, sourceAndContentsConfirmed: true)
+        XCTAssertTrue(receipt.workspace.connectLater)
+        XCTAssertTrue(receipt.missingCredentialIDs.isEmpty)
+        XCTAssertEqual(vault.creates, 1)
+        XCTAssertEqual(receipt.workspace.bindings.count, 2)
+        XCTAssertEqual(Set(receipt.workspace.bindings.map(\.account)).count, 1)
+        let reopened = WorkspaceStore(persistence: disk, vault: vault)
+        let saved = try await reopened.load(), document = try XCTUnwrap(saved.first).document()
+        XCTAssertEqual(document.credentials.first { $0.id == reference.id }?.userCertificate?.blob, fixture.certificateBlob)
+        let target = try destination("target", in: document), gate = try XCTUnwrap(hops(target, in: document).first)
+        XCTAssertEqual(target.credentialIDs, gate.credentialIDs)
+        XCTAssertEqual(target.credentialIDs.first, reference.id)
+        let support = WorkspaceDocument.RouteSupport(routeModes: ["direct_ssh"], authenticationMethods: [.publicKey],
+            credentialAlgorithms: ["ssh-ed25519"], hostKeyAlgorithms: ["ssh-ed25519"],
+            capabilities: [WorkspaceDocument.userCertificateCapability], maximumJumpHops: 3)
+        let readiness = try await reopened.routeReadiness(workspaceID: receipt.workspace.id, support: support)
+        XCTAssertTrue(try XCTUnwrap(readiness.first { $0.routeID == target.id }).isLocallyReady)
+        let pin = try XCTUnwrap(document.hostTrust.first { $0.id == target.trustID }?.pins.first)
+        let authorization = try await reopened.authorizeSSHAuthentication(workspaceID: receipt.workspace.id,
+            expectedRevision: receipt.workspace.revision, routeID: target.id, credentialID: reference.id,
+            presentedHostKey: pin, support: support)
+        XCTAssertEqual(authorization.userCertificate?.blob, fixture.certificateBlob)
+        XCTAssertTrue(try XCTUnwrap(saved.first).connectLater)
     }
 
     func testKnownHostsPinsRevocationsNegationAndPortBinding() throws {

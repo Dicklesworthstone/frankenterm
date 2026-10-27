@@ -73,7 +73,9 @@ struct OpenSSHRSAKeyMaterial: Sendable, CustomDebugStringConvertible {
     /// Raw RFC 8332 RSA signature bytes; the caller wraps the exact negotiated
     /// algorithm in the SSH signature blob. SHA-1 and RSA-PSS are never selected.
     func signature(for payload: Data, algorithm: String) throws -> Data {
-        guard !payload.isEmpty, payload.count <= 2048 else { throw SSHAuthenticationError.invalidChallenge }
+        guard !payload.isEmpty, payload.count <= SSHUserAuthenticationChallenge.maximumSignedDataBytes else {
+            throw SSHAuthenticationError.invalidChallenge
+        }
         try Task.checkCancellation()
         let signature: Data
         switch algorithm {

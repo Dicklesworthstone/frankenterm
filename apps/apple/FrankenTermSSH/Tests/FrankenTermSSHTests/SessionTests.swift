@@ -161,7 +161,8 @@ final class SessionTests: XCTestCase, @unchecked Sendable {
             XCTAssertThrowsError(try NativeSSHIdentity(user: user, publicKey: Data([1])))
         }
         XCTAssertThrowsError(try NativeSSHIdentity(user: "operator", publicKey: Data()))
-        // The native blob capacity holds an 8192-bit RSA key; one byte more is refused.
+        // The public offer capacity also holds bounded user certificates;
+        // structural validation is performed by the native authentication API.
         let capacity = Int(FTSSH_PUBLIC_KEY_CAPACITY)
         XCTAssertNoThrow(try NativeSSHIdentity(user: "operator", publicKey: Data(repeating: 1, count: capacity)))
         XCTAssertThrowsError(try NativeSSHIdentity(user: "operator", publicKey: Data(repeating: 1, count: capacity + 1)))

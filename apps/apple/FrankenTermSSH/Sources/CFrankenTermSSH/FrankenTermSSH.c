@@ -51,12 +51,12 @@ struct ftssh_session {
     size_t egress_head, egress_count, egress_flight, write_receipt;
     int fd, phase, terminal_error, closing;
     size_t limit, allocated, peak;
-    char user[257], algorithm[65], signature_algorithm[65];
+    char user[257], algorithm[65], offer_algorithm[65], signature_algorithm[65];
     uint8_t public_blob[FTSSH_PUBLIC_KEY_CAPACITY], challenge[FTSSH_CHALLENGE_CAPACITY], signature[1024];
     size_t public_length, challenge_length, signature_length, rsa_signature_length;
     uint8_t password[FTSSH_PASSWORD_CAPACITY];
     size_t password_length;
-    int password_authentication, password_supplied;
+    int password_authentication, password_supplied, user_certificate;
     int publickey_interactive, partial_ready;
     uint64_t authentication_deadline, publickey_attempt_baseline;
     int signature_consumed, resize_pending;
@@ -306,6 +306,136 @@ static int positive_mpint(const uint8_t **bytes, size_t *left, const uint8_t **v
     }
     return *length <= maximum;
 }
+static uint64_t certificate_u64(const uint8_t *bytes) {
+    uint64_t value = 0;
+    for(size_t i = 0; i < 8; i++) value = (value << 8) | bytes[i];
+    return value;
+}
+static int certificate_time_valid(const uint64_t validity[2], time_t now) {
+    if(now == (time_t)-1 || now < 0) return 0;
+    uint64_t seconds = (uint64_t)now;
+    return validity[0] <= seconds && seconds < validity[1];
+}
+static int certificate_extensions(const uint8_t *cursor, size_t left) {
+    const uint8_t *previous = NULL; size_t previous_length = 0, count = 0;
+    while(left) {
+        const uint8_t *name, *data; size_t length, data_length;
+        if(++count > 256 || !field(&cursor, &left, &name, &length) || !length || length > 256 ||
+           !field(&cursor, &left, &data, &data_length)) return 0;
+        for(size_t i = 0; i < length; i++) if(name[i] < 33 || name[i] > 126) return 0;
+        if(previous) {
+            size_t common = previous_length < length ? previous_length : length;
+            int order = memcmp(previous, name, common);
+            if(order > 0 || (order == 0 && previous_length >= length)) return 0;
+        }
+        static const char *const flags[] = {"permit-X11-forwarding", "permit-agent-forwarding",
+            "permit-port-forwarding", "permit-pty", "permit-user-rc"};
+        for(size_t i = 0; i < sizeof(flags) / sizeof(flags[0]); i++)
+            if(length == strlen(flags[i]) && !memcmp(name, flags[i], length) && data_length) return 0;
+        previous = name; previous_length = length;
+    }
+    return 1;
+}
+static int signature_payload(const char *algorithm, size_t rsa_length, const uint8_t *payload, size_t length) {
+    if(!length || length > 1024) return 0;
+    if(rsa_length) return length == rsa_length;
+    if(!strcmp(algorithm, "ssh-ed25519")) return length == 64;
+    const uint8_t *cursor = payload, *integer; size_t left = length, width;
+    size_t maximum = algorithm[16] == '2' ? 32 : (algorithm[16] == '3' ? 48 : 66);
+    for(int i = 0; i < 2; i++)
+        if(!positive_mpint(&cursor, &left, &integer, &width, maximum)) return 0;
+    return left == 0;
+}
+/* Allocation-free structural admission. The workspace parser independently
+ * verifies the CA signature, subject binding, time and route permissions.
+ * Recursion is limited to one raw CA key; chained certificates are refused. */
+static int public_key_profile(const uint8_t *blob, size_t length, int allow_certificate,
+                              char algorithm[65], char offer_algorithm[65],
+                              size_t *rsa_signature_length, int *is_certificate, uint64_t validity[2]) {
+    if(!blob || !length || length > FTSSH_PUBLIC_KEY_CAPACITY) return FTSSH_INVALID;
+    const uint8_t *cursor = blob, *name; size_t left = length, n;
+    if(!field(&cursor, &left, &name, &n) || !n || n >= 65) return FTSSH_INVALID;
+    memcpy(offer_algorithm, name, n); offer_algorithm[n] = 0;
+    static const char suffix[] = "-cert-v01@openssh.com";
+    *is_certificate = n > sizeof(suffix) - 1 &&
+        equal(name + n - (sizeof(suffix) - 1), (const uint8_t *)suffix, sizeof(suffix) - 1);
+    if(*is_certificate) {
+        if(!allow_certificate) return FTSSH_UNSUPPORTED;
+        n -= sizeof(suffix) - 1;
+        const uint8_t *nonce; size_t nonce_length;
+        if(!field(&cursor, &left, &nonce, &nonce_length)) return FTSSH_INVALID;
+    } else if(length > FTSSH_RAW_PUBLIC_KEY_CAPACITY) return FTSSH_INVALID;
+    if(!((n == 7 && equal(name, (const uint8_t *)"ssh-rsa", n)) ||
+         (n == 11 && equal(name, (const uint8_t *)"ssh-ed25519", n)) ||
+         (n == 19 && (equal(name, (const uint8_t *)"ecdsa-sha2-nistp256", n) ||
+                      equal(name, (const uint8_t *)"ecdsa-sha2-nistp384", n) ||
+                      equal(name, (const uint8_t *)"ecdsa-sha2-nistp521", n))))) return FTSSH_UNSUPPORTED;
+    memcpy(algorithm, name, n); algorithm[n] = 0;
+    *rsa_signature_length = 0; validity[0] = validity[1] = 0;
+    const uint8_t *point; size_t point_length;
+    if(n == 7) {
+        const uint8_t *exponent, *modulus; size_t exponent_length, modulus_length;
+        if(!positive_mpint(&cursor, &left, &exponent, &exponent_length, 8) ||
+           !positive_mpint(&cursor, &left, &modulus, &modulus_length, 1024) ||
+           !(exponent[exponent_length - 1] & 1) || !(modulus[modulus_length - 1] & 1) ||
+           (exponent_length == 1 && exponent[0] < 3)) return FTSSH_INVALID;
+        size_t bits = (modulus_length - 1) * 8;
+        for(unsigned int high = modulus[0]; high; high >>= 1) bits++;
+        if(bits < 2048 || bits > 8192) return FTSSH_UNSUPPORTED;
+        *rsa_signature_length = modulus_length;
+    } else if(n == 11) {
+        if(!field(&cursor, &left, &point, &point_length) || point_length != 32) return FTSSH_INVALID;
+    } else {
+        if(!expected_field(&cursor, &left, name + 11, 8) ||
+           !field(&cursor, &left, &point, &point_length)) return FTSSH_INVALID;
+        size_t width = name[16] == '2' ? 65 : (name[16] == '3' ? 97 : 133);
+        if(point_length != width || point[0] != 4) return FTSSH_INVALID;
+    }
+    if(!*is_certificate) return left ? FTSSH_INVALID : FTSSH_OK;
+    /* serial followed by SSH_CERT_TYPE_USER; neither serial nor key ID is
+     * substituted for the private subject identity. */
+    if(left < 12 || cursor[8] || cursor[9] || cursor[10] || cursor[11] != 1) return FTSSH_INVALID;
+    cursor += 12; left -= 12;
+    const uint8_t *value; size_t value_length;
+    if(!field(&cursor, &left, &value, &value_length) ||
+       !field(&cursor, &left, &value, &value_length)) return FTSSH_INVALID;
+    const uint8_t *principals = value; size_t principals_left = value_length, principal_count = 0;
+    while(principals_left) {
+        if(++principal_count > 256 || !field(&principals, &principals_left, &value, &value_length) ||
+           !value_length || value_length > 256) return FTSSH_INVALID;
+        for(size_t i = 0; i < value_length; i++) if(value[i] < 32 || value[i] == 127) return FTSSH_INVALID;
+    }
+    if(left < 16 || certificate_u64(cursor) >= certificate_u64(cursor + 8)) return FTSSH_INVALID;
+    validity[0] = certificate_u64(cursor); validity[1] = certificate_u64(cursor + 8);
+    cursor += 16; left -= 16;
+    if(!field(&cursor, &left, &value, &value_length)) return FTSSH_INVALID;
+    if(value_length) return FTSSH_UNSUPPORTED; /* no qualified critical options */
+    if(!field(&cursor, &left, &value, &value_length) || !certificate_extensions(value, value_length) ||
+       !field(&cursor, &left, &value, &value_length) || value_length) return FTSSH_INVALID;
+    if(!field(&cursor, &left, &value, &value_length)) return FTSSH_INVALID;
+    char authority_algorithm[65], authority_offer[65]; size_t authority_rsa; int authority_certificate;
+    uint64_t authority_validity[2];
+    int rc = public_key_profile(value, value_length, 0, authority_algorithm, authority_offer,
+                                &authority_rsa, &authority_certificate, authority_validity);
+    if(rc) return rc;
+    if(!field(&cursor, &left, &value, &value_length) || left || value_length > FTSSH_SIGNATURE_CAPACITY) return FTSSH_INVALID;
+    const uint8_t *signature_name, *signature; size_t signature_name_length, signature_length;
+    const uint8_t *signature_cursor = value; size_t signature_left = value_length;
+    if(!field(&signature_cursor, &signature_left, &signature_name, &signature_name_length) ||
+       !field(&signature_cursor, &signature_left, &signature, &signature_length) || signature_left || !signature_length) return FTSSH_INVALID;
+    if(authority_rsa) {
+        if(signature_name_length != 12 ||
+           !(equal(signature_name, (const uint8_t *)"rsa-sha2-256", 12) ||
+             equal(signature_name, (const uint8_t *)"rsa-sha2-512", 12))) return FTSSH_UNSUPPORTED;
+        /* SSH RSA certificate issuers may omit leading zero signature octets.
+         * Swift left-pads before verifying this exact certificate. Our own
+         * USERAUTH signatures still require the complete modulus width. */
+        if(signature_length > authority_rsa) return FTSSH_INVALID;
+    } else if(signature_name_length != strlen(authority_algorithm) ||
+              !equal(signature_name, (const uint8_t *)authority_algorithm, signature_name_length) ||
+              !signature_payload(authority_algorithm, 0, signature, signature_length)) return FTSSH_INVALID;
+    return FTSSH_OK;
+}
 static int valid_geometry(uint32_t c, uint32_t r, uint32_t w, uint32_t h) {
     return c && r && c <= 512 && r <= 512 && c * r <= 65536 && w <= 65535 && h <= 65535;
 }
@@ -412,38 +542,21 @@ int ftssh_begin_authentication(ftssh_session *s, const char *user, size_t user_l
     int rc = check(s, APPROVED); if(rc) return rc;
     if(!user || !user_length || user_length > 256 || !blob || !length || length > FTSSH_PUBLIC_KEY_CAPACITY) return FTSSH_INVALID;
     for(size_t i = 0; i < user_length; i++) if((unsigned char)user[i] < 32 || user[i] == 127) return FTSSH_INVALID;
-    const uint8_t *cursor = blob, *algorithm; size_t left = length, n;
-    if(!field(&cursor, &left, &algorithm, &n) || n >= sizeof(s->algorithm)) return FTSSH_INVALID;
-    if(!((n == 7 && equal(algorithm, (const uint8_t *)"ssh-rsa", n)) ||
-         (n == 11 && equal(algorithm, (const uint8_t *)"ssh-ed25519", n)) ||
-         (n == 19 && (equal(algorithm, (const uint8_t *)"ecdsa-sha2-nistp256", n) ||
-                      equal(algorithm, (const uint8_t *)"ecdsa-sha2-nistp384", n) ||
-                      equal(algorithm, (const uint8_t *)"ecdsa-sha2-nistp521", n))))) return FTSSH_UNSUPPORTED;
-    const uint8_t *point; size_t point_length, rsa_signature_length = 0;
-    if(n == 7) {
-        const uint8_t *exponent, *modulus; size_t exponent_length, modulus_length;
-        if(!positive_mpint(&cursor, &left, &exponent, &exponent_length, 8) ||
-           !positive_mpint(&cursor, &left, &modulus, &modulus_length, 1024) || left ||
-           !(exponent[exponent_length - 1] & 1) || !(modulus[modulus_length - 1] & 1) ||
-           (exponent_length == 1 && exponent[0] < 3)) return FTSSH_INVALID;
-        size_t bits = (modulus_length - 1) * 8;
-        for(unsigned int high = modulus[0]; high; high >>= 1) bits++;
-        if(bits < 2048 || bits > 8192) return FTSSH_UNSUPPORTED;
-        rsa_signature_length = modulus_length;
-    } else if(n == 11) {
-        if(!field(&cursor, &left, &point, &point_length) || point_length != 32 || left) return FTSSH_INVALID;
-    } else {
-        /* Curve and uncompressed point length must agree with the algorithm.
-         * Mathematical point validation remains with libssh2 and the signer. */
-        if(!expected_field(&cursor, &left, algorithm + 11, 8) ||
-           !field(&cursor, &left, &point, &point_length) || left) return FTSSH_INVALID;
-        size_t width = algorithm[16] == '2' ? 65 : (algorithm[16] == '3' ? 97 : 133);
-        if(point_length != width || point[0] != 4) return FTSSH_INVALID;
-    }
-    memcpy(s->algorithm, algorithm, n); s->algorithm[n] = 0;
+    char algorithm[65], offer_algorithm[65]; size_t rsa_signature_length; int certificate;
+    uint64_t validity[2];
+    rc = public_key_profile(blob, length, 1, algorithm, offer_algorithm, &rsa_signature_length, &certificate, validity);
+    if(rc) return rc;
+    /* The Swift authority verifies issuer/subject/permissions and repeats time
+     * checks at signing and MFA completion. Recheck the actual offer boundary
+     * too: an await after identity selection may have crossed its expiry.
+     * Established channels never call this admission function. */
+    if(certificate && !certificate_time_valid(validity, time(NULL))) return FTSSH_AUTH_FAILED;
+    memcpy(s->algorithm, algorithm, strlen(algorithm) + 1);
+    memcpy(s->offer_algorithm, offer_algorithm, strlen(offer_algorithm) + 1);
     memcpy(s->user, user, user_length); s->user[user_length] = 0;
     memcpy(s->public_blob, blob, length); s->public_length = length;
     s->rsa_signature_length = rsa_signature_length;
+    s->user_certificate = certificate;
 #if defined(LIBSSH2_FRANKENTERM_AUTH_EVIDENCE_VERSION) && LIBSSH2_FRANKENTERM_AUTH_EVIDENCE_VERSION == 1
     s->publickey_attempt_baseline = libssh2_frankenterm_publickey_attempt(s->ssh);
 #endif
@@ -507,22 +620,32 @@ static int sign_callback(LIBSSH2_SESSION *ssh, unsigned char **signature, size_t
     if(!field(&cursor, &left, &selected_algorithm, &selected_length) ||
        !selected_length || selected_length >= sizeof(s->signature_algorithm) ||
        !expected_field(&cursor, &left, s->public_blob, s->public_length) || left) return reject_challenge(s);
+    const uint8_t *signature_algorithm = selected_algorithm;
+    size_t signature_algorithm_length = selected_length;
+    if(s->user_certificate) {
+        static const char suffix[] = "-cert-v01@openssh.com";
+        if(selected_length <= sizeof(suffix) - 1 ||
+           !equal(selected_algorithm + selected_length - (sizeof(suffix) - 1),
+                  (const uint8_t *)suffix, sizeof(suffix) - 1)) return reject_challenge(s);
+        signature_algorithm_length -= sizeof(suffix) - 1;
+    }
     if(s->rsa_signature_length) {
-        if(selected_length != 12 ||
-           !(equal(selected_algorithm, (const uint8_t *)"rsa-sha2-256", 12) ||
-             equal(selected_algorithm, (const uint8_t *)"rsa-sha2-512", 12))) {
+        if(signature_algorithm_length != 12 ||
+           !(equal(signature_algorithm, (const uint8_t *)"rsa-sha2-256", 12) ||
+             equal(signature_algorithm, (const uint8_t *)"rsa-sha2-512", 12))) {
             /* Missing server-sig-algs leaves libssh2's unsigned offer at
              * ssh-rsa despite SIGN_ALGO preferences. Never sign it. In
              * particular do not return ALGO_UNSUPPORTED: libssh2 interprets
              * that callback result as permission to retry its default method. */
             s->sign_error = FTSSH_UNSUPPORTED; return LIBSSH2_ERROR_INVAL;
         }
-    } else if(selected_length != strlen(s->algorithm) ||
-              !equal(selected_algorithm, (const uint8_t *)s->algorithm, selected_length)) return reject_challenge(s);
+    } else if(signature_algorithm_length != strlen(s->algorithm) ||
+              !equal(signature_algorithm, (const uint8_t *)s->algorithm, signature_algorithm_length)) return reject_challenge(s);
     if(s->challenge_length && (s->challenge_length != length || !equal(s->challenge, data, length))) return reject_challenge(s);
     if(!s->challenge_length) {
         memcpy(s->challenge, data, length); s->challenge_length = length;
-        memcpy(s->signature_algorithm, selected_algorithm, selected_length); s->signature_algorithm[selected_length] = 0;
+        memcpy(s->signature_algorithm, signature_algorithm, signature_algorithm_length);
+        s->signature_algorithm[signature_algorithm_length] = 0;
     }
     if(s->signature_consumed) return reject_challenge(s);
     if(!s->signature_length) return LIBSSH2_ERROR_EAGAIN;
@@ -1026,20 +1149,7 @@ int ftssh_supply_signature(ftssh_session *s, const uint8_t *blob, size_t length)
     const uint8_t *cursor = blob, *payload; size_t left = length, n;
     if(!expected_field(&cursor, &left, s->signature_algorithm, strlen(s->signature_algorithm)) ||
        !field(&cursor, &left, &payload, &n) || left || !n || n > sizeof(s->signature)) return FTSSH_CHALLENGE;
-    if(s->rsa_signature_length) {
-        if(n != s->rsa_signature_length) return FTSSH_CHALLENGE;
-    } else if(strcmp(s->algorithm, "ssh-ed25519") == 0) {
-        if(n != 64) return FTSSH_CHALLENGE;
-    } else {
-        const uint8_t *part = payload, *integer; size_t remaining = n, width;
-        size_t maximum = s->algorithm[16] == '2' ? 32 : (s->algorithm[16] == '3' ? 48 : 66);
-        for(int i = 0; i < 2; i++) {
-            if(!field(&part, &remaining, &integer, &width) || !width || width > maximum + 1 ||
-               (integer[0] & 128) || (integer[0] == 0 && (width == 1 || !(integer[1] & 128))) ||
-               (width == maximum + 1 && integer[0] != 0)) return FTSSH_CHALLENGE;
-        }
-        if(remaining) return FTSSH_CHALLENGE;
-    }
+    if(!signature_payload(s->algorithm, s->rsa_signature_length, payload, n)) return FTSSH_CHALLENGE;
     memcpy(s->signature, payload, n); s->signature_length = n; return FTSSH_OK;
 }
 static void store_u32(uint8_t *out, uint32_t value) {

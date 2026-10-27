@@ -148,7 +148,9 @@ private final class ProbeVault: WorkspaceCredentialVault, @unchecked Sendable {
     func remove(account: String) throws { lock.lock(); defer { lock.unlock() }; items[account] = nil }
     func sign(_ challenge: SSHUserAuthenticationChallenge, authorization: WorkspaceSSHAuthorization) throws -> Data {
         let item = try selected(authorization)
-        guard item.identity.blob == challenge.publicBlob, challenge.user == authorization.user else {
+        guard item.identity.blob == challenge.subjectPublicBlob,
+              challenge.publicBlob == (authorization.userCertificate?.blob ?? item.identity.blob),
+              challenge.user.utf8.elementsEqual(authorization.user.utf8) else {
             throw WorkspaceProbeError.invalid
         }
         return try SSHUserAuthenticationSigner.sign(challenge, privateContainer: item.container)

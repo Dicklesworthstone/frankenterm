@@ -99,10 +99,15 @@ public struct SSHPublicIdentity: Sendable, Equatable {
 /// must supply the original session identifier after verifying the actual peer's
 /// exchange signature, and must not substitute a later rekey's exchange hash.
 public struct SSHUserAuthenticationChallenge: Sendable, CustomDebugStringConvertible {
+    public static let maximumSignedDataBytes = 33 * 1024
     public let sessionIdentifier: Data, user: String, publicBlob: Data, algorithm: String
     /// The stable public-identity format is distinct from an RSA-SHA2 signature
     /// algorithm. Changing the hash never changes a saved credential fingerprint.
     public let publicKeyAlgorithm: String, fingerprint: String
+    /// The SSH request may offer a certificate, while its signature envelope
+    /// and protected private key still use the raw subject's algorithm/blob.
+    public let authenticationAlgorithm: String, subjectPublicBlob: Data
+    public let userCertificate: SSHUserCertificate?
     public var debugDescription: String { "SSHUserAuthenticationChallenge([redacted])" }
 
     public init(sessionIdentifier: Data, user: String, publicBlob: Data,
@@ -111,29 +116,42 @@ public struct SSHUserAuthenticationChallenge: Sendable, CustomDebugStringConvert
         // exchange identifiers and arbitrary-size signing inputs are not enabled.
         guard [32, 48, 64].contains(sessionIdentifier.count), !user.isEmpty, user.utf8.count <= 256,
               !user.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
-              !publicBlob.isEmpty, publicBlob.count <= SSHPublicIdentity.maximumBlobBytes else {
+              !publicBlob.isEmpty, publicBlob.count <= SSHUserCertificate.maximumBlobBytes else {
             throw SSHAuthenticationError.invalidChallenge
         }
-        let identity = try SSHPublicIdentity(blob: publicBlob)
-        let algorithm: String
+        let certificate: SSHUserCertificate?
+        let identity: SSHPublicIdentity
+        if try SSHUserCertificate.algorithmName(in: publicBlob).hasSuffix("-cert-v01@openssh.com") {
+            let parsed = try SSHUserCertificate(blob: publicBlob)
+            try parsed.validateAuthentication(user: user)
+            certificate = parsed; identity = parsed.subject
+        } else {
+            certificate = nil; identity = try SSHPublicIdentity(blob: publicBlob)
+        }
+        let algorithm: String, requestAlgorithm: String
         if identity.algorithm == "ssh-rsa" {
             // RFC 8332 retains the ssh-rsa public blob but signs the exact
             // negotiated SHA-2 name. There is no implicit SHA-1 or guessed hash.
+            let suffix = certificate == nil ? "" : "-cert-v01@openssh.com"
             guard let signatureAlgorithm,
-                  signatureAlgorithm == "rsa-sha2-256" || signatureAlgorithm == "rsa-sha2-512" else {
+                  signatureAlgorithm == "rsa-sha2-256" + suffix || signatureAlgorithm == "rsa-sha2-512" + suffix else {
                 throw SSHAuthenticationError.unsupportedAlgorithm
             }
-            algorithm = signatureAlgorithm
+            requestAlgorithm = signatureAlgorithm
+            algorithm = certificate == nil ? signatureAlgorithm : String(signatureAlgorithm.dropLast(suffix.count))
         } else {
-            guard signatureAlgorithm == nil || signatureAlgorithm == identity.algorithm else {
+            requestAlgorithm = certificate?.algorithm ?? identity.algorithm
+            guard signatureAlgorithm == nil || signatureAlgorithm == requestAlgorithm else {
                 throw SSHAuthenticationError.unsupportedAlgorithm
             }
             algorithm = identity.algorithm
         }
         self.sessionIdentifier = sessionIdentifier; self.user = user
         self.publicBlob = publicBlob; self.algorithm = algorithm
+        authenticationAlgorithm = requestAlgorithm; subjectPublicBlob = identity.blob; userCertificate = certificate
         publicKeyAlgorithm = identity.algorithm
         fingerprint = identity.fingerprint
+        guard signedData.count <= Self.maximumSignedDataBytes else { throw SSHAuthenticationError.invalidChallenge }
     }
 
     /// RFC 4252 section 7. The signature field itself is not part of this data.
@@ -144,7 +162,7 @@ public struct SSHUserAuthenticationChallenge: Sendable, CustomDebugStringConvert
         result += Self.string(Data("ssh-connection".utf8))
         result += Self.string(Data("publickey".utf8))
         result.append(1)
-        result += Self.string(Data(algorithm.utf8))
+        result += Self.string(Data(authenticationAlgorithm.utf8))
         result += Self.string(publicBlob)
         return result
     }
@@ -184,9 +202,10 @@ public enum SSHUserAuthenticationSigner {
 
     public static func sign(_ challenge: SSHUserAuthenticationChallenge, privateContainer: Data) throws -> Data {
         try Task.checkCancellation()
-        guard try PrivateKeyRecord.validateContainer(privateContainer, using: IdentityCryptography()) == challenge.publicBlob else {
+        guard try PrivateKeyRecord.validateContainer(privateContainer, using: IdentityCryptography()) == challenge.subjectPublicBlob else {
             throw SSHAuthenticationError.identityMismatch
         }
+        try challenge.userCertificate?.validateAuthentication(user: challenge.user)
         var outer = ByteCursor(privateContainer)
         _ = try outer.take(15)
         for _ in 0..<3 { _ = try outer.sshString() }
@@ -204,7 +223,7 @@ public enum SSHUserAuthenticationSigner {
             guard payload.count == 64 else { throw SSHAuthenticationError.unavailable }
         } else if challenge.publicKeyAlgorithm == "ssh-rsa" {
             let key = try OpenSSHRSAKeyMaterial(reading: &inner)
-            guard key.publicBlob == challenge.publicBlob else { throw SSHAuthenticationError.identityMismatch }
+            guard key.publicBlob == challenge.subjectPublicBlob else { throw SSHAuthenticationError.identityMismatch }
             payload = try key.signature(for: challenge.signedData, algorithm: challenge.algorithm)
         } else {
             guard let curve = SSHECDSACurve.allCases.first(where: { $0.algorithm == challenge.algorithm }) else {
@@ -247,6 +266,9 @@ public struct WorkspaceSSHAuthorization: Equatable, Sendable, CustomDebugStringC
     /// bypass. Nil means this route is being authenticated as a destination.
     public let transitForRouteID: String?
     public let algorithm: String, fingerprint: String, presentedHostKey: WorkspaceDocument.HostKey
+    /// Exact public offer selected by the reviewed credential, never inferred
+    /// from a filename or supplied by the transport's signing callback.
+    public let userCertificate: SSHUserCertificate?
     public var debugDescription: String { "WorkspaceSSHAuthorization([redacted])" }
 }
 
@@ -371,6 +393,8 @@ public protocol WorkspaceSSHSigning: Sendable {
 public struct WorkspaceSSHIdentity: Sendable {
     public let authorization: WorkspaceSSHAuthorization
     public let identity: SSHPublicIdentity
+    public var authenticationBlob: Data { authorization.userCertificate?.blob ?? identity.blob }
+    public var authenticationAlgorithm: String { authorization.userCertificate?.algorithm ?? identity.algorithm }
     let brokerOwner: UUID, foregroundGeneration: UUID
 }
 
@@ -811,8 +835,12 @@ public actor SSHAuthenticationBroker {
         guard identity.algorithm == authorization.algorithm, identity.fingerprint == authorization.fingerprint else {
             throw SSHAuthenticationError.identityMismatch
         }
+        if let certificate = authorization.userCertificate, certificate.subject != identity {
+            throw SSHAuthenticationError.identityMismatch
+        }
         try await store.validateSSHAuthentication(authorization, support: support)
         try checkCurrent(id)
+        try validateCertificate(authorization)
         return .init(authorization: authorization, identity: identity, brokerOwner: owner, foregroundGeneration: foregroundGeneration)
     }
 
@@ -826,6 +854,20 @@ public actor SSHAuthenticationBroker {
         try await store.validateSSHAuthentication(selected.authorization, support: support)
         guard foreground, selected.foregroundGeneration == foregroundGeneration else { throw SSHAuthenticationError.stale }
         try Task.checkCancellation()
+    }
+
+    /// Fresh authentication has a time-limited certificate gate. Established
+    /// forwarding and terminal witnesses call validate instead, retaining all
+    /// durable policy/revocation checks without imposing a new session expiry.
+    public func validateForAuthentication(_ selected: WorkspaceSSHIdentity) async throws {
+        try await validate(selected)
+        try validateCertificate(selected.authorization)
+    }
+
+    private func validateCertificate(_ authorization: WorkspaceSSHAuthorization) throws {
+        try authorization.userCertificate?.validateAuthentication(user: authorization.user,
+            requiresPTY: authorization.routeMode == "direct_ssh" && authorization.transitForRouteID == nil,
+            requiresPortForwarding: authorization.transitForRouteID != nil)
     }
 
     public func cancel(transportID: UUID) {
@@ -844,7 +886,7 @@ public actor SSHAuthenticationBroker {
         // Bound input before retaining it across the first suspension point.
         _ = try WorkspaceDocument.identifier(routeID); _ = try WorkspaceDocument.identifier(credentialID)
         guard [32, 48, 64].contains(sessionIdentifier.count),
-              (1...SSHPublicIdentity.maximumBlobBytes).contains(publicBlob.count),
+              (1...SSHUserCertificate.maximumBlobBytes).contains(publicBlob.count),
               signatureAlgorithm.map({ $0.utf8.count <= 64 }) ?? true else {
             throw SSHAuthenticationError.invalidChallenge
         }
@@ -860,6 +902,12 @@ public actor SSHAuthenticationBroker {
             guard challenge.publicKeyAlgorithm == authorization.algorithm, challenge.fingerprint == authorization.fingerprint else {
                 throw SSHAuthenticationError.identityMismatch
             }
+            // A valid certificate for the same key is still a different offer.
+            // Conversely, a certificate-bound route cannot fall back to its raw key.
+            guard challenge.userCertificate?.blob == authorization.userCertificate?.blob else {
+                throw SSHAuthenticationError.identityMismatch
+            }
+            try validateCertificate(authorization)
             pending?.authorization = authorization; pending?.challenge = challenge; pending?.preparing = false
             return .init(id: id, transportID: transportID, authorization: authorization)
         } catch {
@@ -878,6 +926,7 @@ public actor SSHAuthenticationBroker {
         defer { releaseWorker(requestID) }
         try await store.validateSSHAuthentication(authorization, support: support)
         try checkCurrent(requestID)
+        try validateCertificate(authorization)
         let signer = self.signer
         let signature = try await withTaskCancellationHandler {
             try await signer.sign(requestID: requestID, authorization: authorization, challenge: challenge)
@@ -888,6 +937,7 @@ public actor SSHAuthenticationBroker {
         guard !signature.isEmpty, signature.count <= 1044 else { throw SSHAuthenticationError.unavailable }
         try await store.validateSSHAuthentication(authorization, support: support)
         try checkCurrent(requestID)
+        try validateCertificate(authorization)
         return .init(requestID: requestID, transportID: selected.transportID, authorization: authorization,
                      algorithm: challenge.algorithm,
                      sessionIdentifier: challenge.sessionIdentifier, publicBlob: challenge.publicBlob, signatureBlob: signature)

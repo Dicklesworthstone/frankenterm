@@ -29,6 +29,9 @@ public enum FTLimit {
     public static let envelope = 4 * 1024 * 1024
     public static let key = 64 * 1024
     public static let text = 4096
+    /// Only workspace.credentials[*].user_certificate may hold this bounded
+    /// public binary field. Ordinary JSON strings and object keys keep text.
+    public static let certificateText = 4 * ((SSHUserCertificate.maximumBlobBytes + 2) / 3)
     public static let page = 32768
     public static let qrText = 2048
 }
@@ -64,13 +67,34 @@ public indirect enum JSONValue: Equatable, Sendable {
 /// Validates duplicate keys *before* building a Foundation dictionary.
 /// Node, depth, string, and input caps bound small-token and escape attacks.
 public struct StrictJSON {
+    /// Track the actual container path, including the credential array step.
+    /// An identically named key in extensions or another document stays text.
+    private enum Context {
+        case root, workspace, credentials, credential, userCertificate, other
+        func member(_ key: String) -> Context {
+            switch (self, key) {
+            case (.root, "workspace"): .workspace
+            case (.workspace, "credentials"): .credentials
+            case (.credential, "user_certificate"): .userCertificate
+            default: .other
+            }
+        }
+        var element: Context {
+            if case .credentials = self { return .credential }
+            return .other
+        }
+        var stringLimit: Int {
+            if case .userCertificate = self { return FTLimit.certificateText }
+            return FTLimit.text
+        }
+    }
     private let bytes: [UInt8]
     private var offset = 0
     private var nodes = 0
     public static func decode(_ data: Data) throws -> JSONValue {
         guard !data.isEmpty, data.count <= FTLimit.manifest else { throw FTError.limit("json.bytes") }
         var parser = StrictJSON(bytes: Array(data))
-        let value = try parser.value(depth: 0)
+        let value = try parser.value(depth: 0, context: .root)
         parser.whitespace()
         guard parser.offset == parser.bytes.count else { throw FTError.malformed("json.trailing") }
         return value
@@ -84,7 +108,7 @@ public struct StrictJSON {
             guard data.count <= FTLimit.manifest - output.count else { throw FTError.limit("json.bytes") }
             output += data
         }
-        func write(_ value: JSONValue, depth: Int) throws {
+        func write(_ value: JSONValue, depth: Int, context: Context) throws {
             nodes += 1
             guard nodes <= 32768, depth <= 12 else { throw FTError.limit("json.complexity") }
             switch value {
@@ -94,18 +118,20 @@ public struct StrictJSON {
                     if index > 0 { try append(Data([44])) }
                     guard key.utf8.count <= FTLimit.text else { throw FTError.limit("json.string") }
                     try append(encoder.encode(key)); try append(Data([58]))
-                    if let child = fields[key] { try write(child, depth: depth + 1) }
+                    if let child = fields[key] {
+                        try write(child, depth: depth + 1, context: context.member(key))
+                    }
                 }
                 try append(Data([125]))
             case .array(let items):
                 try append(Data([91]))
                 for (index, item) in items.enumerated() {
                     if index > 0 { try append(Data([44])) }
-                    try write(item, depth: depth + 1)
+                    try write(item, depth: depth + 1, context: context.element)
                 }
                 try append(Data([93]))
             case .string(let text):
-                guard text.utf8.count <= FTLimit.text else { throw FTError.limit("json.string") }
+                guard text.utf8.count <= context.stringLimit else { throw FTError.limit("json.string") }
                 try append(encoder.encode(text))
             case .number(let number):
                 guard number.utf8.count <= 64,
@@ -115,7 +141,7 @@ public struct StrictJSON {
             case .null: try append(Data("null".utf8))
             }
         }
-        try write(value, depth: 0)
+        try write(value, depth: 0, context: .root)
         _ = try decode(output)
         return output
     }
@@ -127,17 +153,17 @@ public struct StrictJSON {
         offset += 1
         return true
     }
-    private mutating func text() throws -> String {
+    private mutating func text(limit: Int = FTLimit.text) throws -> String {
         let start = offset
         guard take(34) else { throw FTError.malformed("json.quote") }
         while offset < bytes.count {
-            guard offset - start <= FTLimit.text * 6 + 2 else { throw FTError.limit("json.string") }
+            guard offset - start <= limit * 6 + 2 else { throw FTError.limit("json.string") }
             let byte = bytes[offset]
             offset += 1
             if byte == 34 {
                 let data = Data(bytes[start..<offset])
                 guard let value = try? JSONDecoder().decode(String.self, from: data),
-                      value.utf8.count <= FTLimit.text else { throw FTError.malformed("json.string") }
+                      value.utf8.count <= limit else { throw FTError.malformed("json.string") }
                 return value
             }
             guard byte >= 32 else { throw FTError.malformed("json.control") }
@@ -158,12 +184,12 @@ public struct StrictJSON {
         }
         throw FTError.malformed("json.unterminated_string")
     }
-    private mutating func value(depth: Int) throws -> JSONValue {
+    private mutating func value(depth: Int, context: Context) throws -> JSONValue {
         nodes += 1
         guard nodes <= 32768, depth <= 12 else { throw FTError.limit("json.complexity") }
         whitespace()
         guard offset < bytes.count else { throw FTError.malformed("json.eof") }
-        if bytes[offset] == 34 { return .string(try text()) }
+        if bytes[offset] == 34 { return .string(try text(limit: context.stringLimit)) }
         if take(123) {
             var result: [String: JSONValue] = [:]
             whitespace()
@@ -174,7 +200,7 @@ public struct StrictJSON {
                 guard result[key] == nil else { throw FTError.malformed("json.duplicate_key") }
                 whitespace()
                 guard take(58) else { throw FTError.malformed("json.colon") }
-                result[key] = try value(depth: depth + 1)
+                result[key] = try value(depth: depth + 1, context: context.member(key))
                 whitespace()
                 if take(125) { return .object(result) }
                 guard take(44) else { throw FTError.malformed("json.object_separator") }
@@ -185,7 +211,7 @@ public struct StrictJSON {
             whitespace()
             if take(93) { return .array(result) }
             while true {
-                result.append(try value(depth: depth + 1))
+                result.append(try value(depth: depth + 1, context: context.element))
                 whitespace()
                 if take(93) { return .array(result) }
                 guard take(44) else { throw FTError.malformed("json.array_separator") }
@@ -267,9 +293,26 @@ public struct WorkspaceDocument: Sendable {
         public let remoteCommand: String?
         public let requiredCapabilities: [String], requiredExtensions: [String]
     }
+    public static let userCertificateCapability = "ssh_user_certificate_v1"
     public struct Credential: Identifiable, Sendable {
         public let id: String, algorithm: String, fingerprint: String
+        /// The offer is public, immutable workspace policy. The protected item
+        /// continues to identify the raw subject key across certificate renewal.
+        public let userCertificate: SSHUserCertificate?
         public let requiredCapabilities: [String], requiredExtensions: [String]
+
+        func permitsCertificate(user: String, transit: Bool, routeMode: String, now: Date?) -> Bool {
+            guard let certificate = userCertificate else { return true }
+            let requiresPTY = !transit && routeMode == "direct_ssh"
+            if let now {
+                return (try? certificate.validateAuthentication(user: user, now: now,
+                    requiresPTY: requiresPTY, requiresPortForwarding: transit)) != nil
+            }
+            // Established SSH sessions retain their exact certificate binding
+            // and static permissions; expiry gates new authentication only.
+            return (try? certificate.validateRestrictions(user: user, requiresPTY: requiresPTY,
+                requiresPortForwarding: transit)) != nil
+        }
     }
     public struct Font: Sendable {
         public let family: String, face: String?
@@ -357,7 +400,7 @@ public struct WorkspaceDocument: Sendable {
     public enum ReadinessCode: String, Hashable, Sendable {
         case requiredCapabilityUnavailable, hostTrustReviewRequired, hostTrustMissing
         case hostIdentityRevoked, hostKeyAlgorithmUnsupported, authenticationMethodUnsupported
-        case credentialRequired, credentialAlgorithmUnsupported
+        case credentialRequired, credentialAlgorithmUnsupported, credentialCertificateUnavailable
     }
     public struct ReadinessIssue: Hashable, Sendable {
         public let routeID: String
@@ -391,7 +434,7 @@ public struct WorkspaceDocument: Sendable {
     }
     public enum RouteReadinessIssue: Equatable, Sendable {
         case transportUnavailable, unsupportedRequirement, authenticationUnavailable
-        case credentialUnavailable, credentialAlgorithmUnavailable, hostTrustMissing, hostTrustNeedsReview, hostIdentityRevoked
+        case credentialUnavailable, credentialAlgorithmUnavailable, credentialCertificateUnavailable, hostTrustMissing, hostTrustNeedsReview, hostIdentityRevoked
         case hostAlgorithmUnavailable, locallyRejectedTrust, sessionPolicyMissing, jumpTransportUnavailable, blockedJumpRoute(String)
         public var message: String {
             switch self {
@@ -400,6 +443,7 @@ public struct WorkspaceDocument: Sendable {
             case .authenticationUnavailable: "None of the permitted authentication methods is supported by this build."
             case .credentialUnavailable: "No permitted matching credential is available for this route."
             case .credentialAlgorithmUnavailable: "The available credential needs an SSH key algorithm not supported by this build."
+            case .credentialCertificateUnavailable: "The user certificate is expired, not yet valid, or does not permit this account or connection. Import a renewed or suitable certificate from your Mac."
             case .hostTrustMissing: "This route needs a verified host identity."
             case .hostTrustNeedsReview: "Review the imported host identity before authentication."
             case .hostIdentityRevoked: "Every host key this route trusts is revoked or blocked on this phone."
@@ -492,15 +536,41 @@ public struct WorkspaceDocument: Sendable {
             guard Set(ids).count == ids.count else { throw FTError.malformed("manifest.duplicate_id") }
             return objects
         }
+        var certificateBytes = 0
         credentials = try records("credentials", cap: 256).map {
-            try $0.allowing(["id", "algorithm", "public_fingerprint", "requirement", "private_material", "required_capabilities"])
+            try $0.allowing(["id", "algorithm", "public_fingerprint", "requirement", "private_material", "required_capabilities", "user_certificate"])
             let fp = try Self.fingerprint($0.text("public_fingerprint"))
+            let algorithm = try Self.algorithm($0.text("algorithm"))
+            let capabilities = try Self.capabilities($0)
+            let certificate: SSHUserCertificate?
+            if let value = $0["user_certificate"] {
+                let encoded = try value.string()
+                guard encoded.utf8.count <= FTLimit.certificateText,
+                      let blob = Data(base64Encoded: encoded), blob.base64EncodedString() == encoded else {
+                    throw FTError.malformed("credential.user_certificate")
+                }
+                certificateBytes += blob.count
+                guard certificateBytes <= 1024 * 1024 else { throw FTError.limit("manifest.certificates") }
+                let parsed = try SSHUserCertificate(blob: blob)
+                guard parsed.subject.algorithm == algorithm, parsed.subject.fingerprint == fp,
+                      capabilities.contains(Self.userCertificateCapability) else {
+                    throw FTError.malformed("credential.certificate_binding")
+                }
+                certificate = parsed
+            } else {
+                // The capability without its exact public offer must never
+                // silently turn into ordinary raw-key authentication.
+                guard !capabilities.contains(Self.userCertificateCapability) else {
+                    throw FTError.malformed("credential.certificate_missing")
+                }
+                certificate = nil
+            }
             guard try $0.text("private_material") == "not_included" else { throw FTError.malformed("workspace.private_material") }
             if let requirement = $0["requirement"], try requirement.string() != "matching_private_key" {
                 throw FTError.unsupported("credential.requirement")
             }
-            return Credential(id: try $0.text("id"), algorithm: try Self.algorithm($0.text("algorithm")), fingerprint: fp,
-                              requiredCapabilities: try Self.capabilities($0), requiredExtensions: try Self.requiredExtensions($0))
+            return Credential(id: try $0.text("id"), algorithm: algorithm, fingerprint: fp, userCertificate: certificate,
+                              requiredCapabilities: capabilities, requiredExtensions: try Self.requiredExtensions($0))
         }
         themes = try records("themes", cap: 128).map {
             try $0.allowing(["id", "name", "foreground", "background", "accent", "ansi", "cursor_foreground", "cursor_background",
@@ -681,6 +751,22 @@ public struct WorkspaceDocument: Sendable {
                           revokedHostKeysByTrustScope: [String: Set<HostKey>] = [:],
                           requiredHostCapabilitiesByTrustScope: [String: Set<String>] = [:],
                           transitForRouteID: String? = nil) throws -> RouteReadiness {
+        try readiness(forRouteID: id, availableCredentialIDs: availableCredentialIDs, reviewedTrustIDs: reviewedTrustIDs,
+            revokedCredentialFingerprints: revokedCredentialFingerprints, locallyRejectedTrustIDs: locallyRejectedTrustIDs,
+            locallyRevokedHostKeys: locallyRevokedHostKeys, support: support,
+            revokedHostKeysByTrustScope: revokedHostKeysByTrustScope,
+            requiredHostCapabilitiesByTrustScope: requiredHostCapabilitiesByTrustScope,
+            transitForRouteID: transitForRouteID, certificateTime: Date())
+    }
+
+    /// Only store validation of an already-issued authorization omits clock
+    /// checks. Public route readiness always evaluates current certificate time.
+    func readiness(forRouteID id: String, availableCredentialIDs: Set<String>, reviewedTrustIDs: Set<String> = [],
+                   revokedCredentialFingerprints: Set<String> = [], locallyRejectedTrustIDs: Set<String> = [],
+                   locallyRevokedHostKeys: [String: Set<HostKey>] = [:], support: RouteSupport = .offlineOnly,
+                   revokedHostKeysByTrustScope: [String: Set<HostKey>] = [:],
+                   requiredHostCapabilitiesByTrustScope: [String: Set<String>] = [:],
+                   transitForRouteID: String? = nil, certificateTime: Date?) throws -> RouteReadiness {
         let routeMap = Dictionary(uniqueKeysWithValues: routes.map { ($0.id, $0) })
         let trustMap = Dictionary(uniqueKeysWithValues: hostTrust.map { ($0.id, $0) })
         let credentialMap = Dictionary(uniqueKeysWithValues: credentials.map { ($0.id, $0) })
@@ -718,13 +804,17 @@ public struct WorkspaceDocument: Sendable {
             let policyCandidates = candidates.filter {
                 Self.supports(Set($0.requiredCapabilities), using: support.capabilities) && $0.requiredExtensions.isEmpty
             }
-            let usable = policyCandidates.filter { support.credentialAlgorithms.contains($0.algorithm) }.map(\.id)
+            let algorithmCandidates = policyCandidates.filter { support.credentialAlgorithms.contains($0.algorithm) }
+            let usable = algorithmCandidates.filter {
+                $0.permitsCertificate(user: route.user, transit: transit, routeMode: route.mode, now: certificateTime)
+            }.map(\.id)
             let alternateMethod = methods.contains(.password) || methods.contains(.keyboardInteractive)
             if route.authenticationMethods.contains(.publicKey), !alternateMethod,
                (methods.contains(.publicKey) || route.authenticationMethods == [.publicKey]) {
                 if candidates.isEmpty { add(.credentialUnavailable) }
                 else if policyCandidates.isEmpty { add(.unsupportedRequirement) }
-                else if usable.isEmpty, !methods.isEmpty { add(.credentialAlgorithmUnavailable) }
+                else if algorithmCandidates.isEmpty, !methods.isEmpty { add(.credentialAlgorithmUnavailable) }
+                else if usable.isEmpty, !methods.isEmpty { add(.credentialCertificateUnavailable) }
             }
             if rejectedScopes.contains(trust.canonicalTrustScope) { add(.locallyRejectedTrust) }
             let revoked = Set((revocations[trust.canonicalTrustScope] ?? []).map(\.fingerprint))
@@ -799,7 +889,8 @@ public struct WorkspaceDocument: Sendable {
         guard let selected = routeMap[routeID] else { throw FTError.malformed("route.reference") }
         var issues: [ReadinessIssue] = [], visited = Set<String>()
         var selectedKeys: [String] = [], selectedMethods: [AuthenticationMethod] = []
-        func inspect(_ route: Route) {
+        let certificateTime = Date()
+        func inspect(_ route: Route, transit: Bool) {
             guard visited.insert(route.id).inserted else { return }
             func issue(_ code: ReadinessCode) { issues.append(.init(routeID: route.id, code: code)) }
             if !Self.supports(Set(route.requiredCapabilities), using: supportedCapabilities) || !route.requiredExtensions.isEmpty { issue(.requiredCapabilityUnavailable) }
@@ -817,6 +908,7 @@ public struct WorkspaceDocument: Sendable {
                 guard availableCredentialIDs.contains(id), let key = credentialMap[id] else { return false }
                 return supportedCredentialAlgorithms.contains(key.algorithm) && !revokedCredentialFingerprints.contains(key.fingerprint)
                     && Self.supports(Set(key.requiredCapabilities), using: supportedCapabilities) && key.requiredExtensions.isEmpty
+                    && key.permitsCertificate(user: route.user, transit: transit, routeMode: route.mode, now: certificateTime)
             }
             let qualifiedMethods = route.authenticationMethods.filter(supportedAuthenticationMethods.contains)
             let usableMethods = qualifiedMethods.filter { $0 != .publicKey || !keys.isEmpty }
@@ -828,12 +920,15 @@ public struct WorkspaceDocument: Sendable {
                 }
                 if !existing.isEmpty, existing.allSatisfy({ !supportedCredentialAlgorithms.contains($0.algorithm) }) {
                     issue(.credentialAlgorithmUnsupported)
+                } else if existing.contains(where: { $0.userCertificate != nil
+                    && !$0.permitsCertificate(user: route.user, transit: transit, routeMode: route.mode, now: certificateTime) }) {
+                    issue(.credentialCertificateUnavailable)
                 } else { issue(.credentialRequired) }
             }
             if route.id == routeID { selectedKeys = keys; selectedMethods = usableMethods }
-            for hopID in route.jumpRoutes { if let hop = routeMap[hopID] { inspect(hop) } }
+            for hopID in route.jumpRoutes { if let hop = routeMap[hopID] { inspect(hop, transit: true) } }
         }
-        inspect(selected)
+        inspect(selected, transit: false)
         return RouteReadinessDetail(routeID: routeID, usableCredentialIDs: selectedKeys,
                               authenticationMethods: selectedMethods, issues: issues)
     }

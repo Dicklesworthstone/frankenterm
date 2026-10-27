@@ -206,6 +206,7 @@ private actor MacExportEngine {
         retireKeyRequest(); invalidateExport()
         guard let pending = sshSource else { throw FTError.stale }
         let publicIdentityFiles = try pending.source.loadPublicIdentityFiles(for: aliases)
+        let publicCertificateFiles = try pending.source.loadPublicCertificateFiles(for: aliases)
         // Freeze the actual user/global trust-file selection for every chosen
         // destination and jump. Never pool unrelated aliases' trust or treat an
         // unreadable revocation source as an absent file.
@@ -219,7 +220,8 @@ private actor MacExportEngine {
                 try JSONDecoder().decode(SSHWorkspaceRegistry.self, from: $0)
             } ?? SSHWorkspaceRegistry()
             let result = try pending.source.export(aliases: aliases, workspaceName: "SSH Machines", defaultUser: NSUserName(),
-                publicIdentityFiles: publicIdentityFiles, knownHostFiles: knownHostFiles, registry: &registry, using: crypto)
+                publicIdentityFiles: publicIdentityFiles, publicCertificateFiles: publicCertificateFiles,
+                knownHostFiles: knownHostFiles, registry: &registry, using: crypto)
             let selected = try WorkspaceExportSelection(workspace: result.workspace,
                 groupIDs: [result.workspace.initialGroupID], findings: result.portability)
             _ = try selected.review(decisions: [:], loadedFingerprints: [])
@@ -669,7 +671,7 @@ private final class MacExportModel {
         let panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
         panel.showsHiddenFiles = true
         panel.directoryURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".ssh")
-        panel.message = "Choose a user SSH config, then select its hosts. Local Include files, public identities, and each host's known-hosts files are read within fixed limits. When a .pub file is missing, a configured OpenSSH key's public header or a clear ECDSA PEM's embedded public point can supply its identity. Including or unlocking private keys requires a separate choice. Relative Include paths use ~/.ssh; commands and Match conditions are never executed."
+        panel.message = "Choose a user SSH config, then select its hosts. Local Include files, public identities, explicit CertificateFile certificates, and each host's known-hosts files are read within fixed limits. When a .pub file is missing, a supported key container can supply its public identity. Including or unlocking private keys requires a separate choice. Relative Include paths use ~/.ssh; commands and Match conditions are never executed."
         guard panel.runModal() == .OK, let url = panel.url, windowOpen, foreground, !busy else { return }
         retireSourceKeyPrompt(); retireSSHSelection(); invalidatePrepared()
         perform { [self] operation in
@@ -1476,7 +1478,7 @@ private struct MacExportView: View {
                     }
                     Text("One private record serves every selected reference to the same public key. Keeping a reference only removes any private material already loaded for that identity.")
                         .font(.caption).foregroundStyle(.secondary)
-                    Text("Supported source keys: OpenSSH Ed25519, ECDSA P-256/P-384/P-521, and RSA (2048–8192 bits), plus ECDSA/RSA PEM files. Protected OpenSSH files use bcrypt with AES-CTR or AES-CBC; encrypted PKCS#8 files use PBES2, PBKDF2 and AES-CBC. Clear SEC1, PKCS#1 and PKCS#8 files are also supported. RSA connections require SHA-2 signatures. Certificates and hardware-bound keys still require a separately supported credential path.")
+                    Text("Supported source keys: OpenSSH Ed25519, ECDSA P-256/P-384/P-521, and RSA (2048–8192 bits), plus ECDSA/RSA PEM files. Protected OpenSSH files use bcrypt with AES-CTR or AES-CBC; encrypted PKCS#8 files use PBES2, PBKDF2 and AES-CBC. Clear SEC1, PKCS#1 and PKCS#8 files are also supported. RSA connections require SHA-2 signatures. Explicit OpenSSH user certificates remain attached to their public references; including their matching private key is a separate choice. Hardware-bound keys cannot be copied into this transfer.")
                         .font(.caption).foregroundStyle(.secondary)
                 }.frame(maxWidth: .infinity, alignment: .leading).padding(10)
             }
@@ -1598,11 +1600,27 @@ private struct MacExportView: View {
 
     private func identityChoice(_ identity: WorkspaceExportSelection.Identity) -> some View {
         let supported = ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521", "ssh-rsa"].contains(identity.algorithm)
+        let certified = model.selection?.workspace.credentials.filter {
+            $0.fingerprint == identity.fingerprint && $0.userCertificate != nil
+        } ?? []
         return VStack(alignment: .leading, spacing: 8) {
             Text(verbatim: identity.credentialIDs.joined(separator: ", ")).font(.headline)
             Text(verbatim: identity.fingerprint).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
             Text(verbatim: algorithmName(identity.algorithm) + " · Routes: " + identity.routeIDs.joined(separator: ", "))
                 .font(.caption).foregroundStyle(.secondary)
+            ForEach(certified) { reference in
+                if let certificate = reference.userCertificate {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(verbatim: "User certificate · " + certificate.fingerprint)
+                            .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                        Text(verbatim: "Signing authority · " + certificate.authority.fingerprint)
+                            .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                        Text(verbatim: "Principals · " + (certificate.principals.isEmpty ? "Any account accepted by the server" : certificate.principals.joined(separator: ", ")))
+                        Text(verbatim: "Valid from " + certificateTime(certificate.validAfter) + " until " +
+                            (certificate.validBefore == UInt64.max ? "no expiration" : certificateTime(certificate.validBefore)))
+                    }.font(.caption).foregroundStyle(.secondary)
+                }
+            }
             if !supported {
                 Text("Private-key import is unavailable for this algorithm. Keep its public reference for a matching identity on the phone.")
                     .font(.caption).foregroundStyle(.secondary)
@@ -1624,6 +1642,11 @@ private struct MacExportView: View {
                 }
             }
         }
+    }
+
+    private func certificateTime(_ seconds: UInt64) -> String {
+        guard seconds <= 253_402_300_799 else { return "beyond year 9999" }
+        return Date(timeIntervalSince1970: Double(seconds)).formatted(date: .abbreviated, time: .shortened)
     }
 
     private func algorithmName(_ algorithm: String) -> String {

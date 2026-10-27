@@ -107,7 +107,9 @@ public struct WorkspaceExportSelection: Sendable {
                     reason: "Private material was deliberately omitted. This public reference is preserved; use a matching identity already on the phone or import it separately."))
             }
         }
-        for credential in workspace.credentials where !credential.requiredCapabilities.isEmpty || !credential.requiredExtensions.isEmpty {
+        let supportedCredentialCapabilities: Set<String> = [WorkspaceDocument.userCertificateCapability]
+        for credential in workspace.credentials where !Set(credential.requiredCapabilities).isSubset(of: supportedCredentialCapabilities)
+            || !credential.requiredExtensions.isEmpty {
             // This candidate's restriction stays mandatory in the manifest.
             // The annotation is informational: another ordered candidate or a
             // permitted interactive method may still satisfy the route.
@@ -127,10 +129,11 @@ public struct WorkspaceExportSelection: Sendable {
             requirements[trust.canonicalTrustScope, default: []].formUnion(trust.requiredPolicyRequirements)
         }
         var blocked: [String] = [], missingIdentity: [String] = []
+        let certificateTime = Date()
         for route in workspace.routes {
-            var required = Set<String>(), needsIdentity = false, lacksPins = false, deniesPins = false
+            var required = Set<String>(), needsIdentity = false, lacksPins = false, deniesPins = false, certificateBlocked = false
             var visited = Set<String>()
-            func inspect(_ candidate: WorkspaceDocument.Route) {
+            func inspect(_ candidate: WorkspaceDocument.Route, transit: Bool) {
                 guard visited.insert(candidate.id).inserted else { return }
                 required.formUnion(candidate.requiredCapabilities)
                 required.formUnion(candidate.requiredExtensions.map { "extension:" + $0 })
@@ -141,15 +144,23 @@ public struct WorkspaceExportSelection: Sendable {
                 }
                 if candidate.authenticationMethods == [.publicKey] {
                     let candidates = candidate.credentialIDs.compactMap { credentials[$0] }
-                    let permitted = candidates.filter { $0.requiredCapabilities.isEmpty && $0.requiredExtensions.isEmpty }
+                    let permitted = candidates.filter {
+                        Set($0.requiredCapabilities).isSubset(of: supportedCredentialCapabilities) && $0.requiredExtensions.isEmpty
+                    }
                     if !candidates.isEmpty, permitted.isEmpty {
                         required.formUnion(candidates.flatMap(\.requiredCapabilities))
                         required.formUnion(candidates.flatMap(\.requiredExtensions).map { "extension:" + $0 })
-                    } else if !permitted.contains(where: { included.contains($0.fingerprint) }) { needsIdentity = true }
+                    } else {
+                        let usable = permitted.filter {
+                            $0.permitsCertificate(user: candidate.user, transit: transit, routeMode: candidate.mode, now: certificateTime)
+                        }
+                        if !permitted.isEmpty, usable.isEmpty { certificateBlocked = true }
+                        if !permitted.contains(where: { included.contains($0.fingerprint) }) { needsIdentity = true }
+                    }
                 }
-                for id in candidate.jumpRoutes { if let hop = routeMap[id] { inspect(hop) } }
+                for id in candidate.jumpRoutes { if let hop = routeMap[id] { inspect(hop, transit: true) } }
             }
-            inspect(route)
+            inspect(route, transit: !destinations.contains(route.id))
             var reasons: [String] = []
             let lacksSessionPolicy = destinations.contains(route.id)
                 && ((route.mode == "direct_ssh" && route.sessionCreation == nil)
@@ -163,12 +174,15 @@ public struct WorkspaceExportSelection: Sendable {
             }
             if deniesPins { reasons.append("Every positive host key for this route or a jump host is revoked. Positive trust cannot override that denial.") }
             if lacksPins { reasons.append("This route or a jump host has no positive host key. Review and verify host identity on the phone before authentication.") }
+            if certificateBlocked { reasons.append("No selected user certificate currently permits this account and connection. The certificate is preserved; renew it or choose an authorized candidate.") }
             if needsIdentity {
                 missingIdentity.append(route.id)
                 reasons.append("Public-key authentication for this route or a jump host needs a matching identity already on the phone or a separate key import.")
             }
+            // Time validity is evaluated again on the phone. Do not persist an
+            // immutable required finding for a not-yet-valid certificate.
             let requiredBlock = !required.isEmpty || deniesPins || lacksSessionPolicy || sourceBlocked.contains(route.id)
-            if requiredBlock { blocked.append(route.id) }
+            if requiredBlock || certificateBlocked { blocked.append(route.id) }
             if !reasons.isEmpty {
                 add(.init(entityID: route.id, setting: "route_readiness", disposition: requiredBlock ? 1 : 0,
                                       reason: reasons.joined(separator: " ")))
@@ -229,7 +243,8 @@ public struct WorkspaceExportSelection: Sendable {
         let selectedKeys = try identities.compactMap { identity -> PrivateKeyRecord? in
             guard decisions[identity.fingerprint] == .includePrivateKey else { return nil }
             guard let key = material[identity.fingerprint], let reference = identity.credentialIDs.first else { throw FTError.stale }
-            return PrivateKeyRecord(credentialID: reference, container: key.container, publicBlob: key.publicBlob, certificates: key.certificates)
+            return PrivateKeyRecord(credentialID: reference, container: key.container, publicBlob: key.publicBlob,
+                certificates: Self.certificates(for: identity.fingerprint, in: workspace))
         }
         return try AirGapArchive(workspace: workspace.reissuingBundle(id: bundleID), keys: selectedKeys,
                                  portability: reviewed.findings, using: crypto)
@@ -247,7 +262,15 @@ public struct WorkspaceExportSelection: Sendable {
                 $0.algorithm == original.algorithm && $0.fingerprint == original.fingerprint
             }) else { return nil }
             return PrivateKeyRecord(credentialID: selected.id, container: key.container,
-                                    publicBlob: key.publicBlob, certificates: key.certificates)
+                                    publicBlob: key.publicBlob, certificates: Self.certificates(for: selected.fingerprint, in: workspace))
+        }
+    }
+
+    private static func certificates(for fingerprint: String, in workspace: WorkspaceDocument) -> [Data] {
+        var seen = Set<Data>()
+        return workspace.credentials.filter { $0.fingerprint == fingerprint }.compactMap { credential in
+            guard let blob = credential.userCertificate?.blob, seen.insert(blob).inserted else { return nil }
+            return blob
         }
     }
 

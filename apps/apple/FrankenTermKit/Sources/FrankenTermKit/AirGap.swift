@@ -339,6 +339,30 @@ public struct PrivateKeyRecord: Sendable, CustomDebugStringConvertible {
     public init(credentialID: String, container: Data, publicBlob: Data, certificates: [Data] = []) {
         self.credentialID = credentialID; self.container = container; self.publicBlob = publicBlob; self.certificates = certificates
     }
+    /// Certificates are public workspace policy, not a second private identity.
+    /// A deduplicated key may carry the certificates of several references, but
+    /// every supplied certificate must be declared for this exact raw subject.
+    /// An empty array is valid for separately imported private material because
+    /// the complete verified certificate already lives in the manifest.
+    func validateCertificates(in workspace: WorkspaceDocument) throws {
+        guard certificates.count <= 256,
+              let reference = workspace.credentials.first(where: { $0.id == credentialID }) else {
+            throw FTError.malformed("archive.key_reference")
+        }
+        let declared = workspace.credentials.filter {
+            $0.algorithm == reference.algorithm && $0.fingerprint == reference.fingerprint
+        }.compactMap(\.userCertificate)
+        var seen = Set<Data>(), bytes = 0
+        for blob in certificates {
+            guard blob.count <= SSHUserCertificate.maximumBlobBytes else { throw FTError.limit("archive.certificate_bytes") }
+            bytes += blob.count
+            guard bytes <= 1024 * 1024,
+                  seen.insert(blob).inserted,
+                  declared.contains(where: { $0.blob == blob && $0.subject.blob == publicBlob }) else {
+                throw FTError.malformed("archive.certificate_binding")
+            }
+        }
+    }
     public static func fromPEM<C: AirGapCryptography>(_ pem: Data, credentialID: String, using crypto: C) throws -> PrivateKeyRecord {
         if LegacyRSASourceKey.recognizes(pem) {
             return try LegacyRSASourceKey(pem: pem).privateRecord(credentialID: credentialID, using: crypto)
@@ -481,7 +505,7 @@ public struct AirGapArchive: Sendable, CustomDebugStringConvertible {
             guard certificateCount <= 256 else { throw FTError.limit("archive.certificates") }
             var certificates: [Data] = []
             for _ in 0..<count {
-                let certificate = try reader.bytes(cap: FTLimit.key)
+                let certificate = try reader.bytes(cap: SSHUserCertificate.maximumBlobBytes)
                 certificateBytes += certificate.count
                 guard certificateBytes <= 1024 * 1024 else { throw FTError.limit("archive.certificate_bytes") }
                 certificates.append(certificate)
@@ -572,10 +596,16 @@ public struct AirGapArchive: Sendable, CustomDebugStringConvertible {
     private func validateKeys<C: AirGapCryptography>(using crypto: C) throws {
         guard keys.count <= 256 else { throw FTError.limit("archive.keys") }
         let references = Dictionary(uniqueKeysWithValues: workspace.credentials.map { ($0.id, $0) })
-        var ids = Set<String>(), identities = Set<Data>()
+        var ids = Set<String>(), identities = Set<Data>(), certificateCount = 0, certificateBytes = 0
         for key in keys {
             guard ids.insert(key.credentialID).inserted, let reference = references[key.credentialID] else { throw FTError.malformed("archive.key_reference") }
-            guard key.certificates.isEmpty else { throw FTError.unsupported("key.user_certificate") }
+            try key.validateCertificates(in: workspace)
+            certificateCount += key.certificates.count
+            guard certificateCount <= 256 else { throw FTError.limit("archive.certificates") }
+            for certificate in key.certificates {
+                certificateBytes += certificate.count
+                guard certificateBytes <= 1024 * 1024 else { throw FTError.limit("archive.certificate_bytes") }
+            }
             let blob = try PrivateKeyRecord.validateContainer(key.container, using: crypto)
             var publicReader = ByteCursor(blob)
             let algorithm = try publicReader.sshString(cap: 64)

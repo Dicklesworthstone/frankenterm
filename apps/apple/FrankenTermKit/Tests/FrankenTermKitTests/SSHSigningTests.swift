@@ -457,6 +457,37 @@ final class SSHSigningTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    func testCertificateOffersSignTheirExactPreimageWithOnlyTheRawSubjectKey() throws {
+        let fixtures = try UserCertificateFixtures.load()
+        let wrong = try sampleKey(using: TestCryptography()).0
+        for fixture in fixtures.certificates + [fixtures.largeCertificate] {
+            let key = try PrivateKeyRecord.fromPEM(Data(fixture.privatePEM.utf8), credentialID: "synthetic",
+                                                   using: TestCryptography())
+            let challenge = try SSHUserAuthenticationChallenge(sessionIdentifier: Data(0..<32), user: fixtures.user,
+                publicBlob: fixture.certificateBlob, signatureAlgorithm: fixture.authenticationAlgorithm)
+            XCTAssertEqual(challenge.signedData, try XCTUnwrap(Data(base64Encoded: fixture.signedData)))
+            let signature = try SSHUserAuthenticationSigner.sign(challenge, privateContainer: key.container)
+            let independent = try XCTUnwrap(Data(base64Encoded: fixture.signature))
+            if fixture.subjectAlgorithm == "ssh-rsa" {
+                // PKCS#1 v1.5 is deterministic: exact equality with an
+                // independently produced pyca signature proves its preimage.
+                XCTAssertEqual(signature, independent, fixture.id)
+            } else {
+                let curve = SSHECDSACurve.allCases.first { $0.algorithm == fixture.subjectAlgorithm }
+                let subject = Fixture(key: key, curve: curve)
+                XCTAssertTrue(try verify(signature, message: challenge.signedData, fixture: subject), fixture.id)
+                XCTAssertTrue(try verify(independent, message: challenge.signedData, fixture: subject), fixture.id)
+                XCTAssertFalse(try verify(signature, message: challenge.signedData + Data([0]), fixture: subject))
+            }
+            if fixture.id == "rsa-large" {
+                XCTAssertGreaterThan(challenge.signedData.count, 2048, "Exercise the old raw-key-only signing cap")
+            }
+            XCTAssertThrowsError(try SSHUserAuthenticationSigner.sign(challenge, privateContainer: wrong.container)) {
+                XCTAssertEqual($0 as? SSHAuthenticationError, .identityMismatch)
+            }
+        }
+    }
+
     func testCancellationNeverReturnsASignature() async throws {
         let key = try sampleKey(using: TestCryptography()).0
         let challenge = try SSHUserAuthenticationChallenge(sessionIdentifier: Data(repeating: 1, count: 32),

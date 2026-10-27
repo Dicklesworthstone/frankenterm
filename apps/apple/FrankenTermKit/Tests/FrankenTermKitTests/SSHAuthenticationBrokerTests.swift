@@ -171,6 +171,62 @@ final class SSHAuthenticationBrokerTests: XCTestCase {
             routeID: "route", credentialID: "key", presentedHostKey: f.pin, transportID: transportID,
             sessionIdentifier: Data(repeating: 0xB7, count: 32), publicBlob: f.key.publicBlob)
     }
+
+    func testCertificateBrokerOffersAndSignsOnlyTheExactReviewedCertificate() async throws {
+        let certificate = try workspaceTestCertificate(serial: 1)
+        let anotherForSameKey = try workspaceTestCertificate(serial: 2)
+        let f = try await fixture { workspace in
+            var credentials = workspace["credentials"] as! [[String: Any]]
+            credentials[0]["user_certificate"] = certificate.base64EncodedString()
+            credentials[0]["required_capabilities"] = [SSHUserCertificate.capability]
+            workspace["credentials"] = credentials
+        }
+        let qualified = WorkspaceDocument.RouteSupport(routeModes: ["direct_ssh"], authenticationMethods: [.publicKey],
+            credentialAlgorithms: ["ssh-ed25519"], hostKeyAlgorithms: ["ssh-ed25519"], capabilities: [SSHUserCertificate.capability])
+        let broker = SSHAuthenticationBroker(store: f.store, signer: ImmediateSSHSigner(container: f.key.container), support: qualified)
+        await broker.resume()
+        let selected = try await broker.publicIdentity(workspaceID: f.installed.id, expectedRevision: f.installed.revision,
+            routeID: "route", credentialID: "key", presentedHostKey: f.pin, transportID: UUID())
+        XCTAssertEqual(selected.identity.blob, f.key.publicBlob)
+        XCTAssertEqual(selected.authenticationBlob, certificate)
+        XCTAssertEqual(selected.authenticationAlgorithm, "ssh-ed25519-cert-v01@openssh.com")
+        try await broker.validateForAuthentication(selected)
+        for (offer, algorithm) in [(f.key.publicBlob, "ssh-ed25519"),
+                                    (anotherForSameKey, "ssh-ed25519-cert-v01@openssh.com")] {
+            do {
+                _ = try await broker.prepare(workspaceID: f.installed.id, expectedRevision: f.installed.revision,
+                    routeID: "route", credentialID: "key", presentedHostKey: f.pin, transportID: UUID(),
+                    sessionIdentifier: Data(0..<32), publicBlob: offer, signatureAlgorithm: algorithm)
+                XCTFail("A raw fallback or different certificate cannot borrow the selected key's authorization")
+            } catch { XCTAssertEqual(error as? SSHAuthenticationError, .identityMismatch) }
+        }
+        let request = try await broker.prepare(workspaceID: f.installed.id, expectedRevision: f.installed.revision,
+            routeID: "route", credentialID: "key", presentedHostKey: f.pin, transportID: UUID(),
+            sessionIdentifier: Data(0..<32), publicBlob: certificate,
+            signatureAlgorithm: "ssh-ed25519-cert-v01@openssh.com")
+        let signed = try await broker.confirm(requestID: request.id)
+        XCTAssertEqual(signed.algorithm, "ssh-ed25519")
+        XCTAssertEqual(signed.publicBlob, certificate)
+        var reader = ByteCursor(signed.signatureBlob)
+        XCTAssertEqual(try reader.sshString(), Data("ssh-ed25519".utf8))
+        XCTAssertEqual(try reader.sshString().count, 64)
+        XCTAssertEqual(reader.remaining, 0)
+        await broker.suspend()
+        await expectFailure { try await broker.validateForAuthentication(selected) }
+    }
+
+    func testRawCredentialCannotBorrowAnUnselectedCertificateForItsSubject() async throws {
+        let f = try await fixture()
+        let broker = SSHAuthenticationBroker(store: f.store, signer: ImmediateSSHSigner(container: f.key.container), support: support)
+        await broker.resume()
+        do {
+            _ = try await broker.prepare(workspaceID: f.installed.id, expectedRevision: f.installed.revision,
+                routeID: "route", credentialID: "key", presentedHostKey: f.pin, transportID: UUID(),
+                sessionIdentifier: Data(0..<32), publicBlob: workspaceTestCertificate(),
+                signatureAlgorithm: "ssh-ed25519-cert-v01@openssh.com")
+            XCTFail("Unselected public certificates cannot acquire signing authority")
+        } catch { XCTAssertEqual(error as? SSHAuthenticationError, .identityMismatch) }
+    }
     private func expectFailure(_ body: () async throws -> Void, file: StaticString = #filePath, line: UInt = #line) async {
         do { try await body(); XCTFail("Expected an authentication refusal", file: file, line: line) }
         catch {}

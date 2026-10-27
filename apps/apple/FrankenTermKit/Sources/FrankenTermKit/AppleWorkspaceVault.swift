@@ -353,7 +353,7 @@ public final class AppleSSHCredentialSigner: WorkspaceSSHSigning, @unchecked Sen
 
     public func sign(requestID: UUID, authorization: WorkspaceSSHAuthorization,
                      challenge: SSHUserAuthenticationChallenge) async throws -> Data {
-        guard challenge.user == authorization.user, challenge.publicKeyAlgorithm == authorization.algorithm,
+        guard challenge.user.utf8.elementsEqual(authorization.user.utf8), challenge.publicKeyAlgorithm == authorization.algorithm,
               challenge.fingerprint == authorization.fingerprint else { throw SSHAuthenticationError.identityMismatch }
         return try await perform(requestID: requestID, authorization: authorization, operation: .signature(challenge))
     }
@@ -381,7 +381,10 @@ public final class AppleSSHCredentialSigner: WorkspaceSSHSigning, @unchecked Sen
                             throw SSHAuthenticationError.identityMismatch
                         }
                         guard case .signature(let challenge) = operation else { return identity.blob }
-                        guard identity.blob == challenge.publicBlob else { throw SSHAuthenticationError.identityMismatch }
+                        guard identity.blob == challenge.subjectPublicBlob,
+                              challenge.publicBlob == (authorization.userCertificate?.blob ?? identity.blob) else {
+                            throw SSHAuthenticationError.identityMismatch
+                        }
                         var selectedGeneration: WorkspacePrivateKeyGeneration?
                         func read(_ context: LAContext) throws -> (status: OSStatus, container: Data?) {
                             func copy(_ generation: WorkspacePrivateKeyGeneration) throws -> (status: OSStatus, container: Data?) {

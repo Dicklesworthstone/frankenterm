@@ -63,7 +63,9 @@ private final class MemorySigner: WorkspaceSSHSigning, @unchecked Sendable {
     func sign(requestID: UUID, authorization: WorkspaceSSHAuthorization,
               challenge: SSHUserAuthenticationChallenge) async throws -> Data {
         let item = try vault.item(authorization)
-        guard item.identity.blob == challenge.publicBlob, challenge.user == authorization.user else {
+        guard item.identity.blob == challenge.subjectPublicBlob,
+              challenge.publicBlob == (authorization.userCertificate?.blob ?? item.identity.blob),
+              challenge.user.utf8.elementsEqual(authorization.user.utf8) else {
             throw LiveSSHTestError.invalid
         }
         return try SSHUserAuthenticationSigner.sign(challenge, privateContainer: item.container)

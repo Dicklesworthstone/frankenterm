@@ -190,6 +190,184 @@ static void test_combined_deadline_and_partial_phase_are_native_boundaries(void)
     assert(atomic_load(&global_interactive_workers) == workers);
 }
 
+typedef struct { uint8_t bytes[FTSSH_CHALLENGE_CAPACITY + 1]; size_t length; } test_wire;
+static void test_string(test_wire *wire, const void *bytes, size_t length) {
+    assert(length <= sizeof(wire->bytes) - wire->length - 4);
+    store_u32(wire->bytes + wire->length, (uint32_t)length); wire->length += 4;
+    if(length) memcpy(wire->bytes + wire->length, bytes, length);
+    wire->length += length;
+}
+static void test_name(test_wire *wire, const char *name) { test_string(wire, name, strlen(name)); }
+static void test_uint(test_wire *wire, uint64_t value, size_t length) {
+    assert(length <= sizeof(wire->bytes) - wire->length);
+    for(size_t i = length; i; i--) wire->bytes[wire->length++] = (uint8_t)(value >> ((i - 1) * 8));
+}
+/* Structural fixtures deliberately omit cryptographic issuer proof: that is
+ * verified by the workspace parser's independent ssh-keygen fixtures. These
+ * tests exercise the transport's offer/request/signature envelope boundary. */
+static test_wire test_certificate_validity(const char *algorithm, uint32_t kind, int critical, uint64_t after, uint64_t before) {
+    test_wire wire = {0}, principals = {0}, extensions = {0}, authority = {0}, signature = {0};
+    char name[65]; snprintf(name, sizeof(name), "%s-cert-v01@openssh.com", algorithm);
+    test_name(&wire, name);
+    uint8_t bytes[1025]; memset(bytes, 7, sizeof(bytes));
+    test_string(&wire, bytes, 32);
+    if(!strcmp(algorithm, "ssh-rsa")) {
+        const uint8_t exponent[] = {1, 0, 1};
+        test_string(&wire, exponent, sizeof(exponent));
+        bytes[0] = 0; bytes[1] = 128; test_string(&wire, bytes, 257);
+    } else if(!strcmp(algorithm, "ssh-ed25519")) { test_string(&wire, bytes, 32); }
+    else {
+        test_name(&wire, algorithm + 11); bytes[0] = 4;
+        test_string(&wire, bytes, algorithm[16] == '2' ? 65 : (algorithm[16] == '3' ? 97 : 133));
+    }
+    test_uint(&wire, 19, 8); test_uint(&wire, kind, 4);
+    test_name(&wire, "native-certificate-boundary");
+    test_name(&principals, "operator"); test_string(&wire, principals.bytes, principals.length);
+    test_uint(&wire, after, 8); test_uint(&wire, before, 8);
+    if(critical) test_name(&wire, "unqualified"); else test_string(&wire, NULL, 0);
+    test_name(&extensions, "permit-port-forwarding"); test_string(&extensions, NULL, 0);
+    test_name(&extensions, "permit-pty"); test_string(&extensions, NULL, 0);
+    test_string(&wire, extensions.bytes, extensions.length); test_string(&wire, NULL, 0);
+    test_name(&authority, "ssh-ed25519"); test_string(&authority, bytes, 32);
+    test_string(&wire, authority.bytes, authority.length);
+    test_name(&signature, "ssh-ed25519"); test_string(&signature, bytes, 64);
+    test_string(&wire, signature.bytes, signature.length);
+    return wire;
+}
+static test_wire test_certificate(const char *algorithm, uint32_t kind, int critical) {
+    return test_certificate_validity(algorithm, kind, critical, 1, UINT64_MAX);
+}
+static ftssh_session test_certificate_session(const test_wire *wire) {
+    ftssh_session session = authentication(); session.limit = 65536;
+    uint64_t validity[2];
+    assert(public_key_profile(wire->bytes, wire->length, 1, session.algorithm, session.offer_algorithm,
+        &session.rsa_signature_length, &session.user_certificate, validity) == FTSSH_OK);
+    assert(session.user_certificate);
+    memcpy(session.user, "operator", 9);
+    memcpy(session.public_blob, wire->bytes, wire->length); session.public_length = wire->length;
+    return session;
+}
+static test_wire test_certificate_challenge(const test_wire *certificate, const char *algorithm) {
+    test_wire wire = {0}; uint8_t session_identifier[32] = {1};
+    test_string(&wire, session_identifier, sizeof(session_identifier)); test_uint(&wire, 50, 1);
+    test_name(&wire, "operator"); test_name(&wire, "ssh-connection"); test_name(&wire, "publickey"); test_uint(&wire, 1, 1);
+    test_name(&wire, algorithm); test_string(&wire, certificate->bytes, certificate->length);
+    return wire;
+}
+static void test_user_certificate_profiles_and_bounds(void) {
+    test_wire certificate = test_certificate("ssh-ed25519", 1, 0);
+    char algorithm[65], offer[65]; size_t rsa_length; int is_certificate;
+    uint64_t validity[2];
+    assert(public_key_profile(certificate.bytes, certificate.length, 1, algorithm, offer, &rsa_length, &is_certificate, validity) == FTSSH_OK);
+    assert(!strcmp(algorithm, "ssh-ed25519") && !strcmp(offer, "ssh-ed25519-cert-v01@openssh.com"));
+    assert(is_certificate && !rsa_length && validity[0] == 1 && validity[1] == UINT64_MAX);
+    assert(public_key_profile(certificate.bytes, certificate.length, 0, algorithm, offer, &rsa_length, &is_certificate, validity) == FTSSH_UNSUPPORTED);
+    for(size_t i = 0; i < certificate.length; i++)
+        assert(public_key_profile(certificate.bytes, i, 1, algorithm, offer, &rsa_length, &is_certificate, validity) != FTSSH_OK);
+    assert(public_key_profile(certificate.bytes, certificate.length + 1, 1, algorithm, offer, &rsa_length, &is_certificate, validity) != FTSSH_OK);
+    assert(public_key_profile(certificate.bytes, FTSSH_PUBLIC_KEY_CAPACITY + 1, 1, algorithm, offer, &rsa_length, &is_certificate, validity) == FTSSH_INVALID);
+    certificate = test_certificate("ssh-ed25519", 2, 0);
+    assert(public_key_profile(certificate.bytes, certificate.length, 1, algorithm, offer, &rsa_length, &is_certificate, validity) == FTSSH_INVALID);
+    certificate = test_certificate("ssh-ed25519", 1, 1);
+    assert(public_key_profile(certificate.bytes, certificate.length, 1, algorithm, offer, &rsa_length, &is_certificate, validity) == FTSSH_UNSUPPORTED);
+}
+static void test_certificate_offer_time_rechecks_after_identity_selection(void) {
+    const uint64_t validity[] = {100, 200};
+    assert(!certificate_time_valid(validity, (time_t)-1));
+    assert(!certificate_time_valid(validity, (time_t)-2));
+    assert(!certificate_time_valid(validity, 99));
+    assert(certificate_time_valid(validity, 100));
+    assert(certificate_time_valid(validity, 199));
+    assert(!certificate_time_valid(validity, 200));
+    test_wire expired = test_certificate_validity("ssh-ed25519", 1, 0, 0, 1);
+    test_wire future = test_certificate_validity("ssh-ed25519", 1, 0, UINT64_MAX - 1, UINT64_MAX);
+    ftssh_session session = {0}; session.phase = APPROVED;
+    assert(ftssh_begin_authentication(&session, "operator", 8, expired.bytes, expired.length) == FTSSH_AUTH_FAILED);
+    assert(session.phase == APPROVED && !session.public_length && !session.challenge_length);
+    assert(ftssh_begin_authentication(&session, "operator", 8, future.bytes, future.length) == FTSSH_AUTH_FAILED);
+    assert(session.phase == APPROVED && !session.public_length && !session.challenge_length);
+}
+static test_wire test_certificate_rsa_authority(size_t signature_length) {
+    test_wire certificate = test_certificate("ssh-ed25519", 1, 0), authority = {0}, envelope = {0};
+    const uint8_t *cursor = certificate.bytes, *value; size_t left = certificate.length, length;
+    /* Retain the certificate subject and policy, then replace its CA envelope.
+     * The production parser has no role in manufacturing these wire fields. */
+    for(int i = 0; i < 3; i++) assert(field(&cursor, &left, &value, &length));
+    assert(left >= 12); cursor += 12; left -= 12;
+    for(int i = 0; i < 2; i++) assert(field(&cursor, &left, &value, &length));
+    assert(left >= 16); cursor += 16; left -= 16;
+    for(int i = 0; i < 3; i++) assert(field(&cursor, &left, &value, &length));
+    certificate.length = (size_t)(cursor - certificate.bytes);
+    const uint8_t exponent[] = {1, 0, 1}; uint8_t modulus[257]; memset(modulus, 7, sizeof(modulus));
+    modulus[0] = 0; modulus[1] = 128;
+    test_name(&authority, "ssh-rsa"); test_string(&authority, exponent, sizeof(exponent));
+    test_string(&authority, modulus, sizeof(modulus));
+    test_string(&certificate, authority.bytes, authority.length);
+    uint8_t signature[257]; memset(signature, 7, sizeof(signature));
+    assert(signature_length <= sizeof(signature));
+    test_name(&envelope, "rsa-sha2-512"); test_string(&envelope, signature, signature_length);
+    test_string(&certificate, envelope.bytes, envelope.length);
+    return certificate;
+}
+static void test_certificate_rsa_authority_allows_only_bounded_short_signatures(void) {
+    const struct { size_t length; int expected; } cases[] = {
+        {1, FTSSH_OK}, {255, FTSSH_OK}, {256, FTSSH_OK}, {0, FTSSH_INVALID}, {257, FTSSH_INVALID}
+    };
+    char algorithm[65], offer[65]; size_t rsa_length; int is_certificate; uint64_t validity[2];
+    for(size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        test_wire certificate = test_certificate_rsa_authority(cases[i].length);
+        assert(public_key_profile(certificate.bytes, certificate.length, 1, algorithm, offer,
+            &rsa_length, &is_certificate, validity) == cases[i].expected);
+    }
+}
+static void test_certificate_request_and_signature_algorithms_are_distinct(void) {
+    const char *subjects[] = {"ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521", "ssh-rsa", "ssh-rsa"};
+    const char *signatures[] = {"ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521", "rsa-sha2-256", "rsa-sha2-512"};
+    for(size_t i = 0; i < sizeof(subjects) / sizeof(subjects[0]); i++) {
+        test_wire certificate = test_certificate(subjects[i], 1, 0);
+        ftssh_session session = test_certificate_session(&certificate);
+        char request[65]; snprintf(request, sizeof(request), "%s-cert-v01@openssh.com", signatures[i]);
+        test_wire challenge = test_certificate_challenge(&certificate, request);
+        void *context = &session; unsigned char *signature = NULL; size_t length = 0;
+        assert(sign_callback(NULL, &signature, &length, challenge.bytes, challenge.length, &context) == LIBSSH2_ERROR_EAGAIN);
+        assert(!strcmp(session.signature_algorithm, signatures[i]));
+        assert(session.challenge_length == challenge.length && !memcmp(session.challenge, challenge.bytes, challenge.length));
+        test_wire envelope = {0}, payload = {0}; uint8_t bytes[256]; memset(bytes, 7, sizeof(bytes));
+        if(session.rsa_signature_length) { memcpy(payload.bytes, bytes, sizeof(bytes)); payload.length = sizeof(bytes); }
+        else if(!strcmp(subjects[i], "ssh-ed25519")) { memcpy(payload.bytes, bytes, 64); payload.length = 64; }
+        else { test_string(&payload, bytes, 1); test_string(&payload, bytes, 1); }
+        test_name(&envelope, request); test_string(&envelope, payload.bytes, payload.length);
+        assert(ftssh_supply_signature(&session, envelope.bytes, envelope.length) == FTSSH_CHALLENGE);
+        if(session.rsa_signature_length) {
+            /* A short certificate-issuer envelope never relaxes the exact
+             * modulus-width response required from our protected signer. */
+            envelope.length = 0; test_name(&envelope, signatures[i]);
+            test_string(&envelope, payload.bytes, payload.length - 1);
+            assert(ftssh_supply_signature(&session, envelope.bytes, envelope.length) == FTSSH_CHALLENGE);
+        }
+        envelope.length = 0; test_name(&envelope, signatures[i]); test_string(&envelope, payload.bytes, payload.length);
+        assert(ftssh_supply_signature(&session, envelope.bytes, envelope.length) == FTSSH_OK);
+        assert(sign_callback(NULL, &signature, &length, challenge.bytes, challenge.length, &context) == 0);
+        assert(length == payload.length && !memcmp(signature, payload.bytes, length));
+        release(signature, &context); assert(!session.allocated);
+
+        session = test_certificate_session(&certificate);
+        challenge = test_certificate_challenge(&certificate, signatures[i]);
+        assert(sign_callback(NULL, &signature, &length, challenge.bytes, challenge.length, &context) == LIBSSH2_ERROR_INVAL);
+        assert(!session.challenge_length && !signature);
+        session = test_certificate_session(&certificate);
+        challenge = test_certificate_challenge(&certificate, request); challenge.bytes[challenge.length - 1] ^= 1;
+        assert(sign_callback(NULL, &signature, &length, challenge.bytes, challenge.length, &context) == LIBSSH2_ERROR_INVAL);
+        assert(!session.challenge_length && !signature);
+    }
+    test_wire rsa = test_certificate("ssh-rsa", 1, 0);
+    ftssh_session session = test_certificate_session(&rsa);
+    test_wire challenge = test_certificate_challenge(&rsa, "ssh-rsa-cert-v01@openssh.com");
+    void *context = &session; unsigned char *signature = NULL; size_t length = 0;
+    assert(sign_callback(NULL, &signature, &length, challenge.bytes, challenge.length, &context) == LIBSSH2_ERROR_INVAL);
+    assert(session.sign_error == FTSSH_UNSUPPORTED && !session.challenge_length && !signature);
+}
+
 int main(void) {
     test_authentication_allocations_are_erased_before_free();
     test_method_tokens();
@@ -197,6 +375,10 @@ int main(void) {
     test_non_refusal_failures_and_callback_evidence();
     test_progress_and_success_require_signature();
     test_combined_deadline_and_partial_phase_are_native_boundaries();
+    test_user_certificate_profiles_and_bounds();
+    test_certificate_offer_time_rechecks_after_identity_selection();
+    test_certificate_rsa_authority_allows_only_bounded_short_signatures();
+    test_certificate_request_and_signature_algorithms_are_distinct();
     puts("authentication boundary assertions passed");
     return 0;
 }
