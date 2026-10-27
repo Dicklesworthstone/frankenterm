@@ -997,9 +997,9 @@ public actor WorkspaceStore {
                 catalog: catalog, support: support)
             let selected: WorkspaceDocument.RouteReadiness
             if let destinationID = transitForRouteID {
-                guard support.maximumJumpHops >= 1, route.jumpRoutes.isEmpty,
-                      let destination = document.routes.first(where: { $0.id == destinationID }),
-                      destination.jumpRoutes == [routeID],
+                let chain = try document.orderedJumpRoutes(forRouteID: destinationID)
+                guard !chain.isEmpty, chain.count <= support.maximumJumpHops,
+                      chain.contains(where: { $0.id == routeID }),
                       states.first(where: { $0.routeID == destinationID })?.isLocallyReady == true else {
                     throw SSHAuthenticationError.denied
                 }

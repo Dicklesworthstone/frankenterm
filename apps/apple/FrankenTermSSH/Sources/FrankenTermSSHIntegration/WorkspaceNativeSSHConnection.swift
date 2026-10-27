@@ -72,7 +72,6 @@ public actor WorkspaceNativeSSHConnection {
         guard let machine = document.machines.first(where: { $0.id == machineID }),
               machine.routeIDs.contains(routeID),
               let route = document.routes.first(where: { $0.id == routeID }),
-              route.jumpRoutes.count <= 1,
               (route.mode == "direct_ssh" && (route.sessionCreation == "on_select" || route.sessionCreation == "manual"))
                 || (route.mode == "frankenterm_mux" && (route.attachPolicy ?? "existing_only") == "existing_only"),
               let ready = entry.routes.first(where: { $0.routeID == routeID }),
@@ -90,14 +89,20 @@ public actor WorkspaceNativeSSHConnection {
             muxCommand = attachMux && muxClientFactory != nil ? defaultMuxCommand : nil
         }
         let endpoint = try NativeSSHEndpoint(host: route.host, port: route.port)
+        let hops = try document.orderedJumpRoutes(forRouteID: routeID)
+        guard hops.count <= WorkspaceNativeSSHAuthentication.routeSupport.maximumJumpHops else {
+            throw SSHAuthenticationError.denied
+        }
         try await broker.validateForeground(foreground)
         try Task.checkCancellation()
         let session: NativeSSHSession
-        if let hopID = route.jumpRoutes.first {
-            guard let hop = document.routes.first(where: { $0.id == hopID }), hop.jumpRoutes.isEmpty,
-                  let hopReadiness = entry.routes.first(where: { $0.routeID == hopID }),
-                  !hopReadiness.usableCredentialIDs.isEmpty else { throw SSHAuthenticationError.denied }
-            session = try await connectThroughHop(hop, credentialIDs: hopReadiness.usableCredentialIDs,
+        if !hops.isEmpty {
+            let credentials = try hops.map { hop -> [String] in
+                guard let readiness = entry.routes.first(where: { $0.routeID == hop.id }),
+                      !readiness.usableCredentialIDs.isEmpty else { throw SSHAuthenticationError.denied }
+                return readiness.usableCredentialIDs
+            }
+            session = try await connectThroughHops(hops, credentialIDs: credentials,
                 destination: endpoint, destinationRouteID: routeID, workspaceID: workspaceID,
                 revision: expectedRevision, store: store, broker: broker, foreground: foreground,
                 lease: lease, connectionTimeout: connectionTimeout, authenticationTimeout: authenticationTimeout)
@@ -135,62 +140,96 @@ public actor WorkspaceNativeSSHConnection {
         }
     }
 
-    /// Each hop-key attempt has its own TCP connection, peer verification and
-    /// signer witness. Only an explicit unsigned refusal advances this list.
+    /// Every hop has independent peer verification and signer authority. A
+    /// refused unsigned key closes the entire chain before trying that hop's
+    /// next candidate, with fresh ancestor logins. Previously refused candidates
+    /// stay consumed across reconstruction; no transit shell or command opens.
     /// A hop failure never masquerades as a refusal of the destination's key.
-    private static func connectThroughHop(_ hop: WorkspaceDocument.Route, credentialIDs: [String],
+    private static func connectThroughHops(_ hops: [WorkspaceDocument.Route], credentialIDs: [[String]],
         destination: NativeSSHEndpoint, destinationRouteID: String, workspaceID: UUID, revision: UUID,
         store: WorkspaceStore, broker: SSHAuthenticationBroker, foreground: SSHForegroundLease,
         lease: WorkspaceNetworkLease, connectionTimeout: Duration, authenticationTimeout: Duration)
         async throws -> NativeSSHSession {
+        var hadCredentialRefusal = false
         do {
-            var plan = try TerminalRouteAttemptPlan(routes: [.init(routeID: hop.id, credentialIDs: credentialIDs)])
-            let endpoint = try NativeSSHEndpoint(host: hop.host, port: hop.port)
-            while let attempt = plan.current {
-                try Task.checkCancellation()
-                try await broker.validateForeground(foreground)
-                // A completed refusal cannot carry the next key across local
-                // revocation/reimport or resume. Recheck before opening a socket.
-                let current = try await store.loadWithReadiness(support: WorkspaceNativeSSHAuthentication.routeSupport)
-                guard let entry = current.first(where: { $0.workspace.id == workspaceID }),
-                      entry.workspace.revision == revision,
-                      entry.routes.first(where: { $0.routeID == destinationRouteID })?.isLocallyReady == true,
-                      entry.routes.first(where: { $0.routeID == hop.id })?.usableCredentialIDs
-                        .contains(attempt.selection.credentialID) == true else { throw SSHAuthenticationError.stale }
-                try await broker.validateForeground(foreground)
-                try Task.checkCancellation()
-                let outer = try await NativeSSHConnector.connect(to: endpoint, timeout: connectionTimeout,
-                                                                networkLifetime: lease)
+            guard (1...3).contains(hops.count), credentialIDs.count == hops.count else {
+                throw SSHAuthenticationError.denied
+            }
+            // Validate every candidate list before any network operation.
+            for index in hops.indices {
+                _ = try TerminalRouteAttemptPlan(routes: [.init(routeID: hops[index].id,
+                                                                credentialIDs: credentialIDs[index])])
+            }
+            var candidateIndices = Array(repeating: 0, count: hops.count)
+            // Every retry consumes a previously untried candidate from one hop:
+            // at most 24 candidates, independent of the prefix's length.
+            while true {
+                var session: NativeSSHSession?
+                var pending: (index: Int, plan: TerminalRouteAttemptPlan, attempt: TerminalRouteAttemptPlan.Attempt)?
                 do {
-                    let authority = WorkspaceNativeSSHAuthentication(broker: broker, workspaceID: workspaceID,
-                        revision: revision, routeID: hop.id, credentialID: attempt.selection.credentialID,
-                        transportID: outer.transportID, endpoint: endpoint, transitForRouteID: destinationRouteID)
-                    _ = try await outer.authenticate(using: authority, timeout: authenticationTimeout)
-                    try await broker.validateForeground(foreground)
-                    try Task.checkCancellation()
-                    _ = try plan.connected(attempt)
-                    let child = try await outer.forward(to: destination, timeout: connectionTimeout)
-                    do {
-                        try await broker.validateForeground(foreground)
-                        try await child.validateForwardingPath()
+                    for index in hops.indices {
+                        let hop = hops[index]
+                        var plan = try TerminalRouteAttemptPlan(routes: [.init(routeID: hop.id,
+                            credentialIDs: Array(credentialIDs[index].dropFirst(candidateIndices[index])))])
+                        guard let attempt = plan.current else { throw SSHAuthenticationError.denied }
                         try Task.checkCancellation()
-                        return child
-                    } catch { await child.close(); throw error }
+                        try await broker.validateForeground(foreground)
+                        // Revalidate the complete destination graph before each
+                        // login and after any chain reconstruction.
+                        let current = try await store.loadWithReadiness(support: WorkspaceNativeSSHAuthentication.routeSupport)
+                        guard let entry = current.first(where: { $0.workspace.id == workspaceID }),
+                              entry.workspace.revision == revision,
+                              entry.routes.first(where: { $0.routeID == destinationRouteID })?.isLocallyReady == true,
+                              entry.routes.first(where: { $0.routeID == hop.id })?.usableCredentialIDs
+                                .contains(attempt.selection.credentialID) == true else { throw SSHAuthenticationError.stale }
+                        try await broker.validateForeground(foreground)
+                        try Task.checkCancellation()
+                        let endpoint = try NativeSSHEndpoint(host: hop.host, port: hop.port)
+                        if session == nil {
+                            session = try await NativeSSHConnector.connect(to: endpoint, timeout: connectionTimeout,
+                                                                           networkLifetime: lease)
+                        }
+                        guard let owner = session, owner.endpoint == endpoint else { throw SSHAuthenticationError.denied }
+                        let authority = WorkspaceNativeSSHAuthentication(broker: broker, workspaceID: workspaceID,
+                            revision: revision, routeID: hop.id, credentialID: attempt.selection.credentialID,
+                            transportID: owner.transportID, endpoint: endpoint, transitForRouteID: destinationRouteID,
+                            allowedJumpRouteIDs: hop.jumpRoutes)
+                        pending = (index, plan, attempt)
+                        _ = try await owner.authenticate(using: authority, timeout: authenticationTimeout)
+                        _ = try plan.connected(attempt)
+                        pending = nil
+                        try await broker.validateForeground(foreground)
+                        try await owner.validateForwardingPath()
+                        try Task.checkCancellation()
+                        let next = index + 1 < hops.count
+                            ? try NativeSSHEndpoint(host: hops[index + 1].host, port: hops[index + 1].port)
+                            : destination
+                        session = try await owner.forward(to: next, timeout: connectionTimeout)
+                    }
+                    guard let child = session else { throw SSHAuthenticationError.denied }
+                    try await broker.validateForeground(foreground)
+                    try await child.validateForwardingPath()
+                    try Task.checkCancellation()
+                    return child
                 } catch {
-                    await outer.close()
+                    await session?.close()
                     try Task.checkCancellation()
                     try await broker.validateForeground(foreground)
-                    if (error as? NativeSSHError)?.isCredentialRefused == true,
-                       try plan.failed(.credentialRefused, attempt: attempt) != nil { continue }
+                    if (error as? NativeSSHError)?.isCredentialRefused == true, var refused = pending {
+                        hadCredentialRefusal = true
+                        if try refused.plan.failed(.credentialRefused, attempt: refused.attempt) != nil {
+                            candidateIndices[refused.index] += 1
+                            continue
+                        }
+                    }
                     throw error
                 }
             }
-            throw NativeSSHError.jumpConnectionFailed
         } catch {
             if Task.isCancelled { throw CancellationError() }
             // No answer from the hop stays that: the caller tries the next
             // route and says the jump host could not be reached.
-            if let failure = error as? NativeSSHError, failure.isUnreachable { throw failure }
+            if !hadCredentialRefusal, let failure = error as? NativeSSHError, failure.isUnreachable { throw failure }
             throw NativeSSHError.jumpConnectionFailed
         }
     }

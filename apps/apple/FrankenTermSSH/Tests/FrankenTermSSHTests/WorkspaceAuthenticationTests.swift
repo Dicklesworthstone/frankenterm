@@ -393,6 +393,10 @@ final class WorkspaceAuthenticationTests: XCTestCase {
               let mode = environment["FT_WORKSPACE_SSH_TEST_MODE"] else {
             throw XCTSkip("Run Tests/Interop/test_workspace.py with the built XCTest bundle and native driver.")
         }
+        if mode.hasPrefix("jump-chain-") {
+            try await exerciseLiveJumpChain(mode: mode, destinationPort: port, destinationHost: host, environment: environment)
+            return
+        }
         if mode.hasPrefix("jump-") {
             try await exerciseLiveJump(mode: mode, destinationPort: port, destinationHost: host, environment: environment)
             return
@@ -594,6 +598,126 @@ final class WorkspaceAuthenticationTests: XCTestCase {
             let expected = mode == "jump-wrong-destination" ? 1 : 0
             XCTAssertEqual(f.vault.counts.reads, mode == "jump-hop-refused" ? 2 : expected)
             XCTAssertEqual(f.vault.counts.signatures, expected)
+        }
+        XCTAssertEqual(activity.accounting().connections, 0)
+    }
+
+    private func exerciseLiveJumpChain(mode: String, destinationPort: UInt16, destinationHost: Data,
+                                       environment: [String: String]) async throws {
+        struct Hop: Decodable { let port: UInt16; let hostKey: String }
+        let encoded = try XCTUnwrap(environment["FT_WORKSPACE_SSH_JUMP_CHAIN"]?.data(using: .utf8))
+        let hops = try JSONDecoder().decode([Hop].self, from: encoded)
+        XCTAssertTrue((2...3).contains(hops.count))
+        let hostKeys = try hops.map { try XCTUnwrap(Data(base64Encoded: $0.hostKey)) }
+        var keys: [PrivateKeyRecord] = []
+        for index in hops.indices {
+            let seed = Data((0..<32).map { UInt8((index + 1) * 32 + $0) })
+            let independent = try await SSHWorkspaceTestFixture.make(seed: seed)
+            let record = try XCTUnwrap(independent.archive.keys.first)
+            keys.append(.init(credentialID: "hop-key-\(index)", container: record.container, publicBlob: record.publicBlob))
+        }
+        let identities = try keys.map { try SSHPublicIdentity(blob: $0.publicBlob) }
+        let revokedIndex = mode == "jump-chain-revoke-last-hop" ? hops.count - 1 :
+            (mode == "jump-chain-revoke-middle-hop" ? 1 : 0)
+        let keepsReady = ["jump-chain-revoke-first-hop", "jump-chain-revoke-middle-hop",
+                          "jump-chain-revoke-last-hop", "jump-chain-revoke-during-signature"].contains(mode)
+        let repeats = ["jump-chain-hop-key-fallback", "jump-chain-hop-refused"].contains(mode)
+        let pins = try hostKeys.enumerated().map { index, host in
+            try SSHPublicIdentity(blob: mode == "jump-chain-wrong-hop" && index == hops.count - 1 ? keys[index].publicBlob : host)
+        }
+        let f = try await SSHWorkspaceTestFixture.make(hostname: "target.internal.invalid", port: destinationPort,
+            hostBlob: mode == "jump-chain-wrong-destination" ? nil : destinationHost, additionalKeys: keys) { workspace in
+            var routes = workspace["routes"] as! [[String: Any]]
+            let template = routes[0]
+            routes[0]["jump_routes"] = hops.indices.map { "hop-\($0)" }
+            var credentials = workspace["credentials"] as! [[String: Any]]
+            var trusts = workspace["host_trust"] as! [[String: Any]]
+            for index in hops.indices {
+                let host = index == 0 ? "127.0.0.1" : "target.internal.invalid"
+                var hop = template
+                hop["id"] = "hop-\(index)"; hop["mode"] = "frankenterm_mux"
+                hop["host"] = host; hop["port"] = Int(hops[index].port)
+                hop["host_trust_ref"] = "hop-trust-\(index)"; hop["jump_routes"] = [String]()
+                hop["session_creation"] = nil; hop["attach_policy"] = "existing_only"
+                hop["credential_refs"] = keepsReady && index == revokedIndex ? ["hop-key-\(index)", "key"] : ["hop-key-\(index)"]
+                if repeats && index == hops.count - 1 { hop["credential_refs"] = ["key", "hop-key-\(index)"] }
+                routes.append(hop)
+                credentials.append(["id": "hop-key-\(index)", "algorithm": identities[index].algorithm,
+                    "public_fingerprint": identities[index].fingerprint, "requirement": "matching_private_key", "private_material": "not_included"])
+                trusts.append(["id": "hop-trust-\(index)", "host": host, "port": Int(hops[index].port), "revoked_keys": [],
+                    "pins": [["algorithm": pins[index].algorithm, "fingerprint": pins[index].fingerprint]]])
+            }
+            workspace["routes"] = routes; workspace["credentials"] = credentials; workspace["host_trust"] = trusts
+        }
+        XCTAssertEqual(Set(hostKeys + [destinationHost]).count, hops.count + 1)
+        XCTAssertEqual(Set(keys.map(\.publicBlob) + [f.publicBlob]).count, hops.count + 1)
+        if ["jump-chain-success", "jump-chain-auth-only", "jump-chain-hop-key-fallback"].contains(mode) {
+            let authentications = repeats ? 2 * hops.count : hops.count + 1
+            try await exerciseLiveOwner(f, mode: mode == "jump-chain-success" ? "owner-success" : "owner-connect-only",
+                expectedAuthentications: authentications, expectedIdentityReads: authentications + (repeats ? 1 : 0))
+            return
+        }
+        let activity = WorkspaceNetworkActivity()
+        func connect(using authority: SSHAuthenticationBroker? = nil) async throws -> WorkspaceNativeSSHConnection {
+            try await WorkspaceNativeSSHConnection.connect(workspaceID: f.installed.id, expectedRevision: f.installed.revision,
+                machineID: "machine", routeID: "route", credentialID: "key", confirmedByUser: true, store: f.store,
+                broker: authority ?? f.broker, networkActivity: activity, connectionTimeout: .seconds(5), authenticationTimeout: .seconds(5))
+        }
+        if mode == "jump-chain-cancel-signature" || mode == "jump-chain-revoke-during-signature" {
+            let signer = SSHJumpPausedSigner(f.vault)
+            let broker = SSHAuthenticationBroker(store: f.store, signer: signer, support: WorkspaceNativeSSHAuthentication.routeSupport)
+            await broker.resume()
+            let task = Task { try await connect(using: broker) }
+            let deadline = ContinuousClock.now + .seconds(5)
+            while !(await signer.isPaused), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(1)) }
+            let paused = await signer.isPaused
+            XCTAssertTrue(paused)
+            if mode == "jump-chain-cancel-signature" || !paused { task.cancel() }
+            else {
+                try await f.store.revokeLocally(fingerprint: identities[revokedIndex].fingerprint)
+                let states = try await f.store.routeReadiness(workspaceID: f.installed.id, support: WorkspaceNativeSSHAuthentication.routeSupport)
+                XCTAssertTrue(try XCTUnwrap(states.first(where: { $0.routeID == "route" })).isLocallyReady)
+                await signer.release()
+            }
+            do {
+                let owner = try await task.value
+                await owner.close()
+                XCTFail("A cancelled or ancestor-revoked chain published a destination connection")
+            } catch {
+                if mode == "jump-chain-cancel-signature" { XCTAssertTrue(error is CancellationError) }
+            }
+            XCTAssertEqual(f.vault.counts.reads, hops.count + 1)
+            XCTAssertEqual(f.vault.counts.signatures, hops.count + (mode == "jump-chain-cancel-signature" ? 0 : 1))
+        } else if keepsReady {
+            let owner = try await connect()
+            do {
+                try await f.store.revokeLocally(fingerprint: identities[revokedIndex].fingerprint)
+                let states = try await f.store.routeReadiness(workspaceID: f.installed.id, support: WorkspaceNativeSSHAuthentication.routeSupport)
+                XCTAssertTrue(try XCTUnwrap(states.first(where: { $0.routeID == "route" })).isLocallyReady)
+                let sink = SSHWorkspaceTerminalProbe(identity: owner.identity), coordinator = try TerminalInputCoordinator()
+                await refuse {
+                    _ = try await owner.openTerminal(geometry: .init(columns: 80, rows: 24), coordinator: coordinator) {
+                        try await sink.prepare($0, fail: false)
+                    }
+                }
+                let summary = await sink.summary()
+                XCTAssertNil(summary.0)
+                await owner.close()
+            } catch { await owner.close(); throw error }
+        } else {
+            XCTAssertTrue(["jump-chain-wrong-hop", "jump-chain-wrong-destination", "jump-chain-revoked", "jump-chain-hop-refused"].contains(mode))
+            if mode == "jump-chain-revoked" { try await f.store.revokeLocally(fingerprint: identities[1].fingerprint) }
+            do {
+                let owner = try await connect()
+                await owner.close()
+                XCTFail("A rejected chain authenticated its destination")
+            } catch {
+                XCTAssertFalse((error as? NativeSSHError)?.isCredentialRefused == true)
+            }
+            let signatures = mode == "jump-chain-wrong-destination" ? hops.count :
+                (mode == "jump-chain-wrong-hop" ? hops.count - 1 : (mode == "jump-chain-hop-refused" ? 2 * (hops.count - 1) : 0))
+            XCTAssertEqual(f.vault.counts.reads, signatures + (mode == "jump-chain-hop-refused" ? 2 : 0))
+            XCTAssertEqual(f.vault.counts.signatures, signatures)
         }
         XCTAssertEqual(activity.accounting().connections, 0)
     }
