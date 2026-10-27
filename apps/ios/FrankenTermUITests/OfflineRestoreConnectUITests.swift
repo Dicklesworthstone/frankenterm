@@ -557,11 +557,118 @@ final class OfflineRestoreConnectUITests: XCTestCase {
                        "the saved workspace is replaced, not added")
     }
 
+    /// A machine switched off Connect with Group on this phone stays out of
+    /// its group's background sign-in, also after a relaunch, and still
+    /// connects when asked. Use Workspace Default puts it back in the group.
+    /// Needs the second machine. Starts and ends on the workspace list, as the
+    /// previous test leaves it and the next expects.
+    @MainActor
+    func test5AMachineOffConnectWithGroupConnectsOnlyWhenAsked() throws {
+        let inputs = try inputs()
+        guard let second = ProcessInfo.processInfo.environment["FT_UI_SECOND_MACHINE_NAME"] else {
+            throw XCTSkip("Set TEST_RUNNER_FT_UI_SECOND_MACHINE_NAME for a package with a second machine")
+        }
+        var app = launch()
+        // No terminal was reopened, so no group has signed anything in yet.
+        // (A terminal's back button also carries the workspace's name.)
+        XCTAssertTrue(app.buttons["Add machines"].waitForExistence(timeout: 20),
+                      "the previous test leaves the workspace list on screen")
+        savedWorkspace(app, inputs).tap()
+        // The machine pager keeps its neighbors' pages in the tree; the one in
+        // view is the hittable one.
+        func onPage(_ query: XCUIElementQuery) -> XCUIElement? {
+            (0..<query.count).map { query.element(boundBy: $0) }.first { $0.isHittable }
+        }
+        func show(_ machine: String) {
+            app.buttons["Machines"].tap()
+            let item = app.buttons[machine].firstMatch
+            XCTAssertTrue(item.waitForExistence(timeout: 10), "the Machines menu lists \(machine)")
+            item.tap()
+            let title = app.staticTexts.matching(NSPredicate(format: "label == %@", machine))
+            for _ in 0..<20 where onPage(title) == nil { usleep(250_000) }
+            XCTAssertNotNil(onPage(title), "\(machine)'s page is in view")
+        }
+        func groupSwitch() -> XCUIElement? {
+            let switches = app.switches.matching(NSPredicate(format: "label == %@", "Connect with Group"))
+            for _ in 0..<3 where onPage(switches) == nil { app.swipeUp() }
+            return onPage(switches)
+        }
+        func warmed() -> XCUIElement {
+            app.buttons.matching(NSPredicate(format: "label IN %@",
+                ["\(second), signed in, terminal not open", "\(second), connected", "\(second), connecting"])).firstMatch
+        }
+        func reset() -> XCUIElement { app.buttons["Use Workspace Default (On)"] }
+        func openTerminal() {
+            let open = app.buttons.matching(NSPredicate(format: "label IN %@", ["Connect", "Open Terminal"]))
+            for _ in 0..<3 where onPage(open) == nil { app.swipeDown() }
+            onPage(open)?.tap()
+            let allow = XCUIApplication(bundleIdentifier: "com.apple.springboard").alerts.buttons["OK"]
+            if allow.waitForExistence(timeout: 3) { allow.tap() }
+            XCTAssertTrue(chip(app, inputs.machine, "connected").waitForExistence(timeout: 60), "the first machine connects")
+        }
+
+        show(second)
+        let off = try XCTUnwrap(groupSwitch(), "the machine page offers Connect with Group")
+        XCTAssertEqual(off.value as? String, "1", "the package's group connects this machine")
+        off.coordinate(withNormalizedOffset: CGVector(dx: 0.95, dy: 0.5)).tap()
+        XCTAssertTrue(reset().waitForExistence(timeout: 10), "the choice is saved as this phone's own")
+        XCTAssertEqual(groupSwitch()?.value as? String, "0")
+        snapshot("g1-switched-off")
+
+        // The group opens without it, and the strip says it is not connected.
+        show(inputs.machine)
+        openTerminal()
+        XCTAssertTrue(chip(app, second, "disconnected").waitForExistence(timeout: 10), "the strip lists it disconnected")
+        XCTAssertFalse(warmed().waitForExistence(timeout: 20), "a machine switched off stays out of the group's sign-in")
+        snapshot("g2-group-without-it")
+        // Asked, it connects.
+        chip(app, second, "disconnected").tap()
+        let connect = app.buttons["Connect"].firstMatch
+        XCTAssertTrue(connect.waitForExistence(timeout: 10), "a disconnected machine offers Connect")
+        connect.tap()
+        XCTAssertTrue(chip(app, second, "connected").waitForExistence(timeout: 60), "Connect still connects it")
+        let screen = app.descendants(matching: .any)["Terminal output"].firstMatch
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 30), "its terminal takes the keyboard")
+        app.typeText("echo ASKED-$((20+1))\n")
+        waitFor("ASKED-21", in: screen, timeout: 30, "the machine connected on request runs commands")
+        chip(app, inputs.machine, "connected").tap()
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 10), "the first machine gets the keyboard back")
+        app.typeText("echo HOME-$((30+3))\n")
+        waitFor("HOME-33", in: screen, timeout: 30, "the first machine is on screen before the relaunch")
+
+        // The choice holds across a relaunch: the group comes back without it.
+        app = launch()
+        _ = reopen(app, inputs)
+        XCTAssertTrue(chip(app, second, "disconnected").waitForExistence(timeout: 10), "after a relaunch it waits again")
+        XCTAssertFalse(warmed().waitForExistence(timeout: 20), "after a relaunch it stays out of the group's sign-in")
+        snapshot("g3-relaunched")
+
+        // Use Workspace Default puts it back; the open group signs it in.
+        app.navigationBars.buttons.element(boundBy: 0).tap()
+        XCTAssertTrue(app.buttons["Machines"].waitForExistence(timeout: 10), "back on the machine pages")
+        show(second)
+        XCTAssertTrue(reset().waitForExistence(timeout: 10), "the saved choice offers the workspace default")
+        reset().tap()
+        XCTAssertTrue(reset().waitForNonExistence(timeout: 10), "the phone's own choice is gone")
+        XCTAssertEqual(groupSwitch()?.value as? String, "1", "the workspace default is on")
+        show(inputs.machine)
+        openTerminal()
+        XCTAssertTrue(warmed().waitForExistence(timeout: 60), "back in the group, it signs in in the background")
+        snapshot("g4-default-again")
+
+        let list = app.buttons["Add machines"]
+        for _ in 0..<3 where !list.exists {
+            app.navigationBars.buttons.element(boundBy: 0).tap()
+            _ = list.waitForExistence(timeout: 5)
+        }
+        XCTAssertTrue(savedWorkspace(app, inputs).waitForExistence(timeout: 20), "the next test starts on the workspace list")
+    }
+
     /// Stop trusting the server's host key from Keys while connected: the
     /// session ends, the key shows as blocked, and the machine no longer
     /// offers Connect. Runs last: the block stays saved in this simulator.
     @MainActor
-    func test5BlockingTheHostKeyEndsTheSessionAndKeepsItBlocked() throws {
+    func test6BlockingTheHostKeyEndsTheSessionAndKeepsItBlocked() throws {
         let inputs = try inputs()
         let app = launch()
         // The previous test leaves the workspace list on screen.
