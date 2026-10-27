@@ -2573,6 +2573,7 @@ impl MuxRequestErrorContext {
                 | Pdu::GetPaneTieredScrollbackStatusesV1(_)
                 | Pdu::GetPaneDomainsV1(_)
                 | Pdu::GetPaneUserVarsV1(_)
+                | Pdu::GetPaneIdentityV1(_)
                 | Pdu::GetPaneRenderChanges(_)
                 | Pdu::GetPaneRenderStateV1(_)
                 | Pdu::GetPaneRenderDeliveryV1(_)
@@ -7352,6 +7353,55 @@ fn sample_tiered_scrollback_status(
     }
 }
 
+/// Resolve durable identity only under the captured registration's operation
+/// lease. A callback that retires that registration cannot make a numeric
+/// successor satisfy this request, even if it reuses the durable UUID.
+fn sample_pane_identity(
+    mux: &Mux,
+    registration: Option<&PaneRegistrationHandle>,
+) -> anyhow::Result<codec::PaneIdentityOutcomeV1> {
+    let Some(registration) = registration else {
+        return Ok(codec::PaneIdentityOutcomeV1::PaneGone);
+    };
+    let (session_incarnation, _) = mux.topology_snapshot_authority()?;
+    let outcome = registration.try_with_current(|current| {
+        let Some(durable_pane_id) = current.durable_pane_id().filter(|id| *id != [0; 16]) else {
+            return codec::PaneIdentityOutcomeV1::Unavailable;
+        };
+        let render_facts = current.coherent_render_facts().map(|facts| {
+            Box::new(codec::PaneRenderMetadataV1 {
+                seqno: facts.seqno,
+                dimensions: facts.dimensions,
+                cursor: facts.cursor,
+                mouse_grabbed: facts.mouse_grabbed,
+                alt_screen_active: facts.alt_screen_active,
+                bracketed_paste: facts.bracketed_paste,
+                focus_tracking: facts.focus_tracking,
+                palette_generation: facts.palette_generation,
+                palette: facts.palette.as_ref().clone(),
+            })
+        });
+        codec::PaneIdentityOutcomeV1::Available {
+            identity: codec::PaneIdentityV1 {
+                session_incarnation,
+                durable_pane_id,
+                pane_registration: ReliablePaneRegistrationIdentityV1::from_bytes(
+                    registration.wire_identity(),
+                ),
+            },
+            render_facts,
+        }
+    });
+    // This check follows all external pane callbacks. An old-generation
+    // read is safe to discard; it must never describe a replacement as live.
+    let still_current = mux.capture_current_pane(registration.pane_id())
+        .is_some_and(|current| current.same_registration(registration));
+    if !still_current {
+        return Ok(codec::PaneIdentityOutcomeV1::PaneGone);
+    }
+    Ok(outcome.unwrap_or(codec::PaneIdentityOutcomeV1::PaneGone))
+}
+
 /// The owning domain of one exact pane registration, named when the domain is
 /// still registered under a name the reply may carry. A pane that retired
 /// after admission is reported `Missing`, like one that never existed.
@@ -8357,6 +8407,37 @@ impl SessionHandler {
                             },
                             send_response,
                         );
+                    },
+                    send_response,
+                );
+            }
+            Pdu::GetPaneIdentityV1(request) => {
+                let pane_id = request.pane_id;
+                let registration = match authority.capture_current_pane_opt(pane_id) {
+                    Ok(registration) => registration,
+                    Err(error) => {
+                        send_response(Err(error.into()));
+                        return;
+                    }
+                };
+                let request_authority = Rc::clone(&request_authority);
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Interactive,
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES
+                        + codec::MAX_PANE_IDENTITY_RESPONSE_DECOMPRESSED_BYTES,
+                    |send_response| async move {
+                        send_response(recover_line_read_callback(|| {
+                            request_authority.ensure_effect_admitted()?;
+                            let response = codec::GetPaneIdentityV1Response {
+                                pane_id,
+                                outcome: sample_pane_identity(
+                                    request_authority.mux(),
+                                    registration.as_ref(),
+                                )?,
+                            };
+                            response.validate()?;
+                            Ok(Pdu::GetPaneIdentityV1Response(response))
+                        }));
                     },
                     send_response,
                 );
@@ -10966,6 +11047,7 @@ impl SessionHandler {
             | Pdu::ListPanesTabStacksResponse { .. }
             | Pdu::ListPanesOrderedV1Response { .. }
             | Pdu::GetPaneUserVarsV1Response { .. }
+            | Pdu::GetPaneIdentityV1Response { .. }
             | Pdu::ReorderWindowTabsV1Response { .. }
             | Pdu::WindowOrderEventV1 { .. }
             | Pdu::GetPaneRenderDeliveryV1Response { .. }
@@ -14654,6 +14736,7 @@ mod tests {
 
     struct FakePane {
         pane_id: PaneId,
+        durable_pane_id: Option<[u8; 16]>,
         state: Mutex<FakePaneState>,
         changed_lines: Mutex<RangeSet<StableRowIndex>>,
         changed_since_seqnos: Mutex<Vec<SequenceNo>>,
@@ -14683,6 +14766,7 @@ mod tests {
         ) -> Self {
             Self {
                 pane_id,
+                durable_pane_id: None,
                 callback_probe: None,
                 tiered_scrollback_status_probe: None,
                 seqno_on_dimensions: None,
@@ -14793,6 +14877,10 @@ mod tests {
     impl Pane for FakePane {
         fn pane_id(&self) -> PaneId {
             self.pane_id
+        }
+
+        fn durable_pane_id(&self) -> Option<[u8; 16]> {
+            self.durable_pane_id
         }
 
         fn mux_registration_slot(&self) -> &Arc<mux::PaneRegistrationSlot> {
@@ -17413,6 +17501,128 @@ mod tests {
         };
         assert_eq!(response.dimensions.scrollback_top, -10_000);
         assert_eq!(pane.line_read_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn pane_identity_query_preserves_mux_authority_and_refuses_missing_durable_ids() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let _mux_guard = ScopedMux::install(&mux);
+        let mut exact = FakePane::new_with_id(7, None);
+        exact.durable_pane_id = Some([0x39; 16]);
+        let exact: Arc<dyn Pane> = Arc::new(exact);
+        let missing: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(8, None));
+        let mut nil = FakePane::new_with_id(9, None);
+        nil.durable_pane_id = Some([0; 16]);
+        let nil: Arc<dyn Pane> = Arc::new(nil);
+        for pane in [&exact, &missing, &nil] {
+            mux.add_pane(pane).unwrap();
+        }
+        let expected_registration = mux.capture_current_pane(7).unwrap().wire_identity();
+        let expected_incarnation = mux.topology_snapshot_authority().unwrap().0;
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_session(
+            sender, SessionOwner::new(Arc::clone(&mux)),
+        ).unwrap();
+        for pane_id in [7, 8, 9, 10] {
+            handler.process_one(DecodedPdu {
+                serial: 500 + pane_id as u64,
+                pdu: Pdu::GetPaneIdentityV1(codec::GetPaneIdentityV1 { pane_id }),
+            });
+            tick_until_response(&executor, &captured, 1);
+            let Pdu::GetPaneIdentityV1Response(response) = take_response(&captured).pdu else {
+                panic!("expected bounded pane identity reply");
+            };
+            assert_eq!(response.pane_id, pane_id);
+            response.validate().unwrap();
+            match pane_id {
+                7 => assert_eq!(response.outcome, codec::PaneIdentityOutcomeV1::Available {
+                    identity: codec::PaneIdentityV1 {
+                        session_incarnation: expected_incarnation,
+                        durable_pane_id: [0x39; 16],
+                        pane_registration: ReliablePaneRegistrationIdentityV1::from_bytes(expected_registration),
+                    },
+                    // The default composed facts are deliberately not authority.
+                    render_facts: None,
+                }),
+                8 | 9 => assert_eq!(response.outcome, codec::PaneIdentityOutcomeV1::Unavailable),
+                10 => assert_eq!(response.outcome, codec::PaneIdentityOutcomeV1::PaneGone),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn queued_pane_identity_query_never_rebinds_a_reused_numeric_id() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let _mux_guard = ScopedMux::install(&mux);
+        let mut old = FakePane::new_with_id(7, None);
+        old.durable_pane_id = Some([0x39; 16]);
+        let old: Arc<dyn Pane> = Arc::new(old);
+        mux.add_pane(&old).unwrap();
+        let old_registration = mux.capture_current_pane(7).unwrap();
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_session(
+            sender, SessionOwner::new(Arc::clone(&mux)),
+        ).unwrap();
+        handler.process_one(DecodedPdu {
+            serial: 501,
+            pdu: Pdu::GetPaneIdentityV1(codec::GetPaneIdentityV1 { pane_id: 7 }),
+        });
+        mux.remove_pane(7);
+        let mut replacement = FakePane::new_with_id(7, None);
+        // Even a restored durable ID is a different live registration.
+        replacement.durable_pane_id = Some([0x39; 16]);
+        let replacement: Arc<dyn Pane> = Arc::new(replacement);
+        mux.add_pane(&replacement).unwrap();
+        let current_registration = mux.capture_current_pane(7).unwrap();
+        assert_ne!(old_registration.wire_identity(), current_registration.wire_identity());
+        tick_until_response(&executor, &captured, 1);
+        let Pdu::GetPaneIdentityV1Response(response) = take_response(&captured).pdu else {
+            panic!("expected identity refusal for retired registration");
+        };
+        assert_eq!(response.outcome, codec::PaneIdentityOutcomeV1::PaneGone);
+        let fresh = sample_pane_identity(&mux, Some(&current_registration)).unwrap();
+        let codec::PaneIdentityOutcomeV1::Available { identity, .. } = fresh else {
+            panic!("fresh request must resolve the new registration");
+        };
+        assert_eq!(identity.pane_registration.as_bytes(), current_registration.wire_identity());
+        assert_eq!(identity.durable_pane_id, [0x39; 16]);
+    }
+
+    #[test]
+    fn pane_identity_distinguishes_mux_restarts_with_the_same_durable_and_numeric_ids() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let capture = || {
+            let mux = Arc::new(Mux::new(None));
+            let _mux_guard = ScopedMux::install(&mux);
+            let mut pane = FakePane::new_with_id(7, None);
+            pane.durable_pane_id = Some([0x39; 16]);
+            let pane: Arc<dyn Pane> = Arc::new(pane);
+            mux.add_pane(&pane).unwrap();
+            let registration = mux.capture_current_pane(7).unwrap();
+            let codec::PaneIdentityOutcomeV1::Available { identity, .. } =
+                sample_pane_identity(&mux, Some(&registration)).unwrap()
+            else {
+                panic!("registered durable pane must have exact identity");
+            };
+            identity
+        };
+        let first = capture();
+        let restarted = capture();
+        assert_eq!(first.durable_pane_id, restarted.durable_pane_id);
+        assert_ne!(first.session_incarnation, restarted.session_incarnation);
+        assert_ne!(first.pane_registration, restarted.pane_registration);
+        assert_ne!(first, restarted);
     }
 
     #[test]

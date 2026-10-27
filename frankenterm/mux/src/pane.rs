@@ -940,6 +940,13 @@ pub trait Pane: Downcast + Send + Sync {
 
     fn get_current_seqno(&self) -> SequenceNo;
 
+    /// Exact render publication for consumers that fence independent row
+    /// reads. Unlike the display-oriented `render_facts` default below,
+    /// this never composes separate getters or invents unavailable modes.
+    fn coherent_render_facts(&self) -> Option<Arc<PaneRenderFacts>> {
+        None
+    }
+
     /// Render facts for UI-thread readers (ft-yccm0.2.2.1).
     ///
     /// Panes that own a terminal override this with a lock-free publication,

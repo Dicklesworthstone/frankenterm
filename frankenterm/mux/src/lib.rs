@@ -4585,6 +4585,14 @@ mod pane_registration_handle {
             self.pane_id
         }
 
+        pub fn durable_pane_id(&self) -> Option<[u8; 16]> {
+            self.pane.durable_pane_id()
+        }
+
+        pub fn coherent_render_facts(&self) -> Option<Arc<crate::pane::PaneRenderFacts>> {
+            self.pane.coherent_render_facts()
+        }
+
         pub fn write_all(&self, data: &[u8]) -> std::io::Result<()> {
             self.pane.writer().write_all(data)
         }

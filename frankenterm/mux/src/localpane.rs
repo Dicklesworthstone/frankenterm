@@ -2299,6 +2299,16 @@ impl Pane for LocalPane {
         self.render_facts.load()
     }
 
+    fn coherent_render_facts(&self) -> Option<Arc<crate::pane::PaneRenderFacts>> {
+        // A tmux control pane delegates its visible source. Its native
+        // terminal publication must not be presented as that other source.
+        let tmux = self.tmux_domain.try_lock()?;
+        if tmux.is_some() {
+            return None;
+        }
+        Some(self.render_facts.load())
+    }
+
     fn get_changed_since(
         &self,
         lines: Range<StableRowIndex>,
@@ -18795,6 +18805,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn coherent_render_facts_preserve_publication_and_refuse_busy_source_identity() {
+        let pane = render_facts_test_pane(796);
+        let initial = pane.coherent_render_facts().unwrap();
+        assert!(Arc::ptr_eq(&initial, &pane.render_facts()));
+
+        let updated = apply_output(
+            &pane,
+            b"\x1b[?2004h\x1b[?1004h\x1b[?1000h\x1b[5;10H\x1b]4;1;rgb:12/34/56\x1b\\",
+        );
+        let coherent = pane.coherent_render_facts().unwrap();
+        assert!(Arc::ptr_eq(&coherent, &updated));
+        assert!(coherent.bracketed_paste && coherent.focus_tracking && coherent.mouse_grabbed);
+        assert_eq!((coherent.cursor.x, coherent.cursor.y), (9, 4));
+        assert!(coherent.seqno > initial.seqno);
+        assert_ne!(coherent.palette_generation, initial.palette_generation);
+
+        // Busy source selection is not permission to compose blocking
+        // getters or expose the native terminal behind a delegated source.
+        let source_guard = pane.tmux_domain.lock();
+        assert!(pane.coherent_render_facts().is_none());
+        drop(source_guard);
+        // An already-published coherent image remains readable while the
+        // terminal is busy, without taking another terminal acquisition.
+        let _terminal_guard = pane.terminal.lock();
+        assert!(Arc::ptr_eq(&pane.coherent_render_facts().unwrap(), &coherent));
     }
 
     #[test]

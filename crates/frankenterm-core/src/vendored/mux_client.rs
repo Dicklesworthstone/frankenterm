@@ -2512,6 +2512,43 @@ impl DirectMuxClient {
         }
     }
 
+    /// Read durable identity from the exact native registration. A peer below
+    /// codec 71 refuses this request before writing; legacy metadata never
+    /// substitutes for the unavailable authority.
+    pub async fn get_pane_identity_with_cx(
+        &mut self,
+        cx: &Cx,
+        pane_id: u64,
+    ) -> Result<codec::GetPaneIdentityV1Response, DirectMuxError> {
+        let native_pane_id = usize::try_from(pane_id).map_err(|_| {
+            DirectMuxError::proven_pre_write_rejection(DirectMuxError::Codec(
+                "pane identity numeric id out of range".to_string(),
+            ))
+        })?;
+        let response = self
+            .send_request_with_cx(cx, Pdu::GetPaneIdentityV1(codec::GetPaneIdentityV1 {
+                pane_id: native_pane_id,
+            }))
+            .await?;
+        let result = match response {
+            Pdu::GetPaneIdentityV1Response(response) => {
+                if response.pane_id != native_pane_id || response.validate().is_err() {
+                    Err(DirectMuxError::AlignedUnexpectedResponse {
+                        expected: "valid identity for requested pane".to_string(),
+                        got: "invalid pane identity response".to_string(),
+                    })
+                } else {
+                    Ok(response)
+                }
+            }
+            other => Err(DirectMuxError::UnexpectedResponse {
+                expected: "GetPaneIdentityV1Response".to_string(),
+                got: other.pdu_name().to_string(),
+            }),
+        };
+        self.settle_transport_result(result, "pane identity response contract failure", true)
+    }
+
     /// Read only the bounded tiered-scrollback health fields for a pane batch.
     pub async fn get_pane_tiered_scrollback_statuses_with_cx(
         &mut self,
@@ -7628,6 +7665,73 @@ mod tests {
             (Vec::new(), handle(connection, pdu), Vec::new())
         })
         .await
+    }
+
+    #[test]
+    fn native_identity_read_preserves_outcomes_and_rejects_a_wrong_pane() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let identity = codec::PaneIdentityV1 {
+                session_incarnation: mux::MuxSessionIncarnation::from_bytes([0x13; 16]),
+                durable_pane_id: [0x26; 16],
+                pane_registration: codec::ReliablePaneRegistrationIdentityV1::from_bytes([0x39; 16]),
+            };
+            let (_dir, path, server) = text_read_server(1, move |_, request| {
+                let Pdu::GetPaneIdentityV1(request) = request else {
+                    panic!("identity fixture received an unrelated request");
+                };
+                Some(Pdu::GetPaneIdentityV1Response(codec::GetPaneIdentityV1Response {
+                    pane_id: if request.pane_id == 10 { 11 } else { request.pane_id },
+                    outcome: match request.pane_id {
+                        7 | 10 => codec::PaneIdentityOutcomeV1::Available {
+                            identity, render_facts: None,
+                        },
+                        8 => codec::PaneIdentityOutcomeV1::Unavailable,
+                        9 => codec::PaneIdentityOutcomeV1::PaneGone,
+                        _ => panic!("unexpected pane"),
+                    },
+                }))
+            }).await;
+            let mut client = DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path)).await.unwrap();
+            for (pane_id, expected) in [
+                (7, codec::PaneIdentityOutcomeV1::Available { identity, render_facts: None }),
+                (8, codec::PaneIdentityOutcomeV1::Unavailable),
+                (9, codec::PaneIdentityOutcomeV1::PaneGone),
+            ] {
+                let response = client.get_pane_identity_with_cx(&cx, pane_id).await.unwrap();
+                assert_eq!(response.pane_id as u64, pane_id);
+                assert_eq!(response.outcome, expected);
+            }
+            assert!(matches!(
+                client.get_pane_identity_with_cx(&cx, 10).await,
+                Err(DirectMuxError::AlignedUnexpectedResponse { .. })
+            ));
+            drop(client);
+            timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
+        });
+    }
+
+    #[test]
+    fn native_identity_read_refuses_codec_70_before_any_identity_request() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let (_dir, path, server) = render_read_server_at_codec(70, 1, |_, request| {
+                let Pdu::ListPanes(_) = request else {
+                    panic!("unsupported identity request reached the socket");
+                };
+                (Vec::new(), Some(Pdu::ListPanesResponse(ListPanesResponse {
+                    tabs: Vec::new(), tab_titles: Vec::new(),
+                    window_titles: HashMap::new(), floating_panes: Vec::new(),
+                })), Vec::new())
+            }).await;
+            let mut client = DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path)).await.unwrap();
+            let error = client.get_pane_identity_with_cx(&cx, 7).await.unwrap_err();
+            assert!(matches!(error, DirectMuxError::OutboundPduRequiresCodec { .. }));
+            assert!(!client.is_connection_poisoned());
+            assert!(client.list_panes_with_cx(&cx).await.unwrap().tabs.is_empty());
+            drop(client);
+            timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
+        });
     }
 
     async fn render_read_server(

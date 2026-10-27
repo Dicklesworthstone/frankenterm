@@ -3581,6 +3581,18 @@ macro_rules! pdu_encoded_body_limit {
             max_zstd_encoded_bytes: MAX_PANE_USER_VARS_RESPONSE_ZSTD_ENCODED_BYTES,
         }
     };
+    (GetPaneIdentityV1, none) => {
+        PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: MAX_PANE_IDENTITY_REQUEST_DECOMPRESSED_BYTES,
+            max_zstd_encoded_bytes: MAX_PANE_IDENTITY_REQUEST_ZSTD_ENCODED_BYTES,
+        }
+    };
+    (GetPaneIdentityV1Response, none) => {
+        PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: MAX_PANE_IDENTITY_RESPONSE_DECOMPRESSED_BYTES,
+            max_zstd_encoded_bytes: MAX_PANE_IDENTITY_RESPONSE_ZSTD_ENCODED_BYTES,
+        }
+    };
     (GetImageCellResponse, none) => {
         PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
             max_decompressed_bytes: MAX_GET_IMAGE_CELL_RESPONSE_DECOMPRESSED_BYTES,
@@ -4336,7 +4348,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 70;
+pub const CODEC_VERSION: usize = 71;
 
 /// Lowest codec version this build can decode wire frames from.
 ///
@@ -4932,6 +4944,12 @@ pdu! {
     GetPaneUserVarsV1Response: 116, 70, server_reply, none,
         state_sync, bulk_data, bulk
         => deserialize_get_pane_user_vars_v1_response;
+    GetPaneIdentityV1: 117, 71, client_request, none,
+        query, query, normal
+        => deserialize_get_pane_identity_v1;
+    GetPaneIdentityV1Response: 118, 71, server_reply, none,
+        query, query, normal
+        => deserialize_get_pane_identity_v1_response;
 }
 
 impl Pdu {
@@ -4953,6 +4971,7 @@ impl Pdu {
             Self::GetPaneDomainsV1(value) => value.validate()?,
             Self::GetPaneDomainsV1Response(value) => value.validate()?,
             Self::GetPaneUserVarsV1Response(value) => value.validate()?,
+            Self::GetPaneIdentityV1Response(value) => value.validate()?,
             Self::SendKeyDownTracedV1(value) => value.validate()?,
             Self::SendPasteTracedV1(value) => value.validate()?,
             Self::ReliableKeyEventV1(value) => value.validate()?,
@@ -6435,6 +6454,8 @@ impl Pdu {
             Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse { pane_id, .. })
             | Pdu::GetPaneUserVarsV1(GetPaneUserVarsV1 { pane_id })
             | Pdu::GetPaneUserVarsV1Response(GetPaneUserVarsV1Response { pane_id, .. })
+            | Pdu::GetPaneIdentityV1(GetPaneIdentityV1 { pane_id })
+            | Pdu::GetPaneIdentityV1Response(GetPaneIdentityV1Response { pane_id, .. })
             | Pdu::GetLinesAtLayout(GetLinesAtLayout { pane_id, .. })
             | Pdu::GetLinesAtLayoutResponse(GetLinesAtLayoutResponse { pane_id, .. })
             | Pdu::CaptureSelectionAnchorV1(CaptureSelectionAnchorV1 { pane_id, .. })
@@ -14367,6 +14388,225 @@ pub const GET_PANE_RENDER_STATE_V1_MIN_CODEC_VERSION: usize = 69;
 #[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
 pub struct GetPaneRenderStateV1 {
     pub pane_id: PaneId,
+}
+
+pub const GET_PANE_IDENTITY_V1_MIN_CODEC_VERSION: usize = 71;
+pub const MAX_PANE_IDENTITY_REQUEST_DECOMPRESSED_BYTES: usize = 16;
+pub const MAX_PANE_IDENTITY_REQUEST_ZSTD_ENCODED_BYTES: usize = 128;
+pub const MAX_PANE_IDENTITY_RESPONSE_DECOMPRESSED_BYTES: usize = 8 * 1024;
+pub const MAX_PANE_IDENTITY_RESPONSE_ZSTD_ENCODED_BYTES: usize = 16 * 1024;
+
+/// Read the existing mux-owned identity of one exact pane registration.
+/// The authenticated transport supplies host authority; these identifiers
+/// alone are neither a host enrollment nor permission to view or control.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GetPaneIdentityV1 {
+    pub pane_id: PaneId,
+}
+
+/// Stable pane-artifact identity together with its current live authority.
+/// A durable UUID can survive restoration, whereas both live fields rotate.
+/// All three must match before attaching historical state to a live pane.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PaneIdentityV1 {
+    pub session_incarnation: MuxSessionIncarnation,
+    pub durable_pane_id: [u8; 16],
+    pub pane_registration: ReliablePaneRegistrationIdentityV1,
+}
+
+/// One coherent native terminal publication. Clients that also read rows
+/// must compare the entire publication and exact pane identity before and
+/// after those reads; a palette/configuration update can preserve `seqno`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct PaneRenderMetadataV1 {
+    pub seqno: SequenceNo,
+    pub dimensions: RenderableDimensions,
+    pub cursor: StableCursorPosition,
+    pub mouse_grabbed: bool,
+    pub alt_screen_active: bool,
+    pub bracketed_paste: bool,
+    pub focus_tracking: bool,
+    pub palette_generation: u64,
+    #[serde(
+        serialize_with = "serialize_pane_identity_palette",
+        deserialize_with = "deserialize_pane_identity_palette"
+    )]
+    pub palette: ColorPalette,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub enum PaneIdentityOutcomeV1 {
+    Available {
+        identity: PaneIdentityV1,
+        /// `None` means this pane cannot provide a coherent publication.
+        /// Never substitute the default composed `Pane::render_facts` here.
+        render_facts: Option<Box<PaneRenderMetadataV1>>,
+    },
+    PaneGone,
+    /// The backend has no non-nil durable identity. Numeric IDs, capture
+    /// UUIDs, titles and working directories are never used as substitutes.
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct GetPaneIdentityV1Response {
+    pub pane_id: PaneId,
+    pub outcome: PaneIdentityOutcomeV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum PaneIdentityError {
+    #[error("pane identity has a reserved {field}")]
+    ReservedIdentity { field: &'static str },
+    #[error("pane render metadata sequence is exhausted")]
+    SequenceExhausted,
+    #[error("pane render metadata has invalid geometry")]
+    InvalidGeometry,
+    #[error("pane render metadata palette contains a non-finite color")]
+    InvalidPalette,
+}
+
+impl PaneIdentityV1 {
+    pub fn validate(&self) -> Result<(), PaneIdentityError> {
+        for (field, reserved) in [
+            ("session incarnation", self.session_incarnation.as_bytes() == [0; 16]),
+            ("durable pane UUID", self.durable_pane_id == [0; 16]),
+            ("pane registration", self.pane_registration.is_reserved()),
+        ] {
+            if reserved {
+                return Err(PaneIdentityError::ReservedIdentity { field });
+            }
+        }
+        Ok(())
+    }
+}
+
+impl PaneRenderMetadataV1 {
+    pub fn validate(&self) -> Result<(), PaneIdentityError> {
+        if self.seqno == SequenceNo::MAX {
+            return Err(PaneIdentityError::SequenceExhausted);
+        }
+        let dims = self.dimensions;
+        if dims.cols == 0
+            || dims.viewport_rows == 0
+            || self.cursor.x > dims.cols
+            || StableRowIndex::try_from(dims.viewport_rows)
+                .ok()
+                .and_then(|rows| dims.physical_top.checked_add(rows))
+                .is_none()
+        {
+            return Err(PaneIdentityError::InvalidGeometry);
+        }
+        for color in self.palette.colors.0.iter().chain([
+            &self.palette.foreground,
+            &self.palette.background,
+            &self.palette.cursor_fg,
+            &self.palette.cursor_bg,
+            &self.palette.cursor_border,
+            &self.palette.selection_fg,
+            &self.palette.selection_bg,
+            &self.palette.scrollbar_thumb,
+            &self.palette.split,
+        ]) {
+            if ![color.0, color.1, color.2, color.3].iter().all(|channel| channel.is_finite()) {
+                return Err(PaneIdentityError::InvalidPalette);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl GetPaneIdentityV1Response {
+    pub fn validate(&self) -> Result<(), PaneIdentityError> {
+        if let PaneIdentityOutcomeV1::Available { identity, render_facts } = &self.outcome {
+            identity.validate()?;
+            if let Some(facts) = render_facts {
+                facts.validate()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+// The existing ColorPalette decoder first allocates an untrusted Vec. This
+// new PDU instead carries exactly 265 colors with no peer-controlled length.
+fn serialize_pane_identity_palette<S>(
+    palette: &ColorPalette,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeTuple;
+    let mut tuple = serializer.serialize_tuple(265)?;
+    for color in palette.colors.0.iter().chain([
+        &palette.foreground,
+        &palette.background,
+        &palette.cursor_fg,
+        &palette.cursor_bg,
+        &palette.cursor_border,
+        &palette.selection_fg,
+        &palette.selection_bg,
+        &palette.scrollbar_thumb,
+        &palette.split,
+    ]) {
+        tuple.serialize_element(color)?;
+    }
+    tuple.end()
+}
+
+fn deserialize_pane_identity_palette<'de, D>(deserializer: D) -> Result<ColorPalette, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct PaletteVisitor;
+    impl<'de> serde::de::Visitor<'de> for PaletteVisitor {
+        type Value = ColorPalette;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("exactly 265 terminal palette colors")
+        }
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut colors = [frankenterm_term::color::SrgbaTuple::default(); 265];
+            for (index, color) in colors.iter_mut().enumerate() {
+                *color = sequence.next_element()?.ok_or_else(|| {
+                    serde::de::Error::invalid_length(index, &self)
+                })?;
+            }
+            Ok(ColorPalette {
+                colors: frankenterm_term::color::Palette256(std::array::from_fn(|i| colors[i])),
+                foreground: colors[256],
+                background: colors[257],
+                cursor_fg: colors[258],
+                cursor_bg: colors[259],
+                cursor_border: colors[260],
+                selection_fg: colors[261],
+                selection_bg: colors[262],
+                scrollbar_thumb: colors[263],
+                split: colors[264],
+            })
+        }
+    }
+    deserializer.deserialize_tuple(265, PaletteVisitor)
+}
+
+fn deserialize_get_pane_identity_v1(data: &[u8], is_compressed: bool) -> Result<GetPaneIdentityV1, Error> {
+    deserialize_exact_payload_with_limit(
+        data, is_compressed, "GetPaneIdentityV1", MAX_PANE_IDENTITY_REQUEST_DECOMPRESSED_BYTES,
+    )
+}
+
+fn deserialize_get_pane_identity_v1_response(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<GetPaneIdentityV1Response, Error> {
+    let response: GetPaneIdentityV1Response = deserialize_exact_payload_with_limit(
+        data, is_compressed, "GetPaneIdentityV1Response", MAX_PANE_IDENTITY_RESPONSE_DECOMPRESSED_BYTES,
+    )?;
+    response.validate()?;
+    Ok(response)
 }
 
 /// Maximum number of panes sampled by one lightweight scrollback-health turn.
@@ -22638,7 +22878,7 @@ mod test {
 
     #[test]
     fn codec_v65_additive_line_layout_preserves_the_v61_compatibility_floor() {
-        assert_eq!(CODEC_VERSION, 70);
+        assert_eq!(CODEC_VERSION, 71);
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 61);
         assert_eq!(ORDERED_WINDOW_V1_MIN_CODEC_VERSION, 54);
         assert!(!codec_version_supports_ordered_window_v1(50));
@@ -24491,7 +24731,7 @@ mod test {
 
     #[test]
     fn codec_version_is_current() {
-        assert_eq!(CODEC_VERSION, 70);
+        assert_eq!(CODEC_VERSION, 71);
     }
 
     #[test]
@@ -24505,6 +24745,133 @@ mod test {
             request.minimum_codec_version(),
             Some(GET_PANE_RENDER_STATE_V1_MIN_CODEC_VERSION)
         );
+    }
+
+    fn identity_reply_fixture() -> GetPaneIdentityV1Response {
+        let mut palette = ColorPalette::default();
+        palette.colors.0[255] = frankenterm_term::color::SrgbaTuple(0.25, 0.5, 0.75, 1.0);
+        GetPaneIdentityV1Response {
+            pane_id: 42,
+            outcome: PaneIdentityOutcomeV1::Available {
+                identity: PaneIdentityV1 {
+                    session_incarnation: MuxSessionIncarnation::from_bytes([0x13; 16]),
+                    durable_pane_id: [0x26; 16],
+                    pane_registration: ReliablePaneRegistrationIdentityV1::from_bytes([0x39; 16]),
+                },
+                render_facts: Some(Box::new(PaneRenderMetadataV1 {
+                    seqno: 99,
+                    dimensions: RenderableDimensions {
+                        cols: 80,
+                        viewport_rows: 24,
+                        scrollback_rows: 100,
+                        physical_top: 76,
+                        ..Default::default()
+                    },
+                    cursor: StableCursorPosition { x: 4, y: 78, ..Default::default() },
+                    mouse_grabbed: true,
+                    alt_screen_active: false,
+                    bracketed_paste: true,
+                    focus_tracking: true,
+                    palette_generation: 81,
+                    palette,
+                })),
+            },
+        }
+    }
+
+    #[test]
+    fn pane_identity_round_trip_preserves_authority_modes_and_fixed_palette() {
+        let rich = identity_reply_fixture();
+        let mut no_facts = rich.clone();
+        if let PaneIdentityOutcomeV1::Available { render_facts, .. } = &mut no_facts.outcome {
+            *render_facts = None;
+        }
+        let pdus = [
+            Pdu::GetPaneIdentityV1(GetPaneIdentityV1 { pane_id: 42 }),
+            Pdu::GetPaneIdentityV1Response(rich),
+            Pdu::GetPaneIdentityV1Response(no_facts),
+            Pdu::GetPaneIdentityV1Response(GetPaneIdentityV1Response {
+                pane_id: 42, outcome: PaneIdentityOutcomeV1::PaneGone,
+            }),
+            Pdu::GetPaneIdentityV1Response(GetPaneIdentityV1Response {
+                pane_id: 42, outcome: PaneIdentityOutcomeV1::Unavailable,
+            }),
+        ];
+        for pdu in pdus {
+            for mode in [CompressionMode::Never, CompressionMode::Always] {
+                let frame = pdu.encode_frame_with_mode(23, mode).unwrap();
+                let decoded = Pdu::decode(frame.as_slice()).unwrap();
+                assert_eq!(decoded.pdu, pdu);
+                assert_eq!(decoded.serial, 23);
+                assert_eq!(pdu.minimum_codec_version(), Some(71));
+                assert_eq!(pdu.pane_id(), Some(42));
+            }
+        }
+        assert_eq!(GetPaneIdentityV1::IDENT, 117);
+        assert_eq!(GetPaneIdentityV1Response::IDENT, 118);
+        assert!(!GetPaneIdentityV1Response::WIRE_SPEC
+            .authorizes(PduProducer::Server, PduWireRole::Unilateral));
+    }
+
+    #[test]
+    fn pane_identity_rejects_reserved_authority_and_invalid_metadata_before_encode_and_after_decode() {
+        for case in 0..7 {
+            let mut reply = identity_reply_fixture();
+            let PaneIdentityOutcomeV1::Available { identity, render_facts } = &mut reply.outcome else {
+                unreachable!();
+            };
+            let facts = render_facts.as_mut().unwrap();
+            match case {
+                0 => identity.session_incarnation = MuxSessionIncarnation::from_bytes([0; 16]),
+                1 => identity.durable_pane_id = [0; 16],
+                2 => identity.pane_registration = ReliablePaneRegistrationIdentityV1::from_bytes([0; 16]),
+                3 => facts.seqno = SequenceNo::MAX,
+                4 => facts.dimensions.cols = 0,
+                5 => facts.dimensions.physical_top = StableRowIndex::MAX,
+                6 => facts.palette.colors.0[255].0 = f32::NAN,
+                _ => unreachable!(),
+            }
+            let mut encoded = Vec::new();
+            assert!(Pdu::GetPaneIdentityV1Response(reply.clone()).encode(&mut encoded, 23).is_err());
+            assert!(encoded.is_empty());
+            for mode in [CompressionMode::Never, CompressionMode::Always] {
+                let (body, compressed) = serialize_with_mode(&reply, mode).unwrap();
+                let mut frame = Vec::new();
+                encode_raw(GetPaneIdentityV1Response::IDENT, 23, &body, compressed, &mut frame).unwrap();
+                assert!(Pdu::decode(frame.as_slice()).is_err(), "case {case}");
+            }
+        }
+    }
+
+    #[test]
+    fn pane_identity_exact_decode_rejects_trailing_truncated_and_oversized_bodies() {
+        let request = GetPaneIdentityV1 { pane_id: 42 };
+        for (ident, body) in [
+            (GetPaneIdentityV1::IDENT, serialize_with_mode(&request, CompressionMode::Never).unwrap().0),
+            (GetPaneIdentityV1Response::IDENT, serialize_with_mode(&identity_reply_fixture(), CompressionMode::Never).unwrap().0),
+        ] {
+            for invalid in [body[..body.len() - 1].to_vec(), [body.as_slice(), &[0]].concat()] {
+                for compressed in [false, true] {
+                    let encoded = if compressed {
+                        zstd::encode_all(invalid.as_slice(), 0).unwrap()
+                    } else { invalid.clone() };
+                    let mut frame = Vec::new();
+                    encode_raw(ident, 23, &encoded, compressed, &mut frame).unwrap();
+                    assert!(Pdu::decode(frame.as_slice()).is_err());
+                }
+            }
+        }
+        for (ident, plain_cap, compressed_cap) in [
+            (GetPaneIdentityV1::IDENT, MAX_PANE_IDENTITY_REQUEST_DECOMPRESSED_BYTES, MAX_PANE_IDENTITY_REQUEST_ZSTD_ENCODED_BYTES),
+            (GetPaneIdentityV1Response::IDENT, MAX_PANE_IDENTITY_RESPONSE_DECOMPRESSED_BYTES, MAX_PANE_IDENTITY_RESPONSE_ZSTD_ENCODED_BYTES),
+        ] {
+            for (compressed, cap) in [(false, plain_cap), (true, compressed_cap)] {
+                let mut frame = Vec::new();
+                encode_raw(ident, 23, &vec![0; cap + 1], compressed, &mut frame).unwrap();
+                let error = Pdu::decode(frame.as_slice()).unwrap_err();
+                assert!(error.downcast_ref::<PduEncodedBodyLimitExceeded>().is_some());
+            }
+        }
     }
 
     #[test]
@@ -25346,7 +25713,7 @@ mod test {
     fn pdu_wire_registry_covers_every_assigned_id_and_only_the_historical_gaps() {
         const GAPS: &[u64] = &[5, 6, 7, 15, 16, 17, 18, 19, 21];
 
-        for ident in 0..=116 {
+        for ident in 0..=118 {
             let spec = Pdu::wire_spec_for_ident(ident);
             assert_eq!(
                 spec.is_none(),
@@ -25360,9 +25727,9 @@ mod test {
             }
         }
 
-        assert!(Pdu::wire_spec_for_ident(117).is_none());
+        assert!(Pdu::wire_spec_for_ident(119).is_none());
         assert!(Pdu::wire_spec_for_ident(u64::MAX).is_none());
-        assert_eq!(Pdu::all_wire_specs().len(), 117 - GAPS.len());
+        assert_eq!(Pdu::all_wire_specs().len(), 119 - GAPS.len());
     }
 
     #[test]
@@ -25408,6 +25775,7 @@ mod test {
                 112..=113 => 68,
                 114 => 69,
                 115..=116 => 70,
+                117..=118 => 71,
                 ident => panic!("unexpected assigned PDU ID {}", ident),
             };
             assert_eq!(
@@ -25443,11 +25811,11 @@ mod test {
             1, 3, 9, 11, 12, 13, 14, 22, 24, 26, 28, 31, 33, 34, 35, 36, 38, 40, 41, 43, 45, 46,
             48, 50, 51, 56, 57, 58, 59, 60, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75,
             77, 80, 81, 85, 86, 88, 91, 93, 95, 96, 98, 99, 100, 102, 104, 106, 108, 110, 112, 114,
-            115,
+            115, 117,
         ];
         const SERVER_REPLIES: &[u64] = &[
             0, 2, 4, 8, 10, 23, 25, 27, 29, 30, 32, 42, 47, 49, 52, 61, 76, 78, 82, 87, 89, 92, 94,
-            97, 101, 103, 105, 107, 109, 111, 113, 116,
+            97, 101, 103, 105, 107, 109, 111, 113, 116, 118,
         ];
         const SERVER_UNILATERALS: &[u64] = &[
             20, 25, 37, 38, 39, 44, 53, 54, 55, 56, 57, 58, 79, 83, 84, 90,
@@ -25559,7 +25927,7 @@ mod test {
                 | 115
                 | 116 => Class::StateSync,
                 24 | 25 | 79 | 80 | 84 | 85 | 91 | 92 | 114 => Class::Render,
-                22 | 31 | 41 | 46 | 51 | 52 | 60 | 61 | 77 | 93 | 102 | 104..=109 | 112 => {
+                22 | 31 | 41 | 46 | 51 | 52 | 60 | 61 | 77 | 93 | 102 | 104..=109 | 112 | 117 | 118 => {
                     Class::Query
                 }
                 23 | 32 | 42 | 47 | 78 | 94 | 103 | 113 => Class::BulkData,
@@ -25590,7 +25958,9 @@ mod test {
                 | 102
                 | 104..=109
                 | 112
-                | 115 => Cap::Query,
+                | 115
+                | 117
+                | 118 => Cap::Query,
                 4 | 13 | 20 | 23 | 32 | 42 | 47 | 76 | 78 | 82 | 87 | 94 | 99 | 103 | 113 | 116 => {
                     Cap::BulkData
                 }
@@ -25633,7 +26003,9 @@ mod test {
                 | 102
                 | 104..=112
                 | 114
-                | 115 => Qos::Normal,
+                | 115
+                | 117
+                | 118 => Qos::Normal,
                 4 | 23 | 32 | 42 | 47 | 76 | 78 | 82 | 87 | 94 | 103 | 113 | 116 => Qos::Bulk,
                 ident => panic!("PDU {} is missing from the queue-QoS census", ident),
             };
@@ -26581,7 +26953,7 @@ mod test {
     #[test]
     fn check_compat_current_build_keeps_v61_floor_after_additive_v65() {
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 61);
-        assert_eq!(CODEC_VERSION, 70);
+        assert_eq!(CODEC_VERSION, 71);
         assert!(check_compat(62, 61, 60, 58).is_err());
         assert_eq!(
             check_compat(62, 61, 61, 61),
