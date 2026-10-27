@@ -1,6 +1,8 @@
 //! One connection owns every read in a native browser snapshot transaction.
 
-use super::{DirectMuxClient, DirectMuxError, cancelled_mux_error, checkpoint_mux_cx, classify_cx_timeout};
+use super::{
+    DirectMuxClient, DirectMuxError, cancelled_mux_error, checkpoint_mux_cx, classify_cx_timeout,
+};
 use crate::cx::Cx;
 use crate::web::terminal_projection::{
     TerminalProjectionError, TerminalSnapshotBuilder, projected_dimensions, scope_for_identity,
@@ -25,7 +27,8 @@ struct SnapshotTransaction<'a> {
 impl Drop for SnapshotTransaction<'_> {
     fn drop(&mut self) {
         if !self.completed {
-            self.client.poison_connection("terminal snapshot abandoned", true);
+            self.client
+                .poison_connection("terminal snapshot abandoned", true);
         }
     }
 }
@@ -43,14 +46,22 @@ struct RenderFence {
 }
 
 impl RenderFence {
-    fn from_native(response: GetPaneRenderChangesResponse) -> Result<Self, TerminalProjectionError> {
+    fn from_native(
+        response: GetPaneRenderChangesResponse,
+    ) -> Result<Self, TerminalProjectionError> {
         if response.title.len() > 4096
-            || response.working_dir.as_ref().is_some_and(|cwd| cwd.as_str().len() > 4096)
+            || response
+                .working_dir
+                .as_ref()
+                .is_some_and(|cwd| cwd.as_str().len() > 4096)
         {
             return Err(TerminalProjectionError::LimitExceeded);
         }
         Ok(Self {
-            layout: LineReadLayout { seqno: response.seqno, dimensions: response.dimensions },
+            layout: LineReadLayout {
+                seqno: response.seqno,
+                dimensions: response.dimensions,
+            },
             cursor: response.cursor_position,
             mouse_grabbed: response.mouse_grabbed,
             alt_screen_active: response.alt_screen_active,
@@ -75,7 +86,10 @@ fn retryable_snapshot_failure(error: &TerminalProjectionError) -> bool {
             reply.validate().is_ok()
                 && reply.effect == codec::MuxErrorEffect::NOT_APPLIED
                 && reply.retry == codec::MuxErrorRetry::SAFE_AFTER_BACKOFF
-                && matches!(reply.code, codec::MuxErrorCode::RESOURCE_BUSY | codec::MuxErrorCode::BACKEND_FAILURE)
+                && matches!(
+                    reply.code,
+                    codec::MuxErrorCode::RESOURCE_BUSY | codec::MuxErrorCode::BACKEND_FAILURE
+                )
         }
         _ => false,
     }
@@ -94,44 +108,81 @@ impl DirectMuxClient {
         snapshot_id: WireU64,
     ) -> Result<FrozenSnapshot, TerminalProjectionError> {
         checkpoint_mux_cx(cx, self.connection_id, "terminal_snapshot_admission")?;
-        if !self.peer_generation.as_ref().is_some_and(|peer| {
-            peer.agreed >= codec::GET_PANE_IDENTITY_V1_MIN_CODEC_VERSION
-        }) {
+        if !self
+            .peer_generation
+            .as_ref()
+            .is_some_and(|peer| peer.agreed >= codec::GET_PANE_IDENTITY_V1_MIN_CODEC_VERSION)
+        {
             return Err(TerminalProjectionError::UnsupportedPeer);
         }
-        let native_pane_id = usize::try_from(pane_id)
-            .map_err(|_| TerminalProjectionError::InvalidSource)?;
-        if scope_for_identity(scope.identity.host.clone(), expected_identity, scope.epoch)? != scope {
+        let native_pane_id =
+            usize::try_from(pane_id).map_err(|_| TerminalProjectionError::InvalidSource)?;
+        if scope_for_identity(scope.identity.host.clone(), expected_identity, scope.epoch)? != scope
+        {
             return Err(TerminalProjectionError::IdentityChanged);
         }
-        let budget = self.config.write_timeout.saturating_add(self.config.read_timeout)
+        let budget = self
+            .config
+            .write_timeout
+            .saturating_add(self.config.read_timeout)
             .min(MAX_SNAPSHOT_DURATION);
-        let mut transaction = SnapshotTransaction { client: self, completed: false };
+        let mut transaction = SnapshotTransaction {
+            client: self,
+            completed: false,
+        };
         let result = crate::runtime_async::timeout_with_cx(cx, budget, async {
             for attempt in 0..MAX_SNAPSHOT_ATTEMPTS {
-                checkpoint_mux_cx(cx, transaction.client.connection_id, "terminal_snapshot_attempt")?;
-                let result = transaction.client.capture_terminal_attempt(
-                    cx, native_pane_id, expected_identity, scope.clone(), snapshot_id,
-                ).await;
+                checkpoint_mux_cx(
+                    cx,
+                    transaction.client.connection_id,
+                    "terminal_snapshot_attempt",
+                )?;
+                let result = transaction
+                    .client
+                    .capture_terminal_attempt(
+                        cx,
+                        native_pane_id,
+                        expected_identity,
+                        scope.clone(),
+                        snapshot_id,
+                    )
+                    .await;
                 match result {
-                    Err(error) if attempt + 1 < MAX_SNAPSHOT_ATTEMPTS
-                        && retryable_snapshot_failure(&error) => {
-                        crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(10)).await
-                            .map_err(|error| cancelled_mux_error("terminal_snapshot_backoff", error))?;
+                    Err(error)
+                        if attempt + 1 < MAX_SNAPSHOT_ATTEMPTS
+                            && retryable_snapshot_failure(&error) =>
+                    {
+                        crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(10))
+                            .await
+                            .map_err(|error| {
+                                cancelled_mux_error("terminal_snapshot_backoff", error)
+                            })?;
                     }
                     result => return result,
                 }
             }
             Err(TerminalProjectionError::SnapshotChanged)
-        }).await;
+        })
+        .await;
         let result = match result {
             Ok(result) => {
-                checkpoint_mux_cx(cx, transaction.client.connection_id, "terminal_snapshot_complete")?;
+                checkpoint_mux_cx(
+                    cx,
+                    transaction.client.connection_id,
+                    "terminal_snapshot_complete",
+                )?;
                 result
             }
             Err(timeout) => {
-                let error = classify_cx_timeout(cx, "terminal_snapshot", timeout, DirectMuxError::ReadTimeout);
-                transaction.client.poison_connection("terminal snapshot budget expired", true);
+                let error = classify_cx_timeout(
+                    cx,
+                    "terminal_snapshot",
+                    timeout,
+                    DirectMuxError::ReadTimeout,
+                );
+                transaction
+                    .client
+                    .poison_connection("terminal snapshot budget expired", true);
                 Err(error.into())
             }
         };
@@ -147,11 +198,16 @@ impl DirectMuxClient {
     ) -> Result<PaneRenderMetadataV1, TerminalProjectionError> {
         let response = self.get_pane_identity_with_cx(cx, pane_id as u64).await?;
         match response.outcome {
-            PaneIdentityOutcomeV1::Available { identity, render_facts } => {
+            PaneIdentityOutcomeV1::Available {
+                identity,
+                render_facts,
+            } => {
                 if identity != *expected_identity {
                     return Err(TerminalProjectionError::IdentityChanged);
                 }
-                render_facts.map(|facts| *facts).ok_or(TerminalProjectionError::UnsupportedPane)
+                render_facts
+                    .map(|facts| *facts)
+                    .ok_or(TerminalProjectionError::UnsupportedPane)
             }
             PaneIdentityOutcomeV1::PaneGone => Err(TerminalProjectionError::IdentityChanged),
             PaneIdentityOutcomeV1::Unavailable => Err(TerminalProjectionError::IdentityUnavailable),
@@ -163,9 +219,12 @@ impl DirectMuxClient {
         cx: &Cx,
         pane_id: usize,
     ) -> Result<RenderFence, TerminalProjectionError> {
-        let response = self.send_request_with_cx(
-            cx, Pdu::GetPaneRenderStateV1(GetPaneRenderStateV1 { pane_id }),
-        ).await?;
+        let response = self
+            .send_request_with_cx(
+                cx,
+                Pdu::GetPaneRenderStateV1(GetPaneRenderStateV1 { pane_id }),
+            )
+            .await?;
         match response {
             Pdu::GetPaneRenderChangesResponse(response) if response.pane_id == pane_id => {
                 RenderFence::from_native(response)
@@ -182,32 +241,48 @@ impl DirectMuxClient {
         scope: Scope,
         snapshot_id: WireU64,
     ) -> Result<FrozenSnapshot, TerminalProjectionError> {
-        let initial_metadata = self.terminal_identity_metadata(cx, pane_id, expected_identity).await?;
+        let initial_metadata = self
+            .terminal_identity_metadata(cx, pane_id, expected_identity)
+            .await?;
         let dimensions = projected_dimensions(&initial_metadata)?;
         let initial = self.terminal_render_fence(cx, pane_id).await?;
         if !initial.matches_metadata(&initial_metadata) {
             return Err(TerminalProjectionError::SnapshotChanged);
         }
         let mut builder = TerminalSnapshotBuilder::new(
-            scope, snapshot_id, &initial_metadata, initial.title.clone(), initial.cwd.clone(),
+            scope,
+            snapshot_id,
+            &initial_metadata,
+            initial.title.clone(),
+            initial.cwd.clone(),
         )?;
         let first = initial.layout.dimensions.physical_top;
-        let visible_rows = isize::try_from(dimensions.rows)
-            .map_err(|_| TerminalProjectionError::InvalidSource)?;
-        let end = first.checked_add(visible_rows)
+        let visible_rows =
+            isize::try_from(dimensions.rows).map_err(|_| TerminalProjectionError::InvalidSource)?;
+        let end = first
+            .checked_add(visible_rows)
             .ok_or(TerminalProjectionError::InvalidSource)?;
         let rows_per_chunk = frankenterm_terminal_wire::MAX_CHUNK_LINES
             .min(frankenterm_terminal_wire::MAX_CHUNK_CELLS / usize::from(dimensions.columns));
-        let rows_per_chunk = isize::try_from(rows_per_chunk)
-            .map_err(|_| TerminalProjectionError::LimitExceeded)?;
-        if rows_per_chunk == 0 { return Err(TerminalProjectionError::LimitExceeded); }
+        let rows_per_chunk =
+            isize::try_from(rows_per_chunk).map_err(|_| TerminalProjectionError::LimitExceeded)?;
+        if rows_per_chunk == 0 {
+            return Err(TerminalProjectionError::LimitExceeded);
+        }
         let mut start = first;
         while start < end {
             checkpoint_mux_cx(cx, self.connection_id, "terminal_snapshot_rows")?;
             let chunk_end = start.checked_add(rows_per_chunk).unwrap_or(end).min(end);
-            let response = self.send_request_with_cx(cx, Pdu::GetLinesAtLayout(GetLinesAtLayout {
-                pane_id, layout: initial.layout, lines: vec![start..chunk_end],
-            })).await?;
+            let response = self
+                .send_request_with_cx(
+                    cx,
+                    Pdu::GetLinesAtLayout(GetLinesAtLayout {
+                        pane_id,
+                        layout: initial.layout,
+                        lines: std::iter::once(start..chunk_end).collect(),
+                    }),
+                )
+                .await?;
             let Pdu::GetLinesAtLayoutResponse(response) = response else {
                 return Err(TerminalProjectionError::InvalidSource);
             };
@@ -222,9 +297,10 @@ impl DirectMuxClient {
                 return Err(TerminalProjectionError::Unsupported("image_placement"));
             }
             if rows.len() != usize::try_from(chunk_end - start).unwrap_or(usize::MAX)
-                || rows.iter().enumerate().any(|(index, (row, _))| {
-                    start.checked_add(index as isize) != Some(*row)
-                })
+                || rows
+                    .iter()
+                    .enumerate()
+                    .any(|(index, (row, _))| start.checked_add(index as isize) != Some(*row))
             {
                 return Err(TerminalProjectionError::InvalidSource);
             }
@@ -232,8 +308,11 @@ impl DirectMuxClient {
             start = chunk_end;
         }
         let final_render = self.terminal_render_fence(cx, pane_id).await?;
-        let final_metadata = self.terminal_identity_metadata(cx, pane_id, expected_identity).await?;
-        if final_render != initial || final_metadata != initial_metadata
+        let final_metadata = self
+            .terminal_identity_metadata(cx, pane_id, expected_identity)
+            .await?;
+        if final_render != initial
+            || final_metadata != initial_metadata
             || !final_render.matches_metadata(&final_metadata)
         {
             return Err(TerminalProjectionError::SnapshotChanged);

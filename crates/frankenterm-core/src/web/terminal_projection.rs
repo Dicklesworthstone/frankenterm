@@ -12,8 +12,8 @@ use frankenterm_cell::{Blink, CellAttributes, Intensity, VerticalAlign};
 use frankenterm_term::color::{ColorAttribute, SrgbaTuple};
 use frankenterm_terminal_wire::{
     self as wire, BoundedVec, Cell, CellStyle, Color, Cursor, CursorShape, Dimensions,
-    FrozenSnapshot, Hyperlink, Id, Line, PaneIdentity, Scope, TerminalModes, Text,
-    Underline, WireI64, WireU64,
+    FrozenSnapshot, Hyperlink, Id, Line, PaneIdentity, Scope, TerminalModes, Text, Underline,
+    WireI64, WireU64,
 };
 use termwiz::surface::{CursorShape as NativeCursorShape, CursorVisibility};
 
@@ -55,7 +55,9 @@ pub fn scope_for_identity(
     identity: &PaneIdentityV1,
     epoch: WireU64,
 ) -> Result<Scope, TerminalProjectionError> {
-    identity.validate().map_err(|_| TerminalProjectionError::InvalidSource)?;
+    identity
+        .validate()
+        .map_err(|_| TerminalProjectionError::InvalidSource)?;
     let session = uuid::Uuid::from_bytes(identity.session_incarnation.as_bytes());
     let registration = uuid::Uuid::from_bytes(identity.pane_registration.as_bytes());
     Ok(Scope {
@@ -71,13 +73,18 @@ pub fn scope_for_identity(
 pub(crate) fn projected_dimensions(
     metadata: &PaneRenderMetadataV1,
 ) -> Result<Dimensions, TerminalProjectionError> {
-    metadata.validate().map_err(|_| TerminalProjectionError::InvalidSource)?;
+    metadata
+        .validate()
+        .map_err(|_| TerminalProjectionError::InvalidSource)?;
     let native = metadata.dimensions;
     let dimensions = Dimensions {
         columns: u16::try_from(native.cols).map_err(|_| TerminalProjectionError::LimitExceeded)?,
-        rows: u16::try_from(native.viewport_rows).map_err(|_| TerminalProjectionError::LimitExceeded)?,
-        pixel_width: u32::try_from(native.pixel_width).map_err(|_| TerminalProjectionError::LimitExceeded)?,
-        pixel_height: u32::try_from(native.pixel_height).map_err(|_| TerminalProjectionError::LimitExceeded)?,
+        rows: u16::try_from(native.viewport_rows)
+            .map_err(|_| TerminalProjectionError::LimitExceeded)?,
+        pixel_width: u32::try_from(native.pixel_width)
+            .map_err(|_| TerminalProjectionError::LimitExceeded)?,
+        pixel_height: u32::try_from(native.pixel_height)
+            .map_err(|_| TerminalProjectionError::LimitExceeded)?,
     };
     dimensions.validate()?;
     Ok(dimensions)
@@ -88,7 +95,9 @@ fn projected_cursor(
     dimensions: &Dimensions,
 ) -> Result<Cursor, TerminalProjectionError> {
     let native = metadata.cursor;
-    let row = native.y.checked_sub(metadata.dimensions.physical_top)
+    let row = native
+        .y
+        .checked_sub(metadata.dimensions.physical_top)
         .and_then(|row| u16::try_from(row).ok())
         .filter(|row| *row < dimensions.rows)
         .ok_or(TerminalProjectionError::InvalidSource)?;
@@ -104,11 +113,21 @@ fn projected_cursor(
         NativeCursorShape::SteadyBar => (CursorShape::Bar, false),
         NativeCursorShape::BlinkingBar => (CursorShape::Bar, true),
     };
-    Ok(Cursor { column, row, shape, blink, visible: native.visibility == CursorVisibility::Visible })
+    Ok(Cursor {
+        column,
+        row,
+        shape,
+        blink,
+        visible: native.visibility == CursorVisibility::Visible,
+    })
 }
 
+// Only an exactly opaque alpha projects; any other value is refused.
+#[allow(clippy::float_cmp)]
 fn projected_color(color: SrgbaTuple) -> Result<Color, TerminalProjectionError> {
-    if ![color.0, color.1, color.2, color.3].iter().all(|channel| channel.is_finite())
+    if ![color.0, color.1, color.2, color.3]
+        .iter()
+        .all(|channel| channel.is_finite())
         || color.3 != 1.0
     {
         return Err(TerminalProjectionError::Unsupported("nonopaque_color"));
@@ -143,12 +162,17 @@ fn projected_style(
     for (enabled, flag) in [
         (attrs.italic(), wire::STYLE_ITALIC),
         (attrs.blink() == Blink::Slow, wire::STYLE_BLINK),
-        (attrs.reverse() ^ metadata.dimensions.reverse_video, wire::STYLE_REVERSE),
+        (
+            attrs.reverse() ^ metadata.dimensions.reverse_video,
+            wire::STYLE_REVERSE,
+        ),
         (attrs.invisible(), wire::STYLE_INVISIBLE),
         (attrs.strikethrough(), wire::STYLE_STRIKETHROUGH),
         (attrs.overline(), wire::STYLE_OVERLINE),
     ] {
-        if enabled { attributes |= flag; }
+        if enabled {
+            attributes |= flag;
+        }
     }
     let underline = match attrs.underline() {
         frankenterm_cell::Underline::None => Underline::None,
@@ -171,11 +195,15 @@ struct SizeBudget(usize);
 
 impl Write for SizeBudget {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0 = self.0.checked_sub(bytes.len())
+        self.0 = self
+            .0
+            .checked_sub(bytes.len())
             .ok_or_else(|| io::Error::other("terminal_projection_limit"))?;
         Ok(bytes.len())
     }
-    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Project and release native chunks progressively. The complete native
@@ -197,10 +225,15 @@ impl TerminalSnapshotBuilder {
     ) -> Result<Self, TerminalProjectionError> {
         let dimensions = projected_dimensions(metadata)?;
         let cursor = projected_cursor(metadata, &dimensions)?;
-        let sequence = WireU64(u64::try_from(metadata.seqno)
-            .map_err(|_| TerminalProjectionError::InvalidSource)?);
+        let sequence = WireU64(
+            u64::try_from(metadata.seqno).map_err(|_| TerminalProjectionError::InvalidSource)?,
+        );
         let snapshot = FrozenSnapshot {
-            scope, snapshot_id, sequence, dimensions, cursor,
+            scope,
+            snapshot_id,
+            sequence,
+            dimensions,
+            cursor,
             modes: TerminalModes {
                 alternate_screen: metadata.alt_screen_active,
                 mouse_tracking: metadata.mouse_grabbed,
@@ -208,29 +241,46 @@ impl TerminalSnapshotBuilder {
             },
             title: Text::new(&title)?,
             cwd: cwd.as_deref().map(Text::new).transpose()?,
-            lines: BoundedVec::new(), hyperlinks: BoundedVec::new(), images: BoundedVec::new(),
+            lines: BoundedVec::new(),
+            hyperlinks: BoundedVec::new(),
+            images: BoundedVec::new(),
         };
         Ok(Self {
-            snapshot, metadata: metadata.clone(), hyperlinks: HashMap::new(),
+            snapshot,
+            metadata: metadata.clone(),
+            hyperlinks: HashMap::new(),
             budget: SizeBudget(wire::MAX_SNAPSHOT_BYTES as usize),
         })
     }
 
-    fn hyperlink(&mut self, attrs: &CellAttributes) -> Result<Option<WireU64>, TerminalProjectionError> {
-        let Some(link) = attrs.hyperlink() else { return Ok(None); };
+    fn hyperlink(
+        &mut self,
+        attrs: &CellAttributes,
+    ) -> Result<Option<WireU64>, TerminalProjectionError> {
+        let Some(link) = attrs.hyperlink() else {
+            return Ok(None);
+        };
         let uri = link.uri();
-        if let Some(id) = self.hyperlinks.get(uri) { return Ok(Some(*id)); }
+        if let Some(id) = self.hyperlinks.get(uri) {
+            return Ok(Some(*id));
+        }
         if self.hyperlinks.len() == wire::MAX_SNAPSHOT_RESOURCES {
             return Err(TerminalProjectionError::LimitExceeded);
         }
-        let id = WireU64(u64::try_from(self.hyperlinks.len() + 1)
-            .map_err(|_| TerminalProjectionError::LimitExceeded)?);
-        let resource = Hyperlink { id, uri: Text::new(uri)? };
+        let id = WireU64(
+            u64::try_from(self.hyperlinks.len() + 1)
+                .map_err(|_| TerminalProjectionError::LimitExceeded)?,
+        );
+        let resource = Hyperlink {
+            id,
+            uri: Text::new(uri)?,
+        };
         serde_json::to_writer(&mut self.budget, &resource)
             .map_err(|_| TerminalProjectionError::LimitExceeded)?;
         // Charge the dictionary's owned key too. Native hyperlink parameters
         // are not retained; only the bounded URI exists in the browser schema.
-        self.budget.write_all(uri.as_bytes())
+        self.budget
+            .write_all(uri.as_bytes())
             .map_err(|_| TerminalProjectionError::LimitExceeded)?;
         self.snapshot.hyperlinks.try_push(resource)?;
         self.hyperlinks.insert(uri.to_string(), id);
@@ -242,53 +292,85 @@ impl TerminalSnapshotBuilder {
         rows: Vec<(isize, frankenterm_term::Line)>,
     ) -> Result<(), TerminalProjectionError> {
         let columns = usize::from(self.snapshot.dimensions.columns);
-        if rows.len() > usize::from(self.snapshot.dimensions.rows).saturating_sub(self.snapshot.lines.len()) {
+        if rows.len()
+            > usize::from(self.snapshot.dimensions.rows).saturating_sub(self.snapshot.lines.len())
+        {
             return Err(TerminalProjectionError::InvalidSource);
         }
         for (stable_row, native) in rows {
             let row = self.snapshot.lines.len();
-            if self.metadata.dimensions.physical_top.checked_add(row as isize) != Some(stable_row) {
+            if self
+                .metadata
+                .dimensions
+                .physical_top
+                .checked_add(row as isize)
+                != Some(stable_row)
+            {
                 return Err(TerminalProjectionError::InvalidSource);
             }
             if !native.is_single_width() {
-                return Err(TerminalProjectionError::Unsupported("double_width_or_height"));
+                return Err(TerminalProjectionError::Unsupported(
+                    "double_width_or_height",
+                ));
             }
             let (bidi_enabled, direction) = native.bidi_info();
             if bidi_enabled || direction != Default::default() {
                 return Err(TerminalProjectionError::Unsupported("bidi_layout"));
             }
-            if native.len() > columns { return Err(TerminalProjectionError::InvalidSource); }
+            if native.len() > columns {
+                return Err(TerminalProjectionError::InvalidSource);
+            }
             let mut cells = BoundedVec::new();
             for cell in native.visible_cells() {
-                if cell.cell_index() != cells.len() || !matches!(cell.width(), 1 | 2)
-                    || cell.cell_index().checked_add(cell.width()).is_none_or(|end| end > columns)
+                if cell.cell_index() != cells.len()
+                    || !matches!(cell.width(), 1 | 2)
+                    || cell
+                        .cell_index()
+                        .checked_add(cell.width())
+                        .is_none_or(|end| end > columns)
                 {
                     return Err(TerminalProjectionError::InvalidSource);
                 }
                 let style = projected_style(cell.attrs(), &self.metadata)?;
                 let hyperlink = self.hyperlink(cell.attrs())?;
-                let column = u16::try_from(cells.len()).map_err(|_| TerminalProjectionError::InvalidSource)?;
+                let column = u16::try_from(cells.len())
+                    .map_err(|_| TerminalProjectionError::InvalidSource)?;
                 cells.try_push(Cell {
-                    column, text: Text::new(cell.str())?, width: cell.width() as u8,
-                    style: style.clone(), hyperlink, image: None,
+                    column,
+                    text: Text::new(cell.str())?,
+                    width: cell.width() as u8,
+                    style: style.clone(),
+                    hyperlink,
+                    image: None,
                 })?;
                 if cell.width() == 2 {
                     cells.try_push(Cell {
-                        column: column + 1, text: Text::new("")?, width: 0,
-                        style, hyperlink, image: None,
+                        column: column + 1,
+                        text: Text::new("")?,
+                        width: 0,
+                        style,
+                        hyperlink,
+                        image: None,
                     })?;
                 }
             }
             let blank = projected_style(&CellAttributes::default(), &self.metadata)?;
             while cells.len() < columns {
                 cells.try_push(Cell {
-                    column: cells.len() as u16, text: Text::new(" ")?, width: 1,
-                    style: blank.clone(), hyperlink: None, image: None,
+                    column: cells.len() as u16,
+                    text: Text::new(" ")?,
+                    width: 1,
+                    style: blank.clone(),
+                    hyperlink: None,
+                    image: None,
                 })?;
             }
             let line = Line {
                 row: row as u16,
-                stable_row: WireI64(i64::try_from(stable_row).map_err(|_| TerminalProjectionError::InvalidSource)?),
+                stable_row: WireI64(
+                    i64::try_from(stable_row)
+                        .map_err(|_| TerminalProjectionError::InvalidSource)?,
+                ),
                 cells,
             };
             serde_json::to_writer(&mut self.budget, &line)

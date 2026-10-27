@@ -238,9 +238,9 @@ fn cap_wait_by_workflow_deadline(
     {
         return Duration::ZERO;
     }
-    observed
-        .remaining_ms
-        .map_or(requested, |remaining| requested.min(Duration::from_millis(remaining)))
+    observed.remaining_ms.map_or(requested, |remaining| {
+        requested.min(Duration::from_millis(remaining))
+    })
 }
 
 fn workflow_budget_error(reason: &'static str) -> crate::Error {
@@ -1434,13 +1434,13 @@ impl WorkflowRunner {
                     .await;
             }
         };
-        let budget_rejection = budget.validate().err().or_else(|| {
-            if budget.started_at_ms != execution_record.started_at {
+        let budget_rejection = match budget.validate() {
+            Err(reason) => Some(reason),
+            Ok(()) if budget.started_at_ms != execution_record.started_at => {
                 Some("workflow_budget_start_mismatch")
-            } else {
-                None
             }
-        });
+            Ok(()) => None,
+        };
         if let Some(reason) = budget_rejection {
             return self
                 .settle_budget_failure(
@@ -1462,10 +1462,7 @@ impl WorkflowRunner {
             // Admission precedes effects. Without a durable ownership lease,
             // a crash and another live process are indistinguishable: refuse
             // replay and leave its execution/trigger untouched for recovery.
-            return workflow_execution_error(
-                execution_id,
-                "workflow_budget_indeterminate_attempt",
-            );
+            return workflow_execution_error(execution_id, "workflow_budget_indeterminate_attempt");
         }
         let is_first_admission = budget.revision == 0 && start_step == 0;
         let observed_budget = budget.clone();
@@ -1754,7 +1751,8 @@ impl WorkflowRunner {
                     &budget,
                     budget_observed_at,
                 );
-                if let Err(error) = wait_duration_with_cx(cx, wait, "workflow retry backoff").await {
+                if let Err(error) = wait_duration_with_cx(cx, wait, "workflow retry backoff").await
+                {
                     let reason = error.to_string();
                     if let Err(cleanup_error) = self
                         .persist_cancelled_execution_with_fresh_cx(
@@ -1769,7 +1767,9 @@ impl WorkflowRunner {
                     {
                         return workflow_execution_error(
                             execution_id,
-                            format!("{reason}; independent cancellation cleanup failed: {cleanup_error}"),
+                            format!(
+                                "{reason}; independent cancellation cleanup failed: {cleanup_error}"
+                            ),
                         );
                     }
                     return WorkflowExecutionResult::Aborted {
@@ -2571,11 +2571,8 @@ impl WorkflowRunner {
                         || Duration::from_millis(self.config.step_timeout_ms),
                         Duration::from_millis,
                     );
-                    let timeout = cap_wait_by_workflow_deadline(
-                        timeout,
-                        &budget,
-                        budget_observed_at,
-                    );
+                    let timeout =
+                        cap_wait_by_workflow_deadline(timeout, &budget, budget_observed_at);
 
                     if let Err(e) = wait_condition_pause_with_cx(
                         cx,
@@ -3733,13 +3730,17 @@ impl WorkflowRunner {
                             ));
                             continue;
                         }
-                        let release_guard = match self.lock_manager.try_acquire_with_limit_owned_full(
-                            record.pane_id,
-                            &record.workflow_name,
-                            &record.id,
-                            self.config.max_concurrent,
-                        ) {
-                            Ok(crate::workflows::lock::OwnedLockAcquisitionResult::Acquired(guard)) => guard,
+                        let release_guard = match self
+                            .lock_manager
+                            .try_acquire_with_limit_owned_full(
+                                record.pane_id,
+                                &record.workflow_name,
+                                &record.id,
+                                self.config.max_concurrent,
+                            ) {
+                            Ok(crate::workflows::lock::OwnedLockAcquisitionResult::Acquired(
+                                guard,
+                            )) => guard,
                             _ => {
                                 results.push(workflow_execution_error(
                                     &record.id,
@@ -3878,9 +3879,7 @@ impl WorkflowRunner {
                     .checked_add(i64::try_from(next.retry_effective_delay_ms).map_err(|_| {
                         workflow_budget_error("workflow_budget_retry_delay_overflow")
                     })?)
-                    .ok_or_else(|| {
-                        workflow_budget_error("workflow_budget_retry_delay_overflow")
-                    })?,
+                    .ok_or_else(|| workflow_budget_error("workflow_budget_retry_delay_overflow"))?,
             );
         }
         next.revision = budget
@@ -5412,7 +5411,10 @@ mod tests {
         }
 
         fn steps(&self) -> Vec<WorkflowStep> {
-            vec![WorkflowStep::new("retry", "Retry until the original allowance is spent")]
+            vec![WorkflowStep::new(
+                "retry",
+                "Retry until the original allowance is spent",
+            )]
         }
 
         fn execute_step(
@@ -5541,9 +5543,17 @@ mod tests {
                 .unwrap();
             assert_eq!(retained.deadline_at_ms, persisted.deadline_at_ms);
             assert_eq!(retained.max_retries_per_step, 2);
-            assert_eq!(retained.retry_backoff_multiplier.to_bits(), 3.0_f64.to_bits());
+            assert_eq!(
+                retained.retry_backoff_multiplier.to_bits(),
+                3.0_f64.to_bits()
+            );
             assert!(retained.remaining_ms <= persisted.remaining_ms);
-            assert!(resumed_runner.resume_incomplete_with_cx(&cx).await.is_empty());
+            assert!(
+                resumed_runner
+                    .resume_incomplete_with_cx(&cx)
+                    .await
+                    .is_empty()
+            );
             reopened.shutdown().await.unwrap();
         });
     }
@@ -5588,15 +5598,17 @@ mod tests {
                 let mut next = budget.clone();
                 next.observe_time(now_ms(), 0).unwrap();
                 next.revision += 1;
-                assert!(storage
-                    .compare_exchange_workflow_budget_with_cx(
-                        &cx,
-                        &execution_id,
-                        budget.revision,
-                        next.clone(),
-                    )
-                    .await
-                    .unwrap());
+                assert!(
+                    storage
+                        .compare_exchange_workflow_budget_with_cx(
+                            &cx,
+                            &execution_id,
+                            budget.revision,
+                            next.clone(),
+                        )
+                        .await
+                        .unwrap()
+                );
                 *winning_budget.lock().unwrap() = Some(next);
                 StepResult::done(serde_json::json!({ "ok": true }))
             })
@@ -5743,10 +5755,17 @@ mod tests {
                             ["private-synthetic-payload-must-not-escape", id.as_str()],
                         ).unwrap();
                     } else {
-                        assert!(storage
-                            .compare_exchange_workflow_budget_with_cx(&cx, &id, budget.revision, next)
-                            .await
-                            .unwrap());
+                        assert!(
+                            storage
+                                .compare_exchange_workflow_budget_with_cx(
+                                    &cx,
+                                    &id,
+                                    budget.revision,
+                                    next
+                                )
+                                .await
+                                .unwrap()
+                        );
                     }
                     id
                 };
@@ -5761,12 +5780,16 @@ mod tests {
                 };
                 let results = runner.resume_incomplete_with_cx(&cx).await;
                 assert_eq!(results.len(), 1, "{case} must report its failed admission");
-                assert!(matches!(
-                    &results[0],
-                    WorkflowExecutionResult::Error { error, .. }
-                        if error.contains(expected_reason)
-                            && !error.contains("private-synthetic-payload")
-                ), "{case}: {:?}", results[0]);
+                assert!(
+                    matches!(
+                        &results[0],
+                        WorkflowExecutionResult::Error { error, .. }
+                            if error.contains(expected_reason)
+                                && !error.contains("private-synthetic-payload")
+                    ),
+                    "{case}: {:?}",
+                    results[0]
+                );
                 assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0, "{case}");
                 assert!(locks.is_locked(77).is_none(), "{case}");
                 let record = storage.get_workflow(&execution_id).await.unwrap().unwrap();
@@ -5785,15 +5808,20 @@ mod tests {
                             .unwrap(),
                         original_budget,
                     );
-                    assert!(storage
-                        .get_audit_actions(crate::storage::AuditQuery::default())
-                        .await
-                        .unwrap()
-                        .is_empty());
+                    assert!(
+                        storage
+                            .get_audit_actions(crate::storage::AuditQuery::default())
+                            .await
+                            .unwrap()
+                            .is_empty()
+                    );
                 } else {
                     assert_eq!(record.status, "failed", "{case}");
                     assert!(record.completed_at.is_some(), "{case}");
-                    assert!(runner.resume_incomplete_with_cx(&cx).await.is_empty(), "{case}");
+                    assert!(
+                        runner.resume_incomplete_with_cx(&cx).await.is_empty(),
+                        "{case}"
+                    );
                 }
                 storage.shutdown().await.unwrap();
             }
@@ -6783,7 +6811,8 @@ mod tests {
             let requested = Duration::from_secs(60);
             let started_at = Instant::now();
             let wall_now = now_ms();
-            let mut budget = WorkflowExecutionBudget::new(wall_now, wall_now, 1_000, 3, 2.0).unwrap();
+            let mut budget =
+                WorkflowExecutionBudget::new(wall_now, wall_now, 1_000, 3, 2.0).unwrap();
             budget.workflow_total_deadline_ms = u64::MAX;
 
             assert_eq!(
