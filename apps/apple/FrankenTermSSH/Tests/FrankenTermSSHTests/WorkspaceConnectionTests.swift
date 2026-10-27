@@ -197,7 +197,7 @@ final class WorkspaceConnectionTests: XCTestCase {
         }
     }
 
-    func testUnsupportedModeOrHopAndMissingSessionOrAuthenticationPoliciesNeverDial() async throws {
+    func testMissingMuxClientSessionMethodOrPasswordPromptOwnerNeverDials() async throws {
         for variant in 0..<4 {
             let fixture = try await SSHWorkspaceTestFixture.make { workspace in
                 var routes = workspace["routes"] as! [[String: Any]]
@@ -207,8 +207,9 @@ final class WorkspaceConnectionTests: XCTestCase {
                     routes[0]["session_creation"] = nil
                     routes[0]["attach_policy"] = "existing_only"
                 case 1:
-                    // Two hops are supported; an outer hop this phone cannot
-                    // sign in to (password only) is not.
+                    // Password hops are implemented, but this caller supplies
+                    // no prompt owner. Refuse before dialing any member of the
+                    // otherwise-ready two-hop graph.
                     var jump = routes[0]
                     jump["id"] = "jump-route"; jump["session_creation"] = nil
                     routes[0]["jump_routes"] = ["jump-route"]
@@ -224,7 +225,12 @@ final class WorkspaceConnectionTests: XCTestCase {
                 workspace["routes"] = routes
             }
             let activity = WorkspaceNetworkActivity()
-            await assertDenied(.authentication(.denied), fixture: fixture, activity: activity) {
+            if variant == 1 {
+                let readiness = try await fixture.store.routeReadiness(workspaceID: fixture.installed.id,
+                    support: WorkspaceNativeSSHAuthentication.routeSupport)
+                XCTAssertTrue(try XCTUnwrap(readiness.first(where: { $0.routeID == "route" })).isLocallyReady)
+            }
+            await assertDenied(.authentication(variant == 1 ? .unavailable : .denied), fixture: fixture, activity: activity) {
                 try await self.connect(fixture, activity: activity)
             }
         }

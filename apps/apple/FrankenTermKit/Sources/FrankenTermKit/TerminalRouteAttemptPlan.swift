@@ -4,16 +4,49 @@ public enum TerminalRouteAttemptPlanError: Error, Equatable, Sendable {
     case invalidRoutes, invalidCredentials, invalidPreference, staleAttempt
 }
 
+/// A selected SSH method, not a credential identifier disguised as a password
+/// option. Only methods expressly permitted by the imported route can appear.
+public enum WorkspaceSSHAuthenticationChoice: Hashable, Sendable {
+    case publicKey(String)
+    case password
+
+    public var credentialID: String? {
+        if case let .publicKey(id) = self { return id }
+        return nil
+    }
+
+    /// Choose the first usable permitted method in the saved order. Exhausting
+    /// keys never silently downgrades to a password, and keyboard-interactive is
+    /// deliberately distinct from the SSH password method.
+    public static func choices(for route: WorkspaceDocument.Route,
+                               usableCredentialIDs: [String]) -> [Self] {
+        for method in route.authenticationMethods {
+            switch method {
+            case .publicKey:
+                let keys = usableCredentialIDs.filter { route.credentialIDs.contains($0) }
+                if !keys.isEmpty { return keys.map(Self.publicKey) }
+            case .password: return [.password]
+            case .keyboardInteractive: continue
+            }
+        }
+        return []
+    }
+}
+
 /// The ordered, bounded choices for one machine connection. This value never
 /// opens a connection or authorizes a key: every issued attempt still needs the
 /// normal current workspace, host-trust and protected-signer checks.
 public struct TerminalRouteAttemptPlan: Sendable {
     public struct Route: Hashable, Sendable {
         public let routeID: String
-        public let credentialIDs: [String]
+        public let authenticationChoices: [WorkspaceSSHAuthenticationChoice]
+        public var credentialIDs: [String] { authenticationChoices.compactMap(\.credentialID) }
 
         public init(routeID: String, credentialIDs: [String]) {
-            self.routeID = routeID; self.credentialIDs = credentialIDs
+            self.init(routeID: routeID, authenticationChoices: credentialIDs.map(WorkspaceSSHAuthenticationChoice.publicKey))
+        }
+        public init(routeID: String, authenticationChoices: [WorkspaceSSHAuthenticationChoice]) {
+            self.routeID = routeID; self.authenticationChoices = authenticationChoices
         }
     }
 
@@ -21,10 +54,15 @@ public struct TerminalRouteAttemptPlan: Sendable {
     /// reconnect, within the same immutable workspace revision. It grants no
     /// authentication authority and must still belong to the supplied routes.
     public struct Selection: Hashable, Sendable {
-        public let routeID: String, credentialID: String
+        public let routeID: String
+        public let authentication: WorkspaceSSHAuthenticationChoice
+        public var credentialID: String? { authentication.credentialID }
 
         public init(routeID: String, credentialID: String) {
-            self.routeID = routeID; self.credentialID = credentialID
+            self.init(routeID: routeID, authentication: .publicKey(credentialID))
+        }
+        public init(routeID: String, authentication: WorkspaceSSHAuthenticationChoice) {
+            self.routeID = routeID; self.authentication = authentication
         }
     }
 
@@ -60,19 +98,20 @@ public struct TerminalRouteAttemptPlan: Sendable {
             throw TerminalRouteAttemptPlanError.invalidRoutes
         }
         guard routes.allSatisfy({ route in
-            (1...8).contains(route.credentialIDs.count)
-                && Set(route.credentialIDs).count == route.credentialIDs.count
+            (1...9).contains(route.authenticationChoices.count)
+                && route.credentialIDs.count <= 8
+                && Set(route.authenticationChoices).count == route.authenticationChoices.count
                 && route.credentialIDs.allSatisfy({ !$0.isEmpty })
         }) else { throw TerminalRouteAttemptPlanError.invalidCredentials }
         var ordered = routes
         if let preferred {
             guard let index = ordered.firstIndex(where: { $0.routeID == preferred.routeID }),
-                  ordered[index].credentialIDs.contains(preferred.credentialID) else {
+                  ordered[index].authenticationChoices.contains(preferred.authentication) else {
                 throw TerminalRouteAttemptPlanError.invalidPreference
             }
             let selected = ordered.remove(at: index)
-            let keys = [preferred.credentialID] + selected.credentialIDs.filter { $0 != preferred.credentialID }
-            ordered.insert(.init(routeID: selected.routeID, credentialIDs: keys), at: 0)
+            let choices = [preferred.authentication] + selected.authenticationChoices.filter { $0 != preferred.authentication }
+            ordered.insert(.init(routeID: selected.routeID, authenticationChoices: choices), at: 0)
         }
         self.routes = ordered
         current = Self.attempt(route: ordered[0], credentialIndex: 0)
@@ -87,7 +126,11 @@ public struct TerminalRouteAttemptPlan: Sendable {
         switch failure {
         case .credentialRefused:
             hasCredentialRefusal = true
-            guard credentialIndex + 1 < routes[routeIndex].credentialIDs.count else {
+            // A refusal proves only that this unsigned key was not accepted.
+            // It never authorizes a password prompt or a retry of a password.
+            guard case .publicKey = attempt.selection.authentication,
+                  credentialIndex + 1 < routes[routeIndex].authenticationChoices.count,
+                  case .publicKey = routes[routeIndex].authenticationChoices[credentialIndex + 1] else {
                 current = nil; return nil
             }
             credentialIndex += 1
@@ -115,6 +158,6 @@ public struct TerminalRouteAttemptPlan: Sendable {
     public mutating func cancel() { current = nil }
 
     private static func attempt(route: Route, credentialIndex: Int) -> Attempt {
-        .init(selection: .init(routeID: route.routeID, credentialID: route.credentialIDs[credentialIndex]))
+        .init(selection: .init(routeID: route.routeID, authentication: route.authenticationChoices[credentialIndex]))
     }
 }

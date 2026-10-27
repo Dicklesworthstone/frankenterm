@@ -809,6 +809,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         previous?.discardRetainedOutput()
         let controller = TerminalSessionController(target: target, connections: connections, focus: self,
             reconnectingFrom: preservingSuccessfulCandidate ? previous : nil,
+            retryingAfterPasswordHop: preservingSuccessfulCandidate ? nil : previous,
             inputDelivery: previous?.inputDelivery ?? .init())
         controller.onChange = { [weak self, weak controller] in
             guard let self, let controller, self.sessions[machineID] === controller else { return }
@@ -962,8 +963,14 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     }
 
     private func permitsPreparation(_ machineID: String) -> Bool {
-        residency.permitsPreparation(machineID, selected: onScreen ? selectedMachineID : nil,
-                                     explicitlyRequested: requestedConnections.contains(machineID))
+        // A password is a visible user action. Do not warm password machines
+        // in other tabs or automatically prompt again after a connection drops.
+        if machines.first(where: { $0.id == machineID })?.target?.requiresPassword == true,
+           !requestedConnections.contains(machineID) {
+            guard onScreen, selectedMachineID == machineID, sessions[machineID] == nil else { return false }
+        }
+        return residency.permitsPreparation(machineID, selected: onScreen ? selectedMachineID : nil,
+                                           explicitlyRequested: requestedConnections.contains(machineID))
     }
 
     func preparationWasReleased(_ machineID: String) -> Bool {

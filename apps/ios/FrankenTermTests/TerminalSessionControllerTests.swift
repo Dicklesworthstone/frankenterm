@@ -2564,6 +2564,192 @@ final class TerminalSessionControllerTests: XCTestCase {
         await scene.close()
     }
 
+    /// Real UI prompt ownership through the production broker, without a
+    /// network, private key, simulator credential or live-server variable.
+    private func passwordPromptFixture() async throws -> (SSHAuthenticationBroker, WorkspaceSSHPasswordIdentity, MobileSSHPasswordPrompt) {
+        let crypto = AppleCryptography()
+        let point = try crypto.ed25519PublicKey(seed: Data(0..<32))
+        func field(_ value: Data) -> Data {
+            var length = UInt32(value.count).bigEndian
+            return withUnsafeBytes(of: &length) { Data($0) } + value
+        }
+        let identity = try SSHPublicIdentity(blob: field(Data("ssh-ed25519".utf8)) + field(point))
+        let initial = try document(identity: identity, host: identity, port: 22, user: "operator")
+        var root = try XCTUnwrap(JSONSerialization.jsonObject(with: initial.raw) as? [String: Any])
+        var workspace = try XCTUnwrap(root["workspace"] as? [String: Any])
+        var routes = try XCTUnwrap(workspace["routes"] as? [[String: Any]])
+        for index in routes.indices {
+            routes[index]["authentication_methods"] = ["password"]
+            routes[index]["credential_refs"] = [] as [String]
+        }
+        workspace["routes"] = routes; root["workspace"] = workspace
+        let passwordDocument = try WorkspaceDocument(data: JSONSerialization.data(withJSONObject: root, options: [.sortedKeys]))
+        let archive = try AirGapArchive(workspace: passwordDocument, keys: [], using: crypto)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("password-prompt-" + UUID().uuidString)
+        let vault = SceneMemoryVault()
+        let store = WorkspaceStore(persistence: try FileWorkspacePersistence(directory: directory), vault: vault)
+        let installed = try await store.install(archive, envelopeDigest: crypto.sha256(try archive.encoded()),
+            expectedRevision: nil, sourceAndContentsConfirmed: true).workspace
+        let broker = SSHAuthenticationBroker(store: store, signer: SceneMemorySigner(vault: vault),
+                                             support: WorkspaceNativeSSHAuthentication.routeSupport)
+        await broker.resume()
+        let selected = try await broker.passwordIdentity(workspaceID: installed.id, expectedRevision: installed.revision,
+            routeID: "route-alpha", presentedHostKey: WorkspaceDocument.HostKey(algorithm: identity.algorithm, fingerprint: identity.fingerprint))
+        let prompt = MobileSSHPasswordPrompt()
+        prompt.setActive(true)
+        prompt.setScope(.init(workspaceID: installed.id, revision: installed.revision, destinationRouteIDs: ["route-alpha"]))
+        return (broker, selected, prompt)
+    }
+
+    private func waitForPasswordPrompt(_ prompt: MobileSSHPasswordPrompt) async throws -> WorkspaceSSHPasswordRequest {
+        let deadline = ContinuousClock.now + .seconds(3)
+        while ContinuousClock.now < deadline {
+            if let request = prompt.request { return request }
+            await Task.yield()
+        }
+        XCTFail("The authorized password prompt did not appear")
+        throw SSHAuthenticationError.unavailable
+    }
+
+    func testPasswordEditorSubmitsOnceAndClearsItsSecret() async throws {
+        let (broker, selected, prompt) = try await passwordPromptFixture()
+        let task = Task { try await broker.password(for: selected, transportID: UUID(), prompter: prompt) }
+        let request = try await waitForPasswordPrompt(prompt)
+        XCTAssertEqual(request.authorization.host, "127.0.0.1")
+        XCTAssertEqual(request.authorization.user, "operator")
+        XCTAssertEqual(request.authorization.presentedHostKey, selected.authorization.presentedHostKey)
+        XCTAssertFalse(prompt.canSubmit)
+        prompt.editSecret("synthetic password")
+        XCTAssertTrue(prompt.canSubmit)
+        prompt.editSecret(String(repeating: "x", count: 1025))
+        XCTAssertEqual(prompt.secret, "synthetic password", "Oversized editing must not retain the paste")
+        prompt.submit(requestID: request.id)
+        XCTAssertNil(prompt.request); XCTAssertTrue(prompt.secret.isEmpty)
+        let value = try await task.value
+        XCTAssertEqual(value, Data("synthetic password".utf8))
+        prompt.submit(requestID: request.id)
+        XCTAssertNil(prompt.request)
+    }
+
+    func testPasswordEditorCancelsOnInactivityAndDestinationChange() async throws {
+        for deactivate in [false, true] {
+            let (broker, selected, prompt) = try await passwordPromptFixture()
+            let task = Task { try await broker.password(for: selected, transportID: UUID(), prompter: prompt) }
+            let request = try await waitForPasswordPrompt(prompt)
+            prompt.editSecret("must not leave")
+            if deactivate { prompt.setActive(false) }
+            else { prompt.setScope(.init(workspaceID: selected.authorization.workspaceID,
+                revision: selected.authorization.workspaceRevision, destinationRouteIDs: ["route-beta"])) }
+            XCTAssertNil(prompt.request); XCTAssertTrue(prompt.secret.isEmpty)
+            prompt.setActive(true)
+            prompt.submit(requestID: request.id)
+            do { _ = try await task.value; XCTFail("Retired prompt leaked a password") } catch {}
+        }
+    }
+
+    func testDelayedPasswordDismissalCannotCancelAReplacementPrompt() async throws {
+        let (broker, selected, prompt) = try await passwordPromptFixture()
+        let first = Task { try await broker.password(for: selected, transportID: UUID(), prompter: prompt) }
+        let old = try await waitForPasswordPrompt(prompt)
+        prompt.editSecret("first"); prompt.submit(requestID: old.id)
+        _ = try await first.value
+        let second = Task { try await broker.password(for: selected, transportID: UUID(), prompter: prompt) }
+        let current = try await waitForPasswordPrompt(prompt)
+        XCTAssertNotEqual(old.id, current.id)
+        prompt.cancelNow(requestID: old.id)
+        XCTAssertEqual(prompt.request?.id, current.id)
+        prompt.editSecret("second"); prompt.submit(requestID: current.id)
+        let value = try await second.value
+        XCTAssertEqual(value, Data("second".utf8))
+    }
+
+    func testPasswordHopKeyRefusalAdvancesOnlyOnExplicitRetryAndConsumesEachKeyOnce() async throws {
+        let (connections, scene, original) = try dormantScene()
+        let route = TerminalSessionRoute(id: "route", credentialIDs: ["first", "second", "third"],
+            host: "destination.invalid", port: 22, passwordJump: true, jumpHost: "jump.invalid")
+        let target = TerminalSessionTarget(workspaceID: original.workspaceID, revision: original.revision,
+            machineID: original.machineID, machineName: original.machineName, routes: [route])
+        let first = TerminalSessionController(target: target, connections: connections, focus: scene)
+        var plan = try first.makeRouteAttemptPlan(candidates: target.routes)
+        let refused = try XCTUnwrap(plan.current)
+        XCTAssertEqual(refused.selection.authentication, .publicKey("first"))
+        XCTAssertTrue(try first.rememberPasswordHopRefusal(refused, plan: &plan))
+        XCTAssertThrowsError(try first.rememberPasswordHopRefusal(refused, plan: &plan))
+        let pending = await connections.manager.pendingCount
+        XCTAssertEqual(pending, 0, "Recording refusal must not start another password login")
+
+        let automatic = TerminalSessionController(target: target, connections: connections, focus: scene, reconnectingFrom: first)
+        XCTAssertEqual(try automatic.makeRouteAttemptPlan(candidates: target.routes).current?.selection.authentication,
+                       .publicKey("first"), "Automatic reconnect cannot consume explicit Retry metadata")
+        let second = TerminalSessionController(target: target, connections: connections, focus: scene, retryingAfterPasswordHop: first)
+        var next = try second.makeRouteAttemptPlan(candidates: target.routes)
+        XCTAssertEqual(next.current?.selection.authentication, .publicKey("second"))
+        XCTAssertTrue(next.hasCredentialRefusal, "The retry cannot silently change trust scopes")
+        let secondRefusal = try XCTUnwrap(next.current)
+        XCTAssertTrue(try second.rememberPasswordHopRefusal(secondRefusal, plan: &next))
+        let third = TerminalSessionController(target: target, connections: connections, focus: scene, retryingAfterPasswordHop: second)
+        var last = try third.makeRouteAttemptPlan(candidates: target.routes)
+        XCTAssertEqual(last.current?.selection.authentication, .publicKey("third"))
+        let lastRefusal = try XCTUnwrap(last.current)
+        XCTAssertFalse(try third.rememberPasswordHopRefusal(lastRefusal, plan: &last))
+        XCTAssertNil(last.current)
+        await scene.close()
+    }
+
+    func testPasswordHopRetryCannotSurviveCancellationOrWorkspaceRevisionChange() async throws {
+        let (connections, scene, original) = try dormantScene()
+        let route = TerminalSessionRoute(id: "route", credentialIDs: ["first", "second"],
+            host: "destination.invalid", port: 22, passwordJump: true)
+        let target = TerminalSessionTarget(workspaceID: original.workspaceID, revision: original.revision,
+            machineID: original.machineID, machineName: original.machineName, routes: [route])
+        for cancel in [false, true] {
+            let old = TerminalSessionController(target: target, connections: connections, focus: scene)
+            var plan = try old.makeRouteAttemptPlan(candidates: target.routes)
+            let refusal = try XCTUnwrap(plan.current)
+            XCTAssertTrue(try old.rememberPasswordHopRefusal(refusal, plan: &plan))
+            if cancel { old.requestStop() }
+            let replacement = cancel ? target : TerminalSessionTarget(workspaceID: target.workspaceID, revision: UUID(),
+                machineID: target.machineID, machineName: target.machineName, routes: target.routes)
+            let next = TerminalSessionController(target: replacement, connections: connections, focus: scene,
+                                                   retryingAfterPasswordHop: old)
+            XCTAssertEqual(try next.makeRouteAttemptPlan(candidates: replacement.routes).current?.selection.authentication,
+                           .publicKey("first"))
+            let stale = TerminalSessionController(target: target, connections: connections, focus: scene, retryingAfterPasswordHop: old)
+            XCTAssertEqual(try stale.makeRouteAttemptPlan(candidates: target.routes).current?.selection.authentication,
+                           .publicKey("first"), "A rejected transfer must not leave reusable Retry metadata")
+        }
+        await scene.close()
+    }
+
+    func testPasswordMuxFailureNeedsAnExplicitScopedRetryBeforeDirectSSH() async throws {
+        let (connections, scene, original) = try dormantScene()
+        let mux = TerminalSessionRoute(id: "mux", credentialIDs: [], host: "destination.invalid", port: 22,
+            authenticationChoices: [.password], mux: true, sessionCreation: .existingOnly)
+        let direct = TerminalSessionRoute(id: "direct", credentialIDs: [], host: "destination.invalid", port: 22,
+            authenticationChoices: [.password])
+        let target = TerminalSessionTarget(workspaceID: original.workspaceID, revision: original.revision,
+            machineID: original.machineID, machineName: original.machineName, routes: [mux, direct])
+        let failed = TerminalSessionController(target: target, connections: connections, focus: scene)
+        XCTAssertTrue(failed.rememberPasswordMuxFallback())
+        let pending = await connections.manager.pendingCount
+        XCTAssertEqual(pending, 0)
+        let retry = TerminalSessionController(target: target, connections: connections, focus: scene,
+                                                retryingAfterPasswordHop: failed)
+        XCTAssertEqual(try retry.makeRouteAttemptPlan(candidates: target.routes).current?.selection,
+                       .init(routeID: "direct", authentication: .password))
+        let consumed = TerminalSessionController(target: target, connections: connections, focus: scene,
+                                                   retryingAfterPasswordHop: failed)
+        XCTAssertEqual(try consumed.makeRouteAttemptPlan(candidates: target.routes).current?.selection.routeID, "mux")
+
+        let cancelled = TerminalSessionController(target: target, connections: connections, focus: scene)
+        XCTAssertTrue(cancelled.rememberPasswordMuxFallback())
+        cancelled.requestStop()
+        let fresh = TerminalSessionController(target: target, connections: connections, focus: scene,
+                                                retryingAfterPasswordHop: cancelled)
+        XCTAssertEqual(try fresh.makeRouteAttemptPlan(candidates: target.routes).current?.selection.routeID, "mux")
+        await scene.close()
+    }
+
     func testStoppingWhileStartupIsPendingJoinsBeforeReportingSettled() async throws {
         let live = try await liveScene(), scene = live.scene
         scene.connect("alpha")

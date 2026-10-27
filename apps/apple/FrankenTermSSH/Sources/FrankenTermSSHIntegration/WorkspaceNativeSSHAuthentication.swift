@@ -2,24 +2,156 @@ import Foundation
 import FrankenTermKit
 import FrankenTermSSH
 
+protocol WorkspaceNativeSSHAuthority: Sendable {
+    func validateCurrent() async throws
+}
+
+/// One password attempt for one actual peer. Account selection verifies local
+/// policy and the exchanged host key before the native transport can request a
+/// prompt. The password exists only during the single bounded authentication.
+public actor WorkspaceNativeSSHPasswordAuthentication: NativeSSHPasswordAuthentication, WorkspaceNativeSSHAuthority {
+    private enum Phase { case fresh, selecting, selected, requesting, supplied, authenticated }
+    private nonisolated let retirement = WorkspaceNativeSSHAuthentication.Retirement()
+    private nonisolated let broker: SSHAuthenticationBroker
+    private nonisolated let transportID: UUID
+    private let prompter: any WorkspaceSSHPasswordPrompting
+    private let workspaceID: UUID, revision: UUID
+    private let routeID: String, endpoint: NativeSSHEndpoint
+    private let transitForRouteID: String?, allowedJumpRouteIDs: [String]
+    private var phase = Phase.fresh
+    private var selected: WorkspaceSSHPasswordIdentity?
+    private var selectedPeer: NativeSSHPeer?
+    private var selectedAccount: NativeSSHPasswordAccount?
+
+    public init(broker: SSHAuthenticationBroker, prompter: any WorkspaceSSHPasswordPrompting,
+                workspaceID: UUID, revision: UUID, routeID: String, transportID: UUID,
+                endpoint: NativeSSHEndpoint, transitForRouteID: String? = nil, allowedJumpRouteIDs: [String] = []) {
+        self.broker = broker; self.prompter = prompter
+        self.workspaceID = workspaceID; self.revision = revision; self.routeID = routeID
+        self.transportID = transportID; self.endpoint = endpoint
+        self.transitForRouteID = transitForRouteID; self.allowedJumpRouteIDs = allowedJumpRouteIDs
+    }
+
+    public func account(for peer: NativeSSHPeer) async throws -> NativeSSHPasswordAccount {
+        try checkCurrent()
+        guard phase == .fresh else { throw SSHAuthenticationError.stale }
+        phase = .selecting
+        let id = UUID()
+        let work = Task { try await selectAccount(for: peer) }
+        retirement.install(id) { work.cancel() }
+        defer { retirement.finish(id) }
+        return try await withTaskCancellationHandler {
+            let account = try await work.value
+            try checkCurrent()
+            return account
+        } onCancel: { self.cancel(transportID: self.transportID) }
+    }
+
+    private func selectAccount(for peer: NativeSSHPeer) async throws -> NativeSSHPasswordAccount {
+        do {
+            let host = try validatePeer(peer)
+            let selected = try await broker.passwordIdentity(workspaceID: workspaceID, expectedRevision: revision,
+                routeID: routeID, presentedHostKey: host, transitForRouteID: transitForRouteID)
+            try checkCurrent()
+            try validateRoute(selected.authorization)
+            let account = try NativeSSHPasswordAccount(user: selected.authorization.user)
+            self.selected = selected; selectedPeer = peer; selectedAccount = account; phase = .selected
+            return account
+        } catch { cancel(transportID: transportID); throw error }
+    }
+
+    public func password(for account: NativeSSHPasswordAccount, peer: NativeSSHPeer) async throws -> Data {
+        try checkCurrent()
+        guard phase == .selected, let selected, account == selectedAccount, peer == selectedPeer else {
+            throw SSHAuthenticationError.stale
+        }
+        phase = .requesting
+        let id = UUID()
+        let work = Task { try await broker.password(for: selected, transportID: transportID, prompter: prompter) }
+        retirement.install(id) { work.cancel() }
+        defer { retirement.finish(id) }
+        do {
+            var bytes = try await withTaskCancellationHandler {
+                try await work.value
+            } onCancel: { self.cancel(transportID: self.transportID) }
+            defer { bytes.resetBytes(in: 0..<bytes.count) }
+            try checkCurrent()
+            try await broker.validate(selected)
+            try checkCurrent()
+            phase = .supplied
+            return bytes
+        } catch { cancel(transportID: transportID); throw error }
+    }
+
+    public func validate(peer: NativeSSHPeer, account: NativeSSHPasswordAccount) async throws {
+        try checkCurrent()
+        guard phase == .selected || phase == .supplied || phase == .authenticated,
+              peer == selectedPeer, account == selectedAccount, let selected else { throw SSHAuthenticationError.stale }
+        _ = try validatePeer(peer)
+        try validateRoute(selected.authorization)
+        if phase == .authenticated { try await broker.validate(selected) }
+        else { try await broker.validatePasswordAttempt(selected) }
+        try checkCurrent()
+    }
+
+    /// Only the connection factory calls this after native SSH reports success
+    /// and repeats validation. No prompt remains, and no password is retained.
+    /// Subsequent live use still checks the broker and durable route policy.
+    func authenticationCompleted() async throws {
+        try checkCurrent()
+        guard phase == .supplied, let selected else { throw SSHAuthenticationError.stale }
+        try await broker.validatePasswordAttempt(selected)
+        try checkCurrent()
+        phase = .authenticated
+    }
+
+    public func validateCurrent() async throws {
+        guard phase == .authenticated, let selectedPeer, let selectedAccount else { throw SSHAuthenticationError.stale }
+        try await validate(peer: selectedPeer, account: selectedAccount)
+    }
+
+    public nonisolated func cancel(transportID: UUID) {
+        guard transportID == self.transportID, retirement.retire() else { return }
+        Task { await broker.cancel(transportID: transportID) }
+    }
+
+    private func checkCurrent() throws { try Task.checkCancellation(); try retirement.check() }
+
+    private func validatePeer(_ peer: NativeSSHPeer) throws -> WorkspaceDocument.HostKey {
+        guard peer.transportID == transportID, peer.endpoint == endpoint else { throw SSHAuthenticationError.stale }
+        let host = try WorkspaceNativeSSHAuthentication.hostIdentity(for: peer)
+        return try WorkspaceDocument.HostKey(algorithm: host.algorithm, fingerprint: host.fingerprint)
+    }
+
+    private func validateRoute(_ authorization: WorkspaceSSHPasswordAuthorization) throws {
+        guard authorization.workspaceID == workspaceID, authorization.workspaceRevision == revision,
+              authorization.routeID == routeID, authorization.host == endpoint.host, authorization.port == endpoint.port,
+              authorization.transitForRouteID == transitForRouteID, authorization.jumpRouteIDs == allowedJumpRouteIDs,
+              allowedJumpRouteIDs.count <= WorkspaceNativeSSHAuthentication.routeSupport.maximumJumpHops,
+              transitForRouteID != nil || WorkspaceNativeSSHAuthentication.routeSupport.routeModes.contains(authorization.routeMode) else {
+            throw SSHAuthenticationError.denied
+        }
+    }
+}
+
 /// Connects the actual libssh2 exchange to the imported workspace and protected
 /// credential broker. One instance belongs to one explicitly selected attempt;
 /// cancellation permanently retires it. It never grants permission to network.
 /// The app shares one foreground broker configured with routeSupport and checks
 /// its offline/network scope before invoking NativeSSHConnector.
-public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication {
+public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, WorkspaceNativeSSHAuthority {
     /// This is the implemented adapter profile, not Apple-device qualification.
     /// Unknown mandatory policies remain blocked by WorkspaceStore. RSA hosts
-    /// require SHA-2 signatures; RSA credentials, certificates and password/MFA
-    /// are not enabled. Up to three ordered public-key jumps are supported. A mux route
+    /// require SHA-2 signatures; RSA credentials, certificates and interactive
+    /// MFA are not enabled. Public-key and password routes support three jumps. A mux route
     /// authenticates like a direct one; only the destination channel differs.
     public static let routeSupport = WorkspaceDocument.RouteSupport(
-        routeModes: ["direct_ssh", "frankenterm_mux"], authenticationMethods: [.publicKey],
+        routeModes: ["direct_ssh", "frankenterm_mux"], authenticationMethods: [.publicKey, .password],
         credentialAlgorithms: ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521"],
         hostKeyAlgorithms: ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521", "ssh-rsa"],
         maximumJumpHops: 3)
 
-    private final class Retirement: @unchecked Sendable {
+    fileprivate final class Retirement: @unchecked Sendable {
         private let lock = NSLock()
         private var retired = false
         private var operation: (id: UUID, cancel: @Sendable () -> Void)?

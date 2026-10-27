@@ -1041,6 +1041,66 @@ public actor WorkspaceStore {
         guard current == authorization else { throw SSHAuthenticationError.stale }
     }
 
+    /// Password authentication has no imported private-key binding. It still
+    /// requires the complete durable route graph, mandatory policy and actual
+    /// peer pin under the same persistence lease as public-key authorization.
+    public func authorizeSSHPasswordAuthentication(workspaceID: UUID, expectedRevision: UUID,
+        routeID: String, presentedHostKey: WorkspaceDocument.HostKey,
+        support: WorkspaceDocument.RouteSupport, transitForRouteID: String? = nil) throws -> WorkspaceSSHPasswordAuthorization {
+        try persistence.withExclusiveAccess {
+            var catalog = try readCatalog()
+            try recover(catalog: &catalog)
+            guard let saved = catalog.workspaces.first(where: { $0.id == workspaceID }),
+                  saved.revision == expectedRevision else { throw SSHAuthenticationError.stale }
+            let document = try saved.document()
+            guard let route = document.routes.first(where: { $0.id == routeID }),
+                  transitForRouteID != nil || route.mode == "direct_ssh" || route.mode == "frankenterm_mux",
+                  route.authenticationMethods.contains(.password), support.authenticationMethods.contains(.password) else {
+                throw SSHAuthenticationError.denied
+            }
+            let available = try availableCredentials(saved, catalog: catalog)
+            let states = try readiness(document: document, workspaceID: workspaceID,
+                available: available, findings: saved.findings, catalog: catalog, support: support)
+            let selected: WorkspaceDocument.RouteReadiness
+            if let destinationID = transitForRouteID {
+                let chain = try document.orderedJumpRoutes(forRouteID: destinationID)
+                guard !chain.isEmpty, chain.count <= support.maximumJumpHops,
+                      chain.contains(where: { $0.id == routeID }),
+                      states.first(where: { $0.routeID == destinationID })?.isLocallyReady == true else {
+                    throw SSHAuthenticationError.denied
+                }
+                selected = try document.readiness(forRouteID: routeID, availableCredentialIDs: available,
+                    reviewedTrustIDs: Set(document.hostTrust.map(\.id)), revokedCredentialFingerprints: catalog.revokedFingerprints,
+                    support: support, revokedHostKeysByTrustScope: hostRevocations(workspaceID, document: document, catalog: catalog),
+                    requiredHostCapabilitiesByTrustScope: hostRequirements(workspaceID, catalog: catalog),
+                    transitForRouteID: destinationID)
+            } else {
+                guard let state = states.first(where: { $0.routeID == routeID }) else { throw SSHAuthenticationError.denied }
+                selected = state
+            }
+            guard selected.isLocallyReady else { throw SSHAuthenticationError.denied }
+            let decision = try document.verifyHostKey(forRouteID: routeID, presented: presentedHostKey,
+                reviewedTrustIDs: Set(document.hostTrust.map(\.id)), support: support,
+                revokedHostKeysByTrustScope: hostRevocations(workspaceID, document: document, catalog: catalog),
+                requiredHostCapabilitiesByTrustScope: hostRequirements(workspaceID, catalog: catalog))
+            guard decision != .pinMismatch else { throw SSHAuthenticationError.hostKeyMismatch }
+            guard decision == .trustedPin else { throw SSHAuthenticationError.denied }
+            return .init(storeOwner: sshAuthorizationOwner, workspaceID: workspaceID, workspaceRevision: saved.revision,
+                routeID: routeID, host: route.host, port: route.port, user: route.user, routeMode: route.mode,
+                jumpRouteIDs: route.jumpRoutes, transitForRouteID: transitForRouteID, presentedHostKey: presentedHostKey)
+        }
+    }
+
+    public func validateSSHPasswordAuthentication(_ authorization: WorkspaceSSHPasswordAuthorization,
+        support: WorkspaceDocument.RouteSupport) throws {
+        guard authorization.storeOwner == sshAuthorizationOwner else { throw SSHAuthenticationError.stale }
+        let current = try authorizeSSHPasswordAuthentication(workspaceID: authorization.workspaceID,
+            expectedRevision: authorization.workspaceRevision, routeID: authorization.routeID,
+            presentedHostKey: authorization.presentedHostKey, support: support,
+            transitForRouteID: authorization.transitForRouteID)
+        guard current == authorization else { throw SSHAuthenticationError.stale }
+    }
+
     public func routeReadiness(workspaceID: UUID,
                                support: WorkspaceDocument.RouteSupport = .offlineOnly) throws -> [WorkspaceDocument.RouteReadiness] {
         try persistence.withExclusiveAccess {
