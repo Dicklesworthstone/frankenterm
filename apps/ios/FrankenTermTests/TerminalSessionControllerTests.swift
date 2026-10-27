@@ -525,6 +525,63 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertTrue(record.inputEvidence.mayHaveRemoteEffect)
     }
 
+    func testDirectSSHMouseUsesCanonicalBytesWithKeyboardHiddenAndCannotReviveAfterDeactivation() async throws {
+        let live = try await liveScene()
+        let session = try await connect(live.scene, "alpha")
+        let terminal = try shown(session)
+        defer { terminal.removeFromSuperview() }
+        let run = UUID().uuidString.prefix(8), done = "MOUSE-DONE-\(run)"
+        let expected = Data("\u{1b}[<0;3;2M\u{1b}[<0;3;2m\u{1b}[<64;3;2M".utf8)
+        let path = "'" + live.outPath.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        // The remote process records real PTY bytes. A single click is both
+        // SGR transitions, followed by the wheel report in the same input FIFO.
+        try await type("stty raw -echo; printf '\\033[?1000h\\033[?1006h'; "
+            + "dd bs=1 count=\(expected.count) 2>/dev/null | od -An -tx1 | tr -d ' \\n' > \(path); "
+            + "stty sane; printf '\\033[?1000l\\033[?1006l'; printf '\\n\(done)\\n' >> \(path)", into: terminal)
+        for _ in 0..<200 where !terminal.remoteMouseGrabbed || terminal.renderer.pointerProjection == nil {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        XCTAssertTrue(terminal.remoteMouseGrabbed)
+        let oldInput = terminal.input
+        oldInput.hideKeyboard()
+        for _ in 0..<200 where terminal.input === oldInput || !terminal.input.session.acceptsPointer
+            || terminal.renderer.pointerProjection == nil {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        XCTAssertFalse(terminal.input === oldInput, "hidden pointer input owns a new responder generation")
+        XCTAssertTrue(terminal.input.session.acceptsPointer)
+        XCTAssertFalse(terminal.input.isFirstResponder, "pointer focus must not reopen the software keyboard")
+        XCTAssertEqual(terminal.input.session.originalFocus.source, terminal.source)
+        oldInput.insertText("late callback")
+        let click = try XCTUnwrap(terminal.onRemoteClick), wheel = try XCTUnwrap(terminal.onRemoteScroll)
+        click(2, 1); wheel(-1, 2, 1)
+        await terminal.input.session.waitUntilSettled()
+        let output = try await hostFile(live.outPath, containing: done)
+        let hex = expected.map { String(format: "%02x", $0) }.joined()
+        XCTAssertEqual(output.split(separator: "\n").map(String.init), [hex, done],
+                       "the remote shell must receive exactly one complete click and one wheel report")
+        XCTAssertEqual(session.phase, .live)
+
+        // Interleave another intentional hide with an entire inactive/active
+        // cycle before its activation task can run. The old request is final.
+        let hiddenInput = terminal.input, activity = terminal.sceneActivityGeneration
+        hiddenInput.hideKeyboard()
+        terminal.setSceneActive(false); terminal.setSceneActive(true)
+        await hiddenInput.session.waitUntilSuspended()
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertNotEqual(terminal.sceneActivityGeneration, activity)
+        XCTAssertTrue(terminal.input === hiddenInput)
+        XCTAssertFalse(terminal.input.session.acceptsPointer)
+        XCTAssertFalse(terminal.input.isFirstResponder)
+        await live.scene.activateKeyboard()
+        for _ in 0..<200 where !terminal.input.isEditable || !terminal.input.isFirstResponder {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        XCTAssertTrue(terminal.input.isFirstResponder, "the explicit Keyboard action can create a later focus")
+        await live.scene.close()
+        await assertReleased(session, connections: live.connections)
+    }
+
     /// An input method composes on the phone and the shell receives only what
     /// it commits, as UTF-8: a Japanese conversion committed with its chosen
     /// text, a dead key replaced by its letter, and a candidate committed as

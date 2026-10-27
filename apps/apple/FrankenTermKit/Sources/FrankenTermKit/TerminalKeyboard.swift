@@ -93,6 +93,46 @@ public enum TerminalKeyboardIntent: Sendable, CustomDebugStringConvertible {
     case releaseAll([TerminalHardwareKey])
 }
 
+/// Finite pointer effects with no held-button lifetime. A click is one complete
+/// press/release pair; a wheel action is at most 32 notches, negative toward
+/// older output. Canonical terminal modes determine the resulting bytes.
+public enum TerminalPointerAction: Equatable, Sendable {
+    case click
+    case wheel(steps: Int)
+}
+
+public struct TerminalPointerEvent: Equatable, Sendable, CustomDebugStringConvertible {
+    public let action: TerminalPointerAction
+    public let source: TerminalSource
+    public let geometryRevision: UInt64
+    public let column: UInt32, row: UInt32
+    public let modifiers: TerminalKeyModifiers
+    public var debugDescription: String { "TerminalPointerEvent([redacted])" }
+
+    /// The actual displayed live frame supplies the source and geometry.
+    /// Retained/history rows cannot be clicked as if they were the live TUI.
+    public init(action: TerminalPointerAction, column: Int, row: Int,
+                frame: TerminalRenderFrame, modifiers: TerminalKeyModifiers = []) throws {
+        guard frame.isLive, frame.flags & 8 == 0, frame.geometryRevision > 0 else {
+            throw TerminalInputError.stale
+        }
+        guard (1...512).contains(frame.columns), (1...512).contains(frame.rows),
+              column >= 0, column < frame.columns, row >= 0, row < frame.rows,
+              modifiers.rawValue & ~UInt8(31) == 0 else { throw TerminalInputError.invalidWriteSize }
+        if case .wheel(let steps) = action {
+            guard steps != 0, (-32...32).contains(steps) else { throw TerminalInputError.invalidWriteSize }
+        }
+        self.action = action; source = frame.source; geometryRevision = frame.geometryRevision
+        self.column = UInt32(column); self.row = UInt32(row); self.modifiers = modifiers
+    }
+}
+
+/// Uses the same source-owned transaction and egress as keyboard input. This
+/// must be read-only, bounded and retryable; there is no Swift escape encoder.
+public protocol TerminalPointerEncoding: Sendable {
+    func encodePointer(_ event: TerminalPointerEvent, source: TerminalSource, maximumBytes: Int) async throws -> Data
+}
+
 /// Implement using the canonical terminal encoder and its source-owned mode
 /// state. This method is encoding ONLY: no writer, local echo, or network effect.
 /// It must honor the byte cap, avoid MainActor/long terminal locks, and cooperate
@@ -172,16 +212,19 @@ public final class TerminalKeyboardSession: CustomDebugStringConvertible {
     public var onStateChange: (@MainActor () -> Void)?
     public var acceptsInput: Bool { phase == .active }
     public var acceptsPaste: Bool { acceptsInput && !document.isMarked && encoder.supportsPaste }
+    public var acceptsPointer: Bool { acceptsInput && !document.isMarked && encoder is any TerminalPointerEncoding }
 
     private enum Event: Sendable {
         case beginComposition, commitComposition(String), text(String), key(TerminalHardwareKey, TerminalKeyPhase)
         case paste(TerminalPasteReview)
+        case pointer(TerminalPointerEvent)
         var charge: Int {
             switch self {
             case .beginComposition: 0
             case .commitComposition(let text), .text(let text): text.utf8.count
             case .key(let key, _): key.characters.utf8.count + 16
             case .paste(let review): review.utf8Bytes
+            case .pointer: 32
             }
         }
     }
@@ -288,6 +331,17 @@ public final class TerminalKeyboardSession: CustomDebugStringConvertible {
         try append(.paste(review))
     }
 
+    /// Synchronous UI admission into this exact focus's existing bounded FIFO.
+    /// Pointer gestures never bypass composition, a paste reservation, focus
+    /// handoff, or the coordinator's complete-record capacity checks.
+    public func pointer(_ event: TerminalPointerEvent) throws {
+        try requireActive()
+        guard !document.isMarked else { throw TerminalInputError.compositionPending }
+        guard acceptsPointer else { throw TerminalKeyboardError.unavailable }
+        guard event.source == originalFocus.source else { throw TerminalInputError.stale }
+        try append(.pointer(event))
+    }
+
     private func schedule() {
         guard worker == nil else { return }
         worker = Task { [weak self] in await self?.pump() }
@@ -367,6 +421,24 @@ public final class TerminalKeyboardSession: CustomDebugStringConvertible {
             try checkLivePump()
             guard prepared.text.utf8.count <= maximumEncodedBytes else { throw TerminalKeyboardError.capacity }
             receipt = try await coordinator.paste(originalFocus, text: prepared.text, bracketed: prepared.bracketed)
+        case .pointer(let event):
+            guard let source = originalFocus.source, let pointer = encoder as? any TerminalPointerEncoding else {
+                throw TerminalKeyboardError.unavailable
+            }
+            let limit = min(maximumEncodedBytes, 4096)
+            let bytes: Data
+            do { bytes = try await pointer.encodePointer(event, source: source, maximumBytes: limit) }
+            catch TerminalModelError.stale {
+                // A resize/history transition invalidates this local gesture,
+                // not the following keystrokes. Never reinterpret its cell on
+                // a newer grid or retain it as a replayable local decision.
+                flightCompleted = true
+                if discarded < UInt64.max { discarded += 1 }
+                return
+            }
+            try checkLivePump()
+            guard bytes.count <= limit else { throw TerminalKeyboardError.capacity }
+            if !bytes.isEmpty { receipt = try await coordinator.submit(originalFocus, encodedBytes: bytes) }
         }
         flightCompleted = true
         if admitted < UInt64.max { admitted += 1 }

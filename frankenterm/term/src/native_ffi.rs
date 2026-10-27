@@ -17,7 +17,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use crate::native::{
-    NativeKeyPhase, NativeTerminal, NativeTerminalConfig, NativeTerminalError as Error,
+    NativeKeyPhase, NativeMouseAction, NativeTerminal, NativeTerminalConfig, NativeTerminalError as Error,
     BASE_PALETTE_BYTES, MAX_FEED_BYTES, MAX_FRAME_BYTES, MAX_INPUT_BYTES, MAX_REPLY_BYTES,
     MAX_TEXT_BYTES,
 };
@@ -500,6 +500,39 @@ pub unsafe extern "C" fn ft_terminal_v1_encode_text(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn ft_terminal_v1_encode_mouse(
+    session: u64,
+    action: u32,
+    steps: i32,
+    column: u32,
+    row: u32,
+    modifiers: u32,
+    geometry_revision: u64,
+    output: *mut u8,
+    capacity: u32,
+    written: *mut u32,
+) -> u32 {
+    boundary(Some(session), |registry| {
+        unsafe {
+            output_scalar(written, 0)?;
+        }
+        let action = match (action, steps) {
+            (0, 0) => NativeMouseAction::Click,
+            (1, steps) => NativeMouseAction::Wheel(steps),
+            _ => return Err(Error::Invalid),
+        };
+        let output = unsafe { output_bytes(output, capacity, MAX_INPUT_BYTES)? };
+        let count = registry.session(session)?.encode_mouse(
+            action, column, row, modifiers, geometry_revision, output,
+        )?;
+        unsafe {
+            output_scalar(written, count as u32)?;
+        }
+        Ok(())
+    })
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn ft_terminal_v1_prepare_paste(
     session: u64,
     text: *const u8,
@@ -847,5 +880,30 @@ mod tests {
         );
         assert_eq!(ft_terminal_v1_release(session), 0);
         assert_eq!(ft_terminal_v1_release(session), Error::Stale as u32);
+    }
+
+    #[test]
+    fn c_mouse_encoding_rejects_invalid_handles_geometry_and_partial_click_capacity() {
+        let mut session = 0;
+        let mut bytes = [0xa5; 64];
+        let mut written = 9;
+        // SAFETY: live initialized disjoint local storage, with exactly the
+        // declared lengths. The stale-handle call borrows no terminal owner.
+        unsafe {
+            assert_eq!(ft_terminal_v1_create(&config(), &mut session), 0);
+            let modes = b"\x1b[?1000h\x1b[?1006h";
+            assert_eq!(ft_terminal_v1_feed(session, modes.as_ptr(), modes.len() as u32), 0);
+            assert_eq!(ft_terminal_v1_encode_mouse(session, 0, 0, 1, 1, 0, 1, bytes.as_mut_ptr(), 9, &mut written), Error::Capacity as u32);
+            assert_eq!(written, 0); assert_eq!(bytes, [0xa5; 64]);
+            assert_eq!(ft_terminal_v1_encode_mouse(session, 2, 0, 1, 1, 0, 1, bytes.as_mut_ptr(), 64, &mut written), Error::Invalid as u32);
+            assert_eq!(written, 0); assert_eq!(bytes, [0xa5; 64]);
+            assert_eq!(ft_terminal_v1_encode_mouse(session, 0, 0, 1, 1, 0, 2, bytes.as_mut_ptr(), 64, &mut written), Error::Stale as u32);
+            assert_eq!(written, 0); assert_eq!(bytes, [0xa5; 64]);
+            assert_eq!(ft_terminal_v1_encode_mouse(session, 0, 0, 1, 1, 0, 1, bytes.as_mut_ptr(), 64, &mut written), 0);
+            assert_eq!(&bytes[..written as usize], b"\x1b[<0;2;2M\x1b[<0;2;2m");
+            assert_eq!(ft_terminal_v1_release(session), 0);
+            assert_eq!(ft_terminal_v1_encode_mouse(session, 0, 0, 1, 1, 0, 1, bytes.as_mut_ptr(), 64, &mut written), Error::Stale as u32);
+            assert_eq!(written, 0);
+        }
     }
 }

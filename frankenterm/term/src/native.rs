@@ -8,6 +8,7 @@
 
 use crate::color::{ColorPalette, SrgbaTuple};
 use crate::config::{GridEngine, NewlineCanon, Osc52WritePolicy, TerminalFeatureProfile};
+use crate::input::{MouseButton, MouseEvent, MouseEventKind};
 use crate::render::{
     capture_terminal_frame, RenderFrameError, RenderFrameLimits, RenderFrameWitness,
 };
@@ -26,6 +27,7 @@ pub const MAX_REPLY_BYTES: usize = 16 * 1024;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_RESIDENT_CELLS: usize = 65536;
 pub const MAX_CELL_GRAPHEME_BYTES: usize = 256;
+pub const MAX_MOUSE_STEPS: i32 = 32;
 /// RGBA8 entries of a base palette: 256 indexed colors, then foreground,
 /// background, cursor foreground/background/border, selection fg/bg.
 pub const BASE_PALETTE_COLORS: usize = 263;
@@ -197,6 +199,15 @@ pub enum NativeKeyPhase {
     Repeated,
     Up,
     Press,
+}
+
+/// Complete, finite pointer effects. A click includes both transitions, so
+/// local admission cannot accept a press while refusing its release. Drags
+/// and held buttons require a separate ownership contract and are not exposed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeMouseAction {
+    Click,
+    Wheel(i32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -472,6 +483,67 @@ impl NativeTerminal {
         })
     }
 
+    /// Encode against the current canonical mouse/keyboard modes, but only for
+    /// the exact displayed geometry. Pixel protocols use the authoritative
+    /// model's cell center, never UIKit points or a guessed display scale.
+    pub fn encode_mouse(
+        &self,
+        action: NativeMouseAction,
+        column: u32,
+        row: u32,
+        modifiers: u32,
+        geometry_revision: u64,
+        output: &mut [u8],
+    ) -> Result<usize, NativeTerminalError> {
+        self.live()?;
+        if geometry_revision == 0 || geometry_revision != self.witness.geometry_revision
+            || self.terminal.synchronized_output()
+        {
+            return Err(NativeTerminalError::Stale);
+        }
+        let size = self.config.size;
+        if column as usize >= size.cols || row as usize >= size.rows || modifiers & !31 != 0
+            || output.len() > MAX_INPUT_BYTES
+        {
+            return Err(NativeTerminalError::Invalid);
+        }
+        let (button, repetitions) = match action {
+            NativeMouseAction::Click => (MouseButton::Left, 1),
+            NativeMouseAction::Wheel(steps) if steps != 0 && (-MAX_MOUSE_STEPS..=MAX_MOUSE_STEPS).contains(&steps) => {
+                (if steps < 0 { MouseButton::WheelUp(1) } else { MouseButton::WheelDown(1) }, steps.unsigned_abs() as usize)
+            }
+            NativeMouseAction::Wheel(_) => return Err(NativeTerminalError::Invalid),
+        };
+        if self.terminal.is_mouse_grabbed() && self.terminal.mouse_uses_pixel_coordinates()
+            && (size.pixel_width < size.cols || size.pixel_height < size.rows)
+        {
+            return Err(NativeTerminalError::Unsupported);
+        }
+        let event = MouseEvent {
+            kind: MouseEventKind::Press,
+            button,
+            x: column as usize,
+            y: i64::from(row),
+            x_pixel_offset: (size.pixel_width / size.cols / 2) as isize,
+            y_pixel_offset: (size.pixel_height / size.rows / 2) as isize,
+            modifiers: native_modifiers(modifiers),
+        };
+        let bytes = match action {
+            NativeMouseAction::Click => self.terminal.encode_mouse_click(event),
+            NativeMouseAction::Wheel(_) => self.terminal.encode_mouse_wheel(event),
+        }.map_err(|_| NativeTerminalError::Unsupported)?;
+        let count = bytes.len().checked_mul(repetitions).ok_or(NativeTerminalError::Capacity)?;
+        if count > output.len() {
+            return Err(NativeTerminalError::Capacity);
+        }
+        if !bytes.is_empty() {
+            for destination in output[..count].chunks_exact_mut(bytes.len()) {
+                destination.copy_from_slice(&bytes);
+            }
+        }
+        Ok(count)
+    }
+
     fn emit_key(
         &self,
         key: KeyCode,
@@ -738,6 +810,93 @@ mod tests {
 
     fn terminal() -> NativeTerminal {
         NativeTerminal::new(config()).unwrap()
+    }
+
+    #[test]
+    fn mouse_click_is_pure_complete_mode_aware_and_capacity_atomic() {
+        let mut terminal = terminal();
+        let mut bytes = [0xa5; 128];
+        assert_eq!(terminal.encode_mouse(NativeMouseAction::Click, 2, 1, 0, 1, &mut bytes).unwrap(), 0);
+        terminal.feed(b"\x1b[?1000h\x1b[?1006h\x1b[6n").unwrap();
+        let before = terminal.terminal.bounded_output_status().unwrap();
+        let sequence = terminal.terminal.current_seqno();
+        let expected = b"\x1b[<0;3;2M\x1b[<0;3;2m";
+        assert_eq!(terminal.encode_mouse(NativeMouseAction::Click, 2, 1, 0, 1, &mut bytes[..expected.len() - 1]), Err(NativeTerminalError::Capacity));
+        assert_eq!(bytes, [0xa5; 128], "a refused release must not leave a copied press");
+        for _ in 0..2 {
+            let count = terminal.encode_mouse(NativeMouseAction::Click, 2, 1, 0, 1, &mut bytes).unwrap();
+            assert_eq!(&bytes[..count], expected);
+        }
+        assert_eq!(terminal.terminal.current_seqno(), sequence);
+        assert_eq!(terminal.terminal.bounded_output_status().unwrap(), before);
+        let reply = terminal.copy_reply(&mut bytes).unwrap().unwrap();
+        assert_eq!(&bytes[..reply.bytes], b"\x1b[1;1R", "mouse encoding cannot consume parser replies");
+        terminal.settle_reply(reply.sequence, BoundedReplyDisposition::Accepted).unwrap();
+        terminal.feed(b"\x1b[?1006l").unwrap();
+        let count = terminal.encode_mouse(NativeMouseAction::Click, 2, 1, 3, 1, &mut bytes).unwrap();
+        assert_eq!(&bytes[..count], b"\x1b[M4#\"\x1b[M##\"", "legacy release is button 3, without modifiers");
+        terminal.feed(b"\x1b[?1000l").unwrap();
+        assert_eq!(terminal.encode_mouse(NativeMouseAction::Click, 2, 1, 0, 1, &mut bytes).unwrap(), 0);
+    }
+
+    #[test]
+    fn mouse_wheel_uses_tracking_or_canonical_alternate_screen_keys() {
+        let mut terminal = terminal();
+        let mut bytes = [0; 256];
+        assert_eq!(terminal.encode_mouse(NativeMouseAction::Wheel(-1), 0, 0, 0, 1, &mut bytes).unwrap(), 0);
+        terminal.feed(b"\x1b[?1002h\x1b[?1006h").unwrap();
+        let count = terminal.encode_mouse(NativeMouseAction::Wheel(-2), 2, 1, 4, 1, &mut bytes).unwrap();
+        assert_eq!(&bytes[..count], b"\x1b[<72;3;2M\x1b[<72;3;2M");
+        terminal.feed(b"\x1b[?1002l\x1b[?1049h\x1b[?1h").unwrap();
+        let count = terminal.encode_mouse(NativeMouseAction::Wheel(2), 0, 0, 0, 2, &mut bytes).unwrap();
+        assert_eq!(&bytes[..count], b"\x1bOB\x1bOB\x1bOB\x1bOB\x1bOB\x1bOB");
+        assert_eq!(terminal.terminal.bounded_output_status().unwrap().pending_input_bytes, 0);
+    }
+
+    #[test]
+    fn mouse_geometry_and_steps_fail_before_copy_and_pixel_modes_use_model_extent() {
+        let mut terminal = terminal();
+        terminal.feed(b"\x1b[?1000h\x1b[?1016h").unwrap();
+        let mut bytes = [0xa5; 128];
+        assert_eq!(terminal.encode_mouse(NativeMouseAction::Click, 2, 1, 0, 1, &mut bytes), Err(NativeTerminalError::Unsupported));
+        let mut size = terminal.config().size;
+        size.pixel_width = 120; size.pixel_height = 60;
+        terminal.resize(size).unwrap();
+        for (action, column, row, geometry, expected) in [
+            (NativeMouseAction::Click, 2, 1, 1, NativeTerminalError::Stale),
+            (NativeMouseAction::Click, 12, 1, 2, NativeTerminalError::Invalid),
+            (NativeMouseAction::Click, 2, 3, 2, NativeTerminalError::Invalid),
+            (NativeMouseAction::Wheel(0), 2, 1, 2, NativeTerminalError::Invalid),
+            (NativeMouseAction::Wheel(i32::MIN), 2, 1, 2, NativeTerminalError::Invalid),
+            (NativeMouseAction::Wheel(33), 2, 1, 2, NativeTerminalError::Invalid),
+        ] {
+            assert_eq!(terminal.encode_mouse(action, column, row, 0, geometry, &mut bytes), Err(expected));
+            assert_eq!(bytes, [0xa5; 128]);
+        }
+        let count = terminal.encode_mouse(NativeMouseAction::Click, 2, 1, 0, 2, &mut bytes).unwrap();
+        assert_eq!(&bytes[..count], b"\x1b[<0;26;31M\x1b[<0;26;31m");
+        terminal.feed(b"\x1b[?2026h").unwrap();
+        assert_eq!(terminal.encode_mouse(NativeMouseAction::Click, 2, 1, 0, 2, &mut bytes), Err(NativeTerminalError::Stale));
+    }
+
+    #[test]
+    fn mouse_utf8_coordinates_and_capture_grab_flag_follow_canonical_modes() {
+        let mut terminal = terminal();
+        let flag = crate::render::RENDER_FRAME_FLAG_MOUSE_GRABBED;
+        let captured_flag = |term: &mut NativeTerminal| {
+            let bytes = term.capture_frame(None).unwrap();
+            u32::from_le_bytes(bytes[12..16].try_into().unwrap()) & flag
+        };
+        assert_eq!(captured_flag(&mut terminal), 0);
+        let mut size = terminal.config().size; size.cols = 300;
+        terminal.resize(size).unwrap();
+        terminal.feed(b"\x1b[?1003h\x1b[?1005h").unwrap();
+        assert_eq!(captured_flag(&mut terminal), flag);
+        let mut bytes = [0; 128];
+        let count = terminal.encode_mouse(NativeMouseAction::Click, 250, 0, 0, 2, &mut bytes).unwrap();
+        assert_eq!(&bytes[..count], b"\x1b[M \xc4\x9b!\x1b[M#\xc4\x9b!");
+        terminal.feed(b"\x1b[?1003l").unwrap();
+        assert_eq!(captured_flag(&mut terminal), 0);
     }
 
     #[test]

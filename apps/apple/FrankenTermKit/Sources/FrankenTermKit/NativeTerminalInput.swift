@@ -54,6 +54,9 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     public var onFailure: (@MainActor (Error) -> Void)?
     public var onPasteReview: (@MainActor (TerminalPasteReview) -> Void)?
     public var onRetired: (@MainActor () -> Void)?
+    /// Only an intentional Hide Keyboard action asks for a fresh focus with
+    /// the software keyboard hidden. OS resignation/deactivation never does.
+    public var onKeyboardDismissed: (@MainActor () -> Void)?
     /// Keeps the keyboard up while a handoff moves its input to another terminal.
     public weak var keyboardHolder: TerminalKeyboardHolder?
     /// Asked when a key arrives while no caret is drawn: true while the live
@@ -200,7 +203,12 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     public func requestKeyboard(_ visible: Bool) {
         keyboardRequested = visible
         if visible, window != nil, !isFirstResponder { _ = becomeFirstResponder() }
-        else if !visible, isFirstResponder { retire() }
+        else if !visible, isFirstResponder { hideKeyboard() }
+    }
+    public func hideKeyboard() {
+        guard !retiring else { return }
+        retire()
+        onKeyboardDismissed?()
     }
     /// The caller runs the session's acknowledged handoff BEFORE installing a
     /// new responder. This operation is for OS interruption/disposal, and never
@@ -667,7 +675,7 @@ public final class NativeTerminalInputView: UIView, UITextInput {
             return value
         }
         let dismiss = key(nil, symbol: "keyboard.chevron.compact.down", label: "Hide keyboard") { [weak self] in
-            self?.retire()
+            self?.hideKeyboard()
         }
         dismiss.accessibilityIdentifier = "terminal.keyboard.hide"
         dismiss.translatesAutoresizingMaskIntoConstraints = false
@@ -944,6 +952,7 @@ public final class NativeTerminalView: UIView {
     /// session owner can install a fresh focus on the SAME source once cleanup
     /// settles. The display and its authenticated channel remain independent.
     public var onInputRetired: (@MainActor () -> Void)?
+    public var onKeyboardDismissed: (@MainActor () -> Void)?
     /// The owner applies this measured geometry to the canonical terminal and
     /// its SSH PTY, then submits the corresponding revised semantic frame.
     public var onViewportChange: (@MainActor (NativeTerminalViewport) -> Void)?
@@ -959,7 +968,11 @@ public final class NativeTerminalView: UIView {
     /// The program on screen has asked for the mouse: a tap clicks the cell
     /// under the finger through `onRemoteClick` instead of toggling the
     /// keyboard.
-    public var remoteMouseGrabbed = false
+    private var remoteMouseGrabOverride: Bool?
+    public var remoteMouseGrabbed: Bool {
+        get { remoteMouseGrabOverride ?? renderer.admittedFrame?.mouseGrabbed ?? false }
+        set { remoteMouseGrabOverride = newValue }
+    }
     public var onRemoteClick: (@MainActor (_ column: Int, _ row: Int) -> Void)?
     /// Rows of drag per wheel notch: a notch scrolls a program about three rows.
     private static let rowsPerNotch = 3
@@ -967,7 +980,8 @@ public final class NativeTerminalView: UIView {
     private let liveButton = UIButton(type: .system)
     private let panDelegate = NativeTerminalHistoryPanDelegate()
     private var panAnchor: (top: Int64, history: TerminalRenderHistory)?
-    private var remoteScroll: (column: Int, row: Int, sent: Int)?
+    private var remoteScroll: (column: Int, row: Int, sent: Int, source: TerminalSource,
+                               geometry: UInt64, font: UInt64, cellSize: CGSize, keyboardID: UUID)?
     private var lastHistoryRequest: Int64??
     private var lastCaret: NativeTerminalCaret?
     private var lastAppearance: (font: UIFont, foreground: UIColor)?
@@ -975,6 +989,8 @@ public final class NativeTerminalView: UIView {
     private var wantsKeyboard = false
     private var hasActivated = false
     private var sceneActive = false
+    public var isSceneActive: Bool { sceneActive && !retired }
+    public private(set) var sceneActivityGeneration = UUID()
 
     /// A tap on the terminal while the keyboard is down: the owner brings a
     /// keyboard back (a tap while it is up puts it away).
@@ -1137,6 +1153,10 @@ public final class NativeTerminalView: UIView {
             self.wantsKeyboard = false
             self.onInputRetired?()
         }
+        input.onKeyboardDismissed = { [weak self] in
+            guard let self, self.isSceneActive else { return }
+            self.onKeyboardDismissed?()
+        }
         input.onInputWithoutProjection = { [weak self] in
             guard let self, !self.retired, self.sceneActive, let frame = self.renderer.admittedFrame else { return false }
             // A resize or new text size redraws the live screen it shows.
@@ -1170,7 +1190,7 @@ public final class NativeTerminalView: UIView {
         onHistoryViewportRequest?(target)
     }
     @objc private func panned(_ pan: UIPanGestureRecognizer) {
-        guard !retired else { return }
+        guard isSceneActive else { return }
         let rowHeight = renderer.cellSize?.height ?? 0
         switch pan.state {
         case .began:
@@ -1178,18 +1198,33 @@ public final class NativeTerminalView: UIView {
             lastHistoryRequest = nil
             panAnchor = nil; remoteScroll = nil
             guard let frame = renderer.admittedFrame else { return }
-            if let history = frame.history, history.first < history.live {
+            if let history = frame.history, history.first < history.live,
+               !frame.isLive || !remoteMouseGrabbed {
                 panAnchor = (frame.viewportFirst, history)
-            } else if onRemoteScroll != nil, let cell = renderer.cellSize, cell.width > 0, cell.height > 0 {
-                // Nothing to scroll here: the program itself may scroll.
+            } else if frame.isLive, onRemoteScroll != nil,
+                      remoteMouseGrabbed || frame.alternateScreen,
+                      let projection = renderer.pointerProjection,
+                      projection.frame.isLive, projection.cellSize.width > 0, projection.cellSize.height > 0 {
+                // A live mouse-grabbing program owns scrolling even if the
+                // terminal also has history. History inspection stays local.
+                let cell = projection.cellSize
                 let point = pan.location(in: self)
                 remoteScroll = (min(max(Int(point.x / cell.width), 0), max(frame.columns - 1, 0)),
-                                min(max(Int(point.y / cell.height), 0), max(frame.lines.count - 1, 0)), 0)
+                                min(max(Int(point.y / cell.height), 0), max(frame.lines.count - 1, 0)), 0,
+                                projection.frame.source, projection.frame.geometryRevision,
+                                projection.frame.fontRevision, cell, input.session.id)
             }
         case .changed:
-            if let remote = remoteScroll, rowHeight > 0 {
+            if let remote = remoteScroll {
+                guard let projection = renderer.pointerProjection,
+                      projection.frame.isLive, projection.frame.source == remote.source,
+                      projection.frame.geometryRevision == remote.geometry,
+                      projection.frame.fontRevision == remote.font,
+                      projection.cellSize == remote.cellSize, input.session.id == remote.keyboardID else {
+                    remoteScroll = nil; return
+                }
                 // Dragging down shows older rows: the wheel turns up.
-                let rows = Int((pan.translation(in: self).y / rowHeight).rounded(.towardZero))
+                let rows = Int((pan.translation(in: self).y / remote.cellSize.height).rounded(.towardZero))
                 let notches = -rows / Self.rowsPerNotch
                 if notches != remote.sent {
                     onRemoteScroll?(notches - remote.sent, remote.column, remote.row)
@@ -1252,13 +1287,18 @@ public final class NativeTerminalView: UIView {
     // MARK: Taps, text size
 
     @objc private func tapped(_ tap: UITapGestureRecognizer) {
-        guard !retired else { return }
+        guard isSceneActive else { return }
         stopMomentum()
         if selection != nil { clearSelection(); return }
         // A program that asked for the mouse takes the tap as a click; the
         // keyboard has its own button then.
-        if remoteMouseGrabbed, let onRemoteClick, let cell = renderer.cellSize, cell.width > 0, cell.height > 0,
-           let frame = renderer.admittedFrame, frame.isLive {
+        if remoteMouseGrabbed, renderer.admittedFrame?.isLive == true, let onRemoteClick {
+            guard let projection = renderer.pointerProjection, projection.frame.isLive,
+                  projection.cellSize.width > 0, projection.cellSize.height > 0 else {
+                onFailure?(TerminalKeyboardError.unavailable)
+                return
+            }
+            let frame = projection.frame, cell = projection.cellSize
             let point = tap.location(in: self)
             onRemoteClick(min(max(Int(point.x / cell.width), 0), max(frame.columns - 1, 0)),
                           min(max(Int(point.y / cell.height), 0), max(frame.lines.count - 1, 0)))
@@ -1269,7 +1309,7 @@ public final class NativeTerminalView: UIView {
         if !input.isFirstResponder { onKeyboardRequest?() }
         // With a hardware keyboard there is no on-screen keyboard to put
         // away, and resigning would only stop the typing.
-        else if GCKeyboard.coalesced == nil { input.retire() }
+        else if GCKeyboard.coalesced == nil { input.hideKeyboard() }
     }
 
     @objc private func pinched(_ pinch: UIPinchGestureRecognizer) {
@@ -1610,10 +1650,14 @@ public final class NativeTerminalView: UIView {
     /// Resumption never revives an old keyboard focus or reconnects a transport.
     public func setSceneActive(_ active: Bool) {
         guard !retired else { return }
+        if sceneActive != active { sceneActivityGeneration = UUID() }
         sceneActive = active
         renderer.setSceneActive(active)
         if active { hasActivated = true }
-        else if hasActivated { wantsKeyboard = false; input.retire() }
+        else if hasActivated {
+            panAnchor = nil; remoteScroll = nil; stopMomentum()
+            wantsKeyboard = false; input.retire()
+        }
     }
     public func submit(_ bytes: Data, source: TerminalSource) throws {
         guard !retired else { throw TerminalInputError.unavailable }
@@ -1640,6 +1684,7 @@ public final class NativeTerminalView: UIView {
         replacement.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         replacement.frame = bounds; replacement.keyboardHolder = keyboardHolder
         input.onFailure = nil; input.onPasteReview = nil; input.onRetired = nil; input.onInputWithoutProjection = nil
+        input.onKeyboardDismissed = nil
         input.removeFromSuperview(); input = replacement
         bindInput(); insertSubview(replacement, aboveSubview: renderer)
     }
@@ -1654,9 +1699,12 @@ public final class NativeTerminalView: UIView {
         guard !retired else { return }
         clearSelection(); stopMomentum()
         onKeyboardRequest = nil; onFontSizeChange = nil; onFontRevision = nil; onRemoteScroll = nil; onRemoteClick = nil
+        onKeyboardDismissed = nil; remoteScroll = nil; panAnchor = nil
+        sceneActivityGeneration = UUID()
         retired = true; wantsKeyboard = false; sceneActive = false; lastCaret = nil; lastAppearance = nil
         input.canCopySelection = nil; input.copySelection = nil
         input.onFailure = nil; input.onPasteReview = nil; input.onRetired = nil; input.onInputWithoutProjection = nil
+        input.onKeyboardDismissed = nil
         onHistoryViewportRequest = nil; liveButton.isHidden = true
         renderer.onFailure = nil; renderer.onCaret = nil; renderer.onAppearance = nil
         renderer.onCaretUnavailable = nil; renderer.onViewportChange = nil; onViewportChange = nil

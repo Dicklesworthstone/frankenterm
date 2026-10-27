@@ -12,6 +12,12 @@ With VoiceOver enabled, the Metal terminal exposes separate logical lines and a 
 
 The projection preserves verified soft wraps, spaces, wide characters and complete Unicode graphemes, and masks concealed terminal cells. Reading is limited to 128 logical lines, 32 KiB in total and 4 KiB per line, with explicit omission/truncation notices. It retains no transcript on disk. Deactivation and retirement clear the reading snapshot and block retained accessibility actions from recapturing text. The ordinary accessibility value remains available for existing UI automation while the scene is active. The portable projection has regression coverage; UIKit/Metal/VoiceOver behavior must still be qualified on an Apple host with the new native test.
 
+## Direct SSH terminal pointer input
+
+Live direct-SSH terminals now route taps and vertical swipes through the canonical Rust mouse encoder and the keyboard's existing bounded input owner. A click admits its press and release together. Wheel actions are bounded to 32 notches and use negotiated SGR, pixel, UTF-8 or X10 reports; a nongrabbing alternate screen uses canonical arrow-key encoding. Ordinary history inspection stays local. Dragging or holding a remote button is outside this initial pointer profile.
+
+Gestures require the selected source, active scene, live viewport and a completed Metal draw with matching geometry and font metrics. A queued gesture whose grid has changed is discarded without retiring later typing. Composition, focus handoff and deactivation retain their existing admission rules. Hiding the software keyboard retires its responder and then restores a fresh same-source focus with the keyboard hidden, so pointer input remains available. New Rust and Apple-hosted regressions require RCH and native execution; C header checking and portable Swift checks do not establish device behavior.
+
 ## Entry points
 
 Open `apps/apple/FrankenTerm.xcodeproj` with a stable Xcode supporting the iOS 26 SDK and Swift 6. The shared `FrankenTerm` scheme builds the iPhone/iPad application; `FrankenTermExport` builds the macOS companion (macOS 14 deployment floor). Both Apple applications link the local package and system cryptography, with no remote package downloads or generated project scripts. Linux validation additionally resolves pinned Apple Swift Crypto 4.5.2 and its locked Swift ASN.1 dependency to exercise the same maintained HPKE API. Development device signing needs the operator's selected team; no team or signing secret is embedded here.

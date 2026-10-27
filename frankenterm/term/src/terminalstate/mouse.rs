@@ -84,14 +84,57 @@ impl TerminalState {
         }
     }
 
-    fn encode_x10_or_utf8(&mut self, event: MouseEvent, button: i8) -> anyhow::Result<()> {
+    /// One canonical mouse report, without a writer or button-state mutation.
+    /// The mutable desktop path and native complete-gesture encoder share this
+    /// implementation, including legacy release and pixel coordinate semantics.
+    fn encode_mouse_report(&self, event: MouseEvent, button: i8, release: bool) -> Vec<u8> {
+        let suffix = if release { 'm' } else { 'M' };
+        if self.mouse_encoding == MouseEncoding::SGR {
+            let (x, y) = sgr_cell_coords(&event);
+            return format!("\x1b[<{};{};{}{}", button, x, y, suffix).into_bytes();
+        }
+        if self.mouse_encoding == MouseEncoding::SgrPixels {
+            let (x, y) = self.sgr_pixel_coords(event);
+            return format!("\x1b[<{};{};{}{}", button, x, y, suffix).into_bytes();
+        }
+        // X10 and UTF-8 report releases as button 3, without modifiers.
+        let button = if release { 3 } else { button };
         let mut buf = vec![b'\x1b', b'[', b'M', (32 + button) as u8];
         self.encode_coord(event.x as i64, &mut buf);
         self.encode_coord(event.y, &mut buf);
-        log::trace!("{event:?} {buf:?}");
-        self.writer.write(&buf)?;
+        buf
+    }
+
+    fn write_mouse_report(&mut self, event: MouseEvent, button: i8, release: bool) -> anyhow::Result<()> {
+        let bytes = self.encode_mouse_report(event, button, release);
+        self.writer.write_all(&bytes)?;
         self.writer.flush()?;
         Ok(())
+    }
+
+    #[cfg(feature = "native")]
+    pub(crate) fn mouse_uses_pixel_coordinates(&self) -> bool {
+        self.mouse_encoding == MouseEncoding::SgrPixels
+    }
+
+    /// A whole click for an embedder with its own ordered egress owner. No
+    /// button remains held, and neither a retry nor a refused admission changes
+    /// the model. Do not use this API to emulate a drag or a held-button stream.
+    #[cfg(feature = "native")]
+    pub(crate) fn encode_mouse_click(&self, event: MouseEvent) -> anyhow::Result<Vec<u8>> {
+        if event.kind != MouseEventKind::Press
+            || !matches!(event.button, MouseButton::Left | MouseButton::Middle | MouseButton::Right)
+            || !self.current_mouse_buttons.is_empty()
+        {
+            bail!("complete mouse click requires an unowned button");
+        }
+        if !self.is_mouse_grabbed() {
+            return Ok(Vec::new());
+        }
+        let (button, _) = self.mouse_report_button_number(&event);
+        let mut bytes = self.encode_mouse_report(event, button, false);
+        bytes.extend_from_slice(&self.encode_mouse_report(event, button, true));
+        Ok(bytes)
     }
 
     fn mouse_report_button_number(&self, event: &MouseEvent) -> (i8, MouseButton) {
@@ -127,27 +170,32 @@ impl TerminalState {
         (code, button)
     }
 
-    fn mouse_wheel(&mut self, event: MouseEvent) -> anyhow::Result<()> {
-        let (button, _button) = self.mouse_report_button_number(&event);
+    pub(crate) fn encode_mouse_wheel(&self, event: MouseEvent) -> anyhow::Result<Vec<u8>> {
+        let key = match event.button {
+            MouseButton::WheelDown(_) => KeyCode::DownArrow,
+            MouseButton::WheelUp(_) => KeyCode::UpArrow,
+            MouseButton::WheelLeft(_) => KeyCode::LeftArrow,
+            MouseButton::WheelRight(_) => KeyCode::RightArrow,
+            _ => bail!("unexpected mouse event"),
+        };
+        if self.is_mouse_grabbed() {
+            let (button, _) = self.mouse_report_button_number(&event);
+            return Ok(self.encode_mouse_report(event, button, false));
+        }
+        if self.screen.is_alt_screen_active() {
+            // Use the same negotiated keyboard modes as ordinary arrow keys.
+            return Ok(self.encode_key(key, KeyModifiers::NONE, true)?
+                .repeat(usize::from(self.config.alternate_buffer_wheel_scroll_speed()))
+                .into_bytes());
+        }
+        Ok(Vec::new())
+    }
 
-        if self.mouse_encoding == MouseEncoding::SGR
-            && (self.mouse_tracking || self.button_event_mouse || self.any_event_mouse)
-        {
-            let (x, y) = sgr_cell_coords(&event);
-            log::trace!("wheel {event:?} ESC [<{};{};{}M", button, x, y);
-            write!(self.writer, "\x1b[<{};{};{}M", button, x, y)?;
-            self.writer.flush()?;
-        } else if self.mouse_encoding == MouseEncoding::SgrPixels
-            && (self.mouse_tracking || self.button_event_mouse || self.any_event_mouse)
-        {
-            let (x, y) = self.sgr_pixel_coords(event);
-            log::trace!("wheel {event:?} ESC [<{};{};{}M", button, x, y);
-            write!(self.writer, "\x1b[<{};{};{}M", button, x, y)?;
-            self.writer.flush()?;
-        } else if self.mouse_tracking || self.button_event_mouse || self.any_event_mouse {
-            self.encode_x10_or_utf8(event, button)?;
-        } else if self.screen.is_alt_screen_active() {
-            // Send cursor keys instead (equivalent to xterm's alternateScroll mode)
+    fn mouse_wheel(&mut self, event: MouseEvent) -> anyhow::Result<()> {
+        // Preserve the desktop key-down path (including its logging and flush
+        // boundaries). Native callers use the pure helper above, because their
+        // own coordinator owns admission of the whole wheel action.
+        if !self.is_mouse_grabbed() && self.screen.is_alt_screen_active() {
             for _ in 0..self.config.alternate_buffer_wheel_scroll_speed() {
                 self.key_down(
                     match event.button {
@@ -160,6 +208,12 @@ impl TerminalState {
                     KeyModifiers::default(),
                 )?;
             }
+            return Ok(());
+        }
+        let bytes = self.encode_mouse_wheel(event)?;
+        if !bytes.is_empty() {
+            self.writer.write_all(&bytes)?;
+            self.writer.flush()?;
         }
         Ok(())
     }
@@ -174,21 +228,7 @@ impl TerminalState {
             return Ok(());
         }
 
-        if self.mouse_encoding == MouseEncoding::SGR {
-            let (x, y) = sgr_cell_coords(&event);
-            log::trace!("press {event:?} ESC [<{};{};{}M", button, x, y);
-            write!(self.writer, "\x1b[<{};{};{}M", button, x, y)?;
-            self.writer.flush()?;
-        } else if self.mouse_encoding == MouseEncoding::SgrPixels {
-            let (x, y) = self.sgr_pixel_coords(event);
-            log::trace!("press {event:?} ESC [<{};{};{}M", button, x, y);
-            write!(self.writer, "\x1b[<{};{};{}M", button, x, y)?;
-            self.writer.flush()?;
-        } else {
-            self.encode_x10_or_utf8(event, button)?;
-        }
-
-        Ok(())
+        self.write_mouse_report(event, button, false)
     }
 
     fn mouse_button_release(&mut self, event: MouseEvent) -> anyhow::Result<()> {
@@ -197,20 +237,7 @@ impl TerminalState {
             self.increment_seqno();
             self.current_mouse_buttons.retain(|&b| b != button);
             if self.mouse_tracking || self.button_event_mouse || self.any_event_mouse {
-                if self.mouse_encoding == MouseEncoding::SGR {
-                    let (x, y) = sgr_cell_coords(&event);
-                    log::trace!("release {event:?} ESC [<{};{};{}m", release_button, x, y);
-                    write!(self.writer, "\x1b[<{};{};{}m", release_button, x, y)?;
-                    self.writer.flush()?;
-                } else if self.mouse_encoding == MouseEncoding::SgrPixels {
-                    let (x, y) = self.sgr_pixel_coords(event);
-                    log::trace!("release {event:?} ESC [<{};{};{}m", release_button, x, y);
-                    write!(self.writer, "\x1b[<{};{};{}m", release_button, x, y)?;
-                    self.writer.flush()?;
-                } else {
-                    let release_button = 3;
-                    self.encode_x10_or_utf8(event, release_button)?;
-                }
+                self.write_mouse_report(event, release_button, true)?;
             }
         }
 
@@ -244,19 +271,7 @@ impl TerminalState {
             let (button, _button) = self.mouse_report_button_number(&event);
             let button = 32 + button;
 
-            if self.mouse_encoding == MouseEncoding::SGR {
-                let (x, y) = sgr_cell_coords(&event);
-                log::trace!("move {event:?} ESC [<{};{};{}M", button, x, y);
-                write!(self.writer, "\x1b[<{};{};{}M", button, x, y)?;
-                self.writer.flush()?;
-            } else if self.mouse_encoding == MouseEncoding::SgrPixels {
-                let (x, y) = self.sgr_pixel_coords(event);
-                log::trace!("move {event:?} ESC [<{};{};{}M", button, x, y);
-                write!(self.writer, "\x1b[<{};{};{}M", button, x, y)?;
-                self.writer.flush()?;
-            } else {
-                self.encode_x10_or_utf8(event, button)?;
-            }
+            self.write_mouse_report(event, button, false)?;
         }
         Ok(())
     }

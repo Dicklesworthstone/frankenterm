@@ -18,10 +18,12 @@ private actor KeyboardTestTransport: TerminalByteTransport {
 
 /// Deliberately synthetic key encoder. Production must use the canonical Rust
 /// mode/keyboard implementation; these tokens expose duplication and ordering.
-private actor KeyboardTestEncoder: TerminalKeyboardEncoding {
+private actor KeyboardTestEncoder: TerminalKeyboardEncoding, TerminalPointerEncoding {
     var shouldBlock = false, failNext = false, entered = false
     var continuation: CheckedContinuation<Void, Never>?
     var calls = 0
+    var pointerGeometry: UInt64 = 1
+    func resizePointerGeometry(_ value: UInt64) { pointerGeometry = value }
     func block() { shouldBlock = true }
     func fail() { failNext = true }
     func isEntered() -> Bool { entered }
@@ -41,6 +43,16 @@ private actor KeyboardTestEncoder: TerminalKeyboardEncoding {
             bytes = Data("<\(prefix):\(key.usage)>".utf8)
         case .releaseAll(let keys): bytes = Data(keys.map { "<U:\($0.usage)>" }.joined().utf8)
         }
+        guard bytes.count <= maximumBytes else { throw TerminalKeyboardError.capacity }
+        return bytes
+    }
+    func encodePointer(_ event: TerminalPointerEvent, source: TerminalSource, maximumBytes: Int) async throws -> Data {
+        calls += 1; entered = true
+        if shouldBlock { await withCheckedContinuation { continuation = $0 } }
+        try Task.checkCancellation()
+        guard event.source == source else { throw TerminalInputError.stale }
+        guard event.geometryRevision == pointerGeometry else { throw TerminalModelError.stale }
+        let bytes = Data("<down><up>".utf8)
         guard bytes.count <= maximumBytes else { throw TerminalKeyboardError.capacity }
         return bytes
     }
@@ -107,6 +119,15 @@ final class TerminalMarkedTextTests: XCTestCase {
 
 @MainActor
 final class TerminalKeyboardSessionTests: XCTestCase {
+    private func pointer(_ source: TerminalSource, geometry: UInt64 = 1) throws -> TerminalPointerEvent {
+        let frame = TerminalRenderFrame(source: source, sequence: 1, geometryRevision: geometry,
+            paletteRevision: 1, fontRevision: 1, revision: 1, rows: 2, columns: 4, viewportFirst: 0, flags: 1 | 64,
+            cursor: .init(stableRow: 0, column: 0, shape: 1, width: 1, visible: false),
+            lines: (0..<2).map { .init(stableIndex: Int64($0), sequence: 1, cells: []) },
+            palette: Array(repeating: .init(0, 0, 0), count: 265), links: [], history: .init(first: 0, live: 0))
+        return try .init(action: .click, column: 2, row: 1, frame: frame)
+    }
+
     private func setup(limits: TerminalInputLimits = TerminalInputLimits(), maximumEvents: Int = 128,
                        maximumBytes: Int = 32_768) async throws
         -> (TerminalInputCoordinator, KeyboardTestTransport, TerminalSource, KeyboardTestEncoder, TerminalKeyboardSession) {
@@ -132,6 +153,79 @@ final class TerminalKeyboardSessionTests: XCTestCase {
         }
         XCTFail("controlled encoder did not enter")
     }
+
+    func testPointerUsesKeyboardFIFOAndRejectsForeignSourceAndComposition() async throws {
+        let (coordinator, transport, source, _, session) = try await setup()
+        let other = try await coordinator.attach(KeyboardTestTransport(machine: "other"))
+        XCTAssertThrowsError(try session.pointer(pointer(other))) {
+            XCTAssertEqual($0 as? TerminalInputError, .stale)
+        }
+        try session.insertText("before")
+        try session.pointer(pointer(source))
+        try session.insertText("after")
+        await session.waitUntilSettled(); try await drain(coordinator, source)
+        let written = await transport.bytes()
+        XCTAssertEqual(written, Data("before<down><up>after".utf8))
+        XCTAssertEqual(session.accounting.admittedEvents, 3)
+        try session.setMarkedText("draft", selectedRange: NSRange(location: 5, length: 0))
+        XCTAssertThrowsError(try session.pointer(pointer(source))) {
+            XCTAssertEqual($0 as? TerminalInputError, .compositionPending)
+        }
+        session.suspend(); await session.waitUntilSuspended()
+    }
+
+    func testPointerCapacityRefusesWholeClickAndExplicitRetryAdmitsItOnce() async throws {
+        var limits = TerminalInputLimits(); limits.bytesPerConnection = 16; limits.totalBytes = 64
+        let (coordinator, transport, source, _, session) = try await setup(limits: limits)
+        try session.insertText("12345678")
+        try session.pointer(pointer(source))
+        await session.waitUntilSettled()
+        XCTAssertEqual(session.phase, .blocked)
+        XCTAssertEqual(session.accounting.admittedEvents, 1)
+        let queued = await coordinator.accounting()
+        XCTAssertEqual(queued.retainedBytes, 8, "neither mouse transition fits by itself")
+        try await drain(coordinator, source)
+        let beforeRetry = await transport.bytes()
+        XCTAssertEqual(beforeRetry, Data("12345678".utf8))
+        try session.retryLocalAdmission()
+        await session.waitUntilSettled(); try await drain(coordinator, source)
+        let afterRetry = await transport.bytes()
+        XCTAssertEqual(afterRetry, Data("12345678<down><up>".utf8))
+        XCTAssertEqual(session.phase, .active)
+        session.suspend(); await session.waitUntilSuspended()
+    }
+
+    func testStalePointerGeometryIsDiscardedWithoutBlockingLaterTyping() async throws {
+        let (coordinator, transport, source, encoder, session) = try await setup()
+        await encoder.resizePointerGeometry(2)
+        try session.pointer(pointer(source, geometry: 1))
+        try session.insertText("still typing")
+        await session.waitUntilSettled(); try await drain(coordinator, source)
+        let written = await transport.bytes()
+        XCTAssertEqual(written, Data("still typing".utf8))
+        XCTAssertEqual(session.phase, .active); XCTAssertNil(session.recovery)
+        XCTAssertEqual(session.accounting.discardedUnadmittedEvents, 1)
+        session.suspend(); await session.waitUntilSuspended()
+    }
+
+    func testAdmittedPointerStaysOnOriginalSourceAcrossFocusHandoff() async throws {
+        let (coordinator, transport, source, encoder, session) = try await setup()
+        let otherTransport = try KeyboardTestTransport(machine: "other")
+        let other = try await coordinator.attach(otherTransport)
+        await encoder.block()
+        try session.pointer(pointer(source))
+        await entered(encoder)
+        let handoff = Task { try await session.handoff(to: other) }
+        for _ in 0..<100 where session.phase == .active { await Task.yield() }
+        await encoder.release()
+        let next = try await handoff.value
+        XCTAssertEqual(next.source, other)
+        try await drain(coordinator, source); try await drain(coordinator, other)
+        let original = await transport.bytes(), successor = await otherTransport.bytes()
+        XCTAssertEqual(original, Data("<down><up>".utf8)); XCTAssertTrue(successor.isEmpty)
+        XCTAssertThrowsError(try session.pointer(pointer(source)))
+    }
+
     func testRealCoordinatorReceivesCommittedTextExactlyOnceWithoutReturn() async throws {
         let (coordinator, transport, source, _, session) = try await setup()
         try session.setMarkedText("候", selectedRange: NSRange(location: 1, length: 0))

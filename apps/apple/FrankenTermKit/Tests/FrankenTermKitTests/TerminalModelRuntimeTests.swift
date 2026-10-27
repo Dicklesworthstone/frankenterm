@@ -91,6 +91,11 @@ private final class OwnedModelFixture: TerminalSessionModel, @unchecked Sendable
         events.append("encode")
         return encoded
     }
+    func encodePointer(_ event: TerminalPointerEvent, maximumBytes: Int) -> Data {
+        lock.lock(); defer { lock.unlock() }
+        events.append("pointer")
+        return encoded
+    }
     func preparePaste(_ text: String, maximumBytes: Int) -> TerminalPreparedPaste {
         lock.lock(); defer { lock.unlock() }
         events.append("paste")
@@ -190,6 +195,15 @@ private actor ModelRuntimeDelivery: TerminalModelDelivery {
 }
 
 final class TerminalModelRuntimeTests: XCTestCase, @unchecked Sendable {
+    private func pointer(_ source: TerminalSource) throws -> TerminalPointerEvent {
+        let frame = TerminalRenderFrame(source: source, sequence: 1, geometryRevision: 1,
+            paletteRevision: 1, fontRevision: 1, revision: 1, rows: 2, columns: 4, viewportFirst: 0, flags: 1 | 64,
+            cursor: .init(stableRow: 0, column: 0, shape: 1, width: 1, visible: false),
+            lines: (0..<2).map { .init(stableIndex: Int64($0), sequence: 1, cells: []) },
+            palette: Array(repeating: .init(0, 0, 0), count: 265), links: [], history: .init(first: 0, live: 0))
+        return try .init(action: .click, column: 2, row: 1, frame: frame)
+    }
+
     private func source(limits: TerminalInputLimits = .init()) async throws
         -> (TerminalInputCoordinator, ModelRuntimeTransport, TerminalSource) {
         let coordinator = try TerminalInputCoordinator(limits: limits), transport = try ModelRuntimeTransport()
@@ -433,6 +447,76 @@ final class TerminalModelRuntimeTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(written, Data([0x31, 0x32]))
         let outcomes = try await coordinator.pendingOutcomes(source)
         XCTAssertEqual(outcomes.outcomes.map(\.receipt), [receipt])
+        try await runtime.close()
+    }
+
+    func testPointerTransactionKeepsModesAndGeometryStableThroughAdmission() async throws {
+        let (coordinator, transport, source) = try await source()
+        let model = OwnedModelFixture(source: source, encoded: Data([0x31, 0x32]))
+        let runtime = TerminalModelRuntime(model: model, coordinator: coordinator, delivery: ModelRuntimeDelivery())
+        let stream = try await coordinator.makeStream(sceneID: UUID())
+        let focus = try await coordinator.changeFocus(stream, to: source)
+        let pointer = try pointer(source)
+        let encoded = ModelRuntimeGate(), admit = ModelRuntimeGate(), refused = ModelRuntimeGate()
+        let input = Task {
+            try await runtime.withInputTransaction(source: source) {
+                let bytes = try await runtime.encodePointer(pointer, source: source, maximumBytes: 2)
+                await encoded.release()
+                await admit.wait()
+                let receipt = try await coordinator.submit(focus, encodedBytes: bytes)
+                model.recordAdmission()
+                return receipt
+            }
+        }
+        await encoded.wait()
+        let resize = try TerminalSessionGeometry(columns: 80, rows: 24)
+        let output = Task {
+            do { try await runtime.receive(.init(output: Data([0x90]), resized: resize), source: source); return true }
+            catch TerminalModelError.busy { await refused.release(); return false }
+        }
+        let extra = Task {
+            do { try await runtime.receive(.init(output: Data([0x91]), resized: resize), source: source); return true }
+            catch TerminalModelError.busy { await refused.release(); return false }
+        }
+        await refused.wait()
+        XCTAssertEqual(model.snapshot().events, ["pointer"], "remote modes and the grid cannot change mid-click")
+        let before = await coordinator.accounting()
+        XCTAssertEqual(before.retainedBytes, 0)
+        await admit.release()
+        let receipt = try await input.value
+        let results = try await (output.value, extra.value)
+        XCTAssertNotEqual(results.0, results.1)
+        XCTAssertEqual(model.snapshot().events, ["pointer", "admitted", "resize:80x24", "feed", "capture"])
+        _ = try await coordinator.drainOne(source)
+        let written = await transport.bytes()
+        XCTAssertEqual(written, Data([0x31, 0x32]))
+        let outcomes = try await coordinator.pendingOutcomes(source)
+        XCTAssertEqual(outcomes.outcomes.map(\.receipt), [receipt])
+        try await runtime.close()
+    }
+
+    func testPointerRejectsForeignHiddenAndHistorySourcesBeforeModelEncoding() async throws {
+        let (coordinator, _, source) = try await source()
+        let (_, _, other) = try await self.source()
+        let model = OwnedModelFixture(source: source)
+        let runtime = TerminalModelRuntime(model: model, coordinator: coordinator, delivery: ModelRuntimeDelivery())
+        let pointer = try pointer(source), foreign = try self.pointer(other)
+        do { _ = try await runtime.encodePointer(foreign, source: source, maximumBytes: 64); XCTFail("Foreign gesture accepted") }
+        catch { XCTAssertEqual(error as? TerminalInputError, .stale) }
+        do { _ = try await runtime.encodePointer(pointer, source: other, maximumBytes: 64); XCTFail("Foreign focus accepted") }
+        catch { XCTAssertEqual(error as? TerminalInputError, .stale) }
+        try await runtime.setVisible(false, source: source)
+        do { _ = try await runtime.encodePointer(pointer, source: source, maximumBytes: 64); XCTFail("Hidden pointer accepted") }
+        catch { XCTAssertEqual(error as? TerminalModelError, .stale) }
+        try await runtime.setViewport(top: -1, source: source)
+        try await runtime.setVisible(true, source: source)
+        do { _ = try await runtime.encodePointer(pointer, source: source, maximumBytes: 64); XCTFail("History pointer accepted") }
+        catch { XCTAssertEqual(error as? TerminalModelError, .stale) }
+        XCTAssertFalse(model.snapshot().events.contains("pointer"))
+        try await runtime.setViewport(top: nil, source: source)
+        let bytes = try await runtime.encodePointer(pointer, source: source, maximumBytes: 64)
+        XCTAssertEqual(bytes, Data([0xA5]))
+        XCTAssertEqual(model.snapshot().events.filter { $0 == "pointer" }, ["pointer"])
         try await runtime.close()
     }
 
@@ -715,6 +799,8 @@ final class TerminalModelRuntimeTests: XCTestCase, @unchecked Sendable {
             paste: .init(text: "unsafe\u{1B}", bracketed: true))
         let runtime = TerminalModelRuntime(model: model, coordinator: coordinator, delivery: ModelRuntimeDelivery())
         do { _ = try await runtime.encode(.text("x"), source: source, maximumBytes: 1); XCTFail("Oversize encoding escaped") }
+        catch { XCTAssertEqual(error as? TerminalModelError, .capacity) }
+        do { _ = try await runtime.encodePointer(pointer(source), source: source, maximumBytes: 1); XCTFail("Oversize pointer escaped") }
         catch { XCTAssertEqual(error as? TerminalModelError, .capacity) }
         do { _ = try await runtime.preparePaste("x", source: source, maximumBytes: 20); XCTFail("Unsafe normalized paste escaped") }
         catch { XCTAssertEqual(error as? TerminalModelError, .invalid) }

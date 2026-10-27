@@ -178,9 +178,13 @@ protocol TerminalSessionFocus: AnyObject {
     func detach(machineID: String, source: TerminalSource) async throws
     func inputRetired(machineID: String)
     /// A tap on the terminal asked for the keyboard back.
-    func activateKeyboard() async
+    func activateKeyboard(showKeyboard: Bool, source: TerminalSource?) async
     /// The user picked a text size on one terminal; every terminal follows.
     func fontSizeChanged(_ size: Double)
+}
+
+extension TerminalSessionFocus {
+    func activateKeyboard() async { await activateKeyboard(showKeyboard: true, source: nil) }
 }
 
 /// Owns one direct-SSH connection, PTY, model and native display. Keyboard
@@ -254,6 +258,7 @@ final class TerminalSessionController {
     @ObservationIgnored private var keyboard: TerminalKeyboardSession?
     @ObservationIgnored private var keyboardRecoveryObservation: (keyboard: TerminalKeyboardSession, token: UUID)?
     @ObservationIgnored private var localInputReset: Task<Void, Never>?
+    @ObservationIgnored private var pointerFocusActivation: Task<Void, Never>?
     @ObservationIgnored private weak var focus: (any TerminalSessionFocus)?
     @ObservationIgnored private var attached = false
     @ObservationIgnored private var startup: Task<Void, Never>?
@@ -349,6 +354,7 @@ final class TerminalSessionController {
         guard overviewBlocking != blocked else { return }
         overviewBlocking = blocked
         if blocked {
+            pointerFocusActivation?.cancel()
             localInputReset?.cancel()
             viewAttachment?.cancel()
             terminal?.input.retire(); keyboard?.suspend()
@@ -799,6 +805,7 @@ final class TerminalSessionController {
         // others give their panes back to the desktop's layout.
         connection?.muxControl?.setVisible(visible)
         if !visible {
+            pointerFocusActivation?.cancel()
             // A delayed view/focus build must not navigate back to a machine
             // the user has already left. Its owner remains retained to join.
             viewAttachment?.cancel(); paneHandoff?.cancel()
@@ -825,7 +832,7 @@ final class TerminalSessionController {
     }
 
     /// Installs only the source-matching keyboard published by navigation.
-    func install(_ keyboard: TerminalKeyboardSession) {
+    func install(_ keyboard: TerminalKeyboardSession, showKeyboard: Bool = true) {
         guard !stopped, phase == .live, let terminal,
               terminal.input.session !== keyboard else { return }
         guard keyboard.originalFocus.source == pump?.source else {
@@ -846,7 +853,7 @@ final class TerminalSessionController {
             self.keyboard = keyboard
             try observeKeyboardRecovery(keyboard)
             clipboard?.inputInstalled()
-            terminal.requestKeyboard(true)
+            terminal.requestKeyboard(showKeyboard)
         } catch { keyboard.suspend(); fail(Self.describe(error)) }
     }
 
@@ -1136,6 +1143,15 @@ final class TerminalSessionController {
                     self.submitPointer(.click(column: column, row: row),
                         destination: expectedMux, control: control, view: view)
                 }
+            } else {
+                view.onRemoteScroll = { [weak self, weak view] steps, column, row in
+                    guard let self, let view else { return }
+                    self.submitDirectPointer(.wheel(steps: steps), column: column, row: row, view: view)
+                }
+                view.onRemoteClick = { [weak self, weak view] column, row in
+                    guard let self, let view else { return }
+                    self.submitDirectPointer(.click, column: column, row: row, view: view)
+                }
             }
             view.onFailure = { [weak self, weak view] error in
                 guard let self, let view, self.terminal === view else { return }
@@ -1146,6 +1162,10 @@ final class TerminalSessionController {
                 self.connection?.muxControl?.inputRouting.discardPointers()
                 self.clipboard?.inputRetired()
                 self.focus?.inputRetired(machineID: self.target.machineID)
+            }
+            view.onKeyboardDismissed = { [weak self, weak view] in
+                guard let self, let view else { return }
+                self.restorePointerFocus(afterHiding: view)
             }
             setPresentationVisible(presentationVisible)
             view.requestKeyboard(presentationVisible)
@@ -1177,6 +1197,43 @@ final class TerminalSessionController {
             // A retired or not-yet-presentable visit is not a broken session.
         } catch {
             interactionProblem = "The gesture was not accepted: \(Self.describe(error)). It will not be replayed."
+        }
+    }
+
+    private func submitDirectPointer(_ action: TerminalPointerAction, column: Int, row: Int,
+                                     view: NativeTerminalView) {
+        guard !stopped, !overviewBlocking, phase == .live, presentationVisible,
+              !clipboardIsPresenting, !localInputNeedsDecision, terminal === view,
+              view.isSceneActive, connection?.muxControl == nil,
+              focus?.shows(machineID: target.machineID) == true,
+              let projection = view.renderer.pointerProjection else { return }
+        do {
+            let event = try TerminalPointerEvent(action: action, column: column, row: row, frame: projection.frame)
+            try view.input.session.pointer(event)
+        } catch TerminalInputError.stale {
+            // The original grid has gone away; no mouse bytes were admitted.
+        } catch {
+            interactionProblem = "The gesture was not accepted: \(Self.describe(error)). Try it again when terminal input is ready."
+        }
+    }
+
+    /// Dismissing the software keyboard retires its IME callbacks and held
+    /// keys first. One owned activation then publishes a new same-source focus
+    /// for pointer input without making its responder first responder.
+    private func restorePointerFocus(afterHiding view: NativeTerminalView) {
+        guard pointerFocusActivation == nil, !stopped, phase == .live,
+              terminal === view, presentationVisible, view.isSceneActive,
+              !overviewBlocking, !keyboardActivationBlocked,
+              focus?.shows(machineID: target.machineID) == true else { return }
+        let source = view.source, activity = view.sceneActivityGeneration
+        pointerFocusActivation = Task { [weak self, weak view] in
+            guard let self else { return }
+            defer { self.pointerFocusActivation = nil }
+            guard !Task.isCancelled, let view, self.terminal === view, view.isSceneActive,
+                  view.sceneActivityGeneration == activity,
+                  self.presentationVisible, !self.stopped, !self.overviewBlocking,
+                  !self.keyboardActivationBlocked else { return }
+            await self.focus?.activateKeyboard(showKeyboard: false, source: source)
         }
     }
 
@@ -1394,6 +1451,7 @@ final class TerminalSessionController {
     }
 
     private func sealLocalOwnership() {
+        pointerFocusActivation?.cancel()
         presentationVisible = false
         retireKeyboardRecovery()
         muxObservation?.retire()
@@ -1485,6 +1543,7 @@ final class TerminalSessionController {
         startup = nil
         if let viewAttachment { await viewAttachment.value }
         if let localInputReset { await localInputReset.value; self.localInputReset = nil }
+        if let pointerFocusActivation { await pointerFocusActivation.value; self.pointerFocusActivation = nil }
         if let paneHandoff { await paneHandoff.value; self.paneHandoff = nil }
         sealLocalOwnership()
         if let muxObservation { await muxObservation.close(); self.muxObservation = nil }

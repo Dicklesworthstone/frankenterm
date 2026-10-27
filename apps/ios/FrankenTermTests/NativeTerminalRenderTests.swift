@@ -137,6 +137,48 @@ final class NativeTerminalRenderTests: XCTestCase {
         XCTAssertFalse(try XCTUnwrap(model).captureFrame(viewportTop: nil).isEmpty)
     }
 
+    func testPointerProjectionRequiresCompletedCurrentGeometryAndActiveScene() async throws {
+        _ = try await render("\u{1b}[?1000h\u{1b}[?1006hmouse target\r\n$ ", name: "pointer-terminal-geometry")
+        let view = try XCTUnwrap(view), model = try XCTUnwrap(model)
+        let original = try XCTUnwrap(view.pointerProjection)
+        XCTAssertTrue(original.frame.mouseGrabbed)
+        XCTAssertGreaterThan(original.cellSize.width, 0); XCTAssertGreaterThan(original.cellSize.height, 0)
+        view.setSceneActive(false)
+        XCTAssertNil(view.pointerProjection)
+        let resumed = expectation(description: "a new completed draw after scene activation")
+        var resumedOnce = false
+        view.onCaret = { _ in if !resumedOnce { resumedOnce = true; resumed.fulfill() } }
+        view.setSceneActive(true)
+        XCTAssertNil(view.pointerProjection, "an old completed draw cannot authorize a resumed gesture")
+        await fulfillment(of: [resumed], timeout: 20)
+        XCTAssertNotNil(view.pointerProjection)
+
+        try model.resize(.init(columns: UInt32(original.frame.columns + 1), rows: UInt32(original.frame.rows)))
+        let admitted = expectation(description: "the replacement grid is admitted before it is drawn")
+        let resized = expectation(description: "a completed draw of the replacement grid")
+        var admittedOnce = false, resizedOnce = false
+        view.onFrameAdmitted = { frame in
+            if !admittedOnce, frame.geometryRevision > original.frame.geometryRevision {
+                admittedOnce = true
+                XCTAssertNil(view.pointerProjection, "admission cannot reuse the old grid's completed draw")
+                admitted.fulfill()
+            }
+        }
+        view.onCaret = { _ in
+            if !resizedOnce, let projection = view.pointerProjection,
+               projection.frame.geometryRevision > original.frame.geometryRevision {
+                resizedOnce = true; resized.fulfill()
+            }
+        }
+        try view.submit(model.captureFrame(viewportTop: nil), source: model.source)
+        await fulfillment(of: [admitted, resized], timeout: 20)
+        let current = try XCTUnwrap(view.pointerProjection)
+        XCTAssertGreaterThan(current.frame.geometryRevision, original.frame.geometryRevision)
+        XCTAssertEqual(current.frame.columns, original.frame.columns + 1)
+        view.retire(); view.setSceneActive(true)
+        XCTAssertNil(view.pointerProjection, "retirement cannot reactivate pointer authority")
+    }
+
     /// Summed glyph intensity per pixel column of row 0, cell 0 (cell geometry
     /// from the caret, cursor at row 1 column 0).
     private func firstCellColumnProfile(_ shot: Snapshot, _ caret: NativeTerminalCaret?) throws -> [Int] {

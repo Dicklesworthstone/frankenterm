@@ -57,6 +57,8 @@ public final class NativeTerminalRenderView: MTKView {
     private var prepared: NativePreparedTerminalFrame?
     private var pending: Data?
     private var latest: TerminalRenderFrame?
+    private var completedPointerProjection: (geometry: UInt64, font: UInt64, viewport: Int64,
+                                             live: Bool, cellSize: CGSize, generation: UInt64)?
     private var preparing = false
     private var preparationGeneration: UInt64 = 1
     private var deliveredCaret: UInt64 = 0
@@ -116,6 +118,17 @@ public final class NativeTerminalRenderView: MTKView {
     /// One cell in points at the current font, once a frame has been laid
     /// out. Cells start at the view's top-left corner.
     public private(set) var cellSize: CGSize?
+    /// Mouse coordinates require a completed draw and its exact cell metrics.
+    /// Admission may be ahead of Metal; never mix that newer grid with a
+    /// previous font/layout, or keep a projection through a hidden scene.
+    public var pointerProjection: (frame: TerminalRenderFrame, cellSize: CGSize)? {
+        guard active, !retired, let projected = completedPointerProjection, let latest,
+              projected.generation == preparationGeneration,
+              projected.geometry == latest.geometryRevision, projected.font == latest.fontRevision,
+              projected.viewport == latest.viewportFirst, projected.live == latest.isLive,
+              latest.flags & 8 == 0 else { return nil }
+        return (latest, projected.cellSize)
+    }
     var permitsAccessibilityReading: Bool { active && !retired }
 
     /// The last admitted screen, read on demand so steady output costs nothing.
@@ -169,6 +182,7 @@ public final class NativeTerminalRenderView: MTKView {
         if active { requestPreparation() }
         else {
             accessibleOutput.discard()
+            completedPointerProjection = nil
             waitingForResources = false
             blinkTimer?.invalidate(); blinkTimer = nil
             displayLink?.isPaused = true
@@ -184,6 +198,7 @@ public final class NativeTerminalRenderView: MTKView {
     public func retire() {
         guard !retired else { return }
         retired = true; active = false; pending = nil; latest = nil
+        completedPointerProjection = nil
         accessibleOutput.discard(); accessibilityCustomRotors = nil
         blinkTimer?.invalidate(); blinkTimer = nil
         displayLink?.invalidate(); displayLink = nil; displayLifetime = nil
@@ -213,6 +228,7 @@ public final class NativeTerminalRenderView: MTKView {
     private func invalidatePreparation() throws {
         guard preparationGeneration < UInt64.max else { throw TerminalRenderError.exhausted }
         preparationGeneration += 1; discardPrepared(); failedRevision = nil
+        completedPointerProjection = nil
         blinkTimer?.invalidate(); blinkTimer = nil
         onCaretUnavailable?()
     }
@@ -372,6 +388,9 @@ public final class NativeTerminalRenderView: MTKView {
                     if succeeded {
                         if frame.lease.serial > self.deliveredCaret {
                             self.deliveredCaret = frame.lease.serial
+                            self.completedPointerProjection = frame.semantic.flags & 8 == 0
+                                ? (frame.semantic.geometryRevision, frame.semantic.fontRevision,
+                                   frame.semantic.viewportFirst, frame.semantic.isLive, frame.cellSize, frame.generation) : nil
                             let color = frame.semantic.palette[frame.semantic.reverseVideo ? 257 : 256]
                             self.onAppearance?(UIFont(name: frame.fontName, size: frame.fontPointSize)
                                 ?? .monospacedSystemFont(ofSize: frame.fontPointSize, weight: .regular),
@@ -420,7 +439,10 @@ public final class NativeTerminalRenderView: MTKView {
         }
     }
 
-    private func fail(_ error: Error) { onFailure?((error as? TerminalRenderError) ?? .unavailable) }
+    private func fail(_ error: Error) {
+        completedPointerProjection = nil
+        onFailure?((error as? TerminalRenderError) ?? .unavailable)
+    }
     @objc private func resourcesBecameAvailable() {
         guard active, !retired, waitingForResources else { return }
         requestPreparation()

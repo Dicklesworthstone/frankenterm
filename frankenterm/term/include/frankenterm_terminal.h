@@ -126,6 +126,21 @@ uint32_t ft_terminal_v1_encode_key(uint64_t session, uint32_t usage, uint32_t mo
                                   uint32_t capacity, uint32_t *written);
 uint32_t ft_terminal_v1_encode_text(uint64_t session, const uint8_t *text, uint32_t length,
                                    uint8_t *output, uint32_t capacity, uint32_t *written);
+/* Pure complete mouse gestures, admitted through the same egress as keys.
+ * action=0 is a primary-button click (steps must be 0), including press and
+ * release together; action=1 is a vertical wheel with 1..32 notches in either
+ * direction (negative is up). column/row are zero-based live cells, strictly
+ * inside the current grid. geometry_revision must equal the captured FTSF
+ * geometry; resize, alternate-screen replacement or retained synchronized
+ * output refuses the gesture as STALE. Modifiers have the key encoder layout.
+ * Pixel reporting uses the authoritative model's cell center; absent pixel
+ * geometry is UNSUPPORTED. Unrequested clicks produce no bytes. Wheel input
+ * follows canonical mouse tracking or the alternate-screen arrow-key policy.
+ * Capacity refusal copies no prefix and changes no terminal or button state. */
+uint32_t ft_terminal_v1_encode_mouse(uint64_t session, uint32_t action, int32_t steps,
+                                    uint32_t column, uint32_t row, uint32_t modifiers,
+                                    uint64_t geometry_revision, uint8_t *output,
+                                    uint32_t capacity, uint32_t *written);
 /* No bracket delimiters are returned. flags bit0 is negotiated bracketed
  * paste; all other bits are zero. The Swift egress owner frames and settles
  * the paste. ESC/C1 and non-text controls are refused before copying. */
