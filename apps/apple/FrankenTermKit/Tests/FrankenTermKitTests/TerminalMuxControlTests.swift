@@ -425,30 +425,31 @@ final class TerminalMuxQueryDriverTests: XCTestCase {
                             workingDir: nil, size: .init(rows: 24, cols: 80), isActive: active, isZoomed: false)
         }
         let listed = [pane(1, tab: 0, active: true), pane(4, tab: 2), pane(7, tab: 3)]
+        // A v0.13 server, which does not name its run: the numbers decide.
         let first = TerminalMuxShownPane(workspace: "w", machine: "ts1", defaults: defaults)
         // Nothing remembered: the desktop's active pane, and nothing to say.
-        XCTAssertEqual(first.choose(from: listed).pane, listed[0])
-        XCTAssertFalse(first.choose(from: listed).lost)
-        first.set(listed[1])
+        XCTAssertEqual(first.choose(from: listed, incarnation: nil).pane, listed[0])
+        XCTAssertFalse(first.choose(from: listed, incarnation: nil).lost)
+        first.set(listed[1], incarnation: nil)
 
         // The next connection to the same machine comes back to it.
         let next = TerminalMuxShownPane(workspace: "w", machine: "ts1", defaults: defaults)
-        XCTAssertEqual(next.record, .init(listed[1]))
-        XCTAssertEqual(next.choose(from: listed).pane, listed[1])
-        XCTAssertFalse(next.choose(from: listed).lost)
+        XCTAssertEqual(next.record, .init(listed[1], incarnation: nil))
+        XCTAssertEqual(next.choose(from: listed, incarnation: nil).pane, listed[1])
+        XCTAssertFalse(next.choose(from: listed, incarnation: nil).lost)
         XCTAssertNil(TerminalMuxShownPane(workspace: "w", machine: "ts2", defaults: defaults).record)
 
         // Gone, or its number in another tab (a restarted server): the active
         // pane, and the screen says the one being viewed closed.
         for panes in [[listed[0], listed[2]], [listed[0], pane(4, tab: 9), listed[2]]] {
-            let choice = next.choose(from: panes)
-            XCTAssertEqual(choice.pane, listed[0]); XCTAssertTrue(choice.lost)
+            let choice = next.choose(from: panes, incarnation: nil)
+            XCTAssertEqual(choice.pane, listed[0]); XCTAssertTrue(choice.lost); XCTAssertFalse(choice.restarted)
         }
-        XCTAssertNil(next.choose(from: []).pane)
+        XCTAssertNil(next.choose(from: [], incarnation: nil).pane)
         // A pane that closed while shown is forgotten: nothing to say later.
-        next.set(nil)
+        next.set(nil, incarnation: nil)
         XCTAssertNil(first.record)
-        XCTAssertFalse(first.choose(from: [listed[0]]).lost)
+        XCTAssertFalse(first.choose(from: [listed[0]], incarnation: nil).lost)
 
         let control = TerminalMuxControl()
         XCTAssertNil(control.current.notice)
@@ -469,23 +470,58 @@ final class TerminalMuxQueryDriverTests: XCTestCase {
         // Nothing remembered: nothing to mark.
         ending.markInputUnconfirmed()
         XCTAssertNil(ending.record)
-        ending.set(listed[1])
-        XCTAssertFalse(ending.choose(from: listed).inputUnconfirmed)
+        ending.set(listed[1], incarnation: nil)
+        XCTAssertFalse(ending.choose(from: listed, incarnation: nil).inputUnconfirmed)
         ending.markInputUnconfirmed()
 
         // The next connection comes back to that pane and is told; showing it
         // clears the mark, so the one after is not.
         let next = TerminalMuxShownPane(workspace: "w", machine: "ts1", defaults: defaults)
-        let choice = next.choose(from: listed)
+        let choice = next.choose(from: listed, incarnation: nil)
         XCTAssertEqual(choice.pane, listed[1]); XCTAssertFalse(choice.lost); XCTAssertTrue(choice.inputUnconfirmed)
         // Gone, or its number in another tab: only that it closed.
         for panes in [[listed[0]], [listed[0], pane(4, tab: 9)]] {
-            let other = next.choose(from: panes)
+            let other = next.choose(from: panes, incarnation: nil)
             XCTAssertTrue(other.lost); XCTAssertFalse(other.inputUnconfirmed)
         }
-        next.set(listed[1])
+        next.set(listed[1], incarnation: nil)
         XCTAssertFalse(TerminalMuxShownPane(workspace: "w", machine: "ts1", defaults: defaults)
-            .choose(from: listed).inputUnconfirmed)
+            .choose(from: listed, incarnation: nil).inputUnconfirmed)
+    }
+
+    func testAPaneShownBeforeTheServerRestartedIsNotTheOneUnderItsNumbersNow() throws {
+        let suite = "frankenterm.tests.restartedMux.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        func pane(_ id: Int) -> TerminalMuxPane {
+            TerminalMuxPane(paneId: id, tabId: id, windowId: 0, tabTitle: "", title: "p\(id)", workspace: "default",
+                            workingDir: nil, size: .init(rows: 24, cols: 80), isActive: id == 0, isZoomed: false)
+        }
+        let listed = [pane(0), pane(1)]
+        let run = Data(repeating: 0x1c, count: 16), restarted = Data(repeating: 0x2d, count: 16)
+        let shown = TerminalMuxShownPane(workspace: "w", machine: "mac", defaults: defaults)
+        shown.set(listed[1], incarnation: run)
+        shown.markInputUnconfirmed()
+        XCTAssertEqual(shown.record?.incarnation, run, "marking input keeps the run")
+
+        // The same run: the same pane, and the input it never confirmed.
+        var choice = shown.choose(from: listed, incarnation: run)
+        XCTAssertEqual(choice.pane, listed[1]); XCTAssertFalse(choice.lost); XCTAssertFalse(choice.restarted)
+        XCTAssertTrue(choice.inputUnconfirmed)
+        // Another run lists the same numbers: the desktop's active pane, told as a
+        // restart. The earlier run's input is not this pane's to report.
+        choice = shown.choose(from: listed, incarnation: restarted)
+        XCTAssertEqual(choice.pane, listed[0]); XCTAssertTrue(choice.lost); XCTAssertTrue(choice.restarted)
+        XCTAssertFalse(choice.inputUnconfirmed)
+        // A server that does not say, or a pane remembered from one: the numbers decide.
+        XCTAssertEqual(shown.choose(from: listed, incarnation: nil).pane, listed[1])
+        shown.set(listed[1], incarnation: nil)
+        choice = shown.choose(from: listed, incarnation: restarted)
+        XCTAssertEqual(choice.pane, listed[1]); XCTAssertFalse(choice.restarted)
+        // A record kept before runs were named reads as not saying.
+        defaults.set(Data(#"{"paneId":1,"tabId":1,"windowId":0,"inputUnconfirmed":false}"#.utf8),
+                     forKey: "frankenterm.mux.shownPane.w.mac")
+        XCTAssertEqual(shown.record, .init(listed[1], incarnation: nil))
     }
 
     func testAnAttachedSessionsFailureReasonReachesTheScreenBounded() {

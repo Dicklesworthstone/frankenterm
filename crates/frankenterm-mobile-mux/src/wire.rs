@@ -72,7 +72,17 @@ pub mod ident {
     /// pane list is out of date.
     pub const TAB_RESIZED: u64 = 54;
     pub const TAB_ADDED_TO_WINDOW: u64 = 55;
+    /// Current servers only: the pane list with the server's incarnation.
+    pub const LIST_PANES_COHERENT: u64 = 81;
+    pub const LIST_PANES_COHERENT_RESPONSE: u64 = 82;
+    /// Pushed in place of PANE_REMOVED, TAB_RESIZED and TAB_ADDED_TO_WINDOW
+    /// once the server answered LIST_PANES_COHERENT with a snapshot.
+    pub const TOPOLOGY_EVENT: u64 = 83;
 }
+
+/// `codec::TopologyCapabilities::FENCED_SNAPSHOT_V1`, the one capability a
+/// coherent pane list needs.
+pub const FENCED_SNAPSHOT: u64 = 1;
 
 pub type StableRowIndex = isize;
 
@@ -354,6 +364,107 @@ pub struct LivenessResponse {
 #[derive(Deserialize, Debug)]
 pub struct PaneRemoved {
     pub pane_id: usize,
+}
+
+/// PDU 81. `supported` and `required` are codec's `TopologyCapabilities`
+/// bits.
+#[derive(Serialize)]
+pub struct ListPanesCoherent {
+    pub supported: u64,
+    pub required: u64,
+}
+
+/// PDU 82.
+#[derive(Deserialize, Debug)]
+pub struct ListPanesCoherentResponse {
+    pub negotiated: u64,
+    pub stream_id: [u8; 16],
+    pub outcome: CoherentOutcome,
+}
+
+#[derive(Deserialize, Debug)]
+pub enum CoherentOutcome {
+    Snapshot(CoherentSnapshot),
+    /// The panes kept changing while the server listed them.
+    Contended {
+        attempts: u8,
+        first_revision: u64,
+        last_revision: u64,
+    },
+    RevisionExhausted,
+    Unsupported {
+        supported: u64,
+    },
+}
+
+/// `codec::CoherentPaneSnapshot`: `session_incarnation` is the same for as
+/// long as the server runs, and new after it restarts, even when the
+/// restarted server numbers its panes as before.
+#[derive(Deserialize, Debug)]
+pub struct CoherentSnapshot {
+    pub session_incarnation: [u8; 16],
+    pub snapshot_revision: u64,
+    pub panes: PaneList,
+}
+
+/// PDU 83.
+#[derive(Deserialize, Debug)]
+pub struct TopologyEvent {
+    pub stream_id: [u8; 16],
+    pub revision: u64,
+    pub event: TopologyChange,
+}
+
+/// `codec::TopologyEventKind`, in its order.
+#[derive(Deserialize, Debug)]
+pub enum TopologyChange {
+    PaneAdded {
+        pane_id: usize,
+    },
+    FloatingPaneSpawned {
+        pane_id: usize,
+        tab_id: usize,
+        window_id: usize,
+    },
+    PaneRemoved {
+        pane_id: usize,
+    },
+    WindowCreated {
+        window_id: usize,
+    },
+    WindowRemoved {
+        window_id: usize,
+    },
+    WindowInvalidated {
+        window_id: usize,
+    },
+    WindowWorkspaceChanged {
+        window_id: usize,
+        workspace: Option<String>,
+    },
+    Empty,
+    TabAddedToWindow {
+        tab_id: usize,
+        window_id: usize,
+    },
+    PaneFocused {
+        pane_id: usize,
+    },
+    TabResized {
+        tab_id: usize,
+    },
+    TabTitleChanged {
+        tab_id: usize,
+        title: String,
+    },
+    WindowTitleChanged {
+        window_id: usize,
+        title: String,
+    },
+    WorkspaceRenamed {
+        old_workspace: String,
+        new_workspace: String,
+    },
 }
 
 /// The exact v46 PDU 4 schema.

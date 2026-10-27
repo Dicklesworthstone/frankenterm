@@ -88,6 +88,9 @@ public final class NativeMuxClient: TerminalMuxClient, @unchecked Sendable {
             case UInt32(FT_MUX_EVENT_NONE): return nil
             case UInt32(FT_MUX_EVENT_READY):
                 return .ready(serverVersion: String(decoding: payload, as: UTF8.self))
+            case UInt32(FT_MUX_EVENT_INCARNATION):
+                guard payload.count == 16 else { throw TerminalModelError.invalid }
+                return .incarnation(payload)
             case UInt32(FT_MUX_EVENT_PANES):
                 let decoder = JSONDecoder()
                 decoder.keyDecodingStrategy = .convertFromSnakeCase

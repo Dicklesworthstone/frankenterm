@@ -42,6 +42,7 @@ const EVENT_CONTEXT: u32 = 8;
 const EVENT_PHONE_SIZE: u32 = 9;
 const EVENT_MOUSE_GRAB: u32 = 10;
 const EVENT_ACTIVITY: u32 = 11;
+const EVENT_INCARNATION: u32 = 12;
 /// Search flags.
 const SEARCH_CASE_SENSITIVE: u32 = 1;
 const SEARCH_REGEX: u32 = 2;
@@ -182,6 +183,7 @@ fn event_parts(event: Option<Event>) -> Result<(u32, u64, u32, u32, Vec<u8>), Er
         Some(Event::Ready { server_version }) => {
             (EVENT_READY, 0, 0, 0, server_version.into_bytes())
         }
+        Some(Event::Incarnation { id }) => (EVENT_INCARNATION, 0, 0, 0, id.to_vec()),
         Some(Event::Panes(panes)) => (
             EVENT_PANES,
             0,

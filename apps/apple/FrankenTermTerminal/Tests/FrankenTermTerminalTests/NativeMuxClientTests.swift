@@ -28,6 +28,33 @@ final class NativeMuxClientTests: XCTestCase {
         return all
     }
 
+    func testACurrentServerNamesItsRunBeforeItsPanesAndPushesTheirChanges() throws {
+        let client = try NativeMuxClient()
+        XCTAssertEqual(Array(try client.outgoing(limit: 4096)), [2, 1, 26])
+        try client.receive(frame(ident: 27, serial: 1, body: leb(70) + text("current")))
+        XCTAssertEqual(try events(client), [.ready(serverVersion: "current")])
+        // ListPanesCoherent(supported and required: a fenced snapshot), serial 2.
+        XCTAssertEqual(Array(try client.outgoing(limit: 4096)), [4, 2, 81, 1, 1])
+
+        var entry: [UInt8] = leb(0) + leb(3) + leb(7) + text("agent")
+        entry += leb(24) + leb(80) + leb(640) + leb(384) + leb(96)
+        entry += [0, 0, 1, 0] + text("default")                  // no working_dir; alt, active, zoomed
+        entry += [0, 0, 0, 1] + [0] + leb(0) + leb(0) + [0]
+        let panes = leb(1) + leb(2) + entry + leb(1) + text("tab one") + leb(0) + leb(0)
+        let run = [UInt8](repeating: 0x1c, count: 16), stream = [UInt8](repeating: 0x5a, count: 16)
+        // negotiated, stream id, Snapshot(incarnation, revision, panes).
+        try client.receive(frame(ident: 82, serial: 2, body: leb(1) + stream + leb(0) + run + leb(0) + panes))
+        let pane = TerminalMuxPane(paneId: 7, tabId: 3, windowId: 0, tabTitle: "tab one", title: "agent",
+            workspace: "default", workingDir: nil, size: .init(rows: 24, cols: 80), isActive: true, isZoomed: false)
+        XCTAssertEqual(try events(client), [.incarnation(Data(run)), .panes([pane])])
+        XCTAssertTrue(try client.outgoing(limit: 4096).isEmpty, "that was the first list")
+
+        // A topology change, PaneRemoved(7): the pane is gone; ListPanes, serial 3.
+        try client.receive(frame(ident: 83, serial: 0, body: stream + leb(1) + leb(2) + leb(7)))
+        XCTAssertEqual(try events(client), [.paneGone(paneID: 7)])
+        XCTAssertEqual(Array(try client.outgoing(limit: 4096)), [2, 3, 3])
+    }
+
     func testAV46ServerIsGreetedAndItsPanesArriveAsTypedPanes() throws {
         let client = try NativeMuxClient()
         // GetCodecVersion, serial 1.

@@ -3,9 +3,12 @@
 
 mod support;
 
+use codec::TopologyEventKind;
 use frankenterm_mobile_mux::Event;
 use frankenterm_mobile_mux::mirror::history_rows;
-use support::{Harness, all_text, assert_kept, assert_mirrored, text, wrapped_text, wraps};
+use support::{
+    Harness, all_text, assert_kept, assert_mirrored, server_frame, text, wrapped_text, wraps,
+};
 
 fn numbered(from: usize, to: usize) -> Vec<u8> {
     let mut out = Vec::new();
@@ -508,6 +511,106 @@ fn a_removed_pane_is_reported_and_the_list_refreshed() {
             .count(),
         lists + 1
     );
+}
+
+fn lists(harness: &Harness) -> usize {
+    harness
+        .server
+        .requests
+        .iter()
+        .filter(|r| **r == "ListPanes")
+        .count()
+}
+
+#[test]
+fn a_current_mux_names_its_incarnation_before_its_first_pane_list() {
+    let mut harness = Harness::new(4, 20);
+    harness.server.codec_vers = 70;
+    harness.attach();
+    let named = harness
+        .events
+        .iter()
+        .position(|event| *event == Event::Incarnation { id: [0x1c; 16] });
+    let listed = harness
+        .events
+        .iter()
+        .position(|event| matches!(event, Event::Panes(_)));
+    assert!(
+        named.is_some() && named < listed,
+        "events: {:?}",
+        harness.events
+    );
+    assert_eq!(
+        harness.server.requests[..2],
+        ["GetCodecVersion", "ListPanesCoherent"]
+    );
+    assert_eq!(lists(&harness), 0, "the coherent list is the first list");
+    assert_mirrored(&mut harness);
+
+    // A v0.13 server has no incarnation and is never asked for one.
+    let mut harness = Harness::new(4, 20);
+    harness.attach();
+    assert!(
+        !harness
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Incarnation { .. }))
+    );
+    assert!(!harness.server.requests.contains(&"ListPanesCoherent"));
+}
+
+#[test]
+fn a_current_muxs_topology_changes_list_the_panes_again() {
+    let mut harness = Harness::new(4, 20);
+    harness.server.codec_vers = 70;
+    harness.attach();
+    // A new title needs no list.
+    harness.server.topology(TopologyEventKind::TabTitleChanged {
+        tab_id: 3,
+        title: "renamed".to_owned(),
+    });
+    harness.pump();
+    assert_eq!(lists(&harness), 0);
+    harness.server.notify_tab_added();
+    harness.pump();
+    assert_eq!(lists(&harness), 1);
+    // A change a newer server knows and this client does not: the list
+    // says what it did.
+    let mut unknown = vec![0x5a; 16];
+    unknown.extend_from_slice(&[9, 99]);
+    harness
+        .server
+        .to_phone
+        .extend_from_slice(&server_frame(83, 0, &unknown, false));
+    harness.pump();
+    assert_eq!(lists(&harness), 2);
+    assert!(harness.session.is_ready());
+    harness.server.remove_pane();
+    harness.pump();
+    assert!(harness.events.contains(&Event::PaneGone { pane_id: 7 }));
+    assert_eq!(lists(&harness), 3);
+}
+
+#[test]
+fn a_current_mux_without_a_coherent_list_is_listed_plainly() {
+    let mut harness = Harness::new(4, 20);
+    harness.server.codec_vers = 70;
+    harness.server.unfenced = true;
+    harness.attach();
+    assert!(
+        !harness
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Incarnation { .. }))
+    );
+    assert_eq!(
+        harness.server.requests[..3],
+        ["GetCodecVersion", "ListPanesCoherent", "ListPanes"]
+    );
+    assert_mirrored(&mut harness);
+    harness.server.remove_pane();
+    harness.pump();
+    assert!(harness.events.contains(&Event::PaneGone { pane_id: 7 }));
 }
 
 fn search_results(

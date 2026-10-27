@@ -7,10 +7,12 @@ use crate::input::{PaneInput, Piece};
 use crate::mirror::PaneMirror;
 use crate::search::{ContextLine, SearchJob, SearchMatch, SearchQuery};
 use crate::wire::{
-    self, CodecVersion, Dialect, GetCodecVersion, GetLines, GetPaneRenderChanges, LinesResponse,
-    ListPanes, LivenessResponse, MouseButton, MouseEvent, MouseEventKind, PaneList, PaneRemoved,
-    RenderChanges, RenderHead, Resize, SearchResults, SearchScrollback, SendKeyDown,
-    SendMouseEvent, SendPaste, SendPasteCurrent, StableRowIndex, TerminalSize, WriteToPane, ident,
+    self, CodecVersion, CoherentOutcome, Dialect, GetCodecVersion, GetLines, GetPaneRenderChanges,
+    LinesResponse, ListPanes, ListPanesCoherent, ListPanesCoherentResponse, LivenessResponse,
+    MouseButton, MouseEvent, MouseEventKind, PaneList, PaneRemoved, RenderChanges, RenderHead,
+    Resize, SearchResults, SearchScrollback, SendKeyDown, SendMouseEvent, SendPaste,
+    SendPasteCurrent, StableRowIndex, TerminalSize, TopologyChange, TopologyEvent, WriteToPane,
+    ident,
 };
 use serde::Deserialize;
 use std::collections::{HashMap, VecDeque};
@@ -41,6 +43,12 @@ pub enum Event {
     /// The server speaks this client's protocol; the pane list follows.
     Ready {
         server_version: String,
+    },
+    /// Names this run of the mux server: the same for as long as it runs,
+    /// new after it restarts, even when it numbers its panes as before.
+    /// Only current servers say; it comes before the first pane list.
+    Incarnation {
+        id: [u8; 16],
     },
     /// The pane list, again whenever it may have changed.
     Panes(Vec<PaneInfo>),
@@ -109,6 +117,8 @@ pub enum Event {
 enum Request {
     Version,
     ListPanes,
+    /// The first pane list from a current server, with its incarnation.
+    CoherentPanes,
     Subscribe {
         pane_id: usize,
     },
@@ -265,6 +275,14 @@ impl Session {
         } else {
             self.listing = true;
             self.send(ident::LIST_PANES, &ListPanes {}, Request::ListPanes);
+        }
+    }
+
+    /// After a list arrives: the one asked for while it was on its way.
+    fn list_again_if_asked(&mut self) {
+        if self.list_again && !self.listing {
+            self.list_again = false;
+            self.refresh_panes();
         }
     }
 
@@ -804,7 +822,20 @@ impl Session {
                     self.events.push_back(Event::Ready {
                         server_version: version.version_string,
                     });
-                    self.refresh_panes();
+                    if dialect == Dialect::Current {
+                        // Lists asked for meanwhile follow its answer.
+                        self.listing = true;
+                        self.send(
+                            ident::LIST_PANES_COHERENT,
+                            &ListPanesCoherent {
+                                supported: wire::FENCED_SNAPSHOT,
+                                required: wire::FENCED_SNAPSHOT,
+                            },
+                            Request::CoherentPanes,
+                        );
+                    } else {
+                        self.refresh_panes();
+                    }
                 } else {
                     self.fail(format!(
                         "the mux server speaks protocol {}, and this app speaks {} to {} and {} to {}",
@@ -822,7 +853,19 @@ impl Session {
                     self.listing = false;
                 }
                 self.listed(&list, frame.serial);
-                if self.list_again && !self.listing {
+                self.list_again_if_asked();
+            }
+            ident::LIST_PANES_COHERENT_RESPONSE => {
+                let response: ListPanesCoherentResponse = wire::decode(&frame.body)?;
+                self.listing = false;
+                if let CoherentOutcome::Snapshot(snapshot) = response.outcome {
+                    self.events.push_back(Event::Incarnation {
+                        id: snapshot.session_incarnation,
+                    });
+                    self.listed(&snapshot.panes, frame.serial);
+                    self.list_again_if_asked();
+                } else {
+                    // No incarnation this time; the plain list still serves.
                     self.list_again = false;
                     self.refresh_panes();
                 }
@@ -921,6 +964,27 @@ impl Session {
             }
             // A tab or split appeared or changed shape on the desktop.
             ident::TAB_RESIZED | ident::TAB_ADDED_TO_WINDOW => self.refresh_panes(),
+            // The same changes from a server that answered a coherent list.
+            ident::TOPOLOGY_EVENT => match wire::decode::<TopologyEvent>(&frame.body) {
+                Ok(TopologyEvent {
+                    event: TopologyChange::PaneRemoved { pane_id },
+                    ..
+                }) => {
+                    self.pane_gone(pane_id);
+                    self.refresh_panes();
+                }
+                Ok(TopologyEvent {
+                    event:
+                        TopologyChange::FloatingPaneSpawned { .. }
+                        | TopologyChange::WindowInvalidated { .. }
+                        | TopologyChange::TabAddedToWindow { .. }
+                        | TopologyChange::TabResized { .. },
+                    ..
+                }) => self.refresh_panes(),
+                Ok(_) => {}
+                // A change this client does not know; the list says what it did.
+                Err(_) => self.refresh_panes(),
+            },
             ident::ERROR_RESPONSE => {
                 match request {
                     Some(Request::Version) => {
@@ -928,6 +992,11 @@ impl Session {
                     }
                     Some(Request::ListPanes) => {
                         self.fail("the mux server could not list its panes".to_owned());
+                    }
+                    Some(Request::CoherentPanes) => {
+                        self.listing = false;
+                        self.list_again = false;
+                        self.refresh_panes();
                     }
                     Some(Request::Subscribe { pane_id } | Request::Poll { pane_id }) => {
                         self.pane_gone(pane_id);

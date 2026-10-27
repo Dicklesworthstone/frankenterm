@@ -6,14 +6,18 @@
 //! Legacy46 decoder, so a request it understands is one a v46 server
 //! accepts; it writes replies from the desktop codec's structs, which v46
 //! encodes identically for PDUs 23, 25, 27, 30 and 37, and PDU 4 from
-//! copies of the v0.13 `mux::tab` types.
+//! copies of the v0.13 `mux::tab` types. Announcing a current codec, it
+//! answers the coherent pane list (PDU 82) as a current server does and
+//! then pushes topology changes as PDU 83.
 #![allow(dead_code)]
 
 use codec::{
-    GetCodecVersionResponse, GetLines, GetLinesResponse, GetPaneRenderChanges,
-    GetPaneRenderChangesResponse, LivenessResponse, MuxWireDecodedPayload, MuxWireDialect,
-    PaneRemoved, Pdu, Resize, SearchScrollbackRequest, SearchScrollbackResponse, SendKeyDown,
-    TabAddedToWindow, UnitResponse, WriteToPane,
+    CoherentPaneSnapshot, GetCodecVersionResponse, GetLines, GetLinesResponse,
+    GetPaneRenderChanges, GetPaneRenderChangesResponse, ListPanesCoherentOutcome,
+    ListPanesCoherentResponse, ListPanesResponse, LivenessResponse, MuxWireDecodedPayload,
+    MuxWireDialect, PaneRemoved, Pdu, Resize, SearchScrollbackRequest, SearchScrollbackResponse,
+    SendKeyDown, TabAddedToWindow, TopologyCapabilities, TopologyEvent, TopologyEventKind,
+    TopologyStreamId, UnitResponse, WriteToPane,
 };
 use frankenterm_mobile_mux::{Event, Session};
 use frankenterm_term::color::ColorPalette;
@@ -221,6 +225,13 @@ pub struct Server {
     /// No push follows a resize (the v0.13 handler pushes nothing itself;
     /// the program's redraw usually does).
     pub quiet_resize: bool,
+    /// A current server's incarnation, in its coherent pane list.
+    pub incarnation: [u8; 16],
+    /// A current server answers a coherent list without one.
+    pub unfenced: bool,
+    /// After a coherent list: topology changes go as PDU 83, numbered.
+    fenced: bool,
+    revision: u64,
     subscribed: bool,
     pushed: Option<Pushed>,
     seqno: termwiz::surface::SequenceNo,
@@ -249,6 +260,10 @@ impl Server {
             line_ranges: Vec::new(),
             search_ranges: Vec::new(),
             quiet_resize: false,
+            incarnation: [0x1c; 16],
+            unfenced: false,
+            fenced: false,
+            revision: 0,
             subscribed: false,
             pushed: None,
             seqno: 0,
@@ -306,6 +321,39 @@ impl Server {
                 );
                 let frame = server_frame(4, serial, &body, self.compress);
                 self.to_phone.extend_from_slice(&frame);
+            }
+            MuxWireDecodedPayload::Pdu(Pdu::ListPanesCoherent(request)) => {
+                self.requests.push("ListPanesCoherent");
+                let fenced = TopologyCapabilities::FENCED_SNAPSHOT_V1;
+                let outcome = if self.unfenced || !request.supported.contains(fenced) {
+                    ListPanesCoherentOutcome::Unsupported {
+                        supported: TopologyCapabilities::NONE,
+                    }
+                } else {
+                    self.fenced = true;
+                    ListPanesCoherentOutcome::Snapshot(CoherentPaneSnapshot {
+                        session_incarnation: mux::MuxSessionIncarnation::from_bytes(
+                            self.incarnation,
+                        ),
+                        snapshot_revision: mux::TopologyRevision::new(self.revision),
+                        panes: ListPanesResponse {
+                            tabs: vec![mux::tab::PaneNode::Leaf(self.current_entry())],
+                            tab_titles: vec!["tab one".to_owned()],
+                            window_titles: HashMap::from([(0, "window".to_owned())]),
+                            floating_panes: Vec::new(),
+                        },
+                    })
+                };
+                let reply = ListPanesCoherentResponse {
+                    negotiated: if self.fenced {
+                        fenced
+                    } else {
+                        TopologyCapabilities::NONE
+                    },
+                    stream_id: TopologyStreamId::from_bytes([0x5a; 16]),
+                    outcome,
+                };
+                self.reply(82, serial, &reply);
             }
             MuxWireDecodedPayload::Pdu(Pdu::GetPaneRenderChanges(GetPaneRenderChanges {
                 pane_id,
@@ -469,6 +517,55 @@ impl Server {
         }
     }
 
+    /// The same pane as the current `mux::tab` type.
+    fn current_entry(&mut self) -> mux::tab::PaneEntry {
+        let V46PaneEntry {
+            window_id,
+            tab_id,
+            pane_id,
+            title,
+            size,
+            working_dir,
+            alt_screen_active,
+            is_active_pane,
+            is_zoomed_pane,
+            workspace,
+            cursor_pos,
+            physical_top,
+            top_row,
+            left_col,
+            tty_name,
+        } = self.entry();
+        mux::tab::PaneEntry {
+            window_id,
+            tab_id,
+            pane_id,
+            title,
+            size,
+            working_dir,
+            alt_screen_active,
+            is_active_pane,
+            is_zoomed_pane,
+            workspace,
+            cursor_pos,
+            physical_top,
+            top_row,
+            left_col,
+            tty_name,
+        }
+    }
+
+    /// A topology change as a current server pushes it after a coherent list.
+    pub fn topology(&mut self, event: TopologyEventKind) {
+        self.revision += 1;
+        let event = TopologyEvent {
+            stream_id: TopologyStreamId::from_bytes([0x5a; 16]),
+            revision: mux::TopologyRevision::new(self.revision),
+            event,
+        };
+        self.reply(83, 0, &event);
+    }
+
     /// The v0.13 `maybe_push_pane_changes`: dirty viewport rows travel as
     /// bonus lines, plus the cursor's row.
     pub fn push(&mut self) {
@@ -525,16 +622,21 @@ impl Server {
 
     pub fn remove_pane(&mut self) {
         let pane_id = self.pane_id;
-        self.reply(37, 0, &PaneRemoved { pane_id });
+        if self.fenced {
+            self.topology(TopologyEventKind::PaneRemoved { pane_id });
+        } else {
+            self.reply(37, 0, &PaneRemoved { pane_id });
+        }
     }
 
     /// The notice every client gets when the desktop opens a tab.
     pub fn notify_tab_added(&mut self) {
-        let notice = TabAddedToWindow {
-            tab_id: self.tab_id + 1,
-            window_id: 0,
-        };
-        self.reply(55, 0, &notice);
+        let (tab_id, window_id) = (self.tab_id + 1, 0);
+        if self.fenced {
+            self.topology(TopologyEventKind::TabAddedToWindow { tab_id, window_id });
+        } else {
+            self.reply(55, 0, &TabAddedToWindow { tab_id, window_id });
+        }
     }
 }
 

@@ -2289,6 +2289,83 @@ final class TerminalSessionControllerTests: XCTestCase {
         await assertReleased(third, connections: live.connections)
     }
 
+    /// Plan 2.2, "return after a remote restart", against a real mux. Its
+    /// server restarts while the phone is away and builds its startup layout
+    /// again, so the pane the phone was showing has a successor under the same
+    /// pane, tab and window numbers. The phone knows the new run by the
+    /// server's incarnation: it says the server restarted and shows the
+    /// desktop's active pane, instead of taking the successor for the pane it
+    /// left. Needs a disposable mux (TEST_RUNNER_FT_LIVE_MUX_COMMAND) and a
+    /// script that restarts it from one of its panes
+    /// (TEST_RUNNER_FT_LIVE_MUX_RESTART; arguments: the server's pid, a file,
+    /// and a marker it writes there as STOPPING-<marker>, then
+    /// RESTARTED-<marker> once the new server listens). It ends the server twice.
+    func testAMuxServerThatRestartedWhileAwayIsNotTakenForTheOneThePhoneLeft() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let command = environment["FT_LIVE_MUX_COMMAND"], let restart = environment["FT_LIVE_MUX_RESTART"] else {
+            throw XCTSkip("Set TEST_RUNNER_FT_LIVE_MUX_COMMAND and TEST_RUNNER_FT_LIVE_MUX_RESTART to restart a disposable mux")
+        }
+        let live = try await liveScene(muxCommand: command), scene = live.scene, out = live.outPath
+        let run = UUID().uuidString.prefix(8)
+        let restarted = "FrankenTerm restarted on this machine while you were away, so the pane you were viewing "
+            + "may be gone. This is the desktop's active pane."
+        // Ends the session, then the server restarts (the pane's shell is the
+        // server's child; the script outlives it).
+        func restartServer(from session: TerminalSessionController, _ marker: String) async throws {
+            let view = try shown(session)
+            try await type("nohup /bin/zsh -f \(restart) $PPID \(out) \(marker) </dev/null >/dev/null 2>&1 &!", into: view)
+            let started = try await hostFile(out, containing: "STOPPING-\(marker)")
+            XCTAssertTrue(started.contains("STOPPING-\(marker)"), "the restart began (\(started))")
+            view.removeFromSuperview()
+            await session.stop()
+            await assertReleased(session, connections: live.connections)
+            var text = ""
+            for _ in 0..<3 where !text.contains("RESTARTED-\(marker)") {
+                text = try await hostFile(out, containing: "RESTARTED-\(marker)")
+            }
+            XCTAssertTrue(text.contains("RESTARTED-\(marker)"), "the server restarted (\(text))")
+        }
+        func shownPane(_ session: TerminalSessionController) async throws -> TerminalMuxControl.State {
+            for _ in 0..<200 where session.muxState?.shown == nil { try await Task.sleep(for: .milliseconds(25)) }
+            return try XCTUnwrap(session.muxState)
+        }
+
+        // A fresh server and layout, whatever earlier tests left.
+        try await restartServer(from: try await connect(scene, "alpha"), "A-\(run)")
+
+        // Back on a new run: told so, on the desktop's active pane.
+        let second = try await connect(scene, "alpha")
+        var state = try await shownPane(second)
+        XCTAssertEqual(second.interactionProblem, restarted)
+        XCTAssertEqual(state.shown, state.panes.first(where: \.isActive)?.paneId)
+        // Leave it on the pane the desktop is not on, and restart again into
+        // the same layout.
+        let other = try XCTUnwrap(state.panes.first { !$0.isActive }, "the startup layout has two panes")
+        second.showPane(other.paneId)
+        for _ in 0..<400 where second.muxState?.shown != other.paneId || second.paneNavigationBusy {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertEqual(second.muxState?.shown, other.paneId)
+        try await restartServer(from: second, "B-\(run)")
+
+        let third = try await connect(scene, "alpha")
+        state = try await shownPane(third)
+        XCTAssertTrue(state.panes.contains {
+            $0.paneId == other.paneId && $0.tabId == other.tabId && $0.windowId == other.windowId
+        }, "the new run repeats the numbers of the pane the phone left (\(state.panes))")
+        XCTAssertNotEqual(state.shown, other.paneId, "the successor is not taken for the pane the phone left")
+        XCTAssertEqual(state.shown, state.panes.first(where: \.isActive)?.paneId)
+        XCTAssertEqual(third.interactionProblem, restarted)
+        // The pane on screen is the new run's, and its shell answers.
+        let view = try shown(third)
+        try await type("echo NEW-\(run)-$((40+2)) >> \(out)", into: view)
+        let text = try await hostFile(out, containing: "NEW-\(run)-42")
+        XCTAssertTrue(text.contains("NEW-\(run)-42"), text)
+        view.removeFromSuperview()
+        await scene.close()
+        await assertReleased(third, connections: live.connections)
+    }
+
     /// The server pushes changes only for panes a connection has shown, so a
     /// pane the phone has not shown would keep the title it had at attach (an
     /// agent's status, say) unless the phone asks for the pane list again.

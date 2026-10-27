@@ -90,6 +90,10 @@ public struct TerminalMuxSize: Codable, Equatable, Sendable {
 
 public enum TerminalMuxEvent: Equatable, Sendable {
     case ready(serverVersion: String)
+    /// Names this run of the mux server: the same while it runs, new after it
+    /// restarts, even when it numbers its panes as before. Current servers
+    /// only, before the first pane list.
+    case incarnation(Data)
     case panes([TerminalMuxPane])
     /// Bytes for the pane's terminal, which must be rows x columns first.
     case output(paneID: Int, rows: Int, columns: Int, bytes: Data)
@@ -159,16 +163,22 @@ public final class TerminalMuxPhoneSizes: @unchecked Sendable {
 /// and launches: a connection that dropped while the phone was away comes
 /// back to that pane, not to whichever one the desktop has active.
 ///
-/// A pane is the same one only under the same pane, tab and window numbers.
-/// A running server never reuses a pane number; one that restarted would have
-/// to rebuild the same layout to repeat all three. Nothing typed before is
-/// ever replayed into the pane a new connection shows.
+/// A pane is the same one only under the same pane, tab and window numbers,
+/// on the same run of the server. A running server never reuses a pane
+/// number, but one that restarted can rebuild the same layout and repeat all
+/// three; a current server names its run (its incarnation), a v0.13 server
+/// does not, and there the numbers alone decide. Nothing typed before is ever
+/// replayed into the pane a new connection shows.
 public final class TerminalMuxShownPane: @unchecked Sendable {
     public struct Record: Codable, Equatable, Sendable {
         public let paneId: Int, tabId: Int, windowId: Int
+        /// The server's run when the pane was shown; nil when it did not say.
+        public let incarnation: Data?
         /// The connection ended before the server confirmed input sent to it.
         public var inputUnconfirmed = false
-        public init(_ pane: TerminalMuxPane) { paneId = pane.paneId; tabId = pane.tabId; windowId = pane.windowId }
+        public init(_ pane: TerminalMuxPane, incarnation: Data?) {
+            paneId = pane.paneId; tabId = pane.tabId; windowId = pane.windowId; self.incarnation = incarnation
+        }
         func names(_ pane: TerminalMuxPane) -> Bool {
             pane.paneId == paneId && pane.tabId == tabId && pane.windowId == windowId
         }
@@ -186,9 +196,10 @@ public final class TerminalMuxShownPane: @unchecked Sendable {
         lock.withLock { defaults.data(forKey: key).flatMap { try? JSONDecoder().decode(Record.self, from: $0) } }
     }
 
-    /// Remembers the pane now shown, or that none is (it closed).
-    public func set(_ pane: TerminalMuxPane?) {
-        let next = pane.map(Record.init)
+    /// Remembers the pane now shown on the server's run `incarnation`, or that
+    /// none is (it closed).
+    public func set(_ pane: TerminalMuxPane?, incarnation: Data?) {
+        let next = pane.map { Record($0, incarnation: incarnation) }
         lock.withLock {
             let stored = defaults.data(forKey: key).flatMap { try? JSONDecoder().decode(Record.self, from: $0) }
             guard stored != next else { return }
@@ -208,16 +219,21 @@ public final class TerminalMuxShownPane: @unchecked Sendable {
         }
     }
 
-    /// The pane a new connection shows from the server's list: the remembered
-    /// one while it is still there, else the desktop's active pane. `lost`
-    /// says a remembered pane is gone, and `inputUnconfirmed` that the last
-    /// connection ended before the pane confirmed input; the screen should
-    /// tell either.
-    public func choose(from panes: [TerminalMuxPane]) -> (pane: TerminalMuxPane?, lost: Bool, inputUnconfirmed: Bool) {
+    /// The pane a new connection shows from the server's list (`incarnation`
+    /// is the server's run, when it says): the remembered one while it is
+    /// still there, else the desktop's active pane. `lost` says a remembered
+    /// pane is gone, `restarted` that it went with a restart of the server,
+    /// and `inputUnconfirmed` that the last connection ended before the pane
+    /// confirmed input; the screen should tell each.
+    public func choose(from panes: [TerminalMuxPane], incarnation: Data?)
+        -> (pane: TerminalMuxPane?, lost: Bool, restarted: Bool, inputUnconfirmed: Bool) {
         let fallback = panes.first(where: \.isActive) ?? panes.first
-        guard let record else { return (fallback, false, false) }
-        if let same = panes.first(where: record.names) { return (same, false, record.inputUnconfirmed) }
-        return (fallback, true, false)
+        guard let record else { return (fallback, false, false, false) }
+        if let incarnation, let shownOn = record.incarnation, shownOn != incarnation {
+            return (fallback, true, true, false)
+        }
+        if let same = panes.first(where: record.names) { return (same, false, false, record.inputUnconfirmed) }
+        return (fallback, true, false, false)
     }
 }
 

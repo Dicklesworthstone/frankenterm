@@ -220,6 +220,10 @@ uint32_t ft_terminal_v1_frame_release(uint64_t frame);
  *              alone does not count), or a pane it never showed scrolled or
  *              moved its cursor between two PANES lists at the same size.
  *              Not repeated while an earlier one is still undrained.
+ *   INCARNATION payload: 16 bytes naming this run of the mux server, the
+ *              same while it runs and new after it restarts (even when it
+ *              numbers its panes as before). Current servers only, once,
+ *              before the first PANES.
  */
 #define FT_MUX_EVENT_NONE 0u
 #define FT_MUX_EVENT_READY 1u
@@ -233,6 +237,7 @@ uint32_t ft_terminal_v1_frame_release(uint64_t frame);
 #define FT_MUX_EVENT_PHONE_SIZE 9u
 #define FT_MUX_EVENT_MOUSE_GRAB 10u
 #define FT_MUX_EVENT_ACTIVITY 11u
+#define FT_MUX_EVENT_INCARNATION 12u
 #define FT_MUX_SEARCH_CASE_SENSITIVE 1u
 #define FT_MUX_SEARCH_REGEX 2u
 #define FT_MUX_MAX_RECEIVE_BYTES 1048576u

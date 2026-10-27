@@ -538,6 +538,8 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         let sizes: TerminalMuxPhoneSizes
         /// The pane shown on this machine, across connections.
         let shownPane: TerminalMuxShownPane
+        /// The server's run, when it says (current servers do, first).
+        var incarnation: Data?
         /// Which panes' programs have asked for the mouse.
         var grabs: [Int: Bool] = [:]
         /// When to ask for the pane list again. The server pushes changes only
@@ -610,9 +612,14 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 try await validateForeground()
             }
             // Back to the pane this phone was showing when it is still there.
-            let (chosen, lost, unconfirmed) = state.shownPane.choose(from: state.panes)
+            let (chosen, lost, restarted, unconfirmed) = state.shownPane.choose(
+                from: state.panes, incarnation: state.incarnation)
             guard let first = chosen else { throw TerminalMuxError.noPanes }
-            if lost {
+            if restarted {
+                // Even a pane under the same numbers may be a new shell now.
+                control.recordNotice("FrankenTerm restarted on this machine while you were away, so the pane "
+                    + "you were viewing may be gone. This is the desktop's active pane.")
+            } else if lost {
                 control.recordNotice("The pane you were viewing closed while you were away. This is the desktop's active pane.")
             } else if unconfirmed {
                 control.recordInputUnconfirmed()
@@ -626,7 +633,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 if pane != first.paneId { try client.restoreSize(pane: pane) }
             }
             state.sizes.removeAll()
-            state.shown = first.paneId; state.shownPane.set(first)
+            state.shown = first.paneId; state.shownPane.set(first, incarnation: state.incarnation)
             try control.inputRouting.select(pane: first.paneId)
             control.publish(panes: state.panes, shown: first.paneId)
             let signal = inputSignal
@@ -690,6 +697,8 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
             switch event {
             case .ready:
                 state.ready = true
+            case .incarnation(let incarnation):
+                state.incarnation = incarnation
             case .panes(let panes):
                 try state.control.inputRouting.replaceInventory(panes.map(\.paneId))
                 let present = Set(panes.map(\.paneId))
@@ -699,7 +708,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                     // The record follows a pane the desktop moved; one that left clears it.
                     let listed = panes.first { $0.paneId == shown }
                     if listed == nil { state.shown = nil; state.showing = false }
-                    state.shownPane.set(listed)
+                    state.shownPane.set(listed, incarnation: state.incarnation)
                 }
                 state.control.publish(panes: panes, shown: state.shown)
             case .output(let pane, let rows, let columns, let bytes):
@@ -750,7 +759,9 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 state.grabs[pane] = nil
                 state.panes.removeAll { $0.paneId == pane }
                 state.control.remove(pane: pane)
-                if state.shown == pane { state.shown = nil; state.showing = false; state.shownPane.set(nil) }
+                if state.shown == pane {
+                    state.shown = nil; state.showing = false; state.shownPane.set(nil, incarnation: state.incarnation)
+                }
             case .searchResults(let pane, let results):
                 state.queries.receive(pane: pane, results: results)
             case .context(let pane, let context):
@@ -785,7 +796,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 try state.client.hide(pane: old); try state.client.restoreSize(pane: old)
             }
             state.shown = requested; state.showing = false
-            state.shownPane.set(state.panes.first { $0.paneId == requested })
+            state.shownPane.set(state.panes.first { $0.paneId == requested }, incarnation: state.incarnation)
             try state.control.inputRouting.select(pane: requested)
             // Finish already-decoded output events before the replacement.
             // Dropping a chunk's suffix could strand the canonical parser in

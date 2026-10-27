@@ -192,6 +192,24 @@ fn the_current_dialect_is_the_desktop_codecs_window_and_layout() {
                 6,
             ),
         ),
+        // Current servers only: the pane list with the server's incarnation.
+        (
+            phone(
+                wire::ident::LIST_PANES_COHERENT,
+                8,
+                &wire::ListPanesCoherent {
+                    supported: wire::FENCED_SNAPSHOT,
+                    required: wire::FENCED_SNAPSHOT,
+                },
+            ),
+            desktop_current(
+                Pdu::ListPanesCoherent(codec::ListPanesCoherent {
+                    supported: codec::TopologyCapabilities::FENCED_SNAPSHOT_V1,
+                    required: codec::TopologyCapabilities::FENCED_SNAPSHOT_V1,
+                }),
+                8,
+            ),
+        ),
         // The one the dialects write differently.
         (
             phone(
