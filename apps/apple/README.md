@@ -2,6 +2,10 @@
 
 This directory contains the shared Swift 6 `FrankenTermKit` package and the native Xcode project for the first offline workspace-transfer slice. It is implementation source, not a signed or device-qualified terminal release.
 
+## Phone-local automatic connections
+
+Each machine's page has **Connect with Group**, an independent preference for this phone, and **Use Workspace Default** to clear the override. A local choice survives relaunch, reimport, renaming, and removal followed by reintroduction of the same stable machine ID. It changes future group preparation without ending an existing session or revoking a deliberate **Connect** action. An explicit local off choice also prevents automatically reopening that machine from the last-viewed-terminal bookmark after relaunch or restore. The group itself must still allow automatic connection. These preferences are stored separately from exported configuration and credential/trust revisions; catalog versions 1–4 migrate to version 5.
+
 ## Entry points
 
 Open `apps/apple/FrankenTerm.xcodeproj` with a stable Xcode supporting the iOS 26 SDK and Swift 6. The shared `FrankenTerm` scheme builds the iPhone/iPad application; `FrankenTermExport` builds the macOS companion (macOS 14 deployment floor). Both Apple applications link the local package and system cryptography, with no remote package downloads or generated project scripts. Linux validation additionally resolves pinned Apple Swift Crypto 4.5.2 and its locked Swift ASN.1 dependency to exercise the same maintained HPKE API. Development device signing needs the operator's selected team; no team or signing secret is embedded here.

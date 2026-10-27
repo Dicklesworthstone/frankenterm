@@ -39,7 +39,8 @@ public struct TerminalConnectionIntent: Sendable {
     /// may attach to those panes again, which creates no PTY; a new shell
     /// still needs New Session.
     private var reattachable: Set<String> = []
-    private let inventory: [String], known: Set<String>, optedIn: Set<String>
+    private let inventory: [String], known: Set<String>
+    private var optedIn: Set<String>
     private var approvedConnections: Set<String> = []
     private var startedConnections: Set<String> = []
     private var explicitTerminals: Set<String> = []
@@ -65,6 +66,23 @@ public struct TerminalConnectionIntent: Sendable {
             }
         }
         group = value
+    }
+
+    /// A saved phone-local preference changes only future group preparation.
+    /// It does not close a connection, cancel an admitted attempt, erase a
+    /// manual Connect action, or reopen a deliberately disconnected machine.
+    public mutating func setAutomaticConnection(_ enabled: Bool, machineID: String) throws {
+        try setAutomaticConnections([machineID: enabled])
+    }
+
+    /// Apply one saved snapshot before scheduling any of its machines. Invalid
+    /// IDs leave the entire current preference set unchanged.
+    public mutating func setAutomaticConnections(_ values: [String: Bool]) throws {
+        guard Set(values.keys).isSubset(of: known) else { throw TerminalConnectionIntentError.unknownMachine }
+        for (machineID, enabled) in values {
+            if enabled { optedIn.insert(machineID) }
+            else { optedIn.remove(machineID) }
+        }
     }
 
     /// A committed selection promotes approved work and may open an already

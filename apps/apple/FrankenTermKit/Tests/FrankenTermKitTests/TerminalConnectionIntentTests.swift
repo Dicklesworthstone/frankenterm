@@ -26,6 +26,41 @@ final class TerminalConnectionIntentTests: XCTestCase {
         XCTAssertEqual(try intent.connectionOrder(available: available), ["archive"])
     }
 
+    func testLocalAutoConnectOffStopsUnsentGroupWorkAcrossGroupChangesButAllowsConnect() throws {
+        var intent = try TerminalConnectionIntent(machines: machines, selectedMachineID: "build", group: work)
+        try intent.setAutomaticConnection(false, machineID: "build")
+        XCTAssertEqual(try intent.connectionOrder(available: available), ["gpu"])
+        XCTAssertEqual(intent.opening("build", creation: .onSelect), .none)
+        try intent.setGroup(.init(id: "other", machineIDs: ["build", "archive"], autoConnect: true))
+        XCTAssertEqual(try intent.connectionOrder(available: available), ["archive"])
+        try intent.setGroup(work)
+        XCTAssertEqual(try intent.connectionOrder(available: available), ["gpu"])
+        try intent.approveConnection("build")
+        XCTAssertEqual(try intent.connectionOrder(available: available), ["build", "gpu"])
+        try intent.setAutomaticConnection(false, machineID: "build")
+        XCTAssertTrue(intent.shouldPrepare("build"), "a preference change cannot revoke a deliberate Connect action")
+        try intent.disconnect("build")
+        try intent.setAutomaticConnection(true, machineID: "build")
+        XCTAssertFalse(intent.shouldPrepare("build"), "a preference change cannot undo Disconnect either")
+    }
+
+    func testLocalAutoConnectChangesPreserveLiveOwnersAndStillRequireGroupApproval() throws {
+        var intent = try TerminalConnectionIntent(machines: machines, selectedMachineID: "build", group: work)
+        try intent.connectionStarted("build")
+        try intent.terminalOpened("build")
+        try intent.setAutomaticConnections(["build": false, "gpu": false, "manual": true])
+        XCTAssertEqual(try intent.connectionOrder(available: available), ["manual"])
+        XCTAssertTrue(intent.permitsReconnect("build"), "the existing user-owned session remains reconnectable")
+        XCTAssertEqual(intent.opening("build", creation: .onSelect), .onSelect)
+        try intent.setGroup(.init(id: "work", machineIDs: work.machineIDs, autoConnect: false))
+        XCTAssertFalse(intent.shouldPrepare("manual"), "a machine preference alone does not opt its group into networking")
+        try intent.setGroup(work)
+        XCTAssertTrue(intent.shouldPrepare("manual"))
+        XCTAssertThrowsError(try intent.setAutomaticConnections(["manual": false, "absent": true]))
+        XCTAssertTrue(intent.shouldPrepare("manual"), "invalid preference snapshots apply no partial changes")
+        XCTAssertThrowsError(try intent.setAutomaticConnection(true, machineID: "absent"))
+    }
+
     func testConnectPreparesManualRouteButOnlyOpenTerminalAuthorizesItsChannel() throws {
         var intent = try TerminalConnectionIntent(machines: machines, selectedMachineID: "manual")
         try intent.approveConnection("manual")

@@ -92,6 +92,166 @@ final class WorkspaceStoreTests: XCTestCase {
         let available = try await reopened.availableCredentialIDs(workspaceID: saved[0].id)
         XCTAssertEqual(available, ["key"])
     }
+
+    func testLocalAutoConnectChoiceSurvivesRelaunchWithoutChangingTrustOrExportedDefaults() async throws {
+        let disk = StoreTestPersistence(), vault = StoreTestVault()
+        let store = WorkspaceStore(persistence: disk, vault: vault), original = try archive()
+        let first = try await store.install(original, envelopeDigest: digest, expectedRevision: nil,
+                                             sourceAndContentsConfirmed: true).workspace
+        try await store.setMachineAutoConnect(workspaceID: first.id, expectedRevision: first.revision,
+                                              machineID: "build", enabled: false)
+        let reopened = WorkspaceStore(persistence: disk, vault: vault)
+        let loaded = try await reopened.loadWithLocalPolicy()
+        let state = try XCTUnwrap(loaded.first)
+        let machines = try state.workspace.document().machines
+        XCTAssertEqual(state.workspace.revision, first.revision, "a setting must not invalidate live authentication")
+        XCTAssertEqual(state.workspace.manifest, first.manifest)
+        XCTAssertEqual(state.workspace.bindings, first.bindings)
+        XCTAssertEqual(state.connectionPreferences.autoConnectOverrides, ["build": false])
+        XCTAssertFalse(state.connectionPreferences.automaticallyConnect(machines[0]))
+        XCTAssertTrue(state.connectionPreferences.automaticallyConnect(machines[1]))
+        XCTAssertTrue(machines.allSatisfy(\.autoConnect), "the public manifest still carries the source's defaults")
+        XCTAssertEqual(vault.creates, 1); XCTAssertNil(disk.bytes(.journal))
+
+        var intent = try TerminalConnectionIntent(machines: machines.map {
+            .init(id: $0.id, autoConnect: state.connectionPreferences.automaticallyConnect($0))
+        }, selectedMachineID: "build", group: .init(id: "group", machineIDs: ["build", "gpu"], autoConnect: true))
+        XCTAssertEqual(try intent.connectionOrder(available: ["build", "gpu"]), ["gpu"])
+        try intent.approveConnection("build")
+        XCTAssertEqual(try intent.connectionOrder(available: ["build", "gpu"]), ["build", "gpu"],
+                       "a persistent local off choice must not disable explicit Connect")
+    }
+
+    func testReimportRenameRemovalAndReintroductionCannotEraseLocalAutoConnectOff() async throws {
+        let disk = StoreTestPersistence(), vault = StoreTestVault()
+        let store = WorkspaceStore(persistence: disk, vault: vault)
+        let first = try await store.install(archive(), envelopeDigest: digest, expectedRevision: nil,
+                                            sourceAndContentsConfirmed: true).workspace
+        try await store.setMachineAutoConnect(workspaceID: first.id, expectedRevision: first.revision,
+                                              machineID: "build", enabled: false)
+        let renamed = try workspaceArchive(id: "work", bundleID: "renamed") { workspace in
+            var machines = workspace["machines"] as! [[String: Any]]
+            machines[0]["name"] = "Renamed builder"; machines[0]["auto_connect"] = true
+            workspace["machines"] = machines
+        }
+        let second = try await store.install(renamed, envelopeDigest: Data(repeating: 81, count: 32),
+            expectedRevision: first.revision, sourceAndContentsConfirmed: true, associateWithExistingWorkspace: true).workspace
+        let missing = try workspaceArchive(id: "work", bundleID: "temporarily-absent") { workspace in
+            workspace["machines"] = (workspace["machines"] as! [[String: Any]]).filter { $0["id"] as? String != "build" }
+            var groups = workspace["groups"] as! [[String: Any]]
+            groups[0]["machine_order"] = ["gpu"]; workspace["groups"] = groups
+            var preferences = workspace["preferences"] as! [String: Any]
+            preferences["initial_machine_ref"] = "gpu"; workspace["preferences"] = preferences
+        }
+        let third = try await store.install(missing, envelopeDigest: Data(repeating: 82, count: 32),
+            expectedRevision: second.revision, sourceAndContentsConfirmed: true, allowMachineRemoval: true,
+            securityChangesConfirmed: true, associateWithExistingWorkspace: true).workspace
+        let reopened = WorkspaceStore(persistence: disk, vault: vault)
+        let restored = try await reopened.install(archive(keys: false, bundleID: "back-again"),
+            envelopeDigest: Data(repeating: 83, count: 32), expectedRevision: third.revision,
+            sourceAndContentsConfirmed: true, securityChangesConfirmed: true, associateWithExistingWorkspace: true).workspace
+        let loaded = try await reopened.loadWithLocalPolicy()
+        let state = try XCTUnwrap(loaded.first)
+        XCTAssertEqual(restored.id, first.id)
+        XCTAssertEqual(state.connectionPreferences.autoConnectOverrides, ["build": false])
+        XCTAssertFalse(state.connectionPreferences.automaticallyConnect(try restored.document().machines[0]))
+        XCTAssertEqual(vault.creates, 1)
+    }
+
+    func testAutoConnectChoiceIsWorkspaceScopedAndCanReturnToTheImportedDefault() async throws {
+        let disk = StoreTestPersistence(), vault = StoreTestVault()
+        let store = WorkspaceStore(persistence: disk, vault: vault)
+        let original = try workspaceArchive(id: "work", bundleID: "manual-default", keys: true) { workspace in
+            var machines = workspace["machines"] as! [[String: Any]]
+            machines[0]["auto_connect"] = false; workspace["machines"] = machines
+        }
+        let first = try await store.install(original, envelopeDigest: digest, expectedRevision: nil,
+                                             sourceAndContentsConfirmed: true).workspace
+        let other = try await store.install(workspaceArchive(id: "other-workspace", bundleID: "other"),
+            envelopeDigest: Data(repeating: 84, count: 32), expectedRevision: nil, sourceAndContentsConfirmed: true).workspace
+        let on = try await store.setMachineAutoConnect(workspaceID: first.id, expectedRevision: first.revision,
+                                                       machineID: "build", enabled: true)
+        XCTAssertTrue(on.automaticallyConnect(original.workspace.machines[0]))
+        let loaded = try await store.loadWithLocalPolicy()
+        XCTAssertEqual(loaded.first { $0.workspace.id == other.id }?.connectionPreferences.autoConnectOverrides, [:])
+        let reset = try await store.setMachineAutoConnect(workspaceID: first.id, expectedRevision: first.revision,
+                                                          machineID: "build", enabled: nil)
+        XCTAssertEqual(reset.autoConnectOverrides, [:])
+        XCTAssertFalse(reset.automaticallyConnect(original.workspace.machines[0]))
+        let before = disk.bytes(.catalog)
+        for (revision, machine) in [(UUID(), "build"), (first.revision, "absent")] {
+            do {
+                try await store.setMachineAutoConnect(workspaceID: first.id, expectedRevision: revision,
+                                                      machineID: machine, enabled: false)
+                XCTFail("a stale workspace or unknown machine changed a local preference")
+            } catch { }
+            XCTAssertEqual(disk.bytes(.catalog), before)
+        }
+        XCTAssertEqual(vault.creates, 1)
+    }
+
+    func testAutoConnectWriteFailuresReadBackOldOrNewWithoutTouchingCredentials() async throws {
+        for (fault, published) in [(StoreTestPersistence.Fault.before(.catalog), false), (.after(.catalog), true)] {
+            let disk = StoreTestPersistence(), vault = StoreTestVault()
+            let store = WorkspaceStore(persistence: disk, vault: vault)
+            let first = try await store.install(archive(), envelopeDigest: digest, expectedRevision: nil,
+                                                sourceAndContentsConfirmed: true).workspace
+            disk.configure(fault)
+            do {
+                try await store.setMachineAutoConnect(workspaceID: first.id, expectedRevision: first.revision,
+                                                      machineID: "build", enabled: false)
+                XCTFail("the configured write boundary did not fail")
+            } catch { }
+            let reopened = WorkspaceStore(persistence: disk, vault: vault)
+            let loaded = try await reopened.loadWithLocalPolicy()
+            let state = try XCTUnwrap(loaded.first)
+            XCTAssertEqual(state.connectionPreferences.autoConnectOverrides, published ? ["build": false] : [:])
+            XCTAssertEqual(state.workspace.revision, first.revision)
+            XCTAssertEqual(state.workspace.bindings, first.bindings)
+            XCTAssertEqual(vault.count, 1); XCTAssertNil(disk.bytes(.journal))
+        }
+    }
+
+    func testPublishedVersionFourMigratesWithoutInventingConnectionChoices() async throws {
+        let disk = StoreTestPersistence(), vault = StoreTestVault()
+        let store = WorkspaceStore(persistence: disk, vault: vault)
+        let first = try await store.install(archive(), envelopeDigest: digest, expectedRevision: nil,
+                                            sourceAndContentsConfirmed: true).workspace
+        var fields = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(disk.bytes(.catalog))) as? [String: Any])
+        fields["version"] = 4; fields.removeValue(forKey: "machineConnectionPreferences")
+        disk.seed(try JSONSerialization.data(withJSONObject: fields), slot: .catalog)
+        let reopened = WorkspaceStore(persistence: disk, vault: vault)
+        let loaded = try await reopened.loadWithLocalPolicy()
+        let state = try XCTUnwrap(loaded.first)
+        XCTAssertEqual(state.workspace.id, first.id); XCTAssertEqual(state.workspace.revision, first.revision)
+        XCTAssertEqual(state.workspace.manifest, first.manifest); XCTAssertEqual(state.workspace.bindings, first.bindings)
+        XCTAssertEqual(state.connectionPreferences.autoConnectOverrides, [:])
+        let migrated = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(disk.bytes(.catalog))) as? [String: Any])
+        XCTAssertEqual(migrated["version"] as? Int, 5)
+        XCTAssertEqual((migrated["machineConnectionPreferences"] as? [Any])?.count, 0)
+        XCTAssertEqual(vault.creates, 1)
+    }
+
+    func testConflictingOrUnownedConnectionChoicesRejectTheCatalogWithoutDeletingKeys() async throws {
+        let disk = StoreTestPersistence(), vault = StoreTestVault()
+        let store = WorkspaceStore(persistence: disk, vault: vault)
+        let first = try await store.install(archive(), envelopeDigest: digest, expectedRevision: nil,
+                                            sourceAndContentsConfirmed: true).workspace
+        let original = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(disk.bytes(.catalog))) as? [String: Any])
+        let off: [String: Any] = ["workspaceID": first.id.uuidString, "machineID": "build", "autoConnect": false]
+        var on = off; on["autoConnect"] = true
+        var foreign = off; foreign["workspaceID"] = UUID().uuidString
+        var malformed = off; malformed["machineID"] = "invalid\nmachine"
+        for choices in [[off, on], [foreign], [malformed], Array(repeating: off, count: 4097)] {
+            var fields = original; fields["machineConnectionPreferences"] = choices
+            let bytes = try JSONSerialization.data(withJSONObject: fields)
+            disk.seed(bytes, slot: .catalog)
+            do { _ = try await WorkspaceStore(persistence: disk, vault: vault).load(); XCTFail("corrupt preferences loaded") }
+            catch { XCTAssertEqual(error as? WorkspaceStoreError, .corruptStore) }
+            XCTAssertEqual(disk.bytes(.catalog), bytes); XCTAssertEqual(vault.count, 1)
+        }
+    }
+
     func testReviewAndRevisionFencesPrecedeAllSideEffects() async throws {
         let persistence = StoreTestPersistence(), vault = StoreTestVault()
         let store = WorkspaceStore(persistence: persistence, vault: vault), archive = try archive()
@@ -644,6 +804,7 @@ final class WorkspaceStoreTests: XCTestCase {
         catalog["workspaces"] = saved; catalog["version"] = 1
         catalog.removeValue(forKey: "acceptedImports"); catalog.removeValue(forKey: "hostRevocations")
         catalog.removeValue(forKey: "hostRequirements"); catalog.removeValue(forKey: "scopedHostRevocations")
+        catalog.removeValue(forKey: "machineConnectionPreferences")
         persistence.seed(try JSONSerialization.data(withJSONObject: catalog), slot: .catalog)
         let reopened = WorkspaceStore(persistence: persistence, vault: vault)
         let migrated = try await reopened.load()
@@ -793,7 +954,7 @@ final class WorkspaceStoreTests: XCTestCase {
         XCTAssertEqual(repeated.workspace.id, first.workspace.id)
         XCTAssertEqual(vault.creates, 1); XCTAssertNil(persistence.bytes(.journal))
         let upgraded = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(persistence.bytes(.catalog))) as? [String: Any])
-        XCTAssertEqual(upgraded["version"] as? Int, 4)
+        XCTAssertEqual(upgraded["version"] as? Int, 5)
         let accepted = try XCTUnwrap((upgraded["acceptedImports"] as? [[String: Any]])?.first)
         XCTAssertEqual(accepted["transferID"] as? String, transferID.base64EncodedString())
         XCTAssertEqual(accepted["envelopeDigest"] as? String, digest.base64EncodedString())
@@ -871,7 +1032,7 @@ final class WorkspaceStoreTests: XCTestCase {
         // Publish the migrated catalog without changing the already-local denial.
         try await reopened.revokeLocally(fingerprint: fingerprint)
         let upgraded = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(persistence.bytes(.catalog))) as? [String: Any])
-        XCTAssertEqual(upgraded["version"] as? Int, 4)
+        XCTAssertEqual(upgraded["version"] as? Int, 5)
         let preserved = try XCTUnwrap(upgraded["acceptedImports"] as? [[String: Any]])
         XCTAssertEqual(preserved.count, 2)
         XCTAssertEqual(preserved.map { $0["firstAcceptedRevision"] as? String },
@@ -1019,7 +1180,7 @@ final class WorkspaceStoreTests: XCTestCase {
             XCTAssertNil(published.range(of: Data(secret.base64EncodedString().utf8)))
             XCTAssertNil(published.range(of: Data("unknown_private_setting".utf8)))
             let catalog = try XCTUnwrap(JSONSerialization.jsonObject(with: published) as? [String: Any])
-            XCTAssertEqual(catalog["version"] as? Int, 4); XCTAssertNil(catalog["needsSanitizedPublication"])
+            XCTAssertEqual(catalog["version"] as? Int, 5); XCTAssertNil(catalog["needsSanitizedPublication"])
             let history = try XCTUnwrap((catalog["acceptedImports"] as? [[String: Any]])?.first)
             XCTAssertEqual(history["envelopeDigest"] as? String, digest.base64EncodedString())
             XCTAssertEqual(history["firstAcceptedRevision"] as? String, first.workspace.revision.uuidString)
