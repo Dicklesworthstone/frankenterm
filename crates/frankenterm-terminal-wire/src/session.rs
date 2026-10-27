@@ -1,7 +1,7 @@
 use crate::{
     AppliedAck, Capabilities, Capability, ClientFrame, ClientMessage, Dimensions, Hello, Id,
-    LeaseDisposition, Scope, ServerFrame, ServerMessage, Sha256, Welcome, WireError, WireU64,
-    MAX_SUBSCRIPTIONS, decode_client, decode_server, encode_client, encode_server,
+    LeaseDisposition, MAX_SUBSCRIPTIONS, Scope, ServerFrame, ServerMessage, Sha256, Welcome,
+    WireError, WireU64, decode_client, decode_server, encode_client, encode_server,
     validate_capabilities,
 };
 
@@ -35,14 +35,20 @@ impl SessionState {
         if scope.identity.host != self.host {
             return Err(WireError::IdentityMismatch);
         }
-        self.bindings.iter().find(|value| value.scope == *scope).ok_or(WireError::StaleScope)
+        self.bindings
+            .iter()
+            .find(|value| value.scope == *scope)
+            .ok_or(WireError::StaleScope)
     }
 
     fn binding_mut(&mut self, scope: &Scope) -> Result<&mut Binding, WireError> {
         if scope.identity.host != self.host {
             return Err(WireError::IdentityMismatch);
         }
-        self.bindings.iter_mut().find(|value| value.scope == *scope).ok_or(WireError::StaleScope)
+        self.bindings
+            .iter_mut()
+            .find(|value| value.scope == *scope)
+            .ok_or(WireError::StaleScope)
     }
 
     fn bind(
@@ -57,7 +63,11 @@ impl SessionState {
         }
         // A new incarnation/epoch cannot silently overwrite a live binding.
         // Its old exact scope must first be explicitly removed by the owner.
-        if self.bindings.iter().any(|value| value.scope.identity.pane == scope.identity.pane) {
+        if self
+            .bindings
+            .iter()
+            .any(|value| value.scope.identity.pane == scope.identity.pane)
+        {
             return Err(WireError::StaleScope);
         }
         if self.bindings.len() >= MAX_SUBSCRIPTIONS {
@@ -80,7 +90,11 @@ impl SessionState {
         Ok(())
     }
 
-    fn update_dimensions(&mut self, scope: &Scope, dimensions: Dimensions) -> Result<(), WireError> {
+    fn update_dimensions(
+        &mut self,
+        scope: &Scope,
+        dimensions: Dimensions,
+    ) -> Result<(), WireError> {
         dimensions.validate()?;
         self.binding_mut(scope)?.dimensions = dimensions;
         Ok(())
@@ -100,10 +114,16 @@ impl SessionState {
         Ok(())
     }
 
-    fn record_lease(&mut self, scope: &Scope, fence: WireU64, active: bool) -> Result<(), WireError> {
+    fn record_lease(
+        &mut self,
+        scope: &Scope,
+        fence: WireU64,
+        active: bool,
+    ) -> Result<(), WireError> {
         self.require(Some(Capability::Control))?;
         let binding = self.binding_mut(scope)?;
-        if fence.0 == 0 || fence < binding.lease_fence
+        if fence.0 == 0
+            || fence < binding.lease_fence
             || (active && !binding.lease_active && fence == binding.lease_fence)
         {
             return Err(WireError::StaleLease);
@@ -152,12 +172,19 @@ impl SessionState {
         }
         match &frame.message {
             ClientMessage::Subscribe(value) => {
-                if value.panes.as_slice().iter().any(|pane| pane.host != self.host) {
+                if value
+                    .panes
+                    .as_slice()
+                    .iter()
+                    .any(|pane| pane.host != self.host)
+                {
                     return Err(WireError::IdentityMismatch);
                 }
             }
             ClientMessage::Unsubscribe(value) => {
-                for scope in value.scopes.as_slice() { self.binding(scope)?; }
+                for scope in value.scopes.as_slice() {
+                    self.binding(scope)?;
+                }
             }
             ClientMessage::AppliedAck(value) => self.check_ack(value)?,
             ClientMessage::Resync(value) => {
@@ -194,9 +221,9 @@ impl SessionState {
                 if scope.identity.host != self.host {
                     return Err(WireError::IdentityMismatch);
                 }
-                if self.bindings.iter().any(|value|
-                    value.scope.identity.pane == scope.identity.pane && value.scope != *scope)
-                {
+                if self.bindings.iter().any(|value| {
+                    value.scope.identity.pane == scope.identity.pane && value.scope != *scope
+                }) {
                     return Err(WireError::StaleScope);
                 }
             } else {
@@ -221,7 +248,10 @@ impl SessionState {
             }
             ServerMessage::SnapshotStart(value) => {
                 let binding = self.binding(&value.scope)?;
-                if value.dimensions != binding.dimensions || value.sequence < binding.delivered {
+                if value.dimensions != binding.dimensions {
+                    return Err(WireError::StaleSequence);
+                }
+                if value.sequence < binding.delivered {
                     return Err(WireError::StaleSequence);
                 }
             }
@@ -238,7 +268,10 @@ impl SessionState {
             ServerMessage::LeaseState(value) => {
                 if let Some(fence) = value.fence {
                     let binding = self.binding(&value.scope)?;
-                    let active = matches!(value.disposition, LeaseDisposition::Granted | LeaseDisposition::Renewed);
+                    let active = matches!(
+                        value.disposition,
+                        LeaseDisposition::Granted | LeaseDisposition::Renewed
+                    );
                     if fence < binding.lease_fence
                         || (active && !binding.lease_active && fence == binding.lease_fence)
                     {
@@ -272,19 +305,31 @@ impl ServerSession {
         supported: Capabilities,
     ) -> Result<Self, WireError> {
         validate_capabilities(&supported)?;
-        Ok(Self { host, session, asset, supported, state: None })
+        Ok(Self {
+            host,
+            session,
+            asset,
+            supported,
+            state: None,
+        })
     }
 
     /// One-shot Hello/Welcome exchange. Failure leaves the session unopened.
     /// Run only after the actual HTTP/socket authentication boundary.
     pub fn negotiate(&mut self, bytes: &[u8]) -> Result<Vec<u8>, WireError> {
-        if self.state.is_some() { return Err(WireError::AlreadyNegotiated); }
+        if self.state.is_some() {
+            return Err(WireError::AlreadyNegotiated);
+        }
         let frame = decode_client(bytes)?;
         let ClientMessage::Hello(hello) = frame.message else {
             return Err(WireError::NotNegotiated);
         };
-        if hello.host != self.host { return Err(WireError::IdentityMismatch); }
-        if hello.asset != self.asset { return Err(WireError::AssetMismatch); }
+        if hello.host != self.host {
+            return Err(WireError::IdentityMismatch);
+        }
+        if hello.asset != self.asset {
+            return Err(WireError::AssetMismatch);
+        }
         let mut capabilities = Capabilities::new();
         for capability in hello.required.as_slice() {
             if !self.supported.as_slice().contains(capability) {
@@ -297,12 +342,15 @@ impl ServerSession {
                 capabilities.try_push(*capability)?;
             }
         }
-        let response = ServerFrame::new(Some(self.session.clone()), ServerMessage::Welcome(Welcome {
-            host: self.host.clone(),
-            hello_id: hello.hello_id,
-            asset: self.asset.clone(),
-            capabilities: capabilities.clone(),
-        }))?;
+        let response = ServerFrame::new(
+            Some(self.session.clone()),
+            ServerMessage::Welcome(Welcome {
+                host: self.host.clone(),
+                hello_id: hello.hello_id,
+                asset: self.asset.clone(),
+                capabilities: capabilities.clone(),
+            }),
+        )?;
         let bytes = encode_server(&response)?;
         self.state = Some(SessionState {
             host: self.host.clone(),
@@ -317,7 +365,9 @@ impl ServerSession {
         let frame = decode_client(bytes)?;
         let state = self.state.as_mut().ok_or(WireError::NotNegotiated)?;
         state.client(&frame)?;
-        if let ClientMessage::AppliedAck(ack) = &frame.message { state.accept_ack(ack)?; }
+        if let ClientMessage::AppliedAck(ack) = &frame.message {
+            state.accept_ack(ack)?;
+        }
         Ok(frame)
     }
 
@@ -331,33 +381,70 @@ impl ServerSession {
 
     /// Prepare a complete bounded snapshot from an image captured by the real
     /// terminal owner. This does not advance the delivered or applied baseline.
-    pub fn encode_snapshot(&self, snapshot: crate::FrozenSnapshot) -> Result<crate::SnapshotPublication, WireError> {
+    pub fn encode_snapshot(
+        &self,
+        snapshot: crate::FrozenSnapshot,
+    ) -> Result<crate::SnapshotPublication, WireError> {
         crate::snapshot::prepare_snapshot(self, &self.session, snapshot)
     }
 
-    pub fn bind_scope(&mut self, scope: Scope, dimensions: Dimensions, delivered: WireU64) -> Result<(), WireError> {
-        self.state.as_mut().ok_or(WireError::NotNegotiated)?.bind(scope, dimensions, delivered)
+    pub fn bind_scope(
+        &mut self,
+        scope: Scope,
+        dimensions: Dimensions,
+        delivered: WireU64,
+    ) -> Result<(), WireError> {
+        self.state
+            .as_mut()
+            .ok_or(WireError::NotNegotiated)?
+            .bind(scope, dimensions, delivered)
     }
 
     pub fn unbind_scope(&mut self, scope: &Scope) -> Result<(), WireError> {
-        self.state.as_mut().ok_or(WireError::NotNegotiated)?.unbind(scope)
+        self.state
+            .as_mut()
+            .ok_or(WireError::NotNegotiated)?
+            .unbind(scope)
     }
 
     /// Mirror an authoritative resize without resetting delivery, ACK, or lease
     /// watermarks. It does not resize the real pane or apply a browser grid.
-    pub fn update_dimensions(&mut self, scope: &Scope, dimensions: Dimensions) -> Result<(), WireError> {
-        self.state.as_mut().ok_or(WireError::NotNegotiated)?.update_dimensions(scope, dimensions)
+    pub fn update_dimensions(
+        &mut self,
+        scope: &Scope,
+        dimensions: Dimensions,
+    ) -> Result<(), WireError> {
+        self.state
+            .as_mut()
+            .ok_or(WireError::NotNegotiated)?
+            .update_dimensions(scope, dimensions)
     }
 
     /// Called after the transport owner delivered a complete publication;
     /// encoding alone never advances the allowed ACK boundary.
-    pub fn record_delivery(&mut self, scope: &Scope, previous: WireU64, sequence: WireU64) -> Result<(), WireError> {
-        self.state.as_mut().ok_or(WireError::NotNegotiated)?.record_delivery(scope, previous, sequence)
+    pub fn record_delivery(
+        &mut self,
+        scope: &Scope,
+        previous: WireU64,
+        sequence: WireU64,
+    ) -> Result<(), WireError> {
+        self.state
+            .as_mut()
+            .ok_or(WireError::NotNegotiated)?
+            .record_delivery(scope, previous, sequence)
     }
 
     /// Mirror the actual authoritative lease decision, including retired fences.
-    pub fn record_lease(&mut self, scope: &Scope, fence: WireU64, active: bool) -> Result<(), WireError> {
-        self.state.as_mut().ok_or(WireError::NotNegotiated)?.record_lease(scope, fence, active)
+    pub fn record_lease(
+        &mut self,
+        scope: &Scope,
+        fence: WireU64,
+        active: bool,
+    ) -> Result<(), WireError> {
+        self.state
+            .as_mut()
+            .ok_or(WireError::NotNegotiated)?
+            .record_lease(scope, fence, active)
     }
 }
 
@@ -374,11 +461,17 @@ pub struct BrowserSession {
 impl BrowserSession {
     pub fn new(hello: Hello) -> Result<Self, WireError> {
         hello.validate()?;
-        Ok(Self { hello, hello_sent: false, state: None })
+        Ok(Self {
+            hello,
+            hello_sent: false,
+            state: None,
+        })
     }
 
     pub fn hello_frame(&mut self) -> Result<Vec<u8>, WireError> {
-        if self.hello_sent { return Err(WireError::AlreadyNegotiated); }
+        if self.hello_sent {
+            return Err(WireError::AlreadyNegotiated);
+        }
         let frame = ClientFrame::new(None, ClientMessage::Hello(self.hello.clone()))?;
         let bytes = encode_client(&frame)?;
         self.hello_sent = true;
@@ -386,8 +479,12 @@ impl BrowserSession {
     }
 
     pub fn accept_welcome(&mut self, bytes: &[u8]) -> Result<(), WireError> {
-        if self.state.is_some() { return Err(WireError::AlreadyNegotiated); }
-        if !self.hello_sent { return Err(WireError::NotNegotiated); }
+        if self.state.is_some() {
+            return Err(WireError::AlreadyNegotiated);
+        }
+        if !self.hello_sent {
+            return Err(WireError::NotNegotiated);
+        }
         let frame = decode_server(bytes)?;
         let ServerMessage::Welcome(welcome) = frame.message else {
             return Err(WireError::NotNegotiated);
@@ -395,12 +492,19 @@ impl BrowserSession {
         if welcome.host != self.hello.host || welcome.hello_id != self.hello.hello_id {
             return Err(WireError::IdentityMismatch);
         }
-        if welcome.asset != self.hello.asset { return Err(WireError::AssetMismatch); }
-        if self.hello.required.as_slice().iter()
+        if welcome.asset != self.hello.asset {
+            return Err(WireError::AssetMismatch);
+        }
+        if self
+            .hello
+            .required
+            .as_slice()
+            .iter()
             .any(|capability| !welcome.capabilities.as_slice().contains(capability))
-            || welcome.capabilities.as_slice().iter().any(|capability|
+            || welcome.capabilities.as_slice().iter().any(|capability| {
                 !self.hello.required.as_slice().contains(capability)
-                && !self.hello.optional.as_slice().contains(capability))
+                    && !self.hello.optional.as_slice().contains(capability)
+            })
         {
             return Err(WireError::UnsupportedCapability);
         }
@@ -415,7 +519,10 @@ impl BrowserSession {
 
     pub fn decode_response(&self, bytes: &[u8]) -> Result<ServerFrame, WireError> {
         let frame = decode_server(bytes)?;
-        self.state.as_ref().ok_or(WireError::NotNegotiated)?.server(&frame)?;
+        self.state
+            .as_ref()
+            .ok_or(WireError::NotNegotiated)?
+            .server(&frame)?;
         Ok(frame)
     }
 
@@ -425,30 +532,66 @@ impl BrowserSession {
         frame.validate()?;
         state.client(&frame)?;
         let bytes = encode_client(&frame)?;
-        if let ClientMessage::AppliedAck(ack) = &frame.message { state.accept_ack(ack)?; }
+        if let ClientMessage::AppliedAck(ack) = &frame.message {
+            state.accept_ack(ack)?;
+        }
         Ok(bytes)
     }
 
-    pub fn bind_scope(&mut self, scope: Scope, dimensions: Dimensions, delivered: WireU64) -> Result<(), WireError> {
-        self.state.as_mut().ok_or(WireError::NotNegotiated)?.bind(scope, dimensions, delivered)
+    pub fn bind_scope(
+        &mut self,
+        scope: Scope,
+        dimensions: Dimensions,
+        delivered: WireU64,
+    ) -> Result<(), WireError> {
+        self.state
+            .as_mut()
+            .ok_or(WireError::NotNegotiated)?
+            .bind(scope, dimensions, delivered)
     }
 
     pub fn unbind_scope(&mut self, scope: &Scope) -> Result<(), WireError> {
-        self.state.as_mut().ok_or(WireError::NotNegotiated)?.unbind(scope)
+        self.state
+            .as_mut()
+            .ok_or(WireError::NotNegotiated)?
+            .unbind(scope)
     }
 
     /// Preserve sequence and lease fences while the host updates its geometry.
-    pub fn update_dimensions(&mut self, scope: &Scope, dimensions: Dimensions) -> Result<(), WireError> {
-        self.state.as_mut().ok_or(WireError::NotNegotiated)?.update_dimensions(scope, dimensions)
+    pub fn update_dimensions(
+        &mut self,
+        scope: &Scope,
+        dimensions: Dimensions,
+    ) -> Result<(), WireError> {
+        self.state
+            .as_mut()
+            .ok_or(WireError::NotNegotiated)?
+            .update_dimensions(scope, dimensions)
     }
 
     /// The host supplies this only after complete model application, including
     /// snapshot assembly and coverage checks. It is not a paint acknowledgment.
-    pub fn record_delivery(&mut self, scope: &Scope, previous: WireU64, sequence: WireU64) -> Result<(), WireError> {
-        self.state.as_mut().ok_or(WireError::NotNegotiated)?.record_delivery(scope, previous, sequence)
+    pub fn record_delivery(
+        &mut self,
+        scope: &Scope,
+        previous: WireU64,
+        sequence: WireU64,
+    ) -> Result<(), WireError> {
+        self.state
+            .as_mut()
+            .ok_or(WireError::NotNegotiated)?
+            .record_delivery(scope, previous, sequence)
     }
 
-    pub fn record_lease(&mut self, scope: &Scope, fence: WireU64, active: bool) -> Result<(), WireError> {
-        self.state.as_mut().ok_or(WireError::NotNegotiated)?.record_lease(scope, fence, active)
+    pub fn record_lease(
+        &mut self,
+        scope: &Scope,
+        fence: WireU64,
+        active: bool,
+    ) -> Result<(), WireError> {
+        self.state
+            .as_mut()
+            .ok_or(WireError::NotNegotiated)?
+            .record_lease(scope, fence, active)
     }
 }

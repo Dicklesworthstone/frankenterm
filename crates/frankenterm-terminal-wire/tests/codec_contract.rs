@@ -1,11 +1,11 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use frankenterm_terminal_wire::{
-    BoundedVec, Capabilities, Capability, Cell, CellStyle, ClientFrame, ClientMessage, Color, Cursor,
-    CursorShape, Delta, Dimensions, GridPatch, Hello, Id, Line, MAX_COLUMNS, MAX_FRAME_BYTES,
-    MAX_PASTE_BYTES, Mutation, PaneIdentity, PasteRequest, Scope, ServerFrame, ServerMessage, Sha256,
-    TerminalModes, Text, Underline, WireError, WireI64, WireU64, decode_client, decode_server,
-    encode_client, encode_server,
+    BoundedVec, Capabilities, Capability, Cell, CellStyle, ClientFrame, ClientMessage, Color,
+    Cursor, CursorShape, Delta, Dimensions, GridPatch, Hello, Id, Line, MAX_COLUMNS,
+    MAX_FRAME_BYTES, MAX_PASTE_BYTES, Mutation, PaneIdentity, PasteRequest, Scope, ServerFrame,
+    ServerMessage, Sha256, TerminalModes, Text, Underline, WireError, WireI64, WireU64,
+    decode_client, decode_server, encode_client, encode_server,
 };
 use serde::{Deserialize, Deserializer};
 
@@ -113,22 +113,22 @@ fn integer_strings_preserve_the_full_unsigned_and_signed_ranges() {
         assert_eq!(serde_json::to_string(&WireI64(expected)).unwrap(), json);
     }
 
-    let ping = decode_client(CLIENT_PING).unwrap();
+    let client_ping = decode_client(CLIENT_PING).unwrap();
     assert_eq!(
-        ping.session.as_ref().unwrap().as_str(),
+        client_ping.session.as_ref().unwrap().as_str(),
         "9007199254740993"
     );
-    let ClientMessage::Ping(value) = ping.message else {
+    let ClientMessage::Ping(value) = client_ping.message else {
         panic!("the ping fixture decoded into a different message");
     };
     assert_eq!(value.nonce, WireU64(u64::MAX));
 
-    let pong = decode_server(SERVER_PONG).unwrap();
+    let server_pong = decode_server(SERVER_PONG).unwrap();
     assert_eq!(
-        pong.session.as_ref().unwrap().as_str(),
+        server_pong.session.as_ref().unwrap().as_str(),
         "9007199254740993"
     );
-    let ServerMessage::Pong(value) = pong.message else {
+    let ServerMessage::Pong(value) = server_pong.message else {
         panic!("the pong fixture decoded into a different message");
     };
     assert_eq!(value.nonce, WireU64(u64::MAX));
@@ -230,15 +230,10 @@ fn identifiers_are_exact_bounded_strings_not_coerced_numbers() {
 
     let at_limit = "a".repeat(128);
     assert_eq!(Id::new(&at_limit).unwrap().as_str(), at_limit);
-    assert_eq!(
-        Id::new(&"a".repeat(129)),
-        Err(WireError::InvalidIdentifier)
-    );
+    assert_eq!(Id::new(&"a".repeat(129)), Err(WireError::InvalidIdentifier));
     for invalid in ["", "two words", "a/b", "a\nb", "é", "💻"] {
         assert_eq!(Id::new(invalid), Err(WireError::InvalidIdentifier));
-        assert!(
-            serde_json::from_str::<Id>(&serde_json::to_string(invalid).unwrap()).is_err()
-        );
+        assert!(serde_json::from_str::<Id>(&serde_json::to_string(invalid).unwrap()).is_err());
     }
 }
 
@@ -323,7 +318,11 @@ fn unknown_and_duplicate_fields_are_rejected_at_each_envelope_layer() {
 
 #[test]
 fn only_one_complete_json_document_is_accepted() {
-    for suffix in [b"{}".as_slice(), b"\nnull".as_slice(), b"garbage".as_slice()] {
+    for suffix in [
+        b"{}".as_slice(),
+        b"\nnull".as_slice(),
+        b"garbage".as_slice(),
+    ] {
         let mut client = CLIENT_PING.to_vec();
         client.extend_from_slice(suffix);
         assert_eq!(decode_client(&client), Err(WireError::Malformed));
@@ -352,9 +351,8 @@ fn deeply_nested_payload_before_discriminator_is_rejected() {
     // limit active instead of accepting arbitrarily nested hostile content.
     let nested = format!("{}0{}", "[".repeat(256), "]".repeat(256));
     for (kind, server) in [("ping", false), ("pong", true)] {
-        let mut json = String::from(
-            r#"{"protocol":"ft.terminal.v1","session":"s","message":{"payload":"#,
-        );
+        let mut json =
+            String::from(r#"{"protocol":"ft.terminal.v1","session":"s","message":{"payload":"#);
         json.push_str(&nested);
         json.push_str(",\"type\":\"");
         json.push_str(kind);
@@ -416,9 +414,7 @@ impl<'de> Deserialize<'de> for CountedElement {
 #[test]
 fn excess_collection_elements_are_rejected_without_constructing_another_value() {
     CONSTRUCTED_ELEMENTS.store(0, Ordering::SeqCst);
-    assert!(
-        serde_json::from_str::<BoundedVec<CountedElement, 2>>("[1,2,3]").is_err()
-    );
+    assert!(serde_json::from_str::<BoundedVec<CountedElement, 2>>("[1,2,3]").is_err());
     assert_eq!(CONSTRUCTED_ELEMENTS.load(Ordering::SeqCst), 2);
 
     let mut values = BoundedVec::<u8, 2>::new();

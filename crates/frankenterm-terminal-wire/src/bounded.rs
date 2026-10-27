@@ -35,7 +35,7 @@ impl<const MAX: usize> Text<MAX> {
 impl<'de, const MAX: usize> Deserialize<'de> for Text<MAX> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct TextVisitor<const MAX: usize>;
-        impl<'de, const MAX: usize> Visitor<'de> for TextVisitor<MAX> {
+        impl<const MAX: usize> Visitor<'_> for TextVisitor<MAX> {
             type Value = Text<MAX>;
 
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -124,7 +124,10 @@ pub struct WireU64(pub u64);
 
 impl WireU64 {
     pub fn next(self) -> Result<Self, WireError> {
-        self.0.checked_add(1).map(Self).ok_or(WireError::StaleSequence)
+        self.0
+            .checked_add(1)
+            .map(Self)
+            .ok_or(WireError::StaleSequence)
     }
 
     pub fn parse(value: &str) -> Result<Self, WireError> {
@@ -135,7 +138,10 @@ impl WireU64 {
         {
             return Err(WireError::InvalidNumber);
         }
-        value.parse().map(Self).map_err(|_| WireError::InvalidNumber)
+        value
+            .parse()
+            .map(Self)
+            .map_err(|_| WireError::InvalidNumber)
     }
 }
 
@@ -174,7 +180,10 @@ impl WireI64 {
         if value == "-0" {
             return Err(WireError::InvalidNumber);
         }
-        value.parse().map(Self).map_err(|_| WireError::InvalidNumber)
+        value
+            .parse()
+            .map(Self)
+            .map_err(|_| WireError::InvalidNumber)
     }
 }
 

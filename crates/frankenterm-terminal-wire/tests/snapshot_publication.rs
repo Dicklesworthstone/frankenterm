@@ -142,13 +142,13 @@ fn image_reference(resource_id: u64) -> ImageReference {
 fn linked_snapshot(columns: u16, rows: u16) -> FrozenSnapshot {
     let mut snapshot = plain_snapshot(columns, rows, "x");
     let mut lines = snapshot.lines.as_slice().to_vec();
-    let mut links = Vec::new();
+    let mut hyperlinks = Vec::new();
     for line in &mut lines {
         let mut cells = line.cells.as_slice().to_vec();
         for cell in &mut cells {
-            let resource_id = u64::try_from(links.len() + 1).unwrap();
+            let resource_id = u64::try_from(hyperlinks.len() + 1).unwrap();
             cell.hyperlink = Some(WireU64(resource_id));
-            links.push(Hyperlink {
+            hyperlinks.push(Hyperlink {
                 id: WireU64(resource_id),
                 uri: Text::new(&format!("urn:ft:snapshot:{resource_id}")).unwrap(),
             });
@@ -156,7 +156,7 @@ fn linked_snapshot(columns: u16, rows: u16) -> FrozenSnapshot {
         line.cells = cells.try_into().unwrap();
     }
     snapshot.lines = lines.try_into().unwrap();
-    snapshot.hyperlinks = links.try_into().unwrap();
+    snapshot.hyperlinks = hyperlinks.try_into().unwrap();
     snapshot
 }
 
@@ -238,7 +238,7 @@ fn publication_preserves_the_frozen_image_and_exact_totals_without_acknowledging
     .unwrap();
     snapshot.images = vec![image_reference(image_id.0)].try_into().unwrap();
     let expected_lines = snapshot.lines.as_slice().to_vec();
-    let expected_links = snapshot.hyperlinks.as_slice().to_vec();
+    let expected_hyperlinks = snapshot.hyperlinks.as_slice().to_vec();
     let expected_images = snapshot.images.as_slice().to_vec();
     let expected_cursor = snapshot.cursor.clone();
     let expected_modes = snapshot.modes.clone();
@@ -257,8 +257,9 @@ fn publication_preserves_the_frozen_image_and_exact_totals_without_acknowledging
     else {
         panic!("first frame must start the complete snapshot");
     };
-    let ServerMessage::SnapshotEnd(end) =
-        decode_server(publication.frames().last().unwrap()).unwrap().message
+    let ServerMessage::SnapshotEnd(end) = decode_server(publication.frames().last().unwrap())
+        .unwrap()
+        .message
     else {
         panic!("last frame must finish the complete snapshot");
     };
@@ -276,7 +277,7 @@ fn publication_preserves_the_frozen_image_and_exact_totals_without_acknowledging
 
     let chunks = chunks(&publication);
     let mut observed_lines = Vec::new();
-    let mut observed_links = BTreeMap::new();
+    let mut observed_hyperlinks = BTreeMap::new();
     let mut observed_images = BTreeMap::new();
     let mut observed_payload_bytes = 0usize;
     for (index, chunk) in chunks.iter().enumerate() {
@@ -294,7 +295,7 @@ fn publication_preserves_the_frozen_image_and_exact_totals_without_acknowledging
         observed_payload_bytes += payload_bytes;
         observed_lines.extend_from_slice(chunk.patch.lines.as_slice());
         for link in chunk.patch.hyperlinks.as_slice() {
-            if let Some(previous) = observed_links.insert(link.id, link.clone()) {
+            if let Some(previous) = observed_hyperlinks.insert(link.id, link.clone()) {
                 assert_eq!(previous, *link);
             }
         }
@@ -305,8 +306,14 @@ fn publication_preserves_the_frozen_image_and_exact_totals_without_acknowledging
         }
     }
     assert_eq!(observed_lines, expected_lines);
-    assert_eq!(observed_links.into_values().collect::<Vec<_>>(), expected_links);
-    assert_eq!(observed_images.into_values().collect::<Vec<_>>(), expected_images);
+    assert_eq!(
+        observed_hyperlinks.into_values().collect::<Vec<_>>(),
+        expected_hyperlinks
+    );
+    assert_eq!(
+        observed_images.into_values().collect::<Vec<_>>(),
+        expected_images
+    );
     assert_eq!(usize::from(start.chunks), chunks.len());
     assert_eq!(start.chunks, end.chunks);
     assert_eq!(start.total_cells, end.total_cells);
@@ -315,13 +322,23 @@ fn publication_preserves_the_frozen_image_and_exact_totals_without_acknowledging
     assert_eq!(start.total_bytes as usize, observed_payload_bytes);
     assert_eq!(publication.frames().len(), chunks.len() + 2);
 
-    assert_eq!(server.decode_request(&ack(NEXT)), Err(WireError::StaleSequence));
+    assert_eq!(
+        server.decode_request(&ack(NEXT)),
+        Err(WireError::StaleSequence)
+    );
     server
         .record_delivery(&scope(), WireU64(BASELINE), WireU64(NEXT))
         .unwrap();
     assert!(server.decode_request(&ack(NEXT)).is_ok());
     let wire_bytes = publication.wire_bytes();
-    assert_eq!(publication.into_frames().iter().map(Vec::len).sum::<usize>(), wire_bytes);
+    assert_eq!(
+        publication
+            .into_frames()
+            .iter()
+            .map(Vec::len)
+            .sum::<usize>(),
+        wire_bytes
+    );
 }
 
 #[test]
@@ -354,7 +371,7 @@ fn per_chunk_resource_limits_split_a_valid_larger_snapshot() {
     let snapshot = linked_snapshot(4, 40);
     assert!(snapshot.hyperlinks.len() > MAX_RESOURCES);
     let expected_lines = snapshot.lines.as_slice().to_vec();
-    let expected_links: BTreeMap<_, _> = snapshot
+    let expected_hyperlinks: BTreeMap<_, _> = snapshot
         .hyperlinks
         .as_slice()
         .iter()
@@ -364,74 +381,131 @@ fn per_chunk_resource_limits_split_a_valid_larger_snapshot() {
     let publication = server.encode_snapshot(snapshot).unwrap();
     assert_frame_bounds(&publication);
     let chunks = chunks(&publication);
-    assert!(chunks.len() >= expected_links.len().div_ceil(MAX_RESOURCES));
+    assert!(chunks.len() >= expected_hyperlinks.len().div_ceil(MAX_RESOURCES));
     let mut observed_lines = Vec::new();
-    let mut observed_links = BTreeMap::new();
+    let mut observed_hyperlinks = BTreeMap::new();
     for chunk in chunks {
         assert!(chunk.patch.hyperlinks.len() <= MAX_RESOURCES);
         observed_lines.extend_from_slice(chunk.patch.lines.as_slice());
         for link in chunk.patch.hyperlinks.as_slice() {
-            assert_eq!(expected_links.get(&link.id), Some(link));
-            let _ = observed_links.insert(link.id, link.clone());
+            assert_eq!(expected_hyperlinks.get(&link.id), Some(link));
+            let _ = observed_hyperlinks.insert(link.id, link.clone());
         }
     }
     assert_eq!(observed_lines, expected_lines);
-    assert_eq!(observed_links, expected_links);
+    assert_eq!(observed_hyperlinks, expected_hyperlinks);
 }
 
 #[test]
 fn invalid_rows_and_resources_never_return_partial_publications() {
     type Mutation = fn(&mut FrozenSnapshot);
     let cases: &[(&str, Mutation, WireError)] = &[
-        ("missing row", |snapshot| {
-            change_lines(snapshot, |lines| { let _ = lines.pop(); });
-        }, WireError::SnapshotIncomplete),
-        ("duplicate row", |snapshot| {
-            change_lines(snapshot, |lines| { lines[1].row = 0; });
-        }, WireError::InvalidBounds),
-        ("row outside viewport", |snapshot| {
-            change_lines(snapshot, |lines| { lines[1].row = 2; });
-        }, WireError::InvalidBounds),
-        ("duplicate stable row", |snapshot| {
-            change_lines(snapshot, |lines| { lines[1].stable_row = lines[0].stable_row; });
-        }, WireError::InvalidBounds),
-        ("incomplete cell row", |snapshot| {
-            change_lines(snapshot, |lines| {
-                let mut cells = lines[0].cells.as_slice().to_vec();
-                let _ = cells.pop();
-                lines[0].cells = cells.try_into().unwrap();
-            });
-        }, WireError::InvalidBounds),
-        ("wide lead at right edge", |snapshot| {
-            change_lines(snapshot, |lines| {
-                let mut cells = lines[0].cells.as_slice().to_vec();
-                cells[1].width = 2;
-                lines[0].cells = cells.try_into().unwrap();
-            });
-        }, WireError::InvalidBounds),
-        ("missing referenced hyperlink", |snapshot| {
-            change_lines(snapshot, |lines| {
-                let mut cells = lines[0].cells.as_slice().to_vec();
-                cells[0].hyperlink = Some(WireU64(9));
-                lines[0].cells = cells.try_into().unwrap();
-            });
-        }, WireError::InvalidState),
-        ("duplicate hyperlink identity", |snapshot| {
-            snapshot.hyperlinks = vec![
-                Hyperlink { id: WireU64(1), uri: Text::new("urn:ft:first").unwrap() },
-                Hyperlink { id: WireU64(1), uri: Text::new("urn:ft:second").unwrap() },
-            ].try_into().unwrap();
-        }, WireError::InvalidState),
-        ("duplicate image identity", |snapshot| {
-            snapshot.images = vec![image_reference(1), image_reference(1)].try_into().unwrap();
-        }, WireError::InvalidState),
+        (
+            "missing row",
+            |snapshot| {
+                change_lines(snapshot, |lines| {
+                    let _ = lines.pop();
+                });
+            },
+            WireError::SnapshotIncomplete,
+        ),
+        (
+            "duplicate row",
+            |snapshot| {
+                change_lines(snapshot, |lines| {
+                    lines[1].row = 0;
+                });
+            },
+            WireError::InvalidBounds,
+        ),
+        (
+            "row outside viewport",
+            |snapshot| {
+                change_lines(snapshot, |lines| {
+                    lines[1].row = 2;
+                });
+            },
+            WireError::InvalidBounds,
+        ),
+        (
+            "duplicate stable row",
+            |snapshot| {
+                change_lines(snapshot, |lines| {
+                    lines[1].stable_row = lines[0].stable_row;
+                });
+            },
+            WireError::InvalidBounds,
+        ),
+        (
+            "incomplete cell row",
+            |snapshot| {
+                change_lines(snapshot, |lines| {
+                    let mut cells = lines[0].cells.as_slice().to_vec();
+                    let _ = cells.pop();
+                    lines[0].cells = cells.try_into().unwrap();
+                });
+            },
+            WireError::InvalidBounds,
+        ),
+        (
+            "wide lead at right edge",
+            |snapshot| {
+                change_lines(snapshot, |lines| {
+                    let mut cells = lines[0].cells.as_slice().to_vec();
+                    cells[1].width = 2;
+                    lines[0].cells = cells.try_into().unwrap();
+                });
+            },
+            WireError::InvalidBounds,
+        ),
+        (
+            "missing referenced hyperlink",
+            |snapshot| {
+                change_lines(snapshot, |lines| {
+                    let mut cells = lines[0].cells.as_slice().to_vec();
+                    cells[0].hyperlink = Some(WireU64(9));
+                    lines[0].cells = cells.try_into().unwrap();
+                });
+            },
+            WireError::InvalidState,
+        ),
+        (
+            "duplicate hyperlink identity",
+            |snapshot| {
+                snapshot.hyperlinks = vec![
+                    Hyperlink {
+                        id: WireU64(1),
+                        uri: Text::new("urn:ft:first").unwrap(),
+                    },
+                    Hyperlink {
+                        id: WireU64(1),
+                        uri: Text::new("urn:ft:second").unwrap(),
+                    },
+                ]
+                .try_into()
+                .unwrap();
+            },
+            WireError::InvalidState,
+        ),
+        (
+            "duplicate image identity",
+            |snapshot| {
+                snapshot.images = vec![image_reference(1), image_reference(1)]
+                    .try_into()
+                    .unwrap();
+            },
+            WireError::InvalidState,
+        ),
     ];
     let mut server = server(dimensions(2, 2));
     for &(label, mutate, expected) in cases {
         let mut snapshot = plain_snapshot(2, 2, "x");
         mutate(&mut snapshot);
         assert_eq!(error_from(&server, snapshot), expected, "{label}");
-        assert_eq!(server.decode_request(&ack(NEXT)), Err(WireError::StaleSequence));
+        assert_eq!(
+            server.decode_request(&ack(NEXT)),
+            Err(WireError::StaleSequence)
+        );
     }
     let valid = server.encode_snapshot(plain_snapshot(2, 2, "x")).unwrap();
     assert_frame_bounds(&valid);
@@ -459,7 +533,10 @@ fn publisher_obeys_negotiation_identity_geometry_and_sequence_fences() {
         WireError::StaleSequence,
     );
     assert!(server.encode_snapshot(plain_snapshot(2, 2, "x")).is_ok());
-    assert_eq!(server.decode_request(&ack(NEXT)), Err(WireError::StaleSequence));
+    assert_eq!(
+        server.decode_request(&ack(NEXT)),
+        Err(WireError::StaleSequence)
+    );
 }
 
 fn one_row_chunk(snapshot: &FrozenSnapshot, line: Line, index: u16, count: u16) -> SnapshotChunk {
@@ -494,11 +571,18 @@ fn a_fitting_payload_does_not_hide_an_oversized_envelope() {
         link.uri = Text::new(&uri).unwrap();
         remaining -= added;
     }
-    assert_eq!(remaining, 0, "fixture must fill its intended payload budget");
+    assert_eq!(
+        remaining, 0,
+        "fixture must fill its intended payload budget"
+    );
     chunk.patch.hyperlinks = links.try_into().unwrap();
     assert_eq!(serde_json::to_vec(&chunk).unwrap().len(), target);
     assert_eq!(snapshot_chunk_bytes(&chunk).unwrap(), target);
-    let frame = ServerFrame::new(Some(id(SESSION)), ServerMessage::SnapshotChunk(chunk.clone())).unwrap();
+    let frame = ServerFrame::new(
+        Some(id(SESSION)),
+        ServerMessage::SnapshotChunk(chunk.clone()),
+    )
+    .unwrap();
     assert_eq!(frame.validate(), Ok(()));
     assert_eq!(encode_server(&frame), Err(WireError::FrameTooLarge));
     snapshot.hyperlinks = chunk.patch.hyperlinks.into_vec().try_into().unwrap();
@@ -507,7 +591,11 @@ fn a_fitting_payload_does_not_hide_an_oversized_envelope() {
     assert!(server.encode_snapshot(plain_snapshot(64, 1, "x")).is_ok());
 }
 
-fn boundary_metadata(snapshot: &FrozenSnapshot, count: u16, total_bytes: u32) -> (Vec<u8>, Vec<u8>) {
+fn boundary_metadata(
+    snapshot: &FrozenSnapshot,
+    count: u16,
+    total_bytes: u32,
+) -> (Vec<u8>, Vec<u8>) {
     let start = ServerMessage::SnapshotStart(SnapshotStart {
         scope: snapshot.scope.clone(),
         snapshot_id: snapshot.snapshot_id,
@@ -547,18 +635,23 @@ fn aggregate_admission_counts_start_end_and_envelopes_not_only_chunk_payloads() 
     let payload_len = serde_json::to_vec(&probe).unwrap().len();
     let probe_frame = encode_server(
         &ServerFrame::new(Some(id(SESSION)), ServerMessage::SnapshotChunk(probe)).unwrap(),
-    ).unwrap();
+    )
+    .unwrap();
     let envelope_bytes = probe_frame.len() - payload_len;
     let (start_probe, end_probe) = boundary_metadata(&snapshot, count, MAX_SNAPSHOT_BYTES);
     let metadata_bytes = start_probe.len() + end_probe.len();
     assert!(metadata_bytes / 2 > 2 * usize::from(count));
-    let payload_target = (MAX_SNAPSHOT_BYTES as usize
-        - envelope_bytes * usize::from(count)
-        - metadata_bytes / 2)
-        / usize::from(count);
+    let payload_target =
+        (MAX_SNAPSHOT_BYTES as usize - envelope_bytes * usize::from(count) - metadata_bytes / 2)
+            / usize::from(count);
     let mut lines = snapshot.lines.as_slice().to_vec();
     for (index, line) in lines.iter_mut().enumerate() {
-        let base = one_row_chunk(&snapshot, line.clone(), u16::try_from(index).unwrap(), count);
+        let base = one_row_chunk(
+            &snapshot,
+            line.clone(),
+            u16::try_from(index).unwrap(),
+            count,
+        );
         let mut remaining = payload_target - serde_json::to_vec(&base).unwrap().len();
         let mut cells = line.cells.as_slice().to_vec();
         for cell in &mut cells {
@@ -566,7 +659,10 @@ fn aggregate_admission_counts_start_end_and_envelopes_not_only_chunk_payloads() 
             cell.text = Text::new(&format!("a{}", "\u{0301}".repeat(accents))).unwrap();
             remaining -= accents * 2;
         }
-        assert!(remaining < 2, "fixture's bounded cells must absorb the budget");
+        assert!(
+            remaining < 2,
+            "fixture's bounded cells must absorb the budget"
+        );
         line.cells = cells.try_into().unwrap();
     }
     snapshot.lines = lines.try_into().unwrap();
@@ -576,12 +672,21 @@ fn aggregate_admission_counts_start_end_and_envelopes_not_only_chunk_payloads() 
     for (index, line) in snapshot.lines.as_slice().iter().enumerate() {
         let line_bytes = serde_json::to_vec(line).unwrap().len();
         if let Some(previous) = previous_line_bytes {
-            assert!(previous + line_bytes > MAX_FRAME_BYTES, "two rows cannot share a frame");
+            assert!(
+                previous + line_bytes > MAX_FRAME_BYTES,
+                "two rows cannot share a frame"
+            );
         }
         previous_line_bytes = Some(line_bytes);
-        let chunk = one_row_chunk(&snapshot, line.clone(), u16::try_from(index).unwrap(), count);
+        let chunk = one_row_chunk(
+            &snapshot,
+            line.clone(),
+            u16::try_from(index).unwrap(),
+            count,
+        );
         canonical_bytes += serde_json::to_vec(&chunk).unwrap().len();
-        let frame = ServerFrame::new(Some(id(SESSION)), ServerMessage::SnapshotChunk(chunk)).unwrap();
+        let frame =
+            ServerFrame::new(Some(id(SESSION)), ServerMessage::SnapshotChunk(chunk)).unwrap();
         let bytes = encode_server(&frame).unwrap();
         assert!(bytes.len() <= MAX_FRAME_BYTES);
         chunk_wire_bytes += bytes.len();
@@ -592,7 +697,10 @@ fn aggregate_admission_counts_start_end_and_envelopes_not_only_chunk_payloads() 
     assert!(start.len() + chunk_wire_bytes + end.len() > MAX_SNAPSHOT_BYTES as usize);
     let mut server = server(snapshot.dimensions.clone());
     assert_eq!(error_from(&server, snapshot), WireError::LimitExceeded);
-    assert_eq!(server.decode_request(&ack(NEXT)), Err(WireError::StaleSequence));
+    assert_eq!(
+        server.decode_request(&ack(NEXT)),
+        Err(WireError::StaleSequence)
+    );
     server
         .record_delivery(&scope(), WireU64(BASELINE), WireU64(NEXT))
         .unwrap();
