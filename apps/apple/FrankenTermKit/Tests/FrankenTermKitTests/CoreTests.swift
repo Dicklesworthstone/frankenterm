@@ -617,8 +617,12 @@ final class CoreTests: XCTestCase {
             reviewedTrustIDs: ["trust"], support: profile(1), transitForRouteID: "route"))
         XCTAssertThrowsError(try oneHop.readiness(forRouteID: "first", availableCredentialIDs: ["key"],
             reviewedTrustIDs: ["trust"], support: profile(), transitForRouteID: "route"))
+        // A nested hop is transit for the destination only while the profile
+        // covers the whole expanded chain.
+        XCTAssertTrue(try document(nested: true).readiness(forRouteID: "first", availableCredentialIDs: ["key"],
+            reviewedTrustIDs: ["trust"], support: profile(2), transitForRouteID: "route").isLocallyReady)
         XCTAssertThrowsError(try document(nested: true).readiness(forRouteID: "first", availableCredentialIDs: ["key"],
-            reviewedTrustIDs: ["trust"], support: profile(2), transitForRouteID: "route"))
+            reviewedTrustIDs: ["trust"], support: profile(1), transitForRouteID: "route"))
         XCTAssertTrue(try oneHop.readiness(forRouteID: "first", availableCredentialIDs: [],
             reviewedTrustIDs: ["trust"], support: profile(1), transitForRouteID: "route").issues.contains(.credentialUnavailable))
         // A direct route needs no jump qualification, even when other routes
