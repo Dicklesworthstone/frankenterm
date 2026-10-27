@@ -1642,6 +1642,11 @@ final class TerminalSessionControllerTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(25))
         }
         let interactive = try XCTUnwrap(scene.sessions["alpha"])
+        // A session goes live before the machine on screen gets its view.
+        for _ in 0..<400 where interactive.phase == .live && interactive.terminal == nil
+            && scene.shows(machineID: "alpha") {
+            try await Task.sleep(for: .milliseconds(25))
+        }
         XCTAssertTrue(observer.settled, "The old native owner settled before mode authority changed")
         XCTAssertTrue(observer.requiresExistingMux, "Stop preserves the successful existing-mux intent")
         XCTAssertNotEqual(interactive.id, observer.id)
