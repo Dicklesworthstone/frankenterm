@@ -11,11 +11,13 @@ mod bounded;
 mod codec;
 mod protocol;
 mod session;
+mod snapshot;
 
 pub use bounded::{BoundedVec, Id, Sha256, Text, WireI64, WireU64};
 pub use codec::{decode_client, decode_server, encode_client, encode_server};
 pub use protocol::*;
 pub use session::{BrowserSession, ServerSession};
+pub use snapshot::{FrozenSnapshot, MAX_SNAPSHOT_RESOURCES, SnapshotPublication, snapshot_chunk_bytes};
 
 pub const MAX_FRAME_BYTES: usize = 256 * 1024;
 pub const MAX_SNAPSHOT_BYTES: u32 = 8 * 1024 * 1024;
