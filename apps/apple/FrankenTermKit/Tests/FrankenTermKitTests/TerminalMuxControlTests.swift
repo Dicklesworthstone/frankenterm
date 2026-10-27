@@ -500,6 +500,20 @@ final class TerminalMuxQueryDriverTests: XCTestCase {
         control.recordFailure(String(repeating: "x", count: 4096))
         XCTAssertEqual(control.current.failure, "The server reported an oversized error message.")
     }
+
+    func testUnconfirmedInputIsStateTheScreenReadsNotANoticeAndIsToldOnce() {
+        let control = TerminalMuxControl()
+        final class Seen: @unchecked Sendable { let lock = NSLock(); var states: [TerminalMuxControl.State] = [] }
+        let seen = Seen()
+        control.observe { state in seen.lock.withLock { seen.states.append(state) } }
+        let before = seen.lock.withLock { seen.states.count }
+        XCTAssertFalse(control.current.inputUnconfirmed)
+        control.recordInputUnconfirmed()
+        control.recordInputUnconfirmed()
+        XCTAssertTrue(control.current.inputUnconfirmed)
+        XCTAssertNil(control.current.notice, "the screen's delivery notice says it, not a second notice")
+        XCTAssertEqual(seen.lock.withLock { seen.states.count }, before + 1, "a repeat changes nothing")
+    }
 }
 
 final class TerminalMuxNavigationRequestTests: XCTestCase {

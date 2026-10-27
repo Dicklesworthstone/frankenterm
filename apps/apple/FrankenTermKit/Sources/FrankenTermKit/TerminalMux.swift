@@ -345,6 +345,9 @@ public final class TerminalMuxControl: @unchecked Sendable {
         /// What changed while the phone was away that the screen should say,
         /// such as the pane it was showing having closed.
         public var notice: String?
+        /// A connection to the shown pane ended before its server confirmed
+        /// input sent to it: this connection, or on return the last one.
+        public var inputUnconfirmed = false
         /// The shown pane's program has asked for the mouse: a tap clicks.
         public var mouseGrabbed = false
         /// Panes with output the phone has not had on screen since it arrived.
@@ -606,6 +609,16 @@ public final class TerminalMuxControl: @unchecked Sendable {
     public func recordNotice(_ notice: String) {
         update { state in
             state.notice = notice
+            return true
+        }
+    }
+
+    /// See `State.inputUnconfirmed`. The screen says the input may or may not
+    /// have arrived; nothing is sent again.
+    public func recordInputUnconfirmed() {
+        update { state in
+            guard !state.inputUnconfirmed else { return false }
+            state.inputUnconfirmed = true
             return true
         }
     }

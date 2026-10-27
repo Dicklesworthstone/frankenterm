@@ -576,7 +576,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
             if lost {
                 control.recordNotice("The pane you were viewing closed while you were away. This is the desktop's active pane.")
             } else if unconfirmed {
-                control.recordNotice("The connection ended before the machine confirmed your last input to this pane. Check whether it arrived before typing it again.")
+                control.recordInputUnconfirmed()
             }
             // Panes an earlier connection left at the phone's size get the
             // desktop's back; the one about to be shown is resized anyway, and
@@ -1058,7 +1058,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
     /// pump may be in its own service turn (ours is then busy); it writes what
     /// we admit. Bounded: a dead server must not hold teardown. An unanswered
     /// restore keeps its record for the next connection to give back, and
-    /// unanswered input is marked for the next connection to tell.
+    /// unanswered input is told now and marked for the next connection to tell.
     private func settleBeforeClose(_ state: MuxAttachment, driver: NativeSSHDriver) async {
         if let pane = state.shown, state.showing {
             try? state.client.hide(pane: pane); try? state.client.restoreSize(pane: pane)
@@ -1096,7 +1096,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
             catch { break }
         }
         settle()
-        if !inputAnswered() { state.shownPane.markInputUnconfirmed() }
+        if !inputAnswered() { state.shownPane.markInputUnconfirmed(); state.control.recordInputUnconfirmed() }
         guard !failed, (try? state.client.restoring()) == false else { return }
         for pane in restored { state.sizes.set(pane: pane, desktop: nil, rows: 0, columns: 0) }
     }

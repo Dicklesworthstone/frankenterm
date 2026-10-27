@@ -957,6 +957,9 @@ final class TerminalSessionController {
             self.pump = pump
             if let control = connection.muxControl {
                 attachedToMux = true
+                // The last connection to this pane, perhaps before a relaunch,
+                // ended before its server confirmed input sent to it.
+                if control.current.inputUnconfirmed, !inputDelivery.unanswered { inputDelivery.endedUnanswered() }
                 observeMux(control)
                 control.setVisible(presentationVisible)
             }
@@ -1544,7 +1547,7 @@ final class TerminalSessionController {
                     if retainEndedOutput { retainedOutputFailure = Self.describe(error) }
                 }
             }
-            // A mux pane's own notice tells input its server had not confirmed.
+            // A mux pane's server says below whether it confirmed the input.
             if dropped, !attachedToMux, !inputDelivery.unanswered, await runtime.inputAwaitsAnswer() {
                 inputDelivery.endedUnanswered()
             }
@@ -1561,6 +1564,10 @@ final class TerminalSessionController {
             // or retaining an otherwise settled coordinator source.
             do { try await connections.manager.close(connectionID: connection.id); self.connection = nil }
             catch { failure = failure ?? error }
+            // Closing settles a mux pane's input: its server confirmed it or not.
+            if dropped, connection.muxControl?.current.inputUnconfirmed == true, !inputDelivery.unanswered {
+                inputDelivery.endedUnanswered()
+            }
         }
         if let failure {
             cleanupFailure = Self.describe(failure)

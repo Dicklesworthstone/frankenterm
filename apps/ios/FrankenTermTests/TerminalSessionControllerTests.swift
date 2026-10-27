@@ -2168,9 +2168,11 @@ final class TerminalSessionControllerTests: XCTestCase {
 
     /// Plan 2.2, "lose Wi-Fi after pressing Enter", against a real mux. The
     /// pane's program freezes its mux server, so what is typed next goes
-    /// unanswered, and then the phone's relay dies. The next connection comes
-    /// back to the same pane and program and says its last input was not
-    /// confirmed; one after an ordinary close says nothing. Needs a disposable
+    /// unanswered, and then the phone's relay dies. The ended session says at
+    /// once that its last input may or may not have arrived. The next
+    /// connection comes back to the same pane and program and says it again
+    /// even after the first notice is gone (as after a relaunch), from the
+    /// pane's own record; one after an ordinary close says nothing. Needs a disposable
     /// mux (TEST_RUNNER_FT_LIVE_MUX_COMMAND): this test stops and resumes its
     /// server and kills the relay processes running that command.
     func testAMuxConnectionLostBeforeInputWasAnsweredSaysSoOnReturn() async throws {
@@ -2194,23 +2196,25 @@ final class TerminalSessionControllerTests: XCTestCase {
         for _ in 0..<300 where !first.settled { try await Task.sleep(for: .milliseconds(50)) }
         XCTAssertEqual(first.phase, .ended(TerminalSessionController.describe(.disconnected)))
         XCTAssertTrue(first.dropped)
-        XCTAssertTrue(first.inputDelivery.isEmpty, "the pane's own notice tells it, once (\(first.inputDelivery))")
+        let unconfirmed = "before Alpha answered it. It may or may not have arrived."
+        XCTAssertTrue(first.inputDelivery.unanswered, "the server had not confirmed it (\(first.inputDelivery))")
+        XCTAssertTrue(first.inputDelivery.message(machine: "Alpha")?.contains(unconfirmed) == true)
         view.removeFromSuperview()
         await assertReleased(first, connections: live.connections)
+        first.dismissInputDelivery()
         try await Task.sleep(for: .seconds(3))
 
-        let unconfirmed = "The connection ended before the machine confirmed your last input to this pane. Check whether it arrived before typing it again."
         let second = try await connect(scene, "alpha")
-        for _ in 0..<200 where second.muxState?.shown == nil || second.interactionProblem == nil {
-            try await Task.sleep(for: .milliseconds(25))
-        }
+        for _ in 0..<200 where second.muxState?.shown == nil { try await Task.sleep(for: .milliseconds(25)) }
         XCTAssertEqual(second.muxState?.shown, pane, "the phone came back to the same pane")
-        XCTAssertEqual(second.interactionProblem, unconfirmed)
+        XCTAssertTrue(second.inputDelivery.unanswered, "the pane's record says it again (\(second.inputDelivery))")
+        XCTAssertNil(second.interactionProblem, "one notice, not two")
         let again = try shown(second)
         try await type("echo AGAIN-\(run)-$$ >> \(out)", into: again)
         let text = try await hostFile(out, containing: "AGAIN-\(run)-")
         XCTAssertTrue(text.contains("AGAIN-\(run)-\(pid)"), "the same program answered (\(text))")
         again.removeFromSuperview()
+        second.dismissInputDelivery()
         await second.stop()
         await assertReleased(second, connections: live.connections)
 
@@ -2220,6 +2224,7 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertEqual(third.muxState?.shown, pane)
         try await Task.sleep(for: .milliseconds(300))
         XCTAssertNil(third.interactionProblem)
+        XCTAssertTrue(third.inputDelivery.isEmpty, "\(third.inputDelivery)")
         await scene.close()
         await assertReleased(third, connections: live.connections)
     }
