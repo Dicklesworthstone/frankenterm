@@ -74,6 +74,7 @@ public final class NativeTerminalRenderView: MTKView {
     private var displayLink: CADisplayLink?
     private var displayLifetime: NativeTerminalDisplayLinkLifetime?
     private lazy var displayTarget = NativeTerminalDisplayTarget(self)
+    private lazy var accessibleOutput = NativeTerminalAccessibility(view: self)
 
     public init(source: TerminalSource, bundle: Bundle = .main,
                 configuration: NativeTerminalRenderConfiguration = .init()) async throws {
@@ -88,8 +89,11 @@ public final class NativeTerminalRenderView: MTKView {
         colorPixelFormat = .bgra8Unorm_srgb; framebufferOnly = true
         isPaused = true; enableSetNeedsDisplay = false; autoResizeDrawable = true
         isOpaque = true; backgroundColor = .black
-        isAccessibilityElement = true; accessibilityLabel = "Terminal output"
-        accessibilityTraits = .updatesFrequently
+        accessibilityLabel = "Terminal output"
+        accessibilityTraits = .staticText
+        accessibilityModeChanged()
+        NotificationCenter.default.addObserver(self, selector: #selector(accessibilityModeChanged),
+            name: UIAccessibility.voiceOverStatusDidChangeNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(applicationDeactivated),
             name: UIApplication.willResignActiveNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(applicationBackgrounded),
@@ -112,11 +116,27 @@ public final class NativeTerminalRenderView: MTKView {
     /// One cell in points at the current font, once a frame has been laid
     /// out. Cells start at the view's top-left corner.
     public private(set) var cellSize: CGSize?
+    var permitsAccessibilityReading: Bool { active && !retired }
 
     /// The last admitted screen, read on demand so steady output costs nothing.
     public override var accessibilityValue: String? {
-        get { latest?.readableText ?? super.accessibilityValue }
+        get { permitsAccessibilityReading ? latest?.readableText ?? super.accessibilityValue : nil }
         set { super.accessibilityValue = newValue }
+    }
+
+    public override var accessibilityElements: [Any]? {
+        get {
+            guard UIAccessibility.isVoiceOverRunning else { return super.accessibilityElements }
+            guard active, !retired else { return [] }
+            return accessibleOutput.elements()
+        }
+        set { super.accessibilityElements = newValue }
+    }
+
+    @objc private func accessibilityModeChanged() {
+        accessibleOutput.discard()
+        isAccessibilityElement = !UIAccessibility.isVoiceOverRunning
+        accessibilityCustomRotors = UIAccessibility.isVoiceOverRunning ? [accessibleOutput.rotor()] : nil
     }
 
     /// Complete replacements can supersede an unprepared frame. No byte stream
@@ -148,6 +168,7 @@ public final class NativeTerminalRenderView: MTKView {
         worker.setActive(active)
         if active { requestPreparation() }
         else {
+            accessibleOutput.discard()
             waitingForResources = false
             blinkTimer?.invalidate(); blinkTimer = nil
             displayLink?.isPaused = true
@@ -163,6 +184,7 @@ public final class NativeTerminalRenderView: MTKView {
     public func retire() {
         guard !retired else { return }
         retired = true; active = false; pending = nil; latest = nil
+        accessibleOutput.discard(); accessibilityCustomRotors = nil
         blinkTimer?.invalidate(); blinkTimer = nil
         displayLink?.invalidate(); displayLink = nil; displayLifetime = nil
         discardPrepared()
