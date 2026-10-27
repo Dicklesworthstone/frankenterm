@@ -219,6 +219,7 @@ final class WorkspaceStoreTests: XCTestCase {
                                             sourceAndContentsConfirmed: true).workspace
         var fields = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(disk.bytes(.catalog))) as? [String: Any])
         fields["version"] = 4; fields.removeValue(forKey: "machineConnectionPreferences")
+        fields.removeValue(forKey: "groupNavigationPreferences")
         disk.seed(try JSONSerialization.data(withJSONObject: fields), slot: .catalog)
         let reopened = WorkspaceStore(persistence: disk, vault: vault)
         let loaded = try await reopened.loadWithLocalPolicy()
@@ -227,7 +228,7 @@ final class WorkspaceStoreTests: XCTestCase {
         XCTAssertEqual(state.workspace.manifest, first.manifest); XCTAssertEqual(state.workspace.bindings, first.bindings)
         XCTAssertEqual(state.connectionPreferences.autoConnectOverrides, [:])
         let migrated = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(disk.bytes(.catalog))) as? [String: Any])
-        XCTAssertEqual(migrated["version"] as? Int, 5)
+        XCTAssertEqual(migrated["version"] as? Int, 6)
         XCTAssertEqual((migrated["machineConnectionPreferences"] as? [Any])?.count, 0)
         XCTAssertEqual(vault.creates, 1)
     }
@@ -247,6 +248,177 @@ final class WorkspaceStoreTests: XCTestCase {
             let bytes = try JSONSerialization.data(withJSONObject: fields)
             disk.seed(bytes, slot: .catalog)
             do { _ = try await WorkspaceStore(persistence: disk, vault: vault).load(); XCTFail("corrupt preferences loaded") }
+            catch { XCTAssertEqual(error as? WorkspaceStoreError, .corruptStore) }
+            XCTAssertEqual(disk.bytes(.catalog), bytes); XCTAssertEqual(vault.count, 1)
+        }
+    }
+
+    func testLocalMachineOrderSurvivesRelaunchAndDrivesNavigationWithoutChangingAuthority() async throws {
+        let disk = StoreTestPersistence(), vault = StoreTestVault()
+        let store = WorkspaceStore(persistence: disk, vault: vault), original = try archive()
+        let first = try await store.install(original, envelopeDigest: digest, expectedRevision: nil,
+                                             sourceAndContentsConfirmed: true).workspace
+        try await store.setMachineOrder(workspaceID: first.id, expectedRevision: first.revision,
+            groupID: "group", expectedOrder: ["build", "gpu"], machineIDs: ["gpu", "build"])
+        let loaded = try await WorkspaceStore(persistence: disk, vault: vault).loadWithLocalPolicy()
+        let state = try XCTUnwrap(loaded.first), group = try XCTUnwrap(original.workspace.groups.first)
+        XCTAssertEqual(state.navigationPreferences.machineOrder(for: group), ["gpu", "build"])
+        XCTAssertEqual(state.workspace.revision, first.revision)
+        XCTAssertEqual(state.workspace.manifest, first.manifest)
+        XCTAssertEqual(state.workspace.bindings, first.bindings)
+        XCTAssertTrue(state.workspace.connectLater)
+        XCTAssertEqual(state.connectionPreferences.autoConnectOverrides, [:])
+        XCTAssertEqual(vault.creates, 1); XCTAssertNil(disk.bytes(.journal))
+        let navigation = try TerminalNavigation(machines: original.workspace.machines.map {
+            try TerminalNavigationMachine(id: $0.id, name: $0.name, panes: [])
+        }, initialMachineID: "build", group: TerminalNavigationGroup(id: group.id,
+            machineIDs: state.navigationPreferences.machineOrder(for: group)))
+        XCTAssertEqual(navigation.machines.map(\.id), ["gpu", "build"])
+        XCTAssertEqual(navigation.selection?.machineID, "build", "reordering cannot choose another input destination")
+    }
+
+    func testMachineOrderReimportKeepsSurvivorsAndAppendsNewMembersInSourceOrder() async throws {
+        let disk = StoreTestPersistence(), vault = StoreTestVault()
+        let store = WorkspaceStore(persistence: disk, vault: vault)
+        let first = try await store.install(archive(), envelopeDigest: digest, expectedRevision: nil,
+                                             sourceAndContentsConfirmed: true).workspace
+        try await store.setMachineOrder(workspaceID: first.id, expectedRevision: first.revision,
+            groupID: "group", expectedOrder: ["build", "gpu"], machineIDs: ["gpu", "build"])
+        let expanded = try workspaceArchive(id: "work", bundleID: "expanded") { workspace in
+            var machines = workspace["machines"] as! [[String: Any]], groups = workspace["groups"] as! [[String: Any]]
+            var firstNew = machines[0]; firstNew["id"] = "new-first"; firstNew["name"] = "New First"
+            var secondNew = machines[0]; secondNew["id"] = "new-second"; secondNew["name"] = "New Second"
+            machines[1]["name"] = "GPU Renamed"; machines += [firstNew, secondNew]
+            groups[0]["machine_order"] = ["new-second", "build", "new-first", "gpu"]
+            var otherGroup = groups[0]; otherGroup["id"] = "other-group"
+            otherGroup["machine_order"] = ["build", "gpu"]
+            workspace["machines"] = machines; workspace["groups"] = groups + [otherGroup]
+        }
+        let second = try await store.install(expanded, envelopeDigest: Data(repeating: 91, count: 32),
+            expectedRevision: first.revision, sourceAndContentsConfirmed: true,
+            securityChangesConfirmed: true, associateWithExistingWorkspace: true).workspace
+        var loaded = try await store.loadWithLocalPolicy()
+        var state = try XCTUnwrap(loaded.first)
+        XCTAssertEqual(state.navigationPreferences.machineOrder(for: expanded.workspace.groups[0]),
+                       ["gpu", "build", "new-second", "new-first"])
+        XCTAssertEqual(state.navigationPreferences.machineOrder(for: expanded.workspace.groups[1]), ["build", "gpu"])
+        try await store.setMachineOrder(workspaceID: second.id, expectedRevision: second.revision,
+            groupID: "other-group", expectedOrder: ["build", "gpu"], machineIDs: ["gpu", "build"])
+        let reduced = try workspaceArchive(id: "work", bundleID: "reduced") { workspace in
+            var groups = workspace["groups"] as! [[String: Any]]
+            groups[0]["machine_order"] = ["build"]
+            workspace["groups"] = groups
+            workspace["machines"] = (workspace["machines"] as! [[String: Any]]).filter { $0["id"] as? String == "build" }
+        }
+        let third = try await store.install(reduced, envelopeDigest: Data(repeating: 92, count: 32),
+            expectedRevision: second.revision, sourceAndContentsConfirmed: true, allowMachineRemoval: true,
+            securityChangesConfirmed: true, associateWithExistingWorkspace: true).workspace
+        let reopened = WorkspaceStore(persistence: disk, vault: vault)
+        _ = try await reopened.install(archive(keys: false, bundleID: "returned"),
+            envelopeDigest: Data(repeating: 93, count: 32), expectedRevision: third.revision,
+            sourceAndContentsConfirmed: true, securityChangesConfirmed: true, associateWithExistingWorkspace: true)
+        loaded = try await reopened.loadWithLocalPolicy(); state = try XCTUnwrap(loaded.first)
+        XCTAssertEqual(state.navigationPreferences.machineOrderOverrides, ["group": ["build", "gpu"]],
+                       "a removed member returns as a new append, never a stale hidden position")
+        XCTAssertEqual(vault.creates, 1)
+    }
+
+    func testMachineOrderIsScopedAndResetRestoresTheImportedDefault() async throws {
+        let disk = StoreTestPersistence(), vault = StoreTestVault()
+        let store = WorkspaceStore(persistence: disk, vault: vault), original = try archive()
+        let first = try await store.install(original, envelopeDigest: digest, expectedRevision: nil,
+                                             sourceAndContentsConfirmed: true).workspace
+        let other = try await store.install(workspaceArchive(id: "other", bundleID: "other-order"),
+            envelopeDigest: Data(repeating: 94, count: 32), expectedRevision: nil,
+            sourceAndContentsConfirmed: true).workspace
+        try await store.setMachineOrder(workspaceID: first.id, expectedRevision: first.revision,
+            groupID: "group", expectedOrder: ["build", "gpu"], machineIDs: ["gpu", "build"])
+        let loaded = try await store.loadWithLocalPolicy()
+        XCTAssertEqual(loaded.first { $0.workspace.id == other.id }?.navigationPreferences.machineOrderOverrides, [:])
+        let reset = try await store.setMachineOrder(workspaceID: first.id, expectedRevision: first.revision,
+            groupID: "group", expectedOrder: ["gpu", "build"], machineIDs: nil)
+        XCTAssertTrue(reset.machineOrderOverrides.isEmpty)
+        XCTAssertEqual(reset.machineOrder(for: original.workspace.groups[0]), ["build", "gpu"])
+        let before = disk.bytes(.catalog)
+        for (revision, group, previous, order) in [
+            (UUID(), "group", ["build", "gpu"], ["gpu", "build"]),
+            (first.revision, "unknown-group", ["build", "gpu"], ["gpu", "build"]),
+            (first.revision, "group", ["gpu", "build"], ["gpu", "build"]),
+            (first.revision, "group", ["build", "gpu"], ["build", "build"]),
+            (first.revision, "group", ["build", "gpu"], ["build"]),
+            (first.revision, "group", ["build", "gpu"], ["build", "unknown-machine"])
+        ] {
+            do {
+                try await store.setMachineOrder(workspaceID: first.id, expectedRevision: revision,
+                    groupID: group, expectedOrder: previous, machineIDs: order)
+                XCTFail("stale or invalid ordering was accepted")
+            } catch { }
+            XCTAssertEqual(disk.bytes(.catalog), before)
+        }
+        XCTAssertEqual(vault.creates, 1)
+    }
+
+    func testMachineOrderWriteFailureKeepsOldOrNewCompletePreferencesWithoutTouchingKeys() async throws {
+        for (fault, published) in [(StoreTestPersistence.Fault.before(.catalog), false), (.after(.catalog), true)] {
+            let disk = StoreTestPersistence(), vault = StoreTestVault()
+            let store = WorkspaceStore(persistence: disk, vault: vault), original = try archive()
+            let first = try await store.install(original, envelopeDigest: digest, expectedRevision: nil,
+                                                sourceAndContentsConfirmed: true).workspace
+            disk.configure(fault)
+            do {
+                try await store.setMachineOrder(workspaceID: first.id, expectedRevision: first.revision,
+                    groupID: "group", expectedOrder: ["build", "gpu"], machineIDs: ["gpu", "build"])
+                XCTFail("publication fault was not reached")
+            } catch { }
+            let loaded = try await WorkspaceStore(persistence: disk, vault: vault).loadWithLocalPolicy()
+            let state = try XCTUnwrap(loaded.first)
+            XCTAssertEqual(state.navigationPreferences.machineOrder(for: original.workspace.groups[0]),
+                           published ? ["gpu", "build"] : ["build", "gpu"])
+            XCTAssertEqual(state.workspace.revision, first.revision)
+            XCTAssertEqual(state.workspace.bindings, first.bindings)
+            XCTAssertEqual(vault.count, 1); XCTAssertNil(disk.bytes(.journal))
+        }
+    }
+
+    func testPublishedVersionFiveMigratesWithoutInventingNavigationChoices() async throws {
+        let disk = StoreTestPersistence(), vault = StoreTestVault()
+        let store = WorkspaceStore(persistence: disk, vault: vault)
+        let first = try await store.install(archive(), envelopeDigest: digest, expectedRevision: nil,
+                                            sourceAndContentsConfirmed: true).workspace
+        try await store.setMachineAutoConnect(workspaceID: first.id, expectedRevision: first.revision,
+                                              machineID: "build", enabled: false)
+        var catalog = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(disk.bytes(.catalog))) as? [String: Any])
+        catalog["version"] = 5; catalog.removeValue(forKey: "groupNavigationPreferences")
+        disk.seed(try JSONSerialization.data(withJSONObject: catalog), slot: .catalog)
+        let loaded = try await WorkspaceStore(persistence: disk, vault: vault).loadWithLocalPolicy()
+        let state = try XCTUnwrap(loaded.first)
+        XCTAssertEqual(state.workspace.revision, first.revision)
+        XCTAssertEqual(state.connectionPreferences.autoConnectOverrides, ["build": false])
+        XCTAssertTrue(state.navigationPreferences.machineOrderOverrides.isEmpty)
+        let migrated = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(disk.bytes(.catalog))) as? [String: Any])
+        XCTAssertEqual(migrated["version"] as? Int, 6)
+        XCTAssertEqual((migrated["groupNavigationPreferences"] as? [Any])?.count, 0)
+        XCTAssertEqual(vault.creates, 1)
+    }
+
+    func testCorruptMachineOrderCannotChangeMembershipOrReachCredentialCleanup() async throws {
+        let disk = StoreTestPersistence(), vault = StoreTestVault()
+        let store = WorkspaceStore(persistence: disk, vault: vault)
+        let first = try await store.install(archive(), envelopeDigest: digest, expectedRevision: nil,
+                                            sourceAndContentsConfirmed: true).workspace
+        let original = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(disk.bytes(.catalog))) as? [String: Any])
+        let valid: [String: Any] = ["workspaceID": first.id.uuidString, "groupID": "group", "machineIDs": ["gpu", "build"]]
+        var foreign = valid; foreign["workspaceID"] = UUID().uuidString
+        var absentGroup = valid; absentGroup["groupID"] = "absent"
+        var duplicate = valid; duplicate["machineIDs"] = ["build", "build"]
+        var unknown = valid; unknown["machineIDs"] = ["build", "foreign"]
+        var incomplete = valid; incomplete["machineIDs"] = ["build"]
+        for choices in [[valid, valid], [foreign], [absentGroup], [duplicate], [unknown], [incomplete],
+                        Array(repeating: valid, count: 2049)] {
+            var fields = original; fields["groupNavigationPreferences"] = choices
+            let bytes = try JSONSerialization.data(withJSONObject: fields)
+            disk.seed(bytes, slot: .catalog)
+            do { _ = try await WorkspaceStore(persistence: disk, vault: vault).load(); XCTFail("corrupt order loaded") }
             catch { XCTAssertEqual(error as? WorkspaceStoreError, .corruptStore) }
             XCTAssertEqual(disk.bytes(.catalog), bytes); XCTAssertEqual(vault.count, 1)
         }
@@ -805,6 +977,7 @@ final class WorkspaceStoreTests: XCTestCase {
         catalog.removeValue(forKey: "acceptedImports"); catalog.removeValue(forKey: "hostRevocations")
         catalog.removeValue(forKey: "hostRequirements"); catalog.removeValue(forKey: "scopedHostRevocations")
         catalog.removeValue(forKey: "machineConnectionPreferences")
+        catalog.removeValue(forKey: "groupNavigationPreferences")
         persistence.seed(try JSONSerialization.data(withJSONObject: catalog), slot: .catalog)
         let reopened = WorkspaceStore(persistence: persistence, vault: vault)
         let migrated = try await reopened.load()
@@ -954,7 +1127,7 @@ final class WorkspaceStoreTests: XCTestCase {
         XCTAssertEqual(repeated.workspace.id, first.workspace.id)
         XCTAssertEqual(vault.creates, 1); XCTAssertNil(persistence.bytes(.journal))
         let upgraded = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(persistence.bytes(.catalog))) as? [String: Any])
-        XCTAssertEqual(upgraded["version"] as? Int, 5)
+        XCTAssertEqual(upgraded["version"] as? Int, 6)
         let accepted = try XCTUnwrap((upgraded["acceptedImports"] as? [[String: Any]])?.first)
         XCTAssertEqual(accepted["transferID"] as? String, transferID.base64EncodedString())
         XCTAssertEqual(accepted["envelopeDigest"] as? String, digest.base64EncodedString())
@@ -1032,7 +1205,7 @@ final class WorkspaceStoreTests: XCTestCase {
         // Publish the migrated catalog without changing the already-local denial.
         try await reopened.revokeLocally(fingerprint: fingerprint)
         let upgraded = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(persistence.bytes(.catalog))) as? [String: Any])
-        XCTAssertEqual(upgraded["version"] as? Int, 5)
+        XCTAssertEqual(upgraded["version"] as? Int, 6)
         let preserved = try XCTUnwrap(upgraded["acceptedImports"] as? [[String: Any]])
         XCTAssertEqual(preserved.count, 2)
         XCTAssertEqual(preserved.map { $0["firstAcceptedRevision"] as? String },
@@ -1180,7 +1353,7 @@ final class WorkspaceStoreTests: XCTestCase {
             XCTAssertNil(published.range(of: Data(secret.base64EncodedString().utf8)))
             XCTAssertNil(published.range(of: Data("unknown_private_setting".utf8)))
             let catalog = try XCTUnwrap(JSONSerialization.jsonObject(with: published) as? [String: Any])
-            XCTAssertEqual(catalog["version"] as? Int, 5); XCTAssertNil(catalog["needsSanitizedPublication"])
+            XCTAssertEqual(catalog["version"] as? Int, 6); XCTAssertNil(catalog["needsSanitizedPublication"])
             let history = try XCTUnwrap((catalog["acceptedImports"] as? [[String: Any]])?.first)
             XCTAssertEqual(history["envelopeDigest"] as? String, digest.base64EncodedString())
             XCTAssertEqual(history["firstAcceptedRevision"] as? String, first.workspace.revision.uuidString)

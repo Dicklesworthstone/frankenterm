@@ -148,11 +148,31 @@ public struct WorkspaceConnectionPreferences: Equatable, Sendable {
     }
 }
 
+/// Phone-local navigation order never changes imported group membership,
+/// connection intent, or remote mux topology. Stable IDs retain the user's
+/// ordering across renamed machines and successive reviewed exports.
+public struct WorkspaceNavigationPreferences: Equatable, Sendable {
+    public let machineOrderOverrides: [String: [String]]
+
+    public init(machineOrderOverrides: [String: [String]] = [:]) {
+        self.machineOrderOverrides = machineOrderOverrides
+    }
+
+    public func machineOrder(for group: WorkspaceDocument.Group) -> [String] {
+        let members = Set(group.machineOrder)
+        var seen = Set<String>()
+        return ((machineOrderOverrides[group.id] ?? []) + group.machineOrder).filter {
+            members.contains($0) && seen.insert($0).inserted
+        }
+    }
+}
+
 /// One revision-consistent snapshot of actual protected-key availability and
 /// mandatory local trust policy for the native browser and future transports.
 public struct WorkspaceLocalState: Sendable {
     public let workspace: InstalledWorkspace
     public let connectionPreferences: WorkspaceConnectionPreferences
+    public let navigationPreferences: WorkspaceNavigationPreferences
     public let credentialIDs: Set<String>
     public let revokedHostKeysByTrustScope: [String: Set<WorkspaceDocument.HostKey>]
     /// Refused host keys whose block could not be saved: this run of the app
@@ -200,8 +220,13 @@ public actor WorkspaceStore {
         let machineID: String
         let autoConnect: Bool
     }
+    private struct GroupNavigationPreference: Codable {
+        let workspaceID: UUID
+        let groupID: String
+        let machineIDs: [String]
+    }
     private struct Catalog: Codable {
-        var version = 5
+        var version = 6
         var workspaces: [InstalledWorkspace] = []
         var revokedFingerprints: Set<String> = []
         var acceptedImports: [AcceptedImport] = []
@@ -209,17 +234,18 @@ public actor WorkspaceStore {
         var scopedHostRevocations: Set<ScopedHostRevocation> = []
         var hostRequirements: Set<HostRequirement> = []
         var machineConnectionPreferences: [MachineConnectionPreference] = []
+        var groupNavigationPreferences: [GroupNavigationPreference] = []
         var needsSanitizedPublication = false
 
         init() {}
         private enum CodingKeys: String, CodingKey {
             case version, workspaces, revokedFingerprints, acceptedImports, hostRevocations, scopedHostRevocations, hostRequirements
-            case machineConnectionPreferences
+            case machineConnectionPreferences, groupNavigationPreferences
         }
         init(from decoder: Decoder) throws {
             let fields = try decoder.container(keyedBy: CodingKeys.self)
             let storedVersion = try fields.decode(Int.self, forKey: .version)
-            guard (1...5).contains(storedVersion) else { throw WorkspaceStoreError.corruptStore }
+            guard (1...6).contains(storedVersion) else { throw WorkspaceStoreError.corruptStore }
             workspaces = try fields.decode([InstalledWorkspace].self, forKey: .workspaces)
             revokedFingerprints = try fields.decode(Set<String>.self, forKey: .revokedFingerprints)
             guard workspaces.count <= 32, revokedFingerprints.count <= 4096 else { throw WorkspaceStoreError.corruptStore }
@@ -270,7 +296,7 @@ public actor WorkspaceStore {
             guard hostRevocations.count <= WorkspaceStore.hostRevocationLimit,
                   scopedHostRevocations.count <= WorkspaceStore.scopedHostRevocationLimit,
                   hostRequirements.count <= WorkspaceStore.hostRequirementLimit else { throw WorkspaceStoreError.corruptStore }
-            if storedVersion == 5 {
+            if storedVersion >= 5 {
                 machineConnectionPreferences = try fields.decode([MachineConnectionPreference].self, forKey: .machineConnectionPreferences)
             } else {
                 guard !fields.contains(.machineConnectionPreferences) else { throw WorkspaceStoreError.corruptStore }
@@ -278,7 +304,15 @@ public actor WorkspaceStore {
             guard machineConnectionPreferences.count <= WorkspaceStore.connectionPreferenceLimit else {
                 throw WorkspaceStoreError.corruptStore
             }
-            needsSanitizedPublication = storedVersion != 5
+            if storedVersion >= 6 {
+                groupNavigationPreferences = try fields.decode([GroupNavigationPreference].self, forKey: .groupNavigationPreferences)
+            } else {
+                guard !fields.contains(.groupNavigationPreferences) else { throw WorkspaceStoreError.corruptStore }
+            }
+            guard groupNavigationPreferences.count <= WorkspaceStore.navigationPreferenceLimit else {
+                throw WorkspaceStoreError.corruptStore
+            }
+            needsSanitizedPublication = storedVersion != 6
             // Older catalogs could retain opaque desktop annotations. Reuse the
             // wire validator so neither migration nor re-export can preserve an
             // untyped private value in this public configuration store.
@@ -324,6 +358,7 @@ public actor WorkspaceStore {
     private static let scopedHostRevocationLimit = 16384
     private static let hostRequirementLimit = 16384
     private static let connectionPreferenceLimit = 4096
+    private static let navigationPreferenceLimit = 32 * 64
 
     public init(persistence: any WorkspacePersistence, vault: any WorkspaceCredentialVault) {
         self.persistence = persistence; self.vault = vault
@@ -359,6 +394,7 @@ public actor WorkspaceStore {
                 let saved = hostRevocations(workspace.id, document: document, catalog: catalog, savedOnly: true)
                 return .init(workspace: workspace,
                       connectionPreferences: connectionPreferences(workspace.id, catalog: catalog),
+                      navigationPreferences: navigationPreferences(workspace.id, catalog: catalog),
                       credentialIDs: available, revokedHostKeysByTrustScope: refused,
                       unsavedHostKeysByTrustScope: refused.reduce(into: [:]) { unsaved, scope in
                           let keys = scope.value.subtracting(saved[scope.key] ?? [])
@@ -416,6 +452,66 @@ public actor WorkspaceStore {
     private func connectionPreferences(_ workspaceID: UUID, catalog: Catalog) -> WorkspaceConnectionPreferences {
         .init(autoConnectOverrides: Dictionary(uniqueKeysWithValues: catalog.machineConnectionPreferences
             .filter { $0.workspaceID == workspaceID }.map { ($0.machineID, $0.autoConnect) }))
+    }
+
+    /// Save an exact permutation of the reviewed group's membership. Both the
+    /// import revision and the previous local order are fenced so a second
+    /// scene cannot silently replace a reorder made while its sheet was open.
+    /// `nil` resets this group to the imported order without touching sessions.
+    @discardableResult
+    public func setMachineOrder(workspaceID: UUID, expectedRevision: UUID, groupID: String,
+                                expectedOrder: [String], machineIDs: [String]?) throws -> WorkspaceNavigationPreferences {
+        try Task.checkCancellation()
+        return try persistence.withExclusiveAccess {
+            var catalog = try readCatalog()
+            try recover(catalog: &catalog)
+            guard let saved = catalog.workspaces.first(where: { $0.id == workspaceID }),
+                  saved.revision == expectedRevision,
+                  let group = try saved.document().groups.first(where: { $0.id == groupID }) else {
+                throw WorkspaceStoreError.staleReview
+            }
+            let preferences = navigationPreferences(workspaceID, catalog: catalog)
+            guard preferences.machineOrder(for: group) == expectedOrder else { throw WorkspaceStoreError.staleReview }
+            if let machineIDs {
+                guard machineIDs.count == group.machineOrder.count,
+                      Set(machineIDs).count == machineIDs.count,
+                      Set(machineIDs) == Set(group.machineOrder) else { throw FTError.malformed("store.machine_order") }
+            }
+            let index = catalog.groupNavigationPreferences.firstIndex {
+                $0.workspaceID == workspaceID && $0.groupID == groupID
+            }
+            if let machineIDs {
+                if let index {
+                    if catalog.groupNavigationPreferences[index].machineIDs == machineIDs { return preferences }
+                    catalog.groupNavigationPreferences[index] = .init(workspaceID: workspaceID, groupID: groupID, machineIDs: machineIDs)
+                } else {
+                    guard catalog.groupNavigationPreferences.count < Self.navigationPreferenceLimit else {
+                        throw FTError.limit("store.navigation_preferences")
+                    }
+                    catalog.groupNavigationPreferences.append(.init(workspaceID: workspaceID, groupID: groupID, machineIDs: machineIDs))
+                }
+            } else if let index {
+                catalog.groupNavigationPreferences.remove(at: index)
+            } else { return preferences }
+            try Task.checkCancellation()
+            try persistence.write(encode(catalog, limit: Self.catalogLimit), to: .catalog)
+            return navigationPreferences(workspaceID, catalog: catalog)
+        }
+    }
+
+    private func navigationPreferences(_ workspaceID: UUID, catalog: Catalog) -> WorkspaceNavigationPreferences {
+        .init(machineOrderOverrides: Dictionary(uniqueKeysWithValues: catalog.groupNavigationPreferences
+            .filter { $0.workspaceID == workspaceID }.map { ($0.groupID, $0.machineIDs) }))
+    }
+
+    private func reconcileNavigationPreferences(workspaceID: UUID, document: WorkspaceDocument, catalog: inout Catalog) {
+        let preferences = navigationPreferences(workspaceID, catalog: catalog)
+        let groups = Dictionary(uniqueKeysWithValues: document.groups.map { ($0.id, $0) })
+        catalog.groupNavigationPreferences = catalog.groupNavigationPreferences.compactMap { preference in
+            guard preference.workspaceID == workspaceID else { return preference }
+            guard let group = groups[preference.groupID] else { return nil }
+            return .init(workspaceID: workspaceID, groupID: group.id, machineIDs: preferences.machineOrder(for: group))
+        }
     }
 
     /// All readiness decisions describe the same durable revision and actual
@@ -639,6 +735,7 @@ public actor WorkspaceStore {
                 }
             }
             if let index { catalog.workspaces[index] = installed } else { catalog.workspaces.append(installed) }
+            reconcileNavigationPreferences(workspaceID: installed.id, document: document, catalog: &catalog)
             let next = try encode(catalog, limit: Self.catalogLimit)
             let retained = Set(bindings.map(\.account))
             let retired = Set(old?.bindings.map(\.account) ?? []).subtracting(retained).sorted()
@@ -1326,13 +1423,14 @@ public actor WorkspaceStore {
     }
     private func readCatalog() throws -> Catalog {
         guard let data = try persistence.read(.catalog, limit: Self.catalogLimit) else { return Catalog() }
-        guard let catalog = try? JSONDecoder().decode(Catalog.self, from: data), catalog.version == 5,
+        guard let catalog = try? JSONDecoder().decode(Catalog.self, from: data), catalog.version == 6,
               catalog.workspaces.count <= 32, catalog.revokedFingerprints.count <= 4096,
               catalog.revokedFingerprints.allSatisfy({ (try? WorkspaceDocument.fingerprint($0)) != nil }),
               catalog.acceptedImports.count <= Self.importHistoryLimit, catalog.hostRevocations.count <= Self.hostRevocationLimit,
               catalog.scopedHostRevocations.count <= Self.scopedHostRevocationLimit,
               catalog.hostRequirements.count <= Self.hostRequirementLimit,
               catalog.machineConnectionPreferences.count <= Self.connectionPreferenceLimit,
+              catalog.groupNavigationPreferences.count <= Self.navigationPreferenceLimit,
               Set(catalog.workspaces.map(\.id)).count == catalog.workspaces.count,
               Set(catalog.workspaces.map(\.revision)).count == catalog.workspaces.count else { throw WorkspaceStoreError.corruptStore }
         var namespaces = Set<[String]>()
@@ -1346,6 +1444,8 @@ public actor WorkspaceStore {
                 throw WorkspaceStoreError.corruptStore
             }
         }
+        let navigationByWorkspace = Dictionary(grouping: catalog.groupNavigationPreferences, by: \.workspaceID)
+        guard Set(navigationByWorkspace.keys).isSubset(of: workspaceIDs) else { throw WorkspaceStoreError.corruptStore }
         var bundleIDs = Set<[String]>(), transferIDs = Set<Data>(), digests = Set<Data>()
         for export in catalog.acceptedImports {
             guard (try? WorkspaceDocument.identifier(export.exporterID)) != nil,
@@ -1372,6 +1472,14 @@ public actor WorkspaceStore {
         }
         for workspace in catalog.workspaces {
             let document = try workspace.document()
+            let groups = Dictionary(uniqueKeysWithValues: document.groups.map { ($0.id, $0) })
+            var navigationIDs = Set<String>()
+            for preference in navigationByWorkspace[workspace.id] ?? [] {
+                guard let group = groups[preference.groupID], preference.machineIDs.count <= 128,
+                      Set(preference.machineIDs).count == preference.machineIDs.count,
+                      Set(preference.machineIDs) == Set(group.machineOrder),
+                      navigationIDs.insert(preference.groupID).inserted else { throw WorkspaceStoreError.corruptStore }
+            }
             guard workspace.connectLater, workspace.envelopeDigest.count == 32, workspace.bindings.count <= 256,
                   workspace.inactiveSettings.count <= 1024, workspace.findings.count <= 1024,
                   namespaces.insert([document.exporterID, document.id]).inserted else { throw WorkspaceStoreError.corruptStore }
