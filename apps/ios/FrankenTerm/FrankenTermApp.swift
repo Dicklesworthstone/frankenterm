@@ -228,6 +228,7 @@ final class MobileWorkspaceModel {
                 }
                 connections = try MobileConnections(store: created,
                     journalDirectory: support.appendingPathComponent("FrankenTermSessions", isDirectory: true))
+                connections?.setPasswordForeground(active)
                 updateConnectionLifecycle()
             }
             try await refreshWorkspaces(using: created, epoch: epoch)
@@ -285,6 +286,7 @@ final class MobileWorkspaceModel {
     /// usual grace period and ends the standing Face ID approval; returning
     /// reconnects whatever dropped meanwhile (WorkspaceTerminalScene).
     func setScenePhase(_ phase: ScenePhase) {
+        connections?.setPasswordForeground(phase == .active)
         if phase == .background {
             AppleSSHCredentialSigner.endApproval()
             beginBackgroundRun()
@@ -370,6 +372,7 @@ final class MobileWorkspaceModel {
     }
     func setRestoreVisible(_ value: Bool) {
         if value { credentialImport?.cancel() }
+        if value { connections?.passwordPrompt.setScope(nil) }
         showRestore = value
         // A just-dismissed request may already be retired. Re-present only the
         // status returned by the serialized lifecycle transition.
@@ -1283,6 +1286,11 @@ final class MobileWorkspaceModel {
     /// may then be ended, is inactive too.
     func showing(_ screen: LiveScreen?) {
         guard active else { return }
+        if let screen, let workspace = workspaces.first(where: { $0.id == screen.workspaceID }),
+           let document = try? workspace.document(), let machine = document.machines.first(where: { $0.id == screen.machineID }) {
+            connections?.passwordPrompt.setScope(.init(workspaceID: screen.workspaceID, revision: workspace.revision,
+                                                       destinationRouteIDs: Set(machine.routeIDs)))
+        } else { connections?.passwordPrompt.setScope(nil) }
         if let screen, let data = try? JSONEncoder().encode(screen) {
             UserDefaults.standard.set(data, forKey: Self.liveScreenKey)
         } else { UserDefaults.standard.removeObject(forKey: Self.liveScreenKey) }
@@ -1722,6 +1730,11 @@ struct MobileWorkspaceRoot: View {
         .onOpenURL { model.importFile($0) }
         .sheet(isPresented: Binding(get: { model.showRestore }, set: { model.setRestoreVisible($0) })) {
             OfflineRestoreSheet(model: model)
+        }
+        .sheet(item: Binding(get: { model.connections?.passwordPrompt.request }, set: { _ in })) { request in
+            if let prompt = model.connections?.passwordPrompt {
+                MobileSSHPasswordSheet(prompt: prompt, request: request).id(request.id)
+            }
         }
         .fileImporter(isPresented: $chooseFile, allowedContentTypes: [.json, .data], allowsMultipleSelection: false) { result in
             switch result {
@@ -3270,8 +3283,9 @@ private struct MachineWorkspaceView: View {
             if let hop, route.jumpRoutes.count == 1, hop.jumpRoutes.isEmpty {
                 Text(verbatim: "Through \(hop.user)@\(hop.host):\(hop.port)")
                     .font(.system(.caption, design: .monospaced)).opacity(0.75).textSelection(.enabled)
-            } else if !route.jumpRoutes.isEmpty {
-                Text("This jump-host chain needs more than the one hop supported by this build.").font(.caption).opacity(0.75)
+            } else if let hops = try? document.orderedJumpRoutes(forRouteID: route.id), !hops.isEmpty {
+                Text(verbatim: "Through " + hops.map { "\($0.user)@\($0.host):\($0.port)" }.joined(separator: " → "))
+                    .font(.system(.caption, design: .monospaced)).opacity(0.75).textSelection(.enabled)
             }
             if route.mode == "frankenterm_mux" {
                 Text("Attaches to this machine's existing FrankenTerm panes, like the desktop app.").font(.caption).opacity(0.75)
@@ -3329,11 +3343,18 @@ private struct MachineWorkspaceView: View {
         for id in [machine.preferredRouteID] + machine.routeIDs where seen.insert(id).inserted {
             guard let route = document.routes.first(where: { $0.id == id }),
                   route.mode == "direct_ssh" || route.mode == "frankenterm_mux",
-                  route.jumpRoutes.count <= 1, let readiness = local.routes.first(where: { $0.routeID == id }),
-                  readiness.issues.isEmpty, !readiness.usableCredentialIDs.isEmpty else { continue }
-            let hop = route.jumpRoutes.first.flatMap { hopID in document.routes.first(where: { $0.id == hopID }) }
-            guard route.jumpRoutes.isEmpty || hop?.jumpRoutes.isEmpty == true else { continue }
+                  let hops = try? document.orderedJumpRoutes(forRouteID: id),
+                  hops.count <= WorkspaceNativeSSHAuthentication.routeSupport.maximumJumpHops,
+                  let readiness = local.routes.first(where: { $0.routeID == id }), readiness.issues.isEmpty else { continue }
+            let choices = WorkspaceSSHAuthenticationChoice.choices(for: route, usableCredentialIDs: readiness.usableCredentialIDs)
+            guard !choices.isEmpty else { continue }
+            let hop = hops.first
+            let passwordJump = hops.contains { hop in
+                let usable = local.routes.first(where: { $0.routeID == hop.id })?.usableCredentialIDs ?? []
+                return WorkspaceSSHAuthenticationChoice.choices(for: hop, usableCredentialIDs: usable).contains(.password)
+            }
             routes.append(.init(id: id, credentialIDs: readiness.usableCredentialIDs, host: route.host, port: route.port,
+                                authenticationChoices: choices, passwordJump: passwordJump,
                                 mux: route.mode == "frankenterm_mux",
                                 sessionCreation: route.mode == "frankenterm_mux" ? .existingOnly
                                     : (route.sessionCreation == "manual" ? .manual : .onSelect),

@@ -7,6 +7,117 @@ import FrankenTermSSH
 import FrankenTermSSHIntegration
 import FrankenTermTerminal
 
+/// One visible, app-owned password editor. It is scoped to the terminal the
+/// person is looking at, and can never store or automatically reuse a password.
+@MainActor
+@Observable
+final class MobileSSHPasswordPrompt: WorkspaceSSHPasswordPrompting {
+    struct Scope: Equatable {
+        let workspaceID: UUID, revision: UUID
+        let destinationRouteIDs: Set<String>
+    }
+    private(set) var request: WorkspaceSSHPasswordRequest?
+    var secret = ""
+    @ObservationIgnored private var active = false
+    @ObservationIgnored private var scope: Scope?
+    @ObservationIgnored private var continuation: CheckedContinuation<Data, Error>?
+    var isActive: Bool { active }
+
+    func setActive(_ value: Bool) {
+        active = value
+        if !value { cancelCurrent() }
+    }
+    func setScope(_ value: Scope?) {
+        if scope != value { cancelCurrent() }
+        scope = value
+    }
+    private func permits(_ request: WorkspaceSSHPasswordRequest) -> Bool {
+        guard active, let scope else { return false }
+        let authorization = request.authorization
+        return scope.workspaceID == authorization.workspaceID && scope.revision == authorization.workspaceRevision
+            && scope.destinationRouteIDs.contains(authorization.transitForRouteID ?? authorization.routeID)
+    }
+    func password(for request: WorkspaceSSHPasswordRequest) async throws -> Data {
+        try Task.checkCancellation()
+        guard permits(request) else { throw SSHAuthenticationError.stale }
+        guard self.request == nil, continuation == nil else { throw SSHAuthenticationError.busy }
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                guard !Task.isCancelled, permits(request) else {
+                    continuation.resume(throwing: CancellationError()); return
+                }
+                secret = ""; self.request = request; self.continuation = continuation
+            }
+        } onCancel: { self.cancel(requestID: request.id) }
+    }
+    nonisolated func cancel(requestID: UUID) {
+        Task { @MainActor in self.cancelNow(requestID: requestID) }
+    }
+    func cancelNow(requestID: UUID) {
+        guard request?.id == requestID else { return }
+        cancelCurrent()
+    }
+    private func cancelCurrent() {
+        let pending = continuation
+        continuation = nil; secret = ""; request = nil
+        pending?.resume(throwing: CancellationError())
+    }
+    var canSubmit: Bool { (1...1024).contains(secret.utf8.count) && !secret.utf8.contains(0) }
+    func editSecret(_ value: String) {
+        guard value.utf8.count <= 1024, !value.utf8.contains(0) else { return }
+        secret = value
+    }
+    func submit(requestID: UUID) {
+        guard let request, request.id == requestID, permits(request), canSubmit, let continuation else { return }
+        let bytes = Data(secret.utf8)
+        self.continuation = nil; secret = ""; self.request = nil
+        continuation.resume(returning: bytes)
+    }
+}
+
+@MainActor
+struct MobileSSHPasswordSheet: View {
+    @Bindable var prompt: MobileSSHPasswordPrompt
+    let request: WorkspaceSSHPasswordRequest
+    @FocusState private var focused: Bool
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section(request.authorization.transitForRouteID == nil ? "Verified machine" : "Verified jump host") {
+                    Text(verbatim: "\(request.authorization.user)@\(request.authorization.host):\(request.authorization.port)")
+                        .font(.system(.body, design: .monospaced)).textSelection(.enabled)
+                    Text(verbatim: request.authorization.presentedHostKey.fingerprint)
+                        .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                }
+                Section {
+                    SecureField("SSH password", text: Binding(get: { prompt.secret }, set: { prompt.editSecret($0) }))
+                        .textContentType(.password).textInputAutocapitalization(.never).autocorrectionDisabled()
+                        .focused($focused).submitLabel(.go)
+                        .onSubmit { prompt.submit(requestID: request.id) }
+                        .accessibilityIdentifier("ssh.password.field")
+                } footer: {
+                    Text("The host key matches the workspace saved on this phone. This password is used once and is not saved. Password changes and verification-code prompts are not supported.")
+                }
+            }
+            .navigationTitle("SSH Password").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { prompt.cancelNow(requestID: request.id) }
+                        .accessibilityIdentifier("ssh.password.cancel")
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Sign In") { prompt.submit(requestID: request.id) }
+                        .disabled(!prompt.canSubmit || prompt.request?.id != request.id)
+                        .accessibilityIdentifier("ssh.password.submit")
+                }
+            }
+        }
+        .interactiveDismissDisabled()
+        .task { focused = true }
+        .onDisappear { prompt.cancelNow(requestID: request.id) }
+    }
+}
+
 /// App-wide live-connection services over the app's single WorkspaceStore: one
 /// input coordinator, one durable shell-creation journal and one connection
 /// manager (which owns the authentication broker's foreground state).
@@ -16,6 +127,9 @@ final class MobileConnections {
     let manager: WorkspaceSSHConnectionManager
     /// Durable record of sessions whose input may have unknown remote effects.
     let journal: TerminalSessionJournal
+    let passwordPrompt = MobileSSHPasswordPrompt()
+    private let broker: SSHAuthenticationBroker
+    private var passwordLifecycle: Task<Void, Never>?
     // Failed cleanup retains its existing bounded connection/model owner even
     // after SwiftUI removes the screen. Never manufacture a replacement owner
     // or forget an unresolved protected-storage write to make room for a shell.
@@ -29,13 +143,23 @@ final class MobileConnections {
          liveness: WorkspaceSSHLiveness = .standard) throws {
         let broker = SSHAuthenticationBroker(store: store, signer: signer,
                                              support: WorkspaceNativeSSHAuthentication.routeSupport)
+        self.broker = broker
         coordinator = try TerminalInputCoordinator()
         journal = try TerminalSessionJournal(directory: journalDirectory, identifier: journalIdentifier)
         // Machines with a FrankenTerm mux are attached to like the desktop app
         // does: the same panes, through the Rust mux client.
         manager = WorkspaceSSHConnectionManager(store: store, broker: broker, journal: journal,
                                                 coordinator: coordinator, liveness: liveness,
-                                                muxClientFactory: { try NativeMuxClient() })
+                                                muxClientFactory: { try NativeMuxClient() }, passwordPrompter: passwordPrompt)
+    }
+
+    func setPasswordForeground(_ active: Bool) {
+        passwordPrompt.setActive(active)
+        let prior = passwordLifecycle, broker = broker
+        passwordLifecycle = Task {
+            await prior?.value
+            await broker.setPasswordForeground(active)
+        }
     }
 
     /// Admits connections and retries any cleanup that failed earlier. Sessions
@@ -44,6 +168,8 @@ final class MobileConnections {
     func activate() async {
         for controller in Array(pendingCleanup.values) { await controller.retryCleanup() }
         await manager.resume()
+        await passwordLifecycle?.value
+        await broker.setPasswordForeground(passwordPrompt.isActive)
     }
 
     fileprivate func retainForCleanup(_ controller: TerminalSessionController) {
@@ -57,6 +183,8 @@ final class MobileConnections {
 /// starting a shell. Readiness never authorizes unrelated Keychain identities.
 struct TerminalSessionRoute: Hashable, Sendable {
     let id: String, credentialIDs: [String], host: String, port: UInt16
+    var authenticationChoices: [WorkspaceSSHAuthenticationChoice]? = nil
+    var passwordJump = false
     var mux = false
     var sessionCreation: TerminalSessionCreation = .onSelect
     var jumpHost: String? = nil
@@ -66,6 +194,10 @@ struct TerminalSessionRoute: Hashable, Sendable {
     /// destination's private address is resolved and reached by its jump host.
     var networkHost: String { jumpHost ?? host }
     var networkPort: UInt16 { jumpHost == nil ? port : (jumpPort ?? 22) }
+    var choices: [WorkspaceSSHAuthenticationChoice] {
+        authenticationChoices ?? credentialIDs.map(WorkspaceSSHAuthenticationChoice.publicKey)
+    }
+    var requiresPassword: Bool { passwordJump || choices.contains(.password) }
 }
 
 /// A machine to open and its ready routes, the chosen or preferred one first.
@@ -76,6 +208,7 @@ struct TerminalSessionTarget: Hashable, Sendable {
     let routes: [TerminalSessionRoute]
     /// The machine theme as the terminal's base palette, and its background.
     let basePalette: [UInt8]?, background: String?
+    var requiresPassword: Bool { routes.contains(where: \.requiresPassword) }
 
     init(workspaceID: UUID, revision: UUID, machineID: String, machineName: String,
          routes: [TerminalSessionRoute], theme: WorkspaceDocument.Theme? = nil) {
@@ -292,6 +425,11 @@ final class TerminalSessionController {
     @ObservationIgnored private var viewAttachment: Task<Void, Never>?
     @ObservationIgnored private var authenticatedSelection: TerminalRouteAttemptPlan.Selection?
     @ObservationIgnored private var reconnectSelection: TerminalRouteAttemptPlan.Selection?
+    /// Bounded public metadata only. A password hop cannot be reconstructed
+    /// automatically after destination key refusal; explicit Retry consumes
+    /// the remaining plan once, without re-offering already-refused keys.
+    @ObservationIgnored private var passwordHopRetryPlan: TerminalRouteAttemptPlan?
+    @ObservationIgnored private var passwordMuxRetry = false
     @ObservationIgnored private var paneHandoff: Task<Void, Never>?
     @ObservationIgnored private var requestedMuxPane: Int?
     @ObservationIgnored private var requestedMuxNavigation: TerminalMuxInputRouting.NavigationPlan?
@@ -301,6 +439,7 @@ final class TerminalSessionController {
 
     init(target: TerminalSessionTarget, connections: MobileConnections, focus: any TerminalSessionFocus,
          reconnectingFrom previous: TerminalSessionController? = nil,
+         retryingAfterPasswordHop retried: TerminalSessionController? = nil,
          inputDelivery: TerminalInputDelivery = .init()) {
         self.target = target; self.connections = connections; self.focus = focus
         self.inputDelivery = inputDelivery
@@ -311,9 +450,20 @@ final class TerminalSessionController {
         if let previous, previous.target.workspaceID == target.workspaceID,
            previous.target.revision == target.revision, previous.target.machineID == target.machineID,
            let selected = previous.authenticatedSelection ?? previous.reconnectSelection,
-           target.routes.contains(where: { $0.id == selected.routeID && $0.credentialIDs.contains(selected.credentialID) }) {
+           target.routes.contains(where: { $0.id == selected.routeID && $0.choices.contains(selected.authentication) }) {
             reconnectSelection = selected
             shellOnly = previous.shellOnly
+        }
+        if let retried {
+            let pending = retried.passwordHopRetryPlan
+            let direct = retried.passwordMuxRetry
+            retried.passwordHopRetryPlan = nil; retried.passwordMuxRetry = false
+            if retried.target.workspaceID == target.workspaceID, retried.target.revision == target.revision,
+               retried.target.machineID == target.machineID, retried.target.routes == target.routes,
+               pending != nil || direct {
+                passwordHopRetryPlan = pending; passwordMuxRetry = direct
+                shellOnly = retried.shellOnly
+            }
         }
     }
 
@@ -799,6 +949,9 @@ final class TerminalSessionController {
     func setPresentationVisible(_ visible: Bool) {
         let visible = visible && !stopped
         presentationVisible = visible
+        // A pending password belongs to this visible destination. Returning to
+        // the same tab later must not revive its old prompt or queued attempt.
+        if !visible, target.requiresPassword, phase == .connecting { requestStop() }
         if visible { unseenShellOutput = false }
         muxObservation?.setActive(visible)
         // Only the machine on screen sizes its mux pane to the phone; the
@@ -955,6 +1108,11 @@ final class TerminalSessionController {
                 // hidden by opening another key, route, or shell.
                 try await connections.manager.close(connectionID: attempt.id)
                 self.connection = nil
+                if rememberPasswordMuxFallback() {
+                    throw ConnectFailure(help: .init(title: "Couldn't attach to \(target.machineName)",
+                        message: "This machine's FrankenTerm mux is unavailable. Choose Retry to open its direct SSH route; you will sign in again. No new shell has been opened.",
+                        remedy: .none))
+                }
                 shellOnly = true
                 try checkStarting()
                 attempt = try await connectAcknowledgingEarlierSessions()
@@ -1275,7 +1433,8 @@ final class TerminalSessionController {
         switch error {
         case let failure as SSHAuthenticationError: failure != .busy
         case let failure as NativeSSHError: failure == .invalidInput || failure.isMachineAnswer
-        case let failure as WorkspaceSSHConnectionError: failure == .capacity || failure == .stale
+        case let failure as WorkspaceSSHConnectionError:
+            failure == .capacity || failure == .stale || failure == .passwordHopRetryRequired
         default: true
         }
     }
@@ -1295,17 +1454,7 @@ final class TerminalSessionController {
             throw ConnectFailure(help: .init(title: "Couldn't connect to \(target.machineName)",
                 message: "No direct SSH route is ready to open a new shell on this device.", remedy: .none))
         }
-        // A direct route's mux-to-shell fallback and an automatic reconnect
-        // start with the key that authenticated. An explicit Retry starts over
-        // in configured order. Every preference remains in this exact target.
-        let prior = authenticatedSelection ?? reconnectSelection
-        let preferred = prior.flatMap { selected in
-            candidates.contains(where: { $0.id == selected.routeID && $0.credentialIDs.contains(selected.credentialID) })
-                ? selected : nil
-        }
-        var plan = try TerminalRouteAttemptPlan(routes: candidates.map {
-            .init(routeID: $0.id, credentialIDs: $0.credentialIDs)
-        }, preferring: preferred)
+        var plan = try makeRouteAttemptPlan(candidates: candidates)
         while let attempt = plan.current {
             try checkStarting()
             guard let candidate = candidates.first(where: { $0.id == attempt.selection.routeID }) else {
@@ -1316,13 +1465,16 @@ final class TerminalSessionController {
             do {
                 let connected = try await connections.manager.connect(workspaceID: target.workspaceID,
                     expectedRevision: target.revision, machineID: target.machineID, routeID: candidate.id,
-                    credentialID: attempt.selection.credentialID, confirmedByUser: true, attachMux: !shellOnly)
+                    authentication: attempt.selection.authentication, confirmedByUser: true,
+                    attachMux: !shellOnly && (!candidate.requiresPassword || candidate.mux))
                 // Retain the owner before any following operation can throw.
                 // performStart checks cancellation before opening the channel.
                 connection = connected
                 authenticatedSelection = try plan.connected(attempt)
+                passwordHopRetryPlan = nil; passwordMuxRetry = false
                 return connected
             } catch is CancellationError {
+                passwordHopRetryPlan = nil; passwordMuxRetry = false
                 plan.cancel()
                 throw CancellationError()
             } catch TerminalSessionJournalError.reviewRequired {
@@ -1332,7 +1484,15 @@ final class TerminalSessionController {
                 // The awaited manager owns and settles the failed transport.
                 // Local cancellation wins before another candidate is selected.
                 try checkStarting()
-                Self.log.error("route \(candidate.id, privacy: .public), key \(attempt.selection.credentialID, privacy: .public) failed: \(String(describing: error), privacy: .public)")
+                Self.log.error("route \(candidate.id, privacy: .public) sign-in failed: \(String(describing: error), privacy: .public)")
+                if error as? WorkspaceSSHConnectionError == .passwordHopRetryRequired {
+                    let hasNext = try rememberPasswordHopRefusal(attempt, plan: &plan)
+                    throw ConnectFailure(help: .init(title: "Couldn't connect to \(target.machineName)",
+                        message: hasNext
+                            ? "The destination refused this key. Choose Retry to try the next configured key; you will sign into the jump host again."
+                            : "The destination refused all available configured keys. Add the intended public key to ~/.ssh/authorized_keys on the destination before retrying.",
+                        remedy: .none))
+                }
                 if let failure = error as? NativeSSHError, failure.isCredentialRefused {
                     if try plan.failed(.credentialRefused, attempt: attempt) != nil { continue }
                     throw ConnectFailure(help: .init(title: "Couldn't connect to \(target.machineName)",
@@ -1344,6 +1504,7 @@ final class TerminalSessionController {
                         port: candidate.networkPort, onTailnet: onTailnet, device: device)
                         ?? .init(title: "Couldn't connect to \(target.machineName)", message: Self.describe(error), remedy: .none)
                     if plan.hasCredentialRefusal {
+                        if candidate.passwordJump { passwordHopRetryPlan = plan }
                         _ = try plan.failed(.unreachable, attempt: attempt)
                         throw ConnectFailure(help: help)
                     }
@@ -1360,6 +1521,47 @@ final class TerminalSessionController {
         throw ConnectFailure(help: WorkspaceConnectionHelp.best(unreachable)
             ?? .init(title: "Couldn't connect to \(target.machineName)", message: "No route answered.", remedy: .none),
             answered: false)
+    }
+
+    func makeRouteAttemptPlan(candidates: [TerminalSessionRoute]) throws -> TerminalRouteAttemptPlan {
+        let candidates = candidates.filter { !(shellOnly && $0.mux) }
+        if let pending = passwordHopRetryPlan, let selected = pending.current?.selection,
+           candidates.contains(where: { $0.id == selected.routeID && $0.choices.contains(selected.authentication) }) {
+            passwordHopRetryPlan = nil
+            return pending
+        }
+        passwordHopRetryPlan = nil
+        // Ordinary reconnects prefer the authenticated key. A fresh explicit
+        // attempt otherwise starts in configured order within this target.
+        let prior = authenticatedSelection ?? reconnectSelection
+        let preferred = prior.flatMap { selected in
+            candidates.contains(where: { $0.id == selected.routeID && $0.choices.contains(selected.authentication) })
+                ? selected : nil
+        }
+        return try TerminalRouteAttemptPlan(routes: candidates.map {
+            .init(routeID: $0.id, authenticationChoices: $0.choices)
+        }, preferring: preferred)
+    }
+
+    /// Called only for the factory's positive unsigned destination-key refusal,
+    /// never for a failed hop, password, signature or ambiguous network result.
+    @discardableResult
+    func rememberPasswordHopRefusal(_ attempt: TerminalRouteAttemptPlan.Attempt,
+                                    plan: inout TerminalRouteAttemptPlan) throws -> Bool {
+        guard target.routes.contains(where: { $0.id == attempt.selection.routeID && $0.passwordJump }),
+              case .publicKey = attempt.selection.authentication else { throw TerminalRouteAttemptPlanError.staleAttempt }
+        let next = try plan.failed(.credentialRefused, attempt: attempt)
+        passwordHopRetryPlan = next == nil ? nil : plan
+        return next != nil
+    }
+
+    /// Existing-only mux failure grants no new login or shell. Preserve only
+    /// the direct-route choice for the person's next explicit Retry.
+    @discardableResult
+    func rememberPasswordMuxFallback() -> Bool {
+        guard route.requiresPassword, target.routes.contains(where: { !$0.mux }) else { return false }
+        shellOnly = true; passwordMuxRetry = true
+        return true
     }
 
     /// The desktop's default terminal font, bundled with its license, when it
@@ -1476,6 +1678,11 @@ final class TerminalSessionController {
 
     /// Synchronous disappearance/close barrier, before SwiftUI schedules cleanup.
     func requestStop() {
+        passwordHopRetryPlan = nil; passwordMuxRetry = false
+        stopCurrentOperation()
+    }
+
+    private func stopCurrentOperation() {
         if !stopped, phase == .connecting || phase == .ready || phase == .live {
             phase = .ended(Self.describe(TerminalSessionEnd.cancelled))
         }
@@ -1522,7 +1729,7 @@ final class TerminalSessionController {
     /// a later explicit retry resumes cleanup, not connection or shell creation.
     private func teardown() async {
         guard !settled else { return }
-        requestStop()
+        stopCurrentOperation()
         let owned: (id: UUID, task: Task<Void, Never>)
         if let cleanup { owned = cleanup }
         else {

@@ -44,7 +44,7 @@ public enum NativeSSHError: Error, Equatable, Sendable, LocalizedError {
         case .invalidChallenge, .jumpAuthenticationRequired: true
         case let .native(code):
             [FTSSH_NEGOTIATION, FTSSH_HOST_REJECTED, FTSSH_AUTH_REJECTED, FTSSH_CHALLENGE, FTSSH_UNSUPPORTED,
-             FTSSH_AUTH_FAILED].contains(Int(code))
+             FTSSH_AUTH_FAILED, FTSSH_PASSWORD_FAILED].contains(Int(code))
         default: false
         }
     }
@@ -68,6 +68,7 @@ public enum NativeSSHError: Error, Equatable, Sendable, LocalizedError {
             case FTSSH_HOST_REJECTED: "The machine's host key changed during the connection."
             case FTSSH_AUTH_REJECTED: "The machine didn't accept this key. Add the key's public half to ~/.ssh/authorized_keys on the machine."
             case FTSSH_AUTH_FAILED: "SSH key authentication could not be completed. The server may require an additional authentication method."
+            case FTSSH_PASSWORD_FAILED: "The server did not complete password authentication. Check the password; the account may require a password change or another authentication method."
             case FTSSH_CLOSED: "The machine closed the connection."
             case FTSSH_UNSUPPORTED: "The machine requires an SSH feature this app doesn't support."
             default: "The SSH connection failed (code \(code))."
@@ -145,6 +146,31 @@ public protocol NativeSSHAuthentication: Sendable {
     func cancel(transportID: UUID)
 }
 
+/// A selected account is public policy, never a password or a synthetic key.
+public struct NativeSSHPasswordAccount: Sendable, Equatable {
+    public let user: String
+    public init(user: String) throws {
+        guard !user.isEmpty, user.utf8.count <= 256,
+              !user.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else {
+            throw NativeSSHError.invalidInput
+        }
+        self.user = user
+    }
+}
+
+/// A foreground password prompt belongs to one verified exchange and attempt.
+/// account(for:) must verify the exact peer and imported password policy before
+/// returning. The driver asks for a secret only after the server advertises the
+/// SSH password method. Keyboard-interactive and password changes are separate.
+/// Implementations must retire pending prompts on cancel and must not persist
+/// the response. validate is called before and after prompting and while live.
+public protocol NativeSSHPasswordAuthentication: Sendable {
+    func account(for peer: NativeSSHPeer) async throws -> NativeSSHPasswordAccount
+    func password(for account: NativeSSHPasswordAccount, peer: NativeSSHPeer) async throws -> Data
+    func validate(peer: NativeSSHPeer, account: NativeSSHPasswordAccount) async throws
+    func cancel(transportID: UUID)
+}
+
 public struct NativeSSHGeometry: Sendable, Equatable {
     public let columns: UInt32, rows: UInt32, pixelWidth: UInt32, pixelHeight: UInt32
     public init(columns: UInt32, rows: UInt32, pixelWidth: UInt32 = 0, pixelHeight: UInt32 = 0) throws {
@@ -216,14 +242,26 @@ public actor NativeSSHSession {
     private var waiter: SocketReadiness?
     private var shutdown: Task<Void, Never>?
     private var authentication: (any NativeSSHAuthentication)?
-    private struct ForwardingWitness: Sendable {
-        let authority: any NativeSSHAuthentication
-        let peer: NativeSSHPeer
-        let identity: NativeSSHIdentity
+    private var passwordAuthentication: (any NativeSSHPasswordAuthentication)?
+    private enum ForwardingWitness: Sendable {
+        case publicKey(any NativeSSHAuthentication, NativeSSHPeer, NativeSSHIdentity)
+        case password(any NativeSSHPasswordAuthentication, NativeSSHPeer, NativeSSHPasswordAccount)
+
+        func validate() async throws {
+            switch self {
+            case let .publicKey(authority, peer, identity): try await authority.validate(peer: peer, identity: identity)
+            case let .password(authority, peer, account): try await authority.validate(peer: peer, account: account)
+            }
+        }
+        func cancel() {
+            switch self {
+            case let .publicKey(authority, peer, _): authority.cancel(transportID: peer.transportID)
+            case let .password(authority, peer, _): authority.cancel(transportID: peer.transportID)
+            }
+        }
     }
     private var forwardingWitnesses: [ForwardingWitness] = []
-    private var peer: NativeSSHPeer?
-    private var identity: NativeSSHIdentity?
+    private var authorization: ForwardingWitness?
     private var requestedResize: NativeSSHGeometry?
     private var outputEnded = false
     private var completionDeadline: ContinuousClock.Instant?
@@ -261,7 +299,7 @@ public actor NativeSSHSession {
                         maximumNativeBytes: Int = 2 * 1024 * 1024) async throws -> NativeSSHSession {
         let deadline = try deadline(timeout)
         guard phase == .authenticated, operation == nil,
-              let authority = authentication, let peer, let identity else {
+              let authority = authorization else {
             throw phase == .closed ? NativeSSHError.closed : .busy
         }
         guard forwardingWitnesses.count < Int(FTSSH_MAX_JUMP_HOPS) else { throw NativeSSHError.native(Int32(FTSSH_UNSUPPORTED)) }
@@ -273,7 +311,7 @@ public actor NativeSSHSession {
         do {
             return try await withTaskCancellationHandler {
                 try await validateForwardingPath()
-                try await authority.validate(peer: peer, identity: identity)
+                try await authority.validate()
                 try current(token, deadline)
                 try requireOK(endpoint.host.withCString {
                     ftssh_begin_forward(native.pointer, $0, endpoint.host.utf8.count, endpoint.port)
@@ -286,15 +324,15 @@ public actor NativeSSHSession {
                     try await ready(directions: ftssh_directions(native.pointer), deadline: deadline)
                 }
                 try await validateForwardingPath()
-                try await authority.validate(peer: peer, identity: identity)
+                try await authority.validate()
                 try current(token, deadline)
                 let transferred = try native.forwarded(maximumNativeBytes: maximumNativeBytes)
                 // No suspension point after native ownership moves. Closing
                 // this consumed actor must never cancel the child's hop grant.
                 let child = NativeSSHSession(native: transferred, endpoint: endpoint,
-                    witnesses: forwardingWitnesses + [.init(authority: authority, peer: peer, identity: identity)])
+                    witnesses: forwardingWitnesses + [authority])
                 forwardingWitnesses.removeAll()
-                authentication = nil; self.peer = nil; self.identity = nil
+                authentication = nil; passwordAuthentication = nil; authorization = nil
                 phase = .closed; operation = nil
                 return child
             } onCancel: { [weak self] in Task { await self?.close() } }
@@ -312,7 +350,7 @@ public actor NativeSSHSession {
         try Task.checkCancellation()
         guard phase != .closed else { throw NativeSSHError.closed }
         for witness in forwardingWitnesses {
-            try await witness.authority.validate(peer: witness.peer, identity: witness.identity)
+            try await witness.validate()
             try Task.checkCancellation()
             guard phase != .closed else { throw NativeSSHError.closed }
         }
@@ -378,7 +416,87 @@ public actor NativeSSHSession {
                 try await authority.validate(peer: found, identity: selected)
                 try await validateForwardingPath()
                 try current(token, deadline)
-                peer = found; identity = selected; phase = .authenticated
+                authorization = .publicKey(authority, found, selected); phase = .authenticated
+                return found
+            } onCancel: { [weak self] in
+                authority.cancel(transportID: transportID)
+                Task { await self?.close() }
+            }
+        } catch {
+            await close()
+            if Task.isCancelled { throw CancellationError() }
+            if ContinuousClock.now >= deadline || error as? NativeSSHError == .timedOut {
+                throw NativeSSHError.authenticationTimedOut
+            }
+            throw error
+        }
+    }
+
+    /// One explicit password attempt. The native method probe precedes the UI
+    /// request; the secret is supplied once and retained only for this attempt.
+    public func authenticate(usingPassword authority: any NativeSSHPasswordAuthentication,
+                             timeout: Duration = .seconds(60)) async throws -> NativeSSHPeer {
+        let deadline = try deadline(timeout)
+        guard phase == .fresh, operation == nil else { throw phase == .closed ? NativeSSHError.closed : .busy }
+        try Task.checkCancellation()
+        let token = UUID(); operation = token; phase = .authenticating; passwordAuthentication = authority
+        let transportID = self.transportID
+        let timer = expiry(deadline, operation: token)
+        defer { timer.cancel(); if operation == token { operation = nil } }
+        do {
+            return try await withTaskCancellationHandler {
+                try await validateForwardingPath()
+                while true {
+                    try current(token, deadline)
+                    let result = ftssh_handshake(native.pointer)
+                    if result == FTSSH_OK { break }
+                    try requireAgain(result)
+                    try await ready(directions: ftssh_directions(native.pointer), deadline: deadline)
+                }
+                let found = try copyPeer()
+                try await validateForwardingPath()
+                try current(token, deadline)
+                let account = try await authority.account(for: found)
+                try await authority.validate(peer: found, account: account)
+                try await validateForwardingPath()
+                try current(token, deadline)
+                try requireOK(found.hostKey.withUnsafeBytes {
+                    ftssh_approve_host_key(native.pointer, $0.bindMemory(to: UInt8.self).baseAddress, found.hostKey.count)
+                })
+                try requireOK(account.user.withCString {
+                    ftssh_begin_password_authentication(native.pointer, $0, account.user.utf8.count)
+                })
+                var supplied = false
+                while true {
+                    try current(token, deadline)
+                    let result = ftssh_authentication_step(native.pointer)
+                    if result == FTSSH_OK { break }
+                    if result == FTSSH_PASSWORD_NEEDED {
+                        guard !supplied else { throw NativeSSHError.invalidChallenge }
+                        try await authority.validate(peer: found, account: account)
+                        try await validateForwardingPath()
+                        try current(token, deadline)
+                        var secret = try await authority.password(for: account, peer: found)
+                        defer { secret.resetBytes(in: 0..<secret.count) }
+                        try current(token, deadline)
+                        try await authority.validate(peer: found, account: account)
+                        try await validateForwardingPath()
+                        try current(token, deadline)
+                        guard (1...Int(FTSSH_PASSWORD_CAPACITY)).contains(secret.count) else { throw NativeSSHError.invalidInput }
+                        try requireOK(secret.withUnsafeBytes {
+                            ftssh_supply_password(native.pointer, $0.bindMemory(to: UInt8.self).baseAddress, secret.count)
+                        })
+                        supplied = true
+                    } else {
+                        try requireAgain(result)
+                        try await ready(directions: ftssh_directions(native.pointer), deadline: deadline)
+                    }
+                }
+                guard supplied else { throw NativeSSHError.invalidChallenge }
+                try await authority.validate(peer: found, account: account)
+                try await validateForwardingPath()
+                try current(token, deadline)
+                authorization = .password(authority, found, account); phase = .authenticated
                 return found
             } onCancel: { [weak self] in
                 authority.cancel(transportID: transportID)
@@ -417,15 +535,16 @@ public actor NativeSSHSession {
 
     private func openChannel(timeout: Duration, begin: () -> Int32) async throws {
         let deadline = try deadline(timeout)
-        guard phase == .authenticated, operation == nil, let authority = authentication,
-              let peer, let identity else { throw phase == .closed ? NativeSSHError.closed : .busy }
+        guard phase == .authenticated, operation == nil, let authority = authorization else {
+            throw phase == .closed ? NativeSSHError.closed : .busy
+        }
         try Task.checkCancellation()
         let token = UUID(); operation = token; phase = .opening
         let timer = expiry(deadline, operation: token)
         defer { timer.cancel(); if operation == token { operation = nil } }
         do {
             try await withTaskCancellationHandler {
-                try await authority.validate(peer: peer, identity: identity)
+                try await authority.validate()
                 try await validateForwardingPath()
                 try current(token, deadline)
                 try requireOK(begin())
@@ -436,7 +555,7 @@ public actor NativeSSHSession {
                     try requireAgain(result)
                     try await ready(directions: ftssh_directions(native.pointer), deadline: deadline)
                 }
-                try await authority.validate(peer: peer, identity: identity)
+                try await authority.validate()
                 try await validateForwardingPath()
                 try current(token, deadline)
                 phase = .live
@@ -671,9 +790,11 @@ public actor NativeSSHSession {
         if let shutdown { await shutdown.value; return }
         phase = .closed; operation = nil
         authentication?.cancel(transportID: transportID)
-        for witness in forwardingWitnesses { witness.authority.cancel(transportID: witness.peer.transportID) }
+        passwordAuthentication?.cancel(transportID: transportID)
+        for witness in forwardingWitnesses { witness.cancel() }
         forwardingWitnesses.removeAll()
-        authentication = nil; peer = nil; identity = nil; requestedResize = nil; serviceWakePending = false
+        authentication = nil; passwordAuthentication = nil; authorization = nil
+        requestedResize = nil; serviceWakePending = false
         native.close()
         let old = waiter; waiter = nil
         let task = Task<Void, Never> { await old?.stop() }

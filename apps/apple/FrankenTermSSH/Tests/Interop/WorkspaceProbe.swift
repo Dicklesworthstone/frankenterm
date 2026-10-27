@@ -370,7 +370,7 @@ private func exerciseOrderedCredentials(store: WorkspaceStore, installed: Instal
             let connection: WorkspaceSSHConnection
             do {
                 connection = try await manager.connect(workspaceID: installed.id, expectedRevision: installed.revision,
-                    machineID: "machine", routeID: attempt.selection.routeID, credentialID: attempt.selection.credentialID,
+                    machineID: "machine", routeID: attempt.selection.routeID, authentication: attempt.selection.authentication,
                     confirmedByUser: true, connectionTimeout: .seconds(5), authenticationTimeout: .seconds(6), attachMux: false)
             } catch {
                 try Task.checkCancellation()

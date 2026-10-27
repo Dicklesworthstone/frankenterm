@@ -81,11 +81,38 @@ The Rust `ft mobile export` / `ft mobile source` path also keeps positive host p
 
 `AppleSSHCredentialSigner` reads only the exact app-owned Keychain account through a fresh user-presence context on one process-wide serial worker. The private container stays within that worker; its results are bounded public identity or signature bytes. Newly imported items retain their verified public blob as nonsecret Keychain metadata, so offering a key does not need a private-key unlock. Older items can derive their public identity through the same bounded protected worker. Public metadata must match the independently stored algorithm and fingerprint; it never authorizes signing. The broker admits up to 32 waiting requests in FIFO order across concurrent connections while retaining one protected worker. Its 60-second deadline includes waiting and confirmation. Cancellation, expiry and backgrounding invalidate queued requests; a cancelled native worker keeps its slot until it settles. The broker rechecks current route and credential authority after waiting. No key file, private-key return API or reusable unlocked-key cache is introduced.
 
-The optional `FrankenTermSSHIntegration.WorkspaceNativeSSHAuthentication` adapter now joins this broker to the real libssh2 driver. It checks the actual exchange's host key and negotiated methods, exact endpoint, route revision, credential, transport identity and RFC 4252 challenge before offering or using an imported identity. A suspension/resume cycle retires its foreground witness; durable revocation and reimport invalidate retained authority. Its implemented profile is direct SSH and FrankenTerm mux routes (a mux route authenticates like a direct one) with the four signing families above and up to three ordered public-key jumps. RSA host keys must sign with SHA-2. Password/MFA, RSA credentials and certificate authentication remain unavailable.
+The optional `FrankenTermSSHIntegration.WorkspaceNativeSSHAuthentication` adapter joins this broker to the real libssh2 driver. It checks the actual exchange's host key and negotiated methods, exact endpoint, route revision, credential, transport identity and RFC 4252 challenge before offering or using an imported identity. A suspension/resume cycle retires its foreground witness; durable revocation and reimport invalidate retained authority. Direct SSH and FrankenTerm mux routes support the four signing families above or explicit SSH password authentication, including up to three ordered jumps with independent methods at each hop. RSA host keys must sign with SHA-2. Interactive MFA, password changes, RSA credentials and certificate authentication remain unavailable.
 
 The native connection follows the declared jump graph, including nested dependencies, with independent pins and credentials at every hop. Every ancestor retains current foreground, revision and revocation checks. An unsigned credential refusal advances that hop's ordered alternatives only after closing and rebuilding the chain. Transit opens only the next approved `direct-tcpip` channel.
 
-Charged 64 KiB ciphertext queues remove the nested callback deadlock. Written input requires handoff through all ancestors to the root socket, without claiming remote delivery. All 23 native tests passed with libssh2 1.11.1: large transfers through one to three hops, the hop limit, pin rejection and complete teardown. Current Swift sources pass semantic checks; new live Swift scenarios and device behavior await execution.
+Charged 64 KiB ciphertext queues remove the nested callback deadlock. Written input requires handoff through all ancestors to the root socket, without claiming remote delivery. All 30 native tests passed with libssh2 1.11.1, including large transfers through one to three hops, pin rejection, complete teardown, password failures and mixed password/key forwarding. The 13 live Swift password scenarios and 14 existing Swift actor interoperability tests also passed. These are portable protocol and ownership results; the new password UI still requires Apple SDK and device qualification.
+
+### Password-only machines and jump hosts
+
+Password routes can connect without an imported private key. A typed choice follows
+the saved method order and never silently changes from a refused key to a password.
+The phone requests a password only after checking the actual host key against the
+saved workspace and confirming that the server advertises SSH password authentication.
+The single SecureField sheet identifies the verified account, endpoint and host
+fingerprint; it accepts at most 1024 UTF-8 bytes and never saves the password.
+
+The prompt shares the protected broker's bounded worker and deadline. Inactivity,
+navigation, cancellation, reimport and revocation retire pending results. Completed
+sessions retain normal durable-policy checks during the existing background grace
+period. Password machines do not prepare hidden connections or reconnect themselves.
+If a destination key is refused after a password hop, explicit **Retry** advances
+to the next configured key without retaining the password. Falling back from an
+explicit password mux route to direct SSH likewise waits for **Retry**.
+
+The complete SSH package reports 62 passing XCTest cases and two ordinary-run
+live-fixture skips, including five new workspace password-authority tests.
+The password fixture separately passes all 13 live scenarios without skips. An
+updated pre-network test proves that a supported password-hop graph still refuses
+before dialing when its caller has no prompt owner. All 1,159 Kit tests passed with
+zero failures and zero skips, including eight new broker/selection tests and two
+attempt-plan tests. Both packages compiled with warnings treated as errors. Six
+iOS prompt/retry tests await an Apple host; changed iOS sources and tests passed
+Swift syntax parsing.
 
 `WorkspaceNativeSSHConnection` owns the explicitly selected route from admission before DNS through authentication and the existing terminal pump. It requires a current ready route, a deliberate Connect request and foreground authority. A shared process network scope excludes strict Offline Restore while connections or uncancelled resolver work remain active; restoration refuses instead of silently closing a remote shell. PTY creation is separate and has a production `TerminalSessionJournal` boundary that durably records creation before any remote request. The owner rechecks current authority before terminal operations and joins teardown before releasing its network scope. The live iOS controller binds this owner to the Rust terminal, native input and Metal presentation.
 

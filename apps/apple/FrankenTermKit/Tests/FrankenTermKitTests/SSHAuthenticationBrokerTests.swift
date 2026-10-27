@@ -73,6 +73,41 @@ private struct ImmediateSSHSigner: WorkspaceSSHSigning {
     }
 }
 
+/// A prompt that deliberately retains its continuation after cancellation,
+/// proving the broker keeps the sole prompt slot until its owner settles.
+private final class DelayedSSHPasswordPrompt: WorkspaceSSHPasswordPrompting, @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending: (WorkspaceSSHPasswordRequest, CheckedContinuation<Data, Error>)?
+    private var observer: CheckedContinuation<Void, Never>?
+    private var callCount = 0, cancellationCount = 0
+    var calls: Int { lock.lock(); defer { lock.unlock() }; return callCount }
+    var cancellations: Int { lock.lock(); defer { lock.unlock() }; return cancellationCount }
+    func password(for request: WorkspaceSSHPasswordRequest) async throws -> Data {
+        try await withCheckedThrowingContinuation { continuation in
+            lock.lock()
+            guard pending == nil else { lock.unlock(); continuation.resume(throwing: SSHAuthenticationError.busy); return }
+            callCount += 1; pending = (request, continuation)
+            let observer = self.observer; self.observer = nil
+            lock.unlock(); observer?.resume()
+        }
+    }
+    func cancel(requestID: UUID) {
+        lock.lock(); defer { lock.unlock() }
+        if pending?.0.id == requestID { cancellationCount += 1 }
+    }
+    func waitUntilStarted() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if pending != nil { lock.unlock(); continuation.resume() }
+            else { observer = continuation; lock.unlock() }
+        }
+    }
+    func finish(_ bytes: Data = Data("one-use password".utf8)) {
+        lock.lock(); let selected = pending; pending = nil; lock.unlock()
+        selected?.1.resume(returning: bytes)
+    }
+}
+
 @MainActor
 final class SSHAuthenticationBrokerTests: XCTestCase {
     private let crypto = TestCryptography()
@@ -83,7 +118,7 @@ final class SSHAuthenticationBrokerTests: XCTestCase {
         let installed: InstalledWorkspace, archive: AirGapArchive, key: PrivateKeyRecord
         let pin: WorkspaceDocument.HostKey
     }
-    private func fixture(mutate: (inout [String: Any]) -> Void = { _ in }) async throws -> Fixture {
+    private func fixture(includeKeys: Bool = true, mutate: (inout [String: Any]) -> Void = { _ in }) async throws -> Fixture {
         let persistence = StoreTestPersistence(), vault = StoreTestVault()
         let store = WorkspaceStore(persistence: persistence, vault: vault)
         let (key, fingerprint) = try sampleKey(using: crypto)
@@ -91,7 +126,7 @@ final class SSHAuthenticationBrokerTests: XCTestCase {
         var workspace = try XCTUnwrap(root["workspace"] as? [String: Any])
         mutate(&workspace); root["workspace"] = workspace
         let document = try WorkspaceDocument(data: JSONSerialization.data(withJSONObject: root, options: [.sortedKeys]))
-        let archive = try AirGapArchive(workspace: document, keys: [key], using: crypto)
+        let archive = try AirGapArchive(workspace: document, keys: includeKeys ? [key] : [], using: crypto)
         let installed = try await store.install(archive, envelopeDigest: Data(repeating: 1, count: 32),
             transferID: Data(repeating: 2, count: 16), expectedRevision: nil, sourceAndContentsConfirmed: true).workspace
         return .init(store: store, persistence: persistence, vault: vault, installed: installed,
@@ -652,6 +687,191 @@ final class SSHAuthenticationBrokerTests: XCTestCase {
         await expectFailure {
             _ = try await f.store.authorizeSSHAuthentication(workspaceID: f.installed.id,
                 expectedRevision: UUID(), routeID: "route", credentialID: "key", presentedHostKey: f.pin, support: self.support)
+        }
+    }
+
+    private var passwordSupport: WorkspaceDocument.RouteSupport {
+        .init(routeModes: ["direct_ssh"], authenticationMethods: [.publicKey, .password],
+              credentialAlgorithms: ["ssh-ed25519"], hostKeyAlgorithms: ["ssh-ed25519"], maximumJumpHops: 3)
+    }
+    private func passwordFixture() async throws -> Fixture {
+        try await fixture(includeKeys: false) { workspace in
+            var routes = workspace["routes"] as! [[String: Any]]
+            routes[0]["authentication_methods"] = ["password"]
+            routes[0]["credential_refs"] = [] as [String]
+            workspace["routes"] = routes
+        }
+    }
+    private func passwordIdentity(_ broker: SSHAuthenticationBroker, _ f: Fixture) async throws -> WorkspaceSSHPasswordIdentity {
+        try await broker.passwordIdentity(workspaceID: f.installed.id, expectedRevision: f.installed.revision,
+                                          routeID: "route", presentedHostKey: f.pin)
+    }
+
+    func testPasswordRouteWithoutImportedKeysAuthorizesOnlyItsVerifiedAccount() async throws {
+        let f = try await passwordFixture(), signer = DelayedSSHSigner(f.key.container), prompt = DelayedSSHPasswordPrompt()
+        let broker = SSHAuthenticationBroker(store: f.store, signer: signer, support: passwordSupport)
+        await broker.resume()
+        let selected = try await passwordIdentity(broker, f)
+        XCTAssertEqual(selected.authorization.routeID, "route")
+        let states = try await f.store.routeReadiness(workspaceID: f.installed.id, support: passwordSupport)
+        XCTAssertTrue(try XCTUnwrap(states.first).isLocallyReady)
+        XCTAssertTrue(try XCTUnwrap(states.first).usableCredentialIDs.isEmpty)
+        let task = Task { try await broker.password(for: selected, transportID: UUID(), prompter: prompt) }
+        await prompt.waitUntilStarted()
+        prompt.finish()
+        let bytes = try await task.value
+        XCTAssertEqual(bytes, Data("one-use password".utf8))
+        XCTAssertEqual(signer.calls, 0)
+        XCTAssertEqual(prompt.calls, 1)
+        try await broker.validatePasswordAttempt(selected)
+    }
+
+    func testPasswordAuthorizationRequiresPermittedMethodProfilePinAndStoreOwner() async throws {
+        let ordinary = try await fixture(), password = try await passwordFixture()
+        for (f, profile, pin) in [(ordinary, passwordSupport, ordinary.pin), (password, support, password.pin),
+            (password, passwordSupport, try WorkspaceDocument.HostKey(algorithm: "ssh-ed25519",
+                fingerprint: "SHA256:" + Data(repeating: 9, count: 32).base64EncodedString().replacingOccurrences(of: "=", with: "")))] {
+            await expectFailure {
+                _ = try await f.store.authorizeSSHPasswordAuthentication(workspaceID: f.installed.id,
+                    expectedRevision: f.installed.revision, routeID: "route", presentedHostKey: pin, support: profile)
+            }
+        }
+        let authorization = try await password.store.authorizeSSHPasswordAuthentication(workspaceID: password.installed.id,
+            expectedRevision: password.installed.revision, routeID: "route", presentedHostKey: password.pin, support: passwordSupport)
+        let reopened = WorkspaceStore(persistence: password.persistence, vault: password.vault)
+        await expectFailure { try await reopened.validateSSHPasswordAuthentication(authorization, support: self.passwordSupport) }
+    }
+
+    func testPasswordForegroundRetiresPendingPromptWithoutRevivingItOnResume() async throws {
+        let f = try await passwordFixture(), prompt = DelayedSSHPasswordPrompt()
+        let broker = SSHAuthenticationBroker(store: f.store, signer: ImmediateSSHSigner(container: f.key.container), support: passwordSupport)
+        await broker.resume()
+        let selected = try await passwordIdentity(broker, f)
+        let task = Task { try await broker.password(for: selected, transportID: UUID(), prompter: prompt) }
+        await prompt.waitUntilStarted()
+        await broker.setPasswordForeground(false)
+        XCTAssertEqual(prompt.cancellations, 1)
+        let busy = await broker.isBusy
+        XCTAssertTrue(busy)
+        await broker.setPasswordForeground(true)
+        prompt.finish()
+        await expectFailure { _ = try await task.value }
+        await expectFailure { try await broker.validatePasswordAttempt(selected) }
+        let fresh = try await passwordIdentity(broker, f)
+        try await broker.validatePasswordAttempt(fresh)
+        // A completed native login may keep the ordinary live policy witness;
+        // its adapter, not this broker call, proves the success transition.
+        try await broker.validate(selected)
+    }
+
+    func testPasswordReimportAndHostRevocationRejectLatePromptResults() async throws {
+        for replace in [false, true] {
+            let f = try await passwordFixture(), prompt = DelayedSSHPasswordPrompt()
+            let broker = SSHAuthenticationBroker(store: f.store, signer: ImmediateSSHSigner(container: f.key.container), support: passwordSupport)
+            await broker.resume()
+            let selected = try await passwordIdentity(broker, f)
+            let task = Task { try await broker.password(for: selected, transportID: UUID(), prompter: prompt) }
+            await prompt.waitUntilStarted()
+            if replace {
+                let replacement = try AirGapArchive(workspace: f.archive.workspace.reissuingBundle(id: "password-replacement"),
+                                                    keys: [], using: crypto)
+                _ = try await f.store.install(replacement, envelopeDigest: Data(repeating: 8, count: 32),
+                    transferID: Data(repeating: 9, count: 16), expectedRevision: f.installed.revision,
+                    sourceAndContentsConfirmed: true, securityChangesConfirmed: true, associateWithExistingWorkspace: true)
+            } else { try await f.store.revokeHostLocally(workspaceID: f.installed.id, trustID: "trust", key: f.pin) }
+            prompt.finish()
+            await expectFailure { _ = try await task.value }
+        }
+    }
+
+    func testPasswordResponsesAreBoundedAndPromptDeadlineRetainsItsOwner() async throws {
+        for response in [Data(), Data(repeating: 65, count: 1025), Data([65, 0, 66])] {
+            let f = try await passwordFixture(), prompt = DelayedSSHPasswordPrompt()
+            let broker = SSHAuthenticationBroker(store: f.store, signer: ImmediateSSHSigner(container: f.key.container), support: passwordSupport)
+            await broker.resume()
+            let selected = try await passwordIdentity(broker, f)
+            let task = Task { try await broker.password(for: selected, transportID: UUID(), prompter: prompt) }
+            await prompt.waitUntilStarted(); prompt.finish(response)
+            await expectFailure { _ = try await task.value }
+        }
+        let f = try await passwordFixture(), prompt = DelayedSSHPasswordPrompt()
+        let broker = SSHAuthenticationBroker(store: f.store, signer: ImmediateSSHSigner(container: f.key.container), support: passwordSupport)
+        await broker.resume()
+        let selected = try await passwordIdentity(broker, f)
+        let task = Task { try await broker.password(for: selected, transportID: UUID(), prompter: prompt) }
+        await prompt.waitUntilStarted()
+        await broker.expireRequests(at: .now + .seconds(61))
+        XCTAssertEqual(prompt.cancellations, 1)
+        let held = await broker.isBusy
+        XCTAssertTrue(held)
+        prompt.finish()
+        await expectFailure { _ = try await task.value }
+        let released = await broker.isBusy
+        XCTAssertFalse(released)
+    }
+
+    func testPasswordAndKeyPromptsShareOneBoundedWorker() async throws {
+        let f = try await fixture { workspace in
+            var routes = workspace["routes"] as! [[String: Any]]
+            routes[0]["authentication_methods"] = ["publickey", "password"]; workspace["routes"] = routes
+        }
+        let signer = DelayedSSHSigner(f.key.container), prompt = DelayedSSHPasswordPrompt()
+        let broker = SSHAuthenticationBroker(store: f.store, signer: signer, support: passwordSupport)
+        await broker.resume()
+        let key = try await prepare(broker, f)
+        let signing = Task { try await broker.confirm(requestID: key.id) }
+        await signer.waitUntilStarted()
+        let selected = try await passwordIdentity(broker, f)
+        let password = Task { try await broker.password(for: selected, transportID: UUID(), prompter: prompt) }
+        await waitUntilQueued(1, broker: broker)
+        XCTAssertEqual(prompt.calls, 0)
+        signer.finish(); _ = try await signing.value
+        await prompt.waitUntilStarted(); prompt.finish()
+        _ = try await password.value
+        XCTAssertEqual(prompt.calls, 1)
+    }
+
+    func testPasswordHopNeedsExactDestinationGraphAndMandatoryPolicy() async throws {
+        for blocked in [false, true] {
+            let f = try await transitFixture { workspace in
+                var routes = workspace["routes"] as! [[String: Any]]
+                routes[1]["authentication_methods"] = ["password"]; routes[1]["credential_refs"] = [] as [String]
+                if blocked { routes[0]["required_capabilities"] = ["unimplemented-security-policy"] }
+                workspace["routes"] = routes
+            }
+            let broker = SSHAuthenticationBroker(store: f.store, signer: ImmediateSSHSigner(container: f.key.container), support: passwordSupport)
+            await broker.resume()
+            if blocked {
+                await expectFailure {
+                    _ = try await broker.passwordIdentity(workspaceID: f.installed.id, expectedRevision: f.installed.revision,
+                        routeID: "hop", presentedHostKey: f.pin, transitForRouteID: "route")
+                }
+            } else {
+                let selected = try await broker.passwordIdentity(workspaceID: f.installed.id, expectedRevision: f.installed.revision,
+                    routeID: "hop", presentedHostKey: f.pin, transitForRouteID: "route")
+                XCTAssertEqual(selected.authorization.transitForRouteID, "route")
+                await expectFailure {
+                    _ = try await broker.passwordIdentity(workspaceID: f.installed.id, expectedRevision: f.installed.revision,
+                        routeID: "hop", presentedHostKey: f.pin, transitForRouteID: "hop")
+                }
+            }
+        }
+    }
+
+    func testAuthenticationChoiceUsesFirstUsablePermittedMethodWithoutInteractiveSubstitution() async throws {
+        let cases: [([String], [String], [WorkspaceSSHAuthenticationChoice])] = [
+            (["publickey", "password"], ["key"], [.publicKey("key")]),
+            (["publickey", "password"], [], [.password]),
+            (["password", "publickey"], ["key"], [.password]),
+            (["keyboard-interactive"], [], [])
+        ]
+        for (methods, available, expected) in cases {
+            let f = try await fixture { workspace in
+                var routes = workspace["routes"] as! [[String: Any]]
+                routes[0]["authentication_methods"] = methods; workspace["routes"] = routes
+            }
+            let route = try XCTUnwrap(f.archive.workspace.routes.first)
+            XCTAssertEqual(WorkspaceSSHAuthenticationChoice.choices(for: route, usableCredentialIDs: available), expected)
         }
     }
 }

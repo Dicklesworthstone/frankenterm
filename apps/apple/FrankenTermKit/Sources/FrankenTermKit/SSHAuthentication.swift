@@ -230,6 +230,38 @@ public struct WorkspaceSSHAuthorization: Equatable, Sendable, CustomDebugStringC
     public var debugDescription: String { "WorkspaceSSHAuthorization([redacted])" }
 }
 
+/// A password route's current policy and actual verified host. It contains no
+/// password, key binding, or reusable credential. Only WorkspaceStore issues it.
+public struct WorkspaceSSHPasswordAuthorization: Equatable, Sendable, CustomDebugStringConvertible {
+    let storeOwner: UUID
+    public let workspaceID: UUID, workspaceRevision: UUID
+    public let routeID: String, host: String, port: UInt16, user: String
+    public let routeMode: String, jumpRouteIDs: [String], transitForRouteID: String?
+    public let presentedHostKey: WorkspaceDocument.HostKey
+    public var debugDescription: String { "WorkspaceSSHPasswordAuthorization([redacted])" }
+}
+
+public struct WorkspaceSSHPasswordIdentity: Sendable {
+    public let authorization: WorkspaceSSHPasswordAuthorization
+    fileprivate let brokerOwner: UUID, foregroundGeneration: UUID, passwordGeneration: UUID
+}
+
+/// Trusted local labels for exactly one verified SSH peer. Server-provided
+/// banners and keyboard-interactive challenges are never password prompts.
+public struct WorkspaceSSHPasswordRequest: Identifiable, Sendable, CustomDebugStringConvertible {
+    public let id: UUID, transportID: UUID
+    public let authorization: WorkspaceSSHPasswordAuthorization
+    public var debugDescription: String { "WorkspaceSSHPasswordRequest([redacted])" }
+}
+
+/// An app-owned prompt must settle on cancellation and clear its editable
+/// secret. The shared broker permits only one protected prompt at a time and
+/// imposes its existing 60-second deadline, including queueing.
+public protocol WorkspaceSSHPasswordPrompting: Sendable {
+    func password(for request: WorkspaceSSHPasswordRequest) async throws -> Data
+    func cancel(requestID: UUID)
+}
+
 /// Implementations own one bounded authentication worker. A cancellation request
 /// must invalidate its prompt; sign must settle its worker before returning.
 /// There is no plaintext-key retrieval method on this boundary.
@@ -285,6 +317,7 @@ public actor SSHAuthenticationBroker {
         let foregroundGeneration: UUID
         let expires: ContinuousClock.Instant
         var authorization: WorkspaceSSHAuthorization?
+        var passwordPrompter: (any WorkspaceSSHPasswordPrompting)?
         var challenge: SSHUserAuthenticationChallenge?
         var preparing = true, signing = false, cancelled = false
     }
@@ -298,6 +331,8 @@ public actor SSHAuthenticationBroker {
     private let owner = UUID()
     private var foregroundGeneration = UUID()
     private var foreground = false
+    private var passwordGeneration = UUID()
+    private var passwordForeground = false
     private var pending: Pending?
     private var waiting: [Waiting] = []
     private var deadlineTask: Task<Void, Never>?
@@ -308,18 +343,28 @@ public actor SSHAuthenticationBroker {
     }
     deinit { deadlineTask?.cancel() }
     public func resume() {
-        if !foreground { foregroundGeneration = UUID() }
+        if !foreground { foregroundGeneration = UUID(); setPasswordForeground(true) }
         foreground = true
     }
     public func suspend() {
         foreground = false
         foregroundGeneration = UUID()
+        setPasswordForeground(false)
         let retired = waiting; waiting.removeAll()
         for waiter in retired { waiter.continuation.resume(throwing: SSHAuthenticationError.stale) }
         if let id = pending?.id { cancel(requestID: id) }
     }
     public var isBusy: Bool { pending != nil }
     public var queuedRequests: Int { waiting.count }
+
+    /// The app may keep authenticated terminals alive during its background
+    /// grace period. An editable password prompt never survives that boundary;
+    /// retiring its own epoch need not revoke those already-live transports.
+    public func setPasswordForeground(_ active: Bool) {
+        guard passwordForeground != active else { return }
+        passwordForeground = active; passwordGeneration = UUID()
+        if !active, let pending, pending.passwordPrompter != nil { cancel(requestID: pending.id) }
+    }
 
     /// One protected operation owns the signer, with a bounded FIFO shared by
     /// all scenes and connections. Waiting never opens a second prompt. The
@@ -446,6 +491,71 @@ public actor SSHAuthenticationBroker {
         return result
     }
 
+    /// This runs after the transport verified its real key exchange and before
+    /// the server is asked which methods it offers. It never opens a prompt.
+    public func passwordIdentity(workspaceID: UUID, expectedRevision: UUID, routeID: String,
+                                 presentedHostKey: WorkspaceDocument.HostKey,
+                                 transitForRouteID: String? = nil) async throws -> WorkspaceSSHPasswordIdentity {
+        let lease = try foregroundLease()
+        guard passwordForeground else { throw SSHAuthenticationError.stale }
+        let passwordEpoch = passwordGeneration
+        let authorization = try await store.authorizeSSHPasswordAuthentication(workspaceID: workspaceID,
+            expectedRevision: expectedRevision, routeID: routeID, presentedHostKey: presentedHostKey,
+            support: support, transitForRouteID: transitForRouteID)
+        try validateForeground(lease)
+        guard passwordForeground, passwordGeneration == passwordEpoch else { throw SSHAuthenticationError.stale }
+        return .init(authorization: authorization, brokerOwner: owner, foregroundGeneration: foregroundGeneration,
+                     passwordGeneration: passwordEpoch)
+    }
+
+    public func validate(_ selected: WorkspaceSSHPasswordIdentity) async throws {
+        guard foreground, selected.brokerOwner == owner, selected.foregroundGeneration == foregroundGeneration else {
+            throw SSHAuthenticationError.stale
+        }
+        try Task.checkCancellation()
+        try await store.validateSSHPasswordAuthentication(selected.authorization, support: support)
+        guard foreground, selected.foregroundGeneration == foregroundGeneration else { throw SSHAuthenticationError.stale }
+        try Task.checkCancellation()
+    }
+
+    /// Pending authentication additionally belongs to the current visible
+    /// password-prompt epoch. A completed native login may retain only the
+    /// normal foreground and durable-policy witness via validate(_:).
+    public func validatePasswordAttempt(_ selected: WorkspaceSSHPasswordIdentity) async throws {
+        try validatePasswordForeground(selected)
+        try await validate(selected)
+        try validatePasswordForeground(selected)
+    }
+
+    public func password(for selected: WorkspaceSSHPasswordIdentity, transportID: UUID,
+                         prompter: any WorkspaceSSHPasswordPrompting) async throws -> Data {
+        try validatePasswordForeground(selected)
+        try await validate(selected)
+        let id = try await acquireWorker(transportID: transportID)
+        defer { releaseWorker(id) }
+        try checkCurrent(id)
+        try await validate(selected)
+        try checkCurrent(id)
+        try validatePasswordForeground(selected)
+        pending?.passwordPrompter = prompter
+        let request = WorkspaceSSHPasswordRequest(id: id, transportID: transportID, authorization: selected.authorization)
+        var bytes = try await withTaskCancellationHandler {
+            try await prompter.password(for: request)
+        } onCancel: { prompter.cancel(requestID: id) }
+        defer { bytes.resetBytes(in: 0..<bytes.count) }
+        try checkCurrent(id)
+        try validatePasswordForeground(selected)
+        guard (1...1024).contains(bytes.count), !bytes.contains(0) else { throw SSHAuthenticationError.invalidChallenge }
+        try await validate(selected)
+        try checkCurrent(id)
+        try validatePasswordForeground(selected)
+        return bytes
+    }
+
+    private func validatePasswordForeground(_ selected: WorkspaceSSHPasswordIdentity) throws {
+        guard passwordForeground, selected.passwordGeneration == passwordGeneration else { throw SSHAuthenticationError.stale }
+    }
+
     /// Verify the real host and current route before reading or offering the
     /// selected public identity. This uses the same bounded worker as signing.
     public func publicIdentity(workspaceID: UUID, expectedRevision: UUID, routeID: String, credentialID: String,
@@ -549,6 +659,7 @@ public actor SSHAuthenticationBroker {
         if pending?.signing == true || pending?.preparing == true {
             pending?.cancelled = true
             signer.cancel(requestID: requestID)
+            pending?.passwordPrompter?.cancel(requestID: requestID)
             // Keep the sole worker reservation until confirm settles. Resume
             // cannot start another prompt while cancelled native I/O still owns it.
         } else { releaseWorker(requestID) }

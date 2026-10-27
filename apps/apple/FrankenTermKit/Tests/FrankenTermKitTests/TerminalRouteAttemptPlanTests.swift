@@ -12,7 +12,7 @@ final class TerminalRouteAttemptPlanTests: XCTestCase {
         var tried: [String] = []
         while let attempt = plan.current {
             XCTAssertEqual(attempt.selection.routeID, "local")
-            tried.append(attempt.selection.credentialID)
+            tried.append(try XCTUnwrap(attempt.selection.credentialID))
             try plan.failed(.credentialRefused, attempt: attempt)
         }
         XCTAssertEqual(tried, ["work", "personal", "recovery"])
@@ -117,5 +117,37 @@ final class TerminalRouteAttemptPlanTests: XCTestCase {
                                attempt: attempt)
         }
         XCTAssertEqual(count, 255 + 8)
+    }
+
+    func testPasswordIsATypedChoiceWithoutACredentialAndNeverRetriesOrFallsBack() throws {
+        for failure in [TerminalRouteAttemptPlan.Failure.credentialRefused, .terminal] {
+            var plan = try TerminalRouteAttemptPlan(routes: [
+                .init(routeID: "password", authenticationChoices: [.password, .publicKey("other")]),
+                .init(routeID: "alternate", credentialIDs: ["key"])
+            ])
+            let attempt = try XCTUnwrap(plan.current)
+            XCTAssertEqual(attempt.selection.authentication, .password)
+            XCTAssertNil(attempt.selection.credentialID)
+            XCTAssertNil(try plan.failed(failure, attempt: attempt))
+        }
+        var keys = try TerminalRouteAttemptPlan(routes: [
+            .init(routeID: "mixed", authenticationChoices: [.publicKey("key"), .password])
+        ])
+        XCTAssertNil(try keys.failed(.credentialRefused, attempt: XCTUnwrap(keys.current)))
+    }
+
+    func testPasswordReconnectPreferenceRemainsTypedAndScopeBound() throws {
+        let routes: [TerminalRouteAttemptPlan.Route] = [
+            .init(routeID: "keys", credentialIDs: ["key"]),
+            .init(routeID: "password", authenticationChoices: [.password])
+        ]
+        let selected = TerminalRouteAttemptPlan.Selection(routeID: "password", authentication: .password)
+        let plan = try TerminalRouteAttemptPlan(routes: routes, preferring: selected)
+        XCTAssertEqual(plan.current?.selection, selected)
+        XCTAssertThrowsError(try TerminalRouteAttemptPlan(routes: routes,
+            preferring: .init(routeID: "keys", authentication: .password)))
+        XCTAssertThrowsError(try TerminalRouteAttemptPlan(routes: [
+            .init(routeID: "password", authenticationChoices: [.password, .password])
+        ]))
     }
 }

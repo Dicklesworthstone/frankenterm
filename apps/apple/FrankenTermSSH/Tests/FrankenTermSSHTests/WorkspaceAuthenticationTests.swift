@@ -2,7 +2,7 @@ import Foundation
 import XCTest
 @testable import FrankenTermKit
 @testable import FrankenTermSSH
-import FrankenTermSSHIntegration
+@testable import FrankenTermSSHIntegration
 #if canImport(CryptoKit)
 import CryptoKit
 #else
@@ -30,6 +30,110 @@ struct SSHWorkspaceTestCryptography: AirGapCryptography {
     func bcryptPBKDF(passphrase: Data, salt: Data, rounds: UInt32, outputByteCount: Int) throws -> Data { throw SSHAuthenticationError.unavailable }
     func decryptAESCTR(_ ciphertext: Data, key: Data, iv: Data) throws -> Data { throw SSHAuthenticationError.unavailable }
     func decryptAESCBC(_ ciphertext: Data, key: Data, iv: Data) throws -> Data { throw SSHAuthenticationError.unavailable }
+}
+
+private actor WorkspaceTestPasswordPrompt: WorkspaceSSHPasswordPrompting {
+    private(set) var calls = 0
+    func password(for request: WorkspaceSSHPasswordRequest) async throws -> Data {
+        calls += 1
+        return Data("synthetic one-use password".utf8)
+    }
+    nonisolated func cancel(requestID: UUID) {}
+}
+
+@MainActor
+final class WorkspacePasswordAuthenticationTests: XCTestCase {
+    private func fixture() async throws -> SSHWorkspaceTestFixture {
+        try await .make { workspace in
+            var routes = workspace["routes"] as! [[String: Any]]
+            routes[0]["authentication_methods"] = ["password"]
+            routes[0]["credential_refs"] = [] as [String]
+            workspace["routes"] = routes
+        }
+    }
+    private func authority(_ f: SSHWorkspaceTestFixture, transport: UUID,
+                           prompt: WorkspaceTestPasswordPrompt) -> WorkspaceNativeSSHPasswordAuthentication {
+        .init(broker: f.broker, prompter: prompt, workspaceID: f.installed.id, revision: f.installed.revision,
+              routeID: "route", transportID: transport, endpoint: f.endpoint)
+    }
+    private func refuse(_ body: () async throws -> Void, file: StaticString = #filePath, line: UInt = #line) async {
+        do { try await body(); XCTFail("Password authority should have been refused", file: file, line: line) } catch {}
+    }
+
+    func testActualPeerAndConfiguredMethodMustMatchBeforeAnyPasswordPrompt() async throws {
+        let f = try await fixture(), transport = UUID(), prompt = WorkspaceTestPasswordPrompt()
+        let other = try await SSHWorkspaceTestFixture.make(seed: Data(repeating: 23, count: 32))
+        let peers = [f.peer(transport: UUID()), f.peer(transport: transport, endpoint: try NativeSSHEndpoint(host: "other.invalid", port: 22)),
+                     f.peer(transport: transport, hostKey: other.hostBlob), f.peer(transport: transport, cipher: "aes128-cbc")]
+        for peer in peers {
+            let authority = authority(f, transport: transport, prompt: prompt)
+            await refuse { _ = try await authority.account(for: peer) }
+        }
+        let keyOnly = try await SSHWorkspaceTestFixture.make()
+        await refuse { _ = try await self.authority(keyOnly, transport: transport, prompt: prompt).account(for: keyOnly.peer(transport: transport)) }
+        let calls = await prompt.calls
+        XCTAssertEqual(calls, 0)
+        XCTAssertEqual(f.vault.counts.reads, 0); XCTAssertEqual(f.vault.counts.signatures, 0)
+    }
+
+    func testPasswordPromptIsSingleUseAndCannotSwitchPeerOrAccount() async throws {
+        let f = try await fixture(), transport = UUID(), prompt = WorkspaceTestPasswordPrompt()
+        let authority = authority(f, transport: transport, prompt: prompt), peer = f.peer(transport: transport)
+        let account = try await authority.account(for: peer)
+        XCTAssertEqual(account.user, "operator")
+        await refuse { try await authority.authenticationCompleted() }
+        await refuse { _ = try await authority.password(for: NativeSSHPasswordAccount(user: "another"), peer: peer) }
+        await refuse { _ = try await authority.password(for: account, peer: f.peer(transport: UUID())) }
+        let password = try await authority.password(for: account, peer: peer)
+        XCTAssertEqual(password, Data("synthetic one-use password".utf8))
+        await refuse { _ = try await authority.password(for: account, peer: peer) }
+        await refuse { try await authority.validateCurrent() }
+        try await authority.validate(peer: peer, account: account)
+        try await authority.authenticationCompleted()
+        try await authority.validateCurrent()
+        let calls = await prompt.calls
+        XCTAssertEqual(calls, 1)
+        XCTAssertEqual(f.vault.counts.reads, 0); XCTAssertEqual(f.vault.counts.signatures, 0)
+    }
+
+    func testPendingPasswordCannotCrossInactivityOrNativeSuccessPublicationRace() async throws {
+        for supplied in [false, true] {
+            let f = try await fixture(), transport = UUID(), prompt = WorkspaceTestPasswordPrompt()
+            let authority = authority(f, transport: transport, prompt: prompt), peer = f.peer(transport: transport)
+            let account = try await authority.account(for: peer)
+            if supplied { _ = try await authority.password(for: account, peer: peer) }
+            await f.broker.setPasswordForeground(false)
+            await f.broker.setPasswordForeground(true)
+            await refuse { try await authority.validate(peer: peer, account: account) }
+            await refuse { try await authority.authenticationCompleted() }
+            if !supplied { await refuse { _ = try await authority.password(for: account, peer: peer) } }
+        }
+    }
+
+    func testCompletedPasswordLoginRetainsLivePolicyWithoutRetainingPromptPermission() async throws {
+        let f = try await fixture(), transport = UUID(), prompt = WorkspaceTestPasswordPrompt()
+        let authority = authority(f, transport: transport, prompt: prompt), peer = f.peer(transport: transport)
+        let account = try await authority.account(for: peer)
+        _ = try await authority.password(for: account, peer: peer)
+        try await authority.authenticationCompleted()
+        await f.broker.setPasswordForeground(false)
+        try await authority.validateCurrent()
+        await refuse { _ = try await authority.password(for: account, peer: peer) }
+        try await f.store.revokeHostLocally(workspaceID: f.installed.id, trustID: "trust", key: f.host)
+        await refuse { try await authority.validateCurrent() }
+    }
+
+    func testPasswordFactoryWithoutPromptOwnerRefusesBeforeDialing() async throws {
+        let f = try await fixture(), activity = WorkspaceNetworkActivity()
+        await refuse {
+            _ = try await WorkspaceNativeSSHConnection.connect(workspaceID: f.installed.id,
+                expectedRevision: f.installed.revision, machineID: "machine", routeID: "route",
+                authentication: .password, confirmedByUser: true, store: f.store, broker: f.broker,
+                networkActivity: activity, connectionTimeout: .milliseconds(1))
+        }
+        XCTAssertEqual(activity.accounting().connections, 0)
+        XCTAssertEqual(f.vault.counts.reads, 0); XCTAssertEqual(f.vault.counts.signatures, 0)
+    }
 }
 
 final class SSHWorkspaceTestPersistence: WorkspacePersistence, @unchecked Sendable {

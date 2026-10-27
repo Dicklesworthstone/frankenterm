@@ -214,7 +214,11 @@ final class TerminalMuxObservationTests: XCTestCase {
         let control = try fixture()
         var count = 0
         var owner: TerminalMuxObservation? = TerminalMuxObservation(control: control) { _, _ in count += 1 }
+        #if compiler(>=6.4)
+        weak let weakOwner = owner
+        #else
         weak var weakOwner = owner
+        #endif
         await eventually { count == 1 }
         owner = nil
         XCTAssertNil(weakOwner)
@@ -226,7 +230,11 @@ final class TerminalMuxObservationTests: XCTestCase {
         final class Payload {}
         let control = try fixture()
         var payload: Payload? = Payload()
+        #if compiler(>=6.4)
+        weak let weakPayload = payload
+        #else
         weak var weakPayload = payload
+        #endif
         let owner = TerminalMuxObservation(control: control) { [payload] _, _ in _ = payload }
         payload = nil
         XCTAssertNotNil(weakPayload)
