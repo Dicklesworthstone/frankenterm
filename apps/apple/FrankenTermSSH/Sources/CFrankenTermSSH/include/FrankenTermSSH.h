@@ -25,7 +25,11 @@ enum {
 };
 enum { FTSSH_READ = 1, FTSSH_WRITE = 2, FTSSH_RETRY = 4,
        FTSSH_WRITE_CAPACITY = 16384, FTSSH_COMMAND_CAPACITY = 1024,
-       FTSSH_MAX_JUMP_HOPS = 3, FTSSH_PASSWORD_CAPACITY = 1024 };
+       FTSSH_MAX_JUMP_HOPS = 3, FTSSH_PASSWORD_CAPACITY = 1024,
+       /* Canonical RSA through 8192 bits, exponent through 64 bits. The
+        * signature bound includes the SSH algorithm and signature strings. */
+       FTSSH_PUBLIC_KEY_CAPACITY = 1053, FTSSH_CHALLENGE_CAPACITY = 1536,
+       FTSSH_SIGNATURE_CAPACITY = 1044 };
 
 typedef struct {
     size_t allocated_bytes, peak_allocated_bytes, pending_write_bytes;
@@ -63,7 +67,10 @@ int ftssh_copy_method(ftssh_session *session, int method, char *output, size_t c
 int ftssh_approve_host_key(ftssh_session *session, const uint8_t *key, size_t length);
 
 /* One chosen public identity per connection; no agent enumeration, automatic
- * fallback or private-key material enters this adapter. */
+ * fallback or private-key material enters this adapter. RSA public blobs retain
+ * their ssh-rsa format, but only rsa-sha2-256/512 challenges can reach a signer.
+ * An unsigned RSA refusal is terminal, not proof for trying another identity:
+ * libssh2 cannot expose the offered algorithm before its signing callback. */
 int ftssh_begin_authentication(ftssh_session *session, const char *user, size_t user_length,
                              const uint8_t *public_blob, size_t blob_length);
 /* Select password authentication only after the same exact host approval.
