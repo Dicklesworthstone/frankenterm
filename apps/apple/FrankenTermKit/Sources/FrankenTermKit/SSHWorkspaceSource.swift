@@ -143,21 +143,41 @@ public struct SSHWorkspaceSource: Sendable {
     private enum RouteContext: String {
         case destination = "route", firstHop = "transit_route", followingHop = "transit_via_route"
     }
+    /// The config lookup name is distinct from its eventual HostName. Explicit
+    /// jump user/port values have command-line precedence for this target only.
+    private struct RouteTarget: Hashable {
+        let alias: String
+        var user: String? = nil
+        var port: UInt16? = nil
+
+        var isQualified: Bool { user != nil || port != nil }
+        var registrySource: String {
+            guard isQualified else { return alias }
+            let account = user ?? ""
+            return "\(alias.utf8.count):\(alias)\(account.utf8.count):\(account):\(port.map(String.init) ?? "")"
+        }
+        var trustRegistrySource: String {
+            guard let port else { return alias }
+            return "\(alias.utf8.count):\(alias):\(port)"
+        }
+        // Qualification must not disguise a repeated host or an alternative
+        // textual spelling of an IP address as another safe chain member.
+        var cycleIdentity: String { (try? WorkspaceDocument.host(alias)) ?? alias }
+    }
     private struct RouteKey: Hashable {
-        let alias: String, context: RouteContext
+        let target: RouteTarget, context: RouteContext
+        var registryKind: String { context.rawValue + (target.isQualified ? "_qualified" : "") }
     }
     private struct PlannedRoute {
         let key: RouteKey, resolution: Resolution, jumps: [RouteKey]
     }
     private enum JumpFailure: Error {
-        case unsupported, unknownAlias, cycle, depth
+        case unsupported, cycle, depth
         var problem: Problem {
             let reason: String
             switch self {
             case .unsupported:
-                reason = "ProxyJump requires a comma-separated list of bare configured aliases. User/port overrides, URIs, expansions, and ambiguous forms remain unresolved; no partial hop chain was exported."
-            case .unknownAlias:
-                reason = "A jump host has no concrete alias in the selected configuration. Its endpoint, authentication, and host policy cannot be reconstructed; no partial hop chain was exported."
+                reason = "ProxyJump requires static [user@]host[:port] targets with numeric ports and brackets around IPv6 addresses. URIs, expansions, and ambiguous forms remain unresolved; no partial hop chain was exported."
             case .cycle:
                 reason = "The expanded ProxyJump chain repeats a host alias or returns to its destination. The route remains inactive; no partial hop chain was exported."
             case .depth:
@@ -709,7 +729,7 @@ public struct SSHWorkspaceSource: Sendable {
         var workingRegistry = registry, budget = MatchBudget()
         let planned = try plan(selectedAliases, budget: &budget)
         var routeIDs: [RouteKey: String] = [:]
-        for item in planned { routeIDs[item.key] = try workingRegistry.id(item.key.context.rawValue, item.key.alias) }
+        for item in planned { routeIDs[item.key] = try workingRegistry.id(item.key.registryKind, item.key.target.registrySource) }
         var routes: [JSONValue] = [], machines: [JSONValue] = [], trusts: [JSONValue] = []
         var credentials: [JSONValue] = [], order: [JSONValue] = []
         var emittedCredentials = Set<String>(), emittedTrusts = Set<String>(), references: [String: String] = [:]
@@ -717,9 +737,12 @@ public struct SSHWorkspaceSource: Sendable {
             reason: "Created from the selected SSH configuration and supplied public keys/known-hosts data. System configuration, agent inventory, live terminal themes, and implicit certificate files were not captured. Review this explicit route configuration before connecting.")]
 
         for item in planned {
-            let alias = item.key.alias
+            let alias = item.key.target.alias
             guard let routeID = routeIDs[item.key] else { throw FTError.stale }
-            let trustID = try workingRegistry.id("trust", alias)
+            // A user override does not change host identity. An explicit port
+            // does: never reuse one alias's trust record for two SSH endpoints.
+            let trustID = try workingRegistry.id(item.key.target.port == nil ? "trust" : "trust_port",
+                                                 item.key.target.trustRegistrySource)
             var resolved = item.resolution
             var known = (entries: [KnownHost](), problems: [Problem]())
             if let knownHostFiles {
@@ -893,42 +916,46 @@ public struct SSHWorkspaceSource: Sendable {
     /// Flatten before publishing so every transit record supplies only endpoint,
     /// authentication and trust, with no shell or independent nested-hop action.
     private func plan(_ selected: [String], budget: inout MatchBudget) throws -> [PlannedRoute] {
-        let inventory = Set(aliases)
         var cache: [String: Resolution] = [:]
-        func resolved(_ alias: String) throws -> Resolution {
-            if let value = cache[alias] { return value }
-            let value = try resolve(alias, budget: &budget)
-            cache[alias] = value
-            return value
+        func resolved(_ target: RouteTarget) throws -> Resolution {
+            let base: Resolution
+            if let value = cache[target.alias] { base = value }
+            else {
+                base = try resolve(target.alias, budget: &budget)
+                cache[target.alias] = base
+            }
+            var options = base.options
+            if let user = target.user { options["user"] = [user] }
+            if let port = target.port { options["port"] = [String(port)] }
+            return Resolution(options: options, identities: base.identities, problems: base.problems)
         }
-        func expand(_ alias: String, path: Set<String>, remaining: Int) throws -> [String] {
-            guard !path.contains(alias) else { throw JumpFailure.cycle }
-            guard let values = try resolved(alias).options["proxyjump"] else { return [] }
+        func expand(_ target: RouteTarget, path: Set<String>, remaining: Int) throws -> [RouteTarget] {
+            guard !path.contains(target.cycleIdentity) else { throw JumpFailure.cycle }
+            guard let values = try resolved(target).options["proxyjump"] else { return [] }
             if values.count == 1, values[0].lowercased() == "none" { return [] }
             guard values.count == 1 else { throw JumpFailure.unsupported }
-            let hops = values[0].split(separator: ",", omittingEmptySubsequences: false).map(String.init)
-            guard hops.allSatisfy({ name in
-                !name.isEmpty && !name.hasPrefix("-") && name.lowercased() != "none" && name.utf8.allSatisfy {
-                    (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || [45, 46, 95].contains($0)
-                }
-            }) else { throw JumpFailure.unsupported }
-            guard hops.allSatisfy(inventory.contains) else { throw JumpFailure.unknownAlias }
-            guard Set(hops).count == hops.count, !hops.contains(alias), !hops.contains(where: path.contains) else { throw JumpFailure.cycle }
-            guard hops.count <= remaining, let first = hops.first else { throw JumpFailure.depth }
-            let prefix = try expand(first, path: path.union([alias]), remaining: remaining - hops.count)
+            let entries = values[0].split(separator: ",", omittingEmptySubsequences: false)
+            guard entries.count <= remaining else { throw JumpFailure.depth }
+            let hops = try entries.map { try Self.jumpTarget(String($0)) }
+            let names = hops.map(\.cycleIdentity)
+            guard Set(names).count == names.count, !names.contains(target.cycleIdentity),
+                  !names.contains(where: path.contains) else { throw JumpFailure.cycle }
+            guard let first = hops.first else { throw JumpFailure.unsupported }
+            let prefix = try expand(first, path: path.union([target.cycleIdentity]), remaining: remaining - hops.count)
             let chain = prefix + hops
-            guard Set(chain).count == chain.count else { throw JumpFailure.cycle }
+            guard Set(chain.map(\.cycleIdentity)).count == chain.count else { throw JumpFailure.cycle }
             return chain
         }
         var destinations: [PlannedRoute] = [], transit: [PlannedRoute] = [], retained = Set<RouteKey>()
         for alias in selected {
-            var root = try resolved(alias)
-            let chain: [String]
-            do { chain = try expand(alias, path: [], remaining: Self.maximumExpandedJumpHosts) }
+            let target = RouteTarget(alias: alias)
+            var root = try resolved(target)
+            let chain: [RouteTarget]
+            do { chain = try expand(target, path: [], remaining: Self.maximumExpandedJumpHosts) }
             catch let failure as JumpFailure { root.problems.append(failure.problem); chain = [] }
             var jumps: [RouteKey] = []
             for (index, hop) in chain.enumerated() {
-                let key = RouteKey(alias: hop, context: index == 0 ? .firstHop : .followingHop)
+                let key = RouteKey(target: hop, context: index == 0 ? .firstHop : .followingHop)
                 jumps.append(key)
                 guard retained.insert(key).inserted else { continue }
                 var policy = try resolved(hop)
@@ -940,9 +967,56 @@ public struct SSHWorkspaceSource: Sendable {
                 transit.append(PlannedRoute(key: key, resolution: policy, jumps: []))
                 guard selected.count + transit.count <= 256 else { throw FTError.limit("ssh.routes") }
             }
-            destinations.append(PlannedRoute(key: RouteKey(alias: alias, context: .destination), resolution: root, jumps: jumps))
+            destinations.append(PlannedRoute(key: RouteKey(target: target, context: .destination), resolution: root, jumps: jumps))
         }
         return destinations + transit
+    }
+
+    /// Bounded static subset of OpenSSH's parse_user_host_port. Brackets are
+    /// syntax, not part of the Host lookup; user and port become per-hop -l/-p
+    /// overrides. Never expand tokens, interpret an URI, or run a command.
+    private static func jumpTarget(_ value: String) throws -> RouteTarget {
+        guard !value.isEmpty, value.utf8.count <= FTLimit.text,
+              !value.unicodeScalars.contains(where: { $0.value <= 32 || $0.value == 127 }),
+              value.rangeOfCharacter(from: CharacterSet(charactersIn: "/\\%$`\"';&|<>!?*{}()")) == nil else {
+            throw JumpFailure.unsupported
+        }
+        var hostAndPort = value, user: String?
+        // OpenSSH splits on the last @ so account names can contain an @.
+        if let separator = value.lastIndex(of: "@") {
+            let account = String(value[..<separator])
+            guard validUser(account), !account.contains(":"), !account.contains("["), !account.contains("]") else {
+                throw JumpFailure.unsupported
+            }
+            user = account; hostAndPort = String(value[value.index(after: separator)...])
+        }
+        let host: String, portText: String?
+        if hostAndPort.first == "[" {
+            guard let closing = hostAndPort.firstIndex(of: "]") else { throw JumpFailure.unsupported }
+            host = String(hostAndPort[hostAndPort.index(after: hostAndPort.startIndex)..<closing])
+            guard host.contains(":"), (try? WorkspaceDocument.host(host)) != nil else { throw JumpFailure.unsupported }
+            let suffix = hostAndPort[hostAndPort.index(after: closing)...]
+            guard suffix.isEmpty || suffix.first == ":" else { throw JumpFailure.unsupported }
+            portText = suffix.isEmpty ? nil : String(suffix.dropFirst())
+        } else {
+            let fields = hostAndPort.split(separator: ":", omittingEmptySubsequences: false)
+            guard fields.count <= 2, let first = fields.first else { throw JumpFailure.unsupported }
+            host = String(first)
+            guard host.utf8.allSatisfy({
+                (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || [45, 46, 95].contains($0)
+            }) else { throw JumpFailure.unsupported }
+            portText = fields.count == 2 ? String(fields[1]) : nil
+        }
+        guard !host.isEmpty, host.utf8.count <= 253, !host.hasPrefix("-"), host.lowercased() != "none" else {
+            throw JumpFailure.unsupported
+        }
+        var port: UInt16?
+        if let portText, !portText.isEmpty {
+            guard portText.utf8.allSatisfy({ (48...57).contains($0) }), let number = UInt64(portText),
+                  let checked = try? WorkspaceDocument.port(number) else { throw JumpFailure.unsupported }
+            port = checked
+        }
+        return RouteTarget(alias: host, user: user, port: port)
     }
 
     private func resolve(_ alias: String, budget: inout MatchBudget) throws -> Resolution {

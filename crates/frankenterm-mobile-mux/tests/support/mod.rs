@@ -229,6 +229,12 @@ pub struct Server {
     pub quiet_resize: bool,
     /// A current server's incarnation, in its coherent pane list.
     pub incarnation: [u8; 16],
+    /// Exact live pane authority; changing this simulates reuse of its number.
+    pub registration: [u8; 16],
+    pub durable_identity: bool,
+    pub client_ids: Vec<mux::client::ClientId>,
+    /// Limit a reliable writer to this many bytes per acknowledged prefix.
+    pub write_prefix: Option<usize>,
     /// A current server answers a coherent list without one.
     pub unfenced: bool,
     /// After a coherent list: topology changes go as PDU 83, numbered.
@@ -264,6 +270,10 @@ impl Server {
             search_ranges: Vec::new(),
             quiet_resize: false,
             incarnation: [0x1c; 16],
+            registration: [0x27; 16],
+            durable_identity: true,
+            client_ids: Vec::new(),
+            write_prefix: None,
             unfenced: false,
             fenced: false,
             revision: 0,
@@ -327,6 +337,112 @@ impl Server {
                 );
                 let frame = server_frame(4, serial, &body, self.compress);
                 self.to_phone.extend_from_slice(&frame);
+            }
+            MuxWireDecodedPayload::Pdu(Pdu::SetClientId(request)) => {
+                self.requests.push("SetClientId");
+                assert!(!request.is_proxy);
+                self.client_ids.push(request.client_id);
+                self.reply(10, serial, &UnitResponse {});
+            }
+            MuxWireDecodedPayload::Pdu(Pdu::GetPaneIdentityV1(request)) => {
+                self.requests.push("GetPaneIdentityV1");
+                let outcome = if request.pane_id != self.pane_id {
+                    codec::PaneIdentityOutcomeV1::PaneGone
+                } else if !self.durable_identity {
+                    codec::PaneIdentityOutcomeV1::Unavailable
+                } else {
+                    codec::PaneIdentityOutcomeV1::Available {
+                        identity: codec::PaneIdentityV1 {
+                            session_incarnation: mux::MuxSessionIncarnation::from_bytes(
+                                self.incarnation,
+                            ),
+                            durable_pane_id: [0xd1; 16],
+                            pane_registration:
+                                codec::ReliablePaneRegistrationIdentityV1::from_bytes(
+                                    self.registration,
+                                ),
+                        },
+                        render_facts: None,
+                    }
+                };
+                self.reply(
+                    118,
+                    serial,
+                    &codec::GetPaneIdentityV1Response {
+                        pane_id: request.pane_id,
+                        outcome,
+                    },
+                );
+            }
+            MuxWireDecodedPayload::Pdu(Pdu::ReliableKeyEventV1(request)) => {
+                self.requests.push("ReliableKeyEventV1");
+                use codec::{
+                    ReliableKeyEventOutcomeV1 as Outcome, ReliableKeyEventRejectionV1 as Rejected,
+                };
+                let registration =
+                    codec::ReliablePaneRegistrationIdentityV1::from_bytes(self.registration);
+                let outcome = if request.pane_id != self.pane_id {
+                    Outcome::Rejected(Rejected::PaneUnavailable)
+                } else if request.pane_registration.is_none() {
+                    Outcome::Retry(codec::ReliableKeyEventRetryV1::PaneAuthorityRequired {
+                        pane_registration: registration,
+                    })
+                } else if request.pane_registration != Some(registration) {
+                    Outcome::Rejected(Rejected::PaneRegistrationMismatch)
+                } else if self.client_ids.is_empty() {
+                    Outcome::Rejected(Rejected::ClientLedgerUnavailable)
+                } else {
+                    assert!(!request.input_serial.is_empty());
+                    self.keys.push(request.event);
+                    Outcome::Applied
+                };
+                self.reply(
+                    97,
+                    serial,
+                    &codec::ReliableKeyEventV1Response {
+                        pane_id: request.pane_id,
+                        input_serial: request.input_serial,
+                        outcome,
+                    },
+                );
+            }
+            MuxWireDecodedPayload::Pdu(Pdu::ReliablePaneWriteV1(request)) => {
+                self.requests.push("ReliablePaneWriteV1");
+                use codec::{
+                    ReliableKeyEventRejectionV1 as InputRejected,
+                    ReliablePaneWriteOutcomeV1 as Outcome,
+                    ReliablePaneWriteRejectionV1 as Rejected,
+                };
+                let expected =
+                    codec::ReliablePaneRegistrationIdentityV1::from_bytes(self.registration);
+                let outcome = if request.pane_id != self.pane_id {
+                    Outcome::Rejected(Rejected::Input(InputRejected::PaneUnavailable))
+                } else if request.pane_registration != Some(expected) {
+                    Outcome::Rejected(Rejected::Input(InputRejected::PaneRegistrationMismatch))
+                } else if self.client_ids.is_empty() {
+                    Outcome::Rejected(Rejected::Input(InputRejected::ClientLedgerUnavailable))
+                } else {
+                    assert!(!request.input_serial.is_empty());
+                    assert!(!request.data.is_empty());
+                    assert!(request.data.len() <= codec::MAX_RELIABLE_PANE_WRITE_DATA_BYTES);
+                    let count = self
+                        .write_prefix
+                        .unwrap_or(request.data.len())
+                        .min(request.data.len());
+                    self.written.extend_from_slice(&request.data[..count]);
+                    Outcome::AppliedPrefix {
+                        bytes: count as u32,
+                    }
+                };
+                self.reply(
+                    101,
+                    serial,
+                    &codec::ReliablePaneWriteV1Response {
+                        pane_id: request.pane_id,
+                        input_serial: request.input_serial,
+                        outcome,
+                    },
+                );
             }
             MuxWireDecodedPayload::Pdu(Pdu::ListPanesCoherent(request)) => {
                 self.requests.push("ListPanesCoherent");

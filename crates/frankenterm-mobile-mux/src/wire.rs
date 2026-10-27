@@ -6,8 +6,9 @@
 //! desktop codec's own encoding and decoding in both dialects.
 //!
 //! A reply struct may stop before the reply's last field: decoding reads a
-//! prefix and ignores the rest (image references, input serials and
-//! sequence numbers, which the phone does not use).
+//! prefix and ignores the rest (such as image references). Effect receipts
+//! instead consume their complete bounded schema: an incomplete or extended
+//! reply cannot settle a different input operation.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -22,8 +23,9 @@ use termwiz::surface::{CursorShape, CursorVisibility, Line};
 pub const LEGACY_VERSIONS: RangeInclusive<usize> = 46..=47;
 /// A current FrankenTerm's own mux (a Mac's GUI, reached through its relay):
 /// the rolling-upgrade window `codec::CODEC_VERSION_MIN_SUPPORTED..=
-/// CODEC_VERSION`. Every PDU the phone uses has kept one schema across it.
-/// Version 71 is additive; it does not change the layouts used by this client.
+/// CODEC_VERSION`. Additive reliable writes (v64) and pane identity (v71)
+/// are gated by the negotiated version; neither silently falls back to a
+/// numeric-pane legacy write on a current connection.
 pub const CURRENT_VERSIONS: RangeInclusive<usize> = 61..=71;
 
 /// Which of the two layouts a server speaks. They differ, for this client,
@@ -76,6 +78,7 @@ pub mod ident {
     pub const SEARCH_SCROLLBACK: u64 = 31;
     pub const SEARCH_SCROLLBACK_RESPONSE: u64 = 32;
     pub const PANE_REMOVED: u64 = 37;
+    pub const SET_CLIENT_ID: u64 = 40;
     /// Pushed when a tab's split layout changes or a tab is added: the
     /// pane list is out of date.
     pub const TAB_RESIZED: u64 = 54;
@@ -86,6 +89,12 @@ pub mod ident {
     /// Pushed in place of PANE_REMOVED, TAB_RESIZED and TAB_ADDED_TO_WINDOW
     /// once the server answered LIST_PANES_COHERENT with a snapshot.
     pub const TOPOLOGY_EVENT: u64 = 83;
+    pub const RELIABLE_KEY_EVENT: u64 = 96;
+    pub const RELIABLE_KEY_EVENT_RESPONSE: u64 = 97;
+    pub const RELIABLE_PANE_WRITE: u64 = 100;
+    pub const RELIABLE_PANE_WRITE_RESPONSE: u64 = 101;
+    pub const GET_PANE_IDENTITY: u64 = 117;
+    pub const GET_PANE_IDENTITY_RESPONSE: u64 = 118;
 }
 
 /// `codec::TopologyCapabilities::FENCED_SNAPSHOT_V1`, the one capability a
@@ -133,6 +142,217 @@ pub struct GetLines {
 pub struct WriteToPane {
     pub pane_id: usize,
     pub data: Vec<u8>,
+}
+
+/// The canonical `mux::client::ClientId` positional schema. The mobile client
+/// uses a fresh opaque hostname per connection, never the device's hostname,
+/// account, or SSH agent socket. It does not reuse a previous input ledger.
+#[derive(Serialize)]
+pub struct ClientId {
+    pub hostname: String,
+    pub username: String,
+    pub pid: u32,
+    pub epoch: u64,
+    pub id: usize,
+    pub ssh_auth_sock: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct SetClientId {
+    pub client_id: ClientId,
+    pub is_proxy: bool,
+}
+
+pub const RELIABLE_WRITE_MIN_VERSION: usize = 64;
+pub const PANE_IDENTITY_MIN_VERSION: usize = 71;
+pub const MAX_PANE_IDENTITY_RESPONSE_BYTES: usize = 8 * 1024;
+pub const MAX_RELIABLE_WRITE_BYTES: usize = 16 * 1024;
+pub const MAX_RELIABLE_RETRY_DELAY_NS: u64 = 1_000_000_000;
+
+#[derive(Serialize)]
+pub struct ReliableKeyEvent {
+    pub pane_id: usize,
+    pub pane_registration: Option<[u8; 16]>,
+    pub event: KeyEvent,
+    pub input_serial: u64,
+    pub kind: ReliableKeyEventKind,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ReliableKeyEventKind {
+    KeyDown,
+    KeyUp,
+}
+
+#[derive(Serialize)]
+pub struct ReliablePaneWrite<'a> {
+    pub pane_id: usize,
+    pub pane_registration: Option<[u8; 16]>,
+    pub input_serial: u64,
+    pub data: &'a [u8],
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+pub struct ReliableInputSchedulerPressure {
+    pub queue_id: u64,
+    pub scheduler_generation: u64,
+    pub active_tasks: u64,
+    pub task_capacity: u64,
+    pub active_estimated_bytes: u64,
+    pub estimated_byte_capacity: u64,
+    pub requested_estimated_bytes: u64,
+    pub retry_after_ns: u64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+pub enum ReliableKeyRetry {
+    SchedulerFull(ReliableInputSchedulerPressure),
+    SchedulerRetired(ReliableInputSchedulerPressure),
+    SchedulerUnavailable { retry_after_ns: u64 },
+    DuplicatePending { retry_after_ns: u64 },
+    ClientRegistrationTransition { retry_after_ns: u64 },
+    PaneAuthorityRequired { pane_registration: [u8; 16] },
+}
+
+impl ReliableKeyRetry {
+    /// Validate the canonical retry schema before granting any scheduling
+    /// authority. DuplicatePending may already have reached the pane; a new
+    /// registration cannot replace the one frozen at admission. Neither is
+    /// permission for this client's no-effect retry path.
+    pub fn no_effect_delay_ns(self) -> Result<Option<u64>, crate::Error> {
+        let delay = match self {
+            Self::SchedulerFull(pressure) | Self::SchedulerRetired(pressure) => {
+                if pressure.queue_id == 0
+                    || pressure.scheduler_generation == 0
+                    || pressure.task_capacity == 0
+                    || pressure.estimated_byte_capacity == 0
+                    || pressure.requested_estimated_bytes == 0
+                    || pressure.active_tasks > pressure.task_capacity
+                    || pressure.active_estimated_bytes > pressure.estimated_byte_capacity
+                {
+                    return Err(crate::Error::Frame(
+                        "invalid reliable input scheduler pressure",
+                    ));
+                }
+                pressure.retry_after_ns
+            }
+            Self::SchedulerUnavailable { retry_after_ns }
+            | Self::ClientRegistrationTransition { retry_after_ns } => retry_after_ns,
+            Self::DuplicatePending { retry_after_ns } => {
+                validate_retry_delay(retry_after_ns)?;
+                return Ok(None);
+            }
+            Self::PaneAuthorityRequired { pane_registration } => {
+                if pane_registration == [0; 16] {
+                    return Err(crate::Error::Frame("reserved reliable input registration"));
+                }
+                return Ok(None);
+            }
+        };
+        validate_retry_delay(delay)?;
+        Ok(Some(delay))
+    }
+}
+
+fn validate_retry_delay(delay_ns: u64) -> Result<(), crate::Error> {
+    if !(1..=MAX_RELIABLE_RETRY_DELAY_NS).contains(&delay_ns) {
+        return Err(crate::Error::Frame("invalid reliable input retry delay"));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+pub enum ReliableKeyRejection {
+    ClientLedgerUnavailable,
+    IdentityAuthorityExhausted,
+    PaneUnavailable,
+    PaneRegistrationMismatch,
+    StaleSerial,
+    IdentityConflict,
+    OutcomeUnknown,
+    InvalidSchedulerConfiguration,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+pub enum ReliableKeyOutcome {
+    Applied,
+    DuplicateApplied,
+    Retry(ReliableKeyRetry),
+    Rejected(ReliableKeyRejection),
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+pub struct ReliableKeyResponse {
+    pub pane_id: usize,
+    pub input_serial: u64,
+    pub outcome: ReliableKeyOutcome,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+pub enum ReliableWriteRetry {
+    Input(ReliableKeyRetry),
+    DefinitelyNotApplied { retry_after_ns: u64 },
+}
+
+impl ReliableWriteRetry {
+    pub fn no_effect_delay_ns(self) -> Result<Option<u64>, crate::Error> {
+        match self {
+            Self::Input(retry) => retry.no_effect_delay_ns(),
+            Self::DefinitelyNotApplied { retry_after_ns } => {
+                validate_retry_delay(retry_after_ns)?;
+                Ok(Some(retry_after_ns))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+pub enum ReliableWriteRejection {
+    Input(ReliableKeyRejection),
+    DefinitelyNotApplied,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+pub enum ReliableWriteOutcome {
+    AppliedPrefix { bytes: u32 },
+    DuplicateAppliedPrefix { bytes: u32 },
+    Retry(ReliableWriteRetry),
+    Rejected(ReliableWriteRejection),
+    Indeterminate,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+pub struct ReliableWriteResponse {
+    pub pane_id: usize,
+    pub input_serial: u64,
+    pub outcome: ReliableWriteOutcome,
+}
+
+#[derive(Serialize)]
+pub struct GetPaneIdentity {
+    pub pane_id: usize,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+pub struct PaneIdentity {
+    pub session_incarnation: [u8; 16],
+    pub durable_pane_id: [u8; 16],
+    pub pane_registration: [u8; 16],
+}
+
+/// Only the identity prefix is consumed. Optional coherent render facts are
+/// not interpreted as a complete mobile snapshot or a controller lease.
+#[derive(Debug, Deserialize)]
+pub enum PaneIdentityOutcome {
+    Available { identity: PaneIdentity },
+    PaneGone,
+    Unavailable,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PaneIdentityResponse {
+    pub pane_id: usize,
+    pub outcome: PaneIdentityOutcome,
 }
 
 /// The v46 PDU 13 schema (no input serial).
@@ -563,4 +783,15 @@ pub fn encode<T: Serialize>(value: &T) -> Vec<u8> {
 /// lengths beyond the bytes it actually sent.
 pub fn decode<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, crate::Error> {
     crate::varbin::deserialize(body).map_err(|_| crate::Error::Schema)
+}
+
+/// Reliable input receipts have a fixed small schema and must consume the
+/// complete body before they can settle an operation.
+pub fn decode_input_receipt<T: serde::de::DeserializeOwned>(
+    body: &[u8],
+) -> Result<T, crate::Error> {
+    if body.len() > 4 * 1024 {
+        return Err(crate::Error::Frame("an input receipt is too large"));
+    }
+    crate::varbin::deserialize_exact(body).map_err(|_| crate::Error::Schema)
 }

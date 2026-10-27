@@ -39,6 +39,17 @@ pub fn deserialize<T: de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     T::deserialize(&mut Deserializer { input: bytes })
 }
 
+/// Effect receipts are complete schemas: trailing bytes cannot silently turn
+/// an incompatible response into authority to send the next input operation.
+pub fn deserialize_exact<T: de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    let mut decoder = Deserializer { input: bytes };
+    let value = T::deserialize(&mut decoder)?;
+    if !decoder.input.is_empty() {
+        return Err(error("unexpected trailing reply bytes"));
+    }
+    Ok(value)
+}
+
 struct Deserializer<'de> {
     input: &'de [u8],
 }

@@ -18,6 +18,8 @@ private final class ObservationMuxClient: TerminalMuxClient, @unchecked Sendable
     private var calls: [Call] = []
     private var sizes: [Int: (rows: Int, columns: Int)]
     private var nextQuery: UInt64 = 0
+    private var inputTimer: ContinuousClock.Instant?
+    private var timerStarted = false
     let panes: [TerminalMuxPane]
 
     init(mode: String) {
@@ -38,11 +40,26 @@ private final class ObservationMuxClient: TerminalMuxClient, @unchecked Sendable
     func receive(_ bytes: Data) throws {}
     func channelClosed() throws {}
     func outgoing(limit: Int) throws -> Data { Data() }
+    func pollInputTimer() throws -> Duration? {
+        lock.withLock {
+            guard let deadline = inputTimer else { return nil }
+            let now = ContinuousClock.now
+            guard now >= deadline else { return now.duration(to: deadline) }
+            inputTimer = nil
+            calls.append(.init(name: "input-timer", pane: 1))
+            events.append(.activity(paneID: 1))
+            return nil
+        }
+    }
     func nextEvent() throws -> TerminalMuxEvent? { lock.withLock { events.isEmpty ? nil : events.removeFirst() } }
     func refreshPanes() throws { lock.withLock { calls.append(.init(name: "list", pane: 0)) } }
     func show(pane: Int) throws {
         lock.withLock {
             calls.append(.init(name: "show", pane: pane))
+            if !timerStarted {
+                timerStarted = true
+                inputTimer = .now + .milliseconds(100)
+            }
             let size = sizes[pane]!
             events.append(.mouseGrab(paneID: pane, grabbed: true))
             events.append(.output(paneID: pane, rows: size.rows, columns: size.columns,
@@ -113,8 +130,8 @@ private actor ObservationConsumer: TerminalSessionConsumer {
 
 @MainActor
 final class MuxObservationTests: XCTestCase {
-    private func waitUntil(_ predicate: @MainActor () async -> Bool) async throws {
-        let deadline = ContinuousClock.now + .seconds(5)
+    private func waitUntil(timeout: Duration = .seconds(5), _ predicate: @MainActor () async -> Bool) async throws {
+        let deadline = ContinuousClock.now + timeout
         while !(await predicate()) {
             guard ContinuousClock.now < deadline else { throw ObservationFixtureError.timeout }
             try await Task.sleep(for: .milliseconds(5))
@@ -201,6 +218,12 @@ final class MuxObservationTests: XCTestCase {
                 XCTAssertEqual(summary.bytes, 0)
             } else {
                 try await waitUntil { control.inputRouting.current.ready }
+                // No network data or UI action wakes this fixture timer. It
+                // must shorten the existing transport wait (ordinary pane
+                // polling takes five seconds) and run exactly once.
+                try await waitUntil(timeout: .seconds(1)) {
+                    client.recorded.filter { $0.name == "input-timer" }.count == 1
+                }
                 let first = try control.inputRouting.capture()
                 let firstSummary = await consumer.summary()
                 XCTAssertEqual(firstSummary.geometry.columns, interactive ? 80 : 256)

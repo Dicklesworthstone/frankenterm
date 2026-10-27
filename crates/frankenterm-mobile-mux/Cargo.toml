@@ -19,6 +19,7 @@ serde = { workspace = true, features = ["derive", "std"] }
 # with true colors or a hyperlink decodes one field short.
 termwiz = { workspace = true, features = ["use_serde", "use_image"] }
 thiserror.workspace = true
+uuid = { workspace = true, features = ["v4"] }
 varbincode.workspace = true
 zstd.workspace = true
 

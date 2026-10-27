@@ -15,8 +15,9 @@ use crate::wire::{
     ident,
 };
 use serde::Deserialize;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
+use termwiz::input::{KeyCode, KeyEvent, Modifiers};
 use termwiz::surface::Line;
 
 /// One pane of the machine's mux, in the order the server lists them.
@@ -122,6 +123,23 @@ pub enum Event {
 #[derive(Debug)]
 enum Request {
     Version,
+    RegisterClient {
+        server_version: String,
+    },
+    PaneIdentity {
+        pane_id: usize,
+    },
+    PaneAuthority {
+        pane_id: usize,
+        input_serial: u64,
+    },
+    /// Exactly one ordered input operation can be outstanding. The queue
+    /// retains its destination, registration and original payload until its
+    /// complete receipt (including any remaining byte suffix) settles.
+    OrderedInput {
+        pane_id: usize,
+        input_serial: u64,
+    },
     ListPanes,
     /// The first pane list from a current server, with its incarnation.
     CoherentPanes,
@@ -169,6 +187,65 @@ enum Request {
 
 /// The most wheel notches one [`Session::wheel`] call sends.
 pub const MAX_WHEEL_STEPS: u32 = 64;
+/// Reliable input retains one admission budget across retries and suffixes.
+pub const INPUT_DEADLINE_NS: u64 = 5_000_000_000;
+/// At most this many proven-no-effect retransmissions per admitted operation.
+pub const MAX_INPUT_RETRIES: u8 = 8;
+const MIN_INPUT_RETRY_DELAY_NS: u64 = 1_000_000;
+const MAX_INPUT_RETRY_BACKOFF_NS: u64 = 100_000_000;
+const MAX_INPUT_CALL_BYTES: usize = 64 * 1024;
+const MAX_QUEUED_INPUT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_QUEUED_INPUT_OPERATIONS: usize = 256;
+
+#[derive(Debug, Clone, Copy)]
+enum PaneAuthority {
+    Pending(u64),
+    Available([u8; 16]),
+    Unavailable,
+}
+
+#[derive(Debug)]
+enum OrderedEffect {
+    Bytes { data: Vec<u8>, offset: usize },
+    Key(KeyEvent),
+    Paste(String),
+    Mouse(MouseEvent),
+}
+
+impl OrderedEffect {
+    fn charge(&self) -> usize {
+        match self {
+            Self::Bytes { data, .. } => data.capacity(),
+            Self::Paste(text) => text.capacity(),
+            Self::Key(_) | Self::Mouse(_) => 128,
+        }
+    }
+
+    fn serials(&self) -> usize {
+        match self {
+            // A writer can accept one byte per reply. Reserve every possible
+            // suffix serial before admitting the original bytes, so a later
+            // key cannot have a lower serial than their final suffix.
+            Self::Bytes { data, .. } => data.len(),
+            _ => 1,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct OrderedInput {
+    pane_id: usize,
+    registration: [u8; 16],
+    input_serial: u64,
+    last_serial: u64,
+    effect: OrderedEffect,
+    in_flight: bool,
+    /// None means the owner has not supplied a clock. Such an operation may
+    /// complete normally, but cannot gain timed retry authority retroactively.
+    deadline_ns: Option<u64>,
+    retry_at_ns: Option<u64>,
+    retries: u8,
+}
 
 /// The pane id that opens PDUs 25, 30 and 37.
 #[derive(Deserialize)]
@@ -198,6 +275,8 @@ pub struct Session {
     outgoing: Vec<u8>,
     ready: bool,
     dialect: Dialect,
+    codec_version: usize,
+    incarnation: Option<[u8; 16]>,
     failed: bool,
     requests: HashMap<u64, Request>,
     panes: Vec<PaneInfo>,
@@ -219,6 +298,14 @@ pub struct Session {
     /// Incomplete paste state belongs to its original observed registration,
     /// never the most recently written or currently visible pane.
     input: PaneInput,
+    authorities: HashMap<usize, PaneAuthority>,
+    next_input_serial: u64,
+    monotonic_ns: Option<u64>,
+    ordered_input: VecDeque<OrderedInput>,
+    ordered_input_bytes: usize,
+    /// Payloads are released on failure, but their uncertain disposition is
+    /// retained for the existing Swift journal/close path.
+    interrupted_input: HashSet<usize>,
 }
 
 impl Session {
@@ -236,6 +323,55 @@ impl Session {
 
     pub fn is_ready(&self) -> bool {
         self.ready && !self.failed
+    }
+
+    /// Advance the owner's monotonic clock, in nanoseconds from any fixed
+    /// origin chosen for this connection. Call before admitting/receiving input
+    /// and at [`Session::next_input_wake_ns`]. Equal ticks are harmless; a
+    /// backward clock fails closed. There is no wall clock, timer or I/O here.
+    ///
+    /// False means the session ended; the owner must stop egress and drain its
+    /// failure event. Expiry never retries an unanswered/possibly applied RPC.
+    pub fn advance_time(&mut self, now_ns: u64) -> bool {
+        if self.failed {
+            return false;
+        }
+        if self.monotonic_ns.is_some_and(|previous| now_ns < previous) {
+            self.fail("the mux input clock moved backwards; input was not replayed".to_owned());
+            return false;
+        }
+        self.monotonic_ns = Some(now_ns);
+        if self
+            .ordered_input
+            .iter()
+            .any(|input| input.deadline_ns.is_some_and(|deadline| now_ns >= deadline))
+        {
+            self.fail(
+                "the mux input deadline expired; unconfirmed input was not replayed".to_owned(),
+            );
+            return false;
+        }
+        self.drive_input();
+        !self.failed
+    }
+
+    /// Earliest absolute wake in the same clock domain supplied to
+    /// [`Session::advance_time`]. Includes queued-operation expiry, so a paste
+    /// or mouse RPC ahead of reliable input cannot hide that input's deadline.
+    /// Only one owner timer is needed; the bounded FIFO remains authoritative.
+    pub fn next_input_wake_ns(&self) -> Option<u64> {
+        if self.failed {
+            return None;
+        }
+        self.ordered_input
+            .iter()
+            .filter_map(|input| input.deadline_ns)
+            .chain(
+                self.ordered_input
+                    .front()
+                    .and_then(|input| input.retry_at_ns),
+            )
+            .min()
     }
 
     pub fn panes(&self) -> &[PaneInfo] {
@@ -262,6 +398,9 @@ impl Session {
                 Ok(Some(frame)) => {
                     if let Err(error) = self.handle(frame) {
                         self.fail(error.to_string());
+                        return;
+                    }
+                    if self.failed {
                         return;
                     }
                 }
@@ -308,16 +447,77 @@ impl Session {
         }
         if let Some(mirror) = self.mirrors.get_mut(&pane_id) {
             mirror.show();
-            self.advance(pane_id);
+            if !matches!(
+                self.authorities.get(&pane_id),
+                Some(PaneAuthority::Pending(_))
+            ) {
+                self.advance(pane_id);
+            }
         } else {
             // The server tracks a pane for this connection from its first
             // GetPaneRenderChanges on, and pushes every later change.
             self.mirrors.insert(pane_id, PaneMirror::new(true));
+            if self.dialect == Dialect::Current {
+                self.capture_pane_authority(pane_id);
+            } else {
+                self.subscribe(pane_id);
+            }
+        }
+    }
+
+    fn subscribe(&mut self, pane_id: usize) {
+        self.send(
+            ident::GET_PANE_RENDER_CHANGES,
+            &GetPaneRenderChanges { pane_id },
+            Request::Subscribe { pane_id },
+        );
+    }
+
+    /// Capture server authority before subscribing/rendering, never lazily
+    /// when the first key arrives after a numeric pane could have been reused.
+    /// Before v71, the no-effect reliable-key probe supplies only this live
+    /// registration; it does not establish a durable pane or resume identity.
+    fn capture_pane_authority(&mut self, pane_id: usize) {
+        if self.codec_version >= wire::PANE_IDENTITY_MIN_VERSION {
             self.send(
-                ident::GET_PANE_RENDER_CHANGES,
-                &GetPaneRenderChanges { pane_id },
-                Request::Subscribe { pane_id },
+                ident::GET_PANE_IDENTITY,
+                &wire::GetPaneIdentity { pane_id },
+                Request::PaneIdentity { pane_id },
             );
+        } else {
+            self.probe_pane_authority(pane_id);
+            return;
+        }
+        if !self.failed {
+            self.authorities
+                .insert(pane_id, PaneAuthority::Pending(self.next_serial));
+        }
+    }
+
+    fn probe_pane_authority(&mut self, pane_id: usize) {
+        let Some(input_serial) = self.reserve_input_serials(1) else {
+            return;
+        };
+        self.send(
+            ident::RELIABLE_KEY_EVENT,
+            &wire::ReliableKeyEvent {
+                pane_id,
+                pane_registration: None,
+                event: KeyEvent {
+                    key: KeyCode::Char('\0'),
+                    modifiers: Modifiers::NONE,
+                },
+                input_serial,
+                kind: wire::ReliableKeyEventKind::KeyDown,
+            },
+            Request::PaneAuthority {
+                pane_id,
+                input_serial,
+            },
+        );
+        if !self.failed {
+            self.authorities
+                .insert(pane_id, PaneAuthority::Pending(self.next_serial));
         }
     }
 
@@ -335,17 +535,58 @@ impl Session {
         if !self.is_ready() || data.is_empty() {
             return;
         }
+        if data.len() > MAX_INPUT_CALL_BYTES {
+            self.interrupted_input.insert(pane_id);
+            self.fail("mux input exceeds its bounded admission size".to_owned());
+            return;
+        }
+        let pending_panes: Vec<_> = self.input.pending_panes().collect();
         let pieces = match self.input.split(pane_id, data) {
             Ok(pieces) => pieces,
             Err(reason) => {
                 // Running out of room, or the rest of a paste for a pane
                 // that closed, ends the connection. Never flush an incomplete
                 // command, emit a prefix from this call, or retry the bytes.
+                self.interrupted_input.extend(pending_panes);
+                self.interrupted_input.insert(pane_id);
                 self.fail(reason.to_owned());
                 return;
             }
         };
         for piece in pieces {
+            if self.dialect == Dialect::Current {
+                match piece {
+                    Piece::Bytes(data) => {
+                        if self.codec_version < wire::RELIABLE_WRITE_MIN_VERSION {
+                            self.interrupted_input.insert(pane_id);
+                            self.fail("this mux protocol cannot provide reliable byte input; update the server".to_owned());
+                            return;
+                        }
+                        for chunk in data.chunks(wire::MAX_RELIABLE_WRITE_BYTES) {
+                            if !self.enqueue_input(
+                                pane_id,
+                                OrderedEffect::Bytes {
+                                    data: chunk.to_vec(),
+                                    offset: 0,
+                                },
+                            ) {
+                                return;
+                            }
+                        }
+                    }
+                    Piece::Key(event) => {
+                        if !self.enqueue_input(pane_id, OrderedEffect::Key(event)) {
+                            return;
+                        }
+                    }
+                    Piece::Paste(text) => {
+                        if !self.enqueue_input(pane_id, OrderedEffect::Paste(text)) {
+                            return;
+                        }
+                    }
+                }
+                continue;
+            }
             match piece {
                 Piece::Bytes(data) => {
                     self.send(
@@ -365,6 +606,7 @@ impl Session {
                 Piece::Paste(text) => self.send_paste(pane_id, &text),
             }
         }
+        self.drive_input();
     }
 
     /// Pasted text; the server brackets it when the pane's program asked.
@@ -373,7 +615,19 @@ impl Session {
             return;
         }
         if self.input.in_paste(pane_id) {
+            self.interrupted_input.insert(pane_id);
             self.fail("a direct paste cannot overtake unfinished input for its pane".to_owned());
+            return;
+        }
+        if text.len() > MAX_QUEUED_INPUT_BYTES {
+            self.interrupted_input.insert(pane_id);
+            self.fail("mux paste exceeds its bounded admission size".to_owned());
+            return;
+        }
+        if self.dialect == Dialect::Current {
+            if self.enqueue_input(pane_id, OrderedEffect::Paste(text.to_owned())) {
+                self.drive_input();
+            }
             return;
         }
         self.send_paste(pane_id, text);
@@ -413,6 +667,10 @@ impl Session {
         if !self.is_ready() || steps == 0 {
             return;
         }
+        if self.input.in_paste(pane_id) {
+            self.fail("mouse input cannot overtake unfinished input for its pane".to_owned());
+            return;
+        }
         let button = if steps < 0 {
             MouseButton::WheelUp(1)
         } else {
@@ -428,12 +686,19 @@ impl Session {
             modifiers: termwiz::input::Modifiers::NONE,
         };
         for _ in 0..steps.unsigned_abs().min(MAX_WHEEL_STEPS) {
+            if self.dialect == Dialect::Current {
+                if !self.enqueue_input(pane_id, OrderedEffect::Mouse(event)) {
+                    return;
+                }
+                continue;
+            }
             self.send(
                 ident::SEND_MOUSE_EVENT,
                 &SendMouseEvent { pane_id, event },
                 Request::Input { pane_id },
             );
         }
+        self.drive_input();
     }
 
     /// Clicks the left button on a cell of the pane's screen: a press and a
@@ -441,6 +706,10 @@ impl Session {
     /// mouse (others ignore them).
     pub fn click(&mut self, pane_id: usize, column: usize, row: usize) {
         if !self.is_ready() {
+            return;
+        }
+        if self.input.in_paste(pane_id) {
+            self.fail("mouse input cannot overtake unfinished input for its pane".to_owned());
             return;
         }
         for kind in [MouseEventKind::Press, MouseEventKind::Release] {
@@ -453,12 +722,19 @@ impl Session {
                 button: MouseButton::Left,
                 modifiers: termwiz::input::Modifiers::NONE,
             };
+            if self.dialect == Dialect::Current {
+                if !self.enqueue_input(pane_id, OrderedEffect::Mouse(event)) {
+                    return;
+                }
+                continue;
+            }
             self.send(
                 ident::SEND_MOUSE_EVENT,
                 &SendMouseEvent { pane_id, event },
                 Request::Input { pane_id },
             );
         }
+        self.drive_input();
     }
 
     /// Searches the pane's scrollback on the server, walking back from its
@@ -713,12 +989,297 @@ impl Session {
     /// Whether input sent to the pane ([`Session::write`], [`Session::paste`],
     /// [`Session::click`], [`Session::wheel`]) is still unanswered, so the
     /// server may not have written it to the pane. Once the connection has
-    /// failed, true means some of it may never have arrived; an error reply
-    /// answers it too (the server wrote nothing).
+    /// failed, true means input did not settle with a validated receipt. A
+    /// malformed or unrelated reply never turns uncertainty into confirmation.
     pub fn unanswered_input(&self, pane_id: usize) -> bool {
-        self.requests
-            .values()
-            .any(|request| matches!(request, Request::Input { pane_id: id } if *id == pane_id))
+        self.interrupted_input.contains(&pane_id)
+            || self
+                .ordered_input
+                .iter()
+                .any(|input| input.pane_id == pane_id)
+            || self.input.in_paste(pane_id)
+            || self
+                .requests
+                .values()
+                .any(|request| matches!(request, Request::Input { pane_id: id } if *id == pane_id))
+    }
+
+    fn reserve_input_serials(&mut self, count: usize) -> Option<u64> {
+        let Some(last) = u64::try_from(count)
+            .ok()
+            .filter(|count| *count != 0)
+            .and_then(|count| self.next_input_serial.checked_add(count))
+        else {
+            self.fail("mux input serial space exhausted".to_owned());
+            return None;
+        };
+        let first = self.next_input_serial + 1;
+        self.next_input_serial = last;
+        Some(first)
+    }
+
+    fn enqueue_input(&mut self, pane_id: usize, effect: OrderedEffect) -> bool {
+        if self.failed {
+            return false;
+        }
+        let Some(PaneAuthority::Available(registration)) = self.authorities.get(&pane_id).copied()
+        else {
+            self.interrupted_input.insert(pane_id);
+            self.fail("the displayed mux pane has no current server input authority".to_owned());
+            return false;
+        };
+        let charge = effect.charge();
+        if self.ordered_input.len() >= MAX_QUEUED_INPUT_OPERATIONS
+            || charge > MAX_QUEUED_INPUT_BYTES.saturating_sub(self.ordered_input_bytes)
+        {
+            self.interrupted_input.insert(pane_id);
+            self.fail("mux input queue capacity exceeded".to_owned());
+            return false;
+        }
+        let count = effect.serials();
+        let deadline_ns = if matches!(effect, OrderedEffect::Bytes { .. } | OrderedEffect::Key(_)) {
+            match self.monotonic_ns {
+                Some(now) => match now.checked_add(INPUT_DEADLINE_NS) {
+                    Some(deadline) => Some(deadline),
+                    None => {
+                        self.interrupted_input.insert(pane_id);
+                        self.fail("mux input deadline overflow; input was not sent".to_owned());
+                        return false;
+                    }
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
+        let Some(input_serial) = self.reserve_input_serials(count) else {
+            self.interrupted_input.insert(pane_id);
+            return false;
+        };
+        self.ordered_input_bytes += charge;
+        self.ordered_input.push_back(OrderedInput {
+            pane_id,
+            registration,
+            input_serial,
+            last_serial: self.next_input_serial,
+            effect,
+            in_flight: false,
+            deadline_ns,
+            retry_at_ns: None,
+            retries: 0,
+        });
+        true
+    }
+
+    /// All current-dialect effects share this order. Paste and mouse retain
+    /// their existing wire semantics (neither is a server controller lease),
+    /// but cannot pass an unacknowledged key or the tail of a partial write.
+    fn drive_input(&mut self) {
+        if !self.is_ready() {
+            return;
+        }
+        let Some(input) = self.ordered_input.front_mut() else {
+            return;
+        };
+        if input.in_flight {
+            return;
+        }
+        if let Some(due) = input.retry_at_ns {
+            let Some(now) = self.monotonic_ns else { return };
+            if now < due {
+                return;
+            }
+        }
+        if !matches!(self.authorities.get(&input.pane_id),
+            Some(PaneAuthority::Available(registration)) if *registration == input.registration)
+        {
+            self.fail("the original mux input registration is no longer available".to_owned());
+            return;
+        }
+        let pane_id = input.pane_id;
+        let input_serial = input.input_serial;
+        let (ident, body) = match &input.effect {
+            OrderedEffect::Bytes { data, offset } => (
+                ident::RELIABLE_PANE_WRITE,
+                wire::encode(&wire::ReliablePaneWrite {
+                    pane_id,
+                    pane_registration: Some(input.registration),
+                    input_serial,
+                    data: &data[*offset..],
+                }),
+            ),
+            OrderedEffect::Key(event) => (
+                ident::RELIABLE_KEY_EVENT,
+                wire::encode(&wire::ReliableKeyEvent {
+                    pane_id,
+                    pane_registration: Some(input.registration),
+                    event: event.clone(),
+                    input_serial,
+                    kind: wire::ReliableKeyEventKind::KeyDown,
+                }),
+            ),
+            OrderedEffect::Paste(text) => (
+                ident::SEND_PASTE,
+                wire::encode(&SendPasteCurrent {
+                    pane_id,
+                    data: text,
+                    input_serial,
+                }),
+            ),
+            OrderedEffect::Mouse(event) => (
+                ident::SEND_MOUSE_EVENT,
+                wire::encode(&SendMouseEvent {
+                    pane_id,
+                    event: *event,
+                }),
+            ),
+        };
+        input.in_flight = true;
+        input.retry_at_ns = None;
+        self.send_encoded(
+            ident,
+            &body,
+            Request::OrderedInput {
+                pane_id,
+                input_serial,
+            },
+        );
+    }
+
+    fn finish_input(&mut self) {
+        if let Some(input) = self.ordered_input.pop_front() {
+            self.ordered_input_bytes -= input.effect.charge();
+        }
+        self.drive_input();
+    }
+
+    fn schedule_input_retry(&mut self, peer_delay_ns: u64) -> Result<(), crate::Error> {
+        let Some(now) = self.monotonic_ns else {
+            self.fail(
+                "timed mux input retry requires an owner clock; input was not replayed".to_owned(),
+            );
+            return Ok(());
+        };
+        let Some(input) = self.ordered_input.front_mut() else {
+            return Err(crate::Error::Schema);
+        };
+        let Some(deadline) = input.deadline_ns else {
+            self.fail("mux input had no clock at admission; input was not replayed".to_owned());
+            return Ok(());
+        };
+        if input.retries >= MAX_INPUT_RETRIES {
+            self.fail(
+                "mux input retry budget exhausted; unconfirmed input was not replayed".to_owned(),
+            );
+            return Ok(());
+        }
+        // Amplify short prompts to avoid a busy loop; never shorten a valid
+        // authoritative delay. Retry count and deadline survive partial writes.
+        let base = peer_delay_ns.max(MIN_INPUT_RETRY_DELAY_NS);
+        let delay = base
+            .saturating_mul(1u64 << input.retries)
+            .min(MAX_INPUT_RETRY_BACKOFF_NS.max(base));
+        let Some(due) = now.checked_add(delay).filter(|due| *due < deadline) else {
+            self.fail(
+                "mux input retry would exceed its original deadline; input was not replayed"
+                    .to_owned(),
+            );
+            return Ok(());
+        };
+        input.retries += 1;
+        input.retry_at_ns = Some(due);
+        input.in_flight = false;
+        Ok(())
+    }
+
+    fn settle_key(&mut self, response: wire::ReliableKeyResponse) -> Result<(), crate::Error> {
+        let Some(input) = self.ordered_input.front() else {
+            return Err(crate::Error::Schema);
+        };
+        if !input.in_flight
+            || input.pane_id != response.pane_id
+            || input.input_serial != response.input_serial
+            || !matches!(input.effect, OrderedEffect::Key(_))
+        {
+            return Err(crate::Error::Frame(
+                "reliable key receipt does not match its operation",
+            ));
+        }
+        match response.outcome {
+            wire::ReliableKeyOutcome::Applied | wire::ReliableKeyOutcome::DuplicateApplied => {
+                self.finish_input()
+            }
+            wire::ReliableKeyOutcome::Retry(retry) => {
+                if let Some(delay) = retry.no_effect_delay_ns()? {
+                    return self.schedule_input_retry(delay);
+                }
+                self.fail(
+                    "the mux did not authorize a no-effect key retry; input was not replayed"
+                        .to_owned(),
+                );
+            }
+            wire::ReliableKeyOutcome::Rejected(_) => {
+                self.fail("the mux refused reliable key input; input was not replayed".to_owned());
+            }
+        }
+        Ok(())
+    }
+
+    fn settle_write(&mut self, response: wire::ReliableWriteResponse) -> Result<(), crate::Error> {
+        let Some(input) = self.ordered_input.front_mut() else {
+            return Err(crate::Error::Schema);
+        };
+        if !input.in_flight
+            || input.pane_id != response.pane_id
+            || input.input_serial != response.input_serial
+        {
+            return Err(crate::Error::Frame(
+                "reliable write receipt does not match its operation",
+            ));
+        }
+        let OrderedEffect::Bytes { data, offset } = &mut input.effect else {
+            return Err(crate::Error::Schema);
+        };
+        match response.outcome {
+            wire::ReliableWriteOutcome::AppliedPrefix { bytes }
+            | wire::ReliableWriteOutcome::DuplicateAppliedPrefix { bytes } => {
+                let bytes = usize::try_from(bytes).map_err(|_| crate::Error::Schema)?;
+                if bytes == 0 || bytes > data.len() - *offset {
+                    return Err(crate::Error::Frame(
+                        "reliable write receipt has an invalid applied prefix",
+                    ));
+                }
+                *offset += bytes;
+                if *offset == data.len() {
+                    self.finish_input();
+                } else {
+                    if input.input_serial >= input.last_serial {
+                        return Err(crate::Error::Frame(
+                            "reliable write suffix serials exhausted",
+                        ));
+                    }
+                    input.input_serial += 1;
+                    input.in_flight = false;
+                    self.drive_input();
+                }
+            }
+            wire::ReliableWriteOutcome::Retry(retry) => {
+                if let Some(delay) = retry.no_effect_delay_ns()? {
+                    return self.schedule_input_retry(delay);
+                }
+                self.fail(
+                    "the mux did not authorize a no-effect byte retry; input was not replayed"
+                        .to_owned(),
+                );
+            }
+            wire::ReliableWriteOutcome::Rejected(_) | wire::ReliableWriteOutcome::Indeterminate => {
+                self.fail(
+                    "the mux did not confirm reliable byte input; input was not replayed"
+                        .to_owned(),
+                );
+            }
+        }
+        Ok(())
     }
 
     fn send_resize(&mut self, tab_id: usize, pane_id: usize, size: TerminalSize, request: Request) {
@@ -731,16 +1292,32 @@ impl Session {
     }
 
     fn send<T: serde::Serialize>(&mut self, pdu: u64, body: &T, request: Request) {
-        self.next_serial += 1;
-        let serial = self.next_serial;
+        self.send_encoded(pdu, &wire::encode(body), request);
+    }
+
+    fn send_encoded(&mut self, pdu: u64, body: &[u8], request: Request) {
+        if self.failed {
+            return;
+        }
+        let Some(serial) = self.next_serial.checked_add(1) else {
+            self.fail("mux request serial space exhausted".to_owned());
+            return;
+        };
+        self.next_serial = serial;
         self.outgoing
-            .extend_from_slice(&frame::encode(pdu, serial, &wire::encode(body)));
+            .extend_from_slice(&frame::encode(pdu, serial, body));
         self.requests.insert(serial, request);
     }
 
     fn fail(&mut self, reason: String) {
         if !self.failed {
             self.failed = true;
+            self.interrupted_input
+                .extend(self.ordered_input.iter().map(|input| input.pane_id));
+            self.interrupted_input.extend(self.input.pending_panes());
+            self.ordered_input.clear();
+            self.ordered_input_bytes = 0;
+            self.outgoing.clear();
             self.input.clear();
             self.events.push_back(Event::Failed { reason });
         }
@@ -749,11 +1326,42 @@ impl Session {
     /// A new pane list, asked for with `serial`.
     fn listed(&mut self, list: &PaneList, serial: u64) {
         self.panes = pane_infos(list);
+        if self
+            .ordered_input
+            .iter()
+            .any(|input| !self.panes.iter().any(|pane| pane.pane_id == input.pane_id))
+        {
+            self.fail(
+                "a pane closed while its input was pending; input was not redirected".to_owned(),
+            );
+            return;
+        }
+        // An inventory removal retires the observed generation just like an
+        // explicit topology notice. A later same-number pane must start with
+        // a new mirror, authority query and set of display requests.
+        let missing: Vec<_> = self
+            .mirrors
+            .keys()
+            .copied()
+            .filter(|pane_id| !self.panes.iter().any(|pane| pane.pane_id == *pane_id))
+            .collect();
+        for pane_id in missing {
+            self.pane_gone(pane_id);
+        }
+        self.authorities
+            .retain(|pane_id, _| self.panes.iter().any(|pane| pane.pane_id == *pane_id));
         let marks = listed_marks(list);
+        for pane_id in self.input.pending_panes() {
+            if !self.panes.iter().any(|pane| pane.pane_id == pane_id) {
+                self.interrupted_input.insert(pane_id);
+            }
+        }
+        let pending_panes: Vec<_> = self.input.pending_panes().collect();
         let retained = self
             .input
             .retain(|pane_id| self.panes.iter().any(|pane| pane.pane_id == pane_id));
         if let Err(reason) = retained {
+            self.interrupted_input.extend(pending_panes);
             self.fail(reason.to_owned());
             return;
         }
@@ -810,6 +1418,12 @@ impl Session {
         } else {
             self.requests.remove(&frame.serial)
         };
+        if frame.serial != 0 && request.is_none() {
+            // Retired requests may finish after pane removal/reselection.
+            // Their numeric pane IDs no longer identify the displayed visit.
+            // An unmatched receipt also cannot settle any current operation.
+            return Ok(());
+        }
         if frame.oversized {
             // Only a search can draw a reply this large; fail just that one.
             return match request {
@@ -834,36 +1448,189 @@ impl Session {
                 _ => Err(crate::Error::Frame("a reply too large to read")),
             };
         }
+        if let Some(Request::OrderedInput {
+            pane_id,
+            input_serial,
+        }) = &request
+        {
+            let Some(input) = self.ordered_input.front() else {
+                return Err(crate::Error::Schema);
+            };
+            if input.pane_id != *pane_id || input.input_serial != *input_serial || !input.in_flight
+            {
+                return Err(crate::Error::Frame(
+                    "an input reply does not match the outstanding request",
+                ));
+            }
+            return match (&input.effect, frame.ident) {
+                (OrderedEffect::Bytes { .. }, ident::RELIABLE_PANE_WRITE_RESPONSE) => {
+                    self.settle_write(wire::decode_input_receipt(&frame.body)?)
+                }
+                (OrderedEffect::Key(_), ident::RELIABLE_KEY_EVENT_RESPONSE) => {
+                    self.settle_key(wire::decode_input_receipt(&frame.body)?)
+                }
+                (OrderedEffect::Paste(_) | OrderedEffect::Mouse(_), ident::UNIT_RESPONSE)
+                    if frame.body.is_empty() =>
+                {
+                    self.finish_input();
+                    Ok(())
+                }
+                (_, ident::ERROR_RESPONSE) => {
+                    self.fail("the mux rejected input without a matching effect receipt; input was not replayed".to_owned());
+                    Ok(())
+                }
+                _ => Err(crate::Error::Frame(
+                    "an input request received an unexpected reply",
+                )),
+            };
+        }
+        if let Some(Request::PaneIdentity { pane_id } | Request::PaneAuthority { pane_id, .. }) =
+            &request
+        {
+            let pane_id = *pane_id;
+            if !matches!(self.authorities.get(&pane_id), Some(PaneAuthority::Pending(serial)) if *serial == frame.serial)
+            {
+                // This observed pane was removed while its query was pending.
+                // A later same-number selection owns its own query, not this one.
+                return Ok(());
+            }
+            let registration = match (&request, frame.ident) {
+                (Some(Request::PaneIdentity { .. }), ident::GET_PANE_IDENTITY_RESPONSE) => {
+                    if frame.body.len() > wire::MAX_PANE_IDENTITY_RESPONSE_BYTES {
+                        return Err(crate::Error::Frame(
+                            "a pane identity reply exceeds its protocol bound",
+                        ));
+                    }
+                    let response: wire::PaneIdentityResponse = wire::decode(&frame.body)?;
+                    if response.pane_id != pane_id {
+                        return Err(crate::Error::Schema);
+                    }
+                    match response.outcome {
+                        wire::PaneIdentityOutcome::Available { identity } => {
+                            if identity.session_incarnation == [0; 16]
+                                || identity.durable_pane_id == [0; 16]
+                                || identity.pane_registration == [0; 16]
+                                || self
+                                    .incarnation
+                                    .is_some_and(|current| current != identity.session_incarnation)
+                            {
+                                return Err(crate::Error::Frame(
+                                    "a pane identity does not match the current mux",
+                                ));
+                            }
+                            Some(identity.pane_registration)
+                        }
+                        wire::PaneIdentityOutcome::PaneGone => {
+                            self.pane_gone(pane_id);
+                            return Ok(());
+                        }
+                        wire::PaneIdentityOutcome::Unavailable => {
+                            // A remote/proxy pane may lack durable identity
+                            // while still owning a live input registration.
+                            // Probe before drawing; this grants no resume or
+                            // durable artifact identity and applies no key.
+                            self.probe_pane_authority(pane_id);
+                            return Ok(());
+                        }
+                    }
+                }
+                (
+                    Some(Request::PaneAuthority { input_serial, .. }),
+                    ident::RELIABLE_KEY_EVENT_RESPONSE,
+                ) => {
+                    let response: wire::ReliableKeyResponse =
+                        wire::decode_input_receipt(&frame.body)?;
+                    if response.pane_id != pane_id || response.input_serial != *input_serial {
+                        return Err(crate::Error::Schema);
+                    }
+                    match response.outcome {
+                        wire::ReliableKeyOutcome::Retry(
+                            wire::ReliableKeyRetry::PaneAuthorityRequired { pane_registration },
+                        ) if pane_registration != [0; 16] => Some(pane_registration),
+                        wire::ReliableKeyOutcome::Rejected(_) => None,
+                        // An authority probe cannot apply a key or authorize an
+                        // arbitrary retry. Treat either claim as a protocol fault.
+                        _ => {
+                            return Err(crate::Error::Frame(
+                                "a no-effect pane probe returned invalid authority",
+                            ));
+                        }
+                    }
+                }
+                (_, ident::ERROR_RESPONSE) => None,
+                _ => {
+                    return Err(crate::Error::Frame(
+                        "a pane authority query received an unexpected reply",
+                    ));
+                }
+            };
+            self.authorities.insert(
+                pane_id,
+                registration.map_or(PaneAuthority::Unavailable, PaneAuthority::Available),
+            );
+            self.subscribe(pane_id);
+            self.advance(pane_id);
+            return Ok(());
+        }
+        if matches!(
+            frame.ident,
+            ident::RELIABLE_KEY_EVENT_RESPONSE
+                | ident::RELIABLE_PANE_WRITE_RESPONSE
+                | ident::GET_PANE_IDENTITY_RESPONSE
+        ) {
+            return Err(crate::Error::Frame(
+                "an unsolicited input authority receipt was received",
+            ));
+        }
+        if matches!(&request, Some(Request::RegisterClient { .. }))
+            && !matches!(frame.ident, ident::UNIT_RESPONSE | ident::ERROR_RESPONSE)
+        {
+            return Err(crate::Error::Frame(
+                "client registration received an unexpected reply",
+            ));
+        }
         if matches!(&request, Some(Request::RestoreSize { .. }))
             && !matches!(frame.ident, ident::UNIT_RESPONSE | ident::ERROR_RESPONSE)
         {
-            return Err(crate::Error::Frame("a restore received an unexpected reply"));
+            return Err(crate::Error::Frame(
+                "a restore received an unexpected reply",
+            ));
         }
         match frame.ident {
             ident::GET_CODEC_VERSION_RESPONSE => {
+                if !matches!(request, Some(Request::Version)) {
+                    return Err(crate::Error::Schema);
+                }
                 let version: CodecVersion = wire::decode(&frame.body)?;
                 let min_supported = wire::decode::<wire::CodecWindow>(&frame.body)
                     .ok()
                     .map(|window| window.min_supported);
                 if let Some(dialect) = Dialect::of(version.codec_vers, min_supported) {
                     self.dialect = dialect;
-                    self.ready = true;
-                    self.events.push_back(Event::Ready {
-                        server_version: version.version_string,
-                    });
+                    self.codec_version = version.codec_vers.min(*wire::CURRENT_VERSIONS.end());
                     if dialect == Dialect::Current {
-                        // Lists asked for meanwhile follow its answer.
-                        self.listing = true;
                         self.send(
-                            ident::LIST_PANES_COHERENT,
-                            &ListPanesCoherent {
-                                supported: wire::FENCED_SNAPSHOT,
-                                required: wire::FENCED_SNAPSHOT,
+                            ident::SET_CLIENT_ID,
+                            &wire::SetClientId {
+                                client_id: wire::ClientId {
+                                    hostname: format!(
+                                        "frankenterm-mobile-{}",
+                                        uuid::Uuid::new_v4()
+                                    ),
+                                    username: "mobile".to_owned(),
+                                    pid: 0,
+                                    epoch: 0,
+                                    id: 1,
+                                    ssh_auth_sock: None,
+                                },
+                                is_proxy: false,
                             },
-                            Request::CoherentPanes,
+                            Request::RegisterClient {
+                                server_version: version.version_string,
+                            },
                         );
                     } else {
-                        self.refresh_panes();
+                        self.become_ready(version.version_string);
                     }
                 } else {
                     self.fail(format!(
@@ -888,6 +1655,16 @@ impl Session {
                 let response: ListPanesCoherentResponse = wire::decode(&frame.body)?;
                 self.listing = false;
                 if let CoherentOutcome::Snapshot(snapshot) = response.outcome {
+                    if snapshot.session_incarnation == [0; 16]
+                        || self
+                            .incarnation
+                            .is_some_and(|current| current != snapshot.session_incarnation)
+                    {
+                        return Err(crate::Error::Frame(
+                            "the mux incarnation changed on a live connection",
+                        ));
+                    }
+                    self.incarnation = Some(snapshot.session_incarnation);
                     self.events.push_back(Event::Incarnation {
                         id: snapshot.session_incarnation,
                     });
@@ -986,6 +1763,9 @@ impl Session {
                     return Err(crate::Error::Frame("a unit reply contains unexpected data"));
                 }
                 match request {
+                    Some(Request::RegisterClient { server_version }) => {
+                        self.become_ready(server_version)
+                    }
                     Some(Request::Resize { pane_id }) => self.poll(pane_id),
                     Some(Request::RestoreSize { pane_id }) => {
                         if let Some(sizing) = self.sizing.get_mut(&pane_id)
@@ -1032,6 +1812,12 @@ impl Session {
             },
             ident::ERROR_RESPONSE => {
                 match request {
+                    Some(Request::RegisterClient { .. }) => {
+                        self.fail(
+                            "the mux refused this connection's input-ledger registration"
+                                .to_owned(),
+                        );
+                    }
                     Some(Request::Version) => {
                         self.fail("the mux server refused the protocol check".to_owned());
                     }
@@ -1086,6 +1872,13 @@ impl Session {
                         });
                     }
                     Some(Request::Input { .. } | Request::Action) | None => {}
+                    Some(
+                        Request::PaneIdentity { .. }
+                        | Request::PaneAuthority { .. }
+                        | Request::OrderedInput { .. },
+                    ) => {
+                        return Err(crate::Error::Schema);
+                    }
                 }
             }
             // Unit replies, palettes, alerts and title notices need nothing.
@@ -1094,7 +1887,36 @@ impl Session {
         Ok(())
     }
 
+    fn become_ready(&mut self, server_version: String) {
+        self.ready = true;
+        self.events.push_back(Event::Ready { server_version });
+        if self.dialect == Dialect::Current {
+            self.listing = true;
+            self.send(
+                ident::LIST_PANES_COHERENT,
+                &ListPanesCoherent {
+                    supported: wire::FENCED_SNAPSHOT,
+                    required: wire::FENCED_SNAPSHOT,
+                },
+                Request::CoherentPanes,
+            );
+        } else {
+            self.refresh_panes();
+        }
+    }
+
     fn poll(&mut self, pane_id: usize) {
+        if matches!(
+            self.authorities.get(&pane_id),
+            Some(PaneAuthority::Pending(_))
+        ) {
+            // A resize can settle while the initial identity query is on its
+            // way. The eventual subscription will fetch the current size.
+            if let Some(mirror) = self.mirrors.get_mut(&pane_id) {
+                mirror.size_settled();
+            }
+            return;
+        }
         if self.mirrors.contains_key(&pane_id) {
             self.send(
                 ident::GET_PANE_RENDER_CHANGES,
@@ -1127,7 +1949,33 @@ impl Session {
     }
 
     fn pane_gone(&mut self, pane_id: usize) {
+        self.authorities.remove(&pane_id);
+        self.requests.retain(|_, request| {
+            !matches!(request,
+                Request::PaneIdentity { pane_id: old }
+                | Request::PaneAuthority { pane_id: old, .. }
+                | Request::Subscribe { pane_id: old }
+                | Request::Lines { pane_id: old, .. }
+                | Request::Resize { pane_id: old }
+                | Request::RestoreSize { pane_id: old }
+                | Request::Poll { pane_id: old } if *old == pane_id
+            )
+        });
+        if self.input.in_paste(pane_id) {
+            self.interrupted_input.insert(pane_id);
+        }
+        if self
+            .ordered_input
+            .iter()
+            .any(|input| input.pane_id == pane_id)
+        {
+            self.fail(
+                "a pane closed while its input was pending; input was not redirected".to_owned(),
+            );
+        }
+        let pending_panes: Vec<_> = self.input.pending_panes().collect();
         if let Err(reason) = self.input.remove(pane_id) {
+            self.interrupted_input.extend(pending_panes);
             self.fail(reason.to_owned());
         }
         self.mirrors.remove(&pane_id);
@@ -1150,6 +1998,12 @@ impl Session {
 
     /// Fetches the rows the pane's mirror lacks, or draws it.
     fn advance(&mut self, pane_id: usize) {
+        if matches!(
+            self.authorities.get(&pane_id),
+            Some(PaneAuthority::Pending(_))
+        ) {
+            return;
+        }
         let Some(mirror) = self.mirrors.get_mut(&pane_id) else {
             return;
         };
@@ -1319,6 +2173,10 @@ mod paste_routing_tests {
         Session {
             ready: true,
             dialect,
+            codec_version: *wire::CURRENT_VERSIONS.end(),
+            authorities: (0..=20)
+                .map(|pane| (pane, PaneAuthority::Available([7; 16])))
+                .collect(),
             ..Session::default()
         }
     }
@@ -1329,15 +2187,43 @@ mod paste_routing_tests {
         let mut reader = FrameReader::default();
         reader.push(&session.take_outgoing());
         let mut result = Vec::new();
-        while let Some(frame) = reader.next_frame().expect("valid encoded frame") {
+        loop {
+            let Some(frame) = reader.next_frame().expect("valid encoded frame") else {
+                let outgoing = session.take_outgoing();
+                if outgoing.is_empty() {
+                    break;
+                }
+                reader.push(&outgoing);
+                continue;
+            };
             match frame.ident {
                 ident::SEND_PASTE => {
                     let body: PasteBody = wire::decode(&frame.body).expect("valid paste");
                     result.push((frame.ident, body.pane_id, body.data.into_bytes()));
+                    if session.dialect == Dialect::Current {
+                        session.receive(&frame::encode(ident::UNIT_RESPONSE, frame.serial, &[]));
+                    }
                 }
                 ident::WRITE_TO_PANE => {
                     let body: BytesBody = wire::decode(&frame.body).expect("valid input");
                     result.push((frame.ident, body.pane_id, body.data));
+                }
+                ident::RELIABLE_PANE_WRITE => {
+                    let body: codec::ReliablePaneWriteV1 =
+                        wire::decode(&frame.body).expect("valid reliable input");
+                    let response = codec::ReliablePaneWriteV1Response {
+                        pane_id: body.pane_id,
+                        input_serial: body.input_serial,
+                        outcome: codec::ReliablePaneWriteOutcomeV1::AppliedPrefix {
+                            bytes: body.data.len() as u32,
+                        },
+                    };
+                    result.push((frame.ident, body.pane_id, body.data));
+                    session.receive(&frame::encode(
+                        ident::RELIABLE_PANE_WRITE_RESPONSE,
+                        frame.serial,
+                        &wire::encode(&response),
+                    ));
                 }
                 other => panic!("unexpected PDU {other}"),
             }
@@ -1354,7 +2240,15 @@ mod paste_routing_tests {
             session.write(20, b"x");
             assert_eq!(
                 writes(&mut session),
-                [(ident::WRITE_TO_PANE, 20, b"x".to_vec())]
+                [(
+                    if dialect == Dialect::Current {
+                        ident::RELIABLE_PANE_WRITE
+                    } else {
+                        ident::WRITE_TO_PANE
+                    },
+                    20,
+                    b"x".to_vec()
+                )]
             );
             session.write(20, b"\x1b[200~second ");
             assert!(writes(&mut session).is_empty());
@@ -1408,8 +2302,8 @@ mod paste_routing_tests {
             [(ident::SEND_PASTE, 2, b"keep me".to_vec())]
         );
         assert!(!failed(&mut session));
-        // Pane numbers are never reused, so this is the rest of pane 1's
-        // paste. Typed, its Return would run it.
+        // A removed pane's incomplete paste remains abandoned even if its
+        // numeric ID is later reused. Typed, its Return would run it.
         session.write(1, b"install\r\x1b[201~");
         assert!(writes(&mut session).is_empty());
         assert!(!session.is_ready());
@@ -1451,6 +2345,8 @@ mod paste_routing_tests {
             session.write(pane, b"\x1b[200~unfinished");
         }
         assert!(!session.is_ready());
+        assert!(session.unanswered_input(0));
+        assert!(session.unanswered_input(16));
         assert!(writes(&mut session).is_empty());
         assert!(matches!(session.next_event(), Some(Event::Failed { .. })));
         assert!(session.next_event().is_none());
@@ -1471,5 +2367,16 @@ mod paste_routing_tests {
             assert!(writes(&mut session).is_empty());
             assert!(matches!(session.next_event(), Some(Event::Failed { .. })));
         }
+    }
+
+    #[test]
+    fn byte_suffix_serials_are_reserved_before_any_part_can_escape() {
+        let mut session = ready(Dialect::Current);
+        session.next_input_serial = u64::MAX - 1;
+        session.write(1, b"two bytes need two serials");
+        assert!(!session.is_ready());
+        assert!(session.unanswered_input(1));
+        assert!(session.take_outgoing().is_empty());
+        assert!(failed(&mut session));
     }
 }

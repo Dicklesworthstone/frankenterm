@@ -112,11 +112,11 @@ impl std::fmt::Debug for InputSplitter {
 /// end-of-paste marker. Removing a pane or closing the connection discards its
 /// unfinished local fragment; neither action sends more commands.
 ///
-/// The server never gives a removed pane's number to another pane (its pane
-/// ids come from one counter that only goes up), so input that arrives later
-/// for a pane removed mid-paste is the rest of that paste. Sent as typing, its
-/// Returns would run the pasted text, so it is refused and the caller must
-/// fail the connection.
+/// A numeric slot abandoned mid-paste remains refused for this connection,
+/// even if the server later reuses the number. Late continuation bytes cannot
+/// be distinguished here from new typing; treating them as typing could run
+/// the pasted text. The conservative refusal makes the caller end the
+/// connection instead of applying those bytes to a replacement pane.
 #[derive(Default)]
 pub struct PaneInput {
     pending: HashMap<usize, InputSplitter>,
@@ -136,6 +136,10 @@ impl std::fmt::Debug for PaneInput {
 }
 
 impl PaneInput {
+    pub fn pending_panes(&self) -> impl Iterator<Item = usize> + '_ {
+        self.pending.keys().copied()
+    }
+
     pub fn in_paste(&self, pane: usize) -> bool {
         self.pending.contains_key(&pane)
     }

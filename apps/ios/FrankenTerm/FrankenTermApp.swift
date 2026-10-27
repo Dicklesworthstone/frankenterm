@@ -968,6 +968,46 @@ final class MobileWorkspaceModel {
         }))
     }
 
+    func machineOrder(_ group: WorkspaceDocument.Group, workspaceID: UUID) -> [String] {
+        (localPolicies[workspaceID]?.navigationPreferences ?? .init()).machineOrder(for: group)
+    }
+
+    /// Keep a reorder tied to the sheet's exact revision and previous order.
+    /// Reading back the durable catalog also reconciles a write that published
+    /// before reporting a storage failure. A reorder never retires a live scene.
+    func setMachineOrder(_ machineIDs: [String]?, workspaceID: UUID, expectedRevision: UUID,
+                         groupID: String, expectedOrder: [String], completed: @escaping @MainActor (Bool) -> Void) {
+        guard active, !busy, !showRestore, let store,
+              localPolicies[workspaceID]?.workspace.revision == expectedRevision else {
+            connectionPreferenceMessage = "The workspace changed. Close this sheet and review its current order."
+            completed(false); return
+        }
+        connectionPreferenceBusy = true; connectionPreferenceMessage = nil
+        workspaceRefreshEpoch = UUID(); workspaceRefresh?.cancel()
+        let ticket = epoch
+        connectionPreferenceUpdate = Task { [self] in
+            defer { connectionPreferenceBusy = false; connectionPreferenceUpdate = nil }
+            var saved = false
+            do {
+                _ = try await store.setMachineOrder(workspaceID: workspaceID, expectedRevision: expectedRevision,
+                    groupID: groupID, expectedOrder: expectedOrder, machineIDs: machineIDs)
+                saved = true
+            } catch {
+                connectionPreferenceMessage = "This machine order could not be confirmed as saved. Close and reopen the order sheet before retrying. \(error.localizedDescription)"
+            }
+            if active {
+                do { try await refreshWorkspaces(using: store, epoch: epoch) }
+                catch {
+                    availableCredentials = [:]; localPolicies = [:]; saved = false
+                    connectionPreferenceMessage = "The saved order could not be refreshed. Reopen the workspace before changing it again. \(error.localizedDescription)"
+                }
+            }
+            // A callback from a retired foreground visit cannot dismiss a new
+            // presentation after the app has locked, resumed, or changed scenes.
+            completed(saved && active && epoch == ticket)
+        }
+    }
+
     func beginCredentialImport(workspaceID: UUID, credentialID: String) {
         guard active, !busy, !showRestore, credentialImport == nil, let store,
               let saved = workspaces.first(where: { $0.id == workspaceID }),
@@ -3086,6 +3126,7 @@ private struct MachineWorkspaceView: View {
     @State private var groupID = ""
     @State private var themeMachineID: String?
     @State private var showKeys = false
+    @State private var orderReview: WorkspaceMachineOrderReview?
     /// Read so a return from Tailscale re-evaluates what Connect needs.
     @Environment(\.scenePhase) private var scenePhase
     private var document: WorkspaceDocument {
@@ -3099,7 +3140,9 @@ private struct MachineWorkspaceView: View {
     }
     private var machines: [WorkspaceDocument.Machine] {
         let selectedGroup = groupID.isEmpty ? document.initialGroupID : groupID
-        let ids = document.groups.first(where: { $0.id == selectedGroup })?.machineOrder ?? []
+        let ids = document.groups.first(where: { $0.id == selectedGroup }).map {
+            model.machineOrder($0, workspaceID: workspaceID)
+        } ?? []
         let map = Dictionary(uniqueKeysWithValues: document.machines.map { ($0.id, $0) })
         return ids.compactMap { map[$0] }
     }
@@ -3175,6 +3218,9 @@ private struct MachineWorkspaceView: View {
         }.tabViewStyle(.page(indexDisplayMode: .always))
             .background(Color(ftHex: shownBackground).ignoresSafeArea())
             .sheet(isPresented: $showKeys) { WorkspaceKeysSheet(workspaceID: workspaceID, model: model) }
+            .sheet(item: $orderReview) { review in
+                WorkspaceMachineOrderScreen(review: review, model: model)
+            }
             .sheet(isPresented: Binding(get: { themeMachineID != nil }, set: { if !$0 { themeMachineID = nil } })) {
                 if let id = themeMachineID, let machine = document.machines.first(where: { $0.id == id }),
                    let themes = model.machineThemes(workspaceID, document: document) {
@@ -3215,12 +3261,23 @@ private struct MachineWorkspaceView: View {
                     ForEach(document.groups) { group in
                         Button {
                             groupID = group.id
-                            if !group.machineOrder.contains(selection) { selection = group.machineOrder.first ?? "" }
+                            let ordered = model.machineOrder(group, workspaceID: workspaceID)
+                            if !ordered.contains(selection) { selection = ordered.first ?? "" }
                         } label: { Text(verbatim: group.name) }
                     }
                 }
                 Menu("Machines", systemImage: "list.bullet") {
                     ForEach(machines) { machine in Button { selection = machine.id } label: { Text(verbatim: machine.name) } }
+                    Divider()
+                    Button("Arrange Machines", systemImage: "arrow.up.arrow.down") {
+                        let selectedGroup = groupID.isEmpty ? document.initialGroupID : groupID
+                        guard let local = model.localPolicies[workspaceID],
+                              let group = document.groups.first(where: { $0.id == selectedGroup }) else { return }
+                        model.connectionPreferenceMessage = nil
+                        orderReview = .init(workspaceID: workspaceID, revision: local.workspace.revision,
+                            group: group, machines: machines, order: model.machineOrder(group, workspaceID: workspaceID))
+                    }.disabled(model.busy || !model.active || model.localPolicies[workspaceID] == nil)
+                        .accessibilityIdentifier("machines.arrange")
                 }
             }
     }
@@ -3348,7 +3405,7 @@ private struct MachineWorkspaceView: View {
         let ordered = machines + document.machines.filter { machine in !machines.contains { $0.id == machine.id } }
         let selectedGroupID = groupID.isEmpty ? document.initialGroupID : groupID
         let group = document.groups.first(where: { $0.id == selectedGroupID }).map {
-            TerminalConnectionIntent.Group(id: $0.id, machineIDs: $0.machineOrder, autoConnect: $0.autoConnect)
+            TerminalConnectionIntent.Group(id: $0.id, machineIDs: model.machineOrder($0, workspaceID: workspaceID), autoConnect: $0.autoConnect)
         }
         return LiveWorkspaceView(initialMachineID: initial, themes: themes, group: group, connectOnOpen: true,
                                  onShowing: { [model, workspaceID] machineID in
@@ -3402,6 +3459,87 @@ private struct MachineWorkspaceView: View {
         guard !routes.isEmpty else { return scene(nil) }
         return scene(.init(workspaceID: workspaceID, revision: local.workspace.revision, machineID: machine.id,
                            machineName: machine.name, routes: routes, theme: theme))
+    }
+}
+
+private struct WorkspaceMachineOrderReview: Identifiable {
+    let id = UUID()
+    let workspaceID: UUID, revision: UUID
+    let group: WorkspaceDocument.Group
+    let machines: [WorkspaceDocument.Machine]
+    let order: [String]
+}
+
+/// The native reorder list edits a local draft. Save publishes one complete
+/// permutation; cancelling or dismissing the sheet makes no preference change.
+@MainActor
+private struct WorkspaceMachineOrderScreen: View {
+    let review: WorkspaceMachineOrderReview
+    @Bindable var model: MobileWorkspaceModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var order: [String]
+    @State private var useImportedOrder = false
+
+    init(review: WorkspaceMachineOrderReview, model: MobileWorkspaceModel) {
+        self.review = review; self.model = model
+        _order = State(initialValue: review.order)
+    }
+
+    var body: some View {
+        let machines = Dictionary(uniqueKeysWithValues: review.machines.map { ($0.id, $0) })
+        NavigationStack {
+            List {
+                Section {
+                    ForEach(order, id: \.self) { id in
+                        if let machine = machines[id] {
+                            Text(verbatim: machine.name)
+                                .accessibilityIdentifier("machines.order.\(id)")
+                                .accessibilityAction(named: Text("Move Up")) { move(id, offset: -1) }
+                                .accessibilityAction(named: Text("Move Down")) { move(id, offset: 1) }
+                        }
+                    }.onMove { source, destination in
+                        order.move(fromOffsets: source, toOffset: destination); useImportedOrder = false
+                    }.moveDisabled(model.busy)
+                } header: { Text(verbatim: review.group.name) } footer: {
+                    Text("Drag machines into the order you want to swipe through. This order is saved on this phone across imports. New machines are appended; existing sessions keep running.")
+                }
+                Section {
+                    Button("Use Workspace Order") {
+                        order = review.group.machineOrder; useImportedOrder = true
+                    }.disabled(model.busy)
+                    if useImportedOrder {
+                        Text("After saving, this group follows the order in future workspace imports.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    if let message = model.connectionPreferenceMessage {
+                        Text(verbatim: message).font(.callout).foregroundStyle(.orange)
+                            .accessibilityIdentifier("machines.order.error")
+                    }
+                }
+            }
+            .environment(\.editMode, .constant(.active))
+            .navigationTitle("Arrange Machines")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }.disabled(model.busy)
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        model.setMachineOrder(useImportedOrder ? nil : order, workspaceID: review.workspaceID,
+                            expectedRevision: review.revision, groupID: review.group.id, expectedOrder: review.order) { saved in
+                                if saved { dismiss() }
+                            }
+                    }.disabled(model.busy || !model.active).accessibilityIdentifier("machines.order.save")
+                }
+            }
+            .interactiveDismissDisabled(model.busy)
+        }
+    }
+
+    private func move(_ id: String, offset: Int) {
+        guard !model.busy, let index = order.firstIndex(of: id), order.indices.contains(index + offset) else { return }
+        order.swapAt(index, index + offset); useImportedOrder = false
     }
 }
 
