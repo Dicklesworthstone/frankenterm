@@ -66,10 +66,13 @@ public struct OpenSSHSourceKey: Sendable, CustomStringConvertible, CustomDebugSt
     }
 
     /// Explicit source selection may normalize an existing clear SEC1/PKCS#8
-    /// ECDSA file. No source is rewritten, and the resulting private record
+    /// ECDSA or PKCS#1/PKCS#8 RSA file. No source is rewritten, and its record
     /// follows the same OpenSSH identity checks and FTAG protection as before.
     public init<C: AirGapCryptography>(pem: Data, using crypto: C) throws {
-        if LegacyECDSASourceKey.recognizes(pem) {
+        if LegacyRSASourceKey.recognizes(pem) {
+            let record = try LegacyRSASourceKey(pem: pem).privateRecord(credentialID: "source-key", using: crypto)
+            try self.init(container: record.container)
+        } else if LegacyECDSASourceKey.recognizes(pem) {
             let record = try LegacyECDSASourceKey(pem: pem).privateRecord(credentialID: "source-key", using: crypto)
             try self.init(container: record.container)
         } else {
@@ -115,6 +118,10 @@ public struct OpenSSHSourceKey: Sendable, CustomStringConvertible, CustomDebugSt
         guard let algorithm = String(data: name, encoding: .ascii) else { throw FTError.malformed("source_key.algorithm") }
         if algorithm == "ssh-ed25519" {
             guard try publicReader.sshString(cap: 32).count == 32 else { throw FTError.malformed("source_key.public") }
+        } else if algorithm == "ssh-rsa" {
+            _ = try SSHPublicIdentity(blob: publicBlob)
+            _ = try publicReader.sshString(cap: 9) // canonical exponent, validated above
+            _ = try publicReader.sshString(cap: 1025) // canonical modulus, validated above
         } else if let curve = SSHECDSACurve.allCases.first(where: { $0.algorithm == algorithm }) {
             guard try publicReader.sshString(cap: 16) == Data(curve.rawValue.utf8) else { throw FTError.malformed("source_key.curve") }
             let point = try publicReader.sshString(cap: curve.publicByteCount)

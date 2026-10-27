@@ -216,6 +216,7 @@ struct SSHWorkspaceTestFixture: Sendable {
 
     @MainActor static func make(hostname: String = "localhost", port: UInt16 = 22, hostBlob: Data? = nil,
                      routeMode: String = "direct_ssh",
+                     primaryKey: PrivateKeyRecord? = nil,
                      additionalKeys: [PrivateKeyRecord] = [],
                      seed: Data = Data(0..<32), persistence: any WorkspacePersistence = SSHWorkspaceTestPersistence(),
                      mutate: (inout [String: Any]) -> Void = { _ in }) async throws -> Self {
@@ -231,7 +232,9 @@ struct SSHWorkspaceTestFixture: Sendable {
         while !part.count.isMultiple(of: 8) { part.append(pad); pad += 1 }
         let container = Data("openssh-key-v1\0".utf8) + field(Data("none".utf8)) + field(Data("none".utf8)) + field(Data())
             + Data([0, 0, 0, 1]) + field(blob) + field(part)
-        let identity = try SSHPublicIdentity(blob: blob)
+        let record = primaryKey ?? PrivateKeyRecord(credentialID: "key", container: container, publicBlob: blob)
+        guard record.credentialID == "key" else { throw SSHAuthenticationError.identityMismatch }
+        let identity = try SSHPublicIdentity(blob: record.publicBlob)
         let peerIdentity = try SSHPublicIdentity(blob: hostBlob ?? blob)
         let theme: [String: Any] = ["id": "theme", "name": "Test", "foreground": "#FFFFFF", "background": "#10223C", "accent": "#3B82F6",
             "ansi": Array(repeating: "#123456", count: 16), "cursor_foreground": "#000000", "cursor_background": "#FFFFFF",
@@ -253,13 +256,13 @@ struct SSHWorkspaceTestFixture: Sendable {
         let manifest = try JSONSerialization.data(withJSONObject: ["format": "ftworkspace", "version": 1, "bundle_id": "bundle",
             "source": ["exporter_id": "test"], "required_capabilities": [], "workspace": workspace], options: [.sortedKeys])
         let archive = try AirGapArchive(workspace: WorkspaceDocument(data: manifest),
-            keys: [PrivateKeyRecord(credentialID: "key", container: container, publicBlob: blob)] + additionalKeys, using: crypto)
+            keys: [record] + additionalKeys, using: crypto)
         let vault = SSHWorkspaceTestVault(), store = WorkspaceStore(persistence: persistence, vault: vault)
         let installed = try await store.install(archive, envelopeDigest: Data(repeating: 1, count: 32),
             expectedRevision: nil, sourceAndContentsConfirmed: true).workspace
         let broker = SSHAuthenticationBroker(store: store, signer: vault, support: WorkspaceNativeSSHAuthentication.routeSupport)
         await broker.resume()
-        return .init(store: store, broker: broker, vault: vault, installed: installed, archive: archive, publicBlob: blob,
+        return .init(store: store, broker: broker, vault: vault, installed: installed, archive: archive, publicBlob: record.publicBlob,
             hostBlob: peerIdentity.blob,
             host: try WorkspaceDocument.HostKey(algorithm: peerIdentity.algorithm, fingerprint: peerIdentity.fingerprint),
             endpoint: try NativeSSHEndpoint(host: hostname, port: port))
@@ -309,6 +312,23 @@ private actor SSHWorkspaceTerminalProbe: TerminalSessionConsumer {
 
 @MainActor
 final class WorkspaceAuthenticationTests: XCTestCase {
+    /// Independent ssh-keygen/OpenSSL fixtures shared with the source-import
+    /// suite. No generated test private identity should ever be authorized.
+    private struct RSAFixtures: Decodable {
+        struct Key: Decodable {
+            let bits: Int
+            let clearPEM, fingerprint: String
+            let signatures, signedData: [String: String]
+        }
+        let keys: [Key]
+        static func load() throws -> Self {
+            var root = URL(fileURLWithPath: #filePath)
+            for _ in 0..<6 { root.deleteLastPathComponent() }
+            return try JSONDecoder().decode(Self.self,
+                from: Data(contentsOf: root.appendingPathComponent("fixtures/ios-airgap/rsa-source-keys.json")))
+        }
+    }
+
     private func refuse(_ body: () async throws -> Void, file: StaticString = #filePath, line: UInt = #line) async {
         do { try await body(); XCTFail("Authority should have been refused", file: file, line: line) } catch {}
     }
@@ -338,6 +358,65 @@ final class WorkspaceAuthenticationTests: XCTestCase {
         let typed = try SSHUserAuthenticationChallenge(sessionIdentifier: Data(repeating: 7, count: 32), user: identity.user, publicBlob: identity.publicKey)
         let replay = try NativeSSHChallenge(bytes: typed.signedData, transportID: transport, identity: identity)
         await refuse { _ = try await authority.signature(for: replay, peer: peer) }
+    }
+
+    func testImportedRSACredentialsSignBothSHA2AlgorithmsWithIndependentExactVectors() async throws {
+        let fixtures = try RSAFixtures.load()
+        XCTAssertEqual(Set(fixtures.keys.map(\.bits)), [2048, 4096, 8192])
+        for fixture in fixtures.keys {
+            let key = try PrivateKeyRecord.fromPEM(Data(fixture.clearPEM.utf8), credentialID: "key",
+                                                   using: SSHWorkspaceTestCryptography())
+            for algorithm in ["rsa-sha2-256", "rsa-sha2-512"] {
+                let f = try await SSHWorkspaceTestFixture.make(primaryKey: key), transport = UUID()
+                let authority = f.authority(transport: transport), peer = f.peer(transport: transport)
+                let identity = try await authority.identity(for: peer)
+                let typed = try SSHUserAuthenticationChallenge(sessionIdentifier: Data(0..<32), user: "operator",
+                    publicBlob: identity.publicKey, signatureAlgorithm: algorithm)
+                XCTAssertEqual(typed.signedData, try Data(ftHex: XCTUnwrap(fixture.signedData[algorithm])))
+                let challenge = try NativeSSHChallenge(bytes: typed.signedData, transportID: transport, identity: identity)
+                let actual = try await authority.signature(for: challenge, peer: peer)
+                let expectedPayload = try Data(ftHex: XCTUnwrap(fixture.signatures[algorithm]))
+                let expected = SSHUserAuthenticationChallenge.string(Data(algorithm.utf8))
+                    + SSHUserAuthenticationChallenge.string(expectedPayload)
+                XCTAssertEqual(actual, expected, "The exact imported key must sign the negotiated hash's exact SSH preimage")
+                XCTAssertEqual(expectedPayload.count, fixture.bits / 8)
+                XCTAssertEqual(typed.fingerprint, fixture.fingerprint)
+                XCTAssertEqual(typed.publicKeyAlgorithm, "ssh-rsa")
+                try await authority.validate(peer: peer, identity: identity)
+                try await authority.validateCurrent()
+                XCTAssertEqual(f.vault.counts.reads, 1)
+                XCTAssertEqual(f.vault.counts.signatures, 1)
+                await refuse { _ = try await authority.signature(for: challenge, peer: peer) }
+                try await f.store.revokeLocally(fingerprint: fixture.fingerprint)
+                await refuse { try await authority.validateCurrent() }
+            }
+        }
+    }
+
+    func testRSABrokerRefusesMissingLegacyAndForeignAlgorithmsBeforeSigning() async throws {
+        let fixture = try XCTUnwrap(RSAFixtures.load().keys.first)
+        let key = try PrivateKeyRecord.fromPEM(Data(fixture.clearPEM.utf8), credentialID: "key",
+                                               using: SSHWorkspaceTestCryptography())
+        let f = try await SSHWorkspaceTestFixture.make(primaryKey: key)
+        for algorithm: String? in [nil, "ssh-rsa", "rsa-sha2-384", "rsa-sha2-512-cert-v01@openssh.com", "ssh-ed25519"] {
+            await refuse {
+                _ = try await f.broker.prepare(workspaceID: f.installed.id, expectedRevision: f.installed.revision,
+                    routeID: "route", credentialID: "key", presentedHostKey: f.host, transportID: UUID(),
+                    sessionIdentifier: Data(0..<32), publicBlob: key.publicBlob, signatureAlgorithm: algorithm)
+            }
+        }
+        XCTAssertEqual(f.vault.counts.reads, 0)
+        XCTAssertEqual(f.vault.counts.signatures, 0)
+        // Rejected requests release the exact broker reservation; a subsequent
+        // explicitly negotiated SHA-2 challenge can still be approved once.
+        let request = try await f.broker.prepare(workspaceID: f.installed.id, expectedRevision: f.installed.revision,
+            routeID: "route", credentialID: "key", presentedHostKey: f.host, transportID: UUID(),
+            sessionIdentifier: Data(0..<32), publicBlob: key.publicBlob, signatureAlgorithm: "rsa-sha2-512")
+        let signature = try await f.broker.confirm(requestID: request.id)
+        XCTAssertEqual(signature.algorithm, "rsa-sha2-512")
+        XCTAssertEqual(signature.authorization.algorithm, "ssh-rsa")
+        XCTAssertEqual(signature.publicBlob, key.publicBlob)
+        XCTAssertEqual(f.vault.counts.signatures, 1)
     }
 
     func testExplicitMuxRouteAuthenticatesWithoutChangingItsAttachmentPolicy() async throws {
@@ -372,7 +451,7 @@ final class WorkspaceAuthenticationTests: XCTestCase {
 
     func testRSAHostSignaturesKeepHostIdentitySeparateFromTheUserCredential() async throws {
         XCTAssertTrue(WorkspaceNativeSSHAuthentication.routeSupport.hostKeyAlgorithms.contains("ssh-rsa"))
-        XCTAssertFalse(WorkspaceNativeSSHAuthentication.routeSupport.credentialAlgorithms.contains("ssh-rsa"))
+        XCTAssertTrue(WorkspaceNativeSSHAuthentication.routeSupport.credentialAlgorithms.contains("ssh-rsa"))
         for signature in ["rsa-sha2-256", "rsa-sha2-512"] {
             let f = try await SSHWorkspaceTestFixture.make(hostBlob: rsaHostBlob()), transport = UUID()
             let (_, peer, identity) = try await signed(f, transport: transport, hostSignature: signature)

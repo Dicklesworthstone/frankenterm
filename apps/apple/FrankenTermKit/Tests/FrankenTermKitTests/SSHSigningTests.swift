@@ -382,19 +382,78 @@ final class SSHSigningTests: XCTestCase, @unchecked Sendable {
         }
     }
 
-    func testRSAHostSupportDoesNotEnableUserAuthenticationOrPrivateKeyImport() throws {
+    func testRSAUserAuthenticationRequiresAnExplicitSHA2AlgorithmAndCompletePrivateKey() throws {
         let blob = rsaPublicBlob(modulus: Data([0]) + Data(repeating: 0xA5, count: 256))
         _ = try SSHPublicIdentity(blob: blob)
         XCTAssertThrowsError(try SSHUserAuthenticationChallenge(sessionIdentifier: Data(repeating: 9, count: 32),
             user: "operator", publicBlob: blob)) { error in
             XCTAssertEqual(error as? SSHAuthenticationError, .unsupportedAlgorithm)
         }
-        // A structurally aligned RSA private record remains outside the import
-        // profile; accepting its host public blob cannot stage private material.
+        // An accepted public blob is not proof that a corresponding private
+        // key exists. A bounded but incomplete private record cannot be staged.
         let container = Data("openssh-key-v1\0".utf8) + string(Data("none".utf8)) + string(Data("none".utf8))
             + string(Data()) + Data([0, 0, 0, 1]) + string(blob) + string(Data(repeating: 0, count: 24))
-        XCTAssertThrowsError(try PrivateKeyRecord.validateContainer(container, using: TestCryptography())) { error in
-            XCTAssertEqual(error as? FTError, .unsupported("key.family"))
+        XCTAssertThrowsError(try PrivateKeyRecord.validateContainer(container, using: TestCryptography()))
+    }
+
+    func testRSAChallengeBindsNegotiatedSHA2ToTheOriginalPublicIdentity() throws {
+        for byteCount in [256, 384, 512, 1024] {
+            let blob = rsaPublicBlob(modulus: Data([0]) + Data(repeating: 0xA5, count: byteCount))
+            let identity = try SSHPublicIdentity(blob: blob)
+            for algorithm in ["rsa-sha2-256", "rsa-sha2-512"] {
+                let user = String(repeating: "u", count: 256), session = Data(0..<64)
+                let challenge = try SSHUserAuthenticationChallenge(sessionIdentifier: session, user: user,
+                    publicBlob: blob, signatureAlgorithm: algorithm)
+                XCTAssertEqual(challenge.publicKeyAlgorithm, "ssh-rsa")
+                XCTAssertEqual(challenge.algorithm, algorithm)
+                XCTAssertEqual(challenge.fingerprint, identity.fingerprint)
+                var expected = string(session)
+                expected.append(50)
+                expected += string(Data(user.utf8))
+                expected += string(Data("ssh-connection".utf8))
+                expected += string(Data("publickey".utf8))
+                expected.append(1)
+                expected += string(Data(algorithm.utf8))
+                expected += string(blob)
+                XCTAssertEqual(challenge.signedData, expected)
+                XCTAssertLessThanOrEqual(challenge.signedData.count, 1536)
+            }
+            for refused in ["ssh-rsa", "rsa-sha2-384", "rsa-sha2-512-cert-v01@openssh.com", "ssh-ed25519", ""] {
+                XCTAssertThrowsError(try SSHUserAuthenticationChallenge(sessionIdentifier: Data(0..<32), user: "operator",
+                    publicBlob: blob, signatureAlgorithm: refused))
+            }
+        }
+        for fixture in try fixtures() {
+            XCTAssertThrowsError(try SSHUserAuthenticationChallenge(sessionIdentifier: Data(0..<32), user: "operator",
+                publicBlob: fixture.key.publicBlob, signatureAlgorithm: "rsa-sha2-512"))
+            let challenge = try SSHUserAuthenticationChallenge(sessionIdentifier: Data(0..<32), user: "operator",
+                publicBlob: fixture.key.publicBlob, signatureAlgorithm: fixture.algorithm)
+            XCTAssertEqual(challenge.algorithm, fixture.algorithm)
+        }
+    }
+
+    func testRSAProducesExactOpenSSLSignaturesFromImportedOpenSSHKeys() throws {
+        let fixtures = try RSAFixtures.load()
+        let session = try Data(ftHex: fixtures.sessionIdentifierHex)
+        for fixture in fixtures.keys {
+            let key = try PrivateKeyRecord.fromPEM(Data(fixture.clearPEM.utf8), credentialID: "synthetic",
+                                                   using: TestCryptography())
+            for algorithm in ["rsa-sha2-256", "rsa-sha2-512"] {
+                let challenge = try SSHUserAuthenticationChallenge(sessionIdentifier: session, user: fixtures.user,
+                    publicBlob: fixture.publicBlob, signatureAlgorithm: algorithm)
+                XCTAssertEqual(challenge.signedData, try Data(ftHex: XCTUnwrap(fixture.signedData[algorithm])))
+                let expectedPayload = try Data(ftHex: XCTUnwrap(fixture.signatures[algorithm]))
+                let signature = try SSHUserAuthenticationSigner.sign(challenge, privateContainer: key.container)
+                XCTAssertEqual(signature, string(Data(algorithm.utf8)) + string(expectedPayload))
+                XCTAssertEqual(signature.count, fixture.bits / 8 + 20)
+                XCTAssertLessThanOrEqual(signature.count, 1044)
+                // The stable public identity is unchanged by the negotiated
+                // hash, but the signed session and username are not fungible.
+                let other = try SSHUserAuthenticationChallenge(sessionIdentifier: Data(repeating: 99, count: 32),
+                    user: "other", publicBlob: fixture.publicBlob, signatureAlgorithm: algorithm)
+                XCTAssertEqual(other.fingerprint, challenge.fingerprint)
+                XCTAssertNotEqual(try SSHUserAuthenticationSigner.sign(other, privateContainer: key.container), signature)
+            }
         }
     }
 

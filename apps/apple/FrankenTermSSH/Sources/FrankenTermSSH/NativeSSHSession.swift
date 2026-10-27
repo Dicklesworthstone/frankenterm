@@ -93,7 +93,7 @@ public struct NativeSSHIdentity: Sendable, Equatable {
     public init(user: String, publicKey: Data) throws {
         guard !user.isEmpty, user.utf8.count <= 256,
               !user.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
-              (1...512).contains(publicKey.count) else { throw NativeSSHError.invalidInput }
+              (1...Int(FTSSH_PUBLIC_KEY_CAPACITY)).contains(publicKey.count) else { throw NativeSSHError.invalidInput }
         self.user = user; self.publicKey = publicKey
     }
 }
@@ -103,10 +103,10 @@ public struct NativeSSHIdentity: Sendable, Equatable {
 /// require equality with signedData before returning its SSH signature blob.
 public struct NativeSSHChallenge: Sendable {
     public let transportID: UUID, sessionIdentifier: Data
-    public let identity: NativeSSHIdentity, algorithm: String, signedData: Data
+    public let identity: NativeSSHIdentity, publicKeyAlgorithm: String, algorithm: String, signedData: Data
 
     init(bytes: Data, transportID: UUID, identity: NativeSSHIdentity) throws {
-        guard bytes.count <= 1024 else { throw NativeSSHError.invalidChallenge }
+        guard bytes.count <= Int(FTSSH_CHALLENGE_CAPACITY) else { throw NativeSSHError.invalidChallenge }
         var offset = 0
         func field() throws -> Data {
             guard bytes.count - offset >= 4 else { throw NativeSSHError.invalidChallenge }
@@ -127,11 +127,20 @@ public struct NativeSSHChallenge: Sendable {
         }
         offset += 1
         let algorithmBytes = try field()
+        guard identity.publicKey.count >= 4 else { throw NativeSSHError.invalidChallenge }
+        let keyAlgorithmLength = identity.publicKey.prefix(4).reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+        guard (1...64).contains(keyAlgorithmLength), keyAlgorithmLength <= identity.publicKey.count - 4,
+              let keyAlgorithm = String(data: identity.publicKey.subdata(in: 4..<4 + Int(keyAlgorithmLength)), encoding: .ascii) else {
+            throw NativeSSHError.invalidChallenge
+        }
         guard let algorithm = String(data: algorithmBytes, encoding: .ascii),
-              ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521"].contains(algorithm),
+              keyAlgorithm == "ssh-rsa"
+                ? ["rsa-sha2-256", "rsa-sha2-512"].contains(algorithm)
+                : (["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521"].contains(keyAlgorithm)
+                   && algorithm == keyAlgorithm),
               try field() == identity.publicKey, offset == bytes.count else { throw NativeSSHError.invalidChallenge }
         self.transportID = transportID; sessionIdentifier = session
-        self.identity = identity; self.algorithm = algorithm; signedData = bytes
+        self.identity = identity; publicKeyAlgorithm = keyAlgorithm; self.algorithm = algorithm; signedData = bytes
     }
 }
 
@@ -394,7 +403,7 @@ public actor NativeSSHSession {
                     if result == FTSSH_OK { break }
                     if result == FTSSH_SIGNATURE_NEEDED {
                         guard !signed else { throw NativeSSHError.invalidChallenge }
-                        let bytes = try copyBytes(capacity: 1024, ftssh_copy_challenge)
+                        let bytes = try copyBytes(capacity: Int(FTSSH_CHALLENGE_CAPACITY), ftssh_copy_challenge)
                         let challenge = try NativeSSHChallenge(bytes: bytes, transportID: transportID, identity: selected)
                         try await validateForwardingPath()
                         try current(token, deadline)
@@ -403,7 +412,7 @@ public actor NativeSSHSession {
                         try await authority.validate(peer: found, identity: selected)
                         try await validateForwardingPath()
                         try current(token, deadline)
-                        guard (1...512).contains(signature.count) else { throw NativeSSHError.invalidChallenge }
+                        guard (1...Int(FTSSH_SIGNATURE_CAPACITY)).contains(signature.count) else { throw NativeSSHError.invalidChallenge }
                         try requireOK(signature.withUnsafeBytes {
                             ftssh_supply_signature(native.pointer, $0.bindMemory(to: UInt8.self).baseAddress, signature.count)
                         })

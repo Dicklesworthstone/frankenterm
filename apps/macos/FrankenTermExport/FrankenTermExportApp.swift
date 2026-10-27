@@ -732,7 +732,7 @@ private final class MacExportModel {
             panel.directoryURL = privateHint.deletingLastPathComponent()
             panel.nameFieldStringValue = privateHint.lastPathComponent
         }
-        panel.message = "Choose the matching OpenSSH Ed25519 or ECDSA key, or a clear ECDSA SEC1/PKCS#8 PEM key (P-256, P-384, or P-521). Protected OpenSSH files using bcrypt and AES-CTR or AES-CBC (128, 192, or 256 bits) are unlocked locally after you enter their passphrase."
+        panel.message = "Choose the matching OpenSSH Ed25519, ECDSA or RSA key, or a clear ECDSA SEC1/PKCS#8 or RSA PKCS#1/PKCS#8 PEM key. ECDSA supports P-256/P-384/P-521; RSA supports 2048–8192 bits with SHA-2 signatures. Protected OpenSSH files using bcrypt and AES-CTR or AES-CBC (128, 192, or 256 bits) are unlocked locally after you enter their passphrase."
         guard panel.runModal() == .OK, let url = panel.url, windowOpen, foreground, !busy else { return }
         retireSourceKeyPrompt(); retireSSHSelection(); invalidatePrepared()
         let token = UUID(); sourceKeyOperation = token
@@ -1467,7 +1467,7 @@ private struct MacExportView: View {
                     }
                     Text("One private record serves every selected reference to the same public key. Keeping a reference only removes any private material already loaded for that identity.")
                         .font(.caption).foregroundStyle(.secondary)
-                    Text("Supported source keys: OpenSSH Ed25519 and ECDSA P-256, P-384, or P-521, plus clear ECDSA SEC1/PKCS#8 PEM files. Protected OpenSSH keys support bcrypt and AES-CTR or AES-CBC (128, 192, or 256 bits). RSA, certificates, hardware keys, and capture from the running Mac workspace need additional support.")
+                    Text("Supported source keys: OpenSSH Ed25519, ECDSA P-256/P-384/P-521, and RSA (2048–8192 bits), plus clear ECDSA SEC1/PKCS#8 and RSA PKCS#1/PKCS#8 PEM files. Protected OpenSSH keys support bcrypt and AES-CTR or AES-CBC (128, 192, or 256 bits). RSA connections require SHA-2 signatures. Certificates, hardware keys, and capture from the running Mac workspace need additional support.")
                         .font(.caption).foregroundStyle(.secondary)
                 }.frame(maxWidth: .infinity, alignment: .leading).padding(10)
             }
@@ -1588,7 +1588,7 @@ private struct MacExportView: View {
     }
 
     private func identityChoice(_ identity: WorkspaceExportSelection.Identity) -> some View {
-        let supported = ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521"].contains(identity.algorithm)
+        let supported = ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521", "ssh-rsa"].contains(identity.algorithm)
         return VStack(alignment: .leading, spacing: 8) {
             Text(verbatim: identity.credentialIDs.joined(separator: ", ")).font(.headline)
             Text(verbatim: identity.fingerprint).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
@@ -1623,6 +1623,7 @@ private struct MacExportView: View {
         case "ecdsa-sha2-nistp256": return "ECDSA P-256"
         case "ecdsa-sha2-nistp384": return "ECDSA P-384"
         case "ecdsa-sha2-nistp521": return "ECDSA P-521"
+        case "ssh-rsa": return "RSA (SHA-2 signatures)"
         default: return algorithm
         }
     }

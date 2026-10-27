@@ -142,12 +142,12 @@ public actor WorkspaceNativeSSHPasswordAuthentication: NativeSSHPasswordAuthenti
 public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, WorkspaceNativeSSHAuthority {
     /// This is the implemented adapter profile, not Apple-device qualification.
     /// Unknown mandatory policies remain blocked by WorkspaceStore. RSA hosts
-    /// require SHA-2 signatures; RSA credentials, certificates and interactive
+    /// and credentials require SHA-2 signatures; certificates and interactive
     /// MFA are not enabled. Public-key and password routes support three jumps. A mux route
     /// authenticates like a direct one; only the destination channel differs.
     public static let routeSupport = WorkspaceDocument.RouteSupport(
         routeModes: ["direct_ssh", "frankenterm_mux"], authenticationMethods: [.publicKey, .password],
-        credentialAlgorithms: ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521"],
+        credentialAlgorithms: ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521", "ssh-rsa"],
         hostKeyAlgorithms: ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521", "ssh-rsa"],
         maximumJumpHops: 3)
 
@@ -261,13 +261,15 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
             try await broker.validate(selected)
             try checkCurrent()
             let typed = try SSHUserAuthenticationChallenge(sessionIdentifier: challenge.sessionIdentifier,
-                user: selected.authorization.user, publicBlob: selected.identity.blob)
+                user: selected.authorization.user, publicBlob: selected.identity.blob,
+                signatureAlgorithm: challenge.algorithm)
             guard typed.algorithm == challenge.algorithm, typed.signedData == challenge.signedData else {
                 throw SSHAuthenticationError.invalidChallenge
             }
             let request = try await broker.prepare(workspaceID: workspaceID, expectedRevision: revision,
                 routeID: routeID, credentialID: credentialID, presentedHostKey: selected.authorization.presentedHostKey,
                 transportID: transportID, sessionIdentifier: challenge.sessionIdentifier, publicBlob: selected.identity.blob,
+                signatureAlgorithm: challenge.algorithm,
                 transitForRouteID: transitForRouteID)
             try checkCurrent()
             guard request.authorization == selected.authorization else { throw SSHAuthenticationError.stale }
@@ -277,7 +279,9 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
             try checkCurrent()
             guard result.requestID == request.id, result.transportID == transportID,
                   result.authorization == selected.authorization, result.sessionIdentifier == challenge.sessionIdentifier,
-                  result.publicBlob == selected.identity.blob else { throw SSHAuthenticationError.stale }
+                  result.publicBlob == selected.identity.blob, result.algorithm == challenge.algorithm else {
+                throw SSHAuthenticationError.stale
+            }
             phase = .signed
             return result.signatureBlob
         } catch { cancel(transportID: transportID); throw error }

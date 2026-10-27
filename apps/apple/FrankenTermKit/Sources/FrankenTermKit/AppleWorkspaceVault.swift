@@ -353,7 +353,7 @@ public final class AppleSSHCredentialSigner: WorkspaceSSHSigning, @unchecked Sen
 
     public func sign(requestID: UUID, authorization: WorkspaceSSHAuthorization,
                      challenge: SSHUserAuthenticationChallenge) async throws -> Data {
-        guard challenge.user == authorization.user, challenge.algorithm == authorization.algorithm,
+        guard challenge.user == authorization.user, challenge.publicKeyAlgorithm == authorization.algorithm,
               challenge.fingerprint == authorization.fingerprint else { throw SSHAuthenticationError.identityMismatch }
         return try await perform(requestID: requestID, authorization: authorization, operation: .signature(challenge))
     }

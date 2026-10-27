@@ -490,7 +490,8 @@ public struct SSHWorkspaceSource: Sendable {
 
     /// Freeze public identities for the selected destinations and jump hosts.
     /// Prefer the exact .pub sidecar; only its absence permits inspection of the
-    /// configured OpenSSH header or clear ECDSA PEM's embedded public point.
+    /// configured OpenSSH header, clear ECDSA PEM's embedded public point, or
+    /// bounded two-prime RSA PEM's embedded public modulus and exponent.
     /// An explicitly configured
     /// .pub reference never authorizes reading a sibling private file.
     ///
@@ -528,6 +529,9 @@ public struct SSHWorkspaceSource: Sendable {
             } else if !explicitlyPublic, var pem = try read(identity) {
                 defer { pem.resetBytes(in: 0..<pem.count) }
                 if let source = try? OpenSSHSourceKey(pem: pem) { result[reference] = .present(source.publicBlob) }
+                else if let blob = try? LegacyRSASourceKey.embeddedPublicBlob(pem: pem) {
+                    result[reference] = .present(blob)
+                }
                 else if let source = try? LegacyECDSASourceKey(pem: pem), let blob = source.embeddedPublicBlob {
                     result[reference] = .present(blob)
                 }
@@ -791,8 +795,9 @@ public struct SSHWorkspaceSource: Sendable {
                         "private_material": .string("not_included")]))
                     references[credentialID] = reference
                 }
-                if key.algorithm != "ssh-ed25519" && !SSHECDSACurve.allCases.contains(where: { $0.algorithm == key.algorithm }) {
-                    resolved.problems.append(Problem("private_key_format", "This public identity was preserved, but its private-key family is not supported by this build's optical exporter.", required: false))
+                let supportedRSA = key.algorithm == "ssh-rsa" && (try? SSHPublicIdentity(blob: key.blob)) != nil
+                if key.algorithm != "ssh-ed25519" && !supportedRSA && !SSHECDSACurve.allCases.contains(where: { $0.algorithm == key.algorithm }) {
+                    resolved.problems.append(Problem("private_key_format", "This public identity was preserved, but its private-key profile or size is not supported by this build's optical exporter.", required: false))
                 }
             }
             if credentialIDs.isEmpty && methods.contains("publickey") {

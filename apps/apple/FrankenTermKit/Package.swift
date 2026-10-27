@@ -2,12 +2,15 @@
 import PackageDescription
 
 var testDependencies: [Target.Dependency] = ["FrankenTermKit"]
-var coreDependencies: [Target.Dependency] = ["CZlib", "COpenSSHBcrypt", "CQRCodeGen"]
-var packageDependencies: [Package.Dependency] = []
+// CryptoExtras supplies maintained RSA primitives on every platform. Existing
+// Apple Ed25519, ECDSA, HPKE and archive cryptography continue using CryptoKit.
+var coreDependencies: [Target.Dependency] = ["CZlib", "COpenSSHBcrypt", "CQRCodeGen",
+    .product(name: "CryptoExtras", package: "swift-crypto")]
+let packageDependencies: [Package.Dependency] = [
+    .package(url: "https://github.com/apple/swift-crypto.git", exact: "4.5.2")
+]
 #if os(Linux)
-// Exercise the same maintained HPKE API on Linux. Apple products use system
-// CryptoKit and do not resolve or link this dependency.
-packageDependencies.append(.package(url: "https://github.com/apple/swift-crypto.git", exact: "4.5.2"))
+// Exercise the same maintained HPKE API on Linux.
 coreDependencies.append(.product(name: "Crypto", package: "swift-crypto"))
 #endif
 var targets: [Target] = [
