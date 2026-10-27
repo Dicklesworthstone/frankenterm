@@ -207,8 +207,14 @@ impl SshSources {
                             aliases.push(alias.clone());
                             for name in aliases {
                                 let options = resolver.config.for_host(&name);
-                                identities
-                                    .extend(split_paths(options.get("identityfile"), context));
+                                if resolver
+                                    .authentication_policy(&options)
+                                    .methods
+                                    .contains(&"publickey")
+                                {
+                                    identities
+                                        .extend(split_paths(options.get("identityfile"), context));
+                                }
                                 known_files.extend(resolver.trust_files(&options).0);
                             }
                         }
@@ -271,6 +277,7 @@ struct AliasResolver {
     config: frankenterm_ssh::Config,
     trust_lists: BTreeMap<String, Option<Vec<PathBuf>>>,
     proxies: BTreeMap<String, ProxySetting>,
+    authentication_values: BTreeMap<String, Option<String>>,
     aliases: BTreeSet<String>,
     incomplete: bool,
 }
@@ -280,7 +287,153 @@ enum ProxySetting {
     Command { disabled: bool },
 }
 
+struct AuthenticationPolicy {
+    /// Empty means no usable policy, not permission to substitute a default.
+    methods: Vec<&'static str>,
+    problems: Vec<String>,
+}
+
 impl AliasResolver {
+    fn authentication_value<'a>(
+        &'a self,
+        options: &frankenterm_ssh::ConfigMap,
+        keyword: &str,
+    ) -> Result<Option<&'a str>, ()> {
+        match options.get(keyword) {
+            None => Ok(None),
+            Some(token) => self
+                .authentication_values
+                .get(token)
+                .and_then(Option::as_deref)
+                .map(Some)
+                .ok_or(()),
+        }
+    }
+
+    /// Preserve OpenSSH's enabled method order, independently of which local
+    /// keys happen to exist. Unsupported required semantics block the entire
+    /// route; they cannot silently turn into a password or key fallback.
+    fn authentication_policy(&self, options: &frankenterm_ssh::ConfigMap) -> AuthenticationPolicy {
+        let mut enabled = BTreeSet::new();
+        let mut problems = Vec::new();
+        for (method, keyword) in [
+            ("publickey", "pubkeyauthentication"),
+            ("password", "passwordauthentication"),
+            ("keyboard-interactive", "kbdinteractiveauthentication"),
+        ] {
+            match self.authentication_value(options, keyword) {
+                Ok(None) => {
+                    enabled.insert(method);
+                }
+                Ok(Some(value)) if value.eq_ignore_ascii_case("yes") => {
+                    enabled.insert(method);
+                }
+                Ok(Some(value)) if value.eq_ignore_ascii_case("no") => {}
+                _ => problems.push(format!(
+                    "{} is not a supported yes/no authentication policy; this route remains blocked",
+                    keyword
+                )),
+            }
+        }
+        // None of these desktop requirements is implemented by a phone-side
+        // password prompt. Explicitly disabling one is faithfully portable.
+        for (keyword, disabled) in [
+            ("batchmode", "no"),
+            ("gssapiauthentication", "no"),
+            ("hostbasedauthentication", "no"),
+            ("pkcs11provider", "none"),
+            ("securitykeyprovider", "none"),
+        ] {
+            match self.authentication_value(options, keyword) {
+                Ok(None) => {}
+                Ok(Some(value)) if value.eq_ignore_ascii_case(disabled) => {}
+                _ => problems.push(format!(
+                    "{} requires authentication behavior the phone cannot enforce; this route remains blocked",
+                    keyword
+                )),
+            }
+        }
+        // Unlike provider sentinels and yes/no values, OpenSSH compares the
+        // IdentityAgent sentinel exactly; "NONE" is still an agent path.
+        match self.authentication_value(options, "identityagent") {
+            Ok(None) | Ok(Some("none")) => {}
+            _ => problems.push("identityagent requires authentication behavior the phone cannot enforce; this route remains blocked".into()),
+        }
+        if !self
+            .authentication_value(options, "identitiesonly")
+            .is_ok_and(|value| {
+                value.is_none_or(|value| {
+                    value.eq_ignore_ascii_case("yes") || value.eq_ignore_ascii_case("no")
+                })
+            })
+        {
+            problems.push("identitiesonly is not a supported yes/no identity policy; this route remains blocked".into());
+        }
+        for keyword in [
+            "numberofpasswordprompts",
+            "kbdinteractivedevices",
+            "authenticationmethods",
+        ] {
+            if options.contains_key(keyword) {
+                problems.push(format!(
+                    "{} requires authentication policy the phone cannot enforce; this route remains blocked",
+                    keyword
+                ));
+            }
+        }
+        let preferred = match self.authentication_value(options, "preferredauthentications") {
+            Ok(None) => "publickey,keyboard-interactive,password",
+            Ok(Some(value)) if value.len() <= 1024 && value.split(',').count() <= 16 => value,
+            _ => {
+                problems.push("preferredauthentications is not one bounded ordered method list; this route remains blocked".into());
+                ""
+            }
+        };
+        let mut methods = Vec::new();
+        let mut unsupported = false;
+        for method in preferred.split(',') {
+            let known = match method {
+                "publickey" => Some("publickey"),
+                "password" => Some("password"),
+                "keyboard-interactive" => Some("keyboard-interactive"),
+                "gssapi-with-mic"
+                    if self
+                        .authentication_value(options, "gssapiauthentication")
+                        .is_ok_and(|value| {
+                            value.is_none_or(|value| value.eq_ignore_ascii_case("no"))
+                        }) =>
+                {
+                    None
+                }
+                "hostbased"
+                    if self
+                        .authentication_value(options, "hostbasedauthentication")
+                        .is_ok_and(|value| {
+                            value.is_none_or(|value| value.eq_ignore_ascii_case("no"))
+                        }) =>
+                {
+                    None
+                }
+                _ => {
+                    unsupported = true;
+                    None
+                }
+            };
+            if let Some(method) = known {
+                if enabled.contains(method) && !methods.contains(&method) {
+                    methods.push(method);
+                }
+            }
+        }
+        if unsupported {
+            problems.push("preferredauthentications contains an unsupported or empty method; this route remains blocked".into());
+        }
+        if methods.is_empty() {
+            problems.push("no permitted authentication method remains; this route stays inactive until its policy is deliberately replaced".into());
+        }
+        AuthenticationPolicy { methods, problems }
+    }
+
     /// Match OpenSSH's explicit ordered prefix: only the first named jump
     /// inherits its configured proxy chain. The preceding -J list overrides
     /// any proxy configuration on later jumps. All hops must be concrete
@@ -473,6 +626,7 @@ fn alias_resolver(config: Option<&str>, home: &Path) -> Option<AliasResolver> {
     }
     let mut trust_lists = BTreeMap::new();
     let mut proxies = BTreeMap::new();
+    let mut authentication_values = BTreeMap::new();
     let mut passive = String::new();
     let mut incomplete = false;
     for line in text.lines() {
@@ -526,6 +680,42 @@ fn alias_resolver(config: Option<&str>, home: &Path) -> Option<AliasResolver> {
                     };
                     proxies.insert(token.clone(), setting);
                     passive.push_str(&format!("frankenterm_proxy {}\n", token));
+                    continue;
+                }
+                "preferredauthentications"
+                | "pubkeyauthentication"
+                | "passwordauthentication"
+                | "kbdinteractiveauthentication"
+                | "challengeresponseauthentication"
+                | "batchmode"
+                | "numberofpasswordprompts"
+                | "kbdinteractivedevices"
+                | "gssapiauthentication"
+                | "hostbasedauthentication"
+                | "identityagent"
+                | "pkcs11provider"
+                | "securitykeyprovider"
+                | "identitiesonly"
+                | "authenticationmethods" => {
+                    // Keep malformed first assignments too: dropping one must
+                    // not let a later wildcard silently enable another method.
+                    let token = format!(
+                        "__frankenterm_authentication_{}__",
+                        authentication_values.len()
+                    );
+                    let value = configuration_words(value)
+                        .filter(|words| words.len() == 1 && !words[0].is_empty())
+                        .map(|words| words[0].clone());
+                    authentication_values.insert(token.clone(), value);
+                    // The deprecated spelling controls the same OpenSSH slot;
+                    // whichever matching spelling appears first takes effect.
+                    let keyword = if keyword.eq_ignore_ascii_case("challengeresponseauthentication")
+                    {
+                        "kbdinteractiveauthentication"
+                    } else {
+                        keyword
+                    };
+                    passive.push_str(&format!("{} {}\n", keyword, token));
                     continue;
                 }
                 _ => {}
@@ -593,6 +783,7 @@ fn alias_resolver(config: Option<&str>, home: &Path) -> Option<AliasResolver> {
         config: resolver,
         trust_lists,
         proxies,
+        authentication_values,
         aliases,
         incomplete,
     })
@@ -919,6 +1110,7 @@ struct Endpoint {
     host: String,
     port: u16,
     user: String,
+    authentication_methods: Vec<&'static str>,
     identities: Vec<PathBuf>,
     host_key_alias: Option<String>,
     known_hosts: Vec<PathBuf>,
@@ -1040,6 +1232,9 @@ fn resolve_endpoint(
             host: host.clone(),
             port: port.unwrap_or(22),
             user: user.clone(),
+            // Literal inventory routes have an explicit file-key contract,
+            // independent of SSH alias defaults and interactive methods.
+            authentication_methods: vec!["publickey"],
             identities: if identity_files.is_empty() {
                 default_identities(context)
             } else {
@@ -1125,6 +1320,13 @@ fn resolve_endpoint(
             if unresolved_policy {
                 note(notes, "the SSH source has unavailable system configuration, unresolved Include/Match conditions, or unsupported passive syntax or trust-file lists; this route remains blocked on the phone".into());
             }
+            let authentication = resolver.authentication_policy(&options);
+            if !authentication.problems.is_empty() {
+                unresolved_policy = true;
+                for problem in &authentication.problems {
+                    note(notes, problem.clone());
+                }
+            }
             // Do not silently substitute the phone's defaults for mandatory
             // source trust, revocation, or algorithm constraints. These are
             // preserved by a required-capability marker in the document itself.
@@ -1143,8 +1345,6 @@ fn resolve_endpoint(
                 "verifyhostkeydns",
                 "checkhostip",
                 "canonicalizehostname",
-                "pubkeyauthentication",
-                "preferredauthentications",
                 "certificatefile",
                 "frankenterm_required_certificate",
                 "refuseconnection",
@@ -1158,8 +1358,6 @@ fn resolve_endpoint(
                         | "checkhostip"
                         | "canonicalizehostname"
                         | "refuseconnection" => value.eq_ignore_ascii_case("no"),
-                        "pubkeyauthentication" => value.eq_ignore_ascii_case("yes"),
-                        "preferredauthentications" => value == "publickey",
                         _ => false,
                     };
                     if !disabled {
@@ -1178,7 +1376,12 @@ fn resolve_endpoint(
                 host,
                 port,
                 user,
-                identities: split_paths(options.get("identityfile"), context),
+                identities: if authentication.methods.contains(&"publickey") {
+                    split_paths(options.get("identityfile"), context)
+                } else {
+                    Vec::new()
+                },
+                authentication_methods: authentication.methods,
                 host_key_alias: options.get("hostkeyalias").cloned(),
                 known_hosts,
                 unresolved_policy,
@@ -1347,12 +1550,16 @@ impl EndpointRecords {
             });
             credential_ids.push(id);
         }
-        if credential_ids.is_empty() {
+        if credential_ids.is_empty() && endpoint.authentication_methods.contains(&"publickey") {
             notes.push(ExportNote {
                 machine: machine.id.clone(),
                 route: Some(route_name.to_string()),
-                message: "no public key is available, so the phone cannot sign in on this route"
-                    .into(),
+                message: if endpoint.authentication_methods.len() == 1 {
+                    "no public key is available, so the phone cannot sign in on this route"
+                } else {
+                    "no public key is available; the other configured authentication methods remain in the export"
+                }
+                .into(),
             });
         }
         // Trust belongs to the route's selected file policy. Sharing an
@@ -1381,7 +1588,14 @@ impl EndpointRecords {
             "port": endpoint.port,
             "user": endpoint.user,
             "credential_refs": credential_ids,
-            "authentication_methods": ["publickey"],
+            // The schema requires a nonempty list. An empty effective policy
+            // gets an inert placeholder with no credentials; its mandatory
+            // unresolved-policy marker prevents activation on the phone.
+            "authentication_methods": if endpoint.authentication_methods.is_empty() {
+                vec!["publickey"]
+            } else {
+                endpoint.authentication_methods.clone()
+            },
             "host_trust_ref": trust_id,
             "jump_routes": resolved.jump_routes,
         });
@@ -2076,6 +2290,342 @@ socket = "/run/frankenterm.sock"
             .unwrap()
     }
 
+    fn authentication_sources(policy: &str) -> SshSources {
+        sources(Some(&format!(
+            "Host app\n{}\n HostName css.example\n User u\n IdentityFile ~/.ssh/trj_ed25519\n GlobalKnownHostsFile none\n",
+            policy
+        )))
+    }
+
+    #[test]
+    fn alias_authentication_preserves_order_switches_and_legacy_alias_precedence() {
+        for (policy, expected) in [
+            ("", vec!["publickey", "keyboard-interactive", "password"]),
+            (
+                "PreferredAuthentications password,publickey,keyboard-interactive\n PasswordAuthentication no\n ChallengeResponseAuthentication yes\n KbdInteractiveAuthentication no",
+                vec!["publickey", "keyboard-interactive"],
+            ),
+            (
+                "PreferredAuthentications password,publickey\n PasswordAuthentication \"yEs\"\n PubkeyAuthentication \"nO\"\n KbdInteractiveAuthentication nO\n IdentityAgent \"none\"\n PKCS11Provider NONE\n SecurityKeyProvider \"NoNe\"\n IdentitiesOnly YES",
+                vec!["password"],
+            ),
+            (
+                "PubkeyAuthentication no",
+                vec!["keyboard-interactive", "password"],
+            ),
+            (
+                "PreferredAuthentications keyboard-interactive,password,publickey\n KbdInteractiveAuthentication no\n ChallengeResponseAuthentication yes",
+                vec!["password", "publickey"],
+            ),
+            (
+                "PreferredAuthentications gssapi-with-mic,hostbased,password,publickey,password\n GSSAPIAuthentication NO\n HostbasedAuthentication no\n BatchMode NO",
+                vec!["password", "publickey"],
+            ),
+            (
+                "PreferredAuthentications = \"password,publickey\" # keep the order\n PubkeyAuthentication no\n PasswordAuthentication yes",
+                vec!["password"],
+            ),
+            (
+                "PasswordAuthentication no\n KbdInteractiveAuthentication no",
+                vec!["publickey"],
+            ),
+        ] {
+            let export = jump_export(&authentication_sources(policy)).unwrap();
+            for id in ["r.app.ssh", "r.app.mux"] {
+                let route = exported_route(&export, id);
+                assert_eq!(
+                    route["authentication_methods"],
+                    json!(expected),
+                    "{}",
+                    policy
+                );
+                assert!(
+                    route_trust(&export, id)["required_capabilities"].is_null(),
+                    "{}",
+                    policy
+                );
+                assert_eq!(
+                    route["credential_refs"].as_array().unwrap().len(),
+                    usize::from(expected.contains(&"publickey"))
+                );
+            }
+            assert_eq!(
+                export.identity_files.len(),
+                usize::from(expected.contains(&"publickey"))
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_or_required_authentication_policy_cannot_become_a_usable_fallback() {
+        for (policy, credential_count) in [
+            (
+                "PubkeyAuthentication no\n PasswordAuthentication no\n KbdInteractiveAuthentication no",
+                0,
+            ),
+            ("PreferredAuthentications none", 0),
+            ("PreferredAuthentications password,unsupported", 0),
+            ("PreferredAuthentications password,,publickey", 1),
+            ("PreferredAuthentications Password", 0),
+            (
+                "PreferredAuthentications password publickey\n PreferredAuthentications password",
+                0,
+            ),
+            ("PreferredAuthentications \"password publickey\"", 0),
+            (
+                "PubkeyAuthentication no\n PasswordAuthentication \"\"\n PasswordAuthentication yes\n KbdInteractiveAuthentication no",
+                0,
+            ),
+            (
+                "PreferredAuthentications password\n PubkeyAuthentication host-bound",
+                0,
+            ),
+            (
+                "PreferredAuthentications password\n PubkeyAuthentication unbound",
+                0,
+            ),
+            (
+                "PreferredAuthentications password\n PasswordAuthentication maybe",
+                0,
+            ),
+            (
+                "PreferredAuthentications password\n PasswordAuthentication \" YES \"",
+                0,
+            ),
+            (
+                "PreferredAuthentications password\n PasswordAuthentication yes#disabled",
+                0,
+            ),
+            ("PreferredAuthentications password\n BatchMode yes", 0),
+            (
+                "PreferredAuthentications password\n NumberOfPasswordPrompts 0",
+                0,
+            ),
+            (
+                "PreferredAuthentications password\n KbdInteractiveDevices pam",
+                0,
+            ),
+            (
+                "PreferredAuthentications password\n AuthenticationMethods publickey,password",
+                0,
+            ),
+            (
+                "PreferredAuthentications password\n GSSAPIAuthentication yes",
+                0,
+            ),
+            (
+                "PreferredAuthentications hostbased,password\n HostbasedAuthentication yes",
+                0,
+            ),
+            (
+                "PreferredAuthentications password\n IdentityAgent /must-not-open/agent",
+                0,
+            ),
+            ("PreferredAuthentications password\n IdentityAgent NONE", 0),
+            (
+                "PreferredAuthentications password\n PKCS11Provider /must-not-load/provider",
+                0,
+            ),
+            (
+                "PreferredAuthentications password\n SecurityKeyProvider internal",
+                0,
+            ),
+            (
+                "PreferredAuthentications password\n IdentitiesOnly maybe",
+                0,
+            ),
+        ] {
+            let export = jump_export(&authentication_sources(policy)).unwrap();
+            for id in ["r.app.ssh", "r.app.mux"] {
+                assert_eq!(
+                    route_trust(&export, id)["required_capabilities"],
+                    json!([UNRESOLVED_POLICY]),
+                    "{}",
+                    policy
+                );
+            }
+            assert!(
+                export
+                    .notes
+                    .iter()
+                    .any(|note| note.message.contains("blocked")
+                        || note.message.contains("inactive")),
+                "{}",
+                policy
+            );
+            assert_eq!(
+                export.identity_files.len(),
+                credential_count,
+                "inactive or non-key policy must not request private material: {}",
+                policy
+            );
+        }
+        for list in [vec!["password"; 17].join(","), "x".repeat(1025)] {
+            let export = jump_export(&authentication_sources(&format!(
+                "PreferredAuthentications {}",
+                list
+            )))
+            .unwrap();
+            assert_eq!(
+                route_trust(&export, "r.app.ssh")["required_capabilities"],
+                json!([UNRESOLVED_POLICY])
+            );
+            assert_eq!(
+                exported_route(&export, "r.app.ssh")["authentication_methods"],
+                json!(["publickey"])
+            );
+            assert!(
+                export.identity_files.is_empty(),
+                "the inert schema placeholder grants no key authority"
+            );
+        }
+    }
+
+    #[test]
+    fn password_only_graphs_need_no_key_records_or_companion_identity_files() {
+        let mut sources = jump_sources();
+        sources.public_keys.clear();
+        sources.config = Some(format!(
+            "{} PreferredAuthentications password\n PubkeyAuthentication no\n PasswordAuthentication yes\n KbdInteractiveAuthentication no\n",
+            JUMP_CONFIG
+        ));
+        let export = jump_export(&sources).unwrap();
+        assert_eq!(export.routes, 5);
+        assert_eq!(export.document["workspace"]["credentials"], json!([]));
+        assert!(export.identity_files.is_empty());
+        assert!(export.notes.is_empty(), "{:?}", export.notes);
+        for route in export.document["workspace"]["routes"].as_array().unwrap() {
+            assert_eq!(route["authentication_methods"], json!(["password"]));
+            assert_eq!(route["credential_refs"], json!([]));
+            assert!(
+                route_trust(&export, route["id"].as_str().unwrap())["required_capabilities"]
+                    .is_null()
+            );
+        }
+        let source = companion_source(&export, Path::new("/config/machines.toml"));
+        assert_eq!(source["identity_files"], json!({}));
+        assert_eq!(source["document"], export.document);
+    }
+
+    #[test]
+    fn every_hop_retains_its_own_authentication_policy_and_key_scope() {
+        let mut sources = jump_sources();
+        sources.config = Some(
+            JUMP_CONFIG
+                .replace(
+                    "Host app\n",
+                    "Host app\n PreferredAuthentications password,publickey\n",
+                )
+                .replace(
+                    "Host first\n",
+                    "Host first\n PreferredAuthentications password\n PubkeyAuthentication no\n",
+                )
+                .replace(
+                    "Host second\n",
+                    "Host second\n PreferredAuthentications keyboard-interactive\n",
+                )
+                .replace(
+                    "Host third\n",
+                    "Host third\n PreferredAuthentications publickey\n",
+                ),
+        );
+        let export = jump_export(&sources).unwrap();
+        let destination = exported_route(&export, "r.app.ssh");
+        assert_eq!(
+            destination["authentication_methods"],
+            json!(["password", "publickey"])
+        );
+        for (index, method) in ["password", "keyboard-interactive", "publickey"]
+            .iter()
+            .enumerate()
+        {
+            let hop = exported_route(&export, destination["jump_routes"][index].as_str().unwrap());
+            assert_eq!(hop["authentication_methods"], json!([method]));
+            assert_eq!(
+                hop["credential_refs"].as_array().unwrap().len(),
+                usize::from(*method == "publickey")
+            );
+            assert!(
+                route_trust(&export, hop["id"].as_str().unwrap())["required_capabilities"]
+                    .is_null()
+            );
+        }
+        assert_eq!(export.identity_files.len(), 2);
+        let files: BTreeSet<_> = export.identity_files.values().cloned().collect();
+        assert_eq!(
+            files,
+            [
+                context().home.join(".ssh/third"),
+                context().home.join(".ssh/app")
+            ]
+            .iter()
+            .cloned()
+            .collect()
+        );
+    }
+
+    #[test]
+    fn user_and_system_authentication_first_assignments_remain_authoritative() {
+        let mut sources = authentication_sources(
+            "PreferredAuthentications password,keyboard-interactive,publickey\n PasswordAuthentication no\n PubkeyAuthentication yes",
+        );
+        sources.system_config = KnownHostsSource::Present(
+            "PreferredAuthentications password\n PasswordAuthentication yes\n PubkeyAuthentication no\n KbdInteractiveAuthentication no\n".into(),
+        );
+        let export = jump_export(&sources).unwrap();
+        assert_eq!(
+            exported_route(&export, "r.app.ssh")["authentication_methods"],
+            json!(["publickey"])
+        );
+        assert!(route_trust(&export, "r.app.ssh")["required_capabilities"].is_null());
+        let mut sources =
+            authentication_sources("PasswordAuthentication maybe\n PasswordAuthentication yes");
+        sources.system_config = KnownHostsSource::Present("PasswordAuthentication yes\n".into());
+        let export = jump_export(&sources).unwrap();
+        assert_eq!(
+            route_trust(&export, "r.app.ssh")["required_capabilities"],
+            json!([UNRESOLVED_POLICY])
+        );
+        assert!(
+            !exported_route(&export, "r.app.ssh")["authentication_methods"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("password"))
+        );
+    }
+
+    #[test]
+    fn missing_optional_keys_do_not_claim_a_password_route_cannot_sign_in() {
+        let mut sources = authentication_sources("PreferredAuthentications password,publickey");
+        sources.public_keys.clear();
+        let export = jump_export(&sources).unwrap();
+        assert!(export.identity_files.is_empty());
+        assert!(route_trust(&export, "r.app.ssh")["required_capabilities"].is_null());
+        assert!(export.notes.iter().any(|note| {
+            note.message
+                .contains("other configured authentication methods")
+        }));
+        assert!(
+            !export
+                .notes
+                .iter()
+                .any(|note| note.message.contains("cannot sign in"))
+        );
+        sources.config = Some(
+            sources
+                .config
+                .unwrap()
+                .replace("password,publickey", "publickey"),
+        );
+        let export = jump_export(&sources).unwrap();
+        assert!(
+            export
+                .notes
+                .iter()
+                .any(|note| note.message.contains("cannot sign in"))
+        );
+    }
+
     #[test]
     fn three_hop_inventory_export_preserves_ordered_endpoints_identity_trust_and_mux() {
         let export = jump_export(&jump_sources()).unwrap();
@@ -2121,7 +2671,10 @@ socket = "/run/frankenterm.sock"
             assert_eq!(route["host"], host);
             assert_eq!(route["port"], port);
             assert_eq!(route["user"], user);
-            assert_eq!(route["authentication_methods"], json!(["publickey"]));
+            assert_eq!(
+                route["authentication_methods"],
+                json!(["publickey", "keyboard-interactive", "password"])
+            );
             let credential_ids = route["credential_refs"].as_array().unwrap();
             assert_eq!(credential_ids.len(), 1);
             let credential = workspace["credentials"]
@@ -2313,7 +2866,7 @@ socket = "/run/frankenterm.sock"
             "RevokedHostKeys /must-not-read",
             "KnownHostsCommand touch /must-not-execute",
             "CertificateFile ~/.ssh/second-cert.pub",
-            "PubkeyAuthentication no",
+            "PubkeyAuthentication host-bound",
         ] {
             let mut sources = jump_sources();
             sources.config =
@@ -2578,6 +3131,37 @@ socket = "/run/frankenterm.sock"
             .unwrap()
         {
             assert_eq!(trust["pins"].as_array().unwrap().len(), 1);
+        }
+        // Existing public files are deliberately excluded when the effective
+        // method list never offers publickey, even without disabling the flag.
+        write_source(
+            &context.home.join(".ssh/config"),
+            format!(
+                "{} ProxyCommand none\n PreferredAuthentications password\n PasswordAuthentication YES\n",
+                JUMP_CONFIG.replace("/trust/", "~/trust/")
+            ),
+        );
+        let snapshot = SshSources::from_disk(&inventory, &context);
+        assert!(snapshot.public_keys.is_empty());
+        let password_export = super::export(
+            &inventory,
+            JUMP_INVENTORY.as_bytes(),
+            None,
+            &snapshot,
+            &context,
+        )
+        .unwrap();
+        assert!(password_export.identity_files.is_empty());
+        assert_eq!(
+            password_export.document["workspace"]["credentials"],
+            json!([])
+        );
+        for route in password_export.document["workspace"]["routes"]
+            .as_array()
+            .unwrap()
+        {
+            assert_eq!(route["authentication_methods"], json!(["password"]));
+            assert_eq!(route["credential_refs"], json!([]));
         }
     }
 
@@ -3101,8 +3685,8 @@ ssh = "right"
             "HostKeyAlgorithms ssh-ed25519",
             "CheckHostIP yes",
             "VerifyHostKeyDNS yes",
-            "PubkeyAuthentication no",
-            "PreferredAuthentications password",
+            "PubkeyAuthentication host-bound",
+            "PreferredAuthentications unsupported-method",
             "CertificateFile /trust/user-cert.pub",
             "CertificateFile none\n CertificateFile /trust/user-cert.pub",
             "RefuseConnection yes",
@@ -3354,8 +3938,9 @@ ssh = "right"
     #[test]
     fn the_kit_fixture_is_this_exporters_output() {
         let inventory = MachineInventory::parse(INVENTORY, &context()).unwrap();
-        let config =
-            "Host css\n  HostName css.example\n  User ubuntu\n  IdentityFile ~/.ssh/trj_ed25519\n";
+        // This cross-language fixture deliberately models a key-only route;
+        // do not make an implicit SSH default redefine its method policy.
+        let config = "Host css\n  HostName css.example\n  User ubuntu\n  IdentityFile ~/.ssh/trj_ed25519\n  PreferredAuthentications publickey\n";
         let mut document = export(
             &inventory,
             INVENTORY.as_bytes(),
