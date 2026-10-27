@@ -2910,8 +2910,104 @@ final class TerminalSessionControllerTests: XCTestCase {
             authenticationChoices: [.keyboardInteractive])
         let jump = TerminalSessionRoute(id: "route", credentialIDs: ["key"], host: "destination.invalid", port: 22,
             promptingJump: true)
+        let keyFirst = TerminalSessionRoute(id: "route", credentialIDs: ["key"], host: "destination.invalid", port: 22,
+            allowsKeyboardInteractiveContinuation: true)
+        let keyOnly = TerminalSessionRoute(id: "route", credentialIDs: ["key"], host: "destination.invalid", port: 22)
         XCTAssertTrue(direct.requiresAuthenticationPrompt)
         XCTAssertTrue(jump.requiresAuthenticationPrompt)
+        XCTAssertTrue(keyFirst.requiresAuthenticationPrompt)
+        XCTAssertFalse(keyOnly.requiresAuthenticationPrompt)
+        XCTAssertEqual(keyFirst.choices, keyOnly.choices, "MFA permission must not reorder or widen authentication candidates")
+    }
+
+    func testPotentialPublicKeyMFAAtDestinationOrHopStopsWhenHiddenDuringConnect() async throws {
+        for throughHop in [false, true] {
+            let (connections, scene, original) = try dormantScene()
+            let route = TerminalSessionRoute(id: "route", credentialIDs: ["key"], host: "destination.invalid", port: 22,
+                allowsKeyboardInteractiveContinuation: !throughHop, promptingJump: throughHop)
+            let target = TerminalSessionTarget(workspaceID: original.workspaceID, revision: original.revision,
+                machineID: original.machineID, machineName: original.machineName, routes: [route])
+            XCTAssertEqual(route.choices, [.publicKey("key")])
+            let controller = TerminalSessionController(target: target, connections: connections, focus: scene)
+            var reachedConnecting = false
+            controller.onChange = {
+                if controller.phase == .connecting {
+                    reachedConnecting = true
+                    controller.setPresentationVisible(false)
+                }
+            }
+            // Hide synchronously at actual startup admission, before the
+            // disabled manager can produce an unrelated offline error.
+            await controller.start(openTerminal: false)
+            controller.onChange = nil
+            XCTAssertTrue(reachedConnecting)
+            if case .ended = controller.phase {} else {
+                XCTFail("A hidden potential MFA attempt was not cancelled: \(controller.phase)")
+            }
+            controller.setPresentationVisible(true)
+            await controller.start(openTerminal: false)
+            if case .ended = controller.phase {} else { XCTFail("Returning to the tab revived its retired attempt") }
+            await controller.stop()
+            await assertReleased(controller, connections: connections)
+            let pending = await connections.manager.pendingCount
+            XCTAssertEqual(pending, 0)
+            await scene.close()
+        }
+    }
+
+    func testPublicKeyMFAHopRefusalRetainsNextKeyOnlyForExplicitRetry() async throws {
+        let (connections, scene, original) = try dormantScene()
+        let route = TerminalSessionRoute(id: "route", credentialIDs: ["first", "second"],
+            host: "destination.invalid", port: 22, authenticationChoices: [.publicKey("first"), .publicKey("second")],
+            promptingJump: true, jumpHost: "jump.invalid")
+        let target = TerminalSessionTarget(workspaceID: original.workspaceID, revision: original.revision,
+            machineID: original.machineID, machineName: original.machineName, routes: [route])
+        let first = TerminalSessionController(target: target, connections: connections, focus: scene)
+        var plan = try first.makeRouteAttemptPlan(candidates: target.routes)
+        let refused = try XCTUnwrap(plan.current)
+        XCTAssertFalse(refused.selection.authentication.requiresForegroundPrompt,
+                       "The first selected method is a key; the completed hop's MFA caused the explicit retry requirement")
+        XCTAssertTrue(try first.rememberPasswordHopRefusal(refused, plan: &plan))
+        XCTAssertThrowsError(try first.rememberPasswordHopRefusal(refused, plan: &plan))
+        let pending = await connections.manager.pendingCount
+        XCTAssertEqual(pending, 0, "Preserving a refused destination key must not repeat the hop's MFA")
+        let automatic = TerminalSessionController(target: target, connections: connections, focus: scene, reconnectingFrom: first)
+        XCTAssertEqual(try automatic.makeRouteAttemptPlan(candidates: target.routes).current?.selection.authentication,
+                       .publicKey("first"))
+        let retry = TerminalSessionController(target: target, connections: connections, focus: scene, retryingAfterPasswordHop: first)
+        var next = try retry.makeRouteAttemptPlan(candidates: target.routes)
+        XCTAssertEqual(next.current?.selection.authentication, .publicKey("second"))
+        XCTAssertTrue(next.hasCredentialRefusal)
+        let last = try XCTUnwrap(next.current)
+        XCTAssertFalse(try retry.rememberPasswordHopRefusal(last, plan: &next))
+        XCTAssertNil(next.current)
+        await scene.close()
+    }
+
+    func testPublicKeyMFAExplicitMuxFailureDoesNotAutomaticallySignInAgain() async throws {
+        let (connections, scene, original) = try dormantScene()
+        let mux = TerminalSessionRoute(id: "mux", credentialIDs: ["key"], host: "destination.invalid", port: 22,
+            allowsKeyboardInteractiveContinuation: true, mux: true, sessionCreation: .existingOnly)
+        let direct = TerminalSessionRoute(id: "direct", credentialIDs: ["key"], host: "destination.invalid", port: 22,
+            allowsKeyboardInteractiveContinuation: true)
+        let target = TerminalSessionTarget(workspaceID: original.workspaceID, revision: original.revision,
+            machineID: original.machineID, machineName: original.machineName, routes: [mux, direct])
+        let failed = TerminalSessionController(target: target, connections: connections, focus: scene)
+        XCTAssertEqual(try failed.makeRouteAttemptPlan(candidates: target.routes).current?.selection.routeID, "mux",
+                       "An explicit mux route remains eligible even when its key may require MFA")
+        XCTAssertTrue(failed.rememberPasswordMuxFallback())
+        let pending = await connections.manager.pendingCount
+        XCTAssertEqual(pending, 0, "Mux failure must not automatically repeat MFA to create a direct shell")
+        let automatic = TerminalSessionController(target: target, connections: connections, focus: scene, reconnectingFrom: failed)
+        XCTAssertEqual(try automatic.makeRouteAttemptPlan(candidates: target.routes).current?.selection.routeID, "mux")
+        let retry = TerminalSessionController(target: target, connections: connections, focus: scene,
+                                             retryingAfterPasswordHop: failed)
+        XCTAssertEqual(try retry.makeRouteAttemptPlan(candidates: target.routes).current?.selection,
+                       .init(routeID: "direct", authentication: .publicKey("key")))
+        let consumed = TerminalSessionController(target: target, connections: connections, focus: scene,
+                                                retryingAfterPasswordHop: failed)
+        XCTAssertEqual(try consumed.makeRouteAttemptPlan(candidates: target.routes).current?.selection.routeID, "mux")
+        await scene.close()
     }
 
     func testPasswordHopKeyRefusalAdvancesOnlyOnExplicitRetryAndConsumesEachKeyOnce() async throws {

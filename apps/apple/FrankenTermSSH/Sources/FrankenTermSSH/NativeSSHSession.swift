@@ -100,6 +100,13 @@ public struct NativeSSHIdentity: Sendable, Equatable {
     }
 }
 
+/// A completed public-key attempt, including whether the server required and
+/// completed its explicitly permitted keyboard-interactive continuation.
+public struct NativeSSHPublicKeyAuthenticationResult: Sendable, Equatable {
+    public let peer: NativeSSHPeer
+    public let usedKeyboardInteractive: Bool
+}
+
 /// Constructed only from the driver's verified user-authentication preimage.
 /// The existing workspace signer should reconstruct its own typed challenge and
 /// require equality with signedData before returning its SSH signature blob.
@@ -340,6 +347,11 @@ package struct NativeSSHDriver: Equatable, Sendable {
 /// requests have finite monotonic deadlines. Hidden panes retain this owner.
 public actor NativeSSHSession {
     public nonisolated static let maximumWriteBytes = Int(FTSSH_WRITE_CAPACITY)
+    /// True only when the linked backend exposes its verified signed-key
+    /// partial-success evidence. Method advertisements alone are insufficient.
+    public nonisolated static var supportsPublicKeyInteractive: Bool {
+        ftssh_supports_publickey_interactive() != 0
+    }
     public nonisolated let transportID: UUID
     /// This session creates at most one shell channel. A replacement connection
     /// always gets a new channel identity, even when its endpoint is unchanged.
@@ -359,12 +371,17 @@ public actor NativeSSHSession {
         case publicKey(any NativeSSHAuthentication, NativeSSHPeer, NativeSSHIdentity)
         case password(any NativeSSHPasswordAuthentication, NativeSSHPeer, NativeSSHPasswordAccount)
         case interactive(any NativeSSHInteractiveAuthentication, NativeSSHPeer, NativeSSHInteractiveAccount)
+        case publicKeyAndInteractive(any NativeSSHAuthentication, NativeSSHIdentity,
+            any NativeSSHInteractiveAuthentication, NativeSSHInteractiveAccount, NativeSSHPeer)
 
         func validate() async throws {
             switch self {
             case let .publicKey(authority, peer, identity): try await authority.validate(peer: peer, identity: identity)
             case let .password(authority, peer, account): try await authority.validate(peer: peer, account: account)
             case let .interactive(authority, peer, account): try await authority.validate(peer: peer, account: account)
+            case let .publicKeyAndInteractive(key, identity, interactive, account, peer):
+                try await key.validate(peer: peer, identity: identity)
+                try await interactive.validate(peer: peer, account: account)
             }
         }
         func cancel() {
@@ -372,6 +389,9 @@ public actor NativeSSHSession {
             case let .publicKey(authority, peer, _): authority.cancel(transportID: peer.transportID)
             case let .password(authority, peer, _): authority.cancel(transportID: peer.transportID)
             case let .interactive(authority, peer, _): authority.cancel(transportID: peer.transportID)
+            case let .publicKeyAndInteractive(key, _, interactive, _, peer):
+                key.cancel(transportID: peer.transportID)
+                interactive.cancel(transportID: peer.transportID)
             }
         }
     }
@@ -472,6 +492,23 @@ public actor NativeSSHSession {
     }
 
     public func authenticate(using authority: any NativeSSHAuthentication, timeout: Duration = .seconds(60)) async throws -> NativeSSHPeer {
+        try await authenticatePublicKey(using: authority, continuation: nil, timeout: timeout).peer
+    }
+
+    /// One finite attempt on one approved peer/account. A signed-key partial
+    /// success naming keyboard-interactive is the only continuation authority;
+    /// a rejected key, unsigned probe or method list can never start its UI.
+    /// The interactive provider is untouched if the key completes the login.
+    public func authenticate(using authority: any NativeSSHAuthentication,
+                             continuingWithInteractive interactive: any NativeSSHInteractiveAuthentication,
+                             timeout: Duration = .seconds(60)) async throws -> NativeSSHPublicKeyAuthenticationResult {
+        guard Self.supportsPublicKeyInteractive else { throw NativeSSHError.native(Int32(FTSSH_UNSUPPORTED)) }
+        return try await authenticatePublicKey(using: authority, continuation: interactive, timeout: timeout)
+    }
+
+    private func authenticatePublicKey(using authority: any NativeSSHAuthentication,
+                                      continuation: (any NativeSSHInteractiveAuthentication)?,
+                                      timeout: Duration) async throws -> NativeSSHPublicKeyAuthenticationResult {
         let deadline = try deadline(timeout)
         guard phase == .fresh, operation == nil else { throw phase == .closed ? NativeSSHError.closed : .busy }
         try Task.checkCancellation()
@@ -498,16 +535,34 @@ public actor NativeSSHSession {
                 try requireOK(found.hostKey.withUnsafeBytes {
                     ftssh_approve_host_key(native.pointer, $0.bindMemory(to: UInt8.self).baseAddress, found.hostKey.count)
                 })
+                let remainingMilliseconds = authenticationMilliseconds(until: deadline)
                 try requireOK(selected.user.withCString { user in selected.publicKey.withUnsafeBytes { key in
-                    ftssh_begin_authentication(native.pointer, user, selected.user.utf8.count,
-                                               key.bindMemory(to: UInt8.self).baseAddress, selected.publicKey.count)
+                    if continuation != nil {
+                        return ftssh_begin_publickey_interactive_authentication(native.pointer, user, selected.user.utf8.count,
+                            key.bindMemory(to: UInt8.self).baseAddress, selected.publicKey.count, remainingMilliseconds)
+                    }
+                    return ftssh_begin_authentication(native.pointer, user, selected.user.utf8.count,
+                        key.bindMemory(to: UInt8.self).baseAddress, selected.publicKey.count)
                 } })
                 var signed = false
+                var continuedAccount: NativeSSHInteractiveAccount?
                 while true {
                     try current(token, deadline)
                     let result = ftssh_authentication_step(native.pointer)
                     if result == FTSSH_OK { break }
-                    if result == FTSSH_SIGNATURE_NEEDED {
+                    if result == FTSSH_AUTH_PARTIAL_REQUIRED {
+                        guard signed, let continuation else { throw NativeSSHError.invalidChallenge }
+                        try await authority.validate(peer: found, identity: selected)
+                        try await validateForwardingPath()
+                        try current(token, deadline)
+                        // Retain and cancel this provider only after actual
+                        // first-factor evidence makes it part of this attempt.
+                        interactiveAuthentication = continuation
+                        continuedAccount = try await performInteractive(using: continuation, peer: found,
+                            expectedUser: selected.user, firstFactor: .publicKey(authority, found, selected),
+                            operation: token, deadline: deadline)
+                        break
+                    } else if result == FTSSH_SIGNATURE_NEEDED {
                         guard !signed else { throw NativeSSHError.invalidChallenge }
                         let bytes = try copyBytes(capacity: Int(FTSSH_CHALLENGE_CAPACITY), ftssh_copy_challenge)
                         let challenge = try NativeSSHChallenge(bytes: bytes, transportID: transportID, identity: selected)
@@ -528,11 +583,16 @@ public actor NativeSSHSession {
                         try await ready(directions: ftssh_directions(native.pointer), deadline: deadline)
                     }
                 }
-                try await authority.validate(peer: found, identity: selected)
+                guard signed else { throw NativeSSHError.invalidChallenge }
+                let completed: ForwardingWitness
+                if let continuation, let continuedAccount {
+                    completed = .publicKeyAndInteractive(authority, selected, continuation, continuedAccount, found)
+                } else { completed = .publicKey(authority, found, selected) }
+                try await completed.validate()
                 try await validateForwardingPath()
                 try current(token, deadline)
-                authorization = .publicKey(authority, found, selected); phase = .authenticated
-                return found
+                authorization = completed; phase = .authenticated
+                return .init(peer: found, usedKeyboardInteractive: continuedAccount != nil)
             } onCancel: { [weak self] in
                 authority.cancel(transportID: transportID)
                 Task { await self?.close() }
@@ -540,7 +600,8 @@ public actor NativeSSHSession {
         } catch {
             await close()
             if Task.isCancelled { throw CancellationError() }
-            if ContinuousClock.now >= deadline || error as? NativeSSHError == .timedOut {
+            if ContinuousClock.now >= deadline || error as? NativeSSHError == .timedOut
+                || error as? NativeSSHError == .native(Int32(FTSSH_AUTH_TIMEOUT)) {
                 throw NativeSSHError.authenticationTimedOut
             }
             throw error
@@ -650,68 +711,8 @@ public actor NativeSSHSession {
                     try await ready(directions: ftssh_directions(native.pointer), deadline: deadline)
                 }
                 let found = try copyPeer()
-                try await validateForwardingPath()
-                try current(token, deadline)
-                let account = try await authority.account(for: found)
-                try await authority.validate(peer: found, account: account)
-                try await validateForwardingPath()
-                try current(token, deadline)
-                try requireOK(found.hostKey.withUnsafeBytes {
-                    ftssh_approve_host_key(native.pointer, $0.bindMemory(to: UInt8.self).baseAddress, found.hostKey.count)
-                })
-                let remaining = ContinuousClock.now.duration(to: deadline).components
-                let milliseconds = max(1, min(120_000, remaining.seconds * 1_000
-                    + (remaining.attoseconds + 999_999_999_999_999) / 1_000_000_000_000_000))
-                try requireOK(native.beginInteractive(user: account.user, timeoutMilliseconds: UInt32(milliseconds)))
-                var answered: UInt32 = 0
-                while true {
-                    try current(token, deadline)
-                    let result = ftssh_authentication_step(native.pointer)
-                    if result == FTSSH_INTERACTIVE_FINISHED {
-                        let settled = await finishInteractive()
-                        try current(token, deadline)
-                        try requireOK(settled)
-                        break
-                    }
-                    if result == FTSSH_INTERACTIVE_NEEDED {
-                        var bytes = Data(count: Int(FTSSH_INTERACTIVE_CHALLENGE_CAPACITY))
-                        var length = 0, round: UInt32 = 0
-                        let copied = bytes.withUnsafeMutableBytes {
-                            ftssh_copy_interactive_challenge(native.pointer, $0.bindMemory(to: UInt8.self).baseAddress,
-                                Int(FTSSH_INTERACTIVE_CHALLENGE_CAPACITY), &length, &round)
-                        }
-                        try requireOK(copied)
-                        guard (0...bytes.count).contains(length), round == answered + 1 else { throw NativeSSHError.invalidChallenge }
-                        bytes.count = length
-                        let challenge = try NativeSSHInteractiveChallenge(bytes: bytes, round: round,
-                            transportID: transportID, account: account)
-                        try await authority.validate(peer: found, account: account)
-                        try await validateForwardingPath()
-                        try current(token, deadline)
-                        var responses = try await authority.responses(for: challenge, peer: found)
-                        defer { for index in responses.indices { responses[index].resetBytes(in: 0..<responses[index].count) } }
-                        try current(token, deadline)
-                        try await authority.validate(peer: found, account: account)
-                        try await validateForwardingPath()
-                        try current(token, deadline)
-                        var encoded = try challenge.encodedResponses(responses)
-                        defer { encoded.resetBytes(in: 0..<encoded.count) }
-                        try requireOK(encoded.withUnsafeBytes {
-                            ftssh_supply_interactive_responses(native.pointer, round,
-                                $0.bindMemory(to: UInt8.self).baseAddress, encoded.count)
-                        })
-                        answered = round
-                    } else {
-                        try requireAgain(result)
-                        // During worker ownership this is its notification pipe,
-                        // never the socket that the worker is currently driving.
-                        try await ready(directions: Int32(FTSSH_READ), deadline: deadline)
-                    }
-                }
-                guard answered > 0 else { throw NativeSSHError.invalidChallenge }
-                try await authority.validate(peer: found, account: account)
-                try await validateForwardingPath()
-                try current(token, deadline)
+                let account = try await performInteractive(using: authority, peer: found,
+                    expectedUser: nil, firstFactor: nil, operation: token, deadline: deadline)
                 authorization = .interactive(authority, found, account); phase = .authenticated
                 return found
             } onCancel: { [weak self] in
@@ -727,6 +728,95 @@ public actor NativeSSHSession {
             }
             throw error
         }
+    }
+
+    /// Both standalone and additional-factor exchanges keep the same bounded
+    /// worker ownership, prompt/response validation and off-executor join.
+    /// A continuation never probes "none", reapproves a host or resets time.
+    private func performInteractive(using authority: any NativeSSHInteractiveAuthentication, peer: NativeSSHPeer,
+                                    expectedUser: String?, firstFactor: ForwardingWitness?, operation token: UUID,
+                                    deadline: ContinuousClock.Instant) async throws -> NativeSSHInteractiveAccount {
+        try await firstFactor?.validate()
+        try await validateForwardingPath()
+        try current(token, deadline)
+        let account = try await authority.account(for: peer)
+        try current(token, deadline)
+        // SSH usernames are wire bytes. Canonical Unicode equivalence must not
+        // let the second provider select a differently encoded remote account.
+        if let expectedUser, !account.user.utf8.elementsEqual(expectedUser.utf8) {
+            throw NativeSSHError.invalidChallenge
+        }
+        try await validateInteractive(authority, peer: peer, account: account, firstFactor: firstFactor,
+            operation: token, deadline: deadline)
+        if firstFactor == nil {
+            try requireOK(peer.hostKey.withUnsafeBytes {
+                ftssh_approve_host_key(native.pointer, $0.bindMemory(to: UInt8.self).baseAddress, peer.hostKey.count)
+            })
+        }
+        try requireOK(native.beginInteractive(user: account.user,
+            timeoutMilliseconds: authenticationMilliseconds(until: deadline), continuing: firstFactor != nil))
+        var answered: UInt32 = 0
+        while true {
+            try current(token, deadline)
+            let result = ftssh_authentication_step(native.pointer)
+            if result == FTSSH_INTERACTIVE_FINISHED {
+                let settled = await finishInteractive()
+                try current(token, deadline)
+                try requireOK(settled)
+                break
+            }
+            if result == FTSSH_INTERACTIVE_NEEDED {
+                var bytes = Data(count: Int(FTSSH_INTERACTIVE_CHALLENGE_CAPACITY))
+                var length = 0, round: UInt32 = 0
+                let copied = bytes.withUnsafeMutableBytes {
+                    ftssh_copy_interactive_challenge(native.pointer, $0.bindMemory(to: UInt8.self).baseAddress,
+                        Int(FTSSH_INTERACTIVE_CHALLENGE_CAPACITY), &length, &round)
+                }
+                try requireOK(copied)
+                guard (0...bytes.count).contains(length), round == answered + 1 else { throw NativeSSHError.invalidChallenge }
+                bytes.count = length
+                let challenge = try NativeSSHInteractiveChallenge(bytes: bytes, round: round,
+                    transportID: transportID, account: account)
+                try await validateInteractive(authority, peer: peer, account: account, firstFactor: firstFactor,
+                    operation: token, deadline: deadline)
+                var responses = try await authority.responses(for: challenge, peer: peer)
+                defer { for index in responses.indices { responses[index].resetBytes(in: 0..<responses[index].count) } }
+                try current(token, deadline)
+                try await validateInteractive(authority, peer: peer, account: account, firstFactor: firstFactor,
+                    operation: token, deadline: deadline)
+                var encoded = try challenge.encodedResponses(responses)
+                defer { encoded.resetBytes(in: 0..<encoded.count) }
+                try requireOK(encoded.withUnsafeBytes {
+                    ftssh_supply_interactive_responses(native.pointer, round,
+                        $0.bindMemory(to: UInt8.self).baseAddress, encoded.count)
+                })
+                answered = round
+            } else {
+                try requireAgain(result)
+                // The worker's notification pipe, never its live SSH socket.
+                try await ready(directions: Int32(FTSSH_READ), deadline: deadline)
+            }
+        }
+        guard answered > 0 else { throw NativeSSHError.invalidChallenge }
+        try await validateInteractive(authority, peer: peer, account: account, firstFactor: firstFactor,
+            operation: token, deadline: deadline)
+        return account
+    }
+
+    private func validateInteractive(_ authority: any NativeSSHInteractiveAuthentication, peer: NativeSSHPeer,
+                                     account: NativeSSHInteractiveAccount, firstFactor: ForwardingWitness?,
+                                     operation token: UUID, deadline: ContinuousClock.Instant) async throws {
+        try await firstFactor?.validate()
+        try current(token, deadline)
+        try await authority.validate(peer: peer, account: account)
+        try await validateForwardingPath()
+        try current(token, deadline)
+    }
+
+    private func authenticationMilliseconds(until deadline: ContinuousClock.Instant) -> UInt32 {
+        let remaining = ContinuousClock.now.duration(to: deadline).components
+        return UInt32(max(1, min(120_000, remaining.seconds * 1_000
+            + (remaining.attoseconds + 999_999_999_999_999) / 1_000_000_000_000_000)))
     }
 
     /// Explicit remote side effect. Does not occur as part of authenticate/import.
@@ -1115,9 +1205,9 @@ private final class NativeHandle: @unchecked Sendable {
     private(set) var interactiveOwned = false
     private var interactiveFinishing = false
     init(_ pointer: OpaquePointer) { self.pointer = pointer }
-    func beginInteractive(user: String, timeoutMilliseconds: UInt32) -> Int32 {
+    func beginInteractive(user: String, timeoutMilliseconds: UInt32, continuing: Bool = false) -> Int32 {
         guard !interactiveOwned else { return Int32(FTSSH_STATE) }
-        let result = user.withCString {
+        let result = continuing ? ftssh_continue_interactive_authentication(pointer) : user.withCString {
             ftssh_begin_interactive_authentication(pointer, $0, user.utf8.count, timeoutMilliseconds)
         }
         if result == FTSSH_OK { interactiveOwned = true }

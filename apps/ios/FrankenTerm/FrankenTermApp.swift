@@ -3387,10 +3387,13 @@ private struct MachineWorkspaceView: View {
             let hop = hops.first
             let promptingJump = hops.contains { hop in
                 let usable = local.routes.first(where: { $0.routeID == hop.id })?.usableCredentialIDs ?? []
-                return WorkspaceSSHAuthenticationChoice.choices(for: hop, usableCredentialIDs: usable).contains(where: \.requiresForegroundPrompt)
+                return hop.authenticationMethods.contains(.keyboardInteractive)
+                    || WorkspaceSSHAuthenticationChoice.choices(for: hop, usableCredentialIDs: usable).contains(where: \.requiresForegroundPrompt)
             }
             routes.append(.init(id: id, credentialIDs: readiness.usableCredentialIDs, host: route.host, port: route.port,
-                                authenticationChoices: choices, promptingJump: promptingJump,
+                                authenticationChoices: choices,
+                                allowsKeyboardInteractiveContinuation: route.authenticationMethods.contains(.keyboardInteractive),
+                                promptingJump: promptingJump,
                                 mux: route.mode == "frankenterm_mux",
                                 sessionCreation: route.mode == "frankenterm_mux" ? .existingOnly
                                     : (route.sessionCreation == "manual" ? .manual : .onSelect),
