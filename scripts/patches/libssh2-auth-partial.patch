@@ -1,0 +1,211 @@
+diff --git a/include/libssh2.h b/include/libssh2.h
+--- a/include/libssh2.h
++++ b/include/libssh2.h
+@@ -751,6 +751,34 @@
+                            LIBSSH2_USERAUTH_PUBLICKEY_SIGN_FUNC
+                                ((*sign_callback)),
+                            void **abstract);
++
++/* FrankenTerm additive authentication evidence, version 1. Stock authentication
++ * return values are unchanged. This is not an upstream libssh2 API.
++ * A failure snapshot exists only for the final response to a SIGNED public-key
++ * request. It is invalidated by the next public-key attempt and consumed by
++ * failure(). Calls require the same exclusive session ownership as userauth.
++ */
++#define LIBSSH2_FRANKENTERM_AUTH_EVIDENCE_VERSION 1
++#define LIBSSH2_FRANKENTERM_AUTH_METHODS_MAX 1024
++
++LIBSSH2_API unsigned int libssh2_frankenterm_auth_evidence_version(void);
++LIBSSH2_API libssh2_uint64_t
++libssh2_frankenterm_publickey_attempt(LIBSSH2_SESSION *session);
++/* Consumes proof of a valid unsigned refusal with partial_success=false.
++ * Returns that request's attempt number, or zero; never authorizes MFA. */
++LIBSSH2_API libssh2_uint64_t
++libssh2_frankenterm_publickey_unsigned_refusal(LIBSSH2_SESSION *session);
++/* Returns 1 for a copied snapshot, 0 for none, or a negative argument/capacity
++ * error. methods_capacity includes its trailing NUL. Any well-formed call
++ * consumes the snapshot, even when capacity is insufficient. No borrowed
++ * pointers, allocation, network I/O, or last-error mutation occurs.
++ */
++LIBSSH2_API int
++libssh2_frankenterm_publickey_failure(LIBSSH2_SESSION *session,
++                                    libssh2_uint64_t *attempt,
++                                    int *partial_success,
++                                    char *methods, size_t methods_capacity,
++                                    size_t *methods_length);
+ 
+ LIBSSH2_API int
+ libssh2_userauth_hostbased_fromfile_ex(LIBSSH2_SESSION *session,
+diff --git a/src/libssh2_priv.h b/src/libssh2_priv.h
+--- a/src/libssh2_priv.h
++++ b/src/libssh2_priv.h
+@@ -846,6 +846,16 @@
+     unsigned char *userauth_pblc_b;
+     packet_requirev_state_t userauth_pblc_packet_requirev_state;
+ 
++    /* Bounded, one-use evidence from the final signed public-key response. */
++    libssh2_uint64_t ft_auth_attempt;
++    libssh2_uint64_t ft_auth_failure_attempt;
++    libssh2_uint64_t ft_auth_unsigned_refusal_attempt;
++    int ft_auth_attempt_exhausted;
++    int ft_auth_failure_valid;
++    int ft_auth_partial_success;
++    size_t ft_auth_methods_length;
++    char ft_auth_methods[LIBSSH2_FRANKENTERM_AUTH_METHODS_MAX + 1];
++
+     /* State variables used in libssh2_userauth_keyboard_interactive_ex() */
+     libssh2_nonblocking_states userauth_kybd_state;
+     unsigned char *userauth_kybd_data;
+diff --git a/src/userauth.c b/src/userauth.c
+--- a/src/userauth.c
++++ b/src/userauth.c
+@@ -1512,6 +1512,115 @@
+     return rc;
+ }
+ 
++/* This additive API deliberately preserves all upstream userauth return codes.
++ * Never expose the response to "none", an unsigned key offer, or a signing /
++ * transport error as signed-key evidence. A separate consuming marker proves
++ * unsigned refusal only when its bounded packet has partial_success=false.
++ */
++static void
++frankenterm_clear_publickey_failure(LIBSSH2_SESSION *session)
++{
++    session->ft_auth_failure_valid = 0;
++    session->ft_auth_failure_attempt = 0;
++    session->ft_auth_unsigned_refusal_attempt = 0;
++    session->ft_auth_partial_success = 0;
++    session->ft_auth_methods_length = 0;
++    memset(session->ft_auth_methods, 0, sizeof(session->ft_auth_methods));
++}
++
++static void
++frankenterm_record_publickey_failure(LIBSSH2_SESSION *session,
++                                    const unsigned char *packet,
++                                    size_t packet_length, int signed_request)
++{
++    size_t length, i;
++    frankenterm_clear_publickey_failure(session);
++    if(!packet || packet_length < 6 ||
++       packet[0] != SSH_MSG_USERAUTH_FAILURE ||
++       !session->ft_auth_attempt || session->ft_auth_attempt_exhausted)
++        return;
++    length = _libssh2_ntohu32(packet + 1);
++    /* Subtract only after the minimum extent check; never index using an
++     * untrusted SSH string length before checking the complete packet. */
++    if(length > LIBSSH2_FRANKENTERM_AUTH_METHODS_MAX ||
++       length != packet_length - 6)
++        return;
++    for(i = 0; i < length; i++) {
++        unsigned char value = packet[5 + i];
++        if(value < 33 || value > 126 ||
++           (value == ',' && (!i || packet[4 + i] == ',')))
++            return;
++    }
++    if(length && packet[4 + length] == ',')
++        return;
++    if(!signed_request) {
++        if(!packet[5 + length])
++            session->ft_auth_unsigned_refusal_attempt =
++                session->ft_auth_attempt;
++        return;
++    }
++    memcpy(session->ft_auth_methods, packet + 5, length);
++    session->ft_auth_methods[length] = 0;
++    session->ft_auth_methods_length = length;
++    /* SSH boolean is false for zero and true for any nonzero byte. */
++    session->ft_auth_partial_success = packet[5 + length] != 0;
++    session->ft_auth_failure_attempt = session->ft_auth_attempt;
++    session->ft_auth_failure_valid = 1;
++}
++
++LIBSSH2_API unsigned int
++libssh2_frankenterm_auth_evidence_version(void)
++{
++    return LIBSSH2_FRANKENTERM_AUTH_EVIDENCE_VERSION;
++}
++
++LIBSSH2_API libssh2_uint64_t
++libssh2_frankenterm_publickey_attempt(LIBSSH2_SESSION *session)
++{
++    return session ? session->ft_auth_attempt : 0;
++}
++
++LIBSSH2_API libssh2_uint64_t
++libssh2_frankenterm_publickey_unsigned_refusal(LIBSSH2_SESSION *session)
++{
++    libssh2_uint64_t attempt;
++    if(!session)
++        return 0;
++    attempt = session->ft_auth_unsigned_refusal_attempt;
++    session->ft_auth_unsigned_refusal_attempt = 0;
++    return attempt;
++}
++
++LIBSSH2_API int
++libssh2_frankenterm_publickey_failure(LIBSSH2_SESSION *session,
++                                    libssh2_uint64_t *attempt,
++                                    int *partial_success,
++                                    char *methods, size_t methods_capacity,
++                                    size_t *methods_length)
++{
++    int result;
++    if(!session || !attempt || !partial_success ||
++       !methods || !methods_capacity || !methods_length)
++        return LIBSSH2_ERROR_INVAL;
++    *attempt = 0;
++    *partial_success = 0;
++    *methods_length = 0;
++    methods[0] = 0;
++    result = session->ft_auth_failure_valid;
++    if(result) {
++        *attempt = session->ft_auth_failure_attempt;
++        *partial_success = session->ft_auth_partial_success;
++        *methods_length = session->ft_auth_methods_length;
++        if(methods_capacity <= session->ft_auth_methods_length)
++            result = LIBSSH2_ERROR_BUFFER_TOO_SMALL;
++        else
++            memcpy(methods, session->ft_auth_methods,
++                   session->ft_auth_methods_length + 1);
++    }
++    frankenterm_clear_publickey_failure(session);
++    return result;
++}
++
+ int
+ _libssh2_userauth_publickey(LIBSSH2_SESSION *session,
+                             const char *username,
+@@ -1535,6 +1644,12 @@
+ 
+     if(session->userauth_pblc_state == libssh2_NB_state_idle) {
+ 
++        frankenterm_clear_publickey_failure(session);
++        if(session->ft_auth_attempt == ~(libssh2_uint64_t)0)
++            session->ft_auth_attempt_exhausted = 1;
++        else
++            session->ft_auth_attempt++;
++
+         /*
+          * The call to _libssh2_ntohu32 later relies on pubkeydata having at
+          * least 4 valid bytes containing the length of the method name.
+@@ -1706,6 +1821,10 @@
+ 
+         if(session->userauth_pblc_data[0] == SSH_MSG_USERAUTH_FAILURE) {
+             /* This public key is not allowed for this user on this server */
++            frankenterm_record_publickey_failure(session,
++                                                session->userauth_pblc_data,
++                                                session->userauth_pblc_data_len,
++                                                0);
+             LIBSSH2_FREE(session, session->userauth_pblc_data);
+             session->userauth_pblc_data = NULL;
+             LIBSSH2_FREE(session, session->userauth_pblc_packet);
+@@ -1891,6 +2010,9 @@
+     }
+ 
+     /* This public key is not allowed for this user on this server */
++    frankenterm_record_publickey_failure(session,
++                                        session->userauth_pblc_data,
++                                        session->userauth_pblc_data_len, 1);
+     LIBSSH2_FREE(session, session->userauth_pblc_data);
+     session->userauth_pblc_data = NULL;
+     session->userauth_pblc_state = libssh2_NB_state_idle;
