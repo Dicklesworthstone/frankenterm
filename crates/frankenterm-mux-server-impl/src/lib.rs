@@ -1,3 +1,8 @@
+// A client domain's layout snapshot points back at its client, so proving
+// ClientDomain: Send walks that cycle through every client field. Let rustc
+// complete the proof without suppressing the lint.
+#![recursion_limit = "256"]
+
 use anyhow::Context;
 use base64::Engine as _;
 use config::{ConfigHandle, SshMultiplexing};
