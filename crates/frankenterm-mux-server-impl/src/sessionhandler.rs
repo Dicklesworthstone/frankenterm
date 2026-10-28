@@ -7394,7 +7394,8 @@ fn sample_pane_identity(
     });
     // This check follows all external pane callbacks. An old-generation
     // read is safe to discard; it must never describe a replacement as live.
-    let still_current = mux.capture_current_pane(registration.pane_id())
+    let still_current = mux
+        .capture_current_pane(registration.pane_id())
         .is_some_and(|current| current.same_registration(registration));
     if !still_current {
         return Ok(codec::PaneIdentityOutcomeV1::PaneGone);
@@ -17524,9 +17525,8 @@ mod tests {
         let expected_registration = mux.capture_current_pane(7).unwrap().wire_identity();
         let expected_incarnation = mux.topology_snapshot_authority().unwrap().0;
         let (sender, captured) = capturing_sender();
-        let mut handler = SessionHandler::new_for_session(
-            sender, SessionOwner::new(Arc::clone(&mux)),
-        ).unwrap();
+        let mut handler =
+            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux))).unwrap();
         for pane_id in [7, 8, 9, 10] {
             handler.process_one(DecodedPdu {
                 serial: 500 + pane_id as u64,
@@ -17539,15 +17539,20 @@ mod tests {
             assert_eq!(response.pane_id, pane_id);
             response.validate().unwrap();
             match pane_id {
-                7 => assert_eq!(response.outcome, codec::PaneIdentityOutcomeV1::Available {
-                    identity: codec::PaneIdentityV1 {
-                        session_incarnation: expected_incarnation,
-                        durable_pane_id: [0x39; 16],
-                        pane_registration: ReliablePaneRegistrationIdentityV1::from_bytes(expected_registration),
-                    },
-                    // The default composed facts are deliberately not authority.
-                    render_facts: None,
-                }),
+                7 => assert_eq!(
+                    response.outcome,
+                    codec::PaneIdentityOutcomeV1::Available {
+                        identity: codec::PaneIdentityV1 {
+                            session_incarnation: expected_incarnation,
+                            durable_pane_id: [0x39; 16],
+                            pane_registration: ReliablePaneRegistrationIdentityV1::from_bytes(
+                                expected_registration
+                            ),
+                        },
+                        // The default composed facts are deliberately not authority.
+                        render_facts: None,
+                    }
+                ),
                 8 | 9 => assert_eq!(response.outcome, codec::PaneIdentityOutcomeV1::Unavailable),
                 10 => assert_eq!(response.outcome, codec::PaneIdentityOutcomeV1::PaneGone),
                 _ => unreachable!(),
@@ -17569,9 +17574,8 @@ mod tests {
         mux.add_pane(&old).unwrap();
         let old_registration = mux.capture_current_pane(7).unwrap();
         let (sender, captured) = capturing_sender();
-        let mut handler = SessionHandler::new_for_session(
-            sender, SessionOwner::new(Arc::clone(&mux)),
-        ).unwrap();
+        let mut handler =
+            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux))).unwrap();
         handler.process_one(DecodedPdu {
             serial: 501,
             pdu: Pdu::GetPaneIdentityV1(codec::GetPaneIdentityV1 { pane_id: 7 }),
@@ -17583,7 +17587,10 @@ mod tests {
         let replacement: Arc<dyn Pane> = Arc::new(replacement);
         mux.add_pane(&replacement).unwrap();
         let current_registration = mux.capture_current_pane(7).unwrap();
-        assert_ne!(old_registration.wire_identity(), current_registration.wire_identity());
+        assert_ne!(
+            old_registration.wire_identity(),
+            current_registration.wire_identity()
+        );
         tick_until_response(&executor, &captured, 1);
         let Pdu::GetPaneIdentityV1Response(response) = take_response(&captured).pdu else {
             panic!("expected identity refusal for retired registration");
@@ -17593,7 +17600,10 @@ mod tests {
         let codec::PaneIdentityOutcomeV1::Available { identity, .. } = fresh else {
             panic!("fresh request must resolve the new registration");
         };
-        assert_eq!(identity.pane_registration.as_bytes(), current_registration.wire_identity());
+        assert_eq!(
+            identity.pane_registration.as_bytes(),
+            current_registration.wire_identity()
+        );
         assert_eq!(identity.durable_pane_id, [0x39; 16]);
     }
 

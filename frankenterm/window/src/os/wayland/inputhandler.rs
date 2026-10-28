@@ -737,13 +737,11 @@ mod tests {
     #[test]
     fn ime_enable_waits_for_both_protocol_and_keyboard_focus_in_either_order() {
         let mut keyboard_first = InputFocus::default();
-        assert!(
-            keyboard_first
-                .keyboard(Some(target(1)))
-                .unwrap()
-                .current
-                .is_none()
-        );
+        assert!(keyboard_first
+            .keyboard(Some(target(1)))
+            .unwrap()
+            .current
+            .is_none());
         assert!(!keyboard_first.commit(Some("too early".into())));
         assert_eq!(
             keyboard_first.enter(Some(target(1))).current,

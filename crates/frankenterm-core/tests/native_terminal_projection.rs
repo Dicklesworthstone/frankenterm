@@ -195,7 +195,7 @@ fn native_parser_cells_modes_and_metadata_survive_wire_publication() {
         assert!(frame.len() <= wire::MAX_FRAME_BYTES);
         match wire::decode_server(frame).unwrap().message {
             wire::ServerMessage::SnapshotChunk(chunk) => {
-                actual.extend_from_slice(chunk.patch.lines.as_slice())
+                actual.extend_from_slice(chunk.patch.lines.as_slice());
             }
             wire::ServerMessage::SnapshotEnd(end) => assert_eq!(end.sequence, expected_sequence),
             wire::ServerMessage::SnapshotStart(_) => {}

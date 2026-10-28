@@ -312,7 +312,9 @@ impl ByteCapture {
         // are fixed below, never remote or user-provided command material.
         let command = format!(
             "stty raw -echo; : > '{}'; dd bs=1 count=1 of='{}' 2>/dev/null; stty sane; : > '{}'\r",
-            ready.display(), bytes.display(), done.display()
+            ready.display(),
+            bytes.display(),
+            done.display()
         );
         probe.write(pane, command.as_bytes());
         wait_until("the raw byte reader", || {
@@ -595,9 +597,10 @@ fn lost_or_missing_selected_panes_end_without_typing_into_a_survivor() {
         session.join().expect("session thread"),
         Err(SessionError::PaneNotFound(id)) if id == first.id
     ));
-    wait_until("the still-current pane's original size after a missing target", || {
-        (size_of(&mut probe, second) == Some(original)).then_some(())
-    });
+    wait_until(
+        "the still-current pane's original size after a missing target",
+        || (size_of(&mut probe, second) == Some(original)).then_some(()),
+    );
     probe.write(second, b"Z");
     missing.expect(b'Z');
     probe.close();

@@ -14469,7 +14469,10 @@ pub enum PaneIdentityError {
 impl PaneIdentityV1 {
     pub fn validate(&self) -> Result<(), PaneIdentityError> {
         for (field, reserved) in [
-            ("session incarnation", self.session_incarnation.as_bytes() == [0; 16]),
+            (
+                "session incarnation",
+                self.session_incarnation.as_bytes() == [0; 16],
+            ),
             ("durable pane UUID", self.durable_pane_id == [0; 16]),
             ("pane registration", self.pane_registration.is_reserved()),
         ] {
@@ -14508,7 +14511,10 @@ impl PaneRenderMetadataV1 {
             &self.palette.scrollbar_thumb,
             &self.palette.split,
         ]) {
-            if ![color.0, color.1, color.2, color.3].iter().all(|channel| channel.is_finite()) {
+            if ![color.0, color.1, color.2, color.3]
+                .iter()
+                .all(|channel| channel.is_finite())
+            {
                 return Err(PaneIdentityError::InvalidPalette);
             }
         }
@@ -14518,7 +14524,11 @@ impl PaneRenderMetadataV1 {
 
 impl GetPaneIdentityV1Response {
     pub fn validate(&self) -> Result<(), PaneIdentityError> {
-        if let PaneIdentityOutcomeV1::Available { identity, render_facts } = &self.outcome {
+        if let PaneIdentityOutcomeV1::Available {
+            identity,
+            render_facts,
+        } = &self.outcome
+        {
             identity.validate()?;
             if let Some(facts) = render_facts {
                 facts.validate()?;
@@ -14571,9 +14581,9 @@ where
         {
             let mut colors = [frankenterm_term::color::SrgbaTuple::default(); 265];
             for (index, color) in colors.iter_mut().enumerate() {
-                *color = sequence.next_element()?.ok_or_else(|| {
-                    serde::de::Error::invalid_length(index, &self)
-                })?;
+                *color = sequence
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(index, &self))?;
             }
             Ok(ColorPalette {
                 colors: frankenterm_term::color::Palette256(std::array::from_fn(|i| colors[i])),
@@ -14592,9 +14602,15 @@ where
     deserializer.deserialize_tuple(265, PaletteVisitor)
 }
 
-fn deserialize_get_pane_identity_v1(data: &[u8], is_compressed: bool) -> Result<GetPaneIdentityV1, Error> {
+fn deserialize_get_pane_identity_v1(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<GetPaneIdentityV1, Error> {
     deserialize_exact_payload_with_limit(
-        data, is_compressed, "GetPaneIdentityV1", MAX_PANE_IDENTITY_REQUEST_DECOMPRESSED_BYTES,
+        data,
+        is_compressed,
+        "GetPaneIdentityV1",
+        MAX_PANE_IDENTITY_REQUEST_DECOMPRESSED_BYTES,
     )
 }
 
@@ -14603,7 +14619,10 @@ fn deserialize_get_pane_identity_v1_response(
     is_compressed: bool,
 ) -> Result<GetPaneIdentityV1Response, Error> {
     let response: GetPaneIdentityV1Response = deserialize_exact_payload_with_limit(
-        data, is_compressed, "GetPaneIdentityV1Response", MAX_PANE_IDENTITY_RESPONSE_DECOMPRESSED_BYTES,
+        data,
+        is_compressed,
+        "GetPaneIdentityV1Response",
+        MAX_PANE_IDENTITY_RESPONSE_DECOMPRESSED_BYTES,
     )?;
     response.validate()?;
     Ok(response)
@@ -24767,7 +24786,11 @@ mod test {
                         physical_top: 76,
                         ..Default::default()
                     },
-                    cursor: StableCursorPosition { x: 4, y: 78, ..Default::default() },
+                    cursor: StableCursorPosition {
+                        x: 4,
+                        y: 78,
+                        ..Default::default()
+                    },
                     mouse_grabbed: true,
                     alt_screen_active: false,
                     bracketed_paste: true,
@@ -24791,10 +24814,12 @@ mod test {
             Pdu::GetPaneIdentityV1Response(rich),
             Pdu::GetPaneIdentityV1Response(no_facts),
             Pdu::GetPaneIdentityV1Response(GetPaneIdentityV1Response {
-                pane_id: 42, outcome: PaneIdentityOutcomeV1::PaneGone,
+                pane_id: 42,
+                outcome: PaneIdentityOutcomeV1::PaneGone,
             }),
             Pdu::GetPaneIdentityV1Response(GetPaneIdentityV1Response {
-                pane_id: 42, outcome: PaneIdentityOutcomeV1::Unavailable,
+                pane_id: 42,
+                outcome: PaneIdentityOutcomeV1::Unavailable,
             }),
         ];
         for pdu in pdus {
@@ -24814,17 +24839,25 @@ mod test {
     }
 
     #[test]
-    fn pane_identity_rejects_reserved_authority_and_invalid_metadata_before_encode_and_after_decode() {
+    fn pane_identity_rejects_reserved_authority_and_invalid_metadata_before_encode_and_after_decode(
+    ) {
         for case in 0..7 {
             let mut reply = identity_reply_fixture();
-            let PaneIdentityOutcomeV1::Available { identity, render_facts } = &mut reply.outcome else {
+            let PaneIdentityOutcomeV1::Available {
+                identity,
+                render_facts,
+            } = &mut reply.outcome
+            else {
                 unreachable!();
             };
             let facts = render_facts.as_mut().unwrap();
             match case {
                 0 => identity.session_incarnation = MuxSessionIncarnation::from_bytes([0; 16]),
                 1 => identity.durable_pane_id = [0; 16],
-                2 => identity.pane_registration = ReliablePaneRegistrationIdentityV1::from_bytes([0; 16]),
+                2 => {
+                    identity.pane_registration =
+                        ReliablePaneRegistrationIdentityV1::from_bytes([0; 16])
+                }
                 3 => facts.seqno = SequenceNo::MAX,
                 4 => facts.dimensions.cols = 0,
                 5 => facts.dimensions.physical_top = StableRowIndex::MAX,
@@ -24832,12 +24865,21 @@ mod test {
                 _ => unreachable!(),
             }
             let mut encoded = Vec::new();
-            assert!(Pdu::GetPaneIdentityV1Response(reply.clone()).encode(&mut encoded, 23).is_err());
+            assert!(Pdu::GetPaneIdentityV1Response(reply.clone())
+                .encode(&mut encoded, 23)
+                .is_err());
             assert!(encoded.is_empty());
             for mode in [CompressionMode::Never, CompressionMode::Always] {
                 let (body, compressed) = serialize_with_mode(&reply, mode).unwrap();
                 let mut frame = Vec::new();
-                encode_raw(GetPaneIdentityV1Response::IDENT, 23, &body, compressed, &mut frame).unwrap();
+                encode_raw(
+                    GetPaneIdentityV1Response::IDENT,
+                    23,
+                    &body,
+                    compressed,
+                    &mut frame,
+                )
+                .unwrap();
                 assert!(Pdu::decode(frame.as_slice()).is_err(), "case {case}");
             }
         }
@@ -24847,14 +24889,29 @@ mod test {
     fn pane_identity_exact_decode_rejects_trailing_truncated_and_oversized_bodies() {
         let request = GetPaneIdentityV1 { pane_id: 42 };
         for (ident, body) in [
-            (GetPaneIdentityV1::IDENT, serialize_with_mode(&request, CompressionMode::Never).unwrap().0),
-            (GetPaneIdentityV1Response::IDENT, serialize_with_mode(&identity_reply_fixture(), CompressionMode::Never).unwrap().0),
+            (
+                GetPaneIdentityV1::IDENT,
+                serialize_with_mode(&request, CompressionMode::Never)
+                    .unwrap()
+                    .0,
+            ),
+            (
+                GetPaneIdentityV1Response::IDENT,
+                serialize_with_mode(&identity_reply_fixture(), CompressionMode::Never)
+                    .unwrap()
+                    .0,
+            ),
         ] {
-            for invalid in [body[..body.len() - 1].to_vec(), [body.as_slice(), &[0]].concat()] {
+            for invalid in [
+                body[..body.len() - 1].to_vec(),
+                [body.as_slice(), &[0]].concat(),
+            ] {
                 for compressed in [false, true] {
                     let encoded = if compressed {
                         zstd::encode_all(invalid.as_slice(), 0).unwrap()
-                    } else { invalid.clone() };
+                    } else {
+                        invalid.clone()
+                    };
                     let mut frame = Vec::new();
                     encode_raw(ident, 23, &encoded, compressed, &mut frame).unwrap();
                     assert!(Pdu::decode(frame.as_slice()).is_err());
@@ -24862,14 +24919,24 @@ mod test {
             }
         }
         for (ident, plain_cap, compressed_cap) in [
-            (GetPaneIdentityV1::IDENT, MAX_PANE_IDENTITY_REQUEST_DECOMPRESSED_BYTES, MAX_PANE_IDENTITY_REQUEST_ZSTD_ENCODED_BYTES),
-            (GetPaneIdentityV1Response::IDENT, MAX_PANE_IDENTITY_RESPONSE_DECOMPRESSED_BYTES, MAX_PANE_IDENTITY_RESPONSE_ZSTD_ENCODED_BYTES),
+            (
+                GetPaneIdentityV1::IDENT,
+                MAX_PANE_IDENTITY_REQUEST_DECOMPRESSED_BYTES,
+                MAX_PANE_IDENTITY_REQUEST_ZSTD_ENCODED_BYTES,
+            ),
+            (
+                GetPaneIdentityV1Response::IDENT,
+                MAX_PANE_IDENTITY_RESPONSE_DECOMPRESSED_BYTES,
+                MAX_PANE_IDENTITY_RESPONSE_ZSTD_ENCODED_BYTES,
+            ),
         ] {
             for (compressed, cap) in [(false, plain_cap), (true, compressed_cap)] {
                 let mut frame = Vec::new();
                 encode_raw(ident, 23, &vec![0; cap + 1], compressed, &mut frame).unwrap();
                 let error = Pdu::decode(frame.as_slice()).unwrap_err();
-                assert!(error.downcast_ref::<PduEncodedBodyLimitExceeded>().is_some());
+                assert!(error
+                    .downcast_ref::<PduEncodedBodyLimitExceeded>()
+                    .is_some());
             }
         }
     }
@@ -25927,9 +25994,21 @@ mod test {
                 | 115
                 | 116 => Class::StateSync,
                 24 | 25 | 79 | 80 | 84 | 85 | 91 | 92 | 114 => Class::Render,
-                22 | 31 | 41 | 46 | 51 | 52 | 60 | 61 | 77 | 93 | 102 | 104..=109 | 112 | 117 | 118 => {
-                    Class::Query
-                }
+                22
+                | 31
+                | 41
+                | 46
+                | 51
+                | 52
+                | 60
+                | 61
+                | 77
+                | 93
+                | 102
+                | 104..=109
+                | 112
+                | 117
+                | 118 => Class::Query,
                 23 | 32 | 42 | 47 | 78 | 94 | 103 | 113 => Class::BulkData,
                 ident => panic!("PDU {} is missing from the semantic-class census", ident),
             };

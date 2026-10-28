@@ -18832,7 +18832,10 @@ mod tests {
         // An already-published coherent image remains readable while the
         // terminal is busy, without taking another terminal acquisition.
         let _terminal_guard = pane.terminal.lock();
-        assert!(Arc::ptr_eq(&pane.coherent_render_facts().unwrap(), &coherent));
+        assert!(Arc::ptr_eq(
+            &pane.coherent_render_facts().unwrap(),
+            &coherent
+        ));
     }
 
     #[test]

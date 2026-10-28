@@ -155,8 +155,7 @@ impl ControlScanner {
             State::Prefix(held) => {
                 if (CONTROL_PREFIX.starts_with(held)
                     && CONTROL_PREFIX.get(held.len()) == Some(&byte))
-                    || (PASTE_START.starts_with(held)
-                        && PASTE_START.get(held.len()) == Some(&byte))
+                    || (PASTE_START.starts_with(held) && PASTE_START.get(held.len()) == Some(&byte))
                 {
                     held.push(byte);
                     if held.as_slice() == CONTROL_PREFIX {
@@ -504,7 +503,10 @@ mod tests {
             head.extend_from_slice(&PASTE_END[..split]);
             assert_eq!(scanner.feed(&head), vec![data(&head)]);
             assert_eq!(parser.parse_as_vec(&head, true), Vec::new());
-            assert!(!scanner.is_pending(), "paste bytes have already been forwarded");
+            assert!(
+                !scanner.is_pending(),
+                "paste bytes have already been forwarded"
+            );
             assert_eq!(scanner.release_after(), None);
             assert!(scanner.on_idle(Duration::from_secs(60)).is_empty());
             assert!(parser.parse_as_vec(&[], false).is_empty());

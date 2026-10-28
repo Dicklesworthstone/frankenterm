@@ -3,12 +3,12 @@
 
 use serde::de::DeserializeOwned;
 
-use frankenterm_terminal_wire::{
-    BrowserSession, ClientMessage, Dimensions, LeaseDisposition, PaneEventKind,
-    Scope, ServerMessage, WireError, WireU64, Id, MAX_FRAME_BYTES,
-    decode_client, decode_server, encode_server,
-};
 use crate::terminal_model::{ApplyOutcome, TerminalModel, bounded_json};
+use frankenterm_terminal_wire::{
+    BrowserSession, ClientMessage, Dimensions, Id, LeaseDisposition, MAX_FRAME_BYTES,
+    PaneEventKind, Scope, ServerMessage, WireError, WireU64, decode_client, decode_server,
+    encode_server,
+};
 
 #[derive(Debug)]
 pub struct TerminalClient {
@@ -17,7 +17,9 @@ pub struct TerminalClient {
 }
 
 fn decode_host_value<T: DeserializeOwned>(json: &str) -> Result<T, WireError> {
-    if json.len() > MAX_FRAME_BYTES { return Err(WireError::FrameTooLarge); }
+    if json.len() > MAX_FRAME_BYTES {
+        return Err(WireError::FrameTooLarge);
+    }
     serde_json::from_str(json).map_err(|_| WireError::Malformed)
 }
 
@@ -27,10 +29,15 @@ impl TerminalClient {
         let ClientMessage::Hello(hello) = frame.message else {
             return Err(WireError::NotNegotiated);
         };
-        Ok(Self { inner: BrowserSession::new(hello)?, model: TerminalModel::new() })
+        Ok(Self {
+            inner: BrowserSession::new(hello)?,
+            model: TerminalModel::new(),
+        })
     }
 
-    pub fn hello_frame(&mut self) -> Result<Vec<u8>, WireError> { self.inner.hello_frame() }
+    pub fn hello_frame(&mut self) -> Result<Vec<u8>, WireError> {
+        self.inner.hello_frame()
+    }
 
     pub fn accept_welcome(&mut self, bytes: &[u8]) -> Result<(), WireError> {
         self.inner.accept_welcome(bytes)
@@ -84,15 +91,20 @@ impl TerminalClient {
                     changes_codec = true;
                 }
                 PaneEventKind::Resized => {
-                    candidate.update_dimensions(&value.scope,
-                        value.dimensions.clone().ok_or(WireError::InvalidState)?)?;
+                    candidate.update_dimensions(
+                        &value.scope,
+                        value.dimensions.clone().ok_or(WireError::InvalidState)?,
+                    )?;
                     changes_codec = true;
                 }
                 _ => {}
             },
             ServerMessage::LeaseState(value) => {
                 if let Some(fence) = value.fence {
-                    let active = matches!(value.disposition, LeaseDisposition::Granted | LeaseDisposition::Renewed);
+                    let active = matches!(
+                        value.disposition,
+                        LeaseDisposition::Granted | LeaseDisposition::Renewed
+                    );
                     candidate.record_lease(&value.scope, fence, active)?;
                     changes_codec = true;
                 }
@@ -100,7 +112,12 @@ impl TerminalClient {
             _ => {}
         }
         let outcome = self.model.ingest(frame.message, bytes.len(), now_ms)?;
-        if changes_codec && !matches!(&outcome, ApplyOutcome::Duplicate { .. } | ApplyOutcome::Staged { .. }) {
+        if changes_codec
+            && !matches!(
+                &outcome,
+                ApplyOutcome::Duplicate { .. } | ApplyOutcome::Staged { .. }
+            )
+        {
             self.inner = candidate;
         }
         Ok(outcome)
@@ -110,7 +127,9 @@ impl TerminalClient {
         bounded_json(&self.ingest_server(bytes, now_ms)?)
     }
 
-    pub fn model(&self) -> &TerminalModel { &self.model }
+    pub fn model(&self) -> &TerminalModel {
+        &self.model
+    }
 
     /// Even generic ACK construction is checked against the actual installed
     /// model. Host-supplied counters cannot manufacture a baseline.
@@ -120,7 +139,9 @@ impl TerminalClient {
     }
 
     fn encode_message(&mut self, message: ClientMessage) -> Result<Vec<u8>, WireError> {
-        if let ClientMessage::AppliedAck(ack) = &message { self.model.validate_ack(ack)?; }
+        if let ClientMessage::AppliedAck(ack) = &message {
+            self.model.validate_ack(ack)?;
+        }
         self.model.validate_recovery_request(&message)?;
         let mut candidate = self.inner.clone();
         let bytes = candidate.encode_request(message.clone())?;
@@ -136,7 +157,12 @@ impl TerminalClient {
 
     /// `minimum` is the server's advertised lower stream cursor, not an applied
     /// baseline. No ACK, including zero, is enabled until a snapshot commits.
-    pub fn bind_scope(&mut self, scope_json: &str, dimensions_json: &str, minimum: &str) -> Result<(), WireError> {
+    pub fn bind_scope(
+        &mut self,
+        scope_json: &str,
+        dimensions_json: &str,
+        minimum: &str,
+    ) -> Result<(), WireError> {
         let scope: Scope = decode_host_value(scope_json)?;
         let dimensions: Dimensions = decode_host_value(dimensions_json)?;
         let minimum = WireU64::parse(minimum)?;
@@ -156,7 +182,11 @@ impl TerminalClient {
         Ok(())
     }
 
-    pub fn update_dimensions(&mut self, scope_json: &str, dimensions_json: &str) -> Result<(), WireError> {
+    pub fn update_dimensions(
+        &mut self,
+        scope_json: &str,
+        dimensions_json: &str,
+    ) -> Result<(), WireError> {
         let scope: Scope = decode_host_value(scope_json)?;
         let dimensions: Dimensions = decode_host_value(dimensions_json)?;
         let mut candidate = self.inner.clone();
@@ -168,32 +198,56 @@ impl TerminalClient {
 
     /// Compatibility check only: the model already has to contain this exact
     /// completed transition. This method cannot advance delivery or ACK authority.
-    pub fn record_delivery(&mut self, scope_json: &str, previous: &str, sequence: &str) -> Result<(), WireError> {
+    pub fn record_delivery(
+        &mut self,
+        scope_json: &str,
+        previous: &str,
+        sequence: &str,
+    ) -> Result<(), WireError> {
         let scope: Scope = decode_host_value(scope_json)?;
-        self.model.verify_delivery(&scope, WireU64::parse(previous)?, WireU64::parse(sequence)?)
+        self.model
+            .verify_delivery(&scope, WireU64::parse(previous)?, WireU64::parse(sequence)?)
     }
 
     /// Mirror an independently established lease; the real server still checks
     /// permissions and its authoritative lease before any pane effect.
-    pub fn record_lease(&mut self, scope_json: &str, fence: &str, active: bool) -> Result<(), WireError> {
+    pub fn record_lease(
+        &mut self,
+        scope_json: &str,
+        fence: &str,
+        active: bool,
+    ) -> Result<(), WireError> {
         let scope: Scope = decode_host_value(scope_json)?;
-        self.inner.record_lease(&scope, WireU64::parse(fence)?, active)
+        self.inner
+            .record_lease(&scope, WireU64::parse(fence)?, active)
     }
 
     pub fn take_applied_ack(&mut self, scope_json: &str) -> Result<Option<Vec<u8>>, WireError> {
         let scope: Scope = decode_host_value(scope_json)?;
-        let Some(ack) = self.model.pending_ack(&scope)? else { return Ok(None); };
-        self.encode_message(ClientMessage::AppliedAck(ack)).map(Some)
+        let Some(ack) = self.model.pending_ack(&scope)? else {
+            return Ok(None);
+        };
+        self.encode_message(ClientMessage::AppliedAck(ack))
+            .map(Some)
     }
 
-    pub fn take_recovery_request(&mut self, scope_json: &str, request_id: &str, now_ms: u64) -> Result<Option<Vec<u8>>, WireError> {
+    pub fn take_recovery_request(
+        &mut self,
+        scope_json: &str,
+        request_id: &str,
+        now_ms: u64,
+    ) -> Result<Option<Vec<u8>>, WireError> {
         self.model.expire_snapshots(now_ms);
         let scope: Scope = decode_host_value(scope_json)?;
-        let Some(message) = self.model.recovery_request(&scope, Id::new(request_id)?)? else { return Ok(None); };
+        let Some(message) = self.model.recovery_request(&scope, Id::new(request_id)?)? else {
+            return Ok(None);
+        };
         self.encode_message(message).map(Some)
     }
 
-    pub fn expire_snapshots(&mut self, now_ms: u64) -> usize { self.model.expire_snapshots(now_ms) }
+    pub fn expire_snapshots(&mut self, now_ms: u64) -> usize {
+        self.model.expire_snapshots(now_ms)
+    }
 
     pub fn abort_snapshot(&mut self, scope_json: &str) -> Result<(), WireError> {
         self.model.abort_snapshot(&decode_host_value(scope_json)?)
@@ -207,8 +261,14 @@ impl TerminalClient {
         self.model.row_json(&decode_host_value(scope_json)?, row)
     }
 
-    pub fn screen_text_page(&self, scope_json: &str, first_row: u16, row_count: u16) -> Result<String, WireError> {
-        self.model.text_page(&decode_host_value(scope_json)?, first_row, row_count)
+    pub fn screen_text_page(
+        &self,
+        scope_json: &str,
+        first_row: u16,
+        row_count: u16,
+    ) -> Result<String, WireError> {
+        self.model
+            .text_page(&decode_host_value(scope_json)?, first_row, row_count)
     }
 }
 
@@ -223,24 +283,54 @@ mod tests {
     fn native_and_browser_consumer_share_exact_identifiers_and_negotiation() {
         let host = Id::new("host-1").unwrap();
         let asset = Sha256::new(&"a".repeat(64)).unwrap();
-        let hello = ClientFrame::new(None, ClientMessage::Hello(Hello {
-            host: host.clone(), hello_id: Id::new("hello-9007199254740993").unwrap(),
-            asset: asset.clone(), required: Capabilities::new(), optional: Capabilities::new(),
-        })).unwrap();
+        let hello = ClientFrame::new(
+            None,
+            ClientMessage::Hello(Hello {
+                host: host.clone(),
+                hello_id: Id::new("hello-9007199254740993").unwrap(),
+                asset: asset.clone(),
+                required: Capabilities::new(),
+                optional: Capabilities::new(),
+            }),
+        )
+        .unwrap();
         let mut browser = TerminalClient::from_hello_frame(
             &frankenterm_terminal_wire::encode_client(&hello).unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
         let mut server = ServerSession::new(
-            host, Id::new("session-1").unwrap(), asset, Capabilities::new(),
-        ).unwrap();
-        assert_eq!(browser.encode_request(r#"{"type":"ping","payload":{"nonce":"9007199254740993"}}"#), Err(WireError::NotNegotiated));
+            host,
+            Id::new("session-1").unwrap(),
+            asset,
+            Capabilities::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            browser.encode_request(r#"{"type":"ping","payload":{"nonce":"9007199254740993"}}"#),
+            Err(WireError::NotNegotiated)
+        );
         let welcome = server.negotiate(&browser.hello_frame().unwrap()).unwrap();
         browser.accept_welcome(&welcome).unwrap();
-        let request = browser.encode_request(r#"{"type":"ping","payload":{"nonce":"9007199254740993"}}"#).unwrap();
-        assert_eq!(server.decode_request(&request).unwrap().message,
-            ClientMessage::Ping(Ping { nonce: WireU64(9_007_199_254_740_993) }));
-        let response = server.encode_response(ServerMessage::Pong(Ping { nonce: WireU64(u64::MAX) })).unwrap();
-        assert!(browser.decode_server(&response).unwrap().contains("\"18446744073709551615\""));
+        let request = browser
+            .encode_request(r#"{"type":"ping","payload":{"nonce":"9007199254740993"}}"#)
+            .unwrap();
+        assert_eq!(
+            server.decode_request(&request).unwrap().message,
+            ClientMessage::Ping(Ping {
+                nonce: WireU64(9_007_199_254_740_993)
+            })
+        );
+        let response = server
+            .encode_response(ServerMessage::Pong(Ping {
+                nonce: WireU64(u64::MAX),
+            }))
+            .unwrap();
+        assert!(
+            browser
+                .decode_server(&response)
+                .unwrap()
+                .contains("\"18446744073709551615\"")
+        );
         assert_eq!(browser.decode_server(b"\xff"), Err(WireError::Malformed));
     }
 }

@@ -14413,7 +14413,9 @@ mod tests {
         ] {
             current.validate_outbound(request, point).unwrap();
         }
-        current.validate_inbound(reply, PduWireRole::CorrelatedReply).unwrap();
+        current
+            .validate_inbound(reply, PduWireRole::CorrelatedReply)
+            .unwrap();
         assert!(matches!(
             current.validate_inbound(reply, PduWireRole::Unilateral),
             Err(OrdinaryMuxProtocolError::DirectionViolation { .. })

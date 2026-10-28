@@ -12106,8 +12106,8 @@ mod tests {
                 .unwrap();
         }
         let directory_file = File::open(directory.path()).unwrap();
-        let segment = GuardianOutputSegmentIdentity::new(identity().pane_id(), id(0x501), 1, None)
-            .unwrap();
+        let segment =
+            GuardianOutputSegmentIdentity::new(identity().pane_id(), id(0x501), 1, None).unwrap();
         let cipher = GuardianOutputCipher::try_from_key_slice(&[0x5a; 32]).unwrap();
         let mut journal = GuardianOutputJournal::create_new_at(
             &directory_file,
@@ -12123,7 +12123,9 @@ mod tests {
         sender
             .send((segment, receipt, Arc::<[u8]>::from(payload.as_slice())))
             .unwrap();
-        delivered_receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        delivered_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
 
         // No explicit checkpoint request and no second output record: the
         // production reader's ordinary schedule must capture the final bytes
@@ -12149,7 +12151,10 @@ mod tests {
                 break Zeroizing::new(state.payload.to_vec());
             }
             drop(state);
-            assert!(Instant::now() < deadline, "idle final-output capture did not reach Stage");
+            assert!(
+                Instant::now() < deadline,
+                "idle final-output capture did not reach Stage"
+            );
             thread::sleep(Duration::from_millis(2));
         };
         let terminal = TerminalCheckpointV3::decode_canonical_json(
@@ -12162,14 +12167,17 @@ mod tests {
         .into_live(Box::new(std::io::sink()))
         .unwrap();
         assert_eq!(
-            terminal.screen().lines_in_phys_range(0..1)[0].as_str().trim_end(),
+            terminal.screen().lines_in_phys_range(0..1)[0]
+                .as_str()
+                .trim_end(),
             "final-output-before-idle"
         );
 
         drop(sender);
-        mutation_state.lock().directives.push_back(FakeDirective::Observe(
-            ObservedChildState::Exited(0),
-        ));
+        mutation_state
+            .lock()
+            .directives
+            .push_back(FakeDirective::Observe(ObservedChildState::Exited(0)));
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             while executor.try_tick().unwrap() {}
@@ -12177,7 +12185,10 @@ mod tests {
             if admission.active_tasks == 0 && admission.active_estimated_bytes == 0 {
                 break;
             }
-            assert!(Instant::now() < deadline, "idle checkpoint fixture alerts did not settle");
+            assert!(
+                Instant::now() < deadline,
+                "idle checkpoint fixture alerts did not settle"
+            );
             thread::yield_now();
         }
     }
@@ -14605,7 +14616,10 @@ mod tests {
         assert!(delivery.has_durable_replay_page_ack());
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].as_ref(), b"after-idle");
-        assert_eq!(reader.idle_poll_interval, GUARDIAN_REPLAY_IDLE_POLL_MIN_INTERVAL);
+        assert_eq!(
+            reader.idle_poll_interval,
+            GUARDIAN_REPLAY_IDLE_POLL_MIN_INTERVAL
+        );
         let state = replay_state.lock();
         assert_eq!(state.requests.len(), 3);
         assert_eq!(state.acks.len(), 3);
@@ -14768,7 +14782,11 @@ mod tests {
         assert!(resumed.has_durable_replay_page_ack());
         assert!(!reader.has_pending_transport_retry());
         let state = replay_state.lock();
-        assert_eq!(state.requests.len(), 1, "no snapshot opens before the idle handoff");
+        assert_eq!(
+            state.requests.len(),
+            1,
+            "no snapshot opens before the idle handoff"
+        );
         assert_eq!(state.acks.len(), GUARDIAN_REPLAY_EXCHANGE_ATTEMPTS + 1);
         assert!(state.acks.iter().all(|ack| *ack == state.acks[0]));
     }

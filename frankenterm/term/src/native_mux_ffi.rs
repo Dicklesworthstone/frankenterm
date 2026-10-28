@@ -16,7 +16,7 @@
 use crate::native::NativeTerminalError as Error;
 use crate::native_ffi::{input_bytes, output_bytes, output_scalar, utf8};
 use frankenterm_mobile_mux::{Event, SearchQuery, Session};
-use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
+use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use std::convert::TryFrom;
 use std::panic::AssertUnwindSafe;
 use std::sync::{LazyLock, Mutex};

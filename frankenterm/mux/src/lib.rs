@@ -13513,12 +13513,8 @@ fn read_from_guardian_live_output(
             // they do not evict older members or independently resolve a
             // journal whose retained-checkpoint floor still blocks reclaim.
             let started_at = Instant::now();
-            match publish_guardian_live_checkpoint(
-                &pane,
-                &generation,
-                pane_id,
-                delivered_boundary,
-            ) {
+            match publish_guardian_live_checkpoint(&pane, &generation, pane_id, delivered_boundary)
+            {
                 Ok(()) => {
                     metrics::counter!(
                         "mux.guardian_checkpoint.publication_total",
