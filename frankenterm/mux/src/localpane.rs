@@ -2078,6 +2078,10 @@ impl std::ops::DerefMut for TerminalGuard<'_> {
     }
 }
 
+/// The shortest gap between two reports of one pane's scrollback durability
+/// failure (ft-92aa4).
+const SCROLLBACK_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(300);
+
 pub struct LocalPane {
     pane_id: PaneId,
     durable_pane_id: [u8; 16],
@@ -2097,6 +2101,9 @@ pub struct LocalPane {
     output_application: Mutex<()>,
     alert_staging: Arc<Mutex<PaneAlertStaging>>,
     scrollback_flush_sink: Mutex<Option<Arc<dyn frankenterm_term::config::ScrollbackSpillSink>>>,
+    /// When the durability failure was last logged and how many repeats
+    /// were not (ft-92aa4).
+    scrollback_failure_log: Mutex<(Option<Instant>, u64)>,
     process: Arc<Mutex<ProcessState>>,
     pty: Arc<Mutex<Box<dyn MasterPty>>>,
     guardian_live_output_reader: Mutex<Option<Box<dyn GuardianLiveOutputReader>>>,
@@ -7567,17 +7574,43 @@ impl LocalPane {
         )
     }
 
+    /// Logs a durability failure once per drain and, per pane, at most once
+    /// per `SCROLLBACK_FAILURE_LOG_INTERVAL` with the repeats it held back.
+    /// A sink that stays failed (a quarantine is restart-only, ft-92aa4)
+    /// otherwise logged on every parser batch, ~50 lines/s per pane.
     fn report_scrollback_failure(
         &self,
         reported: &mut bool,
         error: frankenterm_term::config::ScrollbackSpillError,
     ) {
-        if !*reported {
+        if *reported {
+            return;
+        }
+        *reported = true;
+        metrics::counter!("mux.scrollback.durability_failures").increment(1);
+        let repeats = {
+            let mut log = self.scrollback_failure_log.lock();
+            let now = Instant::now();
+            if log
+                .0
+                .is_some_and(|last| now.duration_since(last) < SCROLLBACK_FAILURE_LOG_INTERVAL)
+            {
+                log.1 += 1;
+                return;
+            }
+            log.0 = Some(now);
+            std::mem::take(&mut log.1)
+        };
+        if repeats == 0 {
             log::error!(
                 "pane {} scrollback durability is failing ({error}); retaining rows and applying parser backpressure outside the terminal lock",
                 self.pane_id
             );
-            *reported = true;
+        } else {
+            log::error!(
+                "pane {} scrollback durability is still failing ({error}); {repeats} more failures since the last report",
+                self.pane_id
+            );
         }
     }
 
@@ -8960,6 +8993,7 @@ impl LocalPane {
             output_application: Mutex::new(()),
             alert_staging,
             scrollback_flush_sink: Mutex::new(scrollback_flush_sink),
+            scrollback_failure_log: Mutex::new((None, 0)),
             process: Arc::clone(&process),
             pty: Arc::new(Mutex::new(pty)),
             guardian_live_output_reader: Mutex::new(guardian_live_output_reader),
@@ -20048,6 +20082,40 @@ mod tests {
         );
         drop(tmux_guard);
         assert!(matches!(pane.capture_surface_snapshot(0), Some(Ok(_))));
+    }
+
+    #[test]
+    fn scrollback_failure_reports_are_rate_limited_per_pane() {
+        use frankenterm_term::config::ScrollbackSpillError;
+        let pane = make_legacy_test_pane(784, guardian_lifetime_test_terminal());
+        let state = || *pane.scrollback_failure_log.lock();
+
+        // The first failure of a drain reports; repeats in that drain do not count.
+        let mut reported = false;
+        pane.report_scrollback_failure(&mut reported, ScrollbackSpillError::StorageUnavailable);
+        pane.report_scrollback_failure(&mut reported, ScrollbackSpillError::StorageUnavailable);
+        let (first, held) = state();
+        assert!(first.is_some());
+        assert_eq!(held, 0);
+
+        // Later drains within the interval are held back and counted.
+        for _ in 0..5 {
+            pane.report_scrollback_failure(&mut false, ScrollbackSpillError::StorageUnavailable);
+        }
+        assert_eq!(state(), (first, 5));
+
+        // Once the interval has passed, the next failure reports again. An
+        // Instant cannot predate boot, so a just-booted host skips this step.
+        let Some(earlier) =
+            Instant::now().checked_sub(SCROLLBACK_FAILURE_LOG_INTERVAL + Duration::from_secs(1))
+        else {
+            return;
+        };
+        pane.scrollback_failure_log.lock().0 = Some(earlier);
+        pane.report_scrollback_failure(&mut false, ScrollbackSpillError::StorageUnavailable);
+        let (last, held) = state();
+        assert!(last.is_some_and(|last| last > earlier));
+        assert_eq!(held, 0);
     }
 
     #[test]

@@ -15540,6 +15540,21 @@ fn legacy_text_scrollback_line(text: &str) -> wezterm_term::Line {
     wezterm_term::Line::from_text(text, &termwiz::cell::CellAttributes::blank(), 0, None)
 }
 
+impl LiveScrollbackSpillState {
+    /// Stops this sink's transactions until the mux restarts and recovery
+    /// adopts, cuts or rolls the retained transaction forward. The first
+    /// quarantine is logged with its step and cause (ft-92aa4): otherwise a
+    /// pane's scrollback stops being durable with nothing saying why.
+    fn quarantine(&mut self, pane_id: u64, step: &str, cause: &dyn std::fmt::Display) {
+        if !self.transaction_quarantined {
+            log::error!(
+                "pane {pane_id} scrollback transaction quarantined at {step}: {cause:#}; durability resumes after the mux restarts"
+            );
+        }
+        self.transaction_quarantined = true;
+    }
+}
+
 impl LiveScrollbackSpillSink {
     #[cfg(test)]
     fn fail_batch_at(&self, point: u8) -> bool {
@@ -15756,13 +15771,16 @@ impl LiveScrollbackSpillSink {
             );
             Ok(target)
         })();
-        let Ok(target) = appended else {
-            if let Ok(mut state) = self.lock_state("commit window quarantine") {
-                // The window's rows may be partly durable; reopen adopts or
-                // cuts them. Never roll the live state back over them.
-                state.transaction_quarantined = true;
+        let target = match appended {
+            Ok(target) => target,
+            Err(error) => {
+                if let Ok(mut state) = self.lock_state("commit window quarantine") {
+                    // The window's rows may be partly durable; reopen adopts
+                    // or cuts them. Never roll the live state back over them.
+                    state.quarantine(self.pane_id, "commit window append", &error);
+                }
+                return false;
             }
-            return false;
         };
         #[cfg(test)]
         scrollback_crash_points::reach("window_rows_synced");
@@ -15885,7 +15903,7 @@ impl LiveScrollbackSpillSink {
         ) {
             if error.outcome_indeterminate() {
                 if let Ok(mut state) = self.lock_state("publish tail WAL quarantine") {
-                    state.transaction_quarantined = true;
+                    state.quarantine(self.pane_id, "tail WAL publication", &error);
                 }
             }
             log::warn!("scrollback tail publication ({reason}) refused its WAL: {error}");
@@ -15917,10 +15935,10 @@ impl LiveScrollbackSpillSink {
             );
             Ok(())
         })();
-        if pruned.is_err() {
+        if let Err(error) = pruned {
             if let Ok(mut state) = self.lock_state("publish tail content quarantine") {
                 // The active WAL authorizes recovery to roll forward.
-                state.transaction_quarantined = true;
+                state.quarantine(self.pane_id, "tail retention", &error);
             }
             return false;
         }
@@ -15930,7 +15948,7 @@ impl LiveScrollbackSpillSink {
         }
         if let Err(error) = self.persist_manifest("complete") {
             if let Ok(mut state) = self.lock_state("publish tail manifest quarantine") {
-                state.transaction_quarantined = true;
+                state.quarantine(self.pane_id, "tail manifest publication", &error);
             }
             log::warn!("scrollback tail publication ({reason}) manifest failed: {error}");
             return false;
@@ -16041,7 +16059,7 @@ impl LiveScrollbackSpillSink {
                         if let Ok(mut state) =
                             self.lock_state("store_scrollback_line staged retry quarantine")
                         {
-                            state.transaction_quarantined = true;
+                            state.quarantine(self.pane_id, "staged manifest retry", &error);
                         }
                     }
                     return false;
@@ -16552,7 +16570,7 @@ impl LiveScrollbackSpillSink {
                     return false;
                 };
                 if error.outcome_indeterminate() {
-                    state.transaction_quarantined = true;
+                    state.quarantine(self.pane_id, "manifest prepare", &error);
                 } else {
                     *state = previous_state;
                 }
@@ -16583,12 +16601,12 @@ impl LiveScrollbackSpillSink {
             );
             Ok(())
         })();
-        if append_result.is_err() {
+        if let Err(error) = append_result {
             if let Ok(mut state) = self.lock_state("store_scrollback_line append quarantine") {
                 // A synchronized prepared manifest may already authorize
                 // recovery, and a failed sync leaves the ledger's tail
                 // uncertain until reopen settles it. Never roll back here.
-                state.transaction_quarantined = true;
+                state.quarantine(self.pane_id, "row append", &error);
             }
             return false;
         }
@@ -16618,7 +16636,7 @@ impl LiveScrollbackSpillSink {
                     if let Ok(mut state) =
                         self.lock_state("store_scrollback_line append WAL quarantine")
                     {
-                        state.transaction_quarantined = true;
+                        state.quarantine(self.pane_id, "append WAL", &error);
                     }
                 }
                 return false;
@@ -16668,12 +16686,12 @@ impl LiveScrollbackSpillSink {
             );
             Ok(())
         })();
-        if content_result.is_err() {
+        if let Err(error) = content_result {
             if let Ok(mut state) = self.lock_state("store_scrollback_line content quarantine") {
                 // A synchronized prepared manifest or active WAL may already
                 // authorize recovery. Never roll the generation back after
                 // entering either durable transaction.
-                state.transaction_quarantined = true;
+                state.quarantine(self.pane_id, "append retention", &error);
             }
             return false;
         }
@@ -16712,7 +16730,7 @@ impl LiveScrollbackSpillSink {
                     if let Ok(mut state) =
                         self.lock_state("store_scrollback_line quarantine publication")
                     {
-                        state.transaction_quarantined = true;
+                        state.quarantine(self.pane_id, "append publication", &error);
                     }
                 }
                 false
@@ -17278,7 +17296,7 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
         if let Err(error) = self.persist_manifest("cleared") {
             if error.outcome_indeterminate() {
                 if let Ok(mut state) = self.lock_state("clear_scrollback quarantine publication") {
-                    state.transaction_quarantined = true;
+                    state.quarantine(self.pane_id, "clear publication", &error);
                 }
                 log::error!("scrollback clear publication outcome is indeterminate");
                 return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
@@ -17626,13 +17644,12 @@ impl LiveScrollbackSpillSink {
                         row_count,
                         staged,
                     )
-                })
-                .is_ok();
-            if !recovered_publication {
+                });
+            if let Err(error) = recovered_publication {
                 if let Ok(mut state) =
                     self.lock_state("replace_scrollback_prefix quarantine publication")
                 {
-                    state.transaction_quarantined = true;
+                    state.quarantine(self.pane_id, "prefix replacement publication", &error);
                 }
                 return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
             }
@@ -17679,11 +17696,11 @@ impl LiveScrollbackSpillSink {
                 staged,
             )
         })();
-        if ledger_verified.is_err() {
+        if let Err(error) = ledger_verified {
             if let Ok(mut state) =
                 self.lock_state("replace_scrollback_prefix quarantine verification")
             {
-                state.transaction_quarantined = true;
+                state.quarantine(self.pane_id, "prefix replacement verification", &error);
             }
             return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
         }
