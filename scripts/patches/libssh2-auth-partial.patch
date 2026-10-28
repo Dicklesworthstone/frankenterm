@@ -80,16 +80,19 @@ diff --git a/src/userauth.c b/src/userauth.c
 -       a filtered list that includes matches */
 +    /* Walk the supported set first so repeated peer names cannot grow the
 +       intersection beyond the buffer bounded by supported_algs. */
-@@ -1417,3 +1418,3 @@
+@@ -1417,5 +1418,5 @@
          p = strchr(s, ',');
          p_len = (p ? (size_t)(p - s) : strlen(s));
 -        a = supported_algs;
 +        a = session->server_sign_algorithms;
-@@ -1432,3 +1433,4 @@
+
+         while(a && *a) {
+@@ -1432,4 +1433,5 @@
                  memcpy(i, s, p_len);
                  i += p_len;
 +                break;
              }
+
 @@ -1476,7 +1478,8 @@
      if(match) {
          if(*key_method_len == 28 &&
