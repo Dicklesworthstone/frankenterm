@@ -744,6 +744,13 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         XCTAssertEqual(app.buttons.matching(NSPredicate(format: "label == %@", "Stop Trusting on This Phone")).count, 1,
                        "one row per host and port, each key once")
         snapshot("h1-host-keys")
+        // Phone keys and the workspace's keys come before host keys, and a
+        // saved block's message is shown first. A list draws only the rows on
+        // screen, so bring the host's row back into view before reading it.
+        let blockedLabel = app.staticTexts["Blocked on this phone"]
+        func showHostKey() {
+            for _ in 0..<6 where !block.isHittable && !blockedLabel.isHittable { app.swipeUp() }
+        }
         // Every trusted host key the workspace lists is blocked in turn.
         var blocked = 0
         while block.exists, blocked < 4 {
@@ -757,11 +764,13 @@ final class OfflineRestoreConnectUITests: XCTestCase {
                                                              "This host key is blocked on this phone")).firstMatch
             XCTAssertTrue(saved.waitForExistence(timeout: 30), "the block is saved and reported")
             blocked += 1
-            _ = app.staticTexts["Blocked on this phone"].waitForExistence(timeout: 10)
+            showHostKey()
+            _ = blockedLabel.waitForExistence(timeout: 10)
             sleep(1)
         }
+        showHostKey()
+        XCTAssertTrue(blockedLabel.exists, "the key shows as blocked")
         XCTAssertFalse(block.exists, "no host key is still trusted")
-        XCTAssertTrue(app.staticTexts["Blocked on this phone"].exists, "the key shows as blocked")
         snapshot("h3-blocked")
         app.navigationBars["SSH Keys"].buttons["Done"].tap()
 
