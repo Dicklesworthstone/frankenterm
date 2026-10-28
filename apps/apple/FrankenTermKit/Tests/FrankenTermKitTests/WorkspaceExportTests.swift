@@ -165,6 +165,73 @@ final class WorkspaceExportTests: XCTestCase {
         XCTAssertEqual(selected.workspace.credentials.map(\.id), ["key-alias"])
     }
 
+    func testConfiguredKeyUsesSelectedAliasThenAnIdenticalUnselectedSourceAlias() throws {
+        let source = try fixture()
+        let selection = try WorkspaceExportSelection(workspace: source, groupIDs: ["selected"], machineIDs: ["gpu"])
+        let fingerprint = try XCTUnwrap(selection.identities.first?.fingerprint)
+        let selected = try XCTUnwrap(selection.configuredIdentityFile(for: fingerprint,
+            fileReferences: ["key": "/tmp/original-key", "key-alias": "~/selected-key"]))
+        XCTAssertEqual(selected.credentialID, "key-alias")
+        XCTAssertEqual(selected.sourceCredentialID, "key-alias")
+        XCTAssertEqual(selected.fileReference, "~/selected-key")
+        let aliased = try XCTUnwrap(selection.configuredIdentityFile(for: fingerprint,
+            fileReferences: ["key": "/tmp/original-key"]))
+        XCTAssertEqual(aliased.credentialID, "key-alias")
+        XCTAssertEqual(aliased.sourceCredentialID, "key")
+        XCTAssertEqual(aliased.fingerprint, fingerprint)
+        XCTAssertNotEqual(aliased, selection.configuredIdentityFile(for: fingerprint,
+            fileReferences: ["key": "/tmp/replaced-key"]), "An old button must not approve a changed path.")
+        XCTAssertNil(selection.configuredIdentityFile(for: fingerprint,
+            fileReferences: ["unselected-only": "/tmp/unrelated-key", "unknown": "/tmp/unknown-key"]))
+        let excluded = try XCTUnwrap(source.credentials.first { $0.id == "unselected-only" })
+        XCTAssertNil(selection.configuredIdentityFile(for: excluded.fingerprint,
+            fileReferences: ["unselected-only": "/tmp/unrelated-key"]))
+    }
+
+    func testConfiguredKeyRejectsUnresolvedNonlocalAndUnboundedPathHints() throws {
+        let selection = try WorkspaceExportSelection(workspace: fixture(), groupIDs: ["selected"], machineIDs: ["gpu"])
+        let fingerprint = try XCTUnwrap(selection.identities.first?.fingerprint)
+        for path in ["", "relative-key", "~someone/key", "$HOME/key", "/tmp/%d/key", "/tmp/$KEY",
+                     "file:///tmp/key", "https://example.invalid/key", "/tmp/key\nother", "/tmp/\u{0}",
+                     "/" + String(repeating: "x", count: FTLimit.text)] {
+            XCTAssertNil(selection.configuredIdentityFile(for: fingerprint, fileReferences: ["key-alias": path]))
+        }
+        let fallback = selection.configuredIdentityFile(for: fingerprint,
+            fileReferences: ["key-alias": "$HOME/key", "key": "/tmp/matching-key"])
+        XCTAssertEqual(fallback?.sourceCredentialID, "key")
+    }
+
+    func testConfiguredKeyHintDoesNotConsentAndSourceBytesMustMatchTheSelectedIdentity() throws {
+        let selection = try WorkspaceExportSelection(workspace: fixture(), groupIDs: ["selected"], machineIDs: ["gpu"])
+        let (key, fingerprint) = try sampleKey(using: crypto)
+        let configured = try XCTUnwrap(selection.configuredIdentityFile(for: fingerprint,
+            fileReferences: ["key": "/tmp/known-key"]))
+        XCTAssertEqual(try selection.review(decisions: [:], loadedFingerprints: []).pendingIdentityCount, 1)
+        XCTAssertThrowsError(try selection.archive(decisions: [:], keys: [], bundleID: "no-consent", using: crypto))
+        let pem = Data(("-----BEGIN OPENSSH PRIVATE KEY-----\n" +
+            key.container.base64EncodedString(options: [.lineLength64Characters, .endLineWithLineFeed]) +
+            "\n-----END OPENSSH PRIVATE KEY-----\n").utf8)
+        let reference = try XCTUnwrap(selection.workspace.credentials.first { $0.id == configured.credentialID })
+        var unlocker = OpenSSHSourceKeyUnlocker(using: crypto)
+        guard case let .ready(loaded) = try unlocker.select(pem: pem, reference: reference) else {
+            return XCTFail("The matching clear source key should be admitted.")
+        }
+        XCTAssertEqual(loaded.credentialID, "key-alias")
+        XCTAssertThrowsError(try selection.archive(decisions: [fingerprint: .keepReferenceOnly],
+            keys: [loaded], bundleID: "reference-only", using: crypto))
+        let archive = try selection.archive(decisions: [fingerprint: .includePrivateKey],
+            keys: [loaded], bundleID: "approved-source-key", using: crypto)
+        XCTAssertEqual(archive.keys.map(\.credentialID), ["key-alias"])
+
+        let unrelatedFingerprint = "SHA256:" + Data(repeating: 42, count: 32).base64EncodedString().replacingOccurrences(of: "=", with: "")
+        let different = try WorkspaceExportSelection(workspace: fixture(aliasFingerprint: unrelatedFingerprint),
+            groupIDs: ["selected"], machineIDs: ["gpu"])
+        let changedReference = try XCTUnwrap(different.workspace.credentials.first)
+        XCTAssertThrowsError(try unlocker.select(pem: pem, reference: changedReference)) {
+            XCTAssertEqual($0 as? OpenSSHSourceKeyError, .identityMismatch)
+        }
+    }
+
     func testSelectionAndPreparationPreserveExactFontNumberTokens() throws {
         var root = try StrictJSON.decode(fixture().raw).object()
         var content = try root.required("workspace").object()

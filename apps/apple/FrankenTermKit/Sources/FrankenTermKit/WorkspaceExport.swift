@@ -51,6 +51,36 @@ public struct WorkspaceExportSelection: Sendable {
         }
     }
 
+    /// A configured source path is a public hint, never permission to read or
+    /// include the key. It binds one selected credential to an exact source
+    /// alias with the same canonical public identity.
+    public struct ConfiguredIdentityFile: Equatable, Sendable {
+        public let credentialID: String, sourceCredentialID: String
+        public let fingerprint: String, fileReference: String
+    }
+
+    /// No file is opened and no consent changes. Prefer selected aliases, then
+    /// another source alias for the same key; an excluded machine's unrelated
+    /// key can never become a candidate for this selection.
+    public func configuredIdentityFile(for fingerprint: String,
+                                       fileReferences: [String: String]) -> ConfiguredIdentityFile? {
+        guard let identity = identities.first(where: { $0.fingerprint == fingerprint }),
+              let targetID = identity.credentialIDs.first else { return nil }
+        let selectedIDs = Set(identity.credentialIDs)
+        let candidates = identity.credentialIDs + source.credentials.filter {
+            $0.fingerprint == fingerprint && $0.algorithm == identity.algorithm && !selectedIDs.contains($0.id)
+        }.map(\.id)
+        for sourceID in candidates {
+            guard let path = fileReferences[sourceID], !path.isEmpty, path.utf8.count <= FTLimit.text,
+                  path.hasPrefix("/") || path.hasPrefix("~/"),
+                  !path.contains("%"), !path.contains("$"),
+                  !path.unicodeScalars.contains(where: { $0.value < 32 || $0.value == 127 }) else { continue }
+            return .init(credentialID: targetID, sourceCredentialID: sourceID,
+                         fingerprint: fingerprint, fileReference: path)
+        }
+        return nil
+    }
+
     public init(workspace source: WorkspaceDocument, groupIDs: Set<String>,
                 machineIDs: Set<String>? = nil,
                 findings: [AirGapArchive.Portability] = []) throws {

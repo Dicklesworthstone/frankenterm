@@ -294,6 +294,17 @@ private actor MacExportEngine {
         case let .passphraseRequired(request): return .passphraseRequired(request)
         }
     }
+    func loadConfiguredKey(_ file: WorkspaceExportSelection.ConfiguredIdentityFile,
+                           operationID: UUID) throws -> KeyLoadResult {
+        // A delayed UI action cannot change its file, identity or inclusion
+        // decision after a group/source change. The normal source unlocker then
+        // verifies the actual public header and private key before admission.
+        guard let selection, decisions[file.fingerprint] == .includePrivateKey,
+              selection.configuredIdentityFile(for: file.fingerprint, fileReferences: identityReferences) == file,
+              let hint = Self.identityURL(file.fileReference) else { throw FTError.stale }
+        let url = hint.pathExtension == "pub" ? hint.deletingPathExtension() : hint
+        return try loadKey(url, credentialID: file.credentialID, operationID: operationID)
+    }
     func unlockKey(operationID: UUID, requestID: UUID, passphrase: Data) throws -> SelectionState {
         // This actor serializes the bounded synchronous KDF. No passphrase or
         // decrypted source bytes are persisted or sent to another process.
@@ -767,6 +778,20 @@ private final class MacExportModel {
             apply(result)
         }
     }
+    func configuredKey(for fingerprint: String) -> WorkspaceExportSelection.ConfiguredIdentityFile? {
+        selection?.configuredIdentityFile(for: fingerprint, fileReferences: identityReferences)
+    }
+    func useConfiguredKey(_ file: WorkspaceExportSelection.ConfiguredIdentityFile) {
+        guard !busy, foreground, windowOpen, NSApplication.shared.isActive,
+              sourceSheet == nil, sourceKeyOperation == nil,
+              identityDecisions[file.fingerprint] == .includePrivateKey,
+              configuredKey(for: file.fingerprint) == file else { return }
+        startKeyLoad(.configuredFile(file))
+    }
+    private enum KeySource {
+        case selectedFile(URL, credentialID: String)
+        case configuredFile(WorkspaceExportSelection.ConfiguredIdentityFile)
+    }
     func chooseKey(_ credentialID: String) {
         guard !busy, sourceSheet == nil else { return }
         cancelRecipientScan()
@@ -779,11 +804,20 @@ private final class MacExportModel {
         }
         panel.message = "Choose the matching OpenSSH Ed25519, ECDSA or RSA key, or an ECDSA/RSA PEM key. ECDSA supports P-256/P-384/P-521; RSA supports 2048–8192 bits with SHA-2 signatures. Protected OpenSSH keys and PKCS#8 files using PBES2, PBKDF2 and AES-CBC are unlocked locally after you enter their passphrase. Clear SEC1, PKCS#1 and PKCS#8 files are also supported."
         guard panel.runModal() == .OK, let url = panel.url, windowOpen, foreground, !busy else { return }
-        retireSourceKeyPrompt(); retireSSHSelection(); invalidatePrepared()
+        startKeyLoad(.selectedFile(url, credentialID: credentialID))
+    }
+    private func startKeyLoad(_ source: KeySource) {
+        cancelRecipientScan(); retireSourceKeyPrompt(); retireSSHSelection(); invalidatePrepared()
         let token = UUID(); sourceKeyOperation = token
         perform { [self] operation in
             do {
-                let result = try await engine.loadKey(url, credentialID: credentialID, operationID: token)
+                let result: MacExportEngine.KeyLoadResult
+                switch source {
+                case let .selectedFile(url, credentialID):
+                    result = try await engine.loadKey(url, credentialID: credentialID, operationID: token)
+                case let .configuredFile(file):
+                    result = try await engine.loadConfiguredKey(file, operationID: token)
+                }
                 try requireCurrentWork(operation)
                 guard foreground, sourceKeyOperation == token else { throw CancellationError() }
                 switch result {
@@ -1696,8 +1730,22 @@ private struct MacExportView: View {
                     Label("Key loaded", systemImage: "checkmark.shield").font(.caption)
                 }
                 if model.identityDecisions[identity.fingerprint] == .includePrivateKey, let credentialID = identity.credentialIDs.first {
+                    if !model.includedFingerprints.contains(identity.fingerprint),
+                       let configured = model.configuredKey(for: identity.fingerprint) {
+                        Button("Use Key on This Mac…") { model.useConfiguredKey(configured) }
+                            .help("Read this configured file and unlock it locally if needed: \(configured.fileReference)")
+                            .disabled(model.busy || !supported)
+                    }
                     Button("Choose Matching Key…") { model.chooseKey(credentialID) }.disabled(model.busy || !supported)
                 }
+            }
+            if model.identityDecisions[identity.fingerprint] == .includePrivateKey,
+               !model.includedFingerprints.contains(identity.fingerprint),
+               let configured = model.configuredKey(for: identity.fingerprint) {
+                Text(verbatim: "Configured identity file: " + configured.fileReference)
+                    .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                Text("Use this file to unlock the selected identity without browsing again. A .pub reference uses its matching private file; the key must still match this fingerprint.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
         }
     }
