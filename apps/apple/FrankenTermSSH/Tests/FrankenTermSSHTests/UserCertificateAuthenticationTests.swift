@@ -64,6 +64,19 @@ final class UserCertificateAuthenticationTests: XCTestCase {
         }
     }
 
+    /// CryptoKit randomizes Ed25519 signatures on Apple platforms, so one is
+    /// verified against the subject key rather than compared with an oracle.
+    private func verifyEd25519(_ signature: Data, challenge: SSHUserAuthenticationChallenge) throws -> Bool {
+        var envelope = ByteCursor(signature)
+        XCTAssertEqual(try envelope.sshString(cap: 64), Data(challenge.algorithm.utf8))
+        let raw = try envelope.sshString()
+        XCTAssertEqual(envelope.remaining, 0)
+        var publicKey = ByteCursor(challenge.subjectPublicBlob)
+        _ = try publicKey.sshString()
+        return try Curve25519.Signing.PublicKey(rawRepresentation: publicKey.sshString())
+            .isValidSignature(raw, for: challenge.signedData)
+    }
+
     func testEveryCertificateFamilyOffersExactCertificateAndSignsWithRawSubject() async throws {
         let files = try Files.load(), session = try Data(ftHex: files.sessionIdentifierHex)
         XCTAssertTrue(WorkspaceNativeSSHAuthentication.routeSupport.capabilities.contains(WorkspaceDocument.userCertificateCapability))
@@ -82,9 +95,11 @@ final class UserCertificateAuthenticationTests: XCTestCase {
             let signature = try await authority.signature(for: native, peer: peer)
             if certificate.subjectAlgorithm.hasPrefix("ecdsa-") {
                 XCTAssertTrue(try verifyECDSA(signature, challenge: challenge), certificate.id)
+            } else if certificate.subjectAlgorithm == "ssh-ed25519" {
+                XCTAssertTrue(try verifyEd25519(signature, challenge: challenge), certificate.id)
             } else {
-                // Ed25519 and PKCS#1 v1.5 RSA signatures are deterministic;
-                // compare every byte with the independently produced oracle.
+                // PKCS#1 v1.5 RSA signatures are deterministic; compare every
+                // byte with the independently produced oracle.
                 XCTAssertEqual(signature, Data(base64Encoded: certificate.signature), certificate.id)
             }
             try await authority.validateForAuthentication(peer: peer, identity: identity)
