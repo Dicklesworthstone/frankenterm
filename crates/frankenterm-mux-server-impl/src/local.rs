@@ -550,6 +550,17 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    /// A socket runtime directly under /tmp. A unix socket path is limited to
+    /// ~104 bytes, and a runner's TMPDIR (an RCH worker's build tree) can
+    /// exceed that before the socket name is added.
+    #[cfg(unix)]
+    fn socket_runtime(what: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("ft-sock-")
+            .tempdir_in(std::fs::canonicalize("/tmp").expect("canonical /tmp"))
+            .unwrap_or_else(|error| panic!("{what}: {error}"))
+    }
+
     /// Source guard: the only `spawn_local` in this file must be the one inside
     /// `admit_connection`'s main-thread handoff closure. A direct
     /// `reservation.spawn_local` in the accept loop aborts the server on the
@@ -711,7 +722,7 @@ mod tests {
         };
 
         for unsafe_kind in ["symlink", "hardlink", "oversized"] {
-            let runtime = tempfile::tempdir().expect("socket lock runtime");
+            let runtime = socket_runtime("socket lock runtime");
             std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700))
                 .expect("make socket lock runtime private");
             let socket = runtime.path().join("gui.sock");
@@ -741,7 +752,7 @@ mod tests {
             );
         }
 
-        let runtime = tempfile::tempdir().expect("valid socket lock runtime");
+        let runtime = socket_runtime("valid socket lock runtime");
         std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700))
             .expect("make valid runtime private");
         let socket = runtime.path().join("gui.sock");
@@ -757,7 +768,7 @@ mod tests {
             lock.symlink_metadata().expect("inspect named lock").ino()
         );
 
-        let legacy_runtime = tempfile::tempdir().expect("legacy socket lock runtime");
+        let legacy_runtime = socket_runtime("legacy socket lock runtime");
         std::fs::set_permissions(
             legacy_runtime.path(),
             std::fs::Permissions::from_mode(0o700),
@@ -784,7 +795,7 @@ mod tests {
             0o600
         );
 
-        let recorded_runtime = tempfile::tempdir().expect("recorded socket runtime");
+        let recorded_runtime = socket_runtime("recorded socket runtime");
         std::fs::set_permissions(
             recorded_runtime.path(),
             std::fs::Permissions::from_mode(0o700),
@@ -811,7 +822,7 @@ mod tests {
     fn exact_dead_socket_lease_is_quarantined_without_deletion() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let runtime = tempfile::tempdir().expect("stale socket runtime");
+        let runtime = socket_runtime("stale socket runtime");
         std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700))
             .expect("make stale socket runtime private");
         let socket = runtime.path().join("gui.sock");
@@ -842,7 +853,7 @@ mod tests {
         use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt as _;
 
-        let foreign_runtime = tempfile::tempdir().expect("foreign socket runtime");
+        let foreign_runtime = socket_runtime("foreign socket runtime");
         std::fs::set_permissions(
             foreign_runtime.path(),
             std::fs::Permissions::from_mode(0o700),
@@ -857,7 +868,7 @@ mod tests {
         assert!(quarantine_existing_socket_under_lease(&foreign, &foreign_lock).is_err());
         assert_eq!(std::fs::read(&foreign).unwrap(), b"must remain");
 
-        let live_runtime = tempfile::tempdir().expect("live publisher runtime");
+        let live_runtime = socket_runtime("live publisher runtime");
         std::fs::set_permissions(live_runtime.path(), std::fs::Permissions::from_mode(0o700))
             .expect("make live publisher runtime private");
         let live_socket = live_runtime.path().join("gui.sock");
@@ -880,7 +891,7 @@ mod tests {
 
         // Release-wave B-M1: a 0.15.1 server left its socket with no versioned
         // lease record, so the new server refused to start over it forever.
-        let runtime = tempfile::tempdir().expect("legacy socket runtime");
+        let runtime = socket_runtime("legacy socket runtime");
         std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700))
             .expect("make legacy socket runtime private");
         let socket = runtime.path().join("gui.sock");
@@ -907,7 +918,7 @@ mod tests {
     fn stale_lease_cannot_quarantine_a_rebound_socket() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let runtime = tempfile::tempdir().expect("rebound socket runtime");
+        let runtime = socket_runtime("rebound socket runtime");
         std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700))
             .expect("make rebound socket runtime private");
         let socket = runtime.path().join("gui.sock");
