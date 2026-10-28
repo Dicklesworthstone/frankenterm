@@ -38,25 +38,41 @@ public struct WorkspaceExportSelection: Sendable {
         }
     }
 
+    /// The selected groups before narrowing individual machines. Keep this
+    /// order stable so removing a machine does not make its selection control
+    /// disappear or change the meaning of another group's shared membership.
+    public var availableMachines: [WorkspaceDocument.Machine] {
+        let groupIDs = Set(workspace.groups.map(\.id))
+        let machineMap = Dictionary(uniqueKeysWithValues: source.machines.map { ($0.id, $0) })
+        var seen = Set<String>()
+        return source.groups.filter { groupIDs.contains($0.id) }.flatMap(\.machineOrder).compactMap { id in
+            guard seen.insert(id).inserted else { return nil }
+            return machineMap[id]
+        }
+    }
+
     public init(workspace source: WorkspaceDocument, groupIDs: Set<String>,
+                machineIDs: Set<String>? = nil,
                 findings: [AirGapArchive.Portability] = []) throws {
-        try self.init(source: source, groupIDs: groupIDs, projectionBundleID: nil, findings: findings)
+        try self.init(source: source, groupIDs: groupIDs, machineIDs: machineIDs,
+                      projectionBundleID: nil, findings: findings)
     }
 
     /// A single reviewed group retains its existing public API, including a new
     /// projection identity. Preparing its archive always issues another identity.
     public init(workspace source: WorkspaceDocument, groupID: String,
                 findings: [AirGapArchive.Portability] = []) throws {
-        try self.init(source: source, groupIDs: [groupID], projectionBundleID: UUID().uuidString, findings: findings)
+        try self.init(source: source, groupIDs: [groupID], machineIDs: nil,
+                      projectionBundleID: UUID().uuidString, findings: findings)
     }
 
-    private init(source: WorkspaceDocument, groupIDs: Set<String>, projectionBundleID: String?,
+    private init(source: WorkspaceDocument, groupIDs: Set<String>, machineIDs: Set<String>?, projectionBundleID: String?,
                  findings: [AirGapArchive.Portability]) throws {
         self.source = source
         // Validate before filtering so an invalid source report cannot become
         // acceptable merely by selecting a group that hides its reference.
         let metadata = try AirGapArchive.validatedMetadata(workspace: source, portability: findings, annotations: [])
-        let selection = try Self.project(source, groupIDs: groupIDs)
+        let selection = try Self.project(source, groupIDs: groupIDs, machineIDs: machineIDs)
         let projected = try projectionBundleID.map { try selection.reissuingBundle(id: $0) } ?? selection
         workspace = projected
         let retainedEntities = Set([projected.id] + projected.groups.map(\.id) + projected.machines.map(\.id)
@@ -287,13 +303,18 @@ public struct WorkspaceExportSelection: Sendable {
         return try archive(decisions: choices, keys: selected, bundleID: UUID().uuidString, using: crypto)
     }
 
-    private static func project(_ source: WorkspaceDocument, groupIDs: Set<String>) throws -> WorkspaceDocument {
+    private static func project(_ source: WorkspaceDocument, groupIDs: Set<String>,
+                                machineIDs requestedMachineIDs: Set<String>?) throws -> WorkspaceDocument {
         guard !groupIDs.isEmpty, groupIDs.isSubset(of: Set(source.groups.map(\.id))) else {
             throw FTError.malformed("export.group_selection")
         }
         let groups = source.groups.filter { groupIDs.contains($0.id) }
-        let machineIDs = Set(groups.flatMap(\.machineOrder))
-        guard !machineIDs.isEmpty else { throw FTError.malformed("export.empty_group_selection") }
+        let availableMachineIDs = Set(groups.flatMap(\.machineOrder))
+        guard !availableMachineIDs.isEmpty else { throw FTError.malformed("export.empty_group_selection") }
+        let machineIDs = requestedMachineIDs ?? availableMachineIDs
+        guard !machineIDs.isEmpty, machineIDs.isSubset(of: availableMachineIDs) else {
+            throw FTError.malformed("export.machine_selection")
+        }
         let machines = source.machines.filter { machineIDs.contains($0.id) }
         let routeMap = Dictionary(uniqueKeysWithValues: source.routes.map { ($0.id, $0) })
         var routeIDs = Set<String>()
@@ -318,11 +339,22 @@ public struct WorkspaceExportSelection: Sendable {
         }
         try retain("groups", groupIDs); try retain("machines", machineIDs); try retain("routes", routeIDs)
         try retain("credentials", credentialIDs); try retain("host_trust", retainedTrustIDs); try retain("themes", themeIDs)
-        guard let initialGroup = groups.first(where: { $0.id == source.initialGroupID })
-                ?? groups.first(where: { $0.machineOrder.contains(source.initialMachineID) })
-                ?? groups.first(where: { !$0.machineOrder.isEmpty }),
-              let initialMachine = initialGroup.machineOrder.contains(source.initialMachineID)
-                ? source.initialMachineID : initialGroup.machineOrder.first else { throw FTError.stale }
+        // Prune only membership. Group identity, order, auto-connect and any
+        // required policy stay intact, including a deliberately retained empty
+        // group. No unselected machine can survive through another group.
+        document["groups"] = .array(try document.required("groups").array().map { value in
+            var group = try value.object()
+            group["machine_order"] = .array(try group.required("machine_order").array().filter {
+                machineIDs.contains(try $0.string())
+            })
+            return .object(group)
+        })
+        let nonemptyGroups = groups.filter { $0.machineOrder.contains(where: machineIDs.contains) }
+        guard let initialGroup = nonemptyGroups.first(where: { $0.id == source.initialGroupID })
+                ?? nonemptyGroups.first(where: { $0.machineOrder.contains(source.initialMachineID) && machineIDs.contains(source.initialMachineID) })
+                ?? nonemptyGroups.first,
+              let initialMachine = initialGroup.machineOrder.contains(source.initialMachineID) && machineIDs.contains(source.initialMachineID)
+                ? source.initialMachineID : initialGroup.machineOrder.first(where: machineIDs.contains) else { throw FTError.stale }
         var preferences = try document.required("preferences").object()
         preferences["initial_group_ref"] = .string(initialGroup.id)
         preferences["initial_machine_ref"] = .string(initialMachine)

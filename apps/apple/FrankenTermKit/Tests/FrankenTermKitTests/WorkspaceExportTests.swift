@@ -111,6 +111,60 @@ final class WorkspaceExportTests: XCTestCase {
         XCTAssertThrowsError(try WorkspaceExportSelection(workspace: fixture(), groupID: "absent"))
     }
 
+    func testMachineSubsetKeepsCompleteDependenciesAndPrunesEveryGroupMembership() throws {
+        let source = try fixture(), raw = source.raw
+        let selected = try WorkspaceExportSelection(workspace: source,
+            groupIDs: ["all", "selected"], machineIDs: ["build"])
+        XCTAssertEqual(selected.availableMachines.map(\.id), ["archive", "gpu", "build"])
+        XCTAssertEqual(selected.orderedMachines.map(\.id), ["build"])
+        XCTAssertEqual(selected.workspace.groups.map(\.id), ["all", "selected"])
+        XCTAssertEqual(selected.workspace.groups.map(\.machineOrder), [["build"], ["build"]])
+        XCTAssertEqual(selected.workspace.groups.map(\.autoConnect), [false, true])
+        XCTAssertEqual(selected.workspace.machines.map(\.id), ["build"])
+        XCTAssertEqual(selected.workspace.routes.map(\.id), ["second-hop", "build-route", "fallback-route", "first-hop"])
+        XCTAssertEqual(selected.workspace.credentials.map(\.id), ["alternative-key", "key-alias", "jump-key"])
+        XCTAssertEqual(selected.workspace.hostTrust.map(\.id), selected.workspace.routes.map { $0.id + "-trust" })
+        XCTAssertEqual(selected.workspace.themes.map(\.id), ["theme"])
+        XCTAssertEqual(selected.workspace.initialGroupID, "all")
+        XCTAssertEqual(selected.workspace.initialMachineID, "build")
+        XCTAssertEqual(source.raw, raw)
+        XCTAssertLessThan(selected.workspace.raw.count, source.raw.count)
+
+        let route = try XCTUnwrap(selected.workspace.routes.first { $0.id == "build-route" })
+        XCTAssertEqual(route.credentialIDs, ["key-alias", "alternative-key"])
+        XCTAssertEqual(route.authenticationMethods, [.publicKey, .keyboardInteractive])
+        XCTAssertEqual(route.jumpRoutes, ["first-hop"])
+        XCTAssertEqual(selected.workspace.routes.first { $0.id == "fallback-route" }?.requiredCapabilities,
+                       ["reviewed-password-policy"])
+    }
+
+    func testMachineSubsetRejectsEmptyUnknownAndOutsideGroupChoices() throws {
+        let source = try fixture()
+        for machines: Set<String> in [[], ["absent"], ["archive"], ["build", "archive"]] {
+            XCTAssertThrowsError(try WorkspaceExportSelection(workspace: source,
+                groupIDs: ["selected"], machineIDs: machines)) {
+                XCTAssertEqual($0 as? FTError, .malformed("export.machine_selection"))
+            }
+        }
+        let implicit = try WorkspaceExportSelection(workspace: source, groupIDs: ["selected"])
+        let explicit = try WorkspaceExportSelection(workspace: source,
+            groupIDs: ["selected"], machineIDs: ["gpu", "build"])
+        XCTAssertEqual(implicit.workspace.raw, explicit.workspace.raw)
+    }
+
+    func testMachineSubsetMovesInitialFocusPastAGroupEmptiedBySelection() throws {
+        let source = try fixture()
+        let selected = try WorkspaceExportSelection(workspace: source,
+            groupIDs: ["selected", "other", "empty"], machineIDs: ["gpu"])
+        XCTAssertEqual(selected.workspace.groups.map(\.id), ["selected", "other", "empty"])
+        XCTAssertEqual(selected.workspace.groups.map(\.machineOrder), [["gpu"], [], []])
+        XCTAssertEqual(selected.workspace.initialGroupID, "selected")
+        XCTAssertEqual(selected.workspace.initialMachineID, "gpu")
+        XCTAssertEqual(selected.availableMachines.map(\.id), ["build", "gpu", "archive"])
+        XCTAssertEqual(selected.workspace.routes.map(\.id), ["gpu-route"])
+        XCTAssertEqual(selected.workspace.credentials.map(\.id), ["key-alias"])
+    }
+
     func testSelectionAndPreparationPreserveExactFontNumberTokens() throws {
         var root = try StrictJSON.decode(fixture().raw).object()
         var content = try root.required("workspace").object()
@@ -271,6 +325,75 @@ final class WorkspaceMultiGroupExportTests: XCTestCase {
         XCTAssertThrowsError(try WorkspaceExportSelection(workspace: source, groupIDs: []))
         XCTAssertThrowsError(try WorkspaceExportSelection(workspace: source, groupIDs: ["unknown"]))
         XCTAssertThrowsError(try WorkspaceExportSelection(workspace: source, groupIDs: ["empty-group"]))
+    }
+
+    func testSubsetTransfersOnlySelectedMachinesAndRequiredKeysThroughQRAndImport() async throws {
+        let (key, fingerprint) = try sampleKey(using: crypto)
+        let source = try fixture(fingerprint: fingerprint)
+        let selection = try WorkspaceExportSelection(workspace: source,
+            groupIDs: ["gpu-group", "both-group"], machineIDs: ["build"])
+        XCTAssertEqual(selection.workspace.groups.map(\.machineOrder), [[], ["build"]])
+        XCTAssertEqual(selection.workspace.initialGroupID, "both-group")
+        XCTAssertEqual(selection.workspace.initialMachineID, "build")
+        XCTAssertEqual(selection.identities.map(\.fingerprint), [fingerprint])
+        XCTAssertEqual(selection.identities[0].credentialIDs, ["selected-key", "hop-key"])
+        let archive = try selection.archive(decisions: [fingerprint: .includePrivateKey], keys: [key],
+            bundleID: "selected-machine-transfer", using: crypto)
+        let sealed = try FTAG.seal(archive, using: crypto)
+        let sender = try OpticalSender(envelope: sealed.envelope, using: crypto)
+        let first = try OpticalFrame(text: sender.frame(page: 0, sequence: 1, using: crypto))
+        var receiver = OpticalReceiver(selecting: first)
+        for page in (0..<sender.identity.pageCount).reversed() {
+            for sequence in (1...(try sender.sourcePartCount(page: page))).reversed() {
+                let frame = try OpticalFrame(text: sender.frame(page: page, sequence: UInt32(sequence), using: crypto))
+                try receiver.receive(frame, using: crypto)
+            }
+        }
+        let received = try receiver.envelope(using: crypto)
+        XCTAssertEqual(received, sealed.envelope)
+        let restored = try FTAG.open(received, code: sealed.code, using: crypto)
+        let vault = StoreTestVault(), store = WorkspaceStore(persistence: StoreTestPersistence(), vault: vault)
+        let receipt = try await store.install(restored, envelopeDigest: crypto.sha256(received),
+            expectedRevision: nil, sourceAndContentsConfirmed: true)
+        let installed = try receipt.workspace.document()
+        XCTAssertEqual(installed.machines.map(\.id), ["build"])
+        XCTAssertEqual(installed.routes.map(\.id), ["hop-two", "route", "hop-one", "alternate"])
+        XCTAssertEqual(installed.groups.map(\.machineOrder), [[], ["build"]])
+        XCTAssertEqual(restored.keys.map(\.credentialID), ["selected-key"])
+        XCTAssertEqual(Set(receipt.workspace.bindings.map(\.credentialID)), ["selected-key", "hop-key"])
+        XCTAssertTrue(receipt.workspace.connectLater)
+        XCTAssertNil(installed.raw.range(of: Data("unused.invalid".utf8)))
+    }
+
+    func testMachineSubsetKeepsSameEndpointDenialsAndRequiredSourceFindings() throws {
+        let source = try fixture { workspace in
+            var trusts = workspace["host_trust"] as! [[String: Any]], detached = trusts[2]
+            detached["id"] = "detached-negative"
+            detached["revoked_keys"] = detached["pins"]
+            detached["required_capabilities"] = ["ssh.fresh_revocation"]
+            trusts.append(detached); workspace["host_trust"] = trusts
+        }
+        let findings: [AirGapArchive.Portability] = [
+            .init(entityID: "hop-one", setting: "source.required", disposition: 1, reason: "A mandatory jump setting needs support."),
+            .init(entityID: "unused-route", setting: "source.required", disposition: 1, reason: "An excluded destination needs support.")
+        ]
+        let selected = try WorkspaceExportSelection(workspace: source,
+            groupIDs: ["both-group"], machineIDs: ["build"], findings: findings)
+        XCTAssertTrue(selected.workspace.hostTrust.contains { $0.id == "detached-negative" })
+        let choices = Dictionary(uniqueKeysWithValues: selected.identities.map {
+            ($0.fingerprint, WorkspaceExportSelection.IdentityDecision.keepReferenceOnly)
+        })
+        let archive = try selected.archive(decisions: choices, keys: [], bundleID: "machine-policy", using: crypto)
+        XCTAssertTrue(archive.portability.contains(findings[0]))
+        XCTAssertFalse(archive.portability.contains(findings[1]))
+        let readiness = try archive.workspace.readiness(forRouteID: "route",
+            availableCredentialIDs: Set(archive.workspace.credentials.map(\.id)),
+            reviewedTrustIDs: Set(archive.workspace.hostTrust.map(\.id)), support: support)
+        XCTAssertTrue(readiness.issues.contains(.hostIdentityRevoked))
+        XCTAssertTrue(readiness.issues.contains(.unsupportedRequirement))
+        let publicDocument = try selected.publicDocument(bundleID: "machine-public-policy")
+        XCTAssertTrue(try XCTUnwrap(publicDocument.routes.first { $0.id == "route" })
+            .requiredCapabilities.contains("source.unresolved_required_policy"))
     }
 
     func testPruningCannotEraseSameScopeNegativeTrustOrMandatoryExtension() async throws {

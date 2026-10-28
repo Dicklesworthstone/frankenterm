@@ -81,6 +81,7 @@ private actor MacExportEngine {
     private var pendingKeyInstallation: PendingKeyInstallation?
     private var document: WorkspaceDocument?
     private var selection: WorkspaceExportSelection?
+    private var excludedMachineIDs = Set<String>()
     private var sourceFindings: [AirGapArchive.Portability] = []
     private var identityReferences: [String: String] = [:]
     private var sshSource: (source: SSHWorkspaceSource, url: URL)?
@@ -111,6 +112,7 @@ private actor MacExportEngine {
         let candidate = try WorkspaceDocument(data: SelectedLocalFile.read(url, limit: FTLimit.manifest))
         let selected = try WorkspaceExportSelection(workspace: candidate, groupIDs: [candidate.initialGroupID])
         document = candidate; selection = selected; decisions = [:]; keys = []; invalidateExport()
+        excludedMachineIDs = []
         sourceFindings = []; identityReferences = [:]; sshSource = nil
         return try state()
     }
@@ -180,6 +182,7 @@ private actor MacExportEngine {
         _ = try AirGapArchive(workspace: candidate, keys: loaded, using: crypto)
         try Task.checkCancellation()
         document = candidate; selection = selected; decisions = included; keys = loaded
+        excludedMachineIDs = []
         sourceFindings = []; identityReferences = files; sshSource = nil; invalidateExport()
         return .init(state: try state(), inventory: (root["inventory"] as? String) ?? "machines.toml",
                      notes: (root["notes"] as? [String]) ?? [], unresolved: unresolved)
@@ -234,6 +237,7 @@ private actor MacExportEngine {
         }
         try Task.checkCancellation()
         document = candidate.workspace; selection = selected; sourceFindings = candidate.portability
+        excludedMachineIDs = []
         identityReferences = candidate.identityReferences; sshSource = nil
         decisions = [:]; keys = []; invalidateExport()
         return try state()
@@ -241,10 +245,26 @@ private actor MacExportEngine {
     func selectGroups(_ ids: Set<String>) throws -> SelectionState {
         retireKeyRequest(); invalidateExport()
         guard let document else { throw FTError.stale }
-        let selected = try WorkspaceExportSelection(workspace: document, groupIDs: ids, findings: sourceFindings)
+        let machines = Set(document.groups.filter { ids.contains($0.id) }.flatMap(\.machineOrder))
+            .subtracting(excludedMachineIDs)
+        let selected = try WorkspaceExportSelection(workspace: document, groupIDs: ids,
+                                                    machineIDs: machines, findings: sourceFindings)
+        return try applySelection(selected)
+    }
+    func selectMachines(_ ids: Set<String>) throws -> SelectionState {
+        retireKeyRequest(); invalidateExport()
+        guard let document, let selection else { throw FTError.stale }
+        let selected = try WorkspaceExportSelection(workspace: document,
+            groupIDs: Set(selection.workspace.groups.map(\.id)), machineIDs: ids, findings: sourceFindings)
+        let available = Set(selected.availableMachines.map(\.id))
+        excludedMachineIDs.subtract(available)
+        excludedMachineIDs.formUnion(available.subtracting(ids))
+        return try applySelection(selected)
+    }
+    private func applySelection(_ selected: WorkspaceExportSelection) throws -> SelectionState {
         let retained = Set(selected.identities.map(\.fingerprint))
-        // A group change removes private material no longer referenced anywhere
-        // in the selected dependency graph. It also invalidates the sealed export.
+        // A group or machine change releases unrelated private material and
+        // its consent. Re-adding that machine cannot silently re-include a key.
         keys = keys.filter { retained.contains(fingerprint($0)) }
         decisions = decisions.filter { retained.contains($0.key) }
         selection = selected; invalidateExport()
@@ -430,6 +450,7 @@ private actor MacExportEngine {
     }
     func clear() {
         retireKeyRequest(); document = nil; selection = nil; decisions = [:]; keys = []
+        excludedMachineIDs = []
         sourceFindings = []; identityReferences = [:]; sshSource = nil; invalidateExport()
     }
 }
@@ -488,6 +509,14 @@ private final class MacExportModel {
     @ObservationIgnored private var screensAwake = true
 
     var selectedGroupIDs: Set<String> { Set(selection?.workspace.groups.map(\.id) ?? []) }
+    var selectedMachineIDs: Set<String> { Set(selection?.workspace.machines.map(\.id) ?? []) }
+    func canDeselectGroup(_ id: String) -> Bool {
+        guard let document else { return false }
+        return document.groups.contains { group in
+            group.id != id && selectedGroupIDs.contains(group.id)
+                && group.machineOrder.contains(where: selectedMachineIDs.contains)
+        }
+    }
     var recipientConfirmed: Bool {
         guard let recipientRequest, let confirmedRecipientDigest else { return false }
         return AppleCryptography().sha256(recipientRequest.encoded) == confirmedRecipientDigest
@@ -713,6 +742,18 @@ private final class MacExportModel {
         cancelRecipientScan(); retireSourceKeyPrompt(); invalidatePrepared()
         perform { [self] operation in
             let result = try await engine.selectGroups(groups)
+            try requireCurrentWork(operation)
+            apply(result)
+        }
+    }
+    func selectMachine(_ id: String, included: Bool) {
+        guard !busy, sourceSheet == nil else { return }
+        var machines = selectedMachineIDs
+        if included { machines.insert(id) } else { machines.remove(id) }
+        guard !machines.isEmpty else { return }
+        cancelRecipientScan(); retireSourceKeyPrompt(); invalidatePrepared()
+        perform { [self] operation in
+            let result = try await engine.selectMachines(machines)
             try requireCurrentWork(operation)
             apply(result)
         }
@@ -1122,8 +1163,12 @@ private final class MacExportModel {
                 message = "The SSH configuration exceeds the bounded Include profile: 64 file reads, eight nested includes, 2 MiB of source, 16,384 lines, and 16,384 scanned directory entries. Choose a smaller explicit configuration; no partial source was imported."
             } else if error == .limit("animation.use_live_transfer") {
                 message = "This package exceeds the 256-symbol saved-animation limit. Use live QR playback or save the encrypted .ftairgap file. No settings or keys were omitted."
+            } else if error == .limit("envelope.bytes") || error == .limit("archive.bytes") {
+                message = "The selected package exceeds this transfer profile: at most 4 MiB encrypted and 8 MiB expanded. Deselect machines in the preview or keep selected identities as references only, then prepare a new transfer. No machine, setting, or key was omitted automatically."
+            } else if error == .malformed("export.machine_selection") {
+                message = "Keep at least one machine selected from the chosen groups. Select a group first to include one of its machines."
             } else if error == .limit("video.use_live_transfer") {
-                message = "This package exceeds the bounded video duration or symbol count. Select fewer groups or identities, use live playback, or save the encrypted .ftairgap file. The package was not truncated."
+                message = "This package exceeds the bounded video duration or symbol count. Select fewer machines, groups or identities, use live playback, or save the encrypted .ftairgap file. The package was not truncated."
             } else if error == .unsupported("video.published_durability_unconfirmed") {
                 message = "The MP4 was verified and saved. The filesystem could not confirm that the directory change would survive a sudden system failure. The completed movie is retained at the selected destination."
             } else if error == .unsupported("ssh.no_concrete_hosts") {
@@ -1141,7 +1186,7 @@ private final class MacExportModel {
             } else if error == .malformed("recipient.image_qr") {
                 message = "The image must contain exactly one readable FrankenTerm recipient-request QR. Choose another image or scan the phone with the camera."
             } else if error == .limit("recipient.envelope_limit") {
-                message = "This export exceeds the size accepted by the iPhone’s request. Select fewer groups or private identities, or create and confirm a new request with a larger limit. Nothing was omitted automatically."
+                message = "This export exceeds the size accepted by the iPhone’s request. Select fewer machines, groups or private identities, or create and confirm a new request with a larger limit. Nothing was omitted automatically."
             } else if error == .authentication, protection == .recipient {
                 message = "The recipient request could not be used for encryption. Create a new request on the iPhone, then scan and compare it again."
             } else { message = error.localizedDescription }
@@ -1388,9 +1433,16 @@ private struct MacExportView: View {
                     .font(.title3).foregroundStyle(.secondary)
             }
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 170), spacing: 10)], alignment: .leading, spacing: 10) {
-                ForEach(selection.orderedMachines) { machine in
-                    let theme = selection.workspace.themes.first { $0.id == machine.themeID }
+                ForEach(selection.availableMachines) { machine in
+                    let theme = model.document?.themes.first { $0.id == machine.themeID }
+                    let included = model.selectedMachineIDs.contains(machine.id)
                     HStack(spacing: 8) {
+                        Toggle(isOn: Binding(get: { model.selectedMachineIDs.contains(machine.id) },
+                                             set: { model.selectMachine(machine.id, included: $0) })) {
+                            Text(verbatim: machine.name)
+                        }.labelsHidden().toggleStyle(.checkbox)
+                            .accessibilityLabel("Include \(machine.name)")
+                            .disabled(model.busy || (included && model.selectedMachineIDs.count == 1))
                         Circle().fill(Color(ftExportHex: theme?.accent ?? "#888888")).frame(width: 10, height: 10)
                         Text(verbatim: machine.name).lineLimit(1).foregroundStyle(Color(ftExportHex: theme?.foreground ?? "#FFFFFF"))
                         Spacer(minLength: 0)
@@ -1398,8 +1450,13 @@ private struct MacExportView: View {
                     .padding(.horizontal, 12).padding(.vertical, 10)
                     .background(Color(ftExportHex: theme?.background ?? "#1C1C1E"), in: RoundedRectangle(cornerRadius: 10))
                     .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color(ftExportHex: theme?.accent ?? "#888888").opacity(0.45)))
+                    .opacity(included ? 1 : 0.6)
                 }
             }
+            Text("Choose the machines to transfer. Shared jump hosts and their required keys stay included. \(selection.availableMachines.count - selection.orderedMachines.count) machines excluded.")
+                .font(.caption).foregroundStyle(.secondary)
+            Text("Selected public settings: \(ByteCountFormatter.string(fromByteCount: Int64(selection.workspace.raw.count), countStyle: .file)). The complete encrypted size and page count appear after preparation; the transfer limit is 4 MiB.")
+                .font(.caption).foregroundStyle(.secondary)
             if !review.canPrepare {
                 Label(review.pendingIdentityCount + review.missingApprovedKeyCount == 1
                       ? "One key needs your attention under Details."
@@ -1437,7 +1494,8 @@ private struct MacExportView: View {
                                 .font(.caption).foregroundStyle(.secondary).lineLimit(2)
                         }
                     }
-                    .disabled(model.busy || group.machineOrder.isEmpty || (model.selectedGroupIDs.count == 1 && model.selectedGroupIDs.contains(group.id)))
+                    .disabled(model.busy || group.machineOrder.isEmpty
+                        || (model.selectedGroupIDs.contains(group.id) && !model.canDeselectGroup(group.id)))
                 }
                 if let selected = model.selection?.workspace {
                     Text("\(selected.groups.count) groups · \(selected.machines.count) machines · \(selected.routes.count) routes including jump hosts")
