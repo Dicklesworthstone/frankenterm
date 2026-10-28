@@ -387,6 +387,8 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
 
     func status(of machineID: String) -> Status {
         guard machines.first(where: { $0.id == machineID })?.target != nil else { return .unavailable }
+        // Switching how the phone uses a shared pane reconnects it.
+        if changingMuxModes.contains(machineID) { return .connecting }
         if disconnected.contains(machineID) { return .disconnected }
         guard let session = sessions[machineID] else {
             return connectionIntent.shouldPrepare(machineID) ? .connecting : .disconnected
@@ -837,6 +839,10 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
                 try? self.connectionIntent.terminalEnded(machineID,
                     reattachesExistingPanes: controller.dropped && controller.attachedToMux)
                 self.reconnectPolicies[machineID, default: .init()].recordEnd()
+                // Unless the person chose View Only: then it is theirs to take.
+                if controller.paneTooLargeToView, self.muxAccessSelections[machineID] == nil {
+                    self.takePaneAtPhoneSize(machineID, from: controller)
+                }
             case .couldNotConnect:
                 self.reconnectPolicies[machineID, default: .init()].recordEnd()
             case .idle, .connecting, .ready: break
@@ -904,6 +910,11 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         for machine in machines where machine.target != nil { disconnect(machine.id) }
     }
 
+    /// The mode a machine's shared pane is reconnecting in, while it is.
+    func changingMuxMode(_ machineID: String) -> TerminalMuxAccessMode? {
+        changingMuxModes.contains(machineID) ? muxAccessSelections[machineID] : nil
+    }
+
     /// A mode change never changes authority under already admitted input.
     /// The old connection settles first; its uncertainty remains visible on
     /// the replacement, and an absent mux cannot become a new SSH shell.
@@ -914,6 +925,28 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
               muxModeJobs[machineID] == nil else { return }
         disconnect(machineID, expectedControllerID: controllerID)
         muxAccessSelections[machineID] = mode
+        existingMuxRequired.insert(machineID)
+        changingMuxModes.insert(machineID)
+        let id = UUID()
+        let task = Task { [weak self, session] in
+            await session.stop()
+            guard let self, self.muxModeJobs[machineID]?.id == id else { return }
+            self.muxModeJobs[machineID] = nil; self.changingMuxModes.remove(machineID)
+            guard !Task.isCancelled, self.permitsTerminalCreation,
+                  self.sessions[machineID] === session, session.settled else { return }
+            self.requestConnection(machineID, terminal: true)
+        }
+        muxModeJobs[machineID] = (id, task)
+    }
+
+    /// A shared pane larger than View Only can draw ended that connection.
+    /// The pane is taken at the phone's size instead, as Use Terminal would,
+    /// once the old connection settles; leaving it gives the desktop its size
+    /// back. An absent mux still cannot become a new SSH shell.
+    func takePaneAtPhoneSize(_ machineID: String, from session: TerminalSessionController) {
+        guard permitsTerminalCreation, sessions[machineID] === session, session.paneTooLargeToView,
+              session.muxAccessMode == .viewOnly, muxModeJobs[machineID] == nil else { return }
+        muxAccessSelections[machineID] = .interactive
         existingMuxRequired.insert(machineID)
         changingMuxModes.insert(machineID)
         let id = UUID()
@@ -1624,7 +1657,10 @@ struct WorkspaceTerminalScreen: View {
 
     @ViewBuilder private func card(for machine: SceneMachine) -> some View {
         let accent = Color(ftHex: scene.themes[machine.id]?.accent ?? "#3B82F6")
-        if scene.disconnected.contains(machine.id) {
+        if let mode = scene.changingMuxMode(machine.id) {
+            connecting(machine, accent: accent, detail: mode == .interactive
+                ? "Fitting the shared pane to this phone…" : "Reconnecting to view only…")
+        } else if scene.disconnected.contains(machine.id) {
             disconnectedCard(machine, accent: accent)
         } else if scene.capacityBlockedMachineID == machine.id {
             capacityCard(machine, accent: accent)
@@ -1740,9 +1776,23 @@ struct WorkspaceTerminalScreen: View {
 
     private func endedCard(_ machine: SceneMachine, message: String, session: TerminalSessionController,
                            accent: Color) -> some View {
-        sceneCard(symbol: "moon.zzz", title: "Session ended", message: message, accent: accent) {
-            Button(session.route.mux ? "Reconnect Existing Panes" : "New Session", systemImage: "arrow.clockwise") {
-                scene.openTerminal(machine.id)
+        // Viewing a pane too large to view would end the same way again;
+        // only the phone's own size can show it.
+        let fits = session.paneTooLargeToView
+        return sceneCard(symbol: "moon.zzz", title: "Session ended", message: fits
+            ? message + " Use at Phone Size fits it to this phone while you use it; the desktop gets its size back when you leave."
+            : message, accent: accent) {
+            Group {
+                if fits {
+                    Button("Use at Phone Size", systemImage: "arrow.down.right.and.arrow.up.left") {
+                        scene.takePaneAtPhoneSize(machine.id, from: session)
+                    }
+                    .accessibilityIdentifier("terminal.ended.fit")
+                } else {
+                    Button(session.route.mux ? "Reconnect Existing Panes" : "New Session", systemImage: "arrow.clockwise") {
+                        scene.openTerminal(machine.id)
+                    }
+                }
             }
                 .buttonStyle(.borderedProminent).controlSize(.large).tint(accent)
                 .disabled(!session.settled)

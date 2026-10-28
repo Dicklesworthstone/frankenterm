@@ -213,6 +213,8 @@ final class MuxObservationTests: XCTestCase {
             if mode == "oversize" || mode == "invalid-grid" {
                 _ = try await run.value
                 XCTAssertNotNil(control.current.failure)
+                XCTAssertEqual(control.current.paneTooLargeToView, mode == "oversize",
+                    "Only a real pane bigger than the phone may be taken at the phone's size")
                 XCTAssertTrue(client.effects.isEmpty, "An unsupported observed grid must never be asked back to phone size")
                 let summary = await consumer.summary()
                 XCTAssertEqual(summary.bytes, 0)

@@ -519,6 +519,9 @@ final class TerminalSessionController {
     /// close on this phone is not a drop. A retry of a drop that cannot reach
     /// the machine is still one: the network may be back for the next try.
     private(set) var dropped = false
+    /// This View Only connection ended because its shared pane was larger
+    /// than the phone can draw; only the phone's own size can show it.
+    private(set) var paneTooLargeToView = false
     @ObservationIgnored private let retriesDrop: Bool
     private(set) var cleanupFailure: String?
     /// What an ended connection left known about the person's input. A later
@@ -1890,20 +1893,26 @@ final class TerminalSessionController {
     private func pumpEnded(_ end: Result<TerminalSessionEnd, Error>) async {
         guard !stopped else { return }
         if phase == .live {
+            // This phone ended it, and viewing again would end the same way:
+            // not a drop to reconnect automatically.
+            paneTooLargeToView = connection?.muxControl?.current.paneTooLargeToView == true
             switch end {
             case let .success(reason):
                 switch reason {
-                case .disconnected, .transportFailed: dropped = true
+                case .disconnected, .transportFailed: dropped = !paneTooLargeToView
                 default: break
                 }
-                // The mux server's own reason, when it ended the session.
-                if let failure = connection?.muxControl?.current.failure {
+                if paneTooLargeToView, let failure = connection?.muxControl?.current.failure {
+                    phase = .ended(failure)
+                } else if let failure = connection?.muxControl?.current.failure {
+                    // The mux server's own reason, when it ended the session.
                     phase = .ended("The machine's FrankenTerm mux ended the session: \(failure)")
                 } else {
                     phase = .ended(Self.describe(reason))
                 }
             case let .failure(error):
-                dropped = error is TerminalTransportError || (error as? NativeSSHError)?.isConnectionFailure == true
+                dropped = !paneTooLargeToView && (error is TerminalTransportError
+                    || (error as? NativeSSHError)?.isConnectionFailure == true)
                 phase = .failed(Self.describe(error))
             }
         }

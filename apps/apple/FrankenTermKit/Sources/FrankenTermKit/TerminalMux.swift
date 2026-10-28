@@ -433,6 +433,9 @@ public final class TerminalMuxControl: @unchecked Sendable {
         /// Why the mux server ended an attached session (a reply this app
         /// could not read, say), when it was not the connection dropping.
         public var failure: String?
+        /// The shown pane is larger than this View Only phone can draw. Only a
+        /// connection that sizes it to the phone can show it.
+        public var paneTooLargeToView = false
         /// What changed while the phone was away that the screen should say,
         /// such as the pane it was showing having closed.
         public var notice: String?
@@ -695,6 +698,16 @@ public final class TerminalMuxControl: @unchecked Sendable {
     public func recordFailure(_ reason: String) {
         update { state in
             state.failure = Self.boundedError(reason)
+            return true
+        }
+    }
+
+    /// The attached View Only session is ending because its pane outgrew what
+    /// the phone can draw; the screen may take the pane at the phone's size.
+    public func recordPaneTooLargeToView(_ reason: String) {
+        update { state in
+            state.failure = Self.boundedError(reason)
+            state.paneTooLargeToView = true
             return true
         }
     }

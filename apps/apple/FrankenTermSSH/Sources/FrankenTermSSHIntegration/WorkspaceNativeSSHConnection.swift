@@ -849,7 +849,10 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                       !state.control.accessMode.controlsSize || own || (rows * 2 + 256) * columns <= 65536 else {
                     guard state.control.accessMode.controlsSize else {
                         let reason = "This shared pane is too large to view on this phone. Its size was not changed."
-                        state.control.recordFailure(reason)
+                        // A real pane bigger than the phone can be taken at the
+                        // phone's size; a grid no pane can have cannot.
+                        if rows > 0, columns > 0 { state.control.recordPaneTooLargeToView(reason) }
+                        else { state.control.recordFailure(reason) }
                         throw TerminalMuxError.failed(reason)
                     }
                     // The mirror counts this output as drawn; draw the pane
