@@ -155,6 +155,267 @@ fn read_source(path: &Path, limit: usize) -> KnownHostsSource {
     }
 }
 
+/// The deepest `Include` nesting OpenSSH reads (READCONF_MAX_DEPTH).
+const MAX_INCLUDE_DEPTH: usize = 16;
+/// Directory entries one `Include` pattern may scan.
+const MAX_INCLUDE_ENTRIES: usize = 16_384;
+
+/// Where `expand_includes` reads: the disk, or a test's fixture.
+trait IncludeFiles {
+    /// One included file, under `read_source`'s rules.
+    fn read(&self, path: &Path, limit: usize) -> KnownHostsSource;
+    /// The names in `directory`: empty when it does not exist, `None` when
+    /// it cannot be listed.
+    fn names(&self, directory: &Path) -> Option<Vec<String>>;
+}
+
+struct DiskIncludes;
+
+impl IncludeFiles for DiskIncludes {
+    fn read(&self, path: &Path, limit: usize) -> KnownHostsSource {
+        // macOS ships /etc/ssh/crypto.conf as a root-owned link to
+        // crypto/apple.conf. Follow one link owned by root or this user; the
+        // target is read under the same rules and may not be a link itself.
+        #[cfg(unix)]
+        if let Ok(link) = std::fs::symlink_metadata(path) {
+            use std::os::unix::fs::MetadataExt;
+            if link.file_type().is_symlink() {
+                let owner = link.uid();
+                if owner != 0 && owner != nix::unistd::Uid::current().as_raw() {
+                    return KnownHostsSource::Unavailable;
+                }
+                return match std::fs::read_link(path) {
+                    Ok(target) => read_source(
+                        &path
+                            .parent()
+                            .map_or(target.clone(), |dir| dir.join(&target)),
+                        limit,
+                    ),
+                    Err(_) => KnownHostsSource::Unavailable,
+                };
+            }
+        }
+        read_source(path, limit)
+    }
+
+    fn names(&self, directory: &Path) -> Option<Vec<String>> {
+        let entries = match std::fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Some(Vec::new()),
+            Err(_) => return None,
+        };
+        let mut names = Vec::new();
+        for entry in entries {
+            names.push(entry.ok()?.file_name().into_string().ok()?);
+            if names.len() > MAX_INCLUDE_ENTRIES {
+                return None;
+            }
+        }
+        Some(names)
+    }
+}
+
+/// What one SSH source, with everything it includes, may still add.
+struct IncludeBudget {
+    bytes: usize,
+    lines: usize,
+    files: usize,
+}
+
+impl IncludeBudget {
+    fn new() -> Self {
+        // The margin covers the `Host *` lines splicing adds, so the result
+        // still fits the resolver's own limit.
+        Self {
+            bytes: MAX_SOURCE_BYTES - 4096,
+            lines: MAX_SOURCE_LINES - 512,
+            files: MAX_SOURCE_FILES,
+        }
+    }
+
+    fn take(&mut self, text: &str) -> bool {
+        let lines = text.lines().count();
+        if text.len() > self.bytes || lines > self.lines {
+            return false;
+        }
+        self.bytes -= text.len();
+        self.lines -= lines;
+        true
+    }
+}
+
+/// Reads one top-level SSH source and splices in what it includes.
+fn read_config_source(
+    path: &Path,
+    base: &Path,
+    home: &Path,
+    budget: &mut IncludeBudget,
+) -> KnownHostsSource {
+    match read_source(path, budget.bytes) {
+        KnownHostsSource::Present(text) if budget.take(&text) => KnownHostsSource::Present(
+            expand_includes(&text, base, home, &DiskIncludes, budget, 0, true),
+        ),
+        KnownHostsSource::Present(_) => KnownHostsSource::Unavailable,
+        other => other,
+    }
+}
+
+/// Splices `Include`d files into `text` where OpenSSH's meaning survives as
+/// flat text (ft-5qgrk): at the top level or under `Host *`, or under any
+/// other Host when the included text starts no Host or Match block. A file
+/// starts in its includer's context, and that context returns after it, as
+/// OpenSSH restores it. An Include it cannot splice in full stays as written
+/// (the resolver then treats the source as unresolved): a pattern needing
+/// token, variable, `?` or bracket expansion, a file it cannot read safely,
+/// or the depth or budget exceeded. A missing file adds nothing, as in
+/// OpenSSH. Relative patterns resolve against `base`: ~/.ssh for the user's
+/// file and /etc/ssh for the system's.
+fn expand_includes(
+    text: &str,
+    base: &Path,
+    home: &Path,
+    files: &dyn IncludeFiles,
+    budget: &mut IncludeBudget,
+    depth: usize,
+    mut unconditional: bool,
+) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        if let Some((keyword, value)) = directive(line) {
+            if keyword.eq_ignore_ascii_case("host") || keyword.eq_ignore_ascii_case("match") {
+                unconditional = keyword.eq_ignore_ascii_case("host")
+                    && configuration_words(value).is_some_and(|words| words == ["*"]);
+            } else if keyword.eq_ignore_ascii_case("include") {
+                if let Some(spliced) =
+                    splice_include(value, base, home, files, budget, depth, unconditional)
+                {
+                    out.push_str(&spliced);
+                    continue;
+                }
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+fn splice_include(
+    value: &str,
+    base: &Path,
+    home: &Path,
+    files: &dyn IncludeFiles,
+    budget: &mut IncludeBudget,
+    depth: usize,
+    unconditional: bool,
+) -> Option<String> {
+    if depth >= MAX_INCLUDE_DEPTH {
+        return None;
+    }
+    let mut spliced = String::new();
+    for pattern in configuration_words(value)? {
+        for path in include_paths(&pattern, base, home, files)? {
+            budget.files = budget.files.checked_sub(1)?;
+            let text = match files.read(&path, budget.bytes) {
+                KnownHostsSource::Present(text) => text,
+                KnownHostsSource::Missing => continue,
+                KnownHostsSource::Unavailable => return None,
+            };
+            if !budget.take(&text) {
+                return None;
+            }
+            let expanded =
+                expand_includes(&text, base, home, files, budget, depth + 1, unconditional);
+            let opens_blocks = expanded.lines().filter_map(directive).any(|(keyword, _)| {
+                keyword.eq_ignore_ascii_case("host") || keyword.eq_ignore_ascii_case("match")
+            });
+            if opens_blocks && !unconditional {
+                return None;
+            }
+            spliced.push_str(&expanded);
+            if opens_blocks {
+                // Back to the includer's context: everything, as before.
+                spliced.push_str("Host *\n");
+            }
+        }
+    }
+    Some(spliced)
+}
+
+/// The files one Include pattern names, sorted as glob(3) sorts them.
+/// `*` is the only wildcard, in the last component only.
+fn include_paths(
+    pattern: &str,
+    base: &Path,
+    home: &Path,
+    files: &dyn IncludeFiles,
+) -> Option<Vec<PathBuf>> {
+    if pattern.is_empty() || pattern.contains(['%', '$', '?', '[', ']', '{', '}']) {
+        return None;
+    }
+    let path = if let Some(rest) = pattern.strip_prefix("~/") {
+        home.join(rest)
+    } else if pattern.starts_with('~') {
+        return None;
+    } else {
+        // An absolute pattern replaces the base.
+        base.join(pattern)
+    };
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return None;
+    }
+    let name = path.file_name()?.to_str()?;
+    let directory = path.parent()?;
+    if directory.to_str()?.contains('*') {
+        return None;
+    }
+    if !name.contains('*') {
+        return Some(vec![path.clone()]);
+    }
+    let mut matched: Vec<String> = files
+        .names(directory)?
+        .into_iter()
+        .filter(|candidate| glob_component_matches(name, candidate))
+        .collect();
+    matched.sort();
+    Some(
+        matched
+            .into_iter()
+            .map(|name| directory.join(name))
+            .collect(),
+    )
+}
+
+/// glob(3) on one component with `*` only: a leading `.` is matched only by
+/// a pattern's leading `.`. Linear in practice: one backtrack point.
+fn glob_component_matches(pattern: &str, name: &str) -> bool {
+    if name.starts_with('.') && !pattern.starts_with('.') {
+        return false;
+    }
+    let (pattern, name) = (pattern.as_bytes(), name.as_bytes());
+    let (mut p, mut n) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while n < name.len() {
+        if p < pattern.len() && pattern[p] == b'*' {
+            star = Some((p, n));
+            p += 1;
+        } else if p < pattern.len() && pattern[p] == name[n] {
+            p += 1;
+            n += 1;
+        } else if let Some((star_p, star_n)) = star {
+            p = star_p + 1;
+            n = star_n + 1;
+            star = Some((star_p, star_n + 1));
+        } else {
+            return false;
+        }
+    }
+    pattern[p..].iter().all(|&byte| byte == b'*')
+}
+
 fn default_known_hosts(home: &Path) -> Vec<PathBuf> {
     vec![
         home.join(".ssh/known_hosts"),
@@ -170,13 +431,18 @@ impl SshSources {
     /// absent; the export reports what that leaves unusable.
     pub fn from_disk(inventory: &MachineInventory, context: &InventoryContext) -> Self {
         let ssh = context.home.join(".ssh");
-        let config = match read_source(&ssh.join("config"), MAX_SOURCE_BYTES) {
+        // One budget for both sources and everything they include.
+        let mut budget = IncludeBudget::new();
+        let config = match read_config_source(&ssh.join("config"), &ssh, &context.home, &mut budget)
+        {
             KnownHostsSource::Present(text) => Some(text),
             _ => None,
         };
-        let system_config = read_source(
+        let system_config = read_config_source(
             Path::new("/etc/ssh/ssh_config"),
-            MAX_SOURCE_BYTES.saturating_sub(config.as_ref().map_or(0, String::len)),
+            Path::new("/etc/ssh"),
+            &context.home,
+            &mut budget,
         );
         let resolver = alias_resolver_with_system(config.as_deref(), &system_config, &context.home);
         let default_known_hosts = default_known_hosts(&context.home);
@@ -791,7 +1057,9 @@ fn alias_resolver(config: Option<&str>, home: &Path) -> Option<AliasResolver> {
 
 /// The concrete `Host` aliases in the user's SSH config, without patterns.
 pub fn ssh_config_hosts(home: &Path) -> Vec<String> {
-    let text = match read_source(&home.join(".ssh/config"), MAX_SOURCE_BYTES) {
+    let ssh = home.join(".ssh");
+    let text = match read_config_source(&ssh.join("config"), &ssh, home, &mut IncludeBudget::new())
+    {
         KnownHostsSource::Present(text) => text,
         _ => return Vec::new(),
     };
@@ -1358,6 +1626,18 @@ fn resolve_endpoint(
                         | "checkhostip"
                         | "canonicalizehostname"
                         | "refuseconnection" => value.eq_ignore_ascii_case("no"),
+                        // `^` puts the listed algorithms first and removes
+                        // none of OpenSSH's defaults: no constraint for the
+                        // phone to enforce. macOS sets Ciphers, KexAlgorithms
+                        // and MACs this way in /etc/ssh/crypto.conf
+                        // (ft-5qgrk). `+`, `-` and a full list still block.
+                        "hostkeyalgorithms"
+                        | "casignaturealgorithms"
+                        | "pubkeyacceptedalgorithms"
+                        | "pubkeyacceptedkeytypes"
+                        | "kexalgorithms"
+                        | "ciphers"
+                        | "macs" => value.starts_with('^'),
                         _ => false,
                     };
                     if !disabled {
@@ -4054,5 +4334,225 @@ ssh = "right"
         let mut bytes = serde_json::to_vec_pretty(&document).unwrap();
         bytes.push(b'\n');
         matches_file("fixtures/ios-airgap/machines-export.ftworkspace", &bytes);
+    }
+
+    /// Include fixtures: file texts by path, and directory listings.
+    #[derive(Default)]
+    struct FixtureIncludes {
+        files: BTreeMap<PathBuf, KnownHostsSource>,
+        directories: BTreeMap<PathBuf, Vec<String>>,
+    }
+
+    impl IncludeFiles for FixtureIncludes {
+        fn read(&self, path: &Path, limit: usize) -> KnownHostsSource {
+            match self.files.get(path) {
+                Some(KnownHostsSource::Present(text)) if text.len() > limit => {
+                    KnownHostsSource::Unavailable
+                }
+                Some(source) => source.clone(),
+                None => KnownHostsSource::Missing,
+            }
+        }
+
+        fn names(&self, directory: &Path) -> Option<Vec<String>> {
+            Some(self.directories.get(directory).cloned().unwrap_or_default())
+        }
+    }
+
+    fn expand(text: &str, base: &str, files: &FixtureIncludes) -> String {
+        let home = context().home;
+        let mut budget = IncludeBudget::new();
+        expand_includes(text, Path::new(base), &home, files, &mut budget, 0, true)
+    }
+
+    fn present(text: &str) -> KnownHostsSource {
+        KnownHostsSource::Present(text.into())
+    }
+
+    #[test]
+    fn stock_macos_system_configuration_leaves_alias_routes_ready() {
+        // /etc/ssh as macOS ships it: one Include, a Host * block, and
+        // crypto.conf's ^ preference lists.
+        let mut files = FixtureIncludes::default();
+        files.directories.insert(
+            "/etc/ssh/ssh_config.d".into(),
+            vec!["100-macos.conf".into()],
+        );
+        files.files.insert(
+            "/etc/ssh/ssh_config.d/100-macos.conf".into(),
+            present("Host *\n  SendEnv LANG LC_*\n  Include /etc/ssh/crypto.conf\n"),
+        );
+        files.files.insert(
+            "/etc/ssh/crypto.conf".into(),
+            present("Ciphers ^aes128-gcm@openssh.com,aes256-gcm@openssh.com\nKexAlgorithms ^ecdh-sha2-nistp256\nMACs ^hmac-sha2-256-etm@openssh.com,hmac-sha2-256\n"),
+        );
+        let system = expand(
+            "# Comments only, then:\nInclude /etc/ssh/ssh_config.d/*\n",
+            "/etc/ssh",
+            &files,
+        );
+        assert_eq!(
+            system,
+            "# Comments only, then:\nHost *\n  SendEnv LANG LC_*\nCiphers ^aes128-gcm@openssh.com,aes256-gcm@openssh.com\nKexAlgorithms ^ecdh-sha2-nistp256\nMACs ^hmac-sha2-256-etm@openssh.com,hmac-sha2-256\nHost *\n"
+        );
+
+        let mut sources = sources(Some(
+            "Host left right\n HostName box\n User u\n UserKnownHostsFile /trust/pins\n GlobalKnownHostsFile none\n",
+        ));
+        supply(
+            &mut sources,
+            "/trust/pins",
+            format!("box ssh-ed25519 {}\n", ED25519),
+        );
+        sources.system_config = present(&system);
+        let export = trust_export(&sources);
+        let left = route_trust(&export, "r.left.ssh");
+        assert!(left["required_capabilities"].is_null(), "{}", left);
+        assert_eq!(left["pins"].as_array().unwrap().len(), 1);
+        // Unexpanded, the same file still blocks the route.
+        sources.system_config = present("Include /etc/ssh/ssh_config.d/*\n");
+        assert_eq!(
+            route_trust(&trust_export(&sources), "r.left.ssh")["required_capabilities"],
+            json!([UNRESOLVED_POLICY])
+        );
+    }
+
+    #[test]
+    fn includes_splice_only_where_openssh_meaning_survives() {
+        let mut files = FixtureIncludes::default();
+        files.files.insert(
+            "/home/me/.ssh/options".into(),
+            present("IdentitiesOnly yes\n"),
+        );
+        files.files.insert(
+            "/home/me/.ssh/hosts".into(),
+            present("Host extra\n HostName extra.example\n"),
+        );
+        files
+            .files
+            .insert("/home/me/.ssh/self".into(), present("Include self\n"));
+        files
+            .files
+            .insert("/home/me/.ssh/locked".into(), KnownHostsSource::Unavailable);
+        files.directories.insert(
+            "/home/me/.ssh/config.d".into(),
+            ["b.conf", "a.conf", ".hidden.conf", "notes.txt"]
+                .map(String::from)
+                .to_vec(),
+        );
+        for name in ["a", "b", ".hidden"] {
+            files.files.insert(
+                format!("/home/me/.ssh/config.d/{name}.conf").into(),
+                present(&format!("Host {name}\n")),
+            );
+        }
+        let base = "/home/me/.ssh";
+        // Options under a specific Host splice in place; relative to ~/.ssh.
+        assert_eq!(
+            expand("Host box\n Include options\n User u\n", base, &files),
+            "Host box\nIdentitiesOnly yes\n User u\n"
+        );
+        // Blocks splice at the top level, which returns after them.
+        assert_eq!(
+            expand("Include ~/.ssh/hosts\nUser u\n", base, &files),
+            "Host extra\n HostName extra.example\nHost *\nUser u\n"
+        );
+        // Not under a specific Host: OpenSSH would require both to match.
+        assert_eq!(
+            expand("Host box\n Include hosts\n", base, &files),
+            "Host box\n Include hosts\n"
+        );
+        // glob(3) order, no dot files, each file back in the includer's
+        // context; a missing file adds nothing.
+        assert_eq!(
+            expand("Include config.d/*.conf absent\n", base, &files),
+            "Host a\nHost *\nHost b\nHost *\n"
+        );
+        // Unreadable, cyclic and unsupported patterns stay as written.
+        for unresolved in [
+            "Include locked\n",
+            "Include self\n",
+            "Include %d/x\n",
+            "Include $HOME/x\n",
+            "Include ~other/x\n",
+            "Include ../x\n",
+            "Include con?ig\n",
+            "Include config.d/[ab].conf\n",
+            "Include */x\n",
+        ] {
+            assert!(
+                expand(unresolved, base, &files).contains("Include "),
+                "{}",
+                unresolved
+            );
+        }
+    }
+
+    #[test]
+    fn algorithm_preferences_do_not_block_but_constraints_do() {
+        let base = "Host *\n HostName box\n User u\n UserKnownHostsFile /trust/keys\n GlobalKnownHostsFile none\n";
+        let required = |policy: &str| {
+            let mut sources = sources(Some(&format!("{base}{policy}\n")));
+            supply(
+                &mut sources,
+                "/trust/keys",
+                format!("box ssh-ed25519 {}\n", ED25519),
+            );
+            route_trust(&trust_export(&sources), "r.left.ssh")["required_capabilities"].clone()
+        };
+        for preference in [
+            "Ciphers ^aes128-gcm@openssh.com,aes256-gcm@openssh.com",
+            "KexAlgorithms ^ecdh-sha2-nistp256",
+            "MACs ^hmac-sha2-256-etm@openssh.com",
+            "HostKeyAlgorithms ^ssh-ed25519",
+            "PubkeyAcceptedAlgorithms ^ssh-ed25519",
+            "CASignatureAlgorithms ^ssh-ed25519",
+        ] {
+            assert!(required(preference).is_null(), "{}", preference);
+        }
+        for constraint in [
+            "Ciphers aes128-ctr",
+            "Ciphers +aes128-cbc",
+            "KexAlgorithms -curve25519-sha256",
+            "MACs hmac-sha2-256",
+            "HostKeyAlgorithms +ssh-rsa",
+        ] {
+            assert_eq!(
+                required(constraint),
+                json!([UNRESOLVED_POLICY]),
+                "{constraint}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disk_includes_follow_one_owned_link_as_macos_crypto_conf_needs() {
+        let dir = tempfile::tempdir().unwrap();
+        write_source(
+            &dir.path().join("apple.conf"),
+            "Ciphers ^aes128-gcm@openssh.com\n",
+        );
+        let link = dir.path().join("crypto.conf");
+        std::os::unix::fs::symlink("apple.conf", &link).unwrap();
+        assert_eq!(
+            DiskIncludes.read(&link, 1024),
+            present("Ciphers ^aes128-gcm@openssh.com\n")
+        );
+        // A link to a link is not followed.
+        let twice = dir.path().join("twice.conf");
+        std::os::unix::fs::symlink("crypto.conf", &twice).unwrap();
+        assert_eq!(
+            DiskIncludes.read(&twice, 1024),
+            KnownHostsSource::Unavailable
+        );
+        // A directory that does not exist has no files; one that does lists them.
+        assert_eq!(
+            DiskIncludes.names(&dir.path().join("absent")),
+            Some(Vec::new())
+        );
+        let mut names = DiskIncludes.names(dir.path()).unwrap();
+        names.sort();
+        assert_eq!(names, ["apple.conf", "crypto.conf", "twice.conf"]);
     }
 }
