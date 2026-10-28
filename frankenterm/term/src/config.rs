@@ -678,9 +678,9 @@ impl std::fmt::Display for ScrollbackSpillError {
             Self::RevisionExhausted => {
                 formatter.write_str("cold scrollback snapshot revision exhausted")
             }
-            Self::CommitOutcomeIndeterminate => {
-                formatter.write_str("cold scrollback commit outcome indeterminate")
-            }
+            Self::CommitOutcomeIndeterminate => formatter.write_str(
+                "cold scrollback commit outcome indeterminate; quarantined until a reopen (mux restart) verifies the disk",
+            ),
         }
     }
 }
@@ -1232,6 +1232,15 @@ pub trait ScrollbackSpillSink: std::fmt::Debug + Send + Sync {
         let _ = (gap_rows, gap_bytes);
         self.store_scrollback_lines(stable_row, std::slice::from_ref(marker), max_retained_rows)
             == 1
+    }
+
+    /// Why the store methods are refusing rows, for a caller that reports a
+    /// refusal as an error (a deferred writer, `ft doctor`). A sink that has
+    /// quarantined itself until reopen says
+    /// [`ScrollbackSpillError::CommitOutcomeIndeterminate`], so the report
+    /// says restart-only rather than a storage fault that may clear.
+    fn refusal_cause(&self) -> ScrollbackSpillError {
+        ScrollbackSpillError::StorageUnavailable
     }
 
     /// Whether parser-side maintenance must drain this sink outside the

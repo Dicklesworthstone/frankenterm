@@ -1921,7 +1921,7 @@ mod deferred_scrollback {
                 gap_rows,
                 gap_bytes,
             ) {
-                return Err(ScrollbackSpillError::StorageUnavailable);
+                return Err(self.backing.refusal_cause());
             }
             let durable_bytes = self.backing.retained_scrollback_bytes();
             let store_oldest = self.backing.oldest_scrollback_row();
@@ -1990,7 +1990,10 @@ mod deferred_scrollback {
                 self.backing
                     .store_scrollback_lines(store_row, &lines, retention)
             };
-            if acknowledged == 0 || acknowledged > pending_lines.len() {
+            if acknowledged == 0 {
+                return Err(self.backing.refusal_cause());
+            }
+            if acknowledged > pending_lines.len() {
                 return Err(ScrollbackSpillError::StorageUnavailable);
             }
             let durable_bytes = self.backing.retained_scrollback_bytes();
@@ -2440,6 +2443,10 @@ mod deferred_scrollback {
         /// Concurrent later arrivals belong to a subsequent commit window.
         fn flush_scrollback(&self) -> Result<(), ScrollbackSpillError> {
             self.drain_scheduled(DrainMode::Flush)
+        }
+
+        fn refusal_cause(&self) -> ScrollbackSpillError {
+            self.backing.refusal_cause()
         }
 
         fn request_scrollback_flush(&self) -> Result<(), ScrollbackSpillError> {
@@ -16802,7 +16809,16 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
         if published {
             Ok(())
         } else {
-            Err(wezterm_term::config::ScrollbackSpillError::StorageUnavailable)
+            Err(self.refusal_cause())
+        }
+    }
+
+    fn refusal_cause(&self) -> wezterm_term::config::ScrollbackSpillError {
+        match self.lock_state("refusal_cause") {
+            Ok(state) if state.transaction_quarantined => {
+                wezterm_term::config::ScrollbackSpillError::CommitOutcomeIndeterminate
+            }
+            _ => wezterm_term::config::ScrollbackSpillError::StorageUnavailable,
         }
     }
 
@@ -19561,6 +19577,46 @@ mod tests {
         assert!(
             deferred.clear_scrollback().is_err(),
             "uncertainty requires reopen"
+        );
+    }
+
+    /// ft-92aa4: a quarantined backing sink refuses every row until reopen.
+    /// The deferred writer's failure (the pane's degraded reason in `ft
+    /// doctor`) must say so, not report a storage fault that may clear.
+    #[test]
+    fn a_quarantined_sink_is_reported_as_restart_only() {
+        use wezterm_term::config::ScrollbackSpillError;
+        let (_dir, backing, deferred) = deferred_test_sink();
+        let line = Line::from_text("row", &CellAttributes::blank(), 5, None);
+        assert!(deferred.store_scrollback_line(0, &line, 8));
+        deferred.flush_scrollback().unwrap();
+        assert_eq!(
+            backing.refusal_cause(),
+            ScrollbackSpillError::StorageUnavailable
+        );
+
+        // Inject the real backing sink's quarantine state, as above.
+        backing
+            .lock_state("restart-only quarantine")
+            .unwrap()
+            .transaction_quarantined = true;
+        assert_eq!(
+            deferred.refusal_cause(),
+            ScrollbackSpillError::CommitOutcomeIndeterminate
+        );
+        assert!(deferred.store_scrollback_line(1, &line, 8));
+        assert_eq!(
+            deferred.flush_scrollback(),
+            Err(ScrollbackSpillError::CommitOutcomeIndeterminate)
+        );
+        let failure = deferred.durability_failure();
+        assert_eq!(
+            failure,
+            Some(ScrollbackSpillError::CommitOutcomeIndeterminate)
+        );
+        assert!(
+            failure.unwrap().to_string().contains("mux restart"),
+            "{failure:?}"
         );
     }
 
