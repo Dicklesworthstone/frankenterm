@@ -1902,11 +1902,11 @@ final class TerminalSessionController {
                 case .disconnected, .transportFailed: dropped = !paneTooLargeToView
                 default: break
                 }
-                if paneTooLargeToView, let failure = connection?.muxControl?.current.failure {
-                    phase = .ended(failure)
-                } else if let failure = connection?.muxControl?.current.failure {
-                    // The mux server's own reason, when it ended the session.
-                    phase = .ended("The machine's FrankenTerm mux ended the session: \(failure)")
+                if let failure = connection?.muxControl?.current.failure {
+                    // The mux server's own reason when it ended the session;
+                    // a pane too large to view was this phone's own.
+                    phase = .ended(paneTooLargeToView ? failure
+                        : "The machine's FrankenTerm mux ended the session: \(failure)")
                 } else {
                     phase = .ended(Self.describe(reason))
                 }

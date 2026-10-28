@@ -2568,6 +2568,75 @@ final class TerminalSessionControllerTests: XCTestCase {
         await assertReleased(session, connections: phone.connections)
     }
 
+    /// A desktop pane larger than View Only can draw (the mux reached by
+    /// TEST_RUNNER_FT_LIVE_LARGE_MUX_COMMAND has one 300 x 120 pane) is taken
+    /// at the phone's size with no tap, and gets its own size back when the
+    /// phone leaves it. View Only chosen afterwards is kept: that pane is the
+    /// person's to take, never retaken or retried on its own.
+    func testAPaneTooLargeToViewIsTakenAtThePhonesSizeUnlessViewOnlyWasChosen() async throws {
+        guard let command = ProcessInfo.processInfo.environment["FT_LIVE_LARGE_MUX_COMMAND"] else {
+            throw XCTSkip("Set TEST_RUNNER_FT_LIVE_LARGE_MUX_COMMAND to reach a disposable mux whose pane is too large to view")
+        }
+        let live = try await liveScene(muxCommand: command, machineIDs: ["alpha"], initialMuxAccessMode: .viewOnly)
+        let scene = live.scene, sizesPath = live.outPath + "-large", run = UUID().uuidString.prefix(8)
+        func replacement(of old: TerminalSessionController) async throws -> TerminalSessionController {
+            for _ in 0..<400 where scene.sessions["alpha"] === old || scene.sessions["alpha"]?.phase != .live
+                || scene.sessions["alpha"]?.terminal == nil {
+                try await Task.sleep(for: .milliseconds(25))
+            }
+            return try XCTUnwrap(scene.sessions["alpha"])
+        }
+        let observer = try await connect(scene, "alpha")
+        let fitted = try await replacement(of: observer)
+        XCTAssertNotIdentical(fitted, observer)
+        XCTAssertTrue(observer.paneTooLargeToView); XCTAssertTrue(observer.settled)
+        XCTAssertFalse(observer.dropped, "a pane too large to view is not a drop to retry")
+        XCTAssertEqual(fitted.muxAccessMode, .interactive); XCTAssertTrue(fitted.requiresExistingMux)
+        XCTAssertNil(scene.changingMuxMode("alpha"))
+        let view = try shown(fitted)
+        // The pane may still be moving to the view's grid when the shell
+        // reads its size; read it again until the two agree.
+        var size = "", grid = ""
+        for attempt in 0..<5 where size.isEmpty || size != grid {
+            if attempt > 0 { try await Task.sleep(for: .milliseconds(200)) }
+            try await type("stty size > \(sizesPath); echo FIT-\(run)-\(attempt)-$((6*7)) >> \(sizesPath)", into: view)
+            let text = try await hostFile(sizesPath, containing: "FIT-\(run)-\(attempt)-42")
+            size = text.split(separator: "\n").first.map(String.init) ?? ""
+            grid = view.renderer.admittedFrame.map { "\($0.rows) \($0.columns)" } ?? ""
+        }
+        XCTAssertEqual(size, grid, "the pane has the grid the phone draws")
+
+        try await type("trap 'stty size >> \(sizesPath)' WINCH; echo TRAP-\(run)-$((6*7)) >> \(sizesPath)", into: view)
+        _ = try await hostFile(sizesPath, containing: "TRAP-\(run)-42")
+        view.removeFromSuperview()
+        scene.reconnectMux(.viewOnly, machineID: "alpha", controllerID: fitted.id)
+        XCTAssertEqual(scene.changingMuxMode("alpha"), .viewOnly)
+        XCTAssertEqual(scene.status(of: "alpha"), .connecting)
+        for _ in 0..<400 where scene.sessions["alpha"] === fitted || scene.sessions["alpha"]?.settled != true {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        let viewer = try XCTUnwrap(scene.sessions["alpha"])
+        XCTAssertEqual(viewer.muxAccessMode, .viewOnly)
+        XCTAssertTrue(viewer.paneTooLargeToView); XCTAssertFalse(viewer.dropped)
+        let restored = try await hostFile(sizesPath, containing: "120 300")
+        XCTAssertTrue(restored.contains("120 300"), "leaving gave the desktop its size back (\(restored))")
+        try await Task.sleep(for: .seconds(2))
+        XCTAssertIdentical(scene.sessions["alpha"], viewer, "the chosen View Only is neither retaken nor retried")
+        XCTAssertEqual(scene.status(of: "alpha"), .attention)
+
+        // Use at Phone Size, on the ended card.
+        scene.takePaneAtPhoneSize("alpha", from: viewer)
+        XCTAssertEqual(scene.changingMuxMode("alpha"), .interactive)
+        let taken = try await replacement(of: viewer)
+        XCTAssertEqual(taken.muxAccessMode, .interactive)
+        let again = try shown(taken)
+        try await type("trap - WINCH; echo UNTRAP-\(run)-$((6*7)) >> \(sizesPath)", into: again)
+        _ = try await hostFile(sizesPath, containing: "UNTRAP-\(run)-42")
+        again.removeFromSuperview()
+        await scene.close()
+        for session in [observer, fitted, viewer, taken] { await assertReleased(session, connections: live.connections) }
+    }
+
     /// A direct route first tries the machine's mux. The loopback host has none,
     /// so that attempt leaves an acknowledged record with no input before the
     /// shell's own record. These are the records of terminals that ran.
