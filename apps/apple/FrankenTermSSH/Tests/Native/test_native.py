@@ -1267,8 +1267,10 @@ class NativeSSHTests(unittest.TestCase):
                  (blob(exponent, b"\0"), -1000), (blob(exponent, modulus[:-1] + b"\2"), -1000),
                  (blob(exponent, b"\x40" + b"\0" * 254 + b"\1"), -1010),
                  (server.public + b"\0", -1000),
+                 # A user certificate is admitted as one: without its nonce
+                 # and certificate fields, this one is malformed.
                  (blob(exponent, b"\0\x80" + b"\0" * 254 + b"\1",
-                       b"ssh-rsa-cert-v01@openssh.com"), -1010)]
+                       b"ssh-rsa-cert-v01@openssh.com"), -1000)]
         for value, expected in cases:
             self.assertEqual(DRIVER.ftssh_begin_authentication(handle, b"operator", 8, value, len(value)), expected)
         # Largest canonical public encoding: a 64-bit positive exponent needs
