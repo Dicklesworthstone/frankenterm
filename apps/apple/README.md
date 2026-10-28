@@ -2,6 +2,18 @@
 
 This directory contains the shared Swift 6 `FrankenTermKit` package and the native Xcode project for the first offline workspace-transfer slice. It is implementation source, not a signed or device-qualified terminal release.
 
+## Phone-generated SSH identities
+
+**Keys → Create Phone SSH Key** creates an independent Ed25519 key in protected storage. Generation preserves existing sessions and does not connect or change a server. **Copy Public Key** copies only its OpenSSH public line, locally with a two-minute clipboard lifetime. Authorize that line on the intended server account through your existing trusted administration method, then use **Choose Routes**. Remote enrollment automation and Secure Enclave keys remain separate work.
+
+A reviewed choice replaces one route's public-key candidates, including use as a jump host. Host trust, permitted password/MFA methods and required policies still apply; certificate-restricted identities cannot be replaced by a plain key. Changing a choice disconnects this workspace first and requires a fresh **Connect**. Generation alone does neither.
+
+The imported manifest/history stay unchanged. Catalog versions 1–6 migrate to version 7 with separate public key metadata and route-policy witnesses. Changed routes require review after reimport. Removed routes retain their choices in case they return; the user can explicitly forget them. Local revocation uses the existing fingerprint and session-retirement path. There are at most 16 generated keys and 256 route choices per workspace. Portable compiler checks do not establish Apple Keychain, server interoperability or device qualification.
+
+## Selective offline exports
+
+The Mac exporter now offers individual machine checkboxes within selected groups. Every selection retains group order and the complete route, jump-host, credential, palette and host-trust dependencies, including negative trust. Excluded machines disappear from every selected group's membership, and unreferenced private material and inclusion decisions are released. The preview shows public-settings size; actual encrypted size and page count follow preparation. Oversized transfers ask the user to narrow the selection explicitly. Public files, FTAG files, QR playback and videos use the same reviewed projection.
+
 ## Phone-local automatic connections
 
 Each machine's page has **Connect with Group**, an independent preference for this phone, and **Use Workspace Default** to clear the override. A local choice survives relaunch, reimport, renaming, and removal followed by reintroduction of the same stable machine ID. It changes future group preparation without ending an existing session or revoking a deliberate **Connect** action. An explicit local off choice also prevents automatically reopening that machine from the last-viewed-terminal bookmark after relaunch or restore. The group itself must still allow automatic connection. These preferences are stored separately from exported configuration and credential/trust revisions; catalog versions 1–4 migrate to version 5.

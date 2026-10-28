@@ -228,7 +228,7 @@ final class WorkspaceStoreTests: XCTestCase {
         XCTAssertEqual(state.workspace.manifest, first.manifest); XCTAssertEqual(state.workspace.bindings, first.bindings)
         XCTAssertEqual(state.connectionPreferences.autoConnectOverrides, [:])
         let migrated = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(disk.bytes(.catalog))) as? [String: Any])
-        XCTAssertEqual(migrated["version"] as? Int, 6)
+        XCTAssertEqual(migrated["version"] as? Int, 7)
         XCTAssertEqual((migrated["machineConnectionPreferences"] as? [Any])?.count, 0)
         XCTAssertEqual(vault.creates, 1)
     }
@@ -396,7 +396,7 @@ final class WorkspaceStoreTests: XCTestCase {
         XCTAssertEqual(state.connectionPreferences.autoConnectOverrides, ["build": false])
         XCTAssertTrue(state.navigationPreferences.machineOrderOverrides.isEmpty)
         let migrated = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(disk.bytes(.catalog))) as? [String: Any])
-        XCTAssertEqual(migrated["version"] as? Int, 6)
+        XCTAssertEqual(migrated["version"] as? Int, 7)
         XCTAssertEqual((migrated["groupNavigationPreferences"] as? [Any])?.count, 0)
         XCTAssertEqual(vault.creates, 1)
     }
@@ -1127,7 +1127,7 @@ final class WorkspaceStoreTests: XCTestCase {
         XCTAssertEqual(repeated.workspace.id, first.workspace.id)
         XCTAssertEqual(vault.creates, 1); XCTAssertNil(persistence.bytes(.journal))
         let upgraded = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(persistence.bytes(.catalog))) as? [String: Any])
-        XCTAssertEqual(upgraded["version"] as? Int, 6)
+        XCTAssertEqual(upgraded["version"] as? Int, 7)
         let accepted = try XCTUnwrap((upgraded["acceptedImports"] as? [[String: Any]])?.first)
         XCTAssertEqual(accepted["transferID"] as? String, transferID.base64EncodedString())
         XCTAssertEqual(accepted["envelopeDigest"] as? String, digest.base64EncodedString())
@@ -1205,7 +1205,7 @@ final class WorkspaceStoreTests: XCTestCase {
         // Publish the migrated catalog without changing the already-local denial.
         try await reopened.revokeLocally(fingerprint: fingerprint)
         let upgraded = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(persistence.bytes(.catalog))) as? [String: Any])
-        XCTAssertEqual(upgraded["version"] as? Int, 6)
+        XCTAssertEqual(upgraded["version"] as? Int, 7)
         let preserved = try XCTUnwrap(upgraded["acceptedImports"] as? [[String: Any]])
         XCTAssertEqual(preserved.count, 2)
         XCTAssertEqual(preserved.map { $0["firstAcceptedRevision"] as? String },
@@ -1353,7 +1353,7 @@ final class WorkspaceStoreTests: XCTestCase {
             XCTAssertNil(published.range(of: Data(secret.base64EncodedString().utf8)))
             XCTAssertNil(published.range(of: Data("unknown_private_setting".utf8)))
             let catalog = try XCTUnwrap(JSONSerialization.jsonObject(with: published) as? [String: Any])
-            XCTAssertEqual(catalog["version"] as? Int, 6); XCTAssertNil(catalog["needsSanitizedPublication"])
+            XCTAssertEqual(catalog["version"] as? Int, 7); XCTAssertNil(catalog["needsSanitizedPublication"])
             let history = try XCTUnwrap((catalog["acceptedImports"] as? [[String: Any]])?.first)
             XCTAssertEqual(history["envelopeDigest"] as? String, digest.base64EncodedString())
             XCTAssertEqual(history["firstAcceptedRevision"] as? String, first.workspace.revision.uuidString)

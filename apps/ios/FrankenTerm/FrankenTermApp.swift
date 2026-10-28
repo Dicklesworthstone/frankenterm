@@ -50,6 +50,57 @@ struct LocalHostRevocationReview: Identifiable {
     fileprivate let epoch: UUID
 }
 
+/// A deliberate phone-local credential change. The imported manifest and its
+/// source identity remain intact; the review names one exact local revision.
+struct LocalDeviceKeyReview: Identifiable {
+    enum Action {
+        case generate
+        case assign(credentialID: String, routeID: String)
+        case remove(routeID: String)
+    }
+    let id = UUID()
+    let workspaceID: UUID, revision: UUID
+    let workspaceName: String
+    let action: Action
+    let fingerprint: String?
+    let destination: String?
+    let disconnectsSessions: Bool
+    fileprivate let epoch: UUID
+
+    var title: String {
+        switch action {
+        case .generate: "Create a Phone SSH Key?"
+        case .assign: "Use This Phone Key?"
+        case .remove: "Use Imported Key Choices?"
+        }
+    }
+    var confirmationTitle: String {
+        switch action {
+        case .generate: "Create Phone Key"
+        case .assign: disconnectsSessions ? "Use Phone Key and Disconnect" : "Use Phone Key"
+        case .remove: disconnectsSessions ? "Use Imported Keys and Disconnect" : "Use Imported Keys"
+        }
+    }
+    var explanation: String {
+        if case .generate = action {
+            return "Create a new Ed25519 identity for \(workspaceName). Its private key stays in this phone's protected storage. You can copy the public key to authorize it on your servers. Creating it does not connect, change a server, or replace any existing key."
+        }
+        let scope = "\(workspaceName)\n\(destination ?? "")\n\(fingerprint ?? "")\n\n"
+        let effects = disconnectsSessions
+            ? "\n\nEvery session in this workspace will disconnect before the change. Direct SSH shells may end, and input already sent may have executed."
+            : ""
+        switch action {
+        case .assign:
+            return scope + "Use this phone key as this route's only public-key candidate, including when the route is a jump host. Its imported host trust and permitted password or MFA methods still apply. Authorize the public key on this exact server account before using it."
+                + effects + "\n\nThis changes only the phone's route choice. It does not install a key on a server."
+        case .remove:
+            return scope + "Restore this route's imported public-key candidates. The generated private key stays on this phone. Removing the choice does not remove its public key from any server or revoke the server's authorization."
+                + effects
+        case .generate: return ""
+        }
+    }
+}
+
 /// Existing verified-page saves remain available alongside the current partial
 /// decoder cache. Each action keeps the original store's exact review witness.
 enum SavedOpticalScan: Identifiable, Sendable {
@@ -77,6 +128,9 @@ final class MobileWorkspaceModel {
     var credentialMessage: String?
     var credentialImport: WorkspaceKeyImportController?
     @ObservationIgnored private var credentialImportOperation: UUID?
+    @ObservationIgnored private var deviceKeyReviewID: UUID?
+    @ObservationIgnored private var deviceKeyOperation: (id: UUID, task: Task<Void, Never>)?
+    private(set) var deviceKeyConnectionHolds = Set<UUID>()
     var state: OfflineRestoreStatus? { didSet { updateIdleTimer(); reconcileScanSaving() } }
     var message: String?
     var showRestore = false { didSet { updateIdleTimer() } }
@@ -88,7 +142,7 @@ final class MobileWorkspaceModel {
     /// Import settlement retains its own reservation across scene transitions
     /// and any older callback that releases the shared operation flag.
     var busy: Bool {
-        get { operationBusy || credentialImportOperation != nil || isReadingRecording || connectionPreferenceBusy }
+        get { operationBusy || credentialImportOperation != nil || deviceKeyOperation != nil || isReadingRecording || connectionPreferenceBusy }
         set { operationBusy = newValue }
     }
     private(set) var isReadingRecording = false
@@ -324,7 +378,8 @@ final class MobileWorkspaceModel {
     @ObservationIgnored private var liveScenes: [UUID: WorkspaceTerminalScene] = [:]
     func liveScene(workspaceID: UUID, revision: UUID,
                    make: () throws -> WorkspaceTerminalScene) throws -> WorkspaceTerminalScene {
-        guard keyRevocation == nil, credentialImportOperation == nil else { throw WorkspaceSSHConnectionError.busy }
+        guard keyRevocation == nil, credentialImportOperation == nil, deviceKeyOperation == nil,
+              !deviceKeyConnectionHolds.contains(workspaceID) else { throw WorkspaceSSHConnectionError.busy }
         if let saved = workspaces.first(where: { $0.id == workspaceID }), let document = try? saved.document(),
            document.credentials.contains(where: { unconfirmedCredentialRevocations.contains($0.fingerprint) }) {
             throw SSHAuthenticationError.denied
@@ -352,6 +407,8 @@ final class MobileWorkspaceModel {
         active = value
         if !value {
             credentialImport?.cancel()
+            deviceKeyReviewID = nil
+            deviceKeyOperation?.task.cancel()
             scannedCode = nil; stopSavingScanProgress()
             cameraRequested = false; state = nil; availableCredentials = [:]; localPolicies = [:]
             locallyRevokedFingerprints = []
@@ -372,6 +429,7 @@ final class MobileWorkspaceModel {
     }
     func setRestoreVisible(_ value: Bool) {
         if value { credentialImport?.cancel() }
+        if value { deviceKeyReviewID = nil; deviceKeyOperation?.task.cancel() }
         if value { connections?.setAuthenticationScope(nil) }
         showRestore = value
         // A just-dismissed request may already be retired. Re-present only the
@@ -1006,6 +1064,137 @@ final class MobileWorkspaceModel {
             // presentation after the app has locked, resumed, or changed scenes.
             completed(saved && active && epoch == ticket)
         }
+    }
+
+    func reviewDeviceKeyChange(_ action: LocalDeviceKeyReview.Action,
+                               workspaceID: UUID) -> LocalDeviceKeyReview? {
+        guard active, !busy, !showRestore, credentialImport == nil, store != nil,
+              let saved = workspaces.first(where: { $0.id == workspaceID }),
+              let document = try? saved.importedDocument() else { return nil }
+        let fingerprint: String?, destination: String?, disconnects: Bool
+        switch action {
+        case .generate:
+            fingerprint = nil; destination = nil; disconnects = false
+        case .assign(let credentialID, let routeID):
+            guard let key = saved.deviceKeys.first(where: { $0.id == credentialID }),
+                  !locallyRevokedFingerprints.contains(key.fingerprint),
+                  !unconfirmedCredentialRevocations.contains(key.fingerprint),
+                  (try? saved.deviceKeyAssignableRouteIDs().contains(routeID)) == true,
+                  let route = document.routes.first(where: { $0.id == routeID }) else { return nil }
+            fingerprint = key.fingerprint
+            destination = "\(route.user)@\(route.host):\(route.port)"
+            disconnects = hasOpenScene(workspaceID)
+        case .remove(let routeID):
+            guard let assignment = saved.deviceKeyAssignments.first(where: { $0.routeID == routeID }),
+                  let key = saved.deviceKeys.first(where: { $0.id == assignment.credentialID }) else { return nil }
+            fingerprint = key.fingerprint
+            destination = document.routes.first(where: { $0.id == routeID }).map {
+                "\($0.user)@\($0.host):\($0.port)"
+            } ?? "Removed route · \(routeID)"
+            disconnects = hasOpenScene(workspaceID)
+        }
+        let review = LocalDeviceKeyReview(workspaceID: workspaceID, revision: saved.revision,
+            workspaceName: document.name, action: action, fingerprint: fingerprint,
+            destination: destination, disconnectsSessions: disconnects, epoch: epoch)
+        deviceKeyReviewID = review.id
+        return review
+    }
+
+    /// A local key choice is authority for one route, including when that route
+    /// is a jump host. End the old revision's sessions before publishing it, and
+    /// reconcile even a cancelled or ambiguously acknowledged storage write.
+    func performDeviceKeyChange(_ review: LocalDeviceKeyReview,
+                                completed: @escaping @MainActor (Bool) -> Void = { _ in }) {
+        guard active, !busy, !showRestore, credentialImport == nil, let store,
+              deviceKeyReviewID == review.id, epoch == review.epoch,
+              workspaces.first(where: { $0.id == review.workspaceID })?.revision == review.revision else {
+            credentialMessage = "The workspace changed. Review this phone-key choice again."
+            completed(false); return
+        }
+        deviceKeyReviewID = nil; keyReviewID = nil; credentialMessage = nil; busy = true
+        workspaceRefreshEpoch = UUID(); workspaceRefresh?.cancel()
+        let changesRoute: Bool
+        if case .generate = review.action { changesRoute = false } else { changesRoute = true }
+        if changesRoute {
+            deviceKeyConnectionHolds.insert(review.workspaceID)
+            if returning?.workspaceID == review.workspaceID { returning = nil }
+            if let data = UserDefaults.standard.data(forKey: Self.liveScreenKey),
+               let screen = try? JSONDecoder().decode(LiveScreen.self, from: data),
+               screen.workspaceID == review.workspaceID {
+                UserDefaults.standard.removeObject(forKey: Self.liveScreenKey)
+            }
+        }
+        let scene = changesRoute ? liveScenes[review.workspaceID] : nil
+        scene?.requestClose()
+        let operation = review.id
+        let task = Task { [self] in
+            let result: Result<String, Error>
+            do {
+                if let scene {
+                    await scene.close()
+                    if liveScenes[review.workspaceID] === scene { liveScenes[review.workspaceID] = nil }
+                }
+                if changesRoute { await connections?.manager.invalidate(workspaceID: review.workspaceID) }
+                try Task.checkCancellation()
+                guard active, !showRestore, epoch == review.epoch,
+                      workspaces.first(where: { $0.id == review.workspaceID })?.revision == review.revision else {
+                    throw WorkspaceStoreError.staleReview
+                }
+                switch review.action {
+                case .generate:
+                    let receipt = try await store.createDeviceKey(workspaceID: review.workspaceID,
+                        expectedRevision: review.revision, confirmedByUser: true)
+                    result = .success(receipt.cleanupPending
+                        ? "Your phone key was saved. Protected-storage cleanup will be retried. Copy its public key to authorize it on a server."
+                        : "Your phone key was saved. Copy its public key to authorize it on a server, then choose the route that should use it.")
+                case .assign(let credentialID, let routeID):
+                    _ = try await store.assignDeviceKey(workspaceID: review.workspaceID,
+                        expectedRevision: review.revision, credentialID: credentialID,
+                        routeID: routeID, confirmedByUser: true)
+                    result = .success("This route now uses the phone key. Connect when you are ready. Server authorization is checked when you sign in.")
+                case .remove(let routeID):
+                    _ = try await store.removeDeviceKeyAssignment(workspaceID: review.workspaceID,
+                        expectedRevision: review.revision, routeID: routeID, confirmedByUser: true)
+                    result = .success("This route uses its imported key choices again. The phone key remains saved, and its public key remains authorized wherever you installed it.")
+                }
+            } catch { result = .failure(error) }
+            let settlement = Task { [self] in
+                guard deviceKeyOperation?.id == operation else { return false }
+                defer { deviceKeyOperation = nil; busy = false }
+                workspaceRefreshEpoch = UUID(); workspaceRefresh?.cancel()
+                availableCredentials.removeValue(forKey: review.workspaceID)
+                localPolicies.removeValue(forKey: review.workspaceID)
+                var refreshed = false
+                if active {
+                    do {
+                        try await refreshWorkspaces(using: store, epoch: epoch)
+                        refreshed = active && localPolicies[review.workspaceID] != nil
+                    } catch { }
+                }
+                switch result {
+                case .success(let text):
+                    credentialMessage = text + (refreshed ? "" : " Reopen SSH Keys when the app is active to refresh its saved status.")
+                    return active && epoch == review.epoch && refreshed
+                case .failure(let error):
+                    let reason = error is CancellationError ? "The phone-key operation stopped."
+                        : "The phone-key change could not be confirmed. \(error.localizedDescription)"
+                    credentialMessage = reason + (refreshed
+                        ? " Review the current saved keys and route choices before trying again."
+                        : " Reopen SSH Keys when the app is active to check what was saved before trying again.")
+                    return false
+                }
+            }
+            completed(await settlement.value)
+        }
+        deviceKeyOperation = (operation, task)
+    }
+
+    /// Only a fresh Connect action releases the local hold. A storage refresh,
+    /// saved screen or suspended callback cannot authenticate with a new key.
+    func connectAfterDeviceKeyReview(workspaceID: UUID) -> Bool {
+        guard active, !busy, !showRestore else { return false }
+        deviceKeyConnectionHolds.remove(workspaceID)
+        return true
     }
 
     func beginCredentialImport(workspaceID: UUID, credentialID: String) {
@@ -2927,6 +3116,13 @@ private struct WorkspaceKeysSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var reviewed: LocalCredentialRevocationReview?
     @State private var hostReview: LocalHostRevocationReview?
+    @State private var deviceReview: LocalDeviceKeyReview?
+    @State private var phoneKey: WorkspaceDeviceKeyChoice?
+    @State private var copiedPhoneKeyID: String?
+
+    private var saved: InstalledWorkspace? {
+        model.workspaces.first(where: { $0.id == workspaceID })
+    }
 
     private var document: WorkspaceDocument? {
         try? model.workspaces.first(where: { $0.id == workspaceID })?.document()
@@ -2947,8 +3143,24 @@ private struct WorkspaceKeysSheet: View {
                                 Button("Dismiss Message") { model.credentialMessage = nil }
                             }
                         }
+                        if let saved {
+                            Section {
+                                ForEach(saved.deviceKeys) { key in
+                                    phoneKeyRow(key, workspace: saved)
+                                }
+                                Button("Create Phone SSH Key", systemImage: "key.horizontal") {
+                                    reviewed = nil; hostReview = nil
+                                    deviceReview = model.reviewDeviceKeyChange(.generate, workspaceID: workspaceID)
+                                }.disabled(saved.deviceKeys.count >= 16 || model.credentialImport != nil)
+                                    .accessibilityIdentifier("keys.phone.create")
+                            } header: {
+                                Text("Phone Keys")
+                            } footer: {
+                                Text("A separate phone identity can be revoked on a server without revoking your Mac's key. Authorize its public key on the server, then choose a route. Private keys stay in protected storage on this device. Up to 16 phone keys can be retained in a workspace.")
+                            }
+                        }
                         Section {
-                            ForEach(document.credentials) { key in
+                            ForEach(document.credentials.filter { key in saved?.deviceKeys.contains(where: { $0.id == key.id }) != true }) { key in
                                 VStack(alignment: .leading, spacing: 10) {
                                     Text(verbatim: key.id).font(.headline)
                                     Text(verbatim: key.algorithm).font(.caption).foregroundStyle(.secondary)
@@ -3024,6 +3236,18 @@ private struct WorkspaceKeysSheet: View {
         .sheet(item: Binding(get: { importing }, set: { if $0 == nil { importing?.cancel() } })) { controller in
             WorkspaceKeyImportSheet(controller: controller)
         }
+        .sheet(item: $phoneKey) { choice in
+            WorkspaceDeviceKeyRoutesSheet(workspaceID: workspaceID, credentialID: choice.id, model: model)
+        }
+        .confirmationDialog(deviceReview?.title ?? "Phone SSH Key",
+                            isPresented: Binding(get: { deviceReview != nil }, set: { if !$0 { deviceReview = nil } }),
+                            titleVisibility: .visible, presenting: deviceReview) { review in
+            Button(review.confirmationTitle) { model.performDeviceKeyChange(review) }
+                .disabled(model.busy || !model.active)
+            Button("Cancel", role: .cancel) { deviceReview = nil }
+        } message: { review in
+            Text(verbatim: review.explanation)
+        }
         .confirmationDialog("Revoke Key on This Phone?",
                             isPresented: Binding(get: { reviewed != nil }, set: { if !$0 { reviewed = nil } }),
                             titleVisibility: .visible, presenting: reviewed) { review in
@@ -3036,8 +3260,53 @@ private struct WorkspaceKeysSheet: View {
                 + review.workspaceNames.joined(separator: "\n")
                 + "\n\nFuture imports cannot restore permission. Your Mac and SSH servers are unchanged.")
         }
-        .onChange(of: model.active) { _, active in if !active { reviewed = nil; hostReview = nil } }
-        .onDisappear { reviewed = nil; hostReview = nil }
+        .onChange(of: model.active) { _, active in
+            if !active { reviewed = nil; hostReview = nil; deviceReview = nil; copiedPhoneKeyID = nil }
+        }
+        .onDisappear { reviewed = nil; hostReview = nil; deviceReview = nil; copiedPhoneKeyID = nil }
+    }
+
+    private func phoneKeyRow(_ key: WorkspaceDeviceKey, workspace: InstalledWorkspace) -> some View {
+        let revoked = model.locallyRevokedFingerprints.contains(key.fingerprint)
+        let pending = model.unconfirmedCredentialRevocations.contains(key.fingerprint)
+        let assignments = workspace.deviceKeyAssignments.filter { $0.credentialID == key.id }
+        return VStack(alignment: .leading, spacing: 10) {
+            Label("Ed25519 phone key", systemImage: "iphone.gen3")
+                .font(.headline)
+            Text(verbatim: key.fingerprint).font(.system(.caption, design: .monospaced))
+                .textSelection(.enabled)
+            if pending {
+                Label("Blocked in this app; saving needs retry", systemImage: "exclamationmark.shield")
+            } else if revoked {
+                Label("Revoked on this phone", systemImage: "key.slash")
+            } else if model.availableCredentials[workspaceID]?.contains(key.id) == true {
+                Label("Private key protected on this phone", systemImage: "lock.shield")
+            } else {
+                Label("Private key unavailable on this phone", systemImage: "exclamationmark.triangle")
+            }
+            Text(assignments.isEmpty ? "Not assigned to a route" : "Chosen for \(assignments.count) routes")
+                .font(.caption).foregroundStyle(.secondary)
+            DisclosureGroup("Public Key") {
+                Text(verbatim: key.authorizedKey).font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled).padding(.top, 6)
+            }
+            Button(copiedPhoneKeyID == key.id ? "Public Key Copied" : "Copy Public Key", systemImage: "doc.on.doc") {
+                guard model.active, !model.busy,
+                      saved?.deviceKeys.contains(where: { $0 == key }) == true else { return }
+                UIPasteboard.general.setItems([[UTType.utf8PlainText.identifier: key.authorizedKey]],
+                    options: [.localOnly: true, .expirationDate: Date().addingTimeInterval(120)])
+                copiedPhoneKeyID = key.id
+            }.accessibilityIdentifier("keys.phone.copy.\(key.id)")
+            Button("Choose Routes…", systemImage: "point.3.connected.trianglepath.dotted") {
+                reviewed = nil; hostReview = nil; deviceReview = nil
+                phoneKey = .init(id: key.id)
+            }.disabled(pending || model.credentialImport != nil)
+                .accessibilityIdentifier("keys.phone.routes.\(key.id)")
+            Button(pending ? "Retry Saving Revocation" : "Revoke on This Phone", role: .destructive) {
+                hostReview = nil; deviceReview = nil
+                reviewed = model.reviewCredentialRevocation(workspaceID: workspaceID, credentialID: key.id)
+            }.disabled(revoked && !pending)
+        }.font(.callout).padding(.vertical, 6)
     }
 
     /// One host and port, and each key its trust records pin there, once.
@@ -3103,6 +3372,120 @@ private struct WorkspaceKeysSheet: View {
         }.padding(.vertical, 6)
     }
 }
+
+@MainActor
+private struct WorkspaceDeviceKeyRoutesSheet: View {
+    let workspaceID: UUID, credentialID: String
+    @Bindable var model: MobileWorkspaceModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var authorizedOnServer = false
+    @State private var review: LocalDeviceKeyReview?
+
+    private var saved: InstalledWorkspace? { model.workspaces.first { $0.id == workspaceID } }
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if !model.active {
+                    ContentUnavailableView("Locked", systemImage: "lock.shield",
+                        description: Text("Return to FrankenTerm to choose where this phone key is used."))
+                } else if let saved, let key = saved.deviceKeys.first(where: { $0.id == credentialID }),
+                          let imported = try? saved.importedDocument() {
+                    let eligible = Set((try? saved.deviceKeyAssignableRouteIDs()) ?? [])
+                    let assigned = saved.deviceKeyAssignments.filter { $0.credentialID == key.id }
+                    let routes = imported.routes.filter { route in
+                        eligible.contains(route.id) || assigned.contains(where: { $0.routeID == route.id })
+                    }
+                    let currentRouteIDs = Set(imported.routes.map(\.id))
+                    let removedChoices = assigned.filter { !currentRouteIDs.contains($0.routeID) }
+                    let revoked = model.locallyRevokedFingerprints.contains(key.fingerprint)
+                        || model.unconfirmedCredentialRevocations.contains(key.fingerprint)
+                    List {
+                        Section {
+                            Text(verbatim: key.fingerprint).font(.system(.caption, design: .monospaced))
+                                .textSelection(.enabled)
+                            Text("Install this key's public line in the intended server account's authorized keys using your existing trusted administration method. Preserve that account's other keys and restrictions.")
+                            Toggle("I have authorized this public key on the server account I select", isOn: $authorizedOnServer)
+                                .disabled(revoked)
+                        } header: { Text("Authorize on the Server First") }
+                        if let message = model.credentialMessage {
+                            Section { Text(verbatim: message) }
+                        }
+                        Section {
+                            ForEach(routes) { route in
+                                let chosen = assigned.contains { $0.routeID == route.id }
+                                let needsReview = (try? saved.deviceKeyAssignmentNeedsReview(routeID: route.id)) == true
+                                VStack(alignment: .leading, spacing: 10) {
+                                    Text(verbatim: "\(route.user)@\(route.host):\(route.port)")
+                                        .font(.system(.callout, design: .monospaced)).textSelection(.enabled)
+                                    let machines = imported.machines.filter { $0.routeIDs.contains(route.id) }.map(\.name)
+                                    Text(verbatim: machines.isEmpty ? "Jump route · \(route.id)" : machines.joined(separator: ", "))
+                                        .font(.caption).foregroundStyle(.secondary)
+                                    if chosen {
+                                        Label(needsReview ? "Imported route changed — review required" : "This phone key is selected",
+                                              systemImage: needsReview ? "exclamationmark.shield" : "checkmark.circle")
+                                            .font(.callout)
+                                    }
+                                    if eligible.contains(route.id) {
+                                        Button(needsReview && chosen ? "Review Updated Route" : "Use This Phone Key") {
+                                            review = model.reviewDeviceKeyChange(.assign(credentialID: key.id, routeID: route.id),
+                                                workspaceID: workspaceID)
+                                        }.disabled(!authorizedOnServer || revoked
+                                            || model.availableCredentials[workspaceID]?.contains(key.id) != true
+                                            || (chosen && !needsReview))
+                                            .accessibilityIdentifier("keys.phone.assign.\(route.id)")
+                                    }
+                                    if chosen {
+                                        Button("Use Imported Key Choices") {
+                                            review = model.reviewDeviceKeyChange(.remove(routeID: route.id), workspaceID: workspaceID)
+                                        }.accessibilityIdentifier("keys.phone.unassign.\(route.id)")
+                                    }
+                                }.padding(.vertical, 6)
+                            }
+                            if routes.isEmpty {
+                                Text("No route currently permits this plain Ed25519 identity. Certificate and mandatory identity policies cannot be replaced by a generated key.")
+                            }
+                        } header: { Text("Routes in \(imported.name)") } footer: {
+                            Text("A route choice replaces its imported public-key candidates only on this phone. Host verification, jump-host policies and permitted additional authentication methods still apply. Server authorization is verified during the next sign-in.")
+                        }
+                        if !removedChoices.isEmpty {
+                            Section {
+                                ForEach(removedChoices, id: \.routeID) { choice in
+                                    VStack(alignment: .leading, spacing: 8) {
+                                        Text(verbatim: choice.routeID).font(.caption.monospaced())
+                                        Button("Forget This Removed Route's Key Choice") {
+                                            review = model.reviewDeviceKeyChange(.remove(routeID: choice.routeID), workspaceID: workspaceID)
+                                        }
+                                    }
+                                }
+                            } header: { Text("Removed Routes") } footer: {
+                                Text("These local choices are retained in case an import brings a route back. Forgetting one allows that route to use its imported key candidates if it returns.")
+                            }
+                        }
+                    }.disabled(model.busy)
+                } else {
+                    ContentUnavailableView("Phone Key Unavailable", systemImage: "key",
+                        description: Text("Reopen SSH Keys to review the current saved workspace."))
+                }
+            }
+            .navigationTitle("Use Phone Key").navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() }.disabled(model.busy) } }
+        }
+        .interactiveDismissDisabled(model.busy)
+        .confirmationDialog(review?.title ?? "Phone Key Route",
+                            isPresented: Binding(get: { review != nil }, set: { if !$0 { review = nil } }),
+                            titleVisibility: .visible, presenting: review) { reviewed in
+            Button(reviewed.confirmationTitle) {
+                model.performDeviceKeyChange(reviewed) { saved in if saved { authorizedOnServer = false } }
+            }.disabled(model.busy || !model.active)
+            Button("Cancel", role: .cancel) { review = nil }
+        } message: { reviewed in Text(verbatim: reviewed.explanation) }
+        .onChange(of: model.active) { _, active in if !active { review = nil; authorizedOnServer = false } }
+        .onChange(of: saved?.revision) { _, _ in review = nil; authorizedOnServer = false }
+    }
+}
+
+private struct WorkspaceDeviceKeyChoice: Identifiable { let id: String }
 
 @MainActor
 private struct MachineWorkspaceView: View {
@@ -3295,6 +3678,7 @@ private struct MachineWorkspaceView: View {
             VStack(alignment: .leading, spacing: 10) {
                 Button {
                     // The user's choice ends a return still waiting for its machine.
+                    guard model.connectAfterDeviceKeyReview(workspaceID: workspaceID) else { return }
                     returnHandled = true
                     terminal = OpenTerminal(machineID: machine.id, local: local)
                 } label: {
@@ -3331,6 +3715,7 @@ private struct MachineWorkspaceView: View {
     /// offered for it; until then this page shows what it still needs.
     private func returnToTerminal() {
         guard !returnHandled, let id = returningMachineID else { return }
+        guard !model.deviceKeyConnectionHolds.contains(workspaceID) else { returnHandled = true; return }
         guard let machine = document.machines.first(where: { $0.id == id }) else { returnHandled = true; return }
         guard !document.credentials.contains(where: { model.unconfirmedCredentialRevocations.contains($0.fingerprint) }),
               model.connections != nil, let local = model.localPolicies[workspaceID],
@@ -3348,10 +3733,12 @@ private struct MachineWorkspaceView: View {
     /// gives way to this page if its machine can no longer connect.
     private func reopenClosedTerminal() {
         guard let closed = terminal, !model.showRestore, !model.hasOpenScene(workspaceID) else { return }
+        guard !model.deviceKeyConnectionHolds.contains(workspaceID) else { terminal = nil; return }
         Task {
             // Dismissing restore releases offline exclusion in its lifecycle
             // step; a connection begun before that would be refused.
             await model.restoreSettled()
+            guard !model.deviceKeyConnectionHolds.contains(workspaceID) else { terminal = nil; return }
             guard terminal?.id == closed.id, !model.showRestore, !model.hasOpenScene(workspaceID),
                   let local = model.localPolicies[workspaceID] else { return }
             guard let machine = document.machines.first(where: { $0.id == closed.machineID }), model.connections != nil,
