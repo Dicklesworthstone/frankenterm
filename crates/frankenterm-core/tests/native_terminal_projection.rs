@@ -353,10 +353,13 @@ fn unsupported_native_geometry_images_and_alignment_are_explicit() {
 #[test]
 fn disabled_bidi_still_refuses_unrepresented_rtl_character_path() {
     let mut term = terminal(1, 8);
-    term.advance_bytes(b"\x1b[2 kABC");
+    // A character path applies to rows cleared or created after it, as the
+    // terminal's other rows do: erasing this one gives it right-to-left.
+    term.advance_bytes(b"\x1b[2 k\x1b[2KABC");
     let (metadata, rows) = parts(&mut term);
+    let (bidi_enabled, direction) = rows[0].1.bidi_info();
     assert!(
-        !rows[0].1.bidi_info().0,
+        !bidi_enabled && direction != Default::default(),
         "fixture must exercise direction without bidi reordering"
     );
     assert!(matches!(
