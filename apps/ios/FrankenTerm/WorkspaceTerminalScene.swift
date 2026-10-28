@@ -1794,8 +1794,8 @@ struct WorkspaceTerminalScreen: View {
                     }
                 }
             }
-                .buttonStyle(.borderedProminent).controlSize(.large).tint(accent)
-                .disabled(!session.settled)
+            .buttonStyle(.borderedProminent).controlSize(.large).tint(accent)
+            .disabled(!session.settled)
             if let output = session.retainedOutput {
                 Button("View Last Output", systemImage: "doc.text.magnifyingglass") { retainedOutput = output }
                     .buttonStyle(.bordered)

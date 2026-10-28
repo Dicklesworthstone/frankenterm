@@ -89,6 +89,8 @@ final class UserCertificateAuthenticationTests: XCTestCase {
             let challenge = try SSHUserAuthenticationChallenge(sessionIdentifier: session, user: files.user,
                 publicBlob: identity.publicKey, signatureAlgorithm: certificate.authenticationAlgorithm)
             XCTAssertEqual(challenge.signedData, Data(base64Encoded: certificate.signedData), certificate.id)
+            // The key the signatures below verify against is the oracle's.
+            XCTAssertEqual(challenge.subjectPublicBlob, certificate.publicBlob, certificate.id)
             let native = try NativeSSHChallenge(bytes: challenge.signedData, transportID: transport, identity: identity)
             XCTAssertEqual(native.algorithm, certificate.authenticationAlgorithm)
             XCTAssertEqual(native.publicKeyAlgorithm, certificate.subjectAlgorithm)
