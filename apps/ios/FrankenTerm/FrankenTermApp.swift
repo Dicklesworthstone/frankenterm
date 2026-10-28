@@ -3673,7 +3673,7 @@ private struct MachineWorkspaceView: View {
         if document.credentials.contains(where: { model.unconfirmedCredentialRevocations.contains($0.fingerprint) }) {
             Label("Finish saving the key revocation in Keys before connecting.", systemImage: "exclamationmark.shield")
                 .font(.callout)
-        } else if let connections = model.connections, let local = model.localPolicies[workspaceID],
+        } else if model.connections != nil, let local = model.localPolicies[workspaceID],
            let target = sceneMachine(machine, local: local).target, let first = target.attemptOrder().first {
             VStack(alignment: .leading, spacing: 10) {
                 Button {
