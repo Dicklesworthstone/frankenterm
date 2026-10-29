@@ -114,6 +114,13 @@ pub enum Event {
     Activity {
         pane_id: usize,
     },
+    /// A current server has refused, as busy, to send the pane's screen
+    /// [`WAITING_AFTER_REFUSALS`] times in a row, and the session keeps
+    /// asking; `waiting` turns false once a read is answered.
+    PaneWaiting {
+        pane_id: usize,
+        waiting: bool,
+    },
     /// The session is over; close the channel.
     Failed {
         reason: String,
@@ -197,6 +204,9 @@ const MAX_INPUT_RETRY_BACKOFF_NS: u64 = 100_000_000;
 /// this delay, doubled per refusal in a row up to the maximum.
 pub const MIN_RENDER_RETRY_DELAY_NS: u64 = 100_000_000;
 pub const MAX_RENDER_RETRY_DELAY_NS: u64 = 5_000_000_000;
+/// From this many refused render reads in a row (about 0.7 s of them) a pane
+/// is reported waiting, so a brief busy spell does not flash a notice.
+pub const WAITING_AFTER_REFUSALS: u32 = 3;
 const MAX_INPUT_CALL_BYTES: usize = 64 * 1024;
 const MAX_QUEUED_INPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_QUEUED_INPUT_OPERATIONS: usize = 256;
@@ -1232,7 +1242,7 @@ impl Session {
         }
         match response.outcome {
             wire::ReliableKeyOutcome::Applied | wire::ReliableKeyOutcome::DuplicateApplied => {
-                self.finish_input()
+                self.finish_input();
             }
             wire::ReliableKeyOutcome::Retry(retry) => {
                 if let Some(delay) = retry.no_effect_delay_ns()? {
@@ -1785,7 +1795,16 @@ impl Session {
                             .is_some_and(|retry| retry.due_ns.is_none())
                     {
                         // The repeat was answered; a later refusal starts over.
-                        self.render_retries.remove(&pane_id);
+                        if self
+                            .render_retries
+                            .remove(&pane_id)
+                            .is_some_and(|retry| retry.refusals >= WAITING_AFTER_REFUSALS)
+                        {
+                            self.events.push_back(Event::PaneWaiting {
+                                pane_id,
+                                waiting: false,
+                            });
+                        }
                     }
                     if let Some(Request::Poll { pane_id }) = request {
                         if let Some(mirror) = self.mirrors.get_mut(&pane_id) {
@@ -1801,7 +1820,7 @@ impl Session {
                 }
                 match request {
                     Some(Request::RegisterClient { server_version }) => {
-                        self.become_ready(server_version)
+                        self.become_ready(server_version);
                     }
                     Some(Request::Resize { pane_id }) => self.poll(pane_id),
                     Some(Request::RestoreSize { pane_id }) => {
@@ -1987,6 +2006,12 @@ impl Session {
         retry.subscribe |= subscribe;
         retry.poll |= !subscribe;
         retry.due_ns = Some(now.saturating_add(delay));
+        if retry.refusals == WAITING_AFTER_REFUSALS {
+            self.events.push_back(Event::PaneWaiting {
+                pane_id,
+                waiting: true,
+            });
+        }
     }
 
     fn repeat_due_renders(&mut self, now_ns: u64) {

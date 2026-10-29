@@ -1461,6 +1461,12 @@ struct WorkspaceTerminalScreen: View {
                 problemBanner(problem) { session.dismissInteractionProblem() }
             } else if let problem = scene.problem {
                 problemBanner(problem) { scene.dismissProblem() }
+            } else if scene.selectedSession?.shownMuxPaneWaiting == true {
+                // Not dismissable: it says what the pane is doing and leaves
+                // when the machine sends the pane's screen.
+                ProgressView("The machine is busy and is not sending this pane's screen. Still asking…")
+                    .padding(14).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16)).padding()
+                    .accessibilityIdentifier("terminal.mux.waiting")
             }
         }
         .navigationTitle(scene.workspaceName)

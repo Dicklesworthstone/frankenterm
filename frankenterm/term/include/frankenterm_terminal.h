@@ -231,6 +231,9 @@ uint32_t ft_terminal_v1_frame_release(uint64_t frame);
  *              same while it runs and new after it restarts (even when it
  *              numbers its panes as before). Current servers only, once,
  *              before the first PANES.
+ *   PANE_WAITING pane_id; payload: one byte, 1 when a current server has
+ *              refused, as busy, to send the pane's screen several times
+ *              in a row (the session keeps asking), 0 once it answers
  */
 #define FT_MUX_EVENT_NONE 0u
 #define FT_MUX_EVENT_READY 1u
@@ -246,6 +249,7 @@ uint32_t ft_terminal_v1_frame_release(uint64_t frame);
 #define FT_MUX_EVENT_ACTIVITY 11u
 #define FT_MUX_EVENT_INCARNATION 12u
 #define FT_MUX_EVENT_PHONE_SIZE_RESTORED 13u
+#define FT_MUX_EVENT_PANE_WAITING 14u
 #define FT_MUX_SEARCH_CASE_SENSITIVE 1u
 #define FT_MUX_SEARCH_REGEX 2u
 #define FT_MUX_MAX_RECEIVE_BYTES 1048576u

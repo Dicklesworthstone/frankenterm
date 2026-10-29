@@ -160,6 +160,9 @@ public final class NativeMuxClient: TerminalMuxClient, @unchecked Sendable {
             case UInt32(FT_MUX_EVENT_ACTIVITY):
                 guard payload.isEmpty else { throw TerminalModelError.invalid }
                 return .activity(paneID: paneID)
+            case UInt32(FT_MUX_EVENT_PANE_WAITING):
+                guard payload.count == 1, payload[payload.startIndex] <= 1 else { throw TerminalModelError.invalid }
+                return .paneWaiting(paneID: paneID, waiting: payload[payload.startIndex] == 1)
             case UInt32(FT_MUX_EVENT_PHONE_SIZE):
                 let decoder = JSONDecoder()
                 decoder.keyDecodingStrategy = .convertFromSnakeCase

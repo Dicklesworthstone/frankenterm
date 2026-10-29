@@ -44,6 +44,7 @@ const EVENT_MOUSE_GRAB: u32 = 10;
 const EVENT_ACTIVITY: u32 = 11;
 const EVENT_INCARNATION: u32 = 12;
 const EVENT_PHONE_SIZE_RESTORED: u32 = 13;
+const EVENT_PANE_WAITING: u32 = 14;
 /// Search flags.
 const SEARCH_CASE_SENSITIVE: u32 = 1;
 const SEARCH_REGEX: u32 = 2;
@@ -217,6 +218,13 @@ fn event_parts(event: Option<Event>) -> Result<(u32, u64, u32, u32, Vec<u8>), Er
             vec![u8::from(grabbed)],
         ),
         Some(Event::Activity { pane_id }) => (EVENT_ACTIVITY, pane_id as u64, 0, 0, Vec::new()),
+        Some(Event::PaneWaiting { pane_id, waiting }) => (
+            EVENT_PANE_WAITING,
+            pane_id as u64,
+            0,
+            0,
+            vec![u8::from(waiting)],
+        ),
         Some(Event::PhoneSizeRestored { pane_id }) => {
             (EVENT_PHONE_SIZE_RESTORED, pane_id as u64, 0, 0, Vec::new())
         }

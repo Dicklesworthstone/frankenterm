@@ -112,6 +112,9 @@ public enum TerminalMuxEvent: Equatable, Sendable {
     case mouseGrab(paneID: Int, grabbed: Bool)
     /// A pane not on screen has new output.
     case activity(paneID: Int)
+    /// The pane's server keeps refusing, as busy, to send its screen and the
+    /// session keeps asking (`waiting`), or it answered again.
+    case paneWaiting(paneID: Int, waiting: Bool)
     /// The session is over; the channel must close.
     case failed(String)
 }
@@ -454,6 +457,9 @@ public final class TerminalMuxControl: @unchecked Sendable {
         /// Panes with output the phone has not had on screen since it arrived.
         /// One leaves this set when it comes on screen.
         public var unread: Set<Int> = []
+        /// Panes whose server keeps refusing, as busy, to send their screen;
+        /// the transport keeps asking. One leaves when its server answers.
+        public var waiting: Set<Int> = []
         /// A captured request expired before the transport could apply it. The
         /// original presenter can stop waiting without selecting a substitute.
         public var rejectedNavigation: TerminalMuxInputRouting.NavigationPlan?
@@ -575,6 +581,16 @@ public final class TerminalMuxControl: @unchecked Sendable {
             inputRouting.discardPointers()
             state.mouseGrabbed = grabbed
             return true
+        }
+    }
+
+    /// Whether the pane's server keeps refusing, as busy, to send its screen
+    /// (transport side). Only a listed pane can be waiting.
+    public func setWaiting(pane: Int, _ waiting: Bool) {
+        update { state in
+            guard waiting else { return state.waiting.remove(pane) != nil }
+            guard state.panes.contains(where: { $0.paneId == pane }) else { return false }
+            return state.waiting.insert(pane).inserted
         }
     }
 
@@ -869,6 +885,7 @@ public final class TerminalMuxControl: @unchecked Sendable {
                 for old in state.panes where !existing.contains(old.paneId) { removeQueryPane(old.paneId) }
                 state.panes = panes
                 state.unread.formIntersection(existing)
+                state.waiting.formIntersection(existing)
                 leftScreen = leftScreen.filter { existing.contains($0.key) }
             }
             _ = moveScreen(shown: shown, visible: state.visible)
@@ -902,6 +919,7 @@ public final class TerminalMuxControl: @unchecked Sendable {
                 state.rejectedNavigation = requested; requested = nil
             }
             let read = state.unread.remove(pane) != nil && state.unread.isEmpty
+            state.waiting.remove(pane)
             leftScreen[pane] = nil
             state.revision = UUID()
             return (observer, state, read ? unreadObserver : nil)

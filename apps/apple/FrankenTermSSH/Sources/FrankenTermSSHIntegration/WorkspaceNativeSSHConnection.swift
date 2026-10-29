@@ -913,6 +913,8 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 state.control.setMouseGrabbed(state.shown.flatMap { state.grabs[$0] } ?? false)
             case .activity(let pane):
                 state.control.noteActivity(pane: pane)
+            case .paneWaiting(let pane, let waiting):
+                state.control.setWaiting(pane: pane, waiting)
             case .failed(let reason):
                 // Once attached, a failure still ends this connection (and may
                 // be reconnected), but its reason reaches the screen.

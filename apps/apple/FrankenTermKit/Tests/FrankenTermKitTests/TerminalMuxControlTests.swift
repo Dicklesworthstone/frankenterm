@@ -928,4 +928,28 @@ final class TerminalMuxNavigationRequestTests: XCTestCase {
         XCTAssertEqual(flips.lock.withLock { flips.values }, [false, true, false],
                        "the off-screen signal changes only when the first pane turns unread and the last is read")
     }
+
+    func testAPaneWaitsForItsBusyServerUntilItAnswersOrLeaves() {
+        let control = TerminalMuxControl()
+        final class Revisions: @unchecked Sendable { let lock = NSLock(); var count = 0 }
+        let revisions = Revisions()
+        control.publish(panes: [queryPane(1), queryPane(2), queryPane(3)], shown: 1)
+        control.observe { _ in revisions.lock.withLock { revisions.count += 1 } }
+        control.setWaiting(pane: 1, true)
+        control.setWaiting(pane: 9, true)
+        XCTAssertEqual(control.current.waiting, [1], "a pane not listed is ignored")
+        let changed = revisions.lock.withLock { revisions.count }
+        control.setWaiting(pane: 1, true)
+        control.setWaiting(pane: 2, false)
+        XCTAssertEqual(revisions.lock.withLock { revisions.count }, changed, "no change, no new state")
+        control.setWaiting(pane: 1, false)
+        XCTAssertEqual(control.current.waiting, [], "its server answered")
+
+        control.setWaiting(pane: 2, true)
+        control.setWaiting(pane: 3, true)
+        control.remove(pane: 3)
+        XCTAssertEqual(control.current.waiting, [2], "a closed pane is not waiting")
+        control.publish(panes: [queryPane(1)], shown: 1)
+        XCTAssertEqual(control.current.waiting, [], "nor is one the new list leaves out")
+    }
 }

@@ -1675,6 +1675,67 @@ fn a_busy_current_mux_keeps_the_pane_and_draws_it_after_a_backoff() {
     assert_mirrored(&mut harness);
     harness.output(&numbered(6, 9));
     assert_mirrored(&mut harness);
+    assert!(
+        waiting_reports(&harness).is_empty(),
+        "two refusals are a brief busy spell: {:?}",
+        harness.events
+    );
+}
+
+fn waiting_reports(harness: &Harness) -> Vec<bool> {
+    harness
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            Event::PaneWaiting { pane_id, waiting } if *pane_id == harness.server.pane_id => {
+                Some(*waiting)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_pane_refused_three_times_in_a_row_is_reported_waiting_until_a_read_is_answered() {
+    use frankenterm_mobile_mux::session::WAITING_AFTER_REFUSALS;
+    let mut harness = Harness::new(4, 20);
+    harness.server.codec_vers = 71;
+    harness.quiet_output(&numbered(0, 6));
+    let busy = codec::ErrorResponse::resource_busy(
+        <codec::GetPaneRenderChanges as codec::PduWireIdent>::IDENT,
+    );
+    harness.server.refuse_render.extend(std::iter::repeat_n(
+        Some(busy),
+        WAITING_AFTER_REFUSALS as usize,
+    ));
+    assert!(harness.session.advance_time(0));
+    harness.attach();
+    for refusals in 1..WAITING_AFTER_REFUSALS {
+        assert!(
+            waiting_reports(&harness).is_empty(),
+            "after {refusals} refusal(s)"
+        );
+        let due = harness
+            .session
+            .next_input_wake_ns()
+            .expect("a repeat is due");
+        assert!(harness.session.advance_time(due));
+        harness.pump();
+    }
+    assert_eq!(render_reads(&harness), WAITING_AFTER_REFUSALS as usize);
+    assert_eq!(waiting_reports(&harness), [true]);
+    assert!(!closed_or_failed(&harness), "{:?}", harness.events);
+
+    // The next read is answered: the pane stops waiting and is drawn.
+    let due = harness
+        .session
+        .next_input_wake_ns()
+        .expect("a repeat is due");
+    assert!(harness.session.advance_time(due));
+    harness.pump();
+    assert_eq!(waiting_reports(&harness), [true, false]);
+    assert_eq!(harness.session.next_input_wake_ns(), None);
+    assert_mirrored(&mut harness);
 }
 
 #[test]

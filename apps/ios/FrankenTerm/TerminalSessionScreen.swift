@@ -541,6 +541,12 @@ final class TerminalSessionController {
     /// The machine's mux panes and the one on screen, when this session is
     /// attached to its FrankenTerm mux rather than a shell of its own.
     private(set) var muxState: TerminalMuxControl.State?
+    /// The mux pane on screen has a busy server that keeps refusing to send
+    /// its screen; the connection keeps asking and this clears when it answers.
+    var shownMuxPaneWaiting: Bool {
+        guard let state = muxState, let shown = state.shown else { return false }
+        return state.waiting.contains(shown)
+    }
     /// Output arrived that this machine has not had on screen since: the
     /// shell's while it was away, or any of its mux panes'. Read from the
     /// machine strip, which updates while the machine is off screen.

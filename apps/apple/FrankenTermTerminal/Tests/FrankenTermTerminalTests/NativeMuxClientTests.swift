@@ -259,6 +259,41 @@ final class NativeMuxClientTests: XCTestCase {
         XCTAssertTrue(try client.unansweredInput(pane: 7))
     }
 
+    func testAPaneWhoseBusyServerKeepsRefusingIsReportedWaitingUntilARepeatIsAnswered() throws {
+        let clock = MuxTestClock(), client = try NativeMuxClient(monotonicNanoseconds: { clock.read() })
+        _ = try request(client, ident: 26, serial: 1)
+        try client.receive(frame(ident: 27, serial: 1, body: leb(71) + text("current")))
+        _ = try request(client, ident: 40, serial: 2)
+        try client.receive(frame(ident: 10, serial: 2, body: []))
+        _ = try request(client, ident: 81, serial: 3)
+        let run = [UInt8](repeating: 0x1c, count: 16), stream = [UInt8](repeating: 0x5a, count: 16)
+        try client.receive(frame(ident: 82, serial: 3, body: [1] + stream + [0] + run + [0, 0, 0, 0, 0]))
+        try client.show(pane: 7)
+        _ = try request(client, ident: 117, serial: 4)
+        let identity = run + [UInt8](repeating: 0xd1, count: 16) + [UInt8](repeating: 0x27, count: 16)
+        try client.receive(frame(ident: 118, serial: 4, body: [7, 0] + identity + [0]))
+        _ = try events(client)
+        // ErrorResponse v1 for GetPaneRenderChanges (24): RESOURCE_BUSY (12),
+        // no object, NOT_APPLIED (1), SAFE_AFTER_BACKOFF (2).
+        let busy: [UInt8] = [1, 24, 12, 0, 1, 2]
+        var serial: UInt8 = 5
+        for refusal in 1...3 {
+            _ = try request(client, ident: 24, serial: serial)
+            try client.receive(frame(ident: 0, serial: UInt64(serial), body: busy))
+            XCTAssertEqual(try events(client), refusal < 3 ? [] : [.paneWaiting(paneID: 7, waiting: true)],
+                           "after \(refusal) refusal(s)")
+            guard let wait = try client.pollInputTimer() else { return XCTFail("no repeat is due") }
+            let (seconds, attoseconds) = wait.components
+            clock.set(clock.read() + UInt64(seconds) * 1_000_000_000 + UInt64(attoseconds / 1_000_000_000))
+            _ = try client.pollInputTimer()
+            serial += 1
+        }
+        _ = try request(client, ident: 24, serial: serial)
+        try client.receive(frame(ident: 30, serial: UInt64(serial), body: [7, 1]))
+        XCTAssertEqual(try events(client), [.paneWaiting(paneID: 7, waiting: false)])
+        XCTAssertNil(try client.pollInputTimer(), "nothing is left to repeat")
+    }
+
     func testAClosedChannelIsReportedOnce() throws {
         let client = try NativeMuxClient()
         try client.channelClosed()
