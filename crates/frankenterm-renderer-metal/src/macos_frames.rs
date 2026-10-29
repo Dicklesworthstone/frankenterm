@@ -2972,7 +2972,7 @@ mod tests {
         assert_eq!(read(&frames, 2), flatten(&original));
         for (index, identity) in identities.into_iter().enumerate() {
             assert!(std::ptr::eq(
-                &*frames.window[index].ui_atlas.as_ref().unwrap().texture,
+                &raw const *frames.window[index].ui_atlas.as_ref().unwrap().texture,
                 identity
             ));
         }
@@ -3199,6 +3199,9 @@ mod tests {
         );
     }
 
+    // One failed growth checks every buffer kind's retention, residency and
+    // ledger accounting, for frame or pane buffers, against the same batch.
+    #[allow(clippy::too_many_lines)]
     fn check_failed_buffer_growth(pane: bool) {
         let ledger = private_ledger();
         let mut frames = FrameSlots::new(device(), SMALL, ledger).unwrap();
@@ -3271,7 +3274,7 @@ mod tests {
                 frames.buffer(slot, *kind)
             };
             assert!(
-                std::ptr::eq(current, &**old),
+                std::ptr::eq(current, &raw const **old),
                 "a failed batch retains the old buffer"
             );
             if let Some(set) = frames.residency() {
