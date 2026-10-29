@@ -1717,7 +1717,7 @@ impl Domain for LocalDomain {
             Ok(KillOnDropChildResult::new(slave.spawn_command(cmd)))
         })
         .await;
-        let mut writer = WriterWrapper::new(master.take_writer()?);
+        let writer = WriterWrapper::new(master.take_writer()?);
 
         let durable_pane_id = *uuid::Uuid::new_v4().as_bytes();
         let term_config = config::TermConfig::new_for_pane(
@@ -1757,15 +1757,12 @@ impl Domain for LocalDomain {
                 command_description,
             )),
             Err(err) => {
-                // Show the error to the user in the new pane
-                let display_result = write!(writer, "{err:#}").and_then(|_| writer.flush());
-                if display_result.is_err() {
-                    tracing::warn!(
-                        spawn_error = ?err,
-                        pane_error_display = ?display_result,
-                        "failed to surface local pane spawn error"
-                    );
-                }
+                // The master writer sends input to the failed child, not
+                // output to the screen. With no child to echo that input the
+                // actual failure disappears behind the generic exit status.
+                // Render it directly before installing the failed-child pane.
+                let message = format!("Unable to start process: {err:#}\r\n");
+                terminal.advance_bytes(message.as_bytes());
 
                 // and return a dummy pane that has exited
                 Arc::new(LocalPane::new(
@@ -2626,6 +2623,36 @@ mod tests {
             1
         );
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_failed_spawn_keeps_the_error_visible_without_child_echo() {
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(Arc::clone(&mux));
+        let exec = promise::spawn::ScopedExecutor::new();
+        let domain = LocalDomain::new("failed-spawn-visible").expect("native PTY domain");
+        let fixture = tempfile::tempdir().expect("isolated executable directory");
+        let missing = fixture.path().join("missing-spawn-error-witness");
+        assert!(!missing.exists());
+
+        let pane = promise::spawn::block_on(exec.run(domain.spawn_pane(
+            &mux,
+            TerminalSize::default(),
+            Some(CommandBuilder::new(&missing)),
+            None,
+        )))
+        .expect("a failed spawn remains inspectable in its pane");
+        let (_, lines) = pane.get_lines(0..24);
+        let visible = lines.iter().map(|line| line.as_str()).collect::<String>();
+        assert!(
+            visible.contains("Unable to start process:"),
+            "spawn error must be visible without a live child to echo it: {visible:?}"
+        );
+        assert!(
+            visible.contains("missing-spawn-error-witness"),
+            "the actual failed executable must remain identifiable: {visible:?}"
+        );
     }
 
     #[test]
