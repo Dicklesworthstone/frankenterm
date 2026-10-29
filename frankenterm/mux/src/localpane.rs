@@ -75,14 +75,13 @@ enum MetadataRefusalStage {
     SinkInterval,
     SurfaceTerminal,
     SurfaceTmux,
-    LayoutUnavailable,
     DimensionsUnavailable,
     SinkUsage,
     SurfaceGeometry,
     PublicationGeometry,
 }
 
-const METADATA_REFUSAL_STAGES: usize = 15;
+const METADATA_REFUSAL_STAGES: usize = 14;
 const METADATA_REFUSAL_LOG_LIMIT: usize = 64;
 static METADATA_REFUSALS: [AtomicUsize; METADATA_REFUSAL_STAGES] =
     [const { AtomicUsize::new(0) }; METADATA_REFUSAL_STAGES];
@@ -159,7 +158,6 @@ impl Drop for MetadataRefusalDiagnostic {
             "sink_interval",
             "surface_terminal",
             "surface_tmux",
-            "layout_unavailable",
             "dimensions_unavailable",
             "sink_usage",
             "surface_geometry",
@@ -6243,12 +6241,14 @@ impl LocalPane {
         let line_layout_floor =
             match Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term) {
                 Ok(Some(floor)) => floor,
-                // Let the existing source-fence path retire an exhausted
-                // sequence domain instead of turning it into retryable busy.
-                Ok(None) if term.current_seqno() == SequenceNo::MAX => return None,
-                Ok(None) => {
-                    return Some(Err(metadata_busy(MetadataRefusalStage::LayoutUnavailable)))
-                }
+                // No layout authority: an exhausted sequence domain, which the
+                // source-fence path retires, or a cold source that cannot
+                // answer. A quarantined sink stays unavailable until the mux
+                // restarts (ft-92aa4), so refusing that as retryable busy
+                // refused every render of the pane for the rest of its life.
+                // Without a snapshot the caller draws the live screen field
+                // by field, as get_line_layout's Ok(None) already lets it.
+                Ok(None) => return None,
                 Err(busy) => return Some(Err(busy)),
             };
 
@@ -20237,6 +20237,29 @@ mod tests {
         // 5. Uncontended call succeeds
         let result = pane.capture_surface_snapshot(0);
         assert!(result.is_some() && result.as_ref().unwrap().is_ok());
+    }
+
+    /// ft-92aa4: a cold source that cannot answer is not busy. A quarantined
+    /// sink stays unavailable until the mux restarts, and a busy refusal made
+    /// every remote client retry a pane it could never draw. With no coherent
+    /// snapshot the render path draws the live screen field by field.
+    #[test]
+    fn an_unavailable_cold_source_leaves_the_live_screen_drawable() {
+        let (pane, _mux, _reg, sink, _token) = cold_resize_fixture(false);
+        assert!(matches!(pane.capture_surface_snapshot(0), Some(Ok(_))));
+        sink.unavailable.store(true, Ordering::Release);
+        assert_eq!(pane.get_line_layout(), Ok(None));
+        for _ in 0..3 {
+            assert!(
+                pane.capture_surface_snapshot(0).is_none(),
+                "no coherent snapshot, and no busy refusal to repeat forever"
+            );
+        }
+        let dims = pane.get_dimensions();
+        let rows = StableRowIndex::try_from(dims.viewport_rows).unwrap();
+        let (first, lines) = pane.get_lines(dims.physical_top..dims.physical_top + rows);
+        assert_eq!(first, dims.physical_top);
+        assert_eq!(lines.len(), dims.viewport_rows);
     }
 
     #[test]
