@@ -238,6 +238,19 @@ impl RenderMirror {
                     .resize_with(snapshots.len(), || MirrorRow::empty(0, 0));
             }
             let resolved = &mut self.resolved_rows[..snapshots.len()];
+            // Resolve into each visible row's own backing storage. Swapping
+            // only after resolution circulates scratch buffers between rows
+            // and replaces their allocations on every dirty capture.
+            for (offset, row) in resolved.iter_mut().enumerate() {
+                let stable = group.stable.start + offset as StableRowIndex;
+                if group.planted_skip != Some(stable) {
+                    if let Ok(index) = usize::try_from(stable - self.first) {
+                        if let Some(slot) = self.rows.get_mut(index) {
+                            std::mem::swap(slot, row);
+                        }
+                    }
+                }
+            }
             let native = snapshots.iter().all(RenderRowSnapshot::is_packed);
             if rules.is_empty() || native {
                 for (offset, (source, row)) in snapshots.iter().zip(resolved.iter_mut()).enumerate()
