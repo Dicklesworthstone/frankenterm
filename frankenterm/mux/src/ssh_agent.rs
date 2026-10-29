@@ -253,7 +253,10 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         use std::os::unix::net::UnixListener;
 
-        let root = tempfile::tempdir().unwrap().keep();
+        // Remote runners may put TMPDIR beneath a long isolated source path.
+        // Unix socket names must fit SUN_LEN; retain a private, uniquely named
+        // fixture on the short Unix temporary root instead.
+        let root = tempfile::tempdir_in("/tmp").unwrap().keep();
         let original = root.join("original.sock");
         let successor = root.join("successor.sock");
         let _original_listener = UnixListener::bind(&original).unwrap();

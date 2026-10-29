@@ -2647,11 +2647,13 @@ mod tests {
         let visible = lines.iter().map(|line| line.as_str()).collect::<String>();
         assert!(
             visible.contains("Unable to start process:"),
-            "spawn error must be visible without a live child to echo it: {visible:?}"
+            "spawn error must be visible without a live child to echo it: {:?}",
+            visible
         );
         assert!(
             visible.contains("missing-spawn-error-witness"),
-            "the actual failed executable must remain identifiable: {visible:?}"
+            "the actual failed executable must remain identifiable: {:?}",
+            visible
         );
     }
 
