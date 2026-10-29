@@ -600,6 +600,38 @@ pub struct LivenessResponse {
     pub is_alive: bool,
 }
 
+/// PDU 0 from a current server: codec's structured `ErrorResponse`, each
+/// newtype code its byte. (A v46 server sends the error's text instead.)
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ErrorResponse {
+    pub schema_version: u8,
+    pub request_ident: u64,
+    pub code: u8,
+    pub object: Option<ErrorObject>,
+    pub effect: u8,
+    pub retry: u8,
+}
+
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ErrorObject {
+    pub kind: u8,
+    pub id: u64,
+}
+
+impl ErrorResponse {
+    /// codec's `MuxErrorEffect::NOT_APPLIED`.
+    pub const NOT_APPLIED: u8 = 1;
+    /// codec's `MuxErrorRetry::SAFE_AFTER_BACKOFF`.
+    pub const SAFE_AFTER_BACKOFF: u8 = 2;
+
+    /// The server applied nothing and the same request may go again after
+    /// a delay (busy render metadata, a full scheduler, a backend failure).
+    #[must_use]
+    pub fn retry_after_backoff(&self) -> bool {
+        self.effect == Self::NOT_APPLIED && self.retry == Self::SAFE_AFTER_BACKOFF
+    }
+}
+
 #[derive(Deserialize, Debug)]
 pub struct PaneRemoved {
     pub pane_id: usize,

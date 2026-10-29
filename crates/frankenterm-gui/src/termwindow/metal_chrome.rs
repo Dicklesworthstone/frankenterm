@@ -77,7 +77,7 @@ impl ChromeTexture {
         let image = self.texture.image.borrow();
         let (width, height) = image.image_dimensions();
         let version = NEXT_ATLAS_VERSION
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
             })
             .expect("chrome atlas content version space exhausted");

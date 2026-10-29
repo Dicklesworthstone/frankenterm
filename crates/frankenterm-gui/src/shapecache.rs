@@ -663,8 +663,12 @@ mod test {
 
         let style = 7u32;
         let cluster = key_cluster("ffi");
-        let key =
-            |cluster, context| BorrowedShapeCacheKey::new(&style, 11, cluster, context).to_owned();
+        // Typed parameters make the closure take any borrow, not one
+        // inferred lifetime that would hold `changed` across reassignment.
+        let key = |cluster: &termwiz::cellcluster::CellCluster,
+                   context: Option<(&str, std::ops::Range<usize>)>| {
+            BorrowedShapeCacheKey::new(&style, 11, cluster, context).to_owned()
+        };
         let base = key(&cluster, Some(("office ffi", 1..4)));
         assert_ne!(base, key(&cluster, Some(("affice ffi", 1..4))), "neighbors");
         assert_ne!(base, key(&cluster, Some(("office ffi", 7..10))), "range");

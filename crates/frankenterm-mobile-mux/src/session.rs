@@ -193,6 +193,10 @@ pub const INPUT_DEADLINE_NS: u64 = 5_000_000_000;
 pub const MAX_INPUT_RETRIES: u8 = 8;
 const MIN_INPUT_RETRY_DELAY_NS: u64 = 1_000_000;
 const MAX_INPUT_RETRY_BACKOFF_NS: u64 = 100_000_000;
+/// A render read a current server refused as safe to repeat goes again after
+/// this delay, doubled per refusal in a row up to the maximum.
+pub const MIN_RENDER_RETRY_DELAY_NS: u64 = 100_000_000;
+pub const MAX_RENDER_RETRY_DELAY_NS: u64 = 5_000_000_000;
 const MAX_INPUT_CALL_BYTES: usize = 64 * 1024;
 const MAX_QUEUED_INPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_QUEUED_INPUT_OPERATIONS: usize = 256;
@@ -268,6 +272,18 @@ struct PaneSizing {
     desktop_list_after: u64,
 }
 
+/// A pane whose render read a current server refused as safe to repeat.
+#[derive(Debug, Clone, Copy, Default)]
+struct RenderRetry {
+    /// When to ask again; `None` while the repeat is on its way.
+    due_ns: Option<u64>,
+    /// Which reads to repeat: the first subscription, a poll, or both.
+    subscribe: bool,
+    poll: bool,
+    /// Refusals in a row, which set the next delay.
+    refusals: u32,
+}
+
 #[derive(Debug, Default)]
 pub struct Session {
     next_serial: u64,
@@ -299,6 +315,7 @@ pub struct Session {
     /// never the most recently written or currently visible pane.
     input: PaneInput,
     authorities: HashMap<usize, PaneAuthority>,
+    render_retries: HashMap<usize, RenderRetry>,
     next_input_serial: u64,
     monotonic_ns: Option<u64>,
     ordered_input: VecDeque<OrderedInput>,
@@ -331,7 +348,8 @@ impl Session {
     /// backward clock fails closed. There is no wall clock, timer or I/O here.
     ///
     /// False means the session ended; the owner must stop egress and drain its
-    /// failure event. Expiry never retries an unanswered/possibly applied RPC.
+    /// failure event. Expiry never retries an unanswered/possibly applied RPC;
+    /// it repeats only a render read the server answered as safe to repeat.
     pub fn advance_time(&mut self, now_ns: u64) -> bool {
         if self.failed {
             return false;
@@ -352,13 +370,15 @@ impl Session {
             return false;
         }
         self.drive_input();
+        self.repeat_due_renders(now_ns);
         !self.failed
     }
 
     /// Earliest absolute wake in the same clock domain supplied to
     /// [`Session::advance_time`]. Includes queued-operation expiry, so a paste
-    /// or mouse RPC ahead of reliable input cannot hide that input's deadline.
-    /// Only one owner timer is needed; the bounded FIFO remains authoritative.
+    /// or mouse RPC ahead of reliable input cannot hide that input's deadline,
+    /// and a refused render read's repeat. Only one owner timer is needed;
+    /// the bounded FIFO remains authoritative.
     pub fn next_input_wake_ns(&self) -> Option<u64> {
         if self.failed {
             return None;
@@ -371,6 +391,7 @@ impl Session {
                     .front()
                     .and_then(|input| input.retry_at_ns),
             )
+            .chain(self.render_retries.values().filter_map(|retry| retry.due_ns))
             .min()
     }
 
@@ -1751,11 +1772,23 @@ impl Session {
                 let reply: LivenessResponse = wire::decode(&frame.body)?;
                 if !reply.is_alive {
                     self.pane_gone(reply.pane_id);
-                } else if let Some(Request::Poll { pane_id }) = request {
-                    if let Some(mirror) = self.mirrors.get_mut(&pane_id) {
-                        mirror.size_settled();
+                } else {
+                    if let Some(Request::Subscribe { pane_id } | Request::Poll { pane_id }) =
+                        request
+                        && self
+                            .render_retries
+                            .get(&pane_id)
+                            .is_some_and(|retry| retry.due_ns.is_none())
+                    {
+                        // The repeat was answered; a later refusal starts over.
+                        self.render_retries.remove(&pane_id);
                     }
-                    self.advance(pane_id);
+                    if let Some(Request::Poll { pane_id }) = request {
+                        if let Some(mirror) = self.mirrors.get_mut(&pane_id) {
+                            mirror.size_settled();
+                        }
+                        self.advance(pane_id);
+                    }
                 }
             }
             ident::UNIT_RESPONSE => {
@@ -1829,8 +1862,11 @@ impl Session {
                         self.list_again = false;
                         self.refresh_panes();
                     }
-                    Some(Request::Subscribe { pane_id } | Request::Poll { pane_id }) => {
-                        self.pane_gone(pane_id);
+                    Some(Request::Subscribe { pane_id }) => {
+                        self.render_refused(pane_id, true, &frame.body);
+                    }
+                    Some(Request::Poll { pane_id }) => {
+                        self.render_refused(pane_id, false, &frame.body);
                     }
                     Some(Request::Resize { pane_id }) => self.poll(pane_id),
                     Some(Request::RestoreSize { pane_id }) => {
@@ -1926,6 +1962,51 @@ impl Session {
         }
     }
 
+    /// The server refused a render read. A current server that applied
+    /// nothing and allows a repeat (busy render metadata, a full scheduler)
+    /// is asked again after a growing delay; the pane stays. A gone pane is
+    /// answered by liveness, not here; any other refusal cannot be drawn.
+    fn render_refused(&mut self, pane_id: usize, subscribe: bool, body: &[u8]) {
+        let repeatable = self.dialect == Dialect::Current
+            && wire::decode::<wire::ErrorResponse>(body)
+                .is_ok_and(|error| error.retry_after_backoff());
+        if !repeatable || !self.mirrors.contains_key(&pane_id) {
+            self.pane_gone(pane_id);
+            return;
+        }
+        let now = self.monotonic_ns.unwrap_or(0);
+        let retry = self.render_retries.entry(pane_id).or_default();
+        let delay = MIN_RENDER_RETRY_DELAY_NS
+            .saturating_mul(1 << retry.refusals.min(6))
+            .min(MAX_RENDER_RETRY_DELAY_NS);
+        retry.refusals = retry.refusals.saturating_add(1);
+        retry.subscribe |= subscribe;
+        retry.poll |= !subscribe;
+        retry.due_ns = Some(now.saturating_add(delay));
+    }
+
+    fn repeat_due_renders(&mut self, now_ns: u64) {
+        let mut due = Vec::new();
+        for (pane_id, retry) in &mut self.render_retries {
+            if retry.due_ns.is_some_and(|at| at <= now_ns) {
+                due.push((*pane_id, retry.subscribe, retry.poll));
+                *retry = RenderRetry {
+                    refusals: retry.refusals,
+                    ..RenderRetry::default()
+                };
+            }
+        }
+        due.sort_unstable();
+        for (pane_id, subscribe, poll) in due {
+            if subscribe {
+                self.subscribe(pane_id);
+            }
+            if poll {
+                self.poll(pane_id);
+            }
+        }
+    }
+
     fn update_title(&mut self, pane_id: usize, title: &str) {
         let known = self
             .mirrors
@@ -1950,6 +2031,7 @@ impl Session {
 
     fn pane_gone(&mut self, pane_id: usize) {
         self.authorities.remove(&pane_id);
+        self.render_retries.remove(&pane_id);
         self.requests.retain(|_, request| {
             !matches!(request,
                 Request::PaneIdentity { pane_id: old }
