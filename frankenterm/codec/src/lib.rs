@@ -24880,7 +24880,7 @@ mod test {
                     &mut frame,
                 )
                 .unwrap();
-                assert!(Pdu::decode(frame.as_slice()).is_err(), "case {case}");
+                assert!(Pdu::decode(frame.as_slice()).is_err(), "case {}", case);
             }
         }
     }

@@ -101,6 +101,7 @@ impl RasterCache {
 mod tests {
     use super::*;
     use crate::units::PixelLength;
+    use euclid::num::Zero;
 
     fn key(font: LoadedFontId, fallback: FallbackIdx, glyph: u32) -> RasterKey {
         RasterKey {

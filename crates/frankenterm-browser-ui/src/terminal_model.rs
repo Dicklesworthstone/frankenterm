@@ -835,11 +835,11 @@ impl TerminalModel {
             .pending
             .take()
             .ok_or(WireError::InvalidState)?;
-        let mut lines = Vec::new();
+        let mut assembled_lines = Vec::new();
         let mut hyperlinks = BTreeMap::new();
         let mut images = BTreeMap::new();
         for chunk in pending.chunks {
-            lines.extend(chunk.patch.lines.into_vec());
+            assembled_lines.extend(chunk.patch.lines.into_vec());
             for link in chunk.patch.hyperlinks.into_vec() {
                 if used_links.contains(&link.id.0) {
                     hyperlinks.entry(link.id.0).or_insert(link);
@@ -851,7 +851,7 @@ impl TerminalModel {
                 }
             }
         }
-        lines.sort_by_key(|line| line.row);
+        assembled_lines.sort_by_key(|line| line.row);
         let start = pending.start;
         let screen = TerminalScreen {
             scope: start.scope,
@@ -861,7 +861,7 @@ impl TerminalModel {
             modes: start.modes,
             title: start.title,
             cwd: start.cwd,
-            lines,
+            lines: assembled_lines,
             hyperlinks,
             images,
             charged_bytes,
@@ -896,10 +896,8 @@ impl TerminalModel {
             });
         }
         let screen = pane.screen.as_ref().ok_or(WireError::SnapshotIncomplete)?;
-        if pane.recovery.is_some()
-            || pane.pending.is_some()
-            || delta.base_sequence != screen.sequence
-        {
+        let base_matches_screen = delta.base_sequence == screen.sequence;
+        if pane.recovery.is_some() || pane.pending.is_some() || !base_matches_screen {
             return Err(WireError::StaleSequence);
         }
         if delta.patch.dimensions != pane.dimensions
