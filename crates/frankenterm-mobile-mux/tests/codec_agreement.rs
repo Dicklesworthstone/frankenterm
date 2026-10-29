@@ -1153,7 +1153,7 @@ fn a_current_servers_rejections_decode_with_their_repeat_authority() {
                 MuxWireDialect::current(codec::CODEC_VERSION).expect("the current dialect"),
                 PduProducer::Server,
                 PduWireRole::CorrelatedReply,
-                None,
+                Some(&<GetPaneRenderChanges as codec::PduWireIdent>::WIRE_SPEC),
                 CompressionMode::Never,
             )
             .expect("the desktop codec plans the rejection")
