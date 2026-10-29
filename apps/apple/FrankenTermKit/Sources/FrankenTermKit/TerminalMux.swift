@@ -117,29 +117,39 @@ public enum TerminalMuxEvent: Equatable, Sendable {
 }
 
 /// The panes a phone left at its own size on one machine, kept across
-/// connections. A later connection may restore a size only on the same
-/// identified server run and pane, still at exactly the phone's dimensions.
-/// A reused number or an unidentified legacy server grants no resize authority.
+/// connections. A later connection may restore a size only to the same pane,
+/// still at exactly the phone's dimensions. On a server that names its run
+/// (its incarnation) it must also be the same run: such a server restores its
+/// panes across a restart, numbers and sizes included, so a reused number
+/// grants no resize authority. A legacy server names no run and cannot bring
+/// a pane back after a restart, so there the pane, tab and window numbers and
+/// the phone's exact dimensions decide, as they do for the shown pane. A
+/// record from one kind of server never matches the other.
 public final class TerminalMuxPhoneSizes: @unchecked Sendable {
     public struct Record: Codable, Equatable, Sendable {
         public let paneId: Int, tabId: Int, windowId: Int
-        public let incarnation: Data
+        /// The server's run; nil for a legacy server that does not name it.
+        public let incarnation: Data?
         public let desktop: TerminalMuxSize
         public let rows: Int, columns: Int
 
         fileprivate var isValid: Bool {
-            paneId >= 0 && tabId >= 0 && windowId >= 0 && incarnation.count == 16
-                && incarnation.contains(where: { $0 != 0 })
+            paneId >= 0 && tabId >= 0 && windowId >= 0
+                && incarnation.map(TerminalMuxPhoneSizes.isRun) ?? true
                 && (1...512).contains(rows) && (1...512).contains(columns)
                 && (1...4096).contains(desktop.rows) && (1...4096).contains(desktop.cols)
                 && UInt32(exactly: desktop.pixelWidth) != nil && UInt32(exactly: desktop.pixelHeight) != nil
                 && UInt32(exactly: desktop.dpi) != nil
         }
 
-        fileprivate func matches(_ pane: TerminalMuxPane, incarnation: Data) -> Bool {
+        fileprivate func matches(_ pane: TerminalMuxPane, incarnation: Data?) -> Bool {
             self.incarnation == incarnation && paneId == pane.paneId && tabId == pane.tabId
                 && windowId == pane.windowId && rows == pane.size.rows && columns == pane.size.cols
         }
+    }
+
+    fileprivate static func isRun(_ incarnation: Data) -> Bool {
+        incarnation.count == 16 && incarnation.contains(where: { $0 != 0 })
     }
     /// More panes than any machine has; older entries beyond it are dropped.
     public static let maximumRecords = 256
@@ -157,8 +167,7 @@ public final class TerminalMuxPhoneSizes: @unchecked Sendable {
     /// remembered size to the native client. The client still checks its own
     /// current dimensions at adoption. Duplicate pane IDs are not authority.
     public func records(matching panes: [TerminalMuxPane], incarnation: Data?) -> [Int: Record] {
-        guard let incarnation, incarnation.count == 16,
-              incarnation.contains(where: { $0 != 0 }) else { return [:] }
+        if let incarnation, !Self.isRun(incarnation) { return [:] }
         var seen = Set<Int>()
         guard panes.allSatisfy({ seen.insert($0.paneId).inserted }) else { return [:] }
         return lock.withLock {
@@ -177,11 +186,9 @@ public final class TerminalMuxPhoneSizes: @unchecked Sendable {
                     rows: Int, columns: Int) {
         lock.withLock {
             var all = load()
-            let record = incarnation.map {
-                Record(paneId: pane.paneId, tabId: pane.tabId, windowId: pane.windowId,
-                       incarnation: $0, desktop: desktop, rows: rows, columns: columns)
-            }
-            all[pane.paneId] = record.flatMap { $0.isValid ? $0 : nil }
+            let record = Record(paneId: pane.paneId, tabId: pane.tabId, windowId: pane.windowId,
+                                incarnation: incarnation, desktop: desktop, rows: rows, columns: columns)
+            all[pane.paneId] = record.isValid ? record : nil
             store(all)
         }
     }

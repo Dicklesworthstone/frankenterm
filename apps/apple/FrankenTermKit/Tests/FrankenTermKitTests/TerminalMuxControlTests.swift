@@ -449,6 +449,43 @@ final class TerminalMuxQueryDriverTests: XCTestCase {
                        "a failed comparison does not mutate the retained record")
     }
 
+    func testPhoneSizesOnALegacyServerComeBackByPaneNumbersAndExactPhoneSize() throws {
+        // A 0.1.0 mux names no run. A drop while its pane was at the phone's
+        // size must still give the desktop its size back on reconnect, or the
+        // reconnect takes the phone's size for the desktop's and keeps it.
+        let suite = "frankenterm.tests.phoneSizes.legacy.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let desktop = TerminalMuxSize(rows: 50, cols: 180, pixelWidth: 1440, pixelHeight: 800, dpi: 144)
+        let run = Data(repeating: 0x1c, count: 16)
+        let pane = phoneSizedPane(4, tab: 2, window: 7), other = phoneSizedPane(9)
+        let dropped = TerminalMuxPhoneSizes(workspace: "w", machine: "linux", defaults: defaults)
+        dropped.set(pane: pane, incarnation: nil, desktop: desktop, rows: 40, columns: 54)
+
+        let reconnect = TerminalMuxPhoneSizes(workspace: "w", machine: "linux", defaults: defaults)
+        XCTAssertEqual(reconnect.records(matching: [pane, other], incarnation: nil),
+                       [4: .init(paneId: 4, tabId: 2, windowId: 7, incarnation: nil,
+                                 desktop: desktop, rows: 40, columns: 54)])
+        // An upgraded server restarted and names a run now: never the legacy record.
+        XCTAssertTrue(reconnect.records(matching: [pane], incarnation: run).isEmpty)
+        for changed in [phoneSizedPane(4, tab: 5, window: 7), phoneSizedPane(4, tab: 2, window: 8),
+                        phoneSizedPane(4, tab: 2, window: 7, rows: 41),
+                        phoneSizedPane(4, tab: 2, window: 7, columns: 55)] {
+            XCTAssertTrue(reconnect.records(matching: [changed], incarnation: nil).isEmpty)
+        }
+        XCTAssertTrue(reconnect.records(matching: [pane, pane], incarnation: nil).isEmpty,
+                      "an ambiguous inventory grants no resize authority")
+        XCTAssertEqual(reconnect.records(matching: [pane], incarnation: nil).count, 1,
+                       "a failed comparison does not mutate the retained record")
+
+        // A run-bound record and a legacy one for the same pane replace each other.
+        reconnect.set(pane: pane, incarnation: run, desktop: desktop, rows: 40, columns: 54)
+        XCTAssertTrue(reconnect.records(matching: [pane], incarnation: nil).isEmpty)
+        XCTAssertEqual(reconnect.records(matching: [pane], incarnation: run).count, 1)
+        reconnect.remove(pane: 4)
+        XCTAssertTrue(reconnect.records(matching: [pane], incarnation: run).isEmpty)
+    }
+
     func testPhoneSizesRequireCurrentTopologyAndDimensionsWithoutLosingAnUnchangedPane() throws {
         let suite = "frankenterm.tests.phoneSizes.topology.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
@@ -512,7 +549,7 @@ final class TerminalMuxQueryDriverTests: XCTestCase {
         XCTAssertEqual(sizes.records(matching: [pane], incarnation: run).count, 1)
     }
 
-    func testPhoneSizesNeverPersistUnidentifiedOrInvalidNewRestorationAuthority() throws {
+    func testPhoneSizesNeverPersistInvalidRestorationAuthorityOrLendALegacyRecordToARun() throws {
         let suite = "frankenterm.tests.phoneSizes.admission.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
@@ -525,6 +562,10 @@ final class TerminalMuxQueryDriverTests: XCTestCase {
             sizes.set(pane: pane, incarnation: run, desktop: desktop, rows: 40, columns: 54)
             sizes.set(pane: pane, incarnation: identity, desktop: desktop, rows: 40, columns: 54)
             XCTAssertEqual(Set(sizes.records(matching: [pane, other], incarnation: run).keys), [9])
+            // No identity is a legacy server's record, seen only by a legacy
+            // server; a malformed identity is no record at all.
+            XCTAssertEqual(Set(sizes.records(matching: [pane], incarnation: nil).keys),
+                           identity == nil ? [4] : [])
         }
         sizes.set(pane: pane, incarnation: run, desktop: invalidDesktop, rows: 40, columns: 54)
         XCTAssertEqual(Set(sizes.records(matching: [pane, other], incarnation: run).keys), [9])

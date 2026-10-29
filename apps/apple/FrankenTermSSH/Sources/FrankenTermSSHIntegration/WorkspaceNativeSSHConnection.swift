@@ -730,10 +730,12 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
             } else if unconfirmed {
                 control.recordInputUnconfirmed()
             }
-            // Restore only the same pane on the same identified server run,
-            // still at the phone's size. Reused IDs after a restart, topology
-            // changes and legacy records cannot resize a replacement shell.
-            // The pane about to be shown keeps its desktop size for later.
+            // Restore only the same pane, still at the phone's size, and on a
+            // server that names its run only that run: there reused IDs after
+            // a restart cannot resize a replacement shell. A legacy server's
+            // panes are matched by their numbers (it cannot restore panes).
+            // Topology changes never match. The pane about to be shown keeps
+            // its desktop size for later.
             if control.accessMode.controlsSize {
                 for (pane, record) in state.sizes.records(matching: state.panes, incarnation: state.incarnation)
                     .sorted(by: { $0.key < $1.key }) {
