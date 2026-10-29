@@ -1129,3 +1129,63 @@ fn a_pane_tree_decodes_like_the_desktop_v46_decoder() {
         assert_eq!(ours.tty_name, desktop.tty_name);
     }
 }
+
+#[test]
+fn a_current_servers_rejections_decode_with_their_repeat_authority() {
+    let ident = <GetPaneRenderChanges as codec::PduWireIdent>::IDENT;
+    let rejections = [
+        (codec::ErrorResponse::resource_busy(ident), true),
+        (codec::ErrorResponse::backend_failure(ident), true),
+        (codec::ErrorResponse::quota_exceeded(ident), true),
+        (codec::ErrorResponse::deadline_exceeded(ident), true),
+        (codec::ErrorResponse::pane_not_found(ident, 7), false),
+        (codec::ErrorResponse::cancelled(ident), false),
+        (codec::ErrorResponse::invalid_request(ident), false),
+        (
+            codec::ErrorResponse::indeterminate_mutation(ident, None),
+            false,
+        ),
+    ];
+    for (canonical, repeatable) in rejections {
+        // The frame a current server writes for PDU 0, read the phone's way.
+        let bytes = Pdu::ErrorResponse(canonical.clone())
+            .prepare_outbound_for_dialect(
+                MuxWireDialect::current(codec::CODEC_VERSION).expect("the current dialect"),
+                PduProducer::Server,
+                PduWireRole::Response,
+                None,
+                CompressionMode::Never,
+            )
+            .expect("the desktop codec plans the rejection")
+            .encode_frame(9)
+            .expect("the desktop codec encodes the rejection");
+        let mut reader = frame::FrameReader::default();
+        reader.push(&bytes);
+        let reply = reader.next_frame().unwrap().expect("one whole frame");
+        assert_eq!(
+            (reply.ident, reply.serial),
+            (wire::ident::ERROR_RESPONSE, 9)
+        );
+        let decoded: wire::ErrorResponse = wire::decode(&reply.body).unwrap();
+        assert_eq!(
+            decoded,
+            wire::ErrorResponse {
+                schema_version: canonical.schema_version,
+                request_ident: ident,
+                code: canonical.code.0,
+                object: canonical.object.map(|object| wire::ErrorObject {
+                    kind: object.kind.0,
+                    id: object.id,
+                }),
+                effect: canonical.effect.0,
+                retry: canonical.retry.0,
+            }
+        );
+        assert_eq!(decoded.retry_after_backoff(), repeatable, "{canonical:?}");
+    }
+    // A v46 server's rejection is its text: never a repeat.
+    let text = varbincode::serialize(&"Error: no such pane".to_owned()).unwrap();
+    assert!(
+        !wire::decode::<wire::ErrorResponse>(&text).is_ok_and(|error| error.retry_after_backoff())
+    );
+}

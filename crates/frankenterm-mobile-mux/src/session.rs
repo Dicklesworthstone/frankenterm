@@ -391,7 +391,11 @@ impl Session {
                     .front()
                     .and_then(|input| input.retry_at_ns),
             )
-            .chain(self.render_retries.values().filter_map(|retry| retry.due_ns))
+            .chain(
+                self.render_retries
+                    .values()
+                    .filter_map(|retry| retry.due_ns),
+            )
             .min()
     }
 

@@ -1620,3 +1620,87 @@ fn a_pane_never_shown_that_scrolls_or_moves_its_cursor_between_lists_is_reported
     harness.pump();
     assert_eq!(activity(&harness), 2);
 }
+
+fn render_reads(harness: &Harness) -> usize {
+    harness
+        .server
+        .requests
+        .iter()
+        .filter(|r| **r == "GetPaneRenderChanges")
+        .count()
+}
+
+fn closed_or_failed(harness: &Harness) -> bool {
+    harness
+        .events
+        .iter()
+        .any(|event| matches!(event, Event::PaneGone { .. } | Event::Failed { .. }))
+}
+
+#[test]
+fn a_busy_current_mux_keeps_the_pane_and_draws_it_after_a_backoff() {
+    use frankenterm_mobile_mux::session::MIN_RENDER_RETRY_DELAY_NS as DELAY;
+    let mut harness = Harness::new(4, 20);
+    harness.server.codec_vers = 71;
+    harness.quiet_output(&numbered(0, 6));
+    // What a current server answers while the pane's render metadata is busy.
+    let busy = codec::ErrorResponse::resource_busy(
+        <codec::GetPaneRenderChanges as codec::PduWireIdent>::IDENT,
+    );
+    harness
+        .server
+        .refuse_render
+        .extend([Some(busy.clone()), Some(busy)]);
+    assert!(harness.session.advance_time(0));
+    harness.attach();
+    assert_eq!(render_reads(&harness), 1);
+    assert!(!closed_or_failed(&harness), "{:?}", harness.events);
+    assert_eq!(harness.session.next_input_wake_ns(), Some(DELAY));
+
+    // Nothing goes again before the delay.
+    assert!(harness.session.advance_time(DELAY - 1));
+    harness.pump();
+    assert_eq!(render_reads(&harness), 1);
+    assert!(harness.session.advance_time(DELAY));
+    harness.pump();
+    assert_eq!(render_reads(&harness), 2);
+
+    // A second refusal in a row waits twice as long.
+    assert_eq!(harness.session.next_input_wake_ns(), Some(3 * DELAY));
+    assert!(harness.session.advance_time(3 * DELAY));
+    harness.pump();
+    assert_eq!(render_reads(&harness), 3);
+    assert_eq!(harness.session.next_input_wake_ns(), None);
+    assert!(!closed_or_failed(&harness), "{:?}", harness.events);
+    assert_mirrored(&mut harness);
+    harness.output(&numbered(6, 9));
+    assert_mirrored(&mut harness);
+}
+
+#[test]
+fn a_refusal_the_server_does_not_allow_repeating_still_closes_the_pane() {
+    let ident = <codec::GetPaneRenderChanges as codec::PduWireIdent>::IDENT;
+    for (version, refusal) in [
+        (71, Some(codec::ErrorResponse::pane_not_found(ident, 7))),
+        (71, Some(codec::ErrorResponse::invalid_request(ident))),
+        // A v46 server's text says nothing about repeating.
+        (46, None),
+    ] {
+        let mut harness = Harness::new(4, 20);
+        harness.server.codec_vers = version;
+        harness.server.refuse_render.push_back(refusal);
+        assert!(harness.session.advance_time(0));
+        harness.attach();
+        assert!(
+            harness.events.contains(&Event::PaneGone { pane_id: 7 }),
+            "codec {version}: {:?}",
+            harness.events
+        );
+        assert_eq!(render_reads(&harness), 1, "codec {version}");
+        assert_eq!(
+            harness.session.next_input_wake_ns(),
+            None,
+            "codec {version}"
+        );
+    }
+}

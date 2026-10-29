@@ -220,6 +220,9 @@ pub struct Server {
     pub requests: Vec<&'static str>,
     /// GetLines requests still to answer with an ErrorResponse.
     pub refuse_lines: usize,
+    /// GetPaneRenderChanges requests still to refuse, in order: a current
+    /// server's structured rejection, or (`None`) a v46 server's text.
+    pub refuse_render: std::collections::VecDeque<Option<codec::ErrorResponse>>,
     /// The row ranges GetLines asked for, in order.
     pub line_ranges: Vec<std::ops::Range<StableRowIndex>>,
     /// The row ranges searches asked for, in order.
@@ -266,6 +269,7 @@ impl Server {
             mouse_grabbed: false,
             requests: Vec::new(),
             refuse_lines: 0,
+            refuse_render: std::collections::VecDeque::new(),
             line_ranges: Vec::new(),
             search_ranges: Vec::new(),
             quiet_resize: false,
@@ -481,6 +485,13 @@ impl Server {
                 pane_id,
             })) => {
                 self.requests.push("GetPaneRenderChanges");
+                if let Some(refusal) = self.refuse_render.pop_front() {
+                    match refusal {
+                        Some(error) => self.reply(0, serial, &error),
+                        None => self.reply(0, serial, &"Error: no such pane".to_owned()),
+                    }
+                    return;
+                }
                 let is_alive = pane_id == self.pane_id;
                 if is_alive {
                     self.subscribed = true;
