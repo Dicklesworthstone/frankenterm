@@ -5,6 +5,8 @@
     objectVersion = 56;
     objects = {
 /* Begin PBXBuildFile section */
+        AC1000000000000000000001 = {isa = PBXBuildFile; fileRef = AC2000000000000000000001; };
+        AC1000000000000000000002 = {isa = PBXBuildFile; fileRef = AC2000000000000000000002; };
         A10000000000000000000001 = {isa = PBXBuildFile; fileRef = A20000000000000000000001; };
         A10000000000000000000002 = {isa = PBXBuildFile; fileRef = A20000000000000000000002; };
         A10000000000000000000003 = {isa = PBXBuildFile; productRef = A90000000000000000000001; };
@@ -39,6 +41,8 @@
         A7000000000000000000000E = {isa = PBXContainerItemProxy; containerPortal = A70000000000000000000001; proxyType = 1; remoteGlobalIDString = A50000000000000000000001; remoteInfo = FrankenTerm; };
 /* End PBXContainerItemProxy section */
 /* Begin PBXFileReference section */
+        AC2000000000000000000001 = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; name = Assets.xcassets; path = ../ios/FrankenTerm/Assets.xcassets; sourceTree = SOURCE_ROOT; };
+        AC2000000000000000000002 = {isa = PBXFileReference; lastKnownFileType = text.xml; name = PrivacyInfo.xcprivacy; path = ../ios/FrankenTerm/PrivacyInfo.xcprivacy; sourceTree = SOURCE_ROOT; };
         A20000000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = FrankenTermApp.swift; path = ../ios/FrankenTerm/FrankenTermApp.swift; sourceTree = SOURCE_ROOT; };
         A20000000000000000000002 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = FrankenTermExportApp.swift; path = ../macos/FrankenTermExport/FrankenTermExportApp.swift; sourceTree = SOURCE_ROOT; };
         A20000000000000000000003 = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = FrankenTerm.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -72,7 +76,7 @@
 /* Begin PBXGroup section */
         A40000000000000000000001 = {isa = PBXGroup; children = (A20000000000000000000001, A2000000000000000000000B, A20000000000000000000011, A20000000000000000000015, A20000000000000000000016, A20000000000000000000014, A20000000000000000000002, A20000000000000000000007, A20000000000000000000009, A2000000000000000000000C, A2000000000000000000000D, A20000000000000000000017, A20000000000000000000012, A20000000000000000000013, A40000000000000000000003, A40000000000000000000002,); sourceTree = "<group>"; };
         A40000000000000000000002 = {isa = PBXGroup; children = (A20000000000000000000003, A20000000000000000000004, A20000000000000000000008, A2000000000000000000000E,); name = Products; sourceTree = "<group>"; };
-        A40000000000000000000003 = {isa = PBXGroup; children = (A20000000000000000000005, A20000000000000000000006, A2000000000000000000000A, A2000000000000000000000F, A20000000000000000000010,); name = "Shared Terminal Resources"; sourceTree = "<group>"; };
+        A40000000000000000000003 = {isa = PBXGroup; children = (A20000000000000000000005, A20000000000000000000006, A2000000000000000000000A, A2000000000000000000000F, A20000000000000000000010, AC2000000000000000000001, AC2000000000000000000002,); name = "Shared Terminal Resources"; sourceTree = "<group>"; };
 /* End PBXGroup section */
 /* Begin PBXNativeTarget section */
         A50000000000000000000001 = {
@@ -135,7 +139,7 @@
         };
 /* End PBXProject section */
 /* Begin PBXResourcesBuildPhase section */
-        A60000000000000000000003 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000005, A10000000000000000000006, A10000000000000000000010, A10000000000000000000014, A10000000000000000000015, A10000000000000000000019,); runOnlyForDeploymentPostprocessing = 0; };
+        A60000000000000000000003 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (AC1000000000000000000001, AC1000000000000000000002, A10000000000000000000005, A10000000000000000000006, A10000000000000000000010, A10000000000000000000014, A10000000000000000000015, A10000000000000000000019,); runOnlyForDeploymentPostprocessing = 0; };
         A60000000000000000000004 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXResourcesBuildPhase section */
 /* Begin PBXShellScriptBuildPhase section */
@@ -176,6 +180,7 @@
             SWIFT_OPTIMIZATION_LEVEL = "-O"; DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
         }; };
         AB0000000000000000000003 = {isa = XCBuildConfiguration; name = Debug; buildSettings = {
+            ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
             PRODUCT_BUNDLE_IDENTIFIER = org.frankenterm.mobile; PRODUCT_NAME = "$(TARGET_NAME)";
             SDKROOT = iphoneos; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
             "EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
@@ -185,6 +190,7 @@
             LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks",);
         }; };
         AB0000000000000000000004 = {isa = XCBuildConfiguration; name = Release; buildSettings = {
+            ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
             PRODUCT_BUNDLE_IDENTIFIER = org.frankenterm.mobile; PRODUCT_NAME = "$(TARGET_NAME)";
             SDKROOT = iphoneos; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
             "EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
