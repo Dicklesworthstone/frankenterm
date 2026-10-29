@@ -850,7 +850,9 @@ mod tests {
 
     #[test]
     fn authenticated_connect_enforces_private_endpoint_metadata_and_peer_uid() {
-        let root = tempfile::tempdir().expect("tempdir");
+        // A unix socket path must fit SUN_LEN; a long TMPDIR (an RCH job's)
+        // would not leave room for it.
+        let root = tempfile::tempdir_in("/tmp").expect("short isolated tempdir");
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
             .expect("secure native bridge parent directory");
         let socket_path = root.path().join("native-bridge.sock");
