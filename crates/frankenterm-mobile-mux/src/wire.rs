@@ -606,7 +606,7 @@ pub struct LivenessResponse {
 pub struct ErrorResponse {
     pub schema_version: u8,
     pub request_ident: u64,
-    pub code: u8,
+    pub code: u16,
     pub object: Option<ErrorObject>,
     pub effect: u8,
     pub retry: u8,

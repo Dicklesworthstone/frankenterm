@@ -1152,7 +1152,7 @@ fn a_current_servers_rejections_decode_with_their_repeat_authority() {
             .prepare_outbound_for_dialect(
                 MuxWireDialect::current(codec::CODEC_VERSION).expect("the current dialect"),
                 PduProducer::Server,
-                PduWireRole::Response,
+                PduWireRole::CorrelatedReply,
                 None,
                 CompressionMode::Never,
             )
