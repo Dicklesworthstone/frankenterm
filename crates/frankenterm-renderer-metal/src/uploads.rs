@@ -43,7 +43,7 @@ const ROW_CHANGE_BLOCK: usize = 64;
 
 fn next_epoch() -> u64 {
     NEXT_EPOCH
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |epoch| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |epoch| {
             epoch.checked_add(1)
         })
         .expect("row change epoch exhausted")
@@ -638,18 +638,18 @@ mod tests {
         cells.set(2, 1, CellBg::rgb(9, 8, 7));
         let background = slot.upload(&cells, &text);
         assert_eq!(background.cell_rows, vec![2]);
-        assert!(background.text_rows.is_empty());
+        assert_eq!(text_rows(&background), Vec::<u32>::new());
         assert_eq!(slot.upload(&cells, &text).bytes(cells.extent()), 0);
 
         text.push(4, CellText::new(1, [1, 2, 3, 255]));
         let glyph = slot.upload(&cells, &text);
-        assert!(glyph.cell_rows.is_empty());
+        assert_eq!(glyph.cell_rows, Vec::<u32>::new());
         assert_eq!(text_rows(&glyph), vec![4]);
         assert_eq!(slot.upload(&cells, &text).bytes(cells.extent()), 0);
 
         text.clear_row(4);
         let cleared = slot.upload(&cells, &text);
-        assert!(cleared.cell_rows.is_empty());
+        assert_eq!(cleared.cell_rows, Vec::<u32>::new());
         assert_eq!(text_rows(&cleared), vec![4]);
         assert!(slot.text.iter().all(|byte| *byte == 0));
     }

@@ -725,59 +725,7 @@ fn shade_instance(
         out = over(line_color, out);
     }
 
-    let offset = cell.offset();
-    let glyph_origin = [
-        span_origin[0].floor() + f32::from(offset[0]),
-        span_origin[1].floor() + f32::from(offset[1]),
-    ];
-    let size = cell.glyph_size();
-    let inner = [x - glyph_origin[0], y - glyph_origin[1]];
-    if let Some(kind) = cell.atlas()
-        && inner[0] >= 0.0
-        && inner[1] >= 0.0
-        && inner[0] < f32::from(size[0])
-        && inner[1] < f32::from(size[1])
-    {
-        let origin = cell.atlas_origin();
-        let phase = if mode == TextRowMode::SingleWidth {
-            [0, 0]
-        } else {
-            cell.texture_phase()
-        };
-        let mut scale = mode.scale();
-        if cell.unscaled_y() {
-            scale[1] = 1;
-        }
-        let texel = atlas(
-            kind,
-            u32::from(origin[0])
-                + ((inner[0] + f32::from(phase[0])) / scale[0] as f32).floor() as u32,
-            u32::from(origin[1])
-                + ((inner[1] + f32::from(phase[1])) / scale[1] as f32).floor() as u32,
-        );
-        let glyph = match kind {
-            // Stored [B, G, R, A], premultiplied sRGB. As on the WebGpu path,
-            // the sRGB atlas decodes the color and it is weighted by its own
-            // alpha (WebGpu blends the texel as straight alpha).
-            AtlasKind::Color => {
-                let weight = unit(texel[3]) * alpha;
-                [
-                    crate::color::byte_to_linear(texel[2]) * weight,
-                    crate::color::byte_to_linear(texel[1]) * weight,
-                    crate::color::byte_to_linear(texel[0]) * weight,
-                    weight,
-                ]
-            }
-            AtlasKind::Grayscale => {
-                let coverage = unit(texel[0]) * alpha;
-                [
-                    fg[0] * coverage,
-                    fg[1] * coverage,
-                    fg[2] * coverage,
-                    coverage,
-                ]
-            }
-        };
+    if let Some(glyph) = sample_glyph(cell, mode, atlas, span_origin, fg, [x, y]) {
         out = over(glyph, out);
     }
 
@@ -792,6 +740,78 @@ fn shade_instance(
         out = over(line_color, out);
     }
     (out[3] > 0.0).then_some(out)
+}
+
+/// The premultiplied glyph color one instance samples at pixel center
+/// `pixel`, given its span origin and linear foreground `fg`, or `None`
+/// outside its glyph box or without a glyph.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn sample_glyph(
+    cell: &CellText,
+    mode: TextRowMode,
+    atlas: &impl Fn(AtlasKind, u32, u32) -> [u8; 4],
+    span_origin: [f32; 2],
+    fg: [f32; 4],
+    pixel: [f32; 2],
+) -> Option<[f32; 4]> {
+    let kind = cell.atlas()?;
+    let offset = cell.offset();
+    let glyph_origin = [
+        span_origin[0].floor() + f32::from(offset[0]),
+        span_origin[1].floor() + f32::from(offset[1]),
+    ];
+    let size = cell.glyph_size();
+    let inner = [pixel[0] - glyph_origin[0], pixel[1] - glyph_origin[1]];
+    let inside = inner[0] >= 0.0
+        && inner[1] >= 0.0
+        && inner[0] < f32::from(size[0])
+        && inner[1] < f32::from(size[1]);
+    if !inside {
+        return None;
+    }
+    let origin = cell.atlas_origin();
+    let phase = if mode == TextRowMode::SingleWidth {
+        [0, 0]
+    } else {
+        cell.texture_phase()
+    };
+    let mut scale = mode.scale();
+    if cell.unscaled_y() {
+        scale[1] = 1;
+    }
+    let texel = atlas(
+        kind,
+        u32::from(origin[0]) + ((inner[0] + f32::from(phase[0])) / scale[0] as f32).floor() as u32,
+        u32::from(origin[1]) + ((inner[1] + f32::from(phase[1])) / scale[1] as f32).floor() as u32,
+    );
+    let alpha = fg[3];
+    Some(match kind {
+        // Stored [B, G, R, A], premultiplied sRGB. As on the WebGpu path,
+        // the sRGB atlas decodes the color and it is weighted by its own
+        // alpha (WebGpu blends the texel as straight alpha).
+        AtlasKind::Color => {
+            let weight = unit(texel[3]) * alpha;
+            [
+                crate::color::byte_to_linear(texel[2]) * weight,
+                crate::color::byte_to_linear(texel[1]) * weight,
+                crate::color::byte_to_linear(texel[0]) * weight,
+                weight,
+            ]
+        }
+        AtlasKind::Grayscale => {
+            let coverage = unit(texel[0]) * alpha;
+            [
+                fg[0] * coverage,
+                fg[1] * coverage,
+                fg[2] * coverage,
+                coverage,
+            ]
+        }
+    })
 }
 
 /// `color` (linear light) as the sRGB target stores it and the next blend
@@ -958,9 +978,9 @@ mod tests {
                         ),
                     );
                     let u = uniforms(&actual);
-                    for y in 0..48 {
-                        for x in 0..76 {
-                            let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                    for y in 0..48_u16 {
+                        for x in 0..76_u16 {
+                            let (px, py) = (f32::from(x) + 0.5, f32::from(y) + 0.5);
                             let top = u.background.grid_origin[1] + u.background.cell_size[1];
                             let expected = if mode.is_double_height()
                                 && !(top..top + u.background.cell_size[1]).contains(&py)

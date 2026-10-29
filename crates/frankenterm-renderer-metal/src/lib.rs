@@ -874,7 +874,9 @@ mod tests {
     #[test]
     fn actual_presentation_time_does_not_depend_on_callback_arrival() {
         // The callback is being processed long after both submit and display.
-        let submitted = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        let submitted = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(2))
+            .expect("the monotonic clock is past two seconds");
         let event = FramePresentation::from_host_time(7, [640, 480], submitted, 100.0, 100.125);
         assert_eq!(event.frame, 7);
         assert_eq!(event.size, [640, 480]);

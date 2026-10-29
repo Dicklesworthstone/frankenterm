@@ -2337,13 +2337,19 @@ mod tests {
                     assert_eq!(cursor.glyph_size(), [16, source.slot.height as u16]);
                     assert_eq!(cursor.offset(), source.offset);
                     assert_eq!(cursor.atlas_origin(), [16376, 16368]);
+                    // The text glyph is the first synthetic one: 12 texels
+                    // at offset 2, so 24 px from 4 px below the double
+                    // row's top. Each half keeps the pixels whose centers
+                    // fall in its physical row: 12 at a whole origin; at
+                    // 0.75 the row's pixels shift down one, so the top half
+                    // shows one more and the bottom half one fewer.
                     let text = scene.text().row(1).find(|cell| !cell.unscaled_y()).unwrap();
                     assert_eq!(
                         text.glyph_size()[1],
                         if mode == TextRowMode::DoubleHeightTop {
-                            16
+                            12 + u16::from(origin > 0.5)
                         } else {
-                            8 - u16::from(origin > 0.5)
+                            12 - u16::from(origin > 0.5)
                         }
                     );
 
@@ -2673,7 +2679,15 @@ mod tests {
             i32::from(i16::MAX) - 2 + 7,
         );
         assert_eq!(cropped.offset()[1], wide_offset.glyph.offset[1]);
-        assert!(glyph_strip(&prepared, 7..20, [255; 4], &style, 4).is_none());
+        // A narrow grid anchors at its last column; the rest still fits.
+        let narrow = glyph_strip(&prepared, 7..20, [255; 4], &style, 4).unwrap();
+        assert_eq!(narrow.col(), 3);
+        assert_eq!(
+            i32::from(narrow.col()) * 8 + i32::from(narrow.offset()[0]),
+            i32::from(i16::MAX) - 2 + 7,
+        );
+        // With one column nothing can absorb the offset: refuse, never wrap.
+        assert!(glyph_strip(&prepared, 7..20, [255; 4], &style, 1).is_none());
         assert!(
             glyph_strip(
                 &PreparedGlyph {
