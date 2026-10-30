@@ -381,6 +381,54 @@
     "negative_for": "wezterm.pane.exited"
   },
   {
+    "name": "cargo_compile_failure_positive",
+    "text": "error: could not compile `example` (lib) due to 1 previous error\n",
+    "expected_rule_ids": ["wezterm.build.cargo_failed"],
+    "expected_extracted": { "package": "example", "error_count": "1" }
+  },
+  {
+    "name": "cargo_compile_failure_warnings_positive",
+    "text": "error: could not compile `example-cli` (bin \"example-cli\") due to 2 previous errors; 3 warnings emitted\r\n",
+    "expected_rule_ids": ["wezterm.build.cargo_failed"],
+    "expected_extracted": { "package": "example-cli", "error_count": "2" }
+  },
+  {
+    "name": "cargo_compile_failure_quoted_negative",
+    "text": "> error: could not compile `example` (lib) due to 1 previous error\n",
+    "expected_rule_ids": [],
+    "negative_for": "wezterm.build.cargo_failed"
+  },
+  {
+    "name": "cargo_compile_failure_incomplete_negative",
+    "text": "error: could not compile `example` (lib) due to 1 previous error",
+    "expected_rule_ids": [],
+    "negative_for": "wezterm.build.cargo_failed"
+  },
+  {
+    "name": "cargo_test_failure_positive",
+    "text": "test result: FAILED. 4 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s\n",
+    "expected_rule_ids": ["wezterm.test.cargo_failed"],
+    "expected_extracted": { "passed": "4", "failed": "2" }
+  },
+  {
+    "name": "cargo_test_success_negative",
+    "text": "test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s\n",
+    "expected_rule_ids": [],
+    "negative_for": "wezterm.test.cargo_failed"
+  },
+  {
+    "name": "cargo_test_failure_partial_negative",
+    "text": "test result: FAILED.\n",
+    "expected_rule_ids": [],
+    "negative_for": "wezterm.test.cargo_failed"
+  },
+  {
+    "name": "cargo_test_failure_quoted_negative",
+    "text": "> test result: FAILED. 4 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s\n",
+    "expected_rule_ids": [],
+    "negative_for": "wezterm.test.cargo_failed"
+  },
+  {
     "name": "claude_code_auth_login_required_positive",
     "text": "To sign in, open this URL in your browser: https://console.anthropic.com/login",
     "expected_rule_ids": ["claude_code.auth.login_required"],

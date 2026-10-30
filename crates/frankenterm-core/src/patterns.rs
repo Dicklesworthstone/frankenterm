@@ -253,6 +253,18 @@ pub enum Severity {
     Critical,
 }
 
+/// Whether an event describes a completed command failure that may contribute
+/// to a retry-loop decision. Provider, authentication and mux errors do not
+/// establish that the command sent to a pane failed.
+#[must_use]
+pub(crate) fn is_command_failure_event(event_type: &str, severity: Severity) -> bool {
+    matches!(severity, Severity::Warning | Severity::Critical)
+        && matches!(
+            event_type,
+            "command.failed" | "build.failed" | "test.failed"
+        )
+}
+
 /// A detected pattern match
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Detection {
@@ -4237,12 +4249,51 @@ fn builtin_gemini_pack() -> PatternPack {
     .with_submit_profiles(vec![builtin_gemini_submit_profile()])
 }
 
-/// Builtin WezTerm pack with rules for WezTerm multiplexer events
+/// Builtin terminal-wide rules for mux events and completed command failures.
 fn builtin_wezterm_pack() -> PatternPack {
     PatternPack::new(
         "builtin:wezterm",
         "0.1.0",
         vec![
+            // A diagnostic or provider outage is not a completed command
+            // failure. Require Cargo's complete summary line, including its
+            // terminator, so a partial capture cannot manufacture an event.
+            RuleDef {
+                id: "wezterm.build.cargo_failed".to_string(),
+                agent_type: AgentType::Wezterm,
+                event_type: "build.failed".to_string(),
+                severity: Severity::Warning,
+                anchors: vec!["error: could not compile".to_string()],
+                regex: Some(
+                    r"(?m)^error: could not compile `(?P<package>[A-Za-z0-9_-]+)`(?: \([^()\r\n]+\))? due to (?P<error_count>[1-9][0-9]*) previous errors?(?:; [0-9]+ warnings? emitted)?[ \t]*\r?\n".to_string(),
+                ),
+                description: "Cargo compilation finished with errors".to_string(),
+                remediation: Some(
+                    "Review the compiler diagnostics before retrying the build".to_string(),
+                ),
+                workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
+            RuleDef {
+                id: "wezterm.test.cargo_failed".to_string(),
+                agent_type: AgentType::Wezterm,
+                event_type: "test.failed".to_string(),
+                severity: Severity::Warning,
+                anchors: vec!["test result: FAILED.".to_string()],
+                regex: Some(
+                    r"(?m)^test result: FAILED\. (?P<passed>[0-9]+) passed; (?P<failed>[1-9][0-9]*) failed; [0-9]+ ignored; [0-9]+ measured; [0-9]+ filtered out; finished in [0-9]+(?:\.[0-9]+)?s[ \t]*\r?\n".to_string(),
+                ),
+                description: "Rust test suite finished with failed tests".to_string(),
+                remediation: Some(
+                    "Review the failing tests before retrying the command".to_string(),
+                ),
+                workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
             // Mux server connection lost
             RuleDef {
                 id: "wezterm.mux.connection_lost".to_string(),
@@ -4704,6 +4755,31 @@ impl PatternEngine {
                         continue;
                     }
 
+                    // A new completed failure is an occurrence, even when
+                    // its summary matches a previous attempt. The overlap
+                    // gate still suppresses text retained from earlier deltas;
+                    // the five-minute status TTL must not hide retry loops.
+                    if is_command_failure_event(&rule.event_type, rule.severity) {
+                        let extracted = Self::extract_captures(compiled, &captures);
+                        let matched_text = captures.get(0).map_or_else(
+                            || fallback_anchor.to_string(),
+                            |m| m.as_str().to_string(),
+                        );
+                        record_detect_with_context_materialization();
+                        result.push(Detection {
+                            rule_id: rule.id.clone(),
+                            agent_type: rule.agent_type,
+                            event_type: rule.event_type.clone(),
+                            severity: rule.severity,
+                            confidence: 0.95,
+                            extracted: serde_json::Value::Object(extracted),
+                            matched_text,
+                            span,
+                        });
+                        emitted_matches += 1;
+                        continue;
+                    }
+
                     #[cfg(all(
                         feature = "patterns-lazy-captures",
                         feature = "patterns-fingerprint-dedup"
@@ -4813,6 +4889,22 @@ impl PatternEngine {
                 }
             } else {
                 if overlap_len > 0 && fallback_span.1 <= overlap_len {
+                    continue;
+                }
+
+                if is_command_failure_event(&rule.event_type, rule.severity) {
+                    record_detect_with_context_materialization();
+                    result.push(Detection {
+                        rule_id: rule.id.clone(),
+                        agent_type: rule.agent_type,
+                        event_type: rule.event_type.clone(),
+                        severity: rule.severity,
+                        confidence: 0.6,
+                        extracted: serde_json::Value::Object(serde_json::Map::new()),
+                        matched_text: fallback_anchor.to_string(),
+                        span: fallback_span,
+                    });
+                    emitted_matches += 1;
                     continue;
                 }
 
@@ -5004,7 +5096,9 @@ impl PatternEngine {
                         Self::evaluate_trace_gates(&detection, overlap_len, context);
 
                     if eligible {
-                        context.mark_seen(&detection);
+                        if !is_command_failure_event(&detection.event_type, detection.severity) {
+                            context.mark_seen(&detection);
+                        }
                         detections.push(detection.clone());
                     }
 
@@ -5078,7 +5172,9 @@ impl PatternEngine {
                         Self::evaluate_trace_gates(&detection, overlap_len, context);
 
                     if eligible {
-                        context.mark_seen(&detection);
+                        if !is_command_failure_event(&detection.event_type, detection.severity) {
+                            context.mark_seen(&detection);
+                        }
                         detections.push(detection.clone());
                     }
 
@@ -5101,6 +5197,15 @@ impl PatternEngine {
                             opts,
                         );
                         traces.push(trace);
+                    }
+
+                    // The fast path retains one fresh anchor occurrence per
+                    // rule per delta. Keep trace emission equivalent for
+                    // occurrence-based user rules without a regex.
+                    if eligible
+                        && is_command_failure_event(&detection.event_type, detection.severity)
+                    {
+                        break;
                     }
                 }
             }
@@ -5380,8 +5485,11 @@ impl PatternEngine {
             gates[1].reason = Some("match within overlap window".to_string());
         }
 
-        // dedupe gate
-        if context.is_seen(detection) {
+        // Repeated command failures are distinct occurrences; only the
+        // overlap gate suppresses an already consumed occurrence.
+        if !is_command_failure_event(&detection.event_type, detection.severity)
+            && context.is_seen(detection)
+        {
             gates[2].passed = false;
             gates[2].reason = Some("already seen within TTL".to_string());
         }
@@ -7996,6 +8104,198 @@ rules:
             d.extracted.get("exit_code").and_then(|v| v.as_str()),
             Some("1")
         );
+    }
+
+    #[test]
+    fn command_failure_summaries_ship_in_the_default_production_pack() {
+        let engine = PatternEngine::from_config(&PatternsConfig::default()).unwrap();
+        for (text, rule_id, event_type, field, value) in [
+            (
+                "error: could not compile `example` (lib) due to 1 previous error\n",
+                "wezterm.build.cargo_failed",
+                "build.failed",
+                "error_count",
+                "1",
+            ),
+            (
+                "error: could not compile `example-cli` (bin \"example-cli\") due to 2 previous errors; 3 warnings emitted\r\n",
+                "wezterm.build.cargo_failed",
+                "build.failed",
+                "package",
+                "example-cli",
+            ),
+            (
+                "test result: FAILED. 4 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s\n",
+                "wezterm.test.cargo_failed",
+                "test.failed",
+                "failed",
+                "2",
+            ),
+        ] {
+            let detections = engine.detect(text);
+            let failures: Vec<_> = detections
+                .iter()
+                .filter(|d| is_command_failure_event(&d.event_type, d.severity))
+                .collect();
+            assert_eq!(
+                failures.len(),
+                1,
+                "expected one completed failure: {text:?}"
+            );
+            assert_eq!(failures[0].rule_id, rule_id);
+            assert_eq!(failures[0].event_type, event_type);
+            assert_eq!(failures[0].severity, Severity::Warning);
+            assert_eq!(failures[0].extracted[field].as_str(), Some(value));
+        }
+    }
+
+    #[test]
+    fn command_failure_summaries_reject_prose_partial_success_and_provider_errors() {
+        let engine = PatternEngine::from_config(&PatternsConfig::default()).unwrap();
+        for text in [
+            "> error: could not compile `example` (lib) due to 1 previous error\n",
+            "\"error: could not compile `example` (lib) due to 1 previous error\"\n",
+            "The message was error: could not compile `example` due to 1 previous error\n",
+            "error: could not compile `example` due to 0 previous errors\n",
+            "error: could not compile `example` due to 1 previous error (quoted example)\n",
+            "error: could not compile `example` due to 1 previous error",
+            "error[E0382]: borrow of moved value\n",
+            "test result: FAILED.\n",
+            "test result: FAILED. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s\n",
+            "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s\n",
+            "> test result: FAILED. 4 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s\n",
+            "Error: connection failed to API server\n",
+            "Request timed out after 30 seconds\n",
+            "Server overloaded, please retry in 30 seconds\n",
+        ] {
+            assert!(
+                engine
+                    .detect(text)
+                    .iter()
+                    .all(|d| !is_command_failure_event(&d.event_type, d.severity)),
+                "non-command failure must not contribute to retry history: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_failure_summaries_wait_for_complete_lines_across_every_split() {
+        let engine = PatternEngine::from_config(&PatternsConfig::default()).unwrap();
+        for text in [
+            "error: could not compile `example` (lib test) due to 2 previous errors; 1 warning emitted\r\n",
+            "test result: FAILED. 4 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s\n",
+        ] {
+            for split in 0..=text.len() {
+                let mut plain = DetectionContext::new();
+                let first = engine.detect_with_context(&text[..split], &mut plain);
+                let second = engine.detect_with_context(&text[split..], &mut plain);
+                assert_eq!(
+                    first.len() + second.len(),
+                    1,
+                    "completed failure must emit once across split {split}: {text:?}"
+                );
+                assert!(
+                    engine
+                        .detect_with_context("next output\n", &mut plain)
+                        .is_empty()
+                );
+
+                let mut traced = DetectionContext::new();
+                let opts = TraceOptions::default();
+                let (first, _) =
+                    engine.detect_with_context_and_trace(&text[..split], &mut traced, &opts);
+                let (second, _) =
+                    engine.detect_with_context_and_trace(&text[split..], &mut traced, &opts);
+                assert_eq!(
+                    first.len() + second.len(),
+                    1,
+                    "trace path must preserve split-line occurrence at {split}"
+                );
+                assert!(
+                    engine
+                        .detect_with_context_and_trace("next output\n", &mut traced, &opts)
+                        .0
+                        .is_empty()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn command_failure_occurrences_repeat_but_status_deduplication_remains() {
+        let engine = PatternEngine::from_config(&PatternsConfig::default()).unwrap();
+        let failure = "error: could not compile `example` (lib) due to 1 previous error\n";
+        let status = "You've hit your usage limit, try again at 3pm.\n";
+        for agent in [
+            AgentType::Codex,
+            AgentType::ClaudeCode,
+            AgentType::Gemini,
+            AgentType::Unknown,
+        ] {
+            let mut plain = DetectionContext::with_agent_type(agent);
+            let mut traced = DetectionContext::with_agent_type(agent);
+            let opts = TraceOptions::default();
+            for attempt in 0..3 {
+                let ordinary = engine.detect_with_context(failure, &mut plain);
+                let (explained, traces) =
+                    engine.detect_with_context_and_trace(failure, &mut traced, &opts);
+                assert_eq!(ordinary.len(), 1, "attempt {attempt} with {agent:?}");
+                assert_eq!(explained.len(), 1);
+                assert_eq!(ordinary[0].dedup_key(), explained[0].dedup_key());
+                assert_eq!(traces.len(), 1);
+                assert!(traces[0].eligible);
+            }
+            assert_eq!(
+                plain.seen_count(),
+                0,
+                "failure occurrences do not occupy the TTL cache"
+            );
+            assert_eq!(traced.seen_count(), 0);
+        }
+
+        let mut plain = DetectionContext::with_agent_type(AgentType::Codex);
+        let mut traced = DetectionContext::with_agent_type(AgentType::Codex);
+        let opts = TraceOptions::default();
+        assert_eq!(engine.detect_with_context(status, &mut plain).len(), 1);
+        assert!(engine.detect_with_context(status, &mut plain).is_empty());
+        assert_eq!(
+            engine
+                .detect_with_context_and_trace(status, &mut traced, &opts)
+                .0
+                .len(),
+            1
+        );
+        assert!(
+            engine
+                .detect_with_context_and_trace(status, &mut traced, &opts)
+                .0
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn anchor_only_command_failure_occurrences_match_trace_behavior() {
+        let mut rule = rule_with_anchor("codex.command.failure", "COMMAND FAILED", None);
+        rule.event_type = "command.failed".to_string();
+        rule.severity = Severity::Warning;
+        let engine =
+            PatternEngine::with_packs(vec![PatternPack::new("test:command", "1.0.0", vec![rule])])
+                .unwrap();
+        let mut plain = DetectionContext::new();
+        let mut traced = DetectionContext::new();
+        let opts = TraceOptions::default();
+        for _ in 0..3 {
+            let ordinary =
+                engine.detect_with_context("COMMAND FAILED COMMAND FAILED\n", &mut plain);
+            let (explained, _) = engine.detect_with_context_and_trace(
+                "COMMAND FAILED COMMAND FAILED\n",
+                &mut traced,
+                &opts,
+            );
+            assert_eq!(ordinary.len(), 1);
+            assert_eq!(explained.len(), 1);
+            assert_eq!(ordinary[0].span, explained[0].span);
+        }
     }
 
     #[test]

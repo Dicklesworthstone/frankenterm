@@ -118,6 +118,29 @@ proptest! {
     }
 
     #[test]
+    fn proposed_command_peeks_leave_state_and_telemetry_unchanged(
+        count in 0usize..50,
+        proposed in prop::sample::select(vec!["cargo test", "git status", ""]),
+    ) {
+        let mut state = test_state();
+        let signatures = vec!["terminal.test.failed".to_string()];
+        for attempt in 0..3 {
+            state.record_command_result(1_000 + attempt * 100, "cargo test", &signatures);
+        }
+        let telemetry_before = state.telemetry().snapshot();
+        let state_before = serde_json::to_vec(&state).expect("serialize state");
+        for _ in 0..count {
+            let decision = state.evaluate_proposed_command(1_300, proposed);
+            prop_assert_eq!(decision.should_intervene, proposed == "cargo test");
+        }
+        prop_assert_eq!(state.telemetry().snapshot(), telemetry_before);
+        prop_assert_eq!(
+            serde_json::to_vec(&state).expect("serialize state after peeks"),
+            state_before,
+        );
+    }
+
+    #[test]
     fn mutations_equal_call_count(
         paths in prop::collection::vec(
             prop::sample::select(vec![
