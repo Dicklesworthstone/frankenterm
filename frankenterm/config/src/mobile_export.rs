@@ -178,7 +178,8 @@ fn read_source(path: &Path, limit: usize) -> KnownHostsSource {
 
 /// The deepest `Include` nesting OpenSSH reads (READCONF_MAX_DEPTH).
 const MAX_INCLUDE_DEPTH: usize = 16;
-/// Directory entries one `Include` pattern may scan.
+/// Directory operations and entries the complete configuration snapshot may
+/// inspect, shared by user/system sources and every Include pattern.
 const MAX_INCLUDE_ENTRIES: usize = 16_384;
 
 /// Where `expand_includes` reads: the disk, or a test's fixture.
@@ -186,8 +187,11 @@ trait IncludeFiles {
     /// One included file, under `read_source`'s rules.
     fn read(&self, path: &Path, limit: usize) -> KnownHostsSource;
     /// The names in `directory`: empty when it does not exist, `None` when
-    /// it cannot be listed.
-    fn names(&self, directory: &Path) -> Option<Vec<String>>;
+    /// it cannot be listed completely within the remaining traversal budget.
+    fn names(&self, directory: &Path, limit: usize) -> Option<Vec<String>>;
+    /// Glob components before the last must name directories. Missing paths
+    /// and ordinary files do not match; an unreadable path remains unresolved.
+    fn is_directory(&self, path: &Path) -> Option<bool>;
 }
 
 struct DiskIncludes;
@@ -219,20 +223,32 @@ impl IncludeFiles for DiskIncludes {
         read_source(path, limit)
     }
 
-    fn names(&self, directory: &Path) -> Option<Vec<String>> {
+    fn names(&self, directory: &Path, limit: usize) -> Option<Vec<String>> {
         let entries = match std::fs::read_dir(directory) {
             Ok(entries) => entries,
-            Err(err) if err.kind() == ErrorKind::NotFound => return Some(Vec::new()),
+            Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+                return Some(Vec::new());
+            }
             Err(_) => return None,
         };
         let mut names = Vec::new();
         for entry in entries {
-            names.push(entry.ok()?.file_name().into_string().ok()?);
-            if names.len() > MAX_INCLUDE_ENTRIES {
+            if names.len() == limit {
                 return None;
             }
+            names.push(entry.ok()?.file_name().into_string().ok()?);
         }
         Some(names)
+    }
+
+    fn is_directory(&self, path: &Path) -> Option<bool> {
+        match std::fs::metadata(path) {
+            Ok(metadata) => Some(metadata.is_dir()),
+            Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+                Some(false)
+            }
+            Err(_) => None,
+        }
     }
 }
 
@@ -241,6 +257,7 @@ struct IncludeBudget {
     bytes: usize,
     lines: usize,
     files: usize,
+    entries: usize,
 }
 
 impl IncludeBudget {
@@ -251,6 +268,7 @@ impl IncludeBudget {
             bytes: MAX_SOURCE_BYTES - 4096,
             lines: MAX_SOURCE_LINES - 512,
             files: MAX_SOURCE_FILES,
+            entries: MAX_INCLUDE_ENTRIES,
         }
     }
 
@@ -263,6 +281,29 @@ impl IncludeBudget {
         self.lines -= lines;
         true
     }
+
+    fn names(&mut self, files: &dyn IncludeFiles, directory: &Path) -> Option<Vec<String>> {
+        // Charge the operation even for empty/nonexistent directories. On an
+        // incomplete listing, retire the remaining budget: repeated patterns
+        // must not retry the same expensive failed scan for free.
+        self.entries = self.entries.checked_sub(1)?;
+        let names = files.names(directory, self.entries);
+        match names {
+            Some(names) if names.len() <= self.entries => {
+                self.entries -= names.len();
+                Some(names)
+            }
+            _ => {
+                self.entries = 0;
+                None
+            }
+        }
+    }
+
+    fn is_directory(&mut self, files: &dyn IncludeFiles, path: &Path) -> Option<bool> {
+        self.entries = self.entries.checked_sub(1)?;
+        files.is_directory(path)
+    }
 }
 
 /// Reads one top-level SSH source and splices in what it includes.
@@ -272,6 +313,10 @@ fn read_config_source(
     home: &Path,
     budget: &mut IncludeBudget,
 ) -> KnownHostsSource {
+    let Some(remaining) = budget.files.checked_sub(1) else {
+        return KnownHostsSource::Unavailable;
+    };
+    budget.files = remaining;
     match read_source(path, budget.bytes) {
         KnownHostsSource::Present(text) if budget.take(&text) => KnownHostsSource::Present(
             expand_includes(&text, base, home, &DiskIncludes, budget, 0, true),
@@ -287,7 +332,7 @@ fn read_config_source(
 /// starts in its includer's context, and that context returns after it, as
 /// OpenSSH restores it. An Include it cannot splice in full stays as written
 /// (the resolver then treats the source as unresolved): a pattern needing
-/// token, variable, `?` or bracket expansion, a file it cannot read safely,
+/// token, variable or bracket expansion, a file it cannot read safely,
 /// or the depth or budget exceeded. A missing file adds nothing, as in
 /// OpenSSH. Relative patterns resolve against `base`: ~/.ssh for the user's
 /// file and /etc/ssh for the system's.
@@ -335,7 +380,7 @@ fn splice_include(
     }
     let mut spliced = String::new();
     for pattern in configuration_words(value)? {
-        for path in include_paths(&pattern, base, home, files)? {
+        for path in include_paths(&pattern, base, home, files, budget)? {
             budget.files = budget.files.checked_sub(1)?;
             let text = match files.read(&path, budget.bytes) {
                 KnownHostsSource::Present(text) => text,
@@ -363,67 +408,98 @@ fn splice_include(
     Some(spliced)
 }
 
-/// The files one Include pattern names, sorted as glob(3) sorts them.
-/// `*` is the only wildcard, in the last component only.
+/// The files one Include pattern names in lexical order. `*` and `?` may
+/// appear in any component; they never cross a path separator. A shared scan
+/// budget and a 64-path frontier bound traversal before any included source is
+/// read. An exhausted or unreadable branch refuses the complete Include.
 fn include_paths(
     pattern: &str,
     base: &Path,
     home: &Path,
     files: &dyn IncludeFiles,
+    budget: &mut IncludeBudget,
 ) -> Option<Vec<PathBuf>> {
-    if pattern.is_empty() || pattern.contains(['%', '$', '?', '[', ']', '{', '}']) {
+    if pattern.is_empty()
+        || pattern.len() > 4096
+        || pattern.ends_with('/')
+        || pattern.contains(['%', '$', '[', ']', '{', '}'])
+    {
         return None;
     }
-    let path = if let Some(rest) = pattern.strip_prefix("~/") {
-        home.join(rest)
+    // The supplied home/base are literal paths. A wildcard in a directory's
+    // own name must not become syntax just because a relative Include uses it.
+    let (root, path) = if let Some(rest) = pattern.strip_prefix("~/") {
+        (home.to_path_buf(), PathBuf::from(rest))
     } else if pattern.starts_with('~') {
         return None;
+    } else if Path::new(pattern).is_absolute() {
+        (PathBuf::new(), PathBuf::from(pattern))
     } else {
-        // An absolute pattern replaces the base.
-        base.join(pattern)
+        (base.to_path_buf(), PathBuf::from(pattern))
     };
     if path
         .components()
+        .chain(root.components())
         .any(|component| matches!(component, Component::ParentDir))
     {
         return None;
     }
-    let name = path.file_name()?.to_str()?;
-    let directory = path.parent()?;
-    if directory.to_str()?.contains('*') {
-        return None;
+    let components: Vec<_> = path.components().collect();
+    let mut paths = vec![root];
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            for path in &mut paths {
+                path.push(component.as_os_str());
+            }
+            continue;
+        };
+        let name = name.to_str()?;
+        let last = index + 1 == components.len();
+        let mut next = Vec::new();
+        for parent in paths {
+            let wildcard = name.contains(['*', '?']);
+            let names = if wildcard {
+                budget.names(files, &parent)?
+            } else {
+                vec![name.to_string()]
+            };
+            for candidate_name in names {
+                if wildcard && !glob_component_matches(name, &candidate_name) {
+                    continue;
+                }
+                let candidate = parent.join(candidate_name);
+                if last || budget.is_directory(files, &candidate)? {
+                    if next.len() >= MAX_SOURCE_FILES {
+                        return None;
+                    }
+                    next.push(candidate);
+                }
+            }
+        }
+        paths = next;
+        if paths.is_empty() {
+            break;
+        }
     }
-    if !name.contains('*') {
-        return Some(vec![path.clone()]);
-    }
-    let mut matched: Vec<String> = files
-        .names(directory)?
-        .into_iter()
-        .filter(|candidate| glob_component_matches(name, candidate))
-        .collect();
-    matched.sort();
-    Some(
-        matched
-            .into_iter()
-            .map(|name| directory.join(name))
-            .collect(),
-    )
+    paths.sort();
+    Some(paths)
 }
 
-/// glob(3) on one component with `*` only: a leading `.` is matched only by
-/// a pattern's leading `.`. Linear in practice: one backtrack point.
+/// glob(3)'s `*` and `?` on one UTF-8 component: a leading `.` is matched only
+/// by a pattern's leading `.`. A question mark consumes one Unicode scalar,
+/// not one byte of a multibyte filename. There is one backtrack point.
 fn glob_component_matches(pattern: &str, name: &str) -> bool {
     if name.starts_with('.') && !pattern.starts_with('.') {
         return false;
     }
-    let (pattern, name) = (pattern.as_bytes(), name.as_bytes());
+    let (pattern, name): (Vec<_>, Vec<_>) = (pattern.chars().collect(), name.chars().collect());
     let (mut p, mut n) = (0, 0);
     let mut star: Option<(usize, usize)> = None;
     while n < name.len() {
-        if p < pattern.len() && pattern[p] == b'*' {
+        if p < pattern.len() && pattern[p] == '*' {
             star = Some((p, n));
             p += 1;
-        } else if p < pattern.len() && pattern[p] == name[n] {
+        } else if p < pattern.len() && (pattern[p] == '?' || pattern[p] == name[n]) {
             p += 1;
             n += 1;
         } else if let Some((star_p, star_n)) = star {
@@ -434,7 +510,7 @@ fn glob_component_matches(pattern: &str, name: &str) -> bool {
             return false;
         }
     }
-    pattern[p..].iter().all(|&byte| byte == b'*')
+    pattern[p..].iter().all(|&character| character == '*')
 }
 
 fn default_known_hosts(home: &Path) -> Vec<PathBuf> {
@@ -5695,8 +5771,20 @@ ssh = "right"
             }
         }
 
-        fn names(&self, directory: &Path) -> Option<Vec<String>> {
-            Some(self.directories.get(directory).cloned().unwrap_or_default())
+        fn names(&self, directory: &Path, limit: usize) -> Option<Vec<String>> {
+            let names = self.directories.get(directory).cloned().unwrap_or_default();
+            (names.len() <= limit).then_some(names)
+        }
+
+        fn is_directory(&self, path: &Path) -> Option<bool> {
+            Some(
+                self.directories.contains_key(path)
+                    || self
+                        .files
+                        .keys()
+                        .any(|file| file != path && file.starts_with(path))
+                    || self.directories.keys().any(|dir| dir.starts_with(path)),
+            )
         }
     }
 
@@ -5817,9 +5905,8 @@ ssh = "right"
             "Include $HOME/x\n",
             "Include ~other/x\n",
             "Include ../x\n",
-            "Include con?ig\n",
             "Include config.d/[ab].conf\n",
-            "Include */x\n",
+            "Include config.d/*/\n",
         ] {
             assert!(
                 expand(unresolved, base, &files).contains("Include "),
@@ -5827,6 +5914,172 @@ ssh = "right"
                 unresolved
             );
         }
+    }
+
+    #[test]
+    fn nested_include_globs_preserve_source_order_and_host_policy() {
+        let base = "/home/me/.ssh";
+        let mut files = FixtureIncludes::default();
+        files.directories.insert(
+            format!("{base}/config.d").into(),
+            ["region2", "notes", "region1", ".region3"]
+                .map(String::from)
+                .to_vec(),
+        );
+        files.files.insert(
+            format!("{base}/config.d/notes").into(),
+            present("not a directory"),
+        );
+        for region in ["region1", "region2", ".region3"] {
+            files.directories.insert(
+                format!("{base}/config.d/{region}").into(),
+                ["20-auth.conf", "10-host.conf", ".private.conf"]
+                    .map(String::from)
+                    .to_vec(),
+            );
+            files.files.insert(
+                format!("{base}/config.d/{region}/10-host.conf").into(),
+                present(&format!(
+                    "Host left right\n HostName box\n User {region}\n UserKnownHostsFile /trust/pins\n GlobalKnownHostsFile none\n"
+                )),
+            );
+            files.files.insert(
+                format!("{base}/config.d/{region}/20-auth.conf").into(),
+                present("Host left right\n User later\n PasswordAuthentication no\n"),
+            );
+            files.files.insert(
+                format!("{base}/config.d/{region}/.private.conf").into(),
+                present("Match exec must-never-run\n ProxyCommand must-never-run\n"),
+            );
+        }
+        let expanded = expand("Include config.d/region?/*.conf\n", base, &files);
+        assert!(!expanded.contains("Include "));
+        assert!(!expanded.contains("must-never-run"));
+        let resolver = alias_resolver(Some(&expanded), &context().home).unwrap();
+        let options = resolver.config.for_host("left");
+        assert_eq!(options.get("user").map(String::as_str), Some("region1"));
+        assert_eq!(
+            resolver.authentication_policy(&options).methods,
+            vec!["publickey", "keyboard-interactive"]
+        );
+        let mut sources = sources(Some(&expanded));
+        supply(
+            &mut sources,
+            "/trust/pins",
+            format!("box ssh-ed25519 {ED25519}\n"),
+        );
+        let export = trust_export(&sources);
+        let trust = route_trust(&export, "r.left.ssh");
+        assert!(trust["required_capabilities"].is_null(), "{trust}");
+        assert_eq!(trust["pins"].as_array().unwrap().len(), 1);
+        // A wildcard may match a file as well as directories; a file cannot
+        // become an intermediate component or poison otherwise valid matches.
+        assert_eq!(
+            expand("Include config.d/*/*.conf\n", base, &files),
+            expanded
+        );
+    }
+
+    #[test]
+    fn include_question_marks_match_characters_and_keep_dotfiles_explicit() {
+        for (pattern, name, matches) in [
+            ("region?", "region1", true),
+            ("region?", "region12", false),
+            ("région?", "régioné", true),
+            ("région??", "régioné", false),
+            ("*?*.conf", "a.conf", true),
+            ("*?*.conf", ".a.conf", false),
+            (".?*.conf", ".é.conf", true),
+            ("*.conf", "a.txt", false),
+        ] {
+            assert_eq!(
+                glob_component_matches(pattern, name),
+                matches,
+                "{pattern} / {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn include_globs_do_not_reinterpret_a_literal_home_directory() {
+        let home = Path::new("/home/a?b");
+        let base = home.join(".ssh");
+        let directory = base.join("config.d");
+        let mut files = FixtureIncludes::default();
+        files
+            .directories
+            .insert(directory.clone(), vec!["a.conf".into()]);
+        files
+            .files
+            .insert(directory.join("a.conf"), present("User selected\n"));
+        for pattern in ["config.d/*.conf", "~/.ssh/config.d/?.conf"] {
+            let paths =
+                include_paths(pattern, &base, home, &files, &mut IncludeBudget::new()).unwrap();
+            assert_eq!(paths, vec![directory.join("a.conf")]);
+        }
+    }
+
+    #[test]
+    fn include_scan_budget_is_shared_even_when_patterns_match_no_files() {
+        let base = "/home/me/.ssh";
+        let mut files = FixtureIncludes::default();
+        files.directories.insert(
+            format!("{base}/empty").into(),
+            (0..9000)
+                .map(|index| format!("unselected-{index}.txt"))
+                .collect(),
+        );
+        let mut budget = IncludeBudget::new();
+        let expanded = expand_includes(
+            "Include empty/*.conf\nInclude empty/*.conf\nInclude empty/*.conf\n",
+            Path::new(base),
+            &context().home,
+            &files,
+            &mut budget,
+            0,
+            true,
+        );
+        // The first complete no-match scan is harmless. The next consumes the
+        // remaining allowance and both uncompleted Includes stay mandatory.
+        assert_eq!(expanded, "Include empty/*.conf\nInclude empty/*.conf\n");
+        assert_eq!(budget.entries, 0);
+        assert!(
+            alias_resolver(Some(&expanded), &context().home)
+                .unwrap()
+                .incomplete
+        );
+    }
+
+    #[test]
+    fn include_traversal_rejects_overfull_frontiers_and_partial_sources() {
+        let base = "/home/me/.ssh";
+        let mut files = FixtureIncludes::default();
+        let names: Vec<_> = (0..65).map(|index| format!("region-{index:02}")).collect();
+        files
+            .directories
+            .insert(format!("{base}/config.d").into(), names.clone());
+        for name in names {
+            files
+                .directories
+                .insert(format!("{base}/config.d/{name}").into(), vec![]);
+        }
+        let include = "Include config.d/*/options\n";
+        assert_eq!(expand(include, base, &files), include);
+
+        files.directories.insert(
+            format!("{base}/config.d").into(),
+            vec!["a.conf".into(), "b.conf".into()],
+        );
+        files.files.insert(
+            format!("{base}/config.d/a.conf").into(),
+            present("User partial\n"),
+        );
+        files.files.insert(
+            format!("{base}/config.d/b.conf").into(),
+            KnownHostsSource::Unavailable,
+        );
+        let include = "Include config.d/?.conf\n";
+        assert_eq!(expand(include, base, &files), include);
     }
 
     #[test]
@@ -5889,11 +6142,17 @@ ssh = "right"
         );
         // A directory that does not exist has no files; one that does lists them.
         assert_eq!(
-            DiskIncludes.names(&dir.path().join("absent")),
+            DiskIncludes.names(&dir.path().join("absent"), MAX_INCLUDE_ENTRIES),
             Some(Vec::new())
         );
-        let mut names = DiskIncludes.names(dir.path()).unwrap();
+        let mut names = DiskIncludes.names(dir.path(), MAX_INCLUDE_ENTRIES).unwrap();
         names.sort();
         assert_eq!(names, ["apple.conf", "crypto.conf", "twice.conf"]);
+        assert!(DiskIncludes.names(dir.path(), 2).is_none());
+        assert_eq!(DiskIncludes.is_directory(dir.path()), Some(true));
+        assert_eq!(
+            DiskIncludes.is_directory(&dir.path().join("apple.conf")),
+            Some(false)
+        );
     }
 }
