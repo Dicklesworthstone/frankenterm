@@ -128,7 +128,7 @@ fn pending_row(harness: &mut Harness) -> (u64, GetLinesAtLayoutResponse) {
         .server
         .term
         .advance_bytes(b"\x1b[H\x1b[2KOLDER REPLY");
-    let change = observation(harness, vec![0..1], false);
+    let change = observation(harness, std::iter::once(0..1).collect(), false);
     deliver(&mut harness.session, 25, 0, &change);
     let (serial, pdu) = take_one(&mut harness.session);
     let Pdu::GetLinesAtLayout(request) = pdu else {
@@ -194,7 +194,7 @@ fn delayed_rows_never_replace_a_newer_push_at_the_same_coordinates() {
         .server
         .term
         .advance_bytes(b"\x1b[H\x1b[2KNEWER PUSH");
-    let newer = observation(&mut harness, vec![0..1], true);
+    let newer = observation(&mut harness, std::iter::once(0..1).collect(), true);
     deliver(&mut harness.session, 25, 0, &newer);
     assert!(
         harness.session.take_outgoing().is_empty(),
@@ -215,7 +215,7 @@ fn unrelated_output_does_not_starve_a_read_of_an_unchanged_row() {
         .server
         .term
         .advance_bytes(b"\x1b[2;1H\x1b[2KNEW SECOND ROW");
-    let mut newer = observation(&mut harness, vec![1..2], false);
+    let mut newer = observation(&mut harness, std::iter::once(1..2).collect(), false);
     let (first, rows) = terminal_get_lines(&mut harness.server.term, 1..2);
     newer.bonus_lines = rows
         .into_iter()
@@ -248,7 +248,7 @@ fn resize_and_alternate_screen_retire_old_row_coordinates() {
                 .term
                 .advance_bytes(b"\x1b[H\x1b[2KNEW GEOMETRY");
         }
-        let newer = observation(&mut harness, vec![0..4], true);
+        let newer = observation(&mut harness, std::iter::once(0..4).collect(), true);
         deliver(&mut harness.session, 25, 0, &newer);
         deliver(&mut harness.session, 103, serial, &old);
         harness.pump();
@@ -295,7 +295,7 @@ fn refused_fenced_rows_keep_the_last_display_until_a_fresh_observation() {
     assert!(harness.session.advance_time(due));
     let (poll, pdu) = take_one(&mut harness.session);
     assert!(matches!(pdu, Pdu::GetPaneRenderStateV1(_)));
-    let refreshed = observation(&mut harness, vec![0..1], true);
+    let refreshed = observation(&mut harness, std::iter::once(0..1).collect(), true);
     deliver(&mut harness.session, 25, poll, &refreshed);
     harness.pump();
     assert!(screen(&mut harness).contains("OLDER REPLY"));
@@ -358,7 +358,7 @@ fn a_new_size_retires_an_earlier_post_ack_render_observation() {
         acknowledge_size(&mut harness.session, first_size, request);
         let (old_poll, pdu) = take_one(&mut harness.session);
         assert!(matches!(pdu, Pdu::GetPaneRenderStateV1(_)));
-        let old = observation(&mut harness, vec![0..4], true);
+        let old = observation(&mut harness, std::iter::once(0..4).collect(), true);
 
         harness.session.resize(pane, 4, 26);
         let (latest_size, request) = take_one(&mut harness.session);
@@ -380,7 +380,7 @@ fn a_new_size_retires_an_earlier_post_ack_render_observation() {
             .server
             .term
             .advance_bytes(b"\x1b[H\x1b[2KLATEST GRID");
-        let latest = observation(&mut harness, vec![0..4], true);
+        let latest = observation(&mut harness, std::iter::once(0..4).collect(), true);
         deliver(&mut harness.session, 25, latest_poll, &latest);
         harness.pump();
         assert!(harness.session.is_ready());
@@ -425,7 +425,7 @@ fn a_retry_or_new_visit_cannot_poll_a_size_effect_before_its_receipt() {
     let (poll, pdu) = take_one(&mut harness.session);
     assert!(matches!(pdu, Pdu::GetPaneRenderStateV1(_)));
     harness.server.term.resize(support::size(4, 26));
-    let latest = observation(&mut harness, vec![0..4], true);
+    let latest = observation(&mut harness, std::iter::once(0..4).collect(), true);
     deliver(&mut harness.session, 25, poll, &latest);
     harness.pump();
     assert_eq!(harness.phone.get_size().cols, 26);
@@ -489,7 +489,7 @@ fn hidden_visit_and_overtaken_correlated_reply_cannot_rewind_the_view() {
     assert!(matches!(pdu, Pdu::GetPaneRenderStateV1(_)));
     let older = observation(&mut harness, vec![], true);
     harness.server.term.advance_bytes(b"\x1b[H\x1b[2KNEW VISIT");
-    let newer = observation(&mut harness, vec![0..1], true);
+    let newer = observation(&mut harness, std::iter::once(0..1).collect(), true);
     deliver(&mut harness.session, 25, 0, &newer);
     deliver(&mut harness.session, 25, poll, &older);
     deliver(&mut harness.session, 103, read, &stale);
@@ -522,7 +522,7 @@ fn a_previous_visits_poll_cannot_open_a_new_visits_display_gate() {
         .server
         .term
         .advance_bytes(b"\x1b[H\x1b[2KEXACT VISIT");
-    let current = observation(&mut harness, vec![0..1], true);
+    let current = observation(&mut harness, std::iter::once(0..1).collect(), true);
     deliver(&mut harness.session, 25, new_poll, &current);
     harness.pump();
     assert!(screen(&mut harness).contains("EXACT VISIT"));

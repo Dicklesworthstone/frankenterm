@@ -95,6 +95,17 @@ fn identity_reply(
     incarnation: [u8; 16],
     registration: [u8; 16],
 ) {
+    identity_reply_with_durable_id(session, rpc, pane, incarnation, registration, [0xd1; 16]);
+}
+
+fn identity_reply_with_durable_id(
+    session: &mut Session,
+    rpc: u64,
+    pane: usize,
+    incarnation: [u8; 16],
+    registration: [u8; 16],
+    durable_pane_id: [u8; 16],
+) {
     reply(
         session,
         118,
@@ -104,7 +115,7 @@ fn identity_reply(
             outcome: codec::PaneIdentityOutcomeV1::Available {
                 identity: codec::PaneIdentityV1 {
                     session_incarnation: mux::MuxSessionIncarnation::from_bytes(incarnation),
-                    durable_pane_id: [0xd1; 16],
+                    durable_pane_id,
                     pane_registration: codec::ReliablePaneRegistrationIdentityV1::from_bytes(
                         registration,
                     ),
@@ -1257,12 +1268,13 @@ fn selecting_another_pane_during_pressure_cannot_retarget_or_overtake_input() {
     let second = first + 1;
     harness.session.show(second);
     let (identity_rpc, _) = take_one(&mut harness.session);
-    identity_reply(
+    identity_reply_with_durable_id(
         &mut harness.session,
         identity_rpc,
         second,
         harness.server.incarnation,
         [0x55; 16],
+        [0xd2; 16],
     );
     assert!(matches!(
         take_one(&mut harness.session).1,

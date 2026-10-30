@@ -313,7 +313,7 @@ fn malformed_or_mismatched_resize_receipts_cannot_settle_another_pane_or_release
             0 => reply.pane_id += 1,
             1 => {
                 reply.identity.pane_registration =
-                    codec::ReliablePaneRegistrationIdentityV1::from_bytes([0xee; 16])
+                    codec::ReliablePaneRegistrationIdentityV1::from_bytes([0xee; 16]);
             }
             2 => reply.outcome = codec::ResizePaneConditionalOutcomeV1::Indeterminate,
             _ => {}
@@ -362,11 +362,12 @@ fn the_wire_request_includes_every_identity_component_and_the_exact_desktop_rest
     harness.session.receive(&server_frame(
         120,
         serial,
-        &codec::ResizePaneConditionalV1Response {
+        &varbincode::serialize(&codec::ResizePaneConditionalV1Response {
             pane_id: pane,
             identity: request.identity,
             outcome: codec::ResizePaneConditionalOutcomeV1::Enqueued,
-        },
+        })
+        .unwrap(),
         false,
     ));
     harness.session.restore_size(pane);
@@ -417,7 +418,7 @@ fn unanswered_geometry_cannot_grow_beyond_the_per_connection_pane_budget() {
         harness.session.receive(&server_frame(
             118,
             query.serial,
-            &codec::GetPaneIdentityV1Response {
+            &varbincode::serialize(&codec::GetPaneIdentityV1Response {
                 pane_id: pane,
                 outcome: codec::PaneIdentityOutcomeV1::Available {
                     identity: codec::PaneIdentityV1 {
@@ -431,7 +432,8 @@ fn unanswered_geometry_cannot_grow_beyond_the_per_connection_pane_budget() {
                     },
                     render_facts: None,
                 },
-            },
+            })
+            .unwrap(),
             false,
         ));
         harness.session.resize(pane, 8, 30);
