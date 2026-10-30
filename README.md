@@ -1710,7 +1710,7 @@ frankenterm/                              # <!--count:workspace_members-->97<!--
 │   ├── env-bootstrap/  tabout/  gui-subcommands/  toast-notification/  open-url/
 │   └── lua-api-crates/{termwiz-funcs,mux-lua,url-funcs}/
 ├── fuzz/                                 # <!--count:fuzz_targets-->52<!--/count--> fuzz targets
-├── docs/                                 # <!--count:doc_markdown_files-->548<!--/count--> Markdown documentation files
+├── docs/                                 # <!--count:doc_markdown_files-->549<!--/count--> Markdown documentation files
 ├── tests/e2e/                            # <!--count:e2e_scripts-->300<!--/count--> shell E2E scripts
 └── fixtures/                             # Test fixtures (including operating-envelope goldens)
 ```

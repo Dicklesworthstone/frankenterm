@@ -106,21 +106,21 @@
       "classification_summary": {
         "cosmetic": 2,
         "docs": 1,
-        "feat": 6,
+        "feat": 7,
         "fix": 19,
-        "other": 5,
+        "other": 9,
         "refactor": 1,
         "rename": 1,
         "security-fix": 2,
         "test": 5
       },
-      "fork_side_commit_count": 42,
+      "fork_side_commit_count": 47,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-10-11T20:28:32-04:00",
-        "sha": "d2be79b862c4996519deb6050bbc22b3853bbeb8",
-        "subject": "fix(unicode): widen VS16 emoji and keycaps by default, as Ghostty and the agent CLIs do (ft-vylyj)"
+        "classification": "feat",
+        "committed_at": "2026-10-17T20:02:13-04:00",
+        "sha": "e6a2f92dee8ac233376633dad6c22273a58a3867",
+        "subject": "feat(checkpoint): keep Kitty images, placements, and cell image layers"
       },
       "name": "frankenterm-cell",
       "path": "frankenterm/cell",
@@ -131,19 +131,19 @@
       "classification_summary": {
         "docs": 1,
         "feat": 2,
-        "fix": 9,
-        "other": 6,
+        "fix": 10,
+        "other": 7,
         "refactor": 2,
         "rename": 1,
         "test": 6
       },
-      "fork_side_commit_count": 27,
+      "fork_side_commit_count": 29,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-10-11T20:28:32-04:00",
-        "sha": "d2be79b862c4996519deb6050bbc22b3853bbeb8",
-        "subject": "fix(unicode): widen VS16 emoji and keycaps by default, as Ghostty and the agent CLIs do (ft-vylyj)"
+        "committed_at": "2026-10-19T17:00:43-04:00",
+        "sha": "9f378263c8c6a097ef93cdc04cf12180358b2f23",
+        "subject": "fix(char-props): restore the phf =0.13.1 pin the dependabot group bump moved again"
       },
       "name": "frankenterm-char-props",
       "path": "frankenterm/char-props",
@@ -154,10 +154,10 @@
       "classification_summary": {
         "chore": 3,
         "cleanup": 2,
-        "cosmetic": 20,
+        "cosmetic": 21,
         "docs": 1,
-        "feat": 55,
-        "fix": 135,
+        "feat": 57,
+        "fix": 137,
         "other": 17,
         "refactor": 5,
         "rename": 2,
@@ -165,13 +165,13 @@
         "security-fix": 2,
         "test": 41
       },
-      "fork_side_commit_count": 287,
+      "fork_side_commit_count": 292,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-10-15T21:06:50-04:00",
-        "sha": "d3dc77b68c289a47557e2eb1d19eeb320a145ecb",
-        "subject": "test(client): split the render-thread spawn regression into fetch and liveness tests"
+        "classification": "cosmetic",
+        "committed_at": "2026-10-28T03:05:14-04:00",
+        "sha": "ae4cc1cd42a5394b46d3fad6a66c5dca220ab565",
+        "subject": "style: apply the pinned rustfmt across the workspace; one clippy semicolon"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -182,10 +182,10 @@
       "classification_summary": {
         "chore": 1,
         "cleanup": 1,
-        "cosmetic": 21,
+        "cosmetic": 22,
         "docs": 2,
-        "feat": 46,
-        "fix": 67,
+        "feat": 48,
+        "fix": 68,
         "other": 21,
         "refactor": 2,
         "rename": 2,
@@ -193,13 +193,13 @@
         "security-fix": 1,
         "test": 84
       },
-      "fork_side_commit_count": 253,
+      "fork_side_commit_count": 257,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-10-12T07:49:17-04:00",
-        "sha": "9aeb5680320e357f1b36c4d2052d6e0fa9e180fc",
-        "subject": "fix(codec,client,mux-server): repair the clippy and test-compile breaks from 0f196211b and 3d6e0d24a"
+        "classification": "feat",
+        "committed_at": "2026-10-30T15:34:20-04:00",
+        "sha": "af66ff138b1fb403ddfbacef07360ef19c7fe85f",
+        "subject": "feat(mux): fence mobile resize and rendering to observed pane state"
       },
       "name": "codec",
       "path": "frankenterm/codec",
@@ -232,24 +232,24 @@
       "classification_summary": {
         "chore": 3,
         "cleanup": 1,
-        "cosmetic": 5,
+        "cosmetic": 7,
         "docs": 1,
-        "feat": 53,
-        "fix": 53,
-        "other": 15,
+        "feat": 70,
+        "fix": 60,
+        "other": 16,
         "refactor": 5,
         "rename": 1,
         "runtime-swap": 8,
         "security-fix": 2,
         "test": 15
       },
-      "fork_side_commit_count": 162,
+      "fork_side_commit_count": 189,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "feat",
-        "committed_at": "2026-10-14T18:24:28-04:00",
-        "sha": "b3e184414dc81fedb0392160745e3d2e7b71b7cf",
-        "subject": "feat(lua): port the rest of WezTerm's Lua API (run_child_process, json, GLOBAL, color, ...)"
+        "committed_at": "2026-10-30T15:24:29-04:00",
+        "sha": "f8530c14131ede5986941e17ba2734b9f9ea579c",
+        "subject": "feat(airgap): preserve source omissions through Mac export and workspace import"
       },
       "name": "config",
       "path": "frankenterm/config",
@@ -341,18 +341,19 @@
         "cosmetic": 2,
         "docs": 1,
         "feat": 1,
+        "fix": 1,
         "other": 1,
         "refactor": 1,
         "rename": 1,
         "test": 3
       },
-      "fork_side_commit_count": 11,
+      "fork_side_commit_count": 12,
       "last_modified": {
-        "author": "Dicklesworthstone",
-        "classification": "cosmetic",
-        "committed_at": "2026-08-27T13:18:52-04:00",
-        "sha": "c466be3bb531648c90538d48725c66046ace690a",
-        "subject": "chore(lints,deps): add workspace clippy exceptions and update hmac dependency"
+        "author": "Jeff Emanuel",
+        "classification": "fix",
+        "committed_at": "2026-10-29T22:55:03-04:00",
+        "sha": "d89487407ecba35b470fd101a583487557ab9b4a",
+        "subject": "fix(dynamic): let a deprecated field without a default compile, unbreaking config"
       },
       "name": "frankenterm-dynamic",
       "path": "frankenterm/dynamic",
@@ -363,17 +364,18 @@
       "classification_summary": {
         "cosmetic": 1,
         "feat": 1,
+        "fix": 1,
         "other": 1,
         "refactor": 1,
         "rename": 1
       },
-      "fork_side_commit_count": 5,
+      "fork_side_commit_count": 6,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "refactor",
-        "committed_at": "2026-06-15T14:11:53-04:00",
-        "sha": "dd97e0bf5102fd4841ed1c07e1c42461742c2de8",
-        "subject": "refactor(vendored): migrate ex-WezTerm crates to upgraded dependency APIs"
+        "classification": "fix",
+        "committed_at": "2026-10-29T22:55:03-04:00",
+        "sha": "d89487407ecba35b470fd101a583487557ab9b4a",
+        "subject": "fix(dynamic): let a deprecated field without a default compile, unbreaking config"
       },
       "name": "frankenterm-dynamic-derive",
       "path": "frankenterm/dynamic/derive",
@@ -405,19 +407,19 @@
         "docs": 1,
         "feat": 8,
         "fix": 22,
-        "other": 9,
+        "other": 13,
         "refactor": 1,
         "rename": 1,
-        "security-fix": 54,
+        "security-fix": 57,
         "test": 6
       },
-      "fork_side_commit_count": 110,
+      "fork_side_commit_count": 117,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "security-fix",
-        "committed_at": "2026-10-16T14:06:53-04:00",
-        "sha": "a39a055b614c4f71eb3d14ac588c3d0871043750",
-        "subject": "perf(escape-parser): validate a parse call's input once and hand runs out as slices of it, not one from_utf8 per run (ft-yccm0.3.2.6)"
+        "committed_at": "2026-10-20T13:58:56-04:00",
+        "sha": "571fef19efa5cfde879bb2134be3adaa1d0b2d06",
+        "subject": "perf(escape-parser): the 256-color SGR shortcut matches fixed patterns"
       },
       "name": "frankenterm-escape-parser",
       "path": "frankenterm/escape-parser",
@@ -449,20 +451,20 @@
         "cleanup": 1,
         "cosmetic": 8,
         "docs": 1,
-        "feat": 4,
-        "fix": 23,
-        "other": 8,
+        "feat": 5,
+        "fix": 24,
+        "other": 10,
         "refactor": 1,
         "rename": 1,
         "test": 2
       },
-      "fork_side_commit_count": 49,
+      "fork_side_commit_count": 53,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-10-08T09:30:41-04:00",
-        "sha": "f59d21f0dd4a895c3e3fa832303c995d1c7f09c3",
-        "subject": "perf(font): a run of single-codepoint clusters is laid out without HarfBuzz from a printable ASCII table and a bounded cluster cache when no lookup of the face can join its glyphs, so a repeated T0 emoji row costs no HarfBuzz call (ft-yccm0.4.3.3) code-first, batch-verify pending"
+        "classification": "fix",
+        "committed_at": "2026-10-29T19:40:19-04:00",
+        "sha": "9af5ecf6ff6026ed64123952749bd2260609dd46",
+        "subject": "fix(term): satisfy clippy on the browser model and the codec assertion"
       },
       "name": "frankenterm-font",
       "path": "frankenterm/font",
@@ -571,15 +573,16 @@
     {
       "authors_raw": null,
       "classification_summary": {
-        "feat": 1
+        "feat": 1,
+        "test": 1
       },
-      "fork_side_commit_count": 1,
+      "fork_side_commit_count": 2,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-10-14T18:24:28-04:00",
-        "sha": "b3e184414dc81fedb0392160745e3d2e7b71b7cf",
-        "subject": "feat(lua): port the rest of WezTerm's Lua API (run_child_process, json, GLOBAL, color, ...)"
+        "classification": "test",
+        "committed_at": "2026-10-30T15:50:35-04:00",
+        "sha": "5109abb50e4cf2fbb7bbd143bcf818265a2a00b5",
+        "subject": "test(lua): poll filesystem and spawn futures on the futures executor"
       },
       "name": "filesystem",
       "path": "frankenterm/lua-api-crates/filesystem",
@@ -661,15 +664,16 @@
     {
       "authors_raw": null,
       "classification_summary": {
-        "feat": 1
+        "feat": 1,
+        "test": 1
       },
-      "fork_side_commit_count": 1,
+      "fork_side_commit_count": 2,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-10-14T18:24:28-04:00",
-        "sha": "b3e184414dc81fedb0392160745e3d2e7b71b7cf",
-        "subject": "feat(lua): port the rest of WezTerm's Lua API (run_child_process, json, GLOBAL, color, ...)"
+        "classification": "test",
+        "committed_at": "2026-10-30T15:50:35-04:00",
+        "sha": "5109abb50e4cf2fbb7bbd143bcf818265a2a00b5",
+        "subject": "test(lua): poll filesystem and spawn futures on the futures executor"
       },
       "name": "spawn-funcs",
       "path": "frankenterm/lua-api-crates/spawn-funcs",
@@ -778,24 +782,24 @@
       "classification_summary": {
         "chore": 10,
         "cleanup": 3,
-        "cosmetic": 32,
-        "docs": 6,
-        "feat": 223,
-        "fix": 323,
-        "other": 73,
+        "cosmetic": 33,
+        "docs": 7,
+        "feat": 229,
+        "fix": 338,
+        "other": 81,
         "refactor": 12,
         "rename": 2,
         "runtime-swap": 3,
         "security-fix": 7,
-        "test": 114
+        "test": 116
       },
-      "fork_side_commit_count": 808,
+      "fork_side_commit_count": 841,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-10-16T12:17:09-04:00",
-        "sha": "0c2e62c7b35765069addb2823ef123112cc0ac9c",
-        "subject": "fix(recovery): an SSH config host no longer disables whole-mux recovery for good"
+        "classification": "test",
+        "committed_at": "2026-10-29T17:01:13-04:00",
+        "sha": "64e796b8cb97e9fc16719eeb1b96c62645d5b7d3",
+        "subject": "test(mux): keep the ssh-agent socket name short and quiet Rust 2018 asserts"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -874,19 +878,19 @@
       "classification_summary": {
         "cosmetic": 5,
         "feat": 7,
-        "fix": 25,
+        "fix": 26,
         "other": 5,
         "refactor": 2,
         "runtime-swap": 1,
         "test": 17
       },
-      "fork_side_commit_count": 62,
+      "fork_side_commit_count": 63,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-10-06T23:17:31-04:00",
-        "sha": "655b7fcdd7bd412e9f21aa1c4431faf99c5fccd1",
-        "subject": "perf(mux): the pane reader gathers PTY output into ring-slot batches: under 1 KiB it publishes at once, above it it keeps reading what is buffered for up to 3 ms, and an idle parser cuts the gather short through a self-pipe (ft-yccm0.3.1.2 slice 1) code-first, batch-verify pending"
+        "classification": "fix",
+        "committed_at": "2026-10-18T22:39:07-04:00",
+        "sha": "99ade443aaf17e3e48ab2f5822feb5cd82495ccb",
+        "subject": "fix(pty): a command's Debug names its environment, never the values"
       },
       "name": "portable-pty",
       "path": "frankenterm/pty",
@@ -940,19 +944,19 @@
         "cosmetic": 1,
         "docs": 1,
         "feat": 7,
-        "fix": 22,
+        "fix": 23,
         "refactor": 2,
         "runtime-swap": 2,
         "security-fix": 5,
         "test": 8
       },
-      "fork_side_commit_count": 48,
+      "fork_side_commit_count": 49,
       "last_modified": {
-        "author": "Jeff Emanuel",
-        "classification": "refactor",
-        "committed_at": "2026-08-07T23:53:54-04:00",
-        "sha": "0d50fcd963db1c4102d4f8cf0a037b5001e8978a",
-        "subject": "refactor(platform): surface, term, window, scripting, and test harness polish"
+        "author": "Dicklesworthstone",
+        "classification": "fix",
+        "committed_at": "2026-10-24T00:42:19-04:00",
+        "sha": "84fbfd1782d20211dcdba1ad351b0c7230389f13",
+        "subject": "fix: compile zip 9 names and SSE mpsc send"
       },
       "name": "frankenterm-scripting",
       "path": "frankenterm/scripting",
@@ -989,22 +993,22 @@
       "classification_summary": {
         "chore": 3,
         "cleanup": 1,
-        "cosmetic": 8,
+        "cosmetic": 10,
         "feat": 16,
         "fix": 59,
-        "other": 53,
+        "other": 55,
         "refactor": 4,
         "rename": 1,
         "security-fix": 2,
         "test": 25
       },
-      "fork_side_commit_count": 172,
+      "fork_side_commit_count": 176,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-10-16T15:55:54-04:00",
-        "sha": "0372320483d1759faf1e4c25239656ea4c9d56b4",
-        "subject": "perf(surface): check a printed ASCII run a word at a time (ft-yccm0.3.2.6)"
+        "classification": "cosmetic",
+        "committed_at": "2026-10-28T03:05:14-04:00",
+        "sha": "ae4cc1cd42a5394b46d3fad6a66c5dca220ab565",
+        "subject": "style: apply the pinned rustfmt across the workspace; one clippy semicolon"
       },
       "name": "frankenterm-surface",
       "path": "frankenterm/surface",
@@ -1035,23 +1039,23 @@
       "classification_summary": {
         "chore": 1,
         "cleanup": 3,
-        "cosmetic": 16,
-        "docs": 2,
-        "feat": 74,
-        "fix": 170,
-        "other": 77,
+        "cosmetic": 21,
+        "docs": 4,
+        "feat": 100,
+        "fix": 189,
+        "other": 135,
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
-        "test": 79
+        "test": 87
       },
-      "fork_side_commit_count": 435,
+      "fork_side_commit_count": 553,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-10-16T15:23:39-04:00",
-        "sha": "c80177441b0912bce95fc548cb619a97bd439975",
-        "subject": "fix(term): a store-less page-engine pane at its limit no longer drops every row above the hot tier in one scroll, nor warns per newline (ft-qvt9l.1)"
+        "classification": "feat",
+        "committed_at": "2026-10-30T15:34:20-04:00",
+        "sha": "af66ff138b1fb403ddfbacef07360ef19c7fe85f",
+        "subject": "feat(mux): fence mobile resize and rendering to observed pane state"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1064,7 +1068,7 @@
         "cleanup": 1,
         "cosmetic": 9,
         "feat": 11,
-        "fix": 61,
+        "fix": 62,
         "other": 8,
         "refactor": 2,
         "rename": 1,
@@ -1072,13 +1076,13 @@
         "security-fix": 5,
         "test": 10
       },
-      "fork_side_commit_count": 110,
+      "fork_side_commit_count": 111,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "refactor",
-        "committed_at": "2026-08-07T23:53:54-04:00",
-        "sha": "0d50fcd963db1c4102d4f8cf0a037b5001e8978a",
-        "subject": "refactor(platform): surface, term, window, scripting, and test harness polish"
+        "classification": "fix",
+        "committed_at": "2026-10-20T22:12:33-04:00",
+        "sha": "67bf8e2c199c0920459fe7ab241e9139571ca4b8",
+        "subject": "fix(term,termwiz): build the canonical terminal C ABI for iOS device and simulator"
       },
       "name": "termwiz",
       "path": "frankenterm/termwiz",
@@ -1177,23 +1181,23 @@
       "classification_summary": {
         "chore": 3,
         "cleanup": 1,
-        "cosmetic": 8,
+        "cosmetic": 9,
         "docs": 2,
-        "feat": 18,
-        "fix": 101,
-        "other": 17,
+        "feat": 19,
+        "fix": 103,
+        "other": 18,
         "refactor": 6,
         "rename": 1,
         "runtime-swap": 1,
         "test": 3
       },
-      "fork_side_commit_count": 161,
+      "fork_side_commit_count": 166,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-10-14T15:34:51-04:00",
-        "sha": "1a11ac1f2e391af9a64fd9ae16e832ed8c3d3331",
-        "subject": "perf(macos): park windows hidden behind another FrankenTerm window"
+        "classification": "cosmetic",
+        "committed_at": "2026-10-28T03:05:14-04:00",
+        "sha": "ae4cc1cd42a5394b46d3fad6a66c5dca220ab565",
+        "subject": "style: apply the pinned rustfmt across the workspace; one clippy semicolon"
       },
       "name": "window",
       "path": "frankenterm/window",
@@ -1206,8 +1210,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 3224,
-  "generated_at": "2026-10-16T19:56:08.277452Z",
+  "fork_side_commit_total": 3445,
+  "generated_at": "2026-10-30T19:52:39.573061Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 55,
