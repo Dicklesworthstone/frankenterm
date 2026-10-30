@@ -5,6 +5,13 @@ use std::path::PathBuf;
 
 #[derive(Default, Debug, Clone, FromDynamic, ToDynamic)]
 pub struct DaemonOptions {
+    /// Read only to warn: upstream locked this file to keep a second
+    /// `--daemonize` server off the runtime dir. Here the mux takes an
+    /// exclusive lease on `<socket_path>.lock` before binding, so a second
+    /// server on the same socket already fails fast, and nothing reads this.
+    #[dynamic(
+        deprecated = "has no effect: the mux server holds an exclusive lock on <socket_path>.lock, which already refuses a second server on the same socket"
+    )]
     pub pid_file: Option<PathBuf>,
     pub stdout: Option<PathBuf>,
     pub stderr: Option<PathBuf>,
@@ -45,14 +52,6 @@ fn open_log(path: PathBuf) -> anyhow::Result<File> {
 }
 
 impl DaemonOptions {
-    #[cfg_attr(windows, allow(dead_code))]
-    pub fn pid_file(&self) -> PathBuf {
-        self.pid_file
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| RUNTIME_DIR.join("pid"))
-    }
-
     pub fn stdout(&self) -> PathBuf {
         self.stdout
             .as_ref()
@@ -89,23 +88,41 @@ mod tests {
     }
 
     #[test]
-    fn pid_file_uses_runtime_dir_when_none() {
-        let opts = DaemonOptions::default();
-        let path = opts.pid_file();
-        assert!(
-            path.ends_with("pid"),
-            "expected path ending with 'pid', got: {}",
-            path.display()
+    fn a_configured_pid_file_is_reported_as_deprecated_not_rejected() {
+        use frankenterm_dynamic::{FromDynamicOptions, UnknownFieldAction, Value};
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert(
+            Value::String("pid_file".to_string()),
+            Value::String("/custom/pid".to_string()),
         );
-    }
+        let config = Value::Object(fields.into());
 
-    #[test]
-    fn pid_file_uses_override_when_some() {
-        let opts = DaemonOptions {
-            pid_file: Some(PathBuf::from("/custom/pid")),
-            ..Default::default()
+        // Strict config files deny unknown fields but only warn on deprecated
+        // ones, so an existing pid_file keeps loading.
+        let strict = FromDynamicOptions {
+            unknown_fields: UnknownFieldAction::Deny,
+            deprecated_fields: UnknownFieldAction::Warn,
         };
-        assert_eq!(opts.pid_file(), PathBuf::from("/custom/pid"));
+        assert!(DaemonOptions::from_dynamic(&config, strict).is_ok());
+
+        let deny = FromDynamicOptions {
+            unknown_fields: UnknownFieldAction::Deny,
+            deprecated_fields: UnknownFieldAction::Deny,
+        };
+        let error = DaemonOptions::from_dynamic(&config, deny).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                frankenterm_dynamic::Error::DeprecatedField {
+                    field_name: "pid_file",
+                    ..
+                }
+            ),
+            "{:#}",
+            error
+        );
+        let message = format!("{:#}", error);
+        assert!(message.contains("<socket_path>.lock"), "{}", message);
     }
 
     #[test]
