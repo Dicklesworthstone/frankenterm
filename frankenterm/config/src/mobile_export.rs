@@ -28,6 +28,7 @@ const MAX_SOURCE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SOURCE_FILES: usize = 64;
 const MAX_SOURCE_LINES: usize = 16_384;
 const MAX_PUBLIC_KEY_FILES: usize = 256;
+const MAX_ROUTE_IDENTITIES: usize = 8;
 const MAX_JUMP_HOPS: usize = 3;
 const MAX_EXPORTED_ROUTES: usize = 256;
 /// The phone's SSH driver runs remote commands up to this size.
@@ -87,6 +88,10 @@ pub struct SshSources {
     pub default_known_hosts: Vec<PathBuf>,
     /// `.pub` contents by path; a route's identity `x` reads `x.pub`.
     pub public_keys: BTreeMap<PathBuf, String>,
+    /// Sources whose contents could not be established, including files beyond
+    /// the snapshot's read budgets. These are not observed missing identities:
+    /// an affected route must not silently export its other candidates instead.
+    pub unavailable_public_keys: BTreeSet<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -428,7 +433,7 @@ fn default_known_hosts(home: &Path) -> Vec<PathBuf> {
 impl SshSources {
     /// Reads the user's real files: SSH config, the default known_hosts files
     /// and every `.pub` an inventory route can name. Missing files are simply
-    /// absent; the export reports what that leaves unusable.
+    /// absent; unreadable and over-budget sources remain explicit blockers.
     pub fn from_disk(inventory: &MachineInventory, context: &InventoryContext) -> Self {
         let ssh = context.home.join(".ssh");
         // One budget for both sources and everything they include.
@@ -513,28 +518,49 @@ impl SshSources {
             })
             .collect();
         let mut remaining_public_bytes = MAX_SOURCE_BYTES;
-        let public_keys = identities
+        let mut public_keys = BTreeMap::new();
+        let mut unavailable_public_keys = BTreeSet::new();
+        for (index, public) in identities
             .into_iter()
             .map(|identity| public_key_path(&identity))
             .collect::<BTreeSet<_>>()
             .into_iter()
-            .take(MAX_PUBLIC_KEY_FILES)
-            .filter_map(|public| {
-                match read_source(&public, remaining_public_bytes.min(64 * 1024)) {
-                    KnownHostsSource::Present(text) => {
-                        remaining_public_bytes -= text.len();
-                        Some((public, text))
-                    }
-                    _ => None,
+            .enumerate()
+        {
+            let source = if index < MAX_PUBLIC_KEY_FILES {
+                read_source(&public, remaining_public_bytes.min(64 * 1024))
+            } else {
+                KnownHostsSource::Unavailable
+            };
+            match source {
+                KnownHostsSource::Present(text) => {
+                    remaining_public_bytes -= text.len();
+                    public_keys.insert(public, text);
                 }
-            })
-            .collect();
+                KnownHostsSource::Missing => {
+                    // A private IdentityFile need not have a .pub sidecar.
+                    // Probe existence only: passive discovery must not read or
+                    // unlock private material. Only ENOENT establishes absence;
+                    // an existing file/link or failed probe leaves identity
+                    // resolution unavailable rather than silently omitting it.
+                    let private = public.with_extension("");
+                    if !matches!(std::fs::symlink_metadata(private), Err(error) if error.kind() == ErrorKind::NotFound)
+                    {
+                        unavailable_public_keys.insert(public);
+                    }
+                }
+                KnownHostsSource::Unavailable => {
+                    unavailable_public_keys.insert(public);
+                }
+            }
+        }
         Self {
             config,
             system_config,
             known_hosts,
             default_known_hosts,
             public_keys,
+            unavailable_public_keys,
         }
     }
 }
@@ -1772,46 +1798,80 @@ impl EndpointRecords {
         notes: &mut Vec<ExportNote>,
     ) -> Value {
         let endpoint = &resolved.endpoint;
-        let mut credential_ids = Vec::new();
+        // Admit the complete ordered candidate set before publishing any
+        // credential or private-file hint. A phone limit is not permission to
+        // replace the source authentication policy with its usable prefix.
+        let mut candidates: Vec<(String, String, PublicKey, &PathBuf)> = Vec::new();
+        let mut identities_complete = true;
         let defaults = default_identities(context);
         for identity in &endpoint.identities {
             let public = public_key_path(identity);
-            let key = match sources.public_keys.get(&public).and_then(|text| {
-                text.lines()
-                    .find(|l| !l.trim().is_empty())
-                    .and_then(PublicKey::parse_line)
-            }) {
-                Some(key) => key,
-                // OpenSSH skips absent default identities silently too.
-                None if defaults.contains(identity) => continue,
-                None => {
-                    notes.push(ExportNote {
-                        machine: machine.id.clone(),
-                        route: Some(route_name.to_string()),
-                        message: format!(
-                            "no readable public key at {}; that identity is not offered",
-                            public.display()
-                        ),
-                    });
-                    continue;
-                }
-            };
-            let fingerprint = key.fingerprint();
-            let id = format!("c.{}", short_digest(&fingerprint));
-            if credential_ids.contains(&id) {
-                continue;
-            }
-            if credential_ids.len() == 8 {
+            if sources.unavailable_public_keys.contains(&public) {
+                identities_complete = false;
                 notes.push(ExportNote {
                     machine: machine.id.clone(),
                     route: Some(route_name.to_string()),
                     message: format!(
-                        "the phone offers at most 8 identities per route; {} is not offered",
-                        identity.display()
+                        "public identity source {} could not be read safely or exceeded the snapshot budget; no partial identity list was exported and this route remains blocked",
+                        public.display()
                     ),
                 });
+                break;
+            }
+            let public_text = sources.public_keys.get(&public);
+            let key = match public_text.and_then(|text| {
+                let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+                let key = PublicKey::parse_line(lines.next()?);
+                if lines.next().is_some() {
+                    None
+                } else {
+                    key
+                }
+            }) {
+                Some(key) => key,
+                // Disk snapshots establish absent default identities only
+                // when neither the private file nor its sidecar exists.
+                None if public_text.is_none() && defaults.contains(identity) => continue,
+                None => {
+                    identities_complete = false;
+                    notes.push(ExportNote {
+                        machine: machine.id.clone(),
+                        route: Some(route_name.to_string()),
+                        message: format!(
+                            "no readable public key at {}; no partial identity list was exported and this route remains blocked",
+                            public.display()
+                        ),
+                    });
+                    break;
+                }
+            };
+            let fingerprint = key.fingerprint();
+            let id = format!("c.{}", short_digest(&fingerprint));
+            if candidates
+                .iter()
+                .any(|(candidate, _, _, _)| candidate == &id)
+            {
                 continue;
             }
+            if candidates.len() == MAX_ROUTE_IDENTITIES {
+                identities_complete = false;
+                notes.push(ExportNote {
+                    machine: machine.id.clone(),
+                    route: Some(route_name.to_string()),
+                    message: format!(
+                        "the phone offers at most {} distinct identities per route; no partial identity list was exported and this route remains blocked; select a smaller identity policy",
+                        MAX_ROUTE_IDENTITIES
+                    ),
+                });
+                break;
+            }
+            candidates.push((id, fingerprint, key, identity));
+        }
+        if !identities_complete {
+            candidates.clear();
+        }
+        let mut credential_ids = Vec::with_capacity(candidates.len());
+        for (id, fingerprint, key, identity) in candidates {
             self.credentials.entry(id.clone()).or_insert_with(|| {
                 json!({
                     "id": id,
@@ -1830,7 +1890,10 @@ impl EndpointRecords {
             });
             credential_ids.push(id);
         }
-        if credential_ids.is_empty() && endpoint.authentication_methods.contains(&"publickey") {
+        if identities_complete
+            && credential_ids.is_empty()
+            && endpoint.authentication_methods.contains(&"publickey")
+        {
             notes.push(ExportNote {
                 machine: machine.id.clone(),
                 route: Some(route_name.to_string()),
@@ -1884,6 +1947,9 @@ impl EndpointRecords {
         }
         if let Some(alias) = &endpoint.host_key_alias {
             record["host_key_alias"] = json!(alias);
+        }
+        if !identities_complete {
+            record["required_capabilities"] = json!([UNRESOLVED_POLICY]);
         }
         record
     }
@@ -2361,6 +2427,7 @@ mod tests {
             known_hosts,
             default_known_hosts: defaults,
             public_keys,
+            unavailable_public_keys: BTreeSet::new(),
         }
     }
 
@@ -3047,10 +3114,21 @@ socket = "/run/frankenterm.sock"
     #[test]
     fn missing_optional_keys_do_not_claim_a_password_route_cannot_sign_in() {
         let mut sources = authentication_sources("PreferredAuthentications password,publickey");
+        // This case models genuinely absent default identities. An explicitly
+        // configured identity without its public witness remains unresolved.
+        sources.config = Some(
+            sources
+                .config
+                .unwrap()
+                .replace(" IdentityFile ~/.ssh/trj_ed25519\n", ""),
+        );
         sources.public_keys.clear();
         let export = jump_export(&sources).unwrap();
         assert!(export.identity_files.is_empty());
         assert!(route_trust(&export, "r.app.ssh")["required_capabilities"].is_null());
+        for id in ["r.app.ssh", "r.app.mux"] {
+            assert!(exported_route(&export, id)["required_capabilities"].is_null());
+        }
         assert!(export.notes.iter().any(|note| {
             note.message
                 .contains("other configured authentication methods")
@@ -3066,6 +3144,7 @@ socket = "/run/frankenterm.sock"
                 .replace("password,publickey", "publickey"),
         );
         let export = jump_export(&sources).unwrap();
+        assert!(exported_route(&export, "r.app.ssh")["required_capabilities"].is_null());
         assert!(export
             .notes
             .iter()
@@ -3578,6 +3657,68 @@ socket = "/run/frankenterm.sock"
     }
 
     #[test]
+    fn disk_identity_budgets_leave_explicit_refusals_instead_of_partial_exports() {
+        for (file_count, padded_bytes, blocked) in [
+            (256, 0, false),
+            (257, 0, true),
+            (32, 65_536, false),
+            (33, 65_536, true),
+            (1, 65_537, true),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let home = directory.path().join("home");
+            std::fs::create_dir_all(home.join(".ssh")).unwrap();
+            let mut text = "version = 1\n[[machines.a.routes]]\nid = \"ssh\"\nhost = \"box\"\nuser = \"u\"\nidentity_files = [".to_string();
+            for index in 0..file_count {
+                text.push_str(&format!("\"~/.ssh/k{:03}\", ", index));
+                // Every file names the same key, so this exercises snapshot
+                // limits independently of the eight-distinct-candidate limit.
+                let mut public = fake_key(1);
+                if padded_bytes > public.len() {
+                    public.push_str(&" ".repeat(padded_bytes - public.len()));
+                }
+                write_source(&home.join(format!(".ssh/k{:03}.pub", index)), public);
+            }
+            text.push_str("]\n");
+            let context = InventoryContext {
+                directory: directory.path().to_path_buf(),
+                home,
+            };
+            let inventory = MachineInventory::parse(&text, &context).unwrap();
+            let sources = SshSources::from_disk(&inventory, &context);
+            assert_eq!(!sources.unavailable_public_keys.is_empty(), blocked);
+            let export = export(&inventory, None, &sources, &context).unwrap();
+            let route = exported_route(&export, "r.a.ssh");
+            assert_eq!(
+                route["required_capabilities"] == json!([UNRESOLVED_POLICY]),
+                blocked
+            );
+            assert_eq!(
+                route["credential_refs"].as_array().unwrap().len(),
+                usize::from(!blocked)
+            );
+            assert_eq!(export.identity_files.len(), usize::from(!blocked));
+            assert_eq!(
+                export.document["workspace"]["credentials"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                usize::from(!blocked)
+            );
+            assert_eq!(
+                export
+                    .notes
+                    .iter()
+                    .any(|note| note.message.contains("no partial identity list")),
+                blocked,
+                "{} source files, {} bytes each",
+                file_count,
+                padded_bytes
+            );
+        }
+    }
+
+    #[test]
     fn the_companion_source_names_the_private_key_behind_each_credential() {
         let text = r#"
 version = 1
@@ -3651,29 +3792,168 @@ ssh = "bad"
     }
 
     #[test]
-    fn a_route_offers_at_most_eight_identities_and_says_which_it_left_out() {
-        let mut text = "version = 1\n[[machines.a.routes]]\nid = \"many\"\nhost = \"100.91.120.17\"\nuser = \"u\"\nidentity_files = [".to_string();
-        let mut sources = sources(None);
-        for seed in 0..9u8 {
-            text.push_str(&format!("\"~/.ssh/k{}\", ", seed));
-            sources.public_keys.insert(
-                PathBuf::from(format!("/home/me/.ssh/k{}.pub", seed)),
-                fake_key(seed),
+    fn a_route_admits_its_complete_identity_policy_or_blocks_without_a_prefix() {
+        for (files, distinct, expected) in [(8, true, 8), (9, true, 0), (9, false, 1)] {
+            let mut text = "version = 1\n[[machines.a.routes]]\nid = \"many\"\nhost = \"100.91.120.17\"\nuser = \"u\"\nidentity_files = [".to_string();
+            let mut sources = sources(None);
+            for index in 0..files {
+                text.push_str(&format!("\"~/.ssh/k{}\", ", index));
+                sources.public_keys.insert(
+                    PathBuf::from(format!("/home/me/.ssh/k{}.pub", index)),
+                    fake_key(if distinct { index } else { 1 }),
+                );
+            }
+            text.push_str("]\n[[machines.a.routes]]\nid = \"mux\"\nkind = \"frankenterm_mux\"\nvia = \"many\"\nsocket = \"/run/frankenterm.sock\"\n");
+            let inventory = MachineInventory::parse(&text, &context()).unwrap();
+            let export = export(&inventory, None, &sources, &context()).unwrap();
+            for id in ["r.a.many", "r.a.mux"] {
+                let route = exported_route(&export, id);
+                assert_eq!(route["credential_refs"].as_array().unwrap().len(), expected);
+                assert_eq!(
+                    route["required_capabilities"] == json!([UNRESOLVED_POLICY]),
+                    expected == 0,
+                    "{} files (distinct={}) on {}",
+                    files,
+                    distinct,
+                    id
+                );
+            }
+            assert_eq!(export.identity_files.len(), expected);
+            assert_eq!(
+                export.document["workspace"]["credentials"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                expected,
+                "refused candidates must not survive as unreferenced private-key requests"
+            );
+            assert_eq!(
+                export
+                    .notes
+                    .iter()
+                    .any(|note| note.message.contains("no partial identity list")),
+                expected == 0
             );
         }
-        text.push_str("]\n");
-        let inventory = MachineInventory::parse(&text, &context()).unwrap();
-        let export = export(&inventory, None, &sources, &context()).unwrap();
-        let route = &export.document["workspace"]["routes"][0];
-        assert_eq!(route["credential_refs"].as_array().unwrap().len(), 8);
-        let messages: Vec<String> = export.notes.iter().map(ToString::to_string).collect();
-        assert!(
-            messages
-                .iter()
-                .any(|m| m.contains("at most 8 identities") && m.contains("/home/me/.ssh/k8")),
-            "{:?}",
-            messages
-        );
+    }
+
+    #[test]
+    fn an_unavailable_identity_blocks_only_its_route_and_every_mux_copy() {
+        for alias in ["app", "first"] {
+            let mut sources = jump_sources();
+            let unavailable = context().home.join(format!(".ssh/{}.pub", alias));
+            // Unavailability wins even if an earlier snapshot entry survived.
+            sources.unavailable_public_keys.insert(unavailable);
+            let export = jump_export(&sources).unwrap();
+            let blocked_host = if alias == "app" {
+                "service.internal"
+            } else {
+                "outer.example"
+            };
+            let mut blocked_ids = Vec::new();
+            for route in export.document["workspace"]["routes"].as_array().unwrap() {
+                let blocked = route["host"] == blocked_host;
+                assert_eq!(
+                    route["credential_refs"].as_array().unwrap().len(),
+                    usize::from(!blocked)
+                );
+                assert_eq!(
+                    route["required_capabilities"] == json!([UNRESOLVED_POLICY]),
+                    blocked
+                );
+                if blocked {
+                    blocked_ids.push(route["id"].clone());
+                }
+            }
+            if alias == "first" {
+                for id in ["r.app.ssh", "r.app.mux"] {
+                    assert!(exported_route(&export, id)["jump_routes"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&blocked_ids[0]));
+                }
+            } else {
+                assert_eq!(blocked_ids.len(), 2, "SSH and mux share the refusal");
+            }
+            assert_eq!(export.identity_files.len(), 3);
+            assert!(!export
+                .identity_files
+                .values()
+                .any(|path| path == &context().home.join(format!(".ssh/{}", alias))));
+        }
+    }
+
+    #[test]
+    fn malformed_or_unresolved_sidecars_cannot_publish_other_identity_candidates() {
+        let inventory = MachineInventory::parse(
+            "version = 1\n[[machines.a.routes]]\nid = \"ssh\"\nhost = \"box\"\nuser = \"u\"\nidentity_files = [\"~/.ssh/trj_ed25519\", \"~/.ssh/second\"]\n",
+            &context(),
+        )
+        .unwrap();
+        for sidecar in [
+            None,
+            Some("not a public key".to_string()),
+            Some(format!("{}\n{}\n", fake_key(1), fake_key(2))),
+        ] {
+            let mut sources = sources(None);
+            if let Some(text) = sidecar {
+                sources
+                    .public_keys
+                    .insert(context().home.join(".ssh/second.pub"), text);
+            }
+            let export = export(&inventory, None, &sources, &context()).unwrap();
+            let route = exported_route(&export, "r.a.ssh");
+            assert_eq!(route["credential_refs"], json!([]));
+            assert_eq!(route["required_capabilities"], json!([UNRESOLVED_POLICY]));
+            assert!(export.identity_files.is_empty());
+            assert_eq!(export.document["workspace"]["credentials"], json!([]));
+        }
+    }
+
+    #[test]
+    fn a_missing_default_sidecar_is_not_evidence_that_its_private_identity_is_absent() {
+        for state in ["absent", "private_only", "malformed_public"] {
+            let directory = tempfile::tempdir().unwrap();
+            let home = directory.path().join("home");
+            std::fs::create_dir_all(home.join(".ssh")).unwrap();
+            // The first default candidate is available. A later unresolved
+            // default must prevent it from becoming a partial ready policy.
+            write_source(&home.join(".ssh/id_ecdsa.pub"), fake_key(1));
+            if state == "private_only" {
+                write_source(&home.join(".ssh/id_ed25519"), "PRIVATE-MATERIAL-NOT-READ");
+            } else if state == "malformed_public" {
+                write_source(&home.join(".ssh/id_ed25519.pub"), "not a public key");
+            }
+            let context = InventoryContext {
+                directory: directory.path().to_path_buf(),
+                home,
+            };
+            let inventory = MachineInventory::parse(
+                "version = 1\n[[machines.a.routes]]\nid = \"ssh\"\nhost = \"box\"\nuser = \"u\"\n",
+                &context,
+            )
+            .unwrap();
+            let sources = SshSources::from_disk(&inventory, &context);
+            assert_eq!(
+                sources
+                    .unavailable_public_keys
+                    .contains(&context.home.join(".ssh/id_ed25519.pub")),
+                state == "private_only"
+            );
+            let export = export(&inventory, None, &sources, &context).unwrap();
+            let route = exported_route(&export, "r.a.ssh");
+            assert_eq!(
+                route["required_capabilities"] == json!([UNRESOLVED_POLICY]),
+                state != "absent"
+            );
+            assert_eq!(export.identity_files.len(), usize::from(state == "absent"));
+            assert!(!serde_json::to_string(&companion_source(
+                &export,
+                Path::new("/machines.toml")
+            ))
+            .unwrap()
+            .contains("PRIVATE-MATERIAL-NOT-READ"));
+        }
     }
 
     #[test]
