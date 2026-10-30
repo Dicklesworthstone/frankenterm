@@ -539,13 +539,21 @@ svc_start() {  # <logical name>
       local plist target
       plist=$HOME/Library/LaunchAgents/$(unit "$1").plist
       target=$(launchd_target "$(unit "$1")")
-      # Only called when the unit is not running, so a unit an older install
-      # left loaded in gui/ moves to user/ without ending anything.
-      case $target in
-        gui/*) launchctl bootout "$target" 2>/dev/null || true ;;
-      esac
-      launchctl bootstrap "$(launchd_domain)" "$plist" 2>/dev/null \
-        || launchctl kickstart "$(launchd_domain)/$(unit "$1")"
+      # Only called when the unit is not running. A unit loaded in user/
+      # starts where it is; one an older install left loaded in gui/ moves to
+      # user/ without ending anything.
+      if launchctl print "$target" >/dev/null 2>&1; then
+        case $target in
+          user/*) launchctl kickstart "$target"; return ;;
+          gui/*) launchctl bootout "$target" 2>/dev/null || true ;;
+        esac
+      fi
+      # launchd reports a missing plist as "5: Input/output error".
+      [ -f "$plist" ] || { log "$plist is missing; install writes it"; return 1; }
+      # Bootstrap's own error says why a unit cannot load (a malformed plist,
+      # say); the kickstart only covers a load that raced this one.
+      launchctl bootstrap "$(launchd_domain)" "$plist" \
+        || launchctl kickstart "$(launchd_domain)/$(unit "$1")" 2>/dev/null
       ;;
     direct)
       local sub pair envs=()
@@ -927,7 +935,8 @@ cmd_load_units() {  # launchd's login loader: start whatever is not running
   # A unit that fails to start must not keep the later ones from trying: the
   # guardian and mux wait for their predecessor and launchd retries the mux.
   for n in pty-broker pty-guardian mux-server; do
-    svc_active "$n" || svc_start "$n" || log "could not start $n; see $STATE/logs/$n.log"
+    svc_active "$n" || svc_start "$n" \
+      || log "could not start $n (launchctl's error is above; the unit logs to $STATE/logs/$n.log)"
   done
   # A unit still in gui/ (installed by an older version and running since)
   # dies with this GUI session; stop-all and install move it.
