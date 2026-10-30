@@ -520,7 +520,12 @@ private actor MacExportEngine {
 
 private actor MacPhoneKeyEnrollmentWorker {
     func loadRequest(_ url: URL) throws -> WorkspaceKeyEnrollmentRequest {
-        try WorkspaceKeyEnrollmentRequest(data: SelectedLocalFile.read(url, limit: WorkspaceKeyEnrollmentRequest.maximumBytes))
+        let bytes = try SelectedLocalFile.read(url, limit: WorkspaceKeyEnrollmentJournal.maximumBytes)
+        if let request = try? WorkspaceKeyEnrollmentRequest(data: bytes) { return request }
+        // A saved public report preserves the original request needed for
+        // scoped removal. Its accounts and receipts are not new authority:
+        // the current workspace and the user must review targets again.
+        return try WorkspaceKeyEnrollmentJournal(data: bytes).request
     }
 
     private func storage(request: WorkspaceKeyEnrollmentRequest,
@@ -694,13 +699,13 @@ private final class MacPhoneKeyEnrollmentModel {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
         panel.allowedContentTypes = [.json, .data]
-        panel.title = "Open Phone Key Enrollment Request"
-        panel.message = "Choose the original public .ftkeyrequest and verify its fingerprint against the phone or a trusted saved record. Removing an enrollment requires the request used for that installation."
+        panel.title = "Open Phone Key Request or Results"
+        panel.message = "Choose the public .ftkeyrequest or a saved results JSON file. Verify its fingerprint against the phone or a trusted saved record. Removing an enrollment requires its original request; saved results preserve that request."
         guard panel.runModal() == .OK, let url = panel.url, windowOpen, active, !busy else { return }
         // Choosing another file retires the old candidate even if the new file
         // fails validation. An error must not leave the old key approved.
         request = nil; rows = []; selectedTargetIDs = []; reviewDigest = nil; confirmedFingerprint = false
-        perform(failure: "This file is not a valid public phone-key enrollment request.") { [self] token in
+        perform(failure: "This file is not a valid public phone-key enrollment request or saved results report.") { [self] token in
             let loaded = try await worker.loadRequest(url)
             try requireCurrent(token)
             request = loaded; rows = []; selectedTargetIDs = []; reviewDigest = nil; confirmedFingerprint = false
@@ -1755,7 +1760,7 @@ private struct MacExportView: View {
             Text("Authorize or remove an enrollment for an independent phone identity on the accounts you select. Each change uses this Mac's existing trusted SSH access.")
                 .font(.callout).foregroundStyle(.secondary)
             HStack {
-                Button("Open Phone Key Request…") { enrollment.chooseRequest() }.disabled(enrollment.busy)
+                Button("Open Request or Results…") { enrollment.chooseRequest() }.disabled(enrollment.busy)
                 if enrollment.busy {
                     ProgressView().controlSize(.small)
                     Button("Stop Enrollment Work") { enrollment.cancel() }
@@ -1798,7 +1803,7 @@ private struct MacExportView: View {
                         Button("Reconcile Selected Accounts") { enrollment.reconcile() }.disabled(!enrollment.canAct)
                         Button("Save Results…") { enrollment.saveResults() }.disabled(!enrollment.canSaveResults)
                     }
-                    Text("Removal requires the original enrollment request. It disables only the unrestricted entry that enrollment installed, retaining it as a comment. Restricted entries and independently installed copies remain and are reported. Existing SSH sessions and remote processes continue.")
+                    Text("Removal requires the original enrollment request, also retained in saved results. It disables only the unrestricted entry that enrollment installed, retaining it as a comment. Restricted entries and independently installed copies remain and are reported. Existing SSH sessions and remote processes continue.")
                         .font(.caption).foregroundStyle(.secondary)
                     Text("Removal also requires a Linux server whose filesystem supports exclusive access to the key file. Unsupported servers need their normal administrator workflow; their result remains separate from other accounts.")
                         .font(.caption).foregroundStyle(.secondary)
