@@ -47,6 +47,95 @@ fn desktop_current(pdu: Pdu, serial: u64) -> Vec<u8> {
     .expect("the desktop codec encodes the current request")
 }
 
+#[test]
+fn conditional_resize_matches_the_desktop_schema_and_exact_receipt() {
+    let identity = wire::PaneIdentity {
+        session_incarnation: [0x13; 16],
+        durable_pane_id: [0x26; 16],
+        pane_registration: [0x39; 16],
+    };
+    let canonical = codec::PaneIdentityV1 {
+        session_incarnation: mux::MuxSessionIncarnation::from_bytes(identity.session_incarnation),
+        durable_pane_id: identity.durable_pane_id,
+        pane_registration: codec::ReliablePaneRegistrationIdentityV1::from_bytes(
+            identity.pane_registration,
+        ),
+    };
+    let requested = size(17, 39);
+    assert_eq!(
+        phone(
+            wire::ident::RESIZE_PANE_CONDITIONAL,
+            31,
+            &wire::ResizePaneConditional {
+                containing_tab_id: 3,
+                pane_id: 7,
+                identity,
+                size: wire::TerminalSize {
+                    rows: requested.rows,
+                    cols: requested.cols,
+                    pixel_width: requested.pixel_width,
+                    pixel_height: requested.pixel_height,
+                    dpi: requested.dpi
+                },
+            }
+        ),
+        desktop_current(
+            Pdu::ResizePaneConditionalV1(codec::ResizePaneConditionalV1 {
+                containing_tab_id: 3,
+                pane_id: 7,
+                identity: canonical,
+                size: requested,
+            }),
+            31
+        )
+    );
+    for (canonical_outcome, expected) in [
+        (
+            codec::ResizePaneConditionalOutcomeV1::Enqueued,
+            wire::ConditionalResizeOutcome::Enqueued,
+        ),
+        (
+            codec::ResizePaneConditionalOutcomeV1::PaneGone,
+            wire::ConditionalResizeOutcome::PaneGone,
+        ),
+        (
+            codec::ResizePaneConditionalOutcomeV1::IdentityMismatch,
+            wire::ConditionalResizeOutcome::IdentityMismatch,
+        ),
+        (
+            codec::ResizePaneConditionalOutcomeV1::IdentityUnavailable,
+            wire::ConditionalResizeOutcome::IdentityUnavailable,
+        ),
+        (
+            codec::ResizePaneConditionalOutcomeV1::Retired,
+            wire::ConditionalResizeOutcome::Retired,
+        ),
+        (
+            codec::ResizePaneConditionalOutcomeV1::Indeterminate,
+            wire::ConditionalResizeOutcome::Indeterminate,
+        ),
+    ] {
+        let body = varbincode::serialize(&codec::ResizePaneConditionalV1Response {
+            pane_id: 7,
+            identity: canonical,
+            outcome: canonical_outcome,
+        })
+        .unwrap();
+        let response = wire::decode_conditional_resize_receipt(&body).unwrap();
+        assert_eq!(response.pane_id, 7);
+        assert_eq!(response.identity, identity);
+        assert_eq!(response.outcome, expected);
+    }
+    assert_eq!(
+        wire::MAX_CONDITIONAL_RESIZE_RESPONSE_BYTES,
+        codec::MAX_CONDITIONAL_RESIZE_RESPONSE_DECOMPRESSED_BYTES
+    );
+    assert_eq!(
+        wire::MAX_CONDITIONAL_RESIZE_CELLS,
+        codec::MAX_CONDITIONAL_RESIZE_CELLS
+    );
+}
+
 fn key_press(pane_id: usize) -> (wire::SendKeyDown, Pdu) {
     use termwiz::input::{KeyCode, KeyEvent, Modifiers};
     let event = KeyEvent {

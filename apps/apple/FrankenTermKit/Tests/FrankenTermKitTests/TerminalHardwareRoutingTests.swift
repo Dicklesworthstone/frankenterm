@@ -27,6 +27,93 @@ final class TerminalHardwareRoutingTests: XCTestCase {
         }
         XCTAssertEqual(TerminalHardwareRouting.destination(usage: 0x2C, modifiers: [.control], hasMarkedText: false), .textSystem)
     }
+    func testOptionCharacterModeLeavesDeadKeysAndNativeNavigationToTheTextSystem() throws {
+        let preferences = TerminalHardwarePreferences(modifierMapping: .optionForCharacters)
+        for usage: UInt16 in [0x08, 0x2A, 0x2C, 0x4F] {
+            XCTAssertEqual(TerminalHardwareRouting.destination(usage: usage, modifiers: [.alt],
+                hasMarkedText: false, preferences: preferences), .textSystem)
+            XCTAssertThrowsError(try TerminalHardwareRouting.key(usage: usage, modifiers: [.alt],
+                characters: "e", preferences: preferences))
+        }
+        XCTAssertEqual(TerminalHardwareRouting.destination(usage: 0x06, modifiers: [.control],
+            hasMarkedText: false, preferences: preferences), .terminal)
+        let chord = try TerminalHardwareRouting.key(usage: 0x06, modifiers: [.control, .alt],
+            characters: "c", preferences: preferences)
+        XCTAssertEqual(chord.modifiers, [.control, .alt])
+    }
+    func testSwappedModifiersPreserveTheLayoutAndDoNotSwapLabelledHelperKeys() throws {
+        let preferences = TerminalHardwarePreferences(modifierMapping: .swapControlAndOption)
+        let control = try TerminalHardwareRouting.key(usage: 0x06, modifiers: [.alt, .shift, .capsLock],
+            characters: "C", preferences: preferences)
+        XCTAssertEqual(control.usage, 0x06); XCTAssertEqual(control.characters, "C")
+        XCTAssertEqual(control.modifiers, [.control, .shift, .capsLock])
+        let meta = try TerminalHardwareRouting.key(usage: 0x05, modifiers: [.control],
+            characters: "b", preferences: preferences)
+        XCTAssertEqual(meta.modifiers, [.alt])
+        let both = try TerminalHardwareRouting.key(usage: 0x05, modifiers: [.control, .alt],
+            characters: "b", preferences: preferences)
+        XCTAssertEqual(both.modifiers, [.control, .alt])
+        let helper = try TerminalHardwareRouting.key(usage: 0x4F, modifiers: [], characters: "",
+            preferences: preferences, accessoryModifiers: [.control])
+        XCTAssertEqual(helper.modifiers, [.control], "the visible Ctrl helper still means Control")
+    }
+    func testBackspacePreferenceUsesCanonicalControlBackspaceWithTheSameHeldKeyIdentity() throws {
+        let preferences = TerminalHardwarePreferences(backspace: .controlBackspace)
+        let normal = try TerminalHardwareRouting.key(usage: 0x2A, modifiers: [], characters: "",
+            preferences: .init())
+        let mapped = try TerminalHardwareRouting.key(usage: 0x2A, modifiers: [.alt], characters: "",
+            preferences: preferences)
+        XCTAssertEqual(normal.usage, 0x2A); XCTAssertTrue(normal.modifiers.isEmpty)
+        XCTAssertEqual(mapped.usage, normal.usage)
+        XCTAssertEqual(mapped.modifiers, [.control, .alt])
+        let forwardDelete = try TerminalHardwareRouting.key(usage: 0x4C, modifiers: [], characters: "",
+            preferences: preferences)
+        XCTAssertTrue(forwardDelete.modifiers.isEmpty, "the separate forward Delete key is unchanged")
+    }
+    func testEveryMappingPreservesPhysicalSystemShortcutsAndIMEBeforeRemapping() {
+        for mapping in TerminalHardwarePreferences.ModifierMapping.allCases {
+            let preferences = TerminalHardwarePreferences(modifierMapping: mapping, backspace: .controlBackspace)
+            for usage: UInt16 in [0x06, 0x2A, 0x2C, 0x50] {
+                XCTAssertEqual(TerminalHardwareRouting.destination(usage: usage, modifiers: [.command, .alt],
+                    hasMarkedText: false, preferences: preferences), .textSystem)
+                XCTAssertEqual(TerminalHardwareRouting.destination(usage: usage, modifiers: [.control, .alt],
+                    hasMarkedText: true, preferences: preferences), .textSystem)
+            }
+            XCTAssertEqual(TerminalHardwareRouting.destination(usage: 0x2C, modifiers: [.control],
+                hasMarkedText: false, preferences: preferences), .textSystem)
+            XCTAssertThrowsError(try TerminalHardwareRouting.key(usage: 0x2C, modifiers: [.control],
+                characters: " ", preferences: preferences))
+            XCTAssertThrowsError(try TerminalHardwareRouting.key(usage: 0x06, modifiers: [.command],
+                characters: "c", preferences: preferences))
+        }
+    }
+    func testHardwarePreferencesPersistTogetherAndCanReturnToCurrentDefaults() throws {
+        let name = "TerminalHardwarePreferencesTests.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
+        defer { defaults.removePersistentDomain(forName: name) }
+        let store = TerminalHardwarePreferencesStore(defaults: defaults)
+        XCTAssertEqual(store.current, .init())
+        let selected = TerminalHardwarePreferences(modifierMapping: .swapControlAndOption, backspace: .controlBackspace)
+        try store.save(selected)
+        XCTAssertEqual(store.current, selected)
+        XCTAssertEqual(TerminalHardwarePreferencesStore(defaults: defaults).current, selected)
+        try store.save(.init())
+        XCTAssertEqual(TerminalHardwarePreferencesStore(defaults: defaults).current, .init())
+    }
+    func testInvalidOrFutureStoredPreferencesCannotSelectAnUnexpectedMapping() throws {
+        let name = "TerminalHardwarePreferencesTests.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
+        defer { defaults.removePersistentDomain(forName: name) }
+        for bytes in [
+            Data(#"{"version":2,"preferences":{"modifierMapping":"swapControlAndOption","backspace":"controlBackspace"}}"#.utf8),
+            Data(#"{"version":1,"preferences":{"modifierMapping":"unknown","backspace":"delete"}}"#.utf8),
+            Data(#"{"version":1,"preferences":{"backspace":"controlBackspace"}}"#.utf8),
+            Data(repeating: 0x20, count: 1025)
+        ] {
+            defaults.set(bytes, forKey: TerminalHardwarePreferencesStore.storageKey)
+            XCTAssertEqual(TerminalHardwarePreferencesStore(defaults: defaults).current, .init())
+        }
+    }
     func testSoftwareHelperChordsKeepLogicalCharactersAndModifiers() throws {
         let controlC = try TerminalHardwareRouting.accessoryKey(text: "c", modifiers: [.control])
         XCTAssertEqual(controlC.usage, 0x06); XCTAssertEqual(controlC.characters, "c")

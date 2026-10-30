@@ -7403,6 +7403,60 @@ fn sample_pane_identity(
     Ok(outcome.unwrap_or(codec::PaneIdentityOutcomeV1::PaneGone))
 }
 
+/// Validate the client's observation before admitting a deferred resize. The
+/// returned guard is the same exact session/client/pane authority used by the
+/// ordinary mutation path; neither scheduling nor callback dispatch resolves
+/// the numeric pane again. Reading durable identity is not a render request.
+fn admit_conditional_resize(
+    request_authority: &Rc<SessionMutationGuard>,
+    request: &codec::ResizePaneConditionalV1,
+) -> anyhow::Result<Result<SessionPaneMutationGuard, codec::ResizePaneConditionalOutcomeV1>> {
+    use codec::ResizePaneConditionalOutcomeV1 as Outcome;
+    request
+        .validate()
+        .map_err(|_| MuxServerRejection::invalid_request())?;
+    let pane = match request_authority.capture_pane(request.pane_id) {
+        Ok(pane) => pane,
+        Err(SessionAuthorityError::PaneNotFound { .. }) => return Ok(Err(Outcome::PaneGone)),
+        Err(error) => return Err(error.into()),
+    };
+    let registration = pane.registration();
+    let incarnation = request_authority.mux().topology_snapshot_authority()?.0;
+    if request.identity.session_incarnation != incarnation
+        || request.identity.pane_registration.as_bytes() != registration.wire_identity()
+    {
+        return Ok(Err(Outcome::IdentityMismatch));
+    }
+    let durable = pane.try_with_pane(|current| Ok(current.durable_pane_id()))?;
+    // External callbacks may retire a registration. A same-ID successor,
+    // including one restored with the same durable UUID, remains unrelated.
+    if !request_authority
+        .mux()
+        .capture_current_pane(request.pane_id)
+        .is_some_and(|current| current.same_registration(&registration))
+    {
+        return Ok(Err(Outcome::PaneGone));
+    }
+    match durable.filter(|identity| *identity != [0; 16]) {
+        None => Ok(Err(Outcome::IdentityUnavailable)),
+        Some(identity) if identity != request.identity.durable_pane_id => {
+            Ok(Err(Outcome::IdentityMismatch))
+        }
+        Some(_) => Ok(Ok(pane)),
+    }
+}
+
+fn conditional_resize_response(
+    request: &codec::ResizePaneConditionalV1,
+    outcome: codec::ResizePaneConditionalOutcomeV1,
+) -> Pdu {
+    Pdu::ResizePaneConditionalV1Response(codec::ResizePaneConditionalV1Response {
+        pane_id: request.pane_id,
+        identity: request.identity,
+        outcome,
+    })
+}
+
 /// The owning domain of one exact pane registration, named when the domain is
 /// still registered under a name the reply may carry. A pane that retired
 /// after admission is reported `Missing`, like one that never existed.
@@ -8995,6 +9049,66 @@ impl SessionHandler {
                                     pane.activate_pane_direction(direction)?;
                                     Ok(Pdu::UnitResponse(UnitResponse {}))
                                 })
+                            },
+                            send_response,
+                        );
+                    },
+                    send_response,
+                );
+            }
+
+            Pdu::ResizePaneConditionalV1(request) => {
+                let pane_authority = match recover_line_read_callback(|| {
+                    admit_conditional_resize(&request_authority, &request)
+                }) {
+                    Ok(Ok(pane)) => pane,
+                    Ok(Err(outcome)) => {
+                        send_response(Ok(conditional_resize_response(&request, outcome)));
+                        return;
+                    }
+                    Err(error) => {
+                        send_response(Err(error));
+                        return;
+                    }
+                };
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Topology,
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+                    move |send_response| async move {
+                        catch(
+                            move || {
+                                use codec::ResizePaneConditionalOutcomeV1 as Outcome;
+                                let entered = Cell::new(false);
+                                let outcome = pane_authority.try_with_pane(|pane| {
+                                    entered.set(true);
+                                    // A backend must not change its durable ID
+                                    // during an exact registration's lifetime.
+                                    // Refuse even that violation before resize.
+                                    let outcome = match pane.durable_pane_id() {
+                                        None => Outcome::IdentityUnavailable,
+                                        Some(identity) if identity == [0; 16] => {
+                                            Outcome::IdentityUnavailable
+                                        }
+                                        Some(identity)
+                                            if identity != request.identity.durable_pane_id =>
+                                        {
+                                            Outcome::IdentityMismatch
+                                        }
+                                        Some(_) => match pane
+                                            .resize_in_tab(request.containing_tab_id, request.size)
+                                        {
+                                            Ok(()) => Outcome::Enqueued,
+                                            Err(_) => Outcome::Indeterminate,
+                                        },
+                                    };
+                                    Ok(outcome)
+                                });
+                                let outcome = match outcome {
+                                    Ok(outcome) => outcome,
+                                    Err(_) if !entered.get() => Outcome::Retired,
+                                    Err(_) => Outcome::Indeterminate,
+                                };
+                                Ok(conditional_resize_response(&request, outcome))
                             },
                             send_response,
                         );
@@ -11049,6 +11163,7 @@ impl SessionHandler {
             | Pdu::ListPanesOrderedV1Response { .. }
             | Pdu::GetPaneUserVarsV1Response { .. }
             | Pdu::GetPaneIdentityV1Response { .. }
+            | Pdu::ResizePaneConditionalV1Response { .. }
             | Pdu::ReorderWindowTabsV1Response { .. }
             | Pdu::WindowOrderEventV1 { .. }
             | Pdu::GetPaneRenderDeliveryV1Response { .. }
@@ -14745,6 +14860,8 @@ mod tests {
         key_down_count: AtomicUsize,
         key_down_probe: Option<KeyDownProbe>,
         paste_count: AtomicUsize,
+        resize_count: AtomicUsize,
+        resize_error_after_apply: AtomicBool,
         callback_probe: Option<Arc<dyn Fn() + Send + Sync>>,
         tiered_scrollback_status_probe: Option<Arc<dyn Fn() + Send + Sync>>,
         seqno_on_dimensions: Option<SequenceNo>,
@@ -14783,6 +14900,8 @@ mod tests {
                 key_down_count: AtomicUsize::new(0),
                 key_down_probe: None,
                 paste_count: AtomicUsize::new(0),
+                resize_count: AtomicUsize::new(0),
+                resize_error_after_apply: AtomicBool::new(false),
                 state: Mutex::new(FakePaneState {
                     cursor_position: StableCursorPosition {
                         x: 4,
@@ -15051,6 +15170,7 @@ mod tests {
         }
 
         fn resize(&self, size: TerminalSize) -> anyhow::Result<()> {
+            self.resize_count.fetch_add(1, Ordering::Relaxed);
             let mut state = self.state.lock().unwrap();
             state.dimensions.cols = size.cols;
             state.dimensions.viewport_rows = size.rows;
@@ -15058,6 +15178,9 @@ mod tests {
             state.dimensions.dpi = size.dpi;
             state.dimensions.pixel_width = size.pixel_width;
             state.dimensions.pixel_height = size.pixel_height;
+            if self.resize_error_after_apply.load(Ordering::Relaxed) {
+                anyhow::bail!("injected resize error after effect");
+            }
             Ok(())
         }
 
@@ -17605,6 +17728,304 @@ mod tests {
             current_registration.wire_identity()
         );
         assert_eq!(identity.durable_pane_id, [0x39; 16]);
+    }
+
+    fn conditional_resize_request(
+        mux: &Mux,
+        tab_id: mux::tab::TabId,
+        pane_id: PaneId,
+    ) -> codec::ResizePaneConditionalV1 {
+        let registration = mux.capture_current_pane(pane_id).unwrap();
+        let codec::PaneIdentityOutcomeV1::Available { identity, .. } =
+            sample_pane_identity(mux, Some(&registration)).unwrap()
+        else {
+            panic!("test pane must expose its exact identity");
+        };
+        codec::ResizePaneConditionalV1 {
+            containing_tab_id: tab_id,
+            pane_id,
+            identity,
+            size: TerminalSize {
+                rows: 19,
+                cols: 71,
+                pixel_width: 568,
+                pixel_height: 304,
+                dpi: 96,
+            },
+        }
+    }
+
+    #[test]
+    fn conditional_resize_checks_each_client_witness_before_the_effect_and_preserves_uncertainty() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = SimpleExecutor::new();
+        for fails_after_apply in [false, true] {
+            let mut fake = FakePane::new_with_id(7_081, None);
+            fake.durable_pane_id = Some([0x39; 16]);
+            let pane = Arc::new(fake);
+            let pane_dyn: Arc<dyn Pane> = pane.clone();
+            let tab = Arc::new(mux::tab::Tab::new(&test_tab_size()));
+            tab.assign_pane(&pane_dyn);
+            let (mux, _mux_guard) = install_tab_with_window(&tab);
+            let baseline = pane.resize_count.load(Ordering::Relaxed);
+            pane.resize_error_after_apply
+                .store(fails_after_apply, Ordering::Relaxed);
+            let request = conditional_resize_request(&mux, tab.tab_id(), pane.pane_id);
+            let (sender, captured) = capturing_sender();
+            let mut handler =
+                SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux)))
+                    .unwrap();
+            for field in 0..3 {
+                let mut stale = request;
+                match field {
+                    0 => {
+                        stale.identity.session_incarnation =
+                            mux::MuxSessionIncarnation::from_bytes([0x41; 16])
+                    }
+                    1 => stale.identity.durable_pane_id = [0x42; 16],
+                    2 => {
+                        stale.identity.pane_registration =
+                            ReliablePaneRegistrationIdentityV1::from_bytes([0x43; 16])
+                    }
+                    _ => unreachable!(),
+                }
+                handler.process_one(DecodedPdu {
+                    serial: 600 + field,
+                    pdu: Pdu::ResizePaneConditionalV1(stale),
+                });
+                tick_until_response(&executor, &captured, 1);
+                let Pdu::ResizePaneConditionalV1Response(reply) = take_response(&captured).pdu
+                else {
+                    panic!("typed conditional reply");
+                };
+                assert_eq!(
+                    reply.identity, stale.identity,
+                    "reply echoes the request, not a replacement's authority"
+                );
+                assert_eq!(
+                    reply.outcome,
+                    codec::ResizePaneConditionalOutcomeV1::IdentityMismatch
+                );
+                assert_eq!(
+                    pane.resize_count.load(Ordering::Relaxed),
+                    baseline,
+                    "mismatched field {field} admitted no resize"
+                );
+            }
+            handler.process_one(DecodedPdu {
+                serial: 604,
+                pdu: Pdu::ResizePaneConditionalV1(request),
+            });
+            tick_until_response(&executor, &captured, 1);
+            let Pdu::ResizePaneConditionalV1Response(reply) = take_response(&captured).pdu else {
+                panic!("typed conditional reply");
+            };
+            assert_eq!(reply.identity, request.identity);
+            assert_eq!(
+                reply.outcome,
+                if fails_after_apply {
+                    codec::ResizePaneConditionalOutcomeV1::Indeterminate
+                } else {
+                    codec::ResizePaneConditionalOutcomeV1::Enqueued
+                }
+            );
+            assert_eq!(pane.resize_count.load(Ordering::Relaxed), baseline + 1);
+            assert_eq!(
+                pane.state.lock().unwrap().dimensions.cols,
+                request.size.cols
+            );
+            assert_eq!(
+                pane.state.lock().unwrap().dimensions.viewport_rows,
+                request.size.rows
+            );
+            drop(handler);
+            drain_simple_executor(&executor);
+        }
+    }
+
+    #[test]
+    fn conditional_resize_refuses_same_id_replacement_that_happened_before_request_arrival() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = SimpleExecutor::new();
+        for same_allocation in [false, true] {
+            let mut fake = FakePane::new_with_id(7_082, None);
+            fake.durable_pane_id = Some([0x39; 16]);
+            let original = Arc::new(fake);
+            let original_dyn: Arc<dyn Pane> = original.clone();
+            let tab = Arc::new(mux::tab::Tab::new(&test_tab_size()));
+            tab.assign_pane(&original_dyn);
+            let (mux, _mux_guard) = install_tab_with_window(&tab);
+            let stale = conditional_resize_request(&mux, tab.tab_id(), original.pane_id);
+            assert!(
+                mux.capture_current_pane(original.pane_id)
+                    .unwrap()
+                    .retire_if_current()
+            );
+            let replacement = if same_allocation {
+                original.clone()
+            } else {
+                let mut fake = FakePane::new_with_id(original.pane_id, None);
+                fake.durable_pane_id = Some(stale.identity.durable_pane_id);
+                Arc::new(fake)
+            };
+            let replacement_dyn: Arc<dyn Pane> = replacement.clone();
+            mux.add_pane(&replacement_dyn).unwrap();
+            tab.assign_pane(&replacement_dyn);
+            let current = conditional_resize_request(&mux, tab.tab_id(), replacement.pane_id);
+            assert_ne!(
+                current.identity.pane_registration,
+                stale.identity.pane_registration
+            );
+            let baseline = replacement.resize_count.load(Ordering::Relaxed);
+            let (sender, captured) = capturing_sender();
+            let mut handler =
+                SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux)))
+                    .unwrap();
+            handler.process_one(DecodedPdu {
+                serial: 610,
+                pdu: Pdu::ResizePaneConditionalV1(stale),
+            });
+            tick_until_response(&executor, &captured, 1);
+            let Pdu::ResizePaneConditionalV1Response(reply) = take_response(&captured).pdu else {
+                panic!("typed stale identity refusal");
+            };
+            assert_eq!(
+                reply.outcome,
+                codec::ResizePaneConditionalOutcomeV1::IdentityMismatch
+            );
+            assert_eq!(replacement.resize_count.load(Ordering::Relaxed), baseline);
+            // Positive control proves the replacement is actually reachable in
+            // this tab; a broken tab binding cannot make the negative pass.
+            handler.process_one(DecodedPdu {
+                serial: 611,
+                pdu: Pdu::ResizePaneConditionalV1(current),
+            });
+            tick_until_response(&executor, &captured, 1);
+            let Pdu::ResizePaneConditionalV1Response(reply) = take_response(&captured).pdu else {
+                panic!("typed fresh identity reply");
+            };
+            assert_eq!(
+                reply.outcome,
+                codec::ResizePaneConditionalOutcomeV1::Enqueued
+            );
+            assert_eq!(
+                replacement.resize_count.load(Ordering::Relaxed),
+                baseline + 1
+            );
+            drop(handler);
+            drain_simple_executor(&executor);
+        }
+    }
+
+    #[test]
+    fn conditional_resize_retains_the_original_operation_guard_until_deferred_work_retires() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = SimpleExecutor::new();
+        let mut fake = FakePane::new_with_id(7_083, None);
+        fake.durable_pane_id = Some([0x39; 16]);
+        let pane = Arc::new(fake);
+        let pane_dyn: Arc<dyn Pane> = pane.clone();
+        let tab = Arc::new(mux::tab::Tab::new(&test_tab_size()));
+        tab.assign_pane(&pane_dyn);
+        let (mux, _mux_guard) = install_tab_with_window(&tab);
+        let request = conditional_resize_request(&mux, tab.tab_id(), pane.pane_id);
+        let baseline = pane.resize_count.load(Ordering::Relaxed);
+        let registration = mux.capture_current_pane(pane.pane_id).unwrap();
+        let (sender, captured) = capturing_sender();
+        let mut handler =
+            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux))).unwrap();
+        handler.process_one(DecodedPdu {
+            serial: 620,
+            pdu: Pdu::ResizePaneConditionalV1(request),
+        });
+        assert!(registration.retire_if_current());
+        assert!(
+            mux.add_pane(&pane_dyn).is_err(),
+            "queued work holds the exact existing operation fence"
+        );
+        // An admitted old-generation operation is allowed to finish on that
+        // original pane; cancelling its owning connection must instead stop
+        // the deferred callback and release the existing retirement fence.
+        drop(handler);
+        drain_simple_executor(&executor);
+        assert!(captured.lock().unwrap().is_empty());
+        assert_eq!(pane.resize_count.load(Ordering::Relaxed), baseline);
+        mux.add_pane(&pane_dyn).unwrap();
+    }
+
+    #[test]
+    fn conditional_resize_missing_identity_and_invalid_geometry_are_zero_effect() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = SimpleExecutor::new();
+        let pane = Arc::new(FakePane::new_with_id(7_084, None));
+        let pane_dyn: Arc<dyn Pane> = pane.clone();
+        let tab = Arc::new(mux::tab::Tab::new(&test_tab_size()));
+        tab.assign_pane(&pane_dyn);
+        let (mux, _mux_guard) = install_tab_with_window(&tab);
+        let baseline = pane.resize_count.load(Ordering::Relaxed);
+        let request = codec::ResizePaneConditionalV1 {
+            pane_id: pane.pane_id,
+            containing_tab_id: tab.tab_id(),
+            identity: codec::PaneIdentityV1 {
+                session_incarnation: mux.topology_snapshot_authority().unwrap().0,
+                durable_pane_id: [0x39; 16],
+                pane_registration: ReliablePaneRegistrationIdentityV1::from_bytes(
+                    mux.capture_current_pane(pane.pane_id)
+                        .unwrap()
+                        .wire_identity(),
+                ),
+            },
+            size: TerminalSize::default(),
+        };
+        let (sender, captured) = capturing_sender();
+        let mut handler =
+            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux))).unwrap();
+        for (serial, request, expected) in [
+            (
+                630,
+                request,
+                codec::ResizePaneConditionalOutcomeV1::IdentityUnavailable,
+            ),
+            (
+                631,
+                codec::ResizePaneConditionalV1 {
+                    pane_id: 7_085,
+                    ..request
+                },
+                codec::ResizePaneConditionalOutcomeV1::PaneGone,
+            ),
+        ] {
+            handler.process_one(DecodedPdu {
+                serial,
+                pdu: Pdu::ResizePaneConditionalV1(request),
+            });
+            tick_until_response(&executor, &captured, 1);
+            let Pdu::ResizePaneConditionalV1Response(reply) = take_response(&captured).pdu else {
+                panic!("typed refusal");
+            };
+            assert_eq!(reply.outcome, expected);
+        }
+        let mut invalid = request;
+        invalid.size.rows = 0;
+        handler.process_one(DecodedPdu {
+            serial: 632,
+            pdu: Pdu::ResizePaneConditionalV1(invalid),
+        });
+        tick_until_response(&executor, &captured, 1);
+        let Pdu::ErrorResponse(reply) = take_response(&captured).pdu else {
+            panic!("invalid geometry must not reach resize");
+        };
+        assert_eq!(reply.effect, MuxErrorEffect::NOT_APPLIED);
+        assert_eq!(reply.code, MuxErrorCode::INVALID_REQUEST);
+        assert_eq!(pane.resize_count.load(Ordering::Relaxed), baseline);
     }
 
     #[test]

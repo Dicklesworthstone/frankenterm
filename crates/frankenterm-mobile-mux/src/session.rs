@@ -168,6 +168,7 @@ enum Request {
     Lines {
         pane_id: usize,
         ranges: Vec<Range<StableRowIndex>>,
+        layout: Option<wire::LineReadLayout>,
     },
     /// A resize of a shown pane, whose drawing waits for the answer.
     Resize {
@@ -177,6 +178,11 @@ enum Request {
     /// a saved recovery record, and only while this restore is still current.
     RestoreSize {
         pane_id: usize,
+    },
+    /// One conditional geometry operation per pane may be on the wire. Its
+    /// serial, full source witness and original deadline survive newer intents.
+    ConditionalResize {
+        intent: ResizeIntent,
     },
     /// Asks for the pane's changes once a resize is answered, so its new
     /// size arrives even when the program has not redrawn.
@@ -212,6 +218,9 @@ pub const INPUT_DEADLINE_NS: u64 = 5_000_000_000;
 /// an input serial or subscribe to a pane's output.
 pub const MAX_IDENTITY_QUERIES: usize = 8;
 pub const IDENTITY_QUERY_DEADLINE_NS: u64 = 5_000_000_000;
+pub const CONDITIONAL_RESIZE_DEADLINE_NS: u64 = 5_000_000_000;
+pub const MAX_CONDITIONAL_RESIZE_PANES: usize = 32;
+const RESTORE_OBSERVATION_INTERVAL_NS: u64 = 100_000_000;
 /// At most this many proven-no-effect retransmissions per admitted operation.
 pub const MAX_INPUT_RETRIES: u8 = 8;
 const MIN_INPUT_RETRY_DELAY_NS: u64 = 1_000_000;
@@ -296,6 +305,22 @@ struct PaneSizing {
     /// A successful restore advances it past every already-issued request,
     /// excluding delayed snapshots captured before its acknowledgement.
     desktop_list_after: u64,
+    /// A v72 enqueue receipt cannot prove that asynchronous reflow finished.
+    /// Keep the original desktop target until a newer list actually shows it.
+    restore_observation: Option<RestoreObservation>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RestoreObservation {
+    deadline_ns: u64,
+    next_read_ns: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResizeIntent {
+    request: wire::ResizePaneConditional,
+    restore: bool,
+    deadline_ns: u64,
 }
 
 /// A pane whose render read a current server refused as safe to repeat.
@@ -327,6 +352,10 @@ pub struct Session {
     listed_marks: HashMap<usize, ListedMark>,
     mirrors: HashMap<usize, PaneMirror>,
     sizing: HashMap<usize, PaneSizing>,
+    /// At most one unsent successor per in-flight conditional resize. A
+    /// newer desired grid replaces only this unsent intent, never the receipt
+    /// authority or deadline of the operation already on the wire.
+    resize_successors: HashMap<usize, ResizeIntent>,
     /// Whether each mirrored pane's program has asked for the mouse.
     grabs: HashMap<usize, bool>,
     events: VecDeque<Event>,
@@ -407,6 +436,34 @@ impl Session {
                 identity: None,
             });
         }
+        if self.requests.values().any(|request| {
+            matches!(request, Request::ConditionalResize { intent } if now_ns >= intent.deadline_ns)
+        }) || self
+            .resize_successors
+            .values()
+            .any(|intent| now_ns >= intent.deadline_ns)
+        {
+            self.fail("the mux size request was not confirmed before its deadline; it was not replayed".to_owned());
+            return false;
+        }
+        let mut read_restoration = false;
+        for sizing in self.sizing.values_mut() {
+            let Some(observation) = &mut sizing.restore_observation else {
+                continue;
+            };
+            if now_ns >= observation.deadline_ns {
+                // No proof of reflow: retain the durable recovery record and
+                // stop polling. A later deliberate restore is still possible.
+                sizing.restore_observation = None;
+                sizing.phone_until = Some(u64::MAX);
+            } else if now_ns >= observation.next_read_ns {
+                observation.next_read_ns = now_ns.saturating_add(RESTORE_OBSERVATION_INTERVAL_NS);
+                read_restoration = true;
+            }
+        }
+        if read_restoration {
+            self.refresh_panes();
+        }
         if self
             .ordered_input
             .iter()
@@ -447,8 +504,20 @@ impl Session {
             )
             .chain(self.requests.values().filter_map(|request| match request {
                 Request::InspectPaneIdentity { deadline_ns, .. } => Some(*deadline_ns),
+                Request::ConditionalResize { intent } => Some(intent.deadline_ns),
                 _ => None,
             }))
+            .chain(
+                self.resize_successors
+                    .values()
+                    .map(|intent| intent.deadline_ns),
+            )
+            .chain(
+                self.sizing
+                    .values()
+                    .filter_map(|sizing| sizing.restore_observation)
+                    .map(|observation| observation.deadline_ns.min(observation.next_read_ns)),
+            )
             .min()
     }
 
@@ -615,7 +684,9 @@ impl Session {
         }
         if let Some(mirror) = self.mirrors.get_mut(&pane_id) {
             mirror.show();
-            if !matches!(
+            if self.codec_version >= wire::OBSERVED_LINES_MIN_VERSION {
+                self.poll(pane_id);
+            } else if !matches!(
                 self.authorities.get(&pane_id),
                 Some(PaneAuthority::Pending(_))
             ) {
@@ -634,11 +705,30 @@ impl Session {
     }
 
     fn subscribe(&mut self, pane_id: usize) {
+        let observed = self.codec_version >= wire::OBSERVED_LINES_MIN_VERSION;
+        if observed && let Some(mirror) = self.mirrors.get_mut(&pane_id) {
+            mirror.require_observation();
+        }
+        if observed && self.size_effect_pending(pane_id) {
+            // The final size receipt starts the observation. A retry of an
+            // earlier subscribe must not open that newer presentation gate.
+            return;
+        }
         self.send(
-            ident::GET_PANE_RENDER_CHANGES,
+            if observed {
+                ident::GET_PANE_RENDER_STATE
+            } else {
+                ident::GET_PANE_RENDER_CHANGES
+            },
             &GetPaneRenderChanges { pane_id },
             Request::Subscribe { pane_id },
         );
+        if observed
+            && !self.failed
+            && let Some(mirror) = self.mirrors.get_mut(&pane_id)
+        {
+            mirror.expect_observation(self.next_serial);
+        }
     }
 
     /// Capture server authority before subscribing/rendering, never lazily
@@ -1053,23 +1143,40 @@ impl Session {
             desktop: pane.size,
             phone_until: None,
             desktop_list_after: 0,
+            restore_observation: None,
         });
         sizing.phone_until = Some(u64::MAX);
+        sizing.restore_observation = None;
         let desktop = sizing.desktop;
+        let Some(pixel_width) = (desktop.pixel_width / desktop.cols.max(1)).checked_mul(cols)
+        else {
+            self.fail("the requested terminal width overflowed its geometry".to_owned());
+            return;
+        };
+        let Some(pixel_height) = (desktop.pixel_height / desktop.rows.max(1)).checked_mul(rows)
+        else {
+            self.fail("the requested terminal height overflowed its geometry".to_owned());
+            return;
+        };
         let size = TerminalSize {
             rows,
             cols,
-            pixel_width: desktop.pixel_width / desktop.cols.max(1) * cols,
-            pixel_height: desktop.pixel_height / desktop.rows.max(1) * rows,
+            pixel_width,
+            pixel_height,
             dpi: desktop.dpi,
         };
         let request = if let Some(mirror) = self.mirrors.get_mut(&pane_id) {
             mirror.expect_size(rows, cols);
+            if self.codec_version >= wire::OBSERVED_LINES_MIN_VERSION {
+                mirror.require_observation();
+            }
             Request::Resize { pane_id }
         } else {
             Request::Action
         };
-        self.send_resize(tab_id, pane_id, size, request);
+        if !self.send_resize(tab_id, pane_id, size, request) {
+            return;
+        }
         self.events.push_back(Event::PhoneSize {
             pane_id,
             desktop: Some(desktop),
@@ -1082,7 +1189,9 @@ impl Session {
     /// (`rows` by `cols`, from its [`Event::PhoneSize`]) without giving the
     /// desktop's back, so [`Session::restore_size`] returns `desktop`. Only a
     /// pane still listed at exactly that size is taken over: one the desktop
-    /// resized since, or another pane under a reused id, is left alone.
+    /// resized since is left alone. On v72, an exact identity must also have
+    /// been read on this connection, and every eventual restore carries it
+    /// to the server; a numeric ID and matching dimensions are insufficient.
     pub fn adopt_phone_size(
         &mut self,
         pane_id: usize,
@@ -1093,7 +1202,13 @@ impl Session {
         let still_phone_sized = self.panes.iter().any(|pane| {
             pane.pane_id == pane_id && (pane.size.rows, pane.size.cols) == (rows, cols)
         });
-        if !self.is_ready() || !still_phone_sized || (desktop.rows, desktop.cols) == (rows, cols) {
+        if !self.is_ready()
+            || !still_phone_sized
+            || (desktop.rows, desktop.cols) == (rows, cols)
+            || (self.conditional_resize_enabled()
+                && (!self.identities.contains_key(&pane_id)
+                    || !wire::conditional_resize_size_is_valid(desktop)))
+        {
             return false;
         }
         self.sizing.insert(
@@ -1102,6 +1217,7 @@ impl Session {
                 desktop,
                 phone_until: Some(u64::MAX),
                 desktop_list_after: 0,
+                restore_observation: None,
             },
         );
         true
@@ -1129,6 +1245,9 @@ impl Session {
         }
         if let Some(mirror) = self.mirrors.get_mut(&pane_id) {
             mirror.size_settled();
+            if self.codec_version >= wire::OBSERVED_LINES_MIN_VERSION {
+                mirror.require_observation();
+            }
         }
         self.send_resize(
             tab_id,
@@ -1136,10 +1255,6 @@ impl Session {
             sizing.desktop,
             Request::RestoreSize { pane_id },
         );
-        let restored = self.next_serial;
-        if let Some(sizing) = self.sizing.get_mut(&pane_id) {
-            sizing.phone_until = Some(restored);
-        }
     }
 
     /// Whether a size [`Session::restore_size`] gave back is still
@@ -1148,10 +1263,11 @@ impl Session {
     /// what it has not forwarded when its channel closes.
     pub fn restoring(&self) -> bool {
         !self.failed
-            && self.sizing.values().any(|sizing| {
+            && (self.sizing.values().any(|sizing| {
                 matches!(sizing.phone_until,
                     Some(serial) if serial != u64::MAX && self.requests.contains_key(&serial))
-            })
+                    || sizing.restore_observation.is_some()
+            }) || self.resize_successors.values().any(|intent| intent.restore))
     }
 
     /// Whether input sent to the pane ([`Session::write`], [`Session::paste`],
@@ -1449,13 +1565,95 @@ impl Session {
         Ok(())
     }
 
-    fn send_resize(&mut self, tab_id: usize, pane_id: usize, size: TerminalSize, request: Request) {
+    fn conditional_resize_enabled(&self) -> bool {
+        self.dialect == Dialect::Current
+            && self.codec_version >= wire::CONDITIONAL_RESIZE_MIN_VERSION
+    }
+
+    fn send_resize(
+        &mut self,
+        tab_id: usize,
+        pane_id: usize,
+        size: TerminalSize,
+        request: Request,
+    ) -> bool {
+        let restore = matches!(&request, Request::RestoreSize { .. });
+        if self.conditional_resize_enabled() {
+            let Some(identity) = self.identities.get(&pane_id).copied() else {
+                self.fail(
+                    "the mux pane's exact identity is unavailable; its shared size was not changed"
+                        .to_owned(),
+                );
+                return false;
+            };
+            if !wire::conditional_resize_size_is_valid(size) {
+                self.fail(
+                    "the requested terminal size exceeds the bounded mux geometry profile"
+                        .to_owned(),
+                );
+                return false;
+            }
+            let Some(deadline_ns) = self
+                .monotonic_ns
+                .and_then(|now| now.checked_add(CONDITIONAL_RESIZE_DEADLINE_NS))
+            else {
+                self.fail("the mux size request has no bounded owner clock".to_owned());
+                return false;
+            };
+            let intent = ResizeIntent {
+                request: wire::ResizePaneConditional {
+                    containing_tab_id: tab_id,
+                    pane_id,
+                    identity,
+                    size,
+                },
+                restore,
+                deadline_ns,
+            };
+            if self.requests.values().any(|request| {
+                matches!(request, Request::ConditionalResize { intent } if intent.request.pane_id == pane_id)
+            }) {
+                self.resize_successors.insert(pane_id, intent);
+                return true;
+            }
+            return self.dispatch_conditional_resize(intent);
+        }
         let resize = Resize {
             containing_tab_id: tab_id,
             pane_id,
             size,
         };
         self.send(ident::RESIZE, &resize, request);
+        if restore && !self.failed {
+            if let Some(sizing) = self.sizing.get_mut(&pane_id) {
+                sizing.phone_until = Some(self.next_serial);
+            }
+        }
+        !self.failed
+    }
+
+    fn dispatch_conditional_resize(&mut self, intent: ResizeIntent) -> bool {
+        if self
+            .requests
+            .values()
+            .filter(|request| matches!(request, Request::ConditionalResize { .. }))
+            .count()
+            >= MAX_CONDITIONAL_RESIZE_PANES
+        {
+            self.fail("too many mux panes have unconfirmed size requests".to_owned());
+            return false;
+        }
+        self.send(
+            ident::RESIZE_PANE_CONDITIONAL,
+            &intent.request,
+            Request::ConditionalResize { intent },
+        );
+        if intent.restore && !self.failed {
+            if let Some(sizing) = self.sizing.get_mut(&intent.request.pane_id) {
+                sizing.phone_until = Some(self.next_serial);
+            }
+        }
+        !self.failed
     }
 
     fn send<T: serde::Serialize>(&mut self, pdu: u64, body: &T, request: Request) {
@@ -1484,6 +1682,7 @@ impl Session {
             self.interrupted_input.extend(self.input.pending_panes());
             self.ordered_input.clear();
             self.ordered_input_bytes = 0;
+            self.resize_successors.clear();
             self.outgoing.clear();
             self.input.clear();
             self.events.push_back(Event::Failed { reason });
@@ -1545,8 +1744,23 @@ impl Session {
                 desktop: pane.size,
                 phone_until: None,
                 desktop_list_after: 0,
+                restore_observation: None,
             });
             if serial <= sizing.desktop_list_after {
+                continue;
+            }
+            if sizing.restore_observation.is_some() {
+                // The receipt acknowledged enqueue only. A fresh list with
+                // the actual target grid is the restoration evidence. An old
+                // phone-sized snapshot must not overwrite the recovery target.
+                if pane.size == sizing.desktop {
+                    sizing.restore_observation = None;
+                    sizing.phone_until = None;
+                    sizing.desktop_list_after = serial;
+                    self.events.push_back(Event::PhoneSizeRestored {
+                        pane_id: pane.pane_id,
+                    });
+                }
                 continue;
             }
             match sizing.phone_until {
@@ -1619,6 +1833,47 @@ impl Session {
                 _ => Err(crate::Error::Frame("a reply too large to read")),
             };
         }
+        if self.codec_version >= wire::OBSERVED_LINES_MIN_VERSION {
+            match &request {
+                Some(Request::Subscribe { pane_id } | Request::Poll { pane_id }) => {
+                    if !self
+                        .mirrors
+                        .get(pane_id)
+                        .is_some_and(|mirror| mirror.expects_observation(frame.serial))
+                    {
+                        // A hidden/reopened view or a newer poll owns a different
+                        // request. This reply cannot settle that view's gate.
+                        return Ok(());
+                    }
+                    if !matches!(
+                        frame.ident,
+                        ident::GET_PANE_RENDER_CHANGES_RESPONSE
+                            | ident::LIVENESS_RESPONSE
+                            | ident::ERROR_RESPONSE
+                    ) {
+                        return Err(crate::Error::Schema);
+                    }
+                    if frame.ident == ident::ERROR_RESPONSE {
+                        let error: wire::ErrorResponse = wire::decode_input_receipt(&frame.body)?;
+                        if error.schema_version != 1
+                            || error.request_ident != ident::GET_PANE_RENDER_STATE
+                        {
+                            return Err(crate::Error::Schema);
+                        }
+                    }
+                }
+                Some(Request::Lines {
+                    layout: Some(_), ..
+                }) if !matches!(
+                    frame.ident,
+                    ident::GET_LINES_AT_LAYOUT_RESPONSE | ident::ERROR_RESPONSE
+                ) =>
+                {
+                    return Err(crate::Error::Schema);
+                }
+                _ => {}
+            }
+        }
         if let Some(Request::InspectPaneIdentity { pane_id, .. }) = &request {
             let pane_id = *pane_id;
             // Removal retires a pending query; a late reply must not restore
@@ -1661,6 +1916,74 @@ impl Session {
                         pane_id,
                         identity: None,
                     });
+                }
+            }
+            return Ok(());
+        }
+        if let Some(Request::ConditionalResize { intent }) = &request {
+            let intent = *intent;
+            if frame.ident == ident::ERROR_RESPONSE {
+                self.fail("the mux refused a conditional size request; its outcome was not replayed through a numeric resize".to_owned());
+                return Ok(());
+            }
+            if frame.ident != ident::RESIZE_PANE_CONDITIONAL_RESPONSE {
+                return Err(crate::Error::Frame(
+                    "a conditional size request received an unexpected reply",
+                ));
+            }
+            let response = wire::decode_conditional_resize_receipt(&frame.body)?;
+            let pane_id = intent.request.pane_id;
+            if response.pane_id != pane_id
+                || response.identity != intent.request.identity
+                || self.identities.get(&pane_id) != Some(&intent.request.identity)
+            {
+                return Err(crate::Error::Frame(
+                    "a size receipt does not match its exact pane request",
+                ));
+            }
+            match response.outcome {
+                wire::ConditionalResizeOutcome::Enqueued => {
+                    if intent.restore && !self.resize_successors.contains_key(&pane_id) {
+                        if let Some(sizing) = self.sizing.get_mut(&pane_id)
+                            && sizing.phone_until == Some(frame.serial)
+                        {
+                            sizing.desktop_list_after = self.next_serial;
+                            sizing.restore_observation = Some(RestoreObservation {
+                                deadline_ns: intent.deadline_ns,
+                                next_read_ns: self
+                                    .monotonic_ns
+                                    .unwrap_or(0)
+                                    .saturating_add(RESTORE_OBSERVATION_INTERVAL_NS),
+                            });
+                            self.refresh_panes();
+                        }
+                    }
+                    if !self.resize_successors.contains_key(&pane_id) {
+                        // Even a restore can supersede an outstanding phone
+                        // resize. Its fresh render read releases that view's
+                        // gate; the independent pane list still proves when
+                        // the requested desktop geometry was actually applied.
+                        self.poll(pane_id);
+                    }
+                    if let Some(successor) = self.resize_successors.remove(&pane_id) {
+                        self.dispatch_conditional_resize(successor);
+                    }
+                }
+                wire::ConditionalResizeOutcome::PaneGone => self.pane_gone(pane_id),
+                wire::ConditionalResizeOutcome::IdentityMismatch => {
+                    self.fail("the mux pane was replaced before its size request; the replacement was not resized".to_owned());
+                }
+                wire::ConditionalResizeOutcome::IdentityUnavailable => {
+                    self.fail("the mux could not verify this pane for its size request; its shared size was not changed".to_owned());
+                }
+                wire::ConditionalResizeOutcome::Retired => {
+                    self.fail(
+                        "the mux retired this pane's size authority before admitting the request"
+                            .to_owned(),
+                    );
+                }
+                wire::ConditionalResizeOutcome::Indeterminate => {
+                    self.fail("the mux could not confirm whether a size request was enqueued; it was not replayed".to_owned());
                 }
             }
             return Ok(());
@@ -1901,12 +2224,44 @@ impl Session {
             }
             ident::GET_PANE_RENDER_CHANGES_RESPONSE => {
                 let PanePrefix { pane_id } = wire::decode(&frame.body)?;
+                let correlated = match request {
+                    Some(
+                        Request::Subscribe { pane_id: expected }
+                        | Request::Poll { pane_id: expected },
+                    ) if expected == pane_id => true,
+                    None => false,
+                    _ => return Err(crate::Error::Schema),
+                };
                 if self.mirrors.contains_key(&pane_id) {
-                    // A line this client cannot read (v46 image cells) costs
-                    // that update's lines, not the connection.
-                    let (head, lines) = match wire::decode::<RenderChanges>(&frame.body) {
-                        Ok(changes) => (changes.head, Some(changes.bonus_lines)),
-                        Err(_) => (wire::decode::<RenderHead>(&frame.body)?, None),
+                    let (head, lines) = if self.codec_version >= wire::OBSERVED_LINES_MIN_VERSION {
+                        let changes: wire::RenderObservation =
+                            wire::decode_observation(&frame.body)?;
+                        if changes.seqno == usize::MAX {
+                            return Err(crate::Error::Schema);
+                        }
+                        let layout = wire::LineReadLayout {
+                            seqno: changes.seqno,
+                            dimensions: changes.head.dimensions,
+                        };
+                        let Some(mirror) = self.mirrors.get_mut(&pane_id) else {
+                            return Ok(());
+                        };
+                        let accepted = mirror.observe(layout, correlated);
+                        if matches!(request, Some(Request::Poll { .. })) {
+                            mirror.size_settled();
+                        }
+                        if !accepted {
+                            self.advance(pane_id);
+                            return Ok(());
+                        }
+                        (changes.head, Some(changes.bonus_lines.entries))
+                    } else {
+                        // Legacy image cells can lack a decodable line prefix.
+                        // Current observed reads never downgrade this way.
+                        match wire::decode::<RenderChanges>(&frame.body) {
+                            Ok(changes) => (changes.head, Some(changes.bonus_lines)),
+                            Err(_) => (wire::decode::<RenderHead>(&frame.body)?, None),
+                        }
                     };
                     self.update_title(pane_id, &head.title);
                     let grabbed = head.mouse_grabbed;
@@ -1922,11 +2277,22 @@ impl Session {
                 }
             }
             ident::GET_LINES_RESPONSE => {
-                let lines = wire::decode::<LinesResponse>(&frame.body)
-                    .map(|reply| reply.lines)
-                    .unwrap_or_default();
+                let reply = wire::decode::<LinesResponse>(&frame.body);
+                if let Some(Request::Lines {
+                    pane_id, layout, ..
+                }) = &request
+                {
+                    if layout.is_some()
+                        || reply.as_ref().is_ok_and(|reply| reply.pane_id != *pane_id)
+                    {
+                        return Err(crate::Error::Schema);
+                    }
+                }
+                let lines = reply.map(|reply| reply.lines).unwrap_or_default();
                 match request {
-                    Some(Request::Lines { pane_id, ranges }) => {
+                    Some(Request::Lines {
+                        pane_id, ranges, ..
+                    }) => {
                         if let Some(mirror) = self.mirrors.get_mut(&pane_id) {
                             mirror.apply_lines(lines, &ranges);
                         }
@@ -1961,6 +2327,26 @@ impl Session {
                     _ => {}
                 }
             }
+            ident::GET_LINES_AT_LAYOUT_RESPONSE => {
+                let Some(Request::Lines {
+                    pane_id,
+                    ranges,
+                    layout: Some(expected),
+                }) = request
+                else {
+                    return Err(crate::Error::Schema);
+                };
+                let reply: wire::LinesAtLayoutResponse = wire::decode_observation(&frame.body)?;
+                if reply.pane_id != pane_id || reply.layout != expected {
+                    return Err(crate::Error::Frame(
+                        "a line reply does not match its observed layout",
+                    ));
+                }
+                if let Some(mirror) = self.mirrors.get_mut(&pane_id) {
+                    mirror.apply_lines(reply.lines.entries, &ranges);
+                }
+                self.advance(pane_id);
+            }
             ident::SEARCH_SCROLLBACK_RESPONSE => {
                 if let Some(Request::Search { search }) = request {
                     let SearchResults { results } = wire::decode(&frame.body)?;
@@ -1972,6 +2358,14 @@ impl Session {
             }
             ident::LIVENESS_RESPONSE => {
                 let reply: LivenessResponse = wire::decode(&frame.body)?;
+                if let Some(Request::Subscribe { pane_id } | Request::Poll { pane_id }) = request {
+                    if pane_id != reply.pane_id
+                        || (reply.is_alive
+                            && self.codec_version >= wire::OBSERVED_LINES_MIN_VERSION)
+                    {
+                        return Err(crate::Error::Schema);
+                    }
+                }
                 if !reply.is_alive {
                     self.pane_gone(reply.pane_id);
                 } else {
@@ -2021,6 +2415,9 @@ impl Session {
                             // separate fences; neither stands in for the other.
                             sizing.desktop_list_after = self.next_serial;
                             self.events.push_back(Event::PhoneSizeRestored { pane_id });
+                        }
+                        if self.codec_version >= wire::OBSERVED_LINES_MIN_VERSION {
+                            self.poll(pane_id);
                         }
                     }
                     _ => {}
@@ -2089,8 +2486,29 @@ impl Session {
                             // explicit restore; no recovery receipt is emitted.
                             sizing.phone_until = Some(u64::MAX);
                         }
+                        if self.codec_version >= wire::OBSERVED_LINES_MIN_VERSION {
+                            self.poll(pane_id);
+                        }
                     }
-                    Some(Request::Lines { pane_id, ranges }) => {
+                    Some(Request::Lines {
+                        pane_id,
+                        ranges,
+                        layout,
+                    }) => {
+                        if layout.is_some() {
+                            let error: wire::ErrorResponse =
+                                wire::decode_input_receipt(&frame.body)?;
+                            if error.schema_version != 1
+                                || error.request_ident != ident::GET_LINES_AT_LAYOUT
+                            {
+                                return Err(crate::Error::Schema);
+                            }
+                            if let Some(mirror) = self.mirrors.get_mut(&pane_id) {
+                                mirror.reject_lines();
+                            }
+                            self.render_refused(pane_id, false, &frame.body);
+                            return Ok(());
+                        }
                         if let Some(mirror) = self.mirrors.get_mut(&pane_id) {
                             mirror.apply_lines(wire::LineEntries::default(), &ranges);
                         }
@@ -2121,7 +2539,9 @@ impl Session {
                     Some(Request::Input { .. } | Request::Action) | None => {}
                     Some(
                         Request::PaneIdentity { .. }
+                        | Request::InspectPaneIdentity { .. }
                         | Request::PaneAuthority { .. }
+                        | Request::ConditionalResize { .. }
                         | Request::OrderedInput { .. },
                     ) => {
                         return Err(crate::Error::Schema);
@@ -2152,7 +2572,25 @@ impl Session {
         }
     }
 
+    fn size_effect_pending(&self, pane_id: usize) -> bool {
+        self.resize_successors.contains_key(&pane_id)
+            || self.requests.values().any(|request| match request {
+                Request::Resize { pane_id: pending }
+                | Request::RestoreSize { pane_id: pending } => *pending == pane_id,
+                Request::ConditionalResize { intent } => intent.request.pane_id == pane_id,
+                _ => false,
+            })
+    }
+
     fn poll(&mut self, pane_id: usize) {
+        if self.codec_version >= wire::OBSERVED_LINES_MIN_VERSION
+            && self.size_effect_pending(pane_id)
+        {
+            if let Some(mirror) = self.mirrors.get_mut(&pane_id) {
+                mirror.require_observation();
+            }
+            return;
+        }
         if matches!(
             self.authorities.get(&pane_id),
             Some(PaneAuthority::Pending(_))
@@ -2165,11 +2603,25 @@ impl Session {
             return;
         }
         if self.mirrors.contains_key(&pane_id) {
+            let observed = self.codec_version >= wire::OBSERVED_LINES_MIN_VERSION;
+            if observed && let Some(mirror) = self.mirrors.get_mut(&pane_id) {
+                mirror.require_observation();
+            }
             self.send(
-                ident::GET_PANE_RENDER_CHANGES,
+                if observed {
+                    ident::GET_PANE_RENDER_STATE
+                } else {
+                    ident::GET_PANE_RENDER_CHANGES
+                },
                 &GetPaneRenderChanges { pane_id },
                 Request::Poll { pane_id },
             );
+            if observed
+                && !self.failed
+                && let Some(mirror) = self.mirrors.get_mut(&pane_id)
+            {
+                mirror.expect_observation(self.next_serial);
+            }
         }
     }
 
@@ -2249,6 +2701,7 @@ impl Session {
     fn pane_gone(&mut self, pane_id: usize) {
         self.authorities.remove(&pane_id);
         self.identities.remove(&pane_id);
+        self.resize_successors.remove(&pane_id);
         self.render_retries.remove(&pane_id);
         self.requests.retain(|_, request| {
             !matches!(request,
@@ -2260,7 +2713,7 @@ impl Session {
                 | Request::Resize { pane_id: old }
                 | Request::RestoreSize { pane_id: old }
                 | Request::Poll { pane_id: old } if *old == pane_id
-            )
+            ) && !matches!(request, Request::ConditionalResize { intent } if intent.request.pane_id == pane_id)
         });
         if self.input.in_paste(pane_id) {
             self.interrupted_input.insert(pane_id);
@@ -2313,21 +2766,57 @@ impl Session {
         }
         let wanted = mirror.wanted();
         if !wanted.is_empty() {
-            mirror.set_fetching();
-            let request = GetLines {
-                pane_id,
-                lines: wanted.clone(),
+            let layout = if self.codec_version >= wire::OBSERVED_LINES_MIN_VERSION {
+                let Some(layout) = mirror.observation() else {
+                    return;
+                };
+                Some(layout)
+            } else {
+                None
             };
-            self.send(
-                ident::GET_LINES,
-                &request,
-                Request::Lines {
-                    pane_id,
-                    ranges: wanted,
-                },
-            );
+            mirror.set_fetching(&wanted);
+            if let Some(layout) = layout {
+                self.send(
+                    ident::GET_LINES_AT_LAYOUT,
+                    &wire::GetLinesAtLayout {
+                        pane_id,
+                        layout,
+                        lines: wanted.clone(),
+                    },
+                    Request::Lines {
+                        pane_id,
+                        ranges: wanted,
+                        layout: Some(layout),
+                    },
+                );
+            } else {
+                self.send(
+                    ident::GET_LINES,
+                    &GetLines {
+                        pane_id,
+                        lines: wanted.clone(),
+                    },
+                    Request::Lines {
+                        pane_id,
+                        ranges: wanted,
+                        layout: None,
+                    },
+                );
+            }
         } else {
-            for output in mirror.render() {
+            let outputs = mirror.render();
+            if mirror.is_drawable()
+                && self
+                    .render_retries
+                    .remove(&pane_id)
+                    .is_some_and(|retry| retry.refusals >= WAITING_AFTER_REFUSALS)
+            {
+                self.events.push_back(Event::PaneWaiting {
+                    pane_id,
+                    waiting: false,
+                });
+            }
+            for output in outputs {
                 self.events.push_back(Event::Output {
                     pane_id,
                     rows: output.rows,

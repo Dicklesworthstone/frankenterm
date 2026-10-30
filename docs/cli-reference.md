@@ -286,6 +286,7 @@ ft mobile show [--inventory <path>]
 ft mobile export [--group <id>] [--inventory <path>] [-o <file.ftworkspace>] [--check]
 ft mobile source [--inventory <path>]
 ft mobile themes [-o <path>]
+ft mobile attach --stdio --no-auto-start [--socket <absolute-path>]
 ```
 
 `machines.toml` (in the FrankenTerm config directory) lists each machine once:
@@ -303,6 +304,22 @@ file behind each credential (the identities the desktop's ssh uses, OpenSSH's
 defaults when a route names none), as paths only. The companion bundles the
 same output as the `frankenterm-machines` helper. `themes` writes the catalog
 the iPhone app bundles.
+
+`attach` connects piped stdin/stdout to an **already running** same-account mux.
+It uses the explicit `--socket`, then `FRANKENTERM_UNIX_SOCKET`, then the same
+platform runtime socket as the mux server. It never starts a server, creates a
+terminal, loads executable configuration or selects another endpoint after a
+failure. Unix socket ownership, permissions, peer credentials and the socket's
+identity across connection are checked before forwarding. The authenticated
+SSH account retains its existing mux access; this is not a device-scoped Via Mac
+gateway. Do not allocate an SSH PTY for the binary protocol.
+
+The relay uses 32 KiB per direction with backpressure, a five-second connection
+budget, a thirty-second stalled-write budget and a five-second final drain after
+EOF. An idle live session stays connected. EOF on stdin closes only mux input
+while final replies drain; mux EOF ends the relay even when stdin remains open.
+All diagnostics go to stderr. The phone's default attachment command now uses
+this endpoint; explicitly configured route commands retain their chosen behavior.
 
 An applied remote `--install-ft` requires a caller-chosen stable transaction ID;
 reuse that exact ID after timeout or lost acknowledgement. The current command

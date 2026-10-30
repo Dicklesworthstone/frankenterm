@@ -15,19 +15,23 @@ private actor UIKitInputTransport: TerminalByteTransport {
     func bytes() -> Data { output }
 }
 private struct UIKitInputEncoder: TerminalKeyboardEncoding {
+    var recordsModifiers = false
     var supportsPaste: Bool { true }
     func encode(_ intent: TerminalKeyboardIntent, source: TerminalSource, maximumBytes: Int) async throws -> Data {
         let value: String
         switch intent {
         case .text(let text): value = text
-        case .key(let key, .press): value = "<key:\(key.usage)>"
-        case .key(let key, .down): value = "<down:\(key.usage)>"
-        case .key(let key, .repeated): value = "<repeat:\(key.usage)>"
-        case .key(let key, .up): value = "<up:\(key.usage)>"
+        case .key(let key, .press): value = "<key:\(label(key))>"
+        case .key(let key, .down): value = "<down:\(label(key))>"
+        case .key(let key, .repeated): value = "<repeat:\(label(key))>"
+        case .key(let key, .up): value = "<up:\(label(key))>"
         case .releaseAll: value = ""
         }
         guard value.utf8.count <= maximumBytes else { throw TerminalKeyboardError.capacity }
         return Data(value.utf8)
+    }
+    private func label(_ key: TerminalHardwareKey) -> String {
+        recordsModifiers ? "\(key.usage):\(key.modifiers.rawValue)" : "\(key.usage)"
     }
     func preparePaste(_ text: String, source: TerminalSource, maximumBytes: Int) async throws -> TerminalPreparedPaste {
         guard text.utf8.count <= maximumBytes else { throw TerminalKeyboardError.capacity }
@@ -37,16 +41,22 @@ private struct UIKitInputEncoder: TerminalKeyboardEncoding {
 /// UIKit makes presses only from real hardware; these stand in for one key.
 private final class HardwareKey: UIKey {
     private let usage: UIKeyboardHIDUsage
-    init(_ usage: UIKeyboardHIDUsage) { self.usage = usage; super.init() }
+    private let flags: UIKeyModifierFlags
+    private let text: String
+    init(_ usage: UIKeyboardHIDUsage, modifiers: UIKeyModifierFlags = [], text: String = "") {
+        self.usage = usage; flags = modifiers; self.text = text; super.init()
+    }
     required init?(coder: NSCoder) { nil }
     override var keyCode: UIKeyboardHIDUsage { usage }
-    override var modifierFlags: UIKeyModifierFlags { [] }
-    override var characters: String { "" }
-    override var charactersIgnoringModifiers: String { "" }
+    override var modifierFlags: UIKeyModifierFlags { flags }
+    override var characters: String { text }
+    override var charactersIgnoringModifiers: String { text }
 }
 private final class HardwarePress: UIPress {
     private let hardwareKey: UIKey
-    init(_ usage: UIKeyboardHIDUsage) { hardwareKey = HardwareKey(usage); super.init() }
+    init(_ usage: UIKeyboardHIDUsage, modifiers: UIKeyModifierFlags = [], text: String = "") {
+        hardwareKey = HardwareKey(usage, modifiers: modifiers, text: text); super.init()
+    }
     override var key: UIKey? { hardwareKey }
 }
 @MainActor
@@ -66,15 +76,22 @@ private final class NativeInputDelegate: NSObject, UITextInputDelegate {
 /// portable coordination tests are not a substitute for this native boundary.
 @MainActor
 final class NativeTerminalInputTests: XCTestCase {
-    private func setup() async throws
+    private func setup(preferences: TerminalHardwarePreferencesStore? = nil, recordsModifiers: Bool = false) async throws
         -> (TerminalInputCoordinator, UIKitInputTransport, TerminalSource, NativeTerminalInputView) {
         let coordinator = try TerminalInputCoordinator()
         let transport = try UIKitInputTransport()
         let source = try await coordinator.attach(transport)
         let stream = try await coordinator.makeStream(sceneID: UUID())
         let focus = try await coordinator.changeFocus(stream, to: source)
-        let session = try TerminalKeyboardSession(focus: focus, coordinator: coordinator, encoder: UIKitInputEncoder())
-        let view = try NativeTerminalInputView(session: session)
+        let session = try TerminalKeyboardSession(focus: focus, coordinator: coordinator,
+            encoder: UIKitInputEncoder(recordsModifiers: recordsModifiers))
+        let store: TerminalHardwarePreferencesStore
+        if let preferences { store = preferences }
+        else {
+            store = TerminalHardwarePreferencesStore(
+                defaults: try XCTUnwrap(UserDefaults(suiteName: "NativeTerminalInputTests.\(UUID())")))
+        }
+        let view = try NativeTerminalInputView(session: session, hardwarePreferences: store)
         view.frame = CGRect(x: 0, y: 0, width: 320, height: 480)
         try view.updateCaret(NativeTerminalCaret(source: source, revision: 1, rect: CGRect(x: 20, y: 20, width: 2, height: 20)))
         return (coordinator, transport, source, view)
@@ -488,6 +505,75 @@ final class NativeTerminalInputTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(200))
         let after = try await sent(view, coordinator, source, transport)
         XCTAssertEqual(after, held, "a key let go repeats no more")
+        view.retire(); await view.session.waitUntilSuspended()
+    }
+
+    func testMappingChangesDoNotRetargetAHeldKeyOrItsRelease() async throws {
+        let name = "NativeHardwarePreferencesTests.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
+        defer { defaults.removePersistentDomain(forName: name) }
+        let preferences = TerminalHardwarePreferencesStore(defaults: defaults)
+        try preferences.save(.init(modifierMapping: .swapControlAndOption, backspace: .controlBackspace))
+        let (coordinator, transport, source, view) = try await setup(preferences: preferences, recordsModifiers: true)
+        view.keyRepeat = (delay: 60, interval: 60)
+        let left = HardwarePress(.keyboardLeftArrow, modifiers: .alternate)
+        view.pressesBegan([left], with: nil)
+        let down = try await sent(view, coordinator, source, transport)
+        XCTAssertEqual(down, "<down:80:2>")
+        try preferences.save(.init(modifierMapping: .optionForCharacters))
+        view.pressesBegan([left], with: nil)
+        view.pressesEnded([HardwarePress(.keyboardLeftArrow)], with: nil)
+        let released = try await sent(view, coordinator, source, transport)
+        XCTAssertEqual(released, "<down:80:2><repeat:80:2><up:80:2>")
+
+        // The next physical press uses the changed native-layout policy.
+        view.pressesBegan([left], with: nil); view.pressesEnded([left], with: nil)
+        view.insertText("é")
+        let typed = try await sent(view, coordinator, source, transport)
+        XCTAssertEqual(typed, "<down:80:2><repeat:80:2><up:80:2>é")
+        view.retire(); await view.session.waitUntilSuspended()
+    }
+
+    func testNativeOptionPressStaysNativeUntilReleaseAfterSettingsChange() async throws {
+        let name = "NativeHardwarePreferencesTests.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
+        defer { defaults.removePersistentDomain(forName: name) }
+        let preferences = TerminalHardwarePreferencesStore(defaults: defaults)
+        try preferences.save(.init(modifierMapping: .optionForCharacters))
+        let (coordinator, transport, source, view) = try await setup(preferences: preferences, recordsModifiers: true)
+        view.keyRepeat = (delay: 60, interval: 60)
+        let accent = HardwarePress(.keyboardE, modifiers: .alternate, text: "e")
+        view.pressesBegan([accent], with: nil)
+        try preferences.save(.init())
+        view.pressesBegan([accent], with: nil); view.pressesEnded([accent], with: nil)
+        let native = try await sent(view, coordinator, source, transport)
+        XCTAssertEqual(native, "")
+        view.pressesBegan([accent], with: nil); view.pressesEnded([accent], with: nil)
+        let terminal = try await sent(view, coordinator, source, transport)
+        XCTAssertEqual(terminal, "<down:8:4><up:8:4>")
+        view.retire(); await view.session.waitUntilSuspended()
+    }
+
+    func testBackspaceMappingKeepsItsUsageAndNeverChangesSoftwareDeletion() async throws {
+        let name = "NativeHardwarePreferencesTests.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
+        defer { defaults.removePersistentDomain(forName: name) }
+        let preferences = TerminalHardwarePreferencesStore(defaults: defaults)
+        try preferences.save(.init(backspace: .controlBackspace))
+        let (coordinator, transport, source, view) = try await setup(preferences: preferences, recordsModifiers: true)
+        view.keyRepeat = (delay: 60, interval: 60)
+        let backspace = HardwarePress(.keyboardDeleteOrBackspace)
+        view.pressesBegan([backspace], with: nil)
+        try preferences.save(.init())
+        view.pressesBegan([backspace], with: nil); view.pressesEnded([backspace], with: nil)
+        let hardware = try await sent(view, coordinator, source, transport)
+        XCTAssertEqual(hardware, "<down:42:2><repeat:42:2><up:42:2>")
+        try preferences.save(.init(backspace: .controlBackspace))
+        view.deleteBackward()
+        let software = try await sent(view, coordinator, source, transport)
+        XCTAssertEqual(software, "<down:42:2><repeat:42:2><up:42:2><key:42:0>")
+        view.setMarkedText("🦀", selectedRange: NSRange(location: 2, length: 0)); view.deleteBackward()
+        XCTAssertEqual(view.session.document.text, "")
         view.retire(); await view.session.waitUntilSuspended()
     }
 

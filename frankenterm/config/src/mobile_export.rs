@@ -43,6 +43,9 @@ const MAX_EXPORTED_CERTIFICATE_BYTES: usize = 1024 * 1024;
 const USER_CERTIFICATE_CAPABILITY: &str = "ssh_user_certificate_v1";
 const MAX_JUMP_HOPS: usize = 3;
 const MAX_EXPORTED_ROUTES: usize = 256;
+const MAX_EXPORT_FINDINGS: usize = 1024;
+const MAX_EXPORT_FINDINGS_BYTES: usize = 256 * 1024;
+const MAX_EXPORT_FINDING_TEXT: usize = 4096;
 /// The phone's SSH driver runs remote commands up to this size.
 const MAX_REMOTE_COMMAND_BYTES: usize = 1024;
 const UNRESOLVED_POLICY: &str = "ssh_config.unresolved_policy";
@@ -73,9 +76,23 @@ pub struct MobileExport {
     pub machines: usize,
     pub routes: usize,
     pub notes: Vec<ExportNote>,
+    /// Bounded public completeness findings, scoped to entities that actually
+    /// survived export. The companion preserves these through group selection
+    /// and the encrypted archive; local diagnostic strings are not the bridge.
+    pub portability: Vec<ExportFinding>,
     /// For each credential, the private key file its public key came from:
     /// what the desktop's own ssh would offer. Read by nothing here.
     pub identity_files: BTreeMap<String, PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ExportFinding {
+    pub entity_id: String,
+    pub setting: String,
+    /// Informational omissions do not authorize or replace required policy.
+    /// Route and trust capability markers remain mandatory in the document.
+    pub disposition: u8,
+    pub reason: String,
 }
 
 /// OpenSSH's identities when a route names none, in its order.
@@ -178,7 +195,8 @@ fn read_source(path: &Path, limit: usize) -> KnownHostsSource {
 
 /// The deepest `Include` nesting OpenSSH reads (READCONF_MAX_DEPTH).
 const MAX_INCLUDE_DEPTH: usize = 16;
-/// Directory entries one `Include` pattern may scan.
+/// Directory operations and entries the complete configuration snapshot may
+/// inspect, shared by user/system sources and every Include pattern.
 const MAX_INCLUDE_ENTRIES: usize = 16_384;
 
 /// Where `expand_includes` reads: the disk, or a test's fixture.
@@ -186,8 +204,11 @@ trait IncludeFiles {
     /// One included file, under `read_source`'s rules.
     fn read(&self, path: &Path, limit: usize) -> KnownHostsSource;
     /// The names in `directory`: empty when it does not exist, `None` when
-    /// it cannot be listed.
-    fn names(&self, directory: &Path) -> Option<Vec<String>>;
+    /// it cannot be listed completely within the remaining traversal budget.
+    fn names(&self, directory: &Path, limit: usize) -> Option<Vec<String>>;
+    /// Glob components before the last must name directories. Missing paths
+    /// and ordinary files do not match; an unreadable path remains unresolved.
+    fn is_directory(&self, path: &Path) -> Option<bool>;
 }
 
 struct DiskIncludes;
@@ -219,20 +240,32 @@ impl IncludeFiles for DiskIncludes {
         read_source(path, limit)
     }
 
-    fn names(&self, directory: &Path) -> Option<Vec<String>> {
+    fn names(&self, directory: &Path, limit: usize) -> Option<Vec<String>> {
         let entries = match std::fs::read_dir(directory) {
             Ok(entries) => entries,
-            Err(err) if err.kind() == ErrorKind::NotFound => return Some(Vec::new()),
+            Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+                return Some(Vec::new());
+            }
             Err(_) => return None,
         };
         let mut names = Vec::new();
         for entry in entries {
-            names.push(entry.ok()?.file_name().into_string().ok()?);
-            if names.len() > MAX_INCLUDE_ENTRIES {
+            if names.len() == limit {
                 return None;
             }
+            names.push(entry.ok()?.file_name().into_string().ok()?);
         }
         Some(names)
+    }
+
+    fn is_directory(&self, path: &Path) -> Option<bool> {
+        match std::fs::metadata(path) {
+            Ok(metadata) => Some(metadata.is_dir()),
+            Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+                Some(false)
+            }
+            Err(_) => None,
+        }
     }
 }
 
@@ -241,6 +274,7 @@ struct IncludeBudget {
     bytes: usize,
     lines: usize,
     files: usize,
+    entries: usize,
 }
 
 impl IncludeBudget {
@@ -251,6 +285,7 @@ impl IncludeBudget {
             bytes: MAX_SOURCE_BYTES - 4096,
             lines: MAX_SOURCE_LINES - 512,
             files: MAX_SOURCE_FILES,
+            entries: MAX_INCLUDE_ENTRIES,
         }
     }
 
@@ -263,6 +298,29 @@ impl IncludeBudget {
         self.lines -= lines;
         true
     }
+
+    fn names(&mut self, files: &dyn IncludeFiles, directory: &Path) -> Option<Vec<String>> {
+        // Charge the operation even for empty/nonexistent directories. On an
+        // incomplete listing, retire the remaining budget: repeated patterns
+        // must not retry the same expensive failed scan for free.
+        self.entries = self.entries.checked_sub(1)?;
+        let names = files.names(directory, self.entries);
+        match names {
+            Some(names) if names.len() <= self.entries => {
+                self.entries -= names.len();
+                Some(names)
+            }
+            _ => {
+                self.entries = 0;
+                None
+            }
+        }
+    }
+
+    fn is_directory(&mut self, files: &dyn IncludeFiles, path: &Path) -> Option<bool> {
+        self.entries = self.entries.checked_sub(1)?;
+        files.is_directory(path)
+    }
 }
 
 /// Reads one top-level SSH source and splices in what it includes.
@@ -272,6 +330,10 @@ fn read_config_source(
     home: &Path,
     budget: &mut IncludeBudget,
 ) -> KnownHostsSource {
+    let Some(remaining) = budget.files.checked_sub(1) else {
+        return KnownHostsSource::Unavailable;
+    };
+    budget.files = remaining;
     match read_source(path, budget.bytes) {
         KnownHostsSource::Present(text) if budget.take(&text) => KnownHostsSource::Present(
             expand_includes(&text, base, home, &DiskIncludes, budget, 0, true),
@@ -287,7 +349,7 @@ fn read_config_source(
 /// starts in its includer's context, and that context returns after it, as
 /// OpenSSH restores it. An Include it cannot splice in full stays as written
 /// (the resolver then treats the source as unresolved): a pattern needing
-/// token, variable, `?` or bracket expansion, a file it cannot read safely,
+/// token, variable or bracket expansion, a file it cannot read safely,
 /// or the depth or budget exceeded. A missing file adds nothing, as in
 /// OpenSSH. Relative patterns resolve against `base`: ~/.ssh for the user's
 /// file and /etc/ssh for the system's.
@@ -335,7 +397,7 @@ fn splice_include(
     }
     let mut spliced = String::new();
     for pattern in configuration_words(value)? {
-        for path in include_paths(&pattern, base, home, files)? {
+        for path in include_paths(&pattern, base, home, files, budget)? {
             budget.files = budget.files.checked_sub(1)?;
             let text = match files.read(&path, budget.bytes) {
                 KnownHostsSource::Present(text) => text,
@@ -363,67 +425,98 @@ fn splice_include(
     Some(spliced)
 }
 
-/// The files one Include pattern names, sorted as glob(3) sorts them.
-/// `*` is the only wildcard, in the last component only.
+/// The files one Include pattern names in lexical order. `*` and `?` may
+/// appear in any component; they never cross a path separator. A shared scan
+/// budget and a 64-path frontier bound traversal before any included source is
+/// read. An exhausted or unreadable branch refuses the complete Include.
 fn include_paths(
     pattern: &str,
     base: &Path,
     home: &Path,
     files: &dyn IncludeFiles,
+    budget: &mut IncludeBudget,
 ) -> Option<Vec<PathBuf>> {
-    if pattern.is_empty() || pattern.contains(['%', '$', '?', '[', ']', '{', '}']) {
+    if pattern.is_empty()
+        || pattern.len() > 4096
+        || pattern.ends_with('/')
+        || pattern.contains(['%', '$', '[', ']', '{', '}'])
+    {
         return None;
     }
-    let path = if let Some(rest) = pattern.strip_prefix("~/") {
-        home.join(rest)
+    // The supplied home/base are literal paths. A wildcard in a directory's
+    // own name must not become syntax just because a relative Include uses it.
+    let (root, path) = if let Some(rest) = pattern.strip_prefix("~/") {
+        (home.to_path_buf(), PathBuf::from(rest))
     } else if pattern.starts_with('~') {
         return None;
+    } else if Path::new(pattern).is_absolute() {
+        (PathBuf::new(), PathBuf::from(pattern))
     } else {
-        // An absolute pattern replaces the base.
-        base.join(pattern)
+        (base.to_path_buf(), PathBuf::from(pattern))
     };
     if path
         .components()
+        .chain(root.components())
         .any(|component| matches!(component, Component::ParentDir))
     {
         return None;
     }
-    let name = path.file_name()?.to_str()?;
-    let directory = path.parent()?;
-    if directory.to_str()?.contains('*') {
-        return None;
+    let components: Vec<_> = path.components().collect();
+    let mut paths = vec![root];
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            for path in &mut paths {
+                path.push(component.as_os_str());
+            }
+            continue;
+        };
+        let name = name.to_str()?;
+        let last = index + 1 == components.len();
+        let mut next = Vec::new();
+        for parent in paths {
+            let wildcard = name.contains(['*', '?']);
+            let names = if wildcard {
+                budget.names(files, &parent)?
+            } else {
+                vec![name.to_string()]
+            };
+            for candidate_name in names {
+                if wildcard && !glob_component_matches(name, &candidate_name) {
+                    continue;
+                }
+                let candidate = parent.join(candidate_name);
+                if last || budget.is_directory(files, &candidate)? {
+                    if next.len() >= MAX_SOURCE_FILES {
+                        return None;
+                    }
+                    next.push(candidate);
+                }
+            }
+        }
+        paths = next;
+        if paths.is_empty() {
+            break;
+        }
     }
-    if !name.contains('*') {
-        return Some(vec![path.clone()]);
-    }
-    let mut matched: Vec<String> = files
-        .names(directory)?
-        .into_iter()
-        .filter(|candidate| glob_component_matches(name, candidate))
-        .collect();
-    matched.sort();
-    Some(
-        matched
-            .into_iter()
-            .map(|name| directory.join(name))
-            .collect(),
-    )
+    paths.sort();
+    Some(paths)
 }
 
-/// glob(3) on one component with `*` only: a leading `.` is matched only by
-/// a pattern's leading `.`. Linear in practice: one backtrack point.
+/// glob(3)'s `*` and `?` on one UTF-8 component: a leading `.` is matched only
+/// by a pattern's leading `.`. A question mark consumes one Unicode scalar,
+/// not one byte of a multibyte filename. There is one backtrack point.
 fn glob_component_matches(pattern: &str, name: &str) -> bool {
     if name.starts_with('.') && !pattern.starts_with('.') {
         return false;
     }
-    let (pattern, name) = (pattern.as_bytes(), name.as_bytes());
+    let (pattern, name): (Vec<_>, Vec<_>) = (pattern.chars().collect(), name.chars().collect());
     let (mut p, mut n) = (0, 0);
     let mut star: Option<(usize, usize)> = None;
     while n < name.len() {
-        if p < pattern.len() && pattern[p] == b'*' {
+        if p < pattern.len() && pattern[p] == '*' {
             star = Some((p, n));
             p += 1;
-        } else if p < pattern.len() && pattern[p] == name[n] {
+        } else if p < pattern.len() && (pattern[p] == '?' || pattern[p] == name[n]) {
             p += 1;
             n += 1;
         } else if let Some((star_p, star_n)) = star {
@@ -434,7 +527,7 @@ fn glob_component_matches(pattern: &str, name: &str) -> bool {
             return false;
         }
     }
-    pattern[p..].iter().all(|&byte| byte == b'*')
+    pattern[p..].iter().all(|&character| character == '*')
 }
 
 fn default_known_hosts(home: &Path) -> Vec<PathBuf> {
@@ -2087,10 +2180,13 @@ fn resolve_endpoint(
                             }
                             None => {
                                 identity_policy_complete = false;
-                                note(notes, format!(
-                                    "CertificateFile {} is missing, unreadable, over budget, unsupported or invalid (including its CA signature); no partial identity list was exported and this route remains blocked",
-                                    path.display()
-                                ));
+                                note(
+                                    notes,
+                                    format!(
+                                        "CertificateFile {} is missing, unreadable, over budget, unsupported or invalid (including its CA signature); no partial identity list was exported and this route remains blocked",
+                                        path.display()
+                                    ),
+                                );
                                 break;
                             }
                         }
@@ -2484,6 +2580,129 @@ impl EndpointRecords {
     }
 }
 
+/// Bind each source omission to a surviving entity. A dropped machine cannot
+/// name a nonexistent archive entity: its retained groups carry the finding,
+/// or the workspace does when none of those groups survived. Numeric note
+/// positions are not identity; exact repeated diagnostics share a stable key.
+fn export_findings(
+    inventory: &MachineInventory,
+    document: &Value,
+    notes: &[ExportNote],
+) -> anyhow::Result<Vec<ExportFinding>> {
+    let workspace = &document["workspace"];
+    let workspace_id = workspace["id"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("export has no workspace identity"))?;
+    let ids = |field: &str| -> BTreeSet<String> {
+        workspace[field]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|value| value["id"].as_str().map(str::to_string))
+            .collect()
+    };
+    let machines = ids("machines");
+    let groups = ids("groups");
+    let routes = ids("routes");
+    let mut findings = BTreeMap::new();
+    let source_scope = ExportFinding {
+        entity_id: workspace_id.to_string(),
+        setting: "machines_toml.source_scope".into(),
+        disposition: 0,
+        reason: "This snapshot contains the selected machine inventory, its resolved themes and bounded local SSH sources. It does not capture running desktop configuration overrides, live sessions or executable configuration.".into(),
+    };
+    findings.insert(
+        (source_scope.entity_id.clone(), source_scope.setting.clone()),
+        source_scope,
+    );
+    for note in notes {
+        let machine_id = format!("m.{}", note.machine);
+        let retained_machine = machines.contains(&machine_id);
+        let source_machine = inventory
+            .machines
+            .iter()
+            .find(|value| value.id == note.machine);
+        let source_route = source_machine.and_then(|machine| {
+            note.route
+                .as_deref()
+                .and_then(|route| machine.routes.iter().find(|value| value.id() == route))
+        });
+        let route_ids: Vec<String> = match source_route {
+            Some(MachineRoute::Ssh { id, .. }) => vec![format!("r.{}.{}", note.machine, id)],
+            Some(MachineRoute::FrankenTermMux { id, via, .. }) => via
+                .iter()
+                .map(|name| {
+                    if via.len() == 1 {
+                        format!("r.{}.{}", note.machine, id)
+                    } else {
+                        format!("r.{}.{}.{}", note.machine, id, name)
+                    }
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        let retained_routes: Vec<_> = route_ids
+            .into_iter()
+            .filter(|id| routes.contains(id))
+            .collect();
+        let kind = if !retained_machine {
+            "omitted_machine"
+        } else if source_route.is_some() && retained_routes.is_empty() {
+            "omitted_route"
+        } else {
+            "source_note"
+        };
+        let scopes = if !retained_routes.is_empty() {
+            retained_routes
+        } else if retained_machine {
+            vec![machine_id]
+        } else {
+            let retained_groups: Vec<_> = inventory
+                .groups
+                .iter()
+                .filter(|group| group.machines.contains(&note.machine))
+                .map(|group| format!("g.{}", group.id))
+                .filter(|id| groups.contains(id))
+                .collect();
+            if retained_groups.is_empty() {
+                vec![workspace_id.to_string()]
+            } else {
+                retained_groups
+            }
+        };
+        let reason = note.to_string();
+        anyhow::ensure!(
+            !reason.is_empty()
+                && reason.len() <= MAX_EXPORT_FINDING_TEXT
+                && !reason.chars().any(char::is_control),
+            "a source finding exceeds the phone's public metadata profile; no incomplete source report was exported"
+        );
+        let setting = format!("machines_toml.{}.{}", kind, short_digest(&reason));
+        for entity_id in scopes {
+            findings.insert(
+                (entity_id.clone(), setting.clone()),
+                ExportFinding {
+                    entity_id,
+                    setting: setting.clone(),
+                    disposition: 0,
+                    reason: reason.clone(),
+                },
+            );
+            anyhow::ensure!(
+                findings.len() <= MAX_EXPORT_FINDINGS,
+                "the complete source report exceeds the phone's {}-finding limit; select a smaller group",
+                MAX_EXPORT_FINDINGS
+            );
+        }
+    }
+    let findings: Vec<_> = findings.into_values().collect();
+    anyhow::ensure!(
+        serde_json::to_vec(&findings)?.len() <= MAX_EXPORT_FINDINGS_BYTES,
+        "the complete source report exceeds its 256 KiB limit; select a smaller group"
+    );
+    Ok(findings)
+}
+
 /// The phone's workspace for the inventory, or for one group of it. Its
 /// revision identifies the resolved public configuration, not just the raw
 /// inventory file: SSH policy, trust, identities and external theme changes
@@ -2683,6 +2902,28 @@ pub fn export(
         }
         let theme_id = format!("t.{}", machine.id);
         themes.push(theme_json(&theme_id, &machine.theme));
+        for (omitted, message) in [
+            (
+                machine.icon.is_some(),
+                "the desktop status-bar icon is not activated on the phone",
+            ),
+            (
+                machine.cwd.is_some(),
+                "the desktop working-directory preference is not used to start remote sessions on the phone",
+            ),
+            (
+                machine.theme.background_gradient.is_some(),
+                "the desktop background gradient is not activated on the phone; its resolved solid background and terminal palette are preserved",
+            ),
+        ] {
+            if omitted {
+                notes.push(ExportNote {
+                    machine: machine.id.clone(),
+                    route: None,
+                    message: message.into(),
+                });
+            }
+        }
         // The phone signs every machine in once the workspace opens, so
         // switching to one is instant; its terminal opens only when chosen.
         let mut record = json!({
@@ -2814,11 +3055,13 @@ pub fn export(
         short_digest(&format!("{}:{}:{}", revision, nanos, std::process::id()))
     ));
     document.sort_all_objects();
+    let portability = export_findings(inventory, &document, &notes)?;
     Ok(MobileExport {
         document,
         machines: machine_count,
         routes: route_count,
         notes,
+        portability,
         identity_files: records.identity_files,
     })
 }
@@ -2850,7 +3093,7 @@ pub fn load_companion_source(path: &Path) -> anyhow::Result<Value> {
 pub fn companion_source(export: &MobileExport, inventory: &Path) -> Value {
     json!({
         "format": "ftmachines-source",
-        "version": 1,
+        "version": 2,
         "inventory": inventory.to_string_lossy(),
         "document": export.document,
         "identity_files": export
@@ -2858,7 +3101,7 @@ pub fn companion_source(export: &MobileExport, inventory: &Path) -> Value {
             .iter()
             .map(|(id, path)| (id.clone(), json!(path.to_string_lossy())))
             .collect::<Map<String, Value>>(),
-        "notes": export.notes.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "portability": export.portability,
     })
 }
 
@@ -3254,6 +3497,138 @@ ssh = "jumped"
         );
     }
 
+    #[test]
+    fn companion_findings_name_surviving_scopes_for_omitted_routes_and_machines() {
+        let mut inventory = MachineInventory::parse(INVENTORY, &context()).unwrap();
+        inventory.machines[0].routes.push(MachineRoute::Ssh {
+            id: "unportable".into(),
+            target: RouteTarget::Alias("jumped".into()),
+        });
+        inventory.machines[0].icon = Some("desktop-icon".into());
+        inventory.machines[0].cwd = Some("/desktop/working-directory".into());
+        let ssh = sources(Some(
+            "Host css\n HostName css.example\n User ubuntu\n IdentityFile ~/.ssh/trj_ed25519\nHost jumped\n HostName inner\n User u\n ProxyCommand desktop-only-proxy\n",
+        ));
+        let first = export(&inventory, None, &ssh, &context()).unwrap();
+        let companion = companion_source(&first, Path::new("/config/machines.toml"));
+        assert_eq!(companion["version"], 2);
+        assert_eq!(companion["document"], first.document);
+        assert_eq!(companion["portability"], json!(first.portability));
+        assert!(companion.get("notes").is_none());
+        assert!(first.portability.iter().any(|finding| {
+            finding.entity_id == "g.fleet"
+                && finding
+                    .setting
+                    .starts_with("machines_toml.omitted_machine.")
+                && finding.reason.starts_with("dark")
+        }));
+        assert!(first.portability.iter().any(|finding| {
+            finding.entity_id == "m.trj"
+                && finding.setting.starts_with("machines_toml.omitted_route.")
+                && finding.reason.contains("unportable")
+        }));
+        for setting in ["status-bar icon", "working-directory preference"] {
+            assert!(first.portability.iter().any(|finding| {
+                finding.entity_id == "m.trj" && finding.reason.contains(setting)
+            }));
+        }
+        assert!(first
+            .portability
+            .iter()
+            .all(|finding| finding.disposition == 0));
+        assert!(!first
+            .portability
+            .iter()
+            .any(|finding| finding.entity_id == "m.dark"));
+
+        // A group with only omitted machines is itself absent. Its source
+        // findings must still survive on the workspace, never name a dangling
+        // group/machine reference that the archive would discard or reject.
+        inventory.groups[0].machines.retain(|id| id != "dark");
+        inventory.groups.push(crate::machines::MachineGroup {
+            id: "unavailable".into(),
+            name: "Unavailable".into(),
+            machines: vec!["dark".into()],
+        });
+        let second = export(&inventory, None, &ssh, &context()).unwrap();
+        assert!(second.portability.iter().any(|finding| {
+            finding.entity_id == "w.machines"
+                && finding
+                    .setting
+                    .starts_with("machines_toml.omitted_machine.")
+                && finding.reason.starts_with("dark")
+        }));
+        let fleet_only = export(&inventory, Some("fleet"), &ssh, &context()).unwrap();
+        assert!(!fleet_only
+            .portability
+            .iter()
+            .any(|finding| finding.reason.starts_with("dark")));
+    }
+
+    #[test]
+    fn companion_report_preserves_blockers_and_is_stable_bounded_and_atomic() {
+        let inventory = MachineInventory::parse(INVENTORY, &context()).unwrap();
+        let exported = export(
+            &inventory,
+            None,
+            &sources(Some(
+                "Host css\n HostName css.example\n User ubuntu\n Match exec forbidden-command\n",
+            )),
+            &context(),
+        )
+        .unwrap();
+        let source = companion_source(&exported, Path::new("/inventory"));
+        let route = source["document"]["workspace"]["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|route| route["id"] == "r.css.ssh")
+            .unwrap();
+        let trust = source["document"]["workspace"]["host_trust"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|trust| trust["id"] == route["host_trust_ref"])
+            .unwrap();
+        assert_eq!(trust["required_capabilities"], json!([UNRESOLVED_POLICY]));
+        let note = |message: String| ExportNote {
+            machine: "trj".into(),
+            route: Some("tailscale".into()),
+            message,
+        };
+        let notes = vec![note("one omission".into()), note("second omission".into())];
+        let first = export_findings(&inventory, &exported.document, &notes).unwrap();
+        let repeated = vec![notes[1].clone(), notes[0].clone(), notes[1].clone()];
+        assert_eq!(
+            first,
+            export_findings(&inventory, &exported.document, &repeated).unwrap()
+        );
+        let exact: Vec<_> = (0..MAX_EXPORT_FINDINGS - 1)
+            .map(|index| note(format!("omission {}", index)))
+            .collect();
+        assert_eq!(
+            export_findings(&inventory, &exported.document, &exact)
+                .unwrap()
+                .len(),
+            MAX_EXPORT_FINDINGS
+        );
+        let mut too_many = exact;
+        too_many.push(note("one beyond the limit".into()));
+        assert!(export_findings(&inventory, &exported.document, &too_many).is_err());
+        for invalid in ["control\ntext".into(), "x".repeat(MAX_EXPORT_FINDING_TEXT)] {
+            assert!(export_findings(
+                &inventory,
+                &exported.document,
+                &[notes[0].clone(), note(invalid)]
+            )
+            .is_err());
+        }
+        let aggregate: Vec<_> = (0..80)
+            .map(|index| note(format!("{}{}", index, "x".repeat(4000))))
+            .collect();
+        assert!(export_findings(&inventory, &exported.document, &aggregate).is_err());
+    }
+
     /// A distinct well-formed Ed25519 public key line for `seed`.
     fn fake_key(seed: u8) -> String {
         let mut blob = vec![0, 0, 0, 11];
@@ -3568,7 +3943,8 @@ socket = "/run/frankenterm.sock"
         let certificate = signed_test_certificate(&["operator"], 1, 32);
         for identity in ["none", "~/.ssh/trj_ed25519"] {
             let mut sources = sources(Some(&format!(
-                "Host app\n HostName css.example\n User operator\n IdentityFile {}\n CertificateFile ~/.ssh/user-cert.pub\n GlobalKnownHostsFile none\n", identity
+                "Host app\n HostName css.example\n User operator\n IdentityFile {}\n CertificateFile ~/.ssh/user-cert.pub\n GlobalKnownHostsFile none\n",
+                identity
             )));
             sources.public_certificates.insert(
                 context().home.join(".ssh/user-cert.pub"),
@@ -3611,7 +3987,7 @@ socket = "/run/frankenterm.sock"
     #[test]
     fn certificate_sources_are_additive_in_host_order_and_internal_slots_are_not_source_policy() {
         let mut sources = sources(Some(
-            "CertificateFile ~/.ssh/first.pub\nHost other\n CertificateFile /must-not-read\nHost app\n HostName css.example\n User operator\n IdentityFile none\n CertificateFile none\n CertificateFile \"~/.ssh/second cert.pub\"\n CertificateFile ~/.ssh/first.pub\nHost *\n CertificateFile ~/.ssh/third.pub\n GlobalKnownHostsFile none\n"
+            "CertificateFile ~/.ssh/first.pub\nHost other\n CertificateFile /must-not-read\nHost app\n HostName css.example\n User operator\n IdentityFile none\n CertificateFile none\n CertificateFile \"~/.ssh/second cert.pub\"\n CertificateFile ~/.ssh/first.pub\nHost *\n CertificateFile ~/.ssh/third.pub\n GlobalKnownHostsFile none\n",
         ));
         sources.system_config =
             KnownHostsSource::Present("CertificateFile ~/.ssh/fourth.pub\n".into());
@@ -3741,8 +4117,10 @@ socket = "/run/frankenterm.sock"
             (8, true, false, 8),
             (8, true, true, 0),
         ] {
-            let mut config = format!("Host app\n HostName css.example\n User operator\n GlobalKnownHostsFile none\n IdentityFile {}\n",
-                if raw { "~/.ssh/trj_ed25519" } else { "none" });
+            let mut config = format!(
+                "Host app\n HostName css.example\n User operator\n GlobalKnownHostsFile none\n IdentityFile {}\n",
+                if raw { "~/.ssh/trj_ed25519" } else { "none" }
+            );
             for index in 0..count {
                 config.push_str(&format!(" CertificateFile ~/.ssh/cert{}.pub\n", index));
             }
@@ -4071,7 +4449,11 @@ socket = "/run/frankenterm.sock"
         assert_eq!(export.routes, 5);
         assert_eq!(export.document["workspace"]["credentials"], json!([]));
         assert!(export.identity_files.is_empty());
-        assert!(export.notes.is_empty(), "{:?}", export.notes);
+        assert_eq!(export.notes.len(), 1, "{:?}", export.notes);
+        assert!(
+            export.notes[0].route.is_none()
+                && export.notes[0].message.contains("background gradient")
+        );
         for route in export.document["workspace"]["routes"].as_array().unwrap() {
             assert_eq!(route["authentication_methods"], json!(["password"]));
             assert_eq!(route["credential_refs"], json!([]));
@@ -4224,7 +4606,11 @@ socket = "/run/frankenterm.sock"
             export.routes, 5,
             "three transit hosts, destination, and mux"
         );
-        assert!(export.notes.is_empty(), "{:?}", export.notes);
+        assert_eq!(export.notes.len(), 1, "{:?}", export.notes);
+        assert!(
+            export.notes[0].route.is_none()
+                && export.notes[0].message.contains("background gradient")
+        );
         let destination = exported_route(&export, "r.app.ssh");
         let jumps = destination["jump_routes"].as_array().unwrap();
         assert_eq!(jumps.len(), 3);
@@ -5695,8 +6081,20 @@ ssh = "right"
             }
         }
 
-        fn names(&self, directory: &Path) -> Option<Vec<String>> {
-            Some(self.directories.get(directory).cloned().unwrap_or_default())
+        fn names(&self, directory: &Path, limit: usize) -> Option<Vec<String>> {
+            let names = self.directories.get(directory).cloned().unwrap_or_default();
+            (names.len() <= limit).then_some(names)
+        }
+
+        fn is_directory(&self, path: &Path) -> Option<bool> {
+            Some(
+                self.directories.contains_key(path)
+                    || self
+                        .files
+                        .keys()
+                        .any(|file| file != path && file.starts_with(path))
+                    || self.directories.keys().any(|dir| dir.starts_with(path)),
+            )
         }
     }
 
@@ -5817,9 +6215,8 @@ ssh = "right"
             "Include $HOME/x\n",
             "Include ~other/x\n",
             "Include ../x\n",
-            "Include con?ig\n",
             "Include config.d/[ab].conf\n",
-            "Include */x\n",
+            "Include config.d/*/\n",
         ] {
             assert!(
                 expand(unresolved, base, &files).contains("Include "),
@@ -5827,6 +6224,172 @@ ssh = "right"
                 unresolved
             );
         }
+    }
+
+    #[test]
+    fn nested_include_globs_preserve_source_order_and_host_policy() {
+        let base = "/home/me/.ssh";
+        let mut files = FixtureIncludes::default();
+        files.directories.insert(
+            format!("{base}/config.d").into(),
+            ["region2", "notes", "region1", ".region3"]
+                .map(String::from)
+                .to_vec(),
+        );
+        files.files.insert(
+            format!("{base}/config.d/notes").into(),
+            present("not a directory"),
+        );
+        for region in ["region1", "region2", ".region3"] {
+            files.directories.insert(
+                format!("{base}/config.d/{region}").into(),
+                ["20-auth.conf", "10-host.conf", ".private.conf"]
+                    .map(String::from)
+                    .to_vec(),
+            );
+            files.files.insert(
+                format!("{base}/config.d/{region}/10-host.conf").into(),
+                present(&format!(
+                    "Host left right\n HostName box\n User {region}\n UserKnownHostsFile /trust/pins\n GlobalKnownHostsFile none\n"
+                )),
+            );
+            files.files.insert(
+                format!("{base}/config.d/{region}/20-auth.conf").into(),
+                present("Host left right\n User later\n PasswordAuthentication no\n"),
+            );
+            files.files.insert(
+                format!("{base}/config.d/{region}/.private.conf").into(),
+                present("Match exec must-never-run\n ProxyCommand must-never-run\n"),
+            );
+        }
+        let expanded = expand("Include config.d/region?/*.conf\n", base, &files);
+        assert!(!expanded.contains("Include "));
+        assert!(!expanded.contains("must-never-run"));
+        let resolver = alias_resolver(Some(&expanded), &context().home).unwrap();
+        let options = resolver.config.for_host("left");
+        assert_eq!(options.get("user").map(String::as_str), Some("region1"));
+        assert_eq!(
+            resolver.authentication_policy(&options).methods,
+            vec!["publickey", "keyboard-interactive"]
+        );
+        let mut sources = sources(Some(&expanded));
+        supply(
+            &mut sources,
+            "/trust/pins",
+            format!("box ssh-ed25519 {ED25519}\n"),
+        );
+        let export = trust_export(&sources);
+        let trust = route_trust(&export, "r.left.ssh");
+        assert!(trust["required_capabilities"].is_null(), "{trust}");
+        assert_eq!(trust["pins"].as_array().unwrap().len(), 1);
+        // A wildcard may match a file as well as directories; a file cannot
+        // become an intermediate component or poison otherwise valid matches.
+        assert_eq!(
+            expand("Include config.d/*/*.conf\n", base, &files),
+            expanded
+        );
+    }
+
+    #[test]
+    fn include_question_marks_match_characters_and_keep_dotfiles_explicit() {
+        for (pattern, name, matches) in [
+            ("region?", "region1", true),
+            ("region?", "region12", false),
+            ("région?", "régioné", true),
+            ("région??", "régioné", false),
+            ("*?*.conf", "a.conf", true),
+            ("*?*.conf", ".a.conf", false),
+            (".?*.conf", ".é.conf", true),
+            ("*.conf", "a.txt", false),
+        ] {
+            assert_eq!(
+                glob_component_matches(pattern, name),
+                matches,
+                "{pattern} / {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn include_globs_do_not_reinterpret_a_literal_home_directory() {
+        let home = Path::new("/home/a?b");
+        let base = home.join(".ssh");
+        let directory = base.join("config.d");
+        let mut files = FixtureIncludes::default();
+        files
+            .directories
+            .insert(directory.clone(), vec!["a.conf".into()]);
+        files
+            .files
+            .insert(directory.join("a.conf"), present("User selected\n"));
+        for pattern in ["config.d/*.conf", "~/.ssh/config.d/?.conf"] {
+            let paths =
+                include_paths(pattern, &base, home, &files, &mut IncludeBudget::new()).unwrap();
+            assert_eq!(paths, vec![directory.join("a.conf")]);
+        }
+    }
+
+    #[test]
+    fn include_scan_budget_is_shared_even_when_patterns_match_no_files() {
+        let base = "/home/me/.ssh";
+        let mut files = FixtureIncludes::default();
+        files.directories.insert(
+            format!("{base}/empty").into(),
+            (0..9000)
+                .map(|index| format!("unselected-{index}.txt"))
+                .collect(),
+        );
+        let mut budget = IncludeBudget::new();
+        let expanded = expand_includes(
+            "Include empty/*.conf\nInclude empty/*.conf\nInclude empty/*.conf\n",
+            Path::new(base),
+            &context().home,
+            &files,
+            &mut budget,
+            0,
+            true,
+        );
+        // The first complete no-match scan is harmless. The next consumes the
+        // remaining allowance and both uncompleted Includes stay mandatory.
+        assert_eq!(expanded, "Include empty/*.conf\nInclude empty/*.conf\n");
+        assert_eq!(budget.entries, 0);
+        assert!(
+            alias_resolver(Some(&expanded), &context().home)
+                .unwrap()
+                .incomplete
+        );
+    }
+
+    #[test]
+    fn include_traversal_rejects_overfull_frontiers_and_partial_sources() {
+        let base = "/home/me/.ssh";
+        let mut files = FixtureIncludes::default();
+        let names: Vec<_> = (0..65).map(|index| format!("region-{index:02}")).collect();
+        files
+            .directories
+            .insert(format!("{base}/config.d").into(), names.clone());
+        for name in names {
+            files
+                .directories
+                .insert(format!("{base}/config.d/{name}").into(), vec![]);
+        }
+        let include = "Include config.d/*/options\n";
+        assert_eq!(expand(include, base, &files), include);
+
+        files.directories.insert(
+            format!("{base}/config.d").into(),
+            vec!["a.conf".into(), "b.conf".into()],
+        );
+        files.files.insert(
+            format!("{base}/config.d/a.conf").into(),
+            present("User partial\n"),
+        );
+        files.files.insert(
+            format!("{base}/config.d/b.conf").into(),
+            KnownHostsSource::Unavailable,
+        );
+        let include = "Include config.d/?.conf\n";
+        assert_eq!(expand(include, base, &files), include);
     }
 
     #[test]
@@ -5889,11 +6452,17 @@ ssh = "right"
         );
         // A directory that does not exist has no files; one that does lists them.
         assert_eq!(
-            DiskIncludes.names(&dir.path().join("absent")),
+            DiskIncludes.names(&dir.path().join("absent"), MAX_INCLUDE_ENTRIES),
             Some(Vec::new())
         );
-        let mut names = DiskIncludes.names(dir.path()).unwrap();
+        let mut names = DiskIncludes.names(dir.path(), MAX_INCLUDE_ENTRIES).unwrap();
         names.sort();
         assert_eq!(names, ["apple.conf", "crypto.conf", "twice.conf"]);
+        assert!(DiskIncludes.names(dir.path(), 2).is_none());
+        assert_eq!(DiskIncludes.is_directory(dir.path()), Some(true));
+        assert_eq!(
+            DiskIncludes.is_directory(&dir.path().join("apple.conf")),
+            Some(false)
+        );
     }
 }

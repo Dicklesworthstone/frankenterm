@@ -26,7 +26,7 @@ pub const LEGACY_VERSIONS: RangeInclusive<usize> = 46..=47;
 /// CODEC_VERSION`. Additive reliable writes (v64) and pane identity (v71)
 /// are gated by the negotiated version; neither silently falls back to a
 /// numeric-pane legacy write on a current connection.
-pub const CURRENT_VERSIONS: RangeInclusive<usize> = 61..=71;
+pub const CURRENT_VERSIONS: RangeInclusive<usize> = 61..=72;
 
 /// Which of the two layouts a server speaks. They differ, for this client,
 /// in SendPaste (an input serial follows the text) and ErrorResponse (a
@@ -70,6 +70,9 @@ pub mod ident {
     pub const RESIZE: u64 = 14;
     pub const GET_LINES: u64 = 22;
     pub const GET_LINES_RESPONSE: u64 = 23;
+    pub const GET_LINES_AT_LAYOUT: u64 = 102;
+    pub const GET_LINES_AT_LAYOUT_RESPONSE: u64 = 103;
+    pub const GET_PANE_RENDER_STATE: u64 = 114;
     pub const GET_PANE_RENDER_CHANGES: u64 = 24;
     pub const GET_PANE_RENDER_CHANGES_RESPONSE: u64 = 25;
     pub const GET_CODEC_VERSION: u64 = 26;
@@ -95,11 +98,15 @@ pub mod ident {
     pub const RELIABLE_PANE_WRITE_RESPONSE: u64 = 101;
     pub const GET_PANE_IDENTITY: u64 = 117;
     pub const GET_PANE_IDENTITY_RESPONSE: u64 = 118;
+    pub const RESIZE_PANE_CONDITIONAL: u64 = 119;
+    pub const RESIZE_PANE_CONDITIONAL_RESPONSE: u64 = 120;
 }
 
 /// `codec::TopologyCapabilities::FENCED_SNAPSHOT_V1`, the one capability a
 /// coherent pane list needs.
 pub const FENCED_SNAPSHOT: u64 = 1;
+/// v69 supplies a correlated observation for v65's layout-fenced row reads.
+pub const OBSERVED_LINES_MIN_VERSION: usize = 69;
 
 pub type StableRowIndex = isize;
 
@@ -333,7 +340,7 @@ pub struct GetPaneIdentity {
     pub pane_id: usize,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PaneIdentity {
     pub session_incarnation: [u8; 16],
     pub durable_pane_id: [u8; 16],
@@ -428,6 +435,61 @@ pub struct Resize {
     pub size: TerminalSize,
 }
 
+pub const CONDITIONAL_RESIZE_MIN_VERSION: usize = 72;
+pub const MAX_CONDITIONAL_RESIZE_RESPONSE_BYTES: usize = 128;
+pub const MAX_CONDITIONAL_RESIZE_CELLS: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct ResizePaneConditional {
+    pub containing_tab_id: usize,
+    pub pane_id: usize,
+    pub identity: PaneIdentity,
+    pub size: TerminalSize,
+}
+
+pub fn conditional_resize_size_is_valid(size: TerminalSize) -> bool {
+    size.rows != 0
+        && size.cols != 0
+        && [size.rows, size.cols, size.pixel_width, size.pixel_height]
+            .iter()
+            .all(|dimension| *dimension <= u16::MAX as usize)
+        && size.dpi <= u16::MAX as u32
+        && size
+            .rows
+            .checked_mul(size.cols)
+            .is_some_and(|cells| cells <= MAX_CONDITIONAL_RESIZE_CELLS)
+}
+
+/// Enqueue acceptance is not proof of reflow. All other outcomes terminate
+/// this operation; none authorizes a numeric resize or a replay.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+pub enum ConditionalResizeOutcome {
+    Enqueued,
+    PaneGone,
+    IdentityMismatch,
+    IdentityUnavailable,
+    Retired,
+    Indeterminate,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResizePaneConditionalResponse {
+    pub pane_id: usize,
+    pub identity: PaneIdentity,
+    pub outcome: ConditionalResizeOutcome,
+}
+
+pub fn decode_conditional_resize_receipt(
+    body: &[u8],
+) -> Result<ResizePaneConditionalResponse, crate::Error> {
+    if body.len() > MAX_CONDITIONAL_RESIZE_RESPONSE_BYTES {
+        return Err(crate::Error::Frame(
+            "a conditional resize receipt is too large",
+        ));
+    }
+    crate::varbin::deserialize_exact(body).map_err(|_| crate::Error::Schema)
+}
+
 /// `mux::pane::Pattern`.
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub enum Pattern {
@@ -482,7 +544,7 @@ pub struct CursorPosition {
 }
 
 /// `mux::renderable::RenderableDimensions`.
-#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Dimensions {
     pub cols: usize,
     pub viewport_rows: usize,
@@ -493,6 +555,19 @@ pub struct Dimensions {
     pub pixel_width: usize,
     pub pixel_height: usize,
     pub reverse_video: bool,
+}
+
+impl Dimensions {
+    /// The server's `same_line_layout_geometry`: scrolling and retention move
+    /// bounds without reinterpreting coordinates of surviving stable rows.
+    pub fn same_line_layout(&self, other: &Self) -> bool {
+        self.cols == other.cols
+            && self.viewport_rows == other.viewport_rows
+            && self.dpi == other.dpi
+            && self.pixel_width == other.pixel_width
+            && self.pixel_height == other.pixel_height
+            && self.reverse_video == other.reverse_video
+    }
 }
 
 /// `mux::renderable::PaneTieredScrollbackStatus`: read only to stay aligned.
@@ -585,6 +660,95 @@ pub struct RenderHead {
 pub struct RenderChanges {
     pub head: RenderHead,
     pub bonus_lines: LineEntries,
+}
+
+/// Unlike the legacy prefix above, this consumes the complete line envelope
+/// before reading its sequence. Skipping image references would interpret
+/// their bytes as input/sequence metadata. Images remain unsupported here.
+#[derive(Deserialize, Debug)]
+pub struct CompleteLineEntries {
+    pub entries: LineEntries,
+    #[serde(deserialize_with = "discard_image_references")]
+    _images: (),
+}
+
+fn discard_image_references<'de, D: serde::Deserializer<'de>>(decoder: D) -> Result<(), D::Error> {
+    struct Images;
+    impl<'de> serde::de::Visitor<'de> for Images {
+        type Value = ();
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a bounded sequence of unsupported image references")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut sequence: A) -> Result<(), A::Error> {
+            const MAXIMUM: usize = 65_536;
+            if sequence.size_hint().is_some_and(|count| count > MAXIMUM) {
+                return Err(serde::de::Error::custom("too many image references"));
+            }
+            let mut count = 0;
+            while sequence.next_element::<ImageReference>()?.is_some() {
+                count += 1;
+                if count > MAXIMUM {
+                    return Err(serde::de::Error::custom("too many image references"));
+                }
+            }
+            Ok(())
+        }
+    }
+    decoder.deserialize_seq(Images)
+}
+
+#[derive(Deserialize, Debug)]
+#[allow(dead_code)]
+struct ImageReference {
+    line_idx: StableRowIndex,
+    cell_idx: usize,
+    top_left: termwiz::image::TextureCoordinate,
+    bottom_right: termwiz::image::TextureCoordinate,
+    data_hash: [u8; 32],
+    z_index: i32,
+    padding_left: u16,
+    padding_top: u16,
+    padding_right: u16,
+    padding_bottom: u16,
+    image_id: Option<u32>,
+    placement_id: Option<u32>,
+}
+
+/// Full PDU25 on v69+; a correlated PDU114 reply uses this same schema.
+/// This is a line-coordinate fence, not a complete palette/mode snapshot.
+#[derive(Deserialize, Debug)]
+pub struct RenderObservation {
+    pub head: RenderHead,
+    pub bonus_lines: CompleteLineEntries,
+    #[allow(dead_code)]
+    input_serial: Option<u64>,
+    pub seqno: usize,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineReadLayout {
+    pub seqno: usize,
+    pub dimensions: Dimensions,
+}
+
+#[derive(Serialize)]
+pub struct GetLinesAtLayout {
+    pub pane_id: usize,
+    pub layout: LineReadLayout,
+    pub lines: Vec<Range<StableRowIndex>>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct LinesAtLayoutResponse {
+    pub pane_id: usize,
+    pub layout: LineReadLayout,
+    pub lines: CompleteLineEntries,
+}
+
+/// A fence cannot be decoded from a prefix or silently downgraded after a
+/// malformed response. Allocation is still limited by varbin and FrameReader.
+pub fn decode_observation<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, crate::Error> {
+    crate::varbin::deserialize_exact(body).map_err(|_| crate::Error::Schema)
 }
 
 /// Prefix of PDU 23.

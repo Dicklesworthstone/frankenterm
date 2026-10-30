@@ -96,6 +96,9 @@ use frankenterm_core::storage::{MigrationPlan, MigrationStatusReport};
 use frankenterm_core::swarm_scheduler::{HerdWaveEventKind, HerdWaveMcpResourceSurface};
 use serde::{Deserialize, Serialize};
 
+#[cfg(unix)]
+mod mobile_attach;
+
 /// Build metadata captured at compile time.
 mod build_meta {
     pub const GIT_HASH: &str = env!("FT_GIT_HASH");
@@ -1753,7 +1756,7 @@ SEE ALSO:
         command: StorageCommands,
     },
 
-    /// The machine inventory (machines.toml) and its iPhone export
+    /// Machine inventory, iPhone export and existing-mux attachment
     #[command(after_help = r#"EXAMPLES:
     ft mobile init css trj ts1        Start machines.toml from SSH config hosts, each in its own theme
     ft mobile show                    The machines, resolved themes and routes
@@ -1761,6 +1764,8 @@ SEE ALSO:
     ft mobile export -o fleet.ftworkspace
     ft mobile export --group fleet -o fleet.ftworkspace
     ft mobile themes -o ThemeCatalog.json
+    ft mobile attach --stdio --no-auto-start
+    ft mobile attach --stdio --no-auto-start --socket /private/path/mux.sock
 
 The inventory lives beside frankenterm.lua (~/.config/frankenterm/machines.toml).
 Exports carry public keys and known_hosts pins only, never a private key; seal
@@ -8162,6 +8167,19 @@ enum ConfigProfileCommands {
 
 #[derive(Subcommand)]
 enum MobileCommands {
+    /// Relay binary mux traffic to an existing same-account Unix socket;
+    /// never starts a mux, opens a shell or reads executable configuration
+    Attach {
+        /// Use stdin/stdout exclusively for the existing mux protocol
+        #[arg(long, required = true)]
+        stdio: bool,
+        /// Require an existing server; automatic startup is never supported
+        #[arg(long, required = true)]
+        no_auto_start: bool,
+        /// Exact mux socket (default: FRANKENTERM_UNIX_SOCKET, then the runtime socket)
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
     /// Start a machine inventory from SSH config hosts, each in its own theme
     Init {
         /// Host aliases from ~/.ssh/config (default: every concrete Host)
@@ -49797,6 +49815,17 @@ fn main() {
     // peer and has no observable output outside `ft version --full`.
     std::hint::black_box(build_meta::ATOMIC_COMPONENT_MARKER);
 
+    // This process owns one bounded synchronous stdio relay for its entire
+    // lifetime. Dispatch before the async runtime, workspace initialization,
+    // configuration evaluation or logging can acquire terminal resources.
+    if let Some(result) = dispatch_mobile_attach_before_runtime() {
+        if let Err(error) = result {
+            eprintln!("ft mobile attach: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let runtime_role = sniff_runtime_process_role_from_args();
     let runtime_spec = runtime_bootstrap_spec_for_role(runtime_role);
     let runtime_worker_threads_env = std::env::var("FT_RUNTIME_WORKER_THREADS").ok();
@@ -49860,6 +49889,37 @@ fn main() {
             }
         }
     });
+}
+
+fn dispatch_mobile_attach_before_runtime() -> Option<anyhow::Result<()>> {
+    // Other command families retain their existing parse/error path. A
+    // malformed mobile invocation also reaches that path, without connecting.
+    if !std::env::args_os().skip(1).any(|arg| arg == "mobile") {
+        return None;
+    }
+    let cli = Cli::try_parse().ok()?;
+    let Commands::Mobile {
+        command:
+            MobileCommands::Attach {
+                stdio: true,
+                no_auto_start: true,
+                socket,
+            },
+    } = cli.command.as_deref()?
+    else {
+        return None;
+    };
+    #[cfg(unix)]
+    {
+        Some(mobile_attach::run(socket.as_deref()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = socket;
+        Some(Err(anyhow::anyhow!(
+            "mobile attachment requires a Unix-domain socket on this host"
+        )))
+    }
 }
 
 async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<()> {
@@ -76181,6 +76241,9 @@ fn handle_mobile_command(command: &MobileCommands) -> anyhow::Result<()> {
         |explicit: &Option<PathBuf>| explicit.clone().unwrap_or_else(machines::default_path);
 
     match command {
+        MobileCommands::Attach { .. } => {
+            anyhow::bail!("mobile attachment must own stdio before runtime initialization");
+        }
         MobileCommands::Init { hosts, inventory } => {
             let path = inventory_path(inventory);
             if path.exists() {

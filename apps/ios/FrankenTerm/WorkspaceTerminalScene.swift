@@ -51,8 +51,10 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// Storing the IDs also makes same-machine group changes observable to UI.
     private(set) var navigationMachineIDs: [String] = []
     private(set) var problem: String?
-    /// A read-only snapshot picker. Its dismissal joins one owned navigation
-    /// operation before the terminal keyboard can be enabled again.
+    /// Native panels share one input fence. Their dismissal joins one owned
+    /// navigation operation before the terminal keyboard can be enabled again.
+    enum Panel: Equatable { case fleet, hardwareKeyboard }
+    private(set) var presentedPanel: Panel = .fleet
     private(set) var overviewPresented = false
     @ObservationIgnored private var overviewVisit: UUID?
     @ObservationIgnored private var overviewGeneration = UUID()
@@ -207,8 +209,8 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
 
     // MARK: Fleet overview
 
-    func beginOverview() {
-        guard !closed, foreground, onScreen, !overviewBlocksInput, !groupAppearanceBlocksInput,
+    func beginOverview(panel: Panel = .fleet) {
+        guard !closed, foreground, onScreen, !overviewBlocksInput, !groupAppearanceBlocksInput, !openingSplit,
               navigation.phase == .ready || navigation.phase == .inactive,
               selectedSession?.clipboardIsPresenting != true,
               selectedSession?.paneNavigationBusy != true else { return }
@@ -216,9 +218,12 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         // an unadmitted local key. Previously admitted bytes keep their owner.
         if let keyboard = owner.keyboard,
            keyboard.document.isMarked || keyboard.accounting.pendingEvents > 0 || keyboard.phase == .blocked {
-            problem = "Finish composing or let pending local input settle before opening the overview."
+            problem = panel == .fleet
+                ? "Finish composing or let pending local input settle before opening the overview."
+                : "Finish composing or let pending local input settle before opening keyboard settings."
             return
         }
+        presentedPanel = panel
         overviewGeneration = UUID(); overviewVisit = overviewGeneration
         overviewChoice = nil; overviewCatalogID = nil; overviewPresented = true
         canvasGeneration = UUID()
@@ -1621,7 +1626,10 @@ struct WorkspaceTerminalScreen: View {
         .sheet(isPresented: Binding(get: { scene.overviewPresented }, set: { visible in
             if !visible { scene.dismissOverview() }
         }), onDismiss: { if let overviewSessionID { scene.finishOverviewDismissal(overviewSessionID) } }) {
-            WorkspaceFleetOverviewScreen(scene: scene)
+            switch scene.presentedPanel {
+            case .fleet: WorkspaceFleetOverviewScreen(scene: scene)
+            case .hardwareKeyboard: TerminalHardwareSettingsScreen()
+            }
         }
         .toolbarBackground(.visible, for: .navigationBar)
         .toolbarColorScheme(chrome, for: .navigationBar)
@@ -1663,6 +1671,11 @@ struct WorkspaceTerminalScreen: View {
                     .disabled(session.isViewingOnly || session.clipboardIsPresenting || session.localInputNeedsDecision)
             }
             Menu {
+                Button("Hardware Keyboard…", systemImage: "keyboard") {
+                    scene.beginOverview(panel: .hardwareKeyboard)
+                }
+                .disabled(scene.openingSplit)
+                .accessibilityIdentifier("terminal.keyboard.settings")
                 if scene.splitLayout.isSplit {
                     Button("Close Split", systemImage: "rectangle") { scene.closeSplit() }
                         .accessibilityIdentifier("terminal.split.close")
@@ -2048,6 +2061,65 @@ struct WorkspaceTerminalScreen: View {
         guard let app = URL(string: "tailscale://"),
               let store = URL(string: "https://apps.apple.com/app/id1470499037") else { return }
         UIApplication.shared.open(app) { opened in if !opened { UIApplication.shared.open(store) } }
+    }
+}
+
+/// These are device preferences, so a workspace import cannot change what a
+/// physical key does. The scene's existing panel fence owns held-key cleanup
+/// and creates a fresh input generation after dismissal, without reconnecting.
+private struct TerminalHardwareSettingsScreen: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var preferences = TerminalHardwarePreferencesStore.shared.current
+    @State private var saveFailed = false
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    Picker("Control and Option", selection: $preferences.modifierMapping) {
+                        ForEach(TerminalHardwarePreferences.ModifierMapping.allCases, id: \.self) { mapping in
+                            Text(mapping.title).tag(mapping)
+                        }
+                    }
+                    .accessibilityIdentifier("terminal.keyboard.modifiers")
+                } footer: {
+                    Text(preferences.modifierMapping.explanation)
+                }
+                Section {
+                    Picker("Backspace", selection: $preferences.backspace) {
+                        ForEach(TerminalHardwarePreferences.Backspace.allCases, id: \.self) { backspace in
+                            Text(backspace.title).tag(backspace)
+                        }
+                    }
+                    .accessibilityIdentifier("terminal.keyboard.backspace")
+                } footer: {
+                    Text("Use Control-Backspace for a shell that expects Ctrl-H. Extended keyboard protocols keep their negotiated key encoding.")
+                }
+                Section {
+                    Button("Use Default Keys") { preferences = .init() }
+                        .accessibilityIdentifier("terminal.keyboard.defaults")
+                } footer: {
+                    Text("Applies to hardware keyboards across this device. Command shortcuts, Control-Space, composed text, paste, and the on-screen key row keep their existing behavior.")
+                }
+                if saveFailed {
+                    Text("Keyboard settings could not be saved. Please try again.").foregroundStyle(.red)
+                }
+            }
+            .navigationTitle("Hardware Keyboard")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        do { try TerminalHardwarePreferencesStore.shared.save(preferences); dismiss() }
+                        catch { saveFailed = true }
+                    }
+                    .accessibilityIdentifier("terminal.keyboard.save")
+                }
+            }
+        }
     }
 }
 

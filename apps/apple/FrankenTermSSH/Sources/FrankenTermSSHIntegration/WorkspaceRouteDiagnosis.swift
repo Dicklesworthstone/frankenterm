@@ -164,6 +164,13 @@ public enum WorkspaceRouteProbe {
         public let hostKey: WorkspaceDocument.HostVerificationDecision?
         public let peer: NativeSSHPeer?
         public let failure: (any Error)?
+        /// A supported public identity from the completed key exchange. This
+        /// is evidence to compare independently, not proof of the host's name.
+        /// Use the same signature/algorithm qualification as authentication.
+        public var observedIdentity: SSHPublicIdentity? {
+            guard failure == nil, let peer else { return nil }
+            return try? WorkspaceNativeSSHAuthentication.hostIdentity(for: peer)
+        }
     }
 
     public static func run(route: WorkspaceDocument.Route, document: WorkspaceDocument,

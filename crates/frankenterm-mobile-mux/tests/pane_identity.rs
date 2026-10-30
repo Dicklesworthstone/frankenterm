@@ -243,6 +243,7 @@ fn a_show_rechecks_preflight_identity_instead_of_inheriting_a_replaced_registrat
     assert!(!harness.session.is_ready());
     assert_eq!(harness.outputs, 0);
     assert!(!harness.server.requests.contains(&"GetPaneRenderChanges"));
+    assert!(!harness.server.requests.contains(&"GetPaneRenderStateV1"));
     assert!(
         harness
             .events

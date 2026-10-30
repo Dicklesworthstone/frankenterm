@@ -3593,6 +3593,18 @@ macro_rules! pdu_encoded_body_limit {
             max_zstd_encoded_bytes: MAX_PANE_IDENTITY_RESPONSE_ZSTD_ENCODED_BYTES,
         }
     };
+    (ResizePaneConditionalV1, none) => {
+        PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: MAX_CONDITIONAL_RESIZE_REQUEST_DECOMPRESSED_BYTES,
+            max_zstd_encoded_bytes: MAX_CONDITIONAL_RESIZE_REQUEST_ZSTD_ENCODED_BYTES,
+        }
+    };
+    (ResizePaneConditionalV1Response, none) => {
+        PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: MAX_CONDITIONAL_RESIZE_RESPONSE_DECOMPRESSED_BYTES,
+            max_zstd_encoded_bytes: MAX_CONDITIONAL_RESIZE_RESPONSE_ZSTD_ENCODED_BYTES,
+        }
+    };
     (GetImageCellResponse, none) => {
         PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
             max_decompressed_bytes: MAX_GET_IMAGE_CELL_RESPONSE_DECOMPRESSED_BYTES,
@@ -4348,7 +4360,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 71;
+pub const CODEC_VERSION: usize = 72;
 
 /// Lowest codec version this build can decode wire frames from.
 ///
@@ -4950,6 +4962,12 @@ pdu! {
     GetPaneIdentityV1Response: 118, 71, server_reply, none,
         query, query, normal
         => deserialize_get_pane_identity_v1_response;
+    ResizePaneConditionalV1: 119, 72, client_request, none,
+        interactive_state, interactive_state, interactive
+        => deserialize_resize_pane_conditional_v1;
+    ResizePaneConditionalV1Response: 120, 72, server_reply, none,
+        interactive_state, interactive_state, interactive
+        => deserialize_resize_pane_conditional_v1_response;
 }
 
 impl Pdu {
@@ -4972,6 +4990,8 @@ impl Pdu {
             Self::GetPaneDomainsV1Response(value) => value.validate()?,
             Self::GetPaneUserVarsV1Response(value) => value.validate()?,
             Self::GetPaneIdentityV1Response(value) => value.validate()?,
+            Self::ResizePaneConditionalV1(value) => value.validate()?,
+            Self::ResizePaneConditionalV1Response(value) => value.validate()?,
             Self::SendKeyDownTracedV1(value) => value.validate()?,
             Self::SendPasteTracedV1(value) => value.validate()?,
             Self::ReliableKeyEventV1(value) => value.validate()?,
@@ -6456,6 +6476,11 @@ impl Pdu {
             | Pdu::GetPaneUserVarsV1Response(GetPaneUserVarsV1Response { pane_id, .. })
             | Pdu::GetPaneIdentityV1(GetPaneIdentityV1 { pane_id })
             | Pdu::GetPaneIdentityV1Response(GetPaneIdentityV1Response { pane_id, .. })
+            | Pdu::ResizePaneConditionalV1(ResizePaneConditionalV1 { pane_id, .. })
+            | Pdu::ResizePaneConditionalV1Response(ResizePaneConditionalV1Response {
+                pane_id,
+                ..
+            })
             | Pdu::GetLinesAtLayout(GetLinesAtLayout { pane_id, .. })
             | Pdu::GetLinesAtLayoutResponse(GetLinesAtLayoutResponse { pane_id, .. })
             | Pdu::CaptureSelectionAnchorV1(CaptureSelectionAnchorV1 { pane_id, .. })
@@ -14272,6 +14297,115 @@ pub struct Resize {
     pub containing_tab_id: TabId,
     pub pane_id: PaneId,
     pub size: TerminalSize,
+}
+
+pub const MAX_CONDITIONAL_RESIZE_REQUEST_DECOMPRESSED_BYTES: usize = 256;
+pub const MAX_CONDITIONAL_RESIZE_REQUEST_ZSTD_ENCODED_BYTES: usize = 512;
+pub const MAX_CONDITIONAL_RESIZE_RESPONSE_DECOMPRESSED_BYTES: usize = 128;
+pub const MAX_CONDITIONAL_RESIZE_RESPONSE_ZSTD_ENCODED_BYTES: usize = 256;
+/// Matches the bounded render-application viewport profile. Each dimension
+/// and pixel extent must also fit the native PTY's unsigned 16-bit fields.
+pub const MAX_CONDITIONAL_RESIZE_CELLS: usize = 4 * 1024 * 1024;
+
+/// Resize only the exact pane observed by the client. The server compares all
+/// three identity fields at admission and retains its existing pane/session
+/// operation guard through enqueue. This does not acquire a controller lease,
+/// establish exclusive size ownership, or compare a layout revision.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ResizePaneConditionalV1 {
+    pub containing_tab_id: TabId,
+    pub pane_id: PaneId,
+    pub identity: PaneIdentityV1,
+    pub size: TerminalSize,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum ResizePaneConditionalOutcomeV1 {
+    /// The exact pane accepted the resize into its queue. Its asynchronous
+    /// worker may still coalesce, fail, or be superseded. Observe subsequent
+    /// authoritative geometry before claiming that the new grid was applied.
+    Enqueued,
+    /// No resize callback was entered for these rejection outcomes.
+    PaneGone,
+    IdentityMismatch,
+    IdentityUnavailable,
+    /// The connection or exact operation retired before entering the callback.
+    Retired,
+    /// The callback failed after entry; it may already have enqueued work.
+    /// Neither this outcome nor a lost reply authorizes automatic replay.
+    Indeterminate,
+}
+
+/// Correlated by the frame serial and the exact requested identity. The echo
+/// names the request, never the identity of a replacement pane.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ResizePaneConditionalV1Response {
+    pub pane_id: PaneId,
+    pub identity: PaneIdentityV1,
+    pub outcome: ResizePaneConditionalOutcomeV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum ConditionalResizeError {
+    #[error(transparent)]
+    Identity(#[from] PaneIdentityError),
+    #[error("conditional resize geometry exceeds the bounded PTY profile")]
+    InvalidGeometry,
+}
+
+impl ResizePaneConditionalV1 {
+    pub fn validate(&self) -> Result<(), ConditionalResizeError> {
+        self.identity.validate()?;
+        let size = self.size;
+        if size.rows == 0
+            || size.cols == 0
+            || [size.rows, size.cols, size.pixel_width, size.pixel_height]
+                .iter()
+                .any(|dimension| *dimension > u16::MAX as usize)
+            || size.dpi > u16::MAX as u32
+            || size
+                .rows
+                .checked_mul(size.cols)
+                .is_none_or(|cells| cells > MAX_CONDITIONAL_RESIZE_CELLS)
+        {
+            return Err(ConditionalResizeError::InvalidGeometry);
+        }
+        Ok(())
+    }
+}
+
+impl ResizePaneConditionalV1Response {
+    pub fn validate(&self) -> Result<(), PaneIdentityError> {
+        self.identity.validate()
+    }
+}
+
+fn deserialize_resize_pane_conditional_v1(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<ResizePaneConditionalV1, Error> {
+    let request: ResizePaneConditionalV1 = deserialize_exact_payload_with_limit(
+        data,
+        is_compressed,
+        "ResizePaneConditionalV1",
+        MAX_CONDITIONAL_RESIZE_REQUEST_DECOMPRESSED_BYTES,
+    )?;
+    request.validate()?;
+    Ok(request)
+}
+
+fn deserialize_resize_pane_conditional_v1_response(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<ResizePaneConditionalV1Response, Error> {
+    let response: ResizePaneConditionalV1Response = deserialize_exact_payload_with_limit(
+        data,
+        is_compressed,
+        "ResizePaneConditionalV1Response",
+        MAX_CONDITIONAL_RESIZE_RESPONSE_DECOMPRESSED_BYTES,
+    )?;
+    response.validate()?;
+    Ok(response)
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
@@ -22897,7 +23031,7 @@ mod test {
 
     #[test]
     fn codec_v65_additive_line_layout_preserves_the_v61_compatibility_floor() {
-        assert_eq!(CODEC_VERSION, 71);
+        assert_eq!(CODEC_VERSION, 72);
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 61);
         assert_eq!(ORDERED_WINDOW_V1_MIN_CODEC_VERSION, 54);
         assert!(!codec_version_supports_ordered_window_v1(50));
@@ -24750,7 +24884,7 @@ mod test {
 
     #[test]
     fn codec_version_is_current() {
-        assert_eq!(CODEC_VERSION, 71);
+        assert_eq!(CODEC_VERSION, 72);
     }
 
     #[test]
@@ -24935,6 +25069,179 @@ mod test {
                 encode_raw(ident, 23, &vec![0; cap + 1], compressed, &mut frame).unwrap();
                 let error = Pdu::decode(frame.as_slice()).unwrap_err();
                 assert!(error
+                    .downcast_ref::<PduEncodedBodyLimitExceeded>()
+                    .is_some());
+            }
+        }
+    }
+
+    fn conditional_resize_fixture() -> ResizePaneConditionalV1 {
+        ResizePaneConditionalV1 {
+            containing_tab_id: 3,
+            pane_id: 42,
+            identity: PaneIdentityV1 {
+                session_incarnation: MuxSessionIncarnation::from_bytes([0x13; 16]),
+                durable_pane_id: [0x26; 16],
+                pane_registration: ReliablePaneRegistrationIdentityV1::from_bytes([0x39; 16]),
+            },
+            size: TerminalSize::default(),
+        }
+    }
+
+    #[test]
+    fn conditional_resize_round_trips_exact_authority_and_requires_codec_72() {
+        let request = conditional_resize_fixture();
+        let mut pdus = vec![Pdu::ResizePaneConditionalV1(request)];
+        for outcome in [
+            ResizePaneConditionalOutcomeV1::Enqueued,
+            ResizePaneConditionalOutcomeV1::PaneGone,
+            ResizePaneConditionalOutcomeV1::IdentityMismatch,
+            ResizePaneConditionalOutcomeV1::IdentityUnavailable,
+            ResizePaneConditionalOutcomeV1::Retired,
+            ResizePaneConditionalOutcomeV1::Indeterminate,
+        ] {
+            pdus.push(Pdu::ResizePaneConditionalV1Response(
+                ResizePaneConditionalV1Response {
+                    pane_id: request.pane_id,
+                    identity: request.identity,
+                    outcome,
+                },
+            ));
+        }
+        for pdu in pdus {
+            for mode in [CompressionMode::Never, CompressionMode::Always] {
+                let frame = pdu.encode_frame_with_mode(31, mode).unwrap();
+                let decoded = Pdu::decode(frame.as_slice()).unwrap();
+                assert_eq!(decoded.serial, 31);
+                assert_eq!(decoded.pdu, pdu);
+            }
+            assert_eq!(pdu.minimum_codec_version(), Some(72));
+            assert_eq!(pdu.pane_id(), Some(42));
+            let (producer, role) = if matches!(&pdu, Pdu::ResizePaneConditionalV1(_)) {
+                (PduProducer::Client, PduWireRole::Request)
+            } else {
+                (PduProducer::Server, PduWireRole::CorrelatedReply)
+            };
+            assert!(pdu
+                .clone()
+                .prepare_outbound_for_dialect(
+                    MuxWireDialect::current(71).unwrap(),
+                    producer,
+                    role,
+                    None,
+                    CompressionMode::Never
+                )
+                .is_err());
+            assert!(pdu
+                .prepare_outbound_for_dialect(
+                    MuxWireDialect::current(72).unwrap(),
+                    producer,
+                    role,
+                    None,
+                    CompressionMode::Never
+                )
+                .is_ok());
+        }
+        assert_eq!(ResizePaneConditionalV1::IDENT, 119);
+        assert_eq!(ResizePaneConditionalV1Response::IDENT, 120);
+        assert!(!ResizePaneConditionalV1Response::WIRE_SPEC
+            .authorizes(PduProducer::Server, PduWireRole::Unilateral));
+    }
+
+    #[test]
+    fn conditional_resize_rejects_unbounded_geometry_and_reserved_identity_before_effect_admission()
+    {
+        for case in 0..10 {
+            let mut request = conditional_resize_fixture();
+            match case {
+                0 => {
+                    request.identity.session_incarnation =
+                        MuxSessionIncarnation::from_bytes([0; 16])
+                }
+                1 => request.identity.durable_pane_id = [0; 16],
+                2 => {
+                    request.identity.pane_registration =
+                        ReliablePaneRegistrationIdentityV1::from_bytes([0; 16])
+                }
+                3 => request.size.rows = 0,
+                4 => request.size.cols = 0,
+                5 => request.size.rows = usize::MAX,
+                6 => request.size.pixel_width = u16::MAX as usize + 1,
+                7 => request.size.pixel_height = u16::MAX as usize + 1,
+                8 => {
+                    request.size.rows = 4096;
+                    request.size.cols = 2048;
+                }
+                9 => request.size.dpi = u16::MAX as u32 + 1,
+                _ => unreachable!(),
+            }
+            let mut output = Vec::new();
+            assert!(Pdu::ResizePaneConditionalV1(request)
+                .encode(&mut output, 31)
+                .is_err());
+            assert!(output.is_empty());
+            for mode in [CompressionMode::Never, CompressionMode::Always] {
+                let (body, compressed) = serialize_with_mode(&request, mode).unwrap();
+                let mut frame = Vec::new();
+                encode_raw(
+                    ResizePaneConditionalV1::IDENT,
+                    31,
+                    &body,
+                    compressed,
+                    &mut frame,
+                )
+                .unwrap();
+                assert!(Pdu::decode(frame.as_slice()).is_err(), "case {case}");
+            }
+        }
+        let mut boundary = conditional_resize_fixture();
+        boundary.size.rows = 2048;
+        boundary.size.cols = 2048;
+        assert!(boundary.validate().is_ok());
+    }
+
+    #[test]
+    fn conditional_resize_exact_body_and_compression_caps_reject_ambiguous_receipts() {
+        let request = conditional_resize_fixture();
+        let reply = ResizePaneConditionalV1Response {
+            pane_id: request.pane_id,
+            identity: request.identity,
+            outcome: ResizePaneConditionalOutcomeV1::Enqueued,
+        };
+        for (ident, body, plain_cap, compressed_cap) in [
+            (
+                ResizePaneConditionalV1::IDENT,
+                varbincode::serialize(&request).unwrap(),
+                MAX_CONDITIONAL_RESIZE_REQUEST_DECOMPRESSED_BYTES,
+                MAX_CONDITIONAL_RESIZE_REQUEST_ZSTD_ENCODED_BYTES,
+            ),
+            (
+                ResizePaneConditionalV1Response::IDENT,
+                varbincode::serialize(&reply).unwrap(),
+                MAX_CONDITIONAL_RESIZE_RESPONSE_DECOMPRESSED_BYTES,
+                MAX_CONDITIONAL_RESIZE_RESPONSE_ZSTD_ENCODED_BYTES,
+            ),
+        ] {
+            for invalid in [
+                body[..body.len() - 1].to_vec(),
+                [body.as_slice(), &[0]].concat(),
+            ] {
+                for compressed in [false, true] {
+                    let encoded = if compressed {
+                        zstd::encode_all(invalid.as_slice(), 0).unwrap()
+                    } else {
+                        invalid.clone()
+                    };
+                    let mut frame = Vec::new();
+                    encode_raw(ident, 31, &encoded, compressed, &mut frame).unwrap();
+                    assert!(Pdu::decode(frame.as_slice()).is_err());
+                }
+            }
+            for (compressed, cap) in [(false, plain_cap), (true, compressed_cap)] {
+                let mut frame = Vec::new();
+                encode_raw(ident, 31, &vec![0; cap + 1], compressed, &mut frame).unwrap();
+                assert!(Pdu::decode(frame.as_slice())
+                    .unwrap_err()
                     .downcast_ref::<PduEncodedBodyLimitExceeded>()
                     .is_some());
             }
@@ -25780,7 +26087,7 @@ mod test {
     fn pdu_wire_registry_covers_every_assigned_id_and_only_the_historical_gaps() {
         const GAPS: &[u64] = &[5, 6, 7, 15, 16, 17, 18, 19, 21];
 
-        for ident in 0..=118 {
+        for ident in 0..=120 {
             let spec = Pdu::wire_spec_for_ident(ident);
             assert_eq!(
                 spec.is_none(),
@@ -25794,9 +26101,9 @@ mod test {
             }
         }
 
-        assert!(Pdu::wire_spec_for_ident(119).is_none());
+        assert!(Pdu::wire_spec_for_ident(121).is_none());
         assert!(Pdu::wire_spec_for_ident(u64::MAX).is_none());
-        assert_eq!(Pdu::all_wire_specs().len(), 119 - GAPS.len());
+        assert_eq!(Pdu::all_wire_specs().len(), 121 - GAPS.len());
     }
 
     #[test]
@@ -25843,6 +26150,7 @@ mod test {
                 114 => 69,
                 115..=116 => 70,
                 117..=118 => 71,
+                119..=120 => 72,
                 ident => panic!("unexpected assigned PDU ID {}", ident),
             };
             assert_eq!(
@@ -25878,11 +26186,11 @@ mod test {
             1, 3, 9, 11, 12, 13, 14, 22, 24, 26, 28, 31, 33, 34, 35, 36, 38, 40, 41, 43, 45, 46,
             48, 50, 51, 56, 57, 58, 59, 60, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75,
             77, 80, 81, 85, 86, 88, 91, 93, 95, 96, 98, 99, 100, 102, 104, 106, 108, 110, 112, 114,
-            115, 117,
+            115, 117, 119,
         ];
         const SERVER_REPLIES: &[u64] = &[
             0, 2, 4, 8, 10, 23, 25, 27, 29, 30, 32, 42, 47, 49, 52, 61, 76, 78, 82, 87, 89, 92, 94,
-            97, 101, 103, 105, 107, 109, 111, 113, 116, 118,
+            97, 101, 103, 105, 107, 109, 111, 113, 116, 118, 120,
         ];
         const SERVER_UNILATERALS: &[u64] = &[
             20, 25, 37, 38, 39, 44, 53, 54, 55, 56, 57, 58, 79, 83, 84, 90,
@@ -25976,7 +26284,8 @@ mod test {
                 | 62..=72
                 | 74
                 | 88
-                | 89 => Class::InteractiveState,
+                | 89
+                | 119..=120 => Class::InteractiveState,
                 3
                 | 4
                 | 37
@@ -26015,9 +26324,19 @@ mod test {
             let expected_cap = match spec.ident {
                 1 | 2 | 26..=30 | 40 => Cap::Control,
                 9 | 11 | 12 | 73 | 95..=98 | 100..=101 => Cap::InteractiveInput,
-                8 | 14 | 33..=36 | 38 | 43 | 45 | 48..=50 | 56..=59 | 62..=72 | 74 | 88 | 89 => {
-                    Cap::InteractiveState
-                }
+                8
+                | 14
+                | 33..=36
+                | 38
+                | 43
+                | 45
+                | 48..=50
+                | 56..=59
+                | 62..=72
+                | 74
+                | 88
+                | 89
+                | 119..=120 => Cap::InteractiveState,
                 37 | 39 | 44 | 53..=55 | 83 | 90 | 110 | 111 => Cap::StateSync,
                 24 | 25 | 79 | 80 | 84 | 85 | 91 | 92 | 114 => Cap::Render,
                 3
@@ -26060,7 +26379,8 @@ mod test {
                 | 62..=74
                 | 88
                 | 89
-                | 95..=101 => Qos::Interactive,
+                | 95..=101
+                | 119..=120 => Qos::Interactive,
                 3
                 | 22
                 | 24
@@ -27032,7 +27352,7 @@ mod test {
     #[test]
     fn check_compat_current_build_keeps_v61_floor_after_additive_v65() {
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 61);
-        assert_eq!(CODEC_VERSION, 71);
+        assert_eq!(CODEC_VERSION, 72);
         assert!(check_compat(62, 61, 60, 58).is_err());
         assert_eq!(
             check_compat(62, 61, 61, 61),

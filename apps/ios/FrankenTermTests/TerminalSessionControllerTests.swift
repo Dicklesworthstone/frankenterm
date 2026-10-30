@@ -1316,6 +1316,33 @@ final class TerminalSessionControllerTests: XCTestCase {
         try await type("echo $FT_SPLIT_WHO >> \(typed)", into: alpha)
         recorded = try await hostFile(typed, containing: "ALPHA")
         XCTAssertEqual(recorded, "BETA\nALPHA\n")
+
+        // Device keyboard settings use the same focus fence with both slots
+        // visible. Dismissal restores only the selected terminal's input; both
+        // shells and the explicitly chosen pair keep their identities.
+        let beforeSettings = alpha.input
+        scene.beginOverview(panel: .hardwareKeyboard)
+        let settingsVisit = try XCTUnwrap(scene.overviewSessionID)
+        await scene.navigation.joinSuspension()
+        XCTAssertFalse(scene.permitsTerminalCreation)
+        XCTAssertFalse(beforeSettings.canBecomeFirstResponder)
+        XCTAssertFalse(beta.input.canBecomeFirstResponder)
+        beforeSettings.insertText("echo WRONG > \(typed).settings-stale\n")
+        scene.dismissOverview(); scene.finishOverviewDismissal(settingsVisit)
+        for _ in 0..<400 where !scene.permitsTerminalCreation || alpha.input.session.id == beforeSettings.session.id {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        show()
+        XCTAssertEqual(scene.displayedMachineIDs, ["alpha", "beta"])
+        XCTAssertEqual(scene.selectedMachineID, "alpha")
+        XCTAssertNotEqual(alpha.input.session.id, beforeSettings.session.id)
+        XCTAssertFalse(beta.input.canBecomeFirstResponder)
+        XCTAssertTrue(scene.sessions["alpha"] === first); XCTAssertTrue(scene.sessions["beta"] === second)
+        try await type("echo SETTINGS-$((40+2)) >> \(typed)", into: alpha)
+        recorded = try await hostFile(typed, containing: "SETTINGS-42")
+        XCTAssertEqual(recorded, "BETA\nALPHA\nSETTINGS-42\n")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: typed + ".settings-stale"))
+
         scene.closeSplit(); show()
         XCTAssertEqual(scene.displayedMachineIDs, ["alpha"])
         XCTAssertNil(beta.window)
@@ -2862,6 +2889,45 @@ final class TerminalSessionControllerTests: XCTestCase {
         let scene = try WorkspaceTerminalScene(workspaceID: target.workspaceID, revision: target.revision, workspaceName: "Dormant",
             machines: [machine], initialMachineID: "machine", connections: connections, autoConnect: false)
         return (connections, scene, target)
+    }
+
+    func testHardwareSettingsOwnTheInputFenceUntilDismissalWithoutConnecting() async throws {
+        let (connections, scene, _) = try dormantScene()
+        try await appear(scene, selecting: "machine")
+        scene.beginOverview(panel: .hardwareKeyboard)
+        let settingsVisit = try XCTUnwrap(scene.overviewSessionID)
+        XCTAssertEqual(scene.presentedPanel, .hardwareKeyboard)
+        XCTAssertTrue(scene.overviewPresented)
+        XCTAssertFalse(scene.permitsTerminalCreation)
+        scene.openTerminal("machine")
+        XCTAssertTrue(scene.sessions.isEmpty, "opening local keyboard settings cannot create a terminal")
+
+        scene.beginOverview()
+        XCTAssertEqual(scene.presentedPanel, .hardwareKeyboard, "another panel cannot replace the active input owner")
+        XCTAssertEqual(scene.overviewSessionID, settingsVisit)
+        scene.dismissOverview()
+        XCTAssertFalse(scene.overviewPresented)
+        XCTAssertFalse(scene.permitsTerminalCreation, "the input fence remains until sheet dismissal joins suspension")
+        scene.finishOverviewDismissal(settingsVisit)
+        for _ in 0..<200 where !scene.permitsTerminalCreation { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertTrue(scene.permitsTerminalCreation)
+        XCTAssertEqual(scene.selectedMachineID, "machine")
+
+        scene.beginOverview()
+        let fleetVisit = try XCTUnwrap(scene.overviewSessionID)
+        XCTAssertEqual(scene.presentedPanel, .fleet)
+        XCTAssertNotEqual(fleetVisit, settingsVisit)
+        scene.finishOverviewDismissal(settingsVisit)
+        XCTAssertEqual(scene.overviewSessionID, fleetVisit, "a delayed settings callback cannot dismiss the next panel")
+        XCTAssertFalse(scene.permitsTerminalCreation)
+        scene.dismissOverview(); scene.finishOverviewDismissal(fleetVisit)
+        for _ in 0..<200 where !scene.permitsTerminalCreation { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertTrue(scene.permitsTerminalCreation)
+        XCTAssertTrue(scene.sessions.isEmpty)
+        let pending = await connections.manager.pendingCount, records = try await connections.journal.records()
+        XCTAssertEqual(pending, 0)
+        XCTAssertTrue(records.isEmpty)
+        await scene.close()
     }
 
     func testStopBeforeStartPermanentlyRetiresThisController() async throws {

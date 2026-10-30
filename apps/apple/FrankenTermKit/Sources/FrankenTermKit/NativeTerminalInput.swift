@@ -105,7 +105,12 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     private var foreground = UIColor.label
     private var stateObservation: UUID?
     private var observedPhase: TerminalKeyboardPhase = .active
+    private let hardwarePreferences: TerminalHardwarePreferencesStore
     private var physicalKeys: [UInt16: TerminalHardwareKey] = [:]
+    /// Native-layout presses keep native ownership through repeats and release,
+    /// even if settings change while an Option/dead key is still held. Only
+    /// ordinary HID usages 1..<0xE0 enter this finite set.
+    private var textSystemKeys: Set<UInt16> = []
     /// UIKit reports a hardware key once however long it is held, so the last
     /// terminal key pressed repeats here while it stays down, as on a desktop.
     /// A key-row arrow held down repeats the same way.
@@ -132,8 +137,10 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     public var canCopySelection: (@MainActor () -> Bool)?
     public var copySelection: (@MainActor () -> Void)?
 
-    public init(session: TerminalKeyboardSession, readOnly: Bool = false) throws {
+    public init(session: TerminalKeyboardSession, readOnly: Bool = false,
+                hardwarePreferences: TerminalHardwarePreferencesStore = .shared) throws {
         self.session = session; isReadOnly = readOnly
+        self.hardwarePreferences = hardwarePreferences
         super.init(frame: .zero)
         isOpaque = false; backgroundColor = .clear
         accessibilityLabel = "Terminal keyboard"
@@ -219,7 +226,7 @@ public final class NativeTerminalInputView: UIView, UITextInput {
         retiring = true
         keyboardRequested = false
         inputDelegate?.textWillChange(self); inputDelegate?.selectionWillChange(self)
-        accessoryModifiers.clear(); pendingPaste = nil; physicalKeys.removeAll(); stopRepeating()
+        accessoryModifiers.clear(); pendingPaste = nil; physicalKeys.removeAll(); textSystemKeys.removeAll(); stopRepeating()
         session.suspend()
         if let token = stateObservation { session.removeStateObserver(token); stateObservation = nil }
         refreshComposition()
@@ -513,19 +520,32 @@ public final class NativeTerminalInputView: UIView, UITextInput {
             // Pressing another key ends a repeat, as on a desktop; a modifier does not.
             if !(0xE0...0xE7).contains(usage) { stopRepeating() }
             let mods = modifiers(key.modifierFlags)
+            if textSystemKeys.contains(usage) {
+                unhandled.insert(press); continue
+            }
+            let preferences = hardwarePreferences.current
+            // Already admitted keys keep their mapping. The default classifier
+            // still reserves IME and physical Command/Control-Space for UIKit.
+            let routingPreferences = physicalKeys[usage] == nil ? preferences : .init()
             guard TerminalHardwareRouting.destination(usage: usage, modifiers: mods,
-                                                       hasMarkedText: session.document.isMarked) == .terminal else {
+                                                       hasMarkedText: session.document.isMarked,
+                                                       preferences: routingPreferences) == .terminal else {
+                if usage > 0, usage < 0xE0, physicalKeys[usage] == nil { textSystemKeys.insert(usage) }
                 unhandled.insert(press); continue
             }
             typed {
                 guard physicalKeys[usage] != nil || physicalKeys.count < 32 else { throw TerminalKeyboardError.capacity }
-                let value = try TerminalHardwareKey(usage: usage, modifiers: mods.union(accessoryModifiers.modifiers),
-                                                    characters: key.charactersIgnoringModifiers)
+                let value = try physicalKeys[usage] ?? TerminalHardwareRouting.key(
+                    usage: usage, modifiers: mods, characters: key.charactersIgnoringModifiers,
+                    preferences: preferences, accessoryModifiers: accessoryModifiers.modifiers)
                 let held = physicalKeys[usage] != nil
                 try session.key(value, phase: held ? .repeated : .down)
-                physicalKeys[usage] = value; accessoryModifiers.consume()
+                physicalKeys[usage] = value
                 // A key UIKit reports again while held is one UIKit repeats.
-                if !held { startRepeating(usage) { $0.repeatHeldKey(usage) } }
+                if !held {
+                    accessoryModifiers.consume()
+                    startRepeating(usage) { $0.repeatHeldKey(usage) }
+                }
             }
         }
         if !unhandled.isEmpty { super.pressesBegan(unhandled, with: event) }
@@ -591,8 +611,10 @@ public final class NativeTerminalInputView: UIView, UITextInput {
                     // source-bound releaseAll cleanup and stops new admission.
                     onFailure?(error); retire()
                 }
-            } else if TerminalHardwareRouting.destination(usage: usage, modifiers: modifiers(key.modifierFlags),
-                                                           hasMarkedText: session.document.isMarked) == .textSystem {
+            } else if textSystemKeys.remove(usage) != nil
+                        || TerminalHardwareRouting.destination(usage: usage, modifiers: modifiers(key.modifierFlags),
+                                                           hasMarkedText: session.document.isMarked,
+                                                           preferences: hardwarePreferences.current) == .textSystem {
                 unhandled.insert(press)
             }
         }

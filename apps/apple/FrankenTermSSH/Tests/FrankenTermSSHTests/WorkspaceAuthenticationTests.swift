@@ -584,13 +584,72 @@ final class WorkspaceAuthenticationTests: XCTestCase {
             try await exerciseLiveJump(mode: mode, destinationPort: port, destinationHost: host, environment: environment)
             return
         }
+        let firstHostVerification = ["host-pin", "host-pin-connect", "rsa-host-pin", "rsa-host-pin-connect"].contains(mode)
         let f = try await SSHWorkspaceTestFixture.make(port: port,
             hostBlob: ["wrong-host", "rsa-wrong-host"].contains(mode) ? nil : host,
-            routeMode: mode.hasPrefix("mux-") ? "frankenterm_mux" : "direct_ssh")
+            routeMode: mode.hasPrefix("mux-") ? "frankenterm_mux" : "direct_ssh") { workspace in
+                if firstHostVerification {
+                    var trusts = workspace["host_trust"] as! [[String: Any]]
+                    trusts[0]["pins"] = [] as [[String: Any]]
+                    workspace["host_trust"] = trusts
+                }
+            }
         let expectedHostSignature = environment["FT_WORKSPACE_SSH_TEST_HOST_SIGNATURE"]
         if mode.hasPrefix("rsa-") {
             XCTAssertNotNil(expectedHostSignature)
             XCTAssertEqual(try SSHPublicIdentity(blob: host).algorithm, "ssh-rsa")
+        }
+        if firstHostVerification {
+            let support = WorkspaceNativeSSHAuthentication.routeSupport
+            let document = try await f.store.hostKeyVerificationDocument(workspaceID: f.installed.id,
+                expectedRevision: f.installed.revision, routeID: "route", support: support)
+            let route = try XCTUnwrap(document.routes.first), activity = WorkspaceNetworkActivity()
+            XCTAssertTrue(try XCTUnwrap(document.hostTrust.first).pins.isEmpty)
+            let result = await WorkspaceRouteProbe.run(route: route, document: document,
+                timeout: .seconds(5), networkActivity: activity)
+            XCTAssertNil(result.failure)
+            XCTAssertEqual(result.hostKey, .pinMismatch)
+            let observed = try XCTUnwrap(result.observedIdentity)
+            // The harness supplies the independent server identity, rather
+            // than deriving the expected fingerprint from the probe itself.
+            XCTAssertEqual(observed.blob, host)
+            XCTAssertEqual(observed.fingerprint, f.host.fingerprint)
+            if let expectedHostSignature {
+                XCTAssertEqual(result.peer?.hostSignature, expectedHostSignature)
+            }
+            XCTAssertEqual(f.vault.counts.reads, 0); XCTAssertEqual(f.vault.counts.signatures, 0)
+            XCTAssertEqual(activity.accounting().connections, 0)
+            let key = try WorkspaceDocument.HostKey(algorithm: observed.algorithm, fingerprint: observed.fingerprint)
+            let review = try await f.store.reviewHostKeyPin(workspaceID: f.installed.id,
+                expectedRevision: f.installed.revision, routeID: "route", key: key, support: support)
+            let pinned = try await f.store.acceptHostKeyPin(review, confirmedByUser: true, support: support)
+            XCTAssertNotEqual(pinned.revision, f.installed.revision)
+            XCTAssertEqual(pinned.manifest, f.installed.manifest)
+            XCTAssertEqual(pinned.envelopeDigest, f.installed.envelopeDigest)
+            XCTAssertTrue(try XCTUnwrap(pinned.importedDocument().hostTrust.first).pins.isEmpty)
+            XCTAssertEqual(try XCTUnwrap(pinned.document().hostTrust.first).pins, [f.host])
+            XCTAssertTrue(pinned.connectLater)
+            let decision = try await f.store.verifyHostKey(workspaceID: pinned.id, routeID: "route",
+                presented: f.host, support: support)
+            XCTAssertEqual(decision, .trustedPin)
+            let states = try await f.store.routeReadiness(workspaceID: pinned.id, support: support)
+            XCTAssertTrue(try XCTUnwrap(states.first).isLocallyReady)
+            XCTAssertEqual(f.vault.counts.reads, 0); XCTAssertEqual(f.vault.counts.signatures, 0)
+            if mode.hasSuffix("-connect") {
+                // A separate, deliberate Connect uses the newly saved revision;
+                // the fingerprint check itself never authorizes authentication.
+                let approved = try await f.store.approveConnections(workspaceID: pinned.id,
+                    expectedRevision: pinned.revision, confirmedByUser: true)
+                XCTAssertFalse(approved.connectLater)
+                let connection = try await WorkspaceNativeSSHConnection.connect(workspaceID: pinned.id,
+                    expectedRevision: approved.revision, machineID: "machine", routeID: "route", credentialID: "key",
+                    confirmedByUser: true, store: f.store, broker: f.broker, networkActivity: activity,
+                    connectionTimeout: .seconds(5), authenticationTimeout: .seconds(5))
+                await connection.close()
+                XCTAssertEqual(f.vault.counts.reads, 1); XCTAssertEqual(f.vault.counts.signatures, 1)
+                XCTAssertEqual(activity.accounting().connections, 0)
+            }
+            return
         }
         if mode == "rsa-probe" {
             let route = try XCTUnwrap(f.archive.workspace.routes.first), activity = WorkspaceNetworkActivity()

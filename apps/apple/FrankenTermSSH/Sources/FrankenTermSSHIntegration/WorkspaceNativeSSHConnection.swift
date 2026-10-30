@@ -20,7 +20,7 @@ public actor WorkspaceNativeSSHConnection {
     public nonisolated let muxControl: TerminalMuxControl?
     /// The command that reaches the machine's mux when no route names one:
     /// the default socket of a FrankenTerm mux server.
-    public static let defaultMuxCommand = "nc -N -U /run/user/$(id -u)/frankenterm/sock"
+    public static let defaultMuxCommand = "ft mobile attach --stdio --no-auto-start"
     private let transport: WorkspaceNativeSSHTransport
     private let mux: (command: String, factory: @Sendable () throws -> any TerminalMuxClient)?
     private var attached: TerminalSessionPump?

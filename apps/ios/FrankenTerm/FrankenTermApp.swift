@@ -153,7 +153,7 @@ final class MobileWorkspaceModel {
     /// Import settlement retains its own reservation across scene transitions
     /// and any older callback that releases the shared operation flag.
     var busy: Bool {
-        get { operationBusy || credentialImportOperation != nil || deviceKeyOperation != nil || isReadingRecording || connectionPreferenceBusy || connectionApproval != nil }
+        get { operationBusy || credentialImportOperation != nil || deviceKeyOperation != nil || hostKeyOperation != nil || isReadingRecording || connectionPreferenceBusy || connectionApproval != nil }
         set { operationBusy = newValue }
     }
     private(set) var isReadingRecording = false
@@ -189,6 +189,8 @@ final class MobileWorkspaceModel {
     /// at most one runs at a time, and it owns its cleanup.
     @ObservationIgnored private var keyReviewID: UUID?
     @ObservationIgnored private var keyRevocation: (id: UUID, task: Task<Void, Never>)?
+    var hostKeyPinReview: WorkspaceHostKeyPinReview?
+    @ObservationIgnored private var hostKeyOperation: (id: UUID, task: Task<Void, Never>)?
     private var pendingImport: PendingFileImport?
     @ObservationIgnored private var epoch = UUID()
     @ObservationIgnored private var lifecycle: Task<Void, Never>?
@@ -389,7 +391,7 @@ final class MobileWorkspaceModel {
     @ObservationIgnored private var liveScenes: [UUID: WorkspaceTerminalScene] = [:]
     func liveScene(workspaceID: UUID, revision: UUID,
                    make: () throws -> WorkspaceTerminalScene) throws -> WorkspaceTerminalScene {
-        guard keyRevocation == nil, credentialImportOperation == nil, deviceKeyOperation == nil,
+        guard keyRevocation == nil, credentialImportOperation == nil, deviceKeyOperation == nil, hostKeyOperation == nil,
               !showRestore, !requiresConnectionApproval(workspaceID),
               !deviceKeyConnectionHolds.contains(workspaceID) else { throw WorkspaceSSHConnectionError.busy }
         guard workspaces.contains(where: { $0.id == workspaceID && $0.revision == revision }) else {
@@ -582,6 +584,8 @@ final class MobileWorkspaceModel {
     private func updateLifecycle(discardRecipientRequest: Bool = false) {
         epoch = UUID()
         keyReviewID = nil
+        hostKeyPinReview = nil
+        hostKeyOperation?.task.cancel()
         workspaceRefreshEpoch = UUID()
         workspaceRefresh?.cancel()
         observations?.finish(); observations = nil
@@ -1474,6 +1478,108 @@ final class MobileWorkspaceModel {
             workspaceNames: names, epoch: epoch)
         keyReviewID = reviewed.id
         return reviewed
+    }
+
+    /// A deliberate, bounded host-key exchange. No key, password or MFA answer
+    /// is offered, and the connection is closed before its fingerprint appears.
+    func beginHostKeyVerification(workspaceID: UUID, routeID: String) {
+        guard active, !busy, !showRestore, credentialImport == nil, let store,
+              let saved = workspaces.first(where: { $0.id == workspaceID }) else { return }
+        let ticket = epoch, operation = UUID()
+        let checkingMessage = "Checking the server's public host key…"
+        hostKeyPinReview = nil; credentialMessage = checkingMessage; busy = true
+        let task = Task { [self] in
+            defer {
+                if hostKeyOperation?.id == operation {
+                    hostKeyOperation = nil; busy = false
+                    if credentialMessage == checkingMessage {
+                        credentialMessage = "The host-key check stopped. Choose Check Host Key to try again."
+                    }
+                }
+            }
+            do {
+                let support = WorkspaceNativeSSHAuthentication.routeSupport
+                let document = try await store.hostKeyVerificationDocument(workspaceID: workspaceID,
+                    expectedRevision: saved.revision, routeID: routeID, support: support)
+                try Task.checkCancellation()
+                guard active, !showRestore, epoch == ticket,
+                      let route = document.routes.first(where: { $0.id == routeID }) else { throw FTError.stale }
+                let probe = await WorkspaceRouteProbe.run(route: route, document: document)
+                try Task.checkCancellation()
+                if let failure = probe.failure { throw failure }
+                guard let identity = probe.observedIdentity else { throw FTError.stale }
+                let review = try await store.reviewHostKeyPin(workspaceID: workspaceID,
+                    expectedRevision: saved.revision, routeID: routeID,
+                    key: .init(algorithm: identity.algorithm, fingerprint: identity.fingerprint), support: support)
+                try Task.checkCancellation()
+                guard active, !showRestore, epoch == ticket else { throw FTError.stale }
+                credentialMessage = nil
+                hostKeyPinReview = review
+            } catch {
+                guard active, epoch == ticket else { return }
+                credentialMessage = "The host key could not be checked. \(error.localizedDescription)"
+            }
+        }
+        hostKeyOperation = (operation, task)
+    }
+
+    /// Fingerprint confirmation changes only local trust. Retire live owners
+    /// before publication and retain the connection hold even if saving fails.
+    func acceptVerifiedHostKey(_ review: WorkspaceHostKeyPinReview) {
+        guard active, !busy, !showRestore, credentialImport == nil, let store,
+              hostKeyPinReview?.id == review.id,
+              workspaces.first(where: { $0.id == review.workspaceID })?.revision == review.expectedRevision else { return }
+        let ticket = epoch, operation = UUID()
+        hostKeyPinReview = nil; credentialMessage = nil; busy = true
+        workspaceRefreshEpoch = UUID(); workspaceRefresh?.cancel()
+        deviceKeyConnectionHolds.insert(review.workspaceID)
+        if returning?.workspaceID == review.workspaceID { returning = nil }
+        if let data = UserDefaults.standard.data(forKey: Self.liveScreenKey),
+           let screen = try? JSONDecoder().decode(LiveScreen.self, from: data), screen.workspaceID == review.workspaceID {
+            UserDefaults.standard.removeObject(forKey: Self.liveScreenKey)
+        }
+        let scene = liveScenes[review.workspaceID]
+        scene?.requestClose()
+        let task = Task { [self] in
+            let result: Result<Void, Error>
+            do {
+                if let scene {
+                    await scene.close()
+                    if liveScenes[review.workspaceID] === scene { liveScenes[review.workspaceID] = nil }
+                }
+                await connections?.manager.invalidate(workspaceID: review.workspaceID)
+                try Task.checkCancellation()
+                guard active, !showRestore, epoch == ticket else { throw WorkspaceStoreError.staleReview }
+                _ = try await store.acceptHostKeyPin(review, confirmedByUser: true,
+                    support: WorkspaceNativeSSHAuthentication.routeSupport)
+                result = .success(())
+            } catch { result = .failure(error) }
+            // Readback belongs to a fresh task: cancellation after an atomic
+            // publication must not disguise a saved pin as an undone operation.
+            await Task { [self] in
+                guard hostKeyOperation?.id == operation else { return }
+                defer { hostKeyOperation = nil; busy = false }
+                workspaceRefreshEpoch = UUID(); workspaceRefresh?.cancel()
+                availableCredentials.removeValue(forKey: review.workspaceID)
+                localPolicies.removeValue(forKey: review.workspaceID)
+                var refreshed = false
+                if active {
+                    do {
+                        try await refreshWorkspaces(using: store, epoch: epoch)
+                        refreshed = active && localPolicies[review.workspaceID] != nil
+                    }
+                    catch { }
+                }
+                switch result {
+                case .success:
+                    credentialMessage = "The verified host key is saved on this phone. This workspace stays offline until you choose Connect."
+                case .failure(let error):
+                    credentialMessage = "Saving the host key could not be confirmed. \(error.localizedDescription) Review the saved host keys before trying again."
+                }
+                if !refreshed { credentialMessage = (credentialMessage ?? "") + " Reopen SSH Keys when the app is active to refresh its saved status." }
+            }.value
+        }
+        hostKeyOperation = (operation, task)
     }
 
     /// Stop trusting one pinned host key on this phone. Sessions in every
@@ -3355,6 +3461,9 @@ private struct WorkspaceKeysSheet: View {
         .sheet(item: $phoneKey) { choice in
             WorkspaceDeviceKeyRoutesSheet(workspaceID: workspaceID, credentialID: choice.id, model: model)
         }
+        .sheet(item: Binding(get: { model.hostKeyPinReview }, set: { model.hostKeyPinReview = $0 })) { review in
+            WorkspaceHostKeyVerificationSheet(review: review, model: model)
+        }
         .confirmationDialog(deviceReview?.title ?? "Phone SSH Key",
                             isPresented: Binding(get: { deviceReview != nil }, set: { if !$0 { deviceReview = nil } }),
                             titleVisibility: .visible, presenting: deviceReview) { review in
@@ -3457,6 +3566,25 @@ private struct WorkspaceKeysSheet: View {
         let revoked = Set(endpoint.trusts.flatMap { $0.revokedKeys.map(\.fingerprint) })
         return VStack(alignment: .leading, spacing: 10) {
             Text(verbatim: "\(endpoint.trusts[0].displayHost) port \(endpoint.trusts[0].port)").font(.headline)
+            ForEach(endpoint.trusts.filter { $0.pins.isEmpty }) { trust in
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("No verified host key", systemImage: "questionmark.shield").font(.callout)
+                    if let route = document?.routes.first(where: {
+                        $0.trustID == trust.id && $0.jumpRoutes.isEmpty
+                            && ($0.mode == "direct_ssh" || $0.mode == "frankenterm_mux")
+                    }) {
+                        Button("Check Host Key…", systemImage: "checkmark.shield") {
+                            reviewed = nil; hostReview = nil; deviceReview = nil
+                            model.beginHostKeyVerification(workspaceID: workspaceID, routeID: route.id)
+                        }.accessibilityIdentifier("hostkeys.check.\(trust.id)")
+                        Text("Connects only to read the server's public host key. No credential is offered. Compare the fingerprint independently before trusting it.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        Text("Import verified host trust from your Mac for a destination reached through a jump host.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
             ForEach(endpoint.pins) { pin in
                 VStack(alignment: .leading, spacing: 6) {
                     Text(verbatim: pin.key.algorithm).font(.caption).foregroundStyle(.secondary)
@@ -3486,6 +3614,47 @@ private struct WorkspaceKeysSheet: View {
                 }
             }
         }.padding(.vertical, 6)
+    }
+}
+
+@MainActor
+private struct WorkspaceHostKeyVerificationSheet: View {
+    let review: WorkspaceHostKeyPinReview
+    @Bindable var model: MobileWorkspaceModel
+    @State private var comparedIndependently = false
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("Server Identity") {
+                    Text(verbatim: "\(review.host) port \(review.port)").font(.headline)
+                    Text(verbatim: review.key.algorithm).font(.callout)
+                    Text(verbatim: review.key.fingerprint)
+                        .font(.system(.body, design: .monospaced)).textSelection(.enabled)
+                        .accessibilityIdentifier("hostkeys.observed-fingerprint")
+                }
+                Section {
+                    Text("The SSH connection has closed without offering a key, password or MFA answer. Receiving this fingerprint alone does not prove the server's identity. Compare the complete fingerprint with your server administrator or an existing trusted connection.")
+                    Toggle("I checked this fingerprint independently", isOn: $comparedIndependently)
+                        .accessibilityIdentifier("hostkeys.confirm-comparison")
+                }
+                Section {
+                    Button("Trust Verified Host Key") { model.acceptVerifiedHostKey(review) }
+                        .disabled(!comparedIndependently || model.busy || !model.active
+                            || model.hostKeyPinReview?.id != review.id)
+                        .accessibilityIdentifier("hostkeys.accept")
+                } footer: {
+                    Text(verbatim: "Saving the key disconnects any sessions in \(review.workspaceName). Direct SSH shells may end, and input already sent may have executed. The workspace stays offline until you choose Connect. This changes only this phone's trust; existing revocations and required policies still apply.")
+                }
+            }
+            .navigationTitle("Verify Host Key").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { model.hostKeyPinReview = nil }
+                }
+            }
+        }
+        .interactiveDismissDisabled(model.busy)
     }
 }
 

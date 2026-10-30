@@ -13,6 +13,167 @@
 
 use assert_cmd::Command;
 
+#[cfg(unix)]
+mod mobile_attach_contract {
+    use super::Command;
+    use std::io::{Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    fn accept(listener: &UnixListener) -> UnixStream {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    return stream;
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("the real attachment process did not connect: {error}"),
+            }
+        }
+    }
+
+    #[allow(deprecated)]
+    fn command(root: &Path) -> Command {
+        let mut command = Command::cargo_bin("ft").unwrap();
+        command
+            .timeout(Duration::from_secs(8))
+            .env("HOME", root.join("home-must-not-be-created"))
+            .env("FT_WORKSPACE", root.join("workspace-must-not-be-created"))
+            .env(
+                "FT_RUNTIME_WORKER_THREADS",
+                "runtime-must-not-be-initialized",
+            )
+            .env_remove("FRANKENTERM_UNIX_SOCKET")
+            .arg("--config")
+            .arg(root.join("unreadable-config.toml"))
+            .args(["mobile", "attach", "--stdio", "--no-auto-start"]);
+        command
+    }
+
+    #[test]
+    fn mobile_attach_real_stdio_preserves_codec_frames_and_has_no_initialization_side_effects() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("mux.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let request = codec::Pdu::GetCodecVersion(codec::GetCodecVersion {});
+        let response = codec::Pdu::GetCodecVersionResponse(codec::GetCodecVersionResponse {
+            codec_vers: codec::CODEC_VERSION,
+            version_string: "independent-loopback-mux".to_owned(),
+            executable_path: "/fixture/ft".into(),
+            config_file_path: None,
+            min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
+        });
+        let mut request_bytes = Vec::new();
+        request.encode(&mut request_bytes, 731).unwrap();
+        let mut response_bytes = Vec::new();
+        response.encode(&mut response_bytes, 731).unwrap();
+        let expected = response_bytes.clone();
+        let server = std::thread::spawn(move || {
+            let mut stream = accept(&listener);
+            let decoded = codec::Pdu::decode(&mut stream).unwrap();
+            assert_eq!(decoded.serial, 731);
+            assert_eq!(decoded.pdu, request);
+            let mut unexpected = Vec::new();
+            stream.read_to_end(&mut unexpected).unwrap();
+            assert!(
+                unexpected.is_empty(),
+                "attachment must not inject its own requests"
+            );
+            // The actual stdio EOF reached the mux, but the relay must still
+            // deliver the final response. Split it across writes deliberately.
+            for chunk in response_bytes.chunks(3) {
+                stream.write_all(chunk).unwrap();
+            }
+        });
+        let assertion = command(root.path())
+            .arg("--socket")
+            .arg(&socket)
+            .write_stdin(request_bytes)
+            .assert()
+            .success();
+        server.join().unwrap();
+        assert_eq!(
+            assertion.get_output().stdout,
+            expected,
+            "stdout must contain only exact mux bytes"
+        );
+        assert!(assertion.get_output().stderr.is_empty());
+        assert!(!root.path().join("home-must-not-be-created").exists());
+        assert!(!root.path().join("workspace-must-not-be-created").exists());
+        assert!(
+            socket.exists(),
+            "attachment must not remove the server endpoint"
+        );
+    }
+
+    #[test]
+    fn mobile_attach_missing_endpoint_fails_without_creating_a_server_or_protocol_output() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("not-running.sock");
+        let assertion = command(root.path())
+            .arg("--socket")
+            .arg(&socket)
+            .write_stdin(b"must-not-be-forwarded".to_vec())
+            .assert()
+            .failure();
+        let output = assertion.get_output();
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("selected mux socket is unavailable")
+        );
+        assert!(!socket.exists());
+        assert_eq!(
+            std::fs::read_dir(root.path()).unwrap().count(),
+            0,
+            "no server, config directory, workspace, log or lock is created"
+        );
+    }
+
+    #[test]
+    fn mobile_attach_selects_the_explicit_socket_before_the_environment_socket() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("chosen.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut stream = accept(&listener);
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, b"selected\0\xff");
+            stream.write_all(b"chosen\0\xff").unwrap();
+        });
+        let assertion = command(root.path())
+            .env(
+                "FRANKENTERM_UNIX_SOCKET",
+                root.path().join("unselected.sock"),
+            )
+            .arg("--socket")
+            .arg(&socket)
+            .write_stdin(b"selected\0\xff".to_vec())
+            .assert()
+            .success();
+        server.join().unwrap();
+        assert_eq!(assertion.get_output().stdout, b"chosen\0\xff");
+        assert!(!root.path().join("unselected.sock").exists());
+    }
+}
+
 #[cfg(all(feature = "mcp", target_os = "linux"))]
 mod mcp_runtime_migration {
     use frankenterm_core::config::McpClientConfig;

@@ -9,7 +9,9 @@
 //! text and addresses run on across the rows as they do on the desktop.
 
 use crate::render;
-use crate::wire::{CursorPosition, Dimensions, LineEntries, RenderHead, StableRowIndex};
+use crate::wire::{
+    CursorPosition, Dimensions, LineEntries, LineReadLayout, RenderHead, StableRowIndex,
+};
 use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
 use termwiz::surface::{CursorVisibility, Line};
@@ -141,6 +143,13 @@ pub struct PaneMirror {
     /// did not track, so their reply is dropped.
     epoch: u64,
     fetch_epoch: u64,
+    observation: Option<LineReadLayout>,
+    awaiting_observation: bool,
+    observation_request: Option<u64>,
+    /// Only the one outstanding read's rows can be invalidated by a push.
+    /// This stays bounded by the already bounded viewport/history request.
+    fetch_ranges: Vec<Range<StableRowIndex>>,
+    fetch_invalidated: BTreeSet<StableRowIndex>,
 }
 
 impl PaneMirror {
@@ -180,9 +189,55 @@ impl PaneMirror {
 
     fn forget_rows(&mut self) {
         self.epoch += 1;
+        self.observation_request = None;
         self.lines.clear();
         self.absent.clear();
         self.dirty.clear();
+    }
+
+    pub fn observation(&self) -> Option<LineReadLayout> {
+        self.observation
+    }
+
+    pub fn require_observation(&mut self) {
+        self.awaiting_observation = true;
+        self.observation_request = None;
+    }
+
+    pub fn expect_observation(&mut self, serial: u64) {
+        self.awaiting_observation = true;
+        self.observation_request = Some(serial);
+    }
+
+    pub fn expects_observation(&self, serial: u64) -> bool {
+        self.observation_request == Some(serial)
+    }
+
+    /// A newer push may overtake a correlated reply. It must not rewind the
+    /// target, but the reply still settles the pending observation request.
+    pub fn observe(&mut self, layout: LineReadLayout, correlated: bool) -> bool {
+        if correlated {
+            self.awaiting_observation = false;
+            self.observation_request = None;
+        }
+        if self
+            .observation
+            .is_some_and(|current| current.seqno > layout.seqno)
+        {
+            return false;
+        }
+        self.observation = Some(layout);
+        true
+    }
+
+    fn invalidate_fetched_rows(&mut self, range: Range<StableRowIndex>) {
+        if self.fetching {
+            for requested in &self.fetch_ranges {
+                let start = range.start.max(requested.start);
+                let end = range.end.min(requested.end);
+                self.fetch_invalidated.extend(start..end);
+            }
+        }
     }
 
     /// A pushed update. Without its lines (they did not decode) every row
@@ -218,9 +273,14 @@ impl PaneMirror {
             });
         if self.visible {
             let viewport = target.viewport();
-            if let Some(previous) = &self.target {
-                if previous.alt != target.alt {
+            if let Some(previous) = self.target.clone() {
+                if previous.alt != target.alt || !previous.dims.same_line_layout(&target.dims) {
+                    self.epoch = self
+                        .epoch
+                        .checked_add(1)
+                        .ok_or(crate::Error::Frame("pane layout epoch exhausted"))?;
                     self.lines.clear();
+                    self.absent.clear();
                 } else if previous.top() != target.top() {
                     // The server reports the rows that changed on the screen
                     // only. Output lands at and below the cursor, so a row
@@ -228,6 +288,7 @@ impl PaneMirror {
                     // the last update, and what is cached for it is out of
                     // date: fetch it again. Rows above the cursor were done.
                     let unsettled = previous.cursor.y.max(previous.top()).min(target.top());
+                    self.invalidate_fetched_rows(unsettled..target.top());
                     self.lines
                         .retain(|row, _| *row < unsettled || viewport.contains(row));
                 }
@@ -239,10 +300,12 @@ impl PaneMirror {
             for range in dirty {
                 let start = range.start.max(viewport.start);
                 let end = range.end.min(viewport.end);
+                self.invalidate_fetched_rows(start..end);
                 self.dirty.extend(start..end);
                 self.lines.retain(|row, _| !(start..end).contains(row));
             }
             for (row, line) in lines.map(LineEntries::linked_lines).unwrap_or_default() {
+                self.invalidate_fetched_rows(row..row.saturating_add(1));
                 self.dirty.insert(row);
                 self.absent.remove(&row);
                 self.lines.insert(row, line);
@@ -257,22 +320,46 @@ impl PaneMirror {
     pub fn apply_lines(&mut self, entries: LineEntries, requested: &[Range<StableRowIndex>]) {
         self.fetching = false;
         if self.fetch_epoch != self.epoch {
+            self.fetch_ranges.clear();
+            self.fetch_invalidated.clear();
             return;
         }
         let mut returned = BTreeSet::new();
         for (row, line) in entries.linked_lines() {
+            if self.fetch_invalidated.contains(&row)
+                || !requested.iter().any(|range| range.contains(&row))
+            {
+                continue;
+            }
             returned.insert(row);
-            self.lines.insert(row, line);
+            // A newer pushed row always wins over this asynchronous read.
+            self.lines.entry(row).or_insert(line);
         }
         for range in requested {
-            self.absent
-                .extend(range.clone().filter(|row| !returned.contains(row)));
+            self.absent.extend(range.clone().filter(|row| {
+                !returned.contains(row)
+                    && !self.fetch_invalidated.contains(row)
+                    && !self.lines.contains_key(row)
+            }));
         }
+        self.fetch_ranges.clear();
+        self.fetch_invalidated.clear();
     }
 
-    pub fn set_fetching(&mut self) {
+    pub fn set_fetching(&mut self, ranges: &[Range<StableRowIndex>]) {
         self.fetching = true;
         self.fetch_epoch = self.epoch;
+        self.fetch_ranges = ranges.to_vec();
+        self.fetch_invalidated.clear();
+    }
+
+    /// A rejected fenced read says nothing about whether its rows exist.
+    /// Keep the last display and request fresh metadata before another fetch.
+    pub fn reject_lines(&mut self) {
+        self.fetching = false;
+        self.fetch_ranges.clear();
+        self.fetch_invalidated.clear();
+        self.require_observation();
     }
 
     /// The pane was asked to become `rows` by `cols`.
@@ -293,6 +380,19 @@ impl PaneMirror {
 
     pub fn is_fetching(&self) -> bool {
         self.fetching
+    }
+
+    /// A successfully observed unchanged target needs no output bytes, but
+    /// still settles a prior busy/waiting state once every row is available.
+    pub fn is_drawable(&self) -> bool {
+        self.visible
+            && !self.fetching
+            && !self.awaiting_observation
+            && self
+                .target
+                .as_ref()
+                .is_some_and(|target| !self.waiting_for_size(target))
+            && self.wanted().is_empty()
     }
 
     fn plan(&self, target: &Target) -> Plan {
@@ -385,11 +485,12 @@ impl PaneMirror {
 
     /// The rows to fetch before the pane can be drawn, as GetLines ranges.
     pub fn wanted(&self) -> Vec<Range<StableRowIndex>> {
-        let Some(target) = self
-            .target
-            .as_ref()
-            .filter(|target| self.visible && !self.fetching && !self.waiting_for_size(target))
-        else {
+        let Some(target) = self.target.as_ref().filter(|target| {
+            self.visible
+                && !self.fetching
+                && !self.awaiting_observation
+                && !self.waiting_for_size(target)
+        }) else {
             return Vec::new();
         };
         let mut missing = BTreeSet::new();
@@ -412,7 +513,8 @@ impl PaneMirror {
     /// the phone's terminal to take in order, each a piece of its own.
     pub fn render(&mut self) -> Vec<Output> {
         let mut outputs = Vec::new();
-        if !self.visible || self.fetching || !self.wanted().is_empty() {
+        if !self.visible || self.fetching || self.awaiting_observation || !self.wanted().is_empty()
+        {
             return outputs;
         }
         let Some(target) = self.target.clone() else {
