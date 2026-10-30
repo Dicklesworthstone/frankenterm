@@ -7093,7 +7093,7 @@ impl LiveScrollbackSpillSink {
         }
         let mut count = usize::try_from(rows.end.saturating_sub(rows.start))?.min(32);
         let ledger_pane_id = self.active_ledger_pane_id();
-        self.verify_current_published_state_before_mutation(&state, ledger_pane_id, false)?;
+        self.verify_published_state_before_read(&state, ledger_pane_id)?;
         let store = self.lock_store("load_scrollback_lines read")?;
         // Retry only an explicitly classified aggregate stored-byte limit.
         // All attempts share the same publication, lease and pinned store.
@@ -11907,27 +11907,62 @@ impl LiveScrollbackSpillSink {
         Ok(())
     }
 
-    fn verify_current_published_state_before_mutation(
+    /// Read the published manifest and authenticate it under the keyring:
+    /// `None` when there is none.
+    fn read_authenticated_published_manifest(
         &self,
-        state: &LiveScrollbackSpillState,
-        ledger_pane_id: u64,
-        allow_prepared_content_ahead: bool,
-    ) -> Result<(), wezterm_term::config::ScrollbackSpillError> {
+        context: &str,
+    ) -> Result<Option<LiveScrollbackManifestV1>, wezterm_term::config::ScrollbackSpillError> {
         use wezterm_term::config::ScrollbackSpillError;
 
-        if !state.authenticated_manifest {
-            return Ok(());
-        }
         let manifest = Self::read_manifest(&self.manifest_path)
             .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
         if let Some(manifest) = manifest.as_ref() {
-            let keyring = self.lock_keyring("pre-mutation manifest authentication")?;
+            let keyring = self.lock_keyring(context)?;
             if !Self::authenticate_manifest(manifest, &keyring)
                 .map_err(|_| ScrollbackSpillError::StorageUnavailable)?
             {
                 return Err(ScrollbackSpillError::StorageUnavailable);
             }
         }
+        Ok(manifest)
+    }
+
+    /// The published-state check before a cold read reads and authenticates
+    /// the manifest once (ft-mfip6), where the mutation check does it twice.
+    /// The reader holds the mutation gate and the filesystem lease through
+    /// its read, so no other writer replaces the manifest meanwhile (the
+    /// argument ft-yccm0.2.1.5 AC2 makes for a commit window), and an
+    /// on-disk change still fails the next read.
+    fn verify_published_state_before_read(
+        &self,
+        state: &LiveScrollbackSpillState,
+        ledger_pane_id: u64,
+    ) -> Result<(), wezterm_term::config::ScrollbackSpillError> {
+        if !state.authenticated_manifest {
+            return Ok(());
+        }
+        let manifest =
+            self.read_authenticated_published_manifest("cold read manifest authentication")?;
+        self.verify_authenticated_published_state_before_mutation(
+            manifest.as_ref(),
+            state,
+            ledger_pane_id,
+            false,
+        )
+    }
+
+    fn verify_current_published_state_before_mutation(
+        &self,
+        state: &LiveScrollbackSpillState,
+        ledger_pane_id: u64,
+        allow_prepared_content_ahead: bool,
+    ) -> Result<(), wezterm_term::config::ScrollbackSpillError> {
+        if !state.authenticated_manifest {
+            return Ok(());
+        }
+        let manifest =
+            self.read_authenticated_published_manifest("pre-mutation manifest authentication")?;
         self.verify_authenticated_published_state_before_mutation(
             manifest.as_ref(),
             state,
@@ -16834,7 +16869,7 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
             return None;
         }
         let ledger_pane_id = self.active_ledger_pane_id();
-        self.verify_current_published_state_before_mutation(&state, ledger_pane_id, false)
+        self.verify_published_state_before_read(&state, ledger_pane_id)
             .ok()?;
         let initial = state.initial_stable_row;
         let content_epoch = state.content_epoch;
@@ -19093,6 +19128,80 @@ mod tests {
              directory scans): {per_window:?}; each window reads and locks at most once, takes \
              at most one lease (two in the first) and scans nothing"
         );
+    }
+
+    /// ft-mfip6: a cold read reads its pane's manifest once, and reads alone
+    /// arm the keyring's stat fast path, so reading an idle pane rescans no
+    /// keyring directory except once per expired one-second window (each read
+    /// used to scan it twice: manifest authentication and decryption). An
+    /// older authentic manifest put back on disk still fails the read.
+    #[cfg(unix)]
+    #[test]
+    fn a_cold_read_reads_the_manifest_once_and_refuses_a_rolled_back_manifest() {
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let sink = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &deferred_test_context())
+            .unwrap();
+        let rows = digest_only_test_lines("cold-read", 4);
+        // The first append establishes the authenticated lineage alone.
+        assert_eq!(sink.store_scrollback_lines(0, &rows[..1], 4096), 1);
+        let older = std::fs::read(&sink.manifest_path).unwrap();
+        assert_eq!(sink.store_scrollback_lines(1, &rows[1..], 4096), 3);
+        assert_ne!(
+            std::fs::read(&sink.manifest_path).unwrap(),
+            older,
+            "the second batch publishes a new manifest"
+        );
+        // Nothing appends from here: only reads can arm the fast path.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            assert_eq!(sink.load_scrollback_line(0), Some(rows[0].clone()));
+            if sink
+                .lock_keyring("settle keyring")
+                .unwrap()
+                .fast_path_validated()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cold reads never armed the keyring fast path"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let counts = || {
+            (
+                LIVE_SCROLLBACK_MANIFEST_READS.with(std::cell::Cell::get),
+                guardian_output_keys::INVENTORY_SCANS.with(std::cell::Cell::get),
+            )
+        };
+        let before = counts();
+        assert_eq!(sink.load_scrollback_line(3), Some(rows[3].clone()));
+        assert_eq!(sink.load_scrollback_lines(0..4), rows);
+        let after = counts();
+        assert_eq!(
+            (after.0 - before.0, after.1 - before.1),
+            (2, 0),
+            "(manifest reads, keyring directory scans) of two settled reads"
+        );
+
+        std::thread::sleep(
+            guardian_output_keys::AUTHORITY_REVALIDATE_INTERVAL + Duration::from_millis(100),
+        );
+        let before = counts();
+        for (row, line) in rows.iter().enumerate() {
+            assert_eq!(sink.load_scrollback_line(row as isize), Some(line.clone()));
+        }
+        let scans = counts().1 - before.1;
+        assert!(
+            scans <= 1,
+            "four reads past the window scanned the keyring {scans} times; the first re-arms"
+        );
+
+        std::fs::write(&sink.manifest_path, &older).unwrap();
+        assert_eq!(sink.load_scrollback_line(0), None);
+        assert!(sink.load_scrollback_lines(0..4).is_empty());
     }
 
     /// The exact-row plaintext of `line` through each encoder: (sealable,

@@ -178,14 +178,18 @@ pub struct GuardianOutputKeyring {
     active_key: GuardianOutputKey,
     pending_generation: Option<u64>,
     /// Stat fingerprint of the last fully validated latest authority and when
-    /// that validation finished; see `refresh_latest_authority_unlocked`.
-    validated_authority: Option<(AuthorityFingerprint, std::time::Instant)>,
+    /// that validation finished; see `refresh_latest_authority_unlocked` and
+    /// `cipher_for_key_id`, which arms it from a lookup (ft-mfip6). A cell so
+    /// a lookup through `&self` can arm it; the keyring is shared only behind
+    /// the process-wide mutex.
+    validated_authority: std::cell::Cell<Option<(AuthorityFingerprint, std::time::Instant)>>,
 }
 
 /// How long an unchanged stat fingerprint may stand in for the full keyring
 /// inventory on the sealing path. Every append refreshes the latest authority
 /// several times; the full inventory re-reads every key and activation file.
-const AUTHORITY_REVALIDATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+pub(crate) const AUTHORITY_REVALIDATE_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(1);
 
 /// Stat identity of one keyring leaf or of the keyring directory. Adding,
 /// removing or renaming an entry moves the directory's mtime and ctime; an
@@ -274,6 +278,17 @@ fn authority_fingerprint(directory: &CapDir, active: Activation) -> Option<Autho
 #[cfg(not(unix))]
 fn authority_fingerprint(_directory: &CapDir, _active: Activation) -> Option<AuthorityFingerprint> {
     None
+}
+
+/// What a lookup's full validation of the active authority found.
+enum ActiveAuthority {
+    /// The latest activation and key on disk are still the keyring's, so the
+    /// in-memory active key is the key the inventory would load. Carries the
+    /// fingerprint that may arm the fast path, when it is trustworthy.
+    Unchanged(Option<AuthorityFingerprint>),
+    /// A rotation, a pending intent or different key material, with the
+    /// inventory that found it.
+    Changed(Inventory),
 }
 
 /// Historical authentication cannot mutate or advance the key authority.
@@ -409,6 +424,7 @@ impl GuardianOutputKeyring {
             }
             let validated_active = keyring
                 .validated_authority
+                .get()
                 .map(|(validated, at)| {
                     keyring
                         .active_key
@@ -562,7 +578,7 @@ impl GuardianOutputKeyring {
     /// Whether a trusted full validation currently arms the stat fast path.
     #[cfg(test)]
     pub(crate) fn fast_path_validated(&self) -> bool {
-        self.validated_authority.is_some()
+        self.validated_authority.get().is_some()
     }
 
     #[must_use]
@@ -613,18 +629,65 @@ impl GuardianOutputKeyring {
         key_id: [u8; 8],
     ) -> Result<GuardianOutputCipher, GuardianOutputKeyringError> {
         let _authority_lease = self.acquire_authority_lease(false)?;
-        // The append path authenticates with the active key. While the stat
-        // fingerprint of a full validation under a second ago still holds,
-        // the full inventory would find exactly the state it validated
-        // (ft-yccm0.2.1.5: no keyring rescan per lookup).
-        if key_id == self.active.key_id
-            && let Some((validated, at)) = self.validated_authority
-            && at.elapsed() < AUTHORITY_REVALIDATE_INTERVAL
-            && authority_fingerprint(&self.directory, self.active).as_ref() == Some(&validated)
-        {
-            return self.active_key.cipher().map_err(Into::into);
+        if key_id == self.active.key_id {
+            // The append path authenticates with the active key. While the
+            // stat fingerprint of a full validation under a second ago still
+            // holds, the full inventory would find exactly the state it
+            // validated (ft-yccm0.2.1.5: no keyring rescan per lookup).
+            if let Some((validated, at)) = self.validated_authority.get()
+                && at.elapsed() < AUTHORITY_REVALIDATE_INTERVAL
+                && authority_fingerprint(&self.directory, self.active).as_ref() == Some(&validated)
+            {
+                return self.active_key.cipher().map_err(Into::into);
+            }
+            // Only appends used to arm that window, so every cold read of a
+            // pane idle for a second took the full inventory (ft-mfip6).
+            return match self.validate_unchanged_active_authority()? {
+                ActiveAuthority::Unchanged(settled) => {
+                    if let Some(stamp) = settled {
+                        self.validated_authority
+                            .set(Some((stamp, std::time::Instant::now())));
+                    }
+                    self.active_key.cipher().map_err(Into::into)
+                }
+                ActiveAuthority::Changed(current) => {
+                    activated_cipher(&self.directory, &current, key_id)
+                }
+            };
         }
         historical_cipher(&self.directory, key_id)
+    }
+
+    /// Fully validate, without changing anything, whether the latest
+    /// authority on disk is still this keyring's activation and key. The
+    /// fingerprint it returns may arm the fast path under the rule
+    /// `refresh_latest_authority_unlocked` arms it by: it bracketed the whole
+    /// validation unchanged, its stamps are settled, and no intent is
+    /// pending. A rotation, a pending intent or different key material is
+    /// left to the refresh, which may advance or refuse the activation; a
+    /// lookup never does either, and serves the key from the inventory it
+    /// took.
+    fn validate_unchanged_active_authority(
+        &self,
+    ) -> Result<ActiveAuthority, GuardianOutputKeyringError> {
+        validate_directory(&self.directory)?;
+        let before = authority_fingerprint(&self.directory, self.active);
+        let current = inventory(&self.directory)?;
+        if current.pending.is_some() || current.latest != Some(self.active) {
+            return Ok(ActiveAuthority::Changed(current));
+        }
+        let on_disk = load_key(&self.directory, self.active.key_id)?;
+        if !self.active_key.has_same_material(&on_disk) {
+            return Ok(ActiveAuthority::Changed(current));
+        }
+        validate_directory(&self.directory)?;
+        let after = authority_fingerprint(&self.directory, self.active);
+        Ok(ActiveAuthority::Unchanged(match after {
+            Some(stamp) if after == before && stamp.settled(std::time::SystemTime::now()) => {
+                Some(stamp)
+            }
+            _ => None,
+        }))
     }
 
     /// Publish a new active key without altering any existing key or activation
@@ -650,7 +713,7 @@ impl GuardianOutputKeyring {
         self.active = active;
         self.active_key = new_key;
         self.pending_generation = None;
-        self.validated_authority = None;
+        self.validated_authority.set(None);
         Ok(key_id)
     }
 
@@ -673,13 +736,13 @@ impl GuardianOutputKeyring {
         // active key file changed since a full validation under a second ago.
         // A rotation adds entries (directory stamp) and so is never skipped.
         let before = authority_fingerprint(&self.directory, self.active);
-        if let (Some(before), Some((validated, at))) = (before, self.validated_authority)
+        if let (Some(before), Some((validated, at))) = (before, self.validated_authority.get())
             && before == validated
             && at.elapsed() < AUTHORITY_REVALIDATE_INTERVAL
         {
             return Ok(());
         }
-        self.validated_authority = None;
+        self.validated_authority.set(None);
         let mut current = inventory(&self.directory)?;
         if current.pending.is_some() {
             current = recover_pending_intent(&self.directory, current)?;
@@ -710,7 +773,8 @@ impl GuardianOutputKeyring {
             && self.pending_generation.is_none()
             && stamp.settled(std::time::SystemTime::now())
         {
-            self.validated_authority = Some((stamp, std::time::Instant::now()));
+            self.validated_authority
+                .set(Some((stamp, std::time::Instant::now())));
         }
         Ok(())
     }
@@ -722,6 +786,16 @@ fn historical_cipher(
 ) -> Result<GuardianOutputCipher, GuardianOutputKeyringError> {
     validate_directory(directory)?;
     let inventory = inventory(directory)?;
+    activated_cipher(directory, &inventory, key_id)
+}
+
+/// The cipher of `key_id` if `inventory`, taken after the directory was
+/// validated, activates it.
+fn activated_cipher(
+    directory: &CapDir,
+    inventory: &Inventory,
+    key_id: [u8; 8],
+) -> Result<GuardianOutputCipher, GuardianOutputKeyringError> {
     if !inventory
         .activations
         .iter()
@@ -754,7 +828,7 @@ fn open_inventory(
         active,
         active_key,
         pending_generation: inventory.pending.map(|intent| intent.generation),
-        validated_authority: None,
+        validated_authority: std::cell::Cell::new(None),
     })
 }
 
@@ -1303,7 +1377,7 @@ fn provision_first(
         active_key,
         pending_generation: None,
         scoped_authority: None,
-        validated_authority: None,
+        validated_authority: std::cell::Cell::new(None),
     })
 }
 
@@ -2785,7 +2859,7 @@ mod tests {
                 keyring
                     .latest_active_cipher()
                     .expect("refresh latest authority");
-                if keyring.validated_authority.is_some() {
+                if keyring.validated_authority.get().is_some() {
                     return;
                 }
                 assert!(
@@ -2850,7 +2924,7 @@ mod tests {
         let active = loop {
             let mut keyring = shared.lock().unwrap();
             let active = keyring.latest_active_cipher().unwrap().key_id();
-            if keyring.validated_authority.is_some() {
+            if keyring.validated_authority.get().is_some() {
                 break active;
             }
             drop(keyring);
@@ -2898,7 +2972,7 @@ mod tests {
         let keyring = loop {
             let mut keyring = shared.lock().unwrap();
             keyring.latest_active_cipher().unwrap();
-            if keyring.validated_authority.is_some() {
+            if keyring.validated_authority.get().is_some() {
                 break keyring;
             }
             drop(keyring);
@@ -2937,7 +3011,11 @@ mod tests {
             keyring.cipher_for_key_id(rotated).unwrap().key_id(),
             rotated
         );
-        assert!(scans() > before, "a changed keyring is rescanned");
+        assert_eq!(
+            scans() - before,
+            2,
+            "a changed keyring is rescanned, once per lookup"
+        );
 
         // Rewriting the old active key in place fails closed.
         let mut options = CapOpenOptions::new();
@@ -2946,6 +3024,65 @@ mod tests {
             .directory
             .open_with(key_name(active), &options)
             .expect("open key for mutation");
+        file.write_all(&[0x5a; GuardianOutputCipher::KEY_BYTES])
+            .expect("change key material without changing inode");
+        file.sync_all().expect("synchronize changed key");
+        assert!(keyring.cipher_for_key_id(active).is_err());
+    }
+
+    /// ft-mfip6: lookups of the active key arm the stat fast path
+    /// themselves. Cold reads of an idle pane never run the append path's
+    /// refresh, so they took the full inventory on every lookup; now an
+    /// expired window costs one inventory, not one per lookup.
+    #[cfg(unix)]
+    #[test]
+    fn active_key_lookups_arm_the_fast_path_without_an_append() {
+        use std::time::{Duration, Instant};
+
+        let root = tempfile::tempdir().expect("create lookup-arming root");
+        let scrollback = root.path().join("scrollback-lines");
+        std::fs::create_dir(&scrollback).expect("create scrollback directory");
+        let shared = GuardianOutputKeyring::shared_scrollback_sibling(&scrollback)
+            .expect("shared authority");
+        let keyring = shared.lock().unwrap();
+        let active = keyring.active_key_id();
+        let scans = || INVENTORY_SCANS.with(std::cell::Cell::get);
+        // Fresh stamps are racy: lookups serve the active key but arm the
+        // fast path only once the stamps settle. Nothing here refreshes.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !keyring.fast_path_validated() {
+            assert_eq!(keyring.cipher_for_key_id(active).unwrap().key_id(), active);
+            assert!(
+                Instant::now() < deadline,
+                "lookups never armed the fast path"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let before = scans();
+        for _ in 0..8 {
+            assert_eq!(keyring.cipher_for_key_id(active).unwrap().key_id(), active);
+        }
+        assert_eq!(scans(), before, "an armed lookup scans nothing");
+
+        std::thread::sleep(AUTHORITY_REVALIDATE_INTERVAL + Duration::from_millis(100));
+        let before = scans();
+        for _ in 0..8 {
+            assert_eq!(keyring.cipher_for_key_id(active).unwrap().key_id(), active);
+        }
+        assert_eq!(
+            scans() - before,
+            1,
+            "past the window one lookup re-validates and re-arms"
+        );
+
+        // The active key rewritten in place, with no rotation, is refused,
+        // not served from the armed window.
+        let mut options = CapOpenOptions::new();
+        options.write(true).follow(FollowSymlinks::No);
+        let mut file = keyring
+            .directory
+            .open_with(key_name(active), &options)
+            .expect("open active key for mutation");
         file.write_all(&[0x5a; GuardianOutputCipher::KEY_BYTES])
             .expect("change key material without changing inode");
         file.sync_all().expect("synchronize changed key");
