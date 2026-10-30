@@ -1,6 +1,36 @@
 import Foundation
 import Dispatch
 
+/// Local presentation policy only. Thermal and battery hints reduce how often
+/// replaceable screens are prepared and presented; they never pause terminal
+/// parsing, discard transport bytes, or change input or remote geometry.
+struct TerminalRenderPowerPolicy: Equatable, Sendable {
+    enum ThermalState: CaseIterable, Equatable, Sendable { case nominal, fair, serious, critical }
+
+    let minimumFramesPerSecond: Float
+    let maximumFramesPerSecond: Float
+    let preferredFramesPerSecond: Float
+    let animatesBlink: Bool
+
+    init(thermalState: ThermalState, lowPower: Bool) {
+        switch (thermalState, lowPower) {
+        case (.critical, _):
+            minimumFramesPerSecond = 10; maximumFramesPerSecond = 15; preferredFramesPerSecond = 15
+        case (.serious, _):
+            minimumFramesPerSecond = 15; maximumFramesPerSecond = 30; preferredFramesPerSecond = 30
+        case (_, true):
+            minimumFramesPerSecond = 15; maximumFramesPerSecond = 30; preferredFramesPerSecond = 30
+        case (.fair, false):
+            minimumFramesPerSecond = 30; maximumFramesPerSecond = 60; preferredFramesPerSecond = 60
+        case (.nominal, false):
+            minimumFramesPerSecond = 30; maximumFramesPerSecond = 120; preferredFramesPerSecond = 60
+        }
+        // Keep blinking text and the cursor visible at phase zero while idle.
+        // Output and deliberate interaction can still request the next frame.
+        animatesBlink = !lowPower && (thermalState == .nominal || thermalState == .fair)
+    }
+}
+
 /// Nonblocking process-wide allocation admission. A resource and every in-flight
 /// command that uses it retain the same lease; removing an idle cache reference
 /// cannot release a reservation still held by a submitted command. Mutable state

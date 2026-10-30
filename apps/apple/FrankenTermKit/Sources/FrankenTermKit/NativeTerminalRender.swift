@@ -80,6 +80,7 @@ public final class NativeTerminalRenderView: MTKView {
     private var displayLifetime: NativeTerminalDisplayLinkLifetime?
     private lazy var displayTarget = NativeTerminalDisplayTarget(self)
     private lazy var accessibleOutput = NativeTerminalAccessibility(view: self)
+    private(set) var powerPolicy = TerminalRenderPowerPolicy(thermalState: .nominal, lowPower: false)
 
     public init(source: TerminalSource, bundle: Bundle = .main,
                 configuration: NativeTerminalRenderConfiguration = .init()) async throws {
@@ -111,6 +112,13 @@ public final class NativeTerminalRenderView: MTKView {
             name: UIScene.didActivateNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(resourcesBecameAvailable),
             name: NativeTerminalGPUReservation.availabilityNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(powerConditionsChanged),
+            name: ProcessInfo.thermalStateDidChangeNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(powerConditionsChanged),
+            name: .NSProcessInfoPowerStateDidChange, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(memoryWarning),
+            name: UIApplication.didReceiveMemoryWarningNotification, object: nil)
+        refreshPowerPolicy()
     }
     @available(*, unavailable)
     public required init(coder: NSCoder) { fatalError("Use init(source:bundle:configuration:)") }
@@ -179,7 +187,10 @@ public final class NativeTerminalRenderView: MTKView {
     }
 
     public func setSceneActive(_ active: Bool) {
-        guard !retired, self.active != active else { return }
+        guard !retired else { return }
+        // Notifications can be missed while the process is suspended.
+        if active { refreshPowerPolicy() }
+        guard self.active != active else { return }
         self.active = active
         worker.setActive(active)
         if active { requestPreparation() }
@@ -331,7 +342,7 @@ public final class NativeTerminalRenderView: MTKView {
         guard active, !retired else { return }
         if displayLink == nil {
             let link = CADisplayLink(target: displayTarget, selector: #selector(NativeTerminalDisplayTarget.tick(_:)))
-            link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 120, preferred: 60)
+            link.preferredFrameRateRange = displayRateRange
             displayLifetime = NativeTerminalDisplayLinkLifetime(link)
             link.add(to: .main, forMode: .common); displayLink = link
         }
@@ -420,7 +431,7 @@ public final class NativeTerminalRenderView: MTKView {
     }
 
     private func armBlink(for frame: TerminalRenderFrame) {
-        guard active, !retired, blinkTimer == nil, failedRevision != frame.revision,
+        guard active, !retired, powerPolicy.animatesBlink, blinkTimer == nil, failedRevision != frame.revision,
               latest?.revision == frame.revision, (latest?.flags ?? 0) & 8 == 0,
               (configuration.cursorBlink && frame.cursor.visible && frame.cursor.blinks)
                 || frame.lines.contains(where: { $0.cells.contains(where: { $0.blink != 0 }) }) else { return }
@@ -434,7 +445,7 @@ public final class NativeTerminalRenderView: MTKView {
                 guard let self, self.preparationGeneration == generation,
                       self.latest?.revision == revision else { return }
                 self.blinkTimer = nil
-                guard self.active, !self.retired, self.blinkPhase < UInt64.max - 1,
+                guard self.active, !self.retired, self.powerPolicy.animatesBlink, self.blinkPhase < UInt64.max - 1,
                       let latest = self.latest, latest.flags & 8 == 0,
                       self.failedRevision != latest.revision else { return }
                 self.blinkPhase += rapid ? 1 : 2; self.requestPreparation()
@@ -446,6 +457,64 @@ public final class NativeTerminalRenderView: MTKView {
         completedPointerProjection = nil
         onFailure?((error as? TerminalRenderError) ?? .unavailable)
     }
+
+    private var displayRateRange: CAFrameRateRange {
+        CAFrameRateRange(minimum: powerPolicy.minimumFramesPerSecond,
+                         maximum: powerPolicy.maximumFramesPerSecond,
+                         preferred: powerPolicy.preferredFramesPerSecond)
+    }
+
+    /// One policy update changes the existing display scheduler. Preparation is
+    /// already bounded by one prepared frame, so its producer slows with that
+    /// scheduler rather than building frames that will never be presented.
+    func applyPowerPolicy(_ policy: TerminalRenderPowerPolicy) {
+        guard !retired, powerPolicy != policy else { return }
+        let blinkingChanged = powerPolicy.animatesBlink != policy.animatesBlink
+        powerPolicy = policy
+        displayLink?.preferredFrameRateRange = displayRateRange
+        guard blinkingChanged else { return }
+        // A blinking cursor or text run must not remain invisible indefinitely
+        // when its timer stops. Re-present the retained screen in its visible
+        // phase, fenced against an older preparation or command completion.
+        blinkPhase = 0
+        do { try invalidatePreparation(); requestPreparation() }
+        catch { fail(error) }
+    }
+
+    private func refreshPowerPolicy() {
+        let state: TerminalRenderPowerPolicy.ThermalState
+        switch ProcessInfo.processInfo.thermalState {
+        case .nominal: state = .nominal
+        case .fair: state = .fair
+        case .serious: state = .serious
+        case .critical: state = .critical
+        @unknown default: state = .critical
+        }
+        applyPowerPolicy(.init(thermalState: state, lowPower: ProcessInfo.processInfo.isLowPowerModeEnabled))
+    }
+
+    /// ProcessInfo notifications need not arrive on the UI executor. Read the
+    /// current combined state there; a queued older notification cannot restore
+    /// a stale thermal or battery setting.
+    @objc private nonisolated func powerConditionsChanged() {
+        Task { @MainActor [weak self] in self?.refreshPowerPolicy() }
+    }
+
+    @objc private func memoryWarning() { reclaimReconstructibleResources() }
+
+    /// Drop only cache ownership. The retained semantic screen, latest pending
+    /// output, prepared frame and submitted commands keep their exact owners.
+    /// Do not immediately request a redraw that would refill the freed cache.
+    func reclaimReconstructibleResources() {
+        guard !retired else { return }
+        accessibleOutput.discard()
+        worker.reclaimCaches()
+    }
+
+    /// Cache ownership, excluding resources retained by prepared or GPU-owned
+    /// frames. Reading on the worker also joins already queued reclamation.
+    func cachedGPUResourceCount() async -> Int { await worker.cachedResourceCount() }
+
     @objc private func resourcesBecameAvailable() {
         guard active, !retired, waitingForResources else { return }
         requestPreparation()
@@ -650,9 +719,12 @@ private final class NativeTerminalPreparation: @unchecked Sendable {
     private var active = true, releaseQueued = false
     init(device: any MTLDevice) { self.device = device }
     func setActive(_ active: Bool) {
+        activityLock.withLock { self.active = active }
+        if !active { reclaimCaches() }
+    }
+    func reclaimCaches() {
         let release = activityLock.withLock {
-            self.active = active
-            guard !active, !releaseQueued else { return false }
+            guard !releaseQueued else { return false }
             releaseQueued = true; return true
         }
         if release {
@@ -662,6 +734,11 @@ private final class NativeTerminalPreparation: @unchecked Sendable {
                 // commands keep their exact resources/permits until completion.
                 resources.removeAll()
             }
+        }
+    }
+    func cachedResourceCount() async -> Int {
+        await withCheckedContinuation { continuation in
+            queue.async { [self] in continuation.resume(returning: resources.count) }
         }
     }
     func enqueue(packet: Data?, retained: TerminalRenderFrame?, source: TerminalSource,

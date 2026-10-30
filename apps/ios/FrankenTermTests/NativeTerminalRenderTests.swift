@@ -42,6 +42,7 @@ final class NativeTerminalRenderTests: XCTestCase {
     /// host app's window, and returns a 1x snapshot plus the drawn caret.
     private func render(_ output: String, name: String,
                         configuration: NativeTerminalRenderConfiguration = .init(),
+                        powerPolicy: TerminalRenderPowerPolicy? = nil,
                         columns: UInt32 = 40, rows: UInt32 = 12) async throws -> (Snapshot, NativeTerminalCaret?) {
         let coordinator = try TerminalInputCoordinator()
         let source = try await coordinator.attach(InertTransport())
@@ -63,6 +64,9 @@ final class NativeTerminalRenderTests: XCTestCase {
         view.onAppearance = { _, _ in drawn.fulfill() }
         view.onCaret = { caret = $0 }
         view.onFailure = { failure = $0 }
+        // Apply after window attachment refreshes system policy and before the
+        // first frame; no older GPU completion can satisfy this baseline draw.
+        if let powerPolicy { view.applyPowerPolicy(powerPolicy) }
         try view.submit(frame, source: source)
         await fulfillment(of: [drawn], timeout: 20)
         XCTAssertNil(failure)
@@ -105,6 +109,71 @@ final class NativeTerminalRenderTests: XCTestCase {
         XCTAssertGreaterThan(green, 200, "SGR 42 background cells were not drawn")
         XCTAssertGreaterThan(blue, 200, "SGR 44 background cells were not drawn")
         XCTAssertGreaterThan(light, 50, "default-foreground glyphs were not rasterized")
+    }
+
+    func testMemoryWarningReclaimsIdleCachesAndPreservesPendingTerminalOutput() async throws {
+        var configuration = NativeTerminalRenderConfiguration()
+        configuration.cursorBlink = false
+        _ = try await render("Before memory pressure", name: "before-memory-pressure", configuration: configuration)
+        let view = try XCTUnwrap(view), model = try XCTUnwrap(model)
+        let original = try XCTUnwrap(view.admittedFrame)
+        let cachedBefore = await view.cachedGPUResourceCount()
+        XCTAssertGreaterThan(cachedBefore, 0)
+
+        for _ in 0..<32 {
+            NotificationCenter.default.post(name: UIApplication.didReceiveMemoryWarningNotification, object: nil)
+        }
+        let cachedAfter = await view.cachedGPUResourceCount()
+        XCTAssertEqual(cachedAfter, 0)
+        XCTAssertEqual(view.admittedFrame?.revision, original.revision)
+        XCTAssertEqual(view.admittedFrame?.readableText, original.readableText)
+
+        let drawn = expectation(description: "new output survives pressure during preparation")
+        drawn.assertForOverFulfill = false
+        var failure: TerminalRenderError?
+        view.onAppearance = { _, _ in drawn.fulfill() }
+        view.onFailure = { failure = $0 }
+        try model.feed(Data("\r\nOutput after pressure".utf8))
+        try view.submit(model.captureFrame(viewportTop: nil), source: view.source)
+        // This can race the worker's preparation or the GPU submission. Each
+        // owns its exact resource set independently from the cache reference.
+        NotificationCenter.default.post(name: UIApplication.didReceiveMemoryWarningNotification, object: nil)
+        await fulfillment(of: [drawn], timeout: 20)
+        XCTAssertNil(failure)
+        XCTAssertTrue(view.admittedFrame?.readableText.contains("Output after pressure") == true)
+        XCTAssertEqual(view.admittedFrame?.source, original.source)
+        XCTAssertEqual(view.admittedFrame?.columns, original.columns)
+        XCTAssertEqual(view.admittedFrame?.rows, original.rows)
+    }
+
+    func testThermalPolicyStopsIdleBlinkWorkAndResumesWithoutNewOutput() async throws {
+        _ = try await render("\u{1b}[5mBlinking output\u{1b}[0m", name: "before-thermal-pressure",
+            powerPolicy: .init(thermalState: .nominal, lowPower: false))
+        let view = try XCTUnwrap(view), original = try XCTUnwrap(view.admittedFrame)
+        let steady = expectation(description: "retained blinking screen is presented visibly")
+        steady.assertForOverFulfill = false
+        var failure: TerminalRenderError?
+        view.onAppearance = { _, _ in steady.fulfill() }
+        view.onFailure = { failure = $0 }
+        view.applyPowerPolicy(.init(thermalState: .critical, lowPower: false))
+        await fulfillment(of: [steady], timeout: 20)
+        XCTAssertNil(failure)
+        XCTAssertEqual(view.admittedFrame?.revision, original.revision)
+
+        let idle = expectation(description: "no decorative redraw under critical thermal pressure")
+        idle.isInverted = true
+        view.onAppearance = { _, _ in idle.fulfill() }
+        await fulfillment(of: [idle], timeout: 0.8)
+
+        let resumed = expectation(description: "cooling re-presents and then blinks retained output")
+        resumed.expectedFulfillmentCount = 2
+        resumed.assertForOverFulfill = false
+        view.onAppearance = { _, _ in resumed.fulfill() }
+        view.applyPowerPolicy(.init(thermalState: .nominal, lowPower: false))
+        await fulfillment(of: [resumed], timeout: 20)
+        XCTAssertNil(failure)
+        XCTAssertEqual(view.admittedFrame?.revision, original.revision)
+        XCTAssertEqual(view.admittedFrame?.source, original.source)
     }
 
     func testKeepDesktopSizeFitsTheWholeRemoteGridWithCaretAndPointerInTheSameCells() async throws {

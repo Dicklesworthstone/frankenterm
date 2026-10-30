@@ -4,6 +4,50 @@ import XCTest
 
 @MainActor
 final class TerminalRenderResourceBudgetTests: XCTestCase {
+    func testLowPowerCapsPresentationAndStopsIdleBlinkingAtEveryTemperature() {
+        for state in TerminalRenderPowerPolicy.ThermalState.allCases {
+            let ordinary = TerminalRenderPowerPolicy(thermalState: state, lowPower: false)
+            let conserving = TerminalRenderPowerPolicy(thermalState: state, lowPower: true)
+            XCTAssertLessThanOrEqual(conserving.maximumFramesPerSecond, 30)
+            XCTAssertLessThanOrEqual(conserving.maximumFramesPerSecond, ordinary.maximumFramesPerSecond)
+            XCTAssertLessThanOrEqual(conserving.preferredFramesPerSecond, ordinary.preferredFramesPerSecond)
+            XCTAssertFalse(conserving.animatesBlink)
+        }
+    }
+
+    func testIncreasingHeatNeverIncreasesWorkAndCriticalHeatStillPresentsOutput() {
+        for lowPower in [false, true] {
+            let policies = TerminalRenderPowerPolicy.ThermalState.allCases.map {
+                TerminalRenderPowerPolicy(thermalState: $0, lowPower: lowPower)
+            }
+            for (cooler, warmer) in zip(policies, policies.dropFirst()) {
+                XCTAssertLessThanOrEqual(warmer.maximumFramesPerSecond, cooler.maximumFramesPerSecond)
+                XCTAssertLessThanOrEqual(warmer.preferredFramesPerSecond, cooler.preferredFramesPerSecond)
+                XCTAssertFalse(warmer.animatesBlink && !cooler.animatesBlink)
+            }
+            for policy in policies {
+                XCTAssertGreaterThan(policy.minimumFramesPerSecond, 0)
+                XCTAssertLessThanOrEqual(policy.minimumFramesPerSecond, policy.preferredFramesPerSecond)
+                XCTAssertLessThanOrEqual(policy.preferredFramesPerSecond, policy.maximumFramesPerSecond)
+            }
+            let critical = policies.last!
+            XCTAssertEqual(critical.maximumFramesPerSecond, 15)
+            XCTAssertFalse(critical.animatesBlink)
+        }
+    }
+
+    func testBatteryAndThermalConstraintsMustBothClearBeforeBlinkingResumes() {
+        let normal = TerminalRenderPowerPolicy(thermalState: .nominal, lowPower: false)
+        XCTAssertEqual(normal.preferredFramesPerSecond, 60)
+        XCTAssertTrue(normal.animatesBlink)
+        let stillHot = TerminalRenderPowerPolicy(thermalState: .serious, lowPower: false)
+        XCTAssertEqual(stillHot.maximumFramesPerSecond, 30)
+        XCTAssertFalse(stillHot.animatesBlink)
+        let stillConserving = TerminalRenderPowerPolicy(thermalState: .nominal, lowPower: true)
+        XCTAssertEqual(stillConserving.maximumFramesPerSecond, 30)
+        XCTAssertFalse(stillConserving.animatesBlink)
+    }
+
     func testExactCapacityNeverGrantsAnExtraResource() {
         let budget = TerminalRenderResourceBudget(maximumResources: 6) {}
         var leases = (0..<6).compactMap { _ in budget.acquire() }
@@ -27,6 +71,25 @@ final class TerminalRenderResourceBudgetTests: XCTestCase {
         submitted = nil
         XCTAssertEqual(budget.retainedResources, 0)
         XCTAssertNotNil(budget.acquire())
+    }
+
+    func testMemoryPressureReclaimsIdleSlotsButPreservesPreparedAndSubmittedOwners() {
+        let budget = TerminalRenderResourceBudget(maximumResources: 3) {}
+        var cache = Dictionary(uniqueKeysWithValues: (0..<3).map { ($0, budget.acquire()!) })
+        var prepared = cache[0], submitted = cache[1]
+        cache.removeAll()
+        XCTAssertEqual(budget.retainedResources, 2, "Only the idle third slot is reclaimable")
+        let anotherScene = budget.acquire()
+        XCTAssertNotNil(anotherScene)
+        for _ in 0..<100 { cache.removeAll() }
+        XCTAssertEqual(budget.retainedResources, 3)
+        XCTAssertNil(budget.acquire(), "Repeated warnings cannot release another owner's reservation")
+        XCTAssertNotNil(prepared); XCTAssertNotNil(submitted)
+        prepared = nil
+        XCTAssertEqual(budget.retainedResources, 2)
+        submitted = nil
+        XCTAssertEqual(budget.retainedResources, 1)
+        withExtendedLifetime(anotherScene) {}
     }
 
     func testManyReleasesCoalesceIntoOneAvailabilityWake() async {

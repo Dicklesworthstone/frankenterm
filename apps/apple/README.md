@@ -2,6 +2,14 @@
 
 This directory contains the shared Swift 6 `FrankenTermKit` package and the native Xcode project for the first offline workspace-transfer slice. It is implementation source, not a signed or device-qualified terminal release.
 
+## Rendering under battery, thermal and memory pressure
+
+The native terminal now responds to Low Power Mode and thermal-state changes through its existing display scheduler. Nominal conditions request a 120 Hz ceiling (60 Hz preferred), fair thermal conditions cap that ceiling at 60 Hz, Low Power Mode or serious heat cap it at 30 Hz, and critical heat caps it at 15 Hz. These are presentation requests, not measured frame-rate guarantees. Decorative text and cursor blinking stop in their visible phase while conserving power; cooling restores them from the retained screen without requiring new terminal output.
+
+Memory warnings release idle worker-owned GPU caches and reconstructible accessibility output. Prepared frames and submitted GPU commands retain their exact resources and allocation leases until completion. The latest terminal screen, pending output, parser state, input order, SSH connections and remote geometry remain owned by their existing subsystems. Cache reclamation does not immediately schedule work to refill the cache.
+
+Four portable policy/resource-lifetime regressions and two hosted Rust-to-Metal regressions accompany this implementation. They still require execution with the Swift and Apple toolchains; source review and whitespace checks alone do not establish device behavior. The native-app and device-qualification beads remain open.
+
 ## Restored workspaces stay offline
 
 **Done**, closing or cancelling Offline Restore, and relaunching the app keep restored and deliberately disconnected workspaces offline. The catalog's `connectLater` gate now controls native scene admission and remembered-terminal reopening. A fresh **Connect** action durably approves the exact saved workspace revision before its terminal opens or its group prepares connections. Imported auto-connect settings and phone-local preferences remain intact; they cannot approve themselves. Identical recordings and changed exports both re-arm the gate without duplicating identities or weakening host policy.
