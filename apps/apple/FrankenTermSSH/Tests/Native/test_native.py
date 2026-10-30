@@ -260,7 +260,10 @@ class LoopbackServer:
             self.events.append(("connection", self.accepted_connections))
             control = sock.dup()
             self.control = control
-            pem = self.host_key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption())
+            host_format = (serialization.PrivateFormat.OpenSSH
+                           if isinstance(self.host_key, ed25519.Ed25519PrivateKey)
+                           else serialization.PrivateFormat.TraditionalOpenSSL)
+            pem = self.host_key.private_bytes(serialization.Encoding.PEM, host_format, serialization.NoEncryption())
             if SERVER.ssh_pki_import_privkey_base64(pem, None, None, None, C.byref(key)) != 0:
                 raise RuntimeError("test host-key import failed")
             server, session = SERVER.ssh_bind_new(), SERVER.ssh_new()

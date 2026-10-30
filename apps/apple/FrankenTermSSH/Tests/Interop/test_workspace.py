@@ -71,7 +71,9 @@ class WorkspaceInteropTests(unittest.TestCase):
 
     def run_host_mode(self, mode, host_key=None, host_signature=None):
         key = ed25519.Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
-        server = fixture.LoopbackServer(key, host_key=host_key, host_signature=host_signature)
+        pin_then_connect = mode in ["host-pin-connect", "rsa-host-pin-connect"]
+        server = fixture.LoopbackServer(key, host_key=host_key, host_signature=host_signature,
+                                       connections=2 if pin_then_connect else 1)
         try:
             environment = dict(os.environ, FT_WORKSPACE_SSH_TEST_PORT=str(server.address[1]),
                                FT_WORKSPACE_SSH_TEST_HOSTKEY=base64.b64encode(server.host_blob).decode(),
@@ -87,14 +89,19 @@ class WorkspaceInteropTests(unittest.TestCase):
             self.assertNotIn("skipped", output.lower())
             authentication = [event for event in server.events if event[0] == "authentication"]
             side_effects = [event[0] for event in server.events if event[0] in ["channel", "pty", "shell"]]
-            expected_authentication = [0, 1] if mode in ["rsa-success", "mux-owner-auth"] else []
+            expected_authentication = [0, 1] if mode in ["rsa-success", "mux-owner-auth"] or pin_then_connect else []
             self.assertEqual([event[1] for event in authentication], expected_authentication)
             self.assertEqual([event[3] for event in authentication],
                              [fixture.public_blob(key)] * len(expected_authentication))
             self.assertEqual(side_effects, ["channel", "pty", "shell"] if mode == "rsa-success" else [])
             self.assertEqual(server.received,
                              "Imported key → real SSH.\rEND-SESSION\r".encode() if mode == "rsa-success" else b"")
-            self.assertEqual(server.accepted_connections, 0 if mode == "mux-revoked" else 1)
+            self.assertEqual(server.accepted_connections, 0 if mode == "mux-revoked" else (2 if pin_then_connect else 1))
+            if mode in ["host-pin", "rsa-host-pin"] or pin_then_connect:
+                connections = [index for index, event in enumerate(server.events) if event[0] == "connection"]
+                probe_end = connections[1] if pin_then_connect else len(server.events)
+                self.assertEqual(server.events[connections[0] + 1:probe_end], [],
+                                 "the initial host-key exchange must close before offering an account or creating a channel")
         finally:
             server.close()
 
@@ -119,6 +126,21 @@ class WorkspaceInteropTests(unittest.TestCase):
         for algorithm in ["rsa-sha2-256", "rsa-sha2-512"]:
             with self.subTest(algorithm=algorithm):
                 self.run_host_mode("rsa-probe", host, algorithm)
+
+    def test_first_host_verification_closes_without_authentication_until_deliberate_connect(self):
+        hosts = [("ecdsa-sha2-nistp256", ec.generate_private_key(ec.SECP256R1())),
+                 ("ssh-ed25519", ed25519.Ed25519PrivateKey.generate())]
+        for algorithm, host in hosts:
+            for mode in ["host-pin", "host-pin-connect"]:
+                with self.subTest(algorithm=algorithm, mode=mode):
+                    self.run_host_mode(mode, host)
+
+    def test_first_rsa_host_verification_preserves_sha2_signature_policy(self):
+        host = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        for algorithm in ["rsa-sha2-256", "rsa-sha2-512"]:
+            for mode in ["rsa-host-pin", "rsa-host-pin-connect"]:
+                with self.subTest(algorithm=algorithm, mode=mode):
+                    self.run_host_mode(mode, host, algorithm)
 
     def test_explicit_mux_route_authenticates_without_opening_a_terminal(self):
         self.run_host_mode("mux-owner-auth")
