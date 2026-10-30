@@ -77,6 +77,7 @@ export -f doctor_cargo_test
 gate "asupersync test-only doctrine"            "scripts/check_asupersync_test_only.sh"
 gate "runtime_compat residuals"                  "scripts/check_runtime_compat_residuals.sh"
 gate "runtime proof coverage"                    "python3 scripts/check_runtime_proof_coverage.py"
+gate "iOS packaging source integrity"            "python3 tests/e2e/test_ios_appstore_source_staging.py"
 gate "runtime proof soundness (Lean)"            "scripts/check-runtime-proof-soundness.sh"
 gate "loom skeleton coverage"                    "scripts/check_loom_skeleton_coverage.sh"
 gate "lua api no promise block_on"               "bash scripts/check_lua_api_no_promise_block_on.sh"

@@ -20,9 +20,11 @@ done
 OUT="$CARGO_TARGET_DIR/appstore-ios-$FT_IOS_VERSION-$FT_IOS_BUILD"
 [[ ! -e "$OUT" ]] || fail "retain existing output; select a fresh DSR build destination"
 check_space() {
-python3 - "$CARGO_TARGET_DIR" <<'PY'
+python3 - "$CARGO_TARGET_DIR" "$ROOT" <<'PY'
 import pathlib, shutil, sys
 p = pathlib.Path(sys.argv[1])
+if p.resolve().is_relative_to(pathlib.Path(sys.argv[2]).resolve()):
+    raise SystemExit("error: build output must be outside the source export")
 while not p.exists():
     p = p.parent
 if shutil.disk_usage(p).free < 20 * 1024**3:
@@ -31,6 +33,58 @@ PY
 }
 check_space
 mkdir -p "$OUT"
+# SwiftPM requires its binary targets inside the package. Stage a byte-checked
+# build tree outside DSR's immutable export rather than modifying that export.
+stage_source() {
+python3 - "$1" "$ROOT" "$OUT/source" "$OUT/staged-source.json" <<'PY'
+import hashlib, json, os, pathlib, shutil, sys
+mode, source, stage, receipt = sys.argv[1:]
+source, stage, receipt = map(pathlib.Path, (source, stage, receipt))
+def inventory(root):
+    result = {}
+    for base, dirs, files in os.walk(root, followlinks=False):
+        for name in dirs + files:
+            p = pathlib.Path(base) / name
+            key = p.relative_to(root).as_posix()
+            if p.is_symlink():
+                result[key] = ['link', os.readlink(p)]
+            elif p.is_dir():
+                result[key] = ['directory']
+            elif p.is_file():
+                with p.open('rb') as f:
+                    digest = hashlib.sha256()
+                    for block in iter(lambda: f.read(1024 * 1024), b''):
+                        digest.update(block)
+                    result[key] = ['file', digest.hexdigest(), p.stat().st_mode & 0o777]
+            else:
+                raise SystemExit(f'error: unsupported source entry: {key}')
+    return result
+if mode == 'prepare':
+    if stage.resolve().is_relative_to(source.resolve()):
+        raise SystemExit('error: mutable build staging must be outside source export')
+    expected = inventory(source)
+    shutil.copytree(source, stage, symlinks=True)
+    if inventory(stage) != expected:
+        raise SystemExit('error: staging copy differs from source export')
+    with receipt.open('x') as f:
+        json.dump(expected, f, sort_keys=True)
+else:
+    expected = json.loads(receipt.read_text())
+    actual = inventory(stage)
+    if any(actual.get(k) != v for k, v in expected.items()):
+        raise SystemExit('error: staged source inputs changed during build')
+    generated = (
+        'apps/apple/FrankenTermTerminal/Artifacts',
+        'apps/apple/FrankenTermSSH/Artifacts',
+    )
+    unexpected = [k for k in actual.keys() - expected.keys()
+                  if not any(k == d or k.startswith(d + '/') for d in generated)]
+    if unexpected:
+        raise SystemExit(f'error: unexpected staged build inputs: {sorted(unexpected)[:10]}')
+PY
+}
+stage_source prepare
+ROOT="$OUT/source"
 export FT_APPLE_BUILD_JOBS=2
 export FT_APPLE_TARGET_DIR="$CARGO_TARGET_DIR/apple-terminal"
 export FT_APPLE_SSH_BUILD_DIR="$CARGO_TARGET_DIR/apple-ssh"
@@ -86,5 +140,6 @@ check_space
 xcodebuild -exportArchive -archivePath "$OUT/FrankenTerm.xcarchive" \
     -exportOptionsPlist "$OUT/ExportOptions.plist" -exportPath "$OUT/export"
 [[ -f "$OUT/export/FrankenTerm.ipa" ]] || fail "export did not produce FrankenTerm.ipa"
+stage_source verify
 (cd "$OUT" && shasum -a 256 export/FrankenTerm.ipa native-library-inputs.json > SHA256SUMS)
 echo "App Store package retained at $OUT; runtime qualification and submission remain separate."
