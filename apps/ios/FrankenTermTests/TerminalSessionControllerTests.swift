@@ -1224,6 +1224,130 @@ final class TerminalSessionControllerTests: XCTestCase {
         for session in scene.sessions.values { await assertReleased(session, connections: live.connections) }
     }
 
+    /// Two real SSH channels and canonical Rust models remain independently
+    /// visible. Only the committed focus can type or resize; a narrow window
+    /// releases the companion drawable without ending its shell.
+    func testIPadSplitKeepsBothOutputsLiveAndTransfersOnlyTheFocusedInput() async throws {
+        let windows = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.flatMap(\.windows)
+        let window = try XCTUnwrap(windows.first { $0.isKeyWindow } ?? windows.first)
+        guard window.bounds.width >= 720 else { throw XCTSkip("Run the split workflow on a wide iPad window") }
+        let live = try await liveScene(), scene = live.scene
+        let first = try await connect(scene, "alpha"), alpha = try XCTUnwrap(first.terminal)
+        let canvas = WorkspaceCanvasView(scene: scene)
+        canvas.frame = CGRect(x: 0, y: 0, width: window.bounds.width, height: min(500, window.bounds.height))
+        window.addSubview(canvas)
+        defer { canvas.retireNavigation(); canvas.removeFromSuperview() }
+        func show() {
+            canvas.show(scene.displayedMachineIDs.map {
+                WorkspaceCanvasPane(machineID: $0, terminal: scene.sessions[$0]?.terminal)
+            })
+            canvas.setNeedsLayout(); canvas.layoutIfNeeded()
+        }
+        scene.setSplitViewport(width: Double(canvas.bounds.width), isPad: true)
+        show()
+        let token = UUID().uuidString, gate = "\(live.outPath).split-\(token)"
+        let winch = gate + ".winch", typed = gate + ".typed", hidden = gate + ".hidden"
+        try await type("FT_SPLIT_WHO=ALPHA; : > \(winch); trap 'echo WINCH >> \(winch)' WINCH; "
+            + "(while [ ! -f \(gate) ]; do sleep 0.05; done; echo LIVE-A-$((40+2)); "
+            + "while [ ! -f \(hidden) ]; do sleep 0.05; done; echo HIDDEN-A-$((40+2)); echo done > \(hidden).ack) & "
+            + "echo ARMED-A-$((40+2))", into: alpha)
+        let armed = try await rows(of: alpha) { self.shows($0, "ARMED-A-42") }
+        XCTAssertTrue(shows(armed, "ARMED-A-42"), "the shell installed its resize trap and output gates")
+        let initial = try XCTUnwrap(alpha.renderer.admittedFrame), oldInput = alpha.input
+        let alphaHost = alpha.superview
+        let second = try await connect(scene, "beta")
+        scene.split(with: "beta")
+        for _ in 0..<400 where scene.openingSplit || second.terminal == nil || scene.navigation.phase != .ready {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertEqual(scene.displayedMachineIDs, ["alpha", "beta"])
+        XCTAssertEqual(scene.selectedMachineID, "beta")
+        let beta = try XCTUnwrap(second.terminal)
+        show()
+        XCTAssertTrue(alpha.superview === alphaHost, "focus changes keep the original machine's host")
+        XCTAssertFalse(alpha.isUserInteractionEnabled)
+        XCTAssertFalse(oldInput.isEditable)
+        XCTAssertFalse(oldInput.canBecomeFirstResponder)
+        XCTAssertTrue(alpha.renderer.configuration.fitsRemoteGrid)
+        XCTAssertNil(first.inspectHistory(), "a stale action cannot open an editor over the companion")
+        first.composeCommand()
+        XCTAssertFalse(first.clipboardIsPresenting)
+        oldInput.insertText("echo WRONG > \(typed).stale\n")
+        try await type("FT_SPLIT_WHO=BETA; echo $FT_SPLIT_WHO > \(typed); touch \(gate); echo LIVE-B-$((40+2))", into: beta)
+        let alphaLive = try await rows(of: alpha) { self.shows($0, "LIVE-A-42") }
+        let betaLive = try await rows(of: beta) { self.shows($0, "LIVE-B-42") }
+        XCTAssertTrue(shows(alphaLive, "LIVE-A-42"), "the unfocused pane receives newly produced output")
+        XCTAssertTrue(shows(betaLive, "LIVE-B-42"), "the focused pane receives its own output")
+        let companion = try XCTUnwrap(alpha.renderer.admittedFrame)
+        XCTAssertEqual(companion.source, initial.source)
+        XCTAssertEqual(companion.columns, initial.columns); XCTAssertEqual(companion.rows, initial.rows)
+        XCTAssertGreaterThan(companion.revision, initial.revision)
+        var recorded = try await hostFile(typed, containing: "BETA")
+        XCTAssertEqual(recorded, "BETA\n", "retired Alpha input cannot reach either shell")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: typed + ".stale"))
+        XCTAssertEqual(try String(contentsOfFile: winch, encoding: .utf8), "",
+            "showing Alpha beside Beta must fit locally without resizing Alpha's PTY")
+
+        // Sidebar/window narrowing keeps the pair for later but releases the
+        // unfocused native view. Its raw SSH stream continues to be consumed.
+        scene.setSplitViewport(width: 400, isPad: true)
+        canvas.frame.size.width = 400; show()
+        XCTAssertEqual(scene.displayedMachineIDs, ["beta"])
+        XCTAssertNil(alpha.window)
+        try await type("touch \(hidden); echo STILL-B-$((40+2))", into: beta)
+        let consumed = try await hostFile(hidden + ".ack", containing: "done")
+        XCTAssertTrue(consumed.contains("done"), "the hidden machine produced output while its drawable was absent")
+        scene.setSplitViewport(width: Double(window.bounds.width), isPad: true)
+        canvas.frame.size.width = window.bounds.width; show()
+        let restored = try await rows(of: alpha) { self.shows($0, "HIDDEN-A-42") }
+        XCTAssertTrue(shows(restored, "HIDDEN-A-42"), "expanding catches up from the still-live semantic model")
+        XCTAssertEqual(scene.selectedMachineID, "beta")
+        XCTAssertFalse(alpha.input.canBecomeFirstResponder)
+        XCTAssertEqual(alpha.renderer.admittedFrame?.columns, initial.columns)
+        XCTAssertEqual(alpha.renderer.admittedFrame?.rows, initial.rows)
+        XCTAssertEqual(try String(contentsOfFile: winch, encoding: .utf8), "",
+            "restoring a companion cannot acquire remote size")
+        XCTAssertTrue(scene.sessions["alpha"] === first); XCTAssertTrue(scene.sessions["beta"] === second)
+
+        try await select(scene, "alpha"); show()
+        XCTAssertEqual(scene.displayedMachineIDs, ["alpha", "beta"], "focus does not swap or duplicate views")
+        XCTAssertNotEqual(alpha.input.session.id, oldInput.session.id)
+        XCTAssertFalse(beta.input.canBecomeFirstResponder)
+        try await type("echo $FT_SPLIT_WHO >> \(typed)", into: alpha)
+        recorded = try await hostFile(typed, containing: "ALPHA")
+        XCTAssertEqual(recorded, "BETA\nALPHA\n")
+        scene.closeSplit(); show()
+        XCTAssertEqual(scene.displayedMachineIDs, ["alpha"])
+        XCTAssertNil(beta.window)
+        XCTAssertEqual(second.phase, .live, "closing the split does not close its shell")
+        await scene.close()
+        for session in scene.sessions.values { await assertReleased(session, connections: live.connections) }
+    }
+
+    func testSplitSelectionDoesNotOpenAManualRouteOrCreateADuplicateSession() async throws {
+        let live = try await liveScene(creation: .manual), scene = live.scene
+        let alpha = try await connect(scene, "alpha")
+        scene.connect("beta")
+        let beta = try XCTUnwrap(scene.sessions["beta"])
+        for _ in 0..<400 where beta.phase == .idle || beta.phase == .connecting {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertEqual(beta.phase, .ready)
+        scene.setSplitViewport(width: 1000, isPad: true)
+        scene.split(with: "beta")
+        for _ in 0..<400 where scene.openingSplit { try await Task.sleep(for: .milliseconds(25)) }
+        XCTAssertEqual(scene.selectedMachineID, "beta")
+        XCTAssertEqual(scene.displayedMachineIDs, ["alpha", "beta"])
+        XCTAssertEqual(beta.phase, .ready)
+        XCTAssertNil(beta.terminal)
+        XCTAssertTrue(scene.sessions["alpha"] === alpha); XCTAssertTrue(scene.sessions["beta"] === beta)
+        let records = try await live.connections.journal.records()
+        XCTAssertEqual(records.filter { $0.scope.machineID == "beta" }.count, 0,
+            "split selection grants no implicit shell-creation permission")
+        await scene.close()
+        for session in scene.sessions.values { await assertReleased(session, connections: live.connections) }
+    }
+
     /// A server that stops answering (its sshd frozen, as a hung host or a dead
     /// network looks to the phone) is reported lost within the liveness window,
     /// and an explicit new session works once it answers again. An idle server

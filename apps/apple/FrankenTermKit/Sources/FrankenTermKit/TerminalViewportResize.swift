@@ -14,6 +14,7 @@ public final class TerminalViewportResize<Source: Equatable & Sendable> {
     public let source: Source
     public private(set) var applied: TerminalSessionGeometry
     public private(set) var isRetired = false
+    public private(set) var isActive = true
     public var onFailure: (@MainActor (Error) -> Void)?
     public var isPending: Bool { flight != nil || desired != nil }
 
@@ -36,8 +37,20 @@ public final class TerminalViewportResize<Source: Equatable & Sendable> {
     /// Synchronous UI entry: a layout storm changes one value, not task count.
     public func propose(_ geometry: TerminalSessionGeometry, source: Source) throws {
         try validate(source)
+        guard isActive else { return }
         desired = geometry == (flight?.geometry ?? applied) ? nil : geometry
         drive()
+    }
+
+    /// Losing focus drops unsent layouts. An already-admitted transport call
+    /// still owns its resources until it returns, and an eventual model update
+    /// still records actual geometry; neither can replay a hidden proposal.
+    public func setActive(_ active: Bool, source: Source) throws {
+        try validate(source)
+        guard isActive != active else { return }
+        isActive = active
+        if !active { desired = nil; flight = nil; waitingForProgress = false }
+        else { drive() }
     }
 
     /// Call only after the canonical model has consumed the corresponding
@@ -75,7 +88,7 @@ public final class TerminalViewportResize<Source: Equatable & Sendable> {
     }
 
     private func drive() {
-        guard !isRetired, worker == nil, flight == nil, !waitingForProgress,
+        guard !isRetired, isActive, worker == nil, flight == nil, !waitingForProgress,
               let geometry = desired else { return }
         if geometry == applied { desired = nil; return }
         desired = nil
@@ -91,7 +104,8 @@ public final class TerminalViewportResize<Source: Equatable & Sendable> {
 
     private func settle(id: UUID, result: Result<TerminalResizeAdmission, Error>) {
         worker = nil
-        guard !isRetired, let owned = flight, owned.id == id else { return }
+        guard !isRetired else { return }
+        guard let owned = flight, owned.id == id else { drive(); return }
         switch result {
         case .success(.queued):
             flight?.admitted = true

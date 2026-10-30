@@ -1107,6 +1107,9 @@ public final class NativeTerminalView: UIView {
             guard let self, !self.retired, self.sceneActive else { return }
             self.lastAppearance = (font, foreground)
             self.input.updateAppearance(font: font, foreground: foreground)
+            // Local fit/resize can change cell metrics without changing the
+            // semantic frame. Keep selection on the completed grid too.
+            if self.renderer.pointerProjection != nil { self.drawSelection() }
         }
         renderer.onCaretUnavailable = { [weak self] in
             guard let self, !self.retired else { return }

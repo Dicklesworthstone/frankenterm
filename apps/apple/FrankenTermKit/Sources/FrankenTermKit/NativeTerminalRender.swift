@@ -186,6 +186,16 @@ public final class NativeTerminalRenderView: MTKView {
         requestPreparation()
     }
 
+    /// Local split/observer presentation changes neither the semantic font
+    /// revision nor the remote terminal. Rebuild projection and caret together.
+    public func setFitsRemoteGrid(_ fits: Bool) throws {
+        guard !retired else { throw TerminalRenderError.unavailable }
+        guard configuration.fitsRemoteGrid != fits else { return }
+        configuration.fitsRemoteGrid = fits
+        try invalidatePreparation()
+        requestPreparation()
+    }
+
     public func setSceneActive(_ active: Bool) {
         guard !retired else { return }
         // Notifications can be missed while the process is suspended.

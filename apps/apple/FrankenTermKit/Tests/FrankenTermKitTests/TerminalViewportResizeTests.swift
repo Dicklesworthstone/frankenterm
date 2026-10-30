@@ -40,6 +40,37 @@ final class TerminalViewportResizeTests: XCTestCase {
         await owner.waitUntilSettled()
         let count = await probe.count(); XCTAssertEqual(count, 0); XCTAssertFalse(owner.isPending)
     }
+    func testLosingFocusDiscardsHiddenLayoutsButStillObservesActualGeometry() async throws {
+        let (owner, probe, source) = try setup()
+        try owner.propose(geometry(90), source: source); await owner.waitUntilSettled()
+        try owner.propose(geometry(100), source: source)
+        try owner.setActive(false, source: source)
+        for width in 110...200 { try owner.propose(geometry(UInt32(width)), source: source) }
+        try owner.didApply(geometry(90), source: source)
+        await owner.waitUntilSettled()
+        XCTAssertEqual(owner.applied, try geometry(90))
+        XCTAssertFalse(owner.isPending)
+        var requests = await probe.requested(); XCTAssertEqual(requests, try [geometry(90)])
+        try owner.setActive(true, source: source)
+        try owner.propose(geometry(120), source: source); await owner.waitUntilSettled()
+        requests = await probe.requested(); XCTAssertEqual(requests, try [geometry(90), geometry(120)])
+    }
+
+    func testRefocusWaitsForTheAbandonedAdmissionBeforeSendingItsFreshLayout() async throws {
+        let (owner, probe, source) = try setup()
+        await probe.configure(paused: true)
+        try owner.propose(geometry(90), source: source); try await waitForPark(probe)
+        try owner.setActive(false, source: source)
+        try owner.setActive(true, source: source)
+        try owner.propose(geometry(100), source: source)
+        var requests = await probe.requested(); XCTAssertEqual(requests, try [geometry(90)])
+        await probe.configure(); await probe.release(.busy)
+        await owner.waitUntilSettled(); await owner.waitUntilSettled()
+        requests = await probe.requested(); XCTAssertEqual(requests, try [geometry(90), geometry(100)])
+        try owner.didApply(geometry(100), source: source)
+        XCTAssertFalse(owner.isPending)
+        XCTAssertThrowsError(try owner.setActive(false, source: UUID()))
+    }
     func testAdmissionDoesNotPretendTheModelWasResized() async throws {
         let (owner, probe, source) = try setup()
         try owner.propose(geometry(90), source: source); await owner.waitUntilSettled()

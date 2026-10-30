@@ -594,6 +594,9 @@ final class TerminalSessionController {
     @ObservationIgnored private var clipboard: NativeTerminalClipboardController?
     @ObservationIgnored private var presentation: TerminalPresentationVisibility<TerminalSource>?
     @ObservationIgnored private var presentationVisible = true
+    private var hasFocusedPresentation: Bool {
+        presentationVisible && focus?.shows(machineID: target.machineID) == true
+    }
     @ObservationIgnored private var overviewBlocking = false
     @ObservationIgnored private var resize: TerminalViewportResize<TerminalSource>?
     @ObservationIgnored private var history: TerminalHistorySelection<TerminalSource>?
@@ -710,7 +713,7 @@ final class TerminalSessionController {
         if let paneHandoff { await paneHandoff.value }
     }
     func beginMuxSearch() {
-        guard !stopped, phase == .live, presentationVisible, !localInputNeedsDecision else { return }
+        guard !stopped, phase == .live, hasFocusedPresentation, !localInputNeedsDecision else { return }
         connection?.muxControl?.inputRouting.discardPointers()
         muxSearchPresented = true
         viewAttachment?.cancel()
@@ -722,17 +725,17 @@ final class TerminalSessionController {
         if resumingView { showView() }
     }
     func inspectOutput() {
-        guard !stopped, phase == .live, presentationVisible, !clipboardIsPresenting, !localInputNeedsDecision else { return }
+        guard !stopped, phase == .live, hasFocusedPresentation, !clipboardIsPresenting, !localInputNeedsDecision else { return }
         connection?.muxControl?.inputRouting.discardPointers()
         interactionProblem = nil; clipboard?.requestCopy()
     }
     func paste() {
-        guard !isViewingOnly, !stopped, phase == .live, presentationVisible, !clipboardIsPresenting, !localInputNeedsDecision else { return }
+        guard !isViewingOnly, !stopped, phase == .live, hasFocusedPresentation, !clipboardIsPresenting, !localInputNeedsDecision else { return }
         connection?.muxControl?.inputRouting.discardPointers()
         interactionProblem = nil; clipboard?.requestPaste()
     }
     func composeCommand() {
-        guard !isViewingOnly, !stopped, phase == .live, presentationVisible, !clipboardIsPresenting,
+        guard !isViewingOnly, !stopped, phase == .live, hasFocusedPresentation, !clipboardIsPresenting,
               !overviewBlocking, !paneNavigationBusy else { return }
         connection?.muxControl?.inputRouting.discardPointers()
         interactionProblem = nil; clipboard?.requestCommandDraft()
@@ -771,7 +774,7 @@ final class TerminalSessionController {
     /// The owner is captured by the sheet, never looked up again through a
     /// possibly different selected machine when that sheet is dismissed.
     func inspectHistory() -> TerminalHistoryInspection? {
-        guard !stopped, phase == .live, presentationVisible, !clipboardIsPresenting, !localInputNeedsDecision,
+        guard !stopped, phase == .live, hasFocusedPresentation, !clipboardIsPresenting, !localInputNeedsDecision,
               let runtime, let source = pump?.source else { return nil }
         connection?.muxControl?.inputRouting.discardPointers()
         interactionProblem = nil
@@ -792,7 +795,7 @@ final class TerminalSessionController {
     }
 
     func returnFromHistorySearch() {
-        guard !stopped, phase == .live, presentationVisible, !clipboardIsPresenting, !localInputNeedsDecision,
+        guard !stopped, phase == .live, hasFocusedPresentation, !clipboardIsPresenting, !localInputNeedsDecision,
               historyReturn == nil, let bookmark = historyReturnBookmark, let runtime,
               bookmark.source == pump?.source else { return }
         historyReturnBookmark = nil; historyReturning = true
@@ -996,7 +999,7 @@ final class TerminalSessionController {
                     await self.keyboard?.waitUntilSuspended()
                 }
                 try Task.checkCancellation()
-                guard !self.stopped, self.phase == .live, self.presentationVisible,
+                guard !self.stopped, self.phase == .live, self.hasFocusedPresentation,
                       self.connection?.muxControl === control,
                       control.current.panes.contains(where: { $0.paneId == paneID }) else {
                     throw TerminalInputError.stale
@@ -1021,7 +1024,7 @@ final class TerminalSessionController {
                 }
                 self.historyReturnBookmark = nil
                 try Task.checkCancellation()
-                guard !self.stopped, self.phase == .live, self.presentationVisible,
+                guard !self.stopped, self.phase == .live, self.hasFocusedPresentation,
                       self.connection?.muxControl === control,
                       control.current.panes.contains(where: { $0.paneId == paneID }) else {
                     throw TerminalInputError.stale
@@ -1139,16 +1142,39 @@ final class TerminalSessionController {
 
     func setPresentationVisible(_ visible: Bool) {
         let visible = visible && !stopped
+        let focused = visible && focus?.shows(machineID: target.machineID) == true
+        // A selected mux needs its first output before its view can attach. A
+        // companion whose connection was replaced waits for explicit focus;
+        // an empty tile must not consume or mark unseen pane output as read.
+        let observing = visible && (focused || terminal != nil)
         presentationVisible = visible
         // Pending authentication belongs to this visible destination. Returning to
         // the same tab later must not revive its old prompt or queued attempt.
-        if !visible, target.requiresAuthenticationPrompt, phase == .connecting { requestStop() }
-        if visible { unseenShellOutput = false }
+        if !focused, target.requiresAuthenticationPrompt, phase == .connecting { requestStop() }
+        if observing { unseenShellOutput = false }
         muxObservation?.setActive(visible)
-        // Only the machine on screen sizes its mux pane to the phone; the
-        // others give their panes back to the desktop's layout.
-        connection?.muxControl?.setVisible(visible)
-        if !visible {
+        // A visible split companion receives output but has no local input,
+        // clipboard or size authority. Existing navigation retires its old
+        // keyboard through the acknowledged source-bound handoff first.
+        connection?.muxControl?.setSizeControlEnabled(focused)
+        connection?.muxControl?.setVisible(observing)
+        if !focused {
+            connection?.muxControl?.inputRouting.discardPointers()
+            // An observer stays in the window, so UIKit will not dismiss its
+            // old edit menu or selection drag merely by detaching the view.
+            if visible { terminal?.clearSelection() }
+            terminal?.requestKeyboard(false)
+        }
+        terminal?.isUserInteractionEnabled = focused
+        if let resize, !resize.isRetired {
+            do { try resize.setActive(focused, source: resize.source) }
+            catch { fail(Self.describe(error)) }
+        }
+        if let renderer = terminal?.renderer {
+            do { try renderer.setFitsRemoteGrid(!focused || keepsSharedMuxSize) }
+            catch { fail(Self.describe(error)) }
+        }
+        if !focused {
             pointerFocusActivation?.cancel()
             // A delayed view/focus build must not navigate back to a machine
             // the user has already left. Its owner remains retained to join.
@@ -1166,7 +1192,7 @@ final class TerminalSessionController {
             $0.inputRouting.current.ready && $0.inputRouting.current.destination == displayedMuxDestination
         } ?? true
         let shown = visible && terminal != nil && requestedMuxPane == nil && muxReady
-        clipboard?.setActive(shown)
+        clipboard?.setActive(shown && focused)
         presenter?.acceptsFrames = shown
         terminal?.renderer.setSceneActive(shown)
         if let presentation, !presentation.isRetired {
@@ -1185,7 +1211,8 @@ final class TerminalSessionController {
         // An activation may have started before a read-only sheet opened and
         // completed its handoff afterwards. Seal that newly published responder
         // before it can acquire hardware input behind the inspection surface.
-        guard !overviewBlocking, !keyboardActivationBlocked, paneHandoff == nil, requestedMuxPane == nil,
+        guard focus?.shows(machineID: target.machineID) == true,
+              !overviewBlocking, !keyboardActivationBlocked, paneHandoff == nil, requestedMuxPane == nil,
               connection?.muxControl.map({ $0.inputRouting.current.ready
                   && $0.inputRouting.current.destination == displayedMuxDestination }) ?? true else {
             keyboard.suspend()
@@ -1328,7 +1355,8 @@ final class TerminalSessionController {
                 // ended before its server confirmed input sent to it.
                 if control.current.inputUnconfirmed, !inputDelivery.unanswered { inputDelivery.endedUnanswered() }
                 observeMux(control)
-                control.setVisible(presentationVisible)
+                control.setSizeControlEnabled(hasFocusedPresentation)
+                control.setVisible(hasFocusedPresentation || (presentationVisible && terminal != nil))
             }
             try checkStarting()
             let presenter = TerminalFramePresenter(source: pump.source, connection: connection)
@@ -1541,6 +1569,7 @@ final class TerminalSessionController {
                                destination: TerminalMuxInputRouting.Destination,
                                control: TerminalMuxControl, view: NativeTerminalView) {
         guard !stopped, !overviewBlocking, phase == .live, presentationVisible, !clipboardIsPresenting,
+              focus?.shows(machineID: target.machineID) == true,
               paneHandoff == nil, terminal === view, connection?.muxControl === control,
               displayedMuxDestination == destination else { return }
         do {
@@ -1830,7 +1859,9 @@ final class TerminalSessionController {
     /// canonical application. There is no timer, optimistic model resize, or
     /// generation-less retry that can target a replacement terminal.
     private func propose(_ viewport: NativeTerminalViewport) {
-        guard !keepsSharedMuxSize, !stopped, phase == .live, let resize, viewport.source == resize.source,
+        guard !keepsSharedMuxSize, !stopped, phase == .live, presentationVisible,
+              focus?.shows(machineID: target.machineID) == true,
+              let resize, viewport.source == resize.source,
               viewport.revision > lastViewportRevision,
               let rows = UInt32(exactly: viewport.rows),
               // At most TerminalSessionGeometry.maximumShownCells: the model

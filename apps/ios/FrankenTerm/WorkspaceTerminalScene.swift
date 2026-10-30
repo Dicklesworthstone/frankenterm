@@ -40,6 +40,13 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     private(set) var themes: [String: WorkspaceDocument.Theme] = [:]
     /// The machine on screen; follows committed navigation only.
     private(set) var selectedMachineID: String?
+    /// Explicitly chosen local slots. Only selectedMachineID owns input; the
+    /// other slot observes its existing session at the shared remote size.
+    private(set) var splitLayout = TerminalSplitLayout()
+    private(set) var splitAvailable = false
+    private(set) var openingSplit = false
+    @ObservationIgnored private var splitGeneration = UUID()
+    @ObservationIgnored private var splitJob: Task<Void, Never>?
     /// The committed group's order, not the full connection-owner inventory.
     /// Storing the IDs also makes same-machine group changes observable to UI.
     private(set) var navigationMachineIDs: [String] = []
@@ -175,6 +182,10 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
 
     var selectedMachine: SceneMachine? { machines.first { $0.id == selectedMachineID } }
     var selectedSession: TerminalSessionController? { selectedMachineID.flatMap { sessions[$0] } }
+    var displayedMachineIDs: [String] {
+        splitLayout.visibleMachineIDs(selected: selectedMachineID, expanded: splitAvailable)
+    }
+    var splitExpanded: Bool { displayedMachineIDs.count == 2 }
     var navigationMachines: [SceneMachine] {
         let known = Dictionary(uniqueKeysWithValues: machines.map { ($0.id, $0) })
         return navigationMachineIDs.compactMap { known[$0] }
@@ -527,6 +538,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// keyboard and rendering stop until it returns.
     func disappear() {
         guard !closed else { return }
+        splitGeneration = UUID(); splitJob?.cancel()
         cancelOverview()
         cancelGroupAppearance()
         onScreen = false
@@ -538,7 +550,10 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
 
     func setForeground(_ active: Bool) {
         guard !closed else { return }
-        if !active { cancelOverview(); cancelGroupAppearance() }
+        if !active {
+            cancelOverview(); cancelGroupAppearance()
+            splitGeneration = UUID(); splitJob?.cancel()
+        }
         if foreground != active { canvasGeneration = UUID() }
         foreground = active
         if active {
@@ -623,6 +638,62 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
                 }
             } catch { report(error) }
         }
+    }
+
+    /// The second machine is selected through the normal composition/input
+    /// barrier before the pair becomes visible. Selection retains the route's
+    /// normal creation policy; a manual or lost shell still needs Open Terminal.
+    func split(with machineID: String) {
+        guard splitAvailable, splitJob == nil, permitsTerminalCreation, onScreen,
+              !overviewBlocksInput, !groupAppearanceBlocksInput,
+              let first = selectedMachineID, first != machineID,
+              let original = selectedSession, original.phase == .live, original.terminal != nil,
+              !original.clipboardIsPresenting, !original.localInputNeedsDecision, !original.paneNavigationBusy,
+              navigationMachineIDs.contains(machineID) else { return }
+        let generation = UUID(), appearance = appearanceGeneration
+        splitGeneration = generation; openingSplit = true
+        splitJob = Task { [weak self] in
+            guard let self else { return }
+            defer { self.splitJob = nil; self.openingSplit = false }
+            do {
+                try await self.whileBusy {
+                    try Task.checkCancellation()
+                    guard self.splitGeneration == generation, self.appearanceGeneration == appearance,
+                          !self.closed, self.onScreen, self.foreground, self.splitAvailable,
+                          self.selectedMachineID == first, self.sessions[first] === original,
+                          !self.overviewBlocksInput, !self.groupAppearanceBlocksInput,
+                          self.navigationMachineIDs.contains(machineID) else { throw CancellationError() }
+                    guard let plan = try self.navigation.navigation.plan(machineID: machineID) else {
+                        throw TerminalNavigationError.unavailable
+                    }
+                    try await self.navigation.perform(plan)
+                }
+                try Task.checkCancellation()
+                guard self.splitGeneration == generation, !self.closed, self.onScreen,
+                      self.selectedMachineID == machineID, self.sessions[first] === original else {
+                    throw CancellationError()
+                }
+                try self.splitLayout.open(first: first, second: machineID, available: self.navigationMachineIDs)
+                self.canvasGeneration = UUID()
+                self.updatePresentationVisibility()
+            } catch {
+                if !(error is CancellationError), self.splitGeneration == generation { self.report(error) }
+            }
+        }
+    }
+
+    func closeSplit() {
+        splitGeneration = UUID(); splitJob?.cancel()
+        splitLayout.close(); canvasGeneration = UUID()
+        updatePresentationVisibility()
+    }
+
+    /// Window geometry only changes local residency, never connection intent.
+    func setSplitViewport(width: Double, isPad: Bool) {
+        let allowed = TerminalSplitLayout.supports(width: width, isPad: isPad)
+        guard splitAvailable != allowed else { return }
+        splitAvailable = allowed; canvasGeneration = UUID()
+        updatePresentationVisibility()
     }
 
     /// The strip's next or previous machine, wrapping at either end, as a
@@ -847,7 +918,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         }
         sessions[machineID] = controller
         residency.started(machineID)
-        controller.setPresentationVisible(isVisible(machineID))
+        controller.setPresentationVisible(isPresented(machineID))
         runController(controller, machineID: machineID, starting: true)
     }
 
@@ -1182,6 +1253,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     func requestClose() {
         guard !closed else { return }
         closed = true
+        splitGeneration = UUID(); splitJob?.cancel()
         cancelOverview()
         cancelGroupAppearance()
         canvasGeneration = UUID()
@@ -1208,7 +1280,9 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         let overview = overviewJob?.task
         let appearance = groupAppearanceJob?.task
         let release = capacityReleaseJob
+        let split = splitJob
         let job = Task {
+            if let split { await split.value }
             if let release { await release.value }
             if let appearance { await appearance.value }
             if let overview { await overview.value }
@@ -1241,6 +1315,8 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     private func navigationChanged() {
         let selection = navigation.navigation.selection
         navigationMachineIDs = navigation.navigation.machines.map(\.id)
+        splitLayout.reconcile(previous: selectedMachineID, selected: selection?.machineID,
+                              available: navigationMachineIDs)
         if selectedMachineID != selection?.machineID {
             canvasGeneration = UUID()
             selectedMachineID = selection?.machineID
@@ -1259,14 +1335,19 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     }
 
     private func isVisible(_ machineID: String) -> Bool {
+        isPresented(machineID) && machineID == selectedMachineID
+    }
+
+    private func isPresented(_ machineID: String) -> Bool {
         !closed && foreground && !inBackground && onScreen && !groupAppearanceBlocksInput && appearanceSelection == nil
-            && (!overviewBlocksInput || overviewAllowsTargetPresentation) && machineID == selectedMachineID
+            && (!overviewBlocksInput || (overviewAllowsTargetPresentation && machineID == selectedMachineID))
+            && displayedMachineIDs.contains(machineID)
     }
 
     private func updatePresentationVisibility() {
         for (machineID, controller) in sessions {
             controller.setOverviewBlocking(overviewBlocksInput || groupAppearanceBlocksInput)
-            controller.setPresentationVisible(isVisible(machineID))
+            controller.setPresentationVisible(isPresented(machineID))
         }
     }
 
@@ -1417,6 +1498,7 @@ struct WorkspaceTerminalScreen: View {
 
     var body: some View {
         let machine = scene.selectedMachine
+        let canvasMachines = scene.displayedMachineIDs.compactMap { id in scene.machines.first { $0.id == id } }
         let overviewSessionID = scene.overviewSessionID
         let backgroundHex = machine.flatMap { scene.themes[$0.id]?.background }
         let background = backgroundHex.map { Color(ftHex: $0) } ?? .black
@@ -1433,9 +1515,40 @@ struct WorkspaceTerminalScreen: View {
                     .environment(\.colorScheme, chrome)
                     .transition(.move(edge: .top).combined(with: .opacity))
             }
+            if scene.splitExpanded {
+                HStack(spacing: 1) {
+                    ForEach(canvasMachines) { splitHeading($0) }
+                }
+                .environment(\.colorScheme, chrome)
+            }
             ZStack {
-                WorkspaceCanvasHost(scene: scene, terminal: machine.flatMap { scene.sessions[$0.id]?.terminal })
-                if let machine { card(for: machine).transition(.opacity.combined(with: .scale(scale: 0.97))) }
+                WorkspaceCanvasHost(scene: scene, panes: canvasMachines.map {
+                    WorkspaceCanvasPane(machineID: $0.id, terminal: scene.sessions[$0.id]?.terminal)
+                })
+                .background {
+                    GeometryReader { geometry in
+                        Color.clear.onChange(of: geometry.size.width, initial: true) { _, width in
+                            scene.setSplitViewport(width: Double(width), isPad: UIDevice.current.userInterfaceIdiom == .pad)
+                        }
+                    }
+                }
+                HStack(spacing: 1) {
+                    ForEach(canvasMachines) { machine in
+                        ZStack {
+                            if machine.id == scene.selectedMachineID {
+                                card(for: machine).transition(.opacity)
+                            } else if scene.sessions[machine.id]?.terminal == nil {
+                                Button { scene.select(machine.id) } label: {
+                                    VStack(spacing: 10) {
+                                        Image(systemName: "desktopcomputer").font(.title)
+                                        Text(verbatim: machine.name).font(.headline)
+                                        Text("Select this machine to continue").font(.callout)
+                                    }.padding().background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+                                }.buttonStyle(.plain)
+                            }
+                        }.frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
+                }
             }
         }
         .background(background.ignoresSafeArea())
@@ -1550,6 +1663,21 @@ struct WorkspaceTerminalScreen: View {
                     .disabled(session.isViewingOnly || session.clipboardIsPresenting || session.localInputNeedsDecision)
             }
             Menu {
+                if scene.splitLayout.isSplit {
+                    Button("Close Split", systemImage: "rectangle") { scene.closeSplit() }
+                        .accessibilityIdentifier("terminal.split.close")
+                }
+                if scene.splitAvailable, scene.selectedSession?.terminal != nil {
+                    Menu("Split with Another Machine", systemImage: "rectangle.split.2x1") {
+                        ForEach(scene.navigationMachines.filter { $0.id != scene.selectedMachineID }) { other in
+                            Button(other.name) { scene.split(with: other.id) }
+                                .accessibilityIdentifier("terminal.split.choose.\(other.id)")
+                        }
+                    }
+                    .disabled(scene.openingSplit || scene.selectedSession?.clipboardIsPresenting == true
+                        || scene.selectedSession?.paneNavigationBusy == true)
+                    .accessibilityIdentifier("terminal.split.open")
+                }
                 if let session = scene.selectedSession, session.phase == .live, let terminal = session.terminal {
                     // ⇧⌘D is the canvas's key command: a SwiftUI shortcut on a
                     // button inside this menu never fired (UI test 3).
@@ -1595,6 +1723,27 @@ struct WorkspaceTerminalScreen: View {
             } label: { Label("More", systemImage: "ellipsis.circle") }
                 .accessibilityIdentifier("terminal.more")
         }
+    }
+
+    private func splitHeading(_ machine: SceneMachine) -> some View {
+        let focused = machine.id == scene.selectedMachineID
+        return Button {
+            if focused { Task { await scene.activateKeyboard() } }
+            else { scene.select(machine.id) }
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: focused ? "scope" : "eye")
+                Text(verbatim: machine.name).fontWeight(.semibold).lineLimit(1)
+                Spacer(minLength: 0)
+                Text(focused ? "Focused" : "Tap to focus").font(.caption2)
+            }
+            .font(.caption).padding(.horizontal, 12).frame(height: 36)
+            .background(focused ? Color.accentColor.opacity(0.18) : Color.primary.opacity(0.06))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain).frame(maxWidth: .infinity)
+        .accessibilityLabel("\(machine.name), \(focused ? "focused terminal" : "observing, activate to type")")
+        .accessibilityIdentifier("terminal.split.focus.\(machine.id)")
     }
 
     private func muxAccessBar(_ session: TerminalSessionController) -> some View {
@@ -2112,23 +2261,30 @@ private struct StatusDot: View {
     }
 }
 
-/// Hosts the selected machine's asynchronously created terminal. Other
-/// machines' views leave the window, which pauses their rendering; their
-/// sessions keep running. The navigation controls are not drawn (the machine
-/// strip replaces their rail) but own both independent canvas gestures.
+struct WorkspaceCanvasPane {
+    let machineID: String
+    let terminal: NativeTerminalView?
+}
+
+/// Hosts one focused terminal and at most one explicit companion. Views keep
+/// their machine slot through focus transfers; removing a slot releases only
+/// its presentation, while its authenticated session remains owned by the scene.
 private struct WorkspaceCanvasHost: UIViewRepresentable {
     let scene: WorkspaceTerminalScene
-    let terminal: NativeTerminalView?
+    let panes: [WorkspaceCanvasPane]
     func makeUIView(context: Context) -> WorkspaceCanvasView { WorkspaceCanvasView(scene: scene) }
-    func updateUIView(_ view: WorkspaceCanvasView, context: Context) { view.show(terminal) }
+    func updateUIView(_ view: WorkspaceCanvasView, context: Context) { view.show(panes) }
     static func dismantleUIView(_ view: WorkspaceCanvasView, coordinator: ()) { view.retireNavigation() }
 }
 
-private final class WorkspaceCanvasView: UIView {
+final class WorkspaceCanvasView: UIView {
     private let canvas = UIView()
     /// Keeps the keyboard up between machines, so switching resizes neither.
     private let keyboardHolder = TerminalKeyboardHolder()
     private var controls: NativeTerminalNavigationControls?
+    private weak var navigationSurface: UIView?
+    private var hosts: [String: WorkspaceCanvasPaneView] = [:]
+    private var panes: [WorkspaceCanvasPane] = []
     private weak var scene: WorkspaceTerminalScene?
 
     init(scene: WorkspaceTerminalScene) {
@@ -2141,10 +2297,20 @@ private final class WorkspaceCanvasView: UIView {
             canvas.topAnchor.constraint(equalTo: topAnchor), canvas.bottomAnchor.constraint(equalTo: bottomAnchor),
             canvas.leadingAnchor.constraint(equalTo: leadingAnchor), canvas.trailingAnchor.constraint(equalTo: trailingAnchor)
         ])
+    }
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { nil }
+    override var canBecomeFirstResponder: Bool { scene?.selectedSession?.isViewingOnly == true }
+
+    private func installNavigation(on surface: UIView?) {
+        guard navigationSurface !== surface else { return }
+        controls?.retire(suspendNavigation: false); controls = nil
+        navigationSurface = surface
+        guard let scene, let surface else { return }
         do {
             // One recognizer owns the finger-count decision and the four
             // captured candidates. Mux panes are not flattened into machines.
-            let controls = try NativeTerminalNavigationControls(coordinator: scene.navigation, terminalCanvas: canvas,
+            let controls = try NativeTerminalNavigationControls(coordinator: scene.navigation, terminalCanvas: surface,
                 permitsCanvasNavigation: { [weak scene] in
                     scene?.permitsCanvasNavigation == true
                 }, canvasAction: { [weak scene] axis, direction in
@@ -2153,22 +2319,35 @@ private final class WorkspaceCanvasView: UIView {
             controls.onFailure = { [weak scene] error in scene?.report(error) }
             self.controls = controls
         } catch { scene.report(error) }
-        // A tap brings the keyboard back after its input generation ended.
-        let tap = UITapGestureRecognizer(target: self, action: #selector(tapped))
-        tap.cancelsTouchesInView = false
-        canvas.addGestureRecognizer(tap)
     }
-    @available(*, unavailable)
-    required init?(coder: NSCoder) { nil }
-    override var canBecomeFirstResponder: Bool { scene?.selectedSession?.isViewingOnly == true }
 
-    @objc private func tapped() {
+    @objc private func tapped(_ gesture: UITapGestureRecognizer) {
+        guard let host = gesture.view as? WorkspaceCanvasPaneView, let scene else { return }
+        if host.machineID != scene.selectedMachineID { scene.select(host.machineID); return }
         // A live terminal handles its own taps: the keyboard, a selection.
-        guard scene?.selectedSession?.terminal == nil else { return }
+        guard scene.selectedSession?.terminal == nil else { return }
         Task { [weak scene] in await scene?.activateKeyboard() }
     }
 
-    func retireNavigation() { controls?.retire(suspendNavigation: false); controls = nil }
+    func retireNavigation() {
+        controls?.retire(suspendNavigation: false); controls = nil; navigationSurface = nil
+        keyboardHolder.release()
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        layoutPanes()
+    }
+
+    private func layoutPanes() {
+        guard !panes.isEmpty else { return }
+        let width = max(0, (canvas.bounds.width - CGFloat(panes.count - 1)) / CGFloat(panes.count))
+        for (index, pane) in panes.enumerated() {
+            let host = hosts[pane.machineID]
+            host?.frame = CGRect(x: CGFloat(index) * (width + 1), y: 0, width: width, height: canvas.bounds.height)
+            if let host { pane.terminal?.frame = host.bounds }
+        }
+    }
 
     /// A hardware keyboard switches as the strips and swipes do: ⇧⌘] ⇧⌘[ for
     /// machines, ⌘] ⌘[ for a mux's panes, ⌘J for the next new output;
@@ -2208,9 +2387,36 @@ private final class WorkspaceCanvasView: UIView {
     @objc private func nextPane() { scene?.stepPane(forward: true) }
     @objc private func previousPane() { scene?.stepPane(forward: false) }
 
-    /// Switching machines cross-fades between their terminals.
-    func show(_ terminal: NativeTerminalView?) {
-        terminal?.keyboardHolder = keyboardHolder
+    func show(_ panes: [WorkspaceCanvasPane]) {
+        guard panes.count <= 2, Set(panes.map(\.machineID)).count == panes.count else { return }
+        self.panes = panes
+        let selected = scene?.selectedMachineID
+        let terminal = panes.first { $0.machineID == selected }?.terminal
+        for id in Array(hosts.keys) where !panes.contains(where: { $0.machineID == id }) {
+            hosts.removeValue(forKey: id)?.removeFromSuperview()
+        }
+        for pane in panes {
+            let host: WorkspaceCanvasPaneView
+            if let existing = hosts[pane.machineID] { host = existing }
+            else {
+                host = WorkspaceCanvasPaneView(machineID: pane.machineID)
+                hosts[pane.machineID] = host; canvas.addSubview(host)
+                let tap = UITapGestureRecognizer(target: self, action: #selector(tapped(_:)))
+                tap.cancelsTouchesInView = false; host.addGestureRecognizer(tap)
+            }
+            pane.terminal?.keyboardHolder = keyboardHolder
+            pane.terminal?.isUserInteractionEnabled = pane.machineID == selected
+            if pane.terminal?.superview !== host || host.subviews.count != 1 {
+                host.subviews.forEach { $0.removeFromSuperview() }
+                if let terminal = pane.terminal {
+                    terminal.frame = host.bounds
+                    terminal.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+                    host.addSubview(terminal)
+                }
+            }
+        }
+        installNavigation(on: selected.flatMap { hosts[$0] })
+        layoutPanes()
         if terminal?.input.isReadOnly == true {
             keyboardHolder.release()
             if !isFirstResponder { _ = becomeFirstResponder() }
@@ -2218,20 +2424,19 @@ private final class WorkspaceCanvasView: UIView {
         // A machine whose terminal is on its way takes the keyboard when it
         // comes (or the holder's deadline lets it go); its page takes none.
         if terminal == nil, scene?.selectedSession.map({ $0.phase == .idle }) ?? true { keyboardHolder.release() }
-        if let terminal, terminal.superview === canvas, canvas.subviews.count == 1 { return }
-        let replacing = !canvas.subviews.isEmpty
-        let swap = { [canvas] in
-            canvas.subviews.forEach { $0.removeFromSuperview() }
-            guard let terminal else { return }
-            terminal.frame = canvas.bounds
-            terminal.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-            canvas.addSubview(terminal)
-        }
-        if replacing, terminal != nil, !UIAccessibility.isReduceMotionEnabled {
-            UIView.transition(with: canvas, duration: 0.18, options: [.transitionCrossDissolve, .allowUserInteraction],
-                              animations: swap)
-        } else { swap() }
     }
+}
+
+private final class WorkspaceCanvasPaneView: UIView {
+    let machineID: String
+    init(machineID: String) {
+        self.machineID = machineID
+        super.init(frame: .zero)
+        clipsToBounds = true
+        accessibilityIdentifier = "terminal.canvas.\(machineID)"
+    }
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { nil }
 }
 
 /// Search the discovered fleet, not terminal contents. The immutable snapshot

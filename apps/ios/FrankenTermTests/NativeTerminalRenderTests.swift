@@ -199,6 +199,33 @@ final class NativeTerminalRenderTests: XCTestCase {
         XCTAssertEqual(cell.rect.minY, projection.cellSize.height * 59, accuracy: 0.01)
     }
 
+    func testSplitFitChangesOnlyLocalProjectionAndCanReturnToThePreferredSize() async throws {
+        var configuration = NativeTerminalRenderConfiguration()
+        configuration.cursorBlink = false
+        _ = try await render("Shared grid\u{1b}[60;180H", name: "before-split-fit",
+            configuration: configuration, columns: 180, rows: 60)
+        let view = try XCTUnwrap(view), original = try XCTUnwrap(view.admittedFrame)
+        let size = try XCTUnwrap(view.cellSize)
+        let fitted = expectation(description: "the retained frame completed at the companion's fitted scale")
+        fitted.assertForOverFulfill = false
+        view.onAppearance = { _, _ in fitted.fulfill() }
+        try view.setFitsRemoteGrid(true)
+        await fulfillment(of: [fitted], timeout: 20)
+        let projection = try XCTUnwrap(view.pointerProjection)
+        XCTAssertLessThan(projection.cellSize.width, size.width)
+        XCTAssertLessThanOrEqual(projection.cellSize.width * 180, view.bounds.width + 0.01)
+        XCTAssertEqual(view.admittedFrame?.revision, original.revision)
+        XCTAssertEqual(view.configuration.fontRevision, configuration.fontRevision)
+        let restored = expectation(description: "focusing again restores the original local scale")
+        restored.assertForOverFulfill = false
+        view.onAppearance = { _, _ in restored.fulfill() }
+        try view.setFitsRemoteGrid(false)
+        await fulfillment(of: [restored], timeout: 20)
+        XCTAssertEqual(try XCTUnwrap(view.cellSize), size)
+        XCTAssertEqual(view.admittedFrame?.source, original.source)
+        XCTAssertEqual(view.admittedFrame?.columns, 180); XCTAssertEqual(view.admittedFrame?.rows, 60)
+    }
+
     func testAccessibleOutputHasSeparateLinesAndDoesNotExposeConcealedText() async throws {
         _ = try await render("first line\r\nwide: 界 👩‍💻\r\n\u{1b}[8mprivate\u{1b}[0m\r\n$ ",
                              name: "accessible-terminal-lines")
