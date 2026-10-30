@@ -70,9 +70,10 @@ public struct StrictJSON {
     /// Track the actual container path, including the credential array step.
     /// An identically named key in extensions or another document stays text.
     private enum Context {
-        case root, workspace, credentials, credential, userCertificate, other
+        case root, machineCompanion, workspace, credentials, credential, userCertificate, other
         func member(_ key: String) -> Context {
             switch (self, key) {
+            case (.machineCompanion, "document"): .root
             case (.root, "workspace"): .workspace
             case (.workspace, "credentials"): .credentials
             case (.credential, "user_certificate"): .userCertificate
@@ -91,10 +92,26 @@ public struct StrictJSON {
     private let bytes: [UInt8]
     private var offset = 0
     private var nodes = 0
+    private var maximumNodes = 32768
+    private var maximumDepth = 12
     public static func decode(_ data: Data) throws -> JSONValue {
         guard !data.isEmpty, data.count <= FTLimit.manifest else { throw FTError.limit("json.bytes") }
         var parser = StrictJSON(bytes: Array(data))
         let value = try parser.value(depth: 0, context: .root)
+        parser.whitespace()
+        guard parser.offset == parser.bytes.count else { throw FTError.malformed("json.trailing") }
+        return value
+    }
+    /// The local helper wraps one ordinary document plus bounded public source
+    /// findings and private-file hints. Only that exact document position gets
+    /// the certificate string profile; the decoded document is independently
+    /// checked against the ordinary manifest limits before use.
+    static func decodeMachineCompanion(_ data: Data) throws -> JSONValue {
+        guard !data.isEmpty, data.count <= MachineCompanionSource.maximumBytes else {
+            throw FTError.limit("machines.source_bytes")
+        }
+        var parser = StrictJSON(bytes: Array(data), maximumNodes: 49152, maximumDepth: 13)
+        let value = try parser.value(depth: 0, context: .machineCompanion)
         parser.whitespace()
         guard parser.offset == parser.bytes.count else { throw FTError.malformed("json.trailing") }
         return value
@@ -186,7 +203,7 @@ public struct StrictJSON {
     }
     private mutating func value(depth: Int, context: Context) throws -> JSONValue {
         nodes += 1
-        guard nodes <= 32768, depth <= 12 else { throw FTError.limit("json.complexity") }
+        guard nodes <= maximumNodes, depth <= maximumDepth else { throw FTError.limit("json.complexity") }
         whitespace()
         guard offset < bytes.count else { throw FTError.malformed("json.eof") }
         if bytes[offset] == 34 { return .string(try text(limit: context.stringLimit)) }

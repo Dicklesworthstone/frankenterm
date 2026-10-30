@@ -2,6 +2,14 @@
 
 This directory contains the shared Swift 6 `FrankenTermKit` package and the native Xcode project for the first offline workspace-transfer slice. It is implementation source, not a signed or device-qualified terminal release.
 
+## Source omissions survive the default Mac export
+
+The default **This Mac's FrankenTerm machines** source now carries a typed completeness report from the Rust helper through the Mac's review, group/machine selection, encrypted FTAG archive and installed workspace. Previously the helper's diagnostic notes were dropped by this path. Omitted routes and machines, desktop working-directory/icon/gradient settings, and the inventory source's limits now remain visible. Findings for removed entities attach to a surviving machine, group or workspace so narrowing the selection cannot discard them accidentally.
+
+The existing Send action shows the relevant omissions and offers **Send Available Settings to iPhone** when the selected source is incomplete. Required route and trust policies keep their existing blocking authority. Informational omissions do not invent new authentication permissions or turn every route into a denial. An inventory snapshot explicitly identifies that it does not capture live desktop overrides or running sessions.
+
+The helper's version-two report and legacy version-one notes share a strict duplicate-key-rejecting parser. Reports are limited to 1,024 findings and 256 KiB, with bounded text, valid surviving entity references and no partial-prefix fallback. Local private-key file hints stay outside the exported public manifest. Rust and Swift regressions include helper-to-QR-to-install preservation, selective scope, required policy, legacy notes, malformed envelopes and all-or-fail limits; execution still requires RCH and Swift/Apple toolchains.
+
 ## Two live machines on iPad
 
 In an iPad window at least 720 points wide, **More → Split with Another Machine** opens two stable machine slots. The existing navigation/composition barrier transfers focus to the chosen machine before the pair is shown. Only the focused slot accepts keyboard, pointer, paste, command-composer or remote-size actions; the other continues rendering its existing session and fits that remote grid locally. Tap its view or heading to transfer focus. Choosing a third machine replaces the focused slot without duplicating the other session.

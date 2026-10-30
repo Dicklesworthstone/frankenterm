@@ -118,7 +118,7 @@ private actor MacExportEngine {
     }
     struct MachineSourceResult: Sendable {
         let state: SelectionState
-        let inventory: String, notes: [String]
+        let inventory: String
         /// Credentials whose key file needs a passphrase or could not be used.
         let unresolved: [(credentialID: String, reason: String)]
     }
@@ -146,14 +146,12 @@ private actor MacExportEngine {
     func loadThisMac() throws -> MachineSourceResult {
         retireKeyRequest(); invalidateExport()
         guard let command = Self.machineSourceCommand() else { throw MachineSourceError.noCommand }
-        let bytes = try Self.run(command.executable, command.arguments, limit: 2 * FTLimit.manifest)
+        let bytes = try Self.run(command.executable, command.arguments, limit: MachineCompanionSource.maximumBytes)
         try Task.checkCancellation()
-        guard let root = try JSONSerialization.jsonObject(with: bytes) as? [String: Any],
-              root["format"] as? String == "ftmachines-source", root["version"] as? Int == 1,
-              let documentObject = root["document"] as? [String: Any] else { throw FTError.unsupported("machines.source") }
-        let files = (root["identity_files"] as? [String: String]) ?? [:]
-        let candidate = try WorkspaceDocument(data: JSONSerialization.data(withJSONObject: documentObject))
-        let selected = try WorkspaceExportSelection(workspace: candidate, groupIDs: Set(candidate.groups.map(\.id)))
+        let source = try MachineCompanionSource(data: bytes)
+        let files = source.identityFiles, candidate = source.workspace
+        let selected = try WorkspaceExportSelection(workspace: candidate, groupIDs: Set(candidate.groups.map(\.id)),
+                                                    findings: source.findings)
         var loaded: [PrivateKeyRecord] = [], included: [String: WorkspaceExportSelection.IdentityDecision] = [:]
         var unresolved: [(credentialID: String, reason: String)] = []
         for identity in selected.identities {
@@ -183,9 +181,8 @@ private actor MacExportEngine {
         try Task.checkCancellation()
         document = candidate; selection = selected; decisions = included; keys = loaded
         excludedMachineIDs = []
-        sourceFindings = []; identityReferences = files; sshSource = nil; invalidateExport()
-        return .init(state: try state(), inventory: (root["inventory"] as? String) ?? "machines.toml",
-                     notes: (root["notes"] as? [String]) ?? [], unresolved: unresolved)
+        sourceFindings = source.findings; identityReferences = files; sshSource = nil; invalidateExport()
+        return .init(state: try state(), inventory: source.inventory, unresolved: unresolved)
     }
     func inspectSSHConfiguration(_ url: URL) throws -> [String] {
         retireKeyRequest(); invalidateExport()
@@ -1460,6 +1457,10 @@ private struct MacExportView: View {
     /// The whole job at a glance: these machines, in their colors, and one button.
     @ViewBuilder
     private func sendSummary(_ selection: WorkspaceExportSelection, _ review: WorkspaceExportSelection.Review) -> some View {
+        let sourceFindings = review.findings.filter {
+            $0.setting.hasPrefix("machines_toml.") && $0.setting != MachineCompanionSource.scopeSetting
+        }
+        let narrowed = !sourceFindings.isEmpty || !review.blockedRouteIDs.isEmpty
         VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Send your machines to your iPhone").font(.title.bold())
@@ -1497,11 +1498,28 @@ private struct MacExportView: View {
                       : "\(review.pendingIdentityCount + review.missingApprovedKeyCount) keys need your attention under Details.",
                       systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
             }
+            if narrowed {
+                VStack(alignment: .leading, spacing: 8) {
+                    Label("Review the available settings", systemImage: "exclamationmark.triangle")
+                        .font(.headline)
+                    if !review.blockedRouteIDs.isEmpty {
+                        Text("\(review.blockedRouteIDs.count) routes retain required policy that is unavailable. Sending this workspace keeps those restrictions in place.")
+                    }
+                    ForEach(Array(sourceFindings.prefix(3).enumerated()), id: \.offset) { _, finding in
+                        Text(verbatim: finding.reason)
+                    }
+                    if sourceFindings.count > 3 {
+                        Text("\(sourceFindings.count - 3) more source findings are listed under Details and travel with the encrypted transfer.")
+                    }
+                    Text("Send Available Settings accepts this narrower workspace. Review the complete report under Details before sending.")
+                        .foregroundStyle(.secondary)
+                }.font(.callout).frame(maxWidth: .infinity, alignment: .leading)
+            }
             HStack(spacing: 14) {
                 Button {
                     model.sendToPhone()
                 } label: {
-                    Label("Send to iPhone", systemImage: "iphone.and.arrow.forward")
+                    Label(narrowed ? "Send Available Settings to iPhone" : "Send to iPhone", systemImage: "iphone.and.arrow.forward")
                         .font(.title3.weight(.semibold)).padding(.horizontal, 10).padding(.vertical, 4)
                 }.buttonStyle(.borderedProminent).controlSize(.extraLarge).keyboardShortcut(.defaultAction)
                     .disabled(model.busy || !review.canPrepare || !model.destinationReady)
@@ -1588,7 +1606,8 @@ private struct MacExportView: View {
                         VStack(alignment: .leading, spacing: 3) {
                             Label(finding.disposition == 1 ? "Required policy unavailable"
                                   : finding.setting == "credential_policy" ? "Credential policy preserved"
-                                  : finding.setting == "ssh_config.source_scope" ? "Source scope" : "Preserved with an omission",
+                                  : finding.setting == "ssh_config.source_scope" || finding.setting == MachineCompanionSource.scopeSetting
+                                    ? "Source scope" : "Preserved with an omission",
                                   systemImage: finding.disposition == 1 ? "lock.trianglebadge.exclamationmark" : "info.circle")
                                 .font(.caption.bold())
                             Text(verbatim: finding.entityID + ": " + finding.reason).font(.caption)

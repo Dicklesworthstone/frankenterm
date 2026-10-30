@@ -43,6 +43,9 @@ const MAX_EXPORTED_CERTIFICATE_BYTES: usize = 1024 * 1024;
 const USER_CERTIFICATE_CAPABILITY: &str = "ssh_user_certificate_v1";
 const MAX_JUMP_HOPS: usize = 3;
 const MAX_EXPORTED_ROUTES: usize = 256;
+const MAX_EXPORT_FINDINGS: usize = 1024;
+const MAX_EXPORT_FINDINGS_BYTES: usize = 256 * 1024;
+const MAX_EXPORT_FINDING_TEXT: usize = 4096;
 /// The phone's SSH driver runs remote commands up to this size.
 const MAX_REMOTE_COMMAND_BYTES: usize = 1024;
 const UNRESOLVED_POLICY: &str = "ssh_config.unresolved_policy";
@@ -73,9 +76,23 @@ pub struct MobileExport {
     pub machines: usize,
     pub routes: usize,
     pub notes: Vec<ExportNote>,
+    /// Bounded public completeness findings, scoped to entities that actually
+    /// survived export. The companion preserves these through group selection
+    /// and the encrypted archive; local diagnostic strings are not the bridge.
+    pub portability: Vec<ExportFinding>,
     /// For each credential, the private key file its public key came from:
     /// what the desktop's own ssh would offer. Read by nothing here.
     pub identity_files: BTreeMap<String, PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ExportFinding {
+    pub entity_id: String,
+    pub setting: String,
+    /// Informational omissions do not authorize or replace required policy.
+    /// Route and trust capability markers remain mandatory in the document.
+    pub disposition: u8,
+    pub reason: String,
 }
 
 /// OpenSSH's identities when a route names none, in its order.
@@ -2163,10 +2180,13 @@ fn resolve_endpoint(
                             }
                             None => {
                                 identity_policy_complete = false;
-                                note(notes, format!(
-                                    "CertificateFile {} is missing, unreadable, over budget, unsupported or invalid (including its CA signature); no partial identity list was exported and this route remains blocked",
-                                    path.display()
-                                ));
+                                note(
+                                    notes,
+                                    format!(
+                                        "CertificateFile {} is missing, unreadable, over budget, unsupported or invalid (including its CA signature); no partial identity list was exported and this route remains blocked",
+                                        path.display()
+                                    ),
+                                );
                                 break;
                             }
                         }
@@ -2560,6 +2580,129 @@ impl EndpointRecords {
     }
 }
 
+/// Bind each source omission to a surviving entity. A dropped machine cannot
+/// name a nonexistent archive entity: its retained groups carry the finding,
+/// or the workspace does when none of those groups survived. Numeric note
+/// positions are not identity; exact repeated diagnostics share a stable key.
+fn export_findings(
+    inventory: &MachineInventory,
+    document: &Value,
+    notes: &[ExportNote],
+) -> anyhow::Result<Vec<ExportFinding>> {
+    let workspace = &document["workspace"];
+    let workspace_id = workspace["id"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("export has no workspace identity"))?;
+    let ids = |field: &str| -> BTreeSet<String> {
+        workspace[field]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|value| value["id"].as_str().map(str::to_string))
+            .collect()
+    };
+    let machines = ids("machines");
+    let groups = ids("groups");
+    let routes = ids("routes");
+    let mut findings = BTreeMap::new();
+    let source_scope = ExportFinding {
+        entity_id: workspace_id.to_string(),
+        setting: "machines_toml.source_scope".into(),
+        disposition: 0,
+        reason: "This snapshot contains the selected machine inventory, its resolved themes and bounded local SSH sources. It does not capture running desktop configuration overrides, live sessions or executable configuration.".into(),
+    };
+    findings.insert(
+        (source_scope.entity_id.clone(), source_scope.setting.clone()),
+        source_scope,
+    );
+    for note in notes {
+        let machine_id = format!("m.{}", note.machine);
+        let retained_machine = machines.contains(&machine_id);
+        let source_machine = inventory
+            .machines
+            .iter()
+            .find(|value| value.id == note.machine);
+        let source_route = source_machine.and_then(|machine| {
+            note.route
+                .as_deref()
+                .and_then(|route| machine.routes.iter().find(|value| value.id() == route))
+        });
+        let route_ids: Vec<String> = match source_route {
+            Some(MachineRoute::Ssh { id, .. }) => vec![format!("r.{}.{}", note.machine, id)],
+            Some(MachineRoute::FrankenTermMux { id, via, .. }) => via
+                .iter()
+                .map(|name| {
+                    if via.len() == 1 {
+                        format!("r.{}.{}", note.machine, id)
+                    } else {
+                        format!("r.{}.{}.{}", note.machine, id, name)
+                    }
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        let retained_routes: Vec<_> = route_ids
+            .into_iter()
+            .filter(|id| routes.contains(id))
+            .collect();
+        let kind = if !retained_machine {
+            "omitted_machine"
+        } else if source_route.is_some() && retained_routes.is_empty() {
+            "omitted_route"
+        } else {
+            "source_note"
+        };
+        let scopes = if !retained_routes.is_empty() {
+            retained_routes
+        } else if retained_machine {
+            vec![machine_id]
+        } else {
+            let retained_groups: Vec<_> = inventory
+                .groups
+                .iter()
+                .filter(|group| group.machines.contains(&note.machine))
+                .map(|group| format!("g.{}", group.id))
+                .filter(|id| groups.contains(id))
+                .collect();
+            if retained_groups.is_empty() {
+                vec![workspace_id.to_string()]
+            } else {
+                retained_groups
+            }
+        };
+        let reason = note.to_string();
+        anyhow::ensure!(
+            !reason.is_empty()
+                && reason.len() <= MAX_EXPORT_FINDING_TEXT
+                && !reason.chars().any(char::is_control),
+            "a source finding exceeds the phone's public metadata profile; no incomplete source report was exported"
+        );
+        let setting = format!("machines_toml.{}.{}", kind, short_digest(&reason));
+        for entity_id in scopes {
+            findings.insert(
+                (entity_id.clone(), setting.clone()),
+                ExportFinding {
+                    entity_id,
+                    setting: setting.clone(),
+                    disposition: 0,
+                    reason: reason.clone(),
+                },
+            );
+            anyhow::ensure!(
+                findings.len() <= MAX_EXPORT_FINDINGS,
+                "the complete source report exceeds the phone's {}-finding limit; select a smaller group",
+                MAX_EXPORT_FINDINGS
+            );
+        }
+    }
+    let findings: Vec<_> = findings.into_values().collect();
+    anyhow::ensure!(
+        serde_json::to_vec(&findings)?.len() <= MAX_EXPORT_FINDINGS_BYTES,
+        "the complete source report exceeds its 256 KiB limit; select a smaller group"
+    );
+    Ok(findings)
+}
+
 /// The phone's workspace for the inventory, or for one group of it. Its
 /// revision identifies the resolved public configuration, not just the raw
 /// inventory file: SSH policy, trust, identities and external theme changes
@@ -2759,6 +2902,28 @@ pub fn export(
         }
         let theme_id = format!("t.{}", machine.id);
         themes.push(theme_json(&theme_id, &machine.theme));
+        for (omitted, message) in [
+            (
+                machine.icon.is_some(),
+                "the desktop status-bar icon is not activated on the phone",
+            ),
+            (
+                machine.cwd.is_some(),
+                "the desktop working-directory preference is not used to start remote sessions on the phone",
+            ),
+            (
+                machine.theme.background_gradient.is_some(),
+                "the desktop background gradient is not activated on the phone; its resolved solid background and terminal palette are preserved",
+            ),
+        ] {
+            if omitted {
+                notes.push(ExportNote {
+                    machine: machine.id.clone(),
+                    route: None,
+                    message: message.into(),
+                });
+            }
+        }
         // The phone signs every machine in once the workspace opens, so
         // switching to one is instant; its terminal opens only when chosen.
         let mut record = json!({
@@ -2890,11 +3055,13 @@ pub fn export(
         short_digest(&format!("{}:{}:{}", revision, nanos, std::process::id()))
     ));
     document.sort_all_objects();
+    let portability = export_findings(inventory, &document, &notes)?;
     Ok(MobileExport {
         document,
         machines: machine_count,
         routes: route_count,
         notes,
+        portability,
         identity_files: records.identity_files,
     })
 }
@@ -2926,7 +3093,7 @@ pub fn load_companion_source(path: &Path) -> anyhow::Result<Value> {
 pub fn companion_source(export: &MobileExport, inventory: &Path) -> Value {
     json!({
         "format": "ftmachines-source",
-        "version": 1,
+        "version": 2,
         "inventory": inventory.to_string_lossy(),
         "document": export.document,
         "identity_files": export
@@ -2934,7 +3101,7 @@ pub fn companion_source(export: &MobileExport, inventory: &Path) -> Value {
             .iter()
             .map(|(id, path)| (id.clone(), json!(path.to_string_lossy())))
             .collect::<Map<String, Value>>(),
-        "notes": export.notes.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "portability": export.portability,
     })
 }
 
@@ -3330,6 +3497,138 @@ ssh = "jumped"
         );
     }
 
+    #[test]
+    fn companion_findings_name_surviving_scopes_for_omitted_routes_and_machines() {
+        let mut inventory = MachineInventory::parse(INVENTORY, &context()).unwrap();
+        inventory.machines[0].routes.push(MachineRoute::Ssh {
+            id: "unportable".into(),
+            target: RouteTarget::Alias("jumped".into()),
+        });
+        inventory.machines[0].icon = Some("desktop-icon".into());
+        inventory.machines[0].cwd = Some("/desktop/working-directory".into());
+        let ssh = sources(Some(
+            "Host css\n HostName css.example\n User ubuntu\n IdentityFile ~/.ssh/trj_ed25519\nHost jumped\n HostName inner\n User u\n ProxyCommand desktop-only-proxy\n",
+        ));
+        let first = export(&inventory, None, &ssh, &context()).unwrap();
+        let companion = companion_source(&first, Path::new("/config/machines.toml"));
+        assert_eq!(companion["version"], 2);
+        assert_eq!(companion["document"], first.document);
+        assert_eq!(companion["portability"], json!(first.portability));
+        assert!(companion.get("notes").is_none());
+        assert!(first.portability.iter().any(|finding| {
+            finding.entity_id == "g.fleet"
+                && finding
+                    .setting
+                    .starts_with("machines_toml.omitted_machine.")
+                && finding.reason.starts_with("dark")
+        }));
+        assert!(first.portability.iter().any(|finding| {
+            finding.entity_id == "m.trj"
+                && finding.setting.starts_with("machines_toml.omitted_route.")
+                && finding.reason.contains("unportable")
+        }));
+        for setting in ["status-bar icon", "working-directory preference"] {
+            assert!(first.portability.iter().any(|finding| {
+                finding.entity_id == "m.trj" && finding.reason.contains(setting)
+            }));
+        }
+        assert!(first
+            .portability
+            .iter()
+            .all(|finding| finding.disposition == 0));
+        assert!(!first
+            .portability
+            .iter()
+            .any(|finding| finding.entity_id == "m.dark"));
+
+        // A group with only omitted machines is itself absent. Its source
+        // findings must still survive on the workspace, never name a dangling
+        // group/machine reference that the archive would discard or reject.
+        inventory.groups[0].machines.retain(|id| id != "dark");
+        inventory.groups.push(crate::machines::MachineGroup {
+            id: "unavailable".into(),
+            name: "Unavailable".into(),
+            machines: vec!["dark".into()],
+        });
+        let second = export(&inventory, None, &ssh, &context()).unwrap();
+        assert!(second.portability.iter().any(|finding| {
+            finding.entity_id == "w.machines"
+                && finding
+                    .setting
+                    .starts_with("machines_toml.omitted_machine.")
+                && finding.reason.starts_with("dark")
+        }));
+        let fleet_only = export(&inventory, Some("fleet"), &ssh, &context()).unwrap();
+        assert!(!fleet_only
+            .portability
+            .iter()
+            .any(|finding| finding.reason.starts_with("dark")));
+    }
+
+    #[test]
+    fn companion_report_preserves_blockers_and_is_stable_bounded_and_atomic() {
+        let inventory = MachineInventory::parse(INVENTORY, &context()).unwrap();
+        let exported = export(
+            &inventory,
+            None,
+            &sources(Some(
+                "Host css\n HostName css.example\n User ubuntu\n Match exec forbidden-command\n",
+            )),
+            &context(),
+        )
+        .unwrap();
+        let source = companion_source(&exported, Path::new("/inventory"));
+        let route = source["document"]["workspace"]["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|route| route["id"] == "r.css.ssh")
+            .unwrap();
+        let trust = source["document"]["workspace"]["host_trust"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|trust| trust["id"] == route["host_trust_ref"])
+            .unwrap();
+        assert_eq!(trust["required_capabilities"], json!([UNRESOLVED_POLICY]));
+        let note = |message: String| ExportNote {
+            machine: "trj".into(),
+            route: Some("tailscale".into()),
+            message,
+        };
+        let notes = vec![note("one omission".into()), note("second omission".into())];
+        let first = export_findings(&inventory, &exported.document, &notes).unwrap();
+        let repeated = vec![notes[1].clone(), notes[0].clone(), notes[1].clone()];
+        assert_eq!(
+            first,
+            export_findings(&inventory, &exported.document, &repeated).unwrap()
+        );
+        let exact: Vec<_> = (0..MAX_EXPORT_FINDINGS - 1)
+            .map(|index| note(format!("omission {}", index)))
+            .collect();
+        assert_eq!(
+            export_findings(&inventory, &exported.document, &exact)
+                .unwrap()
+                .len(),
+            MAX_EXPORT_FINDINGS
+        );
+        let mut too_many = exact;
+        too_many.push(note("one beyond the limit".into()));
+        assert!(export_findings(&inventory, &exported.document, &too_many).is_err());
+        for invalid in ["control\ntext".into(), "x".repeat(MAX_EXPORT_FINDING_TEXT)] {
+            assert!(export_findings(
+                &inventory,
+                &exported.document,
+                &[notes[0].clone(), note(invalid)]
+            )
+            .is_err());
+        }
+        let aggregate: Vec<_> = (0..80)
+            .map(|index| note(format!("{}{}", index, "x".repeat(4000))))
+            .collect();
+        assert!(export_findings(&inventory, &exported.document, &aggregate).is_err());
+    }
+
     /// A distinct well-formed Ed25519 public key line for `seed`.
     fn fake_key(seed: u8) -> String {
         let mut blob = vec![0, 0, 0, 11];
@@ -3644,7 +3943,8 @@ socket = "/run/frankenterm.sock"
         let certificate = signed_test_certificate(&["operator"], 1, 32);
         for identity in ["none", "~/.ssh/trj_ed25519"] {
             let mut sources = sources(Some(&format!(
-                "Host app\n HostName css.example\n User operator\n IdentityFile {}\n CertificateFile ~/.ssh/user-cert.pub\n GlobalKnownHostsFile none\n", identity
+                "Host app\n HostName css.example\n User operator\n IdentityFile {}\n CertificateFile ~/.ssh/user-cert.pub\n GlobalKnownHostsFile none\n",
+                identity
             )));
             sources.public_certificates.insert(
                 context().home.join(".ssh/user-cert.pub"),
@@ -3687,7 +3987,7 @@ socket = "/run/frankenterm.sock"
     #[test]
     fn certificate_sources_are_additive_in_host_order_and_internal_slots_are_not_source_policy() {
         let mut sources = sources(Some(
-            "CertificateFile ~/.ssh/first.pub\nHost other\n CertificateFile /must-not-read\nHost app\n HostName css.example\n User operator\n IdentityFile none\n CertificateFile none\n CertificateFile \"~/.ssh/second cert.pub\"\n CertificateFile ~/.ssh/first.pub\nHost *\n CertificateFile ~/.ssh/third.pub\n GlobalKnownHostsFile none\n"
+            "CertificateFile ~/.ssh/first.pub\nHost other\n CertificateFile /must-not-read\nHost app\n HostName css.example\n User operator\n IdentityFile none\n CertificateFile none\n CertificateFile \"~/.ssh/second cert.pub\"\n CertificateFile ~/.ssh/first.pub\nHost *\n CertificateFile ~/.ssh/third.pub\n GlobalKnownHostsFile none\n",
         ));
         sources.system_config =
             KnownHostsSource::Present("CertificateFile ~/.ssh/fourth.pub\n".into());
@@ -3817,8 +4117,10 @@ socket = "/run/frankenterm.sock"
             (8, true, false, 8),
             (8, true, true, 0),
         ] {
-            let mut config = format!("Host app\n HostName css.example\n User operator\n GlobalKnownHostsFile none\n IdentityFile {}\n",
-                if raw { "~/.ssh/trj_ed25519" } else { "none" });
+            let mut config = format!(
+                "Host app\n HostName css.example\n User operator\n GlobalKnownHostsFile none\n IdentityFile {}\n",
+                if raw { "~/.ssh/trj_ed25519" } else { "none" }
+            );
             for index in 0..count {
                 config.push_str(&format!(" CertificateFile ~/.ssh/cert{}.pub\n", index));
             }
@@ -4147,7 +4449,11 @@ socket = "/run/frankenterm.sock"
         assert_eq!(export.routes, 5);
         assert_eq!(export.document["workspace"]["credentials"], json!([]));
         assert!(export.identity_files.is_empty());
-        assert!(export.notes.is_empty(), "{:?}", export.notes);
+        assert_eq!(export.notes.len(), 1, "{:?}", export.notes);
+        assert!(
+            export.notes[0].route.is_none()
+                && export.notes[0].message.contains("background gradient")
+        );
         for route in export.document["workspace"]["routes"].as_array().unwrap() {
             assert_eq!(route["authentication_methods"], json!(["password"]));
             assert_eq!(route["credential_refs"], json!([]));
@@ -4300,7 +4606,11 @@ socket = "/run/frankenterm.sock"
             export.routes, 5,
             "three transit hosts, destination, and mux"
         );
-        assert!(export.notes.is_empty(), "{:?}", export.notes);
+        assert_eq!(export.notes.len(), 1, "{:?}", export.notes);
+        assert!(
+            export.notes[0].route.is_none()
+                && export.notes[0].message.contains("background gradient")
+        );
         let destination = exported_route(&export, "r.app.ssh");
         let jumps = destination["jump_routes"].as_array().unwrap();
         assert_eq!(jumps.len(), 3);
