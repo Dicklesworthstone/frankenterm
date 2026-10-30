@@ -82,8 +82,10 @@ public struct InstalledWorkspace: Codable, Sendable, Identifiable {
     /// separate from the authenticated imported manifest and its digest.
     public let deviceKeys: [WorkspaceDeviceKey]
     public let deviceKeyAssignments: [WorkspaceDeviceKeyAssignment]
-    /// Restoring NEVER executes imported auto-connect preferences, even on relaunch.
-    public let connectLater: Bool
+    /// Restoring never executes imported auto-connect preferences, even on
+    /// relaunch. Only a deliberate Connect action for this exact saved revision
+    /// clears the gate; a new import or offline restore arms it again.
+    public fileprivate(set) var connectLater: Bool
     public func document() throws -> WorkspaceDocument {
         try WorkspaceDeviceKeyOverlay.document(imported: importedDocument(), keys: deviceKeys,
                                                assignments: deviceKeyAssignments)
@@ -445,6 +447,50 @@ public actor WorkspaceStore {
         }
     }
 
+    /// A fresh local Connect action permits this reviewed revision to use its
+    /// connection preferences. Viewing a group, recalling a terminal bookmark,
+    /// changing an auto-connect setting, or importing cannot call this on the
+    /// user's behalf. Credential and host-policy checks remain independent.
+    @discardableResult
+    public func approveConnections(workspaceID: UUID, expectedRevision: UUID,
+                                   confirmedByUser: Bool) throws -> InstalledWorkspace {
+        guard confirmedByUser else { throw WorkspaceStoreError.reviewRequired }
+        try Task.checkCancellation()
+        return try persistence.withExclusiveAccess {
+            var catalog = try readCatalog()
+            try recover(catalog: &catalog)
+            guard let index = catalog.workspaces.firstIndex(where: { $0.id == workspaceID }),
+                  catalog.workspaces[index].revision == expectedRevision else {
+                throw WorkspaceStoreError.staleReview
+            }
+            // Reaffirm durability on a retry after an ambiguous write failure,
+            // even if the new value is already visible on readback.
+            catalog.workspaces[index].connectLater = false
+            try Task.checkCancellation()
+            try persistence.write(encode(catalog, limit: Self.catalogLimit), to: .catalog)
+            return catalog.workspaces[index]
+        }
+    }
+
+    /// Called after acquiring process-wide offline exclusion, before reading a
+    /// restore source. This includes already installed workspaces: dismissing or
+    /// cancelling restore must not restart a terminal closed to enter it. The
+    /// native owner joins any pending Connect approval before acquiring that
+    /// exclusion, so an old callback cannot clear this durable gate afterward.
+    @discardableResult
+    public func deferConnectionsForOfflineRestore() throws -> [InstalledWorkspace] {
+        try Task.checkCancellation()
+        return try persistence.withExclusiveAccess {
+            var catalog = try readCatalog()
+            try recover(catalog: &catalog)
+            guard !catalog.workspaces.isEmpty else { return [] }
+            for index in catalog.workspaces.indices { catalog.workspaces[index].connectLater = true }
+            try Task.checkCancellation()
+            try persistence.write(encode(catalog, limit: Self.catalogLimit), to: .catalog)
+            return catalog.workspaces
+        }
+    }
+
     /// Changes only the phone's future group warm-up preference. It grants no
     /// credential or terminal authority and does not revoke a live connection.
     /// `nil` deliberately restores the imported default. Keep choices for a
@@ -732,7 +778,15 @@ public actor WorkspaceStore {
                     references[key.credentialID].map { accounts[CredentialIdentity($0)] != nil } == true
                 }
                 if !historyUpdated, availabilityUnchanged, includedKeysAvailable {
-                    return receipt(old, requested: document.credentials.map(\.id),
+                    // An identical recording stays idempotent, but its import
+                    // is still offline. Do not inherit an earlier Connect action.
+                    var held = old
+                    held.connectLater = true
+                    if let index, !old.connectLater {
+                        catalog.workspaces[index] = held
+                        try persistence.write(encode(catalog, limit: Self.catalogLimit), to: .catalog)
+                    }
+                    return receipt(held, requested: document.credentials.map(\.id),
                                    available: Set(reusableBindings.map(\.credentialID)), cleanupPending: false)
                 }
                 // The exact same public document may now resolve a key imported
@@ -1176,16 +1230,25 @@ public actor WorkspaceStore {
         return try persistence.withExclusiveAccess {
             var catalog = try readCatalog()
             try recover(catalog: &catalog)
-            guard let workspace = try catalog.workspaces.first(where: {
+            guard let index = try catalog.workspaces.firstIndex(where: {
                 let document = try $0.document()
                 return document.exporterID == exporterID && document.id == workspaceID && $0.envelopeDigest == envelopeDigest
             }) else { return nil }
+            var workspace = catalog.workspaces[index]
             let document = try workspace.document()
             guard catalog.acceptedImports.contains(where: {
                 $0.exporterID == document.exporterID && $0.workspaceID == document.id && $0.bundleID == document.bundleID && $0.envelopeDigest == envelopeDigest
                     && (transferID == nil || $0.transferID == transferID)
             }) else { return nil }
             let available = try availableCredentials(workspace, catalog: catalog)
+            // An exact reimport can fail before publishing its new offline
+            // gate while older identical bytes are already accepted. Matching
+            // history alone cannot turn that earlier connection approval into
+            // a restored-but-online result. Reaffirm durability even after a
+            // failed write made the gate visible before reporting its error.
+            workspace.connectLater = true
+            catalog.workspaces[index] = workspace
+            try persistence.write(encode(catalog, limit: Self.catalogLimit), to: .catalog)
             return receipt(workspace, requested: document.credentials.map(\.id), available: available, cleanupPending: false)
         }
     }
@@ -1709,7 +1772,7 @@ public actor WorkspaceStore {
                       Set(preference.machineIDs) == Set(group.machineOrder),
                       navigationIDs.insert(preference.groupID).inserted else { throw WorkspaceStoreError.corruptStore }
             }
-            guard workspace.connectLater, workspace.envelopeDigest.count == 32, workspace.bindings.count <= 256,
+            guard workspace.envelopeDigest.count == 32, workspace.bindings.count <= 256,
                   workspace.inactiveSettings.count <= 1024, workspace.findings.count <= 1024,
                   namespaces.insert([document.exporterID, document.id]).inserted else { throw WorkspaceStoreError.corruptStore }
             guard catalog.acceptedImports.contains(where: {

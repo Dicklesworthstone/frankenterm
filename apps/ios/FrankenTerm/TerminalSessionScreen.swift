@@ -564,6 +564,9 @@ final class TerminalSessionController {
     let muxAccessMode: TerminalMuxAccessMode
     private(set) var requiresExistingMux: Bool
     var isViewingOnly: Bool { connection?.muxControl?.accessMode == .viewOnly }
+    /// Both observers and shared-size input clients fit the authoritative grid
+    /// locally. Keyboard permission alone never grants shared resize authority.
+    var keepsSharedMuxSize: Bool { connection?.muxControl?.accessMode.controlsSize == false }
     let target: TerminalSessionTarget
     /// The scene's hook for phase and settlement changes: it starts the next
     /// background connection and reconnects dropped sessions from here.
@@ -1456,7 +1459,7 @@ final class TerminalSessionController {
             try checkLive()
             var configuration = Self.renderConfiguration
             configuration.fontRevision = appliedFontRevision
-            configuration.fitsRemoteGrid = isViewingOnly
+            configuration.fitsRemoteGrid = keepsSharedMuxSize
             let view = try await NativeTerminalView(session: keyboard, configuration: configuration, readOnly: isViewingOnly)
             terminal = view
             try checkLive()
@@ -1827,7 +1830,7 @@ final class TerminalSessionController {
     /// canonical application. There is no timer, optimistic model resize, or
     /// generation-less retry that can target a replacement terminal.
     private func propose(_ viewport: NativeTerminalViewport) {
-        guard !isViewingOnly, !stopped, phase == .live, let resize, viewport.source == resize.source,
+        guard !keepsSharedMuxSize, !stopped, phase == .live, let resize, viewport.source == resize.source,
               viewport.revision > lastViewportRevision,
               let rows = UInt32(exactly: viewport.rows),
               // At most TerminalSessionGeometry.maximumShownCells: the model

@@ -373,8 +373,13 @@ extension TerminalMuxClient {
 /// A phone-local restriction for one connection, not a server controller lease.
 /// Changing it requires a new connection after the previous owner has settled.
 public enum TerminalMuxAccessMode: String, Equatable, Sendable {
-    case viewOnly, interactive
-    public var permitsInput: Bool { self == .interactive }
+    case viewOnly
+    /// Keys, paste and pointer input use the pane's existing geometry.
+    /// Input permission alone must never resize another client's terminal.
+    case inputOnly
+    /// Input plus explicit permission to fit the shared pane to this phone.
+    case interactive
+    public var permitsInput: Bool { self != .viewOnly }
     public var controlsSize: Bool { self == .interactive }
 }
 

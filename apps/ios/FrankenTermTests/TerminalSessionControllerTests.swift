@@ -1615,7 +1615,7 @@ final class TerminalSessionControllerTests: XCTestCase {
         for session in scene.sessions.values { await assertReleased(session, connections: live.connections) }
     }
 
-    func testSharedMuxViewOnlyNeedsAnExplicitSettledReconnectBeforeInput() async throws {
+    func testSharedMuxViewOnlyCanEnableInputWithoutTakingSharedSize() async throws {
         guard let command = ProcessInfo.processInfo.environment["FT_LIVE_MUX_COMMAND"] else {
             throw XCTSkip("Set TEST_RUNNER_FT_LIVE_MUX_COMMAND to reach a disposable mux")
         }
@@ -1629,6 +1629,10 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertFalse(original.input.canBecomeFirstResponder)
         XCTAssertFalse(original.input.canReviewPaste)
         XCTAssertTrue(original.renderer.configuration.fitsRemoteGrid)
+        for _ in 0..<200 where original.renderer.admittedFrame == nil {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        let originalGrid = try XCTUnwrap(original.renderer.admittedFrame)
         await scene.activateKeyboard()
         original.requestKeyboard(true)
         original.input.insertText("must not type")
@@ -1637,7 +1641,7 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertEqual(pending.retainedBytes, 0); XCTAssertEqual(pending.retainedRecords, 0)
         original.removeFromSuperview()
 
-        scene.reconnectMux(.interactive, machineID: "alpha", controllerID: observer.id)
+        scene.reconnectMux(.inputOnly, machineID: "alpha", controllerID: observer.id)
         for _ in 0..<400 where scene.sessions["alpha"] === observer || scene.sessions["alpha"]?.phase != .live {
             try await Task.sleep(for: .milliseconds(25))
         }
@@ -1650,15 +1654,34 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertTrue(observer.settled, "The old native owner settled before mode authority changed")
         XCTAssertTrue(observer.requiresExistingMux, "Stop preserves the successful existing-mux intent")
         XCTAssertNotEqual(interactive.id, observer.id)
-        XCTAssertEqual(interactive.muxAccessMode, .interactive)
+        XCTAssertEqual(interactive.muxAccessMode, .inputOnly)
         XCTAssertTrue(interactive.requiresExistingMux); XCTAssertFalse(interactive.isViewingOnly)
         let active = try shown(interactive)
         XCTAssertFalse(active.input.isReadOnly)
-        XCTAssertFalse(active.renderer.configuration.fitsRemoteGrid)
+        XCTAssertTrue(active.renderer.configuration.fitsRemoteGrid)
         let marker = "OBSERVER-CONTROL-\(UUID().uuidString.prefix(8))"
-        try await type("echo \(marker) > \(live.outPath)", into: active)
+        try await type("stty size > \(live.outPath); trap 'echo WINCH >> \(live.outPath)' WINCH; echo \(marker) >> \(live.outPath)", into: active)
         let received = try await hostFile(live.outPath, containing: marker)
-        XCTAssertTrue(received.contains(marker), "Explicit Use Terminal reaches the existing shared pane")
+        let sharedSize = "\(originalGrid.rows) \(originalGrid.columns)"
+        XCTAssertEqual(received.split(separator: "\n").first.map(String.init), sharedSize)
+        for size in [CGSize(width: 390, height: 300), CGSize(width: 740, height: 360)] {
+            active.frame = CGRect(origin: .zero, size: size)
+            active.layoutIfNeeded()
+            active.input.hideKeyboard()
+            await scene.activateKeyboard()
+            try await Task.sleep(for: .milliseconds(250))
+        }
+        for _ in 0..<200 where active.renderer.pointerProjection == nil {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        let projection = try XCTUnwrap(active.renderer.pointerProjection)
+        XCTAssertEqual(projection.frame.rows, originalGrid.rows)
+        XCTAssertEqual(projection.frame.columns, originalGrid.columns)
+        try await type("stty size >> \(live.outPath); trap - WINCH; echo DONE-\(marker) >> \(live.outPath)", into: active)
+        let afterLayout = try await hostFile(live.outPath, containing: "DONE-\(marker)")
+        XCTAssertFalse(afterLayout.contains("WINCH"), "keyboard and viewport changes must not resize the shared PTY")
+        XCTAssertEqual(afterLayout.split(separator: "\n").filter { $0 == sharedSize }.count, 2)
+        XCTAssertTrue(afterLayout.contains(marker), "Explicit shared-size input reaches the existing pane")
         active.removeFromSuperview()
         // A stale confirmation from the first observer cannot replace its new owner.
         scene.reconnectMux(.viewOnly, machineID: "alpha", controllerID: observer.id)
@@ -1681,7 +1704,7 @@ final class TerminalSessionControllerTests: XCTestCase {
         guard let command = env["FT_LIVE_MUX_COMMAND"], let outPath = env["FT_LIVE_SSH_OUT"] else {
             throw XCTSkip("Set TEST_RUNNER_FT_LIVE_MUX_COMMAND and TEST_RUNNER_FT_LIVE_SSH_OUT")
         }
-        for mode in [TerminalMuxAccessMode.viewOnly, .interactive] {
+        for mode in [TerminalMuxAccessMode.viewOnly, .inputOnly, .interactive] {
             // This disposable relay command answers exactly its first attachment.
             // Neither terminal types a command to arrange the failure.
             let once = "\(outPath).mux-once-\(UUID().uuidString.prefix(8))"
@@ -2569,11 +2592,10 @@ final class TerminalSessionControllerTests: XCTestCase {
     }
 
     /// A desktop pane larger than View Only can draw (the mux reached by
-    /// TEST_RUNNER_FT_LIVE_LARGE_MUX_COMMAND has one 300 x 120 pane) is taken
-    /// at the phone's size with no tap, and gets its own size back when the
-    /// phone leaves it. View Only chosen afterwards is kept: that pane is the
-    /// person's to take, never retaken or retried on its own.
-    func testAPaneTooLargeToViewIsTakenAtThePhonesSizeUnlessViewOnlyWasChosen() async throws {
+    /// TEST_RUNNER_FT_LIVE_LARGE_MUX_COMMAND has one 300 x 120 pane) waits for
+    /// explicit permission before changing shared geometry. Leaving that
+    /// connection restores the desktop size without silently taking it again.
+    func testAPaneTooLargeToViewWaitsForExplicitPhoneSizePermission() async throws {
         guard let command = ProcessInfo.processInfo.environment["FT_LIVE_LARGE_MUX_COMMAND"] else {
             throw XCTSkip("Set TEST_RUNNER_FT_LIVE_LARGE_MUX_COMMAND to reach a disposable mux whose pane is too large to view")
         }
@@ -2587,6 +2609,15 @@ final class TerminalSessionControllerTests: XCTestCase {
             return try XCTUnwrap(scene.sessions["alpha"])
         }
         let observer = try await connect(scene, "alpha")
+        for _ in 0..<400 where !observer.settled { try await Task.sleep(for: .milliseconds(25)) }
+        XCTAssertTrue(observer.paneTooLargeToView); XCTAssertTrue(observer.settled)
+        XCTAssertEqual(observer.muxAccessMode, .viewOnly)
+        XCTAssertNil(observer.terminal)
+        try await Task.sleep(for: .seconds(1))
+        XCTAssertIdentical(scene.sessions["alpha"], observer, "an oversized grid cannot grant resize authority")
+        XCTAssertEqual(scene.status(of: "alpha"), .attention)
+        XCTAssertNil(scene.changingMuxMode("alpha"))
+        scene.takePaneAtPhoneSize("alpha", from: observer)
         let fitted = try await replacement(of: observer)
         XCTAssertNotIdentical(fitted, observer)
         XCTAssertTrue(observer.paneTooLargeToView); XCTAssertTrue(observer.settled)

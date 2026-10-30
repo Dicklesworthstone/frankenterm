@@ -20,12 +20,12 @@ spec = importlib.util.spec_from_file_location(
     "native_observation_fixture", Path(__file__).resolve().parents[1] / "Native" / "test_native.py")
 fixture = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fixture)
-SELECTOR = "FrankenTermSSHTests.MuxObservationTests/testLiveMuxViewOnlyAndInteractiveEffectBoundary"
+SELECTOR = "FrankenTermSSHTests.MuxObservationTests/testLiveMuxAccessModeEffectBoundary"
 
 
 class MuxObservationInteropTests(unittest.TestCase):
     def test_viewing_and_interactive_effect_boundaries(self):
-        for mode in ["observe", "interactive", "oversize", "invalid-grid", "no-panes"]:
+        for mode in ["observe", "input-only", "interactive", "oversize", "input-only-oversize", "invalid-grid", "no-panes"]:
             with self.subTest(mode=mode):
                 key = ed25519.Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
                 server = fixture.LoopbackServer(key, allow_exec=True)

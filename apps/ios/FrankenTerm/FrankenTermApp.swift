@@ -123,6 +123,10 @@ final class MobileWorkspaceModel {
     var connectionPreferenceMessage: String?
     private var connectionPreferenceBusy = false
     @ObservationIgnored private var connectionPreferenceUpdate: Task<Void, Never>?
+    @ObservationIgnored private var connectionApproval: (id: UUID, task: Task<WorkspaceLocalState, Error>)?
+    /// A failed durable write cannot revive a terminal in this process. Its
+    /// bookmark is cleared before explicit restore disconnection as well.
+    private var offlineConnectionHolds = Set<UUID>()
     var locallyRevokedFingerprints: Set<String> = []
     var unconfirmedCredentialRevocations: Set<String> = []
     var credentialMessage: String?
@@ -133,7 +137,14 @@ final class MobileWorkspaceModel {
     private(set) var deviceKeyConnectionHolds = Set<UUID>()
     var state: OfflineRestoreStatus? { didSet { updateIdleTimer(); reconcileScanSaving() } }
     var message: String?
-    var showRestore = false { didSet { updateIdleTimer() } }
+    var showRestore = false {
+        didSet {
+            // Retire remembered launch intent before any actor hop. Existing
+            // live sessions still require the explicit disconnection choice.
+            if showRestore && !oldValue { UserDefaults.standard.removeObject(forKey: Self.liveScreenKey) }
+            updateIdleTimer()
+        }
+    }
     var cameraRequested = false { didSet { updateIdleTimer() } }
     var active = false { didSet { updateIdleTimer() } }
     /// Not in the background (see setScenePhase): live connections may run.
@@ -142,7 +153,7 @@ final class MobileWorkspaceModel {
     /// Import settlement retains its own reservation across scene transitions
     /// and any older callback that releases the shared operation flag.
     var busy: Bool {
-        get { operationBusy || credentialImportOperation != nil || deviceKeyOperation != nil || isReadingRecording || connectionPreferenceBusy }
+        get { operationBusy || credentialImportOperation != nil || deviceKeyOperation != nil || isReadingRecording || connectionPreferenceBusy || connectionApproval != nil }
         set { operationBusy = newValue }
     }
     private(set) var isReadingRecording = false
@@ -379,7 +390,11 @@ final class MobileWorkspaceModel {
     func liveScene(workspaceID: UUID, revision: UUID,
                    make: () throws -> WorkspaceTerminalScene) throws -> WorkspaceTerminalScene {
         guard keyRevocation == nil, credentialImportOperation == nil, deviceKeyOperation == nil,
+              !showRestore, !requiresConnectionApproval(workspaceID),
               !deviceKeyConnectionHolds.contains(workspaceID) else { throw WorkspaceSSHConnectionError.busy }
+        guard workspaces.contains(where: { $0.id == workspaceID && $0.revision == revision }) else {
+            throw WorkspaceSSHConnectionError.stale
+        }
         if let saved = workspaces.first(where: { $0.id == workspaceID }), let document = try? saved.document(),
            document.credentials.contains(where: { unconfirmedCredentialRevocations.contains($0.fingerprint) }) {
             throw SSHAuthenticationError.denied
@@ -389,6 +404,51 @@ final class MobileWorkspaceModel {
         let scene = try make()
         liveScenes[workspaceID] = scene
         return scene
+    }
+
+    func requiresConnectionApproval(_ workspaceID: UUID) -> Bool {
+        offlineConnectionHolds.contains(workspaceID)
+            || workspaces.first(where: { $0.id == workspaceID })?.connectLater != false
+    }
+
+    struct ConnectionApproval: Sendable {
+        let local: WorkspaceLocalState
+        fileprivate let generation: UUID
+    }
+
+    func connectionApprovalIsCurrent(_ approval: ConnectionApproval) -> Bool {
+        let workspace = approval.local.workspace
+        return active && !showRestore && epoch == approval.generation
+            && !requiresConnectionApproval(workspace.id)
+            && localPolicies[workspace.id]?.workspace.revision == workspace.revision
+    }
+
+    /// Called only by the user's Connect button. Join publication before
+    /// opening a scene, and retain that operation so entering offline restore
+    /// can join it before arming the durable gate. Remembered navigation and
+    /// imported auto-connect preferences never obtain this approval themselves.
+    func approveConnections(workspaceID: UUID, expectedRevision: UUID) async throws -> ConnectionApproval {
+        guard active, !busy, !showRestore, let store else { throw WorkspaceSSHConnectionError.busy }
+        let id = UUID(), ticket = epoch, pendingLifecycle = lifecycle
+        let task = Task<WorkspaceLocalState, Error> { [self] in
+            await pendingLifecycle?.value
+            guard active, !showRestore, epoch == ticket else { throw FTError.stale }
+            _ = try await store.approveConnections(workspaceID: workspaceID,
+                expectedRevision: expectedRevision, confirmedByUser: true)
+            guard active, !showRestore, epoch == ticket else { throw FTError.stale }
+            try await refreshWorkspaces(using: store, epoch: ticket)
+            guard active, !showRestore, epoch == ticket,
+                  let local = localPolicies[workspaceID], local.workspace.revision == expectedRevision,
+                  !local.workspace.connectLater else { throw FTError.stale }
+            offlineConnectionHolds.remove(workspaceID)
+            deviceKeyConnectionHolds.remove(workspaceID)
+            return local
+        }
+        connectionApproval = (id, task)
+        defer { if connectionApproval?.id == id { connectionApproval = nil } }
+        let approval = ConnectionApproval(local: try await task.value, generation: ticket)
+        guard connectionApprovalIsCurrent(approval) else { throw FTError.stale }
+        return approval
     }
     /// What a machine's live session is doing, once its workspace has a scene.
     func liveStatus(_ workspaceID: UUID, machineID: String) -> WorkspaceTerminalScene.Status? {
@@ -472,6 +532,9 @@ final class MobileWorkspaceModel {
         // No actor hop may intervene between choosing the owners and sealing
         // input/reconnect admission for every one of them.
         for owner in owners { owner.requestClose() }
+        offlineConnectionHolds.formUnion(owners.map(\.workspaceID))
+        returning = nil
+        UserDefaults.standard.removeObject(forKey: Self.liveScreenKey)
         let job = Task { [weak self] in
             // The model retains this task even after leaving restore. Closing
             // joins each owner's timers, startup, input and transport cleanup;
@@ -527,8 +590,12 @@ final class MobileWorkspaceModel {
         pendingRecording?.cancel()
         guard let restore else { return }
         let ticket = epoch, visible = active && showRestore, prior = lifecycle
+        let pendingApproval = connectionApproval?.task
         lifecycle = Task { [weak self] in
             await prior?.value
+            // A Connect admitted just before the restore sheet appeared must
+            // settle before the offline gate is armed, never after it.
+            _ = try? await pendingApproval?.value
             // The exact reader retires before a lifecycle transition rotates
             // receive authority. A background callback cannot start more work.
             await pendingRecording?.value
@@ -536,6 +603,10 @@ final class MobileWorkspaceModel {
             do {
                 if visible {
                     try await restore.enterOfflineMode()
+                    if let self, let store = self.store {
+                        self.offlineConnectionHolds.formUnion(self.workspaces.map(\.id))
+                        _ = try await store.deferConnectionsForOfflineRestore()
+                    }
                     next = await restore.resume()
                 } else { next = await restore.suspend(discardRecipientRequest: discardRecipientRequest) }
             } catch {
@@ -1189,14 +1260,6 @@ final class MobileWorkspaceModel {
         deviceKeyOperation = (operation, task)
     }
 
-    /// Only a fresh Connect action releases the local hold. A storage refresh,
-    /// saved screen or suspended callback cannot authenticate with a new key.
-    func connectAfterDeviceKeyReview(workspaceID: UUID) -> Bool {
-        guard active, !busy, !showRestore else { return false }
-        deviceKeyConnectionHolds.remove(workspaceID)
-        return true
-    }
-
     func beginCredentialImport(workspaceID: UUID, credentialID: String) {
         guard active, !busy, !showRestore, credentialImport == nil, let store,
               let saved = workspaces.first(where: { $0.id == workspaceID }),
@@ -1514,7 +1577,7 @@ final class MobileWorkspaceModel {
     /// navigation and can rebuild the screen, and the app switcher, where it
     /// may then be ended, is inactive too.
     func showing(_ screen: LiveScreen?) {
-        guard active else { return }
+        guard active, !showRestore else { return }
         if let screen, let workspace = workspaces.first(where: { $0.id == screen.workspaceID }),
            let document = try? workspace.document(), let machine = document.machines.first(where: { $0.id == screen.machineID }) {
             connections?.setAuthenticationScope(.init(workspaceID: screen.workspaceID, revision: workspace.revision,
@@ -1534,7 +1597,8 @@ final class MobileWorkspaceModel {
         guard returning == nil, pendingImport == nil,
               let data = UserDefaults.standard.data(forKey: Self.liveScreenKey),
               let screen = try? JSONDecoder().decode(LiveScreen.self, from: data),
-              workspaces.contains(where: { $0.id == screen.workspaceID }) else { return }
+              workspaces.contains(where: { $0.id == screen.workspaceID && !$0.connectLater }),
+              !offlineConnectionHolds.contains(screen.workspaceID) else { return }
         returning = screen
     }
     private func startObservations(restore: OfflineRestore<AppleCryptography>) {
@@ -2300,6 +2364,10 @@ struct OfflineRestoreSheet: View {
             Image(systemName: "checkmark.circle.fill").font(.system(size: 64)).foregroundStyle(.green)
                 .symbolEffect(.bounce, value: state.phase)
             Text(document.map { "\($0.machines.count) machines added" } ?? "Machines added").font(.title2.bold())
+            Label("Restored offline — Connect later", systemImage: "network.slash")
+                .font(.callout).accessibilityIdentifier("restore.connect_later")
+            Text("Nothing connects when you close this screen or reopen the app. Choose Connect on a machine when you are ready.")
+                .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
             if let document {
                 VStack(spacing: 8) {
                     ForEach(document.machines) { machine in
@@ -3689,9 +3757,17 @@ private struct MachineWorkspaceView: View {
             VStack(alignment: .leading, spacing: 10) {
                 Button {
                     // The user's choice ends a return still waiting for its machine.
-                    guard model.connectAfterDeviceKeyReview(workspaceID: workspaceID) else { return }
                     returnHandled = true
-                    terminal = OpenTerminal(machineID: machine.id, local: local)
+                    Task {
+                        do {
+                            let approved = try await model.approveConnections(workspaceID: workspaceID,
+                                expectedRevision: local.workspace.revision)
+                            guard model.connectionApprovalIsCurrent(approved) else { return }
+                            terminal = OpenTerminal(machineID: machine.id, local: approved.local)
+                        } catch {
+                            model.connectionPreferenceMessage = "Connection approval could not be confirmed. Choose Connect again when the workspace is available. \(error.localizedDescription)"
+                        }
+                    }
                 } label: {
                     // A session that is already running opens where it is.
                     let live = model.liveStatus(workspaceID, machineID: machine.id) == .live
@@ -3701,6 +3777,10 @@ private struct MachineWorkspaceView: View {
                         .foregroundStyle(TerminalSessionTarget.isDark(theme?.accent ?? "#3B82F6") ? Color.white : Color.black)
                         .frame(maxWidth: .infinity).padding(.vertical, 6)
                 }.buttonStyle(.borderedProminent).controlSize(.large).tint(accent).disabled(model.busy)
+                if model.requiresConnectionApproval(workspaceID) {
+                    Text("Restored offline. Connect enables this workspace's saved connection preferences on this phone.")
+                        .font(.footnote).opacity(0.8)
+                }
                 // Tailscale only: say so before the first attempt waits out a timeout.
                 if target.routes.allSatisfy({ WorkspaceRouteNetwork(host: $0.networkHost) == .tailnet }),
                    WorkspaceRouteNetwork.deviceTailnetAddress() == nil {
@@ -3726,6 +3806,7 @@ private struct MachineWorkspaceView: View {
     /// offered for it; until then this page shows what it still needs.
     private func returnToTerminal() {
         guard !returnHandled, let id = returningMachineID else { return }
+        guard !model.requiresConnectionApproval(workspaceID) else { returnHandled = true; return }
         guard !model.deviceKeyConnectionHolds.contains(workspaceID) else { returnHandled = true; return }
         guard let machine = document.machines.first(where: { $0.id == id }) else { returnHandled = true; return }
         guard !document.credentials.contains(where: { model.unconfirmedCredentialRevocations.contains($0.fingerprint) }),
@@ -3738,17 +3819,19 @@ private struct MachineWorkspaceView: View {
         terminal = OpenTerminal(machineID: id, local: local)
     }
 
-    /// A restore closes every session under its sheet, and a replacement
-    /// retires the scene. Once the sheet is gone, the terminal left showing
-    /// opens again on the saved workspace, as a relaunch's return does, or
-    /// gives way to this page if its machine can no longer connect.
+    /// A restore closes every session under its sheet. Its durable gate gives
+    /// way to the machine page, including on cancellation; a remembered screen
+    /// is never a new Connect action. Unrelated approved scene replacement can
+    /// still return to the same available machine.
     private func reopenClosedTerminal() {
         guard let closed = terminal, !model.showRestore, !model.hasOpenScene(workspaceID) else { return }
+        guard !model.requiresConnectionApproval(workspaceID) else { terminal = nil; return }
         guard !model.deviceKeyConnectionHolds.contains(workspaceID) else { terminal = nil; return }
         Task {
             // Dismissing restore releases offline exclusion in its lifecycle
             // step; a connection begun before that would be refused.
             await model.restoreSettled()
+            guard !model.requiresConnectionApproval(workspaceID) else { terminal = nil; return }
             guard !model.deviceKeyConnectionHolds.contains(workspaceID) else { terminal = nil; return }
             guard terminal?.id == closed.id, !model.showRestore, !model.hasOpenScene(workspaceID),
                   let local = model.localPolicies[workspaceID] else { return }
