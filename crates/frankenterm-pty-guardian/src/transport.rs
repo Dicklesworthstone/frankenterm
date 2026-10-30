@@ -3631,6 +3631,8 @@ fn retire_authenticated_input_plaintext(authenticated: &mut AuthenticatedGuardia
 /// already safe token. Existing path bytes are never overwritten. A private
 /// digest-bound stage readiness record is retained so a host-crash cut before
 /// publication can distinguish stable token bytes from an incomplete write.
+/// Validating an existing token does not wait for the live effects of a
+/// running service; only creating one does.
 pub fn provision_guardian_token(
     path: &Path,
 ) -> Result<ProvisionTokenOutcome, GuardianServiceError> {
@@ -3649,21 +3651,22 @@ pub(crate) fn provision_guardian_token_in_pinned_parent(
 ) -> Result<ProvisionTokenOutcome, GuardianServiceError> {
     validate_absolute_path(path)?;
     validate_pinned_private_parent(path, parent_authority)?;
-    let _publication_lease = GuardianTokenPublicationLease::acquire(path, parent_authority)?;
-    validate_pinned_private_parent(path, parent_authority)?;
     let active_name = path
         .file_name()
         .ok_or(GuardianServiceError::InvalidConfiguration(
             "guardian token path has no file name",
         ))?;
-    match open_private_file_read_at(parent_authority, active_name) {
-        Ok(file) => {
-            let _ = load_guardian_secret_from_open_file_at(parent_authority, active_name, file)?;
-            sync_pinned_private_parent(path, parent_authority)?;
-            return Ok(ProvisionTokenOutcome::Existing);
-        }
-        Err(error) if error.kind() == ErrorKind::NotFound => {}
-        Err(error) => return Err(nofollow_open_error("token-absence-check", error)),
+    // Publication never replaces an active token, so validating one that
+    // exists needs no exclusion. Live effects hold the publication lock
+    // shared for nearly every moment a guardian serves its mux; provisioning
+    // an installed token must not queue behind them and time out.
+    if active_guardian_token_exists(path, parent_authority, active_name)? {
+        return Ok(ProvisionTokenOutcome::Existing);
+    }
+    let _publication_lease = GuardianTokenPublicationLease::acquire(path, parent_authority)?;
+    validate_pinned_private_parent(path, parent_authority)?;
+    if active_guardian_token_exists(path, parent_authority, active_name)? {
+        return Ok(ProvisionTokenOutcome::Existing);
     }
 
     let stage_path = token_stage_path(path)?;
@@ -3719,11 +3722,30 @@ pub(crate) fn provision_guardian_token_in_pinned_parent(
     }
 }
 
+/// Whether the active token exists. A present token is validated and its
+/// parent synced first; an unsafe one is an error, never a reason to create.
+fn active_guardian_token_exists(
+    path: &Path,
+    parent_authority: &File,
+    active_name: &OsStr,
+) -> Result<bool, GuardianServiceError> {
+    match open_private_file_read_at(parent_authority, active_name) {
+        Ok(file) => {
+            let _ = load_guardian_secret_from_open_file_at(parent_authority, active_name, file)?;
+            sync_pinned_private_parent(path, parent_authority)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(nofollow_open_error("token-absence-check", error)),
+    }
+}
+
 /// Exclusive cooperative publication authority for one token parent.
 ///
 /// The independently opened descriptor avoids converting a caller-owned
-/// shared lock. Its lifetime covers every absence check, staging mutation,
-/// no-replace publication, directory sync, and final active-token validation.
+/// shared lock. Its lifetime covers the absence check that admits a creation,
+/// every staging mutation, no-replace publication, directory sync, and final
+/// active-token validation.
 struct GuardianTokenPublicationLease {
     parent: File,
     locked: bool,
@@ -8687,6 +8709,39 @@ mod tests {
             guardian_token_publication_lock_is_available(&token_path).unwrap(),
             "dropping the effect lease did not release publication authority"
         );
+    }
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+    ))]
+    #[test]
+    fn provisioning_an_existing_token_does_not_wait_for_a_live_effect_lease() {
+        // A running guardian holds an effect lease for nearly every moment it
+        // serves a mux; re-running install provisions the token it already has.
+        let (token_path, original, mut authority) =
+            retained_token_authority_fixture("existing-under-effect");
+        let lease = authority.acquire_effect_lease().unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            provision_guardian_token(&token_path).unwrap(),
+            ProvisionTokenOutcome::Existing
+        );
+        assert!(
+            started.elapsed() < TOKEN_PUBLICATION_LOCK_TIMEOUT,
+            "validating an existing token waited for the effect lease"
+        );
+        assert_eq!(std::fs::read(&token_path).unwrap(), original);
+        assert!(
+            !guardian_token_publication_lock_is_available(&token_path).unwrap(),
+            "provisioning released the live effect lease"
+        );
+        drop(lease);
     }
 
     #[cfg(any(
