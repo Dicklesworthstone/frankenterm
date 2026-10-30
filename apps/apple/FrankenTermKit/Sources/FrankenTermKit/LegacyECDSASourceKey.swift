@@ -51,6 +51,8 @@ struct LegacyECDSASourceKey: Sendable, CustomStringConvertible, CustomDebugStrin
     /// plaintext PEM/base64 string that the selected-file owner cannot erase.
     init(pkcs8DER: Data) throws { try self.init(der: pkcs8DER, pkcs8: true) }
 
+    init(sec1DER: Data) throws { try self.init(der: sec1DER, pkcs8: false) }
+
     private init(der: Data, pkcs8: Bool) throws {
         guard !der.isEmpty, der.count <= Self.maximumDERBytes else { throw FTError.limit("source_key.der") }
         var document = LegacyECDSADERReader(der)

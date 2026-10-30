@@ -193,17 +193,19 @@ public struct OpenSSHSourceKeyUnlocker<C: AirGapCryptography>: Sendable {
         public var debugDescription: String { "OpenSSHSourceKeyUnlocker.Selection([redacted])" }
     }
     private enum Source: Sendable {
-        case openSSH(OpenSSHSourceKey), encryptedPKCS8(EncryptedPKCS8SourceKey)
+        case openSSH(OpenSSHSourceKey), encryptedPKCS8(EncryptedPKCS8SourceKey), legacyPEM(LegacyEncryptedPEMSourceKey)
         var protection: SourceKeyProtection? {
             switch self {
             case let .openSSH(source): source.bcryptRounds.map { .openSSH(bcryptRounds: $0) }
             case let .encryptedPKCS8(source): source.protection
+            case let .legacyPEM(source): source.protection
             }
         }
         func unlock(passphrase: Data, credentialID: String, using crypto: C) throws -> PrivateKeyRecord {
             switch self {
             case let .openSSH(source): try source.unlock(passphrase: passphrase, credentialID: credentialID, using: crypto)
             case let .encryptedPKCS8(source): try source.unlock(passphrase: passphrase, credentialID: credentialID, using: crypto)
+            case let .legacyPEM(source): try source.unlock(passphrase: passphrase, credentialID: credentialID, using: crypto)
             }
         }
     }
@@ -226,14 +228,18 @@ public struct OpenSSHSourceKeyUnlocker<C: AirGapCryptography>: Sendable {
     }
 
     /// An OpenSSH public header must match the approved reference before a
-    /// prompt. Encrypted PKCS#8 hides that identity, so its request describes
-    /// only the expected reference. Every decrypted key must match it before
+    /// prompt. Encrypted PKCS#8 and traditional PEM hide that identity, so their
+    /// requests describe only the expected reference. Every decrypted key must match it before
     /// admission. Selecting another file retires the previous request.
     public mutating func select(pem: Data, reference: WorkspaceDocument.Credential) throws -> Selection {
         pending = nil
         try Task.checkCancellation()
         let source: Source
-        if EncryptedPKCS8SourceKey.recognizes(pem) {
+        if LegacyEncryptedPEMSourceKey.recognizes(pem) {
+            let encrypted = try LegacyEncryptedPEMSourceKey(pem: pem)
+            guard encrypted.family.accepts(algorithm: reference.algorithm) else { throw FTError.unsupported("source_key.family") }
+            source = .legacyPEM(encrypted)
+        } else if EncryptedPKCS8SourceKey.recognizes(pem) {
             let encrypted = try EncryptedPKCS8SourceKey(pem: pem)
             guard reference.algorithm == "ssh-rsa"
                 || SSHECDSACurve.allCases.contains(where: { $0.algorithm == reference.algorithm }) else {

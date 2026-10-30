@@ -162,6 +162,12 @@ struct LegacyRSASourceKey: Sendable, CustomDebugStringConvertible {
         key = try parts.validatedKey()
     }
 
+    init(pkcs1DER: Data) throws {
+        var parts = try Self.components(der: pkcs1DER, pkcs8: false)
+        defer { parts.erasePrivateBytes() }
+        key = try parts.validatedKey()
+    }
+
     /// Passive discovery may copy the public n/e embedded in a clear legacy
     /// container, exactly as it copies an OpenSSH public header. This path does
     /// not construct a private key, perform RSA arithmetic, derive an identity,

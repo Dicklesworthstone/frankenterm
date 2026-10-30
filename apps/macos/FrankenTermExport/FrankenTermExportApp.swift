@@ -1169,8 +1169,10 @@ private final class MacExportModel {
                 message = "This key's protection settings exceed the supported unlock limits (bcrypt rounds 1–64 and salt 16–64 bytes). Choose another matching supported source file or keep its public reference."
             } else if error == .unsupported("source_key.cipher") || error == .unsupported("source_key.kdf") {
                 message = "This protected key uses an unsupported format. Source unlocking supports OpenSSH bcrypt with AES-CTR or AES-CBC using 128-, 192-, or 256-bit keys."
-            } else if error == .unsupported("source_key.encrypted_pem") {
-                message = "This older encrypted PEM format is not supported. Choose a matching protected OpenSSH key or a PKCS#8 key protected with PBES2, PBKDF2 and AES-CBC."
+            } else if error == .unsupported("source_key.encrypted_pem") || error == .unsupported("source_key.legacy_pem_cipher") {
+                message = "This PEM protection is not supported. Traditional RSA and EC files must use AES-CBC with 128-, 192- or 256-bit keys. Protected OpenSSH and supported PBES2 PKCS#8 files can also be unlocked."
+            } else if error == .limit("source_key.legacy_pem_ciphertext") {
+                message = "This encrypted PEM file exceeds the supported single-key size. Choose another matching supported key file."
             } else if [.unsupported("source_key.pkcs8_encryption"), .unsupported("source_key.pkcs8_kdf"),
                        .unsupported("source_key.pkcs8_prf"), .unsupported("source_key.pkcs8_cipher")].contains(error) {
                 message = "This PKCS#8 file uses unsupported protection. Supported files use PBES2, PBKDF2 with HMAC-SHA1, SHA256, SHA384 or SHA512, and AES-CBC with 128-, 192- or 256-bit keys."
@@ -1833,13 +1835,13 @@ private struct SourceKeyUnlockSheet: View {
         VStack(alignment: .leading, spacing: 16) {
             Label("Unlock selected source key", systemImage: "key.fill").font(.title2.bold())
             Text(verbatim: request.credentialID).font(.headline)
-            if case .encryptedPKCS8 = request.protection {
+            if request.protection.hidesPublicIdentity {
                 Text("Expected workspace identity").font(.caption.bold())
             }
             Text(verbatim: request.algorithm + "\n" + request.fingerprint)
                 .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
-            if case .encryptedPKCS8 = request.protection {
-                Text("This PKCS#8 file keeps its public identity encrypted too. After unlocking, its key must match this algorithm and fingerprint before it can be included.")
+            if request.protection.hidesPublicIdentity {
+                Text("This file keeps its public identity encrypted too. After unlocking, its key must match this algorithm and fingerprint before it can be included.")
                     .font(.callout)
             }
             Text("Enter this key file's passphrase. The key is checked locally and included only in the encrypted transfer you approve.")

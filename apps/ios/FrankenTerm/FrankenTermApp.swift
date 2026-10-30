@@ -3166,8 +3166,11 @@ final class WorkspaceKeyImportController: Identifiable {
 
     static func describe(_ error: Error) -> String {
         if let error = error as? FTError {
-            if error == .unsupported("source_key.encrypted_pem") {
-                return "This older encrypted PEM format is not supported. Choose a matching protected OpenSSH key or a PKCS#8 key protected with PBES2, PBKDF2 and AES-CBC."
+            if error == .unsupported("source_key.encrypted_pem") || error == .unsupported("source_key.legacy_pem_cipher") {
+                return "This PEM protection is not supported. Traditional RSA and EC files must use AES-CBC with 128-, 192- or 256-bit keys. Protected OpenSSH and supported PBES2 PKCS#8 files can also be unlocked."
+            }
+            if error == .limit("source_key.legacy_pem_ciphertext") {
+                return "This encrypted PEM file exceeds the supported single-key size. Choose another matching supported key file."
             }
             if [.unsupported("source_key.pkcs8_encryption"), .unsupported("source_key.pkcs8_kdf"),
                 .unsupported("source_key.pkcs8_prf"), .unsupported("source_key.pkcs8_cipher")].contains(error) {
@@ -3244,7 +3247,7 @@ private struct WorkspaceKeyImportSheet: View {
                                     .textContentType(.password).submitLabel(.done)
                                     .privacySensitive().disabled(controller.isWorking)
                                     .onSubmit { unlock(requestID: request.id) }
-                                if case .encryptedPKCS8 = request.protection {
+                                if request.protection.hidesPublicIdentity {
                                     Text("This file keeps its public identity encrypted too. After unlocking, its key must match the saved algorithm and fingerprint above before it can be imported.")
                                         .font(.callout)
                                 }
@@ -3260,6 +3263,7 @@ private struct WorkspaceKeyImportSheet: View {
                                 switch request.protection {
                                 case .openSSH: Text("Encrypted OpenSSH Key")
                                 case .encryptedPKCS8: Text("Encrypted PKCS#8 Key")
+                                case .legacyPEM: Text("Encrypted PEM Key")
                                 }
                             }
                         }

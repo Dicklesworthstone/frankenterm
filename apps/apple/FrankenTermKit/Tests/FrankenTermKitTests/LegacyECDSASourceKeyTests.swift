@@ -213,11 +213,12 @@ final class LegacyECDSASourceKeyTests: XCTestCase {
                                                 using: LegacyDERProbeCryptography()))
     }
 
-    func testMislabeledPKCS8AndTraditionalEncryptedPEMAreRejectedWithoutWorkOrPrompt() async throws {
+    func testMislabeledPKCS8AndIncompleteTraditionalPEMHeadersAreRejectedWithoutWorkOrPrompt() async throws {
         let fixture = try XCTUnwrap(Fixtures.load().keys.first)
         // A clear PrivateKeyInfo relabeled as EncryptedPrivateKeyInfo is
         // malformed, even though actual bounded PBES2 containers now work.
-        // Traditional Proc-Type/DEK-Info protection remains unsupported.
+        // Traditional PEM requires both exact headers and a blank separator;
+        // relabeling clear DER with incomplete encryption metadata is invalid.
         let mislabeled = pem(try der(fixture.pkcs8PEM), label: "ENCRYPTED PRIVATE KEY")
         var cases: [(Data, FTError)] = [(mislabeled, .malformed("source_key.der_tag"))]
         let procType = "Proc-Type: 4,ENCRYPTED\n"
@@ -225,7 +226,7 @@ final class LegacyECDSASourceKeyTests: XCTestCase {
         for headers in [procType, dekInfo, procType + dekInfo] {
             let bytes = Data(fixture.sec1PEM.replacingOccurrences(of: "-----BEGIN EC PRIVATE KEY-----\n",
                 with: "-----BEGIN EC PRIVATE KEY-----\n" + headers).utf8)
-            cases.append((bytes, .unsupported("source_key.encrypted_pem")))
+            cases.append((bytes, .malformed("source_key.legacy_pem_headers")))
         }
         let reference = try workspace(algorithm: fixture.algorithm, fingerprint: fixture.fingerprint).credentials[0]
         for (bytes, expected) in cases {

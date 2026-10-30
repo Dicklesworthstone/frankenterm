@@ -61,12 +61,15 @@ public protocol AirGapCryptography: SSHIdentityCryptography {
     /// This does not select a new encryption profile or change FTAG's KDF.
     func pbkdf2(passphrase: Data, salt: Data, iterations: UInt32,
                 prf: PKCS8PBKDF2PRF, outputByteCount: Int) throws -> Data
+    /// Compatibility KDF for already-encrypted traditional PEM source files.
+    /// The legacy MD5 derivation is never used to create keys or FTAG envelopes.
+    func legacyPEMKey(passphrase: Data, salt: Data, outputByteCount: Int) throws -> Data
     /// AES-CTR has no authentication tag. The complete decrypted OpenSSH container
     /// and its derived public identity must validate before any key is accepted.
     func decryptAESCTR(_ ciphertext: Data, key: Data, iv: Data) throws -> Data
-    /// OpenSSH's CBC source profile uses the same bounded AES key sizes and
-    /// 16-byte IV, with no PKCS#7 padding. Its checkints, private-derived public
-    /// identity and incremental OpenSSH padding must all validate after decryption.
+    /// Raw CBC decryption with bounded AES key sizes and a 16-byte IV. The
+    /// format owner checks OpenSSH incremental padding or PEM/PKCS#8 PKCS#7
+    /// padding, complete structure and private-derived identity afterward.
     func decryptAESCBC(_ ciphertext: Data, key: Data, iv: Data) throws -> Data
 }
 
@@ -83,6 +86,10 @@ extension AirGapCryptography {
                        prf: PKCS8PBKDF2PRF, outputByteCount: Int) throws -> Data {
         try PKCS8SourcePrimitives.pbkdf2(passphrase: passphrase, salt: salt, iterations: iterations,
                                         prf: prf, outputByteCount: outputByteCount)
+    }
+
+    public func legacyPEMKey(passphrase: Data, salt: Data, outputByteCount: Int) throws -> Data {
+        try LegacyPEMSourcePrimitives.key(passphrase: passphrase, salt: salt, outputByteCount: outputByteCount)
     }
 }
 

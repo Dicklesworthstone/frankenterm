@@ -7,12 +7,20 @@ public enum PKCS8PBKDF2PRF: String, CaseIterable, Sendable {
     case hmacSHA1, hmacSHA256, hmacSHA384, hmacSHA512
 }
 
-/// Public protection metadata for one selected source file. A PKCS#8 encrypted
-/// source hides its public identity too, so its prompt names the expected
+/// Public protection metadata for one selected source file. Encrypted PKCS#8
+/// and traditional PEM hide their public identity too, so the prompt names the expected
 /// workspace identity, which is checked only after successful decryption.
 public enum SourceKeyProtection: Equatable, Sendable {
     case openSSH(bcryptRounds: UInt32)
     case encryptedPKCS8(prf: PKCS8PBKDF2PRF, iterations: UInt32, aesKeyBits: Int)
+    case legacyPEM(aesKeyBits: Int)
+
+    public var hidesPublicIdentity: Bool {
+        switch self {
+        case .openSSH: false
+        case .encryptedPKCS8, .legacyPEM: true
+        }
+    }
 }
 
 /// RFC 5208 EncryptedPrivateKeyInfo with one deliberately bounded RFC 8018

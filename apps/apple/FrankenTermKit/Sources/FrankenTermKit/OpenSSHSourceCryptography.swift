@@ -1,6 +1,39 @@
 import Foundation
 import COpenSSHBcrypt
 import CryptoExtras
+#if canImport(CryptoKit)
+import CryptoKit
+#else
+import Crypto
+#endif
+
+/// OpenSSL's traditional PEM compatibility derivation: EVP_BytesToKey with
+/// MD5, count 1 and the first eight bytes of the file's IV as salt. The IV
+/// itself comes from DEK-Info, not the KDF output (OpenSSL pem_lib.c).
+/// Only reading an explicitly selected existing file can reach this legacy
+/// function. FTAG continues to use HKDF-SHA256 and ChaCha20-Poly1305.
+enum LegacyPEMSourcePrimitives {
+    static func key(passphrase: Data, salt: Data, outputByteCount: Int) throws -> Data {
+        guard (1...OpenSSHSourceKey.maximumPassphraseBytes).contains(passphrase.count),
+              salt.count == 8, [16, 24, 32].contains(outputByteCount) else {
+            throw FTError.limit("source_key.legacy_pem_kdf")
+        }
+        try Task.checkCancellation()
+        var previous = Data(), result = Data()
+        defer { previous.resetBytes(in: 0..<previous.count); result.resetBytes(in: 0..<result.count) }
+        result.reserveCapacity(32)
+        // AES admits at most two digest blocks; no file-supplied work factor.
+        while result.count < outputByteCount {
+            var digest = Insecure.MD5()
+            digest.update(data: previous); digest.update(data: passphrase); digest.update(data: salt)
+            previous.resetBytes(in: 0..<previous.count)
+            previous = Data(digest.finalize())
+            result.append(previous)
+        }
+        try Task.checkCancellation()
+        return Data(result.prefix(outputByteCount))
+    }
+}
 
 /// Existing encrypted source compatibility through pinned Swift CryptoExtras:
 /// CommonCrypto on Apple, BoringSSL on Linux. Bounds apply before native work.
@@ -81,8 +114,6 @@ enum OpenSSHSourcePrimitives {
 }
 
 #if canImport(CryptoKit)
-import CryptoKit
-
 extension AppleCryptography {
     public func bcryptPBKDF(passphrase: Data, salt: Data, rounds: UInt32, outputByteCount: Int) throws -> Data {
         try OpenSSHSourcePrimitives.bcryptPBKDF(passphrase: passphrase, salt: salt, rounds: rounds,
