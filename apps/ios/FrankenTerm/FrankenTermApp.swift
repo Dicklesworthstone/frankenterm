@@ -2113,11 +2113,10 @@ struct MobileWorkspaceRoot: View {
                 }
                 .navigationTitle("FrankenTerm")
                 .toolbar {
-                    if includedMacURL != nil {
-                        ToolbarItem(placement: .topBarLeading) {
-                            Button { showIncludedMac = true } label: {
-                                Label("Included Mac App", systemImage: "desktopcomputer")
-                            }
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button { showIncludedMac = true } label: {
+                            Label(includedMacURL == nil ? "App Information" : "Included Mac App",
+                                  systemImage: includedMacURL == nil ? "info.circle" : "desktopcomputer")
                         }
                     }
                     ToolbarItem(placement: .primaryAction) {
@@ -2142,9 +2141,9 @@ struct MobileWorkspaceRoot: View {
         }
         .task { model.setScenePhase(scenePhase); await model.bootstrap() }
         .sheet(isPresented: $showIncludedMac) {
-            if let url = includedMacURL {
-                NavigationStack {
-                    Form {
+            NavigationStack {
+                Form {
+                    if let url = includedMacURL {
                         Section("FrankenTerm for Mac is included") {
                             Text("Your iOS purchase includes the full Mac app at no extra charge. No separate purchase or subscription is required.")
                             Text("Send this link to your Mac, download FrankenTerm, then open it to install.")
@@ -2154,11 +2153,19 @@ struct MobileWorkspaceRoot: View {
                             Link("Open Mac Download", destination: url)
                         }
                     }
-                    .navigationTitle("Included Mac App")
-                    .toolbar {
-                        ToolbarItem(placement: .confirmationAction) {
-                            Button("Done") { showIncludedMac = false }
+                    Section("Support and Privacy") {
+                        if let privacy = URL(string: "https://github.com/Dicklesworthstone/frankenterm/blob/main/docs/ios-privacy.md") {
+                            Link("Privacy Policy", destination: privacy)
                         }
+                        if let support = URL(string: "https://github.com/Dicklesworthstone/frankenterm/issues") {
+                            Link("Get Support", destination: support)
+                        }
+                    }
+                }
+                .navigationTitle(includedMacURL == nil ? "App Information" : "Included Mac App")
+                .toolbar {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Done") { showIncludedMac = false }
                     }
                 }
             }
