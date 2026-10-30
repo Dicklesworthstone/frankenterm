@@ -19,6 +19,42 @@ private func queryResults(_ count: Int, request: UInt64 = 1, text: String = "a m
 private let queryNeedle = TerminalMuxControl.SearchQuery(text: "needle", caseSensitive: false, regex: false)
 
 final class TerminalMuxControlTests: XCTestCase {
+    func testInputPermissionDoesNotGrantSharedGeometryPermission() throws {
+        let cases: [(TerminalMuxAccessMode, input: Bool, size: Bool)] = [
+            (.viewOnly, false, false), (.inputOnly, true, false), (.interactive, true, true)
+        ]
+        for (mode, input, size) in cases {
+            let control = TerminalMuxControl(accessMode: mode), routing = control.inputRouting
+            XCTAssertEqual(mode.permitsInput, input)
+            XCTAssertEqual(mode.controlsSize, size)
+            XCTAssertEqual(routing.permitsInput, input)
+            try routing.replaceInventory([1])
+            let destination = try routing.select(pane: 1)
+            control.publish(panes: [queryPane(1)], shown: 1)
+            control.setVisible(true); control.setMouseGrabbed(true)
+            XCTAssertThrowsError(try routing.validateAdmission(destination), "input waits for applied output")
+            routing.didApplyOutput(destination)
+            XCTAssertTrue(routing.current.ready, "observers also receive an output witness")
+            if input {
+                XCTAssertNoThrow(try routing.validateAdmission(destination))
+                try control.click(column: 79, row: 23, destination: destination)
+                let pointer = try XCTUnwrap(routing.takePointer())
+                XCTAssertEqual(pointer.destination, destination)
+                XCTAssertEqual(pointer.action, .click(column: 79, row: 23))
+                control.setVisible(false)
+                XCTAssertThrowsError(try control.click(column: 79, row: 23, destination: destination))
+                XCTAssertNoThrow(try routing.validateDelivery(destination), "hiding preserves previously admitted bytes")
+            } else {
+                XCTAssertThrowsError(try routing.validateAdmission(destination))
+                XCTAssertThrowsError(try routing.validateDelivery(destination))
+                XCTAssertThrowsError(try control.click(column: 79, row: 23, destination: destination))
+                XCTAssertFalse(routing.hasPendingPointers)
+            }
+            routing.retire()
+            XCTAssertThrowsError(try routing.validateDelivery(destination))
+        }
+    }
+
     func testASearchFillsInPaneByPaneAndAReplacedOneIsIgnored() {
         let control = TerminalMuxControl()
         control.publish(panes: [queryPane(1), queryPane(2), queryPane(3)], shown: 1)

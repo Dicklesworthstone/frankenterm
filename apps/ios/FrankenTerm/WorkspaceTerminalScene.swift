@@ -839,10 +839,6 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
                 try? self.connectionIntent.terminalEnded(machineID,
                     reattachesExistingPanes: controller.dropped && controller.attachedToMux)
                 self.reconnectPolicies[machineID, default: .init()].recordEnd()
-                // Unless the person chose View Only: then it is theirs to take.
-                if controller.paneTooLargeToView, self.muxAccessSelections[machineID] == nil {
-                    self.takePaneAtPhoneSize(machineID, from: controller)
-                }
             case .couldNotConnect:
                 self.reconnectPolicies[machineID, default: .init()].recordEnd()
             case .idle, .connecting, .ready: break
@@ -939,13 +935,12 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         muxModeJobs[machineID] = (id, task)
     }
 
-    /// A shared pane larger than View Only can draw ended that connection.
-    /// The pane is taken at the phone's size instead, as Use Terminal would,
-    /// once the old connection settles; leaving it gives the desktop its size
-    /// back. An absent mux still cannot become a new SSH shell.
+    /// A shared pane larger than the phone can draw needs explicit permission
+    /// to change its size. The prior owner must settle first; an absent mux
+    /// still cannot become a new SSH shell.
     func takePaneAtPhoneSize(_ machineID: String, from session: TerminalSessionController) {
         guard permitsTerminalCreation, sessions[machineID] === session, session.paneTooLargeToView,
-              session.muxAccessMode == .viewOnly, muxModeJobs[machineID] == nil else { return }
+              !session.muxAccessMode.controlsSize, muxModeJobs[machineID] == nil else { return }
         muxAccessSelections[machineID] = .interactive
         existingMuxRequired.insert(machineID)
         changingMuxModes.insert(machineID)
@@ -1485,16 +1480,30 @@ struct WorkspaceTerminalScreen: View {
         .sheet(item: $historyInspection) { inspected in TerminalHistoryScreen(inspection: inspected) }
         .sheet(item: $muxSearch) { session in MuxSearchScreen(session: session) }
         .sheet(item: $retainedOutput) { output in TerminalRetainedOutputScreen(output: output) }
-        .confirmationDialog("Use this shared terminal?",
+        .confirmationDialog("How should this phone use the shared terminal?",
             isPresented: Binding(get: { useTerminalReview != nil }, set: { if !$0 { useTerminalReview = nil } }),
             titleVisibility: .visible, presenting: useTerminalReview) { session in
-                Button("Reconnect and Use Terminal") {
-                    scene.reconnectMux(.interactive, machineID: session.target.machineID, controllerID: session.id)
-                    useTerminalReview = nil
+                if session.muxAccessMode != .inputOnly {
+                    Button("Type at Shared Size") {
+                        scene.reconnectMux(.inputOnly, machineID: session.target.machineID, controllerID: session.id)
+                        useTerminalReview = nil
+                    }
                 }
-                Button("Keep Viewing", role: .cancel) { useTerminalReview = nil }
+                if session.muxAccessMode != .interactive {
+                    Button("Type and Fit to Phone") {
+                        scene.reconnectMux(.interactive, machineID: session.target.machineID, controllerID: session.id)
+                        useTerminalReview = nil
+                    }
+                }
+                if session.muxAccessMode != .viewOnly {
+                    Button("View Only") {
+                        scene.reconnectMux(.viewOnly, machineID: session.target.machineID, controllerID: session.id)
+                        useTerminalReview = nil
+                    }
+                }
+                Button("Cancel", role: .cancel) { useTerminalReview = nil }
             } message: { session in
-                Text("Reconnect to \(session.target.machineName) to type, paste and use the mouse. Its shared pane will resize to fit this phone. Other connected clients can still type and resize it.")
+                Text("Reconnect to \(session.target.machineName) with the selected permissions. Type at Shared Size keeps the pane's current dimensions. Type and Fit to Phone changes them for every client. Other connected clients can still type and resize it.")
             }
         .sheet(isPresented: Binding(get: { scene.overviewPresented }, set: { visible in
             if !visible { scene.dismissOverview() }
@@ -1593,13 +1602,13 @@ struct WorkspaceTerminalScreen: View {
             VStack(alignment: .leading, spacing: 2) {
                 Label(session.isViewingOnly ? "View Only" : "Using Shared Terminal",
                       systemImage: session.isViewingOnly ? "eye" : "keyboard").font(.caption.weight(.semibold))
-                Text(session.isViewingOnly ? "Shared size · Input is off" : "Phone size · Other clients may also interact")
+                Text(session.isViewingOnly ? "Shared size · Input is off"
+                    : session.muxAccessMode.controlsSize ? "Phone size · Input is on" : "Shared size · Input is on")
                     .font(.caption2).foregroundStyle(.secondary)
             }
             Spacer(minLength: 4)
-            Button(session.isViewingOnly ? "Use Terminal" : "View Only") {
-                if session.isViewingOnly { useTerminalReview = session }
-                else { scene.reconnectMux(.viewOnly, machineID: session.target.machineID, controllerID: session.id) }
+            Button(session.isViewingOnly ? "Use Terminal" : "Change…") {
+                useTerminalReview = session
             }
             .font(.caption.weight(.semibold)).buttonStyle(.bordered)
             .disabled(session.clipboardIsPresenting || session.localInputNeedsDecision
@@ -1665,7 +1674,8 @@ struct WorkspaceTerminalScreen: View {
         let accent = Color(ftHex: scene.themes[machine.id]?.accent ?? "#3B82F6")
         if let mode = scene.changingMuxMode(machine.id) {
             connecting(machine, accent: accent, detail: mode == .interactive
-                ? "Fitting the shared pane to this phone…" : "Reconnecting to view only…")
+                ? "Fitting the shared pane to this phone…"
+                : mode == .inputOnly ? "Enabling input at the shared size…" : "Reconnecting to view only…")
         } else if scene.disconnected.contains(machine.id) {
             disconnectedCard(machine, accent: accent)
         } else if scene.capacityBlockedMachineID == machine.id {

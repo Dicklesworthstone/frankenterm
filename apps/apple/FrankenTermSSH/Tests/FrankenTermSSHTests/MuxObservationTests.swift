@@ -12,7 +12,13 @@ private enum ObservationFixtureError: Error { case timeout, unexpectedSource }
 /// not claim native Rust codec, Metal or physical-device qualification.
 private final class ObservationMuxClient: TerminalMuxClient, @unchecked Sendable {
     static let incarnation = Data(repeating: 0x4a, count: 16)
-    struct Call: Equatable { let name: String, pane: Int }
+    struct Call: Equatable {
+        let name: String, pane: Int
+        let column: Int?, row: Int?
+        init(name: String, pane: Int, column: Int? = nil, row: Int? = nil) {
+            self.name = name; self.pane = pane; self.column = column; self.row = row
+        }
+    }
     private let lock = NSLock()
     private var events: [TerminalMuxEvent]
     private var calls: [Call] = []
@@ -23,7 +29,8 @@ private final class ObservationMuxClient: TerminalMuxClient, @unchecked Sendable
     let panes: [TerminalMuxPane]
 
     init(mode: String) {
-        let dimensions = mode == "oversize" ? (100, 512) : mode == "invalid-grid" ? (-1, 80) : (100, 256)
+        let dimensions = mode == "oversize" || mode == "input-only-oversize"
+            ? (100, 512) : mode == "invalid-grid" ? (-1, 80) : (100, 256)
         panes = (1...2).map { id in
             TerminalMuxPane(paneId: id, tabId: id, windowId: 0, tabTitle: "Desktop", title: "pane-\(id)",
                 workspace: "default", workingDir: nil, size: .init(rows: 100, cols: 256),
@@ -37,6 +44,7 @@ private final class ObservationMuxClient: TerminalMuxClient, @unchecked Sendable
     var effects: [Call] {
         recorded.filter { ["resize", "restore", "adopt", "write", "paste", "wheel", "click"].contains($0.name) }
     }
+    var geometryEffects: [Call] { recorded.filter { ["resize", "restore", "adopt"].contains($0.name) } }
     func receive(_ bytes: Data) throws {}
     func channelClosed() throws {}
     func outgoing(limit: Int) throws -> Data { Data() }
@@ -82,10 +90,10 @@ private final class ObservationMuxClient: TerminalMuxClient, @unchecked Sendable
         lock.withLock { calls.append(.init(name: "adopt", pane: pane)); return true }
     }
     func wheel(pane: Int, steps: Int, column: Int, row: Int) throws {
-        lock.withLock { calls.append(.init(name: "wheel", pane: pane)) }
+        lock.withLock { calls.append(.init(name: "wheel", pane: pane, column: column, row: row)) }
     }
     func click(pane: Int, column: Int, row: Int) throws {
-        lock.withLock { calls.append(.init(name: "click", pane: pane)) }
+        lock.withLock { calls.append(.init(name: "click", pane: pane, column: column, row: row)) }
     }
     func search(pane: Int, text: String, caseSensitive: Bool, regex: Bool) throws -> UInt64 {
         lock.withLock {
@@ -160,14 +168,17 @@ final class MuxObservationTests: XCTestCase {
         }
     }
 
-    func testLiveMuxViewOnlyAndInteractiveEffectBoundary() async throws {
+    func testLiveMuxAccessModeEffectBoundary() async throws {
         let env = ProcessInfo.processInfo.environment
         guard let port = env["FT_MUX_OBSERVATION_PORT"].flatMap(UInt16.init),
               let host = env["FT_MUX_OBSERVATION_HOSTKEY"].flatMap({ Data(base64Encoded: $0) }),
               let mode = env["FT_MUX_OBSERVATION_MODE"] else {
             throw XCTSkip("Requires the independent mux observation SSH fixture")
         }
-        let interactive = mode == "interactive", client = ObservationMuxClient(mode: mode)
+        let controlsSize = mode == "interactive"
+        let permitsInput = controlsSize || mode == "input-only" || mode == "input-only-oversize"
+        let accessMode: TerminalMuxAccessMode = controlsSize ? .interactive : (permitsInput ? .inputOnly : .viewOnly)
+        let client = ObservationMuxClient(mode: mode)
         let fixture = try await SSHWorkspaceTestFixture.make(hostname: "127.0.0.1", port: port,
             hostBlob: host, routeMode: "frankenterm_mux") { workspace in
                 var routes = workspace["routes"] as! [[String: Any]]
@@ -179,7 +190,7 @@ final class MuxObservationTests: XCTestCase {
             expectedRevision: fixture.installed.revision, machineID: "machine", routeID: "route",
             credentialID: "key", confirmedByUser: true, store: fixture.store, broker: fixture.broker,
             networkActivity: activity, connectionTimeout: .seconds(5), authenticationTimeout: .seconds(5),
-            muxClientFactory: { client }, muxAccessMode: interactive ? .interactive : .viewOnly,
+            muxClientFactory: { client }, muxAccessMode: accessMode,
             requiresExistingMux: true)
         let recovery = TerminalMuxPhoneSizes(workspace: owner.identity.workspaceID, machine: "machine")
         let shown = TerminalMuxShownPane(workspace: owner.identity.workspaceID, machine: "machine")
@@ -210,10 +221,10 @@ final class MuxObservationTests: XCTestCase {
             let run = Task { try await pump.run(consumer: consumer) }
             let watchdog = Task { try await Task.sleep(for: .seconds(8)); pump.requestStop() }
             defer { watchdog.cancel(); pump.requestStop() }
-            if mode == "oversize" || mode == "invalid-grid" {
+            if mode == "oversize" || mode == "input-only-oversize" || mode == "invalid-grid" {
                 _ = try await run.value
                 XCTAssertNotNil(control.current.failure)
-                XCTAssertEqual(control.current.paneTooLargeToView, mode == "oversize",
+                XCTAssertEqual(control.current.paneTooLargeToView, mode != "invalid-grid",
                     "Only a real pane bigger than the phone may be taken at the phone's size")
                 XCTAssertTrue(client.effects.isEmpty, "An unsupported observed grid must never be asked back to phone size")
                 let summary = await consumer.summary()
@@ -228,19 +239,22 @@ final class MuxObservationTests: XCTestCase {
                 }
                 let first = try control.inputRouting.capture()
                 let firstSummary = await consumer.summary()
-                XCTAssertEqual(firstSummary.geometry.columns, interactive ? 80 : 256)
-                XCTAssertEqual(firstSummary.geometry.rows, interactive ? 24 : 100)
+                XCTAssertEqual(firstSummary.geometry.columns, controlsSize ? 80 : 256)
+                XCTAssertEqual(firstSummary.geometry.rows, controlsSize ? 24 : 100)
                 let stream = try await coordinator.makeStream(sceneID: UUID())
                 let focus = try await coordinator.changeFocus(stream, to: pump.source)
-                if interactive {
+                if permitsInput {
                     _ = try await coordinator.submit(focus, encodedBytes: Data("typed".utf8))
                     _ = try await coordinator.paste(focus, text: "pasted", bracketed: true)
-                    try control.click(column: 1, row: 1, destination: first)
-                    try control.scroll(steps: -1, column: 1, row: 1, destination: first)
+                    // Shared-size input uses the remote grid, including cells
+                    // beyond the phone's provisional 80 x 24 geometry.
+                    let column = controlsSize ? 79 : 255, row = controlsSize ? 23 : 99
+                    try control.click(column: column, row: row, destination: first)
+                    try control.scroll(steps: -1, column: column, row: row, destination: first)
                     try await waitUntil {
                         client.recorded.filter { $0.name == "write" }.count == 2
-                            && client.recorded.contains(.init(name: "click", pane: 1))
-                            && client.recorded.contains(.init(name: "wheel", pane: 1))
+                            && client.recorded.contains(.init(name: "click", pane: 1, column: column, row: row))
+                            && client.recorded.contains(.init(name: "wheel", pane: 1, column: column, row: row))
                     }
                 } else {
                     do { _ = try await coordinator.submit(focus, encodedBytes: Data("typed".utf8)); XCTFail("Observer typed") }
@@ -269,10 +283,16 @@ final class MuxObservationTests: XCTestCase {
                 _ = control.search(.init(text: "read only search", caseSensitive: false, regex: false), panes: [1, 2])
                 try await waitUntil { control.current.search?.pending.isEmpty == true }
                 XCTAssertEqual(client.recorded.filter { $0.name == "search" }.map(\.pane), [1, 2])
-                if !interactive {
-                    XCTAssertTrue(client.effects.isEmpty, "Viewing, rotation, selection and search must remain read only")
+                if !controlsSize {
+                    XCTAssertTrue(client.geometryEffects.isEmpty, "Input permission cannot resize, adopt or restore a shared pane")
+                    let summary = await consumer.summary()
+                    XCTAssertEqual(summary.geometry.columns, 256)
+                    XCTAssertEqual(summary.geometry.rows, 100)
                     XCTAssertEqual(recovery.records(matching: client.panes, incarnation: ObservationMuxClient.incarnation).count, 2,
-                        "An observer cannot take over or erase recovery from an earlier interactive connection")
+                        "A client without size authority cannot erase another connection's recovery")
+                }
+                if !permitsInput {
+                    XCTAssertTrue(client.effects.isEmpty, "Viewing, rotation, selection and search must remain read only")
                     XCTAssertTrue(control.inputRouting.current.ready, "Denied cleanup must not close the observing pump")
                 }
                 pump.requestStop()
@@ -283,14 +303,18 @@ final class MuxObservationTests: XCTestCase {
             try await coordinator.retire(pump.source)
             await owner.close()
             XCTAssertEqual(activity.accounting().connections, 0)
-            if interactive {
+            if controlsSize {
                 XCTAssertTrue(client.effects.contains { $0.name == "adopt" })
                 XCTAssertTrue(client.effects.contains { $0.name == "resize" })
                 XCTAssertTrue(client.effects.contains { $0.name == "restore" })
+            } else {
+                XCTAssertTrue(client.geometryEffects.isEmpty, "Closing cannot restore someone else's size")
+            }
+            if permitsInput, mode != "input-only-oversize" {
                 XCTAssertTrue(client.effects.contains { $0.name == "write" })
                 XCTAssertTrue(client.effects.contains { $0.name == "click" })
                 XCTAssertTrue(client.effects.contains { $0.name == "wheel" })
-            } else { XCTAssertTrue(client.effects.isEmpty, "Observer close must not restore someone else's size") }
+            } else { XCTAssertTrue(client.effects.isEmpty, "An observer or unsupported grid cannot cause input or geometry effects") }
             let accounting = await coordinator.accounting()
             XCTAssertEqual(accounting.connections, 0); XCTAssertEqual(accounting.streams, 0)
             let offline = try activity.beginOfflineRestore()
