@@ -81,12 +81,21 @@ public struct WorkspaceKeyEnrollmentTarget: Codable, Equatable, Hashable, Identi
     public let host: String
     public let port: UInt16
     public let user: String
+    /// Digest of the reviewed SSH path and trust aliases. Private endpoints
+    /// reached through different bastions are separate enrollment accounts.
+    /// Nil preserves the identity of existing direct, unaliased enrollments.
+    /// This is receipt provenance, never permission to reconstruct a route.
+    public let routeScope: String?
     public var id: String {
-        enrollmentDigest("frankenterm-phone-key-enrollment-target-v1\0" + host + "\0" +
+        let endpoint = host + "\0" + String(port) + "\0" + user
+        if let routeScope {
+            return enrollmentDigest("frankenterm-phone-key-enrollment-target-v2\0" + endpoint + "\0" + routeScope)
+        }
+        return enrollmentDigest("frankenterm-phone-key-enrollment-target-v1\0" + host + "\0" +
             String(port) + "\0" + user)
     }
 
-    public init(host: String, port: UInt16 = 22, user: String) throws {
+    public init(host: String, port: UInt16 = 22, user: String, routeScope: String? = nil) throws {
         guard !host.isEmpty, host.utf8.allSatisfy({ $0 < 128 }), host.first != "-", port > 0 else {
             throw FTError.malformed("enrollment.target")
         }
@@ -100,17 +109,24 @@ public struct WorkspaceKeyEnrollmentTarget: Codable, Equatable, Hashable, Identi
               bytes.allSatisfy({ alphaNumeric($0) || [45, 46, 95].contains($0) }) else {
             throw FTError.malformed("enrollment.account")
         }
-        self.host = canonical; self.port = port; self.user = user
+        if let routeScope {
+            guard routeScope.utf8.count == 64, routeScope.utf8.allSatisfy({
+                (48...57).contains($0) || (97...102).contains($0)
+            }) else { throw FTError.malformed("enrollment.route_scope") }
+        }
+        self.host = canonical; self.port = port; self.user = user; self.routeScope = routeScope
     }
 
-    private enum CodingKeys: String, CodingKey { case host, port, user }
+    private enum CodingKeys: String, CodingKey { case host, port, user, routeScope }
 
     public init(from decoder: any Decoder) throws {
-        try enrollmentExactCodingFields(decoder, ["host", "port", "user"])
         let values = try decoder.container(keyedBy: CodingKeys.self)
+        try enrollmentExactCodingFields(decoder, values.contains(.routeScope)
+            ? ["host", "port", "user", "routeScope"] : ["host", "port", "user"])
         try self.init(host: values.decode(String.self, forKey: .host),
                       port: values.decode(UInt16.self, forKey: .port),
-                      user: values.decode(String.self, forKey: .user))
+                      user: values.decode(String.self, forKey: .user),
+                      routeScope: values.contains(.routeScope) ? values.decode(String.self, forKey: .routeScope) : nil)
     }
 }
 
@@ -194,7 +210,7 @@ public struct WorkspaceKeyEnrollmentJournal: Equatable, Sendable {
         let version = try root.required("version").uint()
         guard Set(root.keys) == ["format", "version", "request", "targets", "results"],
               try root.required("format").string() == "ft-phone-key-enrollment-journal",
-              version == 1 || version == 2 else {
+              version == 1 || version == 2 || version == 3 else {
             throw FTError.malformed("enrollment.journal_format")
         }
         let request = try WorkspaceKeyEnrollmentRequest(data: StrictJSON.encode(root.required("request")))
@@ -204,12 +220,15 @@ public struct WorkspaceKeyEnrollmentJournal: Equatable, Sendable {
         }
         let targets = try rawTargets.map { raw -> WorkspaceKeyEnrollmentTarget in
             let record = try raw.object()
-            guard Set(record.keys) == ["host", "port", "user"] else {
+            let scoped = record["route_scope"] != nil
+            let fields: Set<String> = scoped ? ["host", "port", "user", "route_scope"] : ["host", "port", "user"]
+            guard Set(record.keys) == fields, !scoped || version == 3 else {
                 throw FTError.malformed("enrollment.journal_target_fields")
             }
             return try .init(host: record.required("host").string(),
                 port: WorkspaceDocument.port(record.required("port").uint()),
-                user: record.required("user").string())
+                user: record.required("user").string(),
+                routeScope: record["route_scope"].map { try $0.string() })
         }
         try self.init(request: request, targets: targets)
         let rawResults = try root.required("results").array()
@@ -269,11 +288,16 @@ public struct WorkspaceKeyEnrollmentJournal: Equatable, Sendable {
 
     public func encoded() throws -> Data {
         let data = try StrictJSON.encode(.object([
-            "format": .string("ft-phone-key-enrollment-journal"), "version": .number("2"),
+            "format": .string("ft-phone-key-enrollment-journal"),
+            "version": .number(targets.contains(where: { $0.routeScope != nil }) ? "3" : "2"),
             "request": try StrictJSON.decode(request.encoded()),
-            "targets": .array(targets.map { target in .object([
-                "host": .string(target.host), "port": .number(String(target.port)), "user": .string(target.user)
-            ]) }),
+            "targets": .array(targets.map { target in
+                var record: [String: JSONValue] = [
+                    "host": .string(target.host), "port": .number(String(target.port)), "user": .string(target.user)
+                ]
+                if let scope = target.routeScope { record["route_scope"] = .string(scope) }
+                return .object(record)
+            }),
             "results": .array(try results.map { result in
                 guard let action = actions[result.target.id] else {
                     throw FTError.malformed("enrollment.journal_action")
