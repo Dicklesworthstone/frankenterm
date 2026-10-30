@@ -203,10 +203,15 @@ impl<'a> FieldInfo<'a> {
                     quote!(
                         #ident: {
                             use core::convert::TryFrom;
-                            let target = <#try_from>::from_dynamic(obj.get_by_str(#name).map(|v| {
-                                #check_deprecated
-                                v
-                            }).unwrap_or(&Value::Null), options)
+                            // A match, not Option::map: the deprecation check
+                            // returns early with `?`, which a closure cannot.
+                            let target = <#try_from>::from_dynamic(match obj.get_by_str(#name) {
+                                Some(v) => {
+                                    #check_deprecated
+                                    v
+                                }
+                                None => &Value::Null,
+                            }, options)
                                     .map_err(|source| source.field_context(
                                         #struct_name,
                                         #name,
@@ -270,11 +275,13 @@ impl<'a> FieldInfo<'a> {
                     quote!(
                         #ident: {
                             let value = <#ty>::from_dynamic(
-                                    obj.get_by_str(#name).map(|v| {
-                                        #check_deprecated
-                                        v
-                                    }).
-                                    unwrap_or(&Value::Null),
+                                    match obj.get_by_str(#name) {
+                                        Some(v) => {
+                                            #check_deprecated
+                                            v
+                                        }
+                                        None => &Value::Null,
+                                    },
                                     options
                                 )
                                 .map_err(|source| source.field_context(#struct_name, #name, obj))?;

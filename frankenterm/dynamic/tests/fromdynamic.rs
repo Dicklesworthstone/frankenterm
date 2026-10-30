@@ -288,3 +288,71 @@ fn enum_into() {
         EnumInto::from_dynamic(&Value::String("age:42".to_string()), Default::default()).unwrap()
     );
 }
+
+// Without `#[dynamic(default)]` the deprecation check used to sit inside an
+// Option::map closure, where its `?` did not compile.
+#[derive(FromDynamic, Debug, PartialEq)]
+struct StructWithDeprecatedField {
+    #[dynamic(deprecated = "use age")]
+    years: Option<u8>,
+    #[dynamic(deprecated = "use age", try_from = "Option<u8>")]
+    old_age: Option<u8>,
+    age: u8,
+}
+
+#[test]
+fn deprecated_field_without_default() {
+    use frankenterm_dynamic::{Error, FromDynamicOptions, UnknownFieldAction};
+    let options = |deprecated_fields| FromDynamicOptions {
+        unknown_fields: UnknownFieldAction::Deny,
+        deprecated_fields,
+    };
+    let absent = Value::Object(btreemap!("age".to_dynamic() => Value::U64(42)).into());
+    assert_eq!(
+        StructWithDeprecatedField::from_dynamic(&absent, options(UnknownFieldAction::Deny))
+            .unwrap(),
+        StructWithDeprecatedField {
+            years: None,
+            old_age: None,
+            age: 42
+        }
+    );
+
+    let present = Value::Object(
+        btreemap!(
+            "age".to_dynamic() => Value::U64(42),
+            "years".to_dynamic() => Value::U64(7))
+        .into(),
+    );
+    assert_eq!(
+        StructWithDeprecatedField::from_dynamic(&present, options(UnknownFieldAction::Warn))
+            .unwrap()
+            .years,
+        Some(7)
+    );
+    assert!(matches!(
+        StructWithDeprecatedField::from_dynamic(&present, options(UnknownFieldAction::Deny)),
+        Err(Error::DeprecatedField {
+            field_name: "years",
+            reason: "use age",
+            ..
+        })
+    ));
+
+    let present_try_from = Value::Object(
+        btreemap!(
+            "age".to_dynamic() => Value::U64(42),
+            "old_age".to_dynamic() => Value::U64(7))
+        .into(),
+    );
+    assert!(matches!(
+        StructWithDeprecatedField::from_dynamic(
+            &present_try_from,
+            options(UnknownFieldAction::Deny)
+        ),
+        Err(Error::DeprecatedField {
+            field_name: "old_age",
+            ..
+        })
+    ));
+}
