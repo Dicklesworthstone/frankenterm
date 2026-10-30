@@ -42,6 +42,14 @@ Portable layout/resize cases and hosted renderer/controller regressions cover st
 
 **Fleet Overview** searches imported machine tags alongside names, hosts, pane titles, tabs and working directories. A query such as `production build` can match a machine's environment tag and one of its pane titles together. Search remains literal, case- and diacritic-insensitive, and preserves the imported machine order and captured pane order. Machine/pane scope, connection-status and new-output filters work with tag queries. Tags use the manifest's existing limits and the overview's shared text budget.
 
+## Find the next machine that needs attention
+
+**Next Attention** (⇧⌘J or **More → Next Attention**) visits connection problems, missing route requirements, unresolved input notices and unread output in machine and pane order. The strip offers an alert button when another machine has a problem that needs a decision. **Next New Output** and ⌘J still visit only unread output. Neither action reconnects a failed session, dismisses its notice or resends input.
+
+The overview's **Needs attention** filter includes a connected machine whose previous input may not have arrived, separately labels input that was not sent or stopped partway, and includes keyboard decisions and unread panes. Connection status stays accurate. A machine-wide input notice is not attributed to every mux pane, and a deliberate disconnected state alone is not a failure. The overview records reasons at refresh; incoming activity never changes focus.
+
+Both next actions capture the original session and exact mux navigation plan before waiting for the keyboard handoff. Reconnects, observed pane removal/recreation, reordered inventory and changed source visits invalidate that captured target; a later numeric pane match cannot silently revive it. Portable tests cover filtering, input-disposition evidence and these identity boundaries. The new native navigation test still requires Apple-hosted execution.
+
 ## Durable mux pane continuity
 
 Reconnecting a saved mux pane now requires a fresh match of the server incarnation, durable pane UUID and registration ID. The mobile Rust client exposes the existing v71 passive identity query through the C ABI and Swift adapter without subscribing, typing, resizing or changing the desktop's active pane. It bounds concurrent queries to eight, expires them after five seconds and ignores retired replies. Showing a pane rechecks a previously learned identity before attaching.

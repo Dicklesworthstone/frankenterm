@@ -272,7 +272,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
             }
             inventory.append(.init(id: machine.id, name: machine.name, endpoint: endpoint, status: status,
                 sessionID: session?.id, panes: panes, selectedPaneID: shown,
-                newOutput: hasUnseenOutput(machine.id), tags: machine.tags))
+                newOutput: hasUnseenOutput(machine.id), tags: machine.tags, attention: attentionReasons(machine.id)))
         }
         let selected = selectedMachineID
         let frozenInventory = inventory
@@ -429,6 +429,18 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// A live machine off screen with output the phone has not shown since.
     func hasUnseenOutput(_ machineID: String) -> Bool {
         machineID != selectedMachineID && status(of: machineID) == .live && sessions[machineID]?.hasUnseenOutput == true
+    }
+
+    /// Input notices remain meaningful after reconnect, independently of the
+    /// machine's current connected state. An intentional Disconnect is not a
+    /// failure. Unavailable routes still need their key or trust requirement
+    /// resolved before the machine can connect.
+    func attentionReasons(_ machineID: String) -> Set<TerminalAttentionReason> {
+        let status = status(of: machineID), session = sessions[machineID]
+        return TerminalAttentionReason.observed(input: session?.inputDelivery ?? .init(),
+            keyboardNeedsDecision: session?.localInputNeedsDecision == true,
+            connectionNeedsAttention: status == .attention || status == .unavailable,
+            newOutput: hasUnseenOutput(machineID))
     }
 
     func requiresNewSession(_ machineID: String) -> Bool { connectionIntent.requiresNewSession.contains(machineID) }
@@ -750,32 +762,102 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// order after the one on screen: the machine switch a chip tap makes,
     /// then the pane switch ⌘] makes. Output alone never moves the screen.
     func showNextUnseenOutput() {
-        guard !closed, !overviewBlocksInput, !groupAppearanceBlocksInput,
+        guard !closed, foreground, onScreen, !overviewBlocksInput, !groupAppearanceBlocksInput,
               selectedSession?.clipboardIsPresenting != true, selectedSession?.paneNavigationBusy != true,
               let target = nextUnseenOutput() else { return }
+        visitFleetSource(target)
+    }
+
+    /// Next Attention includes connection/key requirements and unresolved
+    /// input as well as unread output. It never changes either ring's order,
+    /// dismisses a notice, resends input, or runs merely because state changed.
+    var hasAttentionElsewhere: Bool { nextAttention() != nil }
+    var hasActionableAttentionElsewhere: Bool {
+        navigationMachineIDs.contains { $0 != selectedMachineID && !attentionReasons($0).subtracting([.newOutput]).isEmpty }
+    }
+
+    func showNextAttention() {
+        guard !closed, foreground, onScreen, !overviewBlocksInput, !groupAppearanceBlocksInput,
+              selectedSession?.clipboardIsPresenting != true, selectedSession?.paneNavigationBusy != true,
+              let target = nextAttention() else { return }
+        visitFleetSource(target)
+    }
+
+    private func nextAttention() -> TerminalUnseenOutput.Source? {
+        var ring: [TerminalUnseenOutput.Source] = [], attention: Set<TerminalUnseenOutput.Source> = []
+        var current = selectedMachineID.map { TerminalUnseenOutput.Source(machineID: $0) }
+        for id in navigationMachineIDs {
+            let machine = TerminalUnseenOutput.Source(machineID: id)
+            let reasons = attentionReasons(id)
+            ring.append(machine)
+            // Machine-wide warnings belong to the machine, never an invented
+            // pane attribution. The selected machine already shows its notice.
+            if id != selectedMachineID, !reasons.subtracting([.newOutput]).isEmpty { attention.insert(machine) }
+            if let session = sessions[id], session.phase == .live, let state = session.muxControl?.current,
+               !state.panes.isEmpty {
+                for pane in state.panes {
+                    let source = TerminalUnseenOutput.Source(machineID: id, paneID: pane.paneId)
+                    ring.append(source)
+                    if id == selectedMachineID, pane.paneId == state.shown { current = source }
+                    else if status(of: id) == .live, state.unread.contains(pane.paneId) { attention.insert(source) }
+                }
+            } else if reasons.contains(.newOutput) { attention.insert(machine) }
+        }
+        return TerminalUnseenOutput.next(after: current, ring: ring, unseen: attention)
+    }
+
+    /// Both shortcuts capture the original controller and exact pane plan
+    /// before yielding. Reconnecting, inventory replacement, and A -> B -> A
+    /// cannot turn the click into a visit to a replacement pane with its number.
+    private func visitFleetSource(_ source: TerminalUnseenOutput.Source) {
+        let session = sessions[source.machineID]
+        let target: TerminalFleetVisit
+        do {
+            var pane: TerminalMuxInputRouting.NavigationPlan?
+            if let paneID = source.paneID {
+                guard session?.phase == .live, let control = session?.muxControl else {
+                    throw TerminalNavigationError.stale
+                }
+                pane = try control.inputRouting.navigation(pane: paneID)
+            }
+            target = try .init(machineID: source.machineID, sessionID: session?.id, pane: pane)
+        } catch { report(error); return }
         let appearance = appearanceGeneration
         Task {
             do {
                 if target.machineID != self.selectedMachineID {
                     try await whileBusy {
                         guard self.appearanceGeneration == appearance, !self.groupAppearanceBlocksInput,
+                              self.foreground, self.onScreen, !self.overviewBlocksInput,
                               self.navigationMachineIDs.contains(target.machineID) else { throw TerminalNavigationError.stale }
+                        try target.validate(sessionID: self.sessions[target.machineID]?.id,
+                                            routing: self.sessions[target.machineID]?.muxControl?.inputRouting)
                         guard let plan = try self.navigation.navigation.plan(machineID: target.machineID) else { return }
                         try await self.navigation.perform(plan)
                     }
                 }
-                guard let paneID = target.paneID else { return }
+                guard self.appearanceGeneration == appearance, !self.closed, self.foreground, self.onScreen,
+                      !self.overviewBlocksInput, !self.groupAppearanceBlocksInput,
+                      self.selectedMachineID == target.machineID else { throw TerminalNavigationError.stale }
+                try target.validate(sessionID: self.sessions[target.machineID]?.id,
+                                    routing: self.sessions[target.machineID]?.muxControl?.inputRouting)
+                guard let pane = target.pane else { return }
                 // The machine's own view settles first, as after a chip tap.
                 for _ in 0..<40 {
                     guard self.appearanceGeneration == appearance, !self.closed, self.selectedMachineID == target.machineID,
-                          let session = self.selectedSession, session.phase == .live, let control = session.muxControl,
-                          control.current.panes.contains(where: { $0.paneId == paneID }) else {
+                          let session = self.selectedSession, session.phase == .live, let control = session.muxControl else {
                         throw TerminalNavigationError.stale
                     }
-                    if control.current.shown == paneID { return }
+                    try target.validate(sessionID: session.id, routing: control.inputRouting)
+                    if control.current.shown == pane.paneID { return }
                     await session.waitForOverviewPresentation()
+                    guard self.appearanceGeneration == appearance, !self.closed, self.foreground, self.onScreen,
+                          !self.overviewBlocksInput, !self.groupAppearanceBlocksInput,
+                          self.selectedMachineID == target.machineID,
+                          self.sessions[target.machineID] === session else { throw TerminalNavigationError.stale }
+                    try target.validate(sessionID: session.id, routing: control.inputRouting)
                     if !session.paneNavigationBusy {
-                        try await session.navigatePane(control.inputRouting.navigation(pane: paneID))
+                        try await session.navigatePane(pane)
                         return
                     }
                     try await Task.sleep(for: .milliseconds(50))
@@ -1673,6 +1755,9 @@ struct WorkspaceTerminalScreen: View {
                     .disabled(session.isViewingOnly || session.clipboardIsPresenting || session.localInputNeedsDecision)
             }
             Menu {
+                Button("Next Attention", systemImage: "exclamationmark.circle") { scene.showNextAttention() }
+                    .disabled(!scene.hasAttentionElsewhere)
+                    .accessibilityIdentifier("terminal.attention.menu")
                 Button("Hardware Keyboard…", systemImage: "keyboard") {
                     scene.beginOverview(panel: .hardwareKeyboard)
                 }
@@ -2161,8 +2246,22 @@ private struct MachineStrip: View {
                 .accessibilityHint("Shows the next machine or pane with output you have not seen.")
                 .accessibilityIdentifier("terminal.unseen.next")
             }
+            if scene.hasActionableAttentionElsewhere {
+                Button { withAnimation(.snappy) { scene.showNextAttention() } } label: {
+                    Image(systemName: "exclamationmark.circle.fill").font(.title3)
+                        .foregroundStyle(.orange)
+                        .frame(width: 44, height: 40)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .transition(.scale.combined(with: .opacity))
+                .accessibilityLabel("Next Attention")
+                .accessibilityHint("Visits input warnings, connection problems, and unseen output in machine and pane order.")
+                .accessibilityIdentifier("terminal.attention.next")
+            }
         }
         .animation(.snappy, value: scene.hasUnseenOutputElsewhere)
+        .animation(.snappy, value: scene.hasActionableAttentionElsewhere)
         .background(.ultraThinMaterial)
     }
 
@@ -2172,6 +2271,9 @@ private struct MachineStrip: View {
         let selected = machine.id == scene.selectedMachineID
         let status = scene.status(of: machine.id)
         let unseen = scene.hasUnseenOutput(machine.id)
+        let reasons = scene.attentionReasons(machine.id)
+        let attention = TerminalAttentionReason.allCases.filter { reasons.contains($0) }
+        let needsAction = attention.contains { $0 != .newOutput }
         return Button { withAnimation(.snappy) { scene.select(machine.id) } } label: {
             HStack(spacing: 7) {
                 StatusDot(status: status, accent: accent)
@@ -2189,11 +2291,14 @@ private struct MachineStrip: View {
                     Capsule().fill(Color.primary.opacity(0.07))
                 }
             }
-            .overlay(alignment: .topTrailing) { if unseen { UnseenBadge() } }
+            .overlay(alignment: .topTrailing) {
+                if needsAction { Image(systemName: "exclamationmark.circle.fill").foregroundStyle(.orange).font(.caption) }
+                else if unseen { UnseenBadge() }
+            }
             .contentShape(Capsule())
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("\(machine.name), \(Self.describe(status))\(unseen ? ", new output" : "")")
+        .accessibilityLabel(([machine.name, Self.describe(status)] + attention.map(\.label)).joined(separator: ", "))
         .accessibilityHint("Changes machines. One-finger horizontal swipes on the terminal do the same when mouse interaction is inactive.")
         .accessibilityAddTraits(selected ? .isSelected : [])
     }
@@ -2452,9 +2557,12 @@ final class WorkspaceCanvasView: UIView {
         }
         commands.append(UIKeyCommand(title: "Next New Output", action: #selector(nextUnseenOutput),
                                      input: "j", modifierFlags: .command))
+        commands.append(UIKeyCommand(title: "Next Attention", action: #selector(nextAttention),
+                                     input: "j", modifierFlags: [.command, .shift]))
         return commands
     }
     @objc private func nextUnseenOutput() { scene?.showNextUnseenOutput() }
+    @objc private func nextAttention() { scene?.showNextAttention() }
     @objc private func composeCommand() { scene?.selectedSession?.composeCommand() }
     @objc private func nextMachine() { scene?.stepMachine(forward: true) }
     @objc private func previousMachine() { scene?.stepMachine(forward: false) }
@@ -2548,7 +2656,7 @@ private struct WorkspaceFleetOverviewScreen: View {
                         Text("Machines").tag(TerminalFleetOverview.Scope.machines)
                         Text("Panes").tag(TerminalFleetOverview.Scope.panes)
                     }.pickerStyle(.segmented)
-                    Picker("Status at refresh", selection: $query.filter) {
+                    Picker("Show at refresh", selection: $query.filter) {
                         Text("Any status").tag(TerminalFleetOverview.Filter.all)
                         Text("Connected or signed in").tag(TerminalFleetOverview.Filter.connected)
                         Text("Needs attention").tag(TerminalFleetOverview.Filter.attention)
@@ -2670,8 +2778,11 @@ private struct WorkspaceFleetOverviewScreen: View {
                 if !row.detail.isEmpty { Text(verbatim: row.detail).font(.caption).foregroundStyle(.secondary).lineLimit(2) }
                 HStack(spacing: 6) {
                     Text(verbatim: row.status.label).foregroundStyle(.secondary)
-                    if row.newOutput { Text("New output").foregroundStyle(Color.accentColor) }
                 }.font(.caption2)
+                ForEach(TerminalAttentionReason.allCases.filter { row.attention.contains($0) }, id: \.self) { reason in
+                    Text(verbatim: reason.label).font(.caption2)
+                        .foregroundStyle(reason == .newOutput ? Color.accentColor : .orange)
+                }
             }
             Spacer(minLength: 0)
             if row.selected { Image(systemName: "checkmark.circle.fill").accessibilityLabel("Selected at refresh") }

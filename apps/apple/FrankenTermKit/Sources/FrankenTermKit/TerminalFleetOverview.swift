@@ -1,5 +1,36 @@
 import Foundation
 
+/// Evidence-backed reasons to visit a source. These are local observations,
+/// never guesses based on a terminal title or prompt-shaped output. Keeping
+/// them separate from connection status lets a live, reconnected machine
+/// retain an unresolved input warning.
+public enum TerminalAttentionReason: String, CaseIterable, Hashable, Sendable {
+    case inputUncertain, inputStopped, inputNotSent, keyboardDecision, connectionTrouble, newOutput
+
+    public var label: String {
+        switch self {
+        case .inputUncertain: "Input outcome unknown"
+        case .inputStopped: "Input stopped partway"
+        case .inputNotSent: "Input was not sent"
+        case .keyboardDecision: "Keyboard needs a decision"
+        case .connectionTrouble: "Connection needs attention"
+        case .newOutput: "New output"
+        }
+    }
+
+    public static func observed(input: TerminalInputDelivery = .init(), keyboardNeedsDecision: Bool = false,
+                                connectionNeedsAttention: Bool = false, newOutput: Bool = false) -> Set<Self> {
+        var result = Set<Self>()
+        if input.unanswered { result.insert(.inputUncertain) }
+        if input.stoppedPartway { result.insert(.inputStopped) }
+        if input.unsent { result.insert(.inputNotSent) }
+        if keyboardNeedsDecision { result.insert(.keyboardDecision) }
+        if connectionNeedsAttention { result.insert(.connectionTrouble) }
+        if newOutput { result.insert(.newOutput) }
+        return result
+    }
+}
+
 /// A bounded, immutable index of already-known machines and mux panes. Building
 /// or searching it performs no discovery, authentication, terminal creation, or
 /// rendering. A result is a navigation candidate, never permission to send input.
@@ -53,12 +84,15 @@ public struct TerminalFleetOverview: Identifiable, Sendable {
         public let selectedPaneID: Int?
         /// The machine printed while off screen, as its strip chip marks it.
         public let newOutput: Bool
+        /// Machine-scoped input/recovery notices do not claim which mux pane
+        /// received a past operation, and are not copied to every pane row.
+        public let attention: Set<TerminalAttentionReason>
         public init(id: String, name: String, endpoint: String, status: Status,
                     sessionID: UUID? = nil, panes: [Pane] = [], selectedPaneID: Int? = nil, newOutput: Bool = false,
-                    tags: [String] = []) {
+                    tags: [String] = [], attention: Set<TerminalAttentionReason> = []) {
             self.id = id; self.name = name; self.endpoint = endpoint; self.status = status
             self.sessionID = sessionID; self.panes = panes; self.selectedPaneID = selectedPaneID
-            self.newOutput = newOutput; self.tags = tags
+            self.newOutput = newOutput; self.tags = tags; self.attention = attention
         }
     }
     public struct Query: Hashable, Sendable {
@@ -85,6 +119,7 @@ public struct TerminalFleetOverview: Identifiable, Sendable {
         public let paneID: Int?
         public let selected: Bool
         public let newOutput: Bool
+        public let attention: Set<TerminalAttentionReason>
     }
     public struct Results: Sendable {
         public let rows: [Row]
@@ -135,10 +170,13 @@ public struct TerminalFleetOverview: Identifiable, Sendable {
                 throw Failure.invalidInventory
             }
             let machineSearch = try index(([machine.id, machine.name, machine.endpoint] + machine.tags).joined(separator: "\n"))
+            let attention = machine.attention.union(TerminalAttentionReason.observed(
+                connectionNeedsAttention: machine.status == .attention || machine.status == .unavailable,
+                newOutput: machine.newOutput))
             let machineRow = Row(id: Choice(owner: owner, offset: entries.count), machineID: machine.id,
                 machineName: machine.name, title: machine.name, detail: machine.endpoint,
                 status: machine.status, paneID: nil, selected: machine.id == selectedMachineID,
-                newOutput: machine.newOutput)
+                newOutput: machine.newOutput, attention: attention)
             entries.append(IndexedRow(row: machineRow, target: .machine(machine.id),
                 machineSearch: machineSearch, paneSearch: ""))
             var paneIDs = Set<Int>()
@@ -157,7 +195,7 @@ public struct TerminalFleetOverview: Identifiable, Sendable {
                     machineName: machine.name, title: title.isEmpty ? fallback : title, detail: detail,
                     status: machine.status, paneID: pane.plan.paneID,
                     selected: machine.id == selectedMachineID && machine.selectedPaneID == pane.plan.paneID,
-                    newOutput: pane.newOutput)
+                    newOutput: pane.newOutput, attention: pane.newOutput ? [.newOutput] : [])
                 entries.append(IndexedRow(row: row,
                     target: .pane(machineID: machine.id, sessionID: sessionID, plan: pane.plan),
                     machineSearch: machineSearch, paneSearch: paneSearch))
@@ -184,7 +222,7 @@ public struct TerminalFleetOverview: Identifiable, Sendable {
             if query.scope == .machines && row.paneID != nil { continue }
             if query.scope == .panes && row.paneID == nil { continue }
             if query.filter == .connected && row.status != .live && row.status != .ready { continue }
-            if query.filter == .attention && row.status != .attention { continue }
+            if query.filter == .attention && row.attention.isEmpty { continue }
             if query.filter == .newOutput && !row.newOutput { continue }
             guard terms.allSatisfy({ entry.machineSearch.contains($0) || entry.paneSearch.contains($0) }) else { continue }
             count += 1

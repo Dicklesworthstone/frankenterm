@@ -93,7 +93,7 @@ final class TerminalFleetOverviewTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(try catalog.search(.init(text: "fleet", scope: .machines)).rows.map(\.machineID), ["zeta", "beta", "ready"])
         XCTAssertEqual(try catalog.search(.init(text: "fleet", scope: .panes)).rows.map(\.paneID), [9, 3])
         XCTAssertEqual(try catalog.search(.init(text: "fleet", filter: .connected)).rows.map(\.machineID), ["zeta", "zeta", "zeta", "ready"])
-        XCTAssertEqual(try catalog.search(.init(text: "fleet", filter: .attention)).rows.map(\.machineID), ["beta"])
+        XCTAssertEqual(try catalog.search(.init(text: "fleet", filter: .attention)).rows.map(\.machineID), ["beta", "ready"])
         XCTAssertEqual(try catalog.search(.init(text: "fleet", filter: .newOutput)).rows.map(\.machineID), ["ready"])
         let limited = try catalog.search(.init(text: "fleet"), limit: 2)
         XCTAssertEqual(limited.matchingCount, 5); XCTAssertTrue(limited.limited)
@@ -141,7 +141,7 @@ final class TerminalFleetOverviewTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(try catalog.search(.init(scope: .machines)).matchingCount, 6)
         XCTAssertEqual(try catalog.search(.init(scope: .panes)).matchingCount, 3)
         XCTAssertEqual(try catalog.search(.init(scope: .machines, filter: .connected)).rows.map(\.machineID), ["alpha", "ready"])
-        XCTAssertEqual(try catalog.search(.init(filter: .attention)).rows.map(\.machineID), ["attention"])
+        XCTAssertEqual(try catalog.search(.init(filter: .attention)).rows.map(\.machineID), ["attention", "unavailable"])
         XCTAssertEqual(try catalog.search(.init(scope: .panes, filter: .attention)).matchingCount, 0)
     }
 
@@ -167,6 +167,62 @@ final class TerminalFleetOverviewTests: XCTestCase, @unchecked Sendable {
         let all = try catalog.search().rows
         XCTAssertEqual(all.filter(\.newOutput).count, 4, "every row carries its own mark")
         XCTAssertFalse(try XCTUnwrap(all.first { $0.machineID == "quiet" }).newOutput)
+    }
+
+    func testUncertainInputRemainsAttentionOnAConnectedMachineWithoutBlamingEveryPane() throws {
+        let (machine, _, session) = try machine()
+        var input = TerminalInputDelivery()
+        input.endedUnanswered()
+        let value = TerminalFleetOverview.Machine(id: machine.id, name: machine.name, endpoint: machine.endpoint,
+            status: .live, sessionID: session, panes: machine.panes,
+            attention: TerminalAttentionReason.observed(input: input, keyboardNeedsDecision: true))
+        let catalog = try TerminalFleetOverview(machines: [value])
+        let attention = try catalog.search(.init(filter: .attention)).rows
+        XCTAssertEqual(attention.count, 1)
+        XCTAssertEqual(attention.first?.status, .live, "an input warning must not falsify connection state")
+        XCTAssertEqual(attention.first?.attention, [.inputUncertain, .keyboardDecision])
+        XCTAssertNil(attention.first?.paneID, "a machine-scoped notice is not evidence against every pane")
+        XCTAssertTrue(try catalog.search(.init(scope: .panes, filter: .attention)).rows.isEmpty)
+        XCTAssertTrue(try catalog.search(.init(filter: .newOutput)).rows.isEmpty)
+        XCTAssertEqual(try catalog.search(.init(filter: .connected)).matchingCount, 4)
+    }
+
+    func testAttentionFilterCombinesExplicitReasonsAndUnreadPanesInStableOrder() throws {
+        let (value, routing, session) = try machine(ids: [30, 2, 8])
+        let panes = try value.panes.map { pane in
+            TerminalFleetOverview.Pane(plan: try routing.navigation(pane: pane.plan.paneID), title: pane.title,
+                                      newOutput: pane.plan.paneID == 2)
+        }
+        let warned = TerminalFleetOverview.Machine(id: value.id, name: value.name, endpoint: value.endpoint,
+            status: .live, sessionID: session, panes: panes, newOutput: true, attention: [.inputStopped])
+        let failed = TerminalFleetOverview.Machine(id: "failed", name: "Failed", endpoint: "host", status: .attention)
+        let disconnected = TerminalFleetOverview.Machine(id: "manual", name: "Manual", endpoint: "host", status: .disconnected)
+        let catalog = try TerminalFleetOverview(machines: [warned, disconnected, failed])
+        let rows = try catalog.search(.init(filter: .attention)).rows
+        XCTAssertEqual(rows.map(\.machineID), ["alpha", "alpha", "failed"])
+        XCTAssertEqual(rows.map(\.paneID), [nil, 2, nil])
+        XCTAssertEqual(rows[0].attention, [.inputStopped, .newOutput])
+        XCTAssertEqual(rows[1].attention, [.newOutput])
+        XCTAssertEqual(rows[2].attention, [.connectionTrouble])
+        let prefix = try catalog.search(.init(filter: .attention), limit: 1)
+        XCTAssertEqual(prefix.matchingCount, 3); XCTAssertTrue(prefix.limited)
+        XCTAssertEqual(prefix.rows.first?.machineID, "alpha")
+        XCTAssertEqual(try catalog.search(.init(filter: .newOutput)).rows.map(\.paneID), [nil, 2])
+        XCTAssertEqual(try catalog.search(.init(text: "manual", filter: .attention)).matchingCount, 0,
+                       "a deliberate disconnected state is not a failure")
+    }
+
+    func testAttentionSnapshotDoesNotChangeWhenLaterInputIsDismissed() throws {
+        var input = TerminalInputDelivery()
+        input.endedUnanswered()
+        let reason = TerminalAttentionReason.observed(input: input)
+        let catalog = try TerminalFleetOverview(machines: [.init(id: "alpha", name: "Alpha", endpoint: "host",
+            status: .live, attention: reason)])
+        input = .init()
+        XCTAssertTrue(TerminalAttentionReason.observed(input: input).isEmpty)
+        XCTAssertEqual(try catalog.search(.init(filter: .attention)).rows.first?.attention, [.inputUncertain],
+                       "the overview explicitly describes the state at refresh")
+        XCTAssertEqual(TerminalAttentionReason.allCases.filter { reason.contains($0) }.map(\.label), ["Input outcome unknown"])
     }
 
     func testResultsLimitReportsTheFullMatchCountAndKeepsStablePrefix() throws {

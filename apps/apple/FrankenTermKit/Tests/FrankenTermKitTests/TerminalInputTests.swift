@@ -438,6 +438,8 @@ final class TerminalInputTests: XCTestCase, @unchecked Sendable {
             XCTAssertTrue(delivery.unsent, "the queued input never left (\(answer))")
             XCTAssertEqual(delivery.unanswered, unanswered, "the written input's arrival is unknown (\(answer))")
             XCTAssertFalse(delivery.stoppedPartway)
+            XCTAssertEqual(TerminalAttentionReason.observed(input: delivery),
+                           unanswered ? [.inputNotSent, .inputUncertain] : [.inputNotSent])
             // A mux server's confirmation, and its pane's own notice, speak for written input.
             var mux = TerminalInputDelivery()
             mux.record(outcomes, serverConfirms: true)
@@ -465,6 +467,8 @@ final class TerminalInputTests: XCTestCase, @unchecked Sendable {
         var delivery = TerminalInputDelivery()
         delivery.record(outcomes)
         XCTAssertTrue(delivery.isEmpty)
+        XCTAssertTrue(TerminalAttentionReason.observed(input: delivery).isEmpty,
+                      "transport acceptance and terminal replies do not invent an attention event")
         XCTAssertNil(delivery.message(machine: "Alpha"))
         delivery.endedUnanswered()
         XCTAssertEqual(delivery.message(machine: "Alpha"),
@@ -479,6 +483,7 @@ final class TerminalInputTests: XCTestCase, @unchecked Sendable {
         var stopped = TerminalInputDelivery()
         stopped.record(try await pasting.takeOutcomes(pasteSource))
         XCTAssertTrue(stopped.stoppedPartway)
+        XCTAssertEqual(TerminalAttentionReason.observed(input: stopped), [.inputStopped])
         XCTAssertFalse(stopped.unsent || stopped.unanswered)
         XCTAssertEqual(stopped.message(machine: "Alpha"),
                        "Some input was stopped after only part of it was sent. Nothing is sent again by itself: check the screen before you type it again.")

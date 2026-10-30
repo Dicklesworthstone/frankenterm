@@ -1466,6 +1466,8 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertFalse(again === first)
         XCTAssertEqual(again.phase, .live)
         XCTAssertEqual(again.inputDelivery, first.inputDelivery, "a new live terminal does not erase it")
+        XCTAssertTrue(scene.attentionReasons("alpha").contains(.inputUncertain),
+                      "reconnected machines remain in Needs Attention until their input notice is dismissed")
         let fresh = try shown(again)
         defer { fresh.removeFromSuperview() }
         try await type("echo SEEN-$((40+2))", into: fresh)
@@ -1473,6 +1475,7 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertFalse(shows(seen, "LOST-\(run)"), "the lost line was not typed again (screen: \(seen))")
         again.dismissInputDelivery()
         XCTAssertTrue(again.inputDelivery.isEmpty)
+        XCTAssertFalse(scene.attentionReasons("alpha").contains(.inputUncertain))
 
         // Input the machine answered is not reported when the connection drops.
         try await Task.sleep(for: .milliseconds(500))
@@ -1964,6 +1967,44 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertFalse(refused.shellOnly, "a machine with only a mux route never gets a new shell")
         await only.scene.close()
         await assertReleased(refused, connections: only.connections)
+    }
+
+    /// Failed connections are useful attention destinations even without any
+    /// output or pane inventory. Visiting them must not reconnect or resend.
+    func testNextAttentionVisitsFailuresInMachineOrderWithoutRetryingThem() async throws {
+        let live = try await liveScene(muxCommand: "false"), scene = live.scene
+        let alpha = try await connect(scene, "alpha"), beta = try await connect(scene, "beta")
+        for _ in 0..<200 where !alpha.settled || !beta.settled {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertTrue(alpha.settled); XCTAssertTrue(beta.settled)
+        XCTAssertEqual(scene.status(of: "alpha"), .attention)
+        XCTAssertEqual(scene.status(of: "beta"), .attention)
+        XCTAssertEqual(scene.selectedMachineID, "alpha")
+        XCTAssertTrue(scene.hasAttentionElsewhere)
+        XCTAssertTrue(scene.hasActionableAttentionElsewhere)
+        XCTAssertFalse(scene.hasUnseenOutputElsewhere, "the existing New Output shortcut has no work")
+        scene.showNextAttention()
+        for _ in 0..<200 where scene.selectedMachineID != "beta" || scene.navigation.phase == .switching {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertEqual(scene.selectedMachineID, "beta")
+        XCTAssertTrue(scene.sessions["alpha"] === alpha)
+        XCTAssertTrue(scene.sessions["beta"] === beta)
+        scene.showNextAttention()
+        for _ in 0..<200 where scene.selectedMachineID != "alpha" || scene.navigation.phase == .switching {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertEqual(scene.selectedMachineID, "alpha", "a deliberate second action wraps in imported order")
+        XCTAssertTrue(scene.sessions["alpha"] === alpha)
+        XCTAssertTrue(scene.sessions["beta"] === beta)
+        scene.showNextUnseenOutput()
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(scene.selectedMachineID, "alpha", "New Output still ignores connection-only attention")
+        XCTAssertNil(scene.problem)
+        await scene.close()
+        await assertReleased(alpha, connections: live.connections)
+        await assertReleased(beta, connections: live.connections)
     }
 
     /// The direct route's own creation policy decides that fallback: selecting
