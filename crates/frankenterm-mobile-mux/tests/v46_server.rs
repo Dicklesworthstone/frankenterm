@@ -628,7 +628,9 @@ fn a_current_mux_without_a_coherent_list_is_listed_plainly() {
     let mut harness = Harness::new(4, 20);
     harness.server.codec_vers = 71;
     harness.server.unfenced = true;
-    harness.attach();
+    // The unsupported coherent list must not invent a server incarnation.
+    harness.pump();
+    assert!(harness.session.is_ready());
     assert!(
         !harness
             .events
@@ -644,6 +646,22 @@ fn a_current_mux_without_a_coherent_list_is_listed_plainly() {
             "ListPanes"
         ]
     );
+    // Showing the pane separately obtains its authoritative v71 identity.
+    harness.session.show(harness.server.pane_id);
+    harness.pump();
+    assert_eq!(harness.server.requests[4], "GetPaneIdentityV1");
+    let incarnations: Vec<_> = harness
+        .events
+        .iter()
+        .filter_map(|event| {
+            if let Event::Incarnation { id } = event {
+                Some(*id)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(incarnations, [harness.server.incarnation]);
     assert_mirrored(&mut harness);
     harness.server.remove_pane();
     harness.pump();

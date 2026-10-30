@@ -29,10 +29,31 @@ private final class MuxTestClock: @unchecked Sendable {
 }
 
 final class NativeMuxClientTests: XCTestCase {
+    /// Complete codec-v71 PDU25, including the line envelope and sequence
+    /// fence required by GetPaneRenderStateV1 (114). A live PDU30 is only
+    /// the legacy PDU24 reply and cannot establish this observation.
+    private func renderObservation(serial: UInt64) -> Data {
+        var body: [UInt8] = [7, 0, 0, 0, 0, 0, 1] // pane, modes, cursor
+        body += [1, 1, 1, 0, 0, 96, 8, 16, 0] // dimensions, pixels, reverse video
+        body += [0, 0] + text("") + [0] // tiering, dirty ranges, title, working directory
+        body += [0, 0, 0, 0, 1] // lines, hyperlinks, images, input serial, sequence
+        return frame(ident: 25, serial: serial, body: body)
+    }
+
     private func events(_ client: NativeMuxClient) throws -> [TerminalMuxEvent] {
         var all: [TerminalMuxEvent] = []
         while let event = try client.nextEvent() { all.append(event) }
         return all
+    }
+
+    private func settleRender(_ client: NativeMuxClient, serial: UInt8) throws {
+        try client.receive(renderObservation(serial: UInt64(serial)))
+        let layout: [UInt8] = [1, 1, 1, 1, 0, 0, 96, 8, 16, 0]
+        XCTAssertEqual(try request(client, ident: 102, serial: serial + 1),
+                       [7] + layout + [1, 0, 1], "read row 0..<1 at exactly this layout")
+        // No retained line: the protocol renders the requested row as blank.
+        try client.receive(frame(ident: 103, serial: UInt64(serial + 1), body: [7] + layout + [0, 0, 0]))
+        XCTAssertTrue(try client.outgoing(limit: 4096).isEmpty)
     }
 
     /// These small fixture requests have one-byte lengths/serials/IDs; the
@@ -61,8 +82,8 @@ final class NativeMuxClientTests: XCTestCase {
         _ = try request(client, ident: 117, serial: 4)
         let identity = run + [UInt8](repeating: 0xd1, count: 16) + [UInt8](repeating: 0x27, count: 16)
         try client.receive(frame(ident: 118, serial: 4, body: [7, 0] + identity + [0]))
-        _ = try request(client, ident: 24, serial: 5)
-        try client.receive(frame(ident: 30, serial: 5, body: [7, 1]))
+        XCTAssertEqual(try request(client, ident: 114, serial: 5), [7])
+        try settleRender(client, serial: 5)
         _ = try events(client)
         return client
     }
@@ -212,9 +233,9 @@ final class NativeMuxClientTests: XCTestCase {
     func testNoEffectRetryUsesTheSameOperationOnlyWhenItsClockWakeIsDue() throws {
         let clock = MuxTestClock(), client = try currentClient(clock: clock)
         try client.write(pane: 7, bytes: Data("abc".utf8))
-        let original = try request(client, ident: 100, serial: 6)
+        let original = try request(client, ident: 100, serial: 7)
         // ReliableWrite Retry(DefinitelyNotApplied), input serial 1.
-        try client.receive(frame(ident: 101, serial: 6, body: [7, 1, 2, 1] + leb(5_000_000)))
+        try client.receive(frame(ident: 101, serial: 7, body: [7, 1, 2, 1] + leb(5_000_000)))
         try client.write(pane: 7, bytes: Data([0x1b, 0x5b, 0x41]))
         XCTAssertEqual(try client.pollInputTimer(), Duration.milliseconds(5))
         XCTAssertTrue(try client.outgoing(limit: 4096).isEmpty)
@@ -223,12 +244,12 @@ final class NativeMuxClientTests: XCTestCase {
         XCTAssertTrue(try client.outgoing(limit: 4096).isEmpty, "neither retry nor later key may escape early")
         clock.set(5_000_000)
         _ = try client.pollInputTimer()
-        XCTAssertEqual(try request(client, ident: 100, serial: 7), original,
+        XCTAssertEqual(try request(client, ident: 100, serial: 8), original,
                        "new RPC serial, identical pane registration/input serial/payload")
         XCTAssertTrue(try client.unansweredInput(pane: 7))
-        try client.receive(frame(ident: 101, serial: 7, body: [7, 1, 0, 3]))
-        _ = try request(client, ident: 96, serial: 8)
-        try client.receive(frame(ident: 97, serial: 8, body: [7, 4, 0]))
+        try client.receive(frame(ident: 101, serial: 8, body: [7, 1, 0, 3]))
+        _ = try request(client, ident: 96, serial: 9)
+        try client.receive(frame(ident: 97, serial: 9, body: [7, 4, 0]))
         XCTAssertNil(try client.pollInputTimer())
         XCTAssertFalse(try client.unansweredInput(pane: 7))
     }
@@ -236,7 +257,7 @@ final class NativeMuxClientTests: XCTestCase {
     func testMissingReceiptExpiresWithoutReplayAndRetainsUnansweredState() throws {
         let clock = MuxTestClock(), client = try currentClient(clock: clock)
         try client.write(pane: 7, bytes: Data("possibly applied".utf8))
-        _ = try request(client, ident: 100, serial: 6)
+        _ = try request(client, ident: 100, serial: 7)
         clock.set(5_000_000_000)
         XCTAssertThrowsError(try client.pollInputTimer()) { XCTAssertEqual($0 as? TerminalModelError, .closed) }
         XCTAssertTrue(try client.outgoing(limit: 4096).isEmpty)
@@ -249,8 +270,8 @@ final class NativeMuxClientTests: XCTestCase {
     func testAClockRegressionCannotSendTheQueuedRetry() throws {
         let clock = MuxTestClock(), client = try currentClient(clock: clock)
         try client.write(pane: 7, bytes: Data("pending".utf8))
-        _ = try request(client, ident: 100, serial: 6)
-        try client.receive(frame(ident: 101, serial: 6, body: [7, 1, 2, 1] + leb(5_000_000)))
+        _ = try request(client, ident: 100, serial: 7)
+        try client.receive(frame(ident: 101, serial: 7, body: [7, 1, 2, 1] + leb(5_000_000)))
         clock.set(100)
         _ = try client.pollInputTimer()
         clock.set(99)
@@ -273,12 +294,12 @@ final class NativeMuxClientTests: XCTestCase {
         let identity = run + [UInt8](repeating: 0xd1, count: 16) + [UInt8](repeating: 0x27, count: 16)
         try client.receive(frame(ident: 118, serial: 4, body: [7, 0] + identity + [0]))
         _ = try events(client)
-        // ErrorResponse v1 for GetPaneRenderChanges (24): RESOURCE_BUSY (12),
+        // ErrorResponse v1 for GetPaneRenderStateV1 (114): RESOURCE_BUSY (12),
         // no object, NOT_APPLIED (1), SAFE_AFTER_BACKOFF (2).
-        let busy: [UInt8] = [1, 24, 12, 0, 1, 2]
+        let busy: [UInt8] = [1, 114, 12, 0, 1, 2]
         var serial: UInt8 = 5
         for refusal in 1...3 {
-            _ = try request(client, ident: 24, serial: serial)
+            XCTAssertEqual(try request(client, ident: 114, serial: serial), [7])
             try client.receive(frame(ident: 0, serial: UInt64(serial), body: busy))
             XCTAssertEqual(try events(client), refusal < 3 ? [] : [.paneWaiting(paneID: 7, waiting: true)],
                            "after \(refusal) refusal(s)")
@@ -288,9 +309,22 @@ final class NativeMuxClientTests: XCTestCase {
             _ = try client.pollInputTimer()
             serial += 1
         }
-        _ = try request(client, ident: 24, serial: serial)
-        try client.receive(frame(ident: 30, serial: UInt64(serial), body: [7, 1]))
-        XCTAssertEqual(try events(client), [.paneWaiting(paneID: 7, waiting: false)])
+        try client.receive(renderObservation(serial: 0))
+        XCTAssertEqual(try events(client), [.paneTitle(paneID: 7, title: ""),
+                                            .mouseGrab(paneID: 7, grabbed: false)],
+                       "unsolicited output may update metadata but cannot settle the pending read")
+        XCTAssertEqual(try request(client, ident: 114, serial: serial), [7])
+        try settleRender(client, serial: serial)
+        let settled = try events(client)
+        XCTAssertEqual(settled.filter { if case .paneWaiting = $0 { return true }; return false },
+                       [.paneWaiting(paneID: 7, waiting: false)])
+        XCTAssertFalse(settled.contains { if case .failed = $0 { return true }; return false })
+        XCTAssertTrue(settled.contains {
+            if case let .output(paneID, rows, columns, bytes) = $0 {
+                return paneID == 7 && rows == 1 && columns == 1 && !bytes.isEmpty
+            }
+            return false
+        }, "the recovered pane must actually draw")
         XCTAssertNil(try client.pollInputTimer(), "nothing is left to repeat")
     }
 

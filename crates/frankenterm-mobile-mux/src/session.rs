@@ -2263,6 +2263,12 @@ impl Session {
                             Err(_) => (wire::decode::<RenderHead>(&frame.body)?, None),
                         }
                     };
+                    // Only an accepted, correlated observation settles the
+                    // repeated request. Unsolicited output must not clear a
+                    // busy indication while its requested read is pending.
+                    if correlated {
+                        self.render_read_answered(pane_id);
+                    }
                     self.update_title(pane_id, &head.title);
                     let grabbed = head.mouse_grabbed;
                     if self.grabs.insert(pane_id, grabbed) != Some(grabbed) {
@@ -2376,17 +2382,7 @@ impl Session {
                             .get(&pane_id)
                             .is_some_and(|retry| retry.due_ns.is_none())
                     {
-                        // The repeat was answered; a later refusal starts over.
-                        if self
-                            .render_retries
-                            .remove(&pane_id)
-                            .is_some_and(|retry| retry.refusals >= WAITING_AFTER_REFUSALS)
-                        {
-                            self.events.push_back(Event::PaneWaiting {
-                                pane_id,
-                                waiting: false,
-                            });
-                        }
+                        self.render_read_answered(pane_id);
                     }
                     if let Some(Request::Poll { pane_id }) = request {
                         if let Some(mirror) = self.mirrors.get_mut(&pane_id) {
@@ -2552,6 +2548,23 @@ impl Session {
             _ => {}
         }
         Ok(())
+    }
+
+    fn render_read_answered(&mut self, pane_id: usize) {
+        if self
+            .render_retries
+            .get(&pane_id)
+            .is_some_and(|retry| retry.due_ns.is_none())
+            && self
+                .render_retries
+                .remove(&pane_id)
+                .is_some_and(|retry| retry.refusals >= WAITING_AFTER_REFUSALS)
+        {
+            self.events.push_back(Event::PaneWaiting {
+                pane_id,
+                waiting: false,
+            });
+        }
     }
 
     fn become_ready(&mut self, server_version: String) {
