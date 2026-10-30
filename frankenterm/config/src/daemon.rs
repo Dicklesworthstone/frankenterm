@@ -10,7 +10,7 @@ pub struct DaemonOptions {
     /// exclusive lease on `<socket_path>.lock` before binding, so a second
     /// server on the same socket already fails fast, and nothing reads this.
     #[dynamic(
-        deprecated = "has no effect: the mux server holds an exclusive lock on <socket_path>.lock, which already refuses a second server on the same socket"
+        deprecated = "it has no effect, because the mux server's exclusive lock on <socket_path>.lock already refuses a second server on the same socket"
     )]
     pub pid_file: Option<PathBuf>,
     pub stdout: Option<PathBuf>,
