@@ -51857,6 +51857,54 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     &config,
                                     frankenterm_core::policy::ActorKind::Robot,
                                 );
+                                if let Some(storage) = storage.as_ref() {
+                                    let engine =
+                                        frankenterm_core::policy::PolicyEngine::from_safety_config(
+                                            &config.safety,
+                                        );
+                                    let summary = bounded_send_text_summary(&engine, &text);
+                                    let mut input = build_mux_send_policy_input(
+                                        pane_id,
+                                        pane_info.as_ref(),
+                                        resolution.capabilities.clone(),
+                                        &summary,
+                                        &text,
+                                        frankenterm_core::policy::ActorKind::Robot,
+                                    );
+                                    engine
+                                        .populate_trauma_decision_with_cx(&cx, storage, &mut input)
+                                        .await;
+                                    if let Some(trauma) = input.trauma_decision.as_ref() {
+                                        let check = if trauma.should_intervene {
+                                            let message = if trauma.reason_code.as_deref()
+                                                == Some("history_unavailable")
+                                            {
+                                                "Recent command outcomes could not be verified."
+                                                    .to_string()
+                                            } else {
+                                                format!(
+                                                    "Command blocked after {} repeated failures.",
+                                                    trauma.repeat_count
+                                                )
+                                            };
+                                            frankenterm_core::dry_run::PolicyCheck::failed(
+                                                "trauma_guard",
+                                                message,
+                                            )
+                                        } else {
+                                            frankenterm_core::dry_run::PolicyCheck::passed(
+                                                "trauma_guard",
+                                                "No recurring command failure detected.",
+                                            )
+                                        };
+                                        report
+                                            .policy_evaluation
+                                            .get_or_insert_with(
+                                                frankenterm_core::dry_run::PolicyEvaluation::new,
+                                            )
+                                            .add_check(check);
+                                    }
+                                }
                                 report.warnings.extend(resolution.warnings);
                                 let public_report = send_dry_run_report_for_output(report);
                                 let response =
@@ -51950,6 +51998,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                 )
                                 .with_tuning(&config.tuning)
                                 .with_command_gate_config(config.safety.command_gate.clone())
+                                .with_trauma_guard_config(config.safety.trauma_guard.clone())
                                 .with_policy_rules(config.safety.rules.clone());
                                 // Serialize fresh authority reads and the entire
                                 // write/ENTER effect with reservation changes.
@@ -51978,7 +52027,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                 let capabilities = resolution.capabilities;
 
                                 let summary = bounded_send_text_summary(&engine, &text);
-                                let input = build_mux_send_policy_input(
+                                let mut input = build_mux_send_policy_input(
                                     pane_id,
                                     Some(&pane_info),
                                     capabilities,
@@ -51986,6 +52035,9 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     &text,
                                     ActorKind::Robot,
                                 );
+                                engine
+                                    .populate_trauma_decision_with_cx(&cx, &storage, &mut input)
+                                    .await;
 
                                 let decision = engine.authorize(&input);
                                 let decision = match resolve_inline_send_approval(
@@ -52019,6 +52071,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                 };
 
                                 let mut submit_before_text = None;
+                                let mut send_started_at_ms = None;
                                 let mut injection = match decision {
                                     PolicyDecision::Allow { .. } => {
                                         if use_verified_submit_path {
@@ -52028,6 +52081,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                         }
                                         // ft-xbnl0.2.3 tick 231: cx-first send_text. Reuses
                                         // the `cx` from the get_pane migration above (same scope).
+                                        send_started_at_ms = Some(now_ms_i64());
                                         let send_result = if use_verified_submit_path {
                                             match wezterm
                                                 .send_text_with_options_with_cx(
@@ -52248,6 +52302,11 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     None,
                                     Some(domain.clone()),
                                 );
+                                // wait_for/submit verification may finish after a
+                                // failure was captured; retain the dispatch boundary.
+                                if let Some(sent_at) = send_started_at_ms {
+                                    audit_record.ts = sent_at;
+                                }
                                 audit_record.input_summary =
                                     Some(frankenterm_core::policy::build_send_text_audit_summary(
                                         &text, None, None,

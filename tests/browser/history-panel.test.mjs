@@ -24,8 +24,9 @@ function fixture() {
   const html = readFileSync(new URL("../../crates/frankenterm-browser-ui/web/index.html", import.meta.url), "utf8");
   for (const [, id] of html.matchAll(/\bid="([^"]+)"/g)) nodes.set(id, new Node());
   const doc = { getElementById: (id) => nodes.get(id), createElement: (tag) => new Node(tag) };
-  const calls = [], inspected = [];
+  const calls = [], inspected = [], captures = [];
   const panel = mountHistorySearch({ document: doc, inspectPane: (id) => inspected.push(id),
+    inspectCapture: (capture) => captures.push(capture),
     readBody(path, signal) { let resolve; const promise = new Promise((r) => { resolve = r; }); calls.push({ path, signal, resolve }); return promise; } });
   const get = (id) => nodes.get(id);
   get("history-mode").value = "phrase";
@@ -36,7 +37,7 @@ function fixture() {
     await flush();
   };
   panel.open();
-  return { panel, get, calls, inspected, submit };
+  return { panel, get, calls, inspected, captures, submit };
 }
 
 test("search form submits the real endpoint query and displays ranked matches", async () => {
@@ -68,7 +69,7 @@ test("captured markup is inert text; live inspection binds exact large IDs", asy
   f.calls[0].resolve(wire); await flush();
   const item = f.get("history-results").children[0];
   assert.equal(item.children[1].textContent, text);
-  item.children[2].emit("click");
+  item.children[3].emit("click");
   assert.deepEqual(f.inspected, ["18446744073709551615"]);
   assert.equal(f.get("history-search").open, false);
   assert.equal(f.get("history-results").children.length, 0);
@@ -77,12 +78,12 @@ test("captured markup is inert text; live inspection binds exact large IDs", asy
 test("old result actions cannot open a pane after a replacement query", async () => {
   const f = fixture(); await f.submit();
   f.calls[0].resolve(envelope()); await flush();
-  const old = f.get("history-results").children[0].children[2];
+  const old = f.get("history-results").children[0].children[3];
   await f.submit("new");
   old.emit("click"); assert.deepEqual(f.inspected, []);
   f.calls[1].resolve(envelope([hit(5, 8)])); await flush();
   old.emit("click"); assert.deepEqual(f.inspected, []);
-  f.get("history-results").children[0].children[2].emit("click");
+  f.get("history-results").children[0].children[3].emit("click");
   assert.deepEqual(f.inspected, ["8"]);
 });
 
@@ -162,4 +163,43 @@ test("page wiring and hashed package include the search controller, panel and st
   assert.match(html, /<dialog id="history-search"/);
   const ids = [...html.matchAll(/\bid="([^"]+)"/g)].map((m) => m[1]);
   assert.equal(new Set(ids).size, ids.length);
+});
+
+
+test("historical inspection keeps exact segment, pane, time and stored length without opening current output", async () => {
+  const f = fixture();
+  await f.submit();
+  const wire = envelope([hit()])
+    .replace('"segment_id":3', '"segment_id":9223372036854775807')
+    .replace('"pane_id":7', '"pane_id":18446744073709551615')
+    .replace('"captured_at":1000', '"captured_at":9007199254740993')
+    .replace('"content_len":24', '"content_len":9007199254740993');
+  f.calls[0].resolve(wire); await flush();
+  const item = f.get("history-results").children[0];
+  assert.equal(item.children[2].textContent, "Open captured segment");
+  assert.match(item.children[3].textContent, /Open current output/);
+  item.children[2].emit("click");
+  assert.deepEqual(f.captures, [{
+    segmentId: "9223372036854775807", paneId: "18446744073709551615",
+    capturedAt: "9007199254740993", contentLength: "9007199254740993",
+  }]);
+  assert.deepEqual(f.inspected, []);
+  assert.equal(f.get("history-search").open, false);
+  assert.equal(f.get("history-results").children.length, 0);
+});
+
+test("historical actions from prior queries or closed dialogs cannot open another capture", async () => {
+  const f = fixture(); await f.submit();
+  f.calls[0].resolve(envelope()); await flush();
+  const old = f.get("history-results").children[0].children[2];
+  await f.submit("new");
+  old.emit("click"); assert.deepEqual(f.captures, []);
+  f.calls[1].resolve(envelope([hit(5, 8)])); await flush();
+  old.emit("click"); assert.deepEqual(f.captures, []);
+  const current = f.get("history-results").children[0].children[2];
+  current.emit("click");
+  assert.deepEqual(f.captures, [{ segmentId: "5", paneId: "8", capturedAt: "1000", contentLength: "24" }]);
+  current.emit("click"); old.emit("click");
+  assert.equal(f.captures.length, 1);
+  assert.deepEqual(f.inspected, []);
 });

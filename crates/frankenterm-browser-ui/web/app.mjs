@@ -433,6 +433,7 @@ async function main() {
     },
   });
   const historySearch = mountHistorySearch({
+    inspectCapture: (hit) => inspector.openCapture(hit),
     readBody: (path, signal) => readSnapshot(path, apiRoot, globalThis.fetch, signal, 8 * 1024 * 1024),
     inspectPane: (paneId) => {
       // Route the exact captured identity through the same validated native

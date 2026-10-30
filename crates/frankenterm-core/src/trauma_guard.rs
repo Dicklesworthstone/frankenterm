@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::bloom_filter::BloomFilter;
 use crate::edit_distance::jaro_winkler_str;
-use crate::patterns::Detection;
+use crate::patterns::{Detection, is_command_failure_event};
 use crate::sliding_window::{SlidingWindow, SlidingWindowConfig};
 
 // =============================================================================
@@ -140,7 +140,7 @@ pub struct TraumaEvent {
     /// Sorted unique command tokens used for Jaccard similarity.
     #[serde(default)]
     pub command_tokens: Vec<String>,
-    /// Sorted unique critical flags extracted from `command_tokens`.
+    /// Canonical critical flags, including ordered argument values, sorted for comparison.
     #[serde(default)]
     pub critical_flags: Vec<String>,
     /// Mutation epoch snapshot used to reset loop counting after functional edits.
@@ -303,6 +303,60 @@ impl TraumaState {
             .map_or(0, |window| window.count(now_ms))
     }
 
+    /// Evaluate a proposed command against completed failures without recording it.
+    ///
+    /// Only the trailing run of matching failed commands inside the signature
+    /// window is evidence. A signature must occur in every failure in that run;
+    /// Bloom membership and counts from other commands cannot authorize a block.
+    /// A threshold of three therefore permits the first three attempts and
+    /// intervenes before a fourth. Future-dated and expired events are ignored.
+    ///
+    /// This is a read-only decision: history, windows, mutation state, and
+    /// telemetry remain unchanged even when called repeatedly.
+    #[must_use]
+    pub fn evaluate_proposed_command(&self, now_ms: u64, command: &str) -> TraumaDecision {
+        let features = self.command_features(command);
+        let mut repeat_count = 0_u64;
+        let mut recurring_signatures: Vec<String> = Vec::new();
+
+        if features.command_fingerprint.is_empty() {
+            return TraumaDecision::allow(features.command_hash, 0, Vec::new());
+        }
+
+        for event in self.history.iter().rev() {
+            let Some(age_ms) = now_ms.checked_sub(event.timestamp_ms) else {
+                continue;
+            };
+            if age_ms >= self.config.signature_window.window_duration_ms {
+                continue;
+            }
+            if event.error_signatures.is_empty() || !self.is_trivial_variation(&features, event) {
+                break;
+            }
+
+            let common = if repeat_count == 0 {
+                normalize_signatures(&event.error_signatures)
+            } else {
+                recurring_signatures
+                    .iter()
+                    .filter(|signature| event.error_signatures.contains(signature))
+                    .cloned()
+                    .collect()
+            };
+            if common.is_empty() {
+                break;
+            }
+            recurring_signatures = common;
+            repeat_count = repeat_count.saturating_add(1);
+        }
+
+        if repeat_count >= self.config.loop_threshold && !recurring_signatures.is_empty() {
+            TraumaDecision::intervene(features.command_hash, repeat_count, recurring_signatures)
+        } else {
+            TraumaDecision::allow(features.command_hash, repeat_count, Vec::new())
+        }
+    }
+
     /// Record a command result using raw signatures.
     ///
     /// `error_signatures` should come from pattern detections (typically
@@ -344,14 +398,21 @@ impl TraumaState {
         }
     }
 
-    /// Record a command result from pattern detections.
+    /// Record a command result from explicit terminal failure detections.
+    ///
+    /// Provider/network/auth failures, prompts, usage notices, and compaction
+    /// events are not completed command failures and cannot train the guard.
     pub fn record_detections(
         &mut self,
         timestamp_ms: u64,
         command: &str,
         detections: &[Detection],
     ) -> TraumaDecision {
-        let signatures: Vec<String> = detections.iter().map(|d| d.rule_id.clone()).collect();
+        let signatures: Vec<String> = detections
+            .iter()
+            .filter(|d| is_command_failure_event(&d.event_type, d.severity))
+            .map(|d| d.rule_id.clone())
+            .collect();
         self.record_command_result(timestamp_ms, command, &signatures)
     }
 
@@ -451,7 +512,7 @@ impl TraumaState {
         };
 
         let command_tokens = tokenize_command(&command_fingerprint);
-        let critical_flags = extract_critical_flags(&command_tokens, &self.config.critical_flags);
+        let critical_flags = extract_critical_flags(command, &self.config.critical_flags);
 
         CommandFeatures {
             command_hash,
@@ -629,14 +690,74 @@ fn tokenize_command(command: &str) -> Vec<String> {
     tokens
 }
 
-fn extract_critical_flags(tokens: &[String], critical_flags: &[String]) -> Vec<String> {
-    let mut flags: Vec<String> = tokens
+fn extract_critical_flags(command: &str, critical_flags: &[String]) -> Vec<String> {
+    let Some(tokens) = shlex::split(command) else {
+        // An unfinished quote must not make distinct shell inputs fuzzy-equal.
+        return vec![format!("unparsed:{command}")];
+    };
+    let package_is_critical = critical_flags
         .iter()
-        .filter(|token| critical_flags.binary_search(token).is_ok())
-        .cloned()
-        .collect();
+        .any(|flag| matches!(flag.as_str(), "-p" | "--package"));
+    let mut tokens = tokens.into_iter().peekable();
+    let mut flags = Vec::new();
+    let mut occurrences: HashMap<String, usize> = HashMap::new();
+
+    while let Some(token) = tokens.next() {
+        if token == "--" {
+            break;
+        }
+        let (name, value) = token
+            .split_once('=')
+            .map_or((token.as_str(), None), |(name, value)| (name, Some(value)));
+        let (name, attached_value) = if package_is_critical && matches!(name, "-p" | "--package") {
+            ("--package", value)
+        } else if critical_flags.iter().any(|flag| flag == name) {
+            (name, value)
+        } else if package_is_critical && token.starts_with("-p") && token.len() > 2 {
+            ("--package", Some(&token[2..]))
+        } else if let Some(short) = critical_flags.iter().find(|flag| {
+            flag.len() == 2
+                && flag.starts_with('-')
+                && !flag.starts_with("--")
+                && token.starts_with(flag.as_str())
+                && token.len() > flag.len()
+        }) {
+            (short.as_str(), Some(&token[short.len()..]))
+        } else {
+            continue;
+        };
+
+        let boolean_flag = matches!(
+            name,
+            "--all"
+                | "--all-targets"
+                | "--workspace"
+                | "--lib"
+                | "--bins"
+                | "--tests"
+                | "--benches"
+                | "--release"
+        );
+        let value = attached_value.map(str::to_owned).or_else(|| {
+            if boolean_flag {
+                None
+            } else {
+                tokens.next_if(|next| !next.starts_with('-'))
+            }
+        });
+        let occurrence = occurrences.entry(name.to_string()).or_default();
+        *occurrence = occurrence.saturating_add(1);
+        let occurrence = *occurrence;
+        // Preserve operand case and repeated-option order. Sorting only bare
+        // flag names loses target changes such as "-p foo" -> "-p bar", while
+        // sorting repeated values loses last-option-wins semantics.
+        flags.push(value.map_or_else(
+            || format!("{name}[{occurrence}]"),
+            |value| format!("{name}[{occurrence}]={value}"),
+        ));
+    }
+
     flags.sort();
-    flags.dedup();
     flags
 }
 
@@ -698,6 +819,7 @@ fn fnv1a64(data: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::patterns::{AgentType, Severity};
     use proptest::prelude::*;
 
     fn test_config() -> TraumaConfig {
@@ -728,6 +850,330 @@ mod tests {
                 "--benches".to_string(),
                 "-p".to_string(),
             ],
+        }
+    }
+
+    #[test]
+    fn proposed_command_requires_three_completed_failures_and_does_not_mutate_state() {
+        let mut state = TraumaState::with_config(test_config());
+        let signatures = vec!["cargo.test.failed".to_string()];
+        for attempt in 0..3 {
+            let decision = state.evaluate_proposed_command(1_000 + attempt * 100, "cargo test");
+            assert!(!decision.should_intervene);
+            assert_eq!(decision.repeat_count, attempt);
+            state.record_command_result(1_000 + attempt * 100, "cargo test", &signatures);
+        }
+
+        let before = serde_json::to_vec(&state).unwrap();
+        let telemetry_before = state.telemetry().snapshot();
+        let fourth = state.evaluate_proposed_command(1_300, "cargo test");
+        assert!(fourth.should_intervene);
+        assert_eq!(fourth.repeat_count, 3);
+        assert_eq!(fourth.recurring_signatures, signatures);
+        assert_eq!(
+            fourth.reason_code.as_deref(),
+            Some(REASON_RECURRING_FAILURE_LOOP)
+        );
+        assert_eq!(fourth, state.evaluate_proposed_command(1_300, "cargo test"));
+        assert_eq!(serde_json::to_vec(&state).unwrap(), before);
+        assert_eq!(state.telemetry().snapshot(), telemetry_before);
+        assert_eq!(telemetry_before.commands_recorded, 3);
+    }
+
+    #[test]
+    fn proposed_command_matches_trivial_variations_but_not_a_changed_target() {
+        let mut state = TraumaState::with_config(test_config());
+        let signatures = vec!["cargo.test.failed".to_string()];
+        for (offset, command) in [
+            "cargo test -p foo",
+            "cargo test -p foo -v",
+            "cargo test -p foo --verbose",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            state.record_command_result(1_000 + offset as u64 * 100, command, &signatures);
+        }
+        assert!(
+            state
+                .evaluate_proposed_command(1_300, "cargo test -p foo")
+                .should_intervene
+        );
+        for command in [
+            "cargo test -p bar",
+            "cargo test -pbar",
+            "cargo test -p=bar",
+            "cargo test --package bar",
+            "cargo test --package=bar",
+            "cargo test -p Foo",
+            "cargo test --lib",
+            "cargo test --workspace",
+            "git status",
+        ] {
+            let decision = state.evaluate_proposed_command(1_300, command);
+            assert!(!decision.should_intervene, "{command}");
+            assert_eq!(decision.repeat_count, 0, "{command}");
+        }
+    }
+
+    #[test]
+    fn critical_flags_keep_operands_aliases_quoting_and_repeated_option_order() {
+        let flags = sanitize_config(test_config()).critical_flags;
+        for command in [
+            "cargo test -p foo",
+            "cargo test -pfoo",
+            "cargo test -p=foo",
+            "cargo test --package foo",
+            "cargo test --package=foo",
+            "cargo test --package 'foo'",
+        ] {
+            assert_eq!(
+                extract_critical_flags(command, &flags),
+                vec!["--package[1]=foo".to_string()],
+                "{command}"
+            );
+        }
+        assert_ne!(
+            extract_critical_flags("cargo test -p foo -p bar", &flags),
+            extract_critical_flags("cargo test -p bar -p foo", &flags)
+        );
+        assert_ne!(
+            extract_critical_flags("cargo test -p Foo", &flags),
+            extract_critical_flags("cargo test -p foo", &flags)
+        );
+        assert_ne!(
+            extract_critical_flags("cargo test -p", &flags),
+            extract_critical_flags("cargo test -p ''", &flags)
+        );
+        assert_ne!(
+            extract_critical_flags("cargo test -p 'foo", &flags),
+            extract_critical_flags("cargo test -p 'bar", &flags)
+        );
+        assert!(extract_critical_flags("cargo test -- -p foo", &flags).is_empty());
+
+        let mut custom = flags;
+        custom.push("--features".to_string());
+        assert_eq!(
+            extract_critical_flags("cargo test --features 'left,right'", &custom),
+            extract_critical_flags("cargo test --features=left,right", &custom)
+        );
+        assert_ne!(
+            extract_critical_flags("cargo test --features left", &custom),
+            extract_critical_flags("cargo test --features right", &custom)
+        );
+    }
+
+    #[test]
+    fn proposed_command_requires_a_common_signature_in_the_trailing_failure_run() {
+        let mut state = TraumaState::with_config(test_config());
+        state.record_command_result(900, "git status", &["a".to_string()]);
+        for (offset, signatures) in [
+            vec!["a".to_string(), "b".to_string()],
+            vec!["b".to_string(), "c".to_string()],
+            vec!["a".to_string(), "c".to_string()],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            state.record_command_result(1_000 + offset as u64 * 100, "cargo test", &signatures);
+        }
+        assert_eq!(state.signature_count("a", 1_300), 3);
+        assert!(state.was_signature_seen_recently("a"));
+        let decision = state.evaluate_proposed_command(1_300, "cargo test");
+        assert!(!decision.should_intervene);
+        assert_eq!(decision.repeat_count, 2);
+        assert!(decision.recurring_signatures.is_empty());
+    }
+
+    #[test]
+    fn proposed_command_does_not_borrow_failure_counts_from_other_commands() {
+        let mut state = TraumaState::with_config(test_config());
+        let signatures = vec!["shared.failure".to_string()];
+        for offset in 0..3 {
+            state.record_command_result(1_000 + offset * 100, "git status", &signatures);
+        }
+        for offset in 0..2 {
+            state.record_command_result(1_300 + offset * 100, "cargo test", &signatures);
+        }
+        assert_eq!(state.signature_count("shared.failure", 1_500), 5);
+        let decision = state.evaluate_proposed_command(1_500, "cargo test");
+        assert!(!decision.should_intervene);
+        assert_eq!(decision.repeat_count, 2);
+        assert!(decision.recurring_signatures.is_empty());
+    }
+
+    #[test]
+    fn proposed_command_stops_at_success_or_an_intervening_command_and_resets_on_mutation() {
+        let mut failures = TraumaState::with_config(test_config());
+        let signatures = vec!["cargo.test.failed".to_string()];
+        for offset in 0..3 {
+            failures.record_command_result(1_000 + offset * 100, "cargo test", &signatures);
+        }
+        assert!(
+            failures
+                .evaluate_proposed_command(1_300, "cargo test")
+                .should_intervene
+        );
+
+        let mut succeeded = failures.clone();
+        succeeded.record_command_result(1_250, "cargo test", &[]);
+        assert_eq!(
+            succeeded
+                .evaluate_proposed_command(1_300, "cargo test")
+                .repeat_count,
+            0
+        );
+
+        let mut changed = failures.clone();
+        changed.record_command_result(1_250, "git status", &signatures);
+        assert!(
+            !changed
+                .evaluate_proposed_command(1_300, "cargo test")
+                .should_intervene
+        );
+
+        let mut edited = failures.clone();
+        assert!(edited.record_mutation(1_250, "src/lib.rs"));
+        assert!(
+            !edited
+                .evaluate_proposed_command(1_300, "cargo test")
+                .should_intervene
+        );
+        assert!(!failures.record_mutation(1_250, "notes.md"));
+        assert!(
+            failures
+                .evaluate_proposed_command(1_300, "cargo test")
+                .should_intervene
+        );
+        assert!(
+            !failures
+                .evaluate_proposed_command(1_300, "   ")
+                .should_intervene
+        );
+    }
+
+    #[test]
+    fn proposed_command_uses_exact_time_bounds_and_ignores_future_history() {
+        let mut state = TraumaState::with_config(test_config());
+        let signatures = vec!["cargo.test.failed".to_string()];
+        for offset in 0..3 {
+            state.record_command_result(1_000 + offset * 100, "cargo test", &signatures);
+        }
+        assert!(
+            state
+                .evaluate_proposed_command(1_999, "cargo test")
+                .should_intervene
+        );
+        let boundary = state.evaluate_proposed_command(2_000, "cargo test");
+        assert!(!boundary.should_intervene);
+        assert_eq!(boundary.repeat_count, 2);
+        assert_eq!(
+            state
+                .evaluate_proposed_command(2_200, "cargo test")
+                .repeat_count,
+            0
+        );
+        assert_eq!(
+            state
+                .evaluate_proposed_command(999, "cargo test")
+                .repeat_count,
+            0
+        );
+
+        state.record_command_result(5_000, "cargo test", &signatures);
+        let with_future = state.evaluate_proposed_command(1_300, "cargo test");
+        assert!(with_future.should_intervene);
+        assert_eq!(with_future.repeat_count, 3);
+    }
+
+    #[test]
+    fn proposed_command_keeps_a_completed_failure_run_before_a_different_signature() {
+        let mut state = TraumaState::with_config(test_config());
+        state.record_command_result(900, "cargo test", &["other.failure".to_string()]);
+        for offset in 0..3 {
+            state.record_command_result(
+                1_000 + offset * 100,
+                "cargo test",
+                &["cargo.test.failed".to_string()],
+            );
+        }
+        let decision = state.evaluate_proposed_command(1_300, "cargo test");
+        assert!(decision.should_intervene);
+        assert_eq!(decision.repeat_count, 3);
+        assert_eq!(
+            decision.recurring_signatures,
+            vec!["cargo.test.failed".to_string()]
+        );
+    }
+
+    fn terminal_detection(event_type: &str, severity: Severity) -> Detection {
+        Detection {
+            rule_id: format!("test.{event_type}"),
+            agent_type: AgentType::Wezterm,
+            event_type: event_type.to_string(),
+            severity,
+            confidence: 1.0,
+            extracted: serde_json::Value::Null,
+            matched_text: String::new(),
+            span: (0, 0),
+        }
+    }
+
+    #[test]
+    fn only_explicit_warning_or_critical_command_failures_train_the_guard() {
+        for event_type in ["command.failed", "build.failed", "test.failed"] {
+            for severity in [Severity::Warning, Severity::Critical] {
+                let mut state = TraumaState::with_config(test_config());
+                let detection = terminal_detection(event_type, severity);
+                for offset in 0..3 {
+                    state.record_detections(
+                        1_000 + offset * 100,
+                        "cargo test",
+                        std::slice::from_ref(&detection),
+                    );
+                }
+                assert!(
+                    state
+                        .evaluate_proposed_command(1_300, "cargo test")
+                        .should_intervene,
+                    "{event_type} {severity:?}"
+                );
+            }
+        }
+        for (event_type, severity) in [
+            ("command.failed", Severity::Info),
+            ("build.failed", Severity::Info),
+            ("test.failed", Severity::Info),
+            ("provider.failed", Severity::Critical),
+            ("network.failed", Severity::Critical),
+            ("auth.failed", Severity::Critical),
+            ("prompt.ready", Severity::Warning),
+            ("compaction.completed", Severity::Warning),
+            ("usage.reached", Severity::Warning),
+            ("command.failed.extra", Severity::Critical),
+            ("error", Severity::Critical),
+        ] {
+            let mut state = TraumaState::with_config(test_config());
+            let detection = terminal_detection(event_type, severity);
+            for offset in 0..3 {
+                state.record_detections(
+                    1_000 + offset * 100,
+                    "cargo test",
+                    std::slice::from_ref(&detection),
+                );
+            }
+            assert!(
+                !state
+                    .evaluate_proposed_command(1_300, "cargo test")
+                    .should_intervene,
+                "{event_type} {severity:?}"
+            );
+            assert!(
+                state
+                    .recent_events()
+                    .iter()
+                    .all(|event| event.error_signatures.is_empty())
+            );
         }
     }
 

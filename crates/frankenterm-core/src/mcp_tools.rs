@@ -9848,6 +9848,14 @@ impl ToolHandler for WaSendTool {
                 None => None,
             };
 
+            // Reconciliation settles an existing receipt without sending new
+            // input. Automatic sends and previews share the durable retry gate.
+            if params.reconcile.is_none() {
+                engine
+                    .populate_trauma_decision_with_cx(&wezterm_cx, &storage, &mut input)
+                    .await;
+            }
+
             if params.dry_run {
                 tracing::debug!(phase = "preview_authorize", "wa.send request progress");
                 let decision = engine.authorize_preview(&input);

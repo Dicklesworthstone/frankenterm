@@ -42,7 +42,7 @@
       <button type="submit">Next</button>
       <button id="pane-output-previous" type="button">Previous</button>
     </form>
-    <span id="pane-output-find-help">Literal, case-sensitive search pauses the stream. Resume continues from the received cursor.</span>
+    <span id="pane-output-find-help">Literal, case-sensitive search. Following output pauses while finding text; Resume continues from the received cursor.</span>
     <span id="pane-output-find-status" role="status"></span>
     <textarea id="pane-output-text" readonly spellcheck="false" wrap="off" aria-label="Captured pane output, read-only" aria-describedby="pane-output-status pane-output-warnings"></textarea>
     <p class="output-note">Bounded captured text, not a terminal emulator. Select text to copy. Escape closes this view. Deleted history and database replacement cannot be recovered here.</p>
@@ -72,7 +72,7 @@
     <div class="output-toolbar"><button type="submit">Search</button><button id="history-cancel" type="button" disabled>Cancel request</button></div>
   </form>
   <p id="history-status" role="status" aria-live="polite"></p>
-  <p id="history-note">Ranked snippets are captured evidence, not current pane state. A historical pane may no longer exist or its ID may have been reused. Live output is read-only. Results are capped, not paginated; narrow the query for older matches. Closing clears this view.</p>
+  <p id="history-note">Open a captured segment to inspect that historical result without following a current pane. Deleted or changed captures appear unavailable. Opening current output is a separate action: the pane may no longer exist or its ID may have been reused. All views are read-only. Results are capped, not paginated; narrow the query for older matches. Closing clears this view.</p>
   <ol id="history-results" aria-label="Ranked captured-history matches"></ol>
 </dialog>
 <!-- The rendered fleet frame as text: for screen readers and browser tests. -->

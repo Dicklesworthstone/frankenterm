@@ -520,7 +520,12 @@ private actor MacExportEngine {
 
 private actor MacPhoneKeyEnrollmentWorker {
     func loadRequest(_ url: URL) throws -> WorkspaceKeyEnrollmentRequest {
-        try WorkspaceKeyEnrollmentRequest(data: SelectedLocalFile.read(url, limit: WorkspaceKeyEnrollmentRequest.maximumBytes))
+        let bytes = try SelectedLocalFile.read(url, limit: WorkspaceKeyEnrollmentJournal.maximumBytes)
+        if let request = try? WorkspaceKeyEnrollmentRequest(data: bytes) { return request }
+        // A saved public report preserves the original request needed for
+        // scoped removal. Its accounts and receipts are not new authority:
+        // the current workspace and the user must review targets again.
+        return try WorkspaceKeyEnrollmentJournal(data: bytes).request
     }
 
     private func storage(request: WorkspaceKeyEnrollmentRequest,
@@ -547,25 +552,25 @@ private actor MacPhoneKeyEnrollmentWorker {
         return saved
     }
 
-    func readResult(request: WorkspaceKeyEnrollmentRequest,
-                    target: WorkspaceKeyEnrollmentTarget) throws -> WorkspaceKeyEnrollmentResult? {
+    func readJournal(request: WorkspaceKeyEnrollmentRequest,
+                     target: WorkspaceKeyEnrollmentTarget) throws -> WorkspaceKeyEnrollmentJournal {
         try Task.checkCancellation()
         let persistence = try storage(request: request, target: target)
         return try persistence.withExclusiveAccess {
-            try journal(in: persistence, request: request, target: target).result(for: target.id)
+            try journal(in: persistence, request: request, target: target)
         }
     }
 
     func perform(request: WorkspaceKeyEnrollmentRequest, target: WorkspaceKeyEnrollmentTarget,
-                 action: WorkspaceKeyEnrollmentAction) throws -> WorkspaceKeyEnrollmentResult {
+                 action: WorkspaceKeyEnrollmentAction) throws -> WorkspaceKeyEnrollmentJournal {
         let persistence = try storage(request: request, target: target)
         return try persistence.withExclusiveAccess {
             var saved = try journal(in: persistence, request: request, target: target)
             try Task.checkCancellation()
-            if action == .install {
-                try saved.beginInstall(targetID: target.id)
-                // The uncertain receipt must reach durable storage before a
-                // remote edit. A failed write prevents all network effects.
+            if action != .inspect {
+                try saved.beginMutation(targetID: target.id, action: action)
+                // Both installation and removal publish their intent and
+                // uncertainty durably before any remote mutation can begin.
                 try persistence.write(saved.encoded(), to: .catalog)
             }
             let result: WorkspaceKeyEnrollmentResult
@@ -574,16 +579,16 @@ private actor MacPhoneKeyEnrollmentWorker {
                     isCancelled: { Task<Never, Never>.isCancelled })
             } catch {
                 result = try WorkspaceKeyEnrollmentResult(operationID: request.operationID(for: target), target: target,
-                    state: action == .install ? .uncertain : .blocked,
-                    detail: action == .install
-                        ? "The connection did not confirm the outcome. Reconcile this account before authorizing again."
+                    state: action != .inspect ? .uncertain : .blocked,
+                    detail: action != .inspect
+                        ? "The connection did not confirm the outcome. Reconcile this account before another change."
                         : "The account could not be inspected through this Mac's trusted SSH access.")
             }
             try saved.record(result, action: action)
             // A save error stops the batch, including after SSH succeeded.
             try persistence.write(saved.encoded(), to: .catalog)
-            guard let retained = saved.result(for: target.id) else { throw FTError.storage }
-            return retained
+            guard saved.result(for: target.id) != nil else { throw FTError.storage }
+            return saved
         }
     }
 
@@ -600,7 +605,11 @@ private struct MacPhoneKeyEnrollmentRow: Identifiable {
     var machines: [String]
     let target: WorkspaceKeyEnrollmentTarget?
     let unavailableReason: String?
-    var result: WorkspaceKeyEnrollmentResult?
+    var journal: WorkspaceKeyEnrollmentJournal?
+    var result: WorkspaceKeyEnrollmentResult? {
+        guard let target else { return nil }
+        return journal?.result(for: target.id)
+    }
 }
 
 @MainActor
@@ -617,6 +626,9 @@ private final class MacPhoneKeyEnrollmentModel {
     @ObservationIgnored private var workID: UUID?
     @ObservationIgnored private var windowOpen = false
     @ObservationIgnored private var active = false
+    @ObservationIgnored private var sceneActive = false
+    @ObservationIgnored private var sessionActive = true
+    @ObservationIgnored private var screensAwake = true
     @ObservationIgnored private var sourceDigest: Data?
     @ObservationIgnored private var reviewDigest: Data?
 
@@ -624,9 +636,10 @@ private final class MacPhoneKeyEnrollmentModel {
         let request: WorkspaceKeyEnrollmentRequest
         let sourceDigest: Data
         let targetIDs: [String]
+        let action: WorkspaceKeyEnrollmentAction
     }
 
-    var canAct: Bool { approval() != nil }
+    var canAct: Bool { approval(for: .inspect) != nil }
     var canSaveResults: Bool {
         !busy && request != nil && reviewDigest != nil && reviewDigest == sourceDigest
             && rows.contains { $0.target != nil }
@@ -635,10 +648,17 @@ private final class MacPhoneKeyEnrollmentModel {
 
     func open(isActive: Bool) { windowOpen = true; setActive(isActive) }
     func setActive(_ value: Bool) {
-        active = value && windowOpen
+        sceneActive = value; updateActivity()
+    }
+    func setSessionActive(_ value: Bool) { sessionActive = value; updateActivity() }
+    func setScreensAwake(_ value: Bool) { screensAwake = value; updateActivity() }
+    private func updateActivity() {
+        // A scene activation cannot override a still-locked login session or
+        // sleeping screens, and a screen wake cannot override a closed view.
+        active = windowOpen && sceneActive && sessionActive && screensAwake
         if !active { confirmedFingerprint = false; work?.cancel() }
     }
-    func close() { windowOpen = false; active = false; confirmedFingerprint = false; work?.cancel() }
+    func close() { windowOpen = false; sceneActive = false; updateActivity() }
     func closeAndWait() async {
         close()
         let pending = work
@@ -679,17 +699,17 @@ private final class MacPhoneKeyEnrollmentModel {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
         panel.allowedContentTypes = [.json, .data]
-        panel.title = "Open Phone Key Enrollment Request"
-        panel.message = "Choose the public .ftkeyrequest file exported by the phone. Compare its fingerprint directly with the phone before authorizing any account."
+        panel.title = "Open Phone Key Request or Results"
+        panel.message = "Choose the public .ftkeyrequest or a saved results JSON file. Verify its fingerprint against the phone or a trusted saved record. Removing an enrollment requires its original request; saved results preserve that request."
         guard panel.runModal() == .OK, let url = panel.url, windowOpen, active, !busy else { return }
         // Choosing another file retires the old candidate even if the new file
         // fails validation. An error must not leave the old key approved.
         request = nil; rows = []; selectedTargetIDs = []; reviewDigest = nil; confirmedFingerprint = false
-        perform(failure: "This file is not a valid public phone-key enrollment request.") { [self] token in
+        perform(failure: "This file is not a valid public phone-key enrollment request or saved results report.") { [self] token in
             let loaded = try await worker.loadRequest(url)
             try requireCurrent(token)
             request = loaded; rows = []; selectedTargetIDs = []; reviewDigest = nil; confirmedFingerprint = false
-            message = "Public key loaded. Review the selected machine accounts and compare the fingerprint with the phone."
+            message = "Public key loaded. Review the selected accounts and verify the fingerprint against the phone or a trusted saved record."
         }
     }
 
@@ -709,82 +729,114 @@ private final class MacPhoneKeyEnrollmentModel {
                 else {
                     existing[target.id] = candidates.count
                     candidates.append(.init(id: target.id, machines: [machine.name], target: target,
-                        unavailableReason: nil, result: nil))
+                        unavailableReason: nil, journal: nil))
                 }
             } catch {
                 let reason = (error as? WorkspaceKeyEnrollmentSSHError)?.localizedDescription
                     ?? "This route cannot preserve its current policy during direct phone-key enrollment."
                 candidates.append(.init(id: "unavailable:" + machine.id, machines: [machine.name],
-                    target: nil, unavailableReason: reason, result: nil))
+                    target: nil, unavailableReason: reason, journal: nil))
             }
         }
         rows = candidates; selectedTargetIDs = []; confirmedFingerprint = false; reviewDigest = nil
         perform(failure: "Saved enrollment receipts could not be verified. No server was contacted. Check local storage before continuing.") { [self] token in
             for target in candidates.compactMap({ $0.target }) {
                 try requireCurrent(token)
-                let restored = try await worker.readResult(request: request, target: target)
+                let restored = try await worker.readJournal(request: request, target: target)
                 try requireCurrent(token)
-                if let index = rows.firstIndex(where: { $0.target?.id == target.id }) { rows[index].result = restored }
+                if let index = rows.firstIndex(where: { $0.target?.id == target.id }) { rows[index].journal = restored }
             }
             try requireCurrent(token)
             guard sourceDigest == Self.sourceWitness(document, machines: machines) else { throw FTError.stale }
             reviewDigest = sourceDigest
-            message = "Saved account receipts loaded for review. Select accounts and compare the phone fingerprint before contacting servers."
+            message = "Saved account receipts loaded for review. Select accounts and verify the phone-key fingerprint before contacting servers."
         }
     }
 
-    private func approval() -> Approval? {
+    private func approval(for action: WorkspaceKeyEnrollmentAction) -> Approval? {
         guard !busy, windowOpen, active, confirmedFingerprint, let request,
               let sourceDigest, sourceDigest == reviewDigest, !selectedTargetIDs.isEmpty else { return nil }
         let eligible = Set(rows.compactMap { $0.target?.id })
         guard selectedTargetIDs.isSubset(of: eligible) else { return nil }
-        return .init(request: request, sourceDigest: sourceDigest, targetIDs: selectedTargetIDs.sorted())
+        return .init(request: request, sourceDigest: sourceDigest, targetIDs: selectedTargetIDs.sorted(), action: action)
     }
 
-    func authorize() {
-        guard let reviewed = approval() else { return }
+    func authorize() { confirmMutation(.install) }
+
+    func removeEnrolledAccess() { confirmMutation(.remove) }
+
+    private func confirmMutation(_ action: WorkspaceKeyEnrollmentAction) {
+        guard action != .inspect, let reviewed = approval(for: action) else { return }
         let accounts = rows.compactMap { row -> String? in
             guard let target = row.target, reviewed.targetIDs.contains(target.id) else { return nil }
             return "\(target.user)@\(target.host):\(target.port)"
         }
         let alert = NSAlert()
-        alert.messageText = "Authorize this phone key on \(accounts.count) accounts?"
-        alert.informativeText = reviewed.request.key.fingerprint + "\n\n"
+        alert.alertStyle = action == .remove ? .critical : .informational
+        alert.messageText = action == .remove
+            ? "Remove this enrollment's access on \(accounts.count) accounts?"
+            : "Authorize this phone key on \(accounts.count) accounts?"
+        let explanation = action == .remove
+            ? "This Mac will disable only the unrestricted public-key entry installed by this exact enrollment, preserving it as a comment for audit. Independently installed or restricted matching entries remain and will be reported. Use the original enrollment request; a newly exported request does not identify the earlier installation. Existing SSH sessions and their remote processes are not terminated."
+            : "This Mac will sign in through its existing trusted SSH access and add only this public key to each account's standard authorized_keys file. Existing restrictions stay intact. Verify a connection from the phone after enrollment."
+        alert.informativeText = reviewed.request.key.fingerprint + "\nEnrollment request: " + reviewed.request.id + "\n\n"
             + accounts.prefix(12).joined(separator: "\n")
             + (accounts.count > 12 ? "\n…and \(accounts.count - 12) other reviewed accounts." : "")
-            + "\n\nThis Mac will sign in through its existing trusted SSH access and add only this public key to each account's standard authorized_keys file. Existing restrictions stay intact. Verify a connection from the phone after enrollment."
-        alert.addButton(withTitle: "Authorize Listed Accounts"); alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn, approval() == reviewed else { return }
-        run(.install, approval: reviewed)
+            + "\n\n" + explanation
+        alert.addButton(withTitle: action == .remove ? "Remove Enrolled Access" : "Authorize Listed Accounts")
+        alert.addButton(withTitle: "Cancel")
+        // The action is part of the immutable review. An authorization prompt
+        // can never approve removal, or a later source/selection/request.
+        guard alert.runModal() == .alertFirstButtonReturn, approval(for: action) == reviewed else { return }
+        run(approval: reviewed)
     }
 
-    func reconcile() { guard let reviewed = approval() else { return }; run(.inspect, approval: reviewed) }
+    func reconcile() {
+        guard let reviewed = approval(for: .inspect) else { return }
+        run(approval: reviewed)
+    }
 
-    private func run(_ action: WorkspaceKeyEnrollmentAction, approval reviewed: Approval) {
+    private func run(approval reviewed: Approval) {
+        guard approval(for: reviewed.action) == reviewed else { return }
+        let action = reviewed.action
         let targets = rows.compactMap { row -> WorkspaceKeyEnrollmentTarget? in
             guard let target = row.target, reviewed.targetIDs.contains(target.id) else { return nil }
             return target
         }
         guard targets.count == reviewed.targetIDs.count else { return }
-        perform(failure: "The enrollment batch stopped because its durable receipt could not be saved or verified. Reconcile any uncertain accounts before authorizing again.") { [self] token in
+        perform(failure: "The account batch stopped because its durable receipt could not be saved or verified. Reconcile any uncertain accounts before another change.") { [self] token in
             for target in targets {
                 try requireCurrent(token)
                 guard request == reviewed.request, sourceDigest == reviewed.sourceDigest,
                       reviewDigest == reviewed.sourceDigest else { throw FTError.stale }
-                if action == .install, let index = rows.firstIndex(where: { $0.target?.id == target.id }) {
-                    rows[index].result = try WorkspaceKeyEnrollmentResult(operationID: reviewed.request.operationID(for: target),
-                        target: target, state: .uncertain, detail: "Authorization is in progress. Readback is required if it is interrupted.")
+                if action != .inspect, let index = rows.firstIndex(where: { $0.target?.id == target.id }) {
+                    var pending = try rows[index].journal
+                        ?? WorkspaceKeyEnrollmentJournal(request: reviewed.request, targets: [target])
+                    try pending.beginMutation(targetID: target.id, action: action)
+                    rows[index].journal = pending
                 }
-                let result = try await worker.perform(request: reviewed.request, target: target, action: action)
+                let updated = try await worker.perform(request: reviewed.request, target: target, action: action)
                 try requireCurrent(token)
-                if let index = rows.firstIndex(where: { $0.target?.id == target.id }) { rows[index].result = result }
+                if let index = rows.firstIndex(where: { $0.target?.id == target.id }) { rows[index].journal = updated }
             }
             let selectedResults = rows.filter { reviewed.targetIDs.contains($0.id) }.compactMap { $0.result }
-            let verified = selectedResults.filter { $0.state == .installed || $0.state == .alreadyPresent }.count
+            let absent = selectedResults.filter { $0.state == .absent || $0.state == .removed }.count
+            let present = selectedResults.filter {
+                $0.state == .installed || $0.state == .alreadyPresent || $0.state == .restricted || $0.state == .stillAuthorized
+            }.count
             let unknown = selectedResults.filter { $0.state == .uncertain }.count
-            message = "Saved results for \(targets.count) accounts: \(verified) verified key entries and \(targets.count - verified) accounts needing attention, including \(unknown) unknown outcomes."
-                + (unknown > 0 ? " Reconcile unknown outcomes before another authorization attempt." : "")
-                + " Verify server acceptance with a connection from the phone."
+            let blocked = selectedResults.filter { $0.state == .blocked }.count
+            let operation: String
+            switch action {
+            case .install: operation = "Authorization"
+            case .remove: operation = "Scoped removal"
+            case .inspect: operation = "Read-only reconciliation"
+            }
+            message = "\(operation) results saved for \(targets.count) accounts: \(absent) have no live matching key entry, \(present) have matching entries, \(blocked) need attention, and \(unknown) have unknown outcomes. Review each account's receipt."
+                + (unknown > 0 ? " Reconcile unknown outcomes before another change." : "")
+                + (action == .install
+                    ? " Verify server acceptance with a connection from the phone."
+                    : " These are file observations. Existing SSH sessions and their remote processes are not terminated.")
         }
     }
 
@@ -792,15 +844,21 @@ private final class MacPhoneKeyEnrollmentModel {
         guard canSaveResults, windowOpen, active, let request else { return }
         let targets = rows.compactMap { $0.target }; guard !targets.isEmpty else { return }
         do {
+            let reviewedSource = reviewDigest
             var report = try WorkspaceKeyEnrollmentJournal(request: request, targets: targets)
-            for result in rows.compactMap({ $0.result }) {
-                try report.record(result, action: result.state == .installed ? .install : .inspect)
+            for row in rows {
+                guard let target = row.target, let journal = row.journal else { continue }
+                guard journal.targets == [target] else { throw FTError.stale }
+                // Copy exact receipts and their intent. Replaying begin/record
+                // could turn a later blocked inspection into new uncertainty.
+                try report.mergeResults(from: journal)
             }
             let bytes = try report.encoded()
             let panel = NSSavePanel(); panel.allowedContentTypes = [.json]
             panel.nameFieldStringValue = "FrankenTerm-Enrollment-\(request.id).json"
-            panel.message = "Save public account results and operation IDs. This report includes host names, accounts and public-key fingerprints, without private keys."
-            guard panel.runModal() == .OK, let url = panel.url, windowOpen, active, !busy else { return }
+            panel.message = "Save public account results, operation IDs and the last requested change. This report includes host names, accounts and public-key fingerprints, without private keys."
+            guard panel.runModal() == .OK, let url = panel.url, windowOpen, active, canSaveResults,
+                  self.request == request, sourceDigest == reviewedSource, reviewDigest == reviewedSource else { return }
             perform(failure: "Enrollment results could not be saved. Choose another local filename.") { [self] token in
                 try await worker.saveResults(bytes, to: url); try requireCurrent(token)
                 message = "Public enrollment results saved."
@@ -1685,24 +1743,24 @@ private struct MacExportView: View {
                 if phase == .background { model.pause() }
             }
             .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.sessionDidResignActiveNotification)
-                .receive(on: RunLoop.main)) { _ in enrollment.setActive(false); model.setSessionActive(false) }
+                .receive(on: RunLoop.main)) { _ in enrollment.setSessionActive(false); model.setSessionActive(false) }
             .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.sessionDidBecomeActiveNotification)
-                .receive(on: RunLoop.main)) { _ in enrollment.setActive(scenePhase == .active); model.setSessionActive(true) }
+                .receive(on: RunLoop.main)) { _ in enrollment.setSessionActive(true); model.setSessionActive(true) }
             .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.screensDidSleepNotification)
-                .receive(on: RunLoop.main)) { _ in enrollment.setActive(false); model.setScreensAwake(false) }
+                .receive(on: RunLoop.main)) { _ in enrollment.setScreensAwake(false); model.setScreensAwake(false) }
             .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.screensDidWakeNotification)
-                .receive(on: RunLoop.main)) { _ in enrollment.setActive(scenePhase == .active); model.setScreensAwake(true) }
+                .receive(on: RunLoop.main)) { _ in enrollment.setScreensAwake(true); model.setScreensAwake(true) }
             .onDisappear { enrollment.close(); model.closeExport() }
     }
 
     private var enrollmentCard: some View {
         VStack(alignment: .leading, spacing: 12) {
             Divider()
-            Label("Authorize a Phone Key", systemImage: "key.horizontal").font(.title2.bold())
-            Text("Use an independent phone identity with the accounts you select. Authorization is a separate remote action through this Mac's existing trusted SSH access.")
+            Label("Phone Key Access", systemImage: "key.horizontal").font(.title2.bold())
+            Text("Authorize or remove an enrollment for an independent phone identity on the accounts you select. Each change uses this Mac's existing trusted SSH access.")
                 .font(.callout).foregroundStyle(.secondary)
             HStack {
-                Button("Open Phone Key Request…") { enrollment.chooseRequest() }.disabled(enrollment.busy)
+                Button("Open Request or Results…") { enrollment.chooseRequest() }.disabled(enrollment.busy)
                 if enrollment.busy {
                     ProgressView().controlSize(.small)
                     Button("Stop Enrollment Work") { enrollment.cancel() }
@@ -1712,6 +1770,8 @@ private struct MacExportView: View {
                 Text(verbatim: request.key.fingerprint).font(.system(.callout, design: .monospaced)).textSelection(.enabled)
                 DisclosureGroup("Public Phone Key") {
                     Text(verbatim: request.key.authorizedKey).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                    Text(verbatim: "Enrollment request " + request.id)
+                        .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
                 }
                 if let selection = model.selection {
                     Button("Review Selected Accounts") {
@@ -1730,17 +1790,25 @@ private struct MacExportView: View {
                     LazyVStack(alignment: .leading, spacing: 14) {
                         ForEach(enrollment.rows) { row in enrollmentRow(row) }
                     }
-                    Toggle("I compared this fingerprint directly with the phone", isOn: Binding(
+                    Toggle("I verified this fingerprint against the phone or a trusted saved record", isOn: Binding(
                         get: { enrollment.confirmedFingerprint }, set: { enrollment.confirmFingerprint($0) }))
                         .disabled(enrollment.busy)
                     HStack {
                         Button("Authorize Phone Key…") { enrollment.authorize() }
                             .buttonStyle(.borderedProminent).disabled(!enrollment.canAct)
+                        Button("Remove Enrolled Access…", role: .destructive) { enrollment.removeEnrolledAccess() }
+                            .disabled(!enrollment.canAct)
+                    }
+                    HStack {
                         Button("Reconcile Selected Accounts") { enrollment.reconcile() }.disabled(!enrollment.canAct)
                         Button("Save Results…") { enrollment.saveResults() }.disabled(!enrollment.canSaveResults)
                     }
+                    Text("Removal requires the original enrollment request, also retained in saved results. It disables only the unrestricted entry that enrollment installed, retaining it as a comment. Restricted entries and independently installed copies remain and are reported. Existing SSH sessions and remote processes continue.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Text("Removal also requires a Linux server whose filesystem supports exclusive access to the key file. Unsupported servers need their normal administrator workflow; their result remains separate from other accounts.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
-                Text("Direct accounts require Python 3.8 or later and usable existing SSH authentication on this Mac. Enrollment preserves existing authorized-key restrictions and permissions. Reconcile reads account state without adding a key. Verify server acceptance with a connection from the phone; custom authorization files and certificate issuers need their approved workflow.")
+                Text("Direct accounts require Python 3.8 or later and usable existing SSH authentication on this Mac. Enrollment preserves existing authorized-key restrictions and permissions. Reconcile reads account state without adding or removing access. Verify server acceptance with a connection from the phone; custom authorization files and certificate issuers need their approved workflow.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             if let message = enrollment.message { Text(verbatim: message).font(.callout).textSelection(.enabled) }
@@ -1756,6 +1824,13 @@ private struct MacExportView: View {
                     Text(verbatim: "\(target.user) @ \(target.host) · port \(target.port)")
                 }.disabled(enrollment.busy)
                 if let result = row.result {
+                    if let mutation = row.journal?.lastMutation(for: target.id) {
+                        Text(verbatim: "Last requested change: " + Self.enrollmentAction(mutation)).font(.caption)
+                    }
+                    if let action = row.journal?.lastAction(for: target.id) {
+                        Text(verbatim: "Latest operation: " + Self.enrollmentAction(action))
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     Text(verbatim: Self.enrollmentStatus(result.state)).font(.callout.bold())
                     Text(verbatim: result.detail).font(.caption).foregroundStyle(.secondary)
                 } else { Text("Not attempted").font(.caption).foregroundStyle(.secondary) }
@@ -1772,11 +1847,21 @@ private struct MacExportView: View {
         }
     }
 
+    private static func enrollmentAction(_ action: WorkspaceKeyEnrollmentAction) -> String {
+        switch action {
+        case .inspect: "Read-only inspection"
+        case .install: "Authorize public key"
+        case .remove: "Remove this enrollment's access"
+        }
+    }
+
     private static func enrollmentStatus(_ state: WorkspaceKeyEnrollmentState) -> String {
         switch state {
         case .absent: "Key entry absent"
         case .installed: "Key entry installed and verified"
         case .alreadyPresent: "Existing key entry verified"
+        case .removed: "Enrolled entry disabled; no live matching entry remains"
+        case .stillAuthorized: "Other matching key entries remain"
         case .restricted: "Existing restrictions preserved"
         case .blocked: "Needs attention"
         case .uncertain: "Outcome unknown — reconcile this account"

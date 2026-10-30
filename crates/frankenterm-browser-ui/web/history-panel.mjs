@@ -22,6 +22,7 @@ export function mountHistorySearch({
   document: doc = globalThis.document,
   readBody,
   inspectPane,
+  inspectCapture,
   search = createHistorySearch({ readBody }),
 } = {}) {
   const element = (id) => {
@@ -79,9 +80,21 @@ export function mountHistorySearch({
       heading.textContent = `Pane ${hit.paneId} · segment ${hit.segmentId} · ${captureLabel(hit.capturedAt)}`;
       const snippet = doc.createElement("pre");
       snippet.textContent = hit.snippet || "No snippet supplied for this captured segment.";
+      const historical = doc.createElement("button");
+      historical.type = "button";
+      historical.textContent = "Open captured segment";
+      historical.addEventListener("click", () => {
+        const selected = opened && search.hit(index, state.version);
+        if (!selected) return;
+        const capture = { segmentId: selected.segmentId, paneId: selected.paneId,
+          capturedAt: selected.capturedAt, contentLength: selected.contentLength };
+        close();
+        inspectCapture(capture);
+      });
       const inspect = doc.createElement("button");
       inspect.type = "button";
-      inspect.textContent = `Open live output for pane ${hit.paneId}`;
+      inspect.textContent = `Open current output for pane ${hit.paneId}`;
+      inspect.title = "This pane ID may belong to another session now. Opens new captured output only.";
       inspect.addEventListener("click", () => {
         const selected = opened && search.hit(index, state.version);
         if (!selected) return;
@@ -90,7 +103,7 @@ export function mountHistorySearch({
         close();
         inspectPane(exactPaneId);
       });
-      item.append(heading, snippet, inspect);
+      item.append(heading, snippet, historical, inspect);
       results.append(item);
     }
   }

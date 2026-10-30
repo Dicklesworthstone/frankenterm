@@ -47,6 +47,7 @@ for name, result, args in [
     ("ssh_channel_write_stderr", I, [P, P, C.c_uint32]),
     ("ssh_channel_send_eof", I, [P]), ("ssh_channel_close", I, [P]),
     ("ssh_channel_free", None, [P]), ("ssh_channel_request_send_exit_status", I, [P, I]),
+    ("ssh_blocking_flush", I, [P, I]),
 ]:
     function = getattr(SERVER, name)
     function.restype, function.argtypes = result, args
@@ -55,10 +56,10 @@ SERVER.ssh_init()
 # Only the account-database home is synthetic. The production command/program
 # executes unmodified under the real UID and performs real POSIX file effects.
 # A separate audit guard makes any accidental path outside that home fail,
-# including a future regression that bypasses this narrowly scoped pwd seam.
+# except the removal contract's one bounded, read-only kernel lease setting.
 ACCOUNT_DATABASE_WRAPPER = r'''
 import base64, errno, fcntl, hashlib, json, os, pwd, signal, stat, struct, sys, time, uuid
-home, original_code, payload = sys.argv[1:]
+home, original_code, payload, concurrent_append, interference_json = sys.argv[1:]
 home = os.path.realpath(home)
 original = pwd.getpwuid
 record = original(os.geteuid())
@@ -71,6 +72,11 @@ def audit(event, arguments):
         path = arguments[0]
         if isinstance(path, (str, bytes)):
             path = os.fsdecode(path)
+            if event == 'open' and path == '/proc/sys/fs/lease-break-time':
+                flags = arguments[2]
+                if flags & (os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_TRUNC):
+                    raise PermissionError('fixture kernel policy is read-only')
+                return
             if os.path.isabs(path):
                 path = os.path.realpath(path)
                 if path != home and not path.startswith(home + os.sep):
@@ -81,6 +87,50 @@ def audit(event, arguments):
                  'os.chmod', 'os.chown', 'subprocess.Popen', 'os.exec'):
         raise PermissionError('fixture forbids unrelated effects')
 sys.addaudithook(audit)
+interference = json.loads(interference_json)
+if interference.get('mode') == 'short_lease':
+    original_open, original_read = os.open, os.read
+    policy_fds = set()
+    def open_with_short_policy(path, *arguments, **keywords):
+        fd = original_open(path, *arguments, **keywords)
+        if path == '/proc/sys/fs/lease-break-time':
+            policy_fds.add(fd)
+        return fd
+    def read_with_short_policy(fd, count):
+        actual = original_read(fd, count)
+        if fd in policy_fds:
+            policy_fds.remove(fd)
+            return b'1\n'
+        return actual
+    os.open, os.read = open_with_short_policy, read_with_short_policy
+elif interference.get('mode') == 'unsupported_lease':
+    original_fcntl = fcntl.fcntl
+    def unsupported_lease(fd, command, *arguments):
+        if command == fcntl.F_SETLEASE:
+            raise OSError(errno.EOPNOTSUPP, 'fixture filesystem has no leases')
+        return original_fcntl(fd, command, *arguments)
+    fcntl.fcntl = unsupported_lease
+elif interference.get('mode') in ('break_lease', 'replace_directory'):
+    original_pwrite = os.pwrite
+    def pwrite_after_contender(fd, data, offset):
+        os.write(interference['trigger_fd'], b'R')
+        if os.read(interference['reply_fd'], 1) != b'D':
+            raise OSError('fixture contender did not finish')
+        return original_pwrite(fd, data, offset)
+    os.pwrite = pwrite_after_contender
+# A deterministic interference point performs a real append after the one-byte
+# removal write. The production helper remains unchanged and must detect the
+# extra writer's bytes without truncating or rolling them back.
+if concurrent_append:
+    append_bytes = base64.b64decode(concurrent_append, validate=True)
+    original_pwrite = os.pwrite
+    def pwrite_with_concurrent_append(fd, data, offset):
+        count = original_pwrite(fd, data, offset)
+        os.lseek(fd, 0, os.SEEK_END)
+        os.write(fd, append_bytes)
+        os.fsync(fd)
+        return count
+    os.pwrite = pwrite_with_concurrent_append
 sys.argv = ['-c', payload]
 exec(compile(base64.b64decode(original_code), '<production enrollment command>', 'exec'), {})
 '''
@@ -109,6 +159,11 @@ class EnrollmentServer:
         self.events, self.errors, self.commands = [], [], []
         self.control = None
         self.drop_next_acknowledgement = False
+        self.drop_next_removal_acknowledgement = False
+        self.concurrent_removal_append = b""
+        self.removal_interference = ""
+        self.interference_results = []
+        self.replacement_contents = b""
         identity = directory / "client-identity"
         identity.write_bytes(client.private_bytes(serialization.Encoding.PEM,
             serialization.PrivateFormat.OpenSSH, serialization.NoEncryption()))
@@ -214,17 +269,74 @@ class EnrollmentServer:
             # guard denies any access outside the fixture account's real files.
             environment = dict(os.environ, HOME=str(self.decoy_home), USER=self.account,
                                LOGNAME=self.account, PYTHONDONTWRITEBYTECODE="1")
-            completed = subprocess.run([sys.executable, "-I", "-S", "-c", ACCOUNT_DATABASE_WRAPPER,
-                str(self.home), base64.b64encode(words[4].encode()).decode(), words[5]],
-                stdin=subprocess.DEVNULL, capture_output=True, timeout=12,
-                env=environment, cwd=self.home)
+            action = json.loads(base64.b64decode(words[5], validate=True))["action"]
+            interference = {"mode": self.removal_interference if action == "remove" else ""}
+            descriptors, inherited, contender = [], (), None
+            if interference["mode"] in ("break_lease", "replace_directory"):
+                trigger_read, trigger_write = os.pipe()
+                reply_read, reply_write = os.pipe()
+                descriptors = [trigger_read, trigger_write, reply_read, reply_write]
+                inherited = (trigger_write, reply_read)
+                interference.update(trigger_fd=trigger_write, reply_fd=reply_read)
+                def interfere():
+                    try:
+                        if os.read(trigger_read, 1) != b'R':
+                            return
+                        if interference["mode"] == "break_lease":
+                            try:
+                                writer = os.open(self.home / '.ssh/authorized_keys', os.O_WRONLY | os.O_NONBLOCK)
+                            except BlockingIOError:
+                                self.interference_results.append('writer_excluded')
+                            else:
+                                os.close(writer)
+                                self.interference_results.append('writer_was_not_excluded')
+                        else:
+                            (self.home / '.ssh').rename(self.home / 'preserved-ssh-directory')
+                            (self.home / '.ssh').mkdir(mode=0o700)
+                            replacement = self.home / '.ssh/authorized_keys'
+                            replacement.write_bytes(self.replacement_contents)
+                            replacement.chmod(0o600)
+                            self.interference_results.append('directory_replaced')
+                        try:
+                            os.write(reply_write, b'D')
+                        except BrokenPipeError:
+                            pass
+                    except Exception as error:
+                        self.errors.append('contender: ' + repr(error))
+                contender = threading.Thread(target=interfere, daemon=True)
+                contender.start()
+            try:
+                completed = subprocess.run([sys.executable, "-I", "-S", "-c", ACCOUNT_DATABASE_WRAPPER,
+                    str(self.home), base64.b64encode(words[4].encode()).decode(), words[5],
+                    base64.b64encode(self.concurrent_removal_append).decode(), json.dumps(interference)],
+                    stdin=subprocess.DEVNULL, capture_output=True, timeout=12, pass_fds=inherited,
+                    env=environment, cwd=self.home)
+            finally:
+                for descriptor in inherited:
+                    os.close(descriptor)
+                if contender:
+                    contender.join(3)
+                    if contender.is_alive():
+                        raise RuntimeError('fixture contender did not retire')
+                for descriptor in descriptors:
+                    if descriptor not in inherited:
+                        os.close(descriptor)
             if len(completed.stdout) > 65_536 or len(completed.stderr) > 65_536:
                 raise RuntimeError("fixture remote output exceeded bound")
             self.commands.append((completed.returncode, completed.stdout, completed.stderr))
+            (self.directory / ("remote-operation-" + str(len(self.commands)) + ".json")).write_text(json.dumps({
+                "action": action, "exit": completed.returncode,
+                "stdout": completed.stdout.decode("utf-8", errors="replace"),
+                "stderr": completed.stderr.decode("utf-8", errors="replace")}, indent=2))
             # Drop only after the mutation has completed, never its preceding
             # read-only reconciliation. The file oracle below proves that cut.
-            if self.drop_next_acknowledgement and json.loads(completed.stdout).get("state") == "installed":
+            outcome = json.loads(completed.stdout)
+            if self.drop_next_acknowledgement and outcome.get("state") == "installed":
                 self.drop_next_acknowledgement = False
+                control.shutdown(socket.SHUT_RDWR)
+                return
+            if self.drop_next_removal_acknowledgement and outcome.get("state") in ("removed", "stillAuthorized") and outcome.get("detail_code") in ("owned_entry_disabled", "owned_removed_other_remains"):
+                self.drop_next_removal_acknowledgement = False
                 control.shutdown(socket.SHUT_RDWR)
                 return
             for payload, writer in ((completed.stdout, SERVER.ssh_channel_write),
@@ -236,8 +348,24 @@ class EnrollmentServer:
                     offset += count
             if SERVER.ssh_channel_request_send_exit_status(channel, completed.returncode):
                 raise RuntimeError("fixture exit status delivery failed")
-            SERVER.ssh_channel_send_eof(channel)
-            SERVER.ssh_channel_close(channel)
+            if SERVER.ssh_channel_send_eof(channel) or SERVER.ssh_channel_close(channel):
+                raise RuntimeError("fixture channel completion failed")
+            if SERVER.ssh_blocking_flush(session, 1000):
+                raise RuntimeError("fixture response flush failed")
+            # Finish the TCP write half only after libssh flushed the response.
+            # Drain the client's final channel-close/disconnect bytes before
+            # closing the socket; unread peer data can otherwise reset the
+            # connection and lose a successfully produced fixture response.
+            control.shutdown(socket.SHUT_WR)
+            control.settimeout(2)
+            received = 0
+            while True:
+                tail = control.recv(4096)
+                if not tail:
+                    break
+                received += len(tail)
+                if received > 16_384:
+                    raise RuntimeError("fixture shutdown input exceeded bound")
         finally:
             if channel: SERVER.ssh_channel_free(channel)
             if session:
@@ -351,6 +479,7 @@ class DeviceKeyEnrollmentInteropTests(unittest.TestCase):
         self.authorized_keys.symlink_to(target)
         self.invoke("inspect", "blocked")
         self.invoke("install", "uncertain")
+        self.invoke("remove", "uncertain")
         self.assertEqual(target.read_bytes(), b"preserve unrelated data\n")
 
     def test_insecure_permissions_are_reported_without_rewriting_permissions_or_content(self):
@@ -358,6 +487,7 @@ class DeviceKeyEnrollmentInteropTests(unittest.TestCase):
         self.existing(original, mode=0o666)
         self.invoke("inspect", "blocked")
         self.invoke("install", "uncertain")
+        self.invoke("remove", "uncertain")
         self.assertEqual(self.authorized_keys.read_bytes(), original)
         self.assertEqual(stat.S_IMODE(self.authorized_keys.stat().st_mode), 0o666)
 
@@ -368,6 +498,7 @@ class DeviceKeyEnrollmentInteropTests(unittest.TestCase):
         os.link(self.authorized_keys, alias)
         self.invoke("inspect", "blocked")
         self.invoke("install", "uncertain")
+        self.invoke("remove", "uncertain")
         self.assertEqual(alias.read_bytes(), original)
         self.assertEqual(self.authorized_keys.read_bytes(), original)
 
@@ -382,7 +513,193 @@ class DeviceKeyEnrollmentInteropTests(unittest.TestCase):
         os.mkfifo(self.authorized_keys, mode=0o600)
         self.invoke("inspect", "blocked")
         self.invoke("install", "uncertain")
+        self.invoke("remove", "uncertain")
         self.assertTrue(stat.S_ISFIFO(self.authorized_keys.lstat().st_mode))
+
+    def test_remove_owned_entry_preserves_unrelated_bytes_inode_and_permissions(self):
+        other = public_line(ed25519.Ed25519PrivateKey.generate())
+        original = b'# retained comment\nfrom="192.0.2.7",command="echo retained" ' + other + b" other device\r\n"
+        self.existing(original)
+        self.invoke("install", "installed")
+        installed, metadata = self.authorized_keys.read_bytes(), self.authorized_keys.stat()
+        self.invoke("remove", "removed")
+        removed, final = self.authorized_keys.read_bytes(), self.authorized_keys.stat()
+        self.assertEqual(removed[:len(original)], original)
+        self.assertEqual(len(removed), len(installed))
+        self.assertEqual([(i, before, after) for i, (before, after) in enumerate(zip(installed, removed)) if before != after],
+                         [(len(original), ord("s"), ord("#"))])
+        self.assertEqual((final.st_dev, final.st_ino, final.st_uid, final.st_gid, final.st_mode),
+                         (metadata.st_dev, metadata.st_ino, metadata.st_uid, metadata.st_gid, metadata.st_mode))
+        # OpenSSH's independent key-file parser must no longer see the phone
+        # fingerprint, while it still recognizes the unrelated restricted key.
+        listing = subprocess.run(["/usr/bin/ssh-keygen", "-lf", str(self.authorized_keys)],
+                                 capture_output=True, text=True, timeout=5)
+        self.assertEqual(listing.returncode, 0, listing.stderr)
+        phone_fingerprint = json.loads(self.request.read_text())["key"]["public_fingerprint"]
+        self.assertNotIn(phone_fingerprint, listing.stdout)
+        other_blob = base64.b64decode(other.split()[1])
+        other_fingerprint = "SHA256:" + base64.b64encode(hashlib.sha256(other_blob).digest()).decode().rstrip("=")
+        self.assertEqual(listing.stdout.count(other_fingerprint), 1, listing.stdout)
+        self.assertEqual(listing.stdout.count("SHA256:"), 1, listing.stdout)
+        self.invoke("inspect", "absent")
+        self.invoke("remove", "absent")
+        self.assertEqual(self.authorized_keys.read_bytes(), removed)
+        self.assertEqual(self.authorized_keys.stat().st_mtime_ns, final.st_mtime_ns)
+
+    def test_remove_absent_key_never_creates_authorization_files(self):
+        self.invoke("remove", "absent")
+        self.assertFalse(self.authorized_keys.parent.exists())
+        self.authorized_keys.parent.mkdir(mode=0o750)
+        self.invoke("remove", "absent")
+        self.assertFalse(self.authorized_keys.exists())
+        self.assertEqual(stat.S_IMODE(self.authorized_keys.parent.stat().st_mode), 0o750)
+
+    def test_independently_authorized_same_key_is_preserved_and_reported(self):
+        original = b"# independently managed key\n" + self.phone_key + b"\n"
+        self.existing(original)
+        metadata = self.authorized_keys.stat()
+        self.invoke("inspect", "stillAuthorized")
+        self.invoke("remove", "stillAuthorized")
+        self.assertEqual(self.authorized_keys.read_bytes(), original)
+        self.assertEqual(self.authorized_keys.stat().st_mtime_ns, metadata.st_mtime_ns)
+        self.invoke("install", "alreadyPresent")
+        self.assertEqual(self.authorized_keys.read_bytes(), original)
+
+    def test_removal_preserves_restricted_matching_key_even_with_our_marker(self):
+        self.invoke("install", "installed")
+        original = b'restrict,from="192.0.2.18" ' + self.authorized_keys.read_bytes()
+        self.authorized_keys.write_bytes(original)
+        self.invoke("remove", "stillAuthorized")
+        self.invoke("inspect", "stillAuthorized")
+        self.assertEqual(self.authorized_keys.read_bytes(), original)
+        self.invoke("install", "restricted")
+        self.assertEqual(self.authorized_keys.read_bytes(), original)
+
+    def test_owned_removal_reports_same_key_still_authorized_by_another_entry(self):
+        self.invoke("install", "installed")
+        owned = self.authorized_keys.read_bytes()
+        independent = b'from="192.0.2.19",command="echo independent" ' + self.phone_key + b"\n"
+        self.authorized_keys.write_bytes(owned + independent)
+        self.invoke("remove", "stillAuthorized")
+        removed = self.authorized_keys.read_bytes()
+        self.assertEqual(removed, b"#" + owned[1:] + independent)
+        self.invoke("inspect", "stillAuthorized")
+        self.invoke("remove", "stillAuthorized")
+        self.assertEqual(self.authorized_keys.read_bytes(), removed)
+
+    def test_another_enrollment_request_cannot_remove_the_previous_requests_entry(self):
+        self.invoke("install", "installed")
+        original = self.authorized_keys.read_bytes()
+        request = json.loads(self.request.read_text())
+        request["request_id"] = "33333333-3333-3333-3333-333333333333"
+        self.request.write_text(json.dumps(request))
+        self.invoke("remove", "stillAuthorized")
+        self.assertEqual(self.authorized_keys.read_bytes(), original)
+
+    def test_duplicate_owned_entries_require_review_and_are_not_partially_removed(self):
+        self.invoke("install", "installed")
+        original = self.authorized_keys.read_bytes() * 2
+        self.authorized_keys.write_bytes(original)
+        self.invoke("remove", "uncertain")
+        self.assertEqual(self.authorized_keys.read_bytes(), original)
+
+    def test_lost_removal_reply_is_reconciled_without_another_edit(self):
+        self.invoke("install", "installed")
+        installed = self.authorized_keys.read_bytes()
+        self.server.drop_next_removal_acknowledgement = True
+        self.invoke("remove", "uncertain")
+        removed = self.authorized_keys.read_bytes()
+        self.assertEqual(removed, b"#" + installed[1:])
+        self.assertFalse(self.server.drop_next_removal_acknowledgement,
+                         "the lost reply must follow a completed removal")
+        metadata = self.authorized_keys.stat()
+        self.invoke("inspect", "absent")
+        self.invoke("remove", "absent")
+        self.assertEqual(self.authorized_keys.read_bytes(), removed)
+        self.assertEqual(self.authorized_keys.stat().st_mtime_ns, metadata.st_mtime_ns)
+
+    def test_concurrent_append_is_preserved_and_prevents_a_false_removal_receipt(self):
+        self.invoke("install", "installed")
+        installed = self.authorized_keys.read_bytes()
+        other = public_line(ed25519.Ed25519PrivateKey.generate()) + b" concurrent administrator\n"
+        self.server.concurrent_removal_append = other
+        self.invoke("remove", "uncertain")
+        self.assertEqual(self.authorized_keys.read_bytes(), b"#" + installed[1:] + other)
+        self.server.concurrent_removal_append = b""
+        self.invoke("inspect", "absent")
+        self.assertTrue(self.authorized_keys.read_bytes().endswith(other))
+
+    def test_only_an_explicit_install_can_reauthorize_a_removed_enrollment(self):
+        self.invoke("install", "installed")
+        self.invoke("remove", "removed")
+        tombstone = self.authorized_keys.read_bytes()
+        self.invoke("inspect", "absent")
+        self.invoke("remove", "absent")
+        self.assertEqual(self.authorized_keys.read_bytes(), tombstone)
+        self.invoke("install", "installed")
+        reinstalled = self.authorized_keys.read_bytes()
+        self.assertTrue(reinstalled.startswith(tombstone))
+        live_lines = [line for line in reinstalled.splitlines() if line.strip() and not line.lstrip().startswith(b"#")]
+        self.assertEqual(len(live_lines), 1)
+
+    def test_modified_owned_line_without_final_newline_is_not_removed(self):
+        self.invoke("install", "installed")
+        original = self.authorized_keys.read_bytes().removesuffix(b"\n")
+        self.authorized_keys.write_bytes(original)
+        self.invoke("inspect", "stillAuthorized")
+        self.invoke("remove", "stillAuthorized")
+        self.assertEqual(self.authorized_keys.read_bytes(), original)
+
+    def test_existing_independent_writer_prevents_removal_before_any_write(self):
+        self.invoke("install", "installed")
+        original = self.authorized_keys.read_bytes()
+        writer = os.open(self.authorized_keys, os.O_RDWR)
+        try:
+            self.invoke("remove", "uncertain")
+            self.assertEqual(self.authorized_keys.read_bytes(), original)
+        finally:
+            os.close(writer)
+        self.invoke("inspect", "alreadyPresent")
+
+    def test_new_writer_between_final_check_and_write_is_excluded(self):
+        self.invoke("install", "installed")
+        original = self.authorized_keys.read_bytes()
+        self.server.removal_interference = "break_lease"
+        self.invoke("remove", "uncertain")
+        self.assertEqual(self.server.interference_results, ["writer_excluded"])
+        self.assertEqual(self.authorized_keys.read_bytes(), original)
+        self.server.removal_interference = ""
+        self.invoke("inspect", "alreadyPresent")
+
+    def test_filesystem_without_exclusive_leases_cannot_fall_back_to_unsafe_removal(self):
+        self.invoke("install", "installed")
+        original = self.authorized_keys.read_bytes()
+        self.server.removal_interference = "unsupported_lease"
+        self.invoke("remove", "uncertain")
+        self.assertEqual(self.authorized_keys.read_bytes(), original)
+        self.server.removal_interference = ""
+        self.invoke("inspect", "alreadyPresent")
+
+    def test_short_kernel_lease_break_policy_refuses_removal_before_any_write(self):
+        self.invoke("install", "installed")
+        original = self.authorized_keys.read_bytes()
+        self.server.removal_interference = "short_lease"
+        self.invoke("remove", "uncertain")
+        self.assertEqual(self.authorized_keys.read_bytes(), original)
+        self.server.removal_interference = ""
+        self.invoke("inspect", "alreadyPresent")
+
+    def test_replaced_ssh_directory_cannot_redirect_removal_to_another_key_file(self):
+        self.invoke("install", "installed")
+        original = self.authorized_keys.read_bytes()
+        replacement = public_line(ed25519.Ed25519PrivateKey.generate()) + b" replacement account file\n"
+        self.server.replacement_contents = replacement
+        self.server.removal_interference = "replace_directory"
+        self.invoke("remove", "uncertain")
+        self.assertEqual(self.server.interference_results, ["directory_replaced"])
+        self.assertEqual(self.authorized_keys.read_bytes(), replacement)
+        preserved = self.server.home / "preserved-ssh-directory/authorized_keys"
+        self.assertEqual(preserved.read_bytes(), b"#" + original[1:])
 
 
 if __name__ == "__main__":

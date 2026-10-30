@@ -526,3 +526,256 @@ test("packaged page contains the required accessible controls and module", () =>
   assert.ok(wasm.includes("js_name = selectedPaneId"));
   assert.ok(wasm.includes("pub fn selected_pane_id(&self) -> Option<String>"));
 });
+
+
+function captureHit(overrides = {}) {
+  return { paneId: "7", segmentId: "12", capturedAt: "1000", contentLength: "90", ...overrides };
+}
+
+function capturedDelta(source, hit, content, overrides = {}) {
+  const payload = '{"schema":"ft.stream.v1","stream":"deltas","kind":"delta","data":' +
+    '{"pane_id":' + hit.paneId + ',"segment_id":' + hit.segmentId +
+    ',"captured_at":' + hit.capturedAt + ',"content_len":' + hit.contentLength +
+    ',"content":' + JSON.stringify(content) + '}}';
+  source.emit("delta", overrides.payload ?? payload,
+    overrides.cursor ?? "delta-v1:pane:" + hit.paneId + ":" + hit.segmentId);
+}
+
+test("historical inspection admits exactly one captured identity and never follows its pane", () => {
+  const f = fixture();
+  const hit = captureHit({ paneId: "18446744073709551615", segmentId: "9223372036854775807" });
+  f.output.selectCapture(hit);
+  const source = f.latest();
+  assert.equal(source.url.searchParams.get("pane_id"), hit.paneId);
+  assert.equal(source.url.searchParams.get("since_id"), "9223372036854775806");
+  assert.equal(f.output.snapshot().status, "loading");
+  assert.equal(f.timers.size, 1);
+  control(source, "ready", { pane_id: 0 }, ""); // Wrong pane cannot establish a historical read.
+  assert.equal(f.output.snapshot().status, "unavailable");
+  assert.equal(f.output.snapshot().text, "");
+
+  f.output.selectCapture(hit);
+  const exact = f.latest();
+  capturedDelta(exact, hit, "token=[REDACTED]\n");
+  assert.equal(f.output.snapshot().status, "historical");
+  assert.equal(f.output.snapshot().text, "token=[REDACTED]\n");
+  assert.equal(f.output.snapshot().cursor, hit.segmentId);
+  assert.deepEqual(f.output.snapshot().capture, hit);
+  assert.equal(exact.closed, true);
+  assert.equal(f.timers.size, 0);
+  capturedDelta(exact, hit, "duplicate");
+  delta(exact, "9223372036854775807", "new session", hit.paneId);
+  exact.fail(false);
+  f.output.pause(); f.output.resume(); f.output.suspend(); f.output.restore();
+  assert.equal(f.output.snapshot().text, "token=[REDACTED]\n");
+  assert.equal(f.output.snapshot().status, "historical");
+  assert.equal(f.sources.length, 2);
+  assert.equal(f.timers.size, 0);
+});
+
+test("historical ready and gap frames preserve pending status until exact redacted content arrives", () => {
+  const f = fixture();
+  const hit = captureHit();
+  f.output.selectCapture(hit);
+  control(f.latest(), "ready");
+  assert.equal(f.output.snapshot().status, "loading");
+  control(f.latest(), "gap", { pane_id: 7 });
+  control(f.latest(), "lag", { missed_count: 2 });
+  capturedDelta(f.latest(), hit, "[REDACTED]"); // Stored length deliberately differs from wire length.
+  assert.equal(f.output.snapshot().text, "[REDACTED]");
+  assert.equal(f.output.snapshot().gapNotifications, 2);
+  assert.equal(f.output.snapshot().status, "historical");
+  assert.equal(f.latest().closed, true);
+});
+
+test("deleted or out-of-order historical captures cannot fall forward or back to other output", () => {
+  for (const segmentId of ["11", "13"]) {
+    const f = fixture();
+    const hit = captureHit();
+    f.output.selectCapture(hit);
+    capturedDelta(f.latest(), { ...hit, segmentId }, "another session's content");
+    assert.equal(f.output.snapshot().status, "unavailable");
+    assert.equal(f.output.snapshot().text, "");
+    assert.equal(f.output.snapshot().cursor, null);
+    assert.match(f.output.snapshot().error, /no longer available/);
+    assert.equal(f.latest().closed, true);
+    assert.equal(f.timers.size, 0);
+    capturedDelta(f.latest(), hit, "late requested content");
+    assert.equal(f.output.snapshot().text, "");
+  }
+});
+
+test("historical metadata is exact, typed and checked before content admission", () => {
+  const hit = captureHit({ capturedAt: "9007199254740993", contentLength: "9007199254740993" });
+  const cases = [
+    { capturedAt: "9007199254740992" }, { contentLength: "9007199254740992" },
+    { capturedAt: '"9007199254740993"' }, { contentLength: '"9007199254740993"' },
+    { capturedAt: "9.007199254740993e15" }, { capturedAt: "-1" },
+    { contentLength: "18446744073709551616" }, { paneId: "8" },
+  ];
+  for (const invalid of cases) {
+    const f = fixture();
+    f.output.selectCapture(hit);
+    capturedDelta(f.latest(), { ...hit, ...invalid }, "must not appear");
+    assert.equal(f.output.snapshot().status, "unavailable");
+    assert.equal(f.output.snapshot().text, "");
+    assert.equal(f.output.snapshot().cursor, null);
+    assert.equal(f.latest().closed, true);
+    assert.equal(f.timers.size, 0);
+  }
+  const f = fixture();
+  f.output.selectCapture(hit);
+  capturedDelta(f.latest(), hit, "valid redacted content");
+  assert.equal(f.output.snapshot().status, "historical");
+});
+
+test("invalid historical selections preserve the existing live view", () => {
+  const f = fixture(); f.output.select("7");
+  delta(f.latest(), "1", "keep");
+  const original = f.latest();
+  for (const invalid of [
+    null, {}, captureHit({ paneId: 7 }), captureHit({ segmentId: "0" }),
+    captureHit({ segmentId: "9223372036854775808" }), captureHit({ capturedAt: "-1" }),
+    captureHit({ contentLength: "1.5" }), captureHit({ paneId: "18446744073709551616" }),
+  ]) assert.throws(() => f.output.selectCapture(invalid), /invalid capture identity/);
+  assert.equal(f.latest(), original);
+  assert.equal(original.closed, false);
+  assert.equal(f.output.snapshot().text, "keep");
+  assert.equal(f.output.snapshot().capture, null);
+});
+
+test("historical requests have a finite deadline even when only ready frames arrive", () => {
+  const f = fixture({ captureTimeoutMs: 1234 });
+  const hit = captureHit({ segmentId: "1" });
+  f.output.selectCapture(hit);
+  assert.equal(f.latest().url.searchParams.get("since_id"), "0");
+  control(f.latest(), "ready");
+  assert.equal(f.retry(), 1234); // Execute the owned deadline; it must not schedule a retry.
+  assert.equal(f.sources.length, 1);
+  assert.equal(f.timers.size, 0);
+  assert.equal(f.latest().closed, true);
+  assert.equal(f.output.snapshot().status, "unavailable");
+  assert.match(f.output.snapshot().error, /deadline/);
+  capturedDelta(f.latest(), hit, "late");
+  assert.equal(f.output.snapshot().text, "");
+  f.output.restore(); f.output.resume();
+  assert.equal(f.sources.length, 1);
+  f.output.selectCapture(hit); // A fresh explicit action may try the exact identity again.
+  assert.equal(f.sources.length, 2);
+  f.output.close();
+  for (const timeout of [0, -1, 1.5, Infinity, 60001]) {
+    assert.throws(() => fixture({ captureTimeoutMs: timeout }), /invalid transcript limit/);
+  }
+});
+
+test("historical transport failures close native reconnects and never create a retry owner", () => {
+  for (const permanent of [false, true]) {
+    const f = fixture();
+    f.output.selectCapture(captureHit());
+    const source = f.latest();
+    source.fail(permanent);
+    assert.equal(source.closed, true);
+    assert.equal(f.output.snapshot().status, "unavailable");
+    assert.equal(f.timers.size, 0);
+    assert.equal(f.sources.length, 1);
+  }
+  const f = fixture({ EventSourceImpl: class { constructor() { throw new Error("private"); } } });
+  f.output.selectCapture(captureHit());
+  assert.equal(f.output.snapshot().status, "unavailable");
+  assert.equal(f.timers.size, 0);
+  assert.doesNotMatch(f.output.snapshot().error, /private/);
+});
+
+test("historical malformed, oversized, and server-error frames settle without payload diagnostics", () => {
+  for (const fault of ["json", "size", "error"]) {
+    const f = fixture({ maxFrameChars: 400 });
+    f.output.selectCapture(captureHit());
+    if (fault === "json") f.latest().emit("delta", "PRIVATE malformed content", "delta-v1:pane:7:12");
+    if (fault === "size") capturedDelta(f.latest(), captureHit(), "x".repeat(401));
+    if (fault === "error") control(f.latest(), "error", { code: "<PRIVATE>", message: "PRIVATE" });
+    assert.equal(f.output.snapshot().status, "unavailable");
+    assert.equal(f.output.snapshot().text, "");
+    assert.equal(f.latest().closed, true);
+    assert.equal(f.timers.size, 0);
+    assert.doesNotMatch(f.output.snapshot().error, /PRIVATE/);
+  }
+});
+
+test("closing, switching, and page suspension retire historical callbacks and deadlines", () => {
+  for (const action of ["close", "switch", "suspend"]) {
+    const f = fixture();
+    const hit = captureHit();
+    f.output.selectCapture(hit);
+    const old = f.latest();
+    const deadline = f.timers.values().next().value.fn;
+    if (action === "close") f.output.close();
+    if (action === "switch") f.output.select("8");
+    if (action === "suspend") { f.output.suspend(); f.output.restore(); }
+    deadline();
+    capturedDelta(old, hit, "late private capture");
+    old.fail();
+    assert.equal(old.closed, true);
+    assert.equal(f.timers.size, 0);
+    assert.equal(f.output.snapshot().text, "");
+    assert.equal(f.output.snapshot().status, action === "close" ? "closed" : action === "switch" ? "connecting" : "unavailable");
+    assert.equal(f.sources.length, action === "switch" ? 2 : 1);
+  }
+});
+
+test("historical capture uses the existing bounded Unicode-safe transcript", () => {
+  const f = fixture({ maxChars: 3 });
+  f.output.selectCapture(captureHit());
+  capturedDelta(f.latest(), captureHit(), "prefix😀ab");
+  assert.equal(f.output.snapshot().status, "historical");
+  assert.equal(f.output.snapshot().text, "ab");
+  assert.equal(f.output.snapshot().discardedChars, 8);
+  assert.equal(f.latest().closed, true);
+});
+
+test("historical panel is isolated from live controls and searches its captured text", () => {
+  const f = panelFixture();
+  f.panel.openCapture(captureHit());
+  assert.equal(f.nodes["pane-output-title"].textContent, "Pane 7 — captured segment 12");
+  assert.match(f.nodes["pane-output-status"].textContent, /Loading historical capture/);
+  assert.equal(f.nodes["pane-output-pause"].disabled, true);
+  assert.equal(f.nodes["pane-output-history"].disabled, true);
+  assert.equal(f.nodes["pane-output-follow"].disabled, true);
+  const source = f.latest();
+  f.nodes["pane-output-history"].emit("click");
+  f.nodes["pane-output-pause"].emit("click");
+  assert.equal(f.sources.length, 1);
+  capturedDelta(source, captureHit(), "<b>needle</b> and needle");
+  f.panel.render();
+  assert.equal(f.nodes["pane-output-text"].value, "<b>needle</b> and needle");
+  assert.match(f.nodes["pane-output-status"].textContent, /Historical capture loaded/);
+  f.nodes["pane-output-search"].value = "needle";
+  f.nodes["pane-output-find-form"].emit("submit");
+  assert.equal(f.nodes["pane-output-text"].selectionStart, 3);
+  assert.match(f.nodes["pane-output-find-status"].textContent, /historical capture/);
+  assert.doesNotMatch(f.nodes["pane-output-find-status"].textContent, /Resume/);
+  f.panel.openSelected();
+  assert.equal(f.sources.length, 2);
+  assert.equal(f.output.snapshot().capture, null);
+  assert.equal(f.nodes["pane-output-text"].value, "");
+  assert.equal(f.nodes["pane-output-pause"].disabled, false);
+  assert.equal(f.nodes["pane-output-history"].disabled, false);
+  assert.equal(f.latest().url.searchParams.has("since_id"), false);
+});
+
+test("historical panel exposes unavailable and truncated states without substituting a live pane", () => {
+  const f = panelFixture({ maxChars: 3 });
+  f.panel.openCapture(captureHit());
+  capturedDelta(f.latest(), captureHit({ segmentId: "13" }), "wrong");
+  f.panel.render();
+  assert.match(f.nodes["pane-output-status"].textContent, /Historical capture unavailable/);
+  assert.equal(f.nodes["pane-output-text"].value, "");
+  assert.match(f.nodes["pane-output-warnings"].textContent, /no longer available/);
+  f.panel.openCapture(captureHit());
+  capturedDelta(f.latest(), captureHit(), "abcdef");
+  f.panel.render();
+  assert.equal(f.nodes["pane-output-text"].value, "def");
+  assert.match(f.nodes["pane-output-warnings"].textContent, /bounded suffix/);
+  f.panel.openCapture({});
+  assert.equal(f.output.snapshot().text, "def");
+  assert.match(f.nodes["pane-output-hint"].textContent, /invalid capture identity/);
+});

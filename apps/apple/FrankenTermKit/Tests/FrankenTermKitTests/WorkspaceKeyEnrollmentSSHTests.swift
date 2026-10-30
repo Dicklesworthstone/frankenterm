@@ -82,13 +82,58 @@ final class WorkspaceKeyEnrollmentSSHTests: XCTestCase {
         let request = try request()
         let target = try WorkspaceKeyEnrollmentTarget(host: "no-network.invalid", user: "operator")
         let config = URL(fileURLWithPath: "/nonexistent/fixture-only-config")
-        for action in [WorkspaceKeyEnrollmentAction.inspect, .install] {
+        for action in [WorkspaceKeyEnrollmentAction.inspect, .install, .remove] {
             let result = try WorkspaceKeyEnrollmentSSH.perform(request: request, target: target,
                 action: action, sshConfiguration: config, isCancelled: { true })
-            XCTAssertEqual(result.state, action == .install ? .uncertain : .blocked)
+            XCTAssertEqual(result.state, action == .inspect ? .blocked : .uncertain)
             XCTAssertEqual(result.operationID, request.operationID(for: target))
             XCTAssertFalse(result.detail.contains(config.path))
         }
+    }
+
+    func testRemovalReceiptsDistinguishOwnedRemovalFromIndependentAuthorization() throws {
+        let request = try request()
+        let target = try WorkspaceKeyEnrollmentTarget(host: "example.com", user: "operator")
+        func reply(_ state: String, _ code: String, action: WorkspaceKeyEnrollmentAction) throws -> WorkspaceKeyEnrollmentResult {
+            try WorkspaceKeyEnrollmentSSH.response(StrictJSON.encode(.object([
+                "version": .number("1"), "operation_id": .string(request.operationID(for: target)),
+                "target_id": .string(target.id), "fingerprint": .string(request.key.fingerprint),
+                "state": .string(state), "detail_code": .string(code)
+            ])), request: request, target: target, action: action)
+        }
+        XCTAssertEqual(try reply("removed", "owned_entry_disabled", action: .remove).state, .removed)
+        XCTAssertThrowsError(try reply("removed", "owned_entry_disabled", action: .inspect))
+        XCTAssertThrowsError(try reply("removed", "owned_entry_disabled", action: .install))
+        XCTAssertEqual(try reply("stillAuthorized", "owned_removed_other_remains", action: .remove).state, .stillAuthorized)
+        XCTAssertThrowsError(try reply("stillAuthorized", "owned_removed_other_remains", action: .inspect))
+        for action in [WorkspaceKeyEnrollmentAction.remove, .inspect] {
+            XCTAssertEqual(try reply("stillAuthorized", "independent_entry", action: action).state, .stillAuthorized)
+            XCTAssertEqual(try reply("absent", "not_present", action: action).state, .absent)
+        }
+        XCTAssertThrowsError(try reply("stillAuthorized", "independent_entry", action: .install))
+        XCTAssertEqual(try reply("uncertain", "write_uncertain", action: .remove).state, .uncertain)
+        XCTAssertThrowsError(try reply("uncertain", "write_uncertain", action: .inspect))
+        XCTAssertEqual(try reply("alreadyPresent", "owned_and_other", action: .inspect).state, .alreadyPresent)
+    }
+
+    func testRemovalRejectsInstallationClaimsAndMismatchedOperationReceipts() throws {
+        let request = try request()
+        let target = try WorkspaceKeyEnrollmentTarget(host: "example.com", user: "operator")
+        var record: [String: JSONValue] = ["version": .number("1"),
+            "operation_id": .string(request.operationID(for: target)), "target_id": .string(target.id),
+            "fingerprint": .string(request.key.fingerprint), "state": .string("removed"),
+            "detail_code": .string("owned_entry_disabled")]
+        for (state, code) in [("installed", "added"), ("alreadyPresent", "owned_entry"),
+                              ("alreadyPresent", "owned_and_other"), ("restricted", "restricted_entry")] {
+            var changed = record
+            changed["state"] = .string(state); changed["detail_code"] = .string(code)
+            XCTAssertThrowsError(try WorkspaceKeyEnrollmentSSH.response(StrictJSON.encode(.object(changed)),
+                request: request, target: target, action: .remove), state)
+        }
+        let otherRequest = try WorkspaceKeyEnrollmentRequest(key: request.key)
+        record["operation_id"] = .string(otherRequest.operationID(for: target))
+        XCTAssertThrowsError(try WorkspaceKeyEnrollmentSSH.response(StrictJSON.encode(.object(record)),
+            request: request, target: target, action: .remove))
     }
 
     func testLiveEnrollmentUsesTrustedSSHAndAccountsForRemoteEffects() throws {

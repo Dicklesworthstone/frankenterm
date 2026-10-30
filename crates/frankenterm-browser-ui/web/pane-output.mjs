@@ -50,8 +50,9 @@ export function createPaneOutput({
   maxChars = 256 * 1024,
   maxChunks = 2048,
   maxFrameChars = 1024 * 1024,
+  captureTimeoutMs = 10_000,
 } = {}) {
-  for (const [limit, cap] of [[maxChars, 8 * 1024 * 1024], [maxChunks, 32768], [maxFrameChars, 8 * 1024 * 1024]]) {
+  for (const [limit, cap] of [[maxChars, 8 * 1024 * 1024], [maxChunks, 32768], [maxFrameChars, 8 * 1024 * 1024], [captureTimeoutMs, 60_000]]) {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > cap) {
       throw new Error("invalid transcript limit");
     }
@@ -60,6 +61,9 @@ export function createPaneOutput({
   let pane = null;
   let source = null;
   let timer = null;
+  let captureTimer = null;
+  let capture = null;
+  let capturePending = false;
   let generation = 0;
   let retryMs = 1000;
   let paused = false;
@@ -76,12 +80,14 @@ export function createPaneOutput({
   let dirty = true;
   let textDirty = false;
   let text = "";
-  const eligible = () => pane !== null && !paused && !suspended;
+  const eligible = () => pane !== null && !paused && !suspended && (capture === null || capturePending);
 
   function retire() {
     generation += 1;
     if (timer !== null) clearTimer(timer);
     timer = null;
+    if (captureTimer !== null) clearTimer(captureTimer);
+    captureTimer = null;
     const previous = source;
     source = null;
     if (previous) previous.close();
@@ -114,7 +120,21 @@ export function createPaneOutput({
     textDirty = true;
   }
 
+  function settleCapture(reason, available = false) {
+    retire();
+    capturePending = false;
+    status = available ? "historical" : "unavailable";
+    error = reason;
+    dirty = true;
+  }
+
   function reconnect(reason) {
+    // A historical read is a finite request, not a live subscription. Never
+    // fall forward to another segment or let EventSource retry it implicitly.
+    if (capture !== null) {
+      settleCapture(reason);
+      return;
+    }
     retire();
     error = reason;
     status = "retrying";
@@ -132,12 +152,13 @@ export function createPaneOutput({
 
   function open() {
     if (!eligible() || source !== null || timer !== null) return;
-    status = "connecting";
+    status = capture === null ? "connecting" : "loading";
     dirty = true;
     const url = new URL("stream/deltas", root);
     url.searchParams.set("pane_id", pane);
     url.searchParams.set("max_hz", "50");
-    if (received !== null) url.searchParams.set("since_id", received);
+    if (capture !== null) url.searchParams.set("since_id", (BigInt(capture.segmentId) - 1n).toString());
+    else if (received !== null) url.searchParams.set("since_id", received);
     else if (history) url.searchParams.set("since_id", "0");
     let candidate;
     try {
@@ -150,6 +171,11 @@ export function createPaneOutput({
     const expected = generation;
     const selectedPane = pane;
     const current = () => eligible() && source === candidate && generation === expected;
+    if (capture !== null) {
+      captureTimer = setTimer(() => {
+        if (current()) settleCapture("Historical capture was not received before the deadline. Search again to check retained history.");
+      }, captureTimeoutMs);
+    }
     const frame = (message) => {
       if (!current()) return;
       try {
@@ -168,6 +194,25 @@ export function createPaneOutput({
               || unsigned(exact.data.pane_id, U64_MAX) !== selectedPane || typeof data.content !== "string") {
             throw new Error("invalid delta identity or content");
           }
+          if (capture !== null) {
+            if (segment !== capture.segmentId) {
+              settleCapture("The requested capture is no longer available. Later pane output was not opened.");
+              return;
+            }
+            if (typeof data.captured_at !== "number" || typeof data.content_len !== "number"
+                || unsigned(exact.data.captured_at, I64_MAX) !== capture.capturedAt
+                || unsigned(exact.data.content_len, U64_MAX) !== capture.contentLength) {
+              settleCapture("Capture identity changed or was invalid. Search again; no current pane was opened.");
+              return;
+            }
+            // content_len is the stored length, not the redacted wire length.
+            // Admit only the server's currently redacted text, then stop before
+            // any following segment can arrive, even for a reused pane ID.
+            append(data.content);
+            received = segment;
+            settleCapture(null, true);
+            return;
+          }
           // Reconnect may overlap with already admitted rows. Do not regress
           // the received cursor, append duplicates, or interpret ids as floats.
           if (received !== null && BigInt(segment) <= BigInt(received)) return;
@@ -180,7 +225,7 @@ export function createPaneOutput({
           if (typeof data.pane_id !== "number" || unsigned(exact.data.pane_id, U64_MAX) !== selectedPane) {
             throw new Error("wrong ready pane");
           }
-          status = "connected";
+          status = capture === null ? "connected" : "loading";
           // A ready frame does not establish delivery or complete replay.
         } else if (message.type === "gap") {
           if (typeof data.pane_id !== "number" || unsigned(exact.data.pane_id, U64_MAX) !== selectedPane) {
@@ -206,6 +251,7 @@ export function createPaneOutput({
     candidate.addEventListener("error", (message) => {
       if (!current()) return;
       if (typeof message.data === "string") frame(message);
+      else if (capture !== null) reconnect("Historical capture connection ended before delivery. Search again to retry.");
       else if (candidate.readyState === EventSourceImpl.CLOSED) reconnect("output disconnected; reconnecting");
       else {
         status = "connecting";
@@ -222,8 +268,31 @@ export function createPaneOutput({
     }
     return {
       paneId: pane, status, paused, suspended, history, cursor: received,
-      text, discardedChars, gapNotifications: gaps, unanchored, error,
+      text, discardedChars, gapNotifications: gaps, unanchored, error, capture,
     };
+  }
+
+  function startSelection(selected, retainedHistory, target = null) {
+    retire();
+    pane = selected;
+    capture = target;
+    capturePending = target !== null;
+    history = Boolean(retainedHistory);
+    paused = false;
+    received = null;
+    chunks = [];
+    chars = 0;
+    text = "";
+    textDirty = false;
+    error = null;
+    gaps = discardedChars = 0;
+    unanchored = false;
+    retryMs = 1000;
+    status = suspended ? "suspended" : "connecting";
+    dirty = true;
+    if (capture !== null && suspended) {
+      settleCapture("Historical capture request cancelled while the page was suspended.");
+    } else open();
   }
 
   return {
@@ -232,32 +301,32 @@ export function createPaneOutput({
     select(paneId, { retainedHistory = false } = {}) {
       const selected = unsigned(paneId, U64_MAX);
       if (selected === null) throw new Error("invalid pane id");
-      retire();
-      pane = selected;
-      history = Boolean(retainedHistory);
-      paused = false;
-      received = null;
-      chunks = [];
-      chars = 0;
-      text = "";
-      textDirty = false;
-      error = null;
-      gaps = discardedChars = 0;
-      unanchored = false;
-      retryMs = 1000;
-      status = suspended ? "suspended" : "connecting";
-      dirty = true;
-      open();
+      startSelection(selected, retainedHistory);
+    },
+    // Search results identify a capture, not a current pane attachment. Keep
+    // every identity as an exact decimal string; validate before retiring the
+    // current view so malformed or obsolete UI actions cannot retarget it.
+    selectCapture(hit) {
+      const target = {
+        paneId: unsigned(hit?.paneId, U64_MAX),
+        segmentId: unsigned(hit?.segmentId, I64_MAX),
+        capturedAt: unsigned(hit?.capturedAt, I64_MAX),
+        contentLength: unsigned(hit?.contentLength, U64_MAX),
+      };
+      if (Object.values(target).some((value) => value === null) || target.segmentId === "0") {
+        throw new Error("invalid capture identity");
+      }
+      startSelection(target.paneId, true, Object.freeze(target));
     },
     pause() {
-      if (pane === null || paused) return;
+      if (pane === null || paused || capture !== null) return;
       retire();
       paused = true;
       status = "paused";
       dirty = true;
     },
     resume() {
-      if (pane === null || !paused) return;
+      if (pane === null || !paused || capture !== null) return;
       paused = false;
       if (received === null && !history) unanchored = true;
       status = suspended ? "suspended" : "connecting";
@@ -266,22 +335,25 @@ export function createPaneOutput({
     },
     suspend() {
       if (suspended) return;
-      retire();
+      if (capturePending) settleCapture("Historical capture request cancelled when the page was suspended.");
+      else retire();
       suspended = true;
-      if (pane !== null) status = paused ? "paused" : "suspended";
+      if (pane !== null && capture === null) status = paused ? "paused" : "suspended";
       dirty = true;
     },
     restore() {
       if (!suspended) return;
       suspended = false;
-      if (pane !== null && !paused && received === null && !history) unanchored = true;
-      if (pane !== null) status = paused ? "paused" : "connecting";
+      if (pane !== null && capture === null && !paused && received === null && !history) unanchored = true;
+      if (pane !== null && capture === null) status = paused ? "paused" : "connecting";
       dirty = true;
       open();
     },
     close() {
       retire();
       pane = null;
+      capture = null;
+      capturePending = false;
       received = null;
       chunks = [];
       chars = 0;
@@ -350,16 +422,22 @@ export function mountPaneOutput({
     const state = output.takeUpdate();
     if (!state) return;
     const opened = state.paneId !== null;
+    const historical = state.capture !== null;
     panel.hidden = !opened;
     workspace.dataset.outputOpen = String(opened);
-    setText(title, opened ? `Pane ${state.paneId} — captured output` : "Captured output");
-    setText(statusLine, opened
-      ? `${state.status} · read-only · ${state.history ? "following retained history" : "new output since opening"}`
-      : "");
+    setText(title, historical ? `Pane ${state.paneId} — captured segment ${state.capture.segmentId}`
+      : opened ? `Pane ${state.paneId} — captured output` : "Captured output");
+    const captureStatus = state.status === "historical" ? "Historical capture loaded"
+      : state.status === "loading" ? "Loading historical capture" : "Historical capture unavailable";
+    setText(statusLine, historical ? `${captureStatus} · read-only · not following a current pane`
+      : opened ? `${state.status} · read-only · ${state.history ? "following retained history" : "new output since opening"}` : "");
+    pause.disabled = historyButton.disabled = follow.disabled = historical;
     setText(pause, state.paused ? "Resume" : "Pause");
     pause.setAttribute("aria-pressed", String(state.paused));
     const notices = [];
-    if (state.discardedChars) notices.push("Older text was discarded from this bounded view.");
+    if (state.discardedChars) notices.push(historical
+      ? "This captured segment exceeds the view limit; only its bounded suffix is shown."
+      : "Older text was discarded from this bounded view.");
     if (state.gapNotifications) notices.push(`${state.gapNotifications} capture-gap or bus-lag notifications; continuity is not guaranteed.`);
     if (state.unanchored) notices.push("Reconnected before a received cursor existed; earlier output may be missing. Load retained history to recover what remains.");
     if (state.error) notices.push(state.error);
@@ -380,6 +458,19 @@ export function mountPaneOutput({
     }
   }
 
+  function presentSelection(message, followLive) {
+    paneInput.value = output.snapshot().paneId;
+    hint.textContent = message;
+    follow.checked = followLive;
+    search.value = "";
+    matchAt = -1;
+    matchQuery = matchText = "";
+    findStatus.textContent = "";
+    render();
+    if (!followLive) transcript.scrollTop = 0;
+    transcript.focus();
+  }
+
   function show(paneId, retainedHistory = false) {
     try {
       output.select(paneId, { retainedHistory });
@@ -387,15 +478,17 @@ export function mountPaneOutput({
       hint.textContent = "Choose a pane or enter a valid unsigned pane ID.";
       return;
     }
-    paneInput.value = output.snapshot().paneId;
-    hint.textContent = "Output stays on this pane until you explicitly open another.";
-    follow.checked = true;
-    search.value = "";
-    matchAt = -1;
-    matchQuery = matchText = "";
-    findStatus.textContent = "";
-    render();
-    transcript.focus();
+    presentSelection("Output stays on this pane until you explicitly open another.", true);
+  }
+
+  function openCapture(hit) {
+    try {
+      output.selectCapture(hit);
+    } catch (_) {
+      hint.textContent = "The search result has an invalid capture identity. Search again.";
+      return;
+    }
+    presentSelection("Historical capture only. Current output requires a separate explicit Open action.", false);
   }
 
   function openSelected() {
@@ -444,8 +537,10 @@ export function mountPaneOutput({
     matchAt = found;
     matchQuery = query;
     matchText = currentText;
-    findStatus.textContent = found < 0 ? "Not found in retained text. Stream paused."
-      : "Match selected. Stream paused; Resume continues from the received cursor.";
+    const historical = output.snapshot().capture !== null;
+    findStatus.textContent = found < 0 ? `Not found in retained text.${historical ? "" : " Stream paused."}`
+      : historical ? "Match selected in this historical capture."
+        : "Match selected. Stream paused; Resume continues from the received cursor.";
     if (found >= 0) {
       transcript.focus();
       transcript.setSelectionRange(found, found + query.length);
@@ -464,8 +559,8 @@ export function mountPaneOutput({
     render();
   });
   historyButton.addEventListener("click", () => {
-    const paneId = output.snapshot().paneId;
-    if (paneId !== null) show(paneId, true);
+    const state = output.snapshot();
+    if (state.paneId !== null && state.capture === null) show(state.paneId, true);
   });
   closeButton.addEventListener("click", close);
   follow.addEventListener("change", () => {
@@ -481,7 +576,7 @@ export function mountPaneOutput({
   });
   render();
   return {
-    render, openSelected, close,
+    render, openSelected, openCapture, close,
     suspend() { output.suspend(); render(); },
     restore() { output.restore(); render(); },
   };

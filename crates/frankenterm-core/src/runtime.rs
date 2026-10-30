@@ -13999,7 +13999,21 @@ fn detection_to_stored_event(
     } else {
         0
     };
-    let dedupe_key = format!("{identity_key}:{bucket}");
+    let dedupe_key =
+        if crate::patterns::is_command_failure_event(&detection.event_type, detection.severity) {
+            // Retrying the same failing command is new evidence, even within the
+            // ordinary status-deduplication bucket. Bind to persisted capture
+            // identity so replaying this occurrence still returns the same row.
+            // Without a segment there is no stable occurrence identity to invent.
+            segment_id.map(|id| {
+                format!(
+                    "{identity_key}:segment:{id}:span:{}:{}",
+                    detection.span.0, detection.span.1
+                )
+            })
+        } else {
+            Some(format!("{identity_key}:{bucket}"))
+        };
 
     let redacted = redact_detection(detection);
 
@@ -14019,7 +14033,7 @@ fn detection_to_stored_event(
         matched_text: Some(redacted.matched_text),
         segment_id,
         detected_at,
-        dedupe_key: Some(dedupe_key),
+        dedupe_key,
         handled_at: None,
         handled_by_workflow_id: None,
         handled_status: None,
@@ -25474,6 +25488,78 @@ mod tests {
         let key = event.dedupe_key.as_ref().unwrap();
         // Dedupe key should contain a colon separating identity key from bucket
         assert!(key.contains(':'));
+    }
+
+    #[test]
+    fn command_failure_storage_identity_preserves_occurrences_and_exact_replays() {
+        for event_type in ["command.failed", "build.failed", "test.failed"] {
+            let mut detection = test_detection(event_type, Severity::Warning);
+            detection.span = (10, 80);
+            let first = detection_to_stored_event(1, Some("pane-a"), &detection, Some(100));
+            let replay = detection_to_stored_event(1, Some("pane-a"), &detection, Some(100));
+            let next = detection_to_stored_event(1, Some("pane-a"), &detection, Some(101));
+            assert_eq!(first.dedupe_key, replay.dedupe_key);
+            assert_ne!(first.dedupe_key, next.dedupe_key);
+
+            detection.span = (90, 160);
+            let second_in_segment =
+                detection_to_stored_event(1, Some("pane-a"), &detection, Some(100));
+            assert_ne!(first.dedupe_key, second_in_segment.dedupe_key);
+            assert!(
+                detection_to_stored_event(1, Some("pane-a"), &detection, None)
+                    .dedupe_key
+                    .is_none()
+            );
+
+            detection.severity = Severity::Info;
+            let informational = detection_to_stored_event(1, Some("pane-a"), &detection, Some(100));
+            assert_eq!(
+                informational.dedupe_key,
+                Some(format!(
+                    "{}:{}",
+                    event_identity_key(&detection, 1, Some("pane-a")),
+                    informational.detected_at / (5 * 60 * 1000)
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_command_failures_survive_actual_storage_deduplication() {
+        run_async_test_isolated(|| async {
+            let (_dir, db_path) = temp_db_path();
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+            storage.upsert_pane(test_pane_record(1)).await.unwrap();
+            let engine =
+                PatternEngine::from_config(&crate::config::PatternsConfig::default()).unwrap();
+            let mut context = DetectionContext::new();
+            let output = "error: could not compile `example` (lib) due to 1 previous error\n";
+            let mut event_ids = Vec::new();
+            for _ in 0..3 {
+                let segment = storage.append_segment(1, output, None).await.unwrap();
+                let detections = engine.detect_with_context(output, &mut context);
+                assert_eq!(detections.len(), 1);
+                let event =
+                    detection_to_stored_event(1, Some("pane-a"), &detections[0], Some(segment.id));
+                let inserted = storage.record_event_outcome(event.clone()).await.unwrap();
+                assert!(inserted.was_inserted());
+                event_ids.push(inserted.event_id());
+                let replay = storage.record_event_outcome(event).await.unwrap();
+                assert_eq!(replay.event_id(), inserted.event_id());
+                assert!(!replay.was_inserted());
+            }
+            assert!(event_ids.windows(2).all(|ids| ids[0] < ids[1]));
+            let events = storage
+                .get_events(crate::storage::EventQuery {
+                    pane_id: Some(1),
+                    event_type: Some("build.failed".to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(events.len(), 3);
+            storage.shutdown().await.unwrap();
+        });
     }
 
     // =========================================================================

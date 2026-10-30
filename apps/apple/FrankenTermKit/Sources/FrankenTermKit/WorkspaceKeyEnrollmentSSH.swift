@@ -51,9 +51,9 @@ public enum WorkspaceKeyEnrollmentSSH {
         return try WorkspaceKeyEnrollmentTarget(host: route.host, port: route.port, user: route.user)
     }
 
-    /// Call on a worker, after persisting the journal's uncertain install entry.
-    /// Every install starts with readback. Inspection alone never creates files,
-    /// and a lost install response is never converted into a successful retry.
+    /// Call on a worker, after persisting the journal's uncertain mutation entry.
+    /// Every mutation starts with readback. Inspection never creates files or
+    /// disables entries, and a lost response cannot become a successful retry.
     public static func perform(request: WorkspaceKeyEnrollmentRequest, target: WorkspaceKeyEnrollmentTarget,
                                action: WorkspaceKeyEnrollmentAction,
                                isCancelled: () -> Bool = { Task<Never, Never>.isCancelled }) throws -> WorkspaceKeyEnrollmentResult {
@@ -79,13 +79,24 @@ public enum WorkspaceKeyEnrollmentSSH {
         do {
             if isCancelled() { throw CancellationError() }
             let observed = try invoke(.inspect)
-            guard action == .install else { return observed }
+            guard action != .inspect else { return observed }
             if observed.state == .blocked || observed.state == .uncertain {
                 return try result(.uncertain, observed.detail + " Reconcile before retrying an earlier operation.")
             }
-            guard observed.state == .absent else { return observed }
+            switch action {
+            case .install:
+                // An independent entry must be rechecked by the install path,
+                // which preserves its existing restrictions without appending.
+                guard observed.state == .absent || observed.state == .stillAuthorized else { return observed }
+            case .remove:
+                if observed.state == .absent || observed.state == .stillAuthorized { return observed }
+                guard observed.state == .alreadyPresent else {
+                    return try result(.uncertain, "The account's owned enrollment entry could not be established. Reconcile before removal.")
+                }
+            case .inspect: return observed
+            }
             if isCancelled() { throw CancellationError() }
-            let applied = try invoke(.install)
+            let applied = try invoke(action)
             if applied.state == .blocked {
                 return try result(.uncertain, applied.detail + " Reconcile before retrying an earlier operation.")
             }
@@ -93,7 +104,7 @@ public enum WorkspaceKeyEnrollmentSSH {
         } catch {
             // Do not display remote stderr: it can contain arbitrary terminal
             // controls, host-provided text, local paths, or authentication data.
-            return try result(action == .install ? .uncertain : .blocked,
+            return try result(action == .inspect ? .blocked : .uncertain,
                 isCancelled() ? "The operation was cancelled. Its remote result has not been confirmed."
                     : "SSH could not confirm the result. Check this Mac's existing host trust, public-key authentication, and Python 3 support, then reconcile.")
         }
@@ -157,40 +168,68 @@ public enum WorkspaceKeyEnrollmentSSH {
         let code = try root.required("detail_code").string()
         let detail: String
         switch (state, code) {
-        case (.absent, "not_present") where action == .inspect:
-            detail = "This public key is absent from the account's standard authorized_keys file."
+        case (.absent, "not_present") where action != .install:
+            detail = "This public key is absent from the account's standard authorized_keys file. Existing SSH sessions and other authorization sources were not changed."
         case (.installed, "added") where action == .install:
             detail = "The exact phone-key entry was installed and read back. Verify a connection from the phone before relying on it."
         case (.alreadyPresent, "owned_entry"):
             detail = "The entry for this operation was read back. No duplicate was added. Verify a connection from the phone."
+        case (.alreadyPresent, "owned_and_other"):
+            detail = "This operation's entry and another live entry for the same public key were read back. Removing this enrollment alone will leave the other entry intact."
         case (.alreadyPresent, "existing_entry"):
             detail = "This public key already has an unrestricted entry. Existing content was preserved; no duplicate was added."
         case (.restricted, "restricted_entry"):
             detail = "This public key already has a restricted entry. Its restrictions were preserved; no unrestricted copy was added."
+        case (.removed, "owned_entry_disabled") where action == .remove:
+            detail = "This operation's entry was disabled and read back. No live entry for this public key remains in the standard authorized_keys file. Existing SSH sessions are unaffected; other server authorization sources may still grant access."
+        case (.stillAuthorized, "independent_entry") where action != .install:
+            detail = "This operation has no unchanged owned entry, but another live entry for the public key remains. Independent, modified, and restricted entries were preserved."
+        case (.stillAuthorized, "owned_removed_other_remains") where action == .remove:
+            detail = "This operation's entry was disabled and read back, but another live entry for the public key remains. Its authorization and existing SSH sessions were not revoked."
         case (.blocked, "account_mismatch"): detail = "The remote account does not match the reviewed account."
         case (.blocked, "unsafe_home"), (.blocked, "unsafe_directory"), (.blocked, "unsafe_file"):
             detail = "The remote home, SSH directory, or key file has unsupported ownership, permissions, links, or type."
         case (.blocked, "file_limit"): detail = "The existing authorized_keys file exceeds the supported one-MiB limit."
         case (.blocked, "key_conflict"): detail = "The existing key file contains a conflicting or unrecognized entry for this phone identity."
         case (.blocked, "lock_busy"): detail = "Another operation is changing the key file. Reconcile after it finishes."
+        case (.blocked, "lease_unavailable") where action == .remove:
+            detail = "Safe removal requires a Linux server and a filesystem that supports kernel write leases. This account could not provide that exclusion, so no removal was attempted."
+        case (.blocked, "lease_busy") where action == .remove:
+            detail = "Another process has the key file open. Safe removal could not acquire exclusive writer protection; retry after that process finishes, then reconcile."
+        case (.blocked, "lease_changed") where action == .remove:
+            detail = "Another process requested the key file during removal preparation. No removal write was attempted. Reconcile before another change."
         case (.blocked, "changed_file"): detail = "The key file changed during inspection. Reconcile its current contents."
         case (.blocked, "unsupported_platform"): detail = "The server lacks the required Python 3 and POSIX file capabilities."
         case (.blocked, "io"): detail = "The server could not safely inspect or open the standard key file."
-        case (.uncertain, "write_uncertain") where action == .install:
-            detail = "The server could not confirm the complete write and readback. Reconcile before another installation attempt."
+        case (.uncertain, "write_uncertain") where action != .inspect:
+            detail = "The server could not confirm the complete write and readback. Reconcile before another installation or removal attempt."
         default: throw FTError.malformed("enrollment.response_state")
         }
-        if action == .inspect && (state == .installed || state == .uncertain) {
-            throw FTError.malformed("enrollment.inspect_effect")
+        switch action {
+        case .inspect:
+            if state == .installed || state == .removed || state == .uncertain {
+                throw FTError.malformed("enrollment.inspect_effect")
+            }
+        case .install:
+            if state == .absent || state == .removed || state == .stillAuthorized {
+                throw FTError.malformed("enrollment.install_effect")
+            }
+        case .remove:
+            if state == .installed || state == .alreadyPresent || state == .restricted {
+                throw FTError.malformed("enrollment.remove_effect")
+            }
         }
         return try .init(operationID: request.operationID(for: target), target: target, state: state, detail: detail)
     }
 
     // This bounded remote program uses the account's standard authorized_keys
-    // path only. It never replaces, chmods, removes, or rewrites existing data.
-    // O_APPEND, no-follow directory-relative opens, a cooperative file lock,
-    // stable-inode checks and exact readback preserve unrelated entries. A
-    // noncooperating writer or lost response remains an uncertain operation.
+    // path only. Installation appends; removal comments the first byte of one
+    // exact canonical owned line without replacing or truncating the file.
+    // Removal additionally requires a Linux kernel write lease, excluding
+    // other open descriptors and refusing a requested lease break. No-follow
+    // directory-relative opens, stable-inode checks and exact readback preserve
+    // unrelated entries. Lost authority or a lost response remains uncertain;
+    // no advisory-only removal or blind rollback is attempted.
     static let remoteProgram = #"""
 import base64, errno, fcntl, hashlib, json, os, pwd, signal, stat, struct, sys, time, uuid
 
@@ -204,6 +243,59 @@ class Refusal(Exception):
 
 def refuse(code):
     raise Refusal(code)
+
+def lease_changed(signum, frame):
+    refuse('lease_changed')
+
+def require_write_lease(fd):
+    try:
+        current = fcntl.fcntl(fd, fcntl.F_GETLEASE)
+    except OSError:
+        refuse('lease_changed')
+    # A pending break already reports its target type, even before the kernel
+    # lets the competing open/truncate proceed. Never treat it as authority.
+    if current != fcntl.F_WRLCK:
+        refuse('lease_changed')
+
+def qualify_write_lease_timeout():
+    # A forced break must not overtake this helper's twelve-second process
+    # alarm. Read only this exact kernel setting, with a fixed byte budget.
+    try:
+        descriptor = os.open('/proc/sys/fs/lease-break-time', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            raw = bytearray()
+            while len(raw) < 32:
+                part = os.read(descriptor, 32 - len(raw))
+                if not part:
+                    break
+                raw.extend(part)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        refuse('lease_unavailable')
+    # A full budget leaves no room to establish EOF, so reject it as well as
+    # longer inputs. The kernel's decimal setting is much shorter than this.
+    if not raw or len(raw) == 32:
+        refuse('lease_unavailable')
+    if raw[-1] == 10:
+        raw = raw[:-1]
+    if not raw or any(byte < 48 or byte > 57 for byte in raw) or int(raw) < 15:
+        refuse('lease_unavailable')
+
+def acquire_write_lease(fd):
+    if sys.platform != 'linux' or not hasattr(os, 'pwrite') or not hasattr(signal, 'SIGIO') or not all(
+            hasattr(fcntl, name) for name in ('F_SETLEASE', 'F_GETLEASE', 'F_SETOWN', 'F_WRLCK')):
+        refuse('lease_unavailable')
+    qualify_write_lease_timeout()
+    signal.signal(signal.SIGIO, lease_changed)
+    try:
+        fcntl.fcntl(fd, fcntl.F_SETOWN, os.getpid())
+        fcntl.fcntl(fd, fcntl.F_SETLEASE, fcntl.F_WRLCK)
+    except OSError as error:
+        if error.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+            refuse('lease_busy')
+        refuse('lease_unavailable')
+    require_write_lease(fd)
 
 def exact(pairs):
     result = {}
@@ -234,6 +326,10 @@ def checked_file(fd):
 
 def stamp(info):
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_mode, info.st_uid, info.st_gid, info.st_nlink)
+
+def same_snapshot(fd, observed):
+    if stamp(checked_file(fd)) != observed:
+        refuse('changed_file')
 
 def same_path(directory, fd):
     current = os.stat('authorized_keys', dir_fd=directory, follow_symlinks=False)
@@ -277,7 +373,7 @@ def read_all(fd):
         refuse('changed_file')
     if b'\x00' in data:
         refuse('key_conflict')
-    return bytes(data)
+    return bytes(data), before
 
 def field(line, start):
     while start < len(line) and line[start] in b' \t':
@@ -301,12 +397,17 @@ def field(line, start):
     return line[begin:start], start
 
 def existing(data, blob, key_id, operation):
-    seen = False
+    unrestricted = False
     restricted = False
-    owned = False
+    owned = None
     marker = ('frankenterm-phone:' + key_id + ':').encode('ascii')
-    for line in data.split(b'\n'):
-        line = line.rstrip(b'\r')
+    encoded_blob = base64.b64encode(blob)
+    canonical = b'ssh-ed25519 ' + encoded_blob + b' ' + marker + operation.encode('ascii')
+    offset = 0
+    for raw in data.split(b'\n'):
+        line_offset = offset
+        offset += len(raw) + 1
+        line = raw.rstrip(b'\r')
         stripped = line.lstrip(b' \t')
         if not stripped or stripped.startswith(b'#'):
             continue
@@ -325,18 +426,33 @@ def existing(data, blob, key_id, operation):
             try:
                 match = base64.b64decode(encoded, validate=True) == blob
             except Exception:
-                if marker in line or base64.b64encode(blob) in line:
+                if marker in line or encoded_blob in line:
                     refuse('key_conflict')
         if match:
-            seen = True
-            restricted = restricted or options
-            owned = owned or line[end:].strip() == marker + operation.encode('ascii')
-        elif marker in line or base64.b64encode(blob) in line:
+            # Only our exact unrestricted line grants removal authority. A
+            # changed comment, indentation, option, encoding or line ending
+            # belongs to the account owner and remains untouched.
+            if not options and raw == canonical and offset <= len(data):
+                if owned is not None:
+                    refuse('key_conflict')
+                owned = line_offset
+            else:
+                restricted = restricted or options
+                unrestricted = unrestricted or not options
+        elif marker in line or encoded_blob in line:
             refuse('key_conflict')
-    if restricted:
+    return owned, unrestricted, restricted
+
+def entry_state(entries, action):
+    owned, unrestricted, restricted = entries
+    if action == 'install' and restricted:
         return ('restricted', 'restricted_entry')
-    if seen:
-        return ('alreadyPresent', 'owned_entry' if owned else 'existing_entry')
+    if owned is not None:
+        return ('alreadyPresent', 'owned_and_other' if unrestricted or restricted else 'owned_entry')
+    if unrestricted or restricted:
+        if action == 'install':
+            return ('alreadyPresent', 'existing_entry')
+        return ('stillAuthorized', 'independent_entry')
     return ('absent', 'not_present')
 
 def main():
@@ -347,7 +463,7 @@ def main():
     if len(sys.argv) != 2 or len(sys.argv[1]) > 32768:
         refuse('bad_request')
     payload = json.loads(base64.b64decode(sys.argv[1], validate=True), object_pairs_hook=exact)
-    if set(payload) != {'version', 'action', 'operation_id', 'target_id', 'user', 'request'} or payload['version'] != 1 or payload['action'] not in ('inspect', 'install'):
+    if set(payload) != {'version', 'action', 'operation_id', 'target_id', 'user', 'request'} or payload['version'] != 1 or payload['action'] not in ('inspect', 'install', 'remove'):
         refuse('bad_request')
     for name in ('operation_id', 'target_id'):
         value = payload[name]
@@ -373,6 +489,7 @@ def main():
     if account.pw_name != payload['user']:
         refuse('account_mismatch')
     install = payload['action'] == 'install'
+    remove = payload['action'] == 'remove'
     # sshd's standard %h directory comes from the account database, not a
     # shell startup file or client/server environment variable named HOME.
     home = account.pw_dir
@@ -389,8 +506,7 @@ def main():
             if not install:
                 same_directory(home, None, home_fd)
                 still_absent('.ssh', home_fd)
-                emit('absent', 'not_present')
-                return
+                return ('absent', 'not_present')
             try:
                 os.mkdir('.ssh', 0o700, dir_fd=home_fd)
                 os.fsync(home_fd)
@@ -402,7 +518,11 @@ def main():
             same_directory(home, None, home_fd)
             same_directory('.ssh', home_fd, directory)
             safe_file_path(directory)
-            flags = os.O_NOFOLLOW | os.O_NONBLOCK | (os.O_RDWR | os.O_APPEND if install else os.O_RDONLY)
+            # pwrite must never inherit O_APPEND: Linux otherwise appends even
+            # when pwrite supplies an offset. Removal preserves the file size.
+            flags = os.O_NOFOLLOW | os.O_NONBLOCK | (os.O_RDWR if install or remove else os.O_RDONLY)
+            if install:
+                flags |= os.O_APPEND
             created = False
             try:
                 fd = os.open('authorized_keys', flags, dir_fd=directory)
@@ -411,8 +531,7 @@ def main():
                     same_directory(home, None, home_fd)
                     same_directory('.ssh', home_fd, directory)
                     still_absent('authorized_keys', directory)
-                    emit('absent', 'not_present')
-                    return
+                    return ('absent', 'not_present')
                 try:
                     fd = os.open('authorized_keys', flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=directory)
                     created = True
@@ -420,7 +539,7 @@ def main():
                     fd = os.open('authorized_keys', flags, dir_fd=directory)
             try:
                 checked_file(fd)
-                lock = fcntl.LOCK_EX if install else fcntl.LOCK_SH
+                lock = fcntl.LOCK_EX if install or remove else fcntl.LOCK_SH
                 until = time.monotonic() + 5
                 while True:
                     try:
@@ -430,26 +549,48 @@ def main():
                         if time.monotonic() >= until:
                             refuse('lock_busy')
                         time.sleep(0.025)
+                if remove:
+                    acquire_write_lease(fd)
                 same_path(directory, fd)
-                before = read_all(fd)
-                outcome = existing(before, blob, key['id'], payload['operation_id'])
-                if outcome[0] != 'absent' or not install:
+                before, observed_stamp = read_all(fd)
+                entries = existing(before, blob, key['id'], payload['operation_id'])
+                outcome = entry_state(entries, payload['action'])
+                should_install = install and outcome[0] == 'absent'
+                should_remove = remove and entries[0] is not None
+                if not should_install and not should_remove:
                     same_directory(home, None, home_fd)
                     same_directory('.ssh', home_fd, directory)
                     same_path(directory, fd)
-                    emit(*outcome)
-                    return
-                addition = (b'\n' if before and not before.endswith(b'\n') else b'') + b'ssh-ed25519 ' + key['public_blob'].encode('ascii') + b' frankenterm-phone:' + key['id'].encode('ascii') + b':' + payload['operation_id'].encode('ascii') + b'\n'
-                if len(before) + len(addition) > LIMIT:
+                    same_snapshot(fd, observed_stamp)
+                    if remove:
+                        require_write_lease(fd)
+                    return outcome
+                if should_remove:
+                    # A one-byte comment marker disables exactly our owned
+                    # entry. Retaining the remainder avoids replacing/truncating
+                    # unrelated keys and preserves recoverable public evidence.
+                    write_offset = entries[0]
+                    addition = b'#'
+                    expected = before[:write_offset] + addition + before[write_offset + 1:]
+                else:
+                    addition = (b'\n' if before and not before.endswith(b'\n') else b'') + b'ssh-ed25519 ' + key['public_blob'].encode('ascii') + b' frankenterm-phone:' + key['id'].encode('ascii') + b':' + payload['operation_id'].encode('ascii') + b'\n'
+                    expected = before + addition
+                if len(expected) > LIMIT:
                     refuse('file_limit')
-                if read_all(fd) != before:
+                repeated, repeated_stamp = read_all(fd)
+                if repeated != before or repeated_stamp != observed_stamp:
                     refuse('changed_file')
                 same_directory(home, None, home_fd)
                 same_directory('.ssh', home_fd, directory)
                 same_path(directory, fd)
                 metadata = checked_file(fd)
+                if stamp(metadata) != observed_stamp:
+                    refuse('changed_file')
+                if should_remove:
+                    require_write_lease(fd)
                 started_write = True
-                if os.write(fd, addition) != len(addition):
+                written = os.pwrite(fd, addition, write_offset) if should_remove else os.write(fd, addition)
+                if written != len(addition):
                     refuse('write_uncertain')
                 os.fsync(fd)
                 if created:
@@ -457,14 +598,20 @@ def main():
                 same_directory(home, None, home_fd)
                 same_directory('.ssh', home_fd, directory)
                 same_path(directory, fd)
-                after = read_all(fd)
+                after, final_stamp = read_all(fd)
                 final = checked_file(fd)
-                if after != before + addition or (final.st_mode, final.st_uid, final.st_gid) != (metadata.st_mode, metadata.st_uid, metadata.st_gid):
+                if after != expected or stamp(final) != final_stamp or (final.st_mode, final.st_uid, final.st_gid) != (metadata.st_mode, metadata.st_uid, metadata.st_gid):
                     refuse('write_uncertain')
                 same_directory(home, None, home_fd)
                 same_directory('.ssh', home_fd, directory)
                 same_path(directory, fd)
-                emit('installed', 'added')
+                same_snapshot(fd, final_stamp)
+                if should_remove:
+                    require_write_lease(fd)
+                    if entries[1] or entries[2]:
+                        return ('stillAuthorized', 'owned_removed_other_remains')
+                    return ('removed', 'owned_entry_disabled')
+                return ('installed', 'added')
             finally:
                 os.close(fd)
         finally:
@@ -473,7 +620,10 @@ def main():
         os.close(home_fd)
 
 try:
-    main()
+    # main's finally blocks close the file and release its lease before any
+    # reply I/O. The lease covers only bounded local filesystem operations.
+    outcome = main()
+    emit(*outcome)
 except Exception as error:
     if payload is not None and fingerprint is not None:
         code = str(error) if isinstance(error, Refusal) else 'io'

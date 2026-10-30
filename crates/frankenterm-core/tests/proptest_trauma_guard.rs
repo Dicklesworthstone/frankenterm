@@ -24,6 +24,7 @@
 
 use proptest::prelude::*;
 
+use frankenterm_core::patterns::{AgentType, Detection, Severity};
 use frankenterm_core::trauma_guard::{
     TraumaConfig, TraumaDecision, TraumaEvent, TraumaState, hash_command,
 };
@@ -316,17 +317,52 @@ proptest! {
     // ── TG-15: record_detections populates recurring_signatures ───────────
 
     #[test]
-    fn tg15_record_detections(_dummy in 0u8..1) {
+    fn tg15_record_detections(
+        event_type in prop::sample::select(vec![
+            "command.failed", "build.failed", "test.failed",
+            "error", "error.network", "auth.failed", "prompt.ready",
+            "compaction.completed", "usage.reached", "test.failed.extra",
+        ]),
+        severity in prop::sample::select(vec![
+            Severity::Info, Severity::Warning, Severity::Critical,
+        ]),
+        attempts in 3usize..8,
+    ) {
         let mut state = TraumaState::new();
-        let errors = vec!["E0308".to_string()];
+        let detection = Detection {
+            rule_id: "terminal.outcome".to_string(),
+            agent_type: AgentType::Wezterm,
+            event_type: event_type.to_string(),
+            severity,
+            confidence: 1.0,
+            extracted: serde_json::Value::Null,
+            matched_text: String::new(),
+            span: (0, 0),
+        };
+        for attempt in 0..attempts {
+            state.record_detections(
+                1_000 * (attempt as u64 + 1),
+                "cargo test",
+                std::slice::from_ref(&detection),
+            );
+        }
 
-        // Below threshold
-        state.record_command_result(1000, "cargo test", &errors);
-        state.record_command_result(2000, "cargo test", &errors);
-
-        let events = state.recent_events();
-        // Events should exist
-        prop_assert!(events.len() >= 2);
+        // This oracle names the supported outcomes independently of the
+        // implementation's classifier. Provider errors are not command results.
+        let is_command_failure = matches!(event_type, "command.failed" | "build.failed" | "test.failed")
+            && matches!(severity, Severity::Warning | Severity::Critical);
+        let now_ms = 1_000 * (attempts as u64 + 1);
+        let decision = state.evaluate_proposed_command(now_ms, "cargo test");
+        prop_assert_eq!(decision.should_intervene, is_command_failure);
+        prop_assert_eq!(
+            decision.repeat_count,
+            if is_command_failure { attempts as u64 } else { 0 },
+        );
+        prop_assert_eq!(
+            state.signature_count("terminal.outcome", now_ms),
+            if is_command_failure { attempts as u64 } else { 0 },
+        );
+        prop_assert_eq!(state.history_len(), attempts);
     }
 
     // ── TG-16: History ordering is chronological ──────────────────────────
