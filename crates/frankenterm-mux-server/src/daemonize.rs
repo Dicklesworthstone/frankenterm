@@ -2,13 +2,6 @@ use anyhow::Context;
 use std::ffi::OsString;
 use std::process::{Command, Stdio};
 
-#[cfg(unix)]
-use libc::pid_t;
-#[cfg(unix)]
-use std::io::Write;
-#[cfg(unix)]
-use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
-
 pub fn spawn_daemonized_copy(
     args: Vec<OsString>,
     config: &config::ConfigHandle,
@@ -31,8 +24,32 @@ pub fn spawn_daemonized_copy(
     Ok(())
 }
 
+/// Starts the re-exec'd server in a session of its own, as daemon(3) does.
+///
+/// Without it the "daemon" keeps its launcher's session, process group and
+/// controlling terminal, so it dies with whatever ends them: a closed
+/// terminal, a killed GUI app, a torn-down login session.
 #[cfg(unix)]
-fn configure_spawned_daemon_command(_cmd: &mut Command) {}
+#[allow(unsafe_code)]
+fn configure_spawned_daemon_command(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    // SAFETY: `pre_exec` runs the hook in the forked child before `exec`, where
+    // only async-signal-safe work is allowed. The hook captures nothing, calls
+    // only setsid(2), which is async-signal-safe, and builds its error from
+    // errno without allocating. A freshly forked child never leads a process
+    // group, so setsid only fails if the kernel refuses; `spawn` then returns
+    // that error to the invoker instead of starting an undetached server.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+}
 
 #[cfg(windows)]
 fn configure_spawned_daemon_command(cmd: &mut Command) {
@@ -41,228 +58,91 @@ fn configure_spawned_daemon_command(cmd: &mut Command) {
     cmd.creation_flags(winapi::um::winbase::DETACHED_PROCESS);
 }
 
-#[cfg(unix)]
-#[allow(dead_code)]
-enum Fork {
-    #[allow(dead_code)]
-    Child(pid_t),
-    Parent(pid_t),
-}
+#[cfg(all(test, unix))]
+mod tests {
+    use super::configure_spawned_daemon_command;
+    use std::process::{Command, Stdio};
 
-#[cfg(unix)]
-#[allow(dead_code)]
-#[allow(unsafe_code)]
-fn fork() -> anyhow::Result<Fork> {
-    // SAFETY: `fork` is invoked before the daemonized child starts worker
-    // threads. The parent immediately waits or exits; the child performs only
-    // the small post-fork setup in this module before returning to the normal
-    // startup path.
-    let pid = unsafe { libc::fork() };
-
-    if pid == 0 {
-        // We are the child
-        Ok(Fork::Child(current_pid()))
-    } else if pid < 0 {
-        let err: anyhow::Error = std::io::Error::last_os_error().into();
-        Err(err.context("fork"))
-    } else {
-        // We are the parent
-        Ok(Fork::Parent(pid))
-    }
-}
-
-#[cfg(unix)]
-#[allow(dead_code)]
-#[allow(unsafe_code)]
-fn setsid() -> anyhow::Result<()> {
-    // SAFETY: Called only in the first daemon child after fork and before the
-    // second fork. `setsid` has no Rust aliasing requirements; errors are
-    // checked through the POSIX `-1` return value.
-    let pid = unsafe { libc::setsid() };
-    if pid == -1 {
-        let err: anyhow::Error = std::io::Error::last_os_error().into();
-        Err(err.context("setsid"))
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(unix)]
-#[allow(dead_code)]
-#[allow(unsafe_code)]
-fn lock_pid_file(config: &config::ConfigHandle) -> anyhow::Result<std::fs::File> {
-    let pid_file = config.daemon_options.pid_file();
-    let pid_file_dir = pid_file
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("{} has no parent?", pid_file.display()))?;
-    std::fs::create_dir_all(pid_file_dir).with_context(|| {
-        format!(
-            "while creating directory structure: {}",
-            pid_file_dir.display()
-        )
-    })?;
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&pid_file)
-        .with_context(|| format!("opening pid file {}", pid_file.display()))?;
-    config::set_sticky_bit(&pid_file);
-    // SAFETY: `file.as_raw_fd()` is a live descriptor owned by `file`, and
-    // `flock` does not take ownership of it. The return value is checked.
-    let res = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if res != 0 {
-        let err = std::io::Error::last_os_error();
-        anyhow::bail!("unable to lock pid file {}: {}", pid_file.display(), err);
+    /// `ps` fields: pid and process group everywhere, plus the session id on
+    /// Linux. macOS `ps` prints a session of 0 for every process, so there the
+    /// process group is the observable effect of setsid.
+    fn ps_fields() -> Vec<&'static str> {
+        let mut fields = vec!["-o", "pid=", "-o", "pgid="];
+        if cfg!(target_os = "linux") {
+            fields.extend(["-o", "sid="]);
+        }
+        fields
     }
 
-    // SAFETY: `file.as_raw_fd()` is still live and opened for writing. Truncate
-    // failure is intentionally ignored to preserve the previous best-effort
-    // pid-file behavior; the subsequent write still reports I/O errors.
-    let _ = unsafe { libc::ftruncate(file.as_raw_fd(), 0) };
+    fn parse_ids(stdout: &[u8]) -> Vec<u32> {
+        std::str::from_utf8(stdout)
+            .expect("ps prints ASCII")
+            .split_whitespace()
+            .map(|id| id.parse().expect("ps prints decimal ids"))
+            .collect()
+    }
 
-    Ok(file)
-}
+    fn launcher_ids() -> Vec<u32> {
+        let output = Command::new("ps")
+            .args(ps_fields())
+            .arg("-p")
+            .arg(std::process::id().to_string())
+            .output()
+            .expect("run ps on the test process");
+        assert!(output.status.success(), "ps failed: {:?}", output.status);
+        parse_ids(&output.stdout)
+    }
 
-#[cfg(unix)]
-#[allow(dead_code)]
-#[allow(unsafe_code)]
-fn wait_for_intermediate_child(pid: pid_t) -> ! {
-    let mut status: libc::c_int = 0;
-    // SAFETY: `pid` is the child pid returned by the immediately preceding
-    // `fork` call in this process. `status` points to valid writable storage
-    // for the duration of the call, and the return value is checked.
-    let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
-    if waited == -1 {
-        let err = std::io::Error::last_os_error();
-        eprintln!(
-            "frankenterm-mux-server: waitpid({pid}) on daemonize \
-             intermediate failed: {err}; exit status unknown"
+    /// Ids of a child that execs `ps` on itself, so `ps` reports the spawned
+    /// process exactly as the hook left it.
+    fn child_ids(detach: bool) -> Vec<u32> {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("exec ps \"$@\" -p $$")
+            .arg("sh")
+            .args(ps_fields())
+            .stdin(Stdio::null());
+        if detach {
+            configure_spawned_daemon_command(&mut cmd);
+        }
+        let output = cmd.output().expect("spawn a child that runs ps");
+        assert!(
+            output.status.success(),
+            "child ps failed: {:?}",
+            output.status
         );
-        std::process::exit(1);
+        parse_ids(&output.stdout)
     }
-    if libc::WIFEXITED(status) {
-        std::process::exit(libc::WEXITSTATUS(status));
-    }
-    if libc::WIFSIGNALED(status) {
-        let sig = libc::WTERMSIG(status);
-        eprintln!(
-            "frankenterm-mux-server: daemonize intermediate child \
-             killed by signal {sig}"
+
+    #[test]
+    fn daemon_child_leaves_the_launcher_session_and_process_group() {
+        let launcher = launcher_ids();
+        let attached = child_ids(false);
+        let detached = child_ids(true);
+        let fields = ps_fields().len() / 2;
+        assert_eq!(launcher.len(), fields, "launcher ids: {launcher:?}");
+        assert_eq!(attached.len(), fields, "attached child ids: {attached:?}");
+        assert_eq!(detached.len(), fields, "detached child ids: {detached:?}");
+
+        // Control: a child spawned without the hook stays in the launcher's
+        // process group (and session), so the checks below are not vacuous.
+        assert_eq!(
+            attached[1..],
+            launcher[1..],
+            "an undetached child shares its launcher's process group and session"
         );
-        // Conventional encoding: 128 + signal number.
-        std::process::exit(128 + sig);
-    }
-    std::process::exit(1);
-}
 
-#[cfg(unix)]
-#[allow(dead_code)]
-#[allow(unsafe_code)]
-fn current_pid() -> pid_t {
-    // SAFETY: `getpid` takes no pointers and cannot violate Rust aliasing or
-    // memory-safety invariants.
-    unsafe { libc::getpid() }
-}
-
-#[cfg(unix)]
-#[allow(dead_code)]
-#[allow(unsafe_code)]
-fn redirect_standard_streams(
-    devnull: &std::fs::File,
-    stdout: &std::fs::File,
-    stderr: &std::fs::File,
-) {
-    // SAFETY: All source descriptors are live for the duration of these calls.
-    // `dup2` duplicates them onto the standard descriptor numbers without
-    // taking ownership of the Rust `File` values.
-    unsafe { libc::dup2(devnull.as_raw_fd(), libc::STDIN_FILENO) };
-    unsafe { libc::dup2(stdout.as_raw_fd(), libc::STDOUT_FILENO) };
-    unsafe { libc::dup2(stderr.as_raw_fd(), libc::STDERR_FILENO) };
-}
-
-#[cfg(unix)]
-#[allow(dead_code)]
-pub fn daemonize(config: &config::ConfigHandle) -> anyhow::Result<Option<RawFd>> {
-    let pid_file = if !config::running_under_wsl() {
-        // pid file locking is only partly functional when running under
-        // WSL 1; it is possible for the pid file to exist after a reboot
-        // and for attempts to open and lock it to fail when there are no
-        // other processes that might possibly hold a lock on it.
-        // So, we only use a pid file when not under WSL.
-
-        Some(lock_pid_file(config)?)
-    } else {
-        None
-    };
-    let stdout = config.daemon_options.open_stdout()?;
-    let stderr = config.daemon_options.open_stderr()?;
-    let devnull = std::fs::File::open("/dev/null").context("opening /dev/null for read")?;
-
-    match fork()? {
-        Fork::Parent(pid) => {
-            // Propagate the intermediate child's exit status to the
-            // invoking shell so a failure anywhere in the child's
-            // post-fork setup (setsid, the second fork, pidfile write,
-            // stdio redirection) surfaces as a non-zero exit on the
-            // grandparent — not silent success.
-            //
-            // Earlier revisions ignored both the waitpid return value
-            // and the status word: a failing intermediate child would
-            // still see the grandparent exit(0), leaving the user
-            // thinking "daemon started" when nothing was actually
-            // running.
-            wait_for_intermediate_child(pid);
+        assert_eq!(
+            detached[1], detached[0],
+            "the daemon child must lead its own process group: {detached:?}"
+        );
+        assert_ne!(detached[1], launcher[1]);
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                detached[2], detached[0],
+                "the daemon child must lead its own session: {detached:?}"
+            );
+            assert_ne!(detached[2], launcher[2]);
         }
-        Fork::Child(_) => {}
-    }
-
-    setsid()?;
-    match fork()? {
-        Fork::Parent(_) => {
-            std::process::exit(0);
-        }
-        Fork::Child(_) => {}
-    }
-
-    let pid_file_fd = pid_file.map(|mut pid_file| {
-        writeln!(pid_file, "{}", current_pid()).ok();
-        // Leak it so that the descriptor remains open for the duration
-        // of the process runtime
-        let fd = pid_file.into_raw_fd();
-
-        // Since we will always re-exec, we need to clear FD_CLOEXEC
-        // in order for the pidfile to be inherited in our newly
-        // exec'd self
-        set_cloexec(fd, false);
-
-        fd
-    });
-
-    redirect_standard_streams(&devnull, &stdout, &stderr);
-
-    Ok(pid_file_fd)
-}
-
-#[cfg(unix)]
-#[allow(dead_code)]
-#[allow(unsafe_code)]
-pub fn set_cloexec(fd: RawFd, enable: bool) {
-    // SAFETY: `fd` is expected to be an open file descriptor supplied by the
-    // daemonization path. `fcntl` does not take ownership; failures are
-    // best-effort and preserve the previous no-panic behavior.
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFD);
-        if flags == -1 {
-            return;
-        }
-
-        let flags = if enable {
-            flags | libc::FD_CLOEXEC
-        } else {
-            flags & !libc::FD_CLOEXEC
-        };
-
-        libc::fcntl(fd, libc::F_SETFD, flags);
     }
 }

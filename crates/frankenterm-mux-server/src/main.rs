@@ -100,9 +100,8 @@ fn install_shutdown_signal_handlers() {
 
 #[cfg(not(unix))]
 fn install_shutdown_signal_handlers() {
-    // Windows has no POSIX signals. The daemon surface is Unix-only
-    // in practice (the `daemonize` path at daemonize.rs is
-    // `#![cfg(unix)]`), so the non-Unix branch is a no-op.
+    // Windows has no POSIX signals, so there is nothing to install. A
+    // Windows daemon is a DETACHED_PROCESS copy (see daemonize.rs).
 }
 
 #[allow(unsafe_code)]
@@ -1551,13 +1550,7 @@ mod tests {
                 "main.rs:fn install_shutdown_signal_handlers()",
                 "main.rs:fn set_process_env_for_mux_server_startup(name: &str, value: impl AsRef<OsStr>)",
                 "main.rs:fn remove_process_env_for_mux_server_startup(name: &str)",
-                "daemonize.rs:fn fork() -> anyhow::Result<Fork>",
-                "daemonize.rs:fn setsid() -> anyhow::Result<()>",
-                "daemonize.rs:fn lock_pid_file(config: &config::ConfigHandle) -> anyhow::Result<std::fs::File>",
-                "daemonize.rs:fn wait_for_intermediate_child(pid: pid_t) -> !",
-                "daemonize.rs:fn current_pid() -> pid_t",
-                "daemonize.rs:fn redirect_standard_streams(",
-                "daemonize.rs:pub fn set_cloexec(fd: RawFd, enable: bool)",
+                "daemonize.rs:fn configure_spawned_daemon_command(cmd: &mut Command)",
             ]
         );
     }
