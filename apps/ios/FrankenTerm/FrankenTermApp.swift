@@ -3136,89 +3136,100 @@ private struct WorkspaceKeysSheet: View {
                     ContentUnavailableView("Locked", systemImage: "lock.shield",
                         description: Text("Return to FrankenTerm to manage keys."))
                 } else if let document {
-                    List {
-                        if let message = model.credentialMessage {
-                            Section {
-                                Text(verbatim: message)
-                                Button("Dismiss Message") { model.credentialMessage = nil }
-                            }
-                        }
-                        if let saved {
-                            Section {
-                                ForEach(saved.deviceKeys) { key in
-                                    phoneKeyRow(key, workspace: saved)
+                    ScrollViewReader { messages in
+                        List {
+                            if let message = model.credentialMessage {
+                                Section {
+                                    Text(verbatim: message)
+                                        .id("keys.result-message")
+                                    Button("Dismiss Message") { model.credentialMessage = nil }
                                 }
-                                Button("Create Phone SSH Key", systemImage: "key.horizontal") {
-                                    reviewed = nil; hostReview = nil
-                                    deviceReview = model.reviewDeviceKeyChange(.generate, workspaceID: workspaceID)
-                                }.disabled(saved.deviceKeys.count >= 16 || model.credentialImport != nil)
-                                    .accessibilityIdentifier("keys.phone.create")
-                            } header: {
-                                Text("Phone Keys")
-                            } footer: {
-                                Text("A separate phone identity can be revoked on a server without revoking your Mac's key. Authorize its public key on the server, then choose a route. Private keys stay in protected storage on this device. Up to 16 phone keys can be retained in a workspace.")
                             }
-                        }
-                        Section {
-                            ForEach(document.credentials.filter { key in saved?.deviceKeys.contains(where: { $0.id == key.id }) != true }) { key in
-                                VStack(alignment: .leading, spacing: 10) {
-                                    Text(verbatim: key.id).font(.headline)
-                                    Text(verbatim: key.algorithm).font(.caption).foregroundStyle(.secondary)
-                                    Text(verbatim: key.fingerprint).font(.system(.caption, design: .monospaced))
-                                        .textSelection(.enabled)
-                                    let pending = model.unconfirmedCredentialRevocations.contains(key.fingerprint)
-                                    let revoked = model.locallyRevokedFingerprints.contains(key.fingerprint)
-                                    if pending {
-                                        Label("Blocked in this app; saving needs retry", systemImage: "exclamationmark.shield")
-                                            .font(.callout)
-                                    } else if revoked {
-                                        Label("Revoked on this phone", systemImage: "key.slash").font(.callout)
-                                    } else if model.availableCredentials[workspaceID]?.contains(key.id) == true {
-                                        Label("Key present on this phone", systemImage: "key.fill").font(.callout)
-                                    } else {
-                                        Label("Key unavailable on this phone", systemImage: "key").font(.callout)
+                            if let saved {
+                                Section {
+                                    ForEach(saved.deviceKeys) { key in
+                                        phoneKeyRow(key, workspace: saved)
                                     }
-                                    let routeCount = document.routes.filter { $0.credentialIDs.contains(key.id) }.count
-                                    Text("Used by \(routeCount) routes in this workspace").font(.caption).foregroundStyle(.secondary)
-                                    Button("Import Matching Key…", systemImage: "square.and.arrow.down") {
-                                        reviewed = nil
-                                        model.beginCredentialImport(workspaceID: workspaceID, credentialID: key.id)
-                                    }.disabled(revoked || pending || model.credentialImport != nil)
-                                        .accessibilityIdentifier("keys.import.\(key.id)")
-                                    Button(pending ? "Retry Saving Revocation" : "Revoke on This Phone", role: .destructive) {
-                                        hostReview = nil
-                                        reviewed = model.reviewCredentialRevocation(workspaceID: workspaceID, credentialID: key.id)
-                                    }.disabled(revoked && !pending)
-                                }.padding(.vertical, 6)
+                                    Button("Create Phone SSH Key", systemImage: "key.horizontal") {
+                                        reviewed = nil; hostReview = nil
+                                        deviceReview = model.reviewDeviceKeyChange(.generate, workspaceID: workspaceID)
+                                    }.disabled(saved.deviceKeys.count >= 16 || model.credentialImport != nil)
+                                        .accessibilityIdentifier("keys.phone.create")
+                                } header: {
+                                    Text("Phone Keys")
+                                } footer: {
+                                    Text("A separate phone identity can be revoked on a server without revoking your Mac's key. Authorize its public key on the server, then choose a route. Private keys stay in protected storage on this device. Up to 16 phone keys can be retained in a workspace.")
+                                }
                             }
-                        } header: {
-                            Text(verbatim: document.name)
-                        } footer: {
-                            Text("Revocation blocks this fingerprint in every workspace on this phone, including later imports. It does not erase stored key material or revoke access on your Mac or SSH servers.")
-                        }
-                        if !document.hostTrust.isEmpty {
                             Section {
-                                ForEach(Self.endpoints(document)) { endpoint in
-                                    hostRow(endpoint)
+                                ForEach(document.credentials.filter { key in saved?.deviceKeys.contains(where: { $0.id == key.id }) != true }) { key in
+                                    VStack(alignment: .leading, spacing: 10) {
+                                        Text(verbatim: key.id).font(.headline)
+                                        Text(verbatim: key.algorithm).font(.caption).foregroundStyle(.secondary)
+                                        Text(verbatim: key.fingerprint).font(.system(.caption, design: .monospaced))
+                                            .textSelection(.enabled)
+                                        let pending = model.unconfirmedCredentialRevocations.contains(key.fingerprint)
+                                        let revoked = model.locallyRevokedFingerprints.contains(key.fingerprint)
+                                        if pending {
+                                            Label("Blocked in this app; saving needs retry", systemImage: "exclamationmark.shield")
+                                                .font(.callout)
+                                        } else if revoked {
+                                            Label("Revoked on this phone", systemImage: "key.slash").font(.callout)
+                                        } else if model.availableCredentials[workspaceID]?.contains(key.id) == true {
+                                            Label("Key present on this phone", systemImage: "key.fill").font(.callout)
+                                        } else {
+                                            Label("Key unavailable on this phone", systemImage: "key").font(.callout)
+                                        }
+                                        let routeCount = document.routes.filter { $0.credentialIDs.contains(key.id) }.count
+                                        Text("Used by \(routeCount) routes in this workspace").font(.caption).foregroundStyle(.secondary)
+                                        Button("Import Matching Key…", systemImage: "square.and.arrow.down") {
+                                            reviewed = nil
+                                            model.beginCredentialImport(workspaceID: workspaceID, credentialID: key.id)
+                                        }.disabled(revoked || pending || model.credentialImport != nil)
+                                            .accessibilityIdentifier("keys.import.\(key.id)")
+                                        Button(pending ? "Retry Saving Revocation" : "Revoke on This Phone", role: .destructive) {
+                                            hostReview = nil
+                                            reviewed = model.reviewCredentialRevocation(workspaceID: workspaceID, credentialID: key.id)
+                                        }.disabled(revoked && !pending)
+                                    }.padding(.vertical, 6)
                                 }
                             } header: {
-                                Text("Host Keys")
+                                Text(verbatim: document.name)
                             } footer: {
-                                Text("Blocking a host key stops every workspace on this phone from accepting it from that host and port, including later imports. Your Mac and the server are unchanged.")
+                                Text("Revocation blocks this fingerprint in every workspace on this phone, including later imports. It does not erase stored key material or revoke access on your Mac or SSH servers.")
+                            }
+                            if !document.hostTrust.isEmpty {
+                                Section {
+                                    ForEach(Self.endpoints(document)) { endpoint in
+                                        hostRow(endpoint)
+                                    }
+                                } header: {
+                                    Text("Host Keys")
+                                } footer: {
+                                    Text("Blocking a host key stops every workspace on this phone from accepting it from that host and port, including later imports. Your Mac and the server are unchanged.")
+                                }
+                            }
+                        }.disabled(model.busy)
+                        .onChange(of: model.credentialMessage) { _, message in
+                            // Key operations are often initiated at the bottom of
+                            // this list. Bring their result into view on compact
+                            // iPad sheets as well as on iPhone.
+                            if message != nil {
+                                messages.scrollTo("keys.result-message", anchor: .top)
                             }
                         }
-                    }.disabled(model.busy)
-                    .confirmationDialog("Stop Trusting This Host Key?",
-                                        isPresented: Binding(get: { hostReview != nil }, set: { if !$0 { hostReview = nil } }),
-                                        titleVisibility: .visible, presenting: hostReview) { review in
-                        Button("Stop Trusting and Disconnect", role: .destructive) { model.revokeHostLocally(review) }
-                            .disabled(model.busy || !model.active)
-                        Button("Keep Trusting", role: .cancel) { hostReview = nil }
-                    } message: { review in
-                        Text(verbatim: "\(review.displayHost) port \(review.port)\n" + review.key.algorithm + "\n" + review.key.fingerprint
-                            + "\n\nRefuse this key from this host on this phone. All sessions in these workspaces will disconnect; remote shells and programs may end, and input already sent may have executed.\n\n"
-                            + review.workspaceNames.joined(separator: "\n")
-                            + "\n\nImported pins cannot restore trust in it. Your Mac and the server are unchanged.")
+                        .confirmationDialog("Stop Trusting This Host Key?",
+                                            isPresented: Binding(get: { hostReview != nil }, set: { if !$0 { hostReview = nil } }),
+                                            titleVisibility: .visible, presenting: hostReview) { review in
+                            Button("Stop Trusting and Disconnect", role: .destructive) { model.revokeHostLocally(review) }
+                                .disabled(model.busy || !model.active)
+                            Button("Keep Trusting", role: .cancel) { hostReview = nil }
+                        } message: { review in
+                            Text(verbatim: "\(review.displayHost) port \(review.port)\n" + review.key.algorithm + "\n" + review.key.fingerprint
+                                + "\n\nRefuse this key from this host on this phone. All sessions in these workspaces will disconnect; remote shells and programs may end, and input already sent may have executed.\n\n"
+                                + review.workspaceNames.joined(separator: "\n")
+                                + "\n\nImported pins cannot restore trust in it. Your Mac and the server are unchanged.")
+                        }
                     }
                 } else {
                     ContentUnavailableView("Workspace Unavailable", systemImage: "key",
