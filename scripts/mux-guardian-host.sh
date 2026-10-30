@@ -333,9 +333,10 @@ unit() {  # logical name -> manager-specific identifier
 # crash, a logout) and kills every job in it, so the units live in
 # user/<uid>, which outlives that session and still reaches the pasteboard,
 # keychain and AppleScript (it lacks only launchd's ssh-agent socket). Their
-# plists load there at each boot's first login (LimitLoadToSessionType
-# Background), and the login loader (load-units) starts any unit that is not
-# loaded when a GUI session begins.
+# plists say LimitLoadToSessionType Background, the session type launchd loads
+# into user/<uid> when it creates that domain (as it does Apple's contactsd),
+# and the login loader (load-units) starts any unit that is not running when
+# a GUI session begins, so they come back after a teardown either way.
 launchd_domain() { echo "user/$(id -u)"; }
 
 launchd_target() {  # <label> -> domain/label: where it is loaded, user/ if nowhere
@@ -454,10 +455,11 @@ EOF
 EOF
         mv "$d/$label.plist.partial" "$d/$label.plist"
       done
-      # Background plists load only when user/<uid> is created, at boot. When
-      # a GUI teardown took units an older install left in gui/, nothing else
-      # would start them at the next login. This agent runs in the GUI
-      # session, starts whatever is not loaded in user/<uid>, and exits.
+      # launchd loads Background plists only when it creates user/<uid>, at
+      # the first login after boot, so after a GUI teardown took units an
+      # older install left in gui/ nothing would start them before a reboot.
+      # This agent runs at each GUI login, starts whatever is not running (as
+      # each login used to, loading the gui/ plists afresh), and exits.
       label=$(unit login-loader)
       cat > "$d/$label.plist.partial" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -885,8 +887,10 @@ cmd_load_units() {  # launchd's login loader: start whatever is not running
   load_manager
   [ "$MANAGER" = launchd ] || return 0
   local n
+  # A unit that fails to start must not keep the later ones from trying: the
+  # guardian and mux wait for their predecessor and launchd retries the mux.
   for n in pty-broker pty-guardian mux-server; do
-    svc_active "$n" || svc_start "$n"
+    svc_active "$n" || svc_start "$n" || log "could not start $n; see $STATE/logs/$n.log"
   done
   # A unit still in gui/ (installed by an older version and running since)
   # dies with this GUI session; stop-all and install move it.
@@ -907,5 +911,5 @@ case "${1:-}" in
   run-broker) run_broker ;;
   run-guardian) run_guardian ;;
   run-mux) run_mux ;;
-  *) sed -n '2,33p' "$0"; exit 2 ;;
+  *) awk 'NR == 1 { next } /^#/ { print; next } { exit }' "$0"; exit 2 ;;
 esac
