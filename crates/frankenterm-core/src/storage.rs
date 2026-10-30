@@ -9214,6 +9214,42 @@ impl StorageHandle {
         .await
     }
 
+    /// Read bounded command-loop evidence without loading captured terminal output.
+    pub(crate) async fn get_trauma_history_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        since: i64,
+        until: i64,
+        limit: usize,
+    ) -> Result<TraumaHistory> {
+        Self::checkpoint_storage_operation(cx, "get_trauma_history")?;
+        let db_path = Arc::clone(&self.db_path);
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
+            pooled_backend(db_path.as_str(), |backend| {
+                query_trauma_history_backend(backend, pane_id, since, until, limit)
+            })
+        })
+        .await
+    }
+
+    /// The same bounded evidence read for synchronous detached admission.
+    pub(crate) fn get_trauma_history_blocking_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        since: i64,
+        until: i64,
+        limit: usize,
+    ) -> Result<TraumaHistory> {
+        Self::checkpoint_storage_operation(cx, "get_trauma_history")?;
+        let history = pooled_backend(self.db_path.as_str(), |backend| {
+            query_trauma_history_backend(backend, pane_id, since, until, limit)
+        })?;
+        Self::checkpoint_storage_operation(cx, "get_trauma_history")?;
+        Ok(history)
+    }
+
     /// Stream audit actions using a cursor and stable ordering.
     ///
     /// Records are ordered by monotonically increasing ID for deterministic paging.
@@ -11553,6 +11589,16 @@ fn is_operator_token(token: &str) -> bool {
 
 fn is_quoted_token(token: &str) -> bool {
     token.len() >= 2 && token.starts_with('"') && token.ends_with('"')
+}
+
+/// Bounded, redacted failure evidence used by policy admission.
+///
+/// Audit summaries contain only the existing redacted preview and fingerprint;
+/// event payloads, matched output, and decision contexts are never loaded.
+#[derive(Debug, Default)]
+pub(crate) struct TraumaHistory {
+    pub audit_actions: Vec<AuditActionRecord>,
+    pub events: Vec<StoredEvent>,
 }
 
 /// Query options for events
@@ -33478,6 +33524,88 @@ fn audit_action_from_backend_cells(row: &[SqlCell]) -> Result<AuditActionRecord>
             .string(14)
             .map_err(|err| storage_backend_error("Audit action row result", err))?,
     })
+}
+
+fn query_trauma_history_backend(
+    backend: &dyn StorageBackend,
+    pane_id: u64,
+    since: i64,
+    until: i64,
+    limit: usize,
+) -> Result<TraumaHistory> {
+    let limit = limit.clamp(1, 512);
+    let event_limit = limit.saturating_mul(8).clamp(64, 4096);
+    let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
+    // One statement supplies one read snapshot. A newer send must not appear
+    // only in the event read and have its failures attributed to an older send.
+    // Both projections omit captured output and decision-context payloads.
+    let rows = backend
+        .query_map_cells(
+            "WITH recent_sends AS (
+                 SELECT a.id, a.ts, a.actor_kind, a.target_pane_id,
+                        a.action_kind, a.policy_decision,
+                        substr(a.input_summary, 1, 2048) AS input_summary, a.result
+                 FROM audit_actions a
+                 JOIN panes p ON p.pane_id = a.target_pane_id
+                 WHERE a.target_pane_id = ?1 AND a.ts >= ?2 AND a.ts <= ?3
+                   AND a.ts >= p.first_seen_at
+                   AND a.policy_decision = 'allow'
+                   AND a.action_kind IN
+                       ('send_text', 'send_ctrl_c', 'send_ctrl_d', 'send_ctrl_z', 'send_control')
+                 ORDER BY a.ts DESC, a.id DESC LIMIT ?4
+             ), recent_failures AS (
+                 SELECT id, pane_id, rule_id, event_type, severity, confidence, detected_at
+                 FROM events
+                 WHERE pane_id = ?1 AND detected_at > (SELECT MIN(ts) FROM recent_sends)
+                   AND detected_at <= ?3
+                   AND event_type IN ('command.failed', 'build.failed', 'test.failed')
+                   AND severity IN ('warning', 'critical')
+                 ORDER BY detected_at DESC, id DESC LIMIT ?5
+             )
+             SELECT 0, id, ts, actor_kind, NULL, NULL, target_pane_id, NULL,
+                    action_kind, policy_decision, NULL, NULL,
+                    input_summary, NULL, NULL, result
+             FROM recent_sends
+             UNION ALL
+             SELECT 1, id, pane_id, rule_id, '', event_type, severity, confidence,
+                    NULL, NULL, NULL, detected_at, NULL, NULL, NULL, NULL
+             FROM recent_failures",
+            &[
+                ToSqlValue::Integer(pane_id_i64),
+                ToSqlValue::Integer(since),
+                ToSqlValue::Integer(until),
+                ToSqlValue::Integer(usize_to_i64(limit, "trauma history limit")?),
+                ToSqlValue::Integer(usize_to_i64(event_limit + 1, "trauma event limit")?),
+            ],
+        )
+        .map_err(|err| storage_backend_error("Query trauma history snapshot", err))?;
+    let mut history = TraumaHistory::default();
+    for row in &rows {
+        let kind = CellRowReader::new(row)
+            .i64(0)
+            .map_err(|err| storage_backend_error("Trauma history row kind", err))?;
+        match kind {
+            0 => history
+                .audit_actions
+                .push(audit_action_from_backend_cells(&row[1..])?),
+            1 => history
+                .events
+                .push(stored_event_from_backend_cells(&row[1..])?),
+            _ => {
+                return Err(StorageError::Database(
+                    "Invalid Trauma Guard evidence row".to_string(),
+                )
+                .into());
+            }
+        }
+    }
+    if history.events.len() > event_limit {
+        return Err(StorageError::Database(
+            "Trauma Guard failure history exceeds the bounded admission window".to_string(),
+        )
+        .into());
+    }
+    Ok(history)
 }
 
 fn query_audit_actions_backend(

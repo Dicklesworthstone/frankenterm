@@ -44,7 +44,7 @@ use crate::policy_metrics::{
 };
 use crate::policy_quarantine::QuarantineRegistry;
 pub use crate::redactor::Redactor;
-use crate::trauma_guard::TraumaDecision;
+use crate::trauma_guard::{TraumaConfig, TraumaDecision, TraumaState};
 use frankenterm_core_connector_types::{
     BundleRegistrySnapshot, ConnectorReliabilitySnapshot, CredentialBrokerTelemetrySnapshot,
     GovernorSnapshot, IngestionTelemetrySnapshot, MeshTelemetrySnapshot, RegistryTelemetrySnapshot,
@@ -2544,15 +2544,6 @@ pub fn policy_trauma_feedback_failure_count() -> u64 {
     POLICY_TRAUMA_FEEDBACK_FAILURE_COUNT.load(Ordering::Relaxed)
 }
 
-fn record_trauma_feedback_failure(pane_id: u64) {
-    let failures = increment_policy_failure_counter(&POLICY_TRAUMA_FEEDBACK_FAILURE_COUNT);
-    tracing::warn!(
-        pane_id,
-        trauma_feedback_failures_total = failures,
-        "Synthetic trauma guard feedback could not be delivered"
-    );
-}
-
 /// Return the cumulative number of workflow-parent audit lookups that failed.
 #[must_use]
 pub fn policy_workflow_parent_lookup_failure_count() -> u64 {
@@ -3567,6 +3558,7 @@ const COMMAND_TOKENS: &[&str] = &[
     "yarn",
     "pnpm",
     "cargo",
+    "rch",
     "make",
     "bash",
     "sh",
@@ -3698,7 +3690,7 @@ const COMMAND_TOKENS: &[&str] = &[
 
 const TRAUMA_BYPASS_ENV: &str = "FT_BYPASS_TRAUMA";
 const TRAUMA_LOOP_BLOCK_RULE_ID: &str = "policy.trauma_guard.loop_block";
-const TRAUMA_FEEDBACK_PREFIX: &str = "[ft::TraumaGuard]";
+const TRAUMA_HISTORY_UNAVAILABLE: &str = "history_unavailable";
 const RCH_HEAVY_COMPUTE_RULE_ID: &str = "policy.rch.heavy_compute";
 
 /// The lines a terminal executes from `text`: `\n`, `\r\n`, and a bare `\r`
@@ -3875,22 +3867,6 @@ fn has_trauma_bypass_prefix(text: &str) -> bool {
     }
 
     false
-}
-
-#[must_use]
-fn trauma_feedback_comment(decision: &PolicyDecision) -> Option<String> {
-    if decision.rule_id() != Some(TRAUMA_LOOP_BLOCK_RULE_ID) {
-        return None;
-    }
-
-    let reason = decision
-        .reason()
-        .unwrap_or("recurring failure loop detected");
-    let normalized_reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
-
-    Some(format!(
-        "# {TRAUMA_FEEDBACK_PREFIX} EXECUTION BLOCKED: {normalized_reason}. Next: fix-forward (edit code/tests) or prefix with {TRAUMA_BYPASS_ENV}=1 once."
-    ))
 }
 
 #[derive(Debug)]
@@ -4713,6 +4689,8 @@ pub struct PolicyEngine {
     command_gate: CommandGateConfig,
     /// Whether trauma-guard intervention is enabled.
     trauma_guard_enabled: bool,
+    /// Matching and bounded history settings used by every injector admission.
+    trauma_guard_config: TraumaConfig,
     /// Custom policy rules configuration
     policy_rules: PolicyRulesConfig,
     /// Risk scoring configuration
@@ -4775,6 +4753,7 @@ impl PolicyEngine {
             block_recent_gap: true,
             command_gate: CommandGateConfig::default(),
             trauma_guard_enabled: true,
+            trauma_guard_config: TraumaConfig::default(),
             policy_rules: PolicyRulesConfig::default(),
             risk_config: RiskConfig::default(),
             decision_log: PolicyDecisionLog::with_defaults(),
@@ -4833,6 +4812,7 @@ impl PolicyEngine {
         .with_command_gate_config(config.command_gate.clone())
         .with_block_alt_screen(config.block_alt_screen)
         .with_block_recent_gap(config.block_recent_gap)
+        .with_trauma_guard_config(config.trauma_guard.clone())
         .with_policy_rules(config.rules.clone())
         .with_decision_log_config(config.decision_log.clone());
         engine.quarantine_registry = QuarantineRegistry::from_config(&config.quarantine);
@@ -4962,6 +4942,59 @@ impl PolicyEngine {
     pub fn with_trauma_guard_enabled(mut self, enabled: bool) -> Self {
         self.trauma_guard_enabled = enabled;
         self
+    }
+
+    /// Configure the real send-time loop guard, including its enablement.
+    #[must_use]
+    pub fn with_trauma_guard_config(mut self, config: crate::config::TraumaGuardConfig) -> Self {
+        self.trauma_guard_enabled = config.enabled;
+        self.trauma_guard_config = config.to_trauma_config();
+        self
+    }
+
+    fn should_check_trauma_history(&self, input: &PolicyInput) -> bool {
+        self.trauma_guard_enabled
+            && input.action == ActionKind::SendText
+            && matches!(input.actor, ActorKind::Robot | ActorKind::Mcp)
+            && input.capabilities.is_input_safe()
+            && input
+                .command_text
+                .as_deref()
+                .is_some_and(|text| is_command_candidate(text) && !has_trauma_bypass_prefix(text))
+    }
+
+    /// Populate durable command-loop evidence before authorizing a live or
+    /// preview send. Direct Robot/MCP dispatchers use the same admission as
+    /// `PolicyGatedInjector`; this method never sends input or writes history.
+    pub async fn populate_trauma_decision_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        storage: &crate::storage::StorageHandle,
+        input: &mut PolicyInput,
+    ) {
+        input.trauma_decision = None;
+        if !self.should_check_trauma_history(input) {
+            return;
+        }
+        let (Some(pane_id), Some(text)) = (input.pane_id, input.command_text.as_deref()) else {
+            return;
+        };
+        let config = self.trauma_guard_config.clone();
+        let now_ms = checked_now_ms_i64().max(0);
+        let window_ms =
+            i64::try_from(config.signature_window.window_duration_ms).unwrap_or(i64::MAX);
+        let history = storage
+            .get_trauma_history_with_cx(
+                cx,
+                pane_id,
+                now_ms.saturating_sub(window_ms),
+                now_ms,
+                config.history_limit,
+            )
+            .await;
+        input.trauma_decision = Some(trauma_decision_from_history(
+            history, &config, pane_id, text, now_ms,
+        ));
     }
 
     /// Set custom policy rules configuration
@@ -7184,24 +7217,22 @@ impl PolicyEngine {
                                 Some("bypass requested via FT_BYPASS_TRAUMA=1".to_string()),
                             );
                         } else {
-                            let reason = trauma_decision
-                                .reason_code
-                                .as_deref()
-                                .map_or_else(
-                                    || {
-                                        format!(
-                                            "Trauma Guard blocked command after {} repeated failures",
-                                            trauma_decision.repeat_count
-                                        )
-                                    },
-                                    |reason_code| {
-                                        format!(
-                                            "Trauma Guard blocked command ({reason_code}) after {} repeated failures. Prefix with FT_BYPASS_TRAUMA=1 to override once.",
-                                            trauma_decision.repeat_count
-                                        )
-                                    },
-                                );
-                            let rule_id = "policy.trauma_guard.loop_block".to_string();
+                            let unavailable = trauma_decision.reason_code.as_deref()
+                                == Some(TRAUMA_HISTORY_UNAVAILABLE);
+                            let (reason, rule_id) = if unavailable {
+                                (
+                                    "Trauma Guard could not verify recent command outcomes. Retry after storage recovers or prefix with FT_BYPASS_TRAUMA=1 to override once.".to_string(),
+                                    "policy.trauma_guard.history_unavailable".to_string(),
+                                )
+                            } else {
+                                (
+                                    format!(
+                                        "Trauma Guard blocked command after {} repeated failures. Inspect the failure and change the command, or prefix with FT_BYPASS_TRAUMA=1 to retry once after corrective work.",
+                                        trauma_decision.repeat_count
+                                    ),
+                                    TRAUMA_LOOP_BLOCK_RULE_ID.to_string(),
+                                )
+                            };
                             context.record_rule(
                                 rule_id.clone(),
                                 true,
@@ -8075,35 +8106,11 @@ where
         &self.engine
     }
 
-    /// Inject a synthetic Trauma Guard feedback line through
-    /// `send_text_with_options_with_cx` so a cancelled parent (e.g.
-    /// a shutting-down policy engine) bails before pumping the
-    /// trauma-feedback text into the pane.
-    async fn maybe_inject_trauma_feedback_with_cx(
-        &self,
-        cx: &crate::cx::Cx,
-        pane_id: u64,
-        decision: &PolicyDecision,
-    ) {
-        let Some(feedback) = trauma_feedback_comment(decision) else {
-            return;
-        };
-
-        if self
-            .client
-            .send_text_with_options_with_cx(cx, pane_id, &feedback, true, false)
-            .await
-            .is_err()
-        {
-            record_trauma_feedback_failure(pane_id);
-        }
-    }
-
     /// Cx-first [`Self::send_text`] (ft-xbnl0.2.3). Routes the
     /// policy-gated send through [`Self::dispatch_wezterm_send_with_cx`]
     /// so the underlying wezterm subprocess honors caller
     /// cancellation. Policy evaluation, audit emission, ingress tap, and
-    /// trauma-feedback delivery all share the same caller cx.
+    /// command-history reads all share the same caller cx.
     ///
     /// Returns the same `InjectionResult` shape as the legacy
     /// `send_text` for easy drop-in replacement.
@@ -8129,7 +8136,7 @@ where
     }
 
     /// Cx-first internal injection flow (ft-xbnl0.2.3). Routes wezterm sends,
-    /// trauma feedback, workflow-audit lookup, and audit persistence through
+    /// command-history reads, workflow-audit lookup, and audit persistence through
     /// their explicit-cx surfaces.
     // Policy injection keeps Cx, command, actor, and audit dependencies explicit.
     #[allow(clippy::too_many_arguments)]
@@ -8212,6 +8219,11 @@ where
         if action == ActionKind::SendText {
             input = input.with_command_text(text);
         }
+        if let Some(storage) = self.storage.as_ref() {
+            self.engine
+                .populate_trauma_decision_with_cx(cx, storage, &mut input)
+                .await;
+        }
 
         let decision = self.engine.authorize(&input);
 
@@ -8262,6 +8274,9 @@ where
             }
         }
 
+        // Bind outcome evidence to dispatch, not to later audit persistence.
+        // A fast command can finish while transport/verification is still waiting.
+        let send_started_at_ms = checked_now_ms_i64();
         let mut result = match &decision {
             PolicyDecision::Allow { .. } => {
                 #[cfg(test)]
@@ -8292,17 +8307,15 @@ where
                     },
                 }
             }
-            PolicyDecision::Deny { .. } => {
-                self.maybe_inject_trauma_feedback_with_cx(cx, pane_id, &decision)
-                    .await;
-                InjectionResult::Denied {
-                    decision,
-                    summary,
-                    pane_id,
-                    action,
-                    audit_action_id: None,
-                }
-            }
+            // A refusal must never submit synthetic input to a shell or agent.
+            // The structured decision and durable audit carry the feedback.
+            PolicyDecision::Deny { .. } => InjectionResult::Denied {
+                decision,
+                summary,
+                pane_id,
+                action,
+                audit_action_id: None,
+            },
             PolicyDecision::RequireApproval { .. } => InjectionResult::RequiresApproval {
                 decision,
                 summary,
@@ -8372,6 +8385,7 @@ where
             let mut audit_record =
                 result.to_audit_record(actor, workflow_id.map(String::from), None);
             if let Some(summary) = audit_summary {
+                audit_record.ts = send_started_at_ms;
                 audit_record.input_summary = Some(summary);
             }
             match storage
@@ -8602,6 +8616,24 @@ where
         if action == ActionKind::SendText {
             input = input.with_command_text(text);
         }
+        if self.engine.should_check_trauma_history(&input) {
+            if let Some(storage) = self.storage.as_ref() {
+                let config = &self.engine.trauma_guard_config;
+                let now_ms = checked_now_ms_i64().max(0);
+                let window_ms =
+                    i64::try_from(config.signature_window.window_duration_ms).unwrap_or(i64::MAX);
+                let history = storage.get_trauma_history_blocking_with_cx(
+                    cx,
+                    pane_id,
+                    now_ms.saturating_sub(window_ms),
+                    now_ms,
+                    config.history_limit,
+                );
+                input = input.with_trauma_decision(trauma_decision_from_history(
+                    history, config, pane_id, text, now_ms,
+                ));
+            }
+        }
         let decision = self.engine.authorize(&input);
         if let Some(state) = transient_switch {
             self.engine.restore_kill_switch(state);
@@ -8656,6 +8688,7 @@ where
         Box::pin(async move {
             // Own the fence inside the detached future. Dropping the caller's
             // injector mutex must not release trip-versus-dispatch authority.
+            let send_started_at_ms = checked_now_ms_i64();
             let mut result = match &decision {
                 PolicyDecision::Allow { .. } => {
                     let send_result = match action {
@@ -8693,24 +8726,13 @@ where
                         },
                     }
                 }
-                PolicyDecision::Deny { .. } => {
-                    if let Some(feedback) = trauma_feedback_comment(&decision) {
-                        if client
-                            .send_text_with_options_with_cx(cx, pane_id, &feedback, true, false)
-                            .await
-                            .is_err()
-                        {
-                            record_trauma_feedback_failure(pane_id);
-                        }
-                    }
-                    InjectionResult::Denied {
-                        decision: decision.clone(),
-                        summary: summary.clone(),
-                        pane_id,
-                        action,
-                        audit_action_id: None,
-                    }
-                }
+                PolicyDecision::Deny { .. } => InjectionResult::Denied {
+                    decision: decision.clone(),
+                    summary: summary.clone(),
+                    pane_id,
+                    action,
+                    audit_action_id: None,
+                },
                 PolicyDecision::RequireApproval { .. } => InjectionResult::RequiresApproval {
                     decision: decision.clone(),
                     summary: summary.clone(),
@@ -8752,6 +8774,7 @@ where
             if let Some(ref storage) = storage {
                 let mut audit_record = result.to_audit_record(actor, workflow_id.clone(), None);
                 if action == ActionKind::SendText {
+                    audit_record.ts = send_started_at_ms;
                     let parent_action_id = if actor == ActorKind::Workflow {
                         if let Some(id) = workflow_id.as_deref() {
                             settle_workflow_parent_lookup(
@@ -8869,6 +8892,107 @@ fn decision_definition_text(decision: &PolicyDecision) -> String {
         }
     }
     segments.join("|")
+}
+
+/// Rebuild send-time evidence from the durable history shared by one-shot
+/// Robot/MCP processes. Multiple failure detections between two sends describe
+/// one completed attempt, never several retries. Ambiguous timestamps, redacted
+/// or truncated commands, and successful intervening commands break the chain.
+fn trauma_decision_from_history(
+    history: crate::Result<crate::storage::TraumaHistory>,
+    config: &TraumaConfig,
+    pane_id: u64,
+    text: &str,
+    now_ms: i64,
+) -> TraumaDecision {
+    let mut history = match history {
+        Ok(history) => history,
+        Err(_) => {
+            tracing::warn!(
+                pane_id,
+                "Trauma Guard history unavailable; refusing automatic send"
+            );
+            return TraumaDecision {
+                should_intervene: true,
+                reason_code: Some(TRAUMA_HISTORY_UNAVAILABLE.to_string()),
+                command_hash: crate::trauma_guard::hash_command(text),
+                repeat_count: 0,
+                recurring_signatures: Vec::new(),
+            };
+        }
+    };
+    history
+        .audit_actions
+        .sort_unstable_by_key(|row| (row.ts, row.id));
+    let mut state = TraumaState::with_config(config.clone());
+    let proposed_hash = format!("{:016x}", crate::wezterm::stable_hash(text.as_bytes()));
+
+    for (index, row) in history.audit_actions.iter().enumerate() {
+        if row.pane_id != Some(pane_id)
+            || row.ts < 0
+            || row.ts > now_ms
+            || row.action_kind != "send_text"
+            || row.policy_decision != "allow"
+            || row.result != "success"
+        {
+            state = TraumaState::with_config(config.clone());
+            continue;
+        }
+        let summary = row
+            .input_summary
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<SendTextAuditSummary>(value).ok());
+        let Some(summary) = summary.filter(|summary| summary.command_candidate) else {
+            state = TraumaState::with_config(config.clone());
+            continue;
+        };
+        let command = if summary.text_length == text.len() && summary.text_hash == proposed_hash {
+            text
+        } else if summary.text_length == summary.text_preview_redacted.len()
+            && summary.text_hash
+                == format!(
+                    "{:016x}",
+                    crate::wezterm::stable_hash(summary.text_preview_redacted.as_bytes())
+                )
+        {
+            // Fuzzy matching is safe only when the complete preview is proven
+            // identical to the original; redacted secrets must not collapse
+            // distinct commands into the same retry.
+            summary.text_preview_redacted.as_str()
+        } else {
+            state = TraumaState::with_config(config.clone());
+            continue;
+        };
+        let next_send = history.audit_actions.get(index + 1).map(|next| next.ts);
+        let mut completed_at = row.ts;
+        let mut signatures = Vec::new();
+        for event in &history.events {
+            if event.pane_id != pane_id
+                || event.detected_at <= row.ts
+                || event.detected_at > now_ms
+                || next_send.is_some_and(|next| event.detected_at >= next)
+            {
+                continue;
+            }
+            let severity = match event.severity.as_str() {
+                "warning" => crate::patterns::Severity::Warning,
+                "critical" => crate::patterns::Severity::Critical,
+                _ => continue,
+            };
+            if crate::patterns::is_command_failure_event(&event.event_type, severity) {
+                signatures.push(event.rule_id.clone());
+                completed_at = completed_at.max(event.detected_at);
+            }
+        }
+        signatures.sort();
+        signatures.dedup();
+        state.record_command_result(
+            u64::try_from(completed_at).unwrap_or_default(),
+            command,
+            &signatures,
+        );
+    }
+    state.evaluate_proposed_command(u64::try_from(now_ms).unwrap_or_default(), text)
 }
 
 /// Routes through `get_audit_actions_with_cx` so the lookup
@@ -9708,23 +9832,32 @@ mod tests {
     }
 
     #[test]
-    fn trauma_feedback_comment_only_for_loop_block_rule() {
-        let trauma = PolicyDecision::deny_with_rule(
-            "Trauma Guard blocked command (recurring_failure_loop)",
-            TRAUMA_LOOP_BLOCK_RULE_ID,
+    fn trauma_history_failure_is_a_content_free_typed_refusal() {
+        let trauma = trauma_decision_from_history(
+            Err(crate::Error::Policy(
+                "SECRET database failure detail".to_string(),
+            )),
+            &TraumaConfig::default(),
+            42,
+            "npm test",
+            4_000,
         );
-        let non_trauma = PolicyDecision::deny_with_rule("alt screen active", "policy.alt_screen");
-
-        let comment = trauma_feedback_comment(&trauma);
-        assert!(comment.is_some(), "expected trauma feedback comment");
-        let comment = comment.unwrap_or_default();
-        assert!(comment.contains(TRAUMA_FEEDBACK_PREFIX));
-        assert!(comment.contains("FT_BYPASS_TRAUMA=1"));
-
-        assert!(
-            trauma_feedback_comment(&non_trauma).is_none(),
-            "non-trauma deny should not emit trauma feedback"
+        let mut engine = PolicyEngine::permissive();
+        let decision = engine.authorize(
+            &PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+                .with_pane(42)
+                .with_capabilities(unreserved(PaneCapabilities::prompt()))
+                .with_command_text("npm test")
+                .with_trauma_decision(trauma),
         );
+        assert!(decision.is_denied());
+        assert_eq!(
+            decision.rule_id(),
+            Some("policy.trauma_guard.history_unavailable")
+        );
+        let reason = decision.reason().unwrap();
+        assert!(!reason.contains("SECRET"));
+        assert!(reason.contains("FT_BYPASS_TRAUMA=1"));
     }
 
     #[test]
@@ -11079,58 +11212,308 @@ mod tests {
         });
     }
 
-    #[test]
-    fn e2e_trauma_guard_deny_injects_synthetic_feedback() {
-        run_async_test(async {
-            let injector = PolicyGatedInjector::permissive(crate::wezterm::MockWezterm::new());
-            let _pane = injector.client.add_default_pane(1).await;
-            let decision = PolicyDecision::deny_with_rule(
-                "Trauma Guard blocked command (recurring_failure_loop)",
-                TRAUMA_LOOP_BLOCK_RULE_ID,
-            );
+    fn trauma_test_audit(pane_id: u64, ts: i64, text: &str) -> crate::storage::AuditActionRecord {
+        let mut row = InjectionResult::Allowed {
+            decision: PolicyDecision::allow(),
+            summary: text.to_string(),
+            pane_id,
+            action: ActionKind::SendText,
+            audit_action_id: None,
+        }
+        .to_audit_record(ActorKind::Robot, None, None);
+        row.id = ts;
+        row.ts = ts;
+        row.input_summary = Some(build_send_text_audit_summary(text, None, None));
+        row
+    }
 
-            let cx = crate::cx::for_request();
-            injector
-                .maybe_inject_trauma_feedback_with_cx(&cx, 1, &decision)
-                .await;
+    fn trauma_test_failure(
+        pane_id: u64,
+        detected_at: i64,
+        event_type: &str,
+    ) -> crate::storage::StoredEvent {
+        crate::storage::StoredEvent {
+            id: 0,
+            pane_id,
+            rule_id: "wezterm.test.cargo_failed".to_string(),
+            agent_type: "wezterm".to_string(),
+            event_type: event_type.to_string(),
+            severity: "warning".to_string(),
+            confidence: 1.0,
+            extracted: None,
+            matched_text: Some("test result: FAILED. 0 passed; 1 failed;".to_string()),
+            segment_id: None,
+            detected_at,
+            dedupe_key: None,
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        }
+    }
 
-            let pane = injector
-                .client
-                .pane_state(1)
-                .await
-                .expect("pane 1 should exist");
-            assert!(
-                pane.content.contains(TRAUMA_FEEDBACK_PREFIX),
-                "synthetic trauma feedback should be injected into pane content"
-            );
-            assert!(
-                pane.content.contains("EXECUTION BLOCKED"),
-                "feedback should include explicit block wording"
-            );
-        });
+    fn trauma_test_history(text: &str) -> crate::storage::TraumaHistory {
+        crate::storage::TraumaHistory {
+            audit_actions: (1..=3)
+                .map(|attempt| trauma_test_audit(42, attempt * 1_000, text))
+                .collect(),
+            events: (1..=3)
+                .map(|attempt| trauma_test_failure(42, attempt * 1_000 + 500, "test.failed"))
+                .collect(),
+        }
     }
 
     #[test]
-    fn e2e_non_trauma_deny_does_not_inject_synthetic_feedback() {
-        run_async_test(async {
-            let injector = PolicyGatedInjector::permissive(crate::wezterm::MockWezterm::new());
-            let _pane = injector.client.add_default_pane(1).await;
-            let decision = PolicyDecision::deny_with_rule("alt screen active", "policy.alt_screen");
+    fn trauma_history_counts_attempts_and_preserves_uncertain_boundaries() {
+        let config = TraumaConfig::default();
+        let decide =
+            |history| trauma_decision_from_history(Ok(history), &config, 42, "npm test\n", 4_000);
+        let decision = decide(trauma_test_history("npm test\n"));
+        assert!(decision.should_intervene);
+        assert_eq!(decision.repeat_count, 3);
 
-            let cx = crate::cx::for_request();
-            injector
-                .maybe_inject_trauma_feedback_with_cx(&cx, 1, &decision)
-                .await;
+        let mut one_attempt = trauma_test_history("npm test\n");
+        one_attempt.audit_actions.truncate(1);
+        assert!(
+            !decide(one_attempt).should_intervene,
+            "three detections are only one attempt"
+        );
 
-            let pane = injector
-                .client
-                .pane_state(1)
-                .await
-                .expect("pane 1 should exist");
+        let mut benign = trauma_test_history("npm test\n");
+        for event in &mut benign.events {
+            event.event_type = "error.network".to_string();
+        }
+        assert!(!decide(benign).should_intervene);
+
+        let mut same_millisecond = trauma_test_history("npm test\n");
+        for event in &mut same_millisecond.events {
+            event.detected_at -= 500;
+        }
+        assert!(!decide(same_millisecond).should_intervene);
+
+        let mut cross_pane = trauma_test_history("npm test\n");
+        cross_pane.events[1].pane_id = 99;
+        assert!(!decide(cross_pane).should_intervene);
+
+        let mut interrupted = trauma_test_history("npm test\n");
+        interrupted.audit_actions[1].action_kind = "send_ctrl_c".to_string();
+        assert!(!decide(interrupted).should_intervene);
+
+        let mut edited = trauma_test_history("npm test\n");
+        edited.audit_actions[1] = trauma_test_audit(42, 2_000, "sed -i s/bad/good/ src/lib.rs\n");
+        assert!(!decide(edited).should_intervene);
+
+        let mut uncertain_send = trauma_test_history("npm test\n");
+        uncertain_send.audit_actions[1].result = "error".to_string();
+        assert!(!decide(uncertain_send).should_intervene);
+
+        let mut malformed = trauma_test_history("npm test\n");
+        malformed.audit_actions[1].input_summary = Some("not a complete audit summary".to_string());
+        assert!(!decide(malformed).should_intervene);
+    }
+
+    #[test]
+    fn trauma_history_does_not_fuzz_redacted_or_truncated_commands() {
+        let text = format!("npm test -- {}", "long-argument ".repeat(20));
+        let config = TraumaConfig::default();
+        let exact =
+            trauma_decision_from_history(Ok(trauma_test_history(&text)), &config, 42, &text, 4_000);
+        assert!(
+            exact.should_intervene,
+            "full exact fingerprints survive preview truncation"
+        );
+
+        let different = format!("{text}changed");
+        let decision = trauma_decision_from_history(
+            Ok(trauma_test_history(&text)),
+            &config,
+            42,
+            &different,
+            4_000,
+        );
+        assert!(!decision.should_intervene);
+
+        let mut history = trauma_test_history("npm test --token first-secret");
+        for row in &mut history.audit_actions {
+            let mut summary: SendTextAuditSummary =
+                serde_json::from_str(row.input_summary.as_deref().unwrap()).unwrap();
+            summary.text_preview_redacted = "npm test --token [REDACTED]".to_string();
+            row.input_summary = Some(serde_json::to_string(&summary).unwrap());
+        }
+        let decision = trauma_decision_from_history(
+            Ok(history),
+            &config,
+            42,
+            "npm test --token other-secret",
+            4_000,
+        );
+        assert!(!decision.should_intervene);
+    }
+
+    #[test]
+    fn trauma_config_and_actor_scope_reach_real_admission() {
+        let config = crate::config::SafetyConfig {
+            trauma_guard: crate::config::TraumaGuardConfig {
+                enabled: false,
+                max_consecutive_failures: 7,
+                window_size: 32,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let engine = PolicyEngine::from_safety_config(&config);
+        assert!(!engine.trauma_guard_enabled);
+        assert_eq!(engine.trauma_guard_config.loop_threshold, 7);
+        assert_eq!(engine.trauma_guard_config.history_limit, 32);
+        let engine = engine.with_trauma_guard_enabled(true);
+        for actor in [ActorKind::Human, ActorKind::Workflow] {
+            let input = PolicyInput::new(ActionKind::SendText, actor)
+                .with_capabilities(unreserved(PaneCapabilities::prompt()))
+                .with_command_text("npm test");
+            assert!(!engine.should_check_trauma_history(&input));
+        }
+        for actor in [ActorKind::Robot, ActorKind::Mcp] {
+            let input = PolicyInput::new(ActionKind::SendText, actor)
+                .with_capabilities(unreserved(PaneCapabilities::prompt()))
+                .with_command_text("npm test");
+            assert!(engine.should_check_trauma_history(&input));
             assert!(
-                pane.content.is_empty(),
-                "non-trauma deny should not inject trauma feedback"
+                !engine.should_check_trauma_history(&input.clone().with_command_text("continue"))
             );
+            assert!(
+                !engine.should_check_trauma_history(
+                    &input
+                        .clone()
+                        .with_command_text("FT_BYPASS_TRAUMA=1 npm test")
+                )
+            );
+            assert!(!engine.should_check_trauma_history(
+                &input.with_capabilities(PaneCapabilities::running())
+            ));
+        }
+    }
+
+    #[test]
+    fn persisted_trauma_guard_blocks_fresh_injectors_without_sending_feedback() {
+        run_async_test(async {
+            let (_directory, storage, injector) = persisted_stop_injector().await;
+            let cx = crate::cx::for_request();
+            let mock = injector.client.clone();
+            let now_ms = checked_now_ms_i64();
+            for attempt in 0..3 {
+                let sent_at = now_ms - 10_000 + attempt * 1_000;
+                storage
+                    .record_audit_action_with_cx(&cx, trauma_test_audit(42, sent_at, "npm test\n"))
+                    .await
+                    .unwrap();
+                storage
+                    .record_event(trauma_test_failure(42, sent_at + 500, "test.failed"))
+                    .await
+                    .unwrap();
+            }
+            let caps = unreserved(PaneCapabilities::prompt());
+            let before = mock.pane_state(42).await.unwrap().content;
+            let evidence = storage
+                .get_trauma_history_with_cx(&cx, 42, now_ms - 60_000, now_ms, 128)
+                .await
+                .unwrap();
+            assert_eq!(evidence.audit_actions.len(), 3);
+            assert_eq!(evidence.events.len(), 3);
+            assert!(
+                evidence
+                    .events
+                    .iter()
+                    .all(|event| event.matched_text.is_none())
+            );
+
+            let mut direct_engine = PolicyEngine::permissive();
+            let mut direct_input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+                .with_pane(42)
+                .with_capabilities(caps.clone())
+                .with_command_text("npm test\n");
+            direct_engine
+                .populate_trauma_decision_with_cx(&cx, &storage, &mut direct_input)
+                .await;
+            assert_eq!(
+                direct_engine.authorize(&direct_input).rule_id(),
+                Some(TRAUMA_LOOP_BLOCK_RULE_ID),
+            );
+
+            for detached in [false, true] {
+                let mut fresh = PolicyGatedInjector::with_storage(
+                    PolicyEngine::permissive(),
+                    mock.clone(),
+                    storage.clone(),
+                );
+                let result = if detached {
+                    fresh
+                        .inject_with_cx_detached(
+                            &cx,
+                            42,
+                            "npm test\n",
+                            ActionKind::SendText,
+                            ActorKind::Mcp,
+                            &caps,
+                            None,
+                        )
+                        .await
+                } else {
+                    fresh
+                        .send_text_with_cx(&cx, 42, "npm test\n", ActorKind::Robot, &caps, None)
+                        .await
+                };
+                match result {
+                    InjectionResult::Denied {
+                        decision,
+                        audit_action_id,
+                        ..
+                    } => {
+                        assert_eq!(decision.rule_id(), Some(TRAUMA_LOOP_BLOCK_RULE_ID));
+                        assert!(decision.reason().unwrap().contains("FT_BYPASS_TRAUMA=1"));
+                        assert!(audit_action_id.is_some());
+                    }
+                    other => panic!("expected durable loop refusal, got {other:?}"),
+                }
+                assert_eq!(mock.pane_state(42).await.unwrap().content, before);
+            }
+
+            let mut disabled = PolicyGatedInjector::with_storage(
+                PolicyEngine::permissive().with_trauma_guard_enabled(false),
+                mock.clone(),
+                storage.clone(),
+            );
+            assert!(matches!(
+                disabled
+                    .send_text_with_cx(&cx, 42, "npm test\n", ActorKind::Robot, &caps, None)
+                    .await,
+                InjectionResult::Allowed { .. }
+            ));
+            let mut bypass = PolicyGatedInjector::with_storage(
+                PolicyEngine::permissive(),
+                mock.clone(),
+                storage.clone(),
+            );
+            assert!(matches!(
+                bypass
+                    .send_text_with_cx(
+                        &cx,
+                        42,
+                        "FT_BYPASS_TRAUMA=1 npm test\n",
+                        ActorKind::Robot,
+                        &caps,
+                        None,
+                    )
+                    .await,
+                InjectionResult::Allowed { .. }
+            ));
+            assert!(
+                !mock
+                    .pane_state(42)
+                    .await
+                    .unwrap()
+                    .content
+                    .contains("[ft::TraumaGuard]")
+            );
+            storage.shutdown_with_cx(&cx).await.unwrap();
         });
     }
 
