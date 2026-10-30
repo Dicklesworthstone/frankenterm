@@ -93,6 +93,161 @@ final class WorkspaceStoreTests: XCTestCase {
         XCTAssertEqual(available, ["key"])
     }
 
+    func testConnectLaterRequiresDeliberateApprovalOfTheExactRevisionAndPersistsIt() async throws {
+        let disk = StoreTestPersistence(), vault = StoreTestVault()
+        let store = WorkspaceStore(persistence: disk, vault: vault)
+        let installed = try await store.install(archive(), envelopeDigest: digest, expectedRevision: nil,
+            sourceAndContentsConfirmed: true).workspace
+        for (revision, confirmed, expected) in [
+            (installed.revision, false, WorkspaceStoreError.reviewRequired),
+            (UUID(), true, WorkspaceStoreError.staleReview)
+        ] {
+            do {
+                _ = try await store.approveConnections(workspaceID: installed.id,
+                    expectedRevision: revision, confirmedByUser: confirmed)
+                XCTFail("navigation or stale approval must not permit a connection")
+            } catch { XCTAssertEqual(error as? WorkspaceStoreError, expected) }
+        }
+        try await store.setMachineAutoConnect(workspaceID: installed.id, expectedRevision: installed.revision,
+            machineID: "build", enabled: true)
+        let unapproved = try await store.load()
+        XCTAssertTrue(try XCTUnwrap(unapproved.first).connectLater, "a preference is not connection consent")
+
+        let approved = try await store.approveConnections(workspaceID: installed.id,
+            expectedRevision: installed.revision, confirmedByUser: true)
+        XCTAssertFalse(approved.connectLater)
+        XCTAssertEqual(approved.revision, installed.revision)
+        XCTAssertEqual(approved.manifest, installed.manifest)
+        XCTAssertEqual(approved.bindings, installed.bindings)
+        let reopened = WorkspaceStore(persistence: disk, vault: vault)
+        let saved = try await reopened.loadWithLocalPolicy()
+        XCTAssertFalse(try XCTUnwrap(saved.first).workspace.connectLater)
+        XCTAssertEqual(saved.first?.connectionPreferences.autoConnectOverrides, ["build": true])
+        XCTAssertEqual(vault.creates, 1, "connection consent must never provision another identity")
+    }
+
+    func testEnteringOfflineRestoreHoldsEveryWorkspaceAcrossCancelAndRelaunch() async throws {
+        let disk = StoreTestPersistence(), vault = StoreTestVault()
+        let store = WorkspaceStore(persistence: disk, vault: vault)
+        let first = try await store.install(archive(), envelopeDigest: digest, expectedRevision: nil,
+            sourceAndContentsConfirmed: true).workspace
+        let second = try await store.install(workspaceArchive(id: "other-workspace", bundleID: "other-export"),
+            envelopeDigest: Data(repeating: 8, count: 32), expectedRevision: nil,
+            sourceAndContentsConfirmed: true).workspace
+        for workspace in [first, second] {
+            _ = try await store.approveConnections(workspaceID: workspace.id,
+                expectedRevision: workspace.revision, confirmedByUser: true)
+        }
+        let held = try await store.deferConnectionsForOfflineRestore()
+        XCTAssertEqual(Set(held.map(\.id)), [first.id, second.id])
+        XCTAssertTrue(held.allSatisfy(\.connectLater))
+        // No archive is installed: closing or cancelling the sheet still
+        // leaves the old workspaces behind the durable Connect Later gate.
+        let reopened = WorkspaceStore(persistence: disk, vault: vault)
+        let afterCancel = try await reopened.load()
+        XCTAssertTrue(afterCancel.allSatisfy(\.connectLater))
+        XCTAssertEqual(afterCancel.first { $0.id == first.id }?.revision, first.revision)
+        XCTAssertEqual(afterCancel.first { $0.id == second.id }?.manifest, second.manifest)
+        _ = try await reopened.approveConnections(workspaceID: first.id,
+            expectedRevision: first.revision, confirmedByUser: true)
+        let oneApproved = try await reopened.load()
+        XCTAssertFalse(try XCTUnwrap(oneApproved.first { $0.id == first.id }).connectLater)
+        XCTAssertTrue(try XCTUnwrap(oneApproved.first { $0.id == second.id }).connectLater,
+                      "Connect applies only to the chosen workspace")
+    }
+
+    func testExactAndChangedReimportsRearmConnectLaterWithoutReusingOldApproval() async throws {
+        let disk = StoreTestPersistence(), vault = StoreTestVault()
+        let store = WorkspaceStore(persistence: disk, vault: vault), original = try archive()
+        let first = try await store.install(original, envelopeDigest: digest, expectedRevision: nil,
+            sourceAndContentsConfirmed: true).workspace
+        _ = try await store.approveConnections(workspaceID: first.id,
+            expectedRevision: first.revision, confirmedByUser: true)
+        let repeated = try await store.install(original, envelopeDigest: digest, expectedRevision: first.revision,
+            sourceAndContentsConfirmed: true).workspace
+        XCTAssertTrue(repeated.connectLater)
+        XCTAssertEqual(repeated.revision, first.revision, "the same immutable import stays idempotent")
+        XCTAssertEqual(vault.creates, 1)
+        _ = try await store.approveConnections(workspaceID: first.id,
+            expectedRevision: first.revision, confirmedByUser: true)
+        let replacement = try await store.install(archive(bundleID: "new-offline-export"),
+            envelopeDigest: Data(repeating: 9, count: 32), expectedRevision: first.revision,
+            sourceAndContentsConfirmed: true, associateWithExistingWorkspace: true).workspace
+        XCTAssertTrue(replacement.connectLater)
+        XCTAssertNotEqual(replacement.revision, first.revision)
+        do {
+            _ = try await store.approveConnections(workspaceID: first.id,
+                expectedRevision: first.revision, confirmedByUser: true)
+            XCTFail("an old Connect callback must not approve a replacement export")
+        } catch { XCTAssertEqual(error as? WorkspaceStoreError, .staleReview) }
+        let reloaded = try await WorkspaceStore(persistence: disk, vault: vault).load()
+        XCTAssertTrue(try XCTUnwrap(reloaded.first).connectLater)
+    }
+
+    func testConnectLaterPublicationFailuresDoNotReportApprovalAndRetriesReaffirmDurability() async throws {
+        for published in [false, true] {
+            let disk = StoreTestPersistence(), vault = StoreTestVault()
+            let store = WorkspaceStore(persistence: disk, vault: vault)
+            let installed = try await store.install(archive(), envelopeDigest: digest, expectedRevision: nil,
+                sourceAndContentsConfirmed: true).workspace
+            disk.configure(published ? .after(.catalog) : .before(.catalog))
+            do {
+                _ = try await store.approveConnections(workspaceID: installed.id,
+                    expectedRevision: installed.revision, confirmedByUser: true)
+                XCTFail("a storage failure cannot authorize the caller to connect")
+            } catch { XCTAssertEqual(error as? FTError, .storage) }
+            let readback = try await store.load()
+            XCTAssertEqual(readback.first?.connectLater, !published)
+            // A visible value after failed fsync is not durable approval.
+            disk.configure(.before(.catalog))
+            do {
+                _ = try await store.approveConnections(workspaceID: installed.id,
+                    expectedRevision: installed.revision, confirmedByUser: true)
+                XCTFail("retry must perform the durable write even if false is already visible")
+            } catch { XCTAssertEqual(error as? FTError, .storage) }
+            let approved = try await store.approveConnections(workspaceID: installed.id,
+                expectedRevision: installed.revision, confirmedByUser: true)
+            XCTAssertFalse(approved.connectLater)
+            disk.configure(published ? .after(.catalog) : .before(.catalog))
+            do {
+                _ = try await store.deferConnectionsForOfflineRestore()
+                XCTFail("offline admission must report an unconfirmed durable gate")
+            } catch { XCTAssertEqual(error as? FTError, .storage) }
+            let retried = try await store.deferConnectionsForOfflineRestore()
+            XCTAssertTrue(retried.allSatisfy(\.connectLater))
+        }
+    }
+
+    func testRecoveringAnInterruptedExactReimportReaffirmsTheOfflineGate() async throws {
+        for published in [false, true] {
+            let disk = StoreTestPersistence(), vault = StoreTestVault()
+            let store = WorkspaceStore(persistence: disk, vault: vault), original = try archive()
+            let first = try await store.install(original, envelopeDigest: digest, expectedRevision: nil,
+                sourceAndContentsConfirmed: true).workspace
+            _ = try await store.approveConnections(workspaceID: first.id,
+                expectedRevision: first.revision, confirmedByUser: true)
+            disk.configure(published ? .after(.catalog) : .before(.catalog))
+            do {
+                _ = try await store.install(original, envelopeDigest: digest, expectedRevision: first.revision,
+                    sourceAndContentsConfirmed: true)
+                XCTFail("the interrupted exact reimport must report storage failure")
+            } catch { XCTAssertEqual(error as? FTError, .storage) }
+            disk.configure(.before(.catalog))
+            do {
+                _ = try await store.recoverImport(exporterID: original.workspace.exporterID,
+                    workspaceID: original.workspace.id, envelopeDigest: digest)
+                XCTFail("matching old bytes must not report recovery without a durable offline gate")
+            } catch { XCTAssertEqual(error as? FTError, .storage) }
+            let recovered = try await store.recoverImport(exporterID: original.workspace.exporterID,
+                workspaceID: original.workspace.id, envelopeDigest: digest)
+            XCTAssertTrue(try XCTUnwrap(recovered).workspace.connectLater)
+            XCTAssertEqual(recovered?.workspace.revision, first.revision)
+            let saved = try await WorkspaceStore(persistence: disk, vault: vault).load()
+            XCTAssertTrue(try XCTUnwrap(saved.first).connectLater)
+            XCTAssertEqual(vault.creates, 1)
+        }
+    }
+
     func testLocalAutoConnectChoiceSurvivesRelaunchWithoutChangingTrustOrExportedDefaults() async throws {
         let disk = StoreTestPersistence(), vault = StoreTestVault()
         let store = WorkspaceStore(persistence: disk, vault: vault), original = try archive()

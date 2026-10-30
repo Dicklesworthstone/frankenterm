@@ -503,8 +503,9 @@ final class OfflineRestoreConnectUITests: XCTestCase {
     /// (FT_UI_REIMPORT_PATH, FT_UI_REIMPORT_CODE) is the same workspace with
     /// changed host-trust references, so connection settings change. One
     /// line says so; nothing else is asked. Opened over the live terminal,
-    /// the restore ends its sessions first; closing the restore, and later
-    /// the replacement, each bring that terminal back connected.
+    /// the restore ends its sessions first. Cancellation and a successful
+    /// replacement both remain offline, including after relaunch, until a
+    /// fresh Connect action approves the saved workspace.
     @MainActor
     func test4NewerExportReplacesTheSavedWorkspaceInOneTap() throws {
         let inputs = try inputs()
@@ -512,7 +513,7 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         guard let path = environment["FT_UI_REIMPORT_PATH"], let code = environment["FT_UI_REIMPORT_CODE"] else {
             throw XCTSkip("Set TEST_RUNNER_FT_UI_REIMPORT_{PATH,CODE} to a newer export of the same workspace")
         }
-        let app = launch()
+        var app = launch()
         _ = reopen(app, inputs)
         // Opened from Files or AirDrop over the live terminal: an offline
         // restore ends its sessions first, in one tap that says what it ends.
@@ -525,15 +526,24 @@ final class OfflineRestoreConnectUITests: XCTestCase {
             disconnect.tap()
         }
         disconnectForRestore()
-        let field = app.secureTextFields["Transfer code"]
+        var field = app.secureTextFields["Transfer code"]
         XCTAssertTrue(field.waitForExistence(timeout: 20), "the newer package must reach the unlock step")
-        // Closing restore instead brings the terminal back, connected.
+        // Closing restore is not permission to reconnect a detached shell.
         app.navigationBars["Restore"].buttons["Close"].tap()
-        XCTAssertTrue(chip(app, inputs.machine, "connected").waitForExistence(timeout: 60),
-                      "the terminal a cancelled restore closed reconnects")
+        XCTAssertTrue(app.buttons["Connect"].firstMatch.waitForExistence(timeout: 20))
+        XCTAssertFalse(chip(app, inputs.machine, "connected").waitForExistence(timeout: 3),
+                       "cancelling restore must leave every detached machine offline")
         snapshot("r0-restore-cancelled")
 
+        app.terminate()
+        app = launch()
+        XCTAssertTrue(app.buttons["Add machines"].waitForExistence(timeout: 20),
+                      "a cancelled restore must not revive the last terminal on relaunch")
+        XCTAssertFalse(app.descendants(matching: .any)["Terminal output"].firstMatch.exists)
+        _ = connect(app, inputs)
+
         disconnectForRestore()
+        field = app.secureTextFields["Transfer code"]
         XCTAssertTrue(field.waitForExistence(timeout: 20), "the newer package must reach the unlock step")
         field.tap(); field.typeText(code)
         app.buttons["Unlock"].tap()
@@ -550,13 +560,19 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         replace.tap()
         let done = app.buttons["Done"]
         XCTAssertTrue(done.waitForExistence(timeout: 30), "the replacement must publish")
+        XCTAssertTrue(app.descendants(matching: .any)["restore.connect_later"].firstMatch.exists)
         snapshot("r2-replaced")
         done.tap()
 
-        // The terminal the restore closed opens again on the replaced workspace.
-        XCTAssertTrue(chip(app, inputs.machine, "connected").waitForExistence(timeout: 60),
-                      "the terminal left showing reconnects after the replacement")
-        let terminal = app.descendants(matching: .any)["Terminal output"].firstMatch
+        XCTAssertTrue(app.buttons["Connect"].firstMatch.waitForExistence(timeout: 20))
+        XCTAssertFalse(chip(app, inputs.machine, "connected").waitForExistence(timeout: 3),
+                       "Done must not execute imported auto-connect preferences")
+        app.terminate()
+        app = launch()
+        XCTAssertTrue(app.buttons["Add machines"].waitForExistence(timeout: 20),
+                      "the replacement's Connect Later gate must survive a relaunch")
+        XCTAssertFalse(app.descendants(matching: .any)["Terminal output"].firstMatch.exists)
+        let terminal = connect(app, inputs)
         snapshot("r3-reconnected")
         app.typeText("echo AFTER-$((40+2))\n")
         waitFor("AFTER-42", in: terminal, timeout: 30, "the replaced workspace's machine must run commands")
