@@ -970,6 +970,100 @@ fn missing_or_ambiguous_receipts_never_gain_retry_authority_from_a_clock() {
 }
 
 #[test]
+fn a_lone_paste_expires_without_replay_or_later_input() {
+    let mut harness = timed_current();
+    let pane = harness.server.pane_id;
+    harness.session.paste(pane, "possibly applied paste");
+    let (rpc, pdu) = take_one(&mut harness.session);
+    assert!(matches!(pdu, Pdu::SendPaste(_)));
+    assert_eq!(
+        harness.session.next_input_wake_ns(),
+        Some(INPUT_DEADLINE_NS)
+    );
+    assert!(harness.session.advance_time(INPUT_DEADLINE_NS - 1));
+    assert!(harness.session.take_outgoing().is_empty());
+    assert!(!harness.session.advance_time(INPUT_DEADLINE_NS));
+    assert_stopped(&mut harness.session, pane);
+
+    // A late ACK cannot revive the failed connection or clear its uncertainty.
+    reply(&mut harness.session, 10, rpc, &codec::UnitResponse {});
+    assert!(!harness.session.is_ready());
+    assert!(harness.session.unanswered_input(pane));
+    assert!(harness.session.take_outgoing().is_empty());
+}
+
+#[test]
+fn either_unanswered_half_of_a_click_keeps_the_original_deadline() {
+    for acknowledge_press in [false, true] {
+        let mut harness = timed_current();
+        let pane = harness.server.pane_id;
+        harness.session.click(pane, 2, 3);
+        let (press_rpc, pdu) = take_one(&mut harness.session);
+        assert!(matches!(pdu, Pdu::SendMouseEvent(_)));
+        assert!(harness.session.advance_time(INPUT_DEADLINE_NS - 1));
+        assert!(harness.session.take_outgoing().is_empty());
+        if acknowledge_press {
+            reply(&mut harness.session, 10, press_rpc, &codec::UnitResponse {});
+            let (_, release) = take_one(&mut harness.session);
+            assert!(matches!(release, Pdu::SendMouseEvent(_)));
+        }
+        assert_eq!(
+            harness.session.next_input_wake_ns(),
+            Some(INPUT_DEADLINE_NS),
+            "receiving the press ACK cannot grant the queued release more time"
+        );
+        assert!(!harness.session.advance_time(INPUT_DEADLINE_NS));
+        assert_stopped(&mut harness.session, pane);
+    }
+}
+
+#[test]
+fn settling_paste_and_mouse_receipts_retires_only_their_own_deadlines() {
+    let mut harness = timed_current();
+    let pane = harness.server.pane_id;
+    harness.session.paste(pane, "first");
+    let (paste_rpc, paste) = take_one(&mut harness.session);
+    assert!(matches!(paste, Pdu::SendPaste(_)));
+    assert!(harness.session.advance_time(1_000));
+    harness.session.click(pane, 2, 3);
+    assert!(harness.session.take_outgoing().is_empty());
+    assert_eq!(
+        harness.session.next_input_wake_ns(),
+        Some(INPUT_DEADLINE_NS)
+    );
+    reply(&mut harness.session, 10, paste_rpc, &codec::UnitResponse {});
+    for _ in 0..2 {
+        assert_eq!(
+            harness.session.next_input_wake_ns(),
+            Some(INPUT_DEADLINE_NS + 1_000)
+        );
+        let (rpc, mouse) = take_one(&mut harness.session);
+        assert!(matches!(mouse, Pdu::SendMouseEvent(_)));
+        reply(&mut harness.session, 10, rpc, &codec::UnitResponse {});
+    }
+    assert!(!harness.session.unanswered_input(pane));
+    assert_eq!(harness.session.next_input_wake_ns(), None);
+    assert!(harness.session.advance_time(INPUT_DEADLINE_NS + 1_000));
+    assert!(harness.session.is_ready());
+    assert!(harness.session.take_outgoing().is_empty());
+}
+
+#[test]
+fn a_lone_mouse_wheel_operation_expires_without_replay() {
+    let mut harness = timed_current();
+    let pane = harness.server.pane_id;
+    harness.session.wheel(pane, 1, 2, 3);
+    let (_, pdu) = take_one(&mut harness.session);
+    assert!(matches!(pdu, Pdu::SendMouseEvent(_)));
+    assert_eq!(
+        harness.session.next_input_wake_ns(),
+        Some(INPUT_DEADLINE_NS)
+    );
+    assert!(!harness.session.advance_time(INPUT_DEADLINE_NS));
+    assert_stopped(&mut harness.session, pane);
+}
+
+#[test]
 fn invalid_retry_pressure_or_delay_fails_before_scheduling() {
     use codec::ReliableKeyEventRetryV1 as Retry;
     let mut invalid = Vec::new();
@@ -1049,17 +1143,26 @@ fn monotonic_regression_overflow_or_close_cannot_release_a_waiting_retry() {
         assert!(!harness.session.advance_time(1_000_010));
         assert_stopped(&mut harness.session, pane);
     }
-    let mut harness = timed_current();
-    let pane = harness.server.pane_id;
-    assert!(
-        harness
-            .session
-            .advance_time(u64::MAX - INPUT_DEADLINE_NS + 1)
-    );
-    harness
-        .session
-        .write(pane, b"cannot allocate a wrapping deadline");
-    assert_stopped(&mut harness.session, pane);
+    for effect in 0..4 {
+        let mut harness = timed_current();
+        let pane = harness.server.pane_id;
+        assert!(
+            harness
+                .session
+                .advance_time(u64::MAX - INPUT_DEADLINE_NS + 1)
+        );
+        match effect {
+            0 => harness
+                .session
+                .write(pane, b"cannot allocate a wrapping deadline"),
+            1 => harness
+                .session
+                .paste(pane, "cannot allocate a wrapping deadline"),
+            2 => harness.session.click(pane, 2, 3),
+            _ => harness.session.wheel(pane, 1, 2, 3),
+        }
+        assert_stopped(&mut harness.session, pane);
+    }
 }
 
 #[test]

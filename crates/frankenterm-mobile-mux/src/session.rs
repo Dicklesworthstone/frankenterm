@@ -385,10 +385,10 @@ impl Session {
     }
 
     /// Earliest absolute wake in the same clock domain supplied to
-    /// [`Session::advance_time`]. Includes queued-operation expiry, so a paste
-    /// or mouse RPC ahead of reliable input cannot hide that input's deadline,
-    /// and a refused render read's repeat. Only one owner timer is needed;
-    /// the bounded FIFO remains authoritative.
+    /// [`Session::advance_time`]. Includes every admitted operation's expiry,
+    /// including a lone paste or mouse RPC, and a refused render read's repeat.
+    /// A preceding RPC cannot hide a queued operation's original deadline.
+    /// Only one owner timer is needed; the bounded FIFO remains authoritative.
     pub fn next_input_wake_ns(&self) -> Option<u64> {
         if self.failed {
             return None;
@@ -1072,20 +1072,19 @@ impl Session {
             return false;
         }
         let count = effect.serials();
-        let deadline_ns = if matches!(effect, OrderedEffect::Bytes { .. } | OrderedEffect::Key(_)) {
-            match self.monotonic_ns {
-                Some(now) => match now.checked_add(INPUT_DEADLINE_NS) {
-                    Some(deadline) => Some(deadline),
-                    None => {
-                        self.interrupted_input.insert(pane_id);
-                        self.fail("mux input deadline overflow; input was not sent".to_owned());
-                        return false;
-                    }
-                },
-                None => None,
-            }
-        } else {
-            None
+        // A successful transport keepalive does not settle input. Paste and
+        // mouse RPCs need the same admission deadline as reliable writes even
+        // though their ambiguous outcomes never permit an automatic retry.
+        let deadline_ns = match self.monotonic_ns {
+            Some(now) => match now.checked_add(INPUT_DEADLINE_NS) {
+                Some(deadline) => Some(deadline),
+                None => {
+                    self.interrupted_input.insert(pane_id);
+                    self.fail("mux input deadline overflow; input was not sent".to_owned());
+                    return false;
+                }
+            },
+            None => None,
         };
         let Some(input_serial) = self.reserve_input_serials(count) else {
             self.interrupted_input.insert(pane_id);
