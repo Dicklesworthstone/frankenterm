@@ -865,6 +865,30 @@ for source_case in changed mode extra symlink directory; do
     verify_source_fixture "$SOURCE_BAD"
 done
 
+# Git-authenticated source links must preserve exact text and resolve internally.
+SOURCE_REGULAR_COMMIT="$SOURCE_COMMIT"
+for link_target in tool ./tool ../outside /absolute missing link .git/config; do
+  LINK_CASE=$(mktemp -d "$TEST_ROOT/source-link.XXXXXX")
+  cp -Rp "$SOURCE_ARCHIVE/." "$LINK_CASE/"
+  LINK_OBJECT=$(printf '%s' "$link_target" | git --git-dir="$SOURCE_OBJECTS" hash-object -w --stdin)
+  LINK_TREE=$(printf '100644 blob %s\tfont,wght=300(1).ttf\n100755 blob %s\ttool\n120000 blob %s\tlink\n' \
+    "$FONT_OBJECT" "$TOOL_OBJECT" "$LINK_OBJECT" | git --git-dir="$SOURCE_OBJECTS" mktree)
+  SOURCE_COMMIT=$(printf 'Source link fixture\n' | git --git-dir="$SOURCE_OBJECTS" \
+    -c user.name=Fixture -c user.email=fixture@example.invalid commit-tree "$LINK_TREE")
+  ln -s "$link_target" "$LINK_CASE/link"
+  case "$link_target" in
+    tool|./tool)
+      verify_source_fixture "$LINK_CASE" > "$LINK_CASE-result.json"
+      jq -e '.ok and .file_count == 2' "$LINK_CASE-result.json" >/dev/null
+      mv "$LINK_CASE/link" "$LINK_CASE-retained-link"
+      ln -s 'font,wght=300(1).ttf' "$LINK_CASE/link"
+      expect_failure source_content_mismatch "$LINK_CASE-retarget.log" verify_source_fixture "$LINK_CASE"
+      ;;
+    *) expect_failure source_link_invalid "$LINK_CASE-invalid.log" verify_source_fixture "$LINK_CASE" ;;
+  esac
+done
+SOURCE_COMMIT="$SOURCE_REGULAR_COMMIT"
+
 # Exercise the actual packaging entrypoints from a Gitless DSR archive. The
 # fixture deliberately has no browser lock or browser component: successful
 # source admission must emit the real verifier receipt, then reach that next
@@ -912,7 +936,7 @@ printf '#!/usr/bin/env bash\nprintf "UNVERIFIED_CANONICAL_TOOL_EXECUTED\\n" >&2\
 run_dsr_source_entrypoint() {
   local script="$1" archive="$2" target_dir="$3" repository="$4" revision="$5" output="$6"
   (
-    cd "$archive"
+    cd "$archive" || exit 1
     export DSR_SOURCE_REPOSITORY="$repository" DSR_RELEASE_GIT_SHA="$revision"
     export CARGO_TARGET_DIR="$target_dir"
     # The wrong-repository case must not be rescued by ambient Git authority.
