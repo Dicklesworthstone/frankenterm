@@ -18,15 +18,19 @@
 #   1. install: the broker, guardian and mux run in user/<uid> and not in
 #      gui/<uid>; their plists lint, say Background and carry the installer's
 #      FT_GRID_ENGINE, and the mux runs with it; the login loader is Aqua.
-#   2. a forced same-family upgrade restarts the mux in place (kickstart -k)
-#      with the same pane ids, and leaves the broker alone.
-#   3. with the units gone, as after a GUI teardown, launchd running the login
-#      loader brings all three back in user/<uid> and the mux serves panes.
+#   2. re-running install while the units run rewrites the plists (a new
+#      FTG_RECOVERY_INTERVAL) and restarts nothing; a forced same-family
+#      upgrade then restarts the mux on the rewritten definition, with the
+#      same pane ids, and leaves the broker alone.
+#   3. with the units gone, as when a GUI teardown took units an older
+#      install left in gui/<uid>, launchd running the login loader brings all
+#      three back in user/<uid> and the mux serves panes.
 #   4. load-units restarts a unit that is loaded but stopped in user/<uid>
 #      without printing an error, and names a unit whose plist is missing.
 #   5. load-units moves a stopped unit an older install left in gui/<uid>
 #      to user/<uid>.
-#   6. stop-all leaves nothing loaded in either domain.
+#   6. stop-all returns only once every unit's process has exited, and
+#      leaves nothing loaded in either domain.
 set -u
 [ "$(uname -s)" = Darwin ] || { echo "SKIP: launchd runs only on macOS"; exit 0; }
 FAM=${1:?family dir}
@@ -65,6 +69,9 @@ trap cleanup EXIT
 running_in() { launchctl print "$1/$U/$(label "$2")" 2>/dev/null | grep 'state = running' >/dev/null; }
 loaded_in() { launchctl print "$1/$U/$(label "$2")" >/dev/null 2>&1; }
 pid_in() { launchctl print "$1/$U/$(label "$2")" 2>/dev/null | awk '/^\tpid = /{print $3}'; }
+env_of() { ps eww -o command= -p "$1" | tr ' ' '\n' | grep -x "$2" >/dev/null; }  # <pid> <NAME=value>
+# launchd keeps a booted-out label loaded until its process has exited.
+none_in_user() { local n; for n in "$@"; do loaded_in user "$n" && return 1; done; return 0; }
 pane_ids() { "$TOOL" status 2>/dev/null | sed -n 's/^pane ids: *\[\(.*\)\]$/\1/p'; }
 has_panes() { [ -n "$(pane_ids)" ]; }
 all_running_in_user() { local n; for n in $UNITS; do running_in user "$n" || return 1; done; }
@@ -92,26 +99,38 @@ lp=$LA/$(label login-loader).plist
 if plutil -lint "$lp" >/dev/null && [ "$(plutil -extract LimitLoadToSessionType raw "$lp")" = Aqua ]; then
   pass "login-loader plist lints and is Aqua"; else fail "login-loader plist"; fi
 mux_pid=$(pid_in user mux-server)
-if ps eww -o command= -p "$mux_pid" | tr ' ' '\n' | grep -qx 'FT_GRID_ENGINE=page'; then
+if env_of "$mux_pid" FT_GRID_ENGINE=page; then
   pass "mux (pid $mux_pid) runs with FT_GRID_ENGINE=page"; else fail "mux env lacks FT_GRID_ENGINE=page"; fi
 ids=$(pane_ids)
 if [ -n "$ids" ]; then pass "mux reports panes [$ids]"; else fail "mux reports no panes"; fi
 broker_pid=$(pid_in user pty-broker)
+guardian_pid=$(pid_in user pty-guardian)
 
-echo "== 2. forced same-family upgrade (kickstart -k in user/)"
+echo "== 2. re-install with a new setting, then a forced same-family upgrade"
+export FTG_RECOVERY_INTERVAL=6
+if "$TOOL" install --family "$FAM" --manager launchd > "$S/reinstall.log" 2>&1; then pass "re-install"
+else fail "re-install"; tail -20 "$S/reinstall.log"; fi
+if [ "$(plutil -extract EnvironmentVariables.FTG_RECOVERY_INTERVAL raw "$LA/$(label mux-server).plist")" = 6 ]; then
+  pass "re-install rewrote the mux plist"; else fail "the mux plist still has the old interval"; fi
+if [ "$(pid_in user mux-server)" = "$mux_pid" ] && env_of "$mux_pid" FTG_RECOVERY_INTERVAL=5 \
+   && [ "$(pid_in user pty-guardian)" = "$guardian_pid" ] && [ "$(pid_in user pty-broker)" = "$broker_pid" ]; then
+  pass "re-install restarted nothing"; else fail "re-install restarted a unit"; fi
 if "$TOOL" upgrade --family "$FAM" --force > "$S/upgrade.log" 2>&1; then pass "upgrade"
 else fail "upgrade"; tail -20 "$S/upgrade.log"; fi
 new_mux=$(pid_in user mux-server)
 if [ -n "$new_mux" ] && [ "$new_mux" != "$mux_pid" ]; then pass "mux restarted ($mux_pid -> $new_mux)"
 else fail "mux pid $mux_pid -> '$new_mux'"; fi
+if env_of "$new_mux" FTG_RECOVERY_INTERVAL=6; then pass "the restarted mux runs the rewritten plist"
+else fail "the restarted mux runs the old definition"; fi
+if loaded_in gui mux-server; then fail "mux loaded in gui/$U after the upgrade"; else pass "mux stays in user/$U only"; fi
 if [ "$(pane_ids)" = "$ids" ]; then pass "same pane ids [$ids]"; else fail "pane ids [$ids] -> [$(pane_ids)]"; fi
 if [ "$(pid_in user pty-broker)" = "$broker_pid" ]; then pass "broker untouched (pid $broker_pid)"
 else fail "broker changed"; fi
 
-echo "== 3. units gone (as after a GUI teardown); launchd runs the login loader"
+echo "== 3. units gone (as a GUI teardown takes gui/ units); launchd runs the login loader"
 for n in mux-server pty-guardian pty-broker; do launchctl bootout "user/$U/$(label "$n")" 2>/dev/null; done
-gone=1; for n in $UNITS; do loaded_in user "$n" && gone=0; done
-if [ "$gone" = 1 ]; then pass "units booted out"; else fail "units still loaded"; fi
+# shellcheck disable=SC2086
+if wait_for 60 none_in_user $UNITS; then pass "units booted out"; else fail "units still loaded"; fi
 # launchd gives its jobs the account's HOME, which in production is the
 # installer's, where install wrote the plists. Give this sandboxed install's
 # loader the sandbox HOME, as production would have it.
@@ -141,6 +160,7 @@ if grep -q -E 'Bootstrap failed|could not start' "$S/load-units-4a.log"; then
   fail "load-units was noisy: $(tr '\n' ' ' < "$S/load-units-4a.log")"
 else pass "load-units printed no error"; fi
 launchctl bootout "user/$U/$(label pty-broker)" 2>/dev/null
+wait_for 30 none_in_user pty-broker || fail "the broker label stayed loaded after bootout"
 mv "$LA/$(label pty-broker).plist" "$S/broker.plist.aside"
 "$TOOL" load-units > "$S/load-units-4b.log" 2>&1
 if grep -q "$(label pty-broker).plist is missing" "$S/load-units-4b.log"; then pass "the missing broker plist is named"
@@ -160,7 +180,11 @@ if running_in user pty-broker; then pass "broker now runs in user/$U"; else fail
 if loaded_in gui pty-broker; then fail "broker still loaded in gui/$U"; else pass "broker no longer in gui/$U"; fi
 
 echo "== 6. stop-all"
+pids=""; for n in $UNITS; do pids="$pids $(pid_in user "$n")"; done
 if "$TOOL" stop-all --i-accept-pane-loss > "$S/stop-all.log" 2>&1; then pass "stop-all"; else fail "stop-all"; fi
+alive=""; for p in $pids; do kill -0 "$p" 2>/dev/null && alive="$alive $p"; done
+if [ -z "$alive" ]; then pass "every unit process ($pids ) had exited when stop-all returned"
+else fail "still running after stop-all:$alive"; fi
 left=""
 for n in $UNITS; do
   loaded_in user "$n" && left="$left user:$n"

@@ -21,6 +21,9 @@
 # Manager M: systemd (Linux default), launchd (macOS default), direct (pid files;
 # used by tests). FTG_INSTANCE=name runs an isolated instance (own paths, units,
 # and mux socket) next to the default one, for testing on a live host.
+# Re-running install rewrites the units with the current settings and starts
+# whatever is not running; a running unit keeps its settings until it restarts
+# (the mux: `upgrade --force` onto its current family).
 #
 # Invariants:
 #   * The broker owns every pane's child process. It is never restarted by this
@@ -157,8 +160,14 @@ provision_state() {
   private_dir "$STATE"; private_dir "$STATE/receiver"; private_dir "$STATE/broker"
   private_dir "$STATE/broker/spawn"; private_dir "$STATE/broker/lease"
   private_dir "$STATE/stale-sockets"; private_dir "$REC"; private_dir "$RUN"
-  "$g" provision-token --token-path "$STATE/receiver/token" >/dev/null
-  "$g" provision-token --token-path "$STATE/broker/token" >/dev/null
+  # Provision only a missing token. An existing one is what the services
+  # validate on every request, and a pinned guardian whose provision-token
+  # predates the lock-free existing-token check waits for a running guardian
+  # to go idle, which it rarely does, and times out.
+  local t
+  for t in "$STATE/receiver/token" "$STATE/broker/token"; do
+    [ -e "$t" ] || "$g" provision-token --token-path "$t" >/dev/null
+  done
 
   local ft=$BASE/guardian-family/ft
   if [ ! -e "$REC/ids.env" ]; then
@@ -536,24 +545,18 @@ svc_start() {  # <logical name>
   case "$MANAGER" in
     systemd) systemctl --user start "$(unit "$1")" ;;
     launchd)
-      local plist target
+      local plist
       plist=$HOME/Library/LaunchAgents/$(unit "$1").plist
-      target=$(launchd_target "$(unit "$1")")
-      # Only called when the unit is not running. A unit loaded in user/
-      # starts where it is; one an older install left loaded in gui/ moves to
-      # user/ without ending anything.
-      if launchctl print "$target" >/dev/null 2>&1; then
-        case $target in
-          user/*) launchctl kickstart "$target"; return ;;
-          gui/*) launchctl bootout "$target" 2>/dev/null || true ;;
-        esac
-      fi
       # launchd reports a missing plist as "5: Input/output error".
       [ -f "$plist" ] || { log "$plist is missing; install writes it"; return 1; }
+      # Only called when the unit is not running. Unload whatever launchd
+      # still holds for it (stopped in user/, or left in gui/ by an older
+      # install) so that what starts is the plist install wrote last, in
+      # user/<uid>: a kickstart would rerun the definition loaded back then.
+      svc_stop "$1"
       # Bootstrap's own error says why a unit cannot load (a malformed plist,
-      # say); the kickstart only covers a load that raced this one.
-      launchctl bootstrap "$(launchd_domain)" "$plist" \
-        || launchctl kickstart "$(launchd_domain)/$(unit "$1")" 2>/dev/null
+      # say); a unit another loader started meanwhile counts as started.
+      launchctl bootstrap "$(launchd_domain)" "$plist" || svc_active "$1"
       ;;
     direct)
       local sub pair envs=()
@@ -584,23 +587,34 @@ direct_pid() {  # <logical name> -> the pid file's pid, if it still runs that se
   return 0
 }
 
-svc_stop() {  # <logical name>
+wait_exit() {  # <logical name> <pid>: a grace period, then SIGKILL
+  # Like systemd's stop. A replacement must never start beside a predecessor
+  # that still holds the guardian's recovery custody (a mux mid-capture can
+  # take half a minute to exit).
+  for _ in $(seq 120); do kill -0 "$2" 2>/dev/null || return 0; sleep 0.5; done
+  log "$1 (pid $2) ignored SIGTERM for 60s; sending SIGKILL"
+  kill -KILL "$2" 2>/dev/null || true
+  for _ in $(seq 20); do kill -0 "$2" 2>/dev/null || return 0; sleep 0.5; done
+  die "$1 (pid $2) survived SIGKILL"
+}
+
+svc_stop() {  # <logical name>; returns once the unit's process has exited
+  local pid
   case "$MANAGER" in
     systemd) systemctl --user stop "$(unit "$1")" ;;
-    launchd) launchctl bootout "$(launchd_target "$(unit "$1")")" 2>/dev/null || true ;;
+    launchd)
+      # bootout returns at once. launchd then signals the process, and keeps
+      # the label loaded (refusing to bootstrap it: "5: Input/output error")
+      # until the process exits.
+      pid=$(svc_pid "$1")
+      launchctl bootout "$(launchd_target "$(unit "$1")")" 2>/dev/null || true
+      if [ -n "$pid" ]; then wait_exit "$1" "$pid"; fi
+      ;;
     direct)
-      # Like systemd's stop: a grace period, then SIGKILL. A replacement must
-      # never start beside a predecessor that still holds the guardian's
-      # recovery custody (a mux mid-capture can take half a minute to exit).
-      local pid
       pid=$(svc_pid "$1")
       [ -n "$pid" ] || return 0
       kill -TERM "$pid" 2>/dev/null || return 0
-      for _ in $(seq 120); do kill -0 "$pid" 2>/dev/null || return 0; sleep 0.5; done
-      log "$1 (pid $pid) ignored SIGTERM for 60s; sending SIGKILL"
-      kill -KILL "$pid" 2>/dev/null || true
-      for _ in $(seq 20); do kill -0 "$pid" 2>/dev/null || return 0; sleep 0.5; done
-      die "$1 (pid $pid) survived SIGKILL"
+      wait_exit "$1" "$pid"
       ;;
   esac
 }
@@ -613,7 +627,18 @@ svc_restart_mux() {  # returns non-zero, never exits, when the manager refuses
       systemctl --user reset-failed "$(unit mux-server)" 2>/dev/null || true
       systemctl --user restart "$(unit mux-server)"
       ;;
-    launchd) launchctl kickstart -k "$(launchd_target "$(unit mux-server)")" ;;
+    launchd)
+      # Not kickstart -k, which reruns the definition launchd loaded at
+      # bootstrap and ignores a plist install has rewritten since. Stopping
+      # and starting loads the current plist (and moves a mux an older
+      # install left in gui/ to user/); the guardian keeps the panes.
+      if [ -f "$HOME/Library/LaunchAgents/$(unit mux-server).plist" ]; then
+        svc_stop mux-server && svc_start mux-server
+      else
+        log "no mux plist to reload; restarting the loaded definition"
+        launchctl kickstart -k "$(launchd_target "$(unit mux-server)")"
+      fi
+      ;;
     direct) svc_stop mux-server && svc_start mux-server ;;
   esac
 }
@@ -779,8 +804,10 @@ cmd_install() {
     else
       log "session dump of the legacy mux failed; continuing (panes end either way)"
     fi
-    [ "$MANAGER" = launchd ] && launchctl bootout "$(launchd_target com.frankenterm.mux-server)" 2>/dev/null || true
-    [ "$MANAGER" = systemd ] && systemctl --user stop frankenterm-mux-server.service || true
+    # The legacy unit has the label this install's mux takes (no instance).
+    # Wait for its process to exit: launchd refuses to load the label again
+    # before that, and the new mux must not start beside it.
+    svc_stop mux-server || true
     if [ "$MANAGER" = systemd ]; then
       local old=$HOME/.config/systemd/user/frankenterm-mux-server.service
       [ -e "$old" ] && cp -p "$old" "$STATE/frankenterm-mux-server.service.pre-guardian.$(date +%s)"
