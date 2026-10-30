@@ -2,6 +2,14 @@
 
 This directory contains the shared Swift 6 `FrankenTermKit` package and the native Xcode project for the first offline workspace-transfer slice. It is implementation source, not a signed or device-qualified terminal release.
 
+## Complete SSH identity policies in machine exports
+
+The Rust machine-inventory exporter now admits each route's entire ordered public-key candidate set before publishing credentials or private-key file hints. Eight distinct identities are supported; duplicate references to the same key still share one credential. A ninth distinct key, an unreadable or over-budget source, an unresolved explicit identity, or malformed/multiple-key sidecar blocks the route instead of leaving a usable prefix. Mux copies retain the same mandatory refusal, and jump-route readiness propagates it to dependent connections. Other complete routes remain available.
+
+Public-source discovery retains explicit failures at its existing 256-file, 2 MiB aggregate and 64 KiB per-file limits. A missing default public sidecar is ignored only when the corresponding private filename is also absent; checking that requires filesystem metadata, never reading or unlocking private key bytes. Resolve the missing public metadata or deliberately narrow the source identity policy before preparing the affected route. These refusals cannot silently become password fallback.
+
+Regression coverage includes candidate deduplication and boundaries, unavailable jump dependencies, malformed and missing sidecars, private-only default identities and legitimate absent-default fallback. Scoped Rust parsing/formatting and independent source review passed. The required remote test command could not start because `rch` is unavailable; these regressions still require execution through the repository's Rust proof path.
+
 ## Rendering under battery, thermal and memory pressure
 
 The native terminal now responds to Low Power Mode and thermal-state changes through its existing display scheduler. Nominal conditions request a 120 Hz ceiling (60 Hz preferred), fair thermal conditions cap that ceiling at 60 Hz, Low Power Mode or serious heat cap it at 30 Hz, and critical heat caps it at 15 Hz. These are presentation requests, not measured frame-rate guarantees. Decorative text and cursor blinking stop in their visible phase while conserving power; cooling restores them from the retained screen without requiring new terminal output.
