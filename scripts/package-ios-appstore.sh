@@ -24,7 +24,7 @@ with urllib.request.urlopen(request, timeout=30) as response:
         raise SystemExit('error: included Mac download is unavailable')
 PY
 [[ -n "${CARGO_TARGET_DIR:-}" && "$CARGO_TARGET_DIR" = /* ]] || fail "isolated absolute CARGO_TARGET_DIR required"
-[[ "${FT_IOS_VERSION:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "FT_IOS_VERSION must be explicit"
+[[ "${FT_IOS_VERSION:-}" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || fail "FT_IOS_VERSION must be an explicit two- or three-component version"
 [[ "${FT_IOS_BUILD:-}" =~ ^[1-9][0-9]*$ ]] || fail "FT_IOS_BUILD must be explicit"
 [[ "${FT_APPLE_TEAM_ID:-}" =~ ^[A-Z0-9]{10}$ ]] || fail "FT_APPLE_TEAM_ID required"
 # A live checkout may contain concurrent edits or existing development artifacts.
