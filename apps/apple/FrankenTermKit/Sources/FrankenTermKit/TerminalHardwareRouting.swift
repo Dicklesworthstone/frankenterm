@@ -1,5 +1,83 @@
 import Foundation
 
+/// Phone-local physical-key choices. These never transform committed IME text,
+/// pasted text, or the software keyboard's explicitly labelled helper keys.
+public struct TerminalHardwarePreferences: Codable, Equatable, Sendable {
+    public enum ModifierMapping: String, Codable, CaseIterable, Hashable, Sendable {
+        case optionAsMeta
+        case optionForCharacters
+        case swapControlAndOption
+
+        public var title: String {
+            switch self {
+            case .optionAsMeta: "Option as Meta"
+            case .optionForCharacters: "Option Types Characters"
+            case .swapControlAndOption: "Swap Control and Option"
+            }
+        }
+        public var explanation: String {
+            switch self {
+            case .optionAsMeta: "Control sends terminal control keys. Option sends Meta shortcuts such as Option-B."
+            case .optionForCharacters: "Option stays with the native keyboard layout for accents and other characters. Control still sends terminal control keys."
+            case .swapControlAndOption: "The physical Option key sends Control, and the physical Control key sends Meta."
+            }
+        }
+    }
+    public enum Backspace: String, Codable, CaseIterable, Hashable, Sendable {
+        case delete
+        case controlBackspace
+
+        public var title: String {
+            switch self {
+            case .delete: "Delete (DEL)"
+            case .controlBackspace: "Control-Backspace (Ctrl-H)"
+            }
+        }
+    }
+
+    public var modifierMapping: ModifierMapping
+    public var backspace: Backspace
+    public init(modifierMapping: ModifierMapping = .optionAsMeta, backspace: Backspace = .delete) {
+        self.modifierMapping = modifierMapping; self.backspace = backspace
+    }
+}
+
+/// The immutable preference value is read once per new physical press. A held
+/// key retains its admitted mapping even if another scene changes these choices.
+/// All mutable state and UserDefaults access are serialized by the same lock.
+public final class TerminalHardwarePreferencesStore: @unchecked Sendable {
+    public static let shared = TerminalHardwarePreferencesStore()
+    static let storageKey = "frankenterm.keyboard.hardware"
+    private struct Stored: Codable {
+        let version: Int
+        let preferences: TerminalHardwarePreferences
+    }
+    private let lock = NSLock()
+    private let defaults: UserDefaults
+    private var preferences: TerminalHardwarePreferences
+
+    public init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        if let bytes = defaults.data(forKey: Self.storageKey), bytes.count <= 1024,
+           let stored = try? JSONDecoder().decode(Stored.self, from: bytes), stored.version == 1 {
+            preferences = stored.preferences
+        } else { preferences = .init() }
+    }
+
+    public var current: TerminalHardwarePreferences { lock.withLock { preferences } }
+
+    /// One small versioned value keeps a relaunch from observing a half-written
+    /// combination. No workspace import can replace these device-local choices.
+    public func save(_ preferences: TerminalHardwarePreferences) throws {
+        let bytes = try JSONEncoder().encode(Stored(version: 1, preferences: preferences))
+        try lock.withLock {
+            guard bytes.count <= 1024 else { throw TerminalKeyboardError.capacity }
+            defaults.set(bytes, forKey: Self.storageKey)
+            self.preferences = preferences
+        }
+    }
+}
+
 /// UIKit must choose one path for a physical press. Printable keys belong to
 /// the text system (including dead keys and IME); terminal control keys belong
 /// to the shared encoder. Sending a printable press down both paths duplicates it.
@@ -7,7 +85,8 @@ public enum TerminalHardwareRouting {
     public enum Destination: Equatable, Sendable { case textSystem, terminal }
 
     public static func destination(usage: UInt16, modifiers: TerminalKeyModifiers,
-                                   hasMarkedText: Bool) -> Destination {
+                                   hasMarkedText: Bool,
+                                   preferences: TerminalHardwarePreferences = .init()) -> Destination {
         // Command shortcuts, the keyboard/language switch key, and standalone
         // modifiers remain UIKit's responsibility. IME owns navigation while
         // composing, including Return, Escape, and Backspace.
@@ -15,6 +94,8 @@ public enum TerminalHardwareRouting {
               usage > 0, usage < 0xE0 else { return .textSystem }
         // Control-Space is the native keyboard/input-source switch shortcut.
         if usage == 0x2C, modifiers.contains(.control) { return .textSystem }
+        if preferences.modifierMapping == .optionForCharacters,
+           modifiers.contains(.alt), !modifiers.contains(.control) { return .textSystem }
         if modifiers.contains(.control) || modifiers.contains(.alt) { return .terminal }
         switch usage {
         case 0x28...0x2B, 0x3A...0x45, 0x49...0x52, 0x58, 0x68...0x73:
@@ -22,6 +103,25 @@ public enum TerminalHardwareRouting {
         default:
             return .textSystem
         }
+    }
+
+    /// Map semantic keys before the canonical terminal encoder chooses bytes.
+    /// Physical system shortcuts are classified before this call. Accessory
+    /// modifiers describe already-labelled terminal actions and are not swapped.
+    public static func key(usage: UInt16, modifiers: TerminalKeyModifiers, characters: String,
+                           preferences: TerminalHardwarePreferences,
+                           accessoryModifiers: TerminalKeyModifiers = []) throws -> TerminalHardwareKey {
+        guard destination(usage: usage, modifiers: modifiers, hasMarkedText: false,
+                          preferences: preferences) == .terminal else { throw TerminalKeyboardError.unavailable }
+        var mapped = modifiers
+        if preferences.modifierMapping == .swapControlAndOption {
+            mapped.subtract([.control, .alt])
+            if modifiers.contains(.control) { mapped.insert(.alt) }
+            if modifiers.contains(.alt) { mapped.insert(.control) }
+        }
+        mapped.formUnion(accessoryModifiers)
+        if usage == 0x2A, preferences.backspace == .controlBackspace { mapped.insert(.control) }
+        return try TerminalHardwareKey(usage: usage, modifiers: mapped, characters: characters)
     }
 
     /// A software keyboard has no physical HID usage. Essential ASCII helper

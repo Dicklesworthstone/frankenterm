@@ -274,6 +274,12 @@ Each surface retains one replaceable pending full snapshot, one preparation oper
 
 This is an implemented reusable native surface, not an enabled connection in the workspace browser. The bounded SSH driver, model ABI, protected workspace authentication adapter and Swift connection owner now exist; the C-linkable iOS Rust artifact and native scene hookup remain outstanding. Apple SDK typechecking, actual shader compilation and device pixel/IME/lifecycle qualification have not run here.
 
+## Hardware keyboard preferences
+
+In a live terminal, **More → Hardware Keyboard** selects **Option as Meta**, **Option Types Characters** for native accents/dead keys, or **Swap Control and Option**. Backspace can send the normal Delete action or canonical Control-Backspace (Ctrl-H in the ordinary terminal protocol). Extended keyboard protocols retain their negotiated encoding. **Save** applies the choices across this device and persists them for relaunch; **Cancel** discards edits and **Use Default Keys** restores the initial choices for review.
+
+Settings use the existing terminal input fence, including both visible iPad split slots. Opening and dismissing the sheet settles held input and restores the selected terminal without reconnecting. A physical press keeps its original mapping through repeats and release, even when another view changes preferences. Physical Command shortcuts, Control-Space, IME composition, paste, and the labelled software helper keys retain their existing ownership.
+
 ## Native terminal text input
 
 `NativeTerminalInputView` is a UIKit `UITextInput` responder backed by the existing bounded `TerminalKeyboardSession` and `TerminalInputCoordinator`. Its local TextKit document contains only uncommitted IME text, with selection, tokenizer, delegate notifications, grapheme-safe deletion and UTF-16 boundary checks. `NativeTerminalCaret` ties candidate-window geometry to the same immutable source and monotonically identified layout as the visible renderer. Retiring the view, losing scene activity or replacing focus discards unsubmitted composition and settles source-owned cleanup.
