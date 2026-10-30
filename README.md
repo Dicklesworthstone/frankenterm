@@ -32,7 +32,7 @@
 | Auditing the claims | [Trust & Attestation](#trust--attestation) → [Threat Model](#deep-dive-threat-model) → [Formal Methods](#deep-dive-formal-methods-in-this-repo) |
 | Reading the algorithms | [Algorithm & Data Structure Catalog](#algorithm--data-structure-catalog) → [Pattern Engine](#deep-dive-pattern-engine-architecture) → [Cx Cancellation Model](#deep-dive-the-cx-cancellation-model) |
 
-**A swarm-native terminal platform designed to observe, control, and audit large fleets of concurrent AI coding agents.** The retained 200-pane figures are synthetic benchmark-lane results, not a qualified native or target-class operating envelope. <!--count:workspace_members-->83<!--/count--> workspace crates, <!--count:core_subcrates-->19<!--/count--> sub-crates carved out of the core, <!--count:core_top_level_modules-->536<!--/count--> core-library modules, <!--count:core_loc-->1346112<!--/count-->+ lines of Rust, <!--count:test_count-->60535<!--/count-->+ test annotations across <!--count:core_rust_test_files-->1042<!--/count--> integration test files.
+**A swarm-native terminal platform designed to observe, control, and audit large fleets of concurrent AI coding agents.** The retained 200-pane figures are synthetic benchmark-lane results, not a qualified native or target-class operating envelope. <!--count:workspace_members-->97<!--/count--> workspace crates, <!--count:core_subcrates-->19<!--/count--> sub-crates carved out of the core, <!--count:core_top_level_modules-->540<!--/count--> core-library modules, <!--count:core_loc-->1389418<!--/count-->+ lines of Rust, <!--count:test_count-->64035<!--/count-->+ test annotations across <!--count:core_rust_test_files-->1051<!--/count--> integration test files.
 
 _Counts are auto-stamped by `scripts/stamp-readme-counts.sh` and drift fast. See [Maintainers: how counts stay honest](#maintainers-how-counts-stay-honest) at the bottom for the exact recipe. Developer checks use the live worktree by default; release snapshots use `--source=head` so unrelated dirty files cannot alter the attested counts._
 
@@ -696,7 +696,7 @@ FrankenTerm runs on its own terminal engine — a fully vendored, **in-tree** fo
 
 ### The decision
 
-The vendored `frankenterm/<crate>/` workspace members are first-class. There are currently <!--count:vendored_top_level-->42<!--/count--> top-level vendored crate directories and <!--count:vendored_members-->47<!--/count--> Cargo workspace members when nested derive/lua crates are included. No "implementation boundary" exists between `ft` and "the mux"; the in-process mux session API is the `MuxInterface` trait, and the audit under [`docs/proposals/ft-zoxxq-mux-boundary-truth.md`](docs/proposals/ft-zoxxq-mux-boundary-truth.md) (7,803 LOC examined, 31 importers, 192 concrete-type refs, 0 trait-object consumers) confirmed that nobody actually treats the boundary as polymorphic.
+The vendored `frankenterm/<crate>/` workspace members are first-class. There are currently <!--count:vendored_top_level-->42<!--/count--> top-level vendored crate directories and <!--count:vendored_members-->55<!--/count--> Cargo workspace members when nested derive/lua crates are included. No "implementation boundary" exists between `ft` and "the mux"; the in-process mux session API is the `MuxInterface` trait, and the audit under [`docs/proposals/ft-zoxxq-mux-boundary-truth.md`](docs/proposals/ft-zoxxq-mux-boundary-truth.md) (7,803 LOC examined, 31 importers, 192 concrete-type refs, 0 trait-object consumers) confirmed that nobody actually treats the boundary as polymorphic.
 
 ### Why not abstract over both WezTerm and (say) Zellij?
 
@@ -1644,11 +1644,11 @@ Operator-tunable runtime constants live under `[tuning]` sections such as `[tuni
 ### Workspace Structure
 
 ```
-frankenterm/                              # <!--count:workspace_members-->83<!--/count--> workspace members (auto-stamped)
+frankenterm/                              # <!--count:workspace_members-->97<!--/count--> workspace members (auto-stamped)
 ├── Cargo.toml
 ├── crates/
 │   ├── frankenterm/                      # CLI binary (ft)
-│   ├── frankenterm-core/                 # Core library — <!--count:core_top_level_modules-->536<!--/count--> top-level modules, <!--count:core_loc-->1346112<!--/count--> LOC
+│   ├── frankenterm-core/                 # Core library — <!--count:core_top_level_modules-->540<!--/count--> top-level modules, <!--count:core_loc-->1389418<!--/count--> LOC
 │   │   ├── src/
 │   │   │   ├── runtime.rs                # Observation runtime orchestration
 │   │   │   ├── runtime_async.rs          # Canonical asupersync wrapper API surface
@@ -1669,7 +1669,7 @@ frankenterm/                              # <!--count:workspace_members-->83<!--
 │   │   │   ├── incident_bundle.rs        # Live incident-bundle collectors
 │   │   │   ├── mission_objective_plan.rs # Capacity-aware objective planner
 │   │   │   └── …                         # 500+ additional modules
-│   │   ├── tests/                        # <!--count:core_rust_test_files-->1042<!--/count--> Rust test files, <!--count:test_count-->60535<!--/count-->+ test annotations
+│   │   ├── tests/                        # <!--count:core_rust_test_files-->1051<!--/count--> Rust test files, <!--count:test_count-->64035<!--/count-->+ test annotations
 │   │   └── benches/                      # <!--count:criterion_bench_files-->119<!--/count--> Criterion bench files
 │   │
 │   ├── frankenterm-core-ars/             # ARS (Adaptive/Autonomous Reflex System)
@@ -1709,9 +1709,9 @@ frankenterm/                              # <!--count:workspace_members-->83<!--
 │   ├── deps-freetype/  deps-harfbuzz/  deps-fontconfig/
 │   ├── env-bootstrap/  tabout/  gui-subcommands/  toast-notification/  open-url/
 │   └── lua-api-crates/{termwiz-funcs,mux-lua,url-funcs}/
-├── fuzz/                                 # <!--count:fuzz_targets-->51<!--/count--> fuzz targets
-├── docs/                                 # <!--count:doc_markdown_files-->536<!--/count--> Markdown documentation files
-├── tests/e2e/                            # <!--count:e2e_scripts-->284<!--/count--> shell E2E scripts
+├── fuzz/                                 # <!--count:fuzz_targets-->52<!--/count--> fuzz targets
+├── docs/                                 # <!--count:doc_markdown_files-->548<!--/count--> Markdown documentation files
+├── tests/e2e/                            # <!--count:e2e_scripts-->300<!--/count--> shell E2E scripts
 └── fixtures/                             # Test fixtures (including operating-envelope goldens)
 ```
 
@@ -2625,7 +2625,7 @@ capacity guarantees.
 
 ### Current schema version
 
-The current version is **v<!--count:storage_schema_version-->47<!--/count-->**. The authoritative source is
+The current version is **v<!--count:storage_schema_version-->48<!--/count-->**. The authoritative source is
 [`storage/schema_ddl.rs::SCHEMA_VERSION`](crates/frankenterm-core/src/storage/schema_ddl.rs);
 documentation must follow that constant rather than becoming an independent
 version authority.
@@ -4001,7 +4001,7 @@ This section catalogues the non-obvious design decisions the project has made, t
 - **SQLite is bundled** (no system dep), runs in-process (no IPC overhead), and supports FTS5 + WAL out of the box.
 - **Single-writer integrity** is a deliberate constraint: only one watcher writes, and multiple readers are fine.
 - **Backup is the SQLite online backup API**: consistent snapshots without stop-the-world.
-- **Versioned storage**: schema migrations are versioned (current schema: <!--count:storage_schema_version-->47<!--/count-->; the live authority is [`storage/schema_ddl.rs::SCHEMA_VERSION`](crates/frankenterm-core/src/storage/schema_ddl.rs)); rollbacks are tracked in `forensic_migration` + `rollback_execution`.
+- **Versioned storage**: schema migrations are versioned (current schema: <!--count:storage_schema_version-->48<!--/count-->; the live authority is [`storage/schema_ddl.rs::SCHEMA_VERSION`](crates/frankenterm-core/src/storage/schema_ddl.rs)); rollbacks are tracked in `forensic_migration` + `rollback_execution`.
 - **Trade-off accepted**: at fleet-of-thousands scale, write throughput would become a bottleneck. We're not there.
 
 ### Why asupersync, not tokio?
@@ -4233,11 +4233,11 @@ The project maintains extensive test coverage:
 
 | Category | Count | Purpose |
 |---|---|---|
-| Test annotations | <!--count:test_count-->60535<!--/count-->+ | Module-level correctness, property checks, and async test coverage |
-| Core Rust test files | <!--count:core_rust_test_files-->1042<!--/count--> | Cross-module behavior under `crates/frankenterm-core/tests/` |
-| E2E shell scripts | <!--count:e2e_scripts-->284<!--/count--> | Full-pipeline validation |
+| Test annotations | <!--count:test_count-->64035<!--/count-->+ | Module-level correctness, property checks, and async test coverage |
+| Core Rust test files | <!--count:core_rust_test_files-->1051<!--/count--> | Cross-module behavior under `crates/frankenterm-core/tests/` |
+| E2E shell scripts | <!--count:e2e_scripts-->300<!--/count--> | Full-pipeline validation |
 | Criterion bench files | <!--count:criterion_bench_files-->119<!--/count--> | Performance regression detection |
-| Fuzz targets | <!--count:fuzz_targets-->51<!--/count--> | Security / robustness |
+| Fuzz targets | <!--count:fuzz_targets-->52<!--/count--> | Security / robustness |
 
 ```bash
 RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-workspace-test \
@@ -4530,6 +4530,6 @@ MIT License (with OpenAI/Anthropic Rider). See [LICENSE](LICENSE) for details.
 
 **Built to be the terminal runtime for the AI agent age.**
 
-*<!--count:workspace_members-->83<!--/count--> workspace crates. <!--count:core_top_level_modules-->536<!--/count--> top-level core modules + <!--count:core_subcrates-->19<!--/count--> sub-crates. <!--count:core_loc-->1346112<!--/count-->+ lines. <!--count:test_count-->60535<!--/count-->+ test annotations. asupersync-native, Cx-first, `tokio`-banned, `unsafe`-forbidden. One mission: make AI agent swarms observable, controllable, and safe.*
+*<!--count:workspace_members-->97<!--/count--> workspace crates. <!--count:core_top_level_modules-->540<!--/count--> top-level core modules + <!--count:core_subcrates-->19<!--/count--> sub-crates. <!--count:core_loc-->1389418<!--/count-->+ lines. <!--count:test_count-->64035<!--/count-->+ test annotations. asupersync-native, Cx-first, `tokio`-banned, `unsafe`-forbidden. One mission: make AI agent swarms observable, controllable, and safe.*
 
 </div>
