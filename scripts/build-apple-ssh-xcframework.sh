@@ -32,7 +32,10 @@ MACOS_MIN="${MACOSX_DEPLOYMENT_TARGET:-14.0}"
 BUILD="${FT_APPLE_SSH_BUILD_DIR:-$HOME/ft-build/frankenterm-apple-ssh-ios${IOS_MIN}-macos${MACOS_MIN}}"
 ARTIFACTS="$ROOT/apps/apple/FrankenTermSSH/Artifacts"
 OUTPUT="$ARTIFACTS/CLibssh2.xcframework"
-JOBS="$(sysctl -n hw.ncpu)"
+JOBS="${FT_APPLE_BUILD_JOBS:-2}"
+[[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || {
+    echo "error: FT_APPLE_BUILD_JOBS must be a positive integer" >&2; exit 1;
+}
 
 for tool in xcodebuild xcrun cmake perl libtool make patch shasum; do
     command -v "$tool" >/dev/null || { echo "error: $tool is required" >&2; exit 1; }
@@ -45,11 +48,15 @@ crate_source() {
     local name="$1" version
     version="$(locked_version "$name")"
     [ -n "$version" ] || { echo "error: $name is not in Cargo.lock" >&2; exit 1; }
-    local home="${CARGO_HOME:-$HOME/.cargo}" path
-    path="$(ls -d "$home"/registry/src/*/"$name-$version" 2>/dev/null | head -1 || true)"
+    local home="${CARGO_HOME:-$HOME/.cargo}" path="" candidate
+    for candidate in "$home"/registry/src/*/"$name-$version"; do
+        if [ -d "$candidate" ]; then path="$candidate"; break; fi
+    done
     if [ -z "$path" ]; then
         (cd "$ROOT" && RCH_CARGO_WRAPPER_BYPASS=1 cargo fetch --locked)
-        path="$(ls -d "$home"/registry/src/*/"$name-$version" 2>/dev/null | head -1 || true)"
+        for candidate in "$home"/registry/src/*/"$name-$version"; do
+            if [ -d "$candidate" ]; then path="$candidate"; break; fi
+        done
     fi
     [ -n "$path" ] || { echo "error: no registry source for $name $version" >&2; exit 1; }
     echo "$path"
