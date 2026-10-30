@@ -47,9 +47,17 @@ pub enum Event {
     },
     /// Names this run of the mux server: the same for as long as it runs,
     /// new after it restarts, even when it numbers its panes as before.
-    /// Only current servers say; it comes before the first pane list.
+    /// Current servers say before the first pane list when a coherent snapshot
+    /// is available, otherwise before the first verified pane identity.
     Incarnation {
         id: [u8; 16],
+    },
+    /// A passive identity query, or the identity captured before showing a
+    /// pane. An absent witness grants no automatic reconnect or size-recovery
+    /// authority. It does not prevent a deliberate fresh pane selection.
+    PaneIdentity {
+        pane_id: usize,
+        identity: Option<wire::PaneIdentity>,
     },
     /// The pane list, again whenever it may have changed.
     Panes(Vec<PaneInfo>),
@@ -136,6 +144,10 @@ enum Request {
     PaneIdentity {
         pane_id: usize,
     },
+    InspectPaneIdentity {
+        pane_id: usize,
+        deadline_ns: u64,
+    },
     PaneAuthority {
         pane_id: usize,
         input_serial: u64,
@@ -196,6 +208,10 @@ enum Request {
 pub const MAX_WHEEL_STEPS: u32 = 64;
 /// Reliable input retains one admission budget across retries and suffixes.
 pub const INPUT_DEADLINE_NS: u64 = 5_000_000_000;
+/// Passive reconnect checks have their own bounded lane and never consume
+/// an input serial or subscribe to a pane's output.
+pub const MAX_IDENTITY_QUERIES: usize = 8;
+pub const IDENTITY_QUERY_DEADLINE_NS: u64 = 5_000_000_000;
 /// At most this many proven-no-effect retransmissions per admitted operation.
 pub const MAX_INPUT_RETRIES: u8 = 8;
 const MIN_INPUT_RETRY_DELAY_NS: u64 = 1_000_000;
@@ -325,6 +341,10 @@ pub struct Session {
     /// never the most recently written or currently visible pane.
     input: PaneInput,
     authorities: HashMap<usize, PaneAuthority>,
+    /// Exact witnesses learned on this connection. A later show must still
+    /// name the same live registration; durable UUID equality alone is not
+    /// permission to inherit a replaced pane.
+    identities: HashMap<usize, wire::PaneIdentity>,
     render_retries: HashMap<usize, RenderRetry>,
     next_input_serial: u64,
     monotonic_ns: Option<u64>,
@@ -369,6 +389,24 @@ impl Session {
             return false;
         }
         self.monotonic_ns = Some(now_ns);
+        let expired: Vec<_> = self
+            .requests
+            .iter()
+            .filter_map(|(serial, request)| match request {
+                Request::InspectPaneIdentity {
+                    pane_id,
+                    deadline_ns,
+                } if now_ns >= *deadline_ns => Some((*serial, *pane_id)),
+                _ => None,
+            })
+            .collect();
+        for (serial, pane_id) in expired {
+            self.requests.remove(&serial);
+            self.events.push_back(Event::PaneIdentity {
+                pane_id,
+                identity: None,
+            });
+        }
         if self
             .ordered_input
             .iter()
@@ -386,7 +424,8 @@ impl Session {
 
     /// Earliest absolute wake in the same clock domain supplied to
     /// [`Session::advance_time`]. Includes every admitted operation's expiry,
-    /// including a lone paste or mouse RPC, and a refused render read's repeat.
+    /// including a lone paste or mouse RPC, a passive identity query's expiry,
+    /// and a refused render read's repeat.
     /// A preceding RPC cannot hide a queued operation's original deadline.
     /// Only one owner timer is needed; the bounded FIFO remains authoritative.
     pub fn next_input_wake_ns(&self) -> Option<u64> {
@@ -406,6 +445,10 @@ impl Session {
                     .values()
                     .filter_map(|retry| retry.due_ns),
             )
+            .chain(self.requests.values().filter_map(|request| match request {
+                Request::InspectPaneIdentity { deadline_ns, .. } => Some(*deadline_ns),
+                _ => None,
+            }))
             .min()
     }
 
@@ -473,6 +516,96 @@ impl Session {
             self.list_again = false;
             self.refresh_panes();
         }
+    }
+
+    /// Read a pane's exact v71 witness without showing, resizing or sending
+    /// input. At most eight distinct queries may be outstanding; duplicate
+    /// calls coalesce. Older peers answer locally with no witness, without
+    /// sending an unsupported PDU or an input-authority probe. A v71 query
+    /// requires an owner clock sample from `advance_time`; without one it
+    /// returns false rather than admitting work with an unbounded lifetime.
+    pub fn inspect_pane_identity(&mut self, pane_id: usize) -> bool {
+        if !self.is_ready() {
+            return false;
+        }
+        if self.requests.values().any(|request| {
+            matches!(request, Request::InspectPaneIdentity { pane_id: pending, .. } if *pending == pane_id)
+        }) {
+            return true;
+        }
+        if self.dialect != Dialect::Current
+            || self.codec_version < wire::PANE_IDENTITY_MIN_VERSION
+            || !self.panes.iter().any(|pane| pane.pane_id == pane_id)
+        {
+            self.events.push_back(Event::PaneIdentity {
+                pane_id,
+                identity: None,
+            });
+            return true;
+        }
+        if self
+            .requests
+            .values()
+            .filter(|request| matches!(request, Request::InspectPaneIdentity { .. }))
+            .count()
+            >= MAX_IDENTITY_QUERIES
+        {
+            return false;
+        }
+        let Some(deadline_ns) = self
+            .monotonic_ns
+            .and_then(|now| now.checked_add(IDENTITY_QUERY_DEADLINE_NS))
+        else {
+            return false;
+        };
+        self.send(
+            ident::GET_PANE_IDENTITY,
+            &wire::GetPaneIdentity { pane_id },
+            Request::InspectPaneIdentity {
+                pane_id,
+                deadline_ns,
+            },
+        );
+        !self.failed
+    }
+
+    fn retain_pane_identity(
+        &mut self,
+        pane_id: usize,
+        identity: wire::PaneIdentity,
+    ) -> Result<(), crate::Error> {
+        if identity.session_incarnation == [0; 16]
+            || identity.durable_pane_id == [0; 16]
+            || identity.pane_registration == [0; 16]
+            || self
+                .incarnation
+                .is_some_and(|current| current != identity.session_incarnation)
+            || self
+                .identities
+                .get(&pane_id)
+                .is_some_and(|current| *current != identity)
+            || self.identities.iter().any(|(other, current)| {
+                *other != pane_id
+                    && (current.durable_pane_id == identity.durable_pane_id
+                        || current.pane_registration == identity.pane_registration)
+            })
+        {
+            return Err(crate::Error::Frame(
+                "a pane identity changed or does not match the current mux",
+            ));
+        }
+        if self.incarnation.is_none() {
+            self.incarnation = Some(identity.session_incarnation);
+            self.events.push_back(Event::Incarnation {
+                id: identity.session_incarnation,
+            });
+        }
+        self.identities.insert(pane_id, identity);
+        self.events.push_back(Event::PaneIdentity {
+            pane_id,
+            identity: Some(identity),
+        });
+        Ok(())
     }
 
     /// Mirrors the pane onto its terminal, drawing it in full first.
@@ -1359,6 +1492,7 @@ impl Session {
 
     /// A new pane list, asked for with `serial`.
     fn listed(&mut self, list: &PaneList, serial: u64) {
+        let previously_listed: Vec<_> = self.panes.iter().map(|pane| pane.pane_id).collect();
         self.panes = pane_infos(list);
         if self
             .ordered_input
@@ -1373,16 +1507,19 @@ impl Session {
         // An inventory removal retires the observed generation just like an
         // explicit topology notice. A later same-number pane must start with
         // a new mirror, authority query and set of display requests.
-        let missing: Vec<_> = self
+        let missing: HashSet<_> = self
             .mirrors
             .keys()
             .copied()
+            .chain(previously_listed)
             .filter(|pane_id| !self.panes.iter().any(|pane| pane.pane_id == *pane_id))
             .collect();
         for pane_id in missing {
             self.pane_gone(pane_id);
         }
         self.authorities
+            .retain(|pane_id, _| self.panes.iter().any(|pane| pane.pane_id == *pane_id));
+        self.identities
             .retain(|pane_id, _| self.panes.iter().any(|pane| pane.pane_id == *pane_id));
         let marks = listed_marks(list);
         for pane_id in self.input.pending_panes() {
@@ -1482,6 +1619,52 @@ impl Session {
                 _ => Err(crate::Error::Frame("a reply too large to read")),
             };
         }
+        if let Some(Request::InspectPaneIdentity { pane_id, .. }) = &request {
+            let pane_id = *pane_id;
+            // Removal retires a pending query; a late reply must not restore
+            // the pane or publish a witness for a same-number replacement.
+            if !self.panes.iter().any(|pane| pane.pane_id == pane_id) {
+                return Ok(());
+            }
+            let outcome = match frame.ident {
+                ident::GET_PANE_IDENTITY_RESPONSE => {
+                    if frame.body.len() > wire::MAX_PANE_IDENTITY_RESPONSE_BYTES {
+                        return Err(crate::Error::Frame(
+                            "a pane identity reply exceeds its protocol bound",
+                        ));
+                    }
+                    let response: wire::PaneIdentityResponse = wire::decode(&frame.body)?;
+                    if response.pane_id != pane_id {
+                        return Err(crate::Error::Schema);
+                    }
+                    response.outcome
+                }
+                ident::ERROR_RESPONSE => wire::PaneIdentityOutcome::Unavailable,
+                _ => {
+                    return Err(crate::Error::Frame(
+                        "a pane identity query received an unexpected reply",
+                    ));
+                }
+            };
+            match outcome {
+                wire::PaneIdentityOutcome::Available { identity } => {
+                    self.retain_pane_identity(pane_id, identity)?;
+                }
+                wire::PaneIdentityOutcome::PaneGone => self.pane_gone(pane_id),
+                wire::PaneIdentityOutcome::Unavailable => {
+                    if self.identities.contains_key(&pane_id) {
+                        return Err(crate::Error::Frame(
+                            "a verified pane lost its exact identity",
+                        ));
+                    }
+                    self.events.push_back(Event::PaneIdentity {
+                        pane_id,
+                        identity: None,
+                    });
+                }
+            }
+            return Ok(());
+        }
         if let Some(Request::OrderedInput {
             pane_id,
             input_serial,
@@ -1541,17 +1724,7 @@ impl Session {
                     }
                     match response.outcome {
                         wire::PaneIdentityOutcome::Available { identity } => {
-                            if identity.session_incarnation == [0; 16]
-                                || identity.durable_pane_id == [0; 16]
-                                || identity.pane_registration == [0; 16]
-                                || self
-                                    .incarnation
-                                    .is_some_and(|current| current != identity.session_incarnation)
-                            {
-                                return Err(crate::Error::Frame(
-                                    "a pane identity does not match the current mux",
-                                ));
-                            }
+                            self.retain_pane_identity(pane_id, identity)?;
                             Some(identity.pane_registration)
                         }
                         wire::PaneIdentityOutcome::PaneGone => {
@@ -1559,6 +1732,15 @@ impl Session {
                             return Ok(());
                         }
                         wire::PaneIdentityOutcome::Unavailable => {
+                            if self.identities.contains_key(&pane_id) {
+                                return Err(crate::Error::Frame(
+                                    "a verified pane lost its exact identity",
+                                ));
+                            }
+                            self.events.push_back(Event::PaneIdentity {
+                                pane_id,
+                                identity: None,
+                            });
                             // A remote/proxy pane may lack durable identity
                             // while still owning a live input registration.
                             // Probe before drawing; this grants no resume or
@@ -1591,7 +1773,14 @@ impl Session {
                         }
                     }
                 }
-                (_, ident::ERROR_RESPONSE) => None,
+                (_, ident::ERROR_RESPONSE) => {
+                    if self.identities.contains_key(&pane_id) {
+                        return Err(crate::Error::Frame(
+                            "a verified pane lost its exact identity",
+                        ));
+                    }
+                    None
+                }
                 _ => {
                     return Err(crate::Error::Frame(
                         "a pane authority query received an unexpected reply",
@@ -2059,10 +2248,12 @@ impl Session {
 
     fn pane_gone(&mut self, pane_id: usize) {
         self.authorities.remove(&pane_id);
+        self.identities.remove(&pane_id);
         self.render_retries.remove(&pane_id);
         self.requests.retain(|_, request| {
             !matches!(request,
                 Request::PaneIdentity { pane_id: old }
+                | Request::InspectPaneIdentity { pane_id: old, .. }
                 | Request::PaneAuthority { pane_id: old, .. }
                 | Request::Subscribe { pane_id: old }
                 | Request::Lines { pane_id: old, .. }

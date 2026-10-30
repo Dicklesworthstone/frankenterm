@@ -1702,7 +1702,12 @@ struct WorkspaceTerminalScreen: View {
             case .ready:
                 readyCard(machine, session: session, accent: accent)
             case .live:
-                if session.terminal == nil { ProgressView().controlSize(.large).tint(accent) }
+                if session.terminal == nil {
+                    if let mux = session.muxState, mux.shown == nil, !mux.panes.isEmpty {
+                        sceneCard(symbol: "rectangle.split.2x1", title: "Select a Pane",
+                                  message: mux.notice ?? "Choose a pane above to continue on this machine.", accent: accent) {}
+                    } else { ProgressView().controlSize(.large).tint(accent) }
+                }
             case let .couldNotConnect(help):
                 if scene.status(of: machine.id) == .connecting {
                     connecting(machine, accent: accent, detail: "Reconnecting…")

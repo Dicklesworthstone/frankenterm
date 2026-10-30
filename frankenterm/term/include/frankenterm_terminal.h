@@ -229,11 +229,18 @@ uint32_t ft_terminal_v1_frame_release(uint64_t frame);
  *              Not repeated while an earlier one is still undrained.
  *   INCARNATION payload: 16 bytes naming this run of the mux server, the
  *              same while it runs and new after it restarts (even when it
- *              numbers its panes as before). Current servers only, once,
- *              before the first PANES.
+ *              numbers its panes as before). Current servers only, before the
+ *              first coherent PANES, or before the first verified PANE_IDENTITY
+ *              when a coherent list was unavailable.
  *   PANE_WAITING pane_id; payload: one byte, 1 when a current server has
  *              refused, as busy, to send the pane's screen several times
  *              in a row (the session keeps asking), 0 once it answers
+ *   PANE_IDENTITY pane_id, rows and cols 0; payload: exactly 48 bytes:
+ *              16-byte server incarnation, durable pane UUID, then live pane
+ *              registration. Each is nonzero. An empty payload means no
+ *              witness (unsupported, unavailable, or a passive-query timeout),
+ *              never authority to restore a saved pane/size by numeric ID.
+ *              Also emitted before a shown pane's initial subscription.
  */
 #define FT_MUX_EVENT_NONE 0u
 #define FT_MUX_EVENT_READY 1u
@@ -250,6 +257,7 @@ uint32_t ft_terminal_v1_frame_release(uint64_t frame);
 #define FT_MUX_EVENT_INCARNATION 12u
 #define FT_MUX_EVENT_PHONE_SIZE_RESTORED 13u
 #define FT_MUX_EVENT_PANE_WAITING 14u
+#define FT_MUX_EVENT_PANE_IDENTITY 15u
 #define FT_MUX_SEARCH_CASE_SENSITIVE 1u
 #define FT_MUX_SEARCH_REGEX 2u
 #define FT_MUX_MAX_RECEIVE_BYTES 1048576u
@@ -280,6 +288,14 @@ uint32_t ft_mux_v1_event_copy(uint64_t session, uint32_t offset, uint8_t *output
                               uint32_t capacity, uint32_t *written);
 /* Asks for the pane list again; a PANES event answers. */
 uint32_t ft_mux_v1_refresh_panes(uint64_t session);
+/* Passively inspect one listed pane's exact v71 identity. Does not show,
+ * resize, send input or consume an input serial. At most 8 distinct queries
+ * may be outstanding; duplicate queries coalesce. CAPACITY means no query
+ * was admitted. Older peers produce an empty PANE_IDENTITY locally. Each
+ * query expires after 5 seconds on ft_mux_v1_tick's clock, without retry;
+ * sample that clock before calling (otherwise admission returns CAPACITY).
+ * a late reply is inert. PANE_GONE may answer instead when the pane closes. */
+uint32_t ft_mux_v1_inspect_pane_identity(uint64_t session, uint64_t pane_id);
 /* Draws the pane from scratch (clearing its terminal), then every change. */
 uint32_t ft_mux_v1_show(uint64_t session, uint64_t pane_id);
 /* Stops drawing the pane. */

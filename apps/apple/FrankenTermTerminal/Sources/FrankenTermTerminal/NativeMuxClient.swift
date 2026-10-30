@@ -138,6 +138,9 @@ public final class NativeMuxClient: TerminalMuxClient, @unchecked Sendable {
             case UInt32(FT_MUX_EVENT_INCARNATION):
                 guard payload.count == 16 else { throw TerminalModelError.invalid }
                 return .incarnation(payload)
+            case UInt32(FT_MUX_EVENT_PANE_IDENTITY):
+                guard rows == 0, cols == 0 else { throw TerminalModelError.invalid }
+                return .paneIdentity(paneID: paneID, identity: try Self.decodePaneIdentity(payload))
             case UInt32(FT_MUX_EVENT_PANES):
                 let decoder = JSONDecoder()
                 decoder.keyDecodingStrategy = .convertFromSnakeCase
@@ -177,6 +180,18 @@ public final class NativeMuxClient: TerminalMuxClient, @unchecked Sendable {
     }
 
     public func refreshPanes() throws { try call { ft_mux_v1_refresh_panes($0) } }
+    public func inspectPaneIdentity(pane: Int) throws {
+        guard let pane = UInt64(exactly: pane) else { throw TerminalModelError.invalid }
+        try timedCall { ft_mux_v1_inspect_pane_identity($0, pane) }
+    }
+
+    static func decodePaneIdentity(_ payload: Data) throws -> TerminalMuxPaneIdentity? {
+        if payload.isEmpty { return nil }
+        guard payload.count == 48 else { throw TerminalModelError.invalid }
+        let bytes = Data(payload)
+        return try TerminalMuxPaneIdentity(incarnation: Data(bytes[0..<16]),
+            durablePaneID: Data(bytes[16..<32]), registration: Data(bytes[32..<48]))
+    }
     private static func paneID(_ pane: Int) throws -> UInt64 {
         guard let value = UInt64(exactly: pane) else { throw TerminalModelError.invalid }
         return value

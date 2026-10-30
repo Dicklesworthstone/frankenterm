@@ -27,12 +27,20 @@ private final class ObservationMuxClient: TerminalMuxClient, @unchecked Sendable
     private var inputTimer: ContinuousClock.Instant?
     private var timerStarted = false
     let panes: [TerminalMuxPane]
+    let mode: String
+
+    static func identity(pane: Int, registration: UInt8? = nil) throws -> TerminalMuxPaneIdentity {
+        try .init(incarnation: incarnation, durablePaneID: Data(repeating: UInt8(pane), count: 16),
+                  registration: Data(repeating: registration ?? UInt8(pane + 100), count: 16))
+    }
 
     init(mode: String) {
+        self.mode = mode
         let dimensions = mode == "oversize" || mode == "input-only-oversize"
             ? (100, 512) : mode == "invalid-grid" ? (-1, 80) : (100, 256)
         panes = (1...2).map { id in
-            TerminalMuxPane(paneId: id, tabId: id, windowId: 0, tabTitle: "Desktop", title: "pane-\(id)",
+            TerminalMuxPane(paneId: id, tabId: mode == "identity-moved" ? id + 10 : id,
+                windowId: mode == "identity-moved" ? 4 : 0, tabTitle: "Desktop", title: "pane-\(id)",
                 workspace: "default", workingDir: nil, size: .init(rows: 100, cols: 256),
                 isActive: id == 1, isZoomed: false)
         }
@@ -61,6 +69,14 @@ private final class ObservationMuxClient: TerminalMuxClient, @unchecked Sendable
     }
     func nextEvent() throws -> TerminalMuxEvent? { lock.withLock { events.isEmpty ? nil : events.removeFirst() } }
     func refreshPanes() throws { lock.withLock { calls.append(.init(name: "list", pane: 0)) } }
+    func inspectPaneIdentity(pane: Int) throws {
+        let identity = mode == "identity-unavailable" ? nil
+            : try Self.identity(pane: pane, registration: mode == "identity-replaced" ? 0xf0 : nil)
+        lock.withLock {
+            calls.append(.init(name: "identity", pane: pane))
+            events.append(.paneIdentity(paneID: pane, identity: identity))
+        }
+    }
     func show(pane: Int) throws {
         lock.withLock {
             calls.append(.init(name: "show", pane: pane))
@@ -83,7 +99,10 @@ private final class ObservationMuxClient: TerminalMuxClient, @unchecked Sendable
     func restoreSize(pane: Int) throws {
         lock.withLock {
             calls.append(.init(name: "restore", pane: pane))
+            sizes[pane] = (100, 256)
             events.append(.phoneSizeRestored(paneID: pane))
+            events.append(.output(paneID: pane, rows: 100, columns: 256,
+                bytes: Data("restored-\(pane)\r\n".utf8)))
         }
     }
     func adoptPhoneSize(pane: Int, desktop: TerminalMuxSize, rows: Int, columns: Int) throws -> Bool {
@@ -168,6 +187,86 @@ final class MuxObservationTests: XCTestCase {
         }
     }
 
+    func testReconnectPreflightRequiresExactIdentityBeforeSelectionAndGeometry() async throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let port = env["FT_MUX_OBSERVATION_PORT"].flatMap(UInt16.init),
+              let host = env["FT_MUX_OBSERVATION_HOSTKEY"].flatMap({ Data(base64Encoded: $0) }),
+              let mode = env["FT_MUX_OBSERVATION_MODE"], mode.hasPrefix("identity-") else {
+            throw XCTSkip("Requires the independent mux identity SSH fixture")
+        }
+        let client = ObservationMuxClient(mode: mode)
+        let fixture = try await SSHWorkspaceTestFixture.make(hostname: "127.0.0.1", port: port,
+            hostBlob: host, routeMode: "frankenterm_mux") { workspace in
+                var routes = workspace["routes"] as! [[String: Any]]
+                routes[0]["remote_command"] = "fixture-mux-observe"; workspace["routes"] = routes
+            }
+        let activity = WorkspaceNetworkActivity()
+        let owner = try await WorkspaceNativeSSHConnection.connect(workspaceID: fixture.installed.id,
+            expectedRevision: fixture.installed.revision, machineID: "machine", routeID: "route",
+            credentialID: "key", confirmedByUser: true, store: fixture.store, broker: fixture.broker,
+            networkActivity: activity, connectionTimeout: .seconds(5), authenticationTimeout: .seconds(5),
+            muxClientFactory: { client }, muxAccessMode: .interactive, requiresExistingMux: true)
+        let recovery = TerminalMuxPhoneSizes(workspace: owner.identity.workspaceID, machine: "machine")
+        let shown = TerminalMuxShownPane(workspace: owner.identity.workspaceID, machine: "machine")
+        defer { recovery.removeAll(); shown.set(nil, incarnation: nil) }
+        let saved = TerminalMuxPane(paneId: 2, tabId: 2, windowId: 0, tabTitle: "Before moving", title: "pane-2",
+            workspace: "default", workingDir: nil, size: .init(rows: 100, cols: 256), isActive: false, isZoomed: false)
+        let witness = try ObservationMuxClient.identity(pane: 2)
+        shown.set(saved, incarnation: ObservationMuxClient.incarnation, identity: witness)
+        shown.markInputUnconfirmed()
+        recovery.set(pane: saved, incarnation: ObservationMuxClient.incarnation,
+            desktop: .init(rows: 60, cols: 160, pixelWidth: 1600, pixelHeight: 1200, dpi: 96),
+            rows: 100, columns: 256, identity: witness)
+        let control = try XCTUnwrap(owner.muxControl)
+        control.setVisible(true)
+        let coordinator = try TerminalInputCoordinator(), consumer = try ObservationConsumer(identity: owner.identity)
+        do {
+            let pump = try await owner.openTerminal(geometry: .init(columns: 80, rows: 24), coordinator: coordinator) {
+                try await consumer.prepare($0)
+            }
+            let resumed = mode == "identity-same" || mode == "identity-moved"
+            XCTAssertTrue(control.current.inputUnconfirmed,
+                          "fresh identity cannot prove the previous connection's input outcome")
+            if resumed {
+                XCTAssertEqual(control.current.shown, 2, "resume the verified pane, not active pane 1")
+                XCTAssertEqual(shown.record?.identity, witness)
+                XCTAssertEqual(shown.record?.tabId, mode == "identity-moved" ? 12 : 2)
+                XCTAssertTrue(client.recorded.contains(.init(name: "adopt", pane: 2)))
+            } else {
+                XCTAssertNil(control.current.shown)
+                XCTAssertThrowsError(try control.inputRouting.capture())
+                XCTAssertTrue(client.effects.isEmpty)
+                XCTAssertFalse(client.recorded.contains { $0.name == "show" })
+                XCTAssertTrue(control.current.notice?.contains("Select a pane") == true)
+                XCTAssertEqual(shown.record?.identity, witness, "a failed resume preserves the original record")
+            }
+            let run = Task { try await pump.run(consumer: consumer) }
+            let watchdog = Task { try await Task.sleep(for: .seconds(8)); pump.requestStop() }
+            defer { watchdog.cancel(); pump.requestStop() }
+            if !resumed { control.request(pane: 2) }
+            try await waitUntil { control.current.shown == 2 && control.inputRouting.current.ready }
+            XCTAssertFalse(client.recorded.contains(.init(name: "show", pane: 1)))
+            if !resumed {
+                XCTAssertFalse(client.recorded.contains { $0.name == "adopt" },
+                               "explicit fresh selection cannot inherit a replacement's saved size")
+            }
+            let identityIndex = try XCTUnwrap(client.recorded.firstIndex { $0 == .init(name: "identity", pane: 2) })
+            let firstEffect = try XCTUnwrap(client.recorded.firstIndex { ["adopt", "resize", "show"].contains($0.name) })
+            XCTAssertLessThan(identityIndex, firstEffect)
+            let stream = try await coordinator.makeStream(sceneID: UUID())
+            let focus = try await coordinator.changeFocus(stream, to: pump.source)
+            _ = try await coordinator.submit(focus, encodedBytes: Data("a deliberate new action".utf8))
+            try await waitUntil { client.recorded.filter { $0.name == "write" }.count == 1 }
+            XCTAssertEqual(client.recorded.filter { $0.name == "write" }.map(\.pane), [2])
+            pump.requestStop(); _ = try await run.value
+            let pending = try await coordinator.pendingOutcomes(pump.source)
+            if !pending.outcomes.isEmpty { try await coordinator.acknowledgeOutcomes(pending) }
+            try await coordinator.retire(pump.source)
+            await owner.close()
+            XCTAssertEqual(activity.accounting().connections, 0)
+        } catch { await owner.close(); throw error }
+    }
+
     func testLiveMuxAccessModeEffectBoundary() async throws {
         let env = ProcessInfo.processInfo.environment
         guard let port = env["FT_MUX_OBSERVATION_PORT"].flatMap(UInt16.init),
@@ -197,7 +296,8 @@ final class MuxObservationTests: XCTestCase {
         defer { recovery.removeAll(); shown.set(nil, incarnation: nil) }
         for pane in client.panes {
             recovery.set(pane: pane, incarnation: ObservationMuxClient.incarnation,
-                desktop: .init(rows: 60, cols: 160, pixelWidth: 1600, pixelHeight: 1200, dpi: 96), rows: 100, columns: 256)
+                desktop: .init(rows: 60, cols: 160, pixelWidth: 1600, pixelHeight: 1200, dpi: 96), rows: 100, columns: 256,
+                identity: try ObservationMuxClient.identity(pane: pane.paneId))
         }
         let control = try XCTUnwrap(owner.muxControl)
         control.setVisible(true)
@@ -272,11 +372,39 @@ final class MuxObservationTests: XCTestCase {
                 }
                 let reply = try await coordinator.reply(pump.source, encodedBytes: Data("answerback".utf8))
                 XCTAssertEqual(reply, .droppedWhole)
+                if controlsSize {
+                    let effects = client.geometryEffects.count
+                    let shows = client.recorded.filter { $0.name == "show" }.count
+                    control.setSizeControlEnabled(false)
+                    try await waitUntil {
+                        let summary = await consumer.summary()
+                        return client.geometryEffects.count == effects + 1 && summary.geometry.columns == 256
+                    }
+                    XCTAssertEqual(client.geometryEffects.last?.name, "restore")
+                    XCTAssertEqual(client.recorded.filter { $0.name == "show" }.count, shows,
+                        "a companion relinquishes size without resubscribing or losing its output visit")
+                    XCTAssertTrue(control.current.visible)
+                    XCTAssertEqual(control.inputRouting.current.destination, first)
+                    try await owner.requestResize(.init(columns: 54, rows: 40))
+                    XCTAssertEqual(client.geometryEffects.count, effects + 1,
+                        "a late viewport cannot resize the unfocused companion")
+                    control.setVisible(false)
+                    try await waitUntil { client.recorded.contains(.init(name: "hide", pane: 1)) }
+                    control.setVisible(true)
+                    try await waitUntil { client.recorded.filter { $0.name == "show" }.count == shows + 1 }
+                    XCTAssertEqual(client.geometryEffects.count, effects + 1,
+                        "a narrow window restoring its companion does not reacquire size")
+                    control.setSizeControlEnabled(true)
+                    try await waitUntil { client.geometryEffects.count == effects + 2 }
+                    XCTAssertEqual(client.geometryEffects.last?.name, "resize")
+                }
                 try await owner.requestResize(.init(columns: 54, rows: 40, pixelWidth: 540, pixelHeight: 800))
+                let shownBeforeHide = client.recorded.filter { $0 == .init(name: "show", pane: 1) }.count
+                let hiddenBeforeHide = client.recorded.filter { $0 == .init(name: "hide", pane: 1) }.count
                 control.setVisible(false)
-                try await waitUntil { client.recorded.contains(.init(name: "hide", pane: 1)) }
+                try await waitUntil { client.recorded.filter { $0 == .init(name: "hide", pane: 1) }.count > hiddenBeforeHide }
                 control.setVisible(true)
-                try await waitUntil { client.recorded.filter { $0 == .init(name: "show", pane: 1) }.count == 2 }
+                try await waitUntil { client.recorded.filter { $0 == .init(name: "show", pane: 1) }.count == shownBeforeHide + 1 }
                 _ = try await coordinator.suspend(focus)
                 control.request(pane: 2)
                 try await waitUntil { control.current.shown == 2 && control.inputRouting.current.ready }
@@ -288,7 +416,11 @@ final class MuxObservationTests: XCTestCase {
                     let summary = await consumer.summary()
                     XCTAssertEqual(summary.geometry.columns, 256)
                     XCTAssertEqual(summary.geometry.rows, 100)
-                    XCTAssertEqual(recovery.records(matching: client.panes, incarnation: ObservationMuxClient.incarnation).count, 2,
+                    let identities = try Dictionary(uniqueKeysWithValues: client.panes.map {
+                        ($0.paneId, try ObservationMuxClient.identity(pane: $0.paneId))
+                    })
+                    XCTAssertEqual(recovery.records(matching: client.panes, incarnation: ObservationMuxClient.incarnation,
+                                                    identities: identities).count, 2,
                         "A client without size authority cannot erase another connection's recovery")
                 }
                 if !permitsInput {

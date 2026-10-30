@@ -65,13 +65,13 @@ for target in $TARGETS; do
 done
 
 # Every slice must export exactly the functions the header declares.
-expected="$(grep -oE 'ft_terminal_v1_[a-z_]+\(' "$HEADER" | tr -d '(' | sort -u)"
+expected="$(grep -oE 'ft_(terminal|mux)_v1_[a-z_]+\(' "$HEADER" | tr -d '(' | sort -u)"
 for library in $libraries; do
     # nm exits nonzero for archive members without symbols; the comparison below
     # is the check, so its status is not.
-    exported="$({ nm -gU "$library" 2>/dev/null || true; } | awk '$2 == "T" && $3 ~ /^_ft_terminal_v1_/ { sub(/^_/, "", $3); print $3 }' | sort -u)"
+    exported="$({ nm -gU "$library" 2>/dev/null || true; } | awk '$2 == "T" && $3 ~ /^_ft_(terminal|mux)_v1_/ { sub(/^_/, "", $3); print $3 }' | sort -u)"
     if [ "$exported" != "$expected" ]; then
-        echo "error: $library does not export exactly the header's ft_terminal_v1_* ABI" >&2
+        echo "error: $library does not export exactly the header's terminal and mux v1 ABI" >&2
         diff <(echo "$expected") <(echo "$exported") >&2 || true
         exit 1
     fi

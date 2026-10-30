@@ -45,6 +45,7 @@ const EVENT_ACTIVITY: u32 = 11;
 const EVENT_INCARNATION: u32 = 12;
 const EVENT_PHONE_SIZE_RESTORED: u32 = 13;
 const EVENT_PANE_WAITING: u32 = 14;
+const EVENT_PANE_IDENTITY: u32 = 15;
 /// Search flags.
 const SEARCH_CASE_SENSITIVE: u32 = 1;
 const SEARCH_REGEX: u32 = 2;
@@ -186,6 +187,16 @@ fn event_parts(event: Option<Event>) -> Result<(u32, u64, u32, u32, Vec<u8>), Er
             (EVENT_READY, 0, 0, 0, server_version.into_bytes())
         }
         Some(Event::Incarnation { id }) => (EVENT_INCARNATION, 0, 0, 0, id.to_vec()),
+        Some(Event::PaneIdentity { pane_id, identity }) => {
+            let mut payload = Vec::new();
+            if let Some(identity) = identity {
+                payload.reserve_exact(48);
+                payload.extend_from_slice(&identity.session_incarnation);
+                payload.extend_from_slice(&identity.durable_pane_id);
+                payload.extend_from_slice(&identity.pane_registration);
+            }
+            (EVENT_PANE_IDENTITY, pane_id as u64, 0, 0, payload)
+        }
         Some(Event::Panes(panes)) => (
             EVENT_PANES,
             0,
@@ -456,6 +467,21 @@ pub extern "C" fn ft_mux_v1_refresh_panes(session: u64) -> u32 {
 }
 
 #[no_mangle]
+pub extern "C" fn ft_mux_v1_inspect_pane_identity(session: u64, pane_id: u64) -> u32 {
+    boundary(Some(session), |registry| {
+        let pane_id = pane(pane_id)?;
+        let session = registry.session(session)?;
+        if !session.is_ready() {
+            return Err(Error::Closed);
+        }
+        if !session.inspect_pane_identity(pane_id) {
+            return Err(Error::Capacity);
+        }
+        Ok(())
+    })
+}
+
+#[no_mangle]
 pub extern "C" fn ft_mux_v1_show(session: u64, pane_id: u64) -> u32 {
     boundary(Some(session), |registry| {
         let pane_id = pane(pane_id)?;
@@ -705,6 +731,33 @@ pub unsafe extern "C" fn ft_mux_v1_unanswered_input(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pane_identity_event_preserves_all_three_witnesses_and_distinguishes_unavailable() {
+        let identity = frankenterm_mobile_mux::wire::PaneIdentity {
+            session_incarnation: [0x11; 16],
+            durable_pane_id: [0x22; 16],
+            pane_registration: [0x33; 16],
+        };
+        let (kind, pane, rows, cols, payload) = event_parts(Some(Event::PaneIdentity {
+            pane_id: 42,
+            identity: Some(identity),
+        }))
+        .unwrap();
+        assert_eq!((kind, pane, rows, cols), (EVENT_PANE_IDENTITY, 42, 0, 0));
+        assert_eq!(payload.len(), 48);
+        assert_eq!(&payload[..16], &identity.session_incarnation);
+        assert_eq!(&payload[16..32], &identity.durable_pane_id);
+        assert_eq!(&payload[32..], &identity.pane_registration);
+        assert_eq!(
+            event_parts(Some(Event::PaneIdentity {
+                pane_id: 42,
+                identity: None
+            }))
+            .unwrap(),
+            (EVENT_PANE_IDENTITY, 42, 0, 0, Vec::new())
+        );
+    }
 
     fn take_outgoing(session: u64) -> Vec<u8> {
         let mut output = vec![0u8; 4096];

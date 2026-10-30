@@ -11,6 +11,13 @@ private func phoneSizedPane(_ id: Int, tab: Int? = nil, window: Int = 0,
     .init(paneId: id, tabId: tab ?? id, windowId: window, tabTitle: "", title: "p\(id)", workspace: "default",
           workingDir: nil, size: .init(rows: rows, cols: columns), isActive: id == 1, isZoomed: false)
 }
+private func paneIdentity(_ id: Int, run: Data = Data(repeating: 0x1c, count: 16),
+                          registration: UInt8 = 0x27) throws -> TerminalMuxPaneIdentity {
+    var durable = Data(repeating: 0, count: 16)
+    for byte in 0..<8 { durable[byte] = UInt8(truncatingIfNeeded: (id + 1) >> (byte * 8)) }
+    var live = durable; live[15] = registration
+    return try .init(incarnation: run, durablePaneID: durable, registration: live)
+}
 private func queryResults(_ count: Int, request: UInt64 = 1, text: String = "a match", error: String? = nil) -> TerminalMuxSearchResults {
     .init(search: request, matches: (0..<count).map {
         .init(row: Int64($0 + 5), startColumn: 1, endRow: Int64($0 + 5), endColumn: 4, text: text)
@@ -19,6 +26,30 @@ private func queryResults(_ count: Int, request: UInt64 = 1, text: String = "a m
 private let queryNeedle = TerminalMuxControl.SearchQuery(text: "needle", caseSensitive: false, regex: false)
 
 final class TerminalMuxControlTests: XCTestCase {
+    func testVisibleCompanionCanRelinquishSizeWithoutChangingInputOrSelection() throws {
+        for mode in [TerminalMuxAccessMode.viewOnly, .inputOnly, .interactive] {
+            let control = TerminalMuxControl(accessMode: mode), routing = control.inputRouting
+            try routing.replaceInventory([1])
+            let destination = try routing.select(pane: 1)
+            routing.didApplyOutput(destination)
+            control.publish(panes: [queryPane(1)], shown: 1); control.setVisible(true)
+            let before = control.current.revision
+            control.setSizeControlEnabled(false)
+            XCTAssertFalse(control.controlsSize)
+            XCTAssertTrue(control.current.visible)
+            XCTAssertEqual(control.current.shown, 1)
+            XCTAssertEqual(routing.current.destination, destination)
+            XCTAssertEqual(routing.permitsInput, mode.permitsInput)
+            XCTAssertNotEqual(control.current.revision, before)
+            let released = control.current.revision
+            control.setSizeControlEnabled(false)
+            XCTAssertEqual(control.current.revision, released, "repeated layout does not generate work")
+            control.setSizeControlEnabled(true)
+            XCTAssertEqual(control.controlsSize, mode.controlsSize, "presentation cannot escalate connection permission")
+            XCTAssertEqual(routing.current.destination, destination)
+        }
+    }
+
     func testInputPermissionDoesNotGrantSharedGeometryPermission() throws {
         let cases: [(TerminalMuxAccessMode, input: Bool, size: Bool)] = [
             (.viewOnly, false, false), (.inputOnly, true, false), (.interactive, true, true)
@@ -251,6 +282,7 @@ private final class QueryClient: TerminalMuxClient, @unchecked Sendable {
     func outgoing(limit: Int) throws -> Data { Data() }
     func nextEvent() throws -> TerminalMuxEvent? { nil }
     func refreshPanes() throws {}
+    func inspectPaneIdentity(pane: Int) throws {}
     func show(pane: Int) throws {}
     func hide(pane: Int) throws {}
     func write(pane: Int, bytes: Data) throws {}
@@ -440,27 +472,30 @@ final class TerminalMuxQueryDriverTests: XCTestCase {
         defer { defaults.removePersistentDomain(forName: suite) }
         let desktop = TerminalMuxSize(rows: 50, cols: 180, pixelWidth: 1440, pixelHeight: 800, dpi: 144)
         let run = Data(repeating: 0x1c, count: 16), pane = phoneSizedPane(4)
+        let identity = try paneIdentity(4), identities = [4: try paneIdentity(4), 9: try paneIdentity(9)]
         let first = TerminalMuxPhoneSizes(workspace: "w", machine: "ts1", defaults: defaults)
-        first.set(pane: pane, incarnation: run, desktop: desktop, rows: 40, columns: 54)
-        first.set(pane: phoneSizedPane(9), incarnation: run, desktop: desktop, rows: 40, columns: 54)
+        first.set(pane: pane, incarnation: run, desktop: desktop, rows: 40, columns: 54, identity: identity)
+        first.set(pane: phoneSizedPane(9), incarnation: run, desktop: desktop, rows: 40, columns: 54, identity: identities[9])
         first.remove(pane: 9)
 
         // A new owner/process must re-establish the exact current server and
         // pane before a persisted size can be handed to the transport.
         let next = TerminalMuxPhoneSizes(workspace: "w", machine: "ts1", defaults: defaults)
-        XCTAssertEqual(next.records(matching: [pane, phoneSizedPane(9)], incarnation: run),
-                       [4: .init(paneId: 4, tabId: 4, windowId: 0, incarnation: run,
+        XCTAssertEqual(next.records(matching: [pane, phoneSizedPane(9)], incarnation: run, identities: identities),
+                       [4: .init(paneId: 4, tabId: 4, windowId: 0, incarnation: run, identity: identity,
                                  desktop: desktop, rows: 40, columns: 54)])
         XCTAssertTrue(TerminalMuxPhoneSizes(workspace: "w", machine: "ts2", defaults: defaults)
-            .records(matching: [pane], incarnation: run).isEmpty)
+            .records(matching: [pane], incarnation: run, identities: identities).isEmpty)
         next.removeAll()
         XCTAssertTrue(first.records(matching: [pane], incarnation: run).isEmpty)
 
         let panes = (0..<(TerminalMuxPhoneSizes.maximumRecords + 10)).map { phoneSizedPane($0) }
+        var allIdentities: [Int: TerminalMuxPaneIdentity] = [:]
         for pane in panes {
-            first.set(pane: pane, incarnation: run, desktop: desktop, rows: 40, columns: 54)
+            let witness = try paneIdentity(pane.paneId); allIdentities[pane.paneId] = witness
+            first.set(pane: pane, incarnation: run, desktop: desktop, rows: 40, columns: 54, identity: witness)
         }
-        XCTAssertEqual(first.records(matching: panes, incarnation: run).count,
+        XCTAssertEqual(first.records(matching: panes, incarnation: run, identities: allIdentities).count,
                        TerminalMuxPhoneSizes.maximumRecords, "bounded")
     }
 
@@ -471,24 +506,27 @@ final class TerminalMuxQueryDriverTests: XCTestCase {
         let desktop = TerminalMuxSize(rows: 50, cols: 180, pixelWidth: 1440, pixelHeight: 800, dpi: 144)
         let run = Data(repeating: 0x1c, count: 16), restarted = Data(repeating: 0x2d, count: 16)
         let pane = phoneSizedPane(4, tab: 2, window: 7)
+        let identities = [4: try paneIdentity(4)]
         let ended = TerminalMuxPhoneSizes(workspace: "w", machine: "mac", defaults: defaults)
-        ended.set(pane: pane, incarnation: run, desktop: desktop, rows: 40, columns: 54)
+        ended.set(pane: pane, incarnation: run, desktop: desktop, rows: 40, columns: 54, identity: identities[4])
         let reconnect = TerminalMuxPhoneSizes(workspace: "w", machine: "mac", defaults: defaults)
-        XCTAssertEqual(reconnect.records(matching: [pane], incarnation: run).count, 1)
+        XCTAssertEqual(reconnect.records(matching: [pane], incarnation: run, identities: identities).count, 1)
         // Even every numeric ID and both dimensions can recur after restart.
-        XCTAssertTrue(reconnect.records(matching: [pane], incarnation: restarted).isEmpty)
+        XCTAssertTrue(reconnect.records(matching: [pane], incarnation: restarted,
+                                        identities: [4: try paneIdentity(4, run: restarted)]).isEmpty)
+        XCTAssertTrue(reconnect.records(matching: [pane], incarnation: run,
+                                        identities: [4: try paneIdentity(4, registration: 0x99)]).isEmpty)
+        XCTAssertTrue(reconnect.records(matching: [pane], incarnation: run).isEmpty,
+                      "a missing witness cannot inherit size authority from matching numbers")
         XCTAssertTrue(reconnect.records(matching: [pane], incarnation: nil).isEmpty)
         XCTAssertTrue(reconnect.records(matching: [pane], incarnation: Data()).isEmpty)
         XCTAssertTrue(reconnect.records(matching: [pane], incarnation: Data(repeating: 0, count: 16)).isEmpty)
         XCTAssertTrue(reconnect.records(matching: [pane], incarnation: Data(repeating: 1, count: 17)).isEmpty)
-        XCTAssertEqual(reconnect.records(matching: [pane], incarnation: run).count, 1,
+        XCTAssertEqual(reconnect.records(matching: [pane], incarnation: run, identities: identities).count, 1,
                        "a failed comparison does not mutate the retained record")
     }
 
-    func testPhoneSizesOnALegacyServerComeBackByPaneNumbersAndExactPhoneSize() throws {
-        // A 0.1.0 mux names no run. A drop while its pane was at the phone's
-        // size must still give the desktop its size back on reconnect, or the
-        // reconnect takes the phone's size for the desktop's and keeps it.
+    func testLegacyPhoneSizesNeverGrantAutomaticGeometryAuthority() throws {
         let suite = "frankenterm.tests.phoneSizes.legacy.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
@@ -499,9 +537,8 @@ final class TerminalMuxQueryDriverTests: XCTestCase {
         dropped.set(pane: pane, incarnation: nil, desktop: desktop, rows: 40, columns: 54)
 
         let reconnect = TerminalMuxPhoneSizes(workspace: "w", machine: "linux", defaults: defaults)
-        XCTAssertEqual(reconnect.records(matching: [pane, other], incarnation: nil),
-                       [4: .init(paneId: 4, tabId: 2, windowId: 7, incarnation: nil,
-                                 desktop: desktop, rows: 40, columns: 54)])
+        XCTAssertTrue(reconnect.records(matching: [pane, other], incarnation: nil).isEmpty)
+        XCTAssertTrue(reconnect.candidates(matching: [pane, other], incarnation: nil).isEmpty)
         // An upgraded server restarted and names a run now: never the legacy record.
         XCTAssertTrue(reconnect.records(matching: [pane], incarnation: run).isEmpty)
         for changed in [phoneSizedPane(4, tab: 5, window: 7), phoneSizedPane(4, tab: 2, window: 8),
@@ -511,33 +548,37 @@ final class TerminalMuxQueryDriverTests: XCTestCase {
         }
         XCTAssertTrue(reconnect.records(matching: [pane, pane], incarnation: nil).isEmpty,
                       "an ambiguous inventory grants no resize authority")
-        XCTAssertEqual(reconnect.records(matching: [pane], incarnation: nil).count, 1,
-                       "a failed comparison does not mutate the retained record")
+        XCTAssertNotNil(defaults.data(forKey: "frankenterm.mux.phoneSizes.w.linux"),
+                        "lack of proof must not silently erase retained recovery metadata")
 
         // A run-bound record and a legacy one for the same pane replace each other.
-        reconnect.set(pane: pane, incarnation: run, desktop: desktop, rows: 40, columns: 54)
+        let witness = try paneIdentity(4)
+        reconnect.set(pane: pane, incarnation: run, desktop: desktop, rows: 40, columns: 54, identity: witness)
         XCTAssertTrue(reconnect.records(matching: [pane], incarnation: nil).isEmpty)
-        XCTAssertEqual(reconnect.records(matching: [pane], incarnation: run).count, 1)
+        XCTAssertEqual(reconnect.records(matching: [pane], incarnation: run, identities: [4: witness]).count, 1)
         reconnect.remove(pane: 4)
         XCTAssertTrue(reconnect.records(matching: [pane], incarnation: run).isEmpty)
     }
 
-    func testPhoneSizesRequireCurrentTopologyAndDimensionsWithoutLosingAnUnchangedPane() throws {
+    func testPhoneSizesFollowExactMovedPanesButStillRequireCurrentDimensions() throws {
         let suite = "frankenterm.tests.phoneSizes.topology.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let desktop = TerminalMuxSize(rows: 50, cols: 180, pixelWidth: 1440, pixelHeight: 800, dpi: 144)
         let run = Data(repeating: 0x1c, count: 16), unchanged = phoneSizedPane(9)
+        let identities = [4: try paneIdentity(4), 9: try paneIdentity(9)]
         let sizes = TerminalMuxPhoneSizes(workspace: "w", machine: "mac", defaults: defaults)
         for pane in [phoneSizedPane(4), unchanged] {
-            sizes.set(pane: pane, incarnation: run, desktop: desktop, rows: 40, columns: 54)
+            sizes.set(pane: pane, incarnation: run, desktop: desktop, rows: 40, columns: 54, identity: identities[pane.paneId])
         }
-        for changed in [phoneSizedPane(4, tab: 5), phoneSizedPane(4, window: 8),
-                        phoneSizedPane(4, rows: 41), phoneSizedPane(4, columns: 55)] {
-            XCTAssertEqual(Set(sizes.records(matching: [changed, unchanged], incarnation: run).keys), [9])
+        for moved in [phoneSizedPane(4, tab: 5), phoneSizedPane(4, window: 8)] {
+            XCTAssertEqual(Set(sizes.records(matching: [moved, unchanged], incarnation: run, identities: identities).keys), [4, 9])
         }
-        XCTAssertEqual(Set(sizes.records(matching: [unchanged], incarnation: run).keys), [9])
-        XCTAssertTrue(sizes.records(matching: [phoneSizedPane(4), phoneSizedPane(4)], incarnation: run).isEmpty,
+        for changed in [phoneSizedPane(4, rows: 41), phoneSizedPane(4, columns: 55)] {
+            XCTAssertEqual(Set(sizes.records(matching: [changed, unchanged], incarnation: run, identities: identities).keys), [9])
+        }
+        XCTAssertEqual(Set(sizes.records(matching: [unchanged], incarnation: run, identities: identities).keys), [9])
+        XCTAssertTrue(sizes.records(matching: [phoneSizedPane(4), phoneSizedPane(4)], incarnation: run, identities: identities).isEmpty,
                       "an ambiguous inventory grants no resize authority")
     }
 
@@ -548,8 +589,9 @@ final class TerminalMuxQueryDriverTests: XCTestCase {
         let key = "frankenterm.mux.phoneSizes.w.mac"
         let desktop = TerminalMuxSize(rows: 50, cols: 180, pixelWidth: 1440, pixelHeight: 800, dpi: 144)
         let run = Data(repeating: 0x1c, count: 16), pane = phoneSizedPane(4)
+        let identity = try paneIdentity(4), identities = [4: try paneIdentity(4)]
         let sizes = TerminalMuxPhoneSizes(workspace: "w", machine: "mac", defaults: defaults)
-        sizes.set(pane: pane, incarnation: run, desktop: desktop, rows: 40, columns: 54)
+        sizes.set(pane: pane, incarnation: run, desktop: desktop, rows: 40, columns: 54, identity: identity)
         let valid = try XCTUnwrap(defaults.data(forKey: key))
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: valid) as? [String: [String: Any]])
         let record = try XCTUnwrap(object["4"])
@@ -578,11 +620,11 @@ final class TerminalMuxQueryDriverTests: XCTestCase {
         malformed.append(try JSONSerialization.data(withJSONObject: oversized))
         for bytes in malformed {
             defaults.set(bytes, forKey: key)
-            XCTAssertTrue(sizes.records(matching: [pane], incarnation: run).isEmpty)
+            XCTAssertTrue(sizes.records(matching: [pane], incarnation: run, identities: identities).isEmpty)
             XCTAssertEqual(defaults.data(forKey: key), bytes, "read-only rejection preserves existing persistence")
         }
         defaults.set(valid, forKey: key)
-        XCTAssertEqual(sizes.records(matching: [pane], incarnation: run).count, 1)
+        XCTAssertEqual(sizes.records(matching: [pane], incarnation: run, identities: identities).count, 1)
     }
 
     func testPhoneSizesNeverPersistInvalidRestorationAuthorityOrLendALegacyRecordToARun() throws {
@@ -592,21 +634,20 @@ final class TerminalMuxQueryDriverTests: XCTestCase {
         let desktop = TerminalMuxSize(rows: 50, cols: 180, pixelWidth: 1440, pixelHeight: 800, dpi: 144)
         let invalidDesktop = TerminalMuxSize(rows: 0, cols: 180, pixelWidth: 1440, pixelHeight: 800, dpi: 144)
         let run = Data(repeating: 0x1c, count: 16), pane = phoneSizedPane(4), other = phoneSizedPane(9)
+        let identities = [4: try paneIdentity(4), 9: try paneIdentity(9)]
         let sizes = TerminalMuxPhoneSizes(workspace: "w", machine: "mac", defaults: defaults)
-        sizes.set(pane: other, incarnation: run, desktop: desktop, rows: 40, columns: 54)
+        sizes.set(pane: other, incarnation: run, desktop: desktop, rows: 40, columns: 54, identity: identities[9])
         for identity in [nil, Data(), Data(repeating: 0, count: 16), Data(repeating: 0, count: 17)] as [Data?] {
-            sizes.set(pane: pane, incarnation: run, desktop: desktop, rows: 40, columns: 54)
+            sizes.set(pane: pane, incarnation: run, desktop: desktop, rows: 40, columns: 54, identity: identities[4])
             sizes.set(pane: pane, incarnation: identity, desktop: desktop, rows: 40, columns: 54)
-            XCTAssertEqual(Set(sizes.records(matching: [pane, other], incarnation: run).keys), [9])
-            // No identity is a legacy server's record, seen only by a legacy
-            // server; a malformed identity is no record at all.
-            XCTAssertEqual(Set(sizes.records(matching: [pane], incarnation: nil).keys),
-                           identity == nil ? [4] : [])
+            XCTAssertEqual(Set(sizes.records(matching: [pane, other], incarnation: run, identities: identities).keys), [9])
+            XCTAssertTrue(sizes.records(matching: [pane], incarnation: nil).isEmpty,
+                          "a legacy or malformed record cannot infer exact authority")
         }
         sizes.set(pane: pane, incarnation: run, desktop: invalidDesktop, rows: 40, columns: 54)
-        XCTAssertEqual(Set(sizes.records(matching: [pane, other], incarnation: run).keys), [9])
+        XCTAssertEqual(Set(sizes.records(matching: [pane, other], incarnation: run, identities: identities).keys), [9])
         sizes.set(pane: pane, incarnation: run, desktop: desktop, rows: 0, columns: 54)
-        XCTAssertEqual(Set(sizes.records(matching: [pane, other], incarnation: run).keys), [9])
+        XCTAssertEqual(Set(sizes.records(matching: [pane, other], incarnation: run, identities: identities).keys), [9])
     }
 
     func testANewConnectionComesBackToTheShownPaneOnlyWhileItIsStillThere() throws {
@@ -618,26 +659,28 @@ final class TerminalMuxQueryDriverTests: XCTestCase {
                             workingDir: nil, size: .init(rows: 24, cols: 80), isActive: active, isZoomed: false)
         }
         let listed = [pane(1, tab: 0, active: true), pane(4, tab: 2), pane(7, tab: 3)]
-        // A v0.13 server, which does not name its run: the numbers decide.
+        let run = Data(repeating: 0x1c, count: 16), identity = try paneIdentity(4)
+        let identities = [4: identity]
         let first = TerminalMuxShownPane(workspace: "w", machine: "ts1", defaults: defaults)
         // Nothing remembered: the desktop's active pane, and nothing to say.
         XCTAssertEqual(first.choose(from: listed, incarnation: nil).pane, listed[0])
         XCTAssertFalse(first.choose(from: listed, incarnation: nil).lost)
-        first.set(listed[1], incarnation: nil)
+        first.set(listed[1], incarnation: run, identity: identity)
 
         // The next connection to the same machine comes back to it.
         let next = TerminalMuxShownPane(workspace: "w", machine: "ts1", defaults: defaults)
-        XCTAssertEqual(next.record, .init(listed[1], incarnation: nil))
-        XCTAssertEqual(next.choose(from: listed, incarnation: nil).pane, listed[1])
-        XCTAssertFalse(next.choose(from: listed, incarnation: nil).lost)
+        XCTAssertEqual(next.record, .init(listed[1], incarnation: run, identity: identity))
+        XCTAssertEqual(next.choose(from: listed, incarnation: run, identities: identities).pane, listed[1])
+        XCTAssertFalse(next.choose(from: listed, incarnation: run, identities: identities).lost)
         XCTAssertNil(TerminalMuxShownPane(workspace: "w", machine: "ts2", defaults: defaults).record)
 
-        // Gone, or its number in another tab (a restarted server): the active
-        // pane, and the screen says the one being viewed closed.
-        for panes in [[listed[0], listed[2]], [listed[0], pane(4, tab: 9), listed[2]]] {
-            let choice = next.choose(from: panes, incarnation: nil)
-            XCTAssertEqual(choice.pane, listed[0]); XCTAssertTrue(choice.lost); XCTAssertFalse(choice.restarted)
-        }
+        let moved = pane(4, tab: 9)
+        XCTAssertEqual(next.choose(from: [listed[0], moved, listed[2]], incarnation: run, identities: identities).pane, moved)
+        let missing = next.choose(from: [listed[0], listed[2]], incarnation: run, identities: identities)
+        XCTAssertNil(missing.pane); XCTAssertTrue(missing.lost); XCTAssertFalse(missing.restarted)
+        let replaced = next.choose(from: listed, incarnation: run, identities: [4: try paneIdentity(4, registration: 0x99)])
+        XCTAssertNil(replaced.pane); XCTAssertTrue(replaced.lost)
+        XCTAssertTrue(next.choose(from: listed, incarnation: run).unverified)
         XCTAssertNil(next.choose(from: [], incarnation: nil).pane)
         // A pane that closed while shown is forgotten: nothing to say later.
         next.set(nil, incarnation: nil)
@@ -650,7 +693,7 @@ final class TerminalMuxQueryDriverTests: XCTestCase {
         XCTAssertEqual(control.current.notice, "The pane you were viewing closed while you were away.")
     }
 
-    func testInputAConnectionLeftUnconfirmedIsToldOnceOnlyForThatPane() throws {
+    func testUnconfirmedInputSurvivesIdentityDiscontinuityUntilANewSelectionIsRecorded() throws {
         let suite = "frankenterm.tests.unconfirmedInput.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
@@ -659,27 +702,27 @@ final class TerminalMuxQueryDriverTests: XCTestCase {
                             workingDir: nil, size: .init(rows: 24, cols: 80), isActive: id == 1, isZoomed: false)
         }
         let listed = [pane(1, tab: 0), pane(4, tab: 2)]
+        let run = Data(repeating: 0x1c, count: 16), identity = try paneIdentity(4), identities = [4: try paneIdentity(4)]
         let ending = TerminalMuxShownPane(workspace: "w", machine: "ts1", defaults: defaults)
         // Nothing remembered: nothing to mark.
         ending.markInputUnconfirmed()
         XCTAssertNil(ending.record)
-        ending.set(listed[1], incarnation: nil)
-        XCTAssertFalse(ending.choose(from: listed, incarnation: nil).inputUnconfirmed)
+        ending.set(listed[1], incarnation: run, identity: identity)
+        XCTAssertFalse(ending.choose(from: listed, incarnation: run, identities: identities).inputUnconfirmed)
         ending.markInputUnconfirmed()
 
         // The next connection comes back to that pane and is told; showing it
         // clears the mark, so the one after is not.
         let next = TerminalMuxShownPane(workspace: "w", machine: "ts1", defaults: defaults)
-        let choice = next.choose(from: listed, incarnation: nil)
+        let choice = next.choose(from: listed, incarnation: run, identities: identities)
         XCTAssertEqual(choice.pane, listed[1]); XCTAssertFalse(choice.lost); XCTAssertTrue(choice.inputUnconfirmed)
-        // Gone, or its number in another tab: only that it closed.
-        for panes in [[listed[0]], [listed[0], pane(4, tab: 9)]] {
-            let other = next.choose(from: panes, incarnation: nil)
-            XCTAssertTrue(other.lost); XCTAssertFalse(other.inputUnconfirmed)
-        }
-        next.set(listed[1], incarnation: nil)
+        let gone = next.choose(from: [listed[0]], incarnation: run, identities: identities)
+        XCTAssertTrue(gone.lost); XCTAssertTrue(gone.inputUnconfirmed); XCTAssertNil(gone.pane)
+        let unverified = next.choose(from: listed, incarnation: run)
+        XCTAssertTrue(unverified.unverified); XCTAssertTrue(unverified.inputUnconfirmed); XCTAssertNil(unverified.pane)
+        next.set(listed[1], incarnation: run, identity: identity)
         XCTAssertFalse(TerminalMuxShownPane(workspace: "w", machine: "ts1", defaults: defaults)
-            .choose(from: listed, incarnation: nil).inputUnconfirmed)
+            .choose(from: listed, incarnation: run, identities: identities).inputUnconfirmed)
     }
 
     func testAPaneShownBeforeTheServerRestartedIsNotTheOneUnderItsNumbersNow() throws {
@@ -692,29 +735,60 @@ final class TerminalMuxQueryDriverTests: XCTestCase {
         }
         let listed = [pane(0), pane(1)]
         let run = Data(repeating: 0x1c, count: 16), restarted = Data(repeating: 0x2d, count: 16)
+        let identity = try paneIdentity(1), identities = [1: try paneIdentity(1)]
         let shown = TerminalMuxShownPane(workspace: "w", machine: "mac", defaults: defaults)
-        shown.set(listed[1], incarnation: run)
+        shown.set(listed[1], incarnation: run, identity: identity)
         shown.markInputUnconfirmed()
         XCTAssertEqual(shown.record?.incarnation, run, "marking input keeps the run")
 
         // The same run: the same pane, and the input it never confirmed.
-        var choice = shown.choose(from: listed, incarnation: run)
+        var choice = shown.choose(from: listed, incarnation: run, identities: identities)
         XCTAssertEqual(choice.pane, listed[1]); XCTAssertFalse(choice.lost); XCTAssertFalse(choice.restarted)
         XCTAssertTrue(choice.inputUnconfirmed)
-        // Another run lists the same numbers: the desktop's active pane, told as a
-        // restart. The earlier run's input is not this pane's to report.
-        choice = shown.choose(from: listed, incarnation: restarted)
-        XCTAssertEqual(choice.pane, listed[0]); XCTAssertTrue(choice.lost); XCTAssertTrue(choice.restarted)
-        XCTAssertFalse(choice.inputUnconfirmed)
-        // A server that does not say, or a pane remembered from one: the numbers decide.
-        XCTAssertEqual(shown.choose(from: listed, incarnation: nil).pane, listed[1])
+        // Another run can restore the same durable UUID and all numeric IDs;
+        // a new registration still requires explicit selection and never
+        // clears uncertainty about the previous connection's input.
+        choice = shown.choose(from: listed, incarnation: restarted, identities: [1: try paneIdentity(1, run: restarted)])
+        XCTAssertNil(choice.pane); XCTAssertTrue(choice.lost); XCTAssertTrue(choice.restarted)
+        XCTAssertTrue(choice.inputUnconfirmed)
+        XCTAssertNil(shown.choose(from: listed, incarnation: nil).pane)
         shown.set(listed[1], incarnation: nil)
         choice = shown.choose(from: listed, incarnation: restarted)
-        XCTAssertEqual(choice.pane, listed[1]); XCTAssertFalse(choice.restarted)
+        XCTAssertNil(choice.pane); XCTAssertTrue(choice.unverified); XCTAssertFalse(choice.restarted)
         // A record kept before runs were named reads as not saying.
         defaults.set(Data(#"{"paneId":1,"tabId":1,"windowId":0,"inputUnconfirmed":false}"#.utf8),
                      forKey: "frankenterm.mux.shownPane.w.mac")
         XCTAssertEqual(shown.record, .init(listed[1], incarnation: nil))
+        XCTAssertTrue(shown.choose(from: listed, incarnation: restarted, identities: identities).unverified)
+    }
+
+    func testMalformedSavedPaneCannotBecomeAFirstConnectionOrGrantResumeAuthority() throws {
+        let suite = "frankenterm.tests.malformedShownPane.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let key = "frankenterm.mux.shownPane.w.mac"
+        let shown = TerminalMuxShownPane(workspace: "w", machine: "mac", defaults: defaults)
+        let pane = queryPane(1), run = Data(repeating: 0x1c, count: 16), identity = try paneIdentity(1)
+        shown.set(pane, incarnation: run, identity: identity)
+        let valid = try XCTUnwrap(defaults.data(forKey: key))
+        var malformed = [Data("not JSON".utf8), Data(repeating: 0x20, count: 4097)]
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: valid) as? [String: Any])
+        for field in ["incarnation", "durablePaneID", "registration"] {
+            var bad = object
+            var witness = try XCTUnwrap(bad["identity"] as? [String: Any])
+            witness[field] = Data(repeating: 0, count: 16).base64EncodedString()
+            bad["identity"] = witness
+            malformed.append(try JSONSerialization.data(withJSONObject: bad))
+        }
+        for bytes in malformed {
+            defaults.set(bytes, forKey: key)
+            let choice = shown.choose(from: [pane], incarnation: run, identities: [1: identity])
+            XCTAssertNil(choice.pane); XCTAssertTrue(choice.unverified)
+            XCTAssertEqual(defaults.data(forKey: key), bytes)
+        }
+        shown.set(nil, incarnation: nil)
+        XCTAssertNil(defaults.object(forKey: key))
+        XCTAssertEqual(shown.choose(from: [pane], incarnation: run).pane, pane)
     }
 
     func testAnAttachedSessionsFailureReasonReachesTheScreenBounded() {

@@ -88,12 +88,44 @@ public struct TerminalMuxSize: Codable, Equatable, Sendable {
     }
 }
 
+/// An authenticated mux's exact pane witness. A durable UUID may survive a
+/// server restart; its live registration and server incarnation do not. All
+/// three must match before automatic reconnect or saved-size recovery.
+/// This is identity evidence, not a controller or geometry lease.
+public struct TerminalMuxPaneIdentity: Codable, Hashable, Sendable {
+    public let incarnation: Data
+    public let durablePaneID: Data
+    public let registration: Data
+
+    public init(incarnation: Data, durablePaneID: Data, registration: Data) throws {
+        guard Self.isIdentifier(incarnation), Self.isIdentifier(durablePaneID),
+              Self.isIdentifier(registration) else { throw TerminalInputError.invalidIdentity }
+        self.incarnation = incarnation; self.durablePaneID = durablePaneID; self.registration = registration
+    }
+
+    private enum CodingKeys: String, CodingKey { case incarnation, durablePaneID, registration }
+    public init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(incarnation: values.decode(Data.self, forKey: .incarnation),
+                      durablePaneID: values.decode(Data.self, forKey: .durablePaneID),
+                      registration: values.decode(Data.self, forKey: .registration))
+    }
+
+    private static func isIdentifier(_ bytes: Data) -> Bool {
+        bytes.count == 16 && bytes.contains(where: { $0 != 0 })
+    }
+}
+
 public enum TerminalMuxEvent: Equatable, Sendable {
     case ready(serverVersion: String)
     /// Names this run of the mux server: the same while it runs, new after it
     /// restarts, even when it numbers its panes as before. Current servers
-    /// only, before the first pane list.
+    /// only, before the first coherent pane list or verified pane identity.
     case incarnation(Data)
+    /// A passive preflight or the witness captured before showing the pane.
+    /// Nil means continuity could not be established; explicit selection may
+    /// still open a fresh view, but cannot inherit saved input/size authority.
+    case paneIdentity(paneID: Int, identity: TerminalMuxPaneIdentity?)
     case panes([TerminalMuxPane])
     /// Bytes for the pane's terminal, which must be rows x columns first.
     case output(paneID: Int, rows: Int, columns: Int, bytes: Data)
@@ -120,34 +152,36 @@ public enum TerminalMuxEvent: Equatable, Sendable {
 }
 
 /// The panes a phone left at its own size on one machine, kept across
-/// connections. A later connection may restore a size only to the same pane,
-/// still at exactly the phone's dimensions. On a server that names its run
-/// (its incarnation) it must also be the same run: such a server restores its
-/// panes across a restart, numbers and sizes included, so a reused number
-/// grants no resize authority. A legacy server names no run and cannot bring
-/// a pane back after a restart, so there the pane, tab and window numbers and
-/// the phone's exact dimensions decide, as they do for the shown pane. A
-/// record from one kind of server never matches the other.
+/// connections. A later connection may restore a size only to the same exact
+/// server-issued pane witness, still at the phone's dimensions. A tab/window
+/// move does not change that witness; a reused number or restored durable UUID
+/// does not substitute for it. Legacy records remain readable but grant no
+/// automatic geometry authority.
 public final class TerminalMuxPhoneSizes: @unchecked Sendable {
     public struct Record: Codable, Equatable, Sendable {
         public let paneId: Int, tabId: Int, windowId: Int
         /// The server's run; nil for a legacy server that does not name it.
         public let incarnation: Data?
+        public let identity: TerminalMuxPaneIdentity?
         public let desktop: TerminalMuxSize
         public let rows: Int, columns: Int
 
         fileprivate var isValid: Bool {
             paneId >= 0 && tabId >= 0 && windowId >= 0
-                && incarnation.map(TerminalMuxPhoneSizes.isRun) ?? true
+                && (incarnation.map(TerminalMuxPhoneSizes.isRun) ?? true)
+                && (identity == nil || identity?.incarnation == incarnation)
                 && (1...512).contains(rows) && (1...512).contains(columns)
                 && (1...4096).contains(desktop.rows) && (1...4096).contains(desktop.cols)
                 && UInt32(exactly: desktop.pixelWidth) != nil && UInt32(exactly: desktop.pixelHeight) != nil
                 && UInt32(exactly: desktop.dpi) != nil
         }
 
-        fileprivate func matches(_ pane: TerminalMuxPane, incarnation: Data?) -> Bool {
-            self.incarnation == incarnation && paneId == pane.paneId && tabId == pane.tabId
-                && windowId == pane.windowId && rows == pane.size.rows && columns == pane.size.cols
+        fileprivate func isCandidate(_ pane: TerminalMuxPane, incarnation: Data?) -> Bool {
+            identity != nil && self.incarnation == incarnation && paneId == pane.paneId
+                && rows == pane.size.rows && columns == pane.size.cols
+        }
+        fileprivate func matches(_ pane: TerminalMuxPane, incarnation: Data?, identity: TerminalMuxPaneIdentity?) -> Bool {
+            isCandidate(pane, incarnation: incarnation) && self.identity == identity
         }
     }
 
@@ -169,7 +203,8 @@ public final class TerminalMuxPhoneSizes: @unchecked Sendable {
     /// Select against the current authoritative inventory before handing any
     /// remembered size to the native client. The client still checks its own
     /// current dimensions at adoption. Duplicate pane IDs are not authority.
-    public func records(matching panes: [TerminalMuxPane], incarnation: Data?) -> [Int: Record] {
+    public func records(matching panes: [TerminalMuxPane], incarnation: Data?,
+                        identities: [Int: TerminalMuxPaneIdentity] = [:]) -> [Int: Record] {
         if let incarnation, !Self.isRun(incarnation) { return [:] }
         var seen = Set<Int>()
         guard panes.allSatisfy({ seen.insert($0.paneId).inserted }) else { return [:] }
@@ -177,7 +212,8 @@ public final class TerminalMuxPhoneSizes: @unchecked Sendable {
             let stored = load()
             var result: [Int: Record] = [:]
             for pane in panes {
-                if let record = stored[pane.paneId], record.matches(pane, incarnation: incarnation) {
+                if let record = stored[pane.paneId],
+                   record.matches(pane, incarnation: incarnation, identity: identities[pane.paneId]) {
                     result[pane.paneId] = record
                 }
             }
@@ -185,12 +221,25 @@ public final class TerminalMuxPhoneSizes: @unchecked Sendable {
         }
     }
 
+    /// Candidates for passive identity queries. This is scheduling metadata,
+    /// never permission to adopt or restore a size before `records` verifies it.
+    public func candidates(matching panes: [TerminalMuxPane], incarnation: Data?) -> [Int] {
+        guard let incarnation, Self.isRun(incarnation),
+              Set(panes.map(\.paneId)).count == panes.count else { return [] }
+        return lock.withLock {
+            let stored = load()
+            return panes.compactMap { pane in
+                stored[pane.paneId]?.isCandidate(pane, incarnation: incarnation) == true ? pane.paneId : nil
+            }
+        }
+    }
+
     public func set(pane: TerminalMuxPane, incarnation: Data?, desktop: TerminalMuxSize,
-                    rows: Int, columns: Int) {
+                    rows: Int, columns: Int, identity: TerminalMuxPaneIdentity? = nil) {
         lock.withLock {
             var all = load()
             let record = Record(paneId: pane.paneId, tabId: pane.tabId, windowId: pane.windowId,
-                                incarnation: incarnation, desktop: desktop, rows: rows, columns: columns)
+                                incarnation: incarnation, identity: identity, desktop: desktop, rows: rows, columns: columns)
             all[pane.paneId] = record.isValid ? record : nil
             store(all)
         }
@@ -232,29 +281,32 @@ public final class TerminalMuxPhoneSizes: @unchecked Sendable {
 /// and launches: a connection that dropped while the phone was away comes
 /// back to that pane, not to whichever one the desktop has active.
 ///
-/// A pane is the same one only under the same pane, tab and window numbers,
-/// on the same run of the server. A running server never reuses a pane
-/// number, but one that restarted can rebuild the same layout and repeat all
-/// three; a current server names its run (its incarnation), a v0.13 server
-/// does not, and there the numbers alone decide. Nothing typed before is ever
-/// replayed into the pane a new connection shows.
+/// Automatic restoration requires a freshly verified server incarnation,
+/// durable UUID and live registration. Numeric topology is only a lookup hint.
+/// A missing witness, restart or replacement requires explicit pane selection;
+/// nothing typed before is ever replayed into that fresh selection.
 public final class TerminalMuxShownPane: @unchecked Sendable {
     public struct Record: Codable, Equatable, Sendable {
         public let paneId: Int, tabId: Int, windowId: Int
         /// The server's run when the pane was shown; nil when it did not say.
         public let incarnation: Data?
+        public let identity: TerminalMuxPaneIdentity?
         /// The connection ended before the server confirmed input sent to it.
         public var inputUnconfirmed = false
-        public init(_ pane: TerminalMuxPane, incarnation: Data?) {
+        public init(_ pane: TerminalMuxPane, incarnation: Data?, identity: TerminalMuxPaneIdentity? = nil) {
             paneId = pane.paneId; tabId = pane.tabId; windowId = pane.windowId; self.incarnation = incarnation
+            self.identity = identity
         }
-        func names(_ pane: TerminalMuxPane) -> Bool {
-            pane.paneId == paneId && pane.tabId == tabId && pane.windowId == windowId
+        var isValid: Bool {
+            paneId >= 0 && tabId >= 0 && windowId >= 0
+                && (incarnation.map(TerminalMuxPhoneSizes.isRun) ?? true)
+                && (identity == nil || identity?.incarnation == incarnation)
         }
     }
     private let lock = NSLock()
     private let defaults: UserDefaults
     private let key: String
+    private static let maximumEncodedBytes = 4096
 
     public init(workspace: String, machine: String, defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -262,17 +314,23 @@ public final class TerminalMuxShownPane: @unchecked Sendable {
     }
 
     public var record: Record? {
-        lock.withLock { defaults.data(forKey: key).flatMap { try? JSONDecoder().decode(Record.self, from: $0) } }
+        lock.withLock { load() }
+    }
+
+    private func load() -> Record? {
+        guard let data = defaults.data(forKey: key), data.count <= Self.maximumEncodedBytes,
+              let record = try? JSONDecoder().decode(Record.self, from: data), record.isValid else { return nil }
+        return record
     }
 
     /// Remembers the pane now shown on the server's run `incarnation`, or that
     /// none is (it closed).
-    public func set(_ pane: TerminalMuxPane?, incarnation: Data?) {
-        let next = pane.map { Record($0, incarnation: incarnation) }
+    public func set(_ pane: TerminalMuxPane?, incarnation: Data?, identity: TerminalMuxPaneIdentity? = nil) {
+        let next = pane.map { Record($0, incarnation: incarnation, identity: identity) }
         lock.withLock {
-            let stored = defaults.data(forKey: key).flatMap { try? JSONDecoder().decode(Record.self, from: $0) }
-            guard stored != next else { return }
-            if let next, let data = try? JSONEncoder().encode(next) { defaults.set(data, forKey: key) }
+            let stored = load()
+            guard stored != next || (next == nil && defaults.object(forKey: key) != nil) else { return }
+            if let next, next.isValid, let data = try? JSONEncoder().encode(next) { defaults.set(data, forKey: key) }
             else { defaults.removeObject(forKey: key) }
         }
     }
@@ -281,7 +339,7 @@ public final class TerminalMuxShownPane: @unchecked Sendable {
     /// remembered pane; the next connection that shows it says so.
     public func markInputUnconfirmed() {
         lock.withLock {
-            guard var stored = defaults.data(forKey: key).flatMap({ try? JSONDecoder().decode(Record.self, from: $0) }),
+            guard var stored = load(),
                   !stored.inputUnconfirmed else { return }
             stored.inputUnconfirmed = true
             if let data = try? JSONEncoder().encode(stored) { defaults.set(data, forKey: key) }
@@ -289,20 +347,32 @@ public final class TerminalMuxShownPane: @unchecked Sendable {
     }
 
     /// The pane a new connection shows from the server's list (`incarnation`
-    /// is the server's run, when it says): the remembered one while it is
-    /// still there, else the desktop's active pane. `lost` says a remembered
-    /// pane is gone, `restarted` that it went with a restart of the server,
-    /// and `inputUnconfirmed` that the last connection ended before the pane
-    /// confirmed input; the screen should tell each.
-    public func choose(from panes: [TerminalMuxPane], incarnation: Data?)
-        -> (pane: TerminalMuxPane?, lost: Bool, restarted: Bool, inputUnconfirmed: Bool) {
+    /// is the server's run, when it says). Only a first connection without a
+    /// remembered pane defaults to the desktop's active pane. A discontinuity
+    /// leaves selection empty and the live picker available. Unconfirmed
+    /// input remains attached to the prior connection even on discontinuity.
+    public func choose(from panes: [TerminalMuxPane], incarnation: Data?,
+                       identities: [Int: TerminalMuxPaneIdentity] = [:])
+        -> (pane: TerminalMuxPane?, lost: Bool, restarted: Bool, unverified: Bool, inputUnconfirmed: Bool) {
         let fallback = panes.first(where: \.isActive) ?? panes.first
-        guard let record else { return (fallback, false, false, false) }
-        if let incarnation, let shownOn = record.incarnation, shownOn != incarnation {
-            return (fallback, true, true, false)
+        let stored = lock.withLock { (load(), defaults.object(forKey: key) != nil) }
+        guard let record = stored.0 else {
+            return stored.1 ? (nil, false, false, true, false) : (fallback, false, false, false, false)
         }
-        if let same = panes.first(where: record.names) { return (same, false, false, record.inputUnconfirmed) }
-        return (fallback, true, false, false)
+        if let incarnation, let shownOn = record.incarnation, shownOn != incarnation {
+            return (nil, true, true, false, record.inputUnconfirmed)
+        }
+        guard let expected = record.identity, expected.incarnation == incarnation else {
+            return (nil, false, false, true, record.inputUnconfirmed)
+        }
+        let matching = panes.filter { identities[$0.paneId] == expected }
+        if matching.count == 1 {
+            return (matching[0], false, false, false, record.inputUnconfirmed)
+        }
+        if panes.contains(where: { $0.paneId == record.paneId }), identities[record.paneId] == nil {
+            return (nil, false, false, true, record.inputUnconfirmed)
+        }
+        return (nil, true, false, false, record.inputUnconfirmed)
     }
 }
 
@@ -315,12 +385,16 @@ public protocol TerminalMuxClient: AnyObject, Sendable {
     /// Up to `limit` bytes to send next; returned bytes count as taken.
     func outgoing(limit: Int) throws -> Data
     func nextEvent() throws -> TerminalMuxEvent?
-    /// Advance the client's monotonic input clock and return the delay until
-    /// its next wake, or nil when no input timer is pending. The transport
+    /// Advance the client's monotonic clock and return the delay until its next
+    /// input, passive identity or render-retry wake, or nil when none is pending. The transport
     /// folds this into its existing service wait; it must not start another
     /// receive loop or replay bytes itself. A thrown failure stops egress.
     func pollInputTimer() throws -> Duration?
     func refreshPanes() throws
+    /// Passive v71 identity preflight, bounded to eight distinct outstanding
+    /// requests. A `paneIdentity` or `paneGone` event settles it; older peers
+    /// answer with nil identity locally. It grants no control lease or input.
+    func inspectPaneIdentity(pane: Int) throws
     /// Draws the pane from scratch, then every change.
     func show(pane: Int) throws
     func hide(pane: Int) throws
@@ -443,6 +517,9 @@ public final class TerminalMuxControl: @unchecked Sendable {
         public var panes: [TerminalMuxPane] = []
         public var shown: Int?
         public var visible = false
+        /// A visible companion can keep receiving output while the focused
+        /// view alone uses this connection's optional size permission.
+        public var sizeControlEnabled = true
         public var search: Search?
         public var context: Context?
         /// Why the mux server ended an attached session (a reply this app
@@ -499,6 +576,21 @@ public final class TerminalMuxControl: @unchecked Sendable {
     }
 
     public var current: State { lock.withLock { state } }
+
+    /// Presentation can narrow, never expand, the connection's permissions.
+    public var controlsSize: Bool { accessMode.controlsSize && lock.withLock { state.sizeControlEnabled } }
+
+    /// Releasing local size control restores an outstanding override while
+    /// keeping the pane subscribed. This changes neither input permission nor
+    /// the exact selected pane, and grants no server-side exclusive lease.
+    public func setSizeControlEnabled(_ enabled: Bool) {
+        let (wake, notify, snapshot) = lock.withLock { () -> ((@Sendable () -> Void)?, (@Sendable (State) -> Void)?, State) in
+            guard !queriesEnded, state.sizeControlEnabled != enabled else { return (nil, nil, state) }
+            state.sizeControlEnabled = enabled; state.revision = UUID()
+            return (waker, observer, state)
+        }
+        notify?(snapshot); wake?()
+    }
 
     /// The screen's change handler, called with each new state.
     public func observe(_ handler: @escaping @Sendable (State) -> Void) {
@@ -599,8 +691,8 @@ public final class TerminalMuxControl: @unchecked Sendable {
         }
     }
 
-    /// Whether the machine is on screen. Only a visible machine's pane is
-    /// sized to the phone and drawn; a hidden one returns to its own size.
+    /// Whether the machine is on screen. A visible pane is drawn; only one
+    /// with enabled size control is fitted remotely. Hidden panes relinquish it.
     public func setVisible(_ visible: Bool) {
         let (wake, notify, snapshot, read) = lock.withLock { () -> ((@Sendable () -> Void)?, (@Sendable (State) -> Void)?, State, (@Sendable (Bool) -> Void)?) in
             guard state.visible != visible else { return (nil, nil, state, nil) }

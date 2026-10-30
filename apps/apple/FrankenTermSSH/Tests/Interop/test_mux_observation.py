@@ -21,11 +21,18 @@ spec = importlib.util.spec_from_file_location(
 fixture = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fixture)
 SELECTOR = "FrankenTermSSHTests.MuxObservationTests/testLiveMuxAccessModeEffectBoundary"
+IDENTITY_SELECTOR = "FrankenTermSSHTests.MuxObservationTests/testReconnectPreflightRequiresExactIdentityBeforeSelectionAndGeometry"
 
 
 class MuxObservationInteropTests(unittest.TestCase):
     def test_viewing_and_interactive_effect_boundaries(self):
-        for mode in ["observe", "input-only", "interactive", "oversize", "input-only-oversize", "invalid-grid", "no-panes"]:
+        self.check_modes(SELECTOR, ["observe", "input-only", "interactive", "oversize", "input-only-oversize", "invalid-grid", "no-panes"])
+
+    def test_exact_identity_reconnect_and_explicit_selection(self):
+        self.check_modes(IDENTITY_SELECTOR, ["identity-same", "identity-moved", "identity-replaced", "identity-unavailable"])
+
+    def check_modes(self, selector, modes):
+        for mode in modes:
             with self.subTest(mode=mode):
                 key = ed25519.Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
                 server = fixture.LoopbackServer(key, allow_exec=True)
@@ -33,7 +40,7 @@ class MuxObservationInteropTests(unittest.TestCase):
                     env = dict(os.environ, FT_MUX_OBSERVATION_PORT=str(server.address[1]),
                         FT_MUX_OBSERVATION_HOSTKEY=base64.b64encode(server.host_blob).decode(),
                         FT_MUX_OBSERVATION_MODE=mode)
-                    command = ["xcrun", "xctest", "-XCTest", SELECTOR, TEST_BUNDLE] if os.path.isdir(TEST_BUNDLE) else [TEST_BUNDLE, SELECTOR]
+                    command = ["xcrun", "xctest", "-XCTest", selector, TEST_BUNDLE] if os.path.isdir(TEST_BUNDLE) else [TEST_BUNDLE, selector]
                     result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=25)
                     output = result.stdout + result.stderr
                     self.assertEqual(result.returncode, 0, output[-18000:])

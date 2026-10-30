@@ -628,8 +628,9 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         var panes: [TerminalMuxPane] = []
         var listed = false, ready = false, flushing = false
         var shown: Int?
-        /// The shown pane is sized to the phone and drawing.
+        /// The shown pane is subscribed, independently of size ownership.
         var showing = false
+        var controllingSize = false
         var outgoing = Data()
         /// Panes left at the phone's size on this machine, across connections.
         let sizes: TerminalMuxPhoneSizes
@@ -637,6 +638,11 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         let shownPane: TerminalMuxShownPane
         /// The server's run, when it says (current servers do, first).
         var incarnation: Data?
+        var identities: [Int: TerminalMuxPaneIdentity] = [:]
+        var identifiedPanes: Set<Int> = []
+        var identityQueries: Set<Int> = []
+        var sizeRecovery: Set<Int> = []
+        static let maximumIdentityQueries = 8
         /// Which panes' programs have asked for the mouse.
         var grabs: [Int: Bool] = [:]
         /// When to ask for the pane list again. The server pushes changes only
@@ -660,7 +666,29 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
             // A nil desktop was emitted before acknowledgement by older
             // native artifacts. It grants no authority to forget recovery.
             guard let desktop, let listed = panes.first(where: { $0.paneId == pane }) else { return }
-            sizes.set(pane: listed, incarnation: incarnation, desktop: desktop, rows: rows, columns: columns)
+            sizes.set(pane: listed, incarnation: incarnation, desktop: desktop, rows: rows, columns: columns,
+                      identity: identities[pane])
+        }
+
+        @discardableResult
+        func inspectIdentity(pane: Int) throws -> Bool {
+            if identifiedPanes.contains(pane) || identityQueries.contains(pane) { return true }
+            guard identityQueries.count < Self.maximumIdentityQueries else { return false }
+            try client.inspectPaneIdentity(pane: pane)
+            identityQueries.insert(pane)
+            return true
+        }
+
+        func recoverPhoneSize(pane: Int) throws {
+            guard control.controlsSize, sizeRecovery.contains(pane), identifiedPanes.contains(pane) else { return }
+            sizeRecovery.remove(pane)
+            guard let listed = panes.first(where: { $0.paneId == pane }),
+                  let record = sizes.records(matching: [listed], incarnation: incarnation,
+                                             identities: identities)[pane],
+                  try client.adoptPhoneSize(pane: pane, desktop: record.desktop,
+                                           rows: record.rows, columns: record.columns) else { return }
+            if pane != shown || !control.current.visible { try client.restoreSize(pane: pane) }
+            else { controllingSize = true }
         }
     }
 
@@ -717,38 +745,44 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 _ = try await pumpMux(timeout: .seconds(5), driver: driver)
                 try await validateForeground()
             }
-            // Back to the pane this phone was showing when it is still there.
-            let (chosen, lost, restarted, unconfirmed) = state.shownPane.choose(
-                from: state.panes, incarnation: state.incarnation)
-            guard let first = chosen else { throw TerminalMuxError.noPanes }
-            if restarted {
-                // Even a pane under the same numbers may be a new shell now.
-                control.recordNotice("FrankenTerm restarted on this machine while you were away, so the pane "
-                    + "you were viewing may be gone. This is the desktop's active pane.")
-            } else if lost {
-                control.recordNotice("The pane you were viewing closed while you were away. This is the desktop's active pane.")
-            } else if unconfirmed {
-                control.recordInputUnconfirmed()
-            }
-            // Restore only the same pane, still at the phone's size, and on a
-            // server that names its run only that run: there reused IDs after
-            // a restart cannot resize a replacement shell. A legacy server's
-            // panes are matched by their numbers (it cannot restore panes).
-            // Topology changes never match. The pane about to be shown keeps
-            // its desktop size for later.
-            if control.accessMode.controlsSize {
-                for (pane, record) in state.sizes.records(matching: state.panes, incarnation: state.incarnation)
-                    .sorted(by: { $0.key < $1.key }) {
-                    guard try client.adoptPhoneSize(pane: pane, desktop: record.desktop,
-                                                    rows: record.rows, columns: record.columns) else { continue }
-                    if pane != first.paneId { try client.restoreSize(pane: pane) }
+            guard !state.panes.isEmpty else { throw TerminalMuxError.noPanes }
+            // Inspect only the remembered selection (or the first selected
+            // pane), not the entire fleet. No show, resize or input precedes
+            // this bounded, passive check on the new authenticated channel.
+            let remembered = state.shownPane.record
+            let candidate = remembered.flatMap { saved in state.panes.first { $0.paneId == saved.paneId } }
+                ?? (remembered == nil ? state.panes.first(where: \.isActive) ?? state.panes.first : nil)
+            if let candidate, remembered == nil || remembered?.identity != nil {
+                try state.inspectIdentity(pane: candidate.paneId)
+                while state.identityQueries.contains(candidate.paneId) {
+                    guard ContinuousClock.now < deadline else { throw TerminalMuxError.unavailable }
+                    let drained = try drainMux()
+                    if !state.identityQueries.contains(candidate.paneId) { break }
+                    if !drained { await Task.yield() }
+                    else { _ = try await pumpMux(timeout: .seconds(5), driver: driver) }
+                    try await validateForeground()
                 }
             }
-            // Adoption and queued restores do not prove the server applied
-            // them. Keep each record until its explicit confirmed event.
-            state.shown = first.paneId; state.shownPane.set(first, incarnation: state.incarnation)
-            try control.inputRouting.select(pane: first.paneId)
-            control.publish(panes: state.panes, shown: first.paneId)
+            let (chosen, lost, restarted, unverified, unconfirmed) = state.shownPane.choose(
+                from: state.panes, incarnation: state.incarnation, identities: state.identities)
+            if restarted {
+                control.recordNotice("FrankenTerm restarted on this machine while you were away. Select a pane to continue.")
+            } else if unverified {
+                control.recordNotice("The previous pane's identity could not be verified on this connection. Select a pane to continue.")
+            } else if lost {
+                control.recordNotice("The pane you were viewing is gone or has been replaced. Select a pane to continue.")
+            }
+            if unconfirmed { control.recordInputUnconfirmed() }
+            // Unverified saved selection stays empty: a same-number successor
+            // cannot acquire input merely because it is the desktop's active
+            // pane. The connected inventory/picker remains available.
+            if let chosen {
+                state.shown = chosen.paneId
+                state.shownPane.set(chosen, incarnation: state.incarnation, identity: state.identities[chosen.paneId])
+                try control.inputRouting.select(pane: chosen.paneId)
+            }
+            state.sizeRecovery = Set(state.sizes.candidates(matching: state.panes, incarnation: state.incarnation))
+            control.publish(panes: state.panes, shown: state.shown)
             let signal = inputSignal
             control.setWaker { signal.notify() }
             try reconcileMux()
@@ -827,16 +861,42 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                     throw TerminalMuxError.failed("The mux server identity changed. Reconnect before using its panes.")
                 }
                 state.incarnation = incarnation
+            case .paneIdentity(let pane, let identity):
+                state.identityQueries.remove(pane)
+                guard state.panes.contains(where: { $0.paneId == pane }) else { continue }
+                if let identity {
+                    guard state.incarnation == nil || state.incarnation == identity.incarnation,
+                          state.identities[pane] == nil || state.identities[pane] == identity,
+                          !state.identities.contains(where: { $0.key != pane && $0.value == identity }) else {
+                        throw TerminalMuxError.failed("The pane identity changed. Select it again on a new connection.")
+                    }
+                    state.incarnation = identity.incarnation
+                    state.identities[pane] = identity
+                } else {
+                    guard state.identities[pane] == nil else {
+                        throw TerminalMuxError.failed("A verified pane lost its identity. Reconnect before using it.")
+                    }
+                    state.identities[pane] = nil
+                }
+                state.identifiedPanes.insert(pane)
+                if state.shown == pane, let listed = state.panes.first(where: { $0.paneId == pane }) {
+                    state.shownPane.set(listed, incarnation: state.incarnation, identity: identity)
+                }
+                try state.recoverPhoneSize(pane: pane)
             case .panes(let panes):
                 try state.control.inputRouting.replaceInventory(panes.map(\.paneId))
                 let present = Set(panes.map(\.paneId))
                 state.grabs = state.grabs.filter { present.contains($0.key) }
+                state.identities = state.identities.filter { present.contains($0.key) }
+                state.identifiedPanes.formIntersection(present)
+                state.identityQueries.formIntersection(present)
+                state.sizeRecovery.formIntersection(present)
                 state.panes = panes; state.listed = true
                 if let shown = state.shown {
                     // The record follows a pane the desktop moved; one that left clears it.
                     let listed = panes.first { $0.paneId == shown }
-                    if listed == nil { state.shown = nil; state.showing = false }
-                    state.shownPane.set(listed, incarnation: state.incarnation)
+                    if listed == nil { state.shown = nil; state.showing = false; state.controllingSize = false }
+                    state.shownPane.set(listed, incarnation: state.incarnation, identity: state.identities[shown])
                 }
                 state.control.publish(panes: panes, shown: state.shown)
             case .output(let pane, let rows, let columns, let bytes):
@@ -848,8 +908,8 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 let own = rows == Int(state.geometry.rows) && columns == Int(state.geometry.columns)
                 guard (1...512).contains(rows), (1...512).contains(columns),
                       rows * columns <= TerminalSessionGeometry.maximumShownCells,
-                      !state.control.accessMode.controlsSize || own || (rows * 2 + 256) * columns <= 65536 else {
-                    guard state.control.accessMode.controlsSize else {
+                      !state.control.controlsSize || own || (rows * 2 + 256) * columns <= 65536 else {
+                    guard state.control.controlsSize else {
                         let reason = "This shared pane is too large to view on this phone. Its size was not changed."
                         // A real pane bigger than the phone can be taken at the
                         // phone's size; a grid no pane can have cannot.
@@ -861,6 +921,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                     // again from scratch once it is back at the phone's size.
                     try state.client.resize(pane: pane, rows: Int(state.geometry.rows),
                                             columns: Int(state.geometry.columns))
+                    state.controllingSize = true
                     try state.client.show(pane: pane)
                     continue
                 }
@@ -894,10 +955,15 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 state.control.inputRouting.remove(pane: pane)
                 state.sizes.remove(pane: pane)
                 state.grabs[pane] = nil
+                state.identities[pane] = nil
+                state.identifiedPanes.remove(pane)
+                state.identityQueries.remove(pane)
+                state.sizeRecovery.remove(pane)
                 state.panes.removeAll { $0.paneId == pane }
                 state.control.remove(pane: pane)
                 if state.shown == pane {
-                    state.shown = nil; state.showing = false; state.shownPane.set(nil, incarnation: state.incarnation)
+                    state.shown = nil; state.showing = false; state.controllingSize = false
+                    state.shownPane.set(nil, incarnation: state.incarnation)
                 }
             case .searchResults(let pane, let results):
                 state.queries.receive(pane: pane, results: results)
@@ -925,20 +991,20 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         return false
     }
 
-    /// Puts the right pane on screen: the one the user picked, sized to the
-    /// phone and drawing while this machine is visible. A pane that leaves the
-    /// screen stops drawing and gets its own size back, so the desktop's
-    /// layout is untouched by a phone that is not looking at it.
+    /// Visibility subscribes to output; focused presentation separately owns
+    /// any permitted phone-size override. A companion keeps drawing at the
+    /// shared size after focus relinquishes that override.
     private func reconcileMux() throws {
         guard let state = mux else { return }
         if let requested = state.control.takeRequest(), requested != state.shown,
            state.panes.contains(where: { $0.paneId == requested }) {
-            if let old = state.shown, state.showing {
-                try state.client.hide(pane: old)
-                if state.control.accessMode.controlsSize { try state.client.restoreSize(pane: old) }
+            if let old = state.shown {
+                if state.showing { try state.client.hide(pane: old) }
+                if state.controllingSize { try state.client.restoreSize(pane: old) }
             }
-            state.shown = requested; state.showing = false
-            state.shownPane.set(state.panes.first { $0.paneId == requested }, incarnation: state.incarnation)
+            state.shown = requested; state.showing = false; state.controllingSize = false
+            state.shownPane.set(state.panes.first { $0.paneId == requested }, incarnation: state.incarnation,
+                                identity: state.identities[requested])
             try state.control.inputRouting.select(pane: requested)
             // Finish already-decoded output events before the replacement.
             // Dropping a chunk's suffix could strand the canonical parser in
@@ -951,6 +1017,17 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         // One bounded scheduler owns all accepted remote lookup IDs, including
         // superseded and timed-out work. Terminal input keeps its separate lane.
         state.queries.step()
+        // Selected-pane identity takes priority over background size recovery.
+        // The native lane and this owner both cap distinct outstanding reads.
+        if let pane = state.shown, state.control.current.visible, !state.identifiedPanes.contains(pane) {
+            try state.inspectIdentity(pane: pane)
+        }
+        if state.control.controlsSize {
+            for pane in state.sizeRecovery.sorted() {
+                if state.identifiedPanes.contains(pane) { try state.recoverPhoneSize(pane: pane) }
+                else if !(try state.inspectIdentity(pane: pane)) { break }
+            }
+        }
         guard let pane = state.shown else {
             // No pane on screen: nothing has the mouse, and taps meant for a
             // pane that left are not replayed on the next one.
@@ -959,17 +1036,22 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
             return
         }
         let visible = state.control.current.visible
+        guard !visible || state.identifiedPanes.contains(pane) else { return }
+        let controlsSize = visible && state.control.controlsSize
+        if controlsSize, !state.controllingSize || !state.showing {
+            try state.client.resize(pane: pane, rows: Int(state.geometry.rows), columns: Int(state.geometry.columns))
+            state.controllingSize = true
+        } else if !controlsSize, state.controllingSize {
+            try state.client.restoreSize(pane: pane)
+            state.controllingSize = false
+        }
         if visible, !state.showing {
-            if state.control.accessMode.controlsSize {
-                try state.client.resize(pane: pane, rows: Int(state.geometry.rows), columns: Int(state.geometry.columns))
-            }
             try state.client.show(pane: pane)
             state.showing = true
             // Back on screen: its pane strip may be a hidden interval old.
             state.nextListing = .now
         } else if !visible, state.showing {
             try state.client.hide(pane: pane)
-            if state.control.accessMode.controlsSize { try state.client.restoreSize(pane: pane) }
             state.showing = false
         }
         state.control.setMouseGrabbed(state.grabs[pane] ?? false)
@@ -1195,7 +1277,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
             if let state = mux {
                 // The immutable observing connection never owns remote size.
                 // Its renderer fits the received grid locally instead.
-                guard state.control.accessMode.controlsSize else { return }
+                guard state.control.controlsSize, state.control.current.visible else { return }
                 // A mux pane has no PTY here: the server resizes it, and the
                 // pane's next output arrives at the new size, which completes
                 // this request through the ordered update path.
@@ -1208,6 +1290,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                     try state.output.requestPixelGeometry(size)
                 } else if let pane = state.shown, state.showing {
                     try state.client.resize(pane: pane, rows: Int(size.rows), columns: Int(size.columns))
+                    state.controllingSize = true
                 }
                 try await flushMux(driver: driver)
                 try await session.wakeService(driver: driver)
@@ -1259,9 +1342,9 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
     /// restore keeps its record for the next connection to give back, and
     /// unanswered input is told now and marked for the next connection to tell.
     private func settleBeforeClose(_ state: MuxAttachment, driver: NativeSSHDriver) async {
-        if let pane = state.shown, state.showing {
-            try? state.client.hide(pane: pane)
-            if state.control.accessMode.controlsSize { try? state.client.restoreSize(pane: pane) }
+        if let pane = state.shown {
+            if state.showing { try? state.client.hide(pane: pane) }
+            if state.controllingSize { try? state.client.restoreSize(pane: pane) }
         }
         let typedTo = state.shownPane.record?.paneId
         func inputAnswered() -> Bool {
