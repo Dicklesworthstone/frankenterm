@@ -352,31 +352,53 @@ launchd_target() {  # <label> -> domain/label: where it is loaded, user/ if nowh
   echo "$(launchd_domain)/$1"
 }
 
-service_env() {  # NAME=value per line: what a service needs to resolve these paths
-  printf '%s\n' "FTG_INSTANCE=$INSTANCE" "FTG_BASE=$BASE" "FTG_STATE=$STATE" "FTG_RUN=$RUN" \
+service_env() {  # NAME=value pairs, each ending in NUL: what a service needs to resolve these paths
+  # NUL, not newline, so a value keeps every character a path can hold.
+  printf '%s\0' "FTG_INSTANCE=$INSTANCE" "FTG_BASE=$BASE" "FTG_STATE=$STATE" "FTG_RUN=$RUN" \
     "FTG_CONFIG_DIR=$CONFIG_DIR" "FTG_MUX_TOML=$MUX_TOML" "FTG_RECOVERY_INTERVAL=$RECOVERY_INTERVAL"
-  # The mux's durable scrollback store follows XDG_DATA_HOME. launchd and
-  # systemd do not pass the installer's, so without this an isolated
-  # instance's mux would write into the default instance's store.
-  if [ -n "${XDG_DATA_HOME:-}" ]; then printf '%s\n' "XDG_DATA_HOME=$XDG_DATA_HOME"; fi
+  # launchd and systemd do not pass the installer's environment. The mux's
+  # durable scrollback store follows XDG_DATA_HOME, so without it an isolated
+  # instance's mux would write into the default instance's store, and
+  # FT_GRID_ENGINE picks the mux's grid engine (a GUI login's `launchctl
+  # setenv` reaches only gui/<uid>, never the user/<uid> the units run in).
+  local name
+  for name in XDG_DATA_HOME FT_GRID_ENGINE; do
+    if [ -n "${!name:-}" ]; then printf '%s\0' "$name=${!name}"; fi
+  done
 }
 
 unit_safe_value() {  # <value>: whether this manager's unit files carry it verbatim
-  # systemd expands % specifiers and C escapes and splits ExecStart on
-  # whitespace, so such a path would silently run the services elsewhere; a
-  # plist is XML. The host script and logs live under $BASE and $STATE.
+  # systemd expands % specifiers, $VARs and C escapes, and splits ExecStart on
+  # whitespace and quotes, so such a path would silently run the services
+  # elsewhere; a plist is XML. The host script and logs live under $BASE and
+  # $STATE.
   case "$MANAGER" in
-    systemd) case $1 in *[%\"\\[:space:]]*) return 1 ;; esac ;;
+    systemd) case $1 in *[%\$\"\'\\[:space:]]*) return 1 ;; esac ;;
     launchd) case $1 in *[\&\<]*) return 1 ;; esac ;;
   esac
 }
 
+check_install_settings() {  # refuse, before install changes anything, what it cannot honor
+  case "$MANAGER" in
+    systemd|launchd|direct) ;;
+    *) die "unknown manager '$MANAGER' (systemd, launchd or direct)" ;;
+  esac
+  case $INSTANCE in
+    *[![:alnum:]_.-]*) die "FTG_INSTANCE=$INSTANCE names units and paths; use letters, digits, '.', '_' and '-'" ;;
+  esac
+  local pair unsafe
+  case "$MANAGER" in
+    systemd) unsafe="%, \$, quotes, backslashes or whitespace" ;;
+    *) unsafe="& or <" ;;
+  esac
+  while IFS= read -r -d '' pair; do
+    unit_safe_value "${pair#*=}" \
+      || die "$MANAGER units would mangle ${pair%%=*}=${pair#*=}; use a value without $unsafe"
+  done < <(service_env)
+}
+
 write_services() {
   local host_script=$BASE/bin/mux-guardian-host.sh pair
-  while IFS= read -r pair; do
-    unit_safe_value "${pair#*=}" \
-      || die "$MANAGER units cannot carry ${pair%%=*}=${pair#*=}; choose a path without % \" \\ or whitespace (systemd) or & < (launchd)"
-  done < <(service_env)
   case "$MANAGER" in
     systemd)
       local d=$HOME/.config/systemd/user
@@ -384,7 +406,7 @@ write_services() {
       # Every resolved path and the recovery interval, not just the instance:
       # an install with FTG_STATE or FTG_RUN set must run its services there.
       local env=""
-      while IFS= read -r pair; do env="$env${env:+
+      while IFS= read -r -d '' pair; do env="$env${env:+
 }Environment=\"$pair\""; done < <(service_env)
       cat > "$d/$(unit pty-broker).partial" <<EOF
 [Unit]
@@ -439,7 +461,7 @@ EOF
     launchd)
       local d=$HOME/Library/LaunchAgents n label keep sub env=""
       mkdir -p "$d" "$STATE/logs"
-      while IFS= read -r pair; do
+      while IFS= read -r -d '' pair; do
         env="$env<key>${pair%%=*}</key><string>${pair#*=}</string>"
       done < <(service_env)
       for n in pty-broker pty-guardian mux-server; do
@@ -528,7 +550,7 @@ svc_start() {  # <logical name>
     direct)
       local sub pair envs=()
       case $1 in pty-broker) sub=run-broker ;; pty-guardian) sub=run-guardian ;; mux-server) sub=run-mux ;; esac
-      while IFS= read -r pair; do envs+=("$pair"); done < <(service_env)
+      while IFS= read -r -d '' pair; do envs+=("$pair"); done < <(service_env)
       env "${envs[@]}" nohup "$BASE/bin/mux-guardian-host.sh" "$sub" \
         >> "$STATE/logs/$1.log" 2>&1 < /dev/null &
       echo $! > "$STATE/run.$1.pid"
@@ -693,6 +715,7 @@ cmd_install() {
   done
   [ -n "$family" ] || die "install: --family DIR required"
   MANAGER=${MANAGER:-$(default_manager)}
+  check_install_settings
   mkdir -p "$BASE/bin" "$STATE"
   chmod 0700 "$STATE"
   echo "$MANAGER" > "$STATE/manager"
