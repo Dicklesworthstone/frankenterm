@@ -427,6 +427,84 @@ mod dsr_source_metadata_contract {
         assert!(!metadata.dirty);
     }
 
+    #[cfg(unix)]
+    fn link_fixture(target: &Path) -> (tempfile::TempDir, PathBuf, DsrSourceIdentity) {
+        use std::os::unix::fs::symlink;
+        let (owner, repository, _source, _identity) = fixture();
+        symlink(target, repository.join("src/linked.txt")).unwrap();
+        git(&repository, &["add", "src/linked.txt"]);
+        git(&repository, &["commit", "-m", "tracked link fixture"]);
+        let revision = String::from_utf8(git(&repository, &["rev-parse", "HEAD"]))
+            .unwrap()
+            .trim()
+            .to_owned();
+        let archive = git(&repository, &["archive", "--format=tar", "HEAD"]);
+        fs::write(owner.path().join(".source.tar"), &archive).unwrap();
+        let source = owner.path().join("source-with-link");
+        fs::create_dir(&source).unwrap();
+        tar::Archive::new(archive.as_slice())
+            .unpack(&source)
+            .unwrap();
+        (owner, source, identity(revision))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gitless_metadata_accepts_only_exact_internal_tracked_links() {
+        let (owner, source, identity) = link_fixture(Path::new("input.txt"));
+        let metadata = resolve_source_identity(&source, Some(&identity)).unwrap();
+        assert!(!metadata.dirty);
+        assert_eq!(metadata.revision, identity.revision);
+        // Even a different spelling of the same target must match the archive.
+        fs::rename(
+            source.join("src/linked.txt"),
+            owner.path().join("retained-link"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("../src/input.txt", source.join("src/linked.txt")).unwrap();
+        assert!(resolve_source_identity(&source, Some(&identity)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gitless_metadata_rejects_link_type_substitution() {
+        let (owner, source, identity) = link_fixture(Path::new("input.txt"));
+        fs::rename(
+            source.join("src/linked.txt"),
+            owner.path().join("retained-link"),
+        )
+        .unwrap();
+        fs::write(source.join("src/linked.txt"), b"input.txt").unwrap();
+        assert!(resolve_source_identity(&source, Some(&identity)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gitless_metadata_rejects_unsafe_tracked_links() {
+        for target in [
+            "/etc/passwd",
+            "../../repository/src/input.txt",
+            ".",
+            "linked.txt",
+            "missing.txt",
+            "../.git/config",
+        ] {
+            let (_owner, source, identity) = link_fixture(Path::new(target));
+            assert!(
+                resolve_source_identity(&source, Some(&identity)).is_err(),
+                "accepted {target}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gitless_metadata_still_checks_link_target_bytes() {
+        let (_owner, source, identity) = link_fixture(Path::new("input.txt"));
+        fs::write(source.join("src/input.txt"), b"modified source\n").unwrap();
+        assert!(resolve_source_identity(&source, Some(&identity)).is_err());
+    }
+
     #[test]
     fn gitless_metadata_rejects_tampered_or_extra_source() {
         let (_owner, _repository, source, identity) = fixture();

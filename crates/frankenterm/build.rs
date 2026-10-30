@@ -321,6 +321,30 @@ fn plain_metadata(path: &Path) -> io::Result<fs::Metadata> {
     Ok(metadata)
 }
 
+fn verify_source_link(root: &Path, path: &Path, target: &Path) -> io::Result<()> {
+    if target.is_absolute()
+        || target.components().any(|part| match part {
+            Component::Normal(name) => name.to_string_lossy().eq_ignore_ascii_case(".git"),
+            Component::ParentDir | Component::CurDir => false,
+            _ => true,
+        })
+        || !path.symlink_metadata()?.file_type().is_symlink()
+        || fs::read_link(path)? != target
+    {
+        return Err(invalid_source(
+            "source link differs from archive or is unsafe",
+        ));
+    }
+    let resolved = path.canonicalize()?;
+    let root = root.canonicalize()?;
+    if !resolved.starts_with(&root) || !plain_metadata(&resolved)?.is_file() {
+        return Err(invalid_source(
+            "source link must resolve to an internal file",
+        ));
+    }
+    Ok(())
+}
+
 /// Check the immutable sibling archive that DSR retained and verified before
 /// starting Cargo. This checks its Git commit comment and every extracted file;
 /// the release's DSR pre/post source receipts remain the publication authority.
@@ -341,6 +365,7 @@ fn verify_dsr_archive(
     }
     let mut archive = tar::Archive::new(File::open(archive_path)?);
     let mut expected = BTreeSet::new();
+    let mut expected_links = std::collections::BTreeMap::new();
     let mut commit_seen = false;
     let mut buffer = [0u8; 64 * 1024];
     let mut source_buffer = [0u8; 64 * 1024];
@@ -369,7 +394,7 @@ fn verify_dsr_archive(
             }
             continue;
         }
-        if !commit_seen || (!kind.is_file() && !kind.is_dir()) {
+        if !commit_seen || (!kind.is_file() && !kind.is_dir() && !kind.is_symlink()) {
             return Err(invalid_source("unsupported DSR source archive entry"));
         }
         let path = entry.path()?.into_owned();
@@ -391,6 +416,16 @@ fn verify_dsr_archive(
             if !plain_metadata(&root.join(ancestor))?.is_dir() {
                 return Err(invalid_source("invalid source parent directory"));
             }
+        }
+        if kind.is_symlink() {
+            let target = entry
+                .link_name()?
+                .ok_or_else(|| invalid_source("source link has no archive target"))?
+                .into_owned();
+            verify_source_link(root, &source_path, &target)?;
+            expected_links.insert(path, target);
+            rerun(&source_path);
+            continue;
         }
         let metadata = plain_metadata(&source_path)?;
         if kind.is_dir() {
@@ -435,13 +470,17 @@ fn verify_dsr_archive(
         for child in fs::read_dir(root.join(&directory))? {
             let child = child?;
             let relative = directory.join(child.file_name());
-            let metadata = plain_metadata(&root.join(&relative))?;
             if !expected.contains(&relative)
                 || !actual.insert(relative.clone())
                 || actual.len() > MAX_ENTRIES
             {
                 return Err(invalid_source("extra or duplicate source inventory entry"));
             }
+            if let Some(target) = expected_links.get(&relative) {
+                verify_source_link(root, &root.join(&relative), target)?;
+                continue;
+            }
+            let metadata = plain_metadata(&root.join(&relative))?;
             if metadata.is_dir() {
                 directories.push(relative);
             } else if !metadata.is_file() {
