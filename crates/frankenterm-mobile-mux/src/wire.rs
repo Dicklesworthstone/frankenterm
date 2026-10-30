@@ -547,8 +547,8 @@ pub fn conditional_resize_size_is_valid(size: TerminalSize) -> bool {
         && size.cols != 0
         && [size.rows, size.cols, size.pixel_width, size.pixel_height]
             .iter()
-            .all(|dimension| *dimension <= u16::MAX as usize)
-        && size.dpi <= u16::MAX as u32
+            .all(|dimension| u16::try_from(*dimension).is_ok())
+        && u16::try_from(size.dpi).is_ok()
         && size
             .rows
             .checked_mul(size.cols)
@@ -763,18 +763,23 @@ pub struct RenderChanges {
 #[derive(Deserialize, Debug)]
 pub struct CompleteLineEntries {
     pub entries: LineEntries,
-    #[serde(deserialize_with = "discard_image_references")]
-    _images: (),
+    #[serde(rename = "_images", deserialize_with = "discard_image_references")]
+    _image_count: usize,
 }
 
-fn discard_image_references<'de, D: serde::Deserializer<'de>>(decoder: D) -> Result<(), D::Error> {
+fn discard_image_references<'de, D: serde::Deserializer<'de>>(
+    decoder: D,
+) -> Result<usize, D::Error> {
     struct Images;
     impl<'de> serde::de::Visitor<'de> for Images {
-        type Value = ();
+        type Value = usize;
         fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             formatter.write_str("a bounded sequence of unsupported image references")
         }
-        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut sequence: A) -> Result<(), A::Error> {
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> Result<Self::Value, A::Error> {
             const MAXIMUM: usize = 65_536;
             if sequence.size_hint().is_some_and(|count| count > MAXIMUM) {
                 return Err(serde::de::Error::custom("too many image references"));
@@ -786,7 +791,7 @@ fn discard_image_references<'de, D: serde::Deserializer<'de>>(decoder: D) -> Res
                     return Err(serde::de::Error::custom("too many image references"));
                 }
             }
-            Ok(())
+            Ok(count)
         }
     }
     decoder.deserialize_seq(Images)
