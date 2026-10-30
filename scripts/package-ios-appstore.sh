@@ -8,6 +8,21 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 [[ "${DSR_RELEASE_GIT_SHA:-}" =~ ^[0-9a-f]{40}$ ]] || fail "DSR release source identity required"
 [[ "$DSR_RELEASE_GIT_SHA" != 0000000000000000000000000000000000000000 ]] || fail "invalid source identity"
 [[ -n "${DSR_RELEASE_GIT_REF:-}" ]] || fail "DSR release ref required"
+python3 - <<'PY'
+import os, urllib.parse, urllib.request
+value = os.environ.get('FT_INCLUDED_MAC_DOWNLOAD_URL', '')
+url = urllib.parse.urlsplit(value)
+parts = url.path.strip('/').split('/')
+if (url.scheme != 'https' or url.netloc != 'github.com' or url.query or url.fragment
+        or len(parts) != 6 or parts[:4] != ['Dicklesworthstone', 'frankenterm', 'releases', 'download']
+        or parts[4] in ('', '.', '..', 'latest') or not parts[5].endswith(('.dmg', '.zip'))):
+    raise SystemExit('error: FT_INCLUDED_MAC_DOWNLOAD_URL must identify a pinned Mac release asset')
+request = urllib.request.Request(value, method='HEAD', headers={
+    'User-Agent': 'frankenterm-agent (+https://github.com/Dicklesworthstone/frankenterm)'})
+with urllib.request.urlopen(request, timeout=30) as response:
+    if response.status != 200:
+        raise SystemExit('error: included Mac download is unavailable')
+PY
 [[ -n "${CARGO_TARGET_DIR:-}" && "$CARGO_TARGET_DIR" = /* ]] || fail "isolated absolute CARGO_TARGET_DIR required"
 [[ "${FT_IOS_VERSION:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "FT_IOS_VERSION must be explicit"
 [[ "${FT_IOS_BUILD:-}" =~ ^[1-9][0-9]*$ ]] || fail "FT_IOS_BUILD must be explicit"
@@ -112,7 +127,8 @@ xcodebuild -project "$ROOT/apps/apple/FrankenTerm.xcodeproj" -scheme FrankenTerm
     -derivedDataPath "$OUT/DerivedData" -clonedSourcePackagesDirPath "$OUT/Packages" \
     -archivePath "$OUT/FrankenTerm.xcarchive" \
     DEVELOPMENT_TEAM="$FT_APPLE_TEAM_ID" MARKETING_VERSION="$FT_IOS_VERSION" \
-    CURRENT_PROJECT_VERSION="$FT_IOS_BUILD" archive
+    CURRENT_PROJECT_VERSION="$FT_IOS_BUILD" \
+    FT_INCLUDED_MAC_DOWNLOAD_URL="$FT_INCLUDED_MAC_DOWNLOAD_URL" archive
 python3 - "$OUT" <<'PY'
 import os, pathlib, plistlib, sys
 out = pathlib.Path(sys.argv[1])
@@ -123,6 +139,7 @@ with (out / 'ExportOptions.plist').open('xb') as f:
 app = out / 'FrankenTerm.xcarchive/Products/Applications/FrankenTerm.app'
 info = plistlib.loads((app / 'Info.plist').read_bytes())
 expected = {'CFBundleIdentifier': 'org.frankenterm.mobile',
+            'FTIncludedMacDownloadURL': os.environ['FT_INCLUDED_MAC_DOWNLOAD_URL'],
             'CFBundleShortVersionString': os.environ['FT_IOS_VERSION'],
             'CFBundleVersion': os.environ['FT_IOS_BUILD'],
             'CFBundleSupportedPlatforms': ['iPhoneOS']}

@@ -1984,6 +1984,14 @@ struct MobileWorkspaceRoot: View {
     @Bindable var model: MobileWorkspaceModel
     @Environment(\.scenePhase) private var scenePhase
     @State private var chooseFile = false
+    @State private var showIncludedMac = false
+    private var includedMacURL: URL? {
+        guard let value = Bundle.main.object(forInfoDictionaryKey: "FTIncludedMacDownloadURL") as? String,
+              let url = URL(string: value), url.scheme == "https", url.host == "github.com",
+              url.path.hasPrefix("/Dicklesworthstone/frankenterm/releases/download/"),
+              url.user == nil, url.password == nil, url.query == nil, url.fragment == nil else { return nil }
+        return url
+    }
     var body: some View {
         ZStack {
             NavigationStack {
@@ -1999,6 +2007,13 @@ struct MobileWorkspaceRoot: View {
                 }
                 .navigationTitle("FrankenTerm")
                 .toolbar {
+                    if includedMacURL != nil {
+                        ToolbarItem(placement: .topBarLeading) {
+                            Button { showIncludedMac = true } label: {
+                                Label("Included Mac App", systemImage: "desktopcomputer")
+                            }
+                        }
+                    }
                     ToolbarItem(placement: .primaryAction) {
                         Menu {
                             Button { model.requestCamera() } label: { Label("Scan My Mac", systemImage: "qrcode.viewfinder") }
@@ -2020,6 +2035,28 @@ struct MobileWorkspaceRoot: View {
             if !model.active { Color(.systemBackground).ignoresSafeArea().overlay { Label("FrankenTerm", systemImage: "lock.shield").font(.title2) } }
         }
         .task { model.setScenePhase(scenePhase); await model.bootstrap() }
+        .sheet(isPresented: $showIncludedMac) {
+            if let url = includedMacURL {
+                NavigationStack {
+                    Form {
+                        Section("FrankenTerm for Mac is included") {
+                            Text("Your iOS purchase includes the full Mac app at no extra charge. No separate purchase or subscription is required.")
+                            Text("Send this link to your Mac, download FrankenTerm, then open it to install.")
+                            ShareLink(item: url) {
+                                Label("Send Download Link to My Mac", systemImage: "square.and.arrow.up")
+                            }
+                            Link("Open Mac Download", destination: url)
+                        }
+                    }
+                    .navigationTitle("Included Mac App")
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Done") { showIncludedMac = false }
+                        }
+                    }
+                }
+            }
+        }
         .onChange(of: scenePhase) { _, phase in model.setScenePhase(phase) }
         .onOpenURL { model.importFile($0) }
         .sheet(isPresented: Binding(get: { model.showRestore }, set: { model.setRestoreVisible($0) })) {
