@@ -341,7 +341,7 @@ run_rch() {
 
 run_rch_bundle_build() {
     (
-        cd "$PROJECT_ROOT"
+        cd "$PROJECT_ROOT" || exit 1
         # RCH 1.0.62 makes source-content receipts mutually exclusive with the
         # clean-baseline mode; the committed base with no overlay is authoritative.
         RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 \
@@ -877,13 +877,22 @@ fi
 cp "$NATIVE_READINESS_HARNESS" "$APP_BUNDLE/Contents/Resources/e2e-native-events.sh"
 chmod 0755 "$APP_BUNDLE/Contents/Resources/e2e-native-events.sh"
 
-# --- Codesign (ad-hoc) ---
+# Sign fresh output before the final manifest hashes its packaged bytes.
 if ! command -v codesign &>/dev/null; then
     echo "Error: codesign is required to produce a macOS application bundle"
     exit 1
 fi
-echo "Ad-hoc codesigning..."
-codesign --force --deep -s - "$APP_BUNDLE"
+if [[ -n "${FT_MAC_DEVELOPER_ID:-}" ]]; then
+    if [[ "${FT_MAC_NOTARIZE:-0}" == 1 ]]; then
+        python3 "$PROJECT_ROOT/scripts/sign-macos-bundle.py" "$APP_BUNDLE" "$FT_MAC_DEVELOPER_ID" --notarize
+    else
+        python3 "$PROJECT_ROOT/scripts/sign-macos-bundle.py" "$APP_BUNDLE" "$FT_MAC_DEVELOPER_ID"
+    fi
+else
+    [[ "${FT_MAC_NOTARIZE:-0}" == 0 ]] || { echo "Error: notarization requires Developer ID signing" >&2; exit 1; }
+    echo "Ad-hoc codesigning..."
+    codesign --force --deep -s - "$APP_BUNDLE"
+fi
 if ! codesign --verify --deep --strict "$APP_BUNDLE"; then
     echo "Error: final application bundle failed strict deep codesign verification"
     exit 1
