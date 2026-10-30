@@ -228,12 +228,12 @@ public final class NativeMuxClient: TerminalMuxClient, @unchecked Sendable {
     public func resize(pane: Int, rows: Int, columns: Int) throws {
         let pane = try Self.paneID(pane)
         guard (1...512).contains(rows), (1...512).contains(columns) else { throw TerminalModelError.invalid }
-        try call { ft_mux_v1_resize($0, pane, UInt32(rows), UInt32(columns)) }
+        try timedCall { ft_mux_v1_resize($0, pane, UInt32(rows), UInt32(columns)) }
     }
 
     public func restoreSize(pane: Int) throws {
         let pane = try Self.paneID(pane)
-        try call { ft_mux_v1_restore_size($0, pane) }
+        try timedCall { ft_mux_v1_restore_size($0, pane) }
     }
 
     public func restoring() throws -> Bool {

@@ -230,6 +230,8 @@ pub struct Server {
     /// No push follows a resize (the v0.13 handler pushes nothing itself;
     /// the program's redraw usually does).
     pub quiet_resize: bool,
+    /// A conditional enqueue ACK can precede the worker's geometry change.
+    pub defer_conditional_resize: bool,
     /// A current server's incarnation, in its coherent pane list.
     pub incarnation: [u8; 16],
     /// Exact live pane authority; changing this simulates reuse of its number.
@@ -273,6 +275,7 @@ impl Server {
             line_ranges: Vec::new(),
             search_ranges: Vec::new(),
             quiet_resize: false,
+            defer_conditional_resize: false,
             incarnation: [0x1c; 16],
             registration: [0x27; 16],
             durable_identity: true,
@@ -499,6 +502,63 @@ impl Server {
                 }
                 self.reply(30, serial, &LivenessResponse { pane_id, is_alive });
             }
+            MuxWireDecodedPayload::Pdu(Pdu::GetPaneRenderStateV1(request)) => {
+                self.requests.push("GetPaneRenderStateV1");
+                if let Some(refusal) = self.refuse_render.pop_front() {
+                    match refusal {
+                        Some(error) => self.reply(0, serial, &error),
+                        None => self.reply(0, serial, &codec::ErrorResponse::backend_failure(114)),
+                    }
+                    return;
+                }
+                let pane_id = request.pane_id;
+                if pane_id != self.pane_id {
+                    self.reply(
+                        30,
+                        serial,
+                        &LivenessResponse {
+                            pane_id,
+                            is_alive: false,
+                        },
+                    );
+                    return;
+                }
+                self.subscribed = true;
+                self.push();
+                let dimensions = terminal_get_dimensions(&mut self.term);
+                let cursor_position = terminal_get_cursor_position(&mut self.term);
+                let (first, found) = terminal_get_lines(
+                    &mut self.term,
+                    dimensions.physical_top
+                        ..dimensions.physical_top + dimensions.viewport_rows as isize,
+                );
+                let bonus: Vec<_> = found
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, mut line)| {
+                        line.compress_for_scrollback();
+                        (first + index as isize, line)
+                    })
+                    .collect();
+                self.reply(
+                    25,
+                    serial,
+                    &GetPaneRenderChangesResponse {
+                        pane_id,
+                        mouse_grabbed: self.mouse_grabbed,
+                        alt_screen_active: self.term.is_alt_screen_active(),
+                        cursor_position,
+                        dimensions,
+                        tiered_scrollback_status: None,
+                        dirty_lines: Vec::new(),
+                        title: self.title.clone(),
+                        working_dir: None,
+                        bonus_lines: bonus.into(),
+                        input_serial: None,
+                        seqno: self.term.current_seqno(),
+                    },
+                );
+            }
             MuxWireDecodedPayload::Pdu(Pdu::GetLines(GetLines { pane_id, lines })) => {
                 self.requests.push("GetLines");
                 self.line_ranges.extend(lines.iter().cloned());
@@ -522,6 +582,40 @@ impl Server {
                     lines: entries.into(),
                 };
                 self.reply(23, serial, &reply);
+            }
+            MuxWireDecodedPayload::Pdu(Pdu::GetLinesAtLayout(request)) => {
+                self.requests.push("GetLinesAtLayout");
+                self.line_ranges.extend(request.lines.iter().cloned());
+                assert_eq!(request.pane_id, self.pane_id);
+                let dimensions = terminal_get_dimensions(&mut self.term);
+                if self.refuse_lines > 0
+                    || request.layout.seqno > self.term.current_seqno()
+                    || !mux::renderable::same_line_layout_geometry(
+                        &dimensions,
+                        &request.layout.dimensions,
+                    )
+                {
+                    self.refuse_lines = self.refuse_lines.saturating_sub(1);
+                    self.reply(0, serial, &codec::ErrorResponse::backend_failure(102));
+                    return;
+                }
+                let mut entries = Vec::new();
+                for range in request.lines {
+                    let (first, found) = terminal_get_lines(&mut self.term, range);
+                    for (index, mut line) in found.into_iter().enumerate() {
+                        line.compress_for_scrollback();
+                        entries.push((first + index as StableRowIndex, line));
+                    }
+                }
+                self.reply(
+                    103,
+                    serial,
+                    &codec::GetLinesAtLayoutResponse {
+                        pane_id: request.pane_id,
+                        layout: request.layout,
+                        lines: entries.into(),
+                    },
+                );
             }
             MuxWireDecodedPayload::Pdu(Pdu::WriteToPane(WriteToPane { data, .. })) => {
                 self.requests.push("WriteToPane");
@@ -555,6 +649,45 @@ impl Server {
                 self.keys.push(event);
                 self.push();
                 self.reply(10, serial, &UnitResponse {});
+            }
+            MuxWireDecodedPayload::Pdu(Pdu::ResizePaneConditionalV1(request)) => {
+                self.requests.push("ResizePaneConditionalV1");
+                let expected = codec::PaneIdentityV1 {
+                    session_incarnation: mux::MuxSessionIncarnation::from_bytes(self.incarnation),
+                    durable_pane_id: [0xd1; 16],
+                    pane_registration: codec::ReliablePaneRegistrationIdentityV1::from_bytes(
+                        self.registration,
+                    ),
+                };
+                let outcome = if request.pane_id != self.pane_id {
+                    codec::ResizePaneConditionalOutcomeV1::PaneGone
+                } else if !self.durable_identity {
+                    codec::ResizePaneConditionalOutcomeV1::IdentityUnavailable
+                } else if request.identity != expected {
+                    codec::ResizePaneConditionalOutcomeV1::IdentityMismatch
+                } else {
+                    assert_eq!(request.containing_tab_id, self.tab_id);
+                    self.resizes.push(request.size);
+                    if !self.defer_conditional_resize {
+                        self.term.resize(request.size);
+                    }
+                    codec::ResizePaneConditionalOutcomeV1::Enqueued
+                };
+                self.reply(
+                    120,
+                    serial,
+                    &codec::ResizePaneConditionalV1Response {
+                        pane_id: request.pane_id,
+                        identity: request.identity,
+                        outcome,
+                    },
+                );
+                if outcome == codec::ResizePaneConditionalOutcomeV1::Enqueued
+                    && !self.defer_conditional_resize
+                    && !self.quiet_resize
+                {
+                    self.push();
+                }
             }
             MuxWireDecodedPayload::Pdu(Pdu::Resize(Resize { size, .. })) => {
                 self.requests.push("Resize");

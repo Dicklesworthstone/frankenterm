@@ -443,7 +443,7 @@ fn a_refused_history_fetch_leaves_history_out_and_the_pane_carries_on() {
 fn a_server_on_another_protocol_is_refused() {
     // Between v0.13 and the current window, and past it with an oldest
     // accepted version past this app's newest.
-    for version in [48, 72] {
+    for version in [48, 73] {
         let mut harness = Harness::new(4, 20);
         harness.server.codec_vers = version;
         harness.server.min_supported = version;
@@ -455,7 +455,7 @@ fn a_server_on_another_protocol_is_refused() {
         });
         let reason = reason.expect("a failure");
         assert!(
-            reason.contains(&version.to_string()) && reason.contains("46") && reason.contains("71"),
+            reason.contains(&version.to_string()) && reason.contains("46") && reason.contains("72"),
             "{reason}"
         );
         assert_eq!(harness.server.requests, ["GetCodecVersion"]);
@@ -483,7 +483,7 @@ fn a_newer_server_that_still_accepts_this_apps_protocol_is_spoken_to() {
 
 #[test]
 fn the_current_window_keeps_earlier_servers_and_accepts_its_new_upper_bound() {
-    for version in [61, 70, 71] {
+    for version in [61, 70, 71, 72] {
         let mut harness = Harness::new(4, 20);
         harness.server.codec_vers = version;
         harness.attach();
@@ -1626,7 +1626,7 @@ fn render_reads(harness: &Harness) -> usize {
         .server
         .requests
         .iter()
-        .filter(|r| **r == "GetPaneRenderChanges")
+        .filter(|r| matches!(**r, "GetPaneRenderChanges" | "GetPaneRenderStateV1"))
         .count()
 }
 
@@ -1645,7 +1645,7 @@ fn a_busy_current_mux_keeps_the_pane_and_draws_it_after_a_backoff() {
     harness.quiet_output(&numbered(0, 6));
     // What a current server answers while the pane's render metadata is busy.
     let busy = codec::ErrorResponse::resource_busy(
-        <codec::GetPaneRenderChanges as codec::PduWireIdent>::IDENT,
+        <codec::GetPaneRenderStateV1 as codec::PduWireIdent>::IDENT,
     );
     harness
         .server
@@ -1702,7 +1702,7 @@ fn a_pane_refused_three_times_in_a_row_is_reported_waiting_until_a_read_is_answe
     harness.server.codec_vers = 71;
     harness.quiet_output(&numbered(0, 6));
     let busy = codec::ErrorResponse::resource_busy(
-        <codec::GetPaneRenderChanges as codec::PduWireIdent>::IDENT,
+        <codec::GetPaneRenderStateV1 as codec::PduWireIdent>::IDENT,
     );
     harness.server.refuse_render.extend(std::iter::repeat_n(
         Some(busy),
@@ -1740,7 +1740,7 @@ fn a_pane_refused_three_times_in_a_row_is_reported_waiting_until_a_read_is_answe
 
 #[test]
 fn a_refusal_the_server_does_not_allow_repeating_still_closes_the_pane() {
-    let ident = <codec::GetPaneRenderChanges as codec::PduWireIdent>::IDENT;
+    let ident = <codec::GetPaneRenderStateV1 as codec::PduWireIdent>::IDENT;
     for (version, refusal) in [
         (71, Some(codec::ErrorResponse::pane_not_found(ident, 7))),
         (71, Some(codec::ErrorResponse::invalid_request(ident))),

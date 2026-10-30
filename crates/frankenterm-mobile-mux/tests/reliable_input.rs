@@ -169,7 +169,7 @@ fn registration_is_acknowledged_before_ready_and_unique_per_connection() {
             "SetClientId",
             "ListPanesCoherent",
             "GetPaneIdentityV1",
-            "GetPaneRenderChanges",
+            "GetPaneRenderStateV1",
         ]
     );
 }
@@ -441,7 +441,7 @@ fn current_remote_panes_without_durable_identity_keep_live_input_authority() {
             "ListPanesCoherent",
             "GetPaneIdentityV1",
             "ReliableKeyEventV1",
-            "GetPaneRenderChanges",
+            "GetPaneRenderStateV1",
         ]
     );
     assert!(harness.server.keys.is_empty());
@@ -511,7 +511,7 @@ fn inventory_removal_retires_the_mirror_and_delayed_display_replies() {
         &codec::UnitResponse {},
     );
     let (retired_poll, pdu) = take_one(&mut harness.session);
-    assert!(matches!(pdu, Pdu::GetPaneRenderChanges(_)));
+    assert!(matches!(pdu, Pdu::GetPaneRenderStateV1(_)));
 
     harness.session.refresh_panes();
     let (list_rpc, pdu) = take_one(&mut harness.session);
@@ -547,7 +547,7 @@ fn inventory_removal_retires_the_mirror_and_delayed_display_replies() {
     );
     assert!(matches!(
         take_one(&mut harness.session).1,
-        Pdu::GetPaneRenderChanges(_)
+        Pdu::GetPaneRenderStateV1(_)
     ));
 
     // Neither the old request's refusal nor a late liveness answer can close
@@ -1266,7 +1266,7 @@ fn selecting_another_pane_during_pressure_cannot_retarget_or_overtake_input() {
     );
     assert!(matches!(
         take_one(&mut harness.session).1,
-        Pdu::GetPaneRenderChanges(_)
+        Pdu::GetPaneRenderStateV1(_)
     ));
     harness.session.write(second, b"second");
     assert!(harness.session.take_outgoing().is_empty());

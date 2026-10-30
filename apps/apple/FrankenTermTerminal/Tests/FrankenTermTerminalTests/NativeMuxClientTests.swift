@@ -185,21 +185,21 @@ final class NativeMuxClientTests: XCTestCase {
     func testAServerOnAnotherProtocolEndsTheSessionWithItsReason() throws {
         let client = try NativeMuxClient()
         _ = try client.outgoing(limit: 4096)
-        // Newer than the current window this client speaks (61..71), and no
+        // Newer than the current window this client speaks (61..72), and no
         // longer accepting its newest: version, name, executable, no config
         // file, oldest version accepted.
-        let body = leb(72) + text("v0.17") + text("/usr/local/bin/frankenterm-mux-server") + [0] + leb(72)
+        let body = leb(73) + text("v0.17") + text("/usr/local/bin/frankenterm-mux-server") + [0] + leb(73)
         try client.receive(frame(ident: 27, serial: 1, body: body))
         let all = try events(client)
         guard case let .failed(reason)? = all.first, all.count == 1 else { return XCTFail("\(all)") }
-        XCTAssertTrue(reason.contains("72") && reason.contains("46") && reason.contains("71"), reason)
+        XCTAssertTrue(reason.contains("73") && reason.contains("46") && reason.contains("72"), reason)
         XCTAssertTrue(try client.outgoing(limit: 4096).isEmpty, "nothing more is sent")
     }
 
     func testANewerServerThatStillAcceptsThisClientIsSpokenToInTheCurrentLayout() throws {
         let client = try NativeMuxClient()
         _ = try client.outgoing(limit: 4096)
-        let body = leb(72) + text("v0.17") + text("/usr/local/bin/frankenterm-mux-server") + [0] + leb(61)
+        let body = leb(73) + text("v0.17") + text("/usr/local/bin/frankenterm-mux-server") + [0] + leb(61)
         try client.receive(frame(ident: 27, serial: 1, body: body))
         XCTAssertEqual(try events(client), [])
         _ = try request(client, ident: 40, serial: 2)
