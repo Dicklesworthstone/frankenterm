@@ -119,12 +119,18 @@ public enum WorkspaceKeyEnrollmentAction: String, Codable, Sendable {
     case inspect
     /// Inspect first, add only if absent, then read back the exact owned entry.
     case install
+    /// Disable only this request's exact owned entry, then inspect remaining keys.
+    case remove
 }
 
 /// File-level observations, never a claim that the phone successfully signed in.
 /// Restricted preexisting entries are not duplicated with unrestricted entries.
 public enum WorkspaceKeyEnrollmentState: String, Codable, CaseIterable, Sendable {
     case absent, installed, alreadyPresent, restricted, blocked, uncertain
+    /// This request's owned entry was disabled and no other live copy remains.
+    case removed
+    /// Another live copy of the public key remains outside this request's ownership.
+    case stillAuthorized
 }
 
 /// One account's outcome. Remote diagnostic text must not be used as detail;
@@ -160,7 +166,7 @@ public struct WorkspaceKeyEnrollmentResult: Codable, Equatable, Sendable {
 }
 
 /// A bounded public record of the reviewed account set and every known outcome.
-/// The caller must durably save `beginInstall` before allowing the remote edit.
+/// The caller must durably save `beginMutation` before allowing the remote edit.
 /// Loading this record never resumes an operation or grants connection authority.
 public struct WorkspaceKeyEnrollmentJournal: Equatable, Sendable {
     public static let maximumBytes = 524_288
@@ -168,6 +174,9 @@ public struct WorkspaceKeyEnrollmentJournal: Equatable, Sendable {
     public let request: WorkspaceKeyEnrollmentRequest
     public let targets: [WorkspaceKeyEnrollmentTarget]
     public private(set) var results: [WorkspaceKeyEnrollmentResult]
+    /// An inspection replaces the observation but never the last requested edit.
+    private var mutations: [String: WorkspaceKeyEnrollmentAction] = [:]
+    private var actions: [String: WorkspaceKeyEnrollmentAction] = [:]
 
     public init(request: WorkspaceKeyEnrollmentRequest, targets: [WorkspaceKeyEnrollmentTarget]) throws {
         guard (1...Self.maximumTargets).contains(targets.count),
@@ -182,9 +191,10 @@ public struct WorkspaceKeyEnrollmentJournal: Equatable, Sendable {
             throw FTError.limit("enrollment.journal_bytes")
         }
         let root = try StrictJSON.decode(data).object()
+        let version = try root.required("version").uint()
         guard Set(root.keys) == ["format", "version", "request", "targets", "results"],
               try root.required("format").string() == "ft-phone-key-enrollment-journal",
-              try root.required("version").uint() == 1 else {
+              version == 1 || version == 2 else {
             throw FTError.malformed("enrollment.journal_format")
         }
         let request = try WorkspaceKeyEnrollmentRequest(data: StrictJSON.encode(root.required("request")))
@@ -208,7 +218,10 @@ public struct WorkspaceKeyEnrollmentJournal: Equatable, Sendable {
         var seen = Set<String>()
         for raw in rawResults {
             let record = try raw.object()
-            guard Set(record.keys) == ["operation_id", "target_id", "state", "detail"],
+            let fields: Set<String> = version == 1
+                ? ["operation_id", "target_id", "state", "detail"]
+                : ["operation_id", "target_id", "state", "detail", "action", "last_mutation"]
+            guard Set(record.keys) == fields,
                   let target = try indexed[record.required("target_id").string()],
                   let state = try WorkspaceKeyEnrollmentState(rawValue: record.required("state").string()),
                   seen.insert(target.id).inserted else {
@@ -218,22 +231,62 @@ public struct WorkspaceKeyEnrollmentJournal: Equatable, Sendable {
                 operationID: record.required("operation_id").string(), target: target,
                 state: state, detail: record.required("detail").string())
             try validate(result)
+            let action: WorkspaceKeyEnrollmentAction
+            let mutation: WorkspaceKeyEnrollmentAction?
+            if version == 1 {
+                // Install was the only legacy mutation. Other observations do
+                // not reveal whether an edit was ever requested; retain that
+                // unknown history rather than inventing a completed operation.
+                guard state != .removed, state != .stillAuthorized else {
+                    throw FTError.malformed("enrollment.journal_legacy_state")
+                }
+                let wasInstall = state == .installed || state == .uncertain
+                action = wasInstall ? .install : .inspect
+                mutation = wasInstall ? .install : nil
+            } else {
+                guard let decodedAction = try WorkspaceKeyEnrollmentAction(
+                    rawValue: record.required("action").string()) else {
+                    throw FTError.malformed("enrollment.journal_action")
+                }
+                action = decodedAction
+                let rawMutation = try record.required("last_mutation")
+                if case .null = rawMutation { mutation = nil }
+                else {
+                    guard let decodedMutation = try WorkspaceKeyEnrollmentAction(rawValue: rawMutation.string()),
+                          decodedMutation != .inspect else {
+                        throw FTError.malformed("enrollment.journal_mutation")
+                    }
+                    mutation = decodedMutation
+                }
+            }
+            try Self.validate(state: state, action: action, mutation: mutation)
             results.append(result)
+            actions[target.id] = action
+            mutations[target.id] = mutation
         }
         orderResults()
     }
 
     public func encoded() throws -> Data {
         let data = try StrictJSON.encode(.object([
-            "format": .string("ft-phone-key-enrollment-journal"), "version": .number("1"),
+            "format": .string("ft-phone-key-enrollment-journal"), "version": .number("2"),
             "request": try StrictJSON.decode(request.encoded()),
             "targets": .array(targets.map { target in .object([
                 "host": .string(target.host), "port": .number(String(target.port)), "user": .string(target.user)
             ]) }),
-            "results": .array(results.map { result in .object([
-                "operation_id": .string(result.operationID), "target_id": .string(result.target.id),
-                "state": .string(result.state.rawValue), "detail": .string(result.detail)
-            ]) })
+            "results": .array(try results.map { result in
+                guard let action = actions[result.target.id] else {
+                    throw FTError.malformed("enrollment.journal_action")
+                }
+                let mutation = mutations[result.target.id]
+                try Self.validate(state: result.state, action: action, mutation: mutation)
+                return .object([
+                    "operation_id": .string(result.operationID), "target_id": .string(result.target.id),
+                    "state": .string(result.state.rawValue), "detail": .string(result.detail),
+                    "action": .string(action.rawValue),
+                    "last_mutation": mutation.map { .string($0.rawValue) } ?? .null
+                ])
+            })
         ]))
         guard data.count <= Self.maximumBytes else { throw FTError.limit("enrollment.journal_bytes") }
         return data
@@ -243,34 +296,81 @@ public struct WorkspaceKeyEnrollmentJournal: Equatable, Sendable {
         results.first { $0.target.id == targetID }
     }
 
+    /// The operation that produced the latest observation, including inspection.
+    public func lastAction(for targetID: String) -> WorkspaceKeyEnrollmentAction? { actions[targetID] }
+
+    /// The last explicitly requested edit. Read-only reconciliation preserves it.
+    /// Nil means no edit is known, including an ambiguous legacy observation.
+    public func lastMutation(for targetID: String) -> WorkspaceKeyEnrollmentAction? { mutations[targetID] }
+
+    /// Combine disjoint saved receipts into a report without replaying mutation
+    /// transitions. A settled edit followed by a failed inspection stays blocked;
+    /// inventing a new pending edit here would incorrectly make it uncertain.
+    /// Existing destination receipts cannot be replaced by an unordered source.
+    public mutating func mergeResults(from source: WorkspaceKeyEnrollmentJournal) throws {
+        guard source.request == request, source.targets.allSatisfy({ targets.contains($0) }) else {
+            throw FTError.stale
+        }
+        var merged = self
+        for result in source.results {
+            try merged.validate(result)
+            guard merged.result(for: result.target.id) == nil else { throw FTError.stale }
+            guard let action = source.actions[result.target.id] else {
+                throw FTError.malformed("enrollment.journal_action")
+            }
+            let mutation = source.mutations[result.target.id]
+            try Self.validate(state: result.state, action: action, mutation: mutation)
+            merged.mutations[result.target.id] = mutation
+            merged.set(result, action: action)
+        }
+        self = merged
+    }
+
     public mutating func beginInstall(targetID: String) throws {
+        try beginMutation(targetID: targetID, action: .install)
+    }
+
+    public mutating func beginMutation(targetID: String, action: WorkspaceKeyEnrollmentAction) throws {
+        guard action != .inspect else { throw FTError.malformed("enrollment.inspect_mutation") }
         guard let target = targets.first(where: { $0.id == targetID }) else {
             throw FTError.stale
         }
         let pending = try WorkspaceKeyEnrollmentResult(operationID: request.operationID(for: target),
             target: target, state: .uncertain,
-            detail: "This account may have changed. Inspect its current state before another edit.")
-        set(pending)
+            detail: action == .remove
+                ? "Removal may have changed this account. Inspect its current state before another edit."
+                : "Installation may have changed this account. Inspect its current state before another edit.")
+        mutations[targetID] = action
+        set(pending, action: action)
     }
 
     public mutating func record(_ result: WorkspaceKeyEnrollmentResult,
                                 action: WorkspaceKeyEnrollmentAction) throws {
         try validate(result)
+        try Self.validate(state: result.state, action: action, mutation: mutations[result.target.id])
         // A successful read may reconcile uncertainty. A failed read, including
         // an install retry's preflight, cannot certify that an earlier edit failed.
         if result.state == .blocked,
            self.result(for: result.target.id)?.state == .uncertain {
             set(try .init(operationID: result.operationID, target: result.target,
-                          state: .uncertain, detail: result.detail))
+                          state: .uncertain, detail: result.detail), action: action)
             return
         }
-        guard action != .inspect || result.state != .installed else {
+        set(result, action: action)
+    }
+
+    private static func validate(state: WorkspaceKeyEnrollmentState, action: WorkspaceKeyEnrollmentAction,
+                                 mutation: WorkspaceKeyEnrollmentAction?) throws {
+        guard action != .inspect || (state != .installed && state != .removed) else {
             throw FTError.malformed("enrollment.inspect_mutation_claim")
         }
-        guard action != .install || result.state != .absent else {
-            throw FTError.malformed("enrollment.install_absence_claim")
+        guard action != .install || ![.absent, .removed, .stillAuthorized].contains(state) else {
+            throw FTError.malformed("enrollment.install_result")
         }
-        set(result)
+        guard action != .remove || ![.installed, .alreadyPresent, .restricted].contains(state) else {
+            throw FTError.malformed("enrollment.remove_result")
+        }
+        guard action == .inspect || mutation == action else { throw FTError.stale }
     }
 
     private func validate(_ result: WorkspaceKeyEnrollmentResult) throws {
@@ -279,7 +379,8 @@ public struct WorkspaceKeyEnrollmentJournal: Equatable, Sendable {
         }
     }
 
-    private mutating func set(_ result: WorkspaceKeyEnrollmentResult) {
+    private mutating func set(_ result: WorkspaceKeyEnrollmentResult, action: WorkspaceKeyEnrollmentAction) {
+        actions[result.target.id] = action
         if let index = results.firstIndex(where: { $0.target.id == result.target.id }) {
             results[index] = result
         } else { results.append(result) }
