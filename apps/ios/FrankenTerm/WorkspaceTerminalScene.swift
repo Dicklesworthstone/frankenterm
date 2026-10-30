@@ -13,6 +13,7 @@ struct SceneMachine: Identifiable {
     let unavailable: String
     let theme: WorkspaceDocument.Theme?
     var autoConnect = false
+    var tags: [String] = []
 }
 
 /// Keeps the workspace's authenticated connections and terminals, giving its
@@ -270,7 +271,8 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
                 shown = state.shown; paneCount += panes.count
             }
             inventory.append(.init(id: machine.id, name: machine.name, endpoint: endpoint, status: status,
-                sessionID: session?.id, panes: panes, selectedPaneID: shown, newOutput: hasUnseenOutput(machine.id)))
+                sessionID: session?.id, panes: panes, selectedPaneID: shown,
+                newOutput: hasUnseenOutput(machine.id), tags: machine.tags))
         }
         let selected = selectedMachineID
         let frozenInventory = inventory
@@ -2585,7 +2587,7 @@ private struct WorkspaceFleetOverviewScreen: View {
             .navigationTitle("Fleet Overview")
             .navigationBarTitleDisplayMode(.inline)
             .searchable(text: $query.text, placement: .navigationBarDrawer(displayMode: .always),
-                        prompt: "Machine, host, pane, tab, or directory")
+                        prompt: "Machine, tag, host, pane, tab, or directory")
             .textInputAutocapitalization(.never).autocorrectionDisabled()
             .onSubmit(of: .search) {
                 // Return is an explicit shortcut only for an unambiguous result.

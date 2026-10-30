@@ -4115,7 +4115,7 @@ private struct MachineWorkspaceView: View {
         func scene(_ target: TerminalSessionTarget?) -> SceneMachine {
             .init(id: machine.id, name: machine.name, target: target,
                   unavailable: "None of this machine's SSH routes is ready on this device. Open the machine from the workspace to see what each route needs.",
-                  theme: theme, autoConnect: preferences.automaticallyConnect(machine))
+                  theme: theme, autoConnect: preferences.automaticallyConnect(machine), tags: machine.tags)
         }
         // Every ready route, the preferred one first: mux routes attach to the
         // machine's existing panes, direct-SSH routes to its mux if one answers.
