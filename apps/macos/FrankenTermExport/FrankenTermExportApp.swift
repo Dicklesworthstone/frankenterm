@@ -40,15 +40,40 @@ private enum MachineSourceError: LocalizedError {
 struct FrankenTermExportApp: App {
     @NSApplicationDelegateAdaptor(ExportApplicationDelegate.self) private var applicationDelegate
     @State private var model = MacExportModel()
+    @State private var enrollment = MacPhoneKeyEnrollmentModel()
     var body: some Scene {
-        Window("FrankenTerm Offline Export", id: "export") {
-            MacExportView(model: model)
+        Window("FrankenTerm Export", id: "export") {
+            MacExportView(model: model, enrollment: enrollment)
+                .onAppear {
+                    applicationDelegate.retireOwnedWork = {
+                        model.closeExport()
+                        await enrollment.closeAndWait()
+                        await model.closeAndWait()
+                    }
+                }
         }.defaultSize(width: 850, height: 900)
     }
 }
 
 @MainActor
 private final class ExportApplicationDelegate: NSObject, NSApplicationDelegate {
+    var retireOwnedWork: (@MainActor () async -> Void)?
+    private var retiring = false
+    private var retired = false
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard !retired, let retireOwnedWork else { return .terminateNow }
+        if !retiring {
+            retiring = true
+            Task { @MainActor in
+                await retireOwnedWork()
+                retired = true
+                sender.reply(toApplicationShouldTerminate: true)
+            }
+        }
+        return .terminateLater
+    }
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         // A deliberately spawned desktop handoff owns one window/process. This
         // also releases the desktop's bounded child-process admission on close.
@@ -490,6 +515,319 @@ private actor MacExportEngine {
         retireKeyRequest(); document = nil; selection = nil; decisions = [:]; keys = []
         excludedMachineIDs = []
         sourceFindings = []; identityReferences = [:]; sshSource = nil; invalidateExport()
+    }
+}
+
+private actor MacPhoneKeyEnrollmentWorker {
+    func loadRequest(_ url: URL) throws -> WorkspaceKeyEnrollmentRequest {
+        try WorkspaceKeyEnrollmentRequest(data: SelectedLocalFile.read(url, limit: WorkspaceKeyEnrollmentRequest.maximumBytes))
+    }
+
+    private func storage(request: WorkspaceKeyEnrollmentRequest,
+                         target: WorkspaceKeyEnrollmentTarget) throws -> FileWorkspacePersistence {
+        guard let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            throw FTError.storage
+        }
+        let directory = support.appendingPathComponent("FrankenTerm", isDirectory: true)
+            .appendingPathComponent("PhoneKeyEnrollment", isDirectory: true)
+            .appendingPathComponent(request.id, isDirectory: true)
+            .appendingPathComponent(target.id, isDirectory: true)
+        return try FileWorkspacePersistence(directory: directory)
+    }
+
+    private func journal(in storage: FileWorkspacePersistence, request: WorkspaceKeyEnrollmentRequest,
+                         target: WorkspaceKeyEnrollmentTarget) throws -> WorkspaceKeyEnrollmentJournal {
+        guard let bytes = try storage.read(.catalog, limit: WorkspaceKeyEnrollmentJournal.maximumBytes) else {
+            return try WorkspaceKeyEnrollmentJournal(request: request, targets: [target])
+        }
+        let saved = try WorkspaceKeyEnrollmentJournal(data: bytes)
+        guard try saved.request.encoded() == request.encoded(), saved.targets == [target] else {
+            throw FTError.malformed("enrollment.saved_request")
+        }
+        return saved
+    }
+
+    func readResult(request: WorkspaceKeyEnrollmentRequest,
+                    target: WorkspaceKeyEnrollmentTarget) throws -> WorkspaceKeyEnrollmentResult? {
+        try Task.checkCancellation()
+        let persistence = try storage(request: request, target: target)
+        return try persistence.withExclusiveAccess {
+            try journal(in: persistence, request: request, target: target).result(for: target.id)
+        }
+    }
+
+    func perform(request: WorkspaceKeyEnrollmentRequest, target: WorkspaceKeyEnrollmentTarget,
+                 action: WorkspaceKeyEnrollmentAction) throws -> WorkspaceKeyEnrollmentResult {
+        let persistence = try storage(request: request, target: target)
+        return try persistence.withExclusiveAccess {
+            var saved = try journal(in: persistence, request: request, target: target)
+            try Task.checkCancellation()
+            if action == .install {
+                try saved.beginInstall(targetID: target.id)
+                // The uncertain receipt must reach durable storage before a
+                // remote edit. A failed write prevents all network effects.
+                try persistence.write(saved.encoded(), to: .catalog)
+            }
+            let result: WorkspaceKeyEnrollmentResult
+            do {
+                result = try WorkspaceKeyEnrollmentSSH.perform(request: request, target: target, action: action,
+                    isCancelled: { Task<Never, Never>.isCancelled })
+            } catch {
+                result = try WorkspaceKeyEnrollmentResult(operationID: request.operationID(for: target), target: target,
+                    state: action == .install ? .uncertain : .blocked,
+                    detail: action == .install
+                        ? "The connection did not confirm the outcome. Reconcile this account before authorizing again."
+                        : "The account could not be inspected through this Mac's trusted SSH access.")
+            }
+            try saved.record(result, action: action)
+            // A save error stops the batch, including after SSH succeeded.
+            try persistence.write(saved.encoded(), to: .catalog)
+            guard let retained = saved.result(for: target.id) else { throw FTError.storage }
+            return retained
+        }
+    }
+
+    func saveResults(_ bytes: Data, to url: URL) throws {
+        guard bytes.count <= WorkspaceKeyEnrollmentJournal.maximumBytes else { throw FTError.limit("enrollment.results") }
+        let access = url.startAccessingSecurityScopedResource()
+        defer { if access { url.stopAccessingSecurityScopedResource() } }
+        try LocalExportFile.write(bytes, to: url)
+    }
+}
+
+private struct MacPhoneKeyEnrollmentRow: Identifiable {
+    let id: String
+    var machines: [String]
+    let target: WorkspaceKeyEnrollmentTarget?
+    let unavailableReason: String?
+    var result: WorkspaceKeyEnrollmentResult?
+}
+
+@MainActor
+@Observable
+private final class MacPhoneKeyEnrollmentModel {
+    private(set) var request: WorkspaceKeyEnrollmentRequest?
+    private(set) var rows: [MacPhoneKeyEnrollmentRow] = []
+    private(set) var selectedTargetIDs = Set<String>()
+    private(set) var confirmedFingerprint = false
+    private(set) var busy = false
+    private(set) var message: String?
+    @ObservationIgnored private let worker = MacPhoneKeyEnrollmentWorker()
+    @ObservationIgnored private var work: Task<Void, Never>?
+    @ObservationIgnored private var workID: UUID?
+    @ObservationIgnored private var windowOpen = false
+    @ObservationIgnored private var active = false
+    @ObservationIgnored private var sourceDigest: Data?
+    @ObservationIgnored private var reviewDigest: Data?
+
+    private struct Approval: Equatable {
+        let request: WorkspaceKeyEnrollmentRequest
+        let sourceDigest: Data
+        let targetIDs: [String]
+    }
+
+    var canAct: Bool { approval() != nil }
+    var canSaveResults: Bool {
+        !busy && request != nil && reviewDigest != nil && reviewDigest == sourceDigest
+            && rows.contains { $0.target != nil }
+    }
+    var eligibleCount: Int { rows.filter { $0.target != nil }.count }
+
+    func open(isActive: Bool) { windowOpen = true; setActive(isActive) }
+    func setActive(_ value: Bool) {
+        active = value && windowOpen
+        if !active { confirmedFingerprint = false; work?.cancel() }
+    }
+    func close() { windowOpen = false; active = false; confirmedFingerprint = false; work?.cancel() }
+    func closeAndWait() async {
+        close()
+        let pending = work
+        await pending?.value
+    }
+    func cancel() { work?.cancel() }
+
+    static func sourceWitness(_ document: WorkspaceDocument?, machines: [WorkspaceDocument.Machine]) -> Data? {
+        guard let document else { return nil }
+        var identity = document.raw
+        identity.append(0)
+        for machine in machines { identity.append(contentsOf: machine.id.utf8); identity.append(0) }
+        return AppleCryptography().sha256(identity)
+    }
+
+    func sourceChanged(_ document: WorkspaceDocument?, machines: [WorkspaceDocument.Machine]) {
+        let next = Self.sourceWitness(document, machines: machines)
+        guard next != sourceDigest else { return }
+        sourceDigest = next; reviewDigest = nil; confirmedFingerprint = false; selectedTargetIDs = []
+        work?.cancel()
+        if !busy { rows = [] }
+        if request != nil { message = "The selected machines changed. Review the current accounts before contacting servers." }
+    }
+
+    func confirmFingerprint(_ value: Bool) {
+        guard !busy, active, request != nil else { return }
+        confirmedFingerprint = value
+    }
+    func select(_ targetID: String, included: Bool) {
+        guard !busy, rows.contains(where: { $0.target?.id == targetID }) else { return }
+        if included { selectedTargetIDs.insert(targetID) } else { selectedTargetIDs.remove(targetID) }
+    }
+    func selectAll() { guard !busy else { return }; selectedTargetIDs = Set(rows.compactMap { $0.target?.id }) }
+    func selectNone() { guard !busy else { return }; selectedTargetIDs = [] }
+
+    func chooseRequest() {
+        guard !busy, windowOpen, active else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.json, .data]
+        panel.title = "Open Phone Key Enrollment Request"
+        panel.message = "Choose the public .ftkeyrequest file exported by the phone. Compare its fingerprint directly with the phone before authorizing any account."
+        guard panel.runModal() == .OK, let url = panel.url, windowOpen, active, !busy else { return }
+        // Choosing another file retires the old candidate even if the new file
+        // fails validation. An error must not leave the old key approved.
+        request = nil; rows = []; selectedTargetIDs = []; reviewDigest = nil; confirmedFingerprint = false
+        perform(failure: "This file is not a valid public phone-key enrollment request.") { [self] token in
+            let loaded = try await worker.loadRequest(url)
+            try requireCurrent(token)
+            request = loaded; rows = []; selectedTargetIDs = []; reviewDigest = nil; confirmedFingerprint = false
+            message = "Public key loaded. Review the selected machine accounts and compare the fingerprint with the phone."
+        }
+    }
+
+    func review(document: WorkspaceDocument, machines: [WorkspaceDocument.Machine]) {
+        guard !busy, windowOpen, active, let request,
+              sourceDigest == Self.sourceWitness(document, machines: machines),
+              !machines.isEmpty, machines.count <= WorkspaceKeyEnrollmentJournal.maximumTargets else { return }
+        var candidates: [MacPhoneKeyEnrollmentRow] = []
+        var existing: [String: Int] = [:]
+        for machine in machines {
+            do {
+                guard let route = document.routes.first(where: { $0.id == machine.preferredRouteID }) else {
+                    throw WorkspaceKeyEnrollmentSSHError.route
+                }
+                let target = try WorkspaceKeyEnrollmentSSH.target(for: route, in: document)
+                if let index = existing[target.id] { candidates[index].machines.append(machine.name) }
+                else {
+                    existing[target.id] = candidates.count
+                    candidates.append(.init(id: target.id, machines: [machine.name], target: target,
+                        unavailableReason: nil, result: nil))
+                }
+            } catch {
+                let reason = (error as? WorkspaceKeyEnrollmentSSHError)?.localizedDescription
+                    ?? "This route cannot preserve its current policy during direct phone-key enrollment."
+                candidates.append(.init(id: "unavailable:" + machine.id, machines: [machine.name],
+                    target: nil, unavailableReason: reason, result: nil))
+            }
+        }
+        rows = candidates; selectedTargetIDs = []; confirmedFingerprint = false; reviewDigest = nil
+        perform(failure: "Saved enrollment receipts could not be verified. No server was contacted. Check local storage before continuing.") { [self] token in
+            for target in candidates.compactMap({ $0.target }) {
+                try requireCurrent(token)
+                let restored = try await worker.readResult(request: request, target: target)
+                try requireCurrent(token)
+                if let index = rows.firstIndex(where: { $0.target?.id == target.id }) { rows[index].result = restored }
+            }
+            try requireCurrent(token)
+            guard sourceDigest == Self.sourceWitness(document, machines: machines) else { throw FTError.stale }
+            reviewDigest = sourceDigest
+            message = "Saved account receipts loaded for review. Select accounts and compare the phone fingerprint before contacting servers."
+        }
+    }
+
+    private func approval() -> Approval? {
+        guard !busy, windowOpen, active, confirmedFingerprint, let request,
+              let sourceDigest, sourceDigest == reviewDigest, !selectedTargetIDs.isEmpty else { return nil }
+        let eligible = Set(rows.compactMap { $0.target?.id })
+        guard selectedTargetIDs.isSubset(of: eligible) else { return nil }
+        return .init(request: request, sourceDigest: sourceDigest, targetIDs: selectedTargetIDs.sorted())
+    }
+
+    func authorize() {
+        guard let reviewed = approval() else { return }
+        let accounts = rows.compactMap { row -> String? in
+            guard let target = row.target, reviewed.targetIDs.contains(target.id) else { return nil }
+            return "\(target.user)@\(target.host):\(target.port)"
+        }
+        let alert = NSAlert()
+        alert.messageText = "Authorize this phone key on \(accounts.count) accounts?"
+        alert.informativeText = reviewed.request.key.fingerprint + "\n\n"
+            + accounts.prefix(12).joined(separator: "\n")
+            + (accounts.count > 12 ? "\n…and \(accounts.count - 12) other reviewed accounts." : "")
+            + "\n\nThis Mac will sign in through its existing trusted SSH access and add only this public key to each account's standard authorized_keys file. Existing restrictions stay intact. Verify a connection from the phone after enrollment."
+        alert.addButton(withTitle: "Authorize Listed Accounts"); alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn, approval() == reviewed else { return }
+        run(.install, approval: reviewed)
+    }
+
+    func reconcile() { guard let reviewed = approval() else { return }; run(.inspect, approval: reviewed) }
+
+    private func run(_ action: WorkspaceKeyEnrollmentAction, approval reviewed: Approval) {
+        let targets = rows.compactMap { row -> WorkspaceKeyEnrollmentTarget? in
+            guard let target = row.target, reviewed.targetIDs.contains(target.id) else { return nil }
+            return target
+        }
+        guard targets.count == reviewed.targetIDs.count else { return }
+        perform(failure: "The enrollment batch stopped because its durable receipt could not be saved or verified. Reconcile any uncertain accounts before authorizing again.") { [self] token in
+            for target in targets {
+                try requireCurrent(token)
+                guard request == reviewed.request, sourceDigest == reviewed.sourceDigest,
+                      reviewDigest == reviewed.sourceDigest else { throw FTError.stale }
+                if action == .install, let index = rows.firstIndex(where: { $0.target?.id == target.id }) {
+                    rows[index].result = try WorkspaceKeyEnrollmentResult(operationID: reviewed.request.operationID(for: target),
+                        target: target, state: .uncertain, detail: "Authorization is in progress. Readback is required if it is interrupted.")
+                }
+                let result = try await worker.perform(request: reviewed.request, target: target, action: action)
+                try requireCurrent(token)
+                if let index = rows.firstIndex(where: { $0.target?.id == target.id }) { rows[index].result = result }
+            }
+            let selectedResults = rows.filter { reviewed.targetIDs.contains($0.id) }.compactMap { $0.result }
+            let verified = selectedResults.filter { $0.state == .installed || $0.state == .alreadyPresent }.count
+            let unknown = selectedResults.filter { $0.state == .uncertain }.count
+            message = "Saved results for \(targets.count) accounts: \(verified) verified key entries and \(targets.count - verified) accounts needing attention, including \(unknown) unknown outcomes."
+                + (unknown > 0 ? " Reconcile unknown outcomes before another authorization attempt." : "")
+                + " Verify server acceptance with a connection from the phone."
+        }
+    }
+
+    func saveResults() {
+        guard canSaveResults, windowOpen, active, let request else { return }
+        let targets = rows.compactMap { $0.target }; guard !targets.isEmpty else { return }
+        do {
+            var report = try WorkspaceKeyEnrollmentJournal(request: request, targets: targets)
+            for result in rows.compactMap({ $0.result }) {
+                try report.record(result, action: result.state == .installed ? .install : .inspect)
+            }
+            let bytes = try report.encoded()
+            let panel = NSSavePanel(); panel.allowedContentTypes = [.json]
+            panel.nameFieldStringValue = "FrankenTerm-Enrollment-\(request.id).json"
+            panel.message = "Save public account results and operation IDs. This report includes host names, accounts and public-key fingerprints, without private keys."
+            guard panel.runModal() == .OK, let url = panel.url, windowOpen, active, !busy else { return }
+            perform(failure: "Enrollment results could not be saved. Choose another local filename.") { [self] token in
+                try await worker.saveResults(bytes, to: url); try requireCurrent(token)
+                message = "Public enrollment results saved."
+            }
+        } catch { message = "Enrollment results could not be prepared for saving." }
+    }
+
+    private func requireCurrent(_ token: UUID) throws {
+        guard !Task.isCancelled, windowOpen, active, workID == token else { throw CancellationError() }
+    }
+
+    private func perform(failure: String, _ body: @escaping @MainActor (UUID) async throws -> Void) {
+        guard !busy, windowOpen, active else { return }
+        let token = UUID(); workID = token; busy = true; message = nil
+        work = Task {
+            defer { if workID == token { workID = nil; work = nil; busy = false } }
+            do { try requireCurrent(token); try await body(token) }
+            catch {
+                if windowOpen, workID == token {
+                    if error is CancellationError {
+                        message = reviewDigest == nil
+                            ? "Review the current accounts before contacting servers."
+                            : "Stopped. Saved receipts remain available; reconcile any account whose outcome is unknown."
+                    } else { message = failure }
+                }
+            }
+        }
     }
 }
 
@@ -1206,6 +1544,11 @@ private final class MacExportModel {
             closingCleanup = false; busy = false; work = nil; workOperationID = nil
         }
     }
+    func closeAndWait() async {
+        closeExport()
+        let cleanup = work
+        await cleanup?.value
+    }
     private func report(_ error: Error) {
         if let error = error as? LocalHelperProcessError {
             message = "The running desktop snapshot could not be received: \(error.localizedDescription) Choose Export to iPhone again in the desktop, or deliberately select another source."
@@ -1284,6 +1627,7 @@ private final class MacExportModel {
 @MainActor
 private struct MacExportView: View {
     @Bindable var model: MacExportModel
+    @Bindable var enrollment: MacPhoneKeyEnrollmentModel
     @Environment(\.scenePhase) private var scenePhase
     var body: some View {
         Group {
@@ -1300,17 +1644,18 @@ private struct MacExportView: View {
                                 Button("Import SSH Config…") { model.chooseSSHConfiguration() }
                                 Button("Open Workspace…") { model.chooseWorkspace() }
                                 Button("Open Encrypted Transfer…") { model.chooseEncryptedTransfer() }
-                            }.fixedSize().disabled(model.busy)
+                            }.fixedSize().disabled(model.busy || enrollment.busy)
                         }
                         if let message = model.message { Text(verbatim: message).font(.callout).textSelection(.enabled) }
                         if let document = model.document {
-                            exportChoices(document)
+                            exportChoices(document).disabled(enrollment.busy)
                         } else if model.busy {
                             ProgressView("Loading this Mac's machines…").frame(maxWidth: .infinity)
                         } else {
                             ContentUnavailableView("No machines loaded", systemImage: "rectangle.3.group",
                                 description: Text("This Mac's FrankenTerm machines load automatically. Use Other Sources to open a workspace or SSH config instead."))
                         }
+                        enrollmentCard.disabled(model.busy || model.sourceSheet != nil || model.requestingCameraAccess)
                     }.padding(28)
                 }
             }
@@ -1324,20 +1669,118 @@ private struct MacExportView: View {
                     }
                 }.onDisappear { model.sourceSheetDismissed(sheet) }
             }
-            .onAppear { model.openExport(isActive: scenePhase == .active) }
+            .onAppear {
+                enrollment.open(isActive: scenePhase == .active)
+                model.openExport(isActive: scenePhase == .active)
+            }
+            .onChange(of: model.selection?.workspace.raw, initial: true) { _, _ in
+                enrollment.sourceChanged(model.selection?.workspace, machines: model.selection?.orderedMachines ?? [])
+            }
+            .onChange(of: model.selection?.orderedMachines.map(\.id) ?? [], initial: true) { _, _ in
+                enrollment.sourceChanged(model.selection?.workspace, machines: model.selection?.orderedMachines ?? [])
+            }
             .onChange(of: scenePhase, initial: true) { _, phase in
+                enrollment.setActive(phase == .active)
                 model.setForeground(phase == .active)
                 if phase == .background { model.pause() }
             }
             .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.sessionDidResignActiveNotification)
-                .receive(on: RunLoop.main)) { _ in model.setSessionActive(false) }
+                .receive(on: RunLoop.main)) { _ in enrollment.setActive(false); model.setSessionActive(false) }
             .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.sessionDidBecomeActiveNotification)
-                .receive(on: RunLoop.main)) { _ in model.setSessionActive(true) }
+                .receive(on: RunLoop.main)) { _ in enrollment.setActive(scenePhase == .active); model.setSessionActive(true) }
             .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.screensDidSleepNotification)
-                .receive(on: RunLoop.main)) { _ in model.setScreensAwake(false) }
+                .receive(on: RunLoop.main)) { _ in enrollment.setActive(false); model.setScreensAwake(false) }
             .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.screensDidWakeNotification)
-                .receive(on: RunLoop.main)) { _ in model.setScreensAwake(true) }
-            .onDisappear { model.closeExport() }
+                .receive(on: RunLoop.main)) { _ in enrollment.setActive(scenePhase == .active); model.setScreensAwake(true) }
+            .onDisappear { enrollment.close(); model.closeExport() }
+    }
+
+    private var enrollmentCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Divider()
+            Label("Authorize a Phone Key", systemImage: "key.horizontal").font(.title2.bold())
+            Text("Use an independent phone identity with the accounts you select. Authorization is a separate remote action through this Mac's existing trusted SSH access.")
+                .font(.callout).foregroundStyle(.secondary)
+            HStack {
+                Button("Open Phone Key Request…") { enrollment.chooseRequest() }.disabled(enrollment.busy)
+                if enrollment.busy {
+                    ProgressView().controlSize(.small)
+                    Button("Stop Enrollment Work") { enrollment.cancel() }
+                }
+            }
+            if let request = enrollment.request {
+                Text(verbatim: request.key.fingerprint).font(.system(.callout, design: .monospaced)).textSelection(.enabled)
+                DisclosureGroup("Public Phone Key") {
+                    Text(verbatim: request.key.authorizedKey).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                }
+                if let selection = model.selection {
+                    Button("Review Selected Accounts") {
+                        enrollment.review(document: selection.workspace, machines: selection.orderedMachines)
+                    }.disabled(enrollment.busy)
+                } else {
+                    Text("Load a machine inventory or workspace to review its preferred accounts.").font(.callout)
+                }
+                if !enrollment.rows.isEmpty {
+                    HStack {
+                        Button("Select All Available") { enrollment.selectAll() }
+                        Button("Select None") { enrollment.selectNone() }
+                        Text("\(enrollment.selectedTargetIDs.count) of \(enrollment.eligibleCount) available accounts selected")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }.disabled(enrollment.busy)
+                    LazyVStack(alignment: .leading, spacing: 14) {
+                        ForEach(enrollment.rows) { row in enrollmentRow(row) }
+                    }
+                    Toggle("I compared this fingerprint directly with the phone", isOn: Binding(
+                        get: { enrollment.confirmedFingerprint }, set: { enrollment.confirmFingerprint($0) }))
+                        .disabled(enrollment.busy)
+                    HStack {
+                        Button("Authorize Phone Key…") { enrollment.authorize() }
+                            .buttonStyle(.borderedProminent).disabled(!enrollment.canAct)
+                        Button("Reconcile Selected Accounts") { enrollment.reconcile() }.disabled(!enrollment.canAct)
+                        Button("Save Results…") { enrollment.saveResults() }.disabled(!enrollment.canSaveResults)
+                    }
+                }
+                Text("Direct accounts require Python 3.8 or later and usable existing SSH authentication on this Mac. Enrollment preserves existing authorized-key restrictions and permissions. Reconcile reads account state without adding a key. Verify server acceptance with a connection from the phone; custom authorization files and certificate issuers need their approved workflow.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            if let message = enrollment.message { Text(verbatim: message).font(.callout).textSelection(.enabled) }
+        }
+    }
+
+    private func enrollmentRow(_ row: MacPhoneKeyEnrollmentRow) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(verbatim: row.machines.joined(separator: ", ")).font(.headline)
+            if let target = row.target {
+                Toggle(isOn: Binding(get: { enrollment.selectedTargetIDs.contains(target.id) },
+                                     set: { enrollment.select(target.id, included: $0) })) {
+                    Text(verbatim: "\(target.user) @ \(target.host) · port \(target.port)")
+                }.disabled(enrollment.busy)
+                if let result = row.result {
+                    Text(verbatim: Self.enrollmentStatus(result.state)).font(.callout.bold())
+                    Text(verbatim: result.detail).font(.caption).foregroundStyle(.secondary)
+                } else { Text("Not attempted").font(.caption).foregroundStyle(.secondary) }
+                if let request = enrollment.request {
+                    DisclosureGroup("Receipt") {
+                        Text(verbatim: "Operation " + request.operationID(for: target))
+                            .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                    }
+                }
+            } else if let reason = row.unavailableReason {
+                Label("Unavailable for direct enrollment", systemImage: "exclamationmark.triangle").font(.callout)
+                Text(verbatim: reason).font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private static func enrollmentStatus(_ state: WorkspaceKeyEnrollmentState) -> String {
+        switch state {
+        case .absent: "Key entry absent"
+        case .installed: "Key entry installed and verified"
+        case .alreadyPresent: "Existing key entry verified"
+        case .restricted: "Existing restrictions preserved"
+        case .blocked: "Needs attention"
+        case .uncertain: "Outcome unknown — reconcile this account"
+        }
     }
 
     /// The sender knows only what it displays. Completion stays a deliberate

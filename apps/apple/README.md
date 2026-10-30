@@ -108,11 +108,30 @@ Local pins survive relaunch and unchanged source-policy reimports. An endpoint, 
 
 ## Phone-generated SSH identities
 
-**Keys → Create Phone SSH Key** creates an independent Ed25519 key in protected storage. Generation preserves existing sessions and does not connect or change a server. **Copy Public Key** copies only its OpenSSH public line, locally with a two-minute clipboard lifetime. Authorize that line on the intended server account through your existing trusted administration method, then use **Choose Routes**. Remote enrollment automation and Secure Enclave keys remain separate work.
+**Keys → Create Phone SSH Key** creates an independent Ed25519 key in protected storage. Generation preserves existing sessions and does not connect or change a server. **Export Enrollment Request…** saves a public `.ftkeyrequest` for the Mac-assisted enrollment flow below. **Copy Public Key** remains available for your existing trusted administration method, locally with a two-minute clipboard lifetime. After authorizing the intended server account, use **Choose Routes**. The phone's private key stays in protected storage; Secure Enclave keys remain separate work.
 
 A reviewed choice replaces one route's public-key candidates, including use as a jump host. Host trust, permitted password/MFA methods and required policies still apply; certificate-restricted identities cannot be replaced by a plain key. Changing a choice disconnects this workspace first and requires a fresh **Connect**. Generation alone does neither.
 
 The imported manifest/history stay unchanged. Catalog version 8 retains separate public key metadata and route-policy witnesses alongside locally verified host pins. Changed routes require review after reimport. Removed routes retain their choices in case they return; the user can explicitly forget them. Local revocation uses the existing fingerprint and session-retirement path. There are at most 16 generated keys and 256 route choices per workspace. Portable compiler checks do not establish Apple Keychain, server interoperability or device qualification.
+
+### Authorize a phone key through the Mac
+
+1. On the phone, open **Keys**, create or select a usable phone key, and choose **Export Enrollment Request…**. Transfer that public file to the Mac. Opening the request never connects to a server or exports the private key.
+2. In FrankenTerm Export, load the intended machine inventory or workspace and choose its machines. Under **Authorize a Phone Key**, open the request, compare the displayed fingerprint directly with the phone, and choose **Review Selected Accounts**.
+3. Select the exact accounts to authorize. The review uses each selected machine's preferred route, groups duplicate host/port/account targets, and explains unavailable routes. Check the fingerprint confirmation and choose **Authorize Phone Key…**; the native confirmation lists the reviewed account set.
+4. Review the independent per-account results. **Reconcile Selected Accounts** reads current state without adding a key. **Save Results…** exports public account names, fingerprints, operation IDs, and outcomes. Reopen the same request and review its accounts to restore saved receipts; nothing resumes automatically.
+5. On the phone, use **Choose Routes** to assign the phone key to the intended routes, then make an explicit **Connect** to verify server acceptance. A verified key-file entry is not proof that the server's authentication policy accepts that file or that the phone signed in.
+
+The initial enrollment profile supports direct SSH accounts on POSIX hosts with Python 3.8 or later and the standard account-database home directory's `.ssh/authorized_keys`. It uses the Mac's existing public-key authentication and host trust, with strict host-key checking and no interactive password/passphrase prompts, agent forwarding, proxy commands, jump routing, or multiplexed connection reuse. Unlock any required Mac identity through your normal trusted workflow first. Required certificates, unsupported route policy, host-key aliases, jump/Via Mac routes, and source host revocations remain unavailable for this direct enrollment flow; no alternate route is selected silently.
+
+Existing key-file bytes, comments, restrictions, ownership, and permissions are preserved. A matching restricted entry is never duplicated with an unrestricted entry. New directories/files receive private defaults. Symlinked, hard-linked, nonregular, insecurely writable, or oversized key files are refused. An installation inspects first, appends one intended public entry under a bounded lock, syncs it, and reads back the exact result. Each newly added entry carries its phone identity and operation ID.
+
+Before a remote edit, the companion durably records that account's uncertain operation. A lost acknowledgement, failed read, or interrupted write cannot become an invented success or erase earlier uncertainty. Readback reconciles the result before another edit; failures on one account remain separate from other reviewed accounts. Storage failure stops the batch. Changing the source, replacing the request, locking/backgrounding the app, or closing the window retires approval and cancels work. Normal application termination waits for its owned helpers and receipt updates.
+
+The public request is bounded to 16 KiB and contains one validated Ed25519 identity; the public journal holds at most 256 target accounts. These documents are unencrypted public metadata. Managed authorization files, certificate issuer enrollment, and automatic removal of remote entries require their own deliberately scoped workflows. Existing local phone-key revocation does not remove a server entry or terminate an already authenticated remote session.
+
+Portable validation covers the request/journal and SSH boundaries, plus real OpenSSH/libssh transport and real file effects in an isolated account-home fixture, including a response lost after a completed write. Native Apple SDK/UI execution, actual server authorization policy, and phone authentication still need their respective qualification.
+
 
 ## Selective offline exports
 
