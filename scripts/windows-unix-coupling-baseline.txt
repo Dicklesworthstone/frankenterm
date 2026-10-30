@@ -2,6 +2,14 @@
 # Regenerate with: BLESS=1 scripts/check_windows_unix_coupling.sh
 # Each line: <path>\t<trimmed source line>. Removing entries is always safe;
 # adding entries means you accepted a NEW ungated coupling — justify it in the commit.
+# ft-51gsu: these four test calls are already Unix-gated, beyond the eight-line
+# lookback. runtime is cfg(unix) in pty-guardian/src/lib.rs; the two named tests
+# gitless_metadata_accepts_only_exact_internal_tracked_links and
+# disk_includes_follow_one_owned_link_as_macos_crypto_conf_needs are cfg(unix).
+crates/frankenterm-pty-guardian/src/runtime.rs	let (reader, mut producer) = std::os::unix::net::UnixStream::pair().unwrap();
+crates/frankenterm/tests/cli_contract_tests.rs	std::os::unix::fs::symlink("../src/input.txt", source.join("src/linked.txt")).unwrap();
+frankenterm/config/src/mobile_export.rs	std::os::unix::fs::symlink("apple.conf", &link).unwrap();
+frankenterm/config/src/mobile_export.rs	std::os::unix::fs::symlink("crypto.conf", &twice).unwrap();
 Cargo.toml	DEP nix = "0.31.3"
 Cargo.toml	DEP passfd = "0.1.6"
 Cargo.toml	DEP signal-hook = "0.4.4"
