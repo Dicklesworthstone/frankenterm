@@ -3434,6 +3434,27 @@ private struct WorkspaceKeyImportSheet: View {
     }
 }
 
+private struct PhoneKeyEnrollmentDocument: FileDocument {
+    static var readableContentTypes: [UTType] { [.data] }
+    let bytes: Data
+    let keyID: String
+
+    init(request: WorkspaceKeyEnrollmentRequest) throws {
+        bytes = try request.encoded(); keyID = request.key.id
+    }
+
+    init(configuration: ReadConfiguration) throws {
+        guard let bytes = configuration.file.regularFileContents else {
+            throw FTError.malformed("enrollment.request_file")
+        }
+        try self.init(request: WorkspaceKeyEnrollmentRequest(data: bytes))
+    }
+
+    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
+        FileWrapper(regularFileWithContents: bytes)
+    }
+}
+
 @MainActor
 private struct WorkspaceKeysSheet: View {
     let workspaceID: UUID
@@ -3445,6 +3466,8 @@ private struct WorkspaceKeysSheet: View {
     @State private var deviceReview: LocalDeviceKeyReview?
     @State private var phoneKey: WorkspaceDeviceKeyChoice?
     @State private var copiedPhoneKeyID: String?
+    @State private var enrollmentDocument: PhoneKeyEnrollmentDocument?
+    @State private var exportingEnrollment = false
 
     private var saved: InstalledWorkspace? {
         model.workspaces.first(where: { $0.id == workspaceID })
@@ -3484,7 +3507,7 @@ private struct WorkspaceKeysSheet: View {
                                 } header: {
                                     Text("Phone Keys")
                                 } footer: {
-                                    Text("A separate phone identity can be revoked on a server without revoking your Mac's key. Authorize its public key on the server, then choose a route. Private keys stay in protected storage on this device. Up to 16 phone keys can be retained in a workspace.")
+                                    Text("A separate phone identity can be revoked on a server without revoking your Mac's key. Export its public enrollment request to FrankenTerm Export on your Mac, compare the fingerprint, and authorize selected server accounts before choosing routes. Private keys stay in protected storage on this device. Up to 16 phone keys can be retained in a workspace.")
                                 }
                             }
                             Section {
@@ -3582,6 +3605,20 @@ private struct WorkspaceKeysSheet: View {
         .sheet(item: $phoneKey) { choice in
             WorkspaceDeviceKeyRoutesSheet(workspaceID: workspaceID, credentialID: choice.id, model: model)
         }
+        .fileExporter(isPresented: $exportingEnrollment, document: enrollmentDocument,
+                      contentType: .data, defaultFilename: "FrankenTerm-Phone-Key.ftkeyrequest") { result in
+            let keyID = enrollmentDocument?.keyID
+            enrollmentDocument = nil
+            guard model.active, saved?.deviceKeys.contains(where: { $0.id == keyID }) == true else { return }
+            switch result {
+            case .success:
+                model.credentialMessage = "Public enrollment request saved. Open it in FrankenTerm Export on your Mac and compare the fingerprint shown on both devices. Saving this request does not authorize any server or export the private key."
+            case let .failure(error):
+                if (error as? CocoaError)?.code != .userCancelled {
+                    model.credentialMessage = "The public enrollment request could not be saved. Choose another destination and try again."
+                }
+            }
+        }
         .sheet(item: Binding(get: { model.hostKeyPinReview }, set: { model.hostKeyPinReview = $0 })) { review in
             WorkspaceHostKeyVerificationSheet(review: review, model: model)
         }
@@ -3632,9 +3669,13 @@ private struct WorkspaceKeysSheet: View {
                 + "\n\nFuture imports cannot restore permission. Your Mac and SSH servers are unchanged.")
         }
         .onChange(of: model.active) { _, active in
-            if !active { reviewed = nil; hostReview = nil; hostKeyCheck = nil; deviceReview = nil; copiedPhoneKeyID = nil }
+            if !active {
+                reviewed = nil; hostReview = nil; hostKeyCheck = nil; deviceReview = nil; copiedPhoneKeyID = nil
+            }
         }
-        .onDisappear { reviewed = nil; hostReview = nil; hostKeyCheck = nil; deviceReview = nil; copiedPhoneKeyID = nil }
+        .onDisappear {
+            reviewed = nil; hostReview = nil; hostKeyCheck = nil; deviceReview = nil; copiedPhoneKeyID = nil
+        }
     }
 
     private func phoneKeyRow(_ key: WorkspaceDeviceKey, workspace: InstalledWorkspace) -> some View {
@@ -3668,6 +3709,20 @@ private struct WorkspaceKeysSheet: View {
                     options: [.localOnly: true, .expirationDate: Date().addingTimeInterval(120)])
                 copiedPhoneKeyID = key.id
             }.accessibilityIdentifier("keys.phone.copy.\(key.id)")
+            Button("Export Enrollment Request…", systemImage: "square.and.arrow.up") {
+                guard model.active, !model.busy, !revoked, !pending,
+                      model.credentialImport == nil, enrollmentDocument == nil,
+                      model.availableCredentials[workspaceID]?.contains(key.id) == true,
+                      saved?.deviceKeys.contains(where: { $0 == key }) == true else { return }
+                do {
+                    enrollmentDocument = try PhoneKeyEnrollmentDocument(request: .init(key: key))
+                    exportingEnrollment = true
+                } catch {
+                    model.credentialMessage = "This phone key could not produce a valid public enrollment request."
+                }
+            }.disabled(revoked || pending || model.credentialImport != nil || enrollmentDocument != nil
+                       || model.availableCredentials[workspaceID]?.contains(key.id) != true)
+                .accessibilityIdentifier("keys.phone.enroll.\(key.id)")
             Button("Choose Routes…", systemImage: "point.3.connected.trianglepath.dotted") {
                 reviewed = nil; hostReview = nil; deviceReview = nil
                 phoneKey = .init(id: key.id)
