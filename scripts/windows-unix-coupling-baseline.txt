@@ -139,3 +139,10 @@ frankenterm/window/src/os/wayland/window.rs	use std::os::fd::{FromRawFd, IntoRaw
 frankenterm/window/src/os/x11/connection.rs	use std::os::unix::io::AsRawFd;
 frankenterm/window/src/os/x11/keyboard.rs	use std::os::unix::ffi::OsStrExt;
 frankenterm/window/src/spawn.rs	pub(crate) fn raw_fd(&self) -> std::os::unix::io::RawFd {
+
+# ft-51gsu: mobile_attach and its tests are wholly cfg(unix) via src/main.rs.
+# The bounded per-file scan cannot see that parent-module gate.
+crates/frankenterm/src/mobile_attach.rs	use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+crates/frankenterm/src/mobile_attach.rs	use std::os::unix::fs::{FileTypeExt, MetadataExt};
+crates/frankenterm/src/mobile_attach.rs	use std::os::unix::fs::{PermissionsExt, symlink};
+crates/frankenterm/src/mobile_attach.rs	use std::os::unix::net::{UnixListener, UnixStream};
