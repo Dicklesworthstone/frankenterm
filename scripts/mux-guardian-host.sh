@@ -361,8 +361,22 @@ service_env() {  # NAME=value per line: what a service needs to resolve these pa
   if [ -n "${XDG_DATA_HOME:-}" ]; then printf '%s\n' "XDG_DATA_HOME=$XDG_DATA_HOME"; fi
 }
 
+unit_safe_value() {  # <value>: whether this manager's unit files carry it verbatim
+  # systemd expands % specifiers and C escapes and splits ExecStart on
+  # whitespace, so such a path would silently run the services elsewhere; a
+  # plist is XML. The host script and logs live under $BASE and $STATE.
+  case "$MANAGER" in
+    systemd) case $1 in *[%\"\\[:space:]]*) return 1 ;; esac ;;
+    launchd) case $1 in *[\&\<]*) return 1 ;; esac ;;
+  esac
+}
+
 write_services() {
   local host_script=$BASE/bin/mux-guardian-host.sh pair
+  while IFS= read -r pair; do
+    unit_safe_value "${pair#*=}" \
+      || die "$MANAGER units cannot carry ${pair%%=*}=${pair#*=}; choose a path without % \" \\ or whitespace (systemd) or & < (launchd)"
+  done < <(service_env)
   case "$MANAGER" in
     systemd)
       local d=$HOME/.config/systemd/user
