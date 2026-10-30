@@ -133,6 +133,80 @@ final class WorkspaceKeyEnrollmentTests: XCTestCase {
         XCTAssertEqual(try target(port: UInt16.max).port, UInt16.max)
     }
 
+    func testRouteScopedTargetsKeepPrivateNetworksAndLegacyReceiptsDistinct() throws {
+        let request = try request(), direct = try target("internal.example")
+        let first = try WorkspaceKeyEnrollmentTarget(host: direct.host, user: direct.user,
+            routeScope: String(repeating: "a", count: 64))
+        let second = try WorkspaceKeyEnrollmentTarget(host: direct.host, user: direct.user,
+            routeScope: String(repeating: "b", count: 64))
+        XCTAssertEqual(Set([direct.id, first.id, second.id]).count, 3)
+        XCTAssertEqual(Set([direct, first, second].map { request.operationID(for: $0) }).count, 3)
+        XCTAssertEqual(try WorkspaceKeyEnrollmentTarget(host: "INTERNAL.EXAMPLE.", user: direct.user,
+            routeScope: first.routeScope), first)
+        for invalid in ["", "abcd", String(repeating: "A", count: 64), String(repeating: "g", count: 64),
+                        String(repeating: "0", count: 63), String(repeating: "0", count: 65)] {
+            XCTAssertThrowsError(try WorkspaceKeyEnrollmentTarget(host: direct.host, user: direct.user, routeScope: invalid))
+        }
+        XCTAssertEqual(try JSONDecoder().decode(WorkspaceKeyEnrollmentTarget.self,
+            from: JSONEncoder().encode(first)), first)
+        let nullScope = Data(#"{"host":"internal.example","port":22,"user":"operator","routeScope":null}"#.utf8)
+        XCTAssertThrowsError(try JSONDecoder().decode(WorkspaceKeyEnrollmentTarget.self, from: nullScope))
+    }
+
+    func testVersionThreePreservesSeparateResultsForIdenticalEndpointsBehindDifferentRoutes() throws {
+        let request = try request(), direct = try target()
+        let first = try WorkspaceKeyEnrollmentTarget(host: direct.host, user: direct.user,
+            routeScope: String(repeating: "a", count: 64))
+        let second = try WorkspaceKeyEnrollmentTarget(host: direct.host, user: direct.user,
+            routeScope: String(repeating: "b", count: 64))
+        var journal = try WorkspaceKeyEnrollmentJournal(request: request, targets: [direct, first, second])
+        try journal.beginInstall(targetID: first.id)
+        try journal.record(result(request, first, .installed), action: .install)
+        try journal.beginMutation(targetID: second.id, action: .remove)
+        let bytes = try journal.encoded()
+        XCTAssertEqual(try StrictJSON.decode(bytes).object().required("version").uint(), 3)
+        let restored = try WorkspaceKeyEnrollmentJournal(data: bytes)
+        XCTAssertEqual(restored, journal)
+        XCTAssertNil(restored.result(for: direct.id))
+        XCTAssertEqual(restored.result(for: first.id)?.state, .installed)
+        XCTAssertEqual(restored.result(for: second.id)?.state, .uncertain)
+        XCTAssertEqual(restored.lastMutation(for: second.id), .remove)
+        let previous = journal
+        XCTAssertThrowsError(try journal.record(.init(operationID: request.operationID(for: first),
+            target: second, state: .removed, detail: "A receipt for another reviewed route."), action: .remove))
+        XCTAssertEqual(journal, previous)
+        for oldVersion in ["1", "2"] {
+            XCTAssertThrowsError(try WorkspaceKeyEnrollmentJournal(data: edited(bytes) {
+                $0["version"] = .number(oldVersion)
+            }), "A legacy reader cannot silently lose path identity.")
+        }
+        let directOnly = try WorkspaceKeyEnrollmentJournal(request: request, targets: [direct]).encoded()
+        XCTAssertEqual(try StrictJSON.decode(directOnly).object().required("version").uint(), 2)
+    }
+
+    func testRouteScopeTamperingCannotMoveAnExistingReceiptToAnotherPath() throws {
+        let request = try request()
+        let destination = try WorkspaceKeyEnrollmentTarget(host: "internal.example", user: "operator",
+            routeScope: String(repeating: "a", count: 64))
+        var journal = try WorkspaceKeyEnrollmentJournal(request: request, targets: [destination])
+        try journal.beginInstall(targetID: destination.id)
+        let original = try journal.encoded()
+        for replacement in [JSONValue.string(String(repeating: "b", count: 64)), .null, .string("invalid")] {
+            let changed = try edited(original) { root in
+                var targets = try root.required("targets").array()
+                var target = try targets[0].object(); target["route_scope"] = replacement
+                targets[0] = .object(target); root["targets"] = .array(targets)
+            }
+            XCTAssertThrowsError(try WorkspaceKeyEnrollmentJournal(data: changed))
+        }
+        let stripped = try edited(original) { root in
+            var targets = try root.required("targets").array()
+            var target = try targets[0].object(); target["route_scope"] = nil
+            targets[0] = .object(target); root["targets"] = .array(targets)
+        }
+        XCTAssertThrowsError(try WorkspaceKeyEnrollmentJournal(data: stripped))
+    }
+
     func testCodableTargetAndResultRestoreThroughValidation() throws {
         let destination = try target()
         XCTAssertEqual(try JSONDecoder().decode(WorkspaceKeyEnrollmentTarget.self,
@@ -486,7 +560,7 @@ final class WorkspaceKeyEnrollmentTests: XCTestCase {
             rows[0] = .object(row); root["results"] = .array(rows)
         }
         XCTAssertThrowsError(try WorkspaceKeyEnrollmentJournal(data: forgedInspect))
-        for version in [JSONValue.number("0"), .number("3"), .number("2.0"), .string("2")] {
+        for version in [JSONValue.number("0"), .number("4"), .number("2.0"), .string("2")] {
             XCTAssertThrowsError(try WorkspaceKeyEnrollmentJournal(data: edited(original) { $0["version"] = version }))
         }
     }
