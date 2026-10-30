@@ -25122,8 +25122,11 @@ mod test {
             } else {
                 (PduProducer::Server, PduWireRole::CorrelatedReply)
             };
-            assert!(pdu
-                .clone()
+            let old_peer_frame = pdu
+                .encode_frame_with_mode(31, CompressionMode::Never)
+                .unwrap();
+            let old_peer_pdu = Pdu::decode(old_peer_frame.as_slice()).unwrap().pdu;
+            assert!(old_peer_pdu
                 .prepare_outbound_for_dialect(
                     MuxWireDialect::current(71).unwrap(),
                     producer,
