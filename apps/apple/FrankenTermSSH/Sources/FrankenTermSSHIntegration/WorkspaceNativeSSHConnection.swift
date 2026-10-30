@@ -910,8 +910,11 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                     state.shownPane.set(listed, incarnation: state.incarnation, identity: state.identities[shown])
                 }
                 state.control.publish(panes: panes, shown: state.shown)
-            case .output(let pane, let rows, let columns, let bytes):
+            case .output(let pane, let rows, let columns, let bytes),
+                 .preparingOutput(let pane, let rows, let columns, let bytes):
                 guard pane == state.shown, state.showing else { continue }
+                let preparing: Bool
+                if case .preparingOutput = event { preparing = true } else { preparing = false }
                 // The phone draws its own size (at most maximumShownCells), and
                 // a size someone else gave the pane while 256 history rows
                 // still fit beside both screens. A pane someone else made
@@ -952,7 +955,11 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                     state.control.inputRouting.discardPointers()
                 }
                 try state.output.append(bytes, geometry: size,
-                    destination: state.control.inputRouting.capture())
+                    destination: preparing ? nil : state.control.inputRouting.capture(), preparing: preparing)
+                return false
+            case .palette(let pane, let rgba):
+                guard pane == state.shown, state.showing else { continue }
+                try state.output.appendPalette(rgba)
                 return false
             case .paneTitle(let pane, let title):
                 if let index = state.panes.firstIndex(where: { $0.paneId == pane }) {

@@ -129,6 +129,12 @@ public enum TerminalMuxEvent: Equatable, Sendable {
     case panes([TerminalMuxPane])
     /// Bytes for the pane's terminal, which must be rows x columns first.
     case output(paneID: Int, rows: Int, columns: Int, bytes: Data)
+    /// An ordered reset or other prefix of a replacement screen. Consuming it
+    /// alone cannot publish a complete frame or establish input readiness.
+    case preparingOutput(paneID: Int, rows: Int, columns: Int, bytes: Data)
+    /// The exact server palette, as 263 sRGB RGBA8 entries in the native
+    /// terminal palette order. It is transient and precedes completing output.
+    case palette(paneID: Int, rgba: Data)
     case paneTitle(paneID: Int, title: String)
     case paneGone(paneID: Int)
     case searchResults(paneID: Int, TerminalMuxSearchResults)

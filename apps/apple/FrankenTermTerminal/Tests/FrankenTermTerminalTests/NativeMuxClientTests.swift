@@ -67,7 +67,7 @@ final class NativeMuxClientTests: XCTestCase {
         return Array(sent.dropFirst(3))
     }
 
-    private func currentClient(clock: MuxTestClock) throws -> NativeMuxClient {
+    private func currentClient(clock: MuxTestClock, consumeEvents: Bool = true) throws -> NativeMuxClient {
         let client = try NativeMuxClient(monotonicNanoseconds: { clock.read() })
         _ = try request(client, ident: 26, serial: 1)
         try client.receive(frame(ident: 27, serial: 1, body: leb(71) + text("current")))
@@ -84,8 +84,31 @@ final class NativeMuxClientTests: XCTestCase {
         try client.receive(frame(ident: 118, serial: 4, body: [7, 0] + identity + [0]))
         XCTAssertEqual(try request(client, ident: 114, serial: 5), [7])
         try settleRender(client, serial: 5)
-        _ = try events(client)
+        if consumeEvents { _ = try events(client) }
         return client
+    }
+
+    func testInitialResetIsPreparatoryUntilTheCompletePaneOutputArrives() throws {
+        let client = try currentClient(clock: MuxTestClock(), consumeEvents: false)
+        let output = try events(client).filter {
+            switch $0 {
+            case .preparingOutput, .output: true
+            default: false
+            }
+        }
+        XCTAssertEqual(output.count, 2, "the reset keeps its own native parser work budget")
+        guard output.count == 2,
+              case let .preparingOutput(resetPane, resetRows, resetColumns, reset) = output[0],
+              case let .output(pane, rows, columns, complete) = output[1] else {
+            return XCTFail("The native bridge lost the distinction between a reset and a complete pane")
+        }
+        XCTAssertEqual(resetPane, 7); XCTAssertEqual(pane, 7)
+        XCTAssertEqual(resetRows, 1); XCTAssertEqual(resetColumns, 1)
+        XCTAssertEqual(rows, 1); XCTAssertEqual(columns, 1)
+        XCTAssertEqual(reset, Data("\u{1b}c\u{1b}[?25l\u{1b}[?2004h".utf8))
+        XCTAssertFalse(complete.isEmpty)
+        XCTAssertFalse(complete.starts(with: Data("\u{1b}c".utf8)),
+                       "the complete paint must not repeat the separately charged reset")
     }
 
     func testACurrentServerNamesItsRunBeforeItsPanesAndPushesTheirChanges() throws {

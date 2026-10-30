@@ -16,7 +16,7 @@
 use crate::native::NativeTerminalError as Error;
 use crate::native_ffi::{input_bytes, output_bytes, output_scalar, utf8};
 use frankenterm_mobile_mux::{Event, SearchQuery, Session};
-use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
+use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use std::convert::TryFrom;
 use std::panic::AssertUnwindSafe;
 use std::sync::{LazyLock, Mutex};
@@ -46,6 +46,8 @@ const EVENT_INCARNATION: u32 = 12;
 const EVENT_PHONE_SIZE_RESTORED: u32 = 13;
 const EVENT_PANE_WAITING: u32 = 14;
 const EVENT_PANE_IDENTITY: u32 = 15;
+const EVENT_PREPARING_OUTPUT: u32 = 16;
+const EVENT_PALETTE: u32 = 17;
 /// Search flags.
 const SEARCH_CASE_SENSITIVE: u32 = 1;
 const SEARCH_REGEX: u32 = 2;
@@ -218,6 +220,24 @@ fn event_parts(event: Option<Event>) -> Result<(u32, u64, u32, u32, Vec<u8>), Er
         ),
         Some(Event::PaneTitle { pane_id, title }) => {
             (EVENT_PANE_TITLE, pane_id as u64, 0, 0, title.into_bytes())
+        }
+        Some(Event::PreparingOutput {
+            pane_id,
+            rows,
+            cols,
+            bytes,
+        }) => (
+            EVENT_PREPARING_OUTPUT,
+            pane_id as u64,
+            count(rows)?,
+            count(cols)?,
+            bytes,
+        ),
+        Some(Event::Palette { pane_id, rgba }) => {
+            if rgba.len() != crate::native::BASE_PALETTE_BYTES {
+                return Err(Error::Invalid);
+            }
+            (EVENT_PALETTE, pane_id as u64, 0, 0, rgba)
         }
         Some(Event::PaneGone { pane_id }) => (EVENT_PANE_GONE, pane_id as u64, 0, 0, Vec::new()),
         Some(Event::Failed { reason }) => (EVENT_FAILED, 0, 0, 0, reason.into_bytes()),

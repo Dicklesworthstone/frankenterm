@@ -22,6 +22,7 @@ fixture = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fixture)
 SELECTOR = "FrankenTermSSHTests.MuxObservationTests/testLiveMuxAccessModeEffectBoundary"
 IDENTITY_SELECTOR = "FrankenTermSSHTests.MuxObservationTests/testReconnectPreflightRequiresExactIdentityBeforeSelectionAndGeometry"
+PREPARING_SELECTOR = "FrankenTermSSHTests.MuxObservationTests/testPreparingOutputAndPaletteCannotAdmitInputBeforeTheCompleteModelUpdate"
 
 
 class MuxObservationInteropTests(unittest.TestCase):
@@ -30,6 +31,9 @@ class MuxObservationInteropTests(unittest.TestCase):
 
     def test_exact_identity_reconnect_and_explicit_selection(self):
         self.check_modes(IDENTITY_SELECTOR, ["identity-same", "identity-moved", "identity-replaced", "identity-unavailable"])
+
+    def test_preparatory_output_preserves_palette_order_and_input_barrier(self):
+        self.check_modes(PREPARING_SELECTOR, ["preparing-output"])
 
     def check_modes(self, selector, modes):
         for mode in modes:

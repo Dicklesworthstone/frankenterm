@@ -10,7 +10,8 @@
 
 use crate::render;
 use crate::wire::{
-    CursorPosition, Dimensions, LineEntries, LineReadLayout, RenderHead, StableRowIndex,
+    CursorPosition, Dimensions, LineEntries, LineReadLayout, PaneRenderMetadata, RenderHead,
+    StableRowIndex,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
@@ -38,6 +39,7 @@ struct Target {
     dims: Dimensions,
     cursor: CursorPosition,
     alt: bool,
+    mouse_grabbed: bool,
     title: String,
 }
 
@@ -122,6 +124,10 @@ pub struct Output {
     pub rows: usize,
     pub cols: usize,
     pub bytes: Vec<u8>,
+    /// A reset alone does not publish a usable destination frame.
+    pub complete: bool,
+    /// Ordered after any reset and before this output's cells.
+    pub palette: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Default)]
@@ -150,6 +156,14 @@ pub struct PaneMirror {
     /// This stays bounded by the already bounded viewport/history request.
     fetch_ranges: Vec<Range<StableRowIndex>>,
     fetch_invalidated: BTreeSet<StableRowIndex>,
+    /// A coherent publication is offered only by backends that actually own
+    /// one. Generic/proxy fallback remains explicitly narrower.
+    metadata_required: bool,
+    metadata: Option<Box<PaneRenderMetadata>>,
+    metadata_verified: bool,
+    metadata_request: Option<u64>,
+    publication: u64,
+    shown_palette: Option<Box<[termwiz::color::SrgbaTuple; 265]>>,
 }
 
 impl PaneMirror {
@@ -178,6 +192,7 @@ impl PaneMirror {
         self.visible = true;
         self.shown = Shown::default();
         self.drawn = None;
+        self.shown_palette = None;
         self.forget_rows();
     }
 
@@ -189,10 +204,106 @@ impl PaneMirror {
 
     fn forget_rows(&mut self) {
         self.epoch += 1;
+        self.publication += 1;
+        self.metadata = None;
+        self.metadata_verified = false;
+        self.metadata_request = None;
         self.observation_request = None;
         self.lines.clear();
         self.absent.clear();
         self.dirty.clear();
+    }
+
+    pub fn require_render_metadata(&mut self) {
+        self.metadata_required = true;
+        self.metadata = None;
+        self.metadata_verified = false;
+    }
+
+    pub fn requires_render_metadata(&self) -> bool {
+        self.metadata_required
+    }
+
+    /// Publish pointer routing only with the exact accepted screen. A new
+    /// unconfirmed render observation must not change how the old frame's
+    /// gestures are interpreted.
+    pub fn confirmed_mouse_grab(&self) -> Option<bool> {
+        (self.metadata_required && self.metadata_verified)
+            .then(|| self.metadata.as_ref().map(|facts| facts.mouse_grabbed))
+            .flatten()
+    }
+
+    /// One bounded request brackets each candidate's row reads. The first
+    /// captures the full publication; the second must return that exact value.
+    pub fn metadata_check(&self) -> Option<(u64, Option<Box<PaneRenderMetadata>>)> {
+        if !self.metadata_required
+            || self.metadata_request.is_some()
+            || !self.visible
+            || self.awaiting_observation
+            || self.fetching
+            || self.metadata_verified
+            || self
+                .target
+                .as_ref()
+                .is_none_or(|target| self.waiting_for_size(target))
+        {
+            return None;
+        }
+        if self.metadata.is_none() || self.wanted().is_empty() {
+            Some((self.publication, self.metadata.clone()))
+        } else {
+            None
+        }
+    }
+
+    pub fn begin_metadata_check(&mut self, publication: u64) {
+        self.metadata_request = Some(publication);
+    }
+
+    pub fn owns_metadata_check(&self, publication: u64) -> bool {
+        self.metadata_request == Some(publication)
+    }
+
+    pub fn needs_metadata_before_rows(&self) -> bool {
+        self.metadata_required && self.metadata.is_none()
+    }
+
+    pub fn accept_metadata(
+        &mut self,
+        publication: u64,
+        facts: Box<PaneRenderMetadata>,
+        before: Option<&PaneRenderMetadata>,
+    ) -> bool {
+        if self.metadata_request != Some(publication) {
+            return false;
+        }
+        self.metadata_request = None;
+        let matches = self.publication == publication
+            && self.observation.is_some_and(|layout| {
+                layout.seqno == facts.seqno && layout.dimensions == facts.dimensions
+            })
+            && self.target.as_ref().is_some_and(|target| {
+                target.dims == facts.dimensions
+                    && target.cursor == facts.cursor
+                    && target.alt == facts.alt_screen_active
+                    && target.mouse_grabbed == facts.mouse_grabbed
+            })
+            && before.is_none_or(|previous| previous == facts.as_ref());
+        if !matches {
+            return false;
+        }
+        self.metadata_verified = before.is_some();
+        self.metadata = Some(facts);
+        true
+    }
+
+    pub fn reject_metadata(&mut self) {
+        self.metadata_request = None;
+        self.metadata = None;
+        self.metadata_verified = false;
+        self.lines.clear();
+        self.absent.clear();
+        self.require_observation();
     }
 
     pub fn observation(&self) -> Option<LineReadLayout> {
@@ -258,8 +369,15 @@ impl PaneMirror {
             dims,
             cursor: head.cursor_position,
             alt: head.alt_screen_active,
+            mouse_grabbed: head.mouse_grabbed,
             title: head.title,
         };
+        self.publication = self
+            .publication
+            .checked_add(1)
+            .ok_or(crate::Error::Frame("pane publication epoch exhausted"))?;
+        self.metadata = None;
+        self.metadata_verified = false;
         let changed_hidden = !self.visible
             && self.target.as_ref().is_none_or(|previous| {
                 previous.title == target.title
@@ -388,6 +506,7 @@ impl PaneMirror {
         self.visible
             && !self.fetching
             && !self.awaiting_observation
+            && (!self.metadata_required || self.metadata_verified)
             && self
                 .target
                 .as_ref()
@@ -513,7 +632,11 @@ impl PaneMirror {
     /// the phone's terminal to take in order, each a piece of its own.
     pub fn render(&mut self) -> Vec<Output> {
         let mut outputs = Vec::new();
-        if !self.visible || self.fetching || self.awaiting_observation || !self.wanted().is_empty()
+        if !self.visible
+            || self.fetching
+            || self.awaiting_observation
+            || !self.wanted().is_empty()
+            || (self.metadata_required && !self.metadata_verified)
         {
             return outputs;
         }
@@ -526,7 +649,15 @@ impl PaneMirror {
         let plan = self.plan(&target);
         let viewport = target.viewport();
         let changed_rows = self.dirty.range(viewport.clone()).count();
-        if plan == Plan::Dirty && changed_rows == 0 && self.drawn.as_ref() == Some(&target) {
+        let palette_changed = self
+            .metadata
+            .as_ref()
+            .is_some_and(|facts| self.shown_palette.as_deref() != Some(facts.palette.as_ref()));
+        if plan == Plan::Dirty
+            && changed_rows == 0
+            && self.drawn.as_ref() == Some(&target)
+            && !palette_changed
+        {
             self.lines.clear();
             self.absent.clear();
             self.dirty.clear();
@@ -548,9 +679,18 @@ impl PaneMirror {
                 rows,
                 cols,
                 bytes: b"\x1bc\x1b[?25l\x1b[?2004h".to_vec(),
+                complete: false,
+                palette: None,
             });
         }
         let mut out = String::from("\x1b[?25l");
+        // Global reverse video is presentation state, independent of SGR's
+        // per-cell inverse attribute. Always settle it for this candidate.
+        out.push_str(if target.dims.reverse_video {
+            "\x1b[?5h"
+        } else {
+            "\x1b[?5l"
+        });
         // The screen drawn on is blank now: wiped above, or an alternate
         // screen entered here, which clears it.
         let wiped = !self.shown.painted || (target.alt && self.shown.alt.is_none());
@@ -693,6 +833,15 @@ impl PaneMirror {
             rows,
             cols,
             bytes: out.into_bytes(),
+            complete: true,
+            palette: if palette_changed {
+                self.metadata.as_ref().map(|facts| {
+                    self.shown_palette = Some(facts.palette.clone());
+                    facts.native_palette()
+                })
+            } else {
+                None
+            },
         });
         outputs
     }

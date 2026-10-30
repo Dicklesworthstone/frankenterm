@@ -10,7 +10,7 @@ use crate::color::{ColorPalette, SrgbaTuple};
 use crate::config::{GridEngine, NewlineCanon, Osc52WritePolicy, TerminalFeatureProfile};
 use crate::input::{MouseButton, MouseEvent, MouseEventKind};
 use crate::render::{
-    capture_terminal_frame, RenderFrameError, RenderFrameLimits, RenderFrameWitness,
+    RenderFrameError, RenderFrameLimits, RenderFrameWitness, capture_terminal_frame,
 };
 use crate::{
     BoundedOutputLimits, BoundedReplyCopy, BoundedReplyDisposition, KeyCode, KeyModifiers,
@@ -32,6 +32,29 @@ pub const MAX_MOUSE_STEPS: i32 = 32;
 /// background, cursor foreground/background/border, selection fg/bg.
 pub const BASE_PALETTE_COLORS: usize = 263;
 pub const BASE_PALETTE_BYTES: usize = BASE_PALETTE_COLORS * 4;
+
+fn decode_native_palette(rgba: &[u8]) -> Result<ColorPalette, NativeTerminalError> {
+    if rgba.len() != BASE_PALETTE_BYTES {
+        return Err(NativeTerminalError::Invalid);
+    }
+    let color = |index: usize| {
+        let [red, green, blue, alpha] =
+            [0, 1, 2, 3].map(|c| f32::from(rgba[index * 4 + c]) / 255.0);
+        SrgbaTuple(red, green, blue, alpha)
+    };
+    let mut palette = ColorPalette::default();
+    for (index, entry) in palette.colors.0.iter_mut().enumerate() {
+        *entry = color(index);
+    }
+    palette.foreground = color(256);
+    palette.background = color(257);
+    palette.cursor_fg = color(258);
+    palette.cursor_bg = color(259);
+    palette.cursor_border = color(260);
+    palette.selection_fg = color(261);
+    palette.selection_bg = color(262);
+    Ok(palette)
+}
 
 /// Finite, content-free native boundary failures. The numeric values are also
 /// the version 1 C ABI status values; no parser or terminal bytes enter errors.
@@ -387,32 +410,31 @@ impl NativeTerminal {
     /// them, which then yields this palette.
     pub fn set_base_palette(&mut self, rgba: &[u8]) -> Result<(), NativeTerminalError> {
         self.can_mutate()?;
-        if rgba.len() != BASE_PALETTE_BYTES {
-            return Err(NativeTerminalError::Invalid);
-        }
+        let palette = decode_native_palette(rgba)?;
         let revision = self
             .witness
             .palette_revision
             .checked_add(1)
             .ok_or(NativeTerminalError::SequenceExhausted)?;
-        let color = |index: usize| {
-            let [red, green, blue, alpha] =
-                [0, 1, 2, 3].map(|c| f32::from(rgba[index * 4 + c]) / 255.0);
-            SrgbaTuple(red, green, blue, alpha)
-        };
-        let mut palette = ColorPalette::default();
-        for (index, entry) in palette.colors.0.iter_mut().enumerate() {
-            *entry = color(index);
-        }
-        palette.foreground = color(256);
-        palette.background = color(257);
-        palette.cursor_fg = color(258);
-        palette.cursor_bg = color(259);
-        palette.cursor_border = color(260);
-        palette.selection_fg = color(261);
-        palette.selection_bg = color(262);
         self.base_palette = palette;
         self.install_configuration();
+        self.witness.palette_revision = revision;
+        Ok(())
+    }
+
+    /// A verified mux publication's complete native RGBA8 palette. It is a
+    /// transient terminal override, independent of the configured machine
+    /// theme. Geometry/configuration updates preserve it; RIS on pane switch
+    /// clears it and restores the configured palette, including its defaults.
+    pub fn set_mux_palette(&mut self, rgba: &[u8]) -> Result<(), NativeTerminalError> {
+        self.can_mutate()?;
+        let palette = decode_native_palette(rgba)?;
+        let revision = self
+            .witness
+            .palette_revision
+            .checked_add(1)
+            .ok_or(NativeTerminalError::SequenceExhausted)?;
+        *self.terminal.palette_mut() = palette;
         self.witness.palette_revision = revision;
         Ok(())
     }
@@ -1429,6 +1451,66 @@ mod tests {
             terminal.set_base_palette(&theme[..BASE_PALETTE_BYTES - 1]),
             Err(NativeTerminalError::Invalid)
         );
+    }
+
+    #[test]
+    fn mux_palette_is_transient_and_survives_geometry_configuration_reinstallation() {
+        let mut options = config();
+        options.scrollback_rows = 256;
+        let mut terminal = NativeTerminal::new(options).unwrap();
+        let local = [10u8, 20, 30, 255].repeat(BASE_PALETTE_COLORS);
+        let newer_local = [40u8, 50, 60, 255].repeat(BASE_PALETTE_COLORS);
+        let mut remote = [70u8, 80, 90, 100].repeat(BASE_PALETTE_COLORS);
+        remote[258 * 4..259 * 4].copy_from_slice(&[255, 0, 128, 64]);
+        remote[260 * 4..261 * 4].copy_from_slice(&[0, 255, 0, 255]);
+        terminal.set_base_palette(&local).unwrap();
+        let revision = terminal.witness.palette_revision;
+        terminal.set_mux_palette(&remote).unwrap();
+        assert!(terminal.witness.palette_revision > revision);
+        let projected = terminal.terminal.palette();
+        assert_eq!(
+            projected.cursor_fg,
+            SrgbaTuple(1.0, 0.0, 128.0 / 255.0, 64.0 / 255.0)
+        );
+        assert_eq!(projected.cursor_border, SrgbaTuple(0.0, 1.0, 0.0, 1.0));
+        terminal.set_base_palette(&newer_local).unwrap();
+        assert_eq!(
+            terminal.terminal.palette(),
+            projected,
+            "local preference does not erase remote state"
+        );
+        let before = terminal.retained_scrollback_rows();
+        terminal
+            .resize(TerminalSize {
+                rows: 128,
+                cols: 200,
+                ..TerminalSize::default()
+            })
+            .unwrap();
+        assert!(terminal.retained_scrollback_rows() < before);
+        assert_eq!(terminal.terminal.palette(), projected);
+        terminal.feed(b"\x1bc").unwrap();
+        assert_eq!(
+            terminal.terminal.palette(),
+            decode_native_palette(&newer_local).unwrap()
+        );
+    }
+
+    #[test]
+    fn invalid_mux_palette_does_not_mutate_color_or_frame_authority() {
+        let mut terminal = terminal();
+        let original = terminal.terminal.palette();
+        let revision = terminal.witness.palette_revision;
+        let sequence = terminal.terminal.current_seqno();
+        for length in [0, BASE_PALETTE_BYTES - 1, BASE_PALETTE_BYTES + 1] {
+            assert_eq!(
+                terminal.set_mux_palette(&vec![0; length]),
+                Err(NativeTerminalError::Invalid)
+            );
+            assert_eq!(terminal.terminal.palette(), original);
+            assert_eq!(terminal.witness.palette_revision, revision);
+            assert_eq!(terminal.terminal.current_seqno(), sequence);
+        }
     }
 
     #[test]

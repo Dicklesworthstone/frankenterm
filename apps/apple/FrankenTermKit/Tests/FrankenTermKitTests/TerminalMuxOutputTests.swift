@@ -24,8 +24,12 @@ final class TerminalMuxOutputTests: XCTestCase {
             if let size = chunk.resized { sizes.append(size) }
             if let witness = chunk.muxDestination {
                 XCTAssertEqual(received.count, bytes.count)
+                XCTAssertFalse(chunk.muxPreparation)
                 routing.didApplyOutput(witness)
-            } else { XCTAssertFalse(routing.current.ready) }
+            } else {
+                XCTAssertTrue(chunk.muxPreparation)
+                XCTAssertFalse(routing.current.ready)
+            }
         }
         XCTAssertEqual(received, bytes)
         XCTAssertEqual(counts, [16_384, 16_384, 7_233])
@@ -45,6 +49,56 @@ final class TerminalMuxOutputTests: XCTestCase {
         XCTAssertEqual(buffer.retainedBytes, count, "the unsent slice still owns its original allocation")
         XCTAssertEqual(buffer.next()?.output, Data([7]))
         XCTAssertEqual(buffer.retainedBytes, 0)
+    }
+
+    func testResetAndPalettePrecedeCompletingOutputWithoutReadiness() throws {
+        let (routing, destination) = try selected()
+        var buffer = TerminalMuxOutputBuffer(geometry: try geometry())
+        let reset = Data([0x1B, 0x63])
+        try buffer.append(reset, geometry: geometry(90), destination: nil, preparing: true)
+        let colors = Data((0..<TerminalMuxOutputBuffer.paletteBytes).map { UInt8(truncatingIfNeeded: $0) })
+        XCTAssertThrowsError(try buffer.appendPalette(colors))
+        let prefix = try XCTUnwrap(buffer.next())
+        XCTAssertEqual(prefix.output, reset)
+        XCTAssertEqual(prefix.resized, try geometry(90))
+        XCTAssertTrue(prefix.muxPreparation); XCTAssertNil(prefix.muxDestination)
+        try buffer.appendPalette(colors)
+        XCTAssertEqual(buffer.retainedBytes, colors.count)
+        XCTAssertThrowsError(try buffer.append(Data([1]), geometry: geometry(90), destination: destination))
+        let palette = try XCTUnwrap(buffer.next())
+        XCTAssertEqual(palette.muxPalette, colors)
+        XCTAssertTrue(palette.output.isEmpty); XCTAssertNil(palette.resized)
+        XCTAssertTrue(palette.muxPreparation); XCTAssertNil(palette.muxDestination)
+        XCTAssertFalse(routing.current.ready); XCTAssertTrue(buffer.isEmpty)
+        XCTAssertEqual(buffer.retainedBytes, 0)
+        try buffer.append(Data("complete".utf8), geometry: geometry(90), destination: destination)
+        let complete = try XCTUnwrap(buffer.next())
+        XCTAssertFalse(complete.muxPreparation); XCTAssertNil(complete.muxPalette)
+        routing.didApplyOutput(try XCTUnwrap(complete.muxDestination))
+        XCTAssertTrue(routing.current.ready)
+    }
+
+    func testPaletteBoundsOwnershipAndRetirement() throws {
+        var buffer = TerminalMuxOutputBuffer(geometry: try geometry())
+        for size in [0, 1, TerminalMuxOutputBuffer.paletteBytes - 1, TerminalMuxOutputBuffer.paletteBytes + 1] {
+            XCTAssertThrowsError(try buffer.appendPalette(Data(count: size)))
+            XCTAssertTrue(buffer.isEmpty)
+        }
+        var backing = Data(repeating: 7, count: 20_000)
+        try buffer.appendPalette(backing[91..<(91 + TerminalMuxOutputBuffer.paletteBytes)])
+        backing[91] = 9
+        XCTAssertEqual(buffer.next()?.muxPalette, Data(repeating: 7, count: TerminalMuxOutputBuffer.paletteBytes))
+        try buffer.appendPalette(Data(repeating: 3, count: TerminalMuxOutputBuffer.paletteBytes))
+        buffer.retire()
+        XCTAssertNil(buffer.next()); XCTAssertEqual(buffer.retainedBytes, 0)
+        XCTAssertThrowsError(try buffer.appendPalette(Data(count: TerminalMuxOutputBuffer.paletteBytes)))
+    }
+
+    func testPreparingEventCannotCarryAnInputReadinessWitness() throws {
+        let (_, destination) = try selected()
+        var buffer = TerminalMuxOutputBuffer(geometry: try geometry())
+        XCTAssertThrowsError(try buffer.append(Data(), geometry: geometry(), destination: destination, preparing: true))
+        XCTAssertTrue(buffer.isEmpty)
     }
 
     func testBackpressureNeverOverwritesEvenAnEmptyEvent() throws {

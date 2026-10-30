@@ -70,6 +70,20 @@ pub enum Event {
         cols: usize,
         bytes: Vec<u8>,
     },
+    /// Ordered parser preparation. Consuming it alone does not establish a
+    /// visible/interactive frame; a final Output must follow.
+    PreparingOutput {
+        pane_id: usize,
+        rows: usize,
+        cols: usize,
+        bytes: Vec<u8>,
+    },
+    /// Exact supported native palette slots (263 RGBA8 colors), between any
+    /// reset and the cells of one verified coherent publication.
+    Palette {
+        pane_id: usize,
+        rgba: Vec<u8>,
+    },
     PaneTitle {
         pane_id: usize,
         title: String,
@@ -148,6 +162,13 @@ enum Request {
         pane_id: usize,
         deadline_ns: u64,
     },
+    RenderMetadata {
+        pane_id: usize,
+        identity: wire::PaneIdentity,
+        publication: u64,
+        before: Option<Box<wire::PaneRenderMetadata>>,
+        deadline_ns: u64,
+    },
     PaneAuthority {
         pane_id: usize,
         input_serial: u64,
@@ -218,6 +239,8 @@ pub const INPUT_DEADLINE_NS: u64 = 5_000_000_000;
 /// an input serial or subscribe to a pane's output.
 pub const MAX_IDENTITY_QUERIES: usize = 8;
 pub const IDENTITY_QUERY_DEADLINE_NS: u64 = 5_000_000_000;
+pub const MAX_RENDER_METADATA_QUERIES: usize = 8;
+pub const RENDER_METADATA_DEADLINE_NS: u64 = 5_000_000_000;
 pub const CONDITIONAL_RESIZE_DEADLINE_NS: u64 = 5_000_000_000;
 pub const MAX_CONDITIONAL_RESIZE_PANES: usize = 32;
 const RESTORE_OBSERVATION_INTERVAL_NS: u64 = 100_000_000;
@@ -437,6 +460,12 @@ impl Session {
             });
         }
         if self.requests.values().any(|request| {
+            matches!(request, Request::RenderMetadata { deadline_ns, .. } if now_ns >= *deadline_ns)
+        }) {
+            self.fail("the mux could not confirm a coherent screen before its deadline; input was not replayed".to_owned());
+            return false;
+        }
+        if self.requests.values().any(|request| {
             matches!(request, Request::ConditionalResize { intent } if now_ns >= intent.deadline_ns)
         }) || self
             .resize_successors
@@ -503,7 +532,8 @@ impl Session {
                     .filter_map(|retry| retry.due_ns),
             )
             .chain(self.requests.values().filter_map(|request| match request {
-                Request::InspectPaneIdentity { deadline_ns, .. } => Some(*deadline_ns),
+                Request::InspectPaneIdentity { deadline_ns, .. }
+                | Request::RenderMetadata { deadline_ns, .. } => Some(*deadline_ns),
                 Request::ConditionalResize { intent } => Some(intent.deadline_ns),
                 _ => None,
             }))
@@ -679,6 +709,9 @@ impl Session {
 
     /// Mirrors the pane onto its terminal, drawing it in full first.
     pub fn show(&mut self, pane_id: usize) {
+        self.requests.retain(|_, request| {
+            !matches!(request, Request::RenderMetadata { pane_id: old, .. } if *old == pane_id)
+        });
         if !self.is_ready() {
             return;
         }
@@ -781,6 +814,9 @@ impl Session {
 
     /// Stops drawing the pane; [`Session::show`] redraws it later.
     pub fn hide(&mut self, pane_id: usize) {
+        self.requests.retain(|_, request| {
+            !matches!(request, Request::RenderMetadata { pane_id: old, .. } if *old == pane_id)
+        });
         if let Some(mirror) = self.mirrors.get_mut(&pane_id) {
             mirror.hide();
         }
@@ -1888,7 +1924,7 @@ impl Session {
                             "a pane identity reply exceeds its protocol bound",
                         ));
                     }
-                    let response: wire::PaneIdentityResponse = wire::decode(&frame.body)?;
+                    let response = wire::decode_pane_identity(&frame.body)?;
                     if response.pane_id != pane_id {
                         return Err(crate::Error::Schema);
                     }
@@ -1902,7 +1938,7 @@ impl Session {
                 }
             };
             match outcome {
-                wire::PaneIdentityOutcome::Available { identity } => {
+                wire::PaneIdentityOutcome::Available { identity, .. } => {
                     self.retain_pane_identity(pane_id, identity)?;
                 }
                 wire::PaneIdentityOutcome::PaneGone => self.pane_gone(pane_id),
@@ -1917,6 +1953,87 @@ impl Session {
                         identity: None,
                     });
                 }
+            }
+            return Ok(());
+        }
+        if let Some(Request::RenderMetadata {
+            pane_id,
+            identity,
+            publication,
+            before,
+            ..
+        }) = request.as_ref()
+        {
+            let pane_id = *pane_id;
+            if !self
+                .mirrors
+                .get(&pane_id)
+                .is_some_and(|mirror| mirror.owns_metadata_check(*publication))
+            {
+                return Ok(());
+            }
+            if self.identities.get(&pane_id) != Some(identity) {
+                return Err(crate::Error::Frame(
+                    "a render read lost its original pane identity",
+                ));
+            }
+            let accepted = match frame.ident {
+                ident::GET_PANE_IDENTITY_RESPONSE => {
+                    let response = wire::decode_pane_identity(&frame.body)?;
+                    if response.pane_id != pane_id {
+                        return Err(crate::Error::Schema);
+                    }
+                    match response.outcome {
+                        wire::PaneIdentityOutcome::Available {
+                            identity: actual,
+                            render_facts: Some(facts),
+                        } if actual == *identity => {
+                            self.mirrors.get_mut(&pane_id).is_some_and(|mirror| {
+                                mirror.accept_metadata(*publication, facts, before.as_deref())
+                            })
+                        }
+                        wire::PaneIdentityOutcome::PaneGone => {
+                            self.pane_gone(pane_id);
+                            return Ok(());
+                        }
+                        _ => {
+                            return Err(crate::Error::Frame(
+                                "a render read changed pane identity or lost its coherent publication",
+                            ));
+                        }
+                    }
+                }
+                ident::ERROR_RESPONSE => {
+                    let error: wire::ErrorResponse = wire::decode_input_receipt(&frame.body)?;
+                    if error.schema_version != 1
+                        || error.request_ident != ident::GET_PANE_IDENTITY
+                        || !error.retry_after_backoff()
+                    {
+                        return Err(crate::Error::Frame(
+                            "the mux refused coherent render metadata",
+                        ));
+                    }
+                    false
+                }
+                _ => return Err(crate::Error::Schema),
+            };
+            if accepted {
+                self.advance(pane_id);
+            } else if let Some(mirror) = self.mirrors.get_mut(&pane_id) {
+                mirror.reject_metadata();
+                if mirror.is_visible() {
+                    self.schedule_render_retry(pane_id, false);
+                }
+            }
+            // Opening several native scenes cannot exhaust the metadata lane
+            // permanently: every completed read admits the next waiting view.
+            let visible: Vec<_> = self
+                .mirrors
+                .iter()
+                .filter_map(|(pane, mirror)| mirror.is_visible().then_some(*pane))
+                .collect();
+            for pane in visible {
+                self.advance(pane);
             }
             return Ok(());
         }
@@ -2041,13 +2158,21 @@ impl Session {
                             "a pane identity reply exceeds its protocol bound",
                         ));
                     }
-                    let response: wire::PaneIdentityResponse = wire::decode(&frame.body)?;
+                    let response = wire::decode_pane_identity(&frame.body)?;
                     if response.pane_id != pane_id {
                         return Err(crate::Error::Schema);
                     }
                     match response.outcome {
-                        wire::PaneIdentityOutcome::Available { identity } => {
+                        wire::PaneIdentityOutcome::Available {
+                            identity,
+                            render_facts,
+                        } => {
                             self.retain_pane_identity(pane_id, identity)?;
+                            if render_facts.is_some()
+                                && let Some(mirror) = self.mirrors.get_mut(&pane_id)
+                            {
+                                mirror.require_render_metadata();
+                            }
                             Some(identity.pane_registration)
                         }
                         wire::PaneIdentityOutcome::PaneGone => {
@@ -2266,12 +2391,22 @@ impl Session {
                     // Only an accepted, correlated observation settles the
                     // repeated request. Unsolicited output must not clear a
                     // busy indication while its requested read is pending.
-                    if correlated {
+                    if correlated
+                        && self
+                            .mirrors
+                            .get(&pane_id)
+                            .is_none_or(|mirror| !mirror.requires_render_metadata())
+                    {
                         self.render_read_answered(pane_id);
                     }
                     self.update_title(pane_id, &head.title);
                     let grabbed = head.mouse_grabbed;
-                    if self.grabs.insert(pane_id, grabbed) != Some(grabbed) {
+                    if !self
+                        .mirrors
+                        .get(&pane_id)
+                        .is_some_and(PaneMirror::requires_render_metadata)
+                        && self.grabs.insert(pane_id, grabbed) != Some(grabbed)
+                    {
                         self.events.push_back(Event::MouseGrab { pane_id, grabbed });
                     }
                     if let Some(mirror) = self.mirrors.get_mut(&pane_id)
@@ -2424,6 +2559,23 @@ impl Session {
                 self.pane_gone(pane_id);
                 self.refresh_panes();
             }
+            ident::SET_PALETTE => {
+                // Never apply an unsolicited palette independently of rows.
+                // Its bounded pane prefix merely invalidates the candidate;
+                // PDU71 reads establish the exact complete publication.
+                let PanePrefix { pane_id } = wire::decode(&frame.body)?;
+                self.requests.retain(|_, request| {
+                    !matches!(request, Request::RenderMetadata { pane_id: old, .. } if *old == pane_id)
+                });
+                if let Some(mirror) = self.mirrors.get_mut(&pane_id)
+                    && mirror.requires_render_metadata()
+                {
+                    mirror.reject_metadata();
+                    if mirror.is_visible() {
+                        self.schedule_render_retry(pane_id, false);
+                    }
+                }
+            }
             // A tab or split appeared or changed shape on the desktop.
             ident::TAB_RESIZED | ident::TAB_ADDED_TO_WINDOW => self.refresh_panes(),
             // The same changes from a server that answered a coherent list.
@@ -2536,6 +2688,7 @@ impl Session {
                     Some(
                         Request::PaneIdentity { .. }
                         | Request::InspectPaneIdentity { .. }
+                        | Request::RenderMetadata { .. }
                         | Request::PaneAuthority { .. }
                         | Request::ConditionalResize { .. }
                         | Request::OrderedInput { .. },
@@ -2544,7 +2697,7 @@ impl Session {
                     }
                 }
             }
-            // Unit replies, palettes, alerts and title notices need nothing.
+            // Other alerts and title notices need no additional effects.
             _ => {}
         }
         Ok(())
@@ -2650,6 +2803,10 @@ impl Session {
             self.pane_gone(pane_id);
             return;
         }
+        self.schedule_render_retry(pane_id, subscribe);
+    }
+
+    fn schedule_render_retry(&mut self, pane_id: usize, subscribe: bool) {
         let now = self.monotonic_ns.unwrap_or(0);
         let retry = self.render_retries.entry(pane_id).or_default();
         let delay = MIN_RENDER_RETRY_DELAY_NS
@@ -2720,6 +2877,7 @@ impl Session {
             !matches!(request,
                 Request::PaneIdentity { pane_id: old }
                 | Request::InspectPaneIdentity { pane_id: old, .. }
+                | Request::RenderMetadata { pane_id: old, .. }
                 | Request::PaneAuthority { pane_id: old, .. }
                 | Request::Subscribe { pane_id: old }
                 | Request::Lines { pane_id: old, .. }
@@ -2777,6 +2935,39 @@ impl Session {
         if mirror.is_fetching() {
             return;
         }
+        if let Some((publication, before)) = mirror.metadata_check() {
+            if self
+                .requests
+                .values()
+                .filter(|request| matches!(request, Request::RenderMetadata { .. }))
+                .count()
+                >= MAX_RENDER_METADATA_QUERIES
+            {
+                return;
+            }
+            let Some(identity) = self.identities.get(&pane_id).copied() else {
+                return;
+            };
+            mirror.begin_metadata_check(publication);
+            self.send(
+                ident::GET_PANE_IDENTITY,
+                &wire::GetPaneIdentity { pane_id },
+                Request::RenderMetadata {
+                    pane_id,
+                    identity,
+                    publication,
+                    before,
+                    deadline_ns: self
+                        .monotonic_ns
+                        .unwrap_or(0)
+                        .saturating_add(RENDER_METADATA_DEADLINE_NS),
+                },
+            );
+            return;
+        }
+        if mirror.needs_metadata_before_rows() {
+            return;
+        }
         let wanted = mirror.wanted();
         if !wanted.is_empty() {
             let layout = if self.codec_version >= wire::OBSERVED_LINES_MIN_VERSION {
@@ -2818,6 +3009,9 @@ impl Session {
             }
         } else {
             let outputs = mirror.render();
+            let confirmed_grab = (!outputs.is_empty())
+                .then(|| mirror.confirmed_mouse_grab())
+                .flatten();
             if mirror.is_drawable()
                 && self
                     .render_retries
@@ -2830,12 +3024,32 @@ impl Session {
                 });
             }
             for output in outputs {
-                self.events.push_back(Event::Output {
-                    pane_id,
-                    rows: output.rows,
-                    cols: output.cols,
-                    bytes: output.bytes,
+                if let Some(rgba) = output.palette {
+                    self.events.push_back(Event::Palette { pane_id, rgba });
+                }
+                self.events.push_back(if output.complete {
+                    Event::Output {
+                        pane_id,
+                        rows: output.rows,
+                        cols: output.cols,
+                        bytes: output.bytes,
+                    }
+                } else {
+                    Event::PreparingOutput {
+                        pane_id,
+                        rows: output.rows,
+                        cols: output.cols,
+                        bytes: output.bytes,
+                    }
                 });
+            }
+            // The native consumer drains the final output before reading the
+            // next event. Keep pointer-routing policy behind that same frame
+            // completion boundary, not ahead of a rejected candidate.
+            if let Some(grabbed) = confirmed_grab
+                && self.grabs.insert(pane_id, grabbed) != Some(grabbed)
+            {
+                self.events.push_back(Event::MouseGrab { pane_id, grabbed });
             }
         }
     }

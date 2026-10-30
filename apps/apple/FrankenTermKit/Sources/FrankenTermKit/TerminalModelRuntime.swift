@@ -38,12 +38,18 @@ public protocol TerminalSessionModel: AnyObject, Sendable {
     func setFontRevision(_ revision: UInt64) throws
     /// See WorkspaceDocument.Theme.terminalBasePalette for the layout.
     func setBasePalette(_ rgba: [UInt8]) throws
+    /// A mux screen's transient palette; a terminal reset restores the
+    /// configured machine theme. This must not overwrite that configuration.
+    func setMuxPalette(_ rgba: [UInt8]) throws
     /// Idempotent; finishes model ownership without replaying outstanding bytes.
     /// Failure must retain ownership for a later close attempt.
     func close() throws
 }
 
 public extension TerminalSessionModel {
+    func setMuxPalette(_ rgba: [UInt8]) throws {
+        throw TerminalModelError.unsupported
+    }
     func encodePointer(_ event: TerminalPointerEvent, maximumBytes: Int) throws -> Data {
         throw TerminalModelError.unsupported
     }
@@ -100,6 +106,7 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalPointer
     private var closeTask: Task<Void, Error>?
     private var closing = false, closed = false, endOfOutput = false
     private var visible = true
+    private var muxPreparingOutput = false
     /// Called the first time output arrives while the terminal is hidden after
     /// it was on screen, and again only after it is shown again. Output before
     /// the terminal was ever shown (a new shell's greeting) is not news, nor is
@@ -187,6 +194,7 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalPointer
     private func requireInput(_ source: TerminalSource, maximumBytes: Int) throws {
         try requireSource(source); try Task.checkCancellation()
         guard !closing, !closed, !endOfOutput else { throw TerminalModelError.closed }
+        guard !muxPreparingOutput else { throw TerminalModelError.busy }
         guard (1...65_536).contains(maximumBytes) else { throw TerminalModelError.capacity }
     }
 
@@ -232,6 +240,7 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalPointer
         try requireSource(source)
         try await acquireOperation(.keyboard); defer { finishOperation() }
         guard !endOfOutput else { throw TerminalModelError.closed }
+        guard !muxPreparingOutput else { throw TerminalModelError.busy }
         // The callback may encode and admit to the coordinator, but must not
         // call receive, another transaction, or await this runtime's close.
         // Successful admission must return even if cancellation races it.
@@ -241,19 +250,24 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalPointer
     public func receive(_ update: TerminalSessionUpdate, source: TerminalSource) async throws {
         try requireSource(source)
         guard update.output.count <= 16_384 else { throw TerminalModelError.capacity }
+        guard update.muxPalette.map({ $0.count == TerminalMuxOutputBuffer.paletteBytes }) ?? true,
+              !update.muxPreparation || update.muxDestination == nil else { throw TerminalModelError.invalid }
         try await acquireOperation(.consumer); defer { finishOperation() }
         guard !endOfOutput else { throw TerminalModelError.closed }
+        if update.muxPreparation { muxPreparingOutput = true }
         // SSH service reports its completed window change with the output read
         // after it. Apply that geometry before advancing the same ordered bytes.
         if let geometry = update.resized { try model.resize(geometry) }
+        if let palette = update.muxPalette { try model.setMuxPalette(Array(palette)) }
         if !update.output.isEmpty {
             try model.feed(update.output)
-            if inputUnanswered { inputUnanswered = false; awaitingAnswer?(false) }
-            if !visible, shownOnce, !hiddenOutputReported,
+            if !update.muxPreparation, inputUnanswered { inputUnanswered = false; awaitingAnswer?(false) }
+            if !update.muxPreparation, !visible, shownOnce, !hiddenOutputReported,
                hiddenAt.map({ ContinuousClock.now - $0 >= hiddenOutputSettle }) ?? true {
                 hiddenOutputReported = true; hiddenOutput?()
             }
         }
+        if update.muxDestination != nil { muxPreparingOutput = false }
         if update.endOfOutput { endOfOutput = true }
         try await transferReplies()
         try Task.checkCancellation()
@@ -311,6 +325,9 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalPointer
     }
 
     private func publishFrame() async throws {
+        // A mux screen can require several bounded parser calls. Palette,
+        // geometry, reset and row prefixes are not independently displayable.
+        guard !muxPreparingOutput else { return }
         let presentation: TerminalModelPresentation
         do {
             let bytes = try captureSelectedViewport()
@@ -483,6 +500,7 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalPointer
     }
 
     private func decodedHistoryFrame(top: Int64?) throws -> TerminalRenderFrame {
+        guard !muxPreparingOutput else { throw TerminalHistorySearchError.unavailable }
         do {
             let bytes = try model.captureFrame(viewportTop: top)
             guard !bytes.isEmpty else { throw TerminalHistorySearchError.invalidPage }

@@ -13,11 +13,14 @@ import Foundation
 public struct TerminalMuxOutputBuffer: Sendable {
     public static let maximumEventBytes = 4 * 1024 * 1024
     public static let maximumChunkBytes = 16_384
+    public static let paletteBytes = 263 * 4
 
     private struct Event: Sendable {
         let bytes: Data
         let geometry: TerminalSessionGeometry
         let destination: TerminalMuxInputRouting.Destination?
+        let palette: Data?
+        let preparing: Bool
         var offset = 0
     }
     private var event: Event?
@@ -30,21 +33,32 @@ public struct TerminalMuxOutputBuffer: Sendable {
         emittedGeometry = geometry; queuedGeometry = geometry
     }
     public var isEmpty: Bool { event == nil && pixelGeometry == nil }
-    public var retainedBytes: Int { event?.bytes.count ?? 0 }
-    public var remainingBytes: Int { event.map { $0.bytes.count - $0.offset } ?? 0 }
+    public var retainedBytes: Int { event.map { $0.bytes.count + ($0.palette?.count ?? 0) } ?? 0 }
+    public var remainingBytes: Int { event.map { $0.bytes.count - $0.offset + ($0.palette?.count ?? 0) } ?? 0 }
 
     /// A false capacity assumption is an owner error, never permission to drop
     /// the preceding event. Oversized payloads fail before making an owned copy.
     public mutating func append(_ bytes: Data, geometry: TerminalSessionGeometry,
-                                destination: TerminalMuxInputRouting.Destination?) throws {
+                                destination: TerminalMuxInputRouting.Destination?, preparing: Bool = false) throws {
         guard !isRetired else { throw TerminalInputError.unavailable }
         guard isEmpty else { throw TerminalInputError.capacity }
         guard bytes.count <= Self.maximumEventBytes else { throw TerminalInputError.capacity }
+        guard !preparing || destination == nil else { throw TerminalInputError.invalidIdentity }
         // Copy only the selected extent: a small slice must not retain an
         // arbitrarily larger backing buffer. Nonzero Data indices are valid.
         let owned = bytes.withUnsafeBytes { Data($0) }
-        event = Event(bytes: owned, geometry: geometry, destination: destination)
+        event = Event(bytes: owned, geometry: geometry, destination: destination, palette: nil, preparing: preparing)
         queuedGeometry = geometry
+    }
+
+    /// Colors share the same single-event slot as output. They cannot overtake
+    /// a reset or the retained suffix of a preceding frame, or enable input.
+    public mutating func appendPalette(_ rgba: Data) throws {
+        guard !isRetired else { throw TerminalInputError.unavailable }
+        guard isEmpty else { throw TerminalInputError.capacity }
+        guard rgba.count == Self.paletteBytes else { throw TerminalInputError.invalidLimits }
+        let owned = rgba.withUnsafeBytes { Data($0) }
+        event = Event(bytes: Data(), geometry: queuedGeometry, destination: nil, palette: owned, preparing: true)
     }
 
     /// Same-cell pixel changes need no remote redraw. Keep one latest value
@@ -74,7 +88,8 @@ public struct TerminalMuxOutputBuffer: Sendable {
             let complete = end == current.bytes.count
             event = complete ? nil : current
             return TerminalSessionUpdate(output: bytes, resized: resize,
-                muxDestination: complete ? current.destination : nil)
+                muxDestination: complete ? current.destination : nil,
+                muxPalette: current.palette, muxPreparation: current.preparing || !complete)
         }
         if let geometry = pixelGeometry {
             pixelGeometry = nil

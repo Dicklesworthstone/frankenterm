@@ -116,6 +116,17 @@ public final class NativeTerminalModel: TerminalSessionModel, @unchecked Sendabl
         }
     }
 
+    /// A coherent mux snapshot owns these colors only until its next reset.
+    /// Keep the machine theme intact for a later pane or direct shell.
+    public func setMuxPalette(_ rgba: [UInt8]) throws {
+        guard rgba.count == Int(FT_TERMINAL_BASE_PALETTE_BYTES) else { throw TerminalModelError.invalid }
+        try withHandle { session in
+            try Self.check(rgba.withUnsafeBufferPointer {
+                ft_terminal_v1_set_mux_palette(session, $0.baseAddress, UInt32(rgba.count))
+            })
+        }
+    }
+
     private static func encodeKey(_ key: TerminalHardwareKey, phase: TerminalKeyPhase,
                                   session: UInt64, capacity: Int) throws -> Data {
         let nativePhase: UInt32

@@ -147,6 +147,13 @@ public final class NativeMuxClient: TerminalMuxClient, @unchecked Sendable {
                 return .panes(try decoder.decode([TerminalMuxPane].self, from: payload))
             case UInt32(FT_MUX_EVENT_OUTPUT):
                 return .output(paneID: paneID, rows: Int(rows), columns: Int(cols), bytes: payload)
+            case UInt32(FT_MUX_EVENT_PREPARING_OUTPUT):
+                return .preparingOutput(paneID: paneID, rows: Int(rows), columns: Int(cols), bytes: payload)
+            case UInt32(FT_MUX_EVENT_PALETTE):
+                guard rows == 0, cols == 0, payload.count == TerminalMuxOutputBuffer.paletteBytes else {
+                    throw TerminalModelError.invalid
+                }
+                return .palette(paneID: paneID, rgba: payload)
             case UInt32(FT_MUX_EVENT_PANE_TITLE):
                 return .paneTitle(paneID: paneID, title: String(decoding: payload, as: UTF8.self))
             case UInt32(FT_MUX_EVENT_PANE_GONE): return .paneGone(paneID: paneID)

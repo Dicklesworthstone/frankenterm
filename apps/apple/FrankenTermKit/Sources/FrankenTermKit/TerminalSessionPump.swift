@@ -85,11 +85,19 @@ public struct TerminalSessionUpdate: Sendable {
     /// pump acknowledges it after the canonical consumer succeeds, never merely
     /// because the pane list or transport's selected pane changed.
     public let muxDestination: TerminalMuxInputRouting.Destination?
+    /// Ordered server colors for a mux mirror, never a replacement for the
+    /// machine's configured theme. Exactly 263 RGBA8 entries when present.
+    public let muxPalette: Data?
+    /// The model is between the start and completion of one mux screen. Its
+    /// bytes must be consumed, but cannot publish a frame or enable input.
+    public let muxPreparation: Bool
     public init(output: Data, endOfOutput: Bool = false, resized: TerminalSessionGeometry? = nil,
                 completion: TerminalSessionCompletion? = nil,
-                muxDestination: TerminalMuxInputRouting.Destination? = nil) {
+                muxDestination: TerminalMuxInputRouting.Destination? = nil,
+                muxPalette: Data? = nil, muxPreparation: Bool = false) {
         self.output = output; self.endOfOutput = endOfOutput; self.resized = resized; self.completion = completion
         self.muxDestination = muxDestination
+        self.muxPalette = muxPalette; self.muxPreparation = muxPreparation
     }
 }
 
@@ -297,9 +305,12 @@ public actor TerminalSessionPump {
             catch is TerminalTransportError { return Task.isCancelled ? .cancelled : .disconnected }
             catch { return signal.isFinished || Task.isCancelled ? .cancelled : .transportFailed }
             // A corrupt adapter cannot push an oversized receive into the parser.
-            guard update.output.count <= 16_384, update.completion == nil || update.endOfOutput else { return .transportFailed }
+            guard update.output.count <= 16_384, update.completion == nil || update.endOfOutput,
+                  update.muxPalette.map({ $0.count == TerminalMuxOutputBuffer.paletteBytes }) ?? true,
+                  !update.muxPreparation || update.muxDestination == nil else { return .transportFailed }
             if signal.isFinished || Task.isCancelled { return .cancelled }
-            if !update.output.isEmpty || update.resized != nil || update.endOfOutput || update.muxDestination != nil {
+            if !update.output.isEmpty || update.resized != nil || update.endOfOutput || update.muxDestination != nil
+                || update.muxPalette != nil || update.muxPreparation {
                 do {
                     try await consumer.receive(update, source: source)
                     if !signal.isFinished, !Task.isCancelled, let geometry = update.resized {
