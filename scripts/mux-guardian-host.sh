@@ -14,6 +14,7 @@
 #   mux-guardian-host.sh rollback
 #   mux-guardian-host.sh status
 #   mux-guardian-host.sh run-broker | run-guardian | run-mux     (service entry points)
+#   mux-guardian-host.sh load-units          (launchd login loader: start what is not running)
 #   mux-guardian-host.sh stop-all --i-accept-pane-loss            (tears everything down)
 #
 # DIR holds frankenterm-mux-server, frankenterm-pty-guardian and ft from ONE build.
@@ -328,9 +329,35 @@ unit() {  # logical name -> manager-specific identifier
   esac
 }
 
+# launchd tears gui/<uid> down with the GUI login session (a WindowServer
+# crash, a logout) and kills every job in it, so the units live in
+# user/<uid>, which outlives that session and still reaches the pasteboard,
+# keychain and AppleScript (it lacks only launchd's ssh-agent socket). Their
+# plists load there at each boot's first login (LimitLoadToSessionType
+# Background), and the login loader (load-units) starts any unit that is not
+# loaded when a GUI session begins.
+launchd_domain() { echo "user/$(id -u)"; }
+
+launchd_target() {  # <label> -> domain/label: where it is loaded, user/ if nowhere
+  # A unit an older install bootstrapped into gui/ stays there while it runs:
+  # moving a running broker or guardian would end its panes.
+  local domain
+  for domain in "user/$(id -u)" "gui/$(id -u)"; do
+    if launchctl print "$domain/$1" >/dev/null 2>&1; then
+      echo "$domain/$1"
+      return
+    fi
+  done
+  echo "$(launchd_domain)/$1"
+}
+
 service_env() {  # NAME=value per line: what a service needs to resolve these paths
   printf '%s\n' "FTG_INSTANCE=$INSTANCE" "FTG_BASE=$BASE" "FTG_STATE=$STATE" "FTG_RUN=$RUN" \
     "FTG_CONFIG_DIR=$CONFIG_DIR" "FTG_MUX_TOML=$MUX_TOML" "FTG_RECOVERY_INTERVAL=$RECOVERY_INTERVAL"
+  # The mux's durable scrollback store follows XDG_DATA_HOME. launchd and
+  # systemd do not pass the installer's, so without this an isolated
+  # instance's mux would write into the default instance's store.
+  if [ -n "${XDG_DATA_HOME:-}" ]; then printf '%s\n' "XDG_DATA_HOME=$XDG_DATA_HOME"; fi
 }
 
 write_services() {
@@ -416,6 +443,7 @@ EOF
   <key>Label</key><string>$label</string>
   <key>ProgramArguments</key><array><string>$host_script</string><string>$sub</string></array>
   <key>EnvironmentVariables</key><dict>$env</dict>
+  <key>LimitLoadToSessionType</key><string>Background</string>
   <key>RunAtLoad</key><true/>
   $keep
   <key>ProcessType</key><string>Interactive</string>
@@ -426,6 +454,25 @@ EOF
 EOF
         mv "$d/$label.plist.partial" "$d/$label.plist"
       done
+      # Background plists load only when user/<uid> is created, at boot. When
+      # a GUI teardown took units an older install left in gui/, nothing else
+      # would start them at the next login. This agent runs in the GUI
+      # session, starts whatever is not loaded in user/<uid>, and exits.
+      label=$(unit login-loader)
+      cat > "$d/$label.plist.partial" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$label</string>
+  <key>ProgramArguments</key><array><string>$host_script</string><string>load-units</string></array>
+  <key>EnvironmentVariables</key><dict>$env</dict>
+  <key>LimitLoadToSessionType</key><string>Aqua</string>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>$STATE/logs/login-loader.log</string>
+  <key>StandardErrorPath</key><string>$STATE/logs/login-loader.log</string>
+</dict></plist>
+EOF
+      mv "$d/$label.plist.partial" "$d/$label.plist"
       ;;
     direct) mkdir -p "$STATE/logs" ;;
   esac
@@ -434,7 +481,7 @@ EOF
 svc_active() {  # <logical name>
   case "$MANAGER" in
     systemd) systemctl --user is-active --quiet "$(unit "$1")" ;;
-    launchd) launchctl print "gui/$(id -u)/$(unit "$1")" 2>/dev/null | grep -q 'state = running' ;;
+    launchd) launchctl print "$(launchd_target "$(unit "$1")")" 2>/dev/null | grep -q 'state = running' ;;
     direct) [ -n "$(direct_pid "$1")" ] ;;
   esac
 }
@@ -442,7 +489,7 @@ svc_active() {  # <logical name>
 svc_pid() {  # <logical name> -> main pid or empty
   case "$MANAGER" in
     systemd) systemctl --user show -p MainPID --value "$(unit "$1")" 2>/dev/null | grep -v '^0$' || true ;;
-    launchd) launchctl print "gui/$(id -u)/$(unit "$1")" 2>/dev/null | awk '/^\tpid = /{print $3}' || true ;;
+    launchd) launchctl print "$(launchd_target "$(unit "$1")")" 2>/dev/null | awk '/^\tpid = /{print $3}' || true ;;
     direct) direct_pid "$1" ;;
   esac
 }
@@ -451,9 +498,16 @@ svc_start() {  # <logical name>
   case "$MANAGER" in
     systemd) systemctl --user start "$(unit "$1")" ;;
     launchd)
-      local plist
+      local plist target
       plist=$HOME/Library/LaunchAgents/$(unit "$1").plist
-      launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null || launchctl kickstart "gui/$(id -u)/$(unit "$1")"
+      target=$(launchd_target "$(unit "$1")")
+      # Only called when the unit is not running, so a unit an older install
+      # left loaded in gui/ moves to user/ without ending anything.
+      case $target in
+        gui/*) launchctl bootout "$target" 2>/dev/null || true ;;
+      esac
+      launchctl bootstrap "$(launchd_domain)" "$plist" 2>/dev/null \
+        || launchctl kickstart "$(launchd_domain)/$(unit "$1")"
       ;;
     direct)
       local sub pair envs=()
@@ -487,7 +541,7 @@ direct_pid() {  # <logical name> -> the pid file's pid, if it still runs that se
 svc_stop() {  # <logical name>
   case "$MANAGER" in
     systemd) systemctl --user stop "$(unit "$1")" ;;
-    launchd) launchctl bootout "gui/$(id -u)/$(unit "$1")" 2>/dev/null || true ;;
+    launchd) launchctl bootout "$(launchd_target "$(unit "$1")")" 2>/dev/null || true ;;
     direct)
       # Like systemd's stop: a grace period, then SIGKILL. A replacement must
       # never start beside a predecessor that still holds the guardian's
@@ -513,7 +567,7 @@ svc_restart_mux() {  # returns non-zero, never exits, when the manager refuses
       systemctl --user reset-failed "$(unit mux-server)" 2>/dev/null || true
       systemctl --user restart "$(unit mux-server)"
       ;;
-    launchd) launchctl kickstart -k "gui/$(id -u)/$(unit mux-server)" ;;
+    launchd) launchctl kickstart -k "$(launchd_target "$(unit mux-server)")" ;;
     direct) svc_stop mux-server && svc_start mux-server ;;
   esac
 }
@@ -661,7 +715,7 @@ cmd_install() {
           legacy_active=1
         fi ;;
       launchd)
-        if launchctl print "gui/$(id -u)/com.frankenterm.mux-server" >/dev/null 2>&1 && \
+        if launchctl print "$(launchd_target com.frankenterm.mux-server)" >/dev/null 2>&1 && \
            ! grep -q run-mux "$HOME/Library/LaunchAgents/com.frankenterm.mux-server.plist" 2>/dev/null; then
           legacy_active=1
         fi ;;
@@ -678,7 +732,7 @@ cmd_install() {
     else
       log "session dump of the legacy mux failed; continuing (panes end either way)"
     fi
-    [ "$MANAGER" = launchd ] && launchctl bootout "gui/$(id -u)/com.frankenterm.mux-server" 2>/dev/null || true
+    [ "$MANAGER" = launchd ] && launchctl bootout "$(launchd_target com.frankenterm.mux-server)" 2>/dev/null || true
     [ "$MANAGER" = systemd ] && systemctl --user stop frankenterm-mux-server.service || true
     if [ "$MANAGER" = systemd ]; then
       local old=$HOME/.config/systemd/user/frankenterm-mux-server.service
@@ -827,14 +881,31 @@ cmd_stop_all() {
   log "stopped mux, guardian and broker"
 }
 
+cmd_load_units() {  # launchd's login loader: start whatever is not running
+  load_manager
+  [ "$MANAGER" = launchd ] || return 0
+  local n
+  for n in pty-broker pty-guardian mux-server; do
+    svc_active "$n" || svc_start "$n"
+  done
+  # A unit still in gui/ (installed by an older version and running since)
+  # dies with this GUI session; stop-all and install move it.
+  for n in pty-broker pty-guardian mux-server; do
+    case $(launchd_target "$(unit "$n")") in
+      gui/*) log "$n still runs in the GUI session; it ends at GUI teardown until stop-all + install" ;;
+    esac
+  done
+}
+
 case "${1:-}" in
   install) shift; cmd_install "$@" ;;
   upgrade) shift; cmd_upgrade "$@" ;;
   rollback) shift; cmd_rollback ;;
   status) shift; cmd_status ;;
   stop-all) shift; cmd_stop_all "$@" ;;
+  load-units) cmd_load_units ;;
   run-broker) run_broker ;;
   run-guardian) run_guardian ;;
   run-mux) run_mux ;;
-  *) sed -n '2,32p' "$0"; exit 2 ;;
+  *) sed -n '2,33p' "$0"; exit 2 ;;
 esac
