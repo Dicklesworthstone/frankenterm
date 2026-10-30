@@ -14,7 +14,16 @@ use crate::machines::{
 };
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use base64::Engine;
+use finl_unicode::categories::CharacterCategories;
 use hmac::{Hmac, KeyInit, Mac};
+use openssl::bn::{BigNum, BigNumContext};
+use openssl::ec::{EcGroup, EcKey, EcPoint};
+use openssl::ecdsa::EcdsaSig;
+use openssl::hash::MessageDigest;
+use openssl::nid::Nid;
+use openssl::pkey::{Id, PKey, Public};
+use openssl::rsa::{Padding, Rsa};
+use openssl::sign::Verifier;
 use serde_json::{json, Map, Value};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
@@ -29,6 +38,9 @@ const MAX_SOURCE_FILES: usize = 64;
 const MAX_SOURCE_LINES: usize = 16_384;
 const MAX_PUBLIC_KEY_FILES: usize = 256;
 const MAX_ROUTE_IDENTITIES: usize = 8;
+const MAX_CERTIFICATE_BLOB_BYTES: usize = 32 * 1024;
+const MAX_EXPORTED_CERTIFICATE_BYTES: usize = 1024 * 1024;
+const USER_CERTIFICATE_CAPABILITY: &str = "ssh_user_certificate_v1";
 const MAX_JUMP_HOPS: usize = 3;
 const MAX_EXPORTED_ROUTES: usize = 256;
 /// The phone's SSH driver runs remote commands up to this size.
@@ -92,6 +104,10 @@ pub struct SshSources {
     /// the snapshot's read budgets. These are not observed missing identities:
     /// an affected route must not silently export its other candidates instead.
     pub unavailable_public_keys: BTreeSet<PathBuf>,
+    /// Explicit CertificateFile sources only. Missing or unavailable files
+    /// remain witnessed failures; no implicit certificate or private sibling
+    /// is discovered by filename.
+    pub public_certificates: BTreeMap<PathBuf, KnownHostsSource>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -453,6 +469,7 @@ impl SshSources {
         let default_known_hosts = default_known_hosts(&context.home);
         let mut known_files: BTreeSet<PathBuf> = default_known_hosts.iter().cloned().collect();
         let mut identities = BTreeSet::new();
+        let mut certificate_files = BTreeSet::new();
         for machine in &inventory.machines {
             for route in &machine.routes {
                 match route {
@@ -485,6 +502,8 @@ impl SshSources {
                                 {
                                     identities
                                         .extend(split_paths(options.get("identityfile"), context));
+                                    certificate_files
+                                        .extend(resolver.certificate_files(&options).0);
                                 }
                                 known_files.extend(resolver.trust_files(&options).0);
                             }
@@ -554,6 +573,22 @@ impl SshSources {
                 }
             }
         }
+        let mut remaining_certificate_bytes = MAX_SOURCE_BYTES;
+        let public_certificates = certificate_files
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let source = if index < MAX_PUBLIC_KEY_FILES {
+                    read_source(&path, remaining_certificate_bytes.min(64 * 1024))
+                } else {
+                    KnownHostsSource::Unavailable
+                };
+                if let KnownHostsSource::Present(text) = &source {
+                    remaining_certificate_bytes -= text.len();
+                }
+                (path, source)
+            })
+            .collect();
         Self {
             config,
             system_config,
@@ -561,6 +596,7 @@ impl SshSources {
             default_known_hosts,
             public_keys,
             unavailable_public_keys,
+            public_certificates,
         }
     }
 }
@@ -570,6 +606,7 @@ struct AliasResolver {
     trust_lists: BTreeMap<String, Option<Vec<PathBuf>>>,
     proxies: BTreeMap<String, ProxySetting>,
     authentication_values: BTreeMap<String, Option<String>>,
+    certificate_paths: Vec<(String, Option<PathBuf>)>,
     aliases: BTreeSet<String>,
     incomplete: bool,
 }
@@ -586,6 +623,24 @@ struct AuthenticationPolicy {
 }
 
 impl AliasResolver {
+    /// Every matching CertificateFile contributes in source order. Opaque,
+    /// unique resolver slots preserve additive semantics and quoted paths
+    /// without allowing the scalar resolver to discard later declarations.
+    fn certificate_files(&self, options: &frankenterm_ssh::ConfigMap) -> (Vec<PathBuf>, bool) {
+        let mut paths = Vec::new();
+        let mut incomplete = false;
+        for (slot, path) in &self.certificate_paths {
+            if options.contains_key(slot) {
+                match path {
+                    Some(path) if !paths.contains(path) => paths.push(path.clone()),
+                    Some(_) => {}
+                    None => incomplete = true,
+                }
+            }
+        }
+        (paths, incomplete)
+    }
+
     fn authentication_value<'a>(
         &'a self,
         options: &frankenterm_ssh::ConfigMap,
@@ -919,10 +974,21 @@ fn alias_resolver(config: Option<&str>, home: &Path) -> Option<AliasResolver> {
     let mut trust_lists = BTreeMap::new();
     let mut proxies = BTreeMap::new();
     let mut authentication_values = BTreeMap::new();
+    let mut certificate_paths = Vec::new();
     let mut passive = String::new();
     let mut incomplete = false;
     for line in text.lines() {
         if let Some((keyword, value)) = directive(line) {
+            if keyword
+                .to_ascii_lowercase()
+                .starts_with("frankenterm_certificate_")
+                || keyword.eq_ignore_ascii_case("frankenterm_required_certificate")
+            {
+                // Source text cannot select a synthetic parser slot belonging
+                // to an unrelated Host block.
+                incomplete = true;
+                continue;
+            }
             match keyword.to_ascii_lowercase().as_str() {
                 "include" => {
                     // The general resolver's Include reader is unbounded and
@@ -940,6 +1006,22 @@ fn alias_resolver(config: Option<&str>, home: &Path) -> Option<AliasResolver> {
                     // This private parser slot cannot be selected by source
                     // text to bypass a real ProxyCommand/ProxyJump directive.
                     incomplete = true;
+                    continue;
+                }
+                "certificatefile" => {
+                    let words = configuration_words(value);
+                    if words.as_ref().is_some_and(|words| {
+                        words.len() == 1 && words[0].eq_ignore_ascii_case("none")
+                    }) {
+                        continue;
+                    }
+                    let path = words
+                        .filter(|words| words.len() == 1)
+                        .and_then(|_| known_host_paths(value, home))
+                        .and_then(|mut paths| paths.pop());
+                    let slot = format!("frankenterm_certificate_{}", certificate_paths.len());
+                    passive.push_str(&format!("{} yes\n", slot));
+                    certificate_paths.push((slot, path));
                     continue;
                 }
                 "userknownhostsfile" | "globalknownhostsfile" => {
@@ -1027,14 +1109,6 @@ fn alias_resolver(config: Option<&str>, home: &Path) -> Option<AliasResolver> {
                         // match. OpenSSH requires ANY matching negation to win.
                         words.sort_by_key(|word| !word.starts_with('!'));
                     }
-                    if keyword.eq_ignore_ascii_case("certificatefile")
-                        && words.iter().any(|word| !word.eq_ignore_ascii_case("none"))
-                    {
-                        // CertificateFile is additive, unlike the resolver's
-                        // scalar map. A preceding `none` must not hide a later
-                        // certificate candidate or imply ordinary key parity.
-                        passive.push_str("frankenterm_required_certificate yes\n");
-                    }
                     passive.push_str(&format!("{} {}\n", keyword, words.join(" ")));
                 }
                 _ => {
@@ -1076,6 +1150,7 @@ fn alias_resolver(config: Option<&str>, home: &Path) -> Option<AliasResolver> {
         trust_lists,
         proxies,
         authentication_values,
+        certificate_paths,
         aliases,
         incomplete,
     })
@@ -1149,6 +1224,363 @@ impl PublicKey {
 
     /// OpenSSH's `SHA256:` fingerprint, the form the phone pins.
     pub fn fingerprint(&self) -> String {
+        format!(
+            "SHA256:{}",
+            STANDARD_NO_PAD.encode(Sha256::digest(&self.blob))
+        )
+    }
+}
+
+/// One completely verified OpenSSH v01 user certificate. Verification proves
+/// the signed contents, not that a server trusts this CA. The phone preserves
+/// the exact certificate and checks time, principals, critical options and
+/// PTY/forwarding permissions again before each new authentication.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UserCertificate {
+    blob: Vec<u8>,
+    subject: PublicKey,
+}
+
+struct SshBlob<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> SshBlob<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn take(&mut self, count: usize) -> Option<&'a [u8]> {
+        let end = self.offset.checked_add(count)?;
+        let value = self.bytes.get(self.offset..end)?;
+        self.offset = end;
+        Some(value)
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_be_bytes(self.take(4)?.try_into().ok()?))
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_be_bytes(self.take(8)?.try_into().ok()?))
+    }
+
+    fn string(&mut self, limit: usize) -> Option<&'a [u8]> {
+        let count = self.u32()? as usize;
+        if count > limit {
+            return None;
+        }
+        self.take(count)
+    }
+
+    fn name(&mut self, limit: usize) -> Option<&'a str> {
+        let value = self.string(limit)?;
+        if value.is_empty() || !value.iter().all(|byte| (33..=126).contains(byte)) {
+            return None;
+        }
+        std::str::from_utf8(value).ok()
+    }
+
+    fn positive_mpint(&mut self, limit: usize) -> Option<&'a [u8]> {
+        let encoded = self.string(limit + 1)?;
+        let first = *encoded.first()?;
+        if first & 0x80 != 0 {
+            return None;
+        }
+        let magnitude = if first == 0 {
+            if encoded.get(1)? & 0x80 == 0 {
+                return None;
+            }
+            &encoded[1..]
+        } else {
+            encoded
+        };
+        (magnitude.len() <= limit).then_some(magnitude)
+    }
+
+    fn finished(&self) -> bool {
+        self.offset == self.bytes.len()
+    }
+}
+
+struct CertificateCurve {
+    name: &'static str,
+    nid: Nid,
+    point_bytes: usize,
+    scalar_bytes: usize,
+    digest: MessageDigest,
+}
+
+impl CertificateCurve {
+    fn for_algorithm(algorithm: &str) -> Option<Self> {
+        let (name, nid, point_bytes, scalar_bytes, digest) = match algorithm {
+            "ecdsa-sha2-nistp256" => (
+                "nistp256",
+                Nid::X9_62_PRIME256V1,
+                65,
+                32,
+                MessageDigest::sha256(),
+            ),
+            "ecdsa-sha2-nistp384" => ("nistp384", Nid::SECP384R1, 97, 48, MessageDigest::sha384()),
+            "ecdsa-sha2-nistp521" => ("nistp521", Nid::SECP521R1, 133, 66, MessageDigest::sha512()),
+            _ => return None,
+        };
+        Some(Self {
+            name,
+            nid,
+            point_bytes,
+            scalar_bytes,
+            digest,
+        })
+    }
+}
+
+/// The same canonical raw-key profile as SSHPublicIdentity on the phone:
+/// Ed25519, NIST P-256/384/521, or odd 2048..8192-bit RSA with an odd exponent
+/// of at most 64 bits. OpenSSL validates EC points and performs all crypto.
+fn certificate_public_key(blob: &[u8]) -> Option<(PublicKey, PKey<Public>)> {
+    if blob.is_empty() || blob.len() > 1053 {
+        return None;
+    }
+    let mut reader = SshBlob::new(blob);
+    let algorithm = reader.name(64)?;
+    let key = if algorithm == "ssh-ed25519" {
+        let bytes = reader.string(32)?;
+        if bytes.len() != 32 {
+            return None;
+        }
+        PKey::public_key_from_raw_bytes(bytes, Id::ED25519).ok()?
+    } else if algorithm == "ssh-rsa" {
+        let exponent = reader.positive_mpint(8)?;
+        let modulus = reader.positive_mpint(1024)?;
+        let bits = (modulus.len() - 1) * 8 + (8 - modulus[0].leading_zeros() as usize);
+        if !(2048..=8192).contains(&bits)
+            || modulus.last()? & 1 == 0
+            || exponent.last()? & 1 == 0
+            || (exponent.len() == 1 && exponent[0] < 3)
+        {
+            return None;
+        }
+        let key = Rsa::from_public_components(
+            BigNum::from_slice(modulus).ok()?,
+            BigNum::from_slice(exponent).ok()?,
+        )
+        .ok()?;
+        PKey::from_rsa(key).ok()?
+    } else {
+        let curve = CertificateCurve::for_algorithm(algorithm)?;
+        if reader.string(16)? != curve.name.as_bytes() {
+            return None;
+        }
+        let point = reader.string(curve.point_bytes)?;
+        if point.len() != curve.point_bytes || point.first() != Some(&4) {
+            return None;
+        }
+        let group = EcGroup::from_curve_name(curve.nid).ok()?;
+        let mut context = BigNumContext::new().ok()?;
+        let point = EcPoint::from_bytes(&group, point, &mut context).ok()?;
+        let key = EcKey::from_public_key(&group, &point).ok()?;
+        key.check_key().ok()?;
+        PKey::from_ec_key(key).ok()?
+    };
+    reader.finished().then(|| {
+        (
+            PublicKey {
+                algorithm: algorithm.into(),
+                blob: blob.into(),
+            },
+            key,
+        )
+    })
+}
+
+fn certificate_options(bytes: &[u8], extensions: bool) -> Option<()> {
+    let mut reader = SshBlob::new(bytes);
+    let mut previous: Option<&str> = None;
+    let mut count = 0;
+    while !reader.finished() {
+        count += 1;
+        if count > 128 {
+            return None;
+        }
+        let name = reader.name(128)?;
+        if previous.is_some_and(|previous| previous.as_bytes() >= name.as_bytes()) {
+            return None;
+        }
+        let value = reader.string(MAX_CERTIFICATE_BLOB_BYTES)?;
+        if extensions
+            && matches!(
+                name,
+                "permit-X11-forwarding"
+                    | "permit-agent-forwarding"
+                    | "permit-port-forwarding"
+                    | "permit-pty"
+                    | "permit-user-rc"
+                    | "no-touch-required"
+            )
+            && !value.is_empty()
+        {
+            return None;
+        }
+        previous = Some(name);
+    }
+    Some(())
+}
+
+fn verify_certificate_signature(
+    signature: &[u8],
+    message: &[u8],
+    authority: &PublicKey,
+    key: &PKey<Public>,
+) -> Option<()> {
+    let mut reader = SshBlob::new(signature);
+    let algorithm = reader.name(64)?;
+    let payload = reader.string(1024)?;
+    if !reader.finished() {
+        return None;
+    }
+    let valid = if authority.algorithm == "ssh-ed25519" {
+        if algorithm != authority.algorithm || payload.len() != 64 {
+            return None;
+        }
+        Verifier::new_without_digest(key)
+            .ok()?
+            .verify_oneshot(payload, message)
+            .ok()?
+    } else if authority.algorithm == "ssh-rsa" {
+        let digest = match algorithm {
+            "rsa-sha2-256" => MessageDigest::sha256(),
+            "rsa-sha2-512" => MessageDigest::sha512(),
+            _ => return None,
+        };
+        let size = key.rsa().ok()?.size() as usize;
+        if payload.is_empty() || payload.len() > size {
+            return None;
+        }
+        let mut padded = vec![0; size - payload.len()];
+        padded.extend_from_slice(payload);
+        let mut verifier = Verifier::new(digest, key).ok()?;
+        verifier.set_rsa_padding(Padding::PKCS1).ok()?;
+        verifier.update(message).ok()?;
+        verifier.verify(&padded).ok()?
+    } else {
+        if algorithm != authority.algorithm {
+            return None;
+        }
+        let curve = CertificateCurve::for_algorithm(algorithm)?;
+        let mut components = SshBlob::new(payload);
+        let r = BigNum::from_slice(components.positive_mpint(curve.scalar_bytes)?).ok()?;
+        let s = BigNum::from_slice(components.positive_mpint(curve.scalar_bytes)?).ok()?;
+        if !components.finished() {
+            return None;
+        }
+        let signature = EcdsaSig::from_private_components(r, s)
+            .ok()?
+            .to_der()
+            .ok()?;
+        let mut verifier = Verifier::new(curve.digest, key).ok()?;
+        verifier.update(message).ok()?;
+        verifier.verify(&signature).ok()?
+    };
+    valid.then_some(())
+}
+
+impl UserCertificate {
+    fn parse_file(text: &str) -> Option<Self> {
+        if text.len() > 64 * 1024 {
+            return None;
+        }
+        let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+        let line = lines.next()?;
+        if lines.next().is_some() {
+            return None;
+        }
+        let key = PublicKey::parse_line(line)?;
+        // Require one canonical public certificate encoding, not alternate
+        // base64 spellings or an authorized_keys option prefix.
+        if line.split_whitespace().nth(1)? != STANDARD.encode(&key.blob) {
+            return None;
+        }
+        Self::from_blob(key.blob)
+    }
+
+    fn from_blob(blob: Vec<u8>) -> Option<Self> {
+        if blob.is_empty() || blob.len() > MAX_CERTIFICATE_BLOB_BYTES {
+            return None;
+        }
+        let mut reader = SshBlob::new(&blob);
+        let algorithm = reader.name(64)?;
+        let raw = algorithm.strip_suffix("-cert-v01@openssh.com")?;
+        if raw != "ssh-ed25519"
+            && raw != "ssh-rsa"
+            && CertificateCurve::for_algorithm(raw).is_none()
+        {
+            return None;
+        }
+        reader.string(MAX_CERTIFICATE_BLOB_BYTES)?; // nonce, authenticated below
+        let mut subject = Vec::new();
+        let mut append = |value: &[u8]| {
+            subject.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            subject.extend_from_slice(value);
+        };
+        append(raw.as_bytes());
+        match raw {
+            "ssh-ed25519" => append(reader.string(32)?),
+            "ssh-rsa" => {
+                append(reader.string(9)?);
+                append(reader.string(1025)?);
+            }
+            _ => {
+                append(reader.string(16)?);
+                append(reader.string(133)?);
+            }
+        }
+        let (subject, _) = certificate_public_key(&subject)?;
+        reader.u64()?; // serial is signed opaque metadata
+        if reader.u32()? != 1 {
+            return None; // host certificates never become user identities
+        }
+        reader.string(1024)?; // key ID is not a trusted display label
+        let mut principal_bytes = SshBlob::new(reader.string(MAX_CERTIFICATE_BLOB_BYTES)?);
+        let mut principals = BTreeSet::new();
+        while !principal_bytes.finished() {
+            if principals.len() == 128 {
+                return None;
+            }
+            let principal = std::str::from_utf8(principal_bytes.string(256)?).ok()?;
+            // Foundation's CharacterSet.controlCharacters includes both Cc
+            // and Cf. Reject the same controls/format characters so a signed
+            // certificate cannot produce a document the phone cannot parse.
+            if principal.is_empty()
+                || principal
+                    .chars()
+                    .any(|character| character.is_control() || character.is_format())
+                || !principals.insert(principal)
+            {
+                return None;
+            }
+        }
+        let valid_after = reader.u64()?;
+        if valid_after >= reader.u64()? {
+            return None;
+        }
+        certificate_options(reader.string(MAX_CERTIFICATE_BLOB_BYTES)?, false)?;
+        certificate_options(reader.string(MAX_CERTIFICATE_BLOB_BYTES)?, true)?;
+        if !reader.string(MAX_CERTIFICATE_BLOB_BYTES)?.is_empty() {
+            return None;
+        }
+        let (authority, key) = certificate_public_key(reader.string(1053)?)?;
+        let signed = &blob[..reader.offset];
+        let signature = reader.string(1044)?;
+        if !reader.finished() {
+            return None;
+        }
+        verify_certificate_signature(signature, signed, &authority, &key)?;
+        Some(Self { blob, subject })
+    }
+
+    fn fingerprint(&self) -> String {
         format!(
             "SHA256:{}",
             STANDARD_NO_PAD.encode(Sha256::digest(&self.blob))
@@ -1406,6 +1838,8 @@ struct Endpoint {
     user: String,
     authentication_methods: Vec<&'static str>,
     identities: Vec<PathBuf>,
+    certificates: Vec<UserCertificate>,
+    identity_policy_complete: bool,
     host_key_alias: Option<String>,
     known_hosts: Vec<PathBuf>,
     unresolved_policy: bool,
@@ -1534,6 +1968,8 @@ fn resolve_endpoint(
             } else {
                 identity_files.iter().map(|f| context.expand(f)).collect()
             },
+            certificates: Vec::new(),
+            identity_policy_complete: true,
             host_key_alias: None,
             known_hosts: sources.default_known_hosts.clone(),
             unresolved_policy: false,
@@ -1621,6 +2057,50 @@ fn resolve_endpoint(
                     note(notes, problem.clone());
                 }
             }
+            let mut certificates = Vec::new();
+            let mut identity_policy_complete = true;
+            if authentication.methods.contains(&"publickey") {
+                let (paths, incomplete) = resolver.certificate_files(&options);
+                if incomplete || paths.len() > MAX_PUBLIC_KEY_FILES {
+                    identity_policy_complete = false;
+                    note(notes, "CertificateFile requires one supported absolute or ~/ reference per declaration within the 256-file source budget; no partial identity list was exported and this route remains blocked".into());
+                } else {
+                    for path in paths {
+                        let certificate = match sources.public_certificates.get(&path) {
+                            Some(KnownHostsSource::Present(text)) => {
+                                UserCertificate::parse_file(text)
+                            }
+                            _ => None,
+                        };
+                        match certificate {
+                            Some(certificate) => {
+                                if !certificates.iter().any(|candidate: &UserCertificate| {
+                                    candidate.blob == certificate.blob
+                                }) {
+                                    certificates.push(certificate);
+                                    if certificates.len() > MAX_ROUTE_IDENTITIES {
+                                        identity_policy_complete = false;
+                                        note(notes, "the phone offers at most eight distinct certificate identities per route; no partial identity list was exported and this route remains blocked".into());
+                                        break;
+                                    }
+                                }
+                            }
+                            None => {
+                                identity_policy_complete = false;
+                                note(notes, format!(
+                                    "CertificateFile {} is missing, unreadable, over budget, unsupported or invalid (including its CA signature); no partial identity list was exported and this route remains blocked",
+                                    path.display()
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                }
+                if !identity_policy_complete {
+                    certificates.clear();
+                    unresolved_policy = true;
+                }
+            }
             // Do not silently substitute the phone's defaults for mandatory
             // source trust, revocation, or algorithm constraints. These are
             // preserved by a required-capability marker in the document itself.
@@ -1639,13 +2119,11 @@ fn resolve_endpoint(
                 "verifyhostkeydns",
                 "checkhostip",
                 "canonicalizehostname",
-                "certificatefile",
-                "frankenterm_required_certificate",
                 "refuseconnection",
             ] {
                 if let Some(value) = options.get(keyword) {
                     let disabled = match keyword {
-                        "revokedhostkeys" | "knownhostscommand" | "certificatefile" => {
+                        "revokedhostkeys" | "knownhostscommand" => {
                             value.eq_ignore_ascii_case("none")
                         }
                         "verifyhostkeydns"
@@ -1688,6 +2166,8 @@ fn resolve_endpoint(
                     Vec::new()
                 },
                 authentication_methods: authentication.methods,
+                certificates,
+                identity_policy_complete,
                 host_key_alias: options.get("hostkeyalias").cloned(),
                 known_hosts,
                 unresolved_policy,
@@ -1782,9 +2262,17 @@ fn endpoint_keys(
 #[derive(Default)]
 struct EndpointRecords {
     credentials: BTreeMap<String, Value>,
+    certificate_bytes: usize,
     trusts: BTreeMap<String, Value>,
     trust_scopes: BTreeMap<String, (String, u16)>,
     identity_files: BTreeMap<String, PathBuf>,
+}
+
+struct CredentialCandidate<'a> {
+    id: String,
+    key: PublicKey,
+    certificate: Option<&'a UserCertificate>,
+    identity: Option<&'a PathBuf>,
 }
 
 impl EndpointRecords {
@@ -1801,8 +2289,8 @@ impl EndpointRecords {
         // Admit the complete ordered candidate set before publishing any
         // credential or private-file hint. A phone limit is not permission to
         // replace the source authentication policy with its usable prefix.
-        let mut candidates: Vec<(String, String, PublicKey, &PathBuf)> = Vec::new();
-        let mut identities_complete = true;
+        let mut raw_candidates: Vec<CredentialCandidate<'_>> = Vec::new();
+        let mut identities_complete = endpoint.identity_policy_complete;
         let defaults = default_identities(context);
         for identity in &endpoint.identities {
             let public = public_key_path(identity);
@@ -1847,13 +2335,10 @@ impl EndpointRecords {
             };
             let fingerprint = key.fingerprint();
             let id = format!("c.{}", short_digest(&fingerprint));
-            if candidates
-                .iter()
-                .any(|(candidate, _, _, _)| candidate == &id)
-            {
+            if raw_candidates.iter().any(|candidate| candidate.id == id) {
                 continue;
             }
-            if candidates.len() == MAX_ROUTE_IDENTITIES {
+            if raw_candidates.len() == MAX_ROUTE_IDENTITIES {
                 identities_complete = false;
                 notes.push(ExportNote {
                     machine: machine.id.clone(),
@@ -1865,30 +2350,74 @@ impl EndpointRecords {
                 });
                 break;
             }
-            candidates.push((id, fingerprint, key, identity));
+            raw_candidates.push(CredentialCandidate {
+                id,
+                key,
+                certificate: None,
+                identity: Some(identity),
+            });
+        }
+        // OpenSSH offers explicitly configured certificates before file keys.
+        // A certificate does not invent a raw fallback or a private filename:
+        // only a separately configured, exactly matching public identity can
+        // supply the companion's private-file hint for this certificate.
+        let mut candidates = Vec::new();
+        for certificate in &endpoint.certificates {
+            let identity = raw_candidates
+                .iter()
+                .find(|candidate| candidate.key == certificate.subject)
+                .and_then(|candidate| candidate.identity);
+            candidates.push(CredentialCandidate {
+                id: format!("c.cert.{}", short_digest(&certificate.fingerprint())),
+                key: certificate.subject.clone(),
+                certificate: Some(certificate),
+                identity,
+            });
+        }
+        candidates.extend(raw_candidates);
+        if candidates.len() > MAX_ROUTE_IDENTITIES {
+            identities_complete = false;
+            notes.push(ExportNote {
+                machine: machine.id.clone(),
+                route: Some(route_name.to_string()),
+                message: format!(
+                    "the combined certificate and raw-key policy exceeds the phone's {}-candidate limit; no partial identity list was exported and this route remains blocked",
+                    MAX_ROUTE_IDENTITIES
+                ),
+            });
         }
         if !identities_complete {
             candidates.clear();
         }
         let mut credential_ids = Vec::with_capacity(candidates.len());
-        for (id, fingerprint, key, identity) in candidates {
-            self.credentials.entry(id.clone()).or_insert_with(|| {
-                json!({
-                    "id": id,
-                    "algorithm": key.algorithm,
-                    "public_fingerprint": fingerprint,
+        for candidate in candidates {
+            if !self.credentials.contains_key(&candidate.id) {
+                let mut credential = json!({
+                    "id": candidate.id,
+                    "algorithm": candidate.key.algorithm,
+                    "public_fingerprint": candidate.key.fingerprint(),
                     "requirement": "matching_private_key",
                     "private_material": "not_included",
-                })
-            });
-            self.identity_files.entry(id.clone()).or_insert_with(|| {
-                if identity.extension().is_some_and(|ext| ext == "pub") {
-                    identity.with_extension("")
-                } else {
-                    identity.clone()
+                });
+                if let Some(certificate) = candidate.certificate {
+                    credential["user_certificate"] = json!(STANDARD.encode(&certificate.blob));
+                    credential["required_capabilities"] = json!([USER_CERTIFICATE_CAPABILITY]);
+                    self.certificate_bytes += certificate.blob.len();
                 }
-            });
-            credential_ids.push(id);
+                self.credentials.insert(candidate.id.clone(), credential);
+            }
+            if let Some(identity) = candidate.identity {
+                self.identity_files
+                    .entry(candidate.id.clone())
+                    .or_insert_with(|| {
+                        if identity.extension().is_some_and(|ext| ext == "pub") {
+                            identity.with_extension("")
+                        } else {
+                            identity.clone()
+                        }
+                    });
+            }
+            credential_ids.push(candidate.id);
         }
         if identities_complete
             && credential_ids.is_empty()
@@ -2232,6 +2761,10 @@ pub fn export(
         records.credentials.len() <= 256,
         "the complete workspace exceeds the phone's 256-credential limit; select a smaller group"
     );
+    anyhow::ensure!(
+        records.certificate_bytes <= MAX_EXPORTED_CERTIFICATE_BYTES,
+        "the complete workspace exceeds the phone's 1 MiB certificate limit; select a smaller group"
+    );
     let mut document = json!({
         "format": "ftworkspace",
         "version": 1,
@@ -2353,6 +2886,154 @@ mod tests {
         assert_eq!(PublicKey::parse_line("ssh-ed25519 !!!"), None);
     }
 
+    fn certificate_fixtures() -> Value {
+        // Independent OpenSSH certificates shared with the Swift parser and
+        // native authentication tests. All private fixture keys are synthetic.
+        serde_json::from_str(include_str!(
+            "../../../fixtures/ios-airgap/ssh-user-certificates.json"
+        ))
+        .unwrap()
+    }
+
+    fn signed_test_certificate(principals: &[&str], serial: u64, nonce_bytes: usize) -> String {
+        use openssl::sign::Signer;
+
+        fn string(output: &mut Vec<u8>, value: &[u8]) {
+            output.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            output.extend_from_slice(value);
+        }
+        // Deliberately public test seed, never an authorized identity.
+        let key = PKey::private_key_from_raw_bytes(&[0x42; 32], Id::ED25519).unwrap();
+        let point = key.raw_public_key().unwrap();
+        let mut public = Vec::new();
+        string(&mut public, b"ssh-ed25519");
+        string(&mut public, &point);
+        let mut blob = Vec::new();
+        string(&mut blob, b"ssh-ed25519-cert-v01@openssh.com");
+        string(&mut blob, &vec![0x27; nonce_bytes]);
+        string(&mut blob, &point);
+        blob.extend_from_slice(&serial.to_be_bytes());
+        blob.extend_from_slice(&1u32.to_be_bytes());
+        string(&mut blob, b"public synthetic fixture");
+        let mut names = Vec::new();
+        for principal in principals {
+            string(&mut names, principal.as_bytes());
+        }
+        string(&mut blob, &names);
+        blob.extend_from_slice(&1_577_836_800u64.to_be_bytes());
+        blob.extend_from_slice(&2_524_608_000u64.to_be_bytes());
+        string(&mut blob, b""); // critical options
+        let mut extensions = Vec::new();
+        for name in [
+            b"permit-port-forwarding".as_slice(),
+            b"permit-pty".as_slice(),
+        ] {
+            string(&mut extensions, name);
+            string(&mut extensions, b"");
+        }
+        string(&mut blob, &extensions);
+        string(&mut blob, b""); // reserved
+        string(&mut blob, &public);
+        let signature = Signer::new_without_digest(&key)
+            .unwrap()
+            .sign_oneshot_to_vec(&blob)
+            .unwrap();
+        let mut envelope = Vec::new();
+        string(&mut envelope, b"ssh-ed25519");
+        string(&mut envelope, &signature);
+        string(&mut blob, &envelope);
+        format!("ssh-ed25519-cert-v01@openssh.com {}", STANDARD.encode(blob))
+    }
+
+    #[test]
+    fn certificates_verify_independent_openssh_families_and_exact_subjects() {
+        let fixtures = certificate_fixtures();
+        for fixture in fixtures["certificates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(std::iter::once(&fixtures["largeCertificate"]))
+        {
+            let certificate = UserCertificate::parse_file(fixture["certificate"].as_str().unwrap())
+                .unwrap_or_else(|| panic!("{}", fixture["id"]));
+            let public = PublicKey::parse_line(fixture["publicKey"].as_str().unwrap()).unwrap();
+            assert_eq!(certificate.subject, public, "{}", fixture["id"]);
+            let mut nonce_tampered = certificate.blob.clone();
+            let mut reader = SshBlob::new(&certificate.blob);
+            reader.string(64).unwrap();
+            nonce_tampered[reader.offset + 4] ^= 1;
+            let mut signature_tampered = certificate.blob.clone();
+            *signature_tampered.last_mut().unwrap() ^= 1;
+            let mut trailing = certificate.blob.clone();
+            trailing.push(0);
+            for invalid in [
+                nonce_tampered,
+                signature_tampered,
+                trailing,
+                certificate.blob[..certificate.blob.len() - 1].to_vec(),
+                public.blob,
+            ] {
+                assert!(
+                    UserCertificate::from_blob(invalid).is_none(),
+                    "{}",
+                    fixture["id"]
+                );
+            }
+        }
+        // Restriction/time policy remains in the signed bytes for the phone;
+        // passive export does not erase a valid but currently unusable cert.
+        for name in [
+            "unicodeCertificate",
+            "wildcardCertificate",
+            "restrictedCertificate",
+            "withoutPTYCertificate",
+            "withoutForwardingCertificate",
+        ] {
+            assert!(
+                UserCertificate::parse_file(fixtures[name].as_str().unwrap()).is_some(),
+                "{}",
+                name
+            );
+        }
+        assert!(
+            UserCertificate::parse_file(fixtures["hostCertificate"].as_str().unwrap()).is_none()
+        );
+        assert!(UserCertificate::from_blob(vec![0; MAX_CERTIFICATE_BLOB_BYTES + 1]).is_none());
+        let line = fixtures["certificates"][0]["certificate"].as_str().unwrap();
+        assert!(UserCertificate::parse_file(&format!("{}\n{}", line, line)).is_none());
+        assert!(UserCertificate::parse_file(&line.replacen("ssh-ed25519", "ssh-rsa", 1)).is_none());
+    }
+
+    #[test]
+    fn signed_certificate_principals_share_the_phones_unicode_and_count_bounds() {
+        for principals in [vec!["operator"], vec!["e\u{301}"], Vec::new()] {
+            assert!(
+                UserCertificate::parse_file(&signed_test_certificate(&principals, 1, 32)).is_some()
+            );
+        }
+        for principals in [
+            vec![""],
+            vec!["same", "same"],
+            vec!["account\n"],
+            vec!["account\u{200d}"],
+            vec!["account\u{ad}"],
+            vec!["account\u{e0001}"],
+        ] {
+            assert!(
+                UserCertificate::parse_file(&signed_test_certificate(&principals, 1, 32)).is_none()
+            );
+        }
+        let names: Vec<String> = (0..129).map(|index| format!("user{}", index)).collect();
+        let principals: Vec<&str> = names.iter().map(String::as_str).collect();
+        assert!(
+            UserCertificate::parse_file(&signed_test_certificate(&principals[..128], 1, 32))
+                .is_some()
+        );
+        assert!(
+            UserCertificate::parse_file(&signed_test_certificate(&principals, 1, 32)).is_none()
+        );
+    }
+
     #[test]
     fn known_hosts_match_plain_ported_wildcard_negated_and_hashed_names() {
         let line = |hosts: &str| format!("{} ssh-ed25519 {}\n", hosts, ED25519);
@@ -2428,6 +3109,7 @@ mod tests {
             default_known_hosts: defaults,
             public_keys,
             unavailable_public_keys: BTreeSet::new(),
+            public_certificates: BTreeMap::new(),
         }
     }
 
@@ -2812,6 +3494,385 @@ socket = "/run/frankenterm.sock"
             "Host app\n{}\n HostName css.example\n User u\n IdentityFile ~/.ssh/trj_ed25519\n GlobalKnownHostsFile none\n",
             policy
         )))
+    }
+
+    fn exported_credential<'a>(export: &'a MobileExport, id: &Value) -> &'a Value {
+        export.document["workspace"]["credentials"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|credential| &credential["id"] == id)
+            .unwrap()
+    }
+
+    #[test]
+    fn certificate_exports_preserve_exact_offers_subject_binding_and_raw_fallback() {
+        let fixtures = certificate_fixtures();
+        for fixture in fixtures["certificates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(std::iter::once(&fixtures["largeCertificate"]))
+        {
+            let mut sources = authentication_sources("CertificateFile ~/.ssh/user-cert.pub");
+            sources.public_keys.insert(
+                context().home.join(".ssh/trj_ed25519.pub"),
+                fixture["publicKey"].as_str().unwrap().into(),
+            );
+            sources.public_certificates.insert(
+                context().home.join(".ssh/user-cert.pub"),
+                KnownHostsSource::Present(fixture["certificate"].as_str().unwrap().into()),
+            );
+            let exported = jump_export(&sources).unwrap();
+            let route = exported_route(&exported, "r.app.ssh");
+            let refs = route["credential_refs"].as_array().unwrap();
+            assert_eq!(refs.len(), 2, "{}", fixture["id"]);
+            assert!(route["required_capabilities"].is_null());
+            assert!(route_trust(&exported, "r.app.ssh")["required_capabilities"].is_null());
+            let certificate = exported_credential(&exported, &refs[0]);
+            let raw = exported_credential(&exported, &refs[1]);
+            let public = PublicKey::parse_line(fixture["publicKey"].as_str().unwrap()).unwrap();
+            assert_eq!(certificate["algorithm"], public.algorithm);
+            assert_eq!(certificate["public_fingerprint"], public.fingerprint());
+            assert_eq!(
+                certificate["required_capabilities"],
+                json!([USER_CERTIFICATE_CAPABILITY])
+            );
+            assert_eq!(
+                certificate["user_certificate"],
+                fixture["certificate"]
+                    .as_str()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+            );
+            assert_eq!(raw["public_fingerprint"], public.fingerprint());
+            assert!(raw["user_certificate"].is_null());
+            for id in refs {
+                assert_eq!(
+                    exported.identity_files.get(id.as_str().unwrap()),
+                    Some(&context().home.join(".ssh/trj_ed25519"))
+                );
+            }
+            assert_eq!(
+                exported_route(&exported, "r.app.mux")["credential_refs"],
+                route["credential_refs"]
+            );
+            assert!(!exported.document.to_string().contains("PRIVATE KEY"));
+        }
+    }
+
+    #[test]
+    fn certificate_only_and_unrelated_keys_never_invent_private_bindings() {
+        let certificate = signed_test_certificate(&["operator"], 1, 32);
+        for identity in ["none", "~/.ssh/trj_ed25519"] {
+            let mut sources = sources(Some(&format!(
+                "Host app\n HostName css.example\n User operator\n IdentityFile {}\n CertificateFile ~/.ssh/user-cert.pub\n GlobalKnownHostsFile none\n", identity
+            )));
+            sources.public_certificates.insert(
+                context().home.join(".ssh/user-cert.pub"),
+                KnownHostsSource::Present(certificate.clone()),
+            );
+            let first = jump_export(&sources).unwrap();
+            let refs = exported_route(&first, "r.app.ssh")["credential_refs"]
+                .as_array()
+                .unwrap();
+            assert_eq!(refs.len(), if identity == "none" { 1 } else { 2 });
+            assert!(!first.identity_files.contains_key(refs[0].as_str().unwrap()));
+            assert_eq!(
+                first.identity_files.len(),
+                if identity == "none" { 0 } else { 1 }
+            );
+            sources.public_certificates.insert(
+                context().home.join(".ssh/user-cert.pub"),
+                KnownHostsSource::Present(signed_test_certificate(&["operator"], 2, 32)),
+            );
+            let renewed = jump_export(&sources).unwrap();
+            let renewed_refs = exported_route(&renewed, "r.app.ssh")["credential_refs"]
+                .as_array()
+                .unwrap();
+            assert_ne!(
+                refs[0], renewed_refs[0],
+                "a renewal changes the exact certificate binding"
+            );
+            assert_eq!(
+                refs[1..],
+                renewed_refs[1..],
+                "independent raw identities stay stable"
+            );
+            assert_ne!(
+                first.document["source"]["configuration_revision"],
+                renewed.document["source"]["configuration_revision"]
+            );
+        }
+    }
+
+    #[test]
+    fn certificate_sources_are_additive_in_host_order_and_internal_slots_are_not_source_policy() {
+        let mut sources = sources(Some(
+            "CertificateFile ~/.ssh/first.pub\nHost other\n CertificateFile /must-not-read\nHost app\n HostName css.example\n User operator\n IdentityFile none\n CertificateFile none\n CertificateFile \"~/.ssh/second cert.pub\"\n CertificateFile ~/.ssh/first.pub\nHost *\n CertificateFile ~/.ssh/third.pub\n GlobalKnownHostsFile none\n"
+        ));
+        sources.system_config =
+            KnownHostsSource::Present("CertificateFile ~/.ssh/fourth.pub\n".into());
+        let mut expected = Vec::new();
+        for (index, file) in ["first.pub", "second cert.pub", "third.pub", "fourth.pub"]
+            .iter()
+            .enumerate()
+        {
+            let certificate = signed_test_certificate(&["operator"], index as u64, 32);
+            expected.push(certificate.split_whitespace().nth(1).unwrap().to_owned());
+            sources.public_certificates.insert(
+                context().home.join(".ssh").join(file),
+                KnownHostsSource::Present(certificate),
+            );
+        }
+        let exported = jump_export(&sources).unwrap();
+        let route = exported_route(&exported, "r.app.ssh");
+        let actual: Vec<_> = route["credential_refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| {
+                exported_credential(&exported, id)["user_certificate"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(actual, expected);
+        assert!(route_trust(&exported, "r.app.ssh")["required_capabilities"].is_null());
+        let original = sources.config.clone().unwrap();
+        for injection in [
+            "frankenterm_certificate_1 yes",
+            "FrankenTerm_Required_Certificate no",
+        ] {
+            let mut injected = original.clone();
+            injected.push_str(injection);
+            injected.push('\n');
+            sources.config = Some(injected);
+            assert_eq!(
+                route_trust(&jump_export(&sources).unwrap(), "r.app.ssh")["required_capabilities"],
+                json!([UNRESOLVED_POLICY])
+            );
+        }
+    }
+
+    #[test]
+    fn any_unresolved_certificate_blocks_the_complete_candidate_policy() {
+        let certificate = signed_test_certificate(&["operator"], 1, 32);
+        let mut corrupted = PublicKey::parse_line(&certificate).unwrap();
+        *corrupted.blob.last_mut().unwrap() ^= 1;
+        let corrupted = format!(
+            "{} {}",
+            corrupted.algorithm,
+            STANDARD.encode(corrupted.blob)
+        );
+        for invalid in [
+            None,
+            Some(KnownHostsSource::Missing),
+            Some(KnownHostsSource::Unavailable),
+            Some(KnownHostsSource::Present("invalid".into())),
+            Some(KnownHostsSource::Present(corrupted)),
+        ] {
+            let mut sources = authentication_sources(
+                "CertificateFile ~/.ssh/first-cert.pub\n CertificateFile ~/.ssh/second-cert.pub",
+            );
+            sources.public_certificates.insert(
+                context().home.join(".ssh/first-cert.pub"),
+                KnownHostsSource::Present(certificate.clone()),
+            );
+            if let Some(invalid) = invalid {
+                sources
+                    .public_certificates
+                    .insert(context().home.join(".ssh/second-cert.pub"), invalid);
+            }
+            let exported = jump_export(&sources).unwrap();
+            assert!(exported.document["workspace"]["credentials"]
+                .as_array()
+                .unwrap()
+                .is_empty());
+            assert!(exported.identity_files.is_empty());
+            for id in ["r.app.ssh", "r.app.mux"] {
+                let route = exported_route(&exported, id);
+                assert!(route["credential_refs"].as_array().unwrap().is_empty());
+                assert_eq!(route["required_capabilities"], json!([UNRESOLVED_POLICY]));
+            }
+        }
+        for reference in [
+            "relative-cert.pub",
+            "%d/.ssh/cert.pub",
+            "${HOME}/.ssh/cert.pub",
+            "~someone/.ssh/cert.pub",
+            "~/.ssh/../cert.pub",
+            "~/.ssh/a ~/.ssh/b",
+        ] {
+            let exported = jump_export(&authentication_sources(&format!(
+                "CertificateFile {}",
+                reference
+            )))
+            .unwrap();
+            assert!(exported.document["workspace"]["credentials"]
+                .as_array()
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                exported_route(&exported, "r.app.ssh")["required_capabilities"],
+                json!([UNRESOLVED_POLICY])
+            );
+        }
+        // Disabled public-key authentication never reads/offers a certificate
+        // and cannot acquire a blocker from an unused certificate path.
+        let exported = jump_export(&authentication_sources(
+            "PubkeyAuthentication no\n CertificateFile /missing-cert",
+        ))
+        .unwrap();
+        assert!(exported_route(&exported, "r.app.ssh")["required_capabilities"].is_null());
+        assert!(route_trust(&exported, "r.app.ssh")["required_capabilities"].is_null());
+    }
+
+    #[test]
+    fn certificate_candidate_limits_apply_after_blob_dedup_and_before_publication() {
+        let certificates: Vec<_> = (0..9)
+            .map(|serial| signed_test_certificate(&["operator"], serial, 32))
+            .collect();
+        for (count, distinct, raw, expected) in [
+            (9, false, false, 1),
+            (9, true, false, 0),
+            (8, true, false, 8),
+            (8, true, true, 0),
+        ] {
+            let mut config = format!("Host app\n HostName css.example\n User operator\n GlobalKnownHostsFile none\n IdentityFile {}\n",
+                if raw { "~/.ssh/trj_ed25519" } else { "none" });
+            for index in 0..count {
+                config.push_str(&format!(" CertificateFile ~/.ssh/cert{}.pub\n", index));
+            }
+            let mut sources = sources(Some(&config));
+            for index in 0..count {
+                sources.public_certificates.insert(
+                    context().home.join(format!(".ssh/cert{}.pub", index)),
+                    KnownHostsSource::Present(
+                        certificates[if distinct { index } else { 0 }].clone(),
+                    ),
+                );
+            }
+            let exported = jump_export(&sources).unwrap();
+            assert_eq!(
+                exported.document["workspace"]["credentials"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                expected
+            );
+            for id in ["r.app.ssh", "r.app.mux"] {
+                let route = exported_route(&exported, id);
+                assert_eq!(route["credential_refs"].as_array().unwrap().len(), expected);
+                assert_eq!(!route["required_capabilities"].is_null(), expected == 0);
+            }
+            assert!(
+                exported.identity_files.is_empty(),
+                "no raw prefix or guessed filename survives"
+            );
+        }
+    }
+
+    #[test]
+    fn certificate_disk_budgets_keep_explicit_failures_without_private_probes() {
+        let certificate = signed_test_certificate(&["operator"], 1, 32);
+        for (count, padded_bytes, admitted) in [
+            (256, 0, true),
+            (257, 0, false),
+            (32, 64 * 1024, true),
+            (33, 64 * 1024, false),
+            (1, 64 * 1024 + 1, false),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let context = InventoryContext {
+                directory: directory.path().to_path_buf(),
+                home: directory.path().to_path_buf(),
+            };
+            std::fs::create_dir(context.home.join(".ssh")).unwrap();
+            let mut config = "Host app\n HostName css.example\n User operator\n IdentityFile none\n UserKnownHostsFile none\n GlobalKnownHostsFile none\n".to_string();
+            let mut text = certificate.clone();
+            if padded_bytes > text.len() {
+                text.push_str(&" ".repeat(padded_bytes - text.len()));
+            }
+            for index in 0..count {
+                let name = format!("cert{:03}.pub", index);
+                config.push_str(&format!(" CertificateFile ~/.ssh/{}\n", name));
+                write_source(&context.home.join(".ssh").join(name), text.as_bytes());
+            }
+            write_source(&context.home.join(".ssh/config"), config);
+            write_source(
+                &context.home.join(".ssh/cert000"),
+                b"PRIVATE-SIBLING-MUST-NOT-BE-READ",
+            );
+            write_source(
+                &context.home.join(".ssh/unselected-cert.pub"),
+                certificate.as_bytes(),
+            );
+            let inventory = MachineInventory::parse(JUMP_INVENTORY, &context).unwrap();
+            let mut sources = SshSources::from_disk(&inventory, &context);
+            // Only the test's selected user configuration is part of this
+            // assertion; the host's system configuration is not its oracle.
+            sources.system_config = KnownHostsSource::Missing;
+            assert_eq!(sources.public_certificates.len(), count);
+            let unavailable = sources
+                .public_certificates
+                .values()
+                .filter(|source| matches!(source, KnownHostsSource::Unavailable))
+                .count();
+            assert_eq!(unavailable, usize::from(!admitted));
+            let exported = export(&inventory, None, &sources, &context).unwrap();
+            let route = exported_route(&exported, "r.app.ssh");
+            assert_eq!(
+                route["credential_refs"].as_array().unwrap().len(),
+                usize::from(admitted)
+            );
+            assert_eq!(route["required_capabilities"].is_null(), admitted);
+            assert!(exported.identity_files.is_empty());
+            assert!(!companion_source(&exported, Path::new("/inventory"))
+                .to_string()
+                .contains("PRIVATE-SIBLING-MUST-NOT-BE-READ"));
+        }
+    }
+
+    #[test]
+    fn complete_workspace_certificate_bytes_obey_the_phone_manifest_limit() {
+        let overhead = UserCertificate::parse_file(&signed_test_certificate(&["operator"], 0, 0))
+            .unwrap()
+            .blob
+            .len();
+        let nonce_bytes = MAX_CERTIFICATE_BLOB_BYTES - overhead;
+        let mut config = String::new();
+        let mut inventory = "version = 1\n".to_string();
+        let mut sources = sources(None);
+        for index in 0..33 {
+            inventory.push_str(&format!(
+                "[machines.m{0}]\n[[machines.m{0}.routes]]\nid = \"ssh\"\nssh = \"m{0}\"\n",
+                index
+            ));
+            config.push_str(&format!(
+                "Host m{0}\n HostName css.example\n User operator\n IdentityFile none\n GlobalKnownHostsFile none\n CertificateFile ~/.ssh/cert{0}.pub\n", index
+            ));
+            let certificate = signed_test_certificate(&["operator"], index, nonce_bytes);
+            assert_eq!(
+                UserCertificate::parse_file(&certificate)
+                    .unwrap()
+                    .blob
+                    .len(),
+                MAX_CERTIFICATE_BLOB_BYTES
+            );
+            sources.public_certificates.insert(
+                context().home.join(format!(".ssh/cert{}.pub", index)),
+                KnownHostsSource::Present(certificate),
+            );
+        }
+        sources.config = Some(config);
+        let inventory = MachineInventory::parse(&inventory, &context()).unwrap();
+        let error = export(&inventory, None, &sources, &context())
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("1 MiB certificate limit"));
     }
 
     #[test]
