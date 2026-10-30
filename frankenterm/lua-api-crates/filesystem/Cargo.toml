@@ -9,3 +9,6 @@ anyhow.workspace = true
 config.workspace = true
 filenamegen.workspace = true
 promise.workspace = true
+
+[dev-dependencies]
+futures.workspace = true

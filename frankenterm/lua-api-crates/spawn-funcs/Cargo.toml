@@ -10,3 +10,6 @@ bstr.workspace = true
 config.workspace = true
 frankenterm-open-url.workspace = true
 promise.workspace = true
+
+[dev-dependencies]
+futures.workspace = true

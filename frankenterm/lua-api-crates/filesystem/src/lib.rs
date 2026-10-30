@@ -58,7 +58,7 @@ mod tests {
             .set("DIR", dir.to_str().expect("utf8 dir"))
             .expect("DIR");
 
-        let mut listed: Vec<String> = promise::spawn::block_on(
+        let mut listed: Vec<String> = futures::executor::block_on(
             lua.load("return require('wezterm').read_dir(DIR)")
                 .eval_async(),
         )
@@ -72,7 +72,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
 
-        let globbed: Vec<String> = promise::spawn::block_on(
+        let globbed: Vec<String> = futures::executor::block_on(
             lua.load("return require('wezterm').glob('*.txt', DIR)")
                 .eval_async(),
         )

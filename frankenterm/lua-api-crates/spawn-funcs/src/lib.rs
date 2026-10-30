@@ -88,7 +88,7 @@ mod tests {
     #[test]
     fn run_child_process_returns_status_and_output() {
         let lua = lua();
-        let (ok, stdout, stderr): (bool, String, String) = promise::spawn::block_on(
+        let (ok, stdout, stderr): (bool, String, String) = futures::executor::block_on(
             lua.load(
                 "return require('wezterm').run_child_process { '/bin/sh', '-c', 'printf out; printf err >&2' }",
             )
@@ -99,7 +99,7 @@ mod tests {
         assert_eq!(stdout, "out");
         assert_eq!(stderr, "err");
 
-        let (ok, _, _): (bool, String, String) = promise::spawn::block_on(
+        let (ok, _, _): (bool, String, String) = futures::executor::block_on(
             lua.load("return require('wezterm').run_child_process { '/bin/sh', '-c', 'exit 3' }")
                 .eval_async(),
         )
@@ -110,7 +110,7 @@ mod tests {
     #[test]
     fn an_empty_command_is_an_error_not_a_panic() {
         let lua = lua();
-        let err = promise::spawn::block_on(
+        let err = futures::executor::block_on(
             lua.load("return require('wezterm').run_child_process {}")
                 .exec_async(),
         )
@@ -127,7 +127,7 @@ mod tests {
         lua.globals()
             .set("MARKER", marker.to_str().expect("utf8"))
             .expect("MARKER");
-        promise::spawn::block_on(
+        futures::executor::block_on(
             lua.load("require('wezterm').background_child_process { '/usr/bin/touch', MARKER }")
                 .exec_async(),
         )

@@ -3287,6 +3287,7 @@ dependencies = [
  "anyhow",
  "config",
  "filenamegen",
+ "futures",
  "promise",
 ]
 
@@ -11000,6 +11001,7 @@ dependencies = [
  "bstr",
  "config",
  "frankenterm-open-url",
+ "futures",
  "promise",
 ]
 
