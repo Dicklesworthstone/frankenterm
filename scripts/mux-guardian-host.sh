@@ -23,7 +23,8 @@
 # and mux socket) next to the default one, for testing on a live host.
 # Re-running install rewrites the units with the current settings and starts
 # whatever is not running; a running unit keeps its settings until it restarts
-# (the mux: `upgrade --force` onto its current family).
+# (the mux: `upgrade --force` onto its current family). `upgrade --timeout`
+# (default 90) bounds the new mux's restore, plus one second per guardian pane.
 #
 # Invariants:
 #   * The broker owns every pane's child process. It is never restarted by this
@@ -863,10 +864,13 @@ swap_mux() {  # <from dir> <to dir> <timeout> <verb>
 
   # The restored layout is the last published snapshot: wait for one taken
   # after this point so panes created moments ago are included.
-  # A busy guardian can fail a few rounds in a row, so allow several.
-  local mark fresh_within
+  # A busy guardian can fail a few rounds in a row, so allow several. A mux
+  # capture, and a restore, get one more second per guardian pane (ft-4wrv7),
+  # so the waits for them grow the same way.
+  local mark fresh_within verify_within
   mark=$(date +%s)
-  fresh_within=$(( RECOVERY_INTERVAL * 6 + 60 ))
+  fresh_within=$(( RECOVERY_INTERVAL * 6 + 60 + 2 * panes ))
+  verify_within=$(( timeout + panes ))
   wait_fresh_publication "$mark" "$fresh_within" \
     || die "no fresh recovery snapshot within ${fresh_within}s; refusing (see the mux log)"
   log "fresh recovery snapshot published"
@@ -878,7 +882,7 @@ swap_mux() {  # <from dir> <to dir> <timeout> <verb>
   set_link "$BASE/mux-previous" "$from"
   set_link "$BASE/mux-current" "$to"
   log "switching mux $(basename "$from") -> $(basename "$to")"
-  if svc_restart_mux && verify_mux "$to" "$panes" "$ids" "$children" "$timeout"; then
+  if svc_restart_mux && verify_mux "$to" "$panes" "$ids" "$children" "$verify_within"; then
     log "$verb complete: $(basename "$from") -> $(basename "$to")"
     return 0
   fi
@@ -886,7 +890,7 @@ swap_mux() {  # <from dir> <to dir> <timeout> <verb>
   use_family_script "$from"
   set_link "$BASE/mux-current" "$from"
   if [ -n "$previous" ]; then set_link "$BASE/mux-previous" "$previous"; fi
-  if svc_restart_mux && verify_mux "$from" "$panes" "$ids" "$children" "$timeout"; then
+  if svc_restart_mux && verify_mux "$from" "$panes" "$ids" "$children" "$verify_within"; then
     die "$verb rolled back to $(basename "$from"); panes preserved"
   fi
   die "$verb AND rollback verification failed; inspect status and logs before acting"
