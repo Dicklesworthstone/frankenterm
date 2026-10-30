@@ -28,6 +28,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROFILE="${FT_APPLE_PROFILE:-release-interactive}"
+JOBS="${FT_APPLE_BUILD_JOBS:-2}"
+[[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || {
+    echo "error: FT_APPLE_BUILD_JOBS must be a positive integer" >&2; exit 1;
+}
 # Match the Swift packages' platform floors, otherwise the objects carry the
 # host SDK's minimum version and every link warns (or fails on older devices).
 export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-26.0}"
@@ -53,7 +57,7 @@ libraries=""
 for target in $TARGETS; do
     echo "==> frankenterm-term native-ffi staticlib for $target ($PROFILE)"
     (cd "$ROOT" && RCH_CARGO_WRAPPER_BYPASS=1 CARGO_TARGET_DIR="$TARGET_DIR" \
-        cargo rustc --locked -p frankenterm-term --lib --features native-ffi \
+        cargo rustc --locked -j "$JOBS" -p frankenterm-term --lib --features native-ffi \
         --crate-type staticlib --target "$target" --profile "$PROFILE")
     library="$TARGET_DIR/$target/$PROFILE/libfrankenterm_term.a"
     [ -f "$library" ] || { echo "error: cargo did not produce $library" >&2; exit 1; }
