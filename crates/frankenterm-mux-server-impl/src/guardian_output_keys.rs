@@ -663,10 +663,11 @@ impl GuardianOutputKeyring {
     /// fingerprint it returns may arm the fast path under the rule
     /// `refresh_latest_authority_unlocked` arms it by: it bracketed the whole
     /// validation unchanged, its stamps are settled, and no intent is
-    /// pending. A rotation, a pending intent or different key material is
-    /// left to the refresh, which may advance or refuse the activation; a
-    /// lookup never does either, and serves the key from the inventory it
-    /// took.
+    /// pending, on disk or in this keyring's record (an armed window lets the
+    /// refresh skip the inventory that would clear that record). A rotation,
+    /// a pending intent or different key material is left to the refresh,
+    /// which may advance or refuse the activation; a lookup never does
+    /// either, and serves the key from the inventory it took.
     fn validate_unchanged_active_authority(
         &self,
     ) -> Result<ActiveAuthority, GuardianOutputKeyringError> {
@@ -683,7 +684,11 @@ impl GuardianOutputKeyring {
         validate_directory(&self.directory)?;
         let after = authority_fingerprint(&self.directory, self.active);
         Ok(ActiveAuthority::Unchanged(match after {
-            Some(stamp) if after == before && stamp.settled(std::time::SystemTime::now()) => {
+            Some(stamp)
+                if after == before
+                    && self.pending_generation.is_none()
+                    && stamp.settled(std::time::SystemTime::now()) =>
+            {
                 Some(stamp)
             }
             _ => None,
