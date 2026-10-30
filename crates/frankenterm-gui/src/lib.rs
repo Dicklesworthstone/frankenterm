@@ -1293,6 +1293,8 @@ pub mod command_rules {
             // ----------------- WezTerm
             ReloadConfiguration,
             #[cfg(target_os = "macos")]
+            ExportToIPhone,
+            #[cfg(target_os = "macos")]
             HideApplication,
             #[cfg(target_os = "macos")]
             QuitApplication,

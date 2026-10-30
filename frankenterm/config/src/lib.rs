@@ -25,8 +25,8 @@
 use std::convert::TryFrom as _;
 use std::future::Future;
 
-use anyhow::{anyhow, bail, Context, Error};
-use flume::{unbounded, Receiver, Sender};
+use anyhow::{Context, Error, anyhow, bail};
+use flume::{Receiver, Sender, unbounded};
 #[cfg(feature = "lua")]
 use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, UnknownFieldAction};
 use frankenterm_dynamic::{ToDynamic, Value};
@@ -918,6 +918,7 @@ pub fn configuration_warnings_and_errors() -> Vec<String> {
 
 struct ConfigInner {
     config: Arc<Config>,
+    loaded_machine_inventories: Arc<mobile_export::LoadedMachineInventories>,
     error: Option<String>,
     warnings: Vec<String>,
     generation: usize,
@@ -996,7 +997,7 @@ impl ConfigWatchDependencies {
     }
 
     fn relevant(&self, event: &notify::Result<notify::Event>) -> bool {
-        use notify::{event::ModifyKind, EventKind};
+        use notify::{EventKind, event::ModifyKind};
         let event = match event {
             Ok(event) => event,
             Err(_) => return true,
@@ -1128,6 +1129,7 @@ impl ConfigInner {
     fn new() -> Self {
         Self {
             config: Arc::new(Config::default_config()),
+            loaded_machine_inventories: Arc::default(),
             error: None,
             warnings: vec![],
             generation: 0,
@@ -1163,6 +1165,7 @@ impl ConfigInner {
             self.warnings = warnings;
         }
         self.config = Arc::new(config);
+        self.loaded_machine_inventories = Arc::default();
         self.error.take();
         self.generation = generation;
     }
@@ -1282,7 +1285,18 @@ impl ConfigInner {
 
         match config {
             Ok(config) => {
+                #[cfg(feature = "lua")]
+                let captured = lua
+                    .as_ref()
+                    .and_then(|lua| {
+                        lua.app_data_ref::<mobile_export::LoadedMachineInventories>()
+                            .map(|value| (*value).clone())
+                    })
+                    .unwrap_or_default();
+                #[cfg(not(feature = "lua"))]
+                let captured = mobile_export::LoadedMachineInventories::default();
                 self.install_config(config, Some(warnings));
+                self.loaded_machine_inventories = Arc::new(captured);
 
                 // If we loaded a user config, publish this latest version of
                 // the lua state to the LUA_PIPE.  This allows a subsequent
@@ -1336,6 +1350,7 @@ impl ConfigInner {
         Ok(ConfigHandle {
             config: Arc::new(config.config?),
             generation: self.generation,
+            loaded_machine_inventories: Arc::clone(&self.loaded_machine_inventories),
         })
     }
 
@@ -1380,6 +1395,7 @@ impl Configuration {
         ConfigHandle {
             config: Arc::clone(&inner.config),
             generation: inner.generation,
+            loaded_machine_inventories: Arc::clone(&inner.loaded_machine_inventories),
         }
     }
 
@@ -1458,6 +1474,7 @@ impl Configuration {
 pub struct ConfigHandle {
     config: Arc<Config>,
     generation: usize,
+    loaded_machine_inventories: Arc<mobile_export::LoadedMachineInventories>,
 }
 
 impl ConfigHandle {
@@ -1469,10 +1486,15 @@ impl ConfigHandle {
         self.generation
     }
 
+    pub fn loaded_machine_inventories(&self) -> &mobile_export::LoadedMachineInventories {
+        &self.loaded_machine_inventories
+    }
+
     pub fn default_config() -> Self {
         Self {
             config: Arc::new(Config::default_config()),
             generation: 0,
+            loaded_machine_inventories: Arc::default(),
         }
     }
 
@@ -1482,6 +1504,7 @@ impl ConfigHandle {
         Self {
             config: Arc::new(config),
             generation: self.generation,
+            loaded_machine_inventories: Arc::clone(&self.loaded_machine_inventories),
         }
     }
 
@@ -1717,12 +1740,9 @@ mod tests {
         // A removed leaf cannot be canonicalized, but its parent still can.
         std::fs::rename(&config, root.join("saved-config.lua")).unwrap();
         assert!(!config.exists());
-        assert!(
-            dependencies.relevant(&Ok(notify::Event::new(notify::EventKind::Remove(
-                RemoveKind::File,
-            ))
-            .add_path(alias)))
-        );
+        assert!(dependencies.relevant(&Ok(
+            notify::Event::new(notify::EventKind::Remove(RemoveKind::File,)).add_path(alias)
+        )));
         assert!(dependencies.relevant(&rename(config)));
         assert!(!dependencies.relevant(&rename(root.join("links/../saved-config.lua"))));
     }
@@ -1826,6 +1846,7 @@ mod tests {
         inner.error = Some("retained error".to_string());
         inner.warnings = vec!["retained warning".to_string()];
         let retained_config = Arc::clone(&inner.config);
+        let retained_inventory = Arc::clone(&inner.loaded_machine_inventories);
 
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
             inner.install_config(
@@ -1837,8 +1858,51 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(inner.generation, usize::MAX);
         assert!(Arc::ptr_eq(&inner.config, &retained_config));
+        assert!(Arc::ptr_eq(
+            &inner.loaded_machine_inventories,
+            &retained_inventory
+        ));
         assert_eq!(inner.error.as_deref(), Some("retained error"));
         assert_eq!(inner.warnings, ["retained warning"]);
+    }
+
+    #[test]
+    fn config_handle_keeps_its_loaded_inventory_when_a_new_generation_is_installed() {
+        let configuration = Configuration::new();
+        let context = machines::InventoryContext {
+            directory: PathBuf::from("/not/read"),
+            home: PathBuf::from("/not/read"),
+        };
+        let inventory = machines::MachineInventory::parse(
+            "version = 1\n[machines.build]\nname = 'Loaded build'\n[[machines.build.routes]]\nid = 'ssh'\nhost = 'build.invalid'\nuser = 'test'\n",
+            &context,
+        ).unwrap();
+        {
+            let mut inner = configuration.inner_lock();
+            inner.install_config(Config::default_config(), None);
+            let mut captured = mobile_export::LoadedMachineInventories::default();
+            captured.record(PathBuf::from("/not/read/machines.toml"), inventory.clone());
+            inner.loaded_machine_inventories = Arc::new(captured);
+        }
+        let old = configuration.get();
+        assert_eq!(
+            old.loaded_machine_inventories().selected().unwrap().1,
+            &inventory
+        );
+        configuration.inner_lock().use_defaults();
+        let replacement = configuration.get();
+        assert!(replacement.generation() > old.generation());
+        assert!(replacement.loaded_machine_inventories().selected().is_err());
+        assert_eq!(
+            old.loaded_machine_inventories().selected().unwrap().1,
+            &inventory
+        );
+        let recolored = old.with_resolved_palette(old.resolved_palette.clone());
+        assert_eq!(recolored.generation(), old.generation());
+        assert_eq!(
+            recolored.loaded_machine_inventories().selected().unwrap().1,
+            &inventory
+        );
     }
 
     #[test]
@@ -2202,7 +2266,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn user_owned_directory_creation_is_private_and_symlink_safe() {
-        use std::os::unix::fs::{symlink, PermissionsExt as _};
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
 
         let fixture = tempfile::tempdir().expect("private-directory fixture");
         let private = fixture.path().join("state").join("nested");
@@ -2285,7 +2349,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn user_owned_file_io_rejects_symlink_and_hardlink_aliases_without_mutating_targets() {
-        use std::os::unix::fs::{symlink, PermissionsExt as _};
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
 
         for hardlink in [false, true] {
             let fixture = tempfile::tempdir().expect("private-file alias fixture");

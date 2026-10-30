@@ -39,6 +39,46 @@ public enum LocalHelperProcessError: Error, LocalizedError, Equatable {
 /// The deadline includes waiting for EOF: an inherited pipe cannot keep an
 /// already-exited helper's request alive indefinitely.
 public enum LocalHelperProcess {
+    /// Consume one explicitly requested desktop handoff. Only an inherited pipe
+    /// is accepted: opening the app normally cannot read a terminal or a file.
+    /// EOF is mandatory, and cancellation, timeout and overflow return no prefix.
+    /// The caller owns and closes the descriptor after this operation.
+    public static func readInheritedInput(from descriptor: Int32 = STDIN_FILENO,
+                                         maximumBytes: Int = MachineCompanionSource.maximumBytes,
+                                         timeout: TimeInterval = 15,
+                                         isCancelled: () -> Bool = { Task<Never, Never>.isCancelled }) throws -> Data {
+        guard (1...MachineCompanionSource.maximumBytes).contains(maximumBytes), timeout.isFinite,
+              timeout > 0, timeout <= 30 else { throw LocalHelperProcessError.invalidLimits }
+        if isCancelled() { throw CancellationError() }
+        var metadata = stat()
+        guard fstat(descriptor, &metadata) == 0,
+              metadata.st_mode & mode_t(S_IFMT) == mode_t(S_IFIFO) else {
+            throw LocalHelperProcessError.invalidInvocation
+        }
+        let flags = fcntl(descriptor, F_GETFL)
+        guard flags >= 0, fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0 else {
+            throw LocalHelperProcessError.io(errno)
+        }
+        defer { _ = fcntl(descriptor, F_SETFL, flags) }
+        let start = DispatchTime.now().uptimeNanoseconds
+        let budget = UInt64(timeout * 1_000_000_000)
+        var bytes = Data()
+        while true {
+            if isCancelled() { throw CancellationError() }
+            guard DispatchTime.now().uptimeNanoseconds &- start < budget else {
+                throw LocalHelperProcessError.timedOut
+            }
+            if try !drain(descriptor, into: &bytes, limit: maximumBytes, overflow: .outputLimit) {
+                if isCancelled() { throw CancellationError() }
+                return bytes
+            }
+            var event = pollfd(fd: descriptor, events: Int16(POLLIN), revents: 0)
+            let ready = poll(&event, 1, 20)
+            if ready < 0 && errno != EINTR { throw LocalHelperProcessError.io(errno) }
+            if event.revents & Int16(POLLNVAL) != 0 { throw LocalHelperProcessError.io(EBADF) }
+        }
+    }
+
     public static func run(executable: URL, arguments: [String], maximumOutputBytes: Int,
                            maximumDiagnosticBytes: Int = 65_536, timeout: TimeInterval = 30,
                            isCancelled: () -> Bool = { Task<Never, Never>.isCancelled }) throws -> Data {
