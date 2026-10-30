@@ -3,8 +3,8 @@ use crate::keys::KeyNoAction;
 use crate::window::WindowLevel;
 use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, ToDynamic, Value};
 use frankenterm_input_types::{KeyCode, Modifiers};
-use frankenterm_term::input::MouseButton;
 use frankenterm_term::SemanticType;
+use frankenterm_term::input::MouseButton;
 #[cfg(feature = "lua")]
 use luahelper::impl_lua_conversion_dynamic;
 use ordered_float::NotNan;
@@ -605,6 +605,8 @@ pub enum KeyAssignment {
         confirm: bool,
     },
     ReloadConfiguration,
+    /// Send this running desktop's loaded inventory to the native Mac exporter.
+    ExportToIPhone,
     MoveTabRelative(isize),
     MoveTab(usize),
     ScrollByPage(NotNan<f64>),

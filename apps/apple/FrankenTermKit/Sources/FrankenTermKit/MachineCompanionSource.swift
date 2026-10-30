@@ -7,21 +7,53 @@ public struct MachineCompanionSource: Sendable {
     public static let maximumBytes = 2 * FTLimit.manifest
     public static let maximumFindingsBytes = 256 * 1024
     public static let scopeSetting = "machines_toml.source_scope"
+    public static let desktopScopeSetting = "desktop_snapshot.source_scope"
+
+    /// Provenance of an immutable handoff from the running desktop. These
+    /// fields describe the source; they do not authenticate imported SSH trust.
+    public struct Runtime: Equatable, Sendable {
+        public let instanceID: String
+        public let configurationGeneration: UInt64
+        public let configurationRevision: String
+    }
 
     public let workspace: WorkspaceDocument
     public let inventory: String
     public let identityFiles: [String: String]
     public let findings: [AirGapArchive.Portability]
+    public let runtime: Runtime?
 
-    public init(data: Data) throws {
+    public init(data: Data, requireRunningDesktop: Bool = false) throws {
         let root = try StrictJSON.decodeMachineCompanion(data).object()
         guard try root.text("format") == "ftmachines-source" else { throw FTError.unsupported("machines.source") }
         let version = try root.required("version").uint()
-        guard version == 1 || version == 2 else { throw FTError.unsupported("machines.source_version") }
+        guard (1...3).contains(version) else { throw FTError.unsupported("machines.source_version") }
+        guard !requireRunningDesktop || version == 3 else { throw FTError.unsupported("machines.running_source_required") }
         try root.allowing(version == 1
             ? ["format", "version", "inventory", "document", "identity_files", "notes"]
-            : ["format", "version", "inventory", "document", "identity_files", "portability"])
+            : version == 2
+                ? ["format", "version", "inventory", "document", "identity_files", "portability"]
+                : ["format", "version", "inventory", "document", "identity_files", "portability", "runtime"])
         let workspace = try WorkspaceDocument(data: StrictJSON.encode(root.required("document")))
+        let runtime: Runtime?
+        if version == 3 {
+            let witness = try root.required("runtime").object()
+            try witness.allowing(["instance_id", "configuration_generation", "configuration_revision"])
+            let instance = try witness.text("instance_id")
+            let generation = try witness.required("configuration_generation").uint()
+            let revision = try witness.text("configuration_revision")
+            let prefix = "desktop:\(instance):\(generation):sha256:"
+            guard instance.utf8.count == 32, instance.utf8.allSatisfy(Self.lowerHex), generation > 0,
+                  revision.hasPrefix(prefix), revision.utf8.count == prefix.utf8.count + 64,
+                  revision.utf8.dropFirst(prefix.utf8.count).allSatisfy(Self.lowerHex),
+                  workspace.sourceKind == "desktop_snapshot", workspace.configurationRevision == revision else {
+                throw FTError.malformed("machines.runtime_witness")
+            }
+            runtime = .init(instanceID: instance, configurationGeneration: generation, configurationRevision: revision)
+        } else {
+            guard workspace.sourceKind != "desktop_snapshot" else { throw FTError.malformed("machines.runtime_witness") }
+            runtime = nil
+        }
         let inventory = try root.text("inventory")
         try Self.text(inventory)
         let references = try root.required("identity_files").object()
@@ -65,7 +97,8 @@ public struct MachineCompanionSource: Sendable {
                                  disposition: fields.required("disposition").uint(), reason: fields.text("reason"))
             }
             guard findings.contains(where: {
-                $0.entityID == workspace.id && $0.setting == Self.scopeSetting && $0.disposition == 0
+                $0.entityID == workspace.id && $0.setting == (runtime == nil ? Self.scopeSetting : Self.desktopScopeSetting)
+                    && $0.disposition == 0
             }) else { throw FTError.malformed("machines.source_scope") }
         }
         let metadata = try AirGapArchive.validatedMetadata(workspace: workspace, portability: findings, annotations: [])
@@ -78,7 +111,10 @@ public struct MachineCompanionSource: Sendable {
         guard encoded.count <= Self.maximumFindingsBytes else { throw FTError.limit("machines.source_findings") }
         self.workspace = workspace; self.inventory = inventory
         identityFiles = files; self.findings = metadata.portability
+        self.runtime = runtime
     }
+
+    private static func lowerHex(_ byte: UInt8) -> Bool { (48...57).contains(byte) || (97...102).contains(byte) }
 
     private static func text(_ value: String) throws {
         guard !value.isEmpty, value.utf8.count <= FTLimit.text,

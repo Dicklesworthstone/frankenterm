@@ -14,6 +14,84 @@ final class MachineCompanionSourceTests: XCTestCase {
         finding("work", MachineCompanionSource.scopeSetting, "Inventory settings only; live overrides are not captured.")
     }
 
+    private func desktopResponse(mutate: (inout [String: Any]) -> Void = { _ in }) throws -> Data {
+        let instance = String(repeating: "a", count: 32)
+        let revision = "desktop:\(instance):7:sha256:" + String(repeating: "b", count: 64)
+        return try response(version: 3) { root in
+            var document = root["document"] as! [String: Any]
+            var source = document["source"] as! [String: Any]
+            source["kind"] = "desktop_snapshot"
+            source["configuration_revision"] = revision
+            document["source"] = source; root["document"] = document
+            root["runtime"] = ["instance_id": instance, "configuration_generation": 7,
+                               "configuration_revision": revision] as [String: Any]
+            root["portability"] = [finding("work", MachineCompanionSource.desktopScopeSetting,
+                "Loaded inventory at one desktop generation; window overrides and live panes are not captured.")]
+            mutate(&root)
+        }
+    }
+
+    func testDesktopHandoffRetainsExactRuntimeRevisionThroughSelectionAndEncryptedRestore() throws {
+        let source = try MachineCompanionSource(data: desktopResponse(), requireRunningDesktop: true)
+        let runtime = try XCTUnwrap(source.runtime)
+        XCTAssertEqual(runtime.configurationGeneration, 7)
+        XCTAssertEqual(runtime.configurationRevision, source.workspace.configurationRevision)
+        XCTAssertEqual(source.workspace.sourceKind, "desktop_snapshot")
+        let selection = try WorkspaceExportSelection(workspace: source.workspace,
+            groupIDs: ["group"], machineIDs: ["build"], findings: source.findings)
+        let fingerprint = try XCTUnwrap(selection.identities.first?.fingerprint)
+        XCTAssertFalse(try selection.review(decisions: [:], loadedFingerprints: []).canPrepare,
+                       "source capture alone is not a private-key inclusion decision")
+        let archive = try selection.archive(decisions: [fingerprint: .keepReferenceOnly], keys: [],
+            bundleID: "running-desktop-selection", using: crypto)
+        let review = try selection.review(decisions: [fingerprint: .keepReferenceOnly], loadedFingerprints: [])
+        let sealed = try FTAG.seal(archive, using: crypto)
+        let restored = try FTAG.open(sealed.envelope, code: sealed.code, using: crypto)
+        XCTAssertEqual(restored.workspace.configurationRevision, runtime.configurationRevision)
+        XCTAssertEqual(restored.workspace.machines.map(\.id), ["build"])
+        XCTAssertEqual(restored.portability, review.findings)
+        XCTAssertTrue(source.findings.allSatisfy(restored.portability.contains),
+                      "source scope travels together with the reviewed missing-key/readiness findings")
+        XCTAssertNil(restored.workspace.raw.range(of: Data("/source/ssh/selected_key".utf8)))
+    }
+
+    func testRunningHandoffNeverAcceptsAnInventoryFallbackOrMismatchedWitness() throws {
+        for version in [1, 2] {
+            XCTAssertThrowsError(try MachineCompanionSource(data: response(version: version), requireRunningDesktop: true)) {
+                XCTAssertEqual($0 as? FTError, .unsupported("machines.running_source_required"))
+            }
+        }
+        let mutations: [(inout [String: Any]) -> Void] = [
+            { $0.removeValue(forKey: "runtime") },
+            { $0["runtime"] = ["instance_id": "copied"] },
+            { root in var runtime = root["runtime"] as! [String: Any]; runtime["configuration_generation"] = 8; root["runtime"] = runtime },
+            { root in var runtime = root["runtime"] as! [String: Any]; runtime["configuration_generation"] = 0; root["runtime"] = runtime },
+            { root in var runtime = root["runtime"] as! [String: Any]; runtime["instance_id"] = String(repeating: "A", count: 32); root["runtime"] = runtime },
+            { root in var runtime = root["runtime"] as! [String: Any]; runtime["extra"] = true; root["runtime"] = runtime },
+            { root in var document = root["document"] as! [String: Any]; var source = document["source"] as! [String: Any]; source["configuration_revision"] = "different"; document["source"] = source; root["document"] = document },
+            { root in var document = root["document"] as! [String: Any]; var source = document["source"] as! [String: Any]; source["kind"] = "machines_toml"; document["source"] = source; root["document"] = document },
+            { $0["portability"] = [self.scope] },
+            { $0["portability"] = [self.finding("work", MachineCompanionSource.desktopScopeSetting, "Wrong disposition", disposition: 1)] }
+        ]
+        for mutation in mutations {
+            XCTAssertThrowsError(try MachineCompanionSource(data: desktopResponse(mutate: mutation), requireRunningDesktop: true))
+        }
+        XCTAssertThrowsError(try MachineCompanionSource(data: desktopResponse { root in
+            root["version"] = 2; root.removeValue(forKey: "runtime"); root["portability"] = [self.scope]
+        }))
+    }
+
+    func testRuntimeDuplicateKeysCannotChooseOneOfTwoSourceGenerations() throws {
+        let bytes = try desktopResponse()
+        let text = String(decoding: bytes, as: UTF8.self)
+        let duplicate = text.replacingOccurrences(of: "\"configuration_generation\":7",
+            with: "\"configuration_generation\":7,\"configuration_generation\":8")
+        XCTAssertNotEqual(text, duplicate)
+        XCTAssertThrowsError(try MachineCompanionSource(data: Data(duplicate.utf8), requireRunningDesktop: true)) {
+            XCTAssertEqual($0 as? FTError, .malformed("json.duplicate_key"))
+        }
+    }
+
     private func response(document: Data? = nil, version: Int = 2,
                           mutate: (inout [String: Any]) -> Void = { _ in }) throws -> Data {
         let manifest = try document ?? sampleManifest()
@@ -118,7 +196,7 @@ final class MachineCompanionSourceTests: XCTestCase {
             { $0["identity_files"] = ["key": "relative-key"] },
             { $0["identity_files"] = ["key": "/source/$EXPANSION"] },
             { $0["identity_files"] = ["key": "/source/key\u{7f}"] },
-            { $0["version"] = 3 }
+            { $0["version"] = 4 }
         ]
         for mutate in mutations {
             XCTAssertThrowsError(try MachineCompanionSource(data: response(mutate: mutate)))

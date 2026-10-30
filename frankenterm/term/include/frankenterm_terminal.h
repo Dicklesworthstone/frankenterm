@@ -111,6 +111,10 @@ uint32_t ft_terminal_v1_set_font_revision(uint64_t session, uint64_t revision);
  * the frame palette revision. */
 #define FT_TERMINAL_BASE_PALETTE_BYTES 1052u
 uint32_t ft_terminal_v1_set_base_palette(uint64_t session, const uint8_t *rgba, uint32_t length);
+/* Installs one verified mux publication's transient palette using the same
+ * 263-color RGBA8 layout. Does not change the machine's configured theme.
+ * Reconfiguration/resize preserves the override; RIS resets it to the theme. */
+uint32_t ft_terminal_v1_set_mux_palette(uint64_t session, const uint8_t *rgba, uint32_t length);
 
 /* Pure mode-aware encoders. No terminal writer, echo, focus, or input state is
  * changed. Caller must serialize mode changes with admission of these bytes.
@@ -198,7 +202,13 @@ uint32_t ft_terminal_v1_frame_release(uint64_t frame);
  *              physical_top}; again whenever the desktop adds or reshapes
  *              a tab, or a pane closes
  *   OUTPUT     pane_id, rows, cols; payload: bytes for that pane's terminal,
- *              which must be rows x cols before they are fed
+ *              which must be rows x cols before they are fed. Only complete
+ *              consumption of this final event establishes frame readiness.
+ *   PREPARING_OUTPUT same payload as OUTPUT; ordered parser preparation only,
+ *              never readiness. Keep separate feed budgets for reset and cells.
+ *   PALETTE    pane_id; rows and cols 0; exactly 1052 bytes (263 RGBA8 colors),
+ *              applied with ft_terminal_v1_set_mux_palette in order after reset
+ *              and before the final OUTPUT. Does not establish readiness.
  *   PANE_TITLE pane_id; payload: the title
  *   PANE_GONE  pane_id
  *   FAILED     payload: why; the session is over, close the channel
@@ -258,6 +268,8 @@ uint32_t ft_terminal_v1_frame_release(uint64_t frame);
 #define FT_MUX_EVENT_PHONE_SIZE_RESTORED 13u
 #define FT_MUX_EVENT_PANE_WAITING 14u
 #define FT_MUX_EVENT_PANE_IDENTITY 15u
+#define FT_MUX_EVENT_PREPARING_OUTPUT 16u
+#define FT_MUX_EVENT_PALETTE 17u
 #define FT_MUX_SEARCH_CASE_SENSITIVE 1u
 #define FT_MUX_SEARCH_REGEX 2u
 #define FT_MUX_MAX_RECEIVE_BYTES 1048576u

@@ -17,12 +17,12 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use crate::native::{
-    NativeKeyPhase, NativeMouseAction, NativeTerminal, NativeTerminalConfig,
-    NativeTerminalError as Error, BASE_PALETTE_BYTES, MAX_FEED_BYTES, MAX_FRAME_BYTES,
-    MAX_INPUT_BYTES, MAX_REPLY_BYTES, MAX_TEXT_BYTES,
+    BASE_PALETTE_BYTES, MAX_FEED_BYTES, MAX_FRAME_BYTES, MAX_INPUT_BYTES, MAX_REPLY_BYTES,
+    MAX_TEXT_BYTES, NativeKeyPhase, NativeMouseAction, NativeTerminal, NativeTerminalConfig,
+    NativeTerminalError as Error,
 };
 use crate::{BoundedReplyDisposition, TerminalSize};
-use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
+use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use std::convert::TryFrom;
 use std::mem::size_of;
 use std::panic::AssertUnwindSafe;
@@ -448,6 +448,18 @@ pub extern "C" fn ft_terminal_v1_set_font_revision(session: u64, revision: u64) 
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn ft_terminal_v1_set_mux_palette(
+    session: u64,
+    rgba: *const u8,
+    length: u32,
+) -> u32 {
+    boundary(Some(session), |registry| {
+        let rgba = unsafe { input_bytes(rgba, length, BASE_PALETTE_BYTES)? };
+        registry.session(session)?.set_mux_palette(rgba)
+    })
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn ft_terminal_v1_encode_key(
     session: u64,
     usage: u32,
@@ -862,6 +874,26 @@ mod tests {
                 ft_terminal_v1_set_base_palette(session, theme.as_ptr(), BASE_PALETTE_BYTES as u32),
                 0
             );
+            assert_eq!(
+                ft_terminal_v1_set_mux_palette(session, theme.as_ptr(), theme.len() as u32),
+                Error::Capacity as u32
+            );
+            assert_eq!(
+                ft_terminal_v1_set_mux_palette(session, theme.as_ptr(), 4),
+                Error::Invalid as u32
+            );
+            assert_eq!(
+                ft_terminal_v1_set_mux_palette(
+                    session,
+                    std::ptr::null(),
+                    BASE_PALETTE_BYTES as u32
+                ),
+                Error::Invalid as u32
+            );
+            assert_eq!(
+                ft_terminal_v1_set_mux_palette(session, theme.as_ptr(), BASE_PALETTE_BYTES as u32),
+                0
+            );
         }
         assert_eq!(
             boundary(Some(session), |_| -> Result<(), Error> {
@@ -881,6 +913,16 @@ mod tests {
         );
         assert_eq!(
             ft_terminal_v1_set_font_revision(session, 2),
+            Error::Closed as u32
+        );
+        assert_eq!(
+            unsafe {
+                ft_terminal_v1_set_mux_palette(
+                    session,
+                    [0u8; BASE_PALETTE_BYTES].as_ptr(),
+                    BASE_PALETTE_BYTES as u32,
+                )
+            },
             Error::Closed as u32
         );
         assert_eq!(ft_terminal_v1_release(session), 0);

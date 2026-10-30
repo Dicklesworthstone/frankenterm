@@ -127,6 +127,8 @@ mod metal_hyperlinks;
 mod metal_images;
 mod metal_render_thread;
 mod metal_window;
+#[cfg(target_os = "macos")]
+mod mobile_export;
 pub mod modal;
 mod mouseevent;
 pub mod palette;
@@ -9738,6 +9740,12 @@ impl TermWindow {
             CloseCurrentPane { confirm } => self.close_current_pane(*confirm),
             Nop | DisableDefaultAssignment => {}
             ReloadConfiguration => config::reload(),
+            ExportToIPhone => {
+                #[cfg(target_os = "macos")]
+                mobile_export::start_export(config::configuration())?;
+                #[cfg(not(target_os = "macos"))]
+                anyhow::bail!("The native iPhone export companion requires macOS");
+            }
             MoveTab(n) => self.move_tab(*n)?,
             MoveTabRelative(n) => self.move_tab_relative(*n)?,
             ScrollByPage(n) => self.scroll_by_page(**n, pane)?,

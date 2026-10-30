@@ -237,6 +237,8 @@ pub struct Server {
     /// Exact live pane authority; changing this simulates reuse of its number.
     pub registration: [u8; 16],
     pub durable_identity: bool,
+    pub coherent_render: bool,
+    pub palette_generation: u64,
     pub client_ids: Vec<mux::client::ClientId>,
     /// Limit a reliable writer to this many bytes per acknowledged prefix.
     pub write_prefix: Option<usize>,
@@ -279,6 +281,8 @@ impl Server {
             incarnation: [0x1c; 16],
             registration: [0x27; 16],
             durable_identity: true,
+            coherent_render: false,
+            palette_generation: 1,
             client_ids: Vec::new(),
             write_prefix: None,
             unfenced: false,
@@ -369,7 +373,9 @@ impl Server {
                                     self.registration,
                                 ),
                         },
-                        render_facts: None,
+                        render_facts: self
+                            .coherent_render
+                            .then(|| Box::new(self.render_metadata())),
                     }
                 };
                 self.reply(
@@ -895,6 +901,32 @@ impl Server {
         }
     }
 
+    pub fn render_metadata(&mut self) -> codec::PaneRenderMetadataV1 {
+        codec::PaneRenderMetadataV1 {
+            seqno: self.term.current_seqno(),
+            dimensions: terminal_get_dimensions(&mut self.term),
+            cursor: terminal_get_cursor_position(&mut self.term),
+            mouse_grabbed: self.mouse_grabbed,
+            alt_screen_active: self.term.is_alt_screen_active(),
+            bracketed_paste: self.term.bracketed_paste_enabled(),
+            focus_tracking: self.term.focus_tracking_enabled(),
+            palette_generation: self.palette_generation,
+            palette: self.term.palette(),
+        }
+    }
+
+    pub fn palette_changed(&mut self) {
+        self.palette_generation += 1;
+        self.reply(
+            38,
+            0,
+            &codec::SetPalette {
+                pane_id: self.pane_id,
+                palette: Arc::new(self.term.palette()),
+            },
+        );
+    }
+
     /// The notice every client gets when the desktop opens a tab.
     pub fn notify_tab_added(&mut self) {
         let (tab_id, window_id) = (self.tab_id + 1, 0);
@@ -966,6 +998,9 @@ impl Harness {
             while let Some(event) = self.session.next_event() {
                 if let Event::Output {
                     rows, cols, bytes, ..
+                }
+                | Event::PreparingOutput {
+                    rows, cols, bytes, ..
                 } = &event
                 {
                     if (self.phone.get_size().rows, self.phone.get_size().cols) != (*rows, *cols) {
@@ -981,6 +1016,24 @@ impl Harness {
                         );
                     }
                     self.outputs += 1;
+                }
+                if let Event::Palette { rgba, .. } = &event {
+                    assert_eq!(rgba.len(), 263 * 4);
+                    let color = |index: usize| {
+                        let c = |channel| f32::from(rgba[index * 4 + channel]) / 255.0;
+                        frankenterm_term::color::SrgbaTuple(c(0), c(1), c(2), c(3))
+                    };
+                    let palette = self.phone.palette_mut();
+                    for (index, value) in palette.colors.0.iter_mut().enumerate() {
+                        *value = color(index);
+                    }
+                    palette.foreground = color(256);
+                    palette.background = color(257);
+                    palette.cursor_fg = color(258);
+                    palette.cursor_bg = color(259);
+                    palette.cursor_border = color(260);
+                    palette.selection_fg = color(261);
+                    palette.selection_bg = color(262);
                 }
                 self.events.push(event);
             }

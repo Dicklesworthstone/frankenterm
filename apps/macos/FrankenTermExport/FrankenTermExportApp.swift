@@ -38,11 +38,21 @@ private enum MachineSourceError: LocalizedError {
 @main
 @MainActor
 struct FrankenTermExportApp: App {
+    @NSApplicationDelegateAdaptor(ExportApplicationDelegate.self) private var applicationDelegate
     @State private var model = MacExportModel()
     var body: some Scene {
         Window("FrankenTerm Offline Export", id: "export") {
             MacExportView(model: model)
         }.defaultSize(width: 850, height: 900)
+    }
+}
+
+@MainActor
+private final class ExportApplicationDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        // A deliberately spawned desktop handoff owns one window/process. This
+        // also releases the desktop's bounded child-process admission on close.
+        CommandLine.arguments.contains("--desktop-source-stdin")
     }
 }
 
@@ -119,6 +129,7 @@ private actor MacExportEngine {
     struct MachineSourceResult: Sendable {
         let state: SelectionState
         let inventory: String
+        let runtime: MachineCompanionSource.Runtime?
         /// Credentials whose key file needs a passphrase or could not be used.
         let unresolved: [(credentialID: String, reason: String)]
     }
@@ -149,12 +160,31 @@ private actor MacExportEngine {
         let bytes = try Self.run(command.executable, command.arguments, limit: MachineCompanionSource.maximumBytes)
         try Task.checkCancellation()
         let source = try MachineCompanionSource(data: bytes)
+        return try loadMachineSource(source)
+    }
+    func loadDesktopHandoff() throws -> MachineSourceResult {
+        clear()
+        defer { try? FileHandle.standardInput.close() }
+        let bytes = try LocalHelperProcess.readInheritedInput()
+        try Task.checkCancellation()
+        let result = try loadMachineSource(MachineCompanionSource(data: bytes, requireRunningDesktop: true))
+        try Task.checkCancellation()
+        let digest = crypto.sha256(bytes).map { String(format: "%02x", $0) }.joined()
+        // The desktop verifies this exact receipt before accepting the handoff;
+        // an older companion that ignores the flag cannot silently substitute
+        // its ordinary static-inventory startup path.
+        try FileHandle.standardOutput.write(contentsOf: Data("FTDESKTOP3/\(digest)\n".utf8))
+        return result
+    }
+    private func loadMachineSource(_ source: MachineCompanionSource) throws -> MachineSourceResult {
         let files = source.identityFiles, candidate = source.workspace
         let selected = try WorkspaceExportSelection(workspace: candidate, groupIDs: Set(candidate.groups.map(\.id)),
                                                     findings: source.findings)
         var loaded: [PrivateKeyRecord] = [], included: [String: WorkspaceExportSelection.IdentityDecision] = [:]
         var unresolved: [(credentialID: String, reason: String)] = []
-        for identity in selected.identities {
+        // A live desktop handoff supplies public references only. Its private
+        // files are read only after Include Private Key + Use Key on This Mac.
+        for identity in selected.identities where source.runtime == nil {
             try Task.checkCancellation()
             guard let credentialID = identity.credentialIDs.first(where: { files[$0] != nil }),
                   let path = files[credentialID], let url = Self.identityURL(path),
@@ -182,7 +212,7 @@ private actor MacExportEngine {
         document = candidate; selection = selected; decisions = included; keys = loaded
         excludedMachineIDs = []
         sourceFindings = source.findings; identityReferences = files; sshSource = nil; invalidateExport()
-        return .init(state: try state(), inventory: source.inventory, unresolved: unresolved)
+        return .init(state: try state(), inventory: source.inventory, runtime: source.runtime, unresolved: unresolved)
     }
     func inspectSSHConfiguration(_ url: URL) throws -> [String] {
         retireKeyRequest(); invalidateExport()
@@ -672,6 +702,20 @@ private final class MacExportModel {
             message = text + " Approve the keys below, then Prepare Encrypted Transfer."
         }
     }
+    private func loadDesktopHandoff() {
+        guard !busy, sourceSheet == nil else { return }
+        clearVisibleMaterial()
+        perform { [self] operation in
+            let result = try await engine.loadDesktopHandoff()
+            try requireCurrentWork(operation)
+            guard let runtime = result.runtime else { throw FTError.malformed("machines.runtime_witness") }
+            apply(result.state)
+            message = "Captured \(result.state.selection.workspace.machines.count) machines from the running desktop's loaded inventory at configuration \(runtime.configurationGeneration). Review the source scope and selected keys before preparing the transfer."
+            if !result.unresolved.isEmpty {
+                message = (message ?? "") + " Still to decide: " + result.unresolved.map(\.reason).joined(separator: "; ") + "."
+            }
+        }
+    }
     func chooseWorkspace() {
         guard !busy, sourceSheet == nil else { return }
         cancelRecipientScan()
@@ -1009,7 +1053,12 @@ private final class MacExportModel {
     func openExport(isActive: Bool) {
         windowOpen = true
         setForeground(isActive)
-        if !loadedAtLaunch, document == nil, MacExportEngine.machineSourceCommand() != nil {
+        if !loadedAtLaunch, CommandLine.arguments.contains("--desktop-source-stdin") {
+            // An invalid/retired handoff cannot silently turn into a fresh read
+            // of files on disk. The user may deliberately choose Other Sources.
+            loadedAtLaunch = true
+            loadDesktopHandoff()
+        } else if !loadedAtLaunch, document == nil, MacExportEngine.machineSourceCommand() != nil {
             loadedAtLaunch = true
             loadThisMac()
         }
@@ -1158,7 +1207,11 @@ private final class MacExportModel {
         }
     }
     private func report(_ error: Error) {
-        if let error = error as? LocalExportFileError {
+        if let error = error as? LocalHelperProcessError {
+            message = "The running desktop snapshot could not be received: \(error.localizedDescription) Choose Export to iPhone again in the desktop, or deliberately select another source."
+        } else if let error = error as? MachineSourceError {
+            message = error.localizedDescription
+        } else if let error = error as? LocalExportFileError {
             message = error.localizedDescription
         } else if let error = error as? OpenSSHSourceKeyError {
             message = error.localizedDescription
@@ -1460,7 +1513,9 @@ private struct MacExportView: View {
     @ViewBuilder
     private func sendSummary(_ selection: WorkspaceExportSelection, _ review: WorkspaceExportSelection.Review) -> some View {
         let sourceFindings = review.findings.filter {
-            $0.setting.hasPrefix("machines_toml.") && $0.setting != MachineCompanionSource.scopeSetting
+            ($0.setting.hasPrefix("machines_toml.") || $0.setting.hasPrefix("desktop_snapshot."))
+                && $0.setting != MachineCompanionSource.scopeSetting
+                && $0.setting != MachineCompanionSource.desktopScopeSetting
         }
         let narrowed = !sourceFindings.isEmpty || !review.blockedRouteIDs.isEmpty
         VStack(alignment: .leading, spacing: 18) {
@@ -1468,6 +1523,10 @@ private struct MacExportView: View {
                 Text("Send your machines to your iPhone").font(.title.bold())
                 Text("\(selection.orderedMachines.count) machines and \(review.includedIdentityCount) keys from \(selection.workspace.name)")
                     .font(.title3).foregroundStyle(.secondary)
+            }
+            if let scope = review.findings.first(where: { $0.setting == MachineCompanionSource.desktopScopeSetting }) {
+                Label("Captured from the running desktop", systemImage: "desktopcomputer").font(.headline)
+                Text(verbatim: scope.reason).font(.caption).foregroundStyle(.secondary)
             }
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 170), spacing: 10)], alignment: .leading, spacing: 10) {
                 ForEach(selection.availableMachines) { machine in
@@ -1609,6 +1668,7 @@ private struct MacExportView: View {
                             Label(finding.disposition == 1 ? "Required policy unavailable"
                                   : finding.setting == "credential_policy" ? "Credential policy preserved"
                                   : finding.setting == "ssh_config.source_scope" || finding.setting == MachineCompanionSource.scopeSetting
+                                    || finding.setting == MachineCompanionSource.desktopScopeSetting
                                     ? "Source scope" : "Preserved with an omission",
                                   systemImage: finding.disposition == 1 ? "lock.trianglebadge.exclamationmark" : "info.circle")
                                 .font(.caption.bold())

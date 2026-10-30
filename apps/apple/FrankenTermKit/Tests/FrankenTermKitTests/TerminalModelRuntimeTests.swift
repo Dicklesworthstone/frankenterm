@@ -148,6 +148,10 @@ private final class OwnedModelFixture: TerminalSessionModel, @unchecked Sendable
         lock.lock(); defer { lock.unlock() }
         events.append("palette:\(rgba.count)")
     }
+    func setMuxPalette(_ rgba: [UInt8]) {
+        lock.lock(); defer { lock.unlock() }
+        events.append("mux-palette:\(rgba.count):\(rgba.first ?? 0)")
+    }
     func close() throws {
         lock.lock(); defer { lock.unlock() }
         events.append("close"); closeCalls += 1
@@ -195,6 +199,57 @@ private actor ModelRuntimeDelivery: TerminalModelDelivery {
 }
 
 final class TerminalModelRuntimeTests: XCTestCase, @unchecked Sendable {
+    func testMuxPreparationDefersFramesEncodingAndHistoryUntilCompleteOutput() async throws {
+        let (coordinator, _, source) = try await source()
+        let model = OwnedModelFixture(source: source)
+        let runtime = TerminalModelRuntime(model: model, coordinator: coordinator, delivery: ModelRuntimeDelivery())
+        let routing = TerminalMuxInputRouting()
+        try routing.replaceInventory([1])
+        let destination = try routing.select(pane: 1)
+        let size = try TerminalSessionGeometry(columns: 100, rows: 30)
+        try await runtime.receive(.init(output: Data([0x1B, 0x63]), resized: size, muxPreparation: true), source: source)
+        try await runtime.receive(.init(output: Data(),
+            muxPalette: Data(repeating: 29, count: TerminalMuxOutputBuffer.paletteBytes), muxPreparation: true), source: source)
+        try await runtime.receive(.init(output: Data([1, 2]), muxPreparation: true), source: source)
+        try await runtime.refresh(source: source)
+        try await runtime.setVisible(true, source: source)
+        XCTAssertEqual(model.snapshot().captures, 0)
+        do { _ = try await runtime.encode(.text("x"), source: source, maximumBytes: 10); XCTFail("Partial screen encoded input") }
+        catch { XCTAssertEqual(error as? TerminalModelError, .busy) }
+        do { _ = try await runtime.withInputTransaction(source: source) { true }; XCTFail("Partial screen admitted a keyboard transaction") }
+        catch { XCTAssertEqual(error as? TerminalModelError, .busy) }
+        do { _ = try await runtime.captureOutputDocument(source: source); XCTFail("Partial screen escaped as history") }
+        catch { XCTAssertEqual(error as? TerminalHistorySearchError, .unavailable) }
+        XCTAssertEqual(model.snapshot().events, ["resize:100x30", "feed", "mux-palette:1052:29", "feed"])
+        try await runtime.receive(.init(output: Data([3]), muxDestination: destination), source: source)
+        XCTAssertEqual(model.snapshot().captures, 1)
+        XCTAssertEqual(model.snapshot().fed, Data([0x1B, 0x63, 1, 2, 3]))
+        let encoded = try await runtime.encode(.text("x"), source: source, maximumBytes: 10)
+        XCTAssertEqual(encoded, Data([0xA5]))
+        try await runtime.close()
+    }
+
+    func testMuxPaletteAndPreparationValidationPrecedeModelEffects() async throws {
+        let (coordinator, transport, source) = try await source()
+        let other = try TerminalInputCoordinator()
+        let foreign = try await other.attach(ModelRuntimeTransport(identity: transport.identity))
+        let model = OwnedModelFixture(source: source)
+        let runtime = TerminalModelRuntime(model: model, coordinator: coordinator, delivery: ModelRuntimeDelivery())
+        for size in [0, 1051, 1053] {
+            do { try await runtime.receive(.init(output: Data([1]), muxPalette: Data(count: size)), source: source); XCTFail("Malformed palette applied") }
+            catch { XCTAssertEqual(error as? TerminalModelError, .invalid) }
+        }
+        do { try await runtime.receive(.init(output: Data(), muxPalette: Data(count: 1052)), source: foreign); XCTFail("Foreign palette applied") }
+        catch { XCTAssertEqual(error as? TerminalInputError, .stale) }
+        let routing = TerminalMuxInputRouting()
+        try routing.replaceInventory([1])
+        let destination = try routing.select(pane: 1)
+        do { try await runtime.receive(.init(output: Data([1]), muxDestination: destination, muxPreparation: true), source: source); XCTFail("Prefix carried completion authority") }
+        catch { XCTAssertEqual(error as? TerminalModelError, .invalid) }
+        XCTAssertTrue(model.snapshot().events.isEmpty)
+        try await runtime.close()
+    }
+
     private func pointer(_ source: TerminalSource) throws -> TerminalPointerEvent {
         let frame = TerminalRenderFrame(source: source, sequence: 1, geometryRevision: 1,
             paletteRevision: 1, fontRevision: 1, revision: 1, rows: 2, columns: 4, viewportFirst: 0, flags: 1 | 64,
@@ -747,6 +802,16 @@ final class TerminalModelRuntimeTests: XCTestCase, @unchecked Sendable {
                                   source: source)
         awaits = await runtime.inputAwaitsAnswer()
         XCTAssertTrue(awaits, "a local resize is not an answer")
+        try await runtime.receive(.init(output: Data([0x1B, 0x63]), muxPreparation: true), source: source)
+        try await runtime.receive(.init(output: Data(), muxPalette: Data(count: 1052), muxPreparation: true), source: source)
+        awaits = await runtime.inputAwaitsAnswer()
+        XCTAssertTrue(awaits, "synthetic mux reset and palette bytes are not the machine's answer")
+        let routing = TerminalMuxInputRouting()
+        try routing.replaceInventory([1])
+        let destination = try routing.select(pane: 1)
+        try await runtime.receive(.init(output: Data(), muxDestination: destination), source: source)
+        awaits = await runtime.inputAwaitsAnswer()
+        XCTAssertTrue(awaits, "an empty completing screen is not application output")
         try await runtime.receive(.init(output: Data("lost\r\n".utf8)), source: source)
         awaits = await runtime.inputAwaitsAnswer()
         XCTAssertFalse(awaits, "the machine's output answers it")

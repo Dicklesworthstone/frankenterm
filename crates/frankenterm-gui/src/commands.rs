@@ -1384,6 +1384,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["FrankenTerm"],
             icon: Some("md_reload"),
         },
+        ExportToIPhone => CommandDef {
+            brief: "Export to iPhone…".into(),
+            doc: "Review and transfer the machine inventory already loaded by this running desktop, without reevaluating configuration".into(),
+            keys: vec![],
+            args: &[],
+            menubar: &["FrankenTerm"],
+            icon: None,
+        },
         QuitApplication => CommandDef {
             brief: "Quit FrankenTerm".into(),
             doc: "Quits FrankenTerm".into(),

@@ -12,6 +12,11 @@ private enum ObservationFixtureError: Error { case timeout, unexpectedSource }
 /// not claim native Rust codec, Metal or physical-device qualification.
 private final class ObservationMuxClient: TerminalMuxClient, @unchecked Sendable {
     static let incarnation = Data(repeating: 0x4a, count: 16)
+    static let preparatoryBytes = Data("\u{1b}c\u{1b}[?25l\u{1b}[?2004h".utf8)
+    static let completeBytes = Data(repeating: 0x78, count: 40_001)
+    static let palette = Data((0..<263).flatMap { index in
+        [UInt8(truncatingIfNeeded: index), UInt8(37), UInt8(89), UInt8(255)]
+    })
     struct Call: Equatable {
         let name: String, pane: Int
         let column: Int?, row: Int?
@@ -86,8 +91,21 @@ private final class ObservationMuxClient: TerminalMuxClient, @unchecked Sendable
             }
             let size = sizes[pane]!
             events.append(.mouseGrab(paneID: pane, grabbed: true))
+            if mode == "preparing-output" {
+                events.append(.preparingOutput(paneID: pane, rows: size.rows, columns: size.columns,
+                    bytes: Self.preparatoryBytes))
+                events.append(.palette(paneID: pane, rgba: Self.palette))
+                return
+            }
             events.append(.output(paneID: pane, rows: size.rows, columns: size.columns,
                 bytes: Data("pane-\(pane)\r\n".utf8)))
+        }
+    }
+    func releasePreparedOutput(pane: Int) {
+        lock.withLock {
+            let size = sizes[pane]!
+            events.append(.output(paneID: pane, rows: size.rows, columns: size.columns,
+                bytes: Self.completeBytes))
         }
     }
     func hide(pane: Int) throws { lock.withLock { calls.append(.init(name: "hide", pane: pane)) } }
@@ -155,12 +173,60 @@ private actor ObservationConsumer: TerminalSessionConsumer {
     func summary() -> (geometry: TerminalSessionGeometry, bytes: Int) { (geometry, received.count) }
 }
 
+/// Suspends only the final model-consumption callback. The transport must keep
+/// input closed even after the native event and its earlier chunks were drained.
+private actor PreparedOutputConsumer: TerminalSessionConsumer {
+    let identity: TerminalConnectionIdentity
+    nonisolated let completion = TerminalSessionSignal()
+    private var prepared = false
+    private var received = Data()
+    private var palettes: [Data] = []
+    private var order: [String] = []
+    private var preparations: [Bool] = []
+    private var awaitingCompletion = false
+
+    init(identity: TerminalConnectionIdentity) { self.identity = identity }
+    func prepare(_ identity: TerminalConnectionIdentity) throws {
+        guard identity == self.identity, !prepared else { throw ObservationFixtureError.unexpectedSource }
+        prepared = true
+    }
+    func receive(_ update: TerminalSessionUpdate, source: TerminalSource) async throws {
+        guard prepared, source.identity == identity, received.count + update.output.count <= 65536 else {
+            throw ObservationFixtureError.unexpectedSource
+        }
+        if update.muxDestination != nil {
+            awaitingCompletion = true
+            guard await completion.wait() else { throw CancellationError() }
+            awaitingCompletion = false
+        }
+        preparations.append(update.muxPreparation)
+        if let palette = update.muxPalette {
+            palettes.append(palette); order.append("palette")
+        }
+        if !update.output.isEmpty {
+            received += update.output; order.append("output")
+        }
+    }
+    func receive(_ outcomes: [TerminalInputOutcome], source: TerminalSource) throws {
+        guard prepared, source.identity == identity, outcomes.allSatisfy({ $0.receipt.source == source }) else {
+            throw ObservationFixtureError.unexpectedSource
+        }
+    }
+    func summary() -> (bytes: Data, palettes: [Data], order: [String], preparations: [Bool], awaitingCompletion: Bool) {
+        (received, palettes, order, preparations, awaitingCompletion)
+    }
+}
+
 @MainActor
 final class MuxObservationTests: XCTestCase {
-    private func waitUntil(timeout: Duration = .seconds(5), _ predicate: @MainActor () async -> Bool) async throws {
+    private func waitUntil(timeout: Duration = .seconds(5), file: StaticString = #filePath, line: UInt = #line,
+                           _ predicate: @MainActor () async -> Bool) async throws {
         let deadline = ContinuousClock.now + timeout
         while !(await predicate()) {
-            guard ContinuousClock.now < deadline else { throw ObservationFixtureError.timeout }
+            guard ContinuousClock.now < deadline else {
+                XCTFail("The live mux fixture did not reach its expected state", file: file, line: line)
+                throw ObservationFixtureError.timeout
+            }
             try await Task.sleep(for: .milliseconds(5))
         }
     }
@@ -185,6 +251,87 @@ final class MuxObservationTests: XCTestCase {
             XCTAssertEqual(NativeSSHConnector.accounting().connectingSockets, before.connectingSockets)
             XCTAssertEqual(activity.accounting().connections, 0)
         }
+    }
+
+    func testPreparingOutputAndPaletteCannotAdmitInputBeforeTheCompleteModelUpdate() async throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let port = env["FT_MUX_OBSERVATION_PORT"].flatMap(UInt16.init),
+              let host = env["FT_MUX_OBSERVATION_HOSTKEY"].flatMap({ Data(base64Encoded: $0) }),
+              env["FT_MUX_OBSERVATION_MODE"] == "preparing-output" else {
+            throw XCTSkip("Requires the independent preparatory mux-output SSH fixture")
+        }
+        let client = ObservationMuxClient(mode: "preparing-output")
+        let fixture = try await SSHWorkspaceTestFixture.make(hostname: "127.0.0.1", port: port,
+            hostBlob: host, routeMode: "frankenterm_mux") { workspace in
+                var routes = workspace["routes"] as! [[String: Any]]
+                routes[0]["remote_command"] = "fixture-mux-observe"; workspace["routes"] = routes
+            }
+        let activity = WorkspaceNetworkActivity()
+        let owner = try await WorkspaceNativeSSHConnection.connect(workspaceID: fixture.installed.id,
+            expectedRevision: fixture.installed.revision, machineID: "machine", routeID: "route",
+            credentialID: "key", confirmedByUser: true, store: fixture.store, broker: fixture.broker,
+            networkActivity: activity, connectionTimeout: .seconds(5), authenticationTimeout: .seconds(5),
+            muxClientFactory: { client }, muxAccessMode: .inputOnly, requiresExistingMux: true)
+        let control = try XCTUnwrap(owner.muxControl)
+        control.setVisible(true)
+        let coordinator = try TerminalInputCoordinator()
+        let consumer = PreparedOutputConsumer(identity: owner.identity)
+        defer { consumer.completion.finish() }
+        do {
+            let pump = try await owner.openTerminal(geometry: .init(columns: 80, rows: 24), coordinator: coordinator) {
+                try await consumer.prepare($0)
+            }
+            let run = Task { try await pump.run(consumer: consumer) }
+            let watchdog = Task {
+                try await Task.sleep(for: .seconds(8))
+                consumer.completion.finish(); pump.requestStop()
+            }
+            defer { watchdog.cancel(); consumer.completion.finish(); pump.requestStop() }
+            try await waitUntil {
+                let snapshot = await consumer.summary()
+                return snapshot.bytes == ObservationMuxClient.preparatoryBytes && snapshot.palettes.count == 1
+            }
+            let prepared = await consumer.summary()
+            XCTAssertEqual(prepared.palettes, [ObservationMuxClient.palette])
+            XCTAssertEqual(prepared.order, ["output", "palette"], "reset precedes the transient remote palette")
+            XCTAssertEqual(prepared.preparations, [true, true])
+            XCTAssertFalse(control.inputRouting.current.ready)
+            let stream = try await coordinator.makeStream(sceneID: UUID())
+            let focus = try await coordinator.changeFocus(stream, to: pump.source)
+            do {
+                _ = try await coordinator.submit(focus, encodedBytes: Data("too early".utf8))
+                XCTFail("A reset or palette update admitted terminal input")
+            } catch { XCTAssertEqual(error as? TerminalInputError, .stale) }
+            XCTAssertTrue(client.effects.isEmpty)
+            client.releasePreparedOutput(pane: 1)
+            control.request(pane: 1) // Wake the existing service owner without changing the visit.
+            try await waitUntil { await consumer.summary().awaitingCompletion }
+            let waiting = await consumer.summary()
+            XCTAssertEqual(waiting.bytes, ObservationMuxClient.preparatoryBytes + ObservationMuxClient.completeBytes.prefix(32_768))
+            XCTAssertEqual(waiting.order, ["output", "palette", "output", "output"])
+            XCTAssertEqual(waiting.preparations, [true, true, true, true])
+            XCTAssertFalse(control.inputRouting.current.ready, "dequeueing the last chunk is not model consumption")
+            XCTAssertTrue(client.effects.isEmpty)
+            consumer.completion.notify()
+            try await waitUntil { control.inputRouting.current.ready }
+            let complete = await consumer.summary()
+            XCTAssertEqual(complete.bytes, ObservationMuxClient.preparatoryBytes + ObservationMuxClient.completeBytes)
+            XCTAssertEqual(complete.palettes, [ObservationMuxClient.palette])
+            XCTAssertEqual(complete.order, ["output", "palette", "output", "output", "output"])
+            XCTAssertEqual(complete.preparations, [true, true, true, true, false])
+            _ = try await coordinator.submit(focus, encodedBytes: Data("after complete output".utf8))
+            try await waitUntil { client.recorded.filter { $0.name == "write" }.count == 1 }
+            XCTAssertEqual(client.effects, [.init(name: "write", pane: 1)])
+            _ = try await coordinator.suspend(focus)
+            pump.requestStop(); _ = try await run.value
+            let pending = try await coordinator.pendingOutcomes(pump.source)
+            if !pending.outcomes.isEmpty { try await coordinator.acknowledgeOutcomes(pending) }
+            try await coordinator.retire(pump.source)
+            await owner.close()
+            XCTAssertEqual(activity.accounting().connections, 0)
+            let accounting = await coordinator.accounting()
+            XCTAssertEqual(accounting.connections, 0); XCTAssertEqual(accounting.streams, 0)
+        } catch { consumer.completion.finish(); await owner.close(); throw error }
     }
 
     func testReconnectPreflightRequiresExactIdentityBeforeSelectionAndGeometry() async throws {
@@ -258,6 +405,7 @@ final class MuxObservationTests: XCTestCase {
             _ = try await coordinator.submit(focus, encodedBytes: Data("a deliberate new action".utf8))
             try await waitUntil { client.recorded.filter { $0.name == "write" }.count == 1 }
             XCTAssertEqual(client.recorded.filter { $0.name == "write" }.map(\.pane), [2])
+            _ = try await coordinator.suspend(focus)
             pump.requestStop(); _ = try await run.value
             let pending = try await coordinator.pendingOutcomes(pump.source)
             if !pending.outcomes.isEmpty { try await coordinator.acknowledgeOutcomes(pending) }
@@ -404,7 +552,17 @@ final class MuxObservationTests: XCTestCase {
                 control.setVisible(false)
                 try await waitUntil { client.recorded.filter { $0 == .init(name: "hide", pane: 1) }.count > hiddenBeforeHide }
                 control.setVisible(true)
-                try await waitUntil { client.recorded.filter { $0 == .init(name: "show", pane: 1) }.count == shownBeforeHide + 1 }
+                try await waitUntil {
+                    let summary = await consumer.summary()
+                    return client.recorded.filter { $0 == .init(name: "show", pane: 1) }.count >= shownBeforeHide + 1
+                        && control.inputRouting.current.ready
+                        && (!controlsSize || (summary.geometry.columns == 54 && summary.geometry.rows == 40))
+                }
+                // Restoring size during hide can leave one oversized frame
+                // queued. The interactive owner may request one complete
+                // redraw at its current geometry before publishing it.
+                XCTAssertLessThanOrEqual(client.recorded.filter { $0 == .init(name: "show", pane: 1) }.count,
+                    shownBeforeHide + (controlsSize ? 2 : 1))
                 _ = try await coordinator.suspend(focus)
                 control.request(pane: 2)
                 try await waitUntil { control.current.shown == 2 && control.inputRouting.current.ready }
@@ -451,6 +609,9 @@ final class MuxObservationTests: XCTestCase {
             XCTAssertEqual(accounting.connections, 0); XCTAssertEqual(accounting.streams, 0)
             let offline = try activity.beginOfflineRestore()
             withExtendedLifetime(offline) {}
-        } catch { await owner.close(); throw error }
+        } catch {
+            XCTFail("Mux effect sequence at failure: \(client.recorded)")
+            await owner.close(); throw error
+        }
     }
 }

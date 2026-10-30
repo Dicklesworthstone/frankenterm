@@ -81,6 +81,7 @@ pub mod ident {
     pub const SEARCH_SCROLLBACK: u64 = 31;
     pub const SEARCH_SCROLLBACK_RESPONSE: u64 = 32;
     pub const PANE_REMOVED: u64 = 37;
+    pub const SET_PALETTE: u64 = 38;
     pub const SET_CLIENT_ID: u64 = 40;
     /// Pushed when a tab's split layout changes or a tab is added: the
     /// pane list is out of date.
@@ -347,11 +348,77 @@ pub struct PaneIdentity {
     pub pane_registration: [u8; 16],
 }
 
-/// Only the identity prefix is consumed. Optional coherent render facts are
-/// not interpreted as a complete mobile snapshot or a controller lease.
+/// The complete bounded publication carried by PDU71. The palette is a
+/// fixed tuple, not a peer-selected vector. Comparing only sequence/layout
+/// misses palette and configuration changes that preserve the sequence.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct PaneRenderMetadata {
+    pub seqno: usize,
+    pub dimensions: Dimensions,
+    pub cursor: CursorPosition,
+    pub mouse_grabbed: bool,
+    pub alt_screen_active: bool,
+    pub bracketed_paste: bool,
+    pub focus_tracking: bool,
+    pub palette_generation: u64,
+    #[serde(deserialize_with = "decode_render_palette")]
+    pub palette: Box<[termwiz::color::SrgbaTuple; 265]>,
+}
+
+fn decode_render_palette<'de, D: serde::Deserializer<'de>>(
+    decoder: D,
+) -> Result<Box<[termwiz::color::SrgbaTuple; 265]>, D::Error> {
+    struct Palette;
+    impl<'de> serde::de::Visitor<'de> for Palette {
+        type Value = Box<[termwiz::color::SrgbaTuple; 265]>;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("exactly 265 finite terminal colors")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut colors = Box::new([termwiz::color::SrgbaTuple::default(); 265]);
+            for (index, color) in colors.iter_mut().enumerate() {
+                *color = sequence
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(index, &self))?;
+                if ![color.0, color.1, color.2, color.3]
+                    .iter()
+                    .all(|v| v.is_finite())
+                {
+                    return Err(serde::de::Error::custom("non-finite terminal color"));
+                }
+            }
+            Ok(colors)
+        }
+    }
+    decoder.deserialize_tuple(265, Palette)
+}
+
+impl PaneRenderMetadata {
+    /// The native renderer's existing RGBA8 palette profile: indexed colors,
+    /// foreground/background, three cursor colors and two selection colors.
+    /// Scrollbar and split colors participate in the source fence but are
+    /// native UI presentation, not terminal cells.
+    pub fn native_palette(&self) -> Vec<u8> {
+        let mut rgba = Vec::with_capacity(263 * 4);
+        for color in &self.palette[..263] {
+            for value in [color.0, color.1, color.2, color.3] {
+                rgba.push((value.clamp(0.0, 1.0) * 255.0).round() as u8);
+            }
+        }
+        rgba
+    }
+}
+
+/// Identity and render metadata are evidence, never a controller lease.
 #[derive(Debug, Deserialize)]
 pub enum PaneIdentityOutcome {
-    Available { identity: PaneIdentity },
+    Available {
+        identity: PaneIdentity,
+        render_facts: Option<Box<PaneRenderMetadata>>,
+    },
     PaneGone,
     Unavailable,
 }
@@ -360,6 +427,34 @@ pub enum PaneIdentityOutcome {
 pub struct PaneIdentityResponse {
     pub pane_id: usize,
     pub outcome: PaneIdentityOutcome,
+}
+
+pub fn decode_pane_identity(body: &[u8]) -> Result<PaneIdentityResponse, crate::Error> {
+    if body.len() > MAX_PANE_IDENTITY_RESPONSE_BYTES {
+        return Err(crate::Error::Frame(
+            "a pane identity reply exceeds its protocol bound",
+        ));
+    }
+    let response: PaneIdentityResponse = decode_observation(body)?;
+    if let PaneIdentityOutcome::Available {
+        render_facts: Some(facts),
+        ..
+    } = &response.outcome
+    {
+        let dims = facts.dimensions;
+        if facts.seqno == usize::MAX
+            || !(1..=4096).contains(&dims.cols)
+            || !(1..=4096).contains(&dims.viewport_rows)
+            || facts.cursor.x > dims.cols
+            || dims
+                .physical_top
+                .checked_add(dims.viewport_rows as isize)
+                .is_none()
+        {
+            return Err(crate::Error::Schema);
+        }
+    }
+    Ok(response)
 }
 
 /// The v46 PDU 13 schema (no input serial).

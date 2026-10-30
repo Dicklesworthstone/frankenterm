@@ -4,7 +4,7 @@ use crate::{
     Config, FontAttributes, FontStretch, FontStyle, FontWeight, FreeTypeLoadTarget, RgbaColor,
     TextStyle,
 };
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use frankenterm_dynamic::{
     FromDynamic, FromDynamicOptions, ToDynamic, UnknownFieldAction, Value as DynValue,
 };
@@ -415,6 +415,17 @@ end
                 )?;
                 let inventory = crate::machines::MachineInventory::load(&path)
                     .map_err(|err| mlua::Error::external(format!("{:#}", err)))?;
+                if lua
+                    .app_data_ref::<crate::mobile_export::LoadedMachineInventories>()
+                    .is_none()
+                {
+                    lua.set_app_data(crate::mobile_export::LoadedMachineInventories::default());
+                }
+                if let Some(mut captured) =
+                    lua.app_data_mut::<crate::mobile_export::LoadedMachineInventories>()
+                {
+                    captured.record(path.clone(), inventory.clone());
+                }
                 let context = crate::machines::InventoryContext {
                     directory: path.parent().map(Path::to_path_buf).unwrap_or_default(),
                     home: crate::HOME_DIR.clone(),
@@ -1546,7 +1557,7 @@ pub fn add_to_config_reload_watch_list(lua: &Lua, args: Variadic<String>) -> mlu
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::sync::{mpsc, Arc, Mutex};
+    use std::sync::{Arc, Mutex, mpsc};
     use std::time::Instant;
 
     #[test]
@@ -1696,6 +1707,21 @@ ssh = "css"
         );
         assert_eq!(alias, "css");
         assert!(automatic);
+        let captured = (*lua
+            .app_data_ref::<crate::mobile_export::LoadedMachineInventories>()
+            .unwrap())
+        .clone();
+        assert_eq!(
+            captured.selected()?.1.machine("trj").unwrap().name,
+            "Threadripper"
+        );
+        lua.load("local m = frankenterm.machines(); m.machines.trj.name = 'later Lua table edit'")
+            .exec()?;
+        assert_eq!(
+            captured.selected()?.1.machine("trj").unwrap().name,
+            "Threadripper",
+            "the source is the loaded typed inventory, not mutable Lua tables"
+        );
         let named: String = lua
             .load("return frankenterm.machines('machines.toml').machines.trj.name")
             .eval()?;
@@ -1721,6 +1747,11 @@ ssh = "css"
             .exec()
             .expect_err("no routes");
         assert!(err.to_string().contains("machines.a.routes"), "{}", err);
+        assert_eq!(
+            captured.selected()?.1.machine("trj").unwrap().name,
+            "Threadripper",
+            "a file edit and failed later parse cannot mutate the captured source"
+        );
         Ok(())
     }
 
@@ -1801,8 +1832,8 @@ ssh = "css"
     }
 
     #[test]
-    fn time_call_after_retains_callback_across_transient_main_admission_rejection(
-    ) -> anyhow::Result<()> {
+    fn time_call_after_retains_callback_across_transient_main_admission_rejection()
+    -> anyhow::Result<()> {
         let _env = crate::test_env_lock();
         let executor = timer_test_executor();
         let blocker = match promise::spawn::try_reserve_main_thread_with_low_priority(
@@ -1950,8 +1981,8 @@ end
     }
 
     #[test]
-    fn time_call_after_origin_chain_survives_reloads_once_without_multiplication(
-    ) -> anyhow::Result<()> {
+    fn time_call_after_origin_chain_survives_reloads_once_without_multiplication()
+    -> anyhow::Result<()> {
         let _env = crate::test_env_lock();
         let executor = timer_test_executor();
         crate::designate_this_as_the_main_thread();
