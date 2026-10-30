@@ -2045,6 +2045,7 @@ def verify_source(args: argparse.Namespace) -> dict[str, Any]:
         fail("source_revision_mismatch", "source revision must identify the commit itself")
     inventory = source_git(repository, "ls-tree", "-rz", "--full-tree", revision)
     expected: dict[str, tuple[str, bool]] = {}
+    expected_links: dict[str, str] = {}
     directories: set[str] = set()
     for record in inventory.split(b"\0"):
         if not record:
@@ -2052,23 +2053,65 @@ def verify_source(args: argparse.Namespace) -> dict[str, Any]:
         metadata, raw_path = record.split(b"\t", 1)
         mode, kind, object_id = metadata.decode("ascii").split()
         path = normalized_relative(raw_path.decode("utf-8"), "source path")
-        if kind != "blob" or mode not in {"100644", "100755"}:
-            fail("unsupported_source_entry", "source archives require regular Git blobs", path=path)
-        if path in expected or not SOURCE_REVISION_RE.fullmatch(object_id):
+        if kind != "blob" or mode not in {"100644", "100755", "120000"}:
+            fail("unsupported_source_entry", "source archives require regular-file or leaf-link Git blobs", path=path)
+        if path in expected or path in expected_links or not SOURCE_REVISION_RE.fullmatch(object_id):
             fail("invalid_source_inventory", "invalid or duplicate Git source entry", path=path)
-        expected[path] = (object_id, mode == "100755")
+        if mode == "120000":
+            expected_links[path] = object_id
+        else:
+            expected[path] = (object_id, mode == "100755")
         directories.update(str(parent) for parent in PurePosixPath(path).parents if str(parent) != ".")
-        if len(expected) > MAX_FILES or len(directories) + len(expected) > MAX_INVENTORY_ENTRIES:
+        if len(expected) + len(expected_links) > MAX_FILES or len(directories) + len(expected) + len(expected_links) > MAX_INVENTORY_ENTRIES:
             fail("source_inventory_limit", "Git source inventory exceeds entry limits")
     with AnchoredRoot(Path(args.root), "source root") as root:
         initial = root.scan_inventory(set())
         if (
             set(initial.files) != set(expected)
             or set(initial.directories) != directories
-            or initial.symlinks
+            or set(initial.symlinks) != set(expected_links)
             or initial.invalid
         ):
             fail("source_inventory_mismatch", "source archive does not exactly match the Git tree")
+        for path, object_id in expected_links.items():
+            target = initial.symlinks[path]
+            try:
+                payload = target.encode("utf-8")
+            except UnicodeError:
+                fail("source_content_mismatch", "source link is not UTF-8", path=path)
+            digest = hashlib.sha1(b"blob " + str(len(payload)).encode("ascii") + b"\0" + payload).hexdigest()
+            if digest != object_id:
+                fail("source_content_mismatch", "source link text differs from Git", path=path)
+        # Resolve only authenticated leaf links through plain Git directories.
+        # Never follow a filesystem link while checking source authority.
+        for original in expected_links:
+            path = original
+            seen: set[str] = set()
+            while path in expected_links:
+                if path in seen or len(seen) >= 64:
+                    fail("source_link_invalid", "source link cycle or excessive chain", path=original)
+                seen.add(path)
+                target = initial.symlinks[path]
+                if not target or target.startswith("/") or "\\" in target or ":" in target:
+                    fail("source_link_invalid", "source link must be relative", path=original)
+                parts = list(PurePosixPath(path).parent.parts)
+                components = target.split("/")
+                for index, component in enumerate(components):
+                    if component.lower() == ".git":
+                        fail("source_link_invalid", "source link enters Git metadata", path=original)
+                    if component in {"", "."}:
+                        continue
+                    if component == "..":
+                        if not parts:
+                            fail("source_link_invalid", "source link escapes root", path=original)
+                        parts.pop()
+                    else:
+                        parts.append(component)
+                    if index < len(components) - 1 and parts and "/".join(parts) not in directories:
+                        fail("source_link_invalid", "source link traverses a non-directory", path=original)
+                path = "/".join(parts)
+            if path not in expected:
+                fail("source_link_invalid", "source link must resolve to a regular Git file", path=original)
         for path, (object_id, executable) in expected.items():
             evidence = root.read_regular(path, git_blob=True)
             require_inventory_identity(evidence, initial.files[path], path)
