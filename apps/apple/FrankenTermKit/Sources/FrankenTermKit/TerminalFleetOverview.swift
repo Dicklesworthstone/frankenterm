@@ -44,6 +44,9 @@ public struct TerminalFleetOverview: Identifiable, Sendable {
     }
     public struct Machine: Sendable {
         public let id: String, name: String, endpoint: String
+        /// Imported fleet labels participate in machine and pane search without
+        /// changing the machine's title, destination or navigation order.
+        public let tags: [String]
         public let status: Status
         public let sessionID: UUID?
         public let panes: [Pane]
@@ -51,10 +54,11 @@ public struct TerminalFleetOverview: Identifiable, Sendable {
         /// The machine printed while off screen, as its strip chip marks it.
         public let newOutput: Bool
         public init(id: String, name: String, endpoint: String, status: Status,
-                    sessionID: UUID? = nil, panes: [Pane] = [], selectedPaneID: Int? = nil, newOutput: Bool = false) {
+                    sessionID: UUID? = nil, panes: [Pane] = [], selectedPaneID: Int? = nil, newOutput: Bool = false,
+                    tags: [String] = []) {
             self.id = id; self.name = name; self.endpoint = endpoint; self.status = status
             self.sessionID = sessionID; self.panes = panes; self.selectedPaneID = selectedPaneID
-            self.newOutput = newOutput
+            self.newOutput = newOutput; self.tags = tags
         }
     }
     public struct Query: Hashable, Sendable {
@@ -93,6 +97,8 @@ public struct TerminalFleetOverview: Identifiable, Sendable {
         let machineSearch: String, paneSearch: String
     }
     public static let maximumMachines = 128
+    public static let maximumTagsPerMachine = 64
+    public static let maximumTagBytes = 128
     public static let maximumPanes = 4096
     public static let maximumTextBytes = 2 * 1024 * 1024
     public static let maximumResults = 512
@@ -122,11 +128,13 @@ public struct TerminalFleetOverview: Identifiable, Sendable {
             try charge(machine.id, maximum: 128)
             try charge(machine.name, maximum: 1024)
             try charge(machine.endpoint, maximum: 2048)
+            guard machine.tags.count <= Self.maximumTagsPerMachine else { throw Failure.capacity }
+            for tag in machine.tags { try charge(tag, maximum: Self.maximumTagBytes) }
             guard machine.panes.count <= Self.maximumPanes - paneCount else { throw Failure.capacity }
             guard machine.panes.isEmpty || (machine.sessionID != nil && machine.status == .live) else {
                 throw Failure.invalidInventory
             }
-            let machineSearch = try index(machine.id + "\n" + machine.name + "\n" + machine.endpoint)
+            let machineSearch = try index(([machine.id, machine.name, machine.endpoint] + machine.tags).joined(separator: "\n"))
             let machineRow = Row(id: Choice(owner: owner, offset: entries.count), machineID: machine.id,
                 machineName: machine.name, title: machine.name, detail: machine.endpoint,
                 status: machine.status, paneID: nil, selected: machine.id == selectedMachineID,
@@ -159,7 +167,7 @@ public struct TerminalFleetOverview: Identifiable, Sendable {
         id = owner; self.machineCount = machines.count; self.paneCount = paneCount; self.entries = entries
     }
 
-    /// All terms must match the machine's name/ID/endpoint or the pane's
+    /// All terms must match the machine's name/ID/endpoint/tags or the pane's
     /// title/tab/directory. Literal, case/diacritic-insensitive search preserves
     /// imported machine order and the captured remote pane order. Status filters
     /// are explicit; disconnected machines are never silently skipped.

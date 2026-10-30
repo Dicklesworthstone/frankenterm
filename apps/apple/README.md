@@ -38,6 +38,10 @@ Focus loss drops unsent viewport proposals, disables mux geometry control, clear
 
 Portable layout/resize cases and hosted renderer/controller regressions cover stable slots, narrow/wide transitions, live output from both SSH channels, stale input refusal, focus-specific input, unchanged companion PTY geometry and manual session policy. These new tests have syntax/source checks but require Swift and Apple execution; the historical simulator results below do not qualify this split implementation.
 
+## Find machines and panes by imported tags
+
+**Fleet Overview** searches imported machine tags alongside names, hosts, pane titles, tabs and working directories. A query such as `production build` can match a machine's environment tag and one of its pane titles together. Search remains literal, case- and diacritic-insensitive, and preserves the imported machine order and captured pane order. Machine/pane scope, connection-status and new-output filters work with tag queries. Tags use the manifest's existing limits and the overview's shared text budget.
+
 ## Durable mux pane continuity
 
 Reconnecting a saved mux pane now requires a fresh match of the server incarnation, durable pane UUID and registration ID. The mobile Rust client exposes the existing v71 passive identity query through the C ABI and Swift adapter without subscribing, typing, resizing or changing the desktop's active pane. It bounds concurrent queries to eight, expires them after five seconds and ignores retired replies. Showing a pane rechecks a previously learned identity before attaching.

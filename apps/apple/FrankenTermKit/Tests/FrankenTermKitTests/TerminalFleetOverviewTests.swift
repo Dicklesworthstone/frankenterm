@@ -5,7 +5,7 @@ import XCTest
 // The case has no mutable state; each test owns its independent index/routing.
 final class TerminalFleetOverviewTests: XCTestCase, @unchecked Sendable {
     private func machine(_ id: String = "alpha", name: String = "Alpha Production",
-                         ids: [Int] = [10, 20, 30]) throws
+                         ids: [Int] = [10, 20, 30], tags: [String] = []) throws
         -> (TerminalFleetOverview.Machine, TerminalMuxInputRouting, UUID) {
         let routing = TerminalMuxInputRouting(), session = UUID()
         try routing.replaceInventory(ids)
@@ -15,7 +15,7 @@ final class TerminalFleetOverviewTests: XCTestCase, @unchecked Sendable {
                 tabTitle: "Agents", workingDirectory: "/srv/projects/project-\(offset)")
         }
         return (.init(id: id, name: name, endpoint: "\(id).example:22", status: .live,
-                      sessionID: session, panes: panes, selectedPaneID: ids.first), routing, session)
+                      sessionID: session, panes: panes, selectedPaneID: ids.first, tags: tags), routing, session)
     }
     private func paneChoice(_ catalog: TerminalFleetOverview, _ id: Int) throws -> TerminalFleetOverview.Choice {
         try XCTUnwrap(catalog.search(.init(scope: .panes)).rows.first { $0.paneID == id }?.id)
@@ -61,6 +61,75 @@ final class TerminalFleetOverviewTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(try catalog.search(.init(text: ".*")).matchingCount, 1)
         XCTAssertEqual(try catalog.search(.init(text: "^prod")).matchingCount, 0)
         XCTAssertEqual(try catalog.search(.init(text: "<tag>")).rows.first?.title, value.name)
+    }
+
+    func testTagsAreLiteralFoldedTermsInheritedByEveryPane() throws {
+        let (value, routing, session) = try machine(name: "Alpha", tags: ["Production", "Café", "東京", "gpu[0]", "a", "b"])
+        let catalog = try TerminalFleetOverview(machines: [value])
+        XCTAssertEqual(try catalog.search(.init(text: "CAFE 東京 gpu[0]")).rows.map(\.paneID), [nil, 10, 20, 30])
+        XCTAssertEqual(try catalog.search(.init(text: "production", scope: .machines)).rows.first?.title, "Alpha")
+        XCTAssertEqual(try catalog.search(.init(text: "production", scope: .panes)).rows.map(\.paneID), [10, 20, 30])
+        let result = try catalog.search(.init(text: "production alpha.example agents project-1"))
+        XCTAssertEqual(result.matchingCount, 1)
+        let row = try XCTUnwrap(result.rows.first)
+        XCTAssertEqual(try catalog.validatePane(row.id, sessionID: session, routing: routing).paneID, 20)
+        XCTAssertEqual(try catalog.search(.init(text: "^gpu")).matchingCount, 0)
+        XCTAssertEqual(try catalog.search(.init(text: "gpu.*")).matchingCount, 0)
+        XCTAssertEqual(try catalog.search(.init(text: "ab")).matchingCount, 0, "separate tags must not form a new searchable word")
+        XCTAssertEqual(try catalog.search(.init(text: "production missing")).matchingCount, 0)
+    }
+
+    func testTagQueriesPreserveMachinePaneOrderAndExplicitFilters() throws {
+        let first = try machine("zeta", ids: [9, 3], tags: ["fleet"])
+        let unrelated = try machine("other", ids: [5], tags: ["staging"])
+        let attention = TerminalFleetOverview.Machine(id: "beta", name: "Beta", endpoint: "beta:22",
+            status: .attention, tags: ["fleet"])
+        let ready = TerminalFleetOverview.Machine(id: "ready", name: "Ready", endpoint: "ready:22",
+            status: .ready, newOutput: true, tags: ["fleet"])
+        let catalog = try TerminalFleetOverview(machines: [first.0, attention, unrelated.0, ready])
+        let all = try catalog.search(.init(text: "FLEET"))
+        XCTAssertEqual(all.rows.map(\.machineID), ["zeta", "zeta", "zeta", "beta", "ready"])
+        XCTAssertEqual(all.rows.map(\.paneID), [nil, 9, 3, nil, nil])
+        XCTAssertEqual(try catalog.search(.init(text: "fleet", scope: .machines)).rows.map(\.machineID), ["zeta", "beta", "ready"])
+        XCTAssertEqual(try catalog.search(.init(text: "fleet", scope: .panes)).rows.map(\.paneID), [9, 3])
+        XCTAssertEqual(try catalog.search(.init(text: "fleet", filter: .connected)).rows.map(\.machineID), ["zeta", "zeta", "zeta", "ready"])
+        XCTAssertEqual(try catalog.search(.init(text: "fleet", filter: .attention)).rows.map(\.machineID), ["beta"])
+        XCTAssertEqual(try catalog.search(.init(text: "fleet", filter: .newOutput)).rows.map(\.machineID), ["ready"])
+        let limited = try catalog.search(.init(text: "fleet"), limit: 2)
+        XCTAssertEqual(limited.matchingCount, 5); XCTAssertTrue(limited.limited)
+        XCTAssertEqual(limited.rows.map(\.paneID), [nil, 9])
+    }
+
+    func testTagCountAndUTF8LimitsRejectTheWholeInventory() throws {
+        let boundary = Array(repeating: String(repeating: "é", count: 64), count: 64)
+        let valid = TerminalFleetOverview.Machine(id: "m", name: "M", endpoint: "host", status: .ready, tags: boundary)
+        XCTAssertNoThrow(try TerminalFleetOverview(machines: [valid]))
+        for tags in [Array(repeating: "tag", count: 65), [String(repeating: "a", count: 129)],
+                     [String(repeating: "🙂", count: 33)]] {
+            let oversized = TerminalFleetOverview.Machine(id: "over", name: "Over", endpoint: "host", status: .ready, tags: tags)
+            XCTAssertThrowsError(try TerminalFleetOverview(machines: [valid, oversized])) {
+                XCTAssertEqual($0 as? TerminalFleetOverview.Failure, .capacity)
+            }
+        }
+    }
+
+    func testTagsConsumeTheSharedMetadataBudgetInsteadOfAnUnboundedSideIndex() throws {
+        let (value, routing, session) = try machine(ids: Array(0..<300))
+        let panes = try (0..<300).map { id in
+            TerminalFleetOverview.Pane(plan: try routing.navigation(pane: id), title: "Pane",
+                                      workingDirectory: String(repeating: "p", count: 4096))
+        }
+        func inventory(tags: [String]) -> [TerminalFleetOverview.Machine] {
+            [.init(id: value.id, name: value.name, endpoint: value.endpoint, status: .live,
+                   sessionID: session, panes: panes, tags: tags)] + (1..<128).map {
+                .init(id: "m\($0)", name: "Machine", endpoint: "host", status: .ready, tags: tags)
+            }
+        }
+        XCTAssertNoThrow(try TerminalFleetOverview(machines: inventory(tags: [])))
+        let tags = Array(repeating: String(repeating: "t", count: 128), count: 64)
+        XCTAssertThrowsError(try TerminalFleetOverview(machines: inventory(tags: tags))) {
+            XCTAssertEqual($0 as? TerminalFleetOverview.Failure, .capacity)
+        }
     }
 
     func testScopeAndStatusFiltersDoNotSilentlySkipDisconnectedMachines() throws {
