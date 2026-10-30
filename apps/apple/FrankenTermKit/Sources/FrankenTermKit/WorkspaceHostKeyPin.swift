@@ -15,7 +15,7 @@ public struct WorkspaceHostKeyPin: Codable, Equatable, Sendable {
 }
 
 public enum WorkspaceHostKeyPinError: Error, Equatable, Sendable, LocalizedError {
-    case alreadyConfigured, revoked, unsupportedPolicy, unsupportedRoute
+    case alreadyConfigured, revoked, unsupportedPolicy, unsupportedRoute, jumpNotReady
     public var errorDescription: String? {
         switch self {
         case .alreadyConfigured:
@@ -25,9 +25,24 @@ public enum WorkspaceHostKeyPinError: Error, Equatable, Sendable, LocalizedError
         case .unsupportedPolicy:
             "This route has a required policy that this build cannot satisfy. Verifying a host key cannot remove that requirement."
         case .unsupportedRoute:
-            "First-time host verification currently requires a direct SSH connection. Import verified host trust for a destination reached through a jump host."
+            "This route cannot perform a bounded SSH host-key check with this build."
+        case .jumpNotReady:
+            "Verify each jump host and supply its permitted sign-in method before checking the destination's host key."
         }
     }
+}
+
+/// Short-lived, store-issued permission to authenticate only the already
+/// trusted transit hosts of an unconfigured destination. It grants no account
+/// authentication at that destination, no shell, and no durable connection
+/// approval. The issuing store rechecks the complete path on every use.
+public struct WorkspaceHostKeyProbe: Equatable, Sendable {
+    public let id: UUID
+    public let workspaceID: UUID
+    public let expectedRevision: UUID
+    public let routeID: String
+    let owner: UUID
+    let expires: ContinuousClock.Instant
 }
 
 /// A store-issued review for one current route and one observed public key.

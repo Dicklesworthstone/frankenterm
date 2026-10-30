@@ -41,6 +41,47 @@ private actor WorkspaceTestPasswordPrompt: WorkspaceSSHPasswordPrompting {
     nonisolated func cancel(requestID: UUID) {}
 }
 
+/// The live first-use fixture answers only the one independently pinned hop,
+/// never the unverified target. It checks both authentication method paths
+/// carry the store-issued probe scope all the way to the real prompt boundary.
+private actor SSHJumpProbePrompt: WorkspaceSSHPasswordPrompting, WorkspaceSSHKeyboardInteractivePrompting {
+    let workspaceID: UUID, revision: UUID, port: UInt16
+    let hostKey: WorkspaceDocument.HostKey
+    private(set) var passwordCalls = 0, interactiveCalls = 0
+    init(workspaceID: UUID, revision: UUID, port: UInt16, hostKey: WorkspaceDocument.HostKey) {
+        self.workspaceID = workspaceID; self.revision = revision; self.port = port; self.hostKey = hostKey
+    }
+    private func validate(workspaceID: UUID, revision: UUID, routeID: String, host: String, port: UInt16,
+        user: String, key: WorkspaceDocument.HostKey, transit: String?, probe: WorkspaceHostKeyProbe?) throws {
+        guard workspaceID == self.workspaceID, revision == self.revision, routeID == "hop-0",
+              host == "127.0.0.1", port == self.port, user == "operator", key == hostKey,
+              transit == "route", probe?.workspaceID == workspaceID, probe?.expectedRevision == revision,
+              probe?.routeID == "route" else { throw SSHAuthenticationError.denied }
+    }
+    func password(for request: WorkspaceSSHPasswordRequest) async throws -> Data {
+        let a = request.authorization
+        try validate(workspaceID: a.workspaceID, revision: a.workspaceRevision, routeID: a.routeID,
+            host: a.host, port: a.port, user: a.user, key: a.presentedHostKey,
+            transit: a.transitForRouteID, probe: a.hostKeyProbe)
+        guard passwordCalls == 0 else { throw SSHAuthenticationError.denied }
+        passwordCalls += 1
+        return Data("synthetic jump password".utf8)
+    }
+    func responses(for request: WorkspaceSSHKeyboardInteractiveRequest) async throws -> [Data] {
+        let a = request.authorization
+        try validate(workspaceID: a.workspaceID, revision: a.workspaceRevision, routeID: a.routeID,
+            host: a.host, port: a.port, user: a.user, key: a.presentedHostKey,
+            transit: a.transitForRouteID, probe: a.hostKeyProbe)
+        guard interactiveCalls == 0, request.challenge.round == 1,
+              request.challenge.name == "Jump verification", request.challenge.instruction == "Enter the one-time code.",
+              request.challenge.prompts.map(\.text) == ["One-time code:"],
+              request.challenge.prompts.map(\.echo) == [false] else { throw SSHAuthenticationError.invalidChallenge }
+        interactiveCalls += 1
+        return [Data("654321".utf8)]
+    }
+    nonisolated func cancel(requestID: UUID) {}
+}
+
 @MainActor
 final class WorkspacePasswordAuthenticationTests: XCTestCase {
     private func fixture() async throws -> SSHWorkspaceTestFixture {
@@ -179,19 +220,23 @@ final class SSHWorkspaceTestVault: WorkspaceCredentialVault, WorkspaceSSHSigning
     func cancel(requestID: UUID) {}
 }
 
-/// Pauses the actual destination signing operation after the outer hop has
-/// authenticated. It never substitutes a signature or transport decision.
+/// Pauses the actual selected route's signing operation; by default this is
+/// the destination after the outer hop has authenticated. It never substitutes
+/// a signature or transport decision.
 private actor SSHJumpPausedSigner: WorkspaceSSHSigning {
     let base: SSHWorkspaceTestVault
+    let pauseRouteID: String?
     private var pending: (UUID, CheckedContinuation<Void, Error>)?
     var isPaused: Bool { pending != nil }
-    init(_ base: SSHWorkspaceTestVault) { self.base = base }
+    init(_ base: SSHWorkspaceTestVault, pauseRouteID: String? = nil) {
+        self.base = base; self.pauseRouteID = pauseRouteID
+    }
     func publicIdentity(requestID: UUID, authorization: WorkspaceSSHAuthorization) async throws -> Data {
         try await base.publicIdentity(requestID: requestID, authorization: authorization)
     }
     func sign(requestID: UUID, authorization: WorkspaceSSHAuthorization, challenge: SSHUserAuthenticationChallenge) async throws -> Data {
         try Task.checkCancellation()
-        if authorization.transitForRouteID == nil {
+        if pauseRouteID.map({ authorization.routeID == $0 }) ?? (authorization.transitForRouteID == nil) {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                 pending = (requestID, continuation)
             }
@@ -576,6 +621,11 @@ final class WorkspaceAuthenticationTests: XCTestCase {
               let mode = environment["FT_WORKSPACE_SSH_TEST_MODE"] else {
             throw XCTSkip("Run Tests/Interop/test_workspace.py with the built XCTest bundle and native driver.")
         }
+        if mode.hasPrefix("host-pin-jump-") {
+            try await exerciseLiveJumpHostVerification(mode: mode, destinationPort: port,
+                destinationHost: host, environment: environment)
+            return
+        }
         if mode.hasPrefix("jump-chain-") {
             try await exerciseLiveJumpChain(mode: mode, destinationPort: port, destinationHost: host, environment: environment)
             return
@@ -728,6 +778,167 @@ final class WorkspaceAuthenticationTests: XCTestCase {
             let statistics = try await session.accounting()
             XCTAssertEqual(statistics.allocatedBytes, 0)
         } catch { await session.close(); throw error }
+    }
+
+    /// Probe the target behind real forwarding channels, with independent keys
+    /// on every peer. The Python server observes that the target receives no
+    /// account, authentication request or channel until a later explicit login.
+    private func exerciseLiveJumpHostVerification(mode: String, destinationPort: UInt16,
+        destinationHost: Data, environment: [String: String]) async throws {
+        struct Hop: Decodable { let port: UInt16; let hostKey: String }
+        let encoded = try XCTUnwrap(environment["FT_WORKSPACE_SSH_JUMP_CHAIN"]?.data(using: .utf8))
+        let hops = try JSONDecoder().decode([Hop].self, from: encoded)
+        XCTAssertTrue((1...3).contains(hops.count))
+        let hostKeys = try hops.map { try XCTUnwrap(Data(base64Encoded: $0.hostKey)) }
+        var keys: [PrivateKeyRecord] = []
+        for index in hops.indices {
+            let seed = Data((0..<32).map { UInt8((index + 1) * 32 + $0) })
+            let independent = try await SSHWorkspaceTestFixture.make(seed: seed)
+            let record = try XCTUnwrap(independent.archive.keys.first)
+            keys.append(.init(credentialID: "hop-key-\(index)", container: record.container, publicBlob: record.publicBlob))
+        }
+        let identities = try keys.map { try SSHPublicIdentity(blob: $0.publicBlob) }
+        let passwordHop = mode == "host-pin-jump-password", interactiveHop = mode == "host-pin-jump-interactive"
+        let promptedHop = passwordHop || interactiveHop
+        let pins = try hostKeys.enumerated().map { index, host in
+            try SSHPublicIdentity(blob: mode == "host-pin-jump-wrong-hop" && index == hops.count - 1
+                ? keys[index].publicBlob : host)
+        }
+        let f = try await SSHWorkspaceTestFixture.make(hostname: "target.internal.invalid", port: destinationPort,
+            hostBlob: destinationHost, additionalKeys: keys) { workspace in
+            var routes = workspace["routes"] as! [[String: Any]]
+            let template = routes[0]
+            routes[0]["jump_routes"] = hops.indices.map { "hop-\($0)" }
+            var credentials = workspace["credentials"] as! [[String: Any]]
+            var trusts = workspace["host_trust"] as! [[String: Any]]
+            trusts[0]["pins"] = [] as [[String: Any]]
+            for index in hops.indices {
+                let host = index == 0 ? "127.0.0.1" : "target.internal.invalid"
+                var hop = template
+                hop["id"] = "hop-\(index)"; hop["mode"] = "frankenterm_mux"
+                hop["host"] = host; hop["port"] = Int(hops[index].port)
+                hop["host_trust_ref"] = "hop-trust-\(index)"; hop["jump_routes"] = [String]()
+                hop["session_creation"] = nil; hop["attach_policy"] = "existing_only"
+                hop["credential_refs"] = mode == "host-pin-jump-revoke-during-signature" && index == hops.count - 1
+                    ? ["hop-key-\(index)", "key"] : ["hop-key-\(index)"]
+                if promptedHop {
+                    hop["credential_refs"] = [] as [String]
+                    hop["authentication_methods"] = [passwordHop ? "password" : "keyboard-interactive"]
+                }
+                routes.append(hop)
+                credentials.append(["id": "hop-key-\(index)", "algorithm": identities[index].algorithm,
+                    "public_fingerprint": identities[index].fingerprint, "requirement": "matching_private_key",
+                    "private_material": "not_included"])
+                trusts.append(["id": "hop-trust-\(index)", "host": host, "port": Int(hops[index].port),
+                    "revoked_keys": [], "pins": [["algorithm": pins[index].algorithm, "fingerprint": pins[index].fingerprint]]])
+            }
+            workspace["routes"] = routes; workspace["credentials"] = credentials; workspace["host_trust"] = trusts
+        }
+        XCTAssertEqual(Set(hostKeys + [destinationHost]).count, hops.count + 1)
+        XCTAssertEqual(Set(keys.map(\.publicBlob) + [f.publicBlob]).count, hops.count + 1)
+        let activity = WorkspaceNetworkActivity(), support = WorkspaceNativeSSHAuthentication.routeSupport
+        let prompt = SSHJumpProbePrompt(workspaceID: f.installed.id, revision: f.installed.revision,
+            port: hops[0].port, hostKey: try .init(algorithm: pins[0].algorithm, fingerprint: pins[0].fingerprint))
+
+        // Ordinary connection authority still refuses this unverified target.
+        // The probe must not obtain its special scope by weakening that check.
+        await refuse {
+            let owner = try await WorkspaceNativeSSHConnection.connect(workspaceID: f.installed.id,
+                expectedRevision: f.installed.revision, machineID: "machine", routeID: "route", credentialID: "key",
+                confirmedByUser: true, store: f.store, broker: f.broker, networkActivity: activity,
+                connectionTimeout: .seconds(2), authenticationTimeout: .seconds(2))
+            await owner.close()
+        }
+        XCTAssertEqual(f.vault.counts.reads, 0); XCTAssertEqual(f.vault.counts.signatures, 0)
+        XCTAssertEqual(activity.accounting().connections, 0)
+
+        let unconfirmed = await WorkspaceRouteProbe.run(workspaceID: f.installed.id,
+            expectedRevision: f.installed.revision, routeID: "route", confirmedByUser: false,
+            store: f.store, broker: f.broker, timeout: .seconds(2), authenticationTimeout: .seconds(2),
+            networkActivity: activity)
+        XCTAssertNotNil(unconfirmed.failure); XCTAssertNil(unconfirmed.peer)
+        XCTAssertEqual(f.vault.counts.reads, 0)
+        if mode == "host-pin-jump-revoked" {
+            try await f.store.revokeLocally(fingerprint: identities[hops.count - 1].fingerprint)
+        } else if mode == "host-pin-jump-revoked-host" {
+            let pin = try WorkspaceDocument.HostKey(algorithm: pins[0].algorithm, fingerprint: pins[0].fingerprint)
+            try await f.store.revokeHostLocally(workspaceID: f.installed.id, trustID: "hop-trust-0", key: pin)
+        }
+        func probe(using authority: SSHAuthenticationBroker? = nil) async -> WorkspaceRouteProbe.Result {
+            await WorkspaceRouteProbe.run(workspaceID: f.installed.id, expectedRevision: f.installed.revision,
+                routeID: "route", confirmedByUser: true, store: f.store, broker: authority ?? f.broker,
+                passwordPrompter: passwordHop ? prompt : nil, keyboardInteractivePrompter: interactiveHop ? prompt : nil,
+                timeout: .seconds(5), authenticationTimeout: .seconds(5), networkActivity: activity)
+        }
+        let result: WorkspaceRouteProbe.Result
+        if ["host-pin-jump-cancel-signature", "host-pin-jump-revoke-during-signature"].contains(mode) {
+            let signer = SSHJumpPausedSigner(f.vault, pauseRouteID: "hop-\(hops.count - 1)")
+            let broker = SSHAuthenticationBroker(store: f.store, signer: signer, support: support)
+            await broker.resume()
+            let task = Task { await probe(using: broker) }
+            let deadline = ContinuousClock.now + .seconds(5)
+            while !(await signer.isPaused), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(1)) }
+            let paused = await signer.isPaused
+            XCTAssertTrue(paused)
+            XCTAssertGreaterThan(activity.accounting().connections, 0)
+            XCTAssertThrowsError(try activity.beginOfflineRestore()) {
+                XCTAssertEqual($0 as? WorkspaceNetworkError, .connectionsActive)
+            }
+            if mode == "host-pin-jump-cancel-signature" || !paused { task.cancel() }
+            else {
+                // An alternative key keeps this hop usable in principle, but
+                // cannot replace the exact authorization already being signed.
+                try await f.store.revokeLocally(fingerprint: identities[hops.count - 1].fingerprint)
+                await signer.release()
+            }
+            result = await task.value
+            XCTAssertNotNil(result.failure); XCTAssertNil(result.peer); XCTAssertNil(result.observedIdentity)
+            XCTAssertEqual(f.vault.counts.reads, hops.count)
+            XCTAssertEqual(f.vault.counts.signatures,
+                hops.count - (mode == "host-pin-jump-cancel-signature" ? 1 : 0))
+        } else {
+            result = await probe()
+        }
+        XCTAssertEqual(activity.accounting().connections, 0)
+        if ["host-pin-jump-wrong-hop", "host-pin-jump-revoked", "host-pin-jump-revoked-host"].contains(mode) {
+            XCTAssertNotNil(result.failure); XCTAssertNil(result.peer); XCTAssertNil(result.observedIdentity)
+            let signatures = mode == "host-pin-jump-wrong-hop" ? hops.count - 1 : 0
+            XCTAssertEqual(f.vault.counts.reads, signatures); XCTAssertEqual(f.vault.counts.signatures, signatures)
+            return
+        }
+        if mode == "host-pin-jump-cancel-signature" || mode == "host-pin-jump-revoke-during-signature" { return }
+
+        XCTAssertTrue(["host-pin-jump-observe", "host-pin-jump-connect", "host-pin-jump-password", "host-pin-jump-interactive"].contains(mode))
+        XCTAssertNil(result.failure); XCTAssertEqual(result.hostKey, .pinMismatch)
+        let observed = try XCTUnwrap(result.observedIdentity)
+        XCTAssertEqual(observed.blob, destinationHost)
+        XCTAssertEqual(observed.fingerprint, f.host.fingerprint)
+        XCTAssertEqual(f.vault.counts.reads, promptedHop ? 0 : hops.count)
+        XCTAssertEqual(f.vault.counts.signatures, promptedHop ? 0 : hops.count)
+        let passwordCalls = await prompt.passwordCalls, interactiveCalls = await prompt.interactiveCalls
+        XCTAssertEqual(passwordCalls, passwordHop ? 1 : 0)
+        XCTAssertEqual(interactiveCalls, interactiveHop ? 1 : 0)
+        let review = try await f.store.reviewHostKeyPin(workspaceID: f.installed.id,
+            expectedRevision: f.installed.revision, routeID: "route", key: f.host, support: support)
+        let pinned = try await f.store.acceptHostKeyPin(review, confirmedByUser: true, support: support)
+        XCTAssertTrue(pinned.connectLater); XCTAssertNotEqual(pinned.revision, f.installed.revision)
+        XCTAssertEqual(pinned.manifest, f.installed.manifest)
+        XCTAssertEqual(pinned.envelopeDigest, f.installed.envelopeDigest)
+        XCTAssertTrue(try XCTUnwrap(pinned.importedDocument().hostTrust.first).pins.isEmpty)
+        XCTAssertEqual(try XCTUnwrap(pinned.document().hostTrust.first).pins, [f.host])
+        XCTAssertEqual(f.vault.counts.signatures, promptedHop ? 0 : hops.count)
+        if mode == "host-pin-jump-connect" {
+            let approved = try await f.store.approveConnections(workspaceID: pinned.id,
+                expectedRevision: pinned.revision, confirmedByUser: true)
+            let connection = try await WorkspaceNativeSSHConnection.connect(workspaceID: pinned.id,
+                expectedRevision: approved.revision, machineID: "machine", routeID: "route", credentialID: "key",
+                confirmedByUser: true, store: f.store, broker: f.broker, networkActivity: activity,
+                connectionTimeout: .seconds(5), authenticationTimeout: .seconds(5))
+            await connection.close()
+            XCTAssertEqual(f.vault.counts.reads, 2 * hops.count + 1)
+            XCTAssertEqual(f.vault.counts.signatures, 2 * hops.count + 1)
+            XCTAssertEqual(activity.accounting().connections, 0)
+        }
     }
 
     private func exerciseLiveJump(mode: String, destinationPort: UInt16, destinationHost: Data,

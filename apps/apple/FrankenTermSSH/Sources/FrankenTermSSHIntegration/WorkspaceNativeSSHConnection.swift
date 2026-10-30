@@ -187,12 +187,13 @@ public actor WorkspaceNativeSSHConnection {
     /// next candidate, with fresh ancestor logins. Previously refused candidates
     /// stay consumed across reconstruction; no transit shell or command opens.
     /// A hop failure never masquerades as a refusal of the destination's key.
-    private static func connectThroughHops(_ hops: [WorkspaceDocument.Route], authenticationChoices: [[WorkspaceSSHAuthenticationChoice]],
+    static func connectThroughHops(_ hops: [WorkspaceDocument.Route], authenticationChoices: [[WorkspaceSSHAuthenticationChoice]],
         destination: NativeSSHEndpoint, destinationRouteID: String, workspaceID: UUID, revision: UUID,
         store: WorkspaceStore, broker: SSHAuthenticationBroker, foreground: SSHForegroundLease,
         passwordPrompter: (any WorkspaceSSHPasswordPrompting)?,
         keyboardInteractivePrompter: (any WorkspaceSSHKeyboardInteractivePrompting)?,
-        lease: WorkspaceNetworkLease, connectionTimeout: Duration, authenticationTimeout: Duration)
+        lease: WorkspaceNetworkLease, connectionTimeout: Duration, authenticationTimeout: Duration,
+        hostKeyProbe: WorkspaceHostKeyProbe? = nil)
         async throws -> (session: NativeSSHSession, usedPrompt: Bool) {
         var hadCredentialRefusal = false
         var usedPrompt = false
@@ -222,9 +223,15 @@ public actor WorkspaceNativeSSHConnection {
                         // Revalidate the complete destination graph before each
                         // login and after any chain reconstruction.
                         let current = try await store.loadWithReadiness(support: WorkspaceNativeSSHAuthentication.routeSupport)
+                        if let hostKeyProbe {
+                            _ = try await store.validateHostKeyVerification(hostKeyProbe,
+                                support: WorkspaceNativeSSHAuthentication.routeSupport)
+                            guard hostKeyProbe.workspaceID == workspaceID, hostKeyProbe.expectedRevision == revision,
+                                  hostKeyProbe.routeID == destinationRouteID else { throw SSHAuthenticationError.stale }
+                        }
                         guard let entry = current.first(where: { $0.workspace.id == workspaceID }),
                               entry.workspace.revision == revision,
-                              entry.routes.first(where: { $0.routeID == destinationRouteID })?.isLocallyReady == true,
+                              hostKeyProbe != nil || entry.routes.first(where: { $0.routeID == destinationRouteID })?.isLocallyReady == true,
                               let readiness = entry.routes.first(where: { $0.routeID == hop.id }),
                               WorkspaceSSHAuthenticationChoice.choices(for: hop, usableCredentialIDs: readiness.usableCredentialIDs)
                                 .contains(attempt.selection.authentication) else { throw SSHAuthenticationError.stale }
@@ -242,7 +249,7 @@ public actor WorkspaceNativeSSHConnection {
                             route: hop, workspaceID: workspaceID, revision: revision, broker: broker,
                             passwordPrompter: passwordPrompter, keyboardInteractivePrompter: keyboardInteractivePrompter,
                             transitForRouteID: destinationRouteID,
-                            timeout: authenticationTimeout)
+                            timeout: authenticationTimeout, hostKeyProbe: hostKeyProbe)
                         usedPrompt = usedPrompt || authenticated.usedForegroundPrompt
                         _ = try plan.connected(attempt)
                         pending = nil
@@ -286,19 +293,21 @@ public actor WorkspaceNativeSSHConnection {
         route: WorkspaceDocument.Route, workspaceID: UUID, revision: UUID, broker: SSHAuthenticationBroker,
         passwordPrompter: (any WorkspaceSSHPasswordPrompting)?,
         keyboardInteractivePrompter: (any WorkspaceSSHKeyboardInteractivePrompting)?, transitForRouteID: String? = nil,
-        timeout: Duration) async throws -> (peer: NativeSSHPeer, authority: any WorkspaceNativeSSHAuthority, usedForegroundPrompt: Bool) {
+        timeout: Duration, hostKeyProbe: WorkspaceHostKeyProbe? = nil)
+        async throws -> (peer: NativeSSHPeer, authority: any WorkspaceNativeSSHAuthority, usedForegroundPrompt: Bool) {
         let endpoint = try NativeSSHEndpoint(host: route.host, port: route.port)
         switch choice {
         case let .publicKey(credentialID):
             let authority = WorkspaceNativeSSHAuthentication(broker: broker, workspaceID: workspaceID,
                 revision: revision, routeID: route.id, credentialID: credentialID, transportID: session.transportID,
-                endpoint: endpoint, transitForRouteID: transitForRouteID, allowedJumpRouteIDs: route.jumpRoutes)
+                endpoint: endpoint, transitForRouteID: transitForRouteID, allowedJumpRouteIDs: route.jumpRoutes,
+                hostKeyProbe: hostKeyProbe)
             if NativeSSHSession.supportsPublicKeyInteractive, route.authenticationMethods.contains(.keyboardInteractive),
                let keyboardInteractivePrompter {
                 let interactive = WorkspaceNativeSSHInteractiveAuthentication(broker: broker, prompter: keyboardInteractivePrompter,
                     workspaceID: workspaceID, revision: revision, routeID: route.id, transportID: session.transportID,
                     endpoint: endpoint, transitForRouteID: transitForRouteID, allowedJumpRouteIDs: route.jumpRoutes,
-                    continuingPublicKey: authority)
+                    continuingPublicKey: authority, hostKeyProbe: hostKeyProbe)
                 // The native owner asks for this second factor only after the
                 // server accepts the signed key with partial success. A refused
                 // key never becomes permission to display an MFA prompt.
@@ -316,7 +325,8 @@ public actor WorkspaceNativeSSHConnection {
             guard let passwordPrompter else { throw SSHAuthenticationError.unavailable }
             let authority = WorkspaceNativeSSHPasswordAuthentication(broker: broker, prompter: passwordPrompter,
                 workspaceID: workspaceID, revision: revision, routeID: route.id, transportID: session.transportID,
-                endpoint: endpoint, transitForRouteID: transitForRouteID, allowedJumpRouteIDs: route.jumpRoutes)
+                endpoint: endpoint, transitForRouteID: transitForRouteID, allowedJumpRouteIDs: route.jumpRoutes,
+                hostKeyProbe: hostKeyProbe)
             let peer = try await session.authenticate(usingPassword: authority, timeout: timeout)
             try await authority.authenticationCompleted()
             return (peer, authority, true)
@@ -324,7 +334,8 @@ public actor WorkspaceNativeSSHConnection {
             guard let keyboardInteractivePrompter else { throw SSHAuthenticationError.unavailable }
             let authority = WorkspaceNativeSSHInteractiveAuthentication(broker: broker, prompter: keyboardInteractivePrompter,
                 workspaceID: workspaceID, revision: revision, routeID: route.id, transportID: session.transportID,
-                endpoint: endpoint, transitForRouteID: transitForRouteID, allowedJumpRouteIDs: route.jumpRoutes)
+                endpoint: endpoint, transitForRouteID: transitForRouteID, allowedJumpRouteIDs: route.jumpRoutes,
+                hostKeyProbe: hostKeyProbe)
             let peer = try await session.authenticate(usingInteractive: authority, timeout: timeout)
             try await authority.authenticationCompleted()
             return (peer, authority, true)

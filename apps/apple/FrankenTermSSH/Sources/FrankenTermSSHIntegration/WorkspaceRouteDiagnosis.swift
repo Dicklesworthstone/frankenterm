@@ -173,6 +173,86 @@ public enum WorkspaceRouteProbe {
         }
     }
 
+    /// Explicit first-use verification may sign in to already trusted jump
+    /// hosts, using their ordinary policy and protected prompts. The final
+    /// destination receives only a key exchange, never an account or credential.
+    /// Teardown joins the entire chain before retiring its short-lived permit
+    /// and releasing offline-restore exclusion.
+    public static func run(workspaceID: UUID, expectedRevision: UUID, routeID: String,
+                           confirmedByUser: Bool, store: WorkspaceStore, broker: SSHAuthenticationBroker,
+                           passwordPrompter: (any WorkspaceSSHPasswordPrompting)? = nil,
+                           keyboardInteractivePrompter: (any WorkspaceSSHKeyboardInteractivePrompting)? = nil,
+                           timeout: Duration = .seconds(8), authenticationTimeout: Duration = .seconds(60),
+                           networkActivity: WorkspaceNetworkActivity = .shared) async -> Result {
+        var network = WorkspaceRouteNetwork.internet
+        var session: NativeSSHSession?
+        var permit: WorkspaceHostKeyProbe?
+        var lease: WorkspaceNetworkLease?
+        do {
+            guard confirmedByUser else { throw WorkspaceNetworkError.confirmationRequired }
+            try Task.checkCancellation()
+            let foreground = try await broker.foregroundLease()
+            let networkLease = try networkActivity.beginConnection()
+            lease = networkLease
+            let support = WorkspaceNativeSSHAuthentication.routeSupport
+            let probe = try await store.beginHostKeyVerification(workspaceID: workspaceID,
+                expectedRevision: expectedRevision, routeID: routeID, confirmedByUser: true, support: support)
+            permit = probe
+            let document = try await store.validateHostKeyVerification(probe, support: support)
+            guard let route = document.routes.first(where: { $0.id == routeID }) else { throw SSHAuthenticationError.stale }
+            network = WorkspaceRouteNetwork(host: route.host)
+            let hops = try document.orderedJumpRoutes(forRouteID: routeID)
+            let destination = try NativeSSHEndpoint(host: route.host, port: route.port)
+            try await broker.validateForeground(foreground)
+            try Task.checkCancellation()
+            if hops.isEmpty {
+                session = try await NativeSSHConnector.connect(to: destination, timeout: timeout, networkLifetime: networkLease)
+            } else {
+                let entries = try await store.loadWithReadiness(support: support)
+                guard let entry = entries.first(where: { $0.workspace.id == workspaceID }),
+                      entry.workspace.revision == expectedRevision else { throw SSHAuthenticationError.stale }
+                let choices = try hops.map { hop -> [WorkspaceSSHAuthenticationChoice] in
+                    guard let readiness = entry.routes.first(where: { $0.routeID == hop.id }) else {
+                        throw SSHAuthenticationError.denied
+                    }
+                    let choices = WorkspaceSSHAuthenticationChoice.choices(for: hop,
+                        usableCredentialIDs: readiness.usableCredentialIDs)
+                    guard !choices.isEmpty else { throw SSHAuthenticationError.denied }
+                    guard passwordPrompter != nil || !choices.contains(.password),
+                          keyboardInteractivePrompter != nil || !choices.contains(.keyboardInteractive) else {
+                        throw SSHAuthenticationError.unavailable
+                    }
+                    return choices
+                }
+                let path = try await WorkspaceNativeSSHConnection.connectThroughHops(hops, authenticationChoices: choices,
+                    destination: destination, destinationRouteID: routeID, workspaceID: workspaceID,
+                    revision: expectedRevision, store: store, broker: broker, foreground: foreground,
+                    passwordPrompter: passwordPrompter, keyboardInteractivePrompter: keyboardInteractivePrompter,
+                    lease: networkLease, connectionTimeout: timeout, authenticationTimeout: authenticationTimeout,
+                    hostKeyProbe: probe)
+                session = path.session
+            }
+            guard let owner = session else { throw SSHAuthenticationError.unavailable }
+            try await broker.validateForeground(foreground)
+            _ = try await store.validateHostKeyVerification(probe, support: support)
+            try await owner.validateForwardingPath()
+            try Task.checkCancellation()
+            let result = await exchangeAndClose(owner, route: route, document: document, timeout: timeout)
+            session = nil
+            try Task.checkCancellation()
+            try await broker.validateForeground(foreground)
+            _ = try await store.validateHostKeyVerification(probe, support: support)
+            await store.endHostKeyVerification(probe)
+            withExtendedLifetime(lease) {}
+            return result
+        } catch {
+            await session?.close()
+            if let permit { await store.endHostKeyVerification(permit) }
+            withExtendedLifetime(lease) {}
+            return .init(network: network, hostKey: nil, peer: nil, failure: error)
+        }
+    }
+
     public static func run(route: WorkspaceDocument.Route, document: WorkspaceDocument,
                            timeout: Duration = .seconds(8),
                            networkActivity: WorkspaceNetworkActivity = .shared) async -> Result {
@@ -186,11 +266,18 @@ public enum WorkspaceRouteProbe {
             session = try await NativeSSHConnector.connect(to: NativeSSHEndpoint(host: route.host, port: route.port),
                                                            timeout: timeout, networkLifetime: lease)
         } catch { return .init(network: network, hostKey: nil, peer: nil, failure: error) }
+        let result = await exchangeAndClose(session, route: route, document: document, timeout: timeout)
+        withExtendedLifetime(lease) {}
+        return result
+    }
+
+    private static func exchangeAndClose(_ session: NativeSSHSession, route: WorkspaceDocument.Route,
+                                        document: WorkspaceDocument, timeout: Duration) async -> Result {
+        let network = WorkspaceRouteNetwork(host: route.host)
         let witness = PeerWitness(transportID: session.transportID)
         var failure: (any Error)?
         do { _ = try await session.authenticate(using: witness, timeout: timeout) } catch { failure = error }
         await session.close()
-        withExtendedLifetime(lease) {}
         guard let peer = await witness.peer else { return .init(network: network, hostKey: nil, peer: nil, failure: failure) }
         do {
             let identity = try WorkspaceNativeSSHAuthentication.hostIdentity(for: peer)

@@ -397,6 +397,8 @@ public actor WorkspaceStore {
     private let sshAuthorizationOwner = UUID()
     private let credentialImportOwner = UUID()
     private let hostKeyPinOwner = UUID()
+    private var hostKeyProbes: [UUID: WorkspaceHostKeyProbe] = [:]
+    private let hostKeyProbeNow: @Sendable () -> ContinuousClock.Instant
     /// Host-key refusals made in this process. A refusal whose write failed
     /// still holds until the app quits; a retry saves it.
     private var processHostRevocations: Set<HostRevocation> = []
@@ -412,6 +414,12 @@ public actor WorkspaceStore {
 
     public init(persistence: any WorkspacePersistence, vault: any WorkspaceCredentialVault) {
         self.persistence = persistence; self.vault = vault
+        hostKeyProbeNow = { ContinuousClock.now }
+    }
+
+    init(persistence: any WorkspacePersistence, vault: any WorkspaceCredentialVault,
+         hostKeyProbeNow: @escaping @Sendable () -> ContinuousClock.Instant) {
+        self.persistence = persistence; self.vault = vault; self.hostKeyProbeNow = hostKeyProbeNow
     }
 
     public func load() throws -> [InstalledWorkspace] {
@@ -1268,7 +1276,8 @@ public actor WorkspaceStore {
         }
     }
 
-    /// Preflight for a deliberate, credential-free SSH host-key check. The
+    /// Preflight for a deliberate SSH host-key check. The destination never
+    /// receives credentials; trusted jump hosts require their own sign-in. The
     /// caller must still acquire the process-wide network lease. Imported
     /// auto-connect settings cannot call this on the user's behalf.
     public func hostKeyVerificationDocument(workspaceID: UUID, expectedRevision: UUID, routeID: String,
@@ -1280,6 +1289,51 @@ public actor WorkspaceStore {
             return try hostKeyVerificationContext(workspaceID: workspaceID, expectedRevision: expectedRevision,
                 routeID: routeID, support: support, catalog: catalog).document
         }
+    }
+
+    /// At most four explicit probes may own transit authentication, each for
+    /// five minutes. A permit cannot authorize a normal destination login or
+    /// survive an import, local trust/credential revocation, or explicit end.
+    public func beginHostKeyVerification(workspaceID: UUID, expectedRevision: UUID, routeID: String,
+        confirmedByUser: Bool, support: WorkspaceDocument.RouteSupport) throws -> WorkspaceHostKeyProbe {
+        guard confirmedByUser else { throw WorkspaceStoreError.reviewRequired }
+        try Task.checkCancellation()
+        return try persistence.withExclusiveAccess {
+            var catalog = try readCatalog()
+            try recover(catalog: &catalog)
+            _ = try hostKeyVerificationContext(workspaceID: workspaceID, expectedRevision: expectedRevision,
+                routeID: routeID, support: support, catalog: catalog)
+            let now = hostKeyProbeNow()
+            hostKeyProbes = hostKeyProbes.filter { now < $0.value.expires }
+            guard hostKeyProbes.count < 4 else { throw SSHAuthenticationError.busy }
+            let probe = WorkspaceHostKeyProbe(id: UUID(), workspaceID: workspaceID,
+                expectedRevision: expectedRevision, routeID: routeID, owner: hostKeyPinOwner,
+                expires: now + .seconds(300))
+            hostKeyProbes[probe.id] = probe
+            return probe
+        }
+    }
+
+    public func endHostKeyVerification(_ probe: WorkspaceHostKeyProbe) {
+        if probe.owner == hostKeyPinOwner, hostKeyProbes[probe.id] == probe { hostKeyProbes[probe.id] = nil }
+    }
+
+    public func validateHostKeyVerification(_ probe: WorkspaceHostKeyProbe,
+        support: WorkspaceDocument.RouteSupport) throws -> WorkspaceDocument {
+        try Task.checkCancellation()
+        return try persistence.withExclusiveAccess {
+            var catalog = try readCatalog()
+            try recover(catalog: &catalog)
+            return try validateHostKeyProbe(probe, support: support, catalog: catalog).document
+        }
+    }
+
+    private func validateHostKeyProbe(_ probe: WorkspaceHostKeyProbe, support: WorkspaceDocument.RouteSupport,
+        catalog: Catalog) throws -> HostKeyContext {
+        guard probe.owner == hostKeyPinOwner, hostKeyProbes[probe.id] == probe,
+              hostKeyProbeNow() < probe.expires else { throw SSHAuthenticationError.stale }
+        return try hostKeyVerificationContext(workspaceID: probe.workspaceID,
+            expectedRevision: probe.expectedRevision, routeID: probe.routeID, support: support, catalog: catalog)
     }
 
     /// The public key comes from the completed SSH key exchange. This review
@@ -1355,17 +1409,52 @@ public actor WorkspaceStore {
               let trust = document.hostTrust.first(where: { $0.id == route.trustID }) else {
             throw WorkspaceStoreError.staleReview
         }
-        guard route.jumpRoutes.isEmpty, route.mode == "direct_ssh" || route.mode == "frankenterm_mux" else {
+        guard route.mode == "direct_ssh" || route.mode == "frankenterm_mux" else {
             throw WorkspaceHostKeyPinError.unsupportedRoute
         }
         guard trust.pins.isEmpty else { throw WorkspaceHostKeyPinError.alreadyConfigured }
-        let states = try readiness(document: document, workspaceID: workspaceID, available: [],
+        let hops = try document.orderedJumpRoutes(forRouteID: routeID)
+        guard hops.count <= support.maximumJumpHops else { throw WorkspaceHostKeyPinError.unsupportedRoute }
+        // A direct key exchange never reads protected-key metadata. For a
+        // tunneled check, every transit route must independently be ready.
+        let available = hops.isEmpty ? [] : try availableCredentials(saved, catalog: catalog)
+        let states = try readiness(document: document, workspaceID: workspaceID, available: available,
             findings: saved.findings, catalog: catalog, support: support)
         guard let state = states.first(where: { $0.routeID == routeID }),
               !state.issues.contains(.unsupportedRequirement), !state.issues.contains(.transportUnavailable) else {
             throw WorkspaceHostKeyPinError.unsupportedPolicy
         }
+        for hop in hops {
+            let transit = try document.readiness(forRouteID: hop.id, availableCredentialIDs: available,
+                reviewedTrustIDs: Set(document.hostTrust.map(\.id)), revokedCredentialFingerprints: catalog.revokedFingerprints,
+                support: support, revokedHostKeysByTrustScope: hostRevocations(workspaceID, document: document, catalog: catalog),
+                requiredHostCapabilitiesByTrustScope: hostRequirements(workspaceID, catalog: catalog),
+                transitForRouteID: routeID)
+            guard transit.isLocallyReady,
+                  states.first(where: { $0.routeID == hop.id })?.issues.contains(.unsupportedRequirement) != true else {
+                throw WorkspaceHostKeyPinError.jumpNotReady
+            }
+        }
         return (saved, document, route)
+    }
+
+    /// This exception applies only to the final destination's absent key and
+    /// credentials. Every transit peer still uses ordinary pinned host policy,
+    /// credential selection and live authorization. A destination login cannot
+    /// carry a probe permit, even if that destination later becomes ready.
+    private func validateHostKeyProbeTransit(_ probe: WorkspaceHostKeyProbe?, workspaceID: UUID,
+        revision: UUID, routeID: String, destinationID: String?, support: WorkspaceDocument.RouteSupport,
+        catalog: Catalog) throws -> Bool {
+        guard let probe else { return false }
+        guard probe.workspaceID == workspaceID, probe.expectedRevision == revision,
+              let destinationID, probe.routeID == destinationID, routeID != destinationID else {
+            throw SSHAuthenticationError.denied
+        }
+        let context = try validateHostKeyProbe(probe, support: support, catalog: catalog)
+        guard try context.document.orderedJumpRoutes(forRouteID: destinationID).contains(where: { $0.id == routeID }) else {
+            throw SSHAuthenticationError.denied
+        }
+        return true
     }
 
     private func validateHostKeyPin(_ pin: WorkspaceHostKeyPin, context: HostKeyContext, catalog: Catalog,
@@ -1458,16 +1547,17 @@ public actor WorkspaceStore {
     /// lease, then revalidates it before exposing its result to the transport.
     public func authorizeSSHAuthentication(workspaceID: UUID, expectedRevision: UUID,
         routeID: String, credentialID: String, presentedHostKey: WorkspaceDocument.HostKey,
-        support: WorkspaceDocument.RouteSupport, transitForRouteID: String? = nil) throws -> WorkspaceSSHAuthorization {
+        support: WorkspaceDocument.RouteSupport, transitForRouteID: String? = nil,
+        hostKeyProbe: WorkspaceHostKeyProbe? = nil) throws -> WorkspaceSSHAuthorization {
         try authorizeSSHAuthentication(workspaceID: workspaceID, expectedRevision: expectedRevision,
             routeID: routeID, credentialID: credentialID, presentedHostKey: presentedHostKey,
-            support: support, transitForRouteID: transitForRouteID, forAuthentication: true)
+            support: support, transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe, forAuthentication: true)
     }
 
     private func authorizeSSHAuthentication(workspaceID: UUID, expectedRevision: UUID,
         routeID: String, credentialID: String, presentedHostKey: WorkspaceDocument.HostKey,
         support: WorkspaceDocument.RouteSupport, transitForRouteID: String?,
-        forAuthentication: Bool) throws -> WorkspaceSSHAuthorization {
+        hostKeyProbe: WorkspaceHostKeyProbe?, forAuthentication: Bool) throws -> WorkspaceSSHAuthorization {
         try persistence.withExclusiveAccess {
             var catalog = try readCatalog()
             try recover(catalog: &catalog)
@@ -1486,12 +1576,15 @@ public actor WorkspaceStore {
             let states = try readiness(document: document, workspaceID: workspaceID,
                 available: available, findings: saved.findings,
                 catalog: catalog, support: support, certificateTime: certificateTime)
+            let probeTransit = try validateHostKeyProbeTransit(hostKeyProbe, workspaceID: workspaceID,
+                revision: expectedRevision, routeID: routeID, destinationID: transitForRouteID,
+                support: support, catalog: catalog)
             let selected: WorkspaceDocument.RouteReadiness
             if let destinationID = transitForRouteID {
                 let chain = try document.orderedJumpRoutes(forRouteID: destinationID)
                 guard !chain.isEmpty, chain.count <= support.maximumJumpHops,
                       chain.contains(where: { $0.id == routeID }),
-                      states.first(where: { $0.routeID == destinationID })?.isLocallyReady == true else {
+                      probeTransit || states.first(where: { $0.routeID == destinationID })?.isLocallyReady == true else {
                     throw SSHAuthenticationError.denied
                 }
                 selected = try document.readiness(forRouteID: routeID, availableCredentialIDs: available,
@@ -1514,7 +1607,7 @@ public actor WorkspaceStore {
                 workspaceID: workspaceID, workspaceRevision: saved.revision, routeID: routeID,
                 credentialID: credentialID, host: route.host, port: route.port, user: route.user,
                 routeMode: route.mode, jumpRouteIDs: route.jumpRoutes,
-                transitForRouteID: transitForRouteID,
+                transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe,
                 algorithm: credential.algorithm, fingerprint: credential.fingerprint, presentedHostKey: presentedHostKey,
                 userCertificate: credential.userCertificate)
         }
@@ -1529,7 +1622,7 @@ public actor WorkspaceStore {
         let current = try authorizeSSHAuthentication(workspaceID: authorization.workspaceID,
             expectedRevision: authorization.workspaceRevision, routeID: authorization.routeID,
             credentialID: authorization.credentialID, presentedHostKey: authorization.presentedHostKey, support: support,
-            transitForRouteID: authorization.transitForRouteID, forAuthentication: false)
+            transitForRouteID: authorization.transitForRouteID, hostKeyProbe: authorization.hostKeyProbe, forAuthentication: false)
         guard current == authorization else { throw SSHAuthenticationError.stale }
     }
 
@@ -1538,50 +1631,54 @@ public actor WorkspaceStore {
     /// peer pin under the same persistence lease as public-key authorization.
     public func authorizeSSHPasswordAuthentication(workspaceID: UUID, expectedRevision: UUID,
         routeID: String, presentedHostKey: WorkspaceDocument.HostKey,
-        support: WorkspaceDocument.RouteSupport, transitForRouteID: String? = nil) throws -> WorkspaceSSHPasswordAuthorization {
+        support: WorkspaceDocument.RouteSupport, transitForRouteID: String? = nil,
+        hostKeyProbe: WorkspaceHostKeyProbe? = nil) throws -> WorkspaceSSHPasswordAuthorization {
         try authorizeSSHPasswordAuthentication(workspaceID: workspaceID, expectedRevision: expectedRevision,
             routeID: routeID, presentedHostKey: presentedHostKey, support: support,
-            transitForRouteID: transitForRouteID, forAuthentication: true)
+            transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe, forAuthentication: true)
     }
 
     private func authorizeSSHPasswordAuthentication(workspaceID: UUID, expectedRevision: UUID,
         routeID: String, presentedHostKey: WorkspaceDocument.HostKey,
-        support: WorkspaceDocument.RouteSupport, transitForRouteID: String?, forAuthentication: Bool) throws -> WorkspaceSSHPasswordAuthorization {
+        support: WorkspaceDocument.RouteSupport, transitForRouteID: String?,
+        hostKeyProbe: WorkspaceHostKeyProbe?, forAuthentication: Bool) throws -> WorkspaceSSHPasswordAuthorization {
         let selected = try authorizeSSHAccountAuthentication(method: .password, workspaceID: workspaceID,
             expectedRevision: expectedRevision, routeID: routeID, presentedHostKey: presentedHostKey,
-            support: support, transitForRouteID: transitForRouteID, forAuthentication: forAuthentication)
+            support: support, transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe, forAuthentication: forAuthentication)
         return .init(storeOwner: sshAuthorizationOwner, workspaceID: workspaceID, workspaceRevision: selected.revision,
             routeID: routeID, host: selected.route.host, port: selected.route.port, user: selected.route.user,
             routeMode: selected.route.mode, jumpRouteIDs: selected.route.jumpRoutes,
-            transitForRouteID: transitForRouteID, presentedHostKey: presentedHostKey)
+            transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe, presentedHostKey: presentedHostKey)
     }
 
     /// Keyboard-interactive has its own imported method authorization. Permission
     /// to send a password never grants permission to answer this method's prompts.
     public func authorizeSSHKeyboardInteractiveAuthentication(workspaceID: UUID, expectedRevision: UUID,
         routeID: String, presentedHostKey: WorkspaceDocument.HostKey,
-        support: WorkspaceDocument.RouteSupport, transitForRouteID: String? = nil) throws -> WorkspaceSSHKeyboardInteractiveAuthorization {
+        support: WorkspaceDocument.RouteSupport, transitForRouteID: String? = nil,
+        hostKeyProbe: WorkspaceHostKeyProbe? = nil) throws -> WorkspaceSSHKeyboardInteractiveAuthorization {
         try authorizeSSHKeyboardInteractiveAuthentication(workspaceID: workspaceID, expectedRevision: expectedRevision,
             routeID: routeID, presentedHostKey: presentedHostKey, support: support,
-            transitForRouteID: transitForRouteID, forAuthentication: true)
+            transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe, forAuthentication: true)
     }
 
     private func authorizeSSHKeyboardInteractiveAuthentication(workspaceID: UUID, expectedRevision: UUID,
         routeID: String, presentedHostKey: WorkspaceDocument.HostKey,
-        support: WorkspaceDocument.RouteSupport, transitForRouteID: String?, forAuthentication: Bool) throws -> WorkspaceSSHKeyboardInteractiveAuthorization {
+        support: WorkspaceDocument.RouteSupport, transitForRouteID: String?,
+        hostKeyProbe: WorkspaceHostKeyProbe?, forAuthentication: Bool) throws -> WorkspaceSSHKeyboardInteractiveAuthorization {
         let selected = try authorizeSSHAccountAuthentication(method: .keyboardInteractive, workspaceID: workspaceID,
             expectedRevision: expectedRevision, routeID: routeID, presentedHostKey: presentedHostKey,
-            support: support, transitForRouteID: transitForRouteID, forAuthentication: forAuthentication)
+            support: support, transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe, forAuthentication: forAuthentication)
         return .init(storeOwner: sshAuthorizationOwner, workspaceID: workspaceID, workspaceRevision: selected.revision,
             routeID: routeID, host: selected.route.host, port: selected.route.port, user: selected.route.user,
             routeMode: selected.route.mode, jumpRouteIDs: selected.route.jumpRoutes,
-            transitForRouteID: transitForRouteID, presentedHostKey: presentedHostKey)
+            transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe, presentedHostKey: presentedHostKey)
     }
 
     private func authorizeSSHAccountAuthentication(method: WorkspaceDocument.AuthenticationMethod,
         workspaceID: UUID, expectedRevision: UUID, routeID: String, presentedHostKey: WorkspaceDocument.HostKey,
         support: WorkspaceDocument.RouteSupport, transitForRouteID: String?,
-        forAuthentication: Bool) throws -> (route: WorkspaceDocument.Route, revision: UUID) {
+        hostKeyProbe: WorkspaceHostKeyProbe?, forAuthentication: Bool) throws -> (route: WorkspaceDocument.Route, revision: UUID) {
         guard method == .password || method == .keyboardInteractive else { throw SSHAuthenticationError.denied }
         return try persistence.withExclusiveAccess {
             var catalog = try readCatalog()
@@ -1598,12 +1695,15 @@ public actor WorkspaceStore {
             let certificateTime: Date? = forAuthentication ? Date() : nil
             let states = try readiness(document: document, workspaceID: workspaceID,
                 available: available, findings: saved.findings, catalog: catalog, support: support, certificateTime: certificateTime)
+            let probeTransit = try validateHostKeyProbeTransit(hostKeyProbe, workspaceID: workspaceID,
+                revision: expectedRevision, routeID: routeID, destinationID: transitForRouteID,
+                support: support, catalog: catalog)
             let selected: WorkspaceDocument.RouteReadiness
             if let destinationID = transitForRouteID {
                 let chain = try document.orderedJumpRoutes(forRouteID: destinationID)
                 guard !chain.isEmpty, chain.count <= support.maximumJumpHops,
                       chain.contains(where: { $0.id == routeID }),
-                      states.first(where: { $0.routeID == destinationID })?.isLocallyReady == true else {
+                      probeTransit || states.first(where: { $0.routeID == destinationID })?.isLocallyReady == true else {
                     throw SSHAuthenticationError.denied
                 }
                 selected = try document.readiness(forRouteID: routeID, availableCredentialIDs: available,
@@ -1632,7 +1732,7 @@ public actor WorkspaceStore {
         let current = try authorizeSSHPasswordAuthentication(workspaceID: authorization.workspaceID,
             expectedRevision: authorization.workspaceRevision, routeID: authorization.routeID,
             presentedHostKey: authorization.presentedHostKey, support: support,
-            transitForRouteID: authorization.transitForRouteID, forAuthentication: false)
+            transitForRouteID: authorization.transitForRouteID, hostKeyProbe: authorization.hostKeyProbe, forAuthentication: false)
         guard current == authorization else { throw SSHAuthenticationError.stale }
     }
 
@@ -1642,7 +1742,7 @@ public actor WorkspaceStore {
         let current = try authorizeSSHKeyboardInteractiveAuthentication(workspaceID: authorization.workspaceID,
             expectedRevision: authorization.workspaceRevision, routeID: authorization.routeID,
             presentedHostKey: authorization.presentedHostKey, support: support,
-            transitForRouteID: authorization.transitForRouteID, forAuthentication: false)
+            transitForRouteID: authorization.transitForRouteID, hostKeyProbe: authorization.hostKeyProbe, forAuthentication: false)
         guard current == authorization else { throw SSHAuthenticationError.stale }
     }
 

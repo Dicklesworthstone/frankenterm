@@ -142,6 +142,96 @@ class WorkspaceInteropTests(unittest.TestCase):
                 with self.subTest(algorithm=algorithm, mode=mode):
                     self.run_host_mode(mode, host, algorithm)
 
+    def run_jump_host_pin_mode(self, hop_count, mode):
+        destination_key = ed25519.Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
+        keys = [ed25519.Ed25519PrivateKey.from_private_bytes(bytes(range(32 * (index + 1), 32 * (index + 2))))
+                for index in range(hop_count)]
+        reconnect = mode == "host-pin-jump-connect"
+        password_hop = mode == "host-pin-jump-password"
+        interactive_hop = mode == "host-pin-jump-interactive"
+        destination = fixture.LoopbackServer(destination_key, connections=2 if reconnect else 1)
+        peers = []
+        for index in reversed(range(hop_count)):
+            target = peers[0] if peers else destination
+            peers.insert(0, fixture.LoopbackServer(keys[index], forward_to=target.address,
+                connections=2 if reconnect else 1,
+                password=b"synthetic jump password" if password_hop else None,
+                interactive_rounds=[dict(name=b"Jump verification", instruction=b"Enter the one-time code.",
+                    prompts=[(b"One-time code:", False)], responses=[b"654321"])] if interactive_hop else None))
+        try:
+            chain = [{"port": peer.address[1], "hostKey": base64.b64encode(peer.host_blob).decode()} for peer in peers]
+            environment = dict(os.environ, FT_WORKSPACE_SSH_TEST_PORT=str(destination.address[1]),
+                FT_WORKSPACE_SSH_TEST_HOSTKEY=base64.b64encode(destination.host_blob).decode(),
+                FT_WORKSPACE_SSH_JUMP_CHAIN=json.dumps(chain), FT_WORKSPACE_SSH_TEST_MODE=mode)
+            result = subprocess.run(xctest_command(), env=environment, capture_output=True, text=True, timeout=30)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output[-18000:])
+            self.assertIn("Executed 1 test", output)
+            self.assertNotIn("skipped", output.lower())
+            refused_before_network = mode in ["host-pin-jump-revoked", "host-pin-jump-revoked-host"]
+            refused_on_last_hop = mode in ["host-pin-jump-wrong-hop", "host-pin-jump-cancel-signature",
+                                         "host-pin-jump-revoke-during-signature"]
+            for index, peer in enumerate(peers):
+                self.assertEqual(peer.accepted_connections, 0 if refused_before_network else (2 if reconnect else 1))
+                if peer.accepted_connections:
+                    self.assertTrue(peer.done.wait(2), "the completed probe retained a live jump connection")
+                offers = [event for event in peer.events if event[0] == "authentication"]
+                if password_hop or interactive_hop or refused_before_network or (mode == "host-pin-jump-wrong-hop" and index == hop_count - 1):
+                    expected = []
+                elif refused_on_last_hop and index == hop_count - 1:
+                    expected = [0]
+                else:
+                    expected = [0, 1, 0, 1] if reconnect else [0, 1]
+                self.assertEqual([event[1] for event in offers], expected)
+                self.assertTrue(all(event[3] == fixture.public_blob(keys[index]) for event in offers))
+                self.assertEqual([event for event in peer.events if event[0] == "password-authentication"],
+                    [("password-authentication", b"operator", len(b"synthetic jump password"), True)] if password_hop else [])
+                self.assertEqual([event for event in peer.events if event[0] == "interactive-request"],
+                    [("interactive-request", b"operator")] if interactive_hop else [])
+                self.assertEqual([event for event in peer.events if event[0] == "interactive-response"],
+                    [("interactive-response", 1, 1, True)] if interactive_hop else [])
+                self.assertEqual([event for event in peer.events if event[0] in ["channel", "pty", "shell", "resize"]], [])
+                forwarded = [event for event in peer.events if event[0] == "forward"]
+                next_peer = peers[index + 1] if index + 1 < hop_count else destination
+                expected_forwards = 0 if refused_before_network or (refused_on_last_hop and index == hop_count - 1) else (2 if reconnect else 1)
+                self.assertEqual(forwarded,
+                                 [("forward", b"target.internal.invalid", next_peer.address[1])] * expected_forwards)
+                self.assertEqual(peer.received, b"")
+            expected_connections = 0 if refused_before_network or refused_on_last_hop else (2 if reconnect else 1)
+            self.assertEqual(destination.accepted_connections, expected_connections)
+            if expected_connections:
+                self.assertTrue(destination.done.wait(2), "the probe retained its destination connection")
+                connections = [index for index, event in enumerate(destination.events) if event[0] == "connection"]
+                first_end = connections[1] if reconnect else len(destination.events)
+                self.assertEqual(destination.events[connections[0] + 1:first_end], [],
+                                 "the target must receive no account, authentication or channel during first-use verification")
+            offers = [event for event in destination.events if event[0] == "authentication"]
+            self.assertEqual([event[1] for event in offers], [0, 1] if reconnect else [])
+            self.assertTrue(all(event[3] == fixture.public_blob(destination_key) for event in offers))
+            self.assertEqual([event for event in destination.events if event[0] in ["channel", "pty", "shell", "resize"]], [])
+            self.assertEqual(destination.received, b"")
+        finally:
+            for peer in peers:
+                peer.close()
+            destination.close()
+
+    def test_first_host_verification_through_trusted_one_two_three_hop_chains(self):
+        for hops in [1, 2, 3]:
+            for mode in ["host-pin-jump-observe", "host-pin-jump-connect"]:
+                with self.subTest(hops=hops, mode=mode):
+                    self.run_jump_host_pin_mode(hops, mode)
+
+    def test_first_host_verification_refuses_changed_revoked_or_cancelled_hop(self):
+        for mode in ["host-pin-jump-wrong-hop", "host-pin-jump-revoked", "host-pin-jump-revoked-host",
+                     "host-pin-jump-cancel-signature", "host-pin-jump-revoke-during-signature"]:
+            with self.subTest(mode=mode):
+                self.run_jump_host_pin_mode(3, mode)
+
+    def test_first_host_verification_uses_scoped_password_and_interactive_hop_prompts(self):
+        for mode in ["host-pin-jump-password", "host-pin-jump-interactive"]:
+            with self.subTest(mode=mode):
+                self.run_jump_host_pin_mode(1, mode)
+
     def test_explicit_mux_route_authenticates_without_opening_a_terminal(self):
         self.run_host_mode("mux-owner-auth")
 

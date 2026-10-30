@@ -14,6 +14,13 @@ final class WorkspaceHostKeyPinTests: XCTestCase {
         let saved: InstalledWorkspace
     }
 
+    private final class ProbeClock: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = ContinuousClock.now
+        func now() -> ContinuousClock.Instant { lock.withLock { value } }
+        func advance(_ duration: Duration) { lock.withLock { value += duration } }
+    }
+
     private let crypto = TestCryptography()
     private let digest = Data(repeating: 201, count: 32)
     private var support: WorkspaceDocument.RouteSupport {
@@ -62,6 +69,38 @@ final class WorkspaceHostKeyPinTests: XCTestCase {
         let saved = try await store.install(archive, envelopeDigest: digest,
             expectedRevision: nil, sourceAndContentsConfirmed: true).workspace
         return .init(store: store, disk: disk, vault: vault, archive: archive, saved: saved)
+    }
+
+    private func jumpArchive(methods: [String] = ["publickey"], destinationCredential: Bool = true,
+                             keys: Bool = true) throws -> AirGapArchive {
+        let pin = keyFields(try hostKey(17))
+        return try archive(keys: keys) { workspace in
+            var routes = workspace["routes"] as! [[String: Any]], hop = routes[0]
+            hop["id"] = "jump"; hop["host"] = "jump.example.invalid"; hop["host_trust_ref"] = "hop-trust"
+            hop["authentication_methods"] = methods
+            // Transit authentication must not require a terminal creation policy.
+            hop.removeValue(forKey: "session_creation")
+            var unrelated = hop; unrelated["id"] = "unrelated"
+            routes[0]["jump_routes"] = ["jump"]
+            if !destinationCredential { routes[0]["credential_refs"] = [] }
+            routes += [hop, unrelated]; workspace["routes"] = routes
+            var trusts = workspace["host_trust"] as! [[String: Any]], trust = trusts[0]
+            trust["id"] = "hop-trust"; trust["host"] = "jump.example.invalid"; trust["pins"] = [pin]
+            trusts.append(trust); workspace["host_trust"] = trusts
+        }
+    }
+
+    private func probe(_ f: Fixture, support: WorkspaceDocument.RouteSupport? = nil) async throws -> WorkspaceHostKeyProbe {
+        try await f.store.beginHostKeyVerification(workspaceID: f.saved.id, expectedRevision: f.saved.revision,
+            routeID: "route", confirmedByUser: true, support: support ?? self.support)
+    }
+
+    private func hopAuthorization(_ f: Fixture, probe: WorkspaceHostKeyProbe?,
+        routeID: String = "jump", destination: String? = "route",
+        support: WorkspaceDocument.RouteSupport? = nil) async throws -> WorkspaceSSHAuthorization {
+        try await f.store.authorizeSSHAuthentication(workspaceID: f.saved.id, expectedRevision: f.saved.revision,
+            routeID: routeID, credentialID: "key", presentedHostKey: hostKey(17), support: support ?? self.support,
+            transitForRouteID: destination, hostKeyProbe: probe)
     }
 
     private func review(_ fixture: Fixture, saved: InstalledWorkspace? = nil,
@@ -312,7 +351,7 @@ final class WorkspaceHostKeyPinTests: XCTestCase {
         catch { XCTAssertEqual(error as? WorkspaceHostKeyPinError, .unsupportedPolicy) }
     }
 
-    func testDestinationThroughAJumpCannotUseDirectFirstUseVerification() async throws {
+    func testDestinationThroughAnUnverifiedJumpCannotBeginVerification() async throws {
         let source = try archive { workspace in
             var routes = workspace["routes"] as! [[String: Any]], hop = routes[0]
             hop["id"] = "jump"
@@ -320,7 +359,138 @@ final class WorkspaceHostKeyPinTests: XCTestCase {
         }
         let f = try await fixture(source)
         do { _ = try await review(f); XCTFail("a jump destination was probed as a direct endpoint") }
-        catch { XCTAssertEqual(error as? WorkspaceHostKeyPinError, .unsupportedRoute) }
+        catch { XCTAssertEqual(error as? WorkspaceHostKeyPinError, .jumpNotReady) }
+    }
+
+    func testProbeRequiresExplicitConsentAndGrantsOnlyExactTrustedTransit() async throws {
+        let f = try await fixture(jumpArchive())
+        let before = f.disk.bytes(.catalog)
+        do {
+            _ = try await f.store.beginHostKeyVerification(workspaceID: f.saved.id,
+                expectedRevision: f.saved.revision, routeID: "route", confirmedByUser: false, support: support)
+            XCTFail("unconfirmed probe granted transit authentication")
+        } catch { XCTAssertEqual(error as? WorkspaceStoreError, .reviewRequired) }
+        do { _ = try await hopAuthorization(f, probe: nil); XCTFail("normal transit bypassed the destination's missing trust") }
+        catch { XCTAssertEqual(error as? SSHAuthenticationError, .denied) }
+
+        let permit = try await probe(f)
+        let auth = try await hopAuthorization(f, probe: permit)
+        XCTAssertEqual(auth.hostKeyProbe, permit)
+        XCTAssertEqual(auth.transitForRouteID, "route")
+        XCTAssertEqual(auth.presentedHostKey, try hostKey(17))
+        try await f.store.validateSSHAuthentication(auth, support: support)
+        let forbidden: [(String, String?)] = [("route", nil), ("jump", nil), ("unrelated", "route"), ("jump", "jump")]
+        for (route, destination) in forbidden {
+            do {
+                _ = try await hopAuthorization(f, probe: permit, routeID: route, destination: destination)
+                XCTFail("probe authorized unrelated or destination authentication: \(route)")
+            } catch { XCTAssertEqual(error as? SSHAuthenticationError, .denied) }
+        }
+        XCTAssertEqual(f.disk.bytes(.catalog), before, "probing must not publish trust or connection consent")
+        let saved = try await f.store.load()
+        XCTAssertTrue(try XCTUnwrap(saved.first).connectLater)
+        await f.store.endHostKeyVerification(permit)
+        do { try await f.store.validateSSHAuthentication(auth, support: support); XCTFail("ended probe kept signing authority") }
+        catch { XCTAssertEqual(error as? SSHAuthenticationError, .stale) }
+        do { _ = try await hopAuthorization(f, probe: nil); XCTFail("ending probe made normal login ready") }
+        catch { XCTAssertEqual(error as? SSHAuthenticationError, .denied) }
+    }
+
+    func testJumpProbeNeedsHopCredentialsButNoDestinationCredential() async throws {
+        let f = try await fixture(jumpArchive(destinationCredential: false))
+        let permit = try await probe(f)
+        _ = try await hopAuthorization(f, probe: permit)
+        await f.store.endHostKeyVerification(permit)
+        let pinned = try await accept(f)
+        XCTAssertEqual(pinned.manifest, f.saved.manifest)
+        XCTAssertEqual(pinned.envelopeDigest, f.saved.envelopeDigest)
+        XCTAssertTrue(pinned.connectLater)
+        let states = try await f.store.routeReadiness(workspaceID: pinned.id, support: support)
+        XCTAssertEqual(states.first(where: { $0.routeID == "route" })?.issues, [.credentialUnavailable])
+        let missing = try await fixture(jumpArchive(keys: false))
+        do { _ = try await probe(missing); XCTFail("a missing jump credential was ignored") }
+        catch { XCTAssertEqual(error as? WorkspaceHostKeyPinError, .jumpNotReady) }
+    }
+
+    func testProbeOwnsPasswordAndInteractiveTransitWithoutGrantingEitherAtDestination() async throws {
+        let f = try await fixture(jumpArchive(methods: ["publickey", "password", "keyboard-interactive"]))
+        let all = WorkspaceDocument.RouteSupport(routeModes: ["direct_ssh", "frankenterm_mux"],
+            authenticationMethods: [.publicKey, .password, .keyboardInteractive], credentialAlgorithms: ["ssh-ed25519"],
+            hostKeyAlgorithms: ["ssh-ed25519"], maximumJumpHops: 1)
+        let permit = try await probe(f, support: all)
+        let password = try await f.store.authorizeSSHPasswordAuthentication(workspaceID: f.saved.id,
+            expectedRevision: f.saved.revision, routeID: "jump", presentedHostKey: hostKey(17),
+            support: all, transitForRouteID: "route", hostKeyProbe: permit)
+        let interactive = try await f.store.authorizeSSHKeyboardInteractiveAuthentication(workspaceID: f.saved.id,
+            expectedRevision: f.saved.revision, routeID: "jump", presentedHostKey: hostKey(17),
+            support: all, transitForRouteID: "route", hostKeyProbe: permit)
+        XCTAssertEqual(password.hostKeyProbe, permit); XCTAssertEqual(interactive.hostKeyProbe, permit)
+        try await f.store.validateSSHPasswordAuthentication(password, support: all)
+        try await f.store.validateSSHKeyboardInteractiveAuthentication(interactive, support: all)
+        await f.store.endHostKeyVerification(permit)
+        do { try await f.store.validateSSHPasswordAuthentication(password, support: all); XCTFail("ended probe retained a password grant") }
+        catch { XCTAssertEqual(error as? SSHAuthenticationError, .stale) }
+        do { try await f.store.validateSSHKeyboardInteractiveAuthentication(interactive, support: all); XCTFail("ended probe retained an MFA grant") }
+        catch { XCTAssertEqual(error as? SSHAuthenticationError, .stale) }
+    }
+
+    func testProbeIsStoreOwnedBoundedAndExpiresWithoutRenewal() async throws {
+        let original = try await fixture(jumpArchive()), clock = ProbeClock()
+        let store = WorkspaceStore(persistence: original.disk, vault: original.vault, hostKeyProbeNow: { clock.now() })
+        let f = Fixture(store: store, disk: original.disk, vault: original.vault, archive: original.archive, saved: original.saved)
+        var permits: [WorkspaceHostKeyProbe] = []
+        for _ in 0..<4 { permits.append(try await probe(f)) }
+        let first = permits[0], auth = try await hopAuthorization(f, probe: first)
+        do { _ = try await probe(f); XCTFail("probe capacity was unbounded") }
+        catch { XCTAssertEqual(error as? SSHAuthenticationError, .busy) }
+        await original.store.endHostKeyVerification(first)
+        do { _ = try await original.store.validateHostKeyVerification(first, support: support); XCTFail("a different store accepted probe authority") }
+        catch { XCTAssertEqual(error as? SSHAuthenticationError, .stale) }
+        clock.advance(.seconds(299))
+        try await f.store.validateSSHAuthentication(auth, support: support)
+        clock.advance(.seconds(1))
+        do { try await f.store.validateSSHAuthentication(auth, support: support); XCTFail("validation extended the original probe deadline") }
+        catch { XCTAssertEqual(error as? SSHAuthenticationError, .stale) }
+        let fresh = try await probe(f)
+        XCTAssertNotEqual(fresh.id, first.id)
+        _ = try await hopAuthorization(f, probe: fresh)
+        await f.store.endHostKeyVerification(fresh)
+    }
+
+    func testProbeCannotSurviveHostOrSelectedCredentialRevocation() async throws {
+        for host in [true, false] {
+            let f = try await fixture(jumpArchive()), permit = try await probe(f)
+            let auth = try await hopAuthorization(f, probe: permit)
+            if host {
+                f.disk.configure(.before(.catalog))
+                do { try await f.store.revokeHostLocally(workspaceID: f.saved.id, trustID: "hop-trust", key: hostKey(17)); XCTFail("fault did not run") }
+                catch { XCTAssertEqual(error as? FTError, .storage) }
+            } else {
+                try await f.store.revokeLocally(fingerprint: auth.fingerprint)
+            }
+            do { try await f.store.validateSSHAuthentication(auth, support: support); XCTFail("revocation left probe signing authority live") }
+            catch { XCTAssertTrue(error is WorkspaceHostKeyPinError || error is SSHAuthenticationError) }
+            do { _ = try await probe(f); XCTFail("revoked transit path received a new probe") }
+            catch { XCTAssertEqual(error as? WorkspaceHostKeyPinError, .jumpNotReady) }
+            await f.store.endHostKeyVerification(permit)
+        }
+    }
+
+    func testProbeCannotSurviveWorkspaceReplacementOrHostPinPublication() async throws {
+        for publishPin in [true, false] {
+            let f = try await fixture(jumpArchive()), permit = try await probe(f)
+            let auth = try await hopAuthorization(f, probe: permit)
+            if publishPin { _ = try await accept(f) }
+            else {
+                let next = try changed(f.archive.workspace, bundle: "replaced-route") { $0["name"] = "Replaced" }
+                _ = try await replace(f, saved: f.saved, document: next, digestByte: 234)
+            }
+            do { try await f.store.validateSSHAuthentication(auth, support: support); XCTFail("old probe survived a revision change") }
+            catch { XCTAssertEqual(error as? SSHAuthenticationError, .stale) }
+            do { _ = try await f.store.validateHostKeyVerification(permit, support: support); XCTFail("old probe context survived") }
+            catch { XCTAssertEqual(error as? WorkspaceStoreError, .staleReview) }
+            await f.store.endHostKeyVerification(permit)
+        }
     }
 
     func testUnchangedReimportPreviewAndPublicationKeepTheSameVerifiedPin() async throws {

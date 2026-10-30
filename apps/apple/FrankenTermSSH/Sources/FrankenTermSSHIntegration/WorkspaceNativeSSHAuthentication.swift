@@ -18,6 +18,7 @@ public actor WorkspaceNativeSSHPasswordAuthentication: NativeSSHPasswordAuthenti
     private let workspaceID: UUID, revision: UUID
     private let routeID: String, endpoint: NativeSSHEndpoint
     private let transitForRouteID: String?, allowedJumpRouteIDs: [String]
+    private let hostKeyProbe: WorkspaceHostKeyProbe?
     private var phase = Phase.fresh
     private var selected: WorkspaceSSHPasswordIdentity?
     private var selectedPeer: NativeSSHPeer?
@@ -25,11 +26,13 @@ public actor WorkspaceNativeSSHPasswordAuthentication: NativeSSHPasswordAuthenti
 
     public init(broker: SSHAuthenticationBroker, prompter: any WorkspaceSSHPasswordPrompting,
                 workspaceID: UUID, revision: UUID, routeID: String, transportID: UUID,
-                endpoint: NativeSSHEndpoint, transitForRouteID: String? = nil, allowedJumpRouteIDs: [String] = []) {
+                endpoint: NativeSSHEndpoint, transitForRouteID: String? = nil, allowedJumpRouteIDs: [String] = [],
+                hostKeyProbe: WorkspaceHostKeyProbe? = nil) {
         self.broker = broker; self.prompter = prompter
         self.workspaceID = workspaceID; self.revision = revision; self.routeID = routeID
         self.transportID = transportID; self.endpoint = endpoint
         self.transitForRouteID = transitForRouteID; self.allowedJumpRouteIDs = allowedJumpRouteIDs
+        self.hostKeyProbe = hostKeyProbe
     }
 
     public func account(for peer: NativeSSHPeer) async throws -> NativeSSHPasswordAccount {
@@ -51,7 +54,7 @@ public actor WorkspaceNativeSSHPasswordAuthentication: NativeSSHPasswordAuthenti
         do {
             let host = try validatePeer(peer)
             let selected = try await broker.passwordIdentity(workspaceID: workspaceID, expectedRevision: revision,
-                routeID: routeID, presentedHostKey: host, transitForRouteID: transitForRouteID)
+                routeID: routeID, presentedHostKey: host, transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe)
             try checkCurrent()
             try validateRoute(selected.authorization)
             let account = try NativeSSHPasswordAccount(user: selected.authorization.user)
@@ -125,6 +128,7 @@ public actor WorkspaceNativeSSHPasswordAuthentication: NativeSSHPasswordAuthenti
 
     private func validateRoute(_ authorization: WorkspaceSSHPasswordAuthorization) throws {
         guard authorization.workspaceID == workspaceID, authorization.workspaceRevision == revision,
+              authorization.hostKeyProbe == hostKeyProbe,
               authorization.routeID == routeID, authorization.host == endpoint.host, authorization.port == endpoint.port,
               authorization.transitForRouteID == transitForRouteID, authorization.jumpRouteIDs == allowedJumpRouteIDs,
               allowedJumpRouteIDs.count <= WorkspaceNativeSSHAuthentication.routeSupport.maximumJumpHops,
@@ -148,6 +152,7 @@ public actor WorkspaceNativeSSHInteractiveAuthentication: NativeSSHInteractiveAu
     private let workspaceID: UUID, revision: UUID
     private let routeID: String, endpoint: NativeSSHEndpoint
     private let transitForRouteID: String?, allowedJumpRouteIDs: [String]
+    private let hostKeyProbe: WorkspaceHostKeyProbe?
     private var phase = Phase.fresh
     private var selected: WorkspaceSSHKeyboardInteractiveIdentity?
     private var selectedPeer: NativeSSHPeer?
@@ -157,11 +162,13 @@ public actor WorkspaceNativeSSHInteractiveAuthentication: NativeSSHInteractiveAu
     public init(broker: SSHAuthenticationBroker, prompter: any WorkspaceSSHKeyboardInteractivePrompting,
                 workspaceID: UUID, revision: UUID, routeID: String, transportID: UUID,
                 endpoint: NativeSSHEndpoint, transitForRouteID: String? = nil, allowedJumpRouteIDs: [String] = [],
-                continuingPublicKey: WorkspaceNativeSSHAuthentication? = nil) {
+                continuingPublicKey: WorkspaceNativeSSHAuthentication? = nil,
+                hostKeyProbe: WorkspaceHostKeyProbe? = nil) {
         self.broker = broker; self.prompter = prompter
         self.workspaceID = workspaceID; self.revision = revision; self.routeID = routeID
         self.transportID = transportID; self.endpoint = endpoint
         self.transitForRouteID = transitForRouteID; self.allowedJumpRouteIDs = allowedJumpRouteIDs
+        self.hostKeyProbe = hostKeyProbe
         publicKeyPrerequisite = continuingPublicKey
     }
 
@@ -186,7 +193,7 @@ public actor WorkspaceNativeSSHInteractiveAuthentication: NativeSSHInteractiveAu
             try await validatePrerequisite(peer: peer)
             let selected = try await broker.keyboardInteractiveIdentity(workspaceID: workspaceID,
                 expectedRevision: revision, routeID: routeID, presentedHostKey: host,
-                transitForRouteID: transitForRouteID)
+                transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe)
             do {
                 try checkCurrent()
                 try validateRoute(selected.authorization)
@@ -292,7 +299,7 @@ public actor WorkspaceNativeSSHInteractiveAuthentication: NativeSSHInteractiveAu
         try await publicKeyPrerequisite?.validateInteractiveContinuation(peer: peer, account: account,
             workspaceID: workspaceID, revision: revision, routeID: routeID,
             transitForRouteID: transitForRouteID, allowedJumpRouteIDs: allowedJumpRouteIDs,
-            forAuthentication: phase != .authenticated)
+            hostKeyProbe: hostKeyProbe, forAuthentication: phase != .authenticated)
         try checkCurrent()
     }
 
@@ -319,6 +326,7 @@ public actor WorkspaceNativeSSHInteractiveAuthentication: NativeSSHInteractiveAu
 
     private func validateRoute(_ authorization: WorkspaceSSHKeyboardInteractiveAuthorization) throws {
         guard authorization.workspaceID == workspaceID, authorization.workspaceRevision == revision,
+              authorization.hostKeyProbe == hostKeyProbe,
               authorization.routeID == routeID, authorization.host == endpoint.host, authorization.port == endpoint.port,
               authorization.transitForRouteID == transitForRouteID, authorization.jumpRouteIDs == allowedJumpRouteIDs,
               allowedJumpRouteIDs.count <= WorkspaceNativeSSHAuthentication.routeSupport.maximumJumpHops,
@@ -384,6 +392,7 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
     private let workspaceID: UUID, revision: UUID
     private let routeID: String, credentialID: String, endpoint: NativeSSHEndpoint
     private let transitForRouteID: String?, allowedJumpRouteIDs: [String]
+    private let hostKeyProbe: WorkspaceHostKeyProbe?
     private var phase = Phase.fresh
     private var selected: WorkspaceSSHIdentity?
     private var selectedPeer: NativeSSHPeer?
@@ -391,11 +400,13 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
 
     public init(broker: SSHAuthenticationBroker, workspaceID: UUID, revision: UUID,
                 routeID: String, credentialID: String, transportID: UUID, endpoint: NativeSSHEndpoint,
-                transitForRouteID: String? = nil, allowedJumpRouteIDs: [String] = []) {
+                transitForRouteID: String? = nil, allowedJumpRouteIDs: [String] = [],
+                hostKeyProbe: WorkspaceHostKeyProbe? = nil) {
         self.broker = broker; self.workspaceID = workspaceID; self.revision = revision
         self.routeID = routeID; self.credentialID = credentialID
         self.transportID = transportID; self.endpoint = endpoint
         self.transitForRouteID = transitForRouteID; self.allowedJumpRouteIDs = allowedJumpRouteIDs
+        self.hostKeyProbe = hostKeyProbe
     }
 
     public func identity(for peer: NativeSSHPeer) async throws -> NativeSSHIdentity {
@@ -420,12 +431,13 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
             let foreground = try await broker.foregroundLease()
             try checkCurrent()
             let authorization = try await broker.authorization(workspaceID: workspaceID, expectedRevision: revision,
-                routeID: routeID, credentialID: credentialID, presentedHostKey: host, transitForRouteID: transitForRouteID)
+                routeID: routeID, credentialID: credentialID, presentedHostKey: host, transitForRouteID: transitForRouteID,
+                hostKeyProbe: hostKeyProbe)
             try await broker.validateForeground(foreground)
             try checkCurrent(); try validateRoute(authorization)
             let value = try await broker.publicIdentity(workspaceID: workspaceID, expectedRevision: revision,
                 routeID: routeID, credentialID: credentialID, presentedHostKey: host, transportID: transportID,
-                transitForRouteID: transitForRouteID)
+                transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe)
             try await broker.validateForeground(foreground)
             try checkCurrent(); try validateRoute(value.authorization)
             guard value.authorization == authorization else { throw SSHAuthenticationError.stale }
@@ -470,7 +482,7 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
                 routeID: routeID, credentialID: credentialID, presentedHostKey: selected.authorization.presentedHostKey,
                 transportID: transportID, sessionIdentifier: challenge.sessionIdentifier, publicBlob: selected.authenticationBlob,
                 signatureAlgorithm: challenge.algorithm,
-                transitForRouteID: transitForRouteID)
+                transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe)
             try checkCurrent()
             guard request.authorization == selected.authorization else { throw SSHAuthenticationError.stale }
             let result = try await broker.confirm(requestID: request.id)
@@ -518,11 +530,12 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
 
     fileprivate func validateInteractiveContinuation(peer: NativeSSHPeer, account: NativeSSHInteractiveAccount?,
         workspaceID: UUID, revision: UUID, routeID: String, transitForRouteID: String?, allowedJumpRouteIDs: [String],
-        forAuthentication: Bool) async throws {
+        hostKeyProbe: WorkspaceHostKeyProbe?, forAuthentication: Bool) async throws {
         try checkCurrent()
         guard phase == .signed, peer == selectedPeer, let selectedIdentity,
               self.workspaceID == workspaceID, self.revision == revision, self.routeID == routeID,
               self.transitForRouteID == transitForRouteID, self.allowedJumpRouteIDs == allowedJumpRouteIDs,
+              self.hostKeyProbe == hostKeyProbe,
               account.map({ $0.user.utf8.elementsEqual(selectedIdentity.user.utf8) }) ?? true else {
             throw SSHAuthenticationError.stale
         }
@@ -545,6 +558,7 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
 
     private func validateRoute(_ authorization: WorkspaceSSHAuthorization) throws {
         guard authorization.workspaceID == workspaceID, authorization.workspaceRevision == revision,
+              authorization.hostKeyProbe == hostKeyProbe,
               authorization.routeID == routeID, authorization.credentialID == credentialID,
               authorization.host == endpoint.host, authorization.port == endpoint.port,
               authorization.transitForRouteID == transitForRouteID,

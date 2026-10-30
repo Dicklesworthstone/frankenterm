@@ -12,10 +12,11 @@ import FrankenTermTerminal
 @MainActor
 @Observable
 final class MobileSSHPasswordPrompt: WorkspaceSSHPasswordPrompting {
-    struct Scope: Equatable {
+    struct Scope: Equatable, Sendable {
         let workspaceID: UUID, revision: UUID
         let machineID: String
         let destinationRouteIDs: Set<String>
+        var hostKeyVerification = false
     }
     private(set) var request: WorkspaceSSHPasswordRequest?
     private(set) var secret = ""
@@ -36,6 +37,7 @@ final class MobileSSHPasswordPrompt: WorkspaceSSHPasswordPrompting {
         guard active, let scope else { return false }
         let authorization = request.authorization
         return scope.workspaceID == authorization.workspaceID && scope.revision == authorization.workspaceRevision
+            && scope.hostKeyVerification == (authorization.hostKeyProbe != nil)
             && scope.destinationRouteIDs.contains(authorization.transitForRouteID ?? authorization.routeID)
     }
     func password(for request: WorkspaceSSHPasswordRequest) async throws -> Data {
@@ -144,6 +146,7 @@ final class MobileSSHKeyboardInteractivePrompt: WorkspaceSSHKeyboardInteractiveP
         guard active, let scope else { return false }
         let authorization = request.authorization
         return scope.workspaceID == authorization.workspaceID && scope.revision == authorization.workspaceRevision
+            && scope.hostKeyVerification == (authorization.hostKeyProbe != nil)
             && scope.destinationRouteIDs.contains(authorization.transitForRouteID ?? authorization.routeID)
     }
     func responses(for request: WorkspaceSSHKeyboardInteractiveRequest) async throws -> [Data] {
@@ -271,6 +274,18 @@ enum MobileSSHAuthenticationSheetRequest: Identifiable {
         case let .keyboardInteractive(request): request.id
         }
     }
+    var hostKeyVerification: Bool {
+        switch self {
+        case let .password(request): request.authorization.hostKeyProbe != nil
+        case let .keyboardInteractive(request): request.authorization.hostKeyProbe != nil
+        }
+    }
+    var workspaceID: UUID {
+        switch self {
+        case let .password(request): request.authorization.workspaceID
+        case let .keyboardInteractive(request): request.authorization.workspaceID
+        }
+    }
 }
 
 /// App-wide live-connection services over the app's single WorkspaceStore: one
@@ -285,12 +300,21 @@ final class MobileConnections {
     let passwordPrompt = MobileSSHPasswordPrompt()
     let keyboardInteractivePrompt = MobileSSHKeyboardInteractivePrompt()
     var authenticationPrompt: MobileSSHAuthenticationSheetRequest? {
+        pendingAuthenticationPrompt.flatMap { $0.hostKeyVerification ? nil : $0 }
+    }
+    var hostKeyVerificationPrompt: MobileSSHAuthenticationSheetRequest? {
+        pendingAuthenticationPrompt.flatMap { $0.hostKeyVerification ? $0 : nil }
+    }
+    private var pendingAuthenticationPrompt: MobileSSHAuthenticationSheetRequest? {
         if let request = passwordPrompt.request { return .password(request) }
         if let request = keyboardInteractivePrompt.request { return .keyboardInteractive(request) }
         return nil
     }
     private let broker: SSHAuthenticationBroker
+    private let store: WorkspaceStore
     private var passwordLifecycle: Task<Void, Never>?
+    private var terminalAuthenticationScope: MobileSSHPasswordPrompt.Scope?
+    private var hostKeyScope: (id: UUID, cancel: () -> Void)?
     // Failed cleanup retains its existing bounded connection/model owner even
     // after SwiftUI removes the screen. Never manufacture a replacement owner
     // or forget an unresolved protected-storage write to make room for a shell.
@@ -304,7 +328,7 @@ final class MobileConnections {
          liveness: WorkspaceSSHLiveness = .standard) throws {
         let broker = SSHAuthenticationBroker(store: store, signer: signer,
                                              support: WorkspaceNativeSSHAuthentication.routeSupport)
-        self.broker = broker
+        self.broker = broker; self.store = store
         coordinator = try TerminalInputCoordinator()
         journal = try TerminalSessionJournal(directory: journalDirectory, identifier: journalIdentifier)
         // Machines with a FrankenTerm mux are attached to like the desktop app
@@ -326,8 +350,61 @@ final class MobileConnections {
     }
 
     func setAuthenticationScope(_ scope: MobileSSHPasswordPrompt.Scope?) {
+        guard scope?.hostKeyVerification != true else { return }
+        terminalAuthenticationScope = scope
+        if hostKeyScope == nil { applyAuthenticationScope(scope) }
+    }
+
+    private func applyAuthenticationScope(_ scope: MobileSSHPasswordPrompt.Scope?) {
         passwordPrompt.setScope(scope)
         keyboardInteractivePrompt.setScope(scope)
+    }
+
+    /// The Keys sheet temporarily owns only the explicitly reviewed route.
+    /// Updates from a terminal behind that sheet are retained for restoration,
+    /// never allowed to redirect a jump-host password or MFA request.
+    func withHostKeyVerificationScope<Value: Sendable>(_ scope: MobileSSHPasswordPrompt.Scope,
+        operation: @escaping @MainActor @Sendable () async throws -> Value) async throws -> Value {
+        guard passwordPrompt.isActive, scope.hostKeyVerification, scope.destinationRouteIDs.count == 1,
+              hostKeyScope == nil else { throw SSHAuthenticationError.stale }
+        try Task.checkCancellation()
+        let id = UUID()
+        applyAuthenticationScope(scope)
+        let task = Task { try await operation() }
+        hostKeyScope = (id, { task.cancel() })
+        defer {
+            if hostKeyScope?.id == id {
+                hostKeyScope = nil
+                applyAuthenticationScope(terminalAuthenticationScope)
+            }
+        }
+        let value = try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
+        guard !task.isCancelled else { throw CancellationError() }
+        try Task.checkCancellation()
+        return value
+    }
+
+    /// Called on explicit cancellation, backgrounding, restore or sheet exit.
+    /// The child owns transport/permit teardown; ordinary prompt scope returns
+    /// only after that work joins, never behind a still-running probe.
+    func cancelHostKeyVerification() {
+        hostKeyScope?.cancel()
+        if hostKeyScope != nil { applyAuthenticationScope(nil) }
+    }
+
+    func checkHostKey(workspaceID: UUID, revision: UUID, routeID: String) async throws -> WorkspaceRouteProbe.Result {
+        let scope = MobileSSHPasswordPrompt.Scope(workspaceID: workspaceID, revision: revision,
+            machineID: "host-key-verification", destinationRouteIDs: [routeID], hostKeyVerification: true)
+        return try await withHostKeyVerificationScope(scope) { [self] in
+            // This activates signing for the explicit probe; it neither opens
+            // a terminal nor approves a workspace's durable Connect gate.
+            await broker.resume()
+            await passwordLifecycle?.value
+            try Task.checkCancellation()
+            return await WorkspaceRouteProbe.run(workspaceID: workspaceID, expectedRevision: revision,
+                routeID: routeID, confirmedByUser: true, store: store, broker: broker,
+                passwordPrompter: passwordPrompt, keyboardInteractivePrompter: keyboardInteractivePrompt)
+        }
     }
 
     /// Admits connections and retries any cleanup that failed earlier. Sessions
