@@ -8237,13 +8237,13 @@ rules:
             let opts = TraceOptions::default();
             for attempt in 0..3 {
                 let ordinary = engine.detect_with_context(failure, &mut plain);
-                let (explained, traces) =
+                let (explained, explanations) =
                     engine.detect_with_context_and_trace(failure, &mut traced, &opts);
                 assert_eq!(ordinary.len(), 1, "attempt {attempt} with {agent:?}");
                 assert_eq!(explained.len(), 1);
                 assert_eq!(ordinary[0].dedup_key(), explained[0].dedup_key());
-                assert_eq!(traces.len(), 1);
-                assert!(traces[0].eligible);
+                assert_eq!(explanations.len(), 1);
+                assert!(explanations[0].eligible);
             }
             assert_eq!(
                 plain.seen_count(),
