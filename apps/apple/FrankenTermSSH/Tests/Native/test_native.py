@@ -64,7 +64,9 @@ for name, result, args in [
     ("ssh_message_channel_request_pty_term", C.c_char_p, [P]),
     ("ssh_message_channel_request_pty_width", I, [P]), ("ssh_message_channel_request_pty_height", I, [P]),
     ("ssh_message_channel_request_command", C.c_char_p, [P]),
+    ("ssh_message_channel_request_subsystem", C.c_char_p, [P]),
     ("ssh_channel_read_nonblocking", I, [P, P, C.c_uint32, I]),
+    ("ssh_channel_is_eof", I, [P]), ("ssh_channel_is_closed", I, [P]),
     ("ssh_channel_write", I, [P, P, C.c_uint32]), ("ssh_channel_write_stderr", I, [P, P, C.c_uint32]),
     ("ssh_channel_send_eof", I, [P]), ("ssh_channel_close", I, [P]), ("ssh_channel_free", None, [P]),
     ("ssh_channel_request_send_exit_status", I, [P, I]),
@@ -170,7 +172,7 @@ class LoopbackServer:
     def __init__(self, key, reject=False, family=socket.AF_INET, completion="unknown",
                  auth_mode="normal", connections=1, host_key=None, host_signature=None,
                  forward_to=None, forward_host="target.internal.invalid", password=None, user_signature=None,
-                 interactive_rounds=None, allow_exec=False):
+                 interactive_rounds=None, allow_exec=False, sftp_handler=None):
         if not isinstance(connections, int) or not 1 <= connections <= 8:
             raise ValueError("test connection count must be bounded")
         if host_signature not in (None, "rsa-sha2-256", "rsa-sha2-512", "ssh-rsa"):
@@ -182,6 +184,9 @@ class LoopbackServer:
         self.public = public_blob(key)
         self.password = password
         self.allow_exec = allow_exec
+        if sftp_handler is not None and (not callable(sftp_handler) or forward_to is not None):
+            raise ValueError("test SFTP handler must own a dedicated session channel")
+        self.sftp_handler = sftp_handler
         if interactive_rounds is not None:
             if not 1 <= len(interactive_rounds) <= 8:
                 raise ValueError("test interactive rounds must be bounded")
@@ -449,6 +454,14 @@ class LoopbackServer:
                     elif kind == 2 and subtype == 1:
                         channel = SERVER.ssh_message_channel_request_open_reply_accept(message)
                         self.events.append(("channel",))
+                    elif kind == 3 and self.sftp_handler is not None:
+                        subsystem = SERVER.ssh_message_channel_request_subsystem(message) if subtype == 5 else None
+                        if subtype == 5 and subsystem == b"sftp":
+                            self.events.append(("subsystem", subsystem))
+                            SERVER.ssh_message_channel_request_reply_success(message)
+                            break
+                        self.events.append(("rejected-channel-request", subtype))
+                        SERVER.ssh_message_reply_default(message)
                     elif kind == 3 and subtype == 1:
                         self.events.append(("pty", SERVER.ssh_message_channel_request_pty_term(message),
                                             SERVER.ssh_message_channel_request_pty_width(message), SERVER.ssh_message_channel_request_pty_height(message)))
@@ -469,6 +482,9 @@ class LoopbackServer:
                 return
             if self.forward_to is not None:
                 self.forward(session, channel)
+                return
+            if self.sftp_handler is not None:
+                self.sftp_handler(self, session, channel)
                 return
             SERVER.ssh_channel_write(channel, b"ready\r\n", 7)
             SERVER.ssh_channel_write_stderr(channel, b"stderr\r\n", 8)

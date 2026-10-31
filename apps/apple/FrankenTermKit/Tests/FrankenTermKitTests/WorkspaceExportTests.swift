@@ -361,6 +361,58 @@ final class WorkspaceMultiGroupExportTests: XCTestCase {
         return try WorkspaceDocument(data: JSONSerialization.data(withJSONObject: root, options: [.sortedKeys]))
     }
 
+    func testCertificateAuthorityPreviewAndSelectionPreserveDenialsAndOtherRequiredPolicy() throws {
+        let authority = try WorkspaceDocument.HostKey(algorithm: "ssh-ed25519",
+            fingerprint: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+        let other = try WorkspaceDocument.HostKey(algorithm: "ssh-ed25519",
+            fingerprint: "SHA256:ERERERERERERERERERERERERERERERERERERERERERE")
+        func fields(_ key: WorkspaceDocument.HostKey) -> [String: Any] {
+            ["algorithm": key.algorithm, "fingerprint": key.fingerprint]
+        }
+        for mode in ["ready", "revoked", "required-revocation-policy"] {
+            let source = try fixture { workspace in
+                var routes = workspace["routes"] as! [[String: Any]]
+                for index in routes.indices {
+                    routes[index]["authentication_methods"] = ["password"]
+                    routes[index]["credential_refs"] = []
+                }
+                workspace["routes"] = routes
+                var trusts = workspace["host_trust"] as! [[String: Any]]
+                for index in trusts.indices {
+                    trusts[index]["pins"] = []
+                    trusts[index]["certificate_authorities"] = [fields(authority)]
+                    trusts[index]["required_capabilities"] = [WorkspaceDocument.hostCertificateCapability]
+                }
+                var detached = trusts.first { ($0["id"] as? String) == "trust" }!
+                detached["id"] = "detached-policy"
+                detached["certificate_authorities"] = [fields(other)]
+                detached["revoked_keys"] = mode == "revoked" ? [fields(authority)] : []
+                detached["required_capabilities"] = mode == "required-revocation-policy"
+                    ? [WorkspaceDocument.hostCertificateCapability, "host.required_revocation_check"]
+                    : [WorkspaceDocument.hostCertificateCapability]
+                trusts.append(detached); workspace["host_trust"] = trusts
+            }
+            let selected = try WorkspaceExportSelection(workspace: source, groupIDs: ["build-group"])
+            let trust = try XCTUnwrap(selected.workspace.hostTrust.first { $0.id == "trust" })
+            XCTAssertEqual(trust.certificateAuthorities, [authority], "another record cannot extend the route's positive authority")
+            XCTAssertTrue(selected.workspace.hostTrust.contains { $0.id == "detached-policy" })
+            XCTAssertFalse(selected.workspace.hostTrust.contains { $0.id == "unused-trust" })
+            let review = try selected.review(decisions: [:], loadedFingerprints: [])
+            XCTAssertEqual(Set(review.blockedRouteIDs), mode == "ready" ? [] : ["route", "alternate"], mode)
+            if mode == "ready" { XCTAssertFalse(review.findings.contains { $0.disposition == 1 }) }
+            let sealed = try FTAG.seal(selected.archive(including: [], using: crypto), using: crypto)
+            let decoded = try FTAG.open(sealed.envelope, code: sealed.code, using: crypto)
+            let transferred = try XCTUnwrap(decoded.workspace.hostTrust.first { $0.id == "trust" })
+            XCTAssertEqual(transferred.certificateAuthorities, [authority])
+            let retained = try XCTUnwrap(decoded.workspace.hostTrust.first { $0.id == "detached-policy" })
+            XCTAssertEqual(retained.certificateAuthorities, [other])
+            if mode == "revoked" { XCTAssertEqual(retained.revokedKeys, [authority]) }
+            if mode == "required-revocation-policy" {
+                XCTAssertTrue(retained.requiredCapabilities.contains("host.required_revocation_check"))
+            }
+        }
+    }
+
     func testSelectedGroupKeepsEveryRouteAndTransitiveHopInSourceOrder() async throws {
         let source = try fixture(), selection = try WorkspaceExportSelection(workspace: source, groupIDs: ["build-group"])
         let document = selection.workspace

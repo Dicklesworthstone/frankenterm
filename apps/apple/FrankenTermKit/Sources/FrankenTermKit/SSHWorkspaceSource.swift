@@ -892,7 +892,7 @@ public struct SSHWorkspaceSource: Sendable {
             if let values = resolved.options["hostkeyalias"] {
                 if values.count == 1, let value = values.first, let normalized = try? WorkspaceDocument.host(value) {
                     hostKeyAlias = normalized
-                    sourceKeyAlias = value.lowercased()
+                    sourceKeyAlias = Self.asciiLowercase(value)
                 } else {
                     resolved.problems.append(Problem("hostkeyalias", "The host-key lookup alias is unresolved or cannot be represented by the mobile trust policy."))
                 }
@@ -966,7 +966,7 @@ public struct SSHWorkspaceSource: Sendable {
             if credentialIDs.isEmpty && methods.contains("publickey") {
                 resolved.problems.append(Problem("credentials", "No public-key candidate is available for this route. Supply a matching supported identity or deliberately configure an allowed interactive authentication method.", required: false))
             }
-            var pins: [JSONValue] = [], revoked: [JSONValue] = []
+            var pins: [JSONValue] = [], authorities: [JSONValue] = [], revoked: [JSONValue] = []
             // OpenSSH uses an explicit HostKeyAlias verbatim instead of the
             // normal host/port lookup name, including at nonstandard ports.
             let lookup = sourceKeyAlias ?? (port == 22 ? sourceHost : "[\(sourceHost)]:\(port)")
@@ -975,11 +975,12 @@ public struct SSHWorkspaceSource: Sendable {
             for entry in known.entries {
                 let sourceMatches = try Self.knownHostMatches(lookup, names: entry.names, budget: &budget, using: crypto)
                 // Normalizing a hostname for the mobile model cannot erase a
-                // source-side denial. Positive pins still need the source lookup
-                // to match; do not broaden trust across alternate spellings.
-                let canonicalMatches = sourceMatches || lookup == canonicalLookup || entry.marker.isEmpty ? sourceMatches
+                // source-side denial. Positive pins and CAs still need the
+                // original lookup; an alternate spelling cannot broaden trust.
+                let denial = !entry.marker.isEmpty && entry.marker != "@cert-authority"
+                let canonicalMatches = sourceMatches || lookup == canonicalLookup || !denial ? sourceMatches
                     : try Self.knownHostMatches(canonicalLookup, names: entry.names, budget: &budget, using: crypto)
-                guard sourceMatches || (!entry.marker.isEmpty && canonicalMatches) else { continue }
+                guard sourceMatches || (denial && canonicalMatches) else { continue }
                 guard let key = entry.key else {
                     resolved.problems.append(Problem("known_hosts", "A matching known-hosts record has an invalid or unsupported public key. Trust cannot be reconstructed completely.")); continue
                 }
@@ -987,14 +988,13 @@ public struct SSHWorkspaceSource: Sendable {
                 switch entry.marker {
                 case "": if !pins.contains(identity) { pins.append(identity) }
                 case "@revoked": if !revoked.contains(identity) { revoked.append(identity) }
-                case "@cert-authority":
-                    resolved.problems.append(Problem("host_ca", "A matching host-certificate authority requires certificate policy support. It was not converted into a direct host-key pin."))
+                case "@cert-authority": if !authorities.contains(identity) { authorities.append(identity) }
                 default:
                     resolved.problems.append(Problem("known_hosts_marker", "A matching known-hosts marker is unsupported; the route remains inactive."))
                 }
             }
-            if pins.isEmpty {
-                resolved.problems.append(Problem("host_trust", "No matching positive host-key pin was supplied. The machine will await explicit host verification before authentication.", required: false))
+            if pins.isEmpty && authorities.isEmpty {
+                resolved.problems.append(Problem("host_trust", "No matching host-key pin or certificate authority was supplied. The machine will await explicit host verification before authentication.", required: false))
             }
             let problems = Self.merged(resolved.problems)
             for problem in problems {
@@ -1007,15 +1007,23 @@ public struct SSHWorkspaceSource: Sendable {
                 return .string(id)
             }
             var route: [String: JSONValue] = ["id": .string(routeID), "mode": .string("direct_ssh"),
-                "host": .string(host), "port": .number(String(port)), "user": .string(user), "credential_refs": .array(credentialIDs),
+                "host": .string(sourceHost), "port": .number(String(port)), "user": .string(user), "credential_refs": .array(credentialIDs),
                 "authentication_methods": .array(methods.map(JSONValue.string)), "host_trust_ref": .string(trustID), "jump_routes": .array(jumps)]
             if item.key.context == .destination { route["session_creation"] = .string("on_select") }
             if problems.contains(where: \.required) { route["required_capabilities"] = .array([.string("ssh_config.unresolved_policy")]) }
-            if let hostKeyAlias { route["host_key_alias"] = .string(hostKeyAlias) }
+            // The parser canonicalizes endpoint identity and denial scopes.
+            // Certificate principals retain OpenSSH's effective spelling,
+            // including a trailing dot. OpenSSH lowercases the configured
+            // HostKeyAlias before comparing it to the signed principal.
+            if let sourceKeyAlias { route["host_key_alias"] = .string(sourceKeyAlias) }
             routes.append(.object(route))
-            var trust: [String: JSONValue] = ["id": .string(trustID), "host": .string(host), "port": .number(String(port)),
+            var trust: [String: JSONValue] = ["id": .string(trustID), "host": .string(sourceHost), "port": .number(String(port)),
                 "claimed_source": .string("selected_known_hosts"), "pins": .array(pins), "revoked_keys": .array(revoked)]
-            if let hostKeyAlias { trust["host_key_alias"] = .string(hostKeyAlias) }
+            if !authorities.isEmpty {
+                trust["certificate_authorities"] = .array(authorities)
+                trust["required_capabilities"] = .array([.string(WorkspaceDocument.hostCertificateCapability)])
+            }
+            if let sourceKeyAlias { trust["host_key_alias"] = .string(sourceKeyAlias) }
             if emittedTrusts.insert(trustID).inserted { trusts.append(.object(trust)) }
             if item.key.context == .destination {
                 let machineID = try workingRegistry.id("machine", alias)
@@ -1352,13 +1360,13 @@ public struct SSHWorkspaceSource: Sendable {
     /// Glob matching uses bounded iterative backtracking, not an attacker-built
     /// regular expression or recursion. Both input and pattern have source caps.
     private static func matches(_ value: String, patterns: [String], ignoreCase: Bool = false, budget: inout MatchBudget) throws -> Bool {
-        let value = ignoreCase ? value.lowercased() : value
+        let value = ignoreCase ? asciiLowercase(value) : value
         var positive = false
         for item in patterns {
             try budget.consume()
             let negated = item.hasPrefix("!")
             let raw = negated ? String(item.dropFirst()) : item
-            let pattern = ignoreCase ? raw.lowercased() : raw
+            let pattern = ignoreCase ? asciiLowercase(raw) : raw
             if try glob(value, pattern, budget: &budget) {
                 if negated { return false }
                 positive = true
@@ -1457,7 +1465,13 @@ public struct SSHWorkspaceSource: Sendable {
         #endif
         // DNS names and explicit HostKeyAlias values keep their source spelling
         // after OpenSSH's lowercase conversion, including any trailing dot.
-        return value.lowercased()
+        return asciiLowercase(value)
+    }
+    /// OpenSSH's lowercase() folds unsigned bytes, not Unicode characters.
+    /// Preserve every non-ASCII UTF-8 byte in lookup names and signed
+    /// principals; Unicode folding or IDNA belongs only to denial scopes.
+    private static func asciiLowercase(_ value: String) -> String {
+        String(decoding: value.utf8.map { (65...90).contains($0) ? $0 + 32 : $0 }, as: UTF8.self)
     }
     private static func knownHostMatches<C: AirGapCryptography>(_ lookup: String, names: KnownHost.Names,
                                                                budget: inout MatchBudget, using crypto: C) throws -> Bool {

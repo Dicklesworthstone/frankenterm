@@ -270,6 +270,9 @@ public struct WorkspaceSSHAuthorization: Equatable, Sendable, CustomDebugStringC
     /// Exact public offer selected by the reviewed credential, never inferred
     /// from a filename or supplied by the transport's signing callback.
     public let userCertificate: SSHUserCertificate?
+    /// The exact verified certificate of this peer, distinct from the user's
+    /// authentication certificate. Store revalidation retains this evidence.
+    public let hostCertificate: SSHHostCertificate?
     public var debugDescription: String { "WorkspaceSSHAuthorization([redacted])" }
 }
 
@@ -282,6 +285,7 @@ public struct WorkspaceSSHPasswordAuthorization: Equatable, Sendable, CustomDebu
     public let routeMode: String, jumpRouteIDs: [String], transitForRouteID: String?
     public let hostKeyProbe: WorkspaceHostKeyProbe?
     public let presentedHostKey: WorkspaceDocument.HostKey
+    public let hostCertificate: SSHHostCertificate?
     public var debugDescription: String { "WorkspaceSSHPasswordAuthorization([redacted])" }
 }
 
@@ -315,6 +319,7 @@ public struct WorkspaceSSHKeyboardInteractiveAuthorization: Equatable, Sendable,
     public let routeMode: String, jumpRouteIDs: [String], transitForRouteID: String?
     public let hostKeyProbe: WorkspaceHostKeyProbe?
     public let presentedHostKey: WorkspaceDocument.HostKey
+    public let hostCertificate: SSHHostCertificate?
     public var debugDescription: String { "WorkspaceSSHKeyboardInteractiveAuthorization([redacted])" }
 }
 
@@ -622,6 +627,7 @@ public actor SSHAuthenticationBroker {
     /// transport can refuse unimplemented route modes before requesting unlock.
     public func authorization(workspaceID: UUID, expectedRevision: UUID, routeID: String, credentialID: String,
                               presentedHostKey: WorkspaceDocument.HostKey,
+                              hostCertificate: SSHHostCertificate? = nil,
                               transitForRouteID: String? = nil,
                               hostKeyProbe: WorkspaceHostKeyProbe? = nil) async throws -> WorkspaceSSHAuthorization {
         guard foreground else { throw SSHAuthenticationError.unavailable }
@@ -629,10 +635,11 @@ public actor SSHAuthenticationBroker {
         let generation = foregroundGeneration
         let result = try await store.authorizeSSHAuthentication(workspaceID: workspaceID,
             expectedRevision: expectedRevision, routeID: routeID, credentialID: credentialID,
-            presentedHostKey: presentedHostKey, support: support, transitForRouteID: transitForRouteID,
+            presentedHostKey: presentedHostKey, hostCertificate: hostCertificate, support: support, transitForRouteID: transitForRouteID,
             hostKeyProbe: hostKeyProbe)
         guard foreground, foregroundGeneration == generation else { throw SSHAuthenticationError.unavailable }
         try Task.checkCancellation()
+        try result.hostCertificate?.validateValidity()
         return result
     }
 
@@ -640,6 +647,7 @@ public actor SSHAuthenticationBroker {
     /// the server is asked which methods it offers. It never opens a prompt.
     public func passwordIdentity(workspaceID: UUID, expectedRevision: UUID, routeID: String,
                                  presentedHostKey: WorkspaceDocument.HostKey,
+                                 hostCertificate: SSHHostCertificate? = nil,
                                  transitForRouteID: String? = nil,
                                  hostKeyProbe: WorkspaceHostKeyProbe? = nil) async throws -> WorkspaceSSHPasswordIdentity {
         let lease = try foregroundLease()
@@ -647,9 +655,11 @@ public actor SSHAuthenticationBroker {
         let passwordEpoch = passwordGeneration
         let authorization = try await store.authorizeSSHPasswordAuthentication(workspaceID: workspaceID,
             expectedRevision: expectedRevision, routeID: routeID, presentedHostKey: presentedHostKey,
+            hostCertificate: hostCertificate,
             support: support, transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe)
         try validateForeground(lease)
         guard passwordForeground, passwordGeneration == passwordEpoch else { throw SSHAuthenticationError.stale }
+        try authorization.hostCertificate?.validateValidity()
         return .init(authorization: authorization, brokerOwner: owner, foregroundGeneration: foregroundGeneration,
                      passwordGeneration: passwordEpoch)
     }
@@ -670,17 +680,18 @@ public actor SSHAuthenticationBroker {
     public func validatePasswordAttempt(_ selected: WorkspaceSSHPasswordIdentity) async throws {
         try validatePasswordForeground(selected)
         try await validate(selected)
+        try selected.authorization.hostCertificate?.validateValidity()
         try validatePasswordForeground(selected)
     }
 
     public func password(for selected: WorkspaceSSHPasswordIdentity, transportID: UUID,
                          prompter: any WorkspaceSSHPasswordPrompting) async throws -> Data {
         try validatePasswordForeground(selected)
-        try await validate(selected)
+        try await validatePasswordAttempt(selected)
         let id = try await acquireWorker(transportID: transportID)
         defer { releaseWorker(id) }
         try checkCurrent(id)
-        try await validate(selected)
+        try await validatePasswordAttempt(selected)
         try checkCurrent(id)
         try validatePasswordForeground(selected)
         pending?.passwordPrompter = prompter
@@ -692,7 +703,7 @@ public actor SSHAuthenticationBroker {
         try checkCurrent(id)
         try validatePasswordForeground(selected)
         guard (1...1024).contains(bytes.count), !bytes.contains(0) else { throw SSHAuthenticationError.invalidChallenge }
-        try await validate(selected)
+        try await validatePasswordAttempt(selected)
         try checkCurrent(id)
         try validatePasswordForeground(selected)
         return bytes
@@ -707,6 +718,7 @@ public actor SSHAuthenticationBroker {
     /// while another machine owns the shared protected-prompt worker.
     public func keyboardInteractiveIdentity(workspaceID: UUID, expectedRevision: UUID, routeID: String,
                                             presentedHostKey: WorkspaceDocument.HostKey,
+                                            hostCertificate: SSHHostCertificate? = nil,
                                             transitForRouteID: String? = nil,
                                             hostKeyProbe: WorkspaceHostKeyProbe? = nil) async throws -> WorkspaceSSHKeyboardInteractiveIdentity {
         let lease = try foregroundLease()
@@ -714,9 +726,11 @@ public actor SSHAuthenticationBroker {
         let promptEpoch = passwordGeneration
         let authorization = try await store.authorizeSSHKeyboardInteractiveAuthentication(workspaceID: workspaceID,
             expectedRevision: expectedRevision, routeID: routeID, presentedHostKey: presentedHostKey,
+            hostCertificate: hostCertificate,
             support: support, transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe)
         try validateForeground(lease)
         guard passwordForeground, passwordGeneration == promptEpoch else { throw SSHAuthenticationError.stale }
+        try authorization.hostCertificate?.validateValidity()
         expireRequests()
         guard keyboardInteractiveAttempts.count < maximumQueuedRequests else { throw SSHAuthenticationError.busy }
         let generation = UUID()
@@ -742,6 +756,7 @@ public actor SSHAuthenticationBroker {
     public func validateKeyboardInteractiveAttempt(_ selected: WorkspaceSSHKeyboardInteractiveIdentity) async throws {
         try validateKeyboardInteractiveForeground(selected)
         try await validate(selected)
+        try selected.authorization.hostCertificate?.validateValidity()
         try validateKeyboardInteractiveForeground(selected)
     }
 
@@ -822,7 +837,8 @@ public actor SSHAuthenticationBroker {
     /// Verify the real host and current route before reading or offering the
     /// selected public identity. This uses the same bounded worker as signing.
     public func publicIdentity(workspaceID: UUID, expectedRevision: UUID, routeID: String, credentialID: String,
-                               presentedHostKey: WorkspaceDocument.HostKey, transportID: UUID,
+                               presentedHostKey: WorkspaceDocument.HostKey, hostCertificate: SSHHostCertificate? = nil,
+                               transportID: UUID,
                                transitForRouteID: String? = nil,
                                hostKeyProbe: WorkspaceHostKeyProbe? = nil) async throws -> WorkspaceSSHIdentity {
         _ = try WorkspaceDocument.identifier(routeID); _ = try WorkspaceDocument.identifier(credentialID)
@@ -831,9 +847,10 @@ public actor SSHAuthenticationBroker {
         try checkCurrent(id)
         let authorization = try await store.authorizeSSHAuthentication(workspaceID: workspaceID,
             expectedRevision: expectedRevision, routeID: routeID, credentialID: credentialID,
-            presentedHostKey: presentedHostKey, support: support, transitForRouteID: transitForRouteID,
+            presentedHostKey: presentedHostKey, hostCertificate: hostCertificate, support: support, transitForRouteID: transitForRouteID,
             hostKeyProbe: hostKeyProbe)
         try checkCurrent(id)
+        try validateCertificate(authorization)
         pending?.authorization = authorization
         let signer = self.signer
         let bytes = try await withTaskCancellationHandler {
@@ -874,6 +891,7 @@ public actor SSHAuthenticationBroker {
     }
 
     private func validateCertificate(_ authorization: WorkspaceSSHAuthorization) throws {
+        try authorization.hostCertificate?.validateValidity()
         try authorization.userCertificate?.validateAuthentication(user: authorization.user,
             requiresPTY: authorization.routeMode == "direct_ssh" && authorization.transitForRouteID == nil,
             requiresPortForwarding: authorization.transitForRouteID != nil)
@@ -888,7 +906,8 @@ public actor SSHAuthenticationBroker {
     }
 
     public func prepare(workspaceID: UUID, expectedRevision: UUID, routeID: String, credentialID: String,
-                        presentedHostKey: WorkspaceDocument.HostKey, transportID: UUID,
+                        presentedHostKey: WorkspaceDocument.HostKey, hostCertificate: SSHHostCertificate? = nil,
+                        transportID: UUID,
                         sessionIdentifier: Data, publicBlob: Data,
                         signatureAlgorithm: String? = nil,
                         transitForRouteID: String? = nil,
@@ -905,7 +924,7 @@ public actor SSHAuthenticationBroker {
             try checkCurrent(id)
             let authorization = try await store.authorizeSSHAuthentication(workspaceID: workspaceID,
                 expectedRevision: expectedRevision, routeID: routeID, credentialID: credentialID,
-                presentedHostKey: presentedHostKey, support: support, transitForRouteID: transitForRouteID,
+                presentedHostKey: presentedHostKey, hostCertificate: hostCertificate, support: support, transitForRouteID: transitForRouteID,
                 hostKeyProbe: hostKeyProbe)
             try checkCurrent(id)
             let challenge = try SSHUserAuthenticationChallenge(sessionIdentifier: sessionIdentifier,

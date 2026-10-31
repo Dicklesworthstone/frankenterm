@@ -13,7 +13,7 @@ import Crypto
 public struct SSHUserCertificate: Equatable, Sendable, CustomDebugStringConvertible {
     /// Leaves room for the username, authentication fields and largest admitted
     /// signature inside the pinned libssh2 transport's 34,744-byte payload bound.
-    public static let maximumBlobBytes = 32 * 1024
+    public static let maximumBlobBytes = SSHCertificateFields.maximumBlobBytes
     public static let capability = "ssh_user_certificate_v1"
     public let blob: Data, algorithm: String, fingerprint: String
     public let subject: SSHPublicIdentity, authority: SSHPublicIdentity
@@ -25,6 +25,56 @@ public struct SSHUserCertificate: Equatable, Sendable, CustomDebugStringConverti
     public var debugDescription: String { "SSHUserCertificate([redacted])" }
 
     public init(blob: Data) throws {
+        let parsed = try SSHCertificateFields(blob: blob, kind: .user)
+        self.blob = parsed.blob; algorithm = parsed.algorithm; fingerprint = parsed.fingerprint
+        subject = parsed.subject; authority = parsed.authority
+        serial = parsed.serial; validAfter = parsed.validAfter; validBefore = parsed.validBefore
+        principals = parsed.principals; criticalOptions = parsed.criticalOptions
+        extensionOptions = parsed.extensionOptions; extensions = Set(parsed.extensionOptions.keys)
+    }
+
+    /// Time is checked for new offers, signatures and authentication completion.
+    /// Established sessions retain their revision/revocation checks separately.
+    /// Empty principals retain the existing user-certificate wildcard policy;
+    /// the remote server independently decides whether to accept the offer.
+    public func validateAuthentication(user: String, now: Date = Date(), requiresPTY: Bool = false,
+                                       requiresPortForwarding: Bool = false) throws {
+        try validateRestrictions(user: user, requiresPTY: requiresPTY, requiresPortForwarding: requiresPortForwarding)
+        try SSHCertificateFields.validateValidity(validAfter: validAfter, validBefore: validBefore, now: now)
+    }
+
+    /// Static restrictions remain true after authentication; only wall-clock
+    /// expiry ceases to be a reason to end an already established connection.
+    func validateRestrictions(user: String, requiresPTY: Bool, requiresPortForwarding: Bool) throws {
+        guard criticalOptions.isEmpty else { throw FTError.unsupported("certificate.critical_options") }
+        guard principals.isEmpty || principals.contains(where: { $0.utf8.elementsEqual(user.utf8) }) else {
+            throw FTError.unsupported("certificate.principal")
+        }
+        guard !requiresPTY || extensions.contains("permit-pty") else { throw FTError.unsupported("certificate.pty") }
+        guard !requiresPortForwarding || extensions.contains("permit-port-forwarding") else {
+            throw FTError.unsupported("certificate.port_forwarding")
+        }
+    }
+
+    /// Decode only a bounded algorithm name before choosing the typed parser.
+    static func algorithmName(in blob: Data) throws -> String {
+        try SSHCertificateFields.algorithmName(in: blob)
+    }
+}
+
+/// One bounded OpenSSH v01 decoder and issuer-signature verifier for both
+/// certificate roles. It preserves the original signed bytes; interpreting
+/// principals or granting authority remains the typed caller's responsibility.
+struct SSHCertificateFields {
+    enum Kind: UInt64 { case user = 1, host = 2 }
+    static let maximumBlobBytes = 32 * 1024
+    let blob: Data, algorithm: String, fingerprint: String, signatureAlgorithm: String
+    let subject: SSHPublicIdentity, authority: SSHPublicIdentity
+    let serial: UInt64, validAfter: UInt64, validBefore: UInt64
+    let principals: [String], criticalOptions: [String: Data], extensionOptions: [String: Data]
+    let reserved: Data
+
+    init(blob: Data, kind: Kind) throws {
         guard !blob.isEmpty, blob.count <= Self.maximumBlobBytes else { throw FTError.limit("certificate.bytes") }
         var reader = ByteCursor(blob)
         let algorithm = try Self.name(reader.sshString(cap: 64))
@@ -47,8 +97,9 @@ public struct SSHUserCertificate: Equatable, Sendable, CustomDebugStringConverti
         }
         let subject = try SSHPublicIdentity(blob: subjectBlob)
         let serial = try reader.uint(8)
-        guard try reader.uint(4) == 1 else { throw FTError.unsupported("certificate.type") }
-        _ = try reader.sshString(cap: 1024) // key ID is opaque signed metadata, never a trusted UI label
+        guard try reader.uint(4) == kind.rawValue else { throw FTError.unsupported("certificate.type") }
+        // The signed key ID is opaque metadata, never a trusted UI label.
+        _ = try reader.sshString(cap: kind == .user ? 1024 : Self.maximumBlobBytes)
         var principalBytes = ByteCursor(try reader.sshString(cap: Self.maximumBlobBytes))
         var principals: [String] = [], seen = Set<Data>()
         while principalBytes.remaining > 0 {
@@ -63,49 +114,34 @@ public struct SSHUserCertificate: Equatable, Sendable, CustomDebugStringConverti
         guard validAfter < validBefore else { throw FTError.malformed("certificate.validity") }
         let criticalOptions = try Self.options(reader.sshString(cap: Self.maximumBlobBytes))
         let extensionValues = try Self.options(reader.sshString(cap: Self.maximumBlobBytes))
-        let flags: Set<String> = ["permit-X11-forwarding", "permit-agent-forwarding", "permit-port-forwarding",
-                                  "permit-pty", "permit-user-rc", "no-touch-required"]
-        for (name, value) in extensionValues where flags.contains(name) {
-            guard value.isEmpty else { throw FTError.malformed("certificate.extension") }
+        if kind == .user {
+            let flags: Set<String> = ["permit-X11-forwarding", "permit-agent-forwarding", "permit-port-forwarding",
+                                      "permit-pty", "permit-user-rc", "no-touch-required"]
+            for (name, value) in extensionValues where flags.contains(name) {
+                guard value.isEmpty else { throw FTError.malformed("certificate.extension") }
+            }
         }
-        // Future reserved data cannot silently acquire policy meaning here.
-        guard try reader.sshString(cap: Self.maximumBlobBytes).isEmpty else { throw FTError.unsupported("certificate.reserved") }
+        let reserved = try reader.sshString(cap: Self.maximumBlobBytes)
+        // Preserve the published user profile. Host certificates ignore this
+        // signed reserved field as specified by the certificate wire format.
+        if kind == .user, !reserved.isEmpty { throw FTError.unsupported("certificate.reserved") }
         let authority = try SSHPublicIdentity(blob: reader.sshString(cap: SSHPublicIdentity.maximumBlobBytes))
         let signedPrefix = Data(blob.prefix(reader.offset))
         let signature = try reader.sshString(cap: 1044)
         guard reader.remaining == 0 else { throw FTError.malformed("certificate.trailing_bytes") }
-        try Self.verify(signature: signature, message: signedPrefix, authority: authority)
+        signatureAlgorithm = try Self.verify(signature: signature, message: signedPrefix, authority: authority)
         self.blob = blob; self.algorithm = algorithm; self.subject = subject; self.authority = authority
         self.serial = serial; self.validAfter = validAfter; self.validBefore = validBefore
-        self.principals = principals; self.criticalOptions = criticalOptions; self.extensions = Set(extensionValues.keys)
-        extensionOptions = extensionValues
+        self.principals = principals; self.criticalOptions = criticalOptions
+        extensionOptions = extensionValues; self.reserved = reserved
         fingerprint = "SHA256:" + Data(SHA256.hash(data: blob)).base64EncodedString().replacingOccurrences(of: "=", with: "")
     }
 
-    /// Time is checked for new offers, signatures and authentication completion.
-    /// Established sessions retain their revision/revocation checks separately.
-    /// Empty principals mean the protocol's wildcard; alternate server-side
-    /// AuthorizedPrincipals mappings are never guessed from a display label.
-    public func validateAuthentication(user: String, now: Date = Date(), requiresPTY: Bool = false,
-                                       requiresPortForwarding: Bool = false) throws {
-        try validateRestrictions(user: user, requiresPTY: requiresPTY, requiresPortForwarding: requiresPortForwarding)
+    static func validateValidity(validAfter: UInt64, validBefore: UInt64, now: Date) throws {
         let seconds = now.timeIntervalSince1970
         guard seconds.isFinite, seconds >= 0, seconds < Double(UInt64.max) else { throw FTError.malformed("certificate.clock") }
         let instant = UInt64(seconds.rounded(.down))
         guard instant >= validAfter, instant < validBefore else { throw FTError.unsupported("certificate.validity") }
-    }
-
-    /// Static restrictions remain true after authentication; only wall-clock
-    /// expiry ceases to be a reason to end an already established connection.
-    func validateRestrictions(user: String, requiresPTY: Bool, requiresPortForwarding: Bool) throws {
-        guard criticalOptions.isEmpty else { throw FTError.unsupported("certificate.critical_options") }
-        guard principals.isEmpty || principals.contains(where: { $0.utf8.elementsEqual(user.utf8) }) else {
-            throw FTError.unsupported("certificate.principal")
-        }
-        guard !requiresPTY || extensions.contains("permit-pty") else { throw FTError.unsupported("certificate.pty") }
-        guard !requiresPortForwarding || extensions.contains("permit-port-forwarding") else {
-            throw FTError.unsupported("certificate.port_forwarding")
-        }
     }
 
     /// Decode only a bounded algorithm name. Used to select the raw/certificate
@@ -151,7 +187,7 @@ public struct SSHUserCertificate: Equatable, Sendable, CustomDebugStringConverti
         return value
     }
 
-    private static func verify(signature: Data, message: Data, authority: SSHPublicIdentity) throws {
+    private static func verify(signature: Data, message: Data, authority: SSHPublicIdentity) throws -> String {
         var signatureReader = ByteCursor(signature), keyReader = ByteCursor(authority.blob)
         let algorithm = try name(signatureReader.sshString(cap: 64))
         let payload = try signatureReader.sshString(cap: 1024)
@@ -202,5 +238,6 @@ public struct SSHUserCertificate: Equatable, Sendable, CustomDebugStringConverti
             }
         }
         guard valid else { throw FTError.malformed("certificate.signature") }
+        return algorithm
     }
 }

@@ -22,6 +22,7 @@ final class MobileSSHPasswordPrompt: WorkspaceSSHPasswordPrompting {
     private(set) var secret = ""
     @ObservationIgnored private var active = false
     @ObservationIgnored private var scope: Scope?
+    @ObservationIgnored private var promptOwner: UUID?
     @ObservationIgnored private var continuation: CheckedContinuation<Data, Error>?
     var isActive: Bool { active }
 
@@ -29,9 +30,9 @@ final class MobileSSHPasswordPrompt: WorkspaceSSHPasswordPrompting {
         active = value
         if !value { cancelCurrent() }
     }
-    func setScope(_ value: Scope?) {
-        if scope != value { cancelCurrent() }
-        scope = value
+    func setScope(_ value: Scope?, ownerID: UUID? = nil) {
+        if scope != value || promptOwner != ownerID { cancelCurrent() }
+        scope = value; promptOwner = ownerID
     }
     private func permits(_ request: WorkspaceSSHPasswordRequest) -> Bool {
         guard active, let scope else { return false }
@@ -41,12 +42,15 @@ final class MobileSSHPasswordPrompt: WorkspaceSSHPasswordPrompting {
             && scope.destinationRouteIDs.contains(authorization.transitForRouteID ?? authorization.routeID)
     }
     func password(for request: WorkspaceSSHPasswordRequest) async throws -> Data {
+        try await password(for: request, ownerID: nil)
+    }
+    func password(for request: WorkspaceSSHPasswordRequest, ownerID: UUID?) async throws -> Data {
         try Task.checkCancellation()
-        guard permits(request) else { throw SSHAuthenticationError.stale }
+        guard promptOwner == ownerID, permits(request) else { throw SSHAuthenticationError.stale }
         guard self.request == nil, continuation == nil else { throw SSHAuthenticationError.busy }
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                guard !Task.isCancelled, permits(request) else {
+                guard !Task.isCancelled, promptOwner == ownerID, permits(request) else {
                     continuation.resume(throwing: CancellationError()); return
                 }
                 secret = ""; self.request = request; self.continuation = continuation
@@ -132,15 +136,16 @@ final class MobileSSHKeyboardInteractivePrompt: WorkspaceSSHKeyboardInteractiveP
     private(set) var answers: [String] = []
     @ObservationIgnored private var active = false
     @ObservationIgnored private var scope: MobileSSHPasswordPrompt.Scope?
+    @ObservationIgnored private var promptOwner: UUID?
     @ObservationIgnored private var continuation: CheckedContinuation<[Data], Error>?
 
     func setActive(_ value: Bool) {
         active = value
         if !value { cancelCurrent() }
     }
-    func setScope(_ value: MobileSSHPasswordPrompt.Scope?) {
-        if scope != value { cancelCurrent() }
-        scope = value
+    func setScope(_ value: MobileSSHPasswordPrompt.Scope?, ownerID: UUID? = nil) {
+        if scope != value || promptOwner != ownerID { cancelCurrent() }
+        scope = value; promptOwner = ownerID
     }
     private func permits(_ request: WorkspaceSSHKeyboardInteractiveRequest) -> Bool {
         guard active, let scope else { return false }
@@ -150,12 +155,15 @@ final class MobileSSHKeyboardInteractivePrompt: WorkspaceSSHKeyboardInteractiveP
             && scope.destinationRouteIDs.contains(authorization.transitForRouteID ?? authorization.routeID)
     }
     func responses(for request: WorkspaceSSHKeyboardInteractiveRequest) async throws -> [Data] {
+        try await responses(for: request, ownerID: nil)
+    }
+    func responses(for request: WorkspaceSSHKeyboardInteractiveRequest, ownerID: UUID?) async throws -> [Data] {
         try Task.checkCancellation()
-        guard permits(request) else { throw SSHAuthenticationError.stale }
+        guard promptOwner == ownerID, permits(request) else { throw SSHAuthenticationError.stale }
         guard self.request == nil, continuation == nil else { throw SSHAuthenticationError.busy }
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                guard !Task.isCancelled, permits(request) else {
+                guard !Task.isCancelled, promptOwner == ownerID, permits(request) else {
                     continuation.resume(throwing: CancellationError()); return
                 }
                 answers = Array(repeating: "", count: request.challenge.prompts.count)
@@ -300,7 +308,16 @@ final class MobileConnections {
     let passwordPrompt = MobileSSHPasswordPrompt()
     let keyboardInteractivePrompt = MobileSSHKeyboardInteractivePrompt()
     var authenticationPrompt: MobileSSHAuthenticationSheetRequest? {
-        pendingAuthenticationPrompt.flatMap { $0.hostKeyVerification ? nil : $0 }
+        guard fileAuthenticationScope == nil else { return nil }
+        return pendingAuthenticationPrompt.flatMap { $0.hostKeyVerification ? nil : $0 }
+    }
+    func fileAuthenticationPrompt(for ownerID: UUID, target: TerminalRemoteFilesTarget) -> MobileSSHAuthenticationSheetRequest? {
+        guard let scope = fileAuthenticationScope, scope.ownerID == ownerID, scope.target == .terminal(target) else { return nil }
+        return pendingAuthenticationPrompt.flatMap { $0.hostKeyVerification ? nil : $0 }
+    }
+    func fileAuthenticationPrompt(for ownerID: UUID, selection: WorkspaceSSHConnectionSelection) -> MobileSSHAuthenticationSheetRequest? {
+        guard let scope = fileAuthenticationScope, scope.ownerID == ownerID, scope.target == .selection(selection) else { return nil }
+        return pendingAuthenticationPrompt.flatMap { $0.hostKeyVerification ? nil : $0 }
     }
     var hostKeyVerificationPrompt: MobileSSHAuthenticationSheetRequest? {
         pendingAuthenticationPrompt.flatMap { $0.hostKeyVerification ? $0 : nil }
@@ -315,10 +332,16 @@ final class MobileConnections {
     private var passwordLifecycle: Task<Void, Never>?
     private var terminalAuthenticationScope: MobileSSHPasswordPrompt.Scope?
     private var hostKeyScope: (id: UUID, cancel: () -> Void)?
+    private enum FileAuthenticationTarget: Equatable {
+        case terminal(TerminalRemoteFilesTarget)
+        case selection(WorkspaceSSHConnectionSelection)
+    }
+    private var fileAuthenticationScope: (id: UUID, ownerID: UUID, target: FileAuthenticationTarget, cancel: () -> Void)?
     // Failed cleanup retains its existing bounded connection/model owner even
     // after SwiftUI removes the screen. Never manufacture a replacement owner
     // or forget an unresolved protected-storage write to make room for a shell.
     private var pendingCleanup: [UUID: TerminalSessionController] = [:]
+    private var pendingFileCleanup: [UUID: TerminalRemoteFilesController] = [:]
 
     /// `signer` defaults to the protected Keychain signer; tests inject one,
     /// and may shorten how long an unanswering server takes to be reported.
@@ -352,12 +375,12 @@ final class MobileConnections {
     func setAuthenticationScope(_ scope: MobileSSHPasswordPrompt.Scope?) {
         guard scope?.hostKeyVerification != true else { return }
         terminalAuthenticationScope = scope
-        if hostKeyScope == nil { applyAuthenticationScope(scope) }
+        if hostKeyScope == nil, fileAuthenticationScope == nil { applyAuthenticationScope(scope) }
     }
 
-    private func applyAuthenticationScope(_ scope: MobileSSHPasswordPrompt.Scope?) {
-        passwordPrompt.setScope(scope)
-        keyboardInteractivePrompt.setScope(scope)
+    private func applyAuthenticationScope(_ scope: MobileSSHPasswordPrompt.Scope?, ownerID: UUID? = nil) {
+        passwordPrompt.setScope(scope, ownerID: ownerID)
+        keyboardInteractivePrompt.setScope(scope, ownerID: ownerID)
     }
 
     /// The Keys sheet temporarily owns only the explicitly reviewed route.
@@ -366,7 +389,7 @@ final class MobileConnections {
     func withHostKeyVerificationScope<Value: Sendable>(_ scope: MobileSSHPasswordPrompt.Scope,
         operation: @escaping @MainActor @Sendable () async throws -> Value) async throws -> Value {
         guard passwordPrompt.isActive, scope.hostKeyVerification, scope.destinationRouteIDs.count == 1,
-              hostKeyScope == nil else { throw SSHAuthenticationError.stale }
+              hostKeyScope == nil, fileAuthenticationScope == nil else { throw SSHAuthenticationError.stale }
         try Task.checkCancellation()
         let id = UUID()
         applyAuthenticationScope(scope)
@@ -414,6 +437,7 @@ final class MobileConnections {
     /// the manager (a dropped connection reconnects on return instead).
     func activate() async {
         for controller in Array(pendingCleanup.values) { await controller.retryCleanup() }
+        for controller in Array(pendingFileCleanup.values) { await controller.retryCleanup() }
         await manager.resume()
         await passwordLifecycle?.value
         await broker.setPasswordForeground(passwordPrompt.isActive)
@@ -423,6 +447,83 @@ final class MobileConnections {
         pendingCleanup[controller.id] = controller
     }
     fileprivate func releaseCleanup(_ id: UUID) { pendingCleanup[id] = nil }
+
+    /// A separate SFTP connection uses the current terminal's exact account
+    /// and reviewed route choices. Its exact owner presents password/MFA.
+    func connectFiles(_ target: TerminalRemoteFilesTarget, ownerID: UUID) async throws -> WorkspaceSSHConnection {
+        let scope = MobileSSHPasswordPrompt.Scope(workspaceID: target.workspaceID, revision: target.revision,
+            machineID: target.machineID, destinationRouteIDs: [target.route.id])
+        let manager = manager
+        return try await connectFiles(scope: scope, target: .terminal(target), ownerID: ownerID) { prompts in
+            try await manager.connect(workspaceID: target.workspaceID, expectedRevision: target.revision,
+                machineID: target.machineID, routeID: target.route.id, authentication: target.authentication,
+                confirmedByUser: true, attachMux: false, selection: target.route.selectedConnection,
+                purpose: .fileTransfer, authenticationPrompters: prompts)
+        }
+    }
+
+    /// A separately reviewed route can use SFTP without creating a shell or
+    /// requiring an existing terminal, including SFTP-only server accounts.
+    func connectFiles(selection: WorkspaceSSHConnectionSelection, ownerID: UUID) async throws -> WorkspaceSSHConnection {
+        let scope = MobileSSHPasswordPrompt.Scope(workspaceID: selection.workspaceID, revision: selection.expectedRevision,
+            machineID: selection.machineID, destinationRouteIDs: [selection.routeID])
+        let manager = manager
+        return try await connectFiles(scope: scope, target: .selection(selection), ownerID: ownerID) { prompts in
+            try await manager.connect(workspaceID: selection.workspaceID, expectedRevision: selection.expectedRevision,
+                machineID: selection.machineID, routeID: selection.routeID, authentication: selection.authentication,
+                confirmedByUser: true, attachMux: false, selection: selection, purpose: .fileTransfer,
+                authenticationPrompters: prompts)
+        }
+    }
+
+    private func connectFiles(scope: MobileSSHPasswordPrompt.Scope, target: FileAuthenticationTarget, ownerID: UUID,
+        operation: @escaping @MainActor @Sendable (WorkspaceSSHAuthenticationPrompters) async throws -> WorkspaceSSHConnection) async throws -> WorkspaceSSHConnection {
+        guard passwordPrompt.isActive, hostKeyScope == nil, fileAuthenticationScope == nil,
+              passwordPrompt.request == nil, keyboardInteractivePrompt.request == nil else {
+            throw SSHAuthenticationError.stale
+        }
+        try Task.checkCancellation()
+        let id = UUID()
+        applyAuthenticationScope(scope, ownerID: id)
+        let prompts = WorkspaceSSHAuthenticationPrompters(
+            password: MobileFilesPasswordPrompt(prompt: passwordPrompt, ownerID: id),
+            keyboardInteractive: MobileFilesInteractivePrompt(prompt: keyboardInteractivePrompt, ownerID: id))
+        let task = Task { try await operation(prompts) }
+        fileAuthenticationScope = (id, ownerID, target, { task.cancel() })
+        defer {
+            if fileAuthenticationScope?.id == id {
+                fileAuthenticationScope = nil
+                applyAuthenticationScope(terminalAuthenticationScope)
+            }
+        }
+        // A late successful return is retained by the file owner before its
+        // cancellation check, so cleanup never loses a published connection.
+        return try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
+    }
+
+    func retainFileCleanup(_ controller: TerminalRemoteFilesController) { pendingFileCleanup[controller.id] = controller }
+    func releaseFileCleanup(_ id: UUID) { pendingFileCleanup[id] = nil }
+}
+
+/// The owner token travels with this exact connection attempt, including jump
+/// hosts. A queued terminal prompt for the same account has no token and cannot
+/// borrow the Files sheet's visible destination or receive its answers.
+private struct MobileFilesPasswordPrompt: WorkspaceSSHPasswordPrompting {
+    let prompt: MobileSSHPasswordPrompt
+    let ownerID: UUID
+    func password(for request: WorkspaceSSHPasswordRequest) async throws -> Data {
+        try await prompt.password(for: request, ownerID: ownerID)
+    }
+    func cancel(requestID: UUID) { prompt.cancel(requestID: requestID) }
+}
+
+private struct MobileFilesInteractivePrompt: WorkspaceSSHKeyboardInteractivePrompting {
+    let prompt: MobileSSHKeyboardInteractivePrompt
+    let ownerID: UUID
+    func responses(for request: WorkspaceSSHKeyboardInteractiveRequest) async throws -> [Data] {
+        try await prompt.responses(for: request, ownerID: ownerID)
+    }
+    func cancel(requestID: UUID) { prompt.cancel(requestID: requestID) }
 }
 
 /// One ready route, with its available configured keys in the workspace's
@@ -501,6 +602,16 @@ struct TerminalSessionTarget: Hashable, Sendable {
         }
         return 0.2126 * linear(16) + 0.7152 * linear(8) + 0.0722 * linear(0) < 0.179
     }
+}
+
+/// Public metadata from one successful connection, never a credential or
+/// authority that may be reused after its source controller is replaced.
+struct TerminalRemoteFilesTarget: Equatable, Sendable {
+    let controllerID: UUID, connectionID: UUID, workspaceID: UUID, revision: UUID
+    let machineID: String, machineName: String, host: String, user: String
+    let port: UInt16
+    let route: TerminalSessionRoute
+    let authentication: WorkspaceSSHAuthenticationChoice
 }
 
 /// Publishes each owned FTSF frame from the Rust model to the native view.
@@ -612,6 +723,20 @@ final class TerminalSessionController {
     private(set) var paneTooLargeToView = false
     @ObservationIgnored private let retriesDrop: Bool
     private(set) var cleanupFailure: String?
+    var remoteFilesTarget: TerminalRemoteFilesTarget? {
+        guard !stopped, phase == .ready || phase == .live, let connection, let authenticatedSelection,
+              authenticatedSelection.routeID == route.id else { return nil }
+        return .init(controllerID: id, connectionID: connection.id, workspaceID: target.workspaceID,
+            revision: target.revision, machineID: target.machineID, machineName: target.machineName,
+            host: connection.host, user: connection.user, port: connection.port,
+            route: route, authentication: authenticatedSelection.authentication)
+    }
+
+    func makeRemoteFiles(scene: WorkspaceTerminalScene) throws -> TerminalRemoteFilesController {
+        guard let target = remoteFilesTarget else { throw WorkspaceSSHConnectionError.stale }
+        return TerminalRemoteFilesController(target: target, source: self, scene: scene, connections: connections)
+    }
+
     /// Details from this owner's actual refused handshake. Failed-start
     /// cleanup closes its transport without erasing the review; explicit
     /// retirement, replacement and app backgrounding discard it.

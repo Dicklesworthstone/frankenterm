@@ -33,6 +33,75 @@ unavailable until the caller explicitly approves that exact key under its curren
 endpoint/alias/revocation policy. Reading a key and immediately approving it without
 that policy is NOT host verification.
 
+### Hosts certified by an OpenSSH authority
+
+The native backend supports OpenSSH v01 host certificates with Ed25519, ECDSA
+P-256/P-384/P-521, and RSA subjects. RSA exchange and issuer signatures use
+SHA-256 or SHA-512; SHA-1 is refused. The source preparation script verifies the
+pinned libssh2 inputs before applying the host-certificate backport. Both the
+compiled header and the linked library must report the supported version before
+the workspace adapter advertises `ssh_host_certificate_v1`.
+
+Each destination and jump host independently selects raw-key, certificate-only,
+or mixed negotiation from its reviewed trust record before starting the
+handshake. Certificate-only trust cannot fall back to a raw key. The exchange
+hash and peer result retain the entire certificate; the subject key alone cannot
+be substituted for the certificate or accepted as a first-use phone pin.
+
+Both desktop export paths preserve matching `@cert-authority` known-hosts
+entries in the trust record's `certificate_authorities` array, separately from
+raw `pins`. CA identities include their algorithm and SHA-256 fingerprint. Export
+uses the effective OpenSSH hostname or HostKeyAlias spelling, including trailing
+dots, and preserves the original lookup scope for positive CA matching. Canonical
+endpoint aliases may combine denials but cannot introduce a new positive CA.
+Explicit restrictive `CASignatureAlgorithms`/`HostKeyAlgorithms`, KRL inputs,
+unresolved source policy, and unsupported freshness requirements continue to
+block the affected routes rather than being silently approximated.
+
+Before any public-key offer, protected signing, password prompt, or interactive
+MFA round, the store and broker bind the exact exchanged certificate to the
+selected route and its reviewed authority. Verification checks the issuer
+signature, host role, nonempty principal list, current validity, and absence of
+critical options. Principal matching uses bounded, case-sensitive OpenSSH `*`
+and `?` matching against the exact effective name. Route and trust principal
+bytes must agree. Optional extensions and reserved bytes remain signed but do
+not grant local permissions.
+
+Revocations of the full certificate, its subject key, or its signing authority
+take precedence. Existing import and local-denial persistence applies across
+reimport, renamed trust records, and historical replay. A pending authentication
+rechecks expiry before publishing a credential or response; an established
+session retains its exact evidence and continues to honor trust and revocation
+changes without terminating solely because the certificate later expires.
+
+The phone's import review, route review, and Keys screen show authorities
+separately from host pins. An authority can be blocked on the phone through the
+existing durable revocation flow. A valid certificate from an unexpected issuer
+produces the exact-peer mismatch review: permitted CA fingerprints, presented
+certificate, subject, and issuer remain distinct. Reviewing or copying this
+evidence never changes trust or retries authentication.
+
+`Tests/Native/test_host_certificates.py` exercises real loopback OpenSSH exchanges
+for all supported subject families, exact certificate retention, approval before
+authentication, frozen negotiation policy, mixed-profile preference, raw-key
+compatibility, raw downgrade refusal, and RSA-SHA1 refusal. The initial backport
+run passed seven test methods covering ten exchanges after a Release libssh2
+build and a C shim build with `-Wall -Wextra -Werror`; a fresh rebuild and rerun
+also passed. Swift 6.4.1 Linux qualification built all 90 Kit source files and
+both native production modules (eight source files) with warnings-as-errors.
+Targeted original-source regression suites passed:
+
+| Suite | Result | Coverage |
+| --- | --- | --- |
+| Kit and export | 149 passed, zero failures | Host/user certificate parsing, renewal, CA policy, all 67 SSH source exporter cases, and both workspace export classes |
+| Native authentication | 31 passed, zero failures | All six new CA cases plus existing authentication, user-certificate, and credential/host-revocation cases |
+
+The native tests link the actual Kit/dependency objects and patched C backend.
+The CA fixtures carry their requirement on `host_trust`, exactly as the real
+exporters do; v1 rejects unsupported global requirements. These are targeted
+portable runs, not a complete package-test or Apple application qualification.
+Apple-only conditional code still requires Apple SDK and device verification.
+
 Public-key authentication supports Ed25519, ECDSA P-256/P-384/P-521, and RSA
 with 2048–8192-bit moduli and a positive odd exponent of at most 64 bits. The callback
 validates/captures one bounded RFC 4252 preimage and returns libssh2's supported
@@ -44,9 +113,10 @@ shell. Opening the shell is a separate explicit operation.
 
 RSA keeps the canonical `ssh-rsa` public blob and fingerprint but permits only
 `rsa-sha2-256` or `rsa-sha2-512` in the signed authentication preimage and returned
-signature. The native limits are 1,053 public-key bytes, 1,536 challenge bytes,
-and 1,044 encoded signature bytes. The raw RSA signature must have exactly the
-modulus width. A different hash, certificate name, malformed integer, or reused
+signature. The native limits distinguish a 1,053-byte raw public key from a
+32,768-byte certificate offer, with 33,792 challenge bytes and 1,044 encoded
+signature bytes. The raw RSA signature must have exactly the modulus width.
+An unnegotiated hash or certificate request name, malformed integer, or reused
 challenge cannot reach signing or consume the signature.
 
 libssh2 can offer an unsigned `ssh-rsa` request when the server does not advertise
@@ -213,9 +283,11 @@ disconnected, not as a local close.
 `WorkspaceNativeSSHAuthentication` implements the native authentication provider
 with `FrankenTermKit.SSHAuthenticationBroker`. Configure the shared foreground
 broker with the adapter's `routeSupport`: direct SSH or FrankenTerm mux routes,
-up to three ordered jumps, pinned Ed25519/NIST ECDSA/RSA-SHA2 host keys, and
-Ed25519/P-256/P-384/P-521/RSA-SHA2 client keys or an explicit SSH password method. Excessive
-jumps, certificates, interactive MFA, password changes and
+up to three ordered jumps, pinned or CA-certified Ed25519/NIST ECDSA/RSA-SHA2
+host identities, and Ed25519/P-256/P-384/P-521/RSA-SHA2 client keys or supported
+user certificates. Password and keyboard-interactive MFA methods require explicit
+route permission and foreground prompts. Excessive jumps, unsupported certificate
+policy, password changes and
 unsupported mandatory source policies remain blocked.
 The adapter compares the actual negotiated methods, original endpoint, selected
 route revision, host pin and transport identity before looking up a public key.
@@ -414,10 +486,10 @@ the workspace's IDNA/trust canonicalization. It does not implement proxy-command
 execution, jump hosts, automatic reconnect, permission UI or session routing.
 Those remain separate features with explicit authority and continuity contracts.
 
-## Combined Swift validation
+## Earlier transport validation
 
-The current package run executes **41 tests: 40 pass and one live-server entry
-point skips**, with warnings as errors. Independent libssh harnesses separately
+An earlier package run executed **41 tests: 40 passed and one live-server entry
+point skipped**, with warnings as errors. Independent libssh harnesses separately
 pass **12 native-driver methods, 13 Swift interop methods, 12 workspace methods
 and 8 legacy-pump methods**. The completion scenarios cover delayed status after
 EOF, full UInt32 nonzero status, signal, reported zero, absent status, bounded

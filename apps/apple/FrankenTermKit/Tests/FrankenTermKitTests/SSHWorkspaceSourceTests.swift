@@ -903,7 +903,7 @@ final class SSHWorkspaceSourceTests: XCTestCase {
             + hostLine("verified-alias.", seed: 24) + hostLine("verified-alias", seed: 32)
         let result = try exported("Host build\nHostKeyAlias Verified-Alias.\nPort 2200\nIdentityFile none\n", known: Data(known.utf8))
         let trust = try XCTUnwrap(records(result, "host_trust").first)
-        XCTAssertEqual(trust["host_key_alias"], .string("verified-alias"))
+        XCTAssertEqual(trust["host_key_alias"], .string("verified-alias."))
         XCTAssertEqual(try trust.required("pins").array().count, 1, "Only the source lookup may supply positive trust.")
         XCTAssertEqual(try trust.required("revoked_keys").array().count, 2, "Neither spelling's denial may disappear during normalization.")
     }
@@ -962,7 +962,11 @@ final class SSHWorkspaceSourceTests: XCTestCase {
             + hostLine("build", seed: 4, marker: "@cert-authority")
             + hostLine("build", seed: 8)
         let result = try exported("Host build gpu\nIdentityFile none\n", known: Data(known.utf8))
-        XCTAssertTrue(result.portability.contains { $0.setting == "ssh_config.host_ca" && $0.disposition == 1 })
+        XCTAssertFalse(result.portability.contains { $0.setting == "ssh_config.host_ca" && $0.disposition == 1 })
+        XCTAssertEqual(result.workspace.hostTrust[0].certificateAuthorities.count, 1)
+        XCTAssertTrue(result.workspace.hostTrust[1].certificateAuthorities.isEmpty)
+        XCTAssertTrue(result.workspace.routes.allSatisfy { !$0.requiredCapabilities.isEmpty },
+            "a supported CA cannot remove an unresolved malformed revocation source")
         XCTAssertEqual(result.portability.filter { $0.setting == "ssh_config.hashed_known_hosts" && $0.disposition == 1 }.count, 2)
         let trusts = try records(result, "host_trust")
         XCTAssertEqual(try trusts[0].required("pins").array().count, 1)
@@ -1070,8 +1074,8 @@ final class SSHWorkspaceSourceTests: XCTestCase {
                                                          reviewedTrustIDs: [trust.id]), .revoked)
     }
 
-    func testHashedCertificateAndUnknownMarkerConstraintsStayInactiveOnlyWhenApplicable() throws {
-        for (marker, setting) in [("@cert-authority", "host_ca"), ("@future-policy", "known_hosts_marker")] {
+    func testHashedUnknownMarkerConstraintsStayInactiveOnlyWhenApplicable() throws {
+        for (marker, setting) in [("@future-policy", "known_hosts_marker")] {
             // A canonical-spelling constraint must survive source normalization,
             // even though a canonical-spelling positive pin is not broadened.
             let known = try hashedLine("verified-alias", seed: 8, marker: marker)
@@ -1089,6 +1093,153 @@ final class SSHWorkspaceSourceTests: XCTestCase {
         XCTAssertFalse(result.workspace.routes[0].requiredCapabilities.isEmpty)
         XCTAssertTrue(result.workspace.routes[1].requiredCapabilities.isEmpty)
         XCTAssertTrue(result.workspace.hostTrust.allSatisfy { $0.pins.isEmpty })
+    }
+
+    func testCertificateAuthorityTrustAndJumpScopeSurviveEncryptedTransfer() throws {
+        let known = try hostLine("*.corp,!raw.corp", seed: 8, marker: "@cert-authority")
+            + hostLine("gate-verified", seed: 16, marker: "@cert-authority")
+            + hostLine("[gate-verified]:2222", seed: 24, marker: "@cert-authority")
+            + hostLine("raw.corp", seed: 32)
+        let result = try exported("""
+        IdentityFile none
+        PreferredAuthentications password
+        Host app
+          HostName app.corp
+          ProxyJump gate
+        Host raw
+          HostName raw.corp
+        Host gate
+          HostName gate.internal
+          HostKeyAlias gate-verified
+          Port 2222
+        """, aliases: ["app", "raw"], known: Data(known.utf8))
+        let app = try destination("app", in: result.workspace), raw = try destination("raw", in: result.workspace)
+        let hop = try XCTUnwrap(hops(app, in: result.workspace).first)
+        XCTAssertEqual(hop.hostKeyAlias, "gate-verified"); XCTAssertEqual(hop.port, 2222)
+        func trust(_ route: WorkspaceDocument.Route) throws -> WorkspaceDocument.HostTrust {
+            try XCTUnwrap(result.workspace.hostTrust.first { $0.id == route.trustID })
+        }
+        let appTrust = try trust(app), hopTrust = try trust(hop), rawTrust = try trust(raw)
+        XCTAssertTrue(appTrust.pins.isEmpty); XCTAssertTrue(hopTrust.pins.isEmpty)
+        XCTAssertEqual(appTrust.certificateAuthorities.count, 1)
+        XCTAssertEqual(hopTrust.certificateAuthorities.count, 1)
+        XCTAssertNotEqual(appTrust.certificateAuthorities, hopTrust.certificateAuthorities)
+        XCTAssertEqual(appTrust.requiredCapabilities, [WorkspaceDocument.hostCertificateCapability])
+        XCTAssertEqual(hopTrust.requiredCapabilities, [WorkspaceDocument.hostCertificateCapability])
+        XCTAssertEqual(rawTrust.pins.count, 1); XCTAssertTrue(rawTrust.certificateAuthorities.isEmpty)
+        XCTAssertTrue(rawTrust.requiredCapabilities.isEmpty)
+        XCTAssertTrue(result.workspace.routes.allSatisfy { $0.requiredCapabilities.isEmpty })
+        let selection = try WorkspaceExportSelection(workspace: result.workspace,
+            groupIDs: [result.workspace.initialGroupID], findings: result.portability)
+        XCTAssertTrue(try selection.review(decisions: [:], loadedFingerprints: []).blockedRouteIDs.isEmpty)
+        let sealed = try FTAG.seal(selection.archive(including: [], using: crypto), using: crypto)
+        let restored = try FTAG.open(sealed.envelope, code: sealed.code, using: crypto)
+        XCTAssertEqual(restored.workspace.hostTrust.map(\.certificateAuthorities),
+            selection.workspace.hostTrust.map(\.certificateAuthorities))
+        XCTAssertEqual(restored.workspace.routes.map(\.jumpRoutes), selection.workspace.routes.map(\.jumpRoutes))
+        XCTAssertFalse(restored.portability.contains { $0.disposition == 1 })
+    }
+
+    func testCertificateAuthoritiesDoNotSatisfyUnsupportedIssuerOrRevocationPolicy() throws {
+        let known = try hostLine("build", seed: 8, marker: "@cert-authority") + hostLine("build", seed: 16)
+        for policy in ["CASignatureAlgorithms ssh-ed25519", "CASignatureAlgorithms -ssh-rsa",
+                       "HostKeyAlgorithms ssh-ed25519-cert-v01@openssh.com", "RevokedHostKeys /selected/revocations.krl"] {
+            let result = try exported("Host build\nIdentityFile none\n\(policy)\n", known: Data(known.utf8))
+            XCTAssertEqual(result.workspace.hostTrust[0].certificateAuthorities.count, 1, policy)
+            XCTAssertEqual(result.workspace.hostTrust[0].pins.count, 1)
+            XCTAssertEqual(result.workspace.hostTrust[0].requiredCapabilities, [WorkspaceDocument.hostCertificateCapability])
+            XCTAssertFalse(result.workspace.routes[0].requiredCapabilities.isEmpty, policy)
+            XCTAssertTrue(result.portability.contains { $0.disposition == 1 }, policy)
+        }
+    }
+
+    func testHashedCertificateAuthoritiesNeedOriginalLookupAndRetainCanonicalRevocations() throws {
+        let known = try hashedLine("verified-alias", seed: 8, marker: "@cert-authority")
+            + hashedLine("verified-alias.", seed: 16, marker: "@cert-authority")
+            + hashedLine("verified-alias.", seed: 16, marker: "@cert-authority")
+            + hashedLine("verified-alias", seed: 16, marker: "@revoked")
+            + hashedLine("verified-alias.", seed: 32)
+        let result = try exported("Host build\nHostKeyAlias Verified-Alias.\nPort 2200\nIdentityFile none\n", known: Data(known.utf8))
+        let trust = try XCTUnwrap(result.workspace.hostTrust.first)
+        XCTAssertEqual(trust.certificateAuthorities.count, 1, "normalization cannot grant another authority")
+        XCTAssertEqual(trust.certificateAuthorities, trust.revokedKeys, "canonical denials still bind the source authority")
+        XCTAssertEqual(trust.pins.count, 1)
+        XCTAssertFalse(trust.certificateAuthorities.contains(try XCTUnwrap(trust.pins.first)))
+        XCTAssertEqual(trust.requiredCapabilities, [WorkspaceDocument.hostCertificateCapability])
+        XCTAssertTrue(result.workspace.routes[0].requiredCapabilities.isEmpty)
+        let wrongPort = try exported("Host build\nHostName box\nPort 2223\nIdentityFile none\n",
+            known: Data(try hashedLine("[box]:2222", marker: "@cert-authority").utf8))
+        XCTAssertTrue(wrongPort.workspace.hostTrust[0].certificateAuthorities.isEmpty)
+        XCTAssertTrue(wrongPort.workspace.hostTrust[0].requiredCapabilities.isEmpty)
+    }
+
+    func testCertificatePrincipalRetainsEffectiveHostnameAndAliasSpelling() throws {
+        // OpenSSH ssh.c and ssh -G agree: effective names are lowercase and
+        // retain trailing dots, unlike the canonical mobile denial scope.
+        let known = try hostLine("reviewed-alias.", seed: 32, marker: "@cert-authority")
+            + hostLine("target.example.invalid.", seed: 32, marker: "@cert-authority")
+        let result = try exported("""
+        IdentityFile none
+        Host alias
+          HostName TARGET.Example.Invalid.
+          HostKeyAlias Reviewed-Alias.
+        Host hostname
+          HostName TARGET.Example.Invalid.
+        """, known: Data(known.utf8))
+        let routes = try records(result, "routes"), trusts = try records(result, "host_trust")
+        XCTAssertEqual(routes[0]["host_key_alias"], .string("reviewed-alias."))
+        XCTAssertEqual(trusts[0]["host_key_alias"], .string("reviewed-alias."))
+        XCTAssertEqual(routes[1]["host"], .string("target.example.invalid."))
+        XCTAssertEqual(trusts[1]["host"], .string("target.example.invalid."))
+        XCTAssertEqual(result.workspace.routes.map(\.host), ["target.example.invalid", "target.example.invalid"])
+        XCTAssertEqual(result.workspace.hostTrust.map(\.certificatePrincipal), ["reviewed-alias.", "target.example.invalid."])
+        XCTAssertTrue(result.workspace.hostTrust.allSatisfy { $0.certificateAuthorities.count == 1 })
+        let support = WorkspaceDocument.RouteSupport(routeModes: ["direct_ssh"], authenticationMethods: [.publicKey],
+            credentialAlgorithms: ["ssh-ed25519"], hostKeyAlgorithms: ["ssh-ed25519-cert-v01@openssh.com"],
+            capabilities: [WorkspaceDocument.hostCertificateCapability])
+        for (index, principal) in ["reviewed-alias.", "target.example.invalid."].enumerated() {
+            for offered in [principal, String(principal.dropLast()), principal.uppercased()] {
+                let certificate = try SSHHostCertificate(blob: workspaceTestHostCertificate(principals: [offered]))
+                let decision = try result.workspace.verifyHostKey(forRouteID: result.workspace.routes[index].id,
+                    presented: .init(algorithm: certificate.algorithm, fingerprint: certificate.fingerprint),
+                    hostCertificate: certificate, reviewedTrustIDs: Set(result.workspace.hostTrust.map(\.id)), support: support)
+                XCTAssertEqual(decision, offered == principal ? .trustedCertificate : .unsupportedCertificate, offered)
+            }
+        }
+    }
+
+    func testEffectiveCertificateNamesUseASCIIBytesWithoutUnicodeCaseFolding() throws {
+        // Both installed ssh -G and upstream misc.c lowercase() leave the
+        // UTF-8 bytes of Ü, İ and É unchanged while folding ASCII letters.
+        let cases = [
+            ("HostName BÜCHER.Example.Invalid.", "bÜcher.example.invalid.", "bücher.example.invalid."),
+            ("HostKeyAlias ÜPPER-ALIAS.", "Üpper-alias.", "üpper-alias."),
+            ("HostKeyAlias İCAFÉ.", "İcafÉ.", "i\u{0307}café.")
+        ]
+        let support = WorkspaceDocument.RouteSupport(routeModes: ["direct_ssh"], authenticationMethods: [.publicKey],
+            credentialAlgorithms: ["ssh-ed25519"], hostKeyAlgorithms: ["ssh-ed25519-cert-v01@openssh.com"],
+            capabilities: [WorkspaceDocument.hostCertificateCapability])
+        for (option, expected, folded) in cases {
+            let canonical = try WorkspaceDocument.host(expected)
+            let known = try hostLine(expected, seed: 32, marker: "@cert-authority")
+                + hashedLine(expected, seed: 32, marker: "@cert-authority")
+                + hostLine(folded, seed: 16, marker: "@cert-authority")
+                + hostLine(canonical, seed: 24, marker: "@cert-authority")
+                + hostLine(canonical, seed: 8, marker: "@revoked")
+            let result = try exported("Host build\nIdentityFile none\n\(option)\n", known: Data(known.utf8))
+            let trust = try XCTUnwrap(result.workspace.hostTrust.first)
+            XCTAssertTrue(trust.certificatePrincipal.utf8.elementsEqual(expected.utf8), option)
+            XCTAssertEqual(trust.certificateAuthorities.count, 1,
+                "neither Unicode case folding nor IDNA may grant another CA")
+            XCTAssertEqual(trust.revokedKeys.count, 1, "canonical denials remain effective")
+            for principal in [expected, folded, canonical] {
+                let certificate = try SSHHostCertificate(blob: workspaceTestHostCertificate(principals: [principal]))
+                let decision = try result.workspace.verifyHostKey(forRouteID: result.workspace.routes[0].id,
+                    presented: .init(algorithm: certificate.algorithm, fingerprint: certificate.fingerprint),
+                    hostCertificate: certificate, reviewedTrustIDs: [trust.id], support: support)
+                XCTAssertEqual(decision, principal.utf8.elementsEqual(expected.utf8) ? .trustedCertificate : .unsupportedCertificate)
+            }
+        }
     }
 
     func testMalformedOrUnsupportedHashesCannotHideRevocations() throws {

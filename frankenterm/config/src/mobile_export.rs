@@ -42,6 +42,7 @@ const MAX_ROUTE_IDENTITIES: usize = 8;
 const MAX_CERTIFICATE_BLOB_BYTES: usize = 32 * 1024;
 const MAX_EXPORTED_CERTIFICATE_BYTES: usize = 1024 * 1024;
 const USER_CERTIFICATE_CAPABILITY: &str = "ssh_user_certificate_v1";
+const HOST_CERTIFICATE_CAPABILITY: &str = "ssh_host_certificate_v1";
 const MAX_JUMP_HOPS: usize = 3;
 const MAX_EXPORTED_ROUTES: usize = 256;
 const MAX_EXPORT_FINDINGS: usize = 1024;
@@ -1937,8 +1938,10 @@ impl UserCertificate {
 pub struct HostKeys {
     pub pins: Vec<PublicKey>,
     pub revoked: Vec<PublicKey>,
-    /// `@cert-authority` entries matched: the phone cannot use them.
-    pub certificate_authorities: usize,
+    /// Positive CA trust is scoped to this endpoint's original source lookup.
+    /// Keep revoked authorities too: their denial must remain visible rather
+    /// than turn configured certificate policy into an unconfigured endpoint.
+    pub certificate_authorities: Vec<PublicKey>,
     /// A malformed or unsupported record may contain a required denial.
     pub unresolved_entries: usize,
 }
@@ -1989,9 +1992,8 @@ fn host_keys_for_lookup(known_hosts: &str, name: &str, canonical_name: &str) -> 
             keys.unresolved_entries += 1;
             continue;
         }
-        if !patterns_match(first, name)
-            && !(marker.is_some() && patterns_match(first, canonical_name))
-        {
+        let denial = marker.is_some() && marker != Some("@cert-authority");
+        if !patterns_match(first, name) && !(denial && patterns_match(first, canonical_name)) {
             continue;
         }
         let rest: Vec<&str> = words.collect();
@@ -2013,7 +2015,11 @@ fn host_keys_for_lookup(known_hosts: &str, name: &str, canonical_name: &str) -> 
                     keys.revoked.push(key)
                 }
             }
-            Some("@cert-authority") => keys.certificate_authorities += 1,
+            Some("@cert-authority") => {
+                if !keys.certificate_authorities.contains(&key) {
+                    keys.certificate_authorities.push(key)
+                }
+            }
             Some(_) => keys.unresolved_entries += 1,
         }
     }
@@ -2383,10 +2389,13 @@ fn resolve_endpoint(
                     return None;
                 }
             };
+            // OpenSSH lowercases the effective HostName before certificate
+            // principal matching. Preserve its trailing dot: the workspace's
+            // canonical denial scope is not the signed principal's spelling.
             let host = options
                 .get("hostname")
-                .cloned()
-                .unwrap_or_else(|| alias.clone());
+                .map(|host| host.to_ascii_lowercase())
+                .unwrap_or_else(|| alias.to_ascii_lowercase());
             let alias_ok = options
                 .get("hostkeyalias")
                 .is_none_or(|alias| crate::machines::valid_host(alias));
@@ -2525,7 +2534,11 @@ fn resolve_endpoint(
                 authentication_methods: authentication.methods,
                 certificates,
                 identity_policy_complete,
-                host_key_alias: options.get("hostkeyalias").cloned(),
+                // ssh.c also lowercases HostKeyAlias before it replaces the
+                // hostname. Retain all other bytes, including a trailing dot.
+                host_key_alias: options
+                    .get("hostkeyalias")
+                    .map(|alias| alias.to_ascii_lowercase()),
                 known_hosts,
                 unresolved_policy,
             })
@@ -2577,7 +2590,11 @@ fn endpoint_keys(
                         keys.revoked.push(key);
                     }
                 }
-                keys.certificate_authorities += found.certificate_authorities;
+                for key in found.certificate_authorities {
+                    if !keys.certificate_authorities.contains(&key) {
+                        keys.certificate_authorities.push(key);
+                    }
+                }
                 keys.unresolved_entries += found.unresolved_entries;
             }
             Some(KnownHostsSource::Missing) => {}
@@ -2593,23 +2610,18 @@ fn endpoint_keys(
             }
         }
     }
-    if keys.certificate_authorities > 0 || keys.unresolved_entries > 0 {
+    if keys.unresolved_entries > 0 {
         unresolved_policy = true;
-        note(notes, "known_hosts contains a matching certificate authority, unsupported marker, or unresolved record; this route remains blocked".into());
+        note(notes, "known_hosts contains a matching unsupported marker or unresolved record; this route remains blocked".into());
     }
     let revoked = keys.revoked.clone();
     keys.pins.retain(|key| !revoked.contains(key));
-    if keys.pins.is_empty() {
+    if keys.pins.is_empty() && keys.certificate_authorities.is_empty() {
         note(
             notes,
             format!(
-                "no host key for {} in known_hosts{}; review the source trust policy before connecting",
+                "no host key or certificate authority for {} in known_hosts; review the source trust policy before connecting",
                 lookup,
-                if keys.certificate_authorities > 0 {
-                    " (only a certificate authority, which the phone cannot use)"
-                } else {
-                    ""
-                }
             ),
         );
     }
@@ -2802,6 +2814,17 @@ impl EndpointRecords {
             "pins": resolved.keys.pins.iter().map(pin).collect::<Vec<_>>(),
             "revoked_keys": [],
         });
+        if !resolved.keys.certificate_authorities.is_empty() {
+            trust["certificate_authorities"] = json!(
+                resolved
+                    .keys
+                    .certificate_authorities
+                    .iter()
+                    .map(pin)
+                    .collect::<Vec<_>>()
+            );
+            trust["required_capabilities"] = json!([HOST_CERTIFICATE_CAPABILITY]);
+        }
         if let Some(alias) = &endpoint.host_key_alias {
             trust["host_key_alias"] = json!(alias);
         }
@@ -3224,7 +3247,15 @@ pub fn export(
             );
         }
         if unresolved_scopes.contains(scope) {
-            trust["required_capabilities"] = json!([UNRESOLVED_POLICY]);
+            let mut required = trust["required_capabilities"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let unresolved = json!(UNRESOLVED_POLICY);
+            if !required.contains(&unresolved) {
+                required.push(unresolved);
+            }
+            trust["required_capabilities"] = json!(required);
         }
     }
 
@@ -3584,7 +3615,9 @@ mod tests {
             "a revoked key is never pinned"
         );
         let ca = format!("@cert-authority *.corp ssh-ed25519 {}\n", ED25519);
-        assert_eq!(host_keys(&ca, "a.corp", 22).certificate_authorities, 1);
+        let authorities = host_keys(&ca, "a.corp", 22).certificate_authorities;
+        assert_eq!(authorities.len(), 1);
+        assert_eq!(authorities[0].fingerprint(), FINGERPRINT);
     }
 
     fn sources(config: Option<&str>) -> SshSources {
@@ -6141,7 +6174,7 @@ ssh = "bad"
         assert!(
             messages
                 .iter()
-                .any(|m| m.contains("no host key for 100.91.120.17")),
+                .any(|m| m.contains("no host key or certificate authority for 100.91.120.17")),
             "{:?}",
             messages
         );
@@ -6195,6 +6228,289 @@ ssh = "right"
         sources
             .known_hosts
             .insert(PathBuf::from(path), KnownHostsSource::Present(text));
+    }
+
+    #[test]
+    fn certificate_authorities_require_original_lookup_while_denials_survive_normalization() {
+        let hash = |name: &str| {
+            let salt = [7u8; 20];
+            let mut mac = <Hmac<Sha1> as KeyInit>::new_from_slice(&salt).unwrap();
+            mac.update(name.as_bytes());
+            format!(
+                "|1|{}|{}",
+                STANDARD.encode(salt),
+                STANDARD.encode(mac.finalize().into_bytes())
+            )
+        };
+        let records = format!(
+            "@cert-authority {} {}\n@cert-authority {} {}\n@cert-authority {} {}\n@revoked {} {}\n{} {}\n",
+            hash("verified-alias"),
+            fake_key(51),
+            hash("verified-alias."),
+            fake_key(52),
+            hash("verified-alias."),
+            fake_key(52),
+            hash("verified-alias"),
+            fake_key(52),
+            hash("verified-alias."),
+            fake_key(53)
+        );
+        let keys = host_keys_for_lookup(&records, "verified-alias.", "verified-alias");
+        assert_eq!(keys.certificate_authorities.len(), 1);
+        assert_eq!(
+            keys.certificate_authorities[0].fingerprint(),
+            PublicKey::parse_line(&fake_key(52)).unwrap().fingerprint()
+        );
+        assert_eq!(keys.certificate_authorities, keys.revoked);
+        assert_eq!(keys.pins.len(), 1);
+        assert_eq!(keys.unresolved_entries, 0);
+        let wildcard = format!("@cert-authority *.corp,!excluded.corp {}\n", fake_key(51));
+        assert_eq!(
+            host_keys(&wildcard, "allowed.corp", 22)
+                .certificate_authorities
+                .len(),
+            1
+        );
+        assert!(
+            host_keys(&wildcard, "excluded.corp", 22)
+                .certificate_authorities
+                .is_empty()
+        );
+        let port = format!("@cert-authority [box]:2222 {}\n", fake_key(51));
+        assert!(
+            host_keys(&port, "box", 2223)
+                .certificate_authorities
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn certificate_authority_exports_keep_route_specific_allowlists_and_mixed_pins() {
+        let mut sources = sources(Some(
+            "Host left\n HostName box\n UserKnownHostsFile /trust/left\nHost right\n HostName box\n UserKnownHostsFile /trust/right\nHost *\n User u\n GlobalKnownHostsFile none\n",
+        ));
+        supply(
+            &mut sources,
+            "/trust/left",
+            format!(
+                "box {}\n@cert-authority box {}\n@cert-authority box {}\n",
+                fake_key(50),
+                fake_key(51),
+                fake_key(51)
+            ),
+        );
+        supply(
+            &mut sources,
+            "/trust/right",
+            format!("@cert-authority box {}\n", fake_key(52)),
+        );
+        let exported = trust_export(&sources);
+        let left = route_trust(&exported, "r.left.ssh");
+        let right = route_trust(&exported, "r.right.ssh");
+        assert_eq!(left["pins"].as_array().unwrap().len(), 1);
+        assert!(right["pins"].as_array().unwrap().is_empty());
+        for (trust, seed) in [(left, 51), (right, 52)] {
+            assert_eq!(
+                trust["certificate_authorities"].as_array().unwrap().len(),
+                1
+            );
+            assert_eq!(
+                trust["certificate_authorities"][0]["fingerprint"],
+                PublicKey::parse_line(&fake_key(seed))
+                    .unwrap()
+                    .fingerprint()
+            );
+            assert_eq!(
+                trust["required_capabilities"],
+                json!([HOST_CERTIFICATE_CAPABILITY])
+            );
+        }
+        assert!(
+            !exported
+                .notes
+                .iter()
+                .any(|note| note.message.contains("remains blocked"))
+        );
+    }
+
+    #[test]
+    fn certificate_principals_use_effective_ssh_hostnames_and_aliases() {
+        // OpenSSH ssh.c and an independent ssh -G check agree: both names are
+        // lowercased while their trailing dots are preserved.
+        let mut sources = sources(Some(
+            "Host left\n HostName HOST.Example.Invalid.\n HostKeyAlias Reviewed-Alias.\n UserKnownHostsFile /trust/left\nHost right\n HostName HOST.Example.Invalid.\n UserKnownHostsFile /trust/right\nHost *\n User u\n GlobalKnownHostsFile none\n",
+        ));
+        supply(
+            &mut sources,
+            "/trust/left",
+            format!("@cert-authority reviewed-alias. {}\n", fake_key(51)),
+        );
+        supply(
+            &mut sources,
+            "/trust/right",
+            format!("@cert-authority host.example.invalid. {}\n", fake_key(52)),
+        );
+        let exported = trust_export(&sources);
+        let routes = exported.document["workspace"]["routes"].as_array().unwrap();
+        for id in ["r.left.ssh", "r.right.ssh"] {
+            let route = routes.iter().find(|route| route["id"] == id).unwrap();
+            let trust = route_trust(&exported, id);
+            assert_eq!(route["host"], "host.example.invalid.");
+            assert_eq!(trust["host"], route["host"]);
+            assert_eq!(
+                trust["certificate_authorities"].as_array().unwrap().len(),
+                1
+            );
+            if id == "r.left.ssh" {
+                assert_eq!(route["host_key_alias"], "reviewed-alias.");
+                assert_eq!(trust["host_key_alias"], route["host_key_alias"]);
+            } else {
+                assert!(route.get("host_key_alias").is_none());
+                assert!(trust.get("host_key_alias").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn certificate_authority_requirements_cannot_erase_explicit_policy_blockers() {
+        let base = "Host *\n HostName box\n User u\n UserKnownHostsFile /trust/keys\n GlobalKnownHostsFile none\n";
+        for policy in [
+            "CASignatureAlgorithms ssh-ed25519",
+            "CASignatureAlgorithms -ssh-rsa",
+            "HostKeyAlgorithms ssh-ed25519-cert-v01@openssh.com",
+            "RevokedHostKeys /trust/host-revocations.krl",
+            "KnownHostsCommand /bin/false",
+        ] {
+            let mut sources = sources(Some(&format!("{base}{policy}\n")));
+            supply(
+                &mut sources,
+                "/trust/keys",
+                format!(
+                    "box {}\n@cert-authority box {}\n",
+                    fake_key(50),
+                    fake_key(51)
+                ),
+            );
+            let exported = trust_export(&sources);
+            for route in ["r.left.ssh", "r.right.ssh"] {
+                let trust = route_trust(&exported, route);
+                assert_eq!(
+                    trust["required_capabilities"],
+                    json!([HOST_CERTIFICATE_CAPABILITY, UNRESOLVED_POLICY]),
+                    "{policy}"
+                );
+                assert_eq!(
+                    trust["certificate_authorities"].as_array().unwrap().len(),
+                    1
+                );
+                assert_eq!(trust["pins"].as_array().unwrap().len(), 1);
+            }
+        }
+        let mut sources = sources(Some(&format!("{base}CASignatureAlgorithms ^ssh-ed25519\n")));
+        supply(
+            &mut sources,
+            "/trust/keys",
+            format!("@cert-authority box {}\n", fake_key(51)),
+        );
+        assert_eq!(
+            route_trust(&trust_export(&sources), "r.left.ssh")["required_capabilities"],
+            json!([HOST_CERTIFICATE_CAPABILITY]),
+            "preference order does not remove any permitted algorithms"
+        );
+    }
+
+    #[test]
+    fn selected_certificate_authorities_retain_unselected_same_scope_revocations() {
+        let inventory = MachineInventory::parse(
+            &format!("{TRUST_INVENTORY}\n[groups.selected]\nmachines = [\"left\"]\n"),
+            &context(),
+        )
+        .unwrap();
+        let mut sources = sources(Some(
+            "Host left\n HostName box\n UserKnownHostsFile /trust/left\nHost right\n HostName BOX.\n UserKnownHostsFile /trust/right\nHost *\n User u\n GlobalKnownHostsFile none\n",
+        ));
+        supply(
+            &mut sources,
+            "/trust/left",
+            format!("@cert-authority box {}\n", fake_key(51)),
+        );
+        supply(
+            &mut sources,
+            "/trust/right",
+            format!(
+                "@cert-authority box. {}\n@revoked box {}\n",
+                fake_key(52),
+                fake_key(51)
+            ),
+        );
+        let exported = export(&inventory, Some("selected"), &sources, &context()).unwrap();
+        let trust = route_trust(&exported, "r.left.ssh");
+        assert_eq!(exported.machines, 1);
+        assert_eq!(
+            trust["certificate_authorities"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(trust["certificate_authorities"], trust["revoked_keys"]);
+        assert_eq!(
+            trust["required_capabilities"],
+            json!([HOST_CERTIFICATE_CAPABILITY])
+        );
+        sources
+            .known_hosts
+            .insert(PathBuf::from("/trust/right"), KnownHostsSource::Unavailable);
+        let blocked = export(&inventory, Some("selected"), &sources, &context()).unwrap();
+        assert_eq!(
+            route_trust(&blocked, "r.left.ssh")["required_capabilities"],
+            json!([HOST_CERTIFICATE_CAPABILITY, UNRESOLVED_POLICY])
+        );
+    }
+
+    #[test]
+    fn jump_certificate_authorities_preserve_the_hops_alias_and_port_scope() {
+        let mut sources = sources(Some(
+            "Host left\n HostName app.corp\n ProxyJump gate\n UserKnownHostsFile /trust/app\nHost right\n HostName raw.corp\n UserKnownHostsFile /trust/right\nHost gate\n HostName gate.internal\n HostKeyAlias Verified-Gateway.\n Port 2222\n UserKnownHostsFile /trust/gate\nHost *\n User u\n GlobalKnownHostsFile none\n",
+        ));
+        supply(
+            &mut sources,
+            "/trust/app",
+            format!("@cert-authority app.corp {}\n", fake_key(51)),
+        );
+        supply(&mut sources, "/trust/right", String::new());
+        supply(
+            &mut sources,
+            "/trust/gate",
+            format!(
+                "@cert-authority verified-gateway. {}\n@cert-authority [verified-gateway.]:2222 {}\n@cert-authority verified-gateway {}\n",
+                fake_key(52),
+                fake_key(53),
+                fake_key(54)
+            ),
+        );
+        let exported = trust_export(&sources);
+        let routes = exported.document["workspace"]["routes"].as_array().unwrap();
+        let hop = routes
+            .iter()
+            .find(|route| route["host_key_alias"] == "verified-gateway.")
+            .unwrap();
+        let trust = route_trust(&exported, hop["id"].as_str().unwrap());
+        assert_eq!(hop["port"], 2222);
+        assert_eq!(trust["host_key_alias"], "verified-gateway.");
+        assert_eq!(
+            trust["certificate_authorities"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            trust["certificate_authorities"][0]["fingerprint"],
+            PublicKey::parse_line(&fake_key(52)).unwrap().fingerprint()
+        );
+        assert_eq!(
+            trust["required_capabilities"],
+            json!([HOST_CERTIFICATE_CAPABILITY])
+        );
+        assert_ne!(
+            trust["certificate_authorities"],
+            route_trust(&exported, "r.left.ssh")["certificate_authorities"]
+        );
     }
 
     fn write_source(path: &Path, contents: impl AsRef<[u8]>) {
@@ -6545,7 +6861,6 @@ ssh = "right"
             );
         }
         for invalid in [
-            format!("@cert-authority box ssh-ed25519 {}", ED25519),
             format!("@unknown box ssh-ed25519 {}", ED25519),
             "@revoked box ssh-ed25519 !!!".into(),
             format!("@revoked |2|bad|hash ssh-ed25519 {}", ED25519),

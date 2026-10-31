@@ -14,7 +14,8 @@ func workspaceTestCertificate(serial: UInt64 = 1, principals: [String] = ["opera
                               validAfter: UInt64 = 946_684_800, validBefore: UInt64 = 4_102_444_800,
                               extensions: [String] = ["permit-port-forwarding", "permit-pty"],
                               subjectSeed: Data = Data(0..<32), authoritySeed: Data = Data(32..<64),
-                              criticalOptions: [String: Data] = [:], extensionValues: [String: Data] = [:]) throws -> Data {
+                              criticalOptions: [String: Data] = [:], extensionValues: [String: Data] = [:],
+                              certificateType: UInt32 = 1, reserved: Data = Data()) throws -> Data {
     func field(_ bytes: Data) -> Data {
         var value = Data(); value.appendBE(UInt64(bytes.count), bytes: 4); value.append(bytes); return value
     }
@@ -23,7 +24,7 @@ func workspaceTestCertificate(serial: UInt64 = 1, principals: [String] = ["opera
     var result = field(Data("ssh-ed25519-cert-v01@openssh.com".utf8))
     result.append(field(Data(repeating: 19, count: 32)))
     result.append(field(subject.publicKey.rawRepresentation))
-    result.appendBE(serial, bytes: 8); result.appendBE(1, bytes: 4)
+    result.appendBE(serial, bytes: 8); result.appendBE(UInt64(certificateType), bytes: 4)
     result.append(field(Data("workspace-fixture".utf8)))
     result.append(field(principals.reduce(into: Data()) { $0.append(field(Data($1.utf8))) }))
     result.appendBE(validAfter, bytes: 8); result.appendBE(validBefore, bytes: 8)
@@ -35,7 +36,7 @@ func workspaceTestCertificate(serial: UInt64 = 1, principals: [String] = ["opera
     result.append(field(permissions.keys.sorted().reduce(into: Data()) {
         $0.append(field(Data($1.utf8))); $0.append(field(permissions[$1]!))
     }))
-    result.append(field(Data()))
+    result.append(field(reserved))
     result.append(field(publicBlob(authority.publicKey.rawRepresentation)))
     let signature = try authority.signature(for: result)
     result.append(field(field(Data("ssh-ed25519".utf8)) + field(signature)))

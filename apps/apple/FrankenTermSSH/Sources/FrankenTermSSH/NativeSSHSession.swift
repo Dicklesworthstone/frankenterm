@@ -325,6 +325,11 @@ public enum NativeSSHWriteAdmission: Sendable, Equatable { case accepted(Int), w
 /// output or a library packet is still pending; unavailable means this
 /// platform cannot prove a probe would not be left half sent.
 public enum NativeSSHKeepalive: Sendable, Equatable { case sent, deferred, unavailable }
+/// Negotiation is chosen from current trust for each distinct jump/destination
+/// peer. It never substitutes for certificate or pin verification after KEX.
+public enum NativeSSHHostKeyPolicy: Sendable, Equatable {
+    case rawKeys, certificates, certificatesAndRawKeys
+}
 public enum NativeSSHRemoteExit: Sendable, Equatable {
     case exitStatus(UInt32)
     case signal(String)
@@ -356,6 +361,83 @@ package struct NativeSSHDriver: Equatable, Sendable {
     fileprivate let id = UUID()
 }
 
+public enum NativeSFTPFileKind: Equatable, Sendable {
+    case regularFile, directory, symbolicLink, other, unknown
+}
+
+public enum NativeSFTPFileMode: Equatable, Sendable {
+    case read, createExclusive
+}
+
+/// Public metadata returned by the server. Missing attributes stay unknown;
+/// they are not inferred from a filename, a displayed listing, or local time.
+public struct NativeSFTPFileAttributes: Equatable, Sendable {
+    public let size: UInt64?
+    public let permissions: UInt32?
+    public let modificationTime: UInt64?
+    public var kind: NativeSFTPFileKind {
+        guard let permissions else { return .unknown }
+        switch permissions & 0o170000 {
+        case 0o100000: return .regularFile
+        case 0o040000: return .directory
+        case 0o120000: return .symbolicLink
+        case 0: return .unknown
+        default: return .other
+        }
+    }
+    public init(size: UInt64?, permissions: UInt32?, modificationTime: UInt64?) {
+        self.size = size; self.permissions = permissions; self.modificationTime = modificationTime
+    }
+    fileprivate init(_ value: ftssh_sftp_attributes) {
+        size = value.flags & UInt32(FTSSH_SFTP_ATTR_SIZE) != 0 ? value.size : nil
+        permissions = value.flags & UInt32(FTSSH_SFTP_ATTR_PERMISSIONS) != 0 ? value.permissions : nil
+        modificationTime = value.flags & UInt32(FTSSH_SFTP_ATTR_MODIFICATION_TIME) != 0 ? value.modification_time : nil
+    }
+}
+
+public struct NativeSFTPDirectoryEntry: Equatable, Sendable, Identifiable {
+    public let name: String
+    public let attributes: NativeSFTPFileAttributes
+    /// Remote filenames are byte identities. Canonically equivalent Unicode
+    /// spellings can name different files and must not collapse in a native list.
+    public var id: Data { Data(name.utf8) }
+    public init(name: String, attributes: NativeSFTPFileAttributes) {
+        self.name = name; self.attributes = attributes
+    }
+}
+
+public struct NativeSFTPDirectoryListing: Equatable, Sendable {
+    public let path: String
+    public let entries: [NativeSFTPDirectoryEntry]
+    /// True only after observing an additional admissible entry beyond a bound.
+    public let isTruncated: Bool
+    public init(path: String, entries: [NativeSFTPDirectoryEntry], isTruncated: Bool) {
+        self.path = path; self.entries = entries; self.isTruncated = isTruncated
+    }
+}
+
+public enum NativeSFTPError: Error, Equatable, Sendable, LocalizedError,
+    CustomStringConvertible, CustomDebugStringConvertible {
+    case invalidPath, invalidLimit, unsupportedFile, malformedResponse
+    case server(status: UInt32)
+
+    public var description: String {
+        switch self {
+        case .invalidPath: return "The remote path is empty, invalid, or too long."
+        case .invalidLimit: return "The requested file operation exceeds this build's transfer limits."
+        case .unsupportedFile: return "Only a regular file with verified server metadata can be transferred."
+        case .malformedResponse: return "The file server returned an invalid or unsupported response."
+        case .server(status: 2): return "The remote file or directory was not found."
+        case .server(status: 3): return "The file server denied permission for this operation."
+        case .server(status: 8): return "The file server does not support this operation."
+        case .server(status: 11): return "A file already exists at the selected destination."
+        case .server: return "The file server refused this operation. An existing file is never overwritten."
+        }
+    }
+    public var errorDescription: String? { description }
+    public var debugDescription: String { "NativeSFTPError" }
+}
+
 /// A single actor owns one libssh2 session/channel. Ordinary network progress
 /// uses dispatch readiness. Keyboard-interactive temporarily transfers native
 /// ownership to a bounded worker so its synchronous callback can await the UI.
@@ -363,17 +445,23 @@ package struct NativeSSHDriver: Equatable, Sendable {
 /// requests have finite monotonic deadlines. Hidden panes retain this owner.
 public actor NativeSSHSession {
     public nonisolated static let maximumWriteBytes = Int(FTSSH_WRITE_CAPACITY)
+    public nonisolated static var supportsSFTP: Bool { ftssh_supports_sftp() != 0 }
     /// True only when the linked backend exposes its verified signed-key
     /// partial-success evidence. Method advertisements alone are insufficient.
     public nonisolated static var supportsPublicKeyInteractive: Bool {
         ftssh_supports_publickey_interactive() != 0
     }
+    /// The complete supported host-certificate KEX profile is available only
+    /// with the source-verified, versioned backend extension.
+    public nonisolated static var supportsHostCertificates: Bool {
+        ftssh_supports_host_certificates() != 0
+    }
     public nonisolated let transportID: UUID
-    /// This session creates at most one shell channel. A replacement connection
-    /// always gets a new channel identity, even when its endpoint is unchanged.
+    /// This session creates at most one shell/command or dedicated SFTP channel.
+    /// A replacement connection always gets a new channel identity.
     public nonisolated let channelID = UUID()
     public nonisolated let endpoint: NativeSSHEndpoint?
-    private enum Phase { case fresh, authenticating, authenticated, opening, live, closed }
+    private enum Phase { case fresh, authenticating, authenticated, opening, live, sftp, closed }
     private let native: NativeHandle
     private var phase = Phase.fresh
     private var operation: UUID?
@@ -428,6 +516,7 @@ public actor NativeSSHSession {
     private var observedRemoteExit: NativeSSHRemoteExit?
     private var completion: NativeSSHCompletion?
     private var driver: NativeSSHDriver?
+    private var sftpFileMode: NativeSFTPFileMode?
     private var legacyChannelID: UUID?
     private enum ChannelAuthorization {
         case legacy(UUID?)
@@ -514,6 +603,20 @@ public actor NativeSSHSession {
             try Task.checkCancellation()
             guard phase != .closed else { throw NativeSSHError.closed }
         }
+    }
+
+    /// Must run before any authentication or host-probe handshake. A new
+    /// forwarded child has its own fresh policy; its parent is unaffected.
+    public func setHostKeyPolicy(_ policy: NativeSSHHostKeyPolicy) throws {
+        try Task.checkCancellation()
+        guard phase == .fresh, operation == nil else { throw NativeSSHError.invalidInput }
+        let value: Int32
+        switch policy {
+        case .rawKeys: value = Int32(FTSSH_HOST_RAW)
+        case .certificates: value = Int32(FTSSH_HOST_CERTIFICATE)
+        case .certificatesAndRawKeys: value = Int32(FTSSH_HOST_MIXED)
+        }
+        try requireOK(ftssh_set_host_key_policy(native.pointer, value))
     }
 
     public func authenticate(using authority: any NativeSSHAuthentication, timeout: Duration = .seconds(60)) async throws -> NativeSSHPeer {
@@ -865,6 +968,224 @@ public actor NativeSSHSession {
         }
     }
 
+    /// Start the SFTP subsystem on this separately authenticated owner. Shell,
+    /// exec, terminal-driver and forwarding APIs cannot use this owner afterward.
+    public func startSFTP(timeout: Duration = .seconds(15)) async throws {
+        try await performSFTP(starting: true, timeout: timeout) { token, deadline in
+            try requireSFTPOK(ftssh_begin_sftp(native.pointer))
+            _ = try await driveSFTP(token, deadline: deadline, starting: true)
+            phase = .sftp
+        }
+    }
+
+    /// Resolve the path and return one bounded directory listing. Dot entries
+    /// are omitted. A full listing is distinguished from a truncated one by
+    /// reading at most one additional admissible entry; it never buffers a
+    /// complete unbounded remote directory.
+    public func listSFTPDirectory(path: String, limit: Int = 512,
+                                  timeout: Duration = .seconds(15)) async throws -> NativeSFTPDirectoryListing {
+        let pathBytes = try sftpPath(path)
+        guard (1...512).contains(limit) else { throw NativeSFTPError.invalidLimit }
+        guard sftpFileMode == nil else { throw NativeSSHError.busy }
+        return try await performSFTP(timeout: timeout) { token, deadline in
+            try beginSFTP(Int32(FTSSH_SFTP_REALPATH), bytes: pathBytes)
+            _ = try await driveSFTP(token, deadline: deadline)
+            let resolved = try sftpResult(capacity: Int(FTSSH_SFTP_PATH_CAPACITY)).bytes
+            guard let canonical = String(data: resolved, encoding: .utf8), canonical.hasPrefix("/"),
+                  canonical == "/" || canonical.dropFirst().split(separator: "/", omittingEmptySubsequences: false)
+                    .allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
+                throw NativeSFTPError.malformedResponse
+            }
+            try beginSFTP(Int32(FTSSH_SFTP_OPEN_DIRECTORY), bytes: resolved)
+            _ = try await driveSFTP(token, deadline: deadline)
+            var entries: [NativeSFTPDirectoryEntry] = []
+            var names: Set<Data> = []
+            var listingBytes = resolved.count, examined = 0
+            var truncated = false
+            while true {
+                try current(token, deadline)
+                try beginSFTP(Int32(FTSSH_SFTP_READ_DIRECTORY))
+                if try await driveSFTP(token, deadline: deadline) { break }
+                let result = try sftpResult(capacity: Int(FTSSH_SFTP_NAME_CAPACITY))
+                examined += 1
+                guard examined <= 4096, let name = String(data: result.bytes, encoding: .utf8),
+                      !name.isEmpty, !result.bytes.contains(0), !result.bytes.contains(47) else {
+                    throw NativeSFTPError.malformedResponse
+                }
+                if examined.isMultiple(of: 32) { await Task.yield(); try current(token, deadline) }
+                if name == "." || name == ".." { continue }
+                guard names.insert(result.bytes).inserted else { throw NativeSFTPError.malformedResponse }
+                let cost = result.bytes.count + 64
+                if entries.count == limit || cost > 1_048_576 - listingBytes {
+                    truncated = true
+                    break
+                }
+                listingBytes += cost
+                entries.append(.init(name: name, attributes: result.attributes))
+            }
+            try beginSFTP(Int32(FTSSH_SFTP_CLOSE_HANDLE))
+            _ = try await driveSFTP(token, deadline: deadline)
+            return .init(path: canonical, entries: entries, isTruncated: truncated)
+        }
+    }
+
+    /// Opens exactly one regular file. Exclusive creation never truncates,
+    /// replaces, resumes, or seeks an existing remote destination.
+    public func openSFTPFile(path: String, mode: NativeSFTPFileMode,
+                             timeout: Duration = .seconds(15)) async throws -> NativeSFTPFileAttributes {
+        let pathBytes = try sftpPath(path)
+        guard sftpFileMode == nil else { throw NativeSSHError.busy }
+        return try await performSFTP(timeout: timeout) { token, deadline in
+            try beginSFTP(mode == .read ? Int32(FTSSH_SFTP_OPEN_READ) : Int32(FTSSH_SFTP_CREATE_EXCLUSIVE),
+                          bytes: pathBytes)
+            _ = try await driveSFTP(token, deadline: deadline)
+            try beginSFTP(Int32(FTSSH_SFTP_FSTAT))
+            _ = try await driveSFTP(token, deadline: deadline)
+            let attributes = try sftpResult().attributes
+            guard attributes.kind == .regularFile else { throw NativeSFTPError.unsupportedFile }
+            sftpFileMode = mode
+            return attributes
+        }
+    }
+
+    /// Empty data is remote EOF. Every call has a fixed maximum and does not
+    /// preload or retain the rest of the remote file.
+    public func readSFTPFile(maximumBytes: Int = 65_536,
+                             timeout: Duration = .seconds(15)) async throws -> Data {
+        guard (1...Int(FTSSH_SFTP_IO_CAPACITY)).contains(maximumBytes) else { throw NativeSFTPError.invalidLimit }
+        guard sftpFileMode == .read else { throw phase == .closed ? NativeSSHError.closed : .busy }
+        return try await performSFTP(timeout: timeout) { token, deadline in
+            try beginSFTP(Int32(FTSSH_SFTP_READ_FILE), length: maximumBytes)
+            _ = try await driveSFTP(token, deadline: deadline)
+            return try sftpResult(capacity: maximumBytes).bytes
+        }
+    }
+
+    /// Returns the complete chunk length only after the SFTP server acknowledges
+    /// all of it. Failure or cancellation may leave a partial remote file; no
+    /// rollback, replay, or automatic resume is implied.
+    public func writeSFTPFile(_ bytes: Data, timeout: Duration = .seconds(15)) async throws -> Int {
+        guard (1...Int(FTSSH_SFTP_IO_CAPACITY)).contains(bytes.count) else { throw NativeSFTPError.invalidLimit }
+        guard sftpFileMode == .createExclusive else { throw phase == .closed ? NativeSSHError.closed : .busy }
+        return try await performSFTP(timeout: timeout) { token, deadline in
+            try beginSFTP(Int32(FTSSH_SFTP_WRITE_FILE), bytes: bytes)
+            _ = try await driveSFTP(token, deadline: deadline)
+            let result = try sftpResult()
+            guard result.count == bytes.count else { throw NativeSFTPError.malformedResponse }
+            return result.count
+        }
+    }
+
+    public func statSFTPFile(timeout: Duration = .seconds(15)) async throws -> NativeSFTPFileAttributes {
+        guard sftpFileMode != nil else { throw phase == .closed ? NativeSSHError.closed : .busy }
+        return try await performSFTP(timeout: timeout) { token, deadline in
+            try beginSFTP(Int32(FTSSH_SFTP_FSTAT))
+            _ = try await driveSFTP(token, deadline: deadline)
+            let attributes = try sftpResult().attributes
+            guard attributes.kind == .regularFile else { throw NativeSFTPError.unsupportedFile }
+            return attributes
+        }
+    }
+
+    public func closeSFTPFile(timeout: Duration = .seconds(15)) async throws {
+        guard sftpFileMode != nil else { return }
+        try await performSFTP(timeout: timeout) { token, deadline in
+            try beginSFTP(Int32(FTSSH_SFTP_CLOSE_HANDLE))
+            _ = try await driveSFTP(token, deadline: deadline)
+            sftpFileMode = nil
+        }
+    }
+
+    private func sftpPath(_ path: String) throws -> Data {
+        let bytes = Data(path.utf8)
+        guard !bytes.isEmpty, bytes.count <= Int(FTSSH_SFTP_PATH_CAPACITY), !bytes.contains(0) else {
+            throw NativeSFTPError.invalidPath
+        }
+        return bytes
+    }
+
+    private func performSFTP<Value: Sendable>(starting: Bool = false, timeout: Duration,
+        _ body: (UUID, ContinuousClock.Instant) async throws -> Value) async throws -> Value {
+        let deadline = try deadline(timeout)
+        guard phase == (starting ? .authenticated : .sftp), operation == nil, let authority = authorization else {
+            throw phase == .closed ? NativeSSHError.closed : .busy
+        }
+        try Task.checkCancellation()
+        let token = UUID(); operation = token
+        if starting { phase = .opening }
+        let timer = expiry(deadline, operation: token)
+        defer { timer.cancel(); if operation == token { operation = nil } }
+        do {
+            return try await withTaskCancellationHandler {
+                try await authority.validate()
+                try await validateForwardingPath()
+                try current(token, deadline)
+                let result = try await body(token, deadline)
+                try await authority.validate()
+                try await validateForwardingPath()
+                try current(token, deadline)
+                return result
+            } onCancel: { [weak self] in Task { await self?.close() } }
+        } catch {
+            await close()
+            if Task.isCancelled { throw CancellationError() }
+            if ContinuousClock.now >= deadline { throw NativeSSHError.timedOut }
+            throw error
+        }
+    }
+
+    private func beginSFTP(_ operation: Int32, bytes: Data? = nil, length: Int = 0) throws {
+        let result: Int32
+        if let bytes {
+            result = bytes.withUnsafeBytes {
+                ftssh_sftp_begin(native.pointer, operation, $0.bindMemory(to: UInt8.self).baseAddress, bytes.count)
+            }
+        } else { result = ftssh_sftp_begin(native.pointer, operation, nil, length) }
+        try requireSFTPOK(result)
+    }
+
+    /// True means the completed read reached EOF. No borrowed path, buffer or
+    /// attribute pointer spans this await: the C owner retains retry arguments.
+    private func driveSFTP(_ token: UUID, deadline: ContinuousClock.Instant,
+                           starting: Bool = false) async throws -> Bool {
+        while true {
+            try current(token, deadline)
+            let result = starting ? ftssh_sftp_start_step(native.pointer) : ftssh_sftp_step(native.pointer)
+            if result == FTSSH_OK { return false }
+            if !starting, result == FTSSH_EOF { return true }
+            guard result == FTSSH_AGAIN else { throw sftpError(result) }
+            try await ready(directions: ftssh_directions(native.pointer), deadline: deadline)
+        }
+    }
+
+    private func sftpResult(capacity: Int = 0) throws
+        -> (bytes: Data, count: Int, attributes: NativeSFTPFileAttributes) {
+        var bytes = Data(count: capacity), count = 0, attributes = ftssh_sftp_attributes()
+        let result = bytes.withUnsafeMutableBytes {
+            ftssh_sftp_copy_result(native.pointer, $0.bindMemory(to: UInt8.self).baseAddress,
+                capacity, &count, &attributes)
+        }
+        try requireSFTPOK(result)
+        if capacity > 0 {
+            guard count <= capacity else { throw NativeSFTPError.malformedResponse }
+            bytes.count = count
+        }
+        return (bytes, count, .init(attributes))
+    }
+
+    private func requireSFTPOK(_ code: Int32) throws {
+        guard code == FTSSH_OK else { throw sftpError(code) }
+    }
+
+    private func sftpError(_ code: Int32) -> any Error {
+        if code == FTSSH_SFTP_ERROR {
+            var status: UInt32 = 0
+            if ftssh_sftp_status(native.pointer, &status) == FTSSH_OK { return NativeSFTPError.server(status: status) }
+        }
+        if code == FTSSH_SFTP_RESPONSE { return NativeSFTPError.malformedResponse }
+        return NativeSSHError.native(code)
+    }
+
     private func openChannel(timeout: Duration, begin: () -> Int32) async throws {
         let deadline = try deadline(timeout)
         guard phase == .authenticated, operation == nil, let authority = authorization else {
@@ -1121,6 +1442,7 @@ public actor NativeSSHSession {
     public func close() async {
         if let shutdown { await shutdown.value; return }
         phase = .closed; operation = nil
+        sftpFileMode = nil
         authentication?.cancel(transportID: transportID)
         passwordAuthentication?.cancel(transportID: transportID)
         interactiveAuthentication?.cancel(transportID: transportID)
