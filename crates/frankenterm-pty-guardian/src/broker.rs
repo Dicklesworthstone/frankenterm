@@ -8704,15 +8704,17 @@ impl BrokerControlClientV1 {
             {
                 BrokerControlResponseStatusV1::Applied => return Ok(()),
                 // The broker wrote nothing: an output drain held the pane's
-                // reader. The same request may go again until the deadline.
+                // reader. The same request may go again until the deadline,
+                // checked after the pause so no resend starts past it (an
+                // expired exchange would poison a connection that is clean).
                 BrokerControlResponseStatusV1::Retryable => {
+                    thread::sleep(Duration::from_millis(1));
                     if Instant::now() >= deadline {
                         return Err(BrokerControlClientError::Io(std::io::Error::new(
                             std::io::ErrorKind::TimedOut,
                             "broker input deadline",
                         )));
                     }
-                    thread::sleep(Duration::from_millis(1));
                 }
                 // No other status permits retransmission of raw input. The
                 // outer canonical WAL records the failed/ambiguous attempt and
