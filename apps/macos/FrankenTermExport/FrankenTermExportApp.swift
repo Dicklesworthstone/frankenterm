@@ -2505,6 +2505,7 @@ private struct MacExportView: View {
         let related = trust.map { selected in document.hostTrust.filter { $0.canonicalTrustScope == selected.canonicalTrustScope } } ?? []
         let required = Set(route.requiredCapabilities).union(route.requiredExtensions.map { "extension:" + $0 })
             .union(related.flatMap(\.requiredPolicyRequirements))
+            .subtracting([WorkspaceDocument.hostCertificateCapability])
         let revoked = Array(Set(related.flatMap(\.revokedKeys))).sorted {
             $0.algorithm == $1.algorithm ? $0.fingerprint < $1.fingerprint : $0.algorithm < $1.algorithm
         }
@@ -2519,9 +2520,13 @@ private struct MacExportView: View {
                     .font(.caption).foregroundStyle(.orange)
             }
             if let trust {
-                if trust.pins.isEmpty { Label("Host verification required", systemImage: "questionmark.shield").font(.caption) }
+                if !trust.hasConfiguredIdentity { Label("Host verification required", systemImage: "questionmark.shield").font(.caption) }
                 ForEach(trust.pins, id: \.self) { key in
                     Text("Pin · \(key.algorithm) · \(key.fingerprint)").font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                }
+                ForEach(trust.certificateAuthorities, id: \.self) { authority in
+                    Text("Host certificate authority · \(authority.algorithm) · \(authority.fingerprint)")
+                        .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
                 }
                 ForEach(revoked, id: \.self) { key in
                     Text("Revoked · \(key.algorithm) · \(key.fingerprint)").font(.system(.caption, design: .monospaced)).foregroundStyle(.red).textSelection(.enabled)

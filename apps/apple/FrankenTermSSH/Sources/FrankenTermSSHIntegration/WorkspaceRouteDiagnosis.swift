@@ -159,7 +159,7 @@ public struct WorkspaceConnectionHelp: Sendable, Equatable {
 public enum WorkspaceRouteProbe {
     public struct Result: Sendable {
         public let network: WorkspaceRouteNetwork
-        /// The pinned-key decision for the key the machine presented, when the
+        /// The pin or CA decision for the identity the machine presented, when the
         /// exchange got that far.
         public let hostKey: WorkspaceDocument.HostVerificationDecision?
         public let peer: NativeSSHPeer?
@@ -169,7 +169,7 @@ public enum WorkspaceRouteProbe {
         /// Use the same signature/algorithm qualification as authentication.
         public var observedIdentity: SSHPublicIdentity? {
             guard failure == nil, let peer else { return nil }
-            return try? WorkspaceNativeSSHAuthentication.hostIdentity(for: peer)
+            return try? WorkspaceNativeSSHAuthentication.hostIdentity(for: peer).rawIdentity
         }
     }
 
@@ -278,13 +278,16 @@ public enum WorkspaceRouteProbe {
         let network = WorkspaceRouteNetwork(host: route.host)
         let witness = PeerWitness(transportID: session.transportID)
         var failure: (any Error)?
-        do { _ = try await session.authenticate(using: witness, timeout: timeout) } catch { failure = error }
+        do {
+            try await session.setHostKeyPolicy(WorkspaceNativeSSHAuthentication.hostKeyPolicy(for: route, document: document))
+            _ = try await session.authenticate(using: witness, timeout: timeout)
+        } catch { failure = error }
         await session.close()
         guard let peer = await witness.peer else { return .init(network: network, hostKey: nil, peer: nil, failure: failure) }
         do {
             let identity = try WorkspaceNativeSSHAuthentication.hostIdentity(for: peer)
             let decision = try document.verifyHostKey(forRouteID: route.id,
-                presented: .init(algorithm: identity.algorithm, fingerprint: identity.fingerprint),
+                presented: identity.key, hostCertificate: identity.certificate,
                 reviewedTrustIDs: Set(document.hostTrust.map(\.id)),
                 support: WorkspaceNativeSSHAuthentication.routeSupport)
             return .init(network: network, hostKey: decision, peer: peer, failure: nil)

@@ -209,8 +209,14 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     @discardableResult
     func copyHostKeyFingerprint(_ key: WorkspaceDocument.HostKey, from controller: TerminalSessionController,
                                expected mismatch: WorkspaceSSHConnectionHostKeyMismatch) -> Bool {
+        let certificateIdentity = mismatch.hostCertificate.map { certificate in
+            [certificate.subject, certificate.authority].contains {
+                $0.algorithm == key.algorithm && $0.fingerprint == key.fingerprint
+            }
+        } ?? false
         guard hostKeyMismatch(for: controller) == mismatch,
-              key == mismatch.presentedKey || mismatch.expectedKeys.contains(key) else { return false }
+              key == mismatch.presentedKey || mismatch.expectedKeys.contains(key)
+                || mismatch.expectedCertificateAuthorities.contains(key) || certificateIdentity else { return false }
         UIPasteboard.general.setItems([[UTType.utf8PlainText.identifier: key.fingerprint]],
             options: [.localOnly: true, .expirationDate: Date().addingTimeInterval(120)])
         return true
@@ -2311,7 +2317,7 @@ private struct TerminalHostKeyMismatchScreen: View {
                         Section {
                             Label("Connection Stopped", systemImage: "exclamationmark.shield")
                                 .font(.headline)
-                            Text("This peer presented a different host key. FrankenTerm stopped before signing into it. A planned server change, a different server, or interception can cause this; verify the identity independently.")
+                            Text("This peer presented an identity outside this workspace's permitted keys and certificate authorities. FrankenTerm stopped before signing into it. A planned server change, a different server, or interception can cause this; verify the identity independently.")
                         }
                         Section("Affected Connection") {
                             detail("Workspace", scene.workspaceName)
@@ -2324,18 +2330,37 @@ private struct TerminalHostKeyMismatchScreen: View {
                             detail("Port", String(mismatch.port))
                             detail("SSH User", mismatch.user)
                             detail("Host-Key Alias", mismatch.hostKeyAlias ?? "None — uses the host name")
-                        }
-                        Section {
-                            ForEach(Array(mismatch.expectedKeys.enumerated()), id: \.offset) { index, key in
-                                fingerprint(key, mismatch: mismatch, presented: false)
-                                    .accessibilityIdentifier("terminal.host-key.expected.\(index)")
+                            if !mismatch.expectedCertificateAuthorities.isEmpty || mismatch.hostCertificate != nil {
+                                detail("Certificate Principal", mismatch.certificatePrincipal)
                             }
-                        } header: {
-                            Text("Expected on This Phone")
-                        } footer: {
-                            Text("These are the permitted host keys for this exact peer when the connection was checked.")
+                        }
+                        if !mismatch.expectedKeys.isEmpty {
+                            Section {
+                                ForEach(Array(mismatch.expectedKeys.enumerated()), id: \.offset) { index, key in
+                                    fingerprint(key, mismatch: mismatch, presented: false)
+                                        .accessibilityIdentifier("terminal.host-key.expected.\(index)")
+                                }
+                            } header: {
+                                Text("Expected Host Keys")
+                            } footer: {
+                                Text("These were the permitted raw host keys for this exact peer when the connection was checked.")
+                            }
+                        }
+                        if !mismatch.expectedCertificateAuthorities.isEmpty {
+                            Section {
+                                ForEach(Array(mismatch.expectedCertificateAuthorities.enumerated()), id: \.offset) { index, authority in
+                                    fingerprint(authority, mismatch: mismatch, presented: false)
+                                        .accessibilityIdentifier("terminal.host-key.expected-authority.\(index)")
+                                }
+                            } header: {
+                                Text("Expected Certificate Authorities")
+                            } footer: {
+                                Text("These authorities may certify this peer's host key. An authority fingerprint is different from the host key and certificate fingerprints.")
+                            }
                         }
                         Section {
+                            Text(mismatch.hostCertificate == nil ? "Host key" : "Exact host certificate")
+                                .font(.caption).foregroundStyle(.secondary)
                             fingerprint(mismatch.presentedKey, mismatch: mismatch, presented: true)
                                 .accessibilityIdentifier("terminal.host-key.presented")
                         } header: {
@@ -2343,15 +2368,27 @@ private struct TerminalHostKeyMismatchScreen: View {
                         } footer: {
                             Text("Copying a fingerprint does not trust it. Copied text stays on this device and expires from the clipboard after 2 minutes.")
                         }
+                        if let certificate = mismatch.hostCertificate,
+                           let authority = try? WorkspaceDocument.HostKey(algorithm: certificate.authority.algorithm,
+                                fingerprint: certificate.authority.fingerprint),
+                           let subject = try? WorkspaceDocument.HostKey(algorithm: certificate.subject.algorithm,
+                                fingerprint: certificate.subject.fingerprint) {
+                            Section("Presented Certificate's Signing Authority") {
+                                fingerprint(authority, mismatch: mismatch, presented: true)
+                            }
+                            Section("Presented Certificate's Host Key") {
+                                fingerprint(subject, mismatch: mismatch, presented: true)
+                            }
+                        }
                         Section("Verify Before Updating") {
                             Text("Compare the complete new fingerprint with the machine's administrator or a trusted console using a separate channel. A fresh connection or ssh-keyscan alone does not verify identity.")
-                            Text("For a key imported from your Mac, update this peer's trusted host key on the Mac after independent verification, then export the workspace again with FrankenTerm Export.")
+                            Text("For trust imported from your Mac, verify this peer's host key or certificate authority on the Mac, then export the workspace again with FrankenTerm Export.")
                             Text("Return to the workspace list, tap Add machines (+), then choose Scan My Mac or Open a Workspace or Results File. Review the workspace update and its host-key changes before restoring.")
                             Text("For a key you verified on this phone, return to the machine page, open Keys, and choose Check for a Changed Host Key… for this peer. Independently compare the new fingerprint before replacing the phone-verified key.")
                             Text("Keys blocked on this phone remain blocked after a workspace update.")
                         }
                         Section("Check the Connection Path") {
-                            Text("If this is the wrong path, return to the machine page and choose Choose Route and Sign-In. Every jump host and the destination must still match their permitted keys.")
+                            Text("If this is the wrong path, return to the machine page and choose Choose Route and Sign-In. Every jump host and the destination must still match their permitted keys or certificate authorities.")
                         }
                     }
                 } else {
@@ -2359,7 +2396,7 @@ private struct TerminalHostKeyMismatchScreen: View {
                         description: Text("This review is available only while FrankenTerm is in the foreground. Entering the background or replacing the connection clears its fingerprint details."))
                 }
             }
-            .navigationTitle("Host Key Changed").navigationBarTitleDisplayMode(.inline)
+            .navigationTitle("Host Identity Changed").navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
             }

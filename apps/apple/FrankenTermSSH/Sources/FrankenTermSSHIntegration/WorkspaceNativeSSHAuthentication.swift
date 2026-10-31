@@ -23,6 +23,7 @@ public actor WorkspaceNativeSSHPasswordAuthentication: NativeSSHPasswordAuthenti
     private var selected: WorkspaceSSHPasswordIdentity?
     private var selectedPeer: NativeSSHPeer?
     private var selectedAccount: NativeSSHPasswordAccount?
+    private var validatedPeer: (peer: NativeSSHPeer, host: WorkspaceNativeSSHAuthentication.HostIdentity)?
 
     public init(broker: SSHAuthenticationBroker, prompter: any WorkspaceSSHPasswordPrompting,
                 workspaceID: UUID, revision: UUID, routeID: String, transportID: UUID,
@@ -54,7 +55,8 @@ public actor WorkspaceNativeSSHPasswordAuthentication: NativeSSHPasswordAuthenti
         do {
             let host = try validatePeer(peer)
             let selected = try await broker.passwordIdentity(workspaceID: workspaceID, expectedRevision: revision,
-                routeID: routeID, presentedHostKey: host, transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe)
+                routeID: routeID, presentedHostKey: host.key, hostCertificate: host.certificate,
+                transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe)
             try checkCurrent()
             try validateRoute(selected.authorization)
             let account = try NativeSSHPasswordAccount(user: selected.authorization.user)
@@ -120,10 +122,15 @@ public actor WorkspaceNativeSSHPasswordAuthentication: NativeSSHPasswordAuthenti
 
     private func checkCurrent() throws { try Task.checkCancellation(); try retirement.check() }
 
-    private func validatePeer(_ peer: NativeSSHPeer) throws -> WorkspaceDocument.HostKey {
+    private func validatePeer(_ peer: NativeSSHPeer) throws -> WorkspaceNativeSSHAuthentication.HostIdentity {
         guard peer.transportID == transportID, peer.endpoint == endpoint else { throw SSHAuthenticationError.stale }
+        if let validatedPeer {
+            guard validatedPeer.peer == peer else { throw SSHAuthenticationError.stale }
+            return validatedPeer.host
+        }
         let host = try WorkspaceNativeSSHAuthentication.hostIdentity(for: peer)
-        return try WorkspaceDocument.HostKey(algorithm: host.algorithm, fingerprint: host.fingerprint)
+        validatedPeer = (peer, host)
+        return host
     }
 
     private func validateRoute(_ authorization: WorkspaceSSHPasswordAuthorization) throws {
@@ -157,6 +164,7 @@ public actor WorkspaceNativeSSHInteractiveAuthentication: NativeSSHInteractiveAu
     private var selected: WorkspaceSSHKeyboardInteractiveIdentity?
     private var selectedPeer: NativeSSHPeer?
     private var selectedAccount: NativeSSHInteractiveAccount?
+    private var validatedPeer: (peer: NativeSSHPeer, host: WorkspaceNativeSSHAuthentication.HostIdentity)?
     private var lastRound: UInt32 = 0
 
     public init(broker: SSHAuthenticationBroker, prompter: any WorkspaceSSHKeyboardInteractivePrompting,
@@ -192,7 +200,7 @@ public actor WorkspaceNativeSSHInteractiveAuthentication: NativeSSHInteractiveAu
             let host = try validatePeer(peer)
             try await validatePrerequisite(peer: peer)
             let selected = try await broker.keyboardInteractiveIdentity(workspaceID: workspaceID,
-                expectedRevision: revision, routeID: routeID, presentedHostKey: host,
+                expectedRevision: revision, routeID: routeID, presentedHostKey: host.key, hostCertificate: host.certificate,
                 transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe)
             do {
                 try checkCurrent()
@@ -318,10 +326,15 @@ public actor WorkspaceNativeSSHInteractiveAuthentication: NativeSSHInteractiveAu
         func cancel(requestID: UUID) { base.cancel(requestID: requestID) }
     }
 
-    private func validatePeer(_ peer: NativeSSHPeer) throws -> WorkspaceDocument.HostKey {
+    private func validatePeer(_ peer: NativeSSHPeer) throws -> WorkspaceNativeSSHAuthentication.HostIdentity {
         guard peer.transportID == transportID, peer.endpoint == endpoint else { throw SSHAuthenticationError.stale }
+        if let validatedPeer {
+            guard validatedPeer.peer == peer else { throw SSHAuthenticationError.stale }
+            return validatedPeer.host
+        }
         let host = try WorkspaceNativeSSHAuthentication.hostIdentity(for: peer)
-        return try WorkspaceDocument.HostKey(algorithm: host.algorithm, fingerprint: host.fingerprint)
+        validatedPeer = (peer, host)
+        return host
     }
 
     private func validateRoute(_ authorization: WorkspaceSSHKeyboardInteractiveAuthorization) throws {
@@ -353,8 +366,11 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
     public static let routeSupport = WorkspaceDocument.RouteSupport(
         routeModes: ["direct_ssh", "frankenterm_mux"], authenticationMethods: [.publicKey, .password, .keyboardInteractive],
         credentialAlgorithms: ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521", "ssh-rsa"],
-        hostKeyAlgorithms: ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521", "ssh-rsa"],
-        capabilities: [WorkspaceDocument.userCertificateCapability],
+        hostKeyAlgorithms: SSHHostCertificate.supportedAuthorityAlgorithms.union(
+            NativeSSHSession.supportsHostCertificates ? SSHHostCertificate.supportedAlgorithms : []),
+        capabilities: NativeSSHSession.supportsHostCertificates
+            ? [WorkspaceDocument.userCertificateCapability, WorkspaceDocument.hostCertificateCapability]
+            : [WorkspaceDocument.userCertificateCapability],
         maximumJumpHops: 3)
 
     fileprivate final class Retirement: @unchecked Sendable {
@@ -397,6 +413,7 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
     private var selected: WorkspaceSSHIdentity?
     private var selectedPeer: NativeSSHPeer?
     private var selectedIdentity: NativeSSHIdentity?
+    private var validatedPeer: (peer: NativeSSHPeer, host: HostIdentity)?
 
     public init(broker: SSHAuthenticationBroker, workspaceID: UUID, revision: UUID,
                 routeID: String, credentialID: String, transportID: UUID, endpoint: NativeSSHEndpoint,
@@ -431,12 +448,14 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
             let foreground = try await broker.foregroundLease()
             try checkCurrent()
             let authorization = try await broker.authorization(workspaceID: workspaceID, expectedRevision: revision,
-                routeID: routeID, credentialID: credentialID, presentedHostKey: host, transitForRouteID: transitForRouteID,
+                routeID: routeID, credentialID: credentialID, presentedHostKey: host.key, hostCertificate: host.certificate,
+                transitForRouteID: transitForRouteID,
                 hostKeyProbe: hostKeyProbe)
             try await broker.validateForeground(foreground)
             try checkCurrent(); try validateRoute(authorization)
             let value = try await broker.publicIdentity(workspaceID: workspaceID, expectedRevision: revision,
-                routeID: routeID, credentialID: credentialID, presentedHostKey: host, transportID: transportID,
+                routeID: routeID, credentialID: credentialID, presentedHostKey: host.key, hostCertificate: host.certificate,
+                transportID: transportID,
                 transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe)
             try await broker.validateForeground(foreground)
             try checkCurrent(); try validateRoute(value.authorization)
@@ -480,6 +499,7 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
             }
             let request = try await broker.prepare(workspaceID: workspaceID, expectedRevision: revision,
                 routeID: routeID, credentialID: credentialID, presentedHostKey: selected.authorization.presentedHostKey,
+                hostCertificate: selected.authorization.hostCertificate,
                 transportID: transportID, sessionIdentifier: challenge.sessionIdentifier, publicBlob: selected.authenticationBlob,
                 signatureAlgorithm: challenge.algorithm,
                 transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe)
@@ -569,15 +589,44 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
         }
     }
 
-    private func validatePeer(_ peer: NativeSSHPeer) throws -> WorkspaceDocument.HostKey {
+    private func validatePeer(_ peer: NativeSSHPeer) throws -> HostIdentity {
         guard peer.transportID == transportID, peer.endpoint == endpoint else { throw SSHAuthenticationError.denied }
+        if let validatedPeer {
+            guard validatedPeer.peer == peer else { throw SSHAuthenticationError.stale }
+            return validatedPeer.host
+        }
         let host = try Self.hostIdentity(for: peer)
-        return try WorkspaceDocument.HostKey(algorithm: host.algorithm, fingerprint: host.fingerprint)
+        validatedPeer = (peer, host)
+        return host
+    }
+
+    /// Preserve the whole certificate as the presented identity. A subject key
+    /// is neither an imported raw pin nor a substitute for a verified issuer.
+    struct HostIdentity: Sendable {
+        let key: WorkspaceDocument.HostKey
+        let certificate: SSHHostCertificate?
+        let rawIdentity: SSHPublicIdentity?
+    }
+
+    /// Each fresh transport selects its profile from this exact peer's current
+    /// imported trust. A CA-only route cannot negotiate a raw-key downgrade.
+    static func hostKeyPolicy(for route: WorkspaceDocument.Route,
+                              document: WorkspaceDocument) throws -> NativeSSHHostKeyPolicy {
+        guard let trust = document.hostTrust.first(where: { $0.id == route.trustID }) else {
+            throw SSHAuthenticationError.denied
+        }
+        guard !trust.certificateAuthorities.isEmpty else { return .rawKeys }
+        guard NativeSSHSession.supportsHostCertificates else { throw SSHAuthenticationError.unavailable }
+        return trust.pins.isEmpty ? .certificates : .certificatesAndRawKeys
     }
 
     /// Authentication and read-only route diagnosis apply the same negotiated
-    /// exchange profile. The native driver has already verified its signature.
-    static func hostIdentity(for peer: NativeSSHPeer) throws -> SSHPublicIdentity {
+    /// exchange profile. The native driver has proved subject-key possession;
+    /// parsing a certificate separately verifies its complete issuer signature.
+    /// The broker then checks current CA trust, principals, time and revocation.
+    /// Actors cache this immutable parse only for the exact same exchanged peer;
+    /// the broker continues to revalidate mutable policy at every trust boundary.
+    static func hostIdentity(for peer: NativeSSHPeer) throws -> HostIdentity {
         let exchanges: Set<String> = ["curve25519-sha256", "curve25519-sha256@libssh.org",
             "ecdh-sha2-nistp256", "ecdh-sha2-nistp384", "ecdh-sha2-nistp521"]
         let ciphers: Set<String> = ["aes256-ctr", "aes128-ctr"]
@@ -587,10 +636,21 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
               peer.outboundCompression == "none", peer.inboundCompression == "none" else {
             throw SSHAuthenticationError.denied
         }
+        if peer.hostSignature.hasSuffix("-cert-v01@openssh.com") {
+            guard NativeSSHSession.supportsHostCertificates else { throw SSHAuthenticationError.unavailable }
+            let certificate = try SSHHostCertificate(blob: peer.hostKey)
+            guard certificate.permitsHostSignature(peer.hostSignature),
+                  Self.routeSupport.hostKeyAlgorithms.contains(certificate.subject.algorithm) else {
+                throw SSHAuthenticationError.denied
+            }
+            return HostIdentity(key: try .init(algorithm: certificate.algorithm, fingerprint: certificate.fingerprint),
+                certificate: certificate, rawIdentity: nil)
+        }
         let host = try SSHPublicIdentity(blob: peer.hostKey)
         guard host.permitsHostSignature(peer.hostSignature), Self.routeSupport.hostKeyAlgorithms.contains(host.algorithm) else {
             throw SSHAuthenticationError.denied
         }
-        return host
+        return HostIdentity(key: try .init(algorithm: host.algorithm, fingerprint: host.fingerprint),
+            certificate: nil, rawIdentity: host)
     }
 }

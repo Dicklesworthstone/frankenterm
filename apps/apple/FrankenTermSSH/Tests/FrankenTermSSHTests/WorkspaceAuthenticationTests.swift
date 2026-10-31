@@ -264,6 +264,7 @@ struct SSHWorkspaceTestFixture: Sendable {
                      primaryKey: PrivateKeyRecord? = nil,
                      additionalKeys: [PrivateKeyRecord] = [],
                      seed: Data = Data(0..<32), persistence: any WorkspacePersistence = SSHWorkspaceTestPersistence(),
+                     requiredCapabilities: [String] = [],
                      mutate: (inout [String: Any]) -> Void = { _ in }) async throws -> Self {
         let crypto = SSHWorkspaceTestCryptography()
         let key = try crypto.ed25519PublicKey(seed: seed)
@@ -299,7 +300,7 @@ struct SSHWorkspaceTestFixture: Sendable {
             "themes": [theme], "preferences": ["initial_machine_ref": "machine", "initial_group_ref": "group", "connect_on_open": true]]
         mutate(&workspace)
         let manifest = try JSONSerialization.data(withJSONObject: ["format": "ftworkspace", "version": 1, "bundle_id": "bundle",
-            "source": ["exporter_id": "test"], "required_capabilities": [], "workspace": workspace], options: [.sortedKeys])
+            "source": ["exporter_id": "test"], "required_capabilities": requiredCapabilities, "workspace": workspace], options: [.sortedKeys])
         let archive = try AirGapArchive(workspace: WorkspaceDocument(data: manifest),
             keys: [record] + additionalKeys, using: crypto)
         let vault = SSHWorkspaceTestVault(), store = WorkspaceStore(persistence: persistence, vault: vault)

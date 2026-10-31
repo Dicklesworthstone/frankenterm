@@ -2093,7 +2093,7 @@ final class MobileWorkspaceModel {
               let saved = workspaces.first(where: { $0.id == workspaceID }),
               let document = try? saved.document(),
               let trust = document.hostTrust.first(where: { $0.id == trustID }),
-              trust.pins.contains(key) else { return nil }
+              trust.pins.contains(key) || trust.certificateAuthorities.contains(key) else { return nil }
         let names = workspacesNaming(host: trust.host, port: trust.port).compactMap { try? $0.document().name }
             .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
         let reviewed = LocalHostRevocationReview(workspaceID: workspaceID, revision: saved.revision,
@@ -2117,7 +2117,7 @@ final class MobileWorkspaceModel {
             && (route.mode == "direct_ssh" || route.mode == "frankenterm_mux") {
             // Rotation is offered only for this phone's still-applicable pin.
             // Imported trust remains under the workspace source's authority.
-            if !trust.pins.isEmpty {
+            if trust.hasConfiguredIdentity {
                 guard (try? saved.phoneHostKeyPin(forRouteID: route.id)) != nil else { continue }
             }
             // Direct checks need no credential inventory. Even if protected
@@ -2297,7 +2297,7 @@ final class MobileWorkspaceModel {
               let saved = workspaces.first(where: { $0.id == reviewed.workspaceID }), saved.revision == reviewed.revision,
               let document = try? saved.document(), document.hostTrust.contains(where: {
                   $0.id == reviewed.trustID && $0.host == reviewed.host && $0.port == reviewed.port
-                      && $0.pins.contains(reviewed.key)
+                      && ($0.pins.contains(reviewed.key) || $0.certificateAuthorities.contains(reviewed.key))
               }) else {
             credentialMessage = "This host or workspace changed. Review the host key again before blocking it."
             return
@@ -3485,6 +3485,10 @@ struct OfflineRestoreSheet: View {
                             ForEach(trust.pins, id: \.self) { key in
                                 Text(verbatim: "Host \(key.algorithm) \(key.fingerprint)").font(.system(.caption2, design: .monospaced))
                             }
+                            ForEach(trust.certificateAuthorities, id: \.self) { authority in
+                                Text(verbatim: "Host certificate authority \(authority.algorithm) \(authority.fingerprint)")
+                                    .font(.system(.caption2, design: .monospaced))
+                            }
                             if !trust.revokedKeys.isEmpty { Text("\(trust.revokedKeys.count) host-key revocations apply.").font(.caption) }
                         }
                     }
@@ -3635,10 +3639,18 @@ private struct ImportHostPolicyReview: View {
                             Text(verbatim: "\(pin.algorithm) · \(pin.fingerprint)")
                                 .font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
                         }
+                        ForEach(trust.certificateAuthorities, id: \.self) { authority in
+                            Text(verbatim: "Certificate authority · \(authority.algorithm) · \(authority.fingerprint)")
+                                .font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
+                        }
+                        if !trust.certificateAuthorities.isEmpty {
+                            Text(verbatim: "Host certificates must be signed by a listed authority, be currently valid, and name \(trust.certificatePrincipal). Revoked certificates, host keys, and authorities remain blocked.")
+                                .font(.caption)
+                        }
                         if !trust.revokedKeys.isEmpty {
                             Text("\(trust.revokedKeys.count) explicitly revoked host identities remain blocked.").font(.caption)
                         }
-                        ForEach(trust.requiredPolicyRequirements.sorted(), id: \.self) { requirement in
+                        ForEach(trust.requiredPolicyRequirements.subtracting([WorkspaceDocument.hostCertificateCapability]).sorted(), id: \.self) { requirement in
                             Text(verbatim: "Required policy: \(requirement)").font(.caption)
                         }
                     }
@@ -4762,7 +4774,7 @@ private struct WorkspaceKeysSheet: View {
         }.font(.callout).padding(.vertical, 6)
     }
 
-    /// One host and port, and each key its trust records pin there, once.
+    /// One host and port, and each pinned key or authority there, once.
     private struct HostEndpoint: Identifiable {
         struct Pin: Identifiable { let trustID: String, key: WorkspaceDocument.HostKey; var id: String { key.fingerprint } }
         let trusts: [WorkspaceDocument.HostTrust], pins: [Pin]
@@ -4780,7 +4792,9 @@ private struct WorkspaceKeysSheet: View {
         }
         return order.compactMap { groups[$0] }.map { trusts in
             var seen = Set<String>()
-            let pins = trusts.flatMap { trust in trust.pins.map { HostEndpoint.Pin(trustID: trust.id, key: $0) } }
+            let pins = trusts.flatMap { trust in
+                (trust.pins + trust.certificateAuthorities).map { HostEndpoint.Pin(trustID: trust.id, key: $0) }
+            }
                 .filter { seen.insert($0.key.fingerprint).inserted }
             return HostEndpoint(trusts: trusts, pins: pins)
         }
@@ -4794,7 +4808,7 @@ private struct WorkspaceKeysSheet: View {
         let revoked = Set(endpoint.trusts.flatMap { $0.revokedKeys.map(\.fingerprint) })
         return VStack(alignment: .leading, spacing: 10) {
             Text(verbatim: "\(endpoint.trusts[0].displayHost) port \(endpoint.trusts[0].port)").font(.headline)
-            ForEach(endpoint.trusts.filter { $0.pins.isEmpty }) { trust in
+            ForEach(endpoint.trusts.filter { !$0.hasConfiguredIdentity }) { trust in
                 VStack(alignment: .leading, spacing: 6) {
                     Label("No verified host key", systemImage: "questionmark.shield").font(.callout)
                     if let route = model.hostKeyVerificationRoute(workspaceID: workspaceID, trustID: trust.id) {
@@ -4816,6 +4830,11 @@ private struct WorkspaceKeysSheet: View {
             }
             ForEach(endpoint.pins) { pin in
                 VStack(alignment: .leading, spacing: 6) {
+                    if endpoint.trusts.contains(where: { $0.certificateAuthorities.contains(pin.key) }) {
+                        Label("Host certificate authority", systemImage: "checkmark.seal").font(.callout)
+                        Text("Certifies host keys for the configured identity. Blocking this authority also blocks certificates it signs for this endpoint.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     Text(verbatim: pin.key.algorithm).font(.caption).foregroundStyle(.secondary)
                     Text(verbatim: pin.key.fingerprint).font(.system(.caption, design: .monospaced))
                         .textSelection(.enabled)
@@ -5269,6 +5288,10 @@ private struct WorkspaceRouteChoiceScreen: View {
                 .union((context.local.unsavedHostKeysByTrustScope[trust.canonicalTrustScope] ?? []).map(\.fingerprint))
             ForEach(trust.pins.filter { !blocked.contains($0.fingerprint) }, id: \.self) { pin in
                 Text(verbatim: "Trusted host key · \(pin.algorithm) · \(pin.fingerprint)")
+                    .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+            }
+            ForEach(trust.certificateAuthorities.filter { !blocked.contains($0.fingerprint) }, id: \.self) { authority in
+                Text(verbatim: "Trusted host certificate authority · \(authority.algorithm) · \(authority.fingerprint)")
                     .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
             }
         }

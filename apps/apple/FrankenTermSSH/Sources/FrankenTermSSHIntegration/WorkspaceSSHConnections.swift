@@ -246,10 +246,11 @@ public actor WorkspaceSSHConnectionManager {
         guard confirmedByUser else { throw WorkspaceNetworkError.confirmationRequired }
         try Task.checkCancellation()
         let workspaces = try await store.load()
-        // Only a key the workspace pins can be refused, so arbitrary input
+        // Only an imported pin or CA can be refused, so arbitrary input
         // cannot consume the bounded saved revocation inventory.
         guard let trust = try workspaces.first(where: { $0.id == workspaceID })?.document().hostTrust
-            .first(where: { $0.id == trustID }), trust.pins.contains(key) else { throw FTError.stale }
+            .first(where: { $0.id == trustID }),
+              trust.pins.contains(key) || trust.certificateAuthorities.contains(key) else { throw FTError.stale }
         var affected: Set<UUID> = [workspaceID]
         for workspace in workspaces {
             if try workspace.document().hostTrust.contains(where: { $0.host == trust.host && $0.port == trust.port }) {
