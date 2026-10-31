@@ -34,17 +34,19 @@ spec.loader.exec_module(fixture)
 fixture.bind(fixture.DRIVER, "ftssh_supports_sftp", fixture.I)
 
 LIVE_TEST = "FrankenTermSSHTests.WorkspaceSFTPLiveTests/testLiveSFTPTransfersStayBoundToWorkspaceAuthority"
+PROMPT_TEST = "FrankenTermSSHTests.WorkspaceAuthenticationPrompterTests/testLivePromptDelegatesRemainBoundToOneFileConnectionAttempt"
 MODES = ("direct", "jump", "cancel-stall", "cancel-init", "cancel-upload", "timeout-stall",
-         "ownership", "revoke", "stale")
+         "ownership", "revoke", "stale", "scope-password", "scope-interactive", "scope-publickey-interactive")
 DOWNLOAD = bytes((index * 37 + 11) & 255 for index in range(131113))
 UPLOAD = bytes((index * 17 + 73) & 255 for index in range(98327))
 EXISTING = b"This pre-existing remote file must remain byte-for-byte intact.\n"
 
 
-def xctest_command():
+def xctest_command(mode):
+    selected = PROMPT_TEST if mode.startswith("scope-") else LIVE_TEST
     if Path(TEST_PRODUCT).is_dir():
-        return ["xcrun", "xctest", "-XCTest", LIVE_TEST, TEST_PRODUCT]
-    return [TEST_PRODUCT, LIVE_TEST]
+        return ["xcrun", "xctest", "-XCTest", selected, TEST_PRODUCT]
+    return [TEST_PRODUCT, selected]
 
 
 class OpenSSHSFTPBridge:
@@ -218,7 +220,18 @@ class WorkspaceSFTPInteropTests(unittest.TestCase):
                           "hostKey": base64.b64encode(server.host_blob).decode("ascii")})
             return server
 
-        target = add("target")
+        if mode.startswith("scope-"):
+            options = {"connections": 2}
+            if mode == "scope-password":
+                options["password"] = b"files owner password"
+            else:
+                options["interactive_rounds"] = [{"name": b"Files ownership", "instruction": b"Confirm this file connection.",
+                                                  "prompts": [(b"Approval:", False)], "responses": [b"approved"]}]
+                if mode == "scope-publickey-interactive":
+                    options["auth_mode"] = "publickeyInteractive"
+            target = add("target", **options)
+        else:
+            target = add("target")
         if mode == "jump":
             add("hop", sftp=False, forward_to=target.address, forward_host="target.internal.invalid")
         elif mode == "ownership":
@@ -228,7 +241,7 @@ class WorkspaceSFTPInteropTests(unittest.TestCase):
         try:
             environment = dict(os.environ, FT_SFTP_TEST_MODE=mode, FT_SFTP_TEST_ROOT=str(root),
                                FT_SFTP_TEST_PEERS=json.dumps(peers))
-            result = subprocess.run(xctest_command(), env=environment, capture_output=True, text=True, timeout=35)
+            result = subprocess.run(xctest_command(mode), env=environment, capture_output=True, text=True, timeout=35)
             output = result.stdout + result.stderr
             self.assertEqual(result.returncode, 0, output[-20000:])
             self.assertIn("Executed 1 test", output)
@@ -236,15 +249,25 @@ class WorkspaceSFTPInteropTests(unittest.TestCase):
             for role, server in servers:
                 self.assertTrue(server.done.wait(2), (role, "SSH owner did not close"))
                 self.assertEqual(server.errors, [], role)
-                self.assertEqual(server.accepted_connections, 1, role)
+                logins = 2 if mode.startswith("scope-") else 1
+                self.assertEqual(server.accepted_connections, logins, role)
                 self.assertFalse(any(event[0] in ("pty", "shell", "exec", "resize", "rejected-channel-request")
                                      for event in server.events), (role, server.events))
                 authentication = [event for event in server.events if event[0] == "authentication"]
-                self.assertEqual([event[1] for event in authentication], [0, 1], role)
+                expected_keys = [] if mode in ("scope-password", "scope-interactive") else [0, 1] * logins
+                self.assertEqual([event[1] for event in authentication], expected_keys, role)
                 self.assertTrue(all(event[2] == b"operator" and event[3] == fixture.public_blob(key)
                                     for event in authentication), role)
+                if mode == "scope-password":
+                    self.assertEqual([event for event in server.events if event[0] == "password-authentication"],
+                                     [("password-authentication", b"operator", len(b"files owner password"), True)] * 2)
+                elif mode in ("scope-interactive", "scope-publickey-interactive"):
+                    self.assertEqual([event for event in server.events if event[0] == "interactive-request"],
+                                     [("interactive-request", b"operator")] * 2)
+                    self.assertEqual([event for event in server.events if event[0] == "interactive-response"],
+                                     [("interactive-response", 1, 1, True)] * 2)
                 subsystems = [event for event in server.events if event[0] == "subsystem"]
-                self.assertEqual(subsystems, [("subsystem", b"sftp")] if role in bridges else [], role)
+                self.assertEqual(subsystems, [("subsystem", b"sftp")] * logins if role in bridges else [], role)
             self.assertEqual((root / "existing.bin").read_bytes(), EXISTING)
             if mode in ("direct", "jump"):
                 self.assertEqual((root / "local" / "downloaded.bin").read_bytes(), DOWNLOAD)

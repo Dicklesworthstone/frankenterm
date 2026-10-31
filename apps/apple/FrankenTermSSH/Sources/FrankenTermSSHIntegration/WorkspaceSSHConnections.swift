@@ -8,6 +8,21 @@ public enum WorkspaceSSHConnectionPurpose: String, Sendable, Hashable {
     case terminal, fileTransfer
 }
 
+/// Optional prompt owners for one connection attempt, including its jump
+/// hosts. Supplying this bundle replaces both manager defaults: a nil member
+/// refuses that prompting method instead of borrowing another screen's editor.
+/// Host, route, method and foreground authorization remain the broker's work.
+public struct WorkspaceSSHAuthenticationPrompters: Sendable {
+    public let password: (any WorkspaceSSHPasswordPrompting)?
+    public let keyboardInteractive: (any WorkspaceSSHKeyboardInteractivePrompting)?
+
+    public init(password: (any WorkspaceSSHPasswordPrompting)? = nil,
+                keyboardInteractive: (any WorkspaceSSHKeyboardInteractivePrompting)? = nil) {
+        self.password = password
+        self.keyboardInteractive = keyboardInteractive
+    }
+}
+
 public enum WorkspaceSSHConnectionError: Error, Equatable, Sendable, LocalizedError {
     case offline, busy, capacity, stale, promptedHopRetryRequired, filesUnavailable
     public var errorDescription: String? {
@@ -310,11 +325,13 @@ public actor WorkspaceSSHConnectionManager {
                         authenticationTimeout: Duration = .seconds(60),
                         attachMux: Bool = true, muxAccessMode: TerminalMuxAccessMode = .interactive,
                         requiresExistingMux: Bool = false,
-                        purpose: WorkspaceSSHConnectionPurpose = .terminal) async throws -> WorkspaceSSHConnection {
+                        purpose: WorkspaceSSHConnectionPurpose = .terminal,
+                        authenticationPrompters: WorkspaceSSHAuthenticationPrompters? = nil) async throws -> WorkspaceSSHConnection {
         try await connect(workspaceID: workspaceID, expectedRevision: expectedRevision, machineID: machineID,
             routeID: routeID, authentication: .publicKey(credentialID), confirmedByUser: confirmedByUser,
             connectionTimeout: connectionTimeout, authenticationTimeout: authenticationTimeout, attachMux: attachMux,
-            muxAccessMode: muxAccessMode, requiresExistingMux: requiresExistingMux, purpose: purpose)
+            muxAccessMode: muxAccessMode, requiresExistingMux: requiresExistingMux, purpose: purpose,
+            authenticationPrompters: authenticationPrompters)
     }
 
     public func connect(workspaceID: UUID, expectedRevision: UUID, machineID: String,
@@ -324,7 +341,8 @@ public actor WorkspaceSSHConnectionManager {
                         attachMux: Bool = true, muxAccessMode: TerminalMuxAccessMode = .interactive,
                         requiresExistingMux: Bool = false,
                         selection: WorkspaceSSHConnectionSelection? = nil,
-                        purpose: WorkspaceSSHConnectionPurpose = .terminal) async throws -> WorkspaceSSHConnection {
+                        purpose: WorkspaceSSHConnectionPurpose = .terminal,
+                        authenticationPrompters: WorkspaceSSHAuthenticationPrompters? = nil) async throws -> WorkspaceSSHConnection {
         guard confirmedByUser else { throw WorkspaceNetworkError.confirmationRequired }
         guard purpose == .terminal || (!attachMux && !requiresExistingMux) else {
             throw NativeSSHError.invalidInput
@@ -362,8 +380,10 @@ public actor WorkspaceSSHConnectionManager {
         let generation = lifecycle, attemptID = UUID()
         let store = self.store, broker = self.broker, journal = self.journal
         let coordinator = self.coordinator, networkActivity = self.networkActivity, liveness = self.liveness
-        let muxClientFactory = self.muxClientFactory, passwordPrompter = self.passwordPrompter
-        let keyboardInteractivePrompter = self.keyboardInteractivePrompter
+        let muxClientFactory = self.muxClientFactory
+        let prompts = authenticationPrompters ?? .init(password: self.passwordPrompter,
+            keyboardInteractive: self.keyboardInteractivePrompter)
+        let passwordPrompter = prompts.password, keyboardInteractivePrompter = prompts.keyboardInteractive
         let task = Task<WorkspaceSSHConnection, Error> {
             let fingerprints = try await credentialSnapshot(machine: machine, attemptID: attemptID,
                 generation: generation, expectedRevision: expectedRevision, routeID: routeID,
