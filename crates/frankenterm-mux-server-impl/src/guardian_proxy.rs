@@ -92,6 +92,15 @@ const GUARDIAN_CHECKPOINT_STAGE_CHUNK_BYTES: u32 =
 const GUARDIAN_CHECKPOINT_QUERY_ATTEMPTS: usize = 2;
 const GUARDIAN_RETIREMENT_RETRY_MIN_INTERVAL: Duration = Duration::from_millis(50);
 const GUARDIAN_RETIREMENT_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(5);
+/// A guardian can close an Input without recording it while it restarts, or
+/// after waiting too long for its protocol. One built before that wait closes
+/// an Input whenever a job holds the protocol, and guardians outlive mux
+/// upgrades. `write_input` repeats the exact input within the budget, doubling
+/// its pause from the first to the largest. It runs on the mux main thread, so
+/// these pauses hold that thread, for at most the budget per lost input.
+const GUARDIAN_INPUT_RETRY_FIRST_PAUSE: Duration = Duration::from_millis(1);
+const GUARDIAN_INPUT_RETRY_MAX_PAUSE: Duration = Duration::from_millis(16);
+const GUARDIAN_INPUT_RETRY_BUDGET: Duration = Duration::from_secs(2);
 const GUARDIAN_CONNECT_ATTEMPTS: usize = 32;
 const GUARDIAN_CONNECT_RETRY_BUDGET: Duration = Duration::from_secs(5);
 const GUARDIAN_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(10);
@@ -922,6 +931,18 @@ pub enum GuardianProxyError {
     Client(#[source] GuardianClientError),
 }
 
+impl GuardianProxyError {
+    /// The guardian has not answered this input terminally, so its exact
+    /// identity can still settle it.
+    const fn input_can_still_settle(&self) -> bool {
+        matches!(
+            self,
+            Self::Client(GuardianClientError::Io(_) | GuardianClientError::Setup(_))
+                | Self::InputDurabilityPending
+        )
+    }
+}
+
 impl From<GuardianProxyError> for io::Error {
     fn from(error: GuardianProxyError) -> Self {
         match error {
@@ -1076,6 +1097,10 @@ enum GuardianMutationTransportError {
 }
 
 trait GuardianMutationTransport: Send {
+    fn input_retry_budget(&self) -> Duration {
+        GUARDIAN_INPUT_RETRY_BUDGET
+    }
+
     fn input(
         &mut self,
         pane_id: Uuid,
@@ -3024,7 +3049,8 @@ fn classify_child_census_entry(
 /// I/O failure therefore preserves the exact request UUID, effect UUID, and
 /// lease sequence for a fresh-connection retry.  Pending input retains only
 /// its length and SHA-256 commitment; plaintext is supplied again by the
-/// caller only after `QueryInputEffect` proves that resending is safe.
+/// caller only after `QueryInputEffect` proves that resending is safe, which
+/// `write_input` does itself for a bounded time, while it holds the bytes.
 pub struct GuardianPaneLeaseActor {
     identity: GuardianPaneLeaseIdentity,
     next_sequence: u64,
@@ -3709,7 +3735,7 @@ impl GuardianPaneLeaseActor {
             }
         }
         self.begin_input(payload)?;
-        match self.retry_pending(Some(payload))? {
+        match self.settle_new_input(payload)? {
             RecoveredPendingMutation::InputApplied { applied_bytes, .. } => {
                 usize::try_from(applied_bytes)
                     .map_err(|_| GuardianProxyError::UnexpectedMutationReply)
@@ -3720,6 +3746,34 @@ impl GuardianPaneLeaseActor {
             RecoveredPendingMutation::Generic | RecoveredPendingMutation::Checkpoint(_) => {
                 self.disposition = GuardianLeaseDisposition::Quarantined;
                 Err(GuardianProxyError::UnexpectedMutationReply)
+            }
+        }
+    }
+
+    /// Settle the input `begin_input` installed while this call still holds
+    /// its plaintext. `pending` keeps only a commitment, so an input abandoned
+    /// here as `NotSeen` can be resent by nothing else, and it then refuses
+    /// this lease's captures, its retirement and every different input. Each
+    /// pass goes through `retry_pending`, so a resend still follows an exact
+    /// `NotSeen`, and an input that took effect is never written twice.
+    fn settle_new_input(
+        &mut self,
+        payload: &[u8],
+    ) -> Result<RecoveredPendingMutation, GuardianProxyError> {
+        let deadline = Instant::now() + self.transport.input_retry_budget();
+        let mut pause = GUARDIAN_INPUT_RETRY_FIRST_PAUSE;
+        loop {
+            match self.retry_pending(Some(payload)) {
+                Err(error)
+                    if error.input_can_still_settle()
+                        && self.pending.is_some()
+                        && Instant::now() + pause < deadline =>
+                {
+                    metrics::counter!("mux.guardian_proxy.input_retry_total").increment(1);
+                    thread::sleep(pause);
+                    pause = pause.saturating_mul(2).min(GUARDIAN_INPUT_RETRY_MAX_PAUSE);
+                }
+                outcome => return outcome,
             }
         }
     }
@@ -8370,6 +8424,8 @@ mod tests {
     struct FakeState {
         directives: VecDeque<FakeDirective>,
         calls: Vec<FakeCall>,
+        // Zero by default: most tests script each attempt as its own call.
+        input_retry_budget: Duration,
     }
 
     #[derive(Clone)]
@@ -11514,6 +11570,10 @@ mod tests {
     }
 
     impl GuardianMutationTransport for FakeTransport {
+        fn input_retry_budget(&self) -> Duration {
+            self.state.lock().input_retry_budget
+        }
+
         fn input(
             &mut self,
             pane_id: Uuid,
@@ -11859,6 +11919,7 @@ mod tests {
         let state = Arc::new(Mutex::new(FakeState {
             directives: directives.into_iter().collect(),
             calls: Vec::new(),
+            input_retry_budget: Duration::ZERO,
         }));
         let staging = GuardianProxyStaging::with_transports(
             identity(),
@@ -15369,6 +15430,112 @@ mod tests {
             panic!("input calls surround the query");
         };
         assert_eq!(first_digest, retry_digest);
+    }
+
+    fn input_call_count(state: &FakeState) -> usize {
+        state
+            .calls
+            .iter()
+            .filter(|call| matches!(call, FakeCall::Input { .. }))
+            .count()
+    }
+
+    #[test]
+    fn an_input_the_guardian_closed_settles_within_one_write() {
+        // The guardian closed the Input without recording it, as it does
+        // while a job owns the protocol, then closed the Query the same way.
+        let (staging, state) = fake_staging(
+            [
+                FakeDirective::Io,
+                FakeDirective::Io,
+                FakeDirective::Query(InputEffectState::NotSeen),
+                FakeDirective::Auto,
+            ],
+            31,
+        );
+        state.lock().input_retry_budget = Duration::from_secs(5);
+        let actor = staging.shared_actor();
+        let payload = b"typed";
+        assert_eq!(actor.lock().write_input(payload).unwrap(), payload.len());
+        assert_eq!(actor.lock().next_sequence(), 32);
+
+        // Nothing is left pending to refuse the next input.
+        assert_eq!(actor.lock().write_input(b"next").unwrap(), 4);
+        let state = state.lock();
+        assert_eq!(state.calls.len(), 5);
+        assert_eq!(
+            call_ids(&state.calls[0]).expect("first input identity"),
+            call_ids(&state.calls[3]).expect("resent input identity")
+        );
+        assert_eq!(input_call_count(&state), 3);
+    }
+
+    #[test]
+    fn an_input_that_took_effect_is_never_resent_by_its_retry() {
+        let (staging, state) = fake_staging(
+            [
+                FakeDirective::Io,
+                FakeDirective::Query(InputEffectState::AcceptedNotDurable),
+                FakeDirective::Query(InputEffectState::DurableFull),
+            ],
+            31,
+        );
+        state.lock().input_retry_budget = Duration::from_secs(5);
+        let actor = staging.shared_actor();
+        let payload = b"typed";
+        assert_eq!(actor.lock().write_input(payload).unwrap(), payload.len());
+        assert_eq!(actor.lock().next_sequence(), 32);
+        assert_eq!(input_call_count(&state.lock()), 1);
+    }
+
+    #[test]
+    fn an_input_stops_retrying_at_its_budget_and_keeps_its_identity() {
+        let (staging, state) = fake_staging(std::iter::repeat_n(FakeDirective::Io, 4096), 31);
+        state.lock().input_retry_budget = Duration::from_millis(40);
+        let actor = staging.shared_actor();
+        let started = Instant::now();
+        assert!(matches!(
+            actor.lock().write_input(b"typed"),
+            Err(GuardianProxyError::Client(GuardianClientError::Io(_)))
+        ));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(actor.lock().next_sequence(), 31);
+        let state = state.lock();
+        assert!(state.calls.len() > 1, "the budget allowed retries");
+        assert_eq!(input_call_count(&state), 1);
+    }
+
+    #[test]
+    fn a_failed_connection_setup_leaves_an_input_able_to_settle() {
+        // A socket missing across a guardian restart fails here, not as Io.
+        assert!(
+            GuardianProxyError::Client(GuardianClientError::Setup(
+                frankenterm_pty_guardian::GuardianServiceError::OutputInitialization,
+            ))
+            .input_can_still_settle()
+        );
+    }
+
+    #[test]
+    fn a_terminal_input_answer_is_not_retried() {
+        for (code, closed) in [
+            (GuardianRejectionCode::PaneNotFound, true),
+            (GuardianRejectionCode::InputKnownNotApplied, false),
+        ] {
+            let (staging, state) = fake_staging([FakeDirective::Reject(code)], 31);
+            state.lock().input_retry_budget = Duration::from_secs(5);
+            let actor = staging.shared_actor();
+            let result = actor.lock().write_input(b"typed");
+            if closed {
+                assert!(matches!(result, Err(GuardianProxyError::PaneNotFound)));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(GuardianProxyError::InputKnownNotApplied)
+                ));
+            }
+            assert_eq!(state.lock().calls.len(), 1);
+        }
     }
 
     #[test]
