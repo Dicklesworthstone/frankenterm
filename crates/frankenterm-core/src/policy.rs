@@ -3809,7 +3809,7 @@ fn is_exact_trauma_bypass_assignment(assignment: &str) -> bool {
     let Some((name, value)) = trimmed.split_once('=') else {
         return false;
     };
-    if name != "FT_BYPASS_TRAUMA" {
+    if name != TRAUMA_BYPASS_ENV {
         return false;
     }
     // Strip optional surrounding quotes; only `1` is the
