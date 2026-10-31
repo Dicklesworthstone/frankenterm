@@ -185,8 +185,13 @@ const REPLAY_REQUEST_BINDING_DOMAIN: &[u8] = b"frankenterm.guardian-replay-reque
 /// Every pane a mux starts or restores replays through a snapshot until its
 /// first page is acknowledged, and only an acknowledged snapshot can be
 /// evicted: with eight, twelve panes starting at once had their ninth replay
-/// refused. Each snapshot holds a few descriptors, so the bound stays finite.
-const REPLAY_MAX_ACTIVE_SNAPSHOTS: usize = 32;
+/// refused. Each live tail then keeps one open, so below the pane count the
+/// store evicts and reopens tails without end: at 32, a 60-pane upgrade run
+/// was refused 1210 times in 13 minutes, and every reopen rescans its catalog
+/// (ft-udi9a, ft-6wm86). Each snapshot holds about one descriptor per
+/// segment it pins, well inside the 2048 the guardian raises its limit to,
+/// so the bound stays finite.
+const REPLAY_MAX_ACTIVE_SNAPSHOTS: usize = 128;
 const REPLAY_MAX_REQUEST_BINDINGS: usize = 256;
 const REPLAY_MAX_OUTSTANDING_PAGES_PER_SNAPSHOT: usize = 1;
 const _: () = assert!(REPLAY_MAX_OUTSTANDING_PAGES_PER_SNAPSHOT == 1);
