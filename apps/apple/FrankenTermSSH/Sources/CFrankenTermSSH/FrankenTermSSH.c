@@ -1,5 +1,6 @@
 #include "FrankenTermSSH.h"
 #include <libssh2.h>
+#include <libssh2_sftp.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -30,12 +31,23 @@
  * No global signal handler, key-file loading, shell command or trace is used.
  */
 enum phase { HANDSHAKE, PEER, APPROVED, AUTH, PARTIAL_AUTH, AUTHENTICATED, FORWARD_OPENING, FORWARD_READY,
-             OPENING, PTY, SHELL, LIVE, FAILED, CLOSED };
+             OPENING, PTY, SHELL, LIVE, SFTP_OPENING, SFTP_READY, FAILED, CLOSED };
 enum { EGRESS_CAPACITY = 65536, EGRESS_RESERVE = 49152 };
 struct interactive_worker;
+struct sftp_owner {
+    LIBSSH2_SFTP *client;
+    LIBSSH2_SFTP_HANDLE *handle;
+    LIBSSH2_SFTP_ATTRIBUTES attributes;
+    char path[FTSSH_SFTP_PATH_CAPACITY + 1];
+    uint8_t bytes[FTSSH_SFTP_IO_CAPACITY + 1];
+    size_t path_length, length, offset, result_length;
+    uint32_t status;
+    int operation, result_operation, handle_kind, regular_file, retry, wait_read;
+};
 struct ftssh_session {
     LIBSSH2_SESSION *ssh;
     LIBSSH2_CHANNEL *channel;
+    struct sftp_owner *sftp;
     /* Owned exclusively after forward_adopt. Both libraries are driven by the
      * same actor; no other owner may access the adopted outer session. */
     struct ftssh_session *parent;
@@ -1272,6 +1284,229 @@ int ftssh_shell_step(ftssh_session *s) {
     }
     return check(s, LIVE);
 }
+
+static int valid_sftp_utf8(const uint8_t *bytes, size_t length) {
+    for(size_t i = 0; i < length;) {
+        uint8_t first = bytes[i++];
+        if(first == 0) return 0;
+        if(first < 0x80) continue;
+        uint32_t scalar; size_t count;
+        if(first >= 0xc2 && first <= 0xdf) { scalar = first & 0x1f; count = 1; }
+        else if(first >= 0xe0 && first <= 0xef) { scalar = first & 0x0f; count = 2; }
+        else if(first >= 0xf0 && first <= 0xf4) { scalar = first & 7; count = 3; }
+        else return 0;
+        if(count > length - i) return 0;
+        for(size_t j = 0; j < count; j++) {
+            uint8_t next = bytes[i++];
+            if((next & 0xc0) != 0x80) return 0;
+            scalar = (scalar << 6) | (next & 0x3f);
+        }
+        if((count == 1 && scalar < 0x80) || (count == 2 && scalar < 0x800) ||
+           (count == 3 && scalar < 0x10000) || scalar > 0x10ffff ||
+           (scalar >= 0xd800 && scalar <= 0xdfff)) return 0;
+    }
+    return 1;
+}
+
+static int sftp_failure(ftssh_session *s, int error) {
+    if(error == LIBSSH2_ERROR_EAGAIN) return FTSSH_AGAIN;
+    if(error == LIBSSH2_ERROR_SFTP_PROTOCOL && s->sftp && s->sftp->client) {
+        unsigned long status = libssh2_sftp_last_error(s->sftp->client);
+        if(status != LIBSSH2_FX_OK && status <= UINT32_MAX) {
+            s->sftp->status = (uint32_t)status;
+            return fail(s, FTSSH_SFTP_ERROR);
+        }
+        return fail(s, FTSSH_SFTP_RESPONSE);
+    }
+    if(error == LIBSSH2_ERROR_BUFFER_TOO_SMALL) return fail(s, FTSSH_LIMIT);
+    return fail(s, FTSSH_IO);
+}
+
+int ftssh_supports_sftp(void) {
+#if defined(LIBSSH2_FRANKENTERM_SFTP_BOUNDS_VERSION) && LIBSSH2_FRANKENTERM_SFTP_BOUNDS_VERSION == 1
+    return libssh2_frankenterm_sftp_bounds_version() == 1;
+#else
+    return 0;
+#endif
+}
+
+int ftssh_begin_sftp(ftssh_session *s) {
+    int rc = check(s, AUTHENTICATED); if(rc) return rc;
+    if(!ftssh_supports_sftp()) return FTSSH_UNSUPPORTED;
+    if(s->channel || s->sftp) return FTSSH_STATE;
+    void *context = s;
+    s->sftp = allocate(sizeof(*s->sftp), &context);
+    if(!s->sftp) return FTSSH_LIMIT;
+    memset(s->sftp, 0, sizeof(*s->sftp));
+    s->phase = SFTP_OPENING;
+    return FTSSH_OK;
+}
+
+int ftssh_sftp_start_step(ftssh_session *s) {
+    int rc = check(s, SFTP_OPENING); if(rc) return rc;
+    rc = prepare_egress(s); if(rc) return rc;
+    s->receive_budget = 32768; s->limited_receive = 1;
+    s->sftp->client = libssh2_sftp_init(s->ssh);
+    s->limited_receive = 0;
+    if(!s->sftp->client) return sftp_failure(s, libssh2_session_last_errno(s->ssh));
+    s->phase = SFTP_READY;
+    return FTSSH_OK;
+}
+
+int ftssh_sftp_begin(ftssh_session *s, int operation, const uint8_t *bytes, size_t length) {
+    int rc = check(s, SFTP_READY); if(rc) return rc;
+    struct sftp_owner *owner = s->sftp;
+    if(!owner || !owner->client || owner->operation) return FTSSH_STATE;
+    int path = operation == FTSSH_SFTP_REALPATH || operation == FTSSH_SFTP_OPEN_DIRECTORY ||
+        operation == FTSSH_SFTP_OPEN_READ || operation == FTSSH_SFTP_CREATE_EXCLUSIVE;
+    if(path) {
+        if(owner->handle) return FTSSH_STATE;
+        if(!bytes || !length || length > FTSSH_SFTP_PATH_CAPACITY ||
+           !valid_sftp_utf8(bytes, length)) return FTSSH_INVALID;
+    } else if(operation == FTSSH_SFTP_READ_DIRECTORY) {
+        if(!owner->handle || owner->handle_kind != FTSSH_SFTP_OPEN_DIRECTORY) return FTSSH_STATE;
+        if(bytes || length) return FTSSH_INVALID;
+    } else if(operation == FTSSH_SFTP_READ_FILE || operation == FTSSH_SFTP_WRITE_FILE) {
+        if(!owner->handle || !owner->regular_file ||
+           owner->handle_kind != (operation == FTSSH_SFTP_READ_FILE ?
+               FTSSH_SFTP_OPEN_READ : FTSSH_SFTP_CREATE_EXCLUSIVE)) return FTSSH_STATE;
+        if(!length || length > FTSSH_SFTP_IO_CAPACITY ||
+           (operation == FTSSH_SFTP_READ_FILE ? bytes != NULL : bytes == NULL)) return FTSSH_INVALID;
+    } else if(operation == FTSSH_SFTP_FSTAT || operation == FTSSH_SFTP_CLOSE_HANDLE) {
+        if(!owner->handle) return FTSSH_STATE;
+        if(bytes || length) return FTSSH_INVALID;
+    } else return FTSSH_INVALID;
+    if(path) {
+        memcpy(owner->path, bytes, length); owner->path[length] = 0;
+        owner->path_length = length;
+    }
+    if(operation == FTSSH_SFTP_WRITE_FILE) memcpy(owner->bytes, bytes, length);
+    owner->length = length; owner->offset = 0; owner->result_length = 0;
+    owner->result_operation = 0; owner->status = 0; owner->retry = 0; owner->wait_read = 0;
+    memset(&owner->attributes, 0, sizeof(owner->attributes));
+    owner->operation = operation;
+    return FTSSH_OK;
+}
+
+int ftssh_sftp_step(ftssh_session *s) {
+    int rc = check(s, SFTP_READY); if(rc) return rc;
+    struct sftp_owner *owner = s->sftp;
+    if(!owner || !owner->client || !owner->operation) return FTSSH_STATE;
+    rc = prepare_egress(s); if(rc) return rc;
+    owner->retry = 0; owner->wait_read = 0;
+    s->receive_budget = 32768; s->limited_receive = 1;
+    ssize_t amount = 0;
+    int operation = owner->operation;
+    switch(operation) {
+    case FTSSH_SFTP_REALPATH:
+        amount = libssh2_sftp_symlink_ex(owner->client, owner->path, (unsigned int)owner->path_length,
+            (char *)owner->bytes, FTSSH_SFTP_PATH_CAPACITY + 1, LIBSSH2_SFTP_REALPATH);
+        break;
+    case FTSSH_SFTP_OPEN_DIRECTORY:
+    case FTSSH_SFTP_OPEN_READ:
+    case FTSSH_SFTP_CREATE_EXCLUSIVE:
+        owner->handle = libssh2_sftp_open_ex(owner->client, owner->path, (unsigned int)owner->path_length,
+            operation == FTSSH_SFTP_CREATE_EXCLUSIVE ? LIBSSH2_FXF_WRITE | LIBSSH2_FXF_CREAT | LIBSSH2_FXF_EXCL :
+                operation == FTSSH_SFTP_OPEN_READ ? LIBSSH2_FXF_READ : 0,
+            operation == FTSSH_SFTP_CREATE_EXCLUSIVE ? 0600 : 0,
+            operation == FTSSH_SFTP_OPEN_DIRECTORY ? LIBSSH2_SFTP_OPENDIR : LIBSSH2_SFTP_OPENFILE);
+        amount = owner->handle ? 0 : libssh2_session_last_errno(s->ssh);
+        if(owner->handle) { owner->handle_kind = operation; owner->regular_file = 0; }
+        break;
+    case FTSSH_SFTP_READ_DIRECTORY:
+        amount = libssh2_sftp_readdir_ex(owner->handle, (char *)owner->bytes,
+            FTSSH_SFTP_NAME_CAPACITY + 1, NULL, 0, &owner->attributes);
+        break;
+    case FTSSH_SFTP_READ_FILE:
+        amount = libssh2_sftp_read(owner->handle, (char *)owner->bytes, owner->length);
+        break;
+    case FTSSH_SFTP_WRITE_FILE:
+        amount = libssh2_sftp_write(owner->handle, (const char *)owner->bytes + owner->offset,
+            owner->length - owner->offset);
+        break;
+    case FTSSH_SFTP_FSTAT:
+        amount = libssh2_sftp_fstat_ex(owner->handle, &owner->attributes, 0);
+        break;
+    case FTSSH_SFTP_CLOSE_HANDLE:
+        amount = libssh2_sftp_close_handle(owner->handle);
+        /* libssh2 frees the handle on every result except EAGAIN, including a
+         * remote close error. Retaining that pointer would double-free it. */
+        if(amount != LIBSSH2_ERROR_EAGAIN) {
+            owner->handle = NULL; owner->handle_kind = 0; owner->regular_file = 0;
+        }
+        break;
+    default:
+        s->limited_receive = 0;
+        return FTSSH_STATE;
+    }
+    s->limited_receive = 0;
+    if(amount < 0) return sftp_failure(s, (int)amount);
+    if(operation == FTSSH_SFTP_WRITE_FILE) {
+        if((size_t)amount > owner->length - owner->offset) return fail(s, FTSSH_SFTP_RESPONSE);
+        owner->offset += (size_t)amount;
+        if(owner->offset < owner->length) {
+            owner->retry = amount > 0; owner->wait_read = amount == 0;
+            return FTSSH_AGAIN;
+        }
+        owner->result_length = owner->length;
+        /* A receipt is only a byte count; do not retain upload contents. */
+        memset(owner->bytes, 0, owner->length);
+    } else if(operation == FTSSH_SFTP_REALPATH) {
+        if(amount <= 0 || amount > FTSSH_SFTP_PATH_CAPACITY || owner->bytes[0] != '/' ||
+           !valid_sftp_utf8(owner->bytes, (size_t)amount)) return fail(s, FTSSH_SFTP_RESPONSE);
+        owner->result_length = (size_t)amount;
+    } else if(operation == FTSSH_SFTP_READ_DIRECTORY) {
+        if(amount > FTSSH_SFTP_NAME_CAPACITY || (amount > 0 &&
+           (!valid_sftp_utf8(owner->bytes, (size_t)amount) || memchr(owner->bytes, '/', (size_t)amount))))
+            return fail(s, FTSSH_SFTP_RESPONSE);
+        owner->result_length = (size_t)amount;
+    } else if(operation == FTSSH_SFTP_READ_FILE) {
+        if((size_t)amount > owner->length) return fail(s, FTSSH_SFTP_RESPONSE);
+        owner->result_length = (size_t)amount;
+    } else if(operation == FTSSH_SFTP_FSTAT) {
+        owner->regular_file = (owner->attributes.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) &&
+            (owner->attributes.permissions & LIBSSH2_SFTP_S_IFMT) == LIBSSH2_SFTP_S_IFREG;
+    }
+    owner->result_operation = operation; owner->operation = 0;
+    return amount == 0 && (operation == FTSSH_SFTP_READ_FILE || operation == FTSSH_SFTP_READ_DIRECTORY)
+        ? FTSSH_EOF : FTSSH_OK;
+}
+
+int ftssh_sftp_copy_result(ftssh_session *s, uint8_t *out, size_t capacity, size_t *length,
+                          ftssh_sftp_attributes *attributes) {
+    int rc = check(s, SFTP_READY); if(rc) return rc;
+    struct sftp_owner *owner = s->sftp;
+    if(!length || !attributes) return FTSSH_INVALID;
+    *length = 0; memset(attributes, 0, sizeof(*attributes));
+    if(!owner || owner->operation || !owner->result_operation) return FTSSH_STATE;
+    if(owner->result_operation != FTSSH_SFTP_WRITE_FILE && owner->result_length) {
+        if(!out) return FTSSH_INVALID;
+        if(owner->result_length > capacity) return FTSSH_LIMIT;
+        memcpy(out, owner->bytes, owner->result_length);
+    }
+    *length = owner->result_length;
+    if(owner->attributes.flags & LIBSSH2_SFTP_ATTR_SIZE) {
+        attributes->flags |= FTSSH_SFTP_ATTR_SIZE; attributes->size = owner->attributes.filesize;
+    }
+    if(owner->attributes.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) {
+        if(owner->attributes.permissions > UINT32_MAX) return fail(s, FTSSH_SFTP_RESPONSE);
+        attributes->flags |= FTSSH_SFTP_ATTR_PERMISSIONS;
+        attributes->permissions = (uint32_t)owner->attributes.permissions;
+    }
+    if(owner->attributes.flags & LIBSSH2_SFTP_ATTR_ACMODTIME) {
+        attributes->flags |= FTSSH_SFTP_ATTR_MODIFICATION_TIME;
+        attributes->modification_time = owner->attributes.mtime;
+    }
+    return FTSSH_OK;
+}
+
+int ftssh_sftp_status(ftssh_session *s, uint32_t *status) {
+    if(!s || !status) return FTSSH_INVALID;
+    if(s->worker_owner || !s->sftp) return FTSSH_STATE;
+    *status = s->sftp->status;
+    return FTSSH_OK;
+}
+
 int ftssh_admit_write(ftssh_session *s, const uint8_t *bytes, size_t length) {
     int rc = check(s, LIVE); if(rc) return rc;
     if(!bytes || !length || length > FTSSH_WRITE_CAPACITY) return FTSSH_INVALID;
@@ -1439,12 +1674,15 @@ static int transport_directions(ftssh_session *s) {
     /* Inner write may need an outer WINDOW_ADJUST read, and inner read may
      * need an outer packet write. Waiting on the inner hint would busy-spin. */
     ftssh_session *root = s;
-    int retry = progress || ((s->phase == AUTH || s->phase == FORWARD_OPENING) && s->receive_budget == 0);
+    int retry = progress || ((s->phase == AUTH || s->phase == FORWARD_OPENING ||
+        s->phase == SFTP_OPENING || s->phase == SFTP_READY) && s->receive_budget == 0) ||
+        (s->sftp && s->sftp->retry);
     while(root->parent) {
         root = root->parent;
         if(root->receive_budget == 0) retry = 1;
     }
     int directions = libssh2_session_block_directions(root->ssh);
+    if(s->sftp && s->sftp->wait_read) directions |= LIBSSH2_SESSION_BLOCK_INBOUND;
     if(root->egress_count) directions |= LIBSSH2_SESSION_BLOCK_OUTBOUND;
     return (directions & LIBSSH2_SESSION_BLOCK_INBOUND ? FTSSH_READ : 0) |
            (directions & LIBSSH2_SESSION_BLOCK_OUTBOUND ? FTSSH_WRITE : 0) |
@@ -1485,6 +1723,23 @@ int ftssh_close(ftssh_session *s) {
         s->fd = -1;
         if(rc) return fail(s, rc);
     } else if(s->fd >= 0) { shutdown(s->fd, SHUT_RDWR); close(s->fd); s->fd = -1; }
+    if(s->sftp) {
+        /* Abort network callbacks first, then dispose the one owned file handle
+         * before the SFTP subsystem. libssh2's session/channel destructor alone
+         * does not release outstanding SFTP handles or request buffers. */
+        if(s->sftp->handle) {
+            int rc = libssh2_sftp_close_handle(s->sftp->handle);
+            if(rc == LIBSSH2_ERROR_EAGAIN) return FTSSH_AGAIN;
+            s->sftp->handle = NULL;
+        }
+        if(s->sftp->client) {
+            int rc = libssh2_sftp_shutdown(s->sftp->client);
+            if(rc == LIBSSH2_ERROR_EAGAIN) return FTSSH_AGAIN;
+            s->sftp->client = NULL;
+        }
+        memset(s->sftp, 0, sizeof(*s->sftp));
+        void *context = s; release(s->sftp, &context); s->sftp = NULL;
+    }
     if(s->ssh) {
         int rc = libssh2_session_free(s->ssh);
         if(rc != 0) return fail(s, FTSSH_IO); // retain ownership for explicit retry

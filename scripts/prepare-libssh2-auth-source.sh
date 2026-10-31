@@ -1,6 +1,7 @@
 #!/bin/bash
 # Prepare libssh2's signed-key MFA evidence, corrected RSA-certificate
-# signature negotiation, and host-certificate KEX. One digest binds all patches.
+# signature negotiation, host-certificate KEX, and bounded SFTP responses.
+# One digest binds all patches and their linked capability markers.
 # The Cargo registry remains untouched. The patch accepts only the reviewed
 # source bytes, and every cached result is checked before reuse.
 # Usage: bash scripts/prepare-libssh2-auth-source.sh UPSTREAM_SOURCE CACHE_DIR
@@ -38,7 +39,7 @@ else
     (cd "$STAGING" && patch -N -f -F 0 -p1 -i "$HOST_PATCH" >&2)
     cp "$PATCH" "$STAGING/.frankenterm-auth.patch"
     cp "$HOST_PATCH" "$STAGING/.frankenterm-host-certificate.patch"
-    (cd "$STAGING" && shasum -a 256 include/libssh2.h src/libssh2_priv.h src/userauth.c src/hostkey.c \
+    (cd "$STAGING" && shasum -a 256 include/libssh2.h src/libssh2_priv.h src/userauth.c src/hostkey.c src/sftp.c \
         > .frankenterm-auth-source.sha256)
     mv "$STAGING" "$PREPARED"
 fi

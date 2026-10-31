@@ -15,6 +15,8 @@ public actor WorkspaceNativeSSHConnection {
     public nonisolated let peer: NativeSSHPeer
     public nonisolated let workspaceRevision: UUID
     public nonisolated let scope: TerminalSessionScope
+    public nonisolated let purpose: WorkspaceSSHConnectionPurpose
+    public nonisolated let host: String, port: UInt16, user: String
     /// Present when this connection attaches to the machine's existing mux
     /// panes (like the desktop app) instead of starting a shell.
     public nonisolated let muxControl: TerminalMuxControl?
@@ -26,6 +28,7 @@ public actor WorkspaceNativeSSHConnection {
     private var attached: TerminalSessionPump?
     private var coordinator: TerminalInputCoordinator?
     private var opening: Task<TerminalSessionPump, Error>?
+    private var filesOpening: Task<NativeSSHSession, Error>?
     private var openingAttempted = false, sourcePublished = false, closed = false
     private var shutdown: Task<Void, Never>?
     private var settlement: (id: UUID, task: Task<Void, Error>)?
@@ -34,10 +37,12 @@ public actor WorkspaceNativeSSHConnection {
     private var inputSeal: TerminalInputSeal?
 
     private init(transport: WorkspaceNativeSSHTransport, peer: NativeSSHPeer, scope: TerminalSessionScope,
+                 purpose: WorkspaceSSHConnectionPurpose, host: String, port: UInt16, user: String,
                  mux: (command: String, factory: @Sendable () throws -> any TerminalMuxClient)?) {
         self.transport = transport; self.peer = peer; identity = transport.identity
         self.scope = scope; workspaceRevision = scope.workspaceRevision
         self.mux = mux; muxControl = transport.muxControl
+        self.purpose = purpose; self.host = host; self.port = port; self.user = user
     }
     public var isClosed: Bool { closed }
 
@@ -55,13 +60,14 @@ public actor WorkspaceNativeSSHConnection {
                                liveness: WorkspaceSSHLiveness = .standard,
                                muxClientFactory: (@Sendable () throws -> any TerminalMuxClient)? = nil,
                                attachMux: Bool = true, muxAccessMode: TerminalMuxAccessMode = .interactive,
-                               requiresExistingMux: Bool = false) async throws -> WorkspaceNativeSSHConnection {
+                               requiresExistingMux: Bool = false,
+                               purpose: WorkspaceSSHConnectionPurpose = .terminal) async throws -> WorkspaceNativeSSHConnection {
         try await connect(workspaceID: workspaceID, expectedRevision: expectedRevision, machineID: machineID,
             routeID: routeID, authentication: .publicKey(credentialID), confirmedByUser: confirmedByUser,
             store: store, broker: broker, journal: journal, networkActivity: networkActivity,
             connectionTimeout: connectionTimeout, authenticationTimeout: authenticationTimeout, liveness: liveness,
             muxClientFactory: muxClientFactory, attachMux: attachMux, muxAccessMode: muxAccessMode,
-            requiresExistingMux: requiresExistingMux)
+            requiresExistingMux: requiresExistingMux, purpose: purpose)
     }
 
     public static func connect(workspaceID: UUID, expectedRevision: UUID, machineID: String,
@@ -77,8 +83,15 @@ public actor WorkspaceNativeSSHConnection {
                                muxClientFactory: (@Sendable () throws -> any TerminalMuxClient)? = nil,
                                attachMux: Bool = true, muxAccessMode: TerminalMuxAccessMode = .interactive,
                                requiresExistingMux: Bool = false,
-                               selection: WorkspaceSSHConnectionSelection? = nil) async throws -> WorkspaceNativeSSHConnection {
+                               selection: WorkspaceSSHConnectionSelection? = nil,
+                               purpose: WorkspaceSSHConnectionPurpose = .terminal) async throws -> WorkspaceNativeSSHConnection {
         guard confirmedByUser else { throw WorkspaceNetworkError.confirmationRequired }
+        guard purpose == .terminal || (!attachMux && !requiresExistingMux) else {
+            throw NativeSSHError.invalidInput
+        }
+        guard purpose == .terminal || NativeSSHSession.supportsSFTP else {
+            throw WorkspaceSSHConnectionError.filesUnavailable
+        }
         try Task.checkCancellation()
         if let selection {
             guard selection.workspaceID == workspaceID, selection.expectedRevision == expectedRevision,
@@ -91,7 +104,7 @@ public actor WorkspaceNativeSSHConnection {
             }
         }
         let foreground = try await broker.foregroundLease()
-        if let journal {
+        if purpose == .terminal, let journal {
             let records = try await journal.records()
             guard !records.contains(where: {
                 $0.blocksNewSession && $0.scope.workspaceID == workspaceID && $0.scope.machineID == machineID
@@ -122,7 +135,9 @@ public actor WorkspaceNativeSSHConnection {
         // command the desktop runs. A plain SSH route tries the default mux
         // socket first; the caller falls back to a shell when none answers.
         let muxCommand: String?
-        if route.mode == "frankenterm_mux" {
+        if purpose == .fileTransfer {
+            muxCommand = nil
+        } else if route.mode == "frankenterm_mux" {
             guard muxClientFactory != nil else { throw SSHAuthenticationError.denied }
             muxCommand = route.remoteCommand ?? defaultMuxCommand
         } else {
@@ -196,7 +211,8 @@ public actor WorkspaceNativeSSHConnection {
                 foreground: foreground, networkLease: lease, authority: authenticated.authority, liveness: liveness,
                 muxControl: muxCommand == nil ? nil : TerminalMuxControl(accessMode: muxAccessMode))
             let mux = muxCommand.flatMap { command in muxClientFactory.map { (command: command, factory: $0) } }
-            return WorkspaceNativeSSHConnection(transport: transport, peer: authenticated.peer, scope: scope, mux: mux)
+            return WorkspaceNativeSSHConnection(transport: transport, peer: authenticated.peer, scope: scope,
+                purpose: purpose, host: route.host, port: route.port, user: route.user, mux: mux)
         } catch {
             await session.close()
             // Keep exclusion until cancellation/readiness teardown has joined.
@@ -443,7 +459,7 @@ public actor WorkspaceNativeSSHConnection {
                               prepareForInput: (@Sendable (TerminalConnectionIdentity) async throws -> Void)?)
         async throws -> TerminalSessionPump {
         try Task.checkCancellation()
-        guard !closed, !openingAttempted, attached == nil else { throw NativeSSHError.busy }
+        guard purpose == .terminal, !closed, !openingAttempted, attached == nil else { throw NativeSSHError.busy }
         openingAttempted = true
         self.coordinator = coordinator
         let task = Task<TerminalSessionPump, Error> {
@@ -464,6 +480,32 @@ public actor WorkspaceNativeSSHConnection {
                 task.cancel()
                 await close()
                 opening = nil
+                throw error
+            }
+        } onCancel: { task.cancel() }
+    }
+
+    /// Opens only an SFTP subsystem on the independently admitted file owner.
+    /// No shell, PTY, exec request, terminal source, or creation epoch is made.
+    public func openFiles() async throws -> WorkspaceSFTPClient {
+        try Task.checkCancellation()
+        guard purpose == .fileTransfer, !closed, !openingAttempted,
+              attached == nil, mux == nil else { throw NativeSSHError.busy }
+        openingAttempted = true
+        let task = Task<NativeSSHSession, Error> { try await self.transport.openSFTP() }
+        filesOpening = task
+        return try await withTaskCancellationHandler {
+            do {
+                let session = try await task.value
+                try await validateCurrent()
+                filesOpening = nil
+                return WorkspaceSFTPClient(session: session,
+                    validate: { try await self.validateCurrent() },
+                    retire: { await self.close() })
+            } catch {
+                task.cancel()
+                await close()
+                filesOpening = nil
                 throw error
             }
         } onCancel: { task.cancel() }
@@ -560,6 +602,7 @@ public actor WorkspaceNativeSSHConnection {
     public func sealAdmission() async {
         closed = true
         opening?.cancel()
+        filesOpening?.cancel()
         if let pump = attached {
             pump.requestStop()
             if let coordinator { try? await coordinator.stopAdmission(pump.source) }
@@ -584,12 +627,14 @@ public actor WorkspaceNativeSSHConnection {
         if let existing = shutdown { task = existing }
         else {
             let pump = attached, transport = self.transport, opening = self.opening
+            let filesOpening = self.filesOpening
             task = Task<Void, Never> {
                 if let pump { try? await pump.disconnect() }
                 await transport.close()
                 // performOpen never calls this public close path. Its own
                 // transport cleanup can finish independently before this join.
                 if let opening { _ = await opening.result }
+                if let filesOpening { _ = await filesOpening.result }
             }
             shutdown = task
         }
@@ -783,6 +828,16 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         self.session = session; self.identity = identity; self.broker = broker
         self.foreground = foreground; self.networkLease = networkLease; self.authority = authority
         self.liveness = liveness; self.muxControl = muxControl
+    }
+
+    func openSFTP() async throws -> NativeSSHSession {
+        do {
+            try await validateForeground()
+            guard driver == nil, muxControl == nil else { throw NativeSSHError.busy }
+            try await session.startSFTP(timeout: .seconds(15))
+            try await validateForeground()
+            return session
+        } catch { await close(); throw error }
     }
 
     func openShell(geometry: NativeSSHGeometry) async throws {

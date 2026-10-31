@@ -1,10 +1,15 @@
 diff --git a/include/libssh2.h b/include/libssh2.h
 --- a/include/libssh2.h
 +++ b/include/libssh2.h
-@@ -751,6 +751,34 @@
+@@ -751,6 +751,39 @@
                             LIBSSH2_USERAUTH_PUBLICKEY_SIGN_FUNC
                                 ((*sign_callback)),
                             void **abstract);
++
++/* The bounded READLINK/REALPATH parser is present in this linked library.
++ * This additive marker is not an upstream libssh2 API. */
++#define LIBSSH2_FRANKENTERM_SFTP_BOUNDS_VERSION 1
++LIBSSH2_API unsigned int libssh2_frankenterm_sftp_bounds_version(void);
 +
 +/* FrankenTerm additive authentication evidence, version 1. Stock authentication
 + * return values are unchanged. This is not an upstream libssh2 API.
@@ -263,3 +268,103 @@ diff --git a/src/userauth.c b/src/userauth.c
      LIBSSH2_FREE(session, session->userauth_pblc_data);
      session->userauth_pblc_data = NULL;
      session->userauth_pblc_state = libssh2_NB_state_idle;
+diff --git a/src/sftp.c b/src/sftp.c
+--- a/src/sftp.c
++++ b/src/sftp.c
+@@ -49,6 +49,12 @@
+ #include <assert.h>
+ #include <stdlib.h>  /* strtol() */
+ 
++LIBSSH2_API unsigned int
++libssh2_frankenterm_sftp_bounds_version(void)
++{
++    return LIBSSH2_FRANKENTERM_SFTP_BOUNDS_VERSION;
++}
++
+ /* This release of libssh2 implements Version 5 with automatic downgrade
+  * based on server's declaration
+  *   https://www.ietf.org/archive/id/draft-ietf-secsh-filexfer-05.txt
+@@ -770,6 +776,12 @@
+         LIBSSH2_FREE(session, sftp->readdir_packet);
+     }
+ 
++    /* Cancellation can close the channel before VERSION publishes the SFTP
++       handle. Retire that temporary owner before session_free can see it. */
++    if(session->sftpInit_sftp == sftp)
++        session->sftpInit_sftp = NULL;
++    sftp_packet_flush(sftp);
++    *channel_abstract = NULL;
+     LIBSSH2_FREE(session, sftp);
+ }
+ 
+@@ -868,6 +880,10 @@
+         }
+         sftp_handle->channel = session->sftpInit_channel;
+         sftp_handle->request_id = 0;
++        /* VERSION can be fragmented or never arrive. Its partial and queued
++           packets must already belong to the channel's teardown callback. */
++        sftp_handle->channel->abstract = sftp_handle;
++        sftp_handle->channel->close_cb = libssh2_sftp_dtor;
+ 
+         _libssh2_htonu32(session->sftpInit_buffer, 5);
+         session->sftpInit_buffer[4] = SSH_FXP_INIT;
+@@ -990,6 +1006,7 @@
+             char *extversion_str;
+             extversion_str = (char *)LIBSSH2_ALLOC(session, extdata_len + 1);
+             if(!extversion_str) {
++                LIBSSH2_FREE(session, data);
+                 _libssh2_error(session, LIBSSH2_ERROR_ALLOC,
+                                "Unable to allocate memory for SSH_FXP_VERSION "
+                                "packet");
+@@ -1007,11 +1024,6 @@
+ 
+     }
+     LIBSSH2_FREE(session, data);
+-
+-    /* Make sure that when the channel gets closed, the SFTP service is shut
+-       down too */
+-    sftp_handle->channel->abstract = sftp_handle;
+-    sftp_handle->channel->close_cb = libssh2_sftp_dtor;
+ 
+     session->sftpInit_state = libssh2_NB_state_idle;
+ 
+@@ -1702,21 +1714,25 @@
+                        https://tools.ietf.org/html/draft-ietf-secsh-filexfer-02
+                        #section-6.4
+                      */
++                    LIBSSH2_FREE(session, data);
+                     return _libssh2_error(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
+                                           "Read Packet At Unexpected Offset");
+                 }
+ 
+                 rc32 = _libssh2_ntohu32(data + 5);
+-                if(rc32 > (data_len - 9))
++                if(rc32 > (data_len - 9)) {
++                    LIBSSH2_FREE(session, data);
+                     return _libssh2_error(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
+                                           "SFTP Protocol badness");
++                }
+ 
+                 if(rc32 > chunk->len) {
+                     /* A chunk larger than we requested was returned to us.
+                        This is a protocol violation and we don't know how to
+                        deal with it. Bail out! */
++                    LIBSSH2_FREE(session, data);
+                     return _libssh2_error(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
+                                           "FXP_READ response too big");
+                 }
+ 
+                 if(rc32 != chunk->len) {
+@@ -3921,6 +3937,11 @@
+-    /* this reads a u32 and stores it into a signed 32bit value */
++    /* Validate the complete peer string before copying any filename bytes. */
+     link_len = _libssh2_ntohu32(data + 9);
++    if(link_len > data_len - 13) {
++        LIBSSH2_FREE(session, data);
++        return _libssh2_error(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
++                              "SFTP READLINK/REALPATH packet too short");
++    }
+     if(link_len < target_len) {
+         memcpy(target, data + 13, link_len);
+         target[link_len] = 0;
+         retcode = (int)link_len;

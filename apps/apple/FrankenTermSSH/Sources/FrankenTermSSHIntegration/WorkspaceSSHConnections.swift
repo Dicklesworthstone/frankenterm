@@ -2,14 +2,21 @@ import Foundation
 import FrankenTermKit
 import FrankenTermSSH
 
+/// File transfers have their own authenticated transport and never borrow a
+/// terminal's channel, input authority, or creation journal.
+public enum WorkspaceSSHConnectionPurpose: String, Sendable, Hashable {
+    case terminal, fileTransfer
+}
+
 public enum WorkspaceSSHConnectionError: Error, Equatable, Sendable, LocalizedError {
-    case offline, busy, capacity, stale, promptedHopRetryRequired
+    case offline, busy, capacity, stale, promptedHopRetryRequired, filesUnavailable
     public var errorDescription: String? {
         switch self {
         case .offline: return "Connections are paused. Resume while the app is active to connect."
-        case .busy: return "This machine already has a connection or an attempt in progress."
+        case .busy: return "This machine already has a connection or an attempt for this activity."
         case .capacity: return "The connection limit has been reached. Close a session before connecting another machine."
         case .stale: return "This connection changed or closed. Select the machine again."
+        case .filesUnavailable: return "Remote Files requires an updated native SSH component in this build."
         case .promptedHopRetryRequired:
             return "The destination refused this sign-in after an interactive sign-in to a jump host. Choose Retry to sign in again; the app will not automatically repeat authentication prompts."
         }
@@ -67,12 +74,17 @@ public struct WorkspaceSSHLiveness: Sendable, Equatable {
 }
 
 /// One app-owned manager shared by scenes. It admits at most three attempts and
-/// sixteen retained owners, with one owner per installed workspace and machine.
+/// sixteen retained owners. A machine may own one terminal and one independent
+/// file connection; at most two file connections are admitted across the app.
 /// Networking starts disabled. Imported preferences and row selection do not
 /// call connect; each attempt requires explicit user confirmation. All native
 /// work uses WorkspaceNativeSSHConnection and its process-wide offline exclusion.
 public actor WorkspaceSSHConnectionManager {
-    private struct Machine: Hashable, Sendable { let workspaceID: UUID; let machineID: String }
+    private struct Machine: Hashable, Sendable {
+        let workspaceID: UUID
+        let machineID: String
+        let purpose: WorkspaceSSHConnectionPurpose
+    }
     private struct Pending {
         let id: UUID
         let machine: Machine
@@ -283,7 +295,10 @@ public actor WorkspaceSSHConnectionManager {
             if $0.scope.workspaceID != $1.scope.workspaceID {
                 return $0.scope.workspaceID.uuidString < $1.scope.workspaceID.uuidString
             }
-            return $0.identity.machineID < $1.identity.machineID
+            if $0.identity.machineID != $1.identity.machineID {
+                return $0.identity.machineID < $1.identity.machineID
+            }
+            return $0.purpose.rawValue < $1.purpose.rawValue
         }
     }
     public var pendingCount: Int { pending.count }
@@ -294,11 +309,12 @@ public actor WorkspaceSSHConnectionManager {
                         connectionTimeout: Duration = .seconds(15),
                         authenticationTimeout: Duration = .seconds(60),
                         attachMux: Bool = true, muxAccessMode: TerminalMuxAccessMode = .interactive,
-                        requiresExistingMux: Bool = false) async throws -> WorkspaceSSHConnection {
+                        requiresExistingMux: Bool = false,
+                        purpose: WorkspaceSSHConnectionPurpose = .terminal) async throws -> WorkspaceSSHConnection {
         try await connect(workspaceID: workspaceID, expectedRevision: expectedRevision, machineID: machineID,
             routeID: routeID, authentication: .publicKey(credentialID), confirmedByUser: confirmedByUser,
             connectionTimeout: connectionTimeout, authenticationTimeout: authenticationTimeout, attachMux: attachMux,
-            muxAccessMode: muxAccessMode, requiresExistingMux: requiresExistingMux)
+            muxAccessMode: muxAccessMode, requiresExistingMux: requiresExistingMux, purpose: purpose)
     }
 
     public func connect(workspaceID: UUID, expectedRevision: UUID, machineID: String,
@@ -307,8 +323,15 @@ public actor WorkspaceSSHConnectionManager {
                         authenticationTimeout: Duration = .seconds(60),
                         attachMux: Bool = true, muxAccessMode: TerminalMuxAccessMode = .interactive,
                         requiresExistingMux: Bool = false,
-                        selection: WorkspaceSSHConnectionSelection? = nil) async throws -> WorkspaceSSHConnection {
+                        selection: WorkspaceSSHConnectionSelection? = nil,
+                        purpose: WorkspaceSSHConnectionPurpose = .terminal) async throws -> WorkspaceSSHConnection {
         guard confirmedByUser else { throw WorkspaceNetworkError.confirmationRequired }
+        guard purpose == .terminal || (!attachMux && !requiresExistingMux) else {
+            throw NativeSSHError.invalidInput
+        }
+        guard purpose == .terminal || NativeSSHSession.supportsSFTP else {
+            throw WorkspaceSSHConnectionError.filesUnavailable
+        }
         guard foreground else { throw WorkspaceSSHConnectionError.offline }
         guard retiringWorkspaces[workspaceID] == nil else { throw WorkspaceSSHConnectionError.stale }
         if let selection {
@@ -326,10 +349,15 @@ public actor WorkspaceSSHConnectionManager {
             throw NativeSSHError.invalidInput
         }
         try Task.checkCancellation()
-        let machine = Machine(workspaceID: workspaceID, machineID: machineID)
+        let machine = Machine(workspaceID: workspaceID, machineID: machineID, purpose: purpose)
         guard pending[machine] == nil, live[machine] == nil else { throw WorkspaceSSHConnectionError.busy }
         guard pending.count < 3, pending.count + live.count + settlements.count < 16 else {
             throw WorkspaceSSHConnectionError.capacity
+        }
+        if purpose == .fileTransfer {
+            let owners = pending.keys.filter { $0.purpose == .fileTransfer }.count
+                + live.keys.filter { $0.purpose == .fileTransfer }.count
+            guard owners < 2 else { throw WorkspaceSSHConnectionError.capacity }
         }
         let generation = lifecycle, attemptID = UUID()
         let store = self.store, broker = self.broker, journal = self.journal
@@ -347,7 +375,8 @@ public actor WorkspaceSSHConnectionManager {
                 keyboardInteractivePrompter: keyboardInteractivePrompter, journal: journal, networkActivity: networkActivity,
                 connectionTimeout: connectionTimeout, authenticationTimeout: authenticationTimeout,
                 liveness: liveness, muxClientFactory: muxClientFactory, attachMux: attachMux,
-                muxAccessMode: muxAccessMode, requiresExistingMux: requiresExistingMux, selection: selection)
+                muxAccessMode: muxAccessMode, requiresExistingMux: requiresExistingMux,
+                selection: selection, purpose: purpose)
             do {
                 try Task.checkCancellation()
                 return WorkspaceSSHConnection(native: native, journal: journal, coordinator: coordinator,
@@ -485,6 +514,12 @@ public final class WorkspaceSSHConnection: Sendable {
     public let identity: TerminalConnectionIdentity
     public let peer: NativeSSHPeer
     public let scope: TerminalSessionScope
+    public var purpose: WorkspaceSSHConnectionPurpose { native.purpose }
+    /// The account and endpoint selected by the validated route, including its
+    /// final destination when the transport traverses jump hosts.
+    public var host: String { native.host }
+    public var port: UInt16 { native.port }
+    public var user: String { native.user }
     /// The machine's mux panes when this connection attaches to them.
     public var muxControl: TerminalMuxControl? { native.muxControl }
     fileprivate let credentialFingerprints: Set<String>
@@ -503,6 +538,10 @@ public final class WorkspaceSSHConnection: Sendable {
         try await native.openTerminal(geometry: NativeSSHGeometry(columns: geometry.columns, rows: geometry.rows,
             pixelWidth: geometry.pixelWidth, pixelHeight: geometry.pixelHeight),
             coordinator: coordinator, journal: journal)
+    }
+
+    public func openFiles() async throws -> WorkspaceSFTPClient {
+        try await native.openFiles()
     }
 
     public func requestResize(_ geometry: TerminalSessionGeometry, source: TerminalSource) async throws {

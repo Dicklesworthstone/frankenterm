@@ -26,7 +26,8 @@ enum {
     FTSSH_AUTH_REJECTED = -1006, FTSSH_CHALLENGE = -1007, FTSSH_CHANNEL = -1008,
     FTSSH_CLOSED = -1009, FTSSH_UNSUPPORTED = -1010,
     FTSSH_AUTH_FAILED = -1011, FTSSH_PASSWORD_FAILED = -1012,
-    FTSSH_INTERACTIVE_FAILED = -1013, FTSSH_AUTH_TIMEOUT = -1014
+    FTSSH_INTERACTIVE_FAILED = -1013, FTSSH_AUTH_TIMEOUT = -1014,
+    FTSSH_SFTP_ERROR = -1015, FTSSH_SFTP_RESPONSE = -1016
 };
 enum { FTSSH_READ = 1, FTSSH_WRITE = 2, FTSSH_RETRY = 4,
        FTSSH_WRITE_CAPACITY = 16384, FTSSH_COMMAND_CAPACITY = 1024,
@@ -216,6 +217,52 @@ int ftssh_begin_shell(ftssh_session *session, uint32_t columns, uint32_t rows,
  * read, write, completion and close then work as for a shell; resize does not. */
 int ftssh_begin_command(ftssh_session *session, const char *command, size_t length);
 int ftssh_shell_step(ftssh_session *session);
+
+/* SFTP is an exclusive channel purpose of a separately authenticated session.
+ * It cannot share a shell/exec/forwarding owner. A single serial caller owns one
+ * file or directory handle. No rename, remove, overwrite, seek or resume API is
+ * exposed. All path/write arguments are copied before returning; stable owned
+ * storage survives every EAGAIN. Each begin must be driven to completion before
+ * another operation. Caller supplies finite deadlines and current authority. */
+enum {
+    FTSSH_SFTP_PATH_CAPACITY = 4096, FTSSH_SFTP_NAME_CAPACITY = 1024,
+    FTSSH_SFTP_IO_CAPACITY = 65536,
+    FTSSH_SFTP_REALPATH = 1, FTSSH_SFTP_OPEN_DIRECTORY = 2,
+    FTSSH_SFTP_READ_DIRECTORY = 3, FTSSH_SFTP_OPEN_READ = 4,
+    FTSSH_SFTP_CREATE_EXCLUSIVE = 5, FTSSH_SFTP_READ_FILE = 6,
+    FTSSH_SFTP_WRITE_FILE = 7, FTSSH_SFTP_FSTAT = 8,
+    FTSSH_SFTP_CLOSE_HANDLE = 9,
+    FTSSH_SFTP_ATTR_SIZE = 1, FTSSH_SFTP_ATTR_PERMISSIONS = 2,
+    FTSSH_SFTP_ATTR_MODIFICATION_TIME = 4
+};
+typedef struct {
+    uint64_t size, modification_time;
+    uint32_t permissions, flags;
+} ftssh_sftp_attributes;
+/* Only the audited dependency build with bounded REALPATH parsing is enabled.
+ * A system library without the compile-time and runtime marker stays disabled. */
+int ftssh_supports_sftp(void);
+int ftssh_begin_sftp(ftssh_session *session);
+int ftssh_sftp_start_step(ftssh_session *session);
+/* REALPATH/OPEN take a UTF-8 path; WRITE takes a nonempty byte chunk.
+ * READ takes NULL and the maximum requested bytes. Other operations take
+ * NULL/zero. CREATE_EXCLUSIVE uses WRITE|CREAT|EXCL with mode 0600, never TRUNC.
+ * File I/O requires an opened handle whose fstat proves it is a regular file. */
+int ftssh_sftp_begin(ftssh_session *session, int operation,
+                    const uint8_t *bytes, size_t length);
+/* OK settles the operation; EOF settles one READ/READ_DIRECTORY. AGAIN retains
+ * it unchanged. A successful WRITE settles only after every byte in its chunk
+ * is acknowledged by the SFTP server, not merely accepted into local buffers. */
+int ftssh_sftp_step(ftssh_session *session);
+/* Copies the completed operation's bytes and metadata. READ_DIRECTORY returns
+ * one strict UTF-8 name (possibly . or .. for the caller to omit); no slash or
+ * NUL is accepted. No libssh2 pointer escapes. Calling begin invalidates it. */
+int ftssh_sftp_copy_result(ftssh_session *session, uint8_t *output, size_t capacity,
+                          size_t *length, ftssh_sftp_attributes *attributes);
+/* Numeric status only; no server-provided message or path is exposed in errors.
+ * Read before close when step/start returned FTSSH_SFTP_ERROR. */
+int ftssh_sftp_status(ftssh_session *session, uint32_t *status);
+
 /* Admission copies the whole bounded unit or accepts nothing. Success means
  * accepted into this adapter's single 16 KiB slot, NOT remote delivery. */
 int ftssh_admit_write(ftssh_session *session, const uint8_t *bytes, size_t length);
