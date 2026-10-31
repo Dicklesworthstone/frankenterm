@@ -57,7 +57,8 @@ pub struct RecoveryOptions {
     /// Local publication age target (seconds; default 120). No replica claim.
     #[arg(long, requires = "recovery_store", value_parser = clap::value_parser!(u64).range(1..=604800))]
     pub recovery_rpo_seconds: Option<u64>,
-    /// Cooperative capture deadline (seconds; default 30, maximum 30).
+    /// Cooperative capture and startup restore deadline (seconds; default 30,
+    /// maximum 30), plus one second per guardian pane.
     #[arg(long, requires = "recovery_store", value_parser = clap::value_parser!(u64).range(1..=30))]
     pub recovery_timeout_seconds: Option<u64>,
 }

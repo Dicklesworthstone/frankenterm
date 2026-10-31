@@ -6674,6 +6674,9 @@ pub fn restore_from_options(
 /// Restore one independently configured guardian's cohort before exposing a
 /// server listener. All metadata and lease plans are admitted before the first
 /// Claim; failed activation/publication retains lease-only rollback custody.
+/// The restore gets `timeout` plus one second per pane
+/// ([`frankenterm_core::snapshot_engine::whole_mux_recovery_budget`]): it
+/// connects, claims and replays the panes one after another.
 pub fn restore_authenticated_topology(
     owner: Arc<mux::Mux>,
     recovery: frankenterm_core::session_restore::ValidatedWholeMuxRecovery,
@@ -6686,15 +6689,21 @@ pub fn restore_authenticated_topology(
         CheckpointAuthority, RecoveryDomainPolicy, RecoverySpawnCustody,
     };
     let started = Instant::now();
+    // Every restored pane is guardian-backed (checked below).
+    let budget = frankenterm_core::snapshot_engine::whole_mux_recovery_budget(
+        timeout,
+        recovery.pane_count(),
+    );
     let deadline = started
-        .checked_add(timeout)
+        .checked_add(budget)
         .context("startup recovery deadline overflow")?;
     let checkpoint = || -> anyhow::Result<()> {
         cx.checkpoint()
             .map_err(|_| anyhow::anyhow!("startup recovery cancelled"))?;
         anyhow::ensure!(
-            started.elapsed() < timeout,
-            "startup recovery deadline expired"
+            started.elapsed() < budget,
+            "startup recovery deadline of {} ms expired",
+            budget.as_millis()
         );
         Ok(())
     };

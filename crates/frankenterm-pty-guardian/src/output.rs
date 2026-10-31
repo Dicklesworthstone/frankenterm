@@ -51,11 +51,12 @@ use mux::guardian_protocol::{
     GuardianCheckpointRuntimeSealPermitV1, GuardianCheckpointScopeV1,
     GuardianCheckpointStageKindV1, GuardianCheckpointStageReplyV1,
     GuardianCheckpointStageRequestV1, GuardianEffectTransactionError, GuardianOperation,
-    GuardianProtocolError, GuardianProtocolState, GuardianReplayAckReceiptV1, GuardianReplayAckV1,
-    GuardianReplayCursorV1, GuardianReplayGapReasonV1, GuardianReplayOutputRecordsDelivery,
-    GuardianReplayPageBodyDelivery, GuardianReplayPageDelivery, GuardianReplayPhaseV1,
-    GuardianReplayPredecessorV1, GuardianReplayRecordDelivery, GuardianReplayRecordMetadataV1,
-    GuardianReplayRequestV1, GuardianReplaySelectorV1, GuardianReply,
+    GuardianPaneState, GuardianProtocolError, GuardianProtocolState, GuardianReplayAckReceiptV1,
+    GuardianReplayAckV1, GuardianReplayCursorV1, GuardianReplayGapReasonV1,
+    GuardianReplayOutputRecordsDelivery, GuardianReplayPageBodyDelivery,
+    GuardianReplayPageDelivery, GuardianReplayPhaseV1, GuardianReplayPredecessorV1,
+    GuardianReplayRecordDelivery, GuardianReplayRecordMetadataV1, GuardianReplayRequestV1,
+    GuardianReplaySelectorV1, GuardianReply,
 };
 use nix::unistd::{PathconfVar, fpathconf, geteuid};
 use sha2::{Digest as _, Sha256};
@@ -5158,6 +5159,35 @@ impl GuardianCheckpointStageStore {
         }
     }
 
+    /// Drop every replay snapshot that no request can acknowledge any more,
+    /// because its pane's lease moved past the one it was opened under
+    /// ([`guardian_replay_lease_is_current`]). A mux that dies with pages in
+    /// flight leaves a snapshot behind for each, and a successor's Claims fence
+    /// them all. A 60-pane mux upgraded under load left 34, more than the store
+    /// holds. Admission gives up only the opening pane's own fenced snapshot,
+    /// so a restore of any other pane could only wait for a slot nothing would
+    /// free, and the refusal ended the mux (ft-udi9a). Returns how many went.
+    pub(crate) fn release_fenced_replay_snapshots(
+        &self,
+        protocol: &GuardianProtocolState,
+    ) -> Result<usize, GuardianCheckpointStageStoreError> {
+        let mut state = self
+            .inner
+            .replay
+            .lock()
+            .map_err(|_| GuardianCheckpointStageStoreError::LockPoisoned)?;
+        let retained = state.snapshots.len();
+        state.snapshots.retain(|_, snapshot| {
+            guardian_replay_lease_is_current(
+                protocol,
+                snapshot.pane_id,
+                snapshot.generation,
+                snapshot.mux_incarnation,
+            )
+        });
+        Ok(retained - state.snapshots.len())
+    }
+
     /// Acknowledge only the exact page currently outstanding for a snapshot.
     /// This ledger transition never authorizes retention or compaction.
     pub(crate) fn apply_replay_ack(
@@ -5509,6 +5539,32 @@ fn guardian_replay_plan_snapshot_admission(
     Ok(GuardianReplaySnapshotAdmissionPlan {
         evicted_snapshot_id,
     })
+}
+
+/// Whether a Replay or ReplayAck under `generation` from `mux_incarnation`
+/// can still pass `pane_id`'s lease fence, the rule the protocol state applies
+/// to both (`require_replay_generation`): a live pane answers only its current
+/// claim, while an exited, closed or quarantined one answers its last
+/// generation from any mux.
+fn guardian_replay_lease_is_current(
+    protocol: &GuardianProtocolState,
+    pane_id: Uuid,
+    generation: u64,
+    mux_incarnation: Uuid,
+) -> bool {
+    match protocol.pane_state(pane_id) {
+        Some(GuardianPaneState::LiveClaimed {
+            generation: live_generation,
+            mux_incarnation: owner,
+            ..
+        }) => *live_generation == generation && *owner == mux_incarnation,
+        Some(
+            state @ (GuardianPaneState::ExitedUnclaimed { .. }
+            | GuardianPaneState::ClosedTerminal { .. }
+            | GuardianPaneState::Quarantined { .. }),
+        ) => state.generation() == generation,
+        Some(GuardianPaneState::LiveUnclaimed { .. }) | None => false,
+    }
 }
 
 /// What admission needs to know about one retained replay snapshot.
@@ -20415,6 +20471,96 @@ mod tests {
             guardian_replay_eviction_candidate(snapshots.into_iter(), pane, 2),
             None
         );
+    }
+
+    /// A mux that died with a page in flight leaves its snapshot behind; once a
+    /// successor claims the pane, no ack can release it, so it goes, freeing
+    /// the slot for any pane's Open (ft-udi9a).
+    #[test]
+    fn a_successor_claim_releases_the_replay_snapshot_its_predecessor_left()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-replay-fenced-release-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let guardian = Uuid::from_u128(0xf600);
+        let mux = Uuid::from_u128(0xf601);
+        let pane = Uuid::from_u128(0xf602);
+        let generation = 1;
+        let journal = pipeline.prepare_pane(guardian, pane)?;
+        let mut protocol = checkpoint_catalog_claimed_protocol_state(guardian, mux, pane)?;
+        checkpoint_catalog_stage_and_publish(
+            &pipeline,
+            &store,
+            &journal,
+            &mut protocol,
+            guardian,
+            mux,
+            pane,
+            generation,
+            1,
+            0xf610,
+            b"fenced-release",
+            b"fenced-release",
+        )?;
+        let open = GuardianReplayRequestV1::Open {
+            selector: GuardianReplaySelectorV1::LatestCompatible,
+            max_plaintext_bytes: 64 * 1024,
+            max_records: 4,
+            wait_millis: 0,
+        };
+        let open_request = checkpoint_catalog_replay_request(
+            guardian,
+            mux,
+            Uuid::from_u128(0xf620),
+            pane,
+            generation,
+            open,
+        )?;
+        let _in_flight = store.apply_replay(
+            &open_request,
+            protocol.preflight_replay(&open_request)?,
+            Some(&journal),
+        )?;
+        let snapshots = |store: &GuardianCheckpointStageStore| {
+            store
+                .inner
+                .replay
+                .lock()
+                .map(|replay| replay.snapshots.len())
+                .map_err(|_| "replay ledger poisoned")
+        };
+        // Its page is in flight under the current claim: it stays.
+        assert_eq!(store.release_fenced_replay_snapshots(&protocol)?, 0);
+        assert_eq!(snapshots(&store)?, 1);
+
+        let claim = checkpoint_catalog_authenticate_request(
+            GuardianOperation::Claim,
+            guardian,
+            Uuid::from_u128(0xf603),
+            Uuid::from_u128(0xf630),
+            Some(pane),
+            generation,
+            0,
+            Some(Uuid::from_u128(0xf631)),
+            Zeroizing::new(Vec::new()),
+        )?;
+        protocol.apply_effect_transactionally(&claim, |_| {
+            GuardianEffectOutcome::<std::convert::Infallible>::Applied
+        })?;
+        assert!(!guardian_replay_lease_is_current(
+            &protocol, pane, generation, mux
+        ));
+        assert!(guardian_replay_lease_is_current(
+            &protocol,
+            pane,
+            generation + 1,
+            Uuid::from_u128(0xf603)
+        ));
+        assert_eq!(store.release_fenced_replay_snapshots(&protocol)?, 1);
+        assert_eq!(snapshots(&store)?, 0);
+        Ok(())
     }
 
     #[test]

@@ -154,9 +154,10 @@ pub enum WholeMuxCaptureError {
     /// With how far the capture got: its panes are captured one after
     /// another under the one budget.
     #[error(
-        "model capture exhausted its total time budget after {elapsed_ms} ms with {taken} of {panes} pane checkpoints taken (slowest: pane {slowest_pane:?} in {slowest_ms} ms)"
+        "model capture exhausted its total time budget of {budget_ms} ms after {elapsed_ms} ms with {taken} of {panes} pane checkpoints taken (slowest: pane {slowest_pane:?} in {slowest_ms} ms)"
     )]
     CaptureDeadline {
+        budget_ms: u128,
         elapsed_ms: u128,
         taken: usize,
         panes: usize,
@@ -298,12 +299,34 @@ fn pane_bindings_agree(
         })
 }
 
+/// What each guardian pane adds to the budget of a whole-mux capture or
+/// restore (ft-4wrv7). Both take the panes one after another through the
+/// guardian's one checkpoint worker. A capture's checkpoint is several round
+/// trips (stage, chunks, seal, adoption, ack), about 0.6 s a pane at 40 panes
+/// on a loaded Mac; a restore of 60 panes spent 25 s of a fixed 30 s loading
+/// and claiming before its first replay. Under a fixed budget, every capture of
+/// a large enough mux overran, threw away the guardian work it had done and
+/// retried, so nothing was published. Model panes are captured in process and
+/// add nothing.
+#[cfg(feature = "frankenterm-deps")]
+const GUARDIAN_PANE_RECOVERY_ALLOWANCE: Duration = Duration::from_secs(1);
+
+/// The total budget of a whole-mux capture or restore: the configured
+/// recovery timeout, plus [`GUARDIAN_PANE_RECOVERY_ALLOWANCE`] for each
+/// guardian pane.
+#[cfg(feature = "frankenterm-deps")]
+pub fn whole_mux_recovery_budget(timeout: Duration, guardian_panes: usize) -> Duration {
+    let panes = u32::try_from(guardian_panes).unwrap_or(u32::MAX);
+    timeout.saturating_add(GUARDIAN_PANE_RECOVERY_ALLOWANCE.saturating_mul(panes))
+}
+
 /// The pane checkpoints of one whole-mux capture, timed so that a capture
 /// out of budget names how far it got and which pane spent the most: the
 /// panes are captured one after another under one total budget.
 #[cfg(feature = "frankenterm-deps")]
 struct CaptureTiming {
     started: Instant,
+    budget: Duration,
     panes: usize,
     taken: usize,
     slowest: Option<(usize, Duration)>,
@@ -322,6 +345,7 @@ impl CaptureTiming {
     /// mux logs as the capture's failure.
     fn deadline(&self) -> WholeMuxCaptureError {
         WholeMuxCaptureError::CaptureDeadline {
+            budget_ms: self.budget.as_millis(),
             elapsed_ms: self.started.elapsed().as_millis(),
             taken: self.taken,
             panes: self.panes,
@@ -334,9 +358,11 @@ impl CaptureTiming {
 /// Capture actual mux/parser state and publish an encrypted offline recovery image.
 ///
 /// Run on an owned blocking worker, never a mux or readiness thread. There is
-/// one attempt, at most 1,024 panes, a total deadline checked between phases,
-/// and at most 100ms for each parser ACK channel wait. Registry locks, staging,
-/// and cold-history filesystem calls are not preemptible by that wait bound.
+/// one attempt, at most 1,024 panes, a total deadline checked between phases
+/// ([`whole_mux_recovery_budget`]: `capture_timeout` plus one second per
+/// guardian pane), and at most 100ms for each parser ACK channel wait.
+/// Registry locks, staging, guardian publication round trips, and cold-history
+/// filesystem calls are not preemptible by that wait bound.
 /// Supports both legacy model-only panes and authenticated guardian-owned panes.
 /// All periodic/manual callers must share this store authority and this entry
 /// point. The store additionally serializes the final root CAS across processes.
@@ -405,9 +431,6 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
         return Err(WholeMuxCaptureError::ReconciliationRequired);
     }
     let started = Instant::now();
-    let deadline = started
-        .checked_add(capture_timeout)
-        .ok_or(WholeMuxCaptureError::InvalidTimeout)?;
     let config = mux::MuxTopologyCaptureConfig {
         max_attempts: 1,
         max_panes: 1024,
@@ -419,6 +442,15 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
             "mux incarnation differs from the publication identity",
         ));
     }
+    let guardian_panes = captured
+        .pane_bindings
+        .iter()
+        .filter(|pane| pane.spawn_custody.is_some())
+        .count();
+    let budget = whole_mux_recovery_budget(capture_timeout, guardian_panes);
+    let deadline = started
+        .checked_add(budget)
+        .ok_or(WholeMuxCaptureError::InvalidTimeout)?;
     let mut checkpoints = Vec::with_capacity(captured.pane_bindings.len());
     let mut total_bytes = 0usize;
     // Version 4 lines, graphics and protection when the mux's guardian admits
@@ -435,6 +467,7 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
     };
     let mut timing = CaptureTiming {
         started,
+        budget,
         panes: captured.pane_bindings.len(),
         taken: 0,
         slowest: None,
@@ -442,10 +475,13 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
     for pane in &captured.pane_bindings {
         snapshot_cx_checkpoint(cx)?;
         let pane_started = Instant::now();
+        // The budget grows with the panes; one pane's parser wait stays within
+        // the configured timeout, as before.
         let remaining = deadline
             .checked_duration_since(pane_started)
             .filter(|duration| !duration.is_zero())
-            .ok_or_else(|| timing.deadline())?;
+            .ok_or_else(|| timing.deadline())?
+            .min(capture_timeout);
         let mut cancellation = None;
         let mut capture_deadline_reached = false;
         let checkpoint = if pane.spawn_custody.is_some() {
@@ -14126,6 +14162,23 @@ mod tests {
         )
         .to_string();
         assert!(shown.contains("superseded for pane 1"), "{shown}");
+    }
+
+    #[test]
+    #[cfg(feature = "frankenterm-deps")]
+    fn recovery_budget_grows_by_one_second_per_guardian_pane() {
+        let base = Duration::from_secs(30);
+        assert_eq!(whole_mux_recovery_budget(base, 0), base);
+        // 50 guardian panes at about 0.6 s each overran the fixed 30 s.
+        assert_eq!(whole_mux_recovery_budget(base, 50), Duration::from_secs(80));
+        assert_eq!(
+            whole_mux_recovery_budget(Duration::from_secs(5), 1024),
+            Duration::from_secs(1029)
+        );
+        assert_eq!(
+            whole_mux_recovery_budget(base, usize::MAX),
+            base + Duration::from_secs(u64::from(u32::MAX))
+        );
     }
 
     #[test]

@@ -1057,6 +1057,17 @@ fn execute_checkpoint_job(
                     ));
                 }
             };
+            // Before an Open takes a snapshot slot, free those that a dead or
+            // replaced mux left with pages no one can acknowledge.
+            if matches!(replay, GuardianReplayRequestV1::Open { .. }) {
+                match store.release_fenced_replay_snapshots(&job.protocol) {
+                    Ok(0) => {}
+                    Ok(released) => log::info!(
+                        "guardian released {released} replay snapshot(s) of fenced leases"
+                    ),
+                    Err(error) => return replay_store_error_response(&job.request, &error),
+                }
+            }
             let page = match store.apply_replay_with_genesis(
                 &job.request,
                 replay,
