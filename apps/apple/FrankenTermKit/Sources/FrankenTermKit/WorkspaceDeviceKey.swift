@@ -104,6 +104,14 @@ enum WorkspaceDeviceKeyOverlay {
         try PolicyIndex(document: document).witness(routeID: routeID)
     }
 
+    /// Reuse the same complete authentication-path policy for a bounded group
+    /// of public certificate renewals, without reparsing the fleet per route.
+    static func certificateRenewalWitnesses(routeIDs: Set<String>, in document: WorkspaceDocument) throws -> [String: Data] {
+        guard routeIDs.count <= assignmentLimit else { throw FTError.limit("device_key.route_graph") }
+        let index = try PolicyIndex(document: document, digestCertificates: true)
+        return try Dictionary(uniqueKeysWithValues: routeIDs.sorted().map { ($0, try index.witness(routeID: $0)) })
+    }
+
     /// One bounded policy index for a fleet-sized atomic selection. Creating
     /// metadata here does not publish it or grant access to a protected key.
     static func assignments(routeIDs: Set<String>, credentialID: String,
@@ -129,7 +137,7 @@ enum WorkspaceDeviceKeyOverlay {
         let typed: [String: WorkspaceDocument.Route]
         let contexts: [String: [[String]]]
 
-        init(document: WorkspaceDocument) throws {
+        init(document: WorkspaceDocument, digestCertificates: Bool = false) throws {
             self.document = document
             root = try StrictJSON.decode(document.raw).object()
             workspace = try root.required("workspace").object()
@@ -139,7 +147,23 @@ enum WorkspaceDeviceKeyOverlay {
                 })
             }
             routes = try indexed("routes", workspace: workspace)
-            credentials = try indexed("credentials", workspace: workspace)
+            let rawCredentials = try indexed("credentials", workspace: workspace)
+            if digestCertificates {
+                // These are policy fingerprints, not manifest records. Hash the
+                // already-validated complete signed blobs so certificates up to
+                // 32 KiB do not enter the ordinary 4 KiB JSON-string profile.
+                credentials = try rawCredentials.mapValues { value in
+                    var fields = try value.object()
+                    if let encoded = fields["user_certificate"] {
+                        guard let blob = Data(base64Encoded: try encoded.string()) else {
+                            throw WorkspaceStoreError.corruptStore
+                        }
+                        fields["user_certificate"] = nil
+                        fields["user_certificate_sha256"] = .string(Data(SHA256.hash(data: blob)).base64EncodedString())
+                    }
+                    return .object(fields)
+                }
+            } else { credentials = rawCredentials }
             trusts = try indexed("host_trust", workspace: workspace)
             typed = Dictionary(uniqueKeysWithValues: document.routes.map { ($0.id, $0) })
             // A route can be a transit account behind several different

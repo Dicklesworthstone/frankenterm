@@ -83,6 +83,7 @@ public struct InstalledWorkspace: Codable, Sendable, Identifiable {
     public let deviceKeys: [WorkspaceDeviceKey]
     public let deviceKeyAssignments: [WorkspaceDeviceKeyAssignment]
     public let hostKeyPins: [WorkspaceHostKeyPin]
+    public let certificateRenewals: [WorkspaceCertificateRenewal]
     /// Restoring never executes imported auto-connect preferences, even on
     /// relaunch. Only a deliberate Connect action for this exact saved revision
     /// clears the gate; a new import or offline restore arms it again.
@@ -91,22 +92,25 @@ public struct InstalledWorkspace: Codable, Sendable, Identifiable {
         let imported = try importedDocument()
         let effective = try WorkspaceDeviceKeyOverlay.document(imported: imported, keys: deviceKeys,
                                                                 assignments: deviceKeyAssignments)
-        return try WorkspaceHostKeyOverlay.document(effective: effective, imported: imported, pins: hostKeyPins)
+        let trusted = try WorkspaceHostKeyOverlay.document(effective: effective, imported: imported, pins: hostKeyPins)
+        return try WorkspaceCertificateRenewalOverlay.document(effective: trusted, imported: imported,
+                                                               renewals: certificateRenewals)
     }
 
     init(id: UUID, revision: UUID, manifest: Data, envelopeDigest: Data, bindings: [Binding],
          inactiveSettings: [InactiveSetting], findings: [PortabilityFinding], connectLater: Bool,
          deviceKeys: [WorkspaceDeviceKey] = [], deviceKeyAssignments: [WorkspaceDeviceKeyAssignment] = [],
-         hostKeyPins: [WorkspaceHostKeyPin] = []) {
+         hostKeyPins: [WorkspaceHostKeyPin] = [], certificateRenewals: [WorkspaceCertificateRenewal] = []) {
         self.id = id; self.revision = revision; self.manifest = manifest; self.envelopeDigest = envelopeDigest
         self.bindings = bindings; self.inactiveSettings = inactiveSettings; self.findings = findings
         self.connectLater = connectLater; self.deviceKeys = deviceKeys; self.deviceKeyAssignments = deviceKeyAssignments
         self.hostKeyPins = hostKeyPins
+        self.certificateRenewals = certificateRenewals
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, revision, manifest, envelopeDigest, bindings, inactiveSettings, findings, connectLater
-        case deviceKeys, deviceKeyAssignments, hostKeyPins
+        case deviceKeys, deviceKeyAssignments, hostKeyPins, certificateRenewals
     }
 
     public init(from decoder: Decoder) throws {
@@ -122,6 +126,7 @@ public struct InstalledWorkspace: Codable, Sendable, Identifiable {
         deviceKeys = try fields.decodeIfPresent([WorkspaceDeviceKey].self, forKey: .deviceKeys) ?? []
         deviceKeyAssignments = try fields.decodeIfPresent([WorkspaceDeviceKeyAssignment].self, forKey: .deviceKeyAssignments) ?? []
         hostKeyPins = try fields.decodeIfPresent([WorkspaceHostKeyPin].self, forKey: .hostKeyPins) ?? []
+        certificateRenewals = try fields.decodeIfPresent([WorkspaceCertificateRenewal].self, forKey: .certificateRenewals) ?? []
     }
 }
 
@@ -268,7 +273,7 @@ public actor WorkspaceStore {
         let machineIDs: [String]
     }
     private struct Catalog: Codable {
-        var version = 8
+        var version = 9
         var workspaces: [InstalledWorkspace] = []
         var revokedFingerprints: Set<String> = []
         var acceptedImports: [AcceptedImport] = []
@@ -287,7 +292,7 @@ public actor WorkspaceStore {
         init(from decoder: Decoder) throws {
             let fields = try decoder.container(keyedBy: CodingKeys.self)
             let storedVersion = try fields.decode(Int.self, forKey: .version)
-            guard (1...8).contains(storedVersion) else { throw WorkspaceStoreError.corruptStore }
+            guard (1...9).contains(storedVersion) else { throw WorkspaceStoreError.corruptStore }
             workspaces = try fields.decode([InstalledWorkspace].self, forKey: .workspaces)
             revokedFingerprints = try fields.decode(Set<String>.self, forKey: .revokedFingerprints)
             guard workspaces.count <= 32, revokedFingerprints.count <= 4096 else { throw WorkspaceStoreError.corruptStore }
@@ -360,7 +365,10 @@ public actor WorkspaceStore {
             if storedVersion < 8, workspaces.contains(where: { !$0.hostKeyPins.isEmpty }) {
                 throw WorkspaceStoreError.corruptStore
             }
-            needsSanitizedPublication = storedVersion != 8
+            if storedVersion < 9, workspaces.contains(where: { !$0.certificateRenewals.isEmpty }) {
+                throw WorkspaceStoreError.corruptStore
+            }
+            needsSanitizedPublication = storedVersion != 9
             // Older catalogs could retain opaque desktop annotations. Reuse the
             // wire validator so neither migration nor re-export can preserve an
             // untyped private value in this public configuration store.
@@ -380,7 +388,8 @@ public actor WorkspaceStore {
                         inactiveSettings: metadata.annotations.map { .init(entityID: $0.entityID, setting: $0.setting, original: $0.original) },
                         findings: metadata.portability.map { .init(entityID: $0.entityID, setting: $0.setting, disposition: $0.disposition, reason: $0.reason) },
                         connectLater: saved.connectLater, deviceKeys: saved.deviceKeys,
-                        deviceKeyAssignments: saved.deviceKeyAssignments, hostKeyPins: saved.hostKeyPins)
+                        deviceKeyAssignments: saved.deviceKeyAssignments, hostKeyPins: saved.hostKeyPins,
+                        certificateRenewals: saved.certificateRenewals)
                 }
             }
         }
@@ -398,6 +407,8 @@ public actor WorkspaceStore {
     private let credentialImportOwner = UUID()
     private let hostKeyPinOwner = UUID()
     private let enrollmentReportOwner = UUID()
+    private let certificateRenewalOwner = UUID()
+    private let certificateRenewalNow: @Sendable () -> Date
     private var hostKeyProbes: [UUID: WorkspaceHostKeyProbe] = [:]
     private let hostKeyProbeNow: @Sendable () -> ContinuousClock.Instant
     /// Host-key refusals made in this process. A refusal whose write failed
@@ -416,11 +427,19 @@ public actor WorkspaceStore {
     public init(persistence: any WorkspacePersistence, vault: any WorkspaceCredentialVault) {
         self.persistence = persistence; self.vault = vault
         hostKeyProbeNow = { ContinuousClock.now }
+        certificateRenewalNow = { Date() }
     }
 
     init(persistence: any WorkspacePersistence, vault: any WorkspaceCredentialVault,
          hostKeyProbeNow: @escaping @Sendable () -> ContinuousClock.Instant) {
         self.persistence = persistence; self.vault = vault; self.hostKeyProbeNow = hostKeyProbeNow
+        certificateRenewalNow = { Date() }
+    }
+
+    init(persistence: any WorkspacePersistence, vault: any WorkspaceCredentialVault,
+         certificateRenewalNow: @escaping @Sendable () -> Date) {
+        self.persistence = persistence; self.vault = vault; self.certificateRenewalNow = certificateRenewalNow
+        hostKeyProbeNow = { ContinuousClock.now }
     }
 
     public func load() throws -> [InstalledWorkspace] {
@@ -656,8 +675,12 @@ public actor WorkspaceStore {
             let withDeviceKeys = try WorkspaceDeviceKeyOverlay.document(imported: document,
                 keys: review.existingWorkspace?.deviceKeys ?? [],
                 assignments: review.existingWorkspace?.deviceKeyAssignments ?? [])
-            let effective = try WorkspaceHostKeyOverlay.document(effective: withDeviceKeys, imported: document,
+            let trusted = try WorkspaceHostKeyOverlay.document(effective: withDeviceKeys, imported: document,
                 pins: review.existingWorkspace?.hostKeyPins ?? [])
+            let renewals = try WorkspaceCertificateRenewalOverlay.retained(
+                review.existingWorkspace?.certificateRenewals ?? [], in: document)
+            let effective = try WorkspaceCertificateRenewalOverlay.document(effective: trusted, imported: document,
+                renewals: renewals)
             return (review, try readiness(document: effective, workspaceID: review.existingWorkspace?.id,
                 available: available,
                 findings: archive.portability.map { .init(entityID: $0.entityID, setting: $0.setting, disposition: $0.disposition, reason: $0.reason) },
@@ -842,7 +865,8 @@ public actor WorkspaceStore {
                 inactiveSettings: archive.annotations.map { .init(entityID: $0.entityID, setting: $0.setting, original: $0.original) },
                 findings: archive.portability.map { .init(entityID: $0.entityID, setting: $0.setting, disposition: $0.disposition, reason: $0.reason) },
                 connectLater: true, deviceKeys: deviceKeys, deviceKeyAssignments: deviceAssignments,
-                hostKeyPins: old?.hostKeyPins ?? [])
+                hostKeyPins: old?.hostKeyPins ?? [],
+                certificateRenewals: try WorkspaceCertificateRenewalOverlay.retained(old?.certificateRenewals ?? [], in: document))
             let effectiveReferences = Dictionary(uniqueKeysWithValues: try installed.document().credentials.map { ($0.id, $0) })
             if acceptedImport(document, catalog: catalog) == nil {
                 guard catalog.acceptedImports.count < Self.importHistoryLimit else { throw WorkspaceStoreError.importHistoryFull }
@@ -1005,7 +1029,7 @@ public actor WorkspaceStore {
                 envelopeDigest: saved.envelopeDigest, bindings: bindings,
                 inactiveSettings: saved.inactiveSettings, findings: saved.findings, connectLater: saved.connectLater,
                 deviceKeys: saved.deviceKeys, deviceKeyAssignments: saved.deviceKeyAssignments,
-                hostKeyPins: saved.hostKeyPins)
+                hostKeyPins: saved.hostKeyPins, certificateRenewals: saved.certificateRenewals)
             catalog.workspaces[index] = repaired
             let next = try encode(catalog, limit: Self.catalogLimit)
             let retained = Set(bindings.map(\.account))
@@ -1067,7 +1091,7 @@ public actor WorkspaceStore {
                 bindings: saved.bindings + [.init(credentialID: key.id, fingerprint: key.fingerprint, account: account)],
                 inactiveSettings: saved.inactiveSettings, findings: saved.findings, connectLater: saved.connectLater,
                 deviceKeys: saved.deviceKeys + [key], deviceKeyAssignments: saved.deviceKeyAssignments,
-                hostKeyPins: saved.hostKeyPins)
+                hostKeyPins: saved.hostKeyPins, certificateRenewals: saved.certificateRenewals)
             _ = try installed.document()
             catalog.workspaces[index] = installed
             let next = try encode(catalog, limit: Self.catalogLimit)
@@ -1158,7 +1182,8 @@ public actor WorkspaceStore {
             let installed = InstalledWorkspace(id: saved.id, revision: UUID(), manifest: saved.manifest,
                 envelopeDigest: saved.envelopeDigest, bindings: saved.bindings,
                 inactiveSettings: saved.inactiveSettings, findings: saved.findings, connectLater: true,
-                deviceKeys: saved.deviceKeys, deviceKeyAssignments: assignments, hostKeyPins: saved.hostKeyPins)
+                deviceKeys: saved.deviceKeys, deviceKeyAssignments: assignments, hostKeyPins: saved.hostKeyPins,
+                certificateRenewals: saved.certificateRenewals)
             _ = try installed.document()
             catalog.workspaces[index] = installed
             let next = try encode(catalog, limit: Self.catalogLimit)
@@ -1235,7 +1260,8 @@ public actor WorkspaceStore {
             let installed = InstalledWorkspace(id: saved.id, revision: UUID(), manifest: saved.manifest,
                 envelopeDigest: saved.envelopeDigest, bindings: saved.bindings,
                 inactiveSettings: saved.inactiveSettings, findings: saved.findings, connectLater: saved.connectLater,
-                deviceKeys: saved.deviceKeys, deviceKeyAssignments: assignments, hostKeyPins: saved.hostKeyPins)
+                deviceKeys: saved.deviceKeys, deviceKeyAssignments: assignments, hostKeyPins: saved.hostKeyPins,
+                certificateRenewals: saved.certificateRenewals)
             _ = try installed.document()
             catalog.workspaces[index] = installed
             let next = try encode(catalog, limit: Self.catalogLimit)
@@ -1262,7 +1288,8 @@ public actor WorkspaceStore {
             let installed = InstalledWorkspace(id: saved.id, revision: UUID(), manifest: saved.manifest,
                 envelopeDigest: saved.envelopeDigest, bindings: saved.bindings,
                 inactiveSettings: saved.inactiveSettings, findings: saved.findings, connectLater: saved.connectLater,
-                deviceKeys: saved.deviceKeys, deviceKeyAssignments: assignments, hostKeyPins: saved.hostKeyPins)
+                deviceKeys: saved.deviceKeys, deviceKeyAssignments: assignments, hostKeyPins: saved.hostKeyPins,
+                certificateRenewals: saved.certificateRenewals)
             _ = try installed.document()
             catalog.workspaces[index] = installed
             let next = try encode(catalog, limit: Self.catalogLimit)
@@ -1270,6 +1297,97 @@ public actor WorkspaceStore {
             try persistence.write(next, to: .catalog)
             return installed
         }
+    }
+
+    /// Inspect one deliberately selected public certificate for an existing
+    /// imported subject and issuer. No Keychain read, signing, or connection is
+    /// performed. The scene must discard this review when it loses foreground.
+    public func reviewCertificateRenewal(workspaceID: UUID, expectedRevision: UUID,
+        credentialID: String, certificateFile: Data) throws -> WorkspaceCertificateRenewalReview {
+        try Task.checkCancellation()
+        let renewed = try WorkspaceCertificateRenewalOverlay.readPublicFile(certificateFile)
+        return try persistence.withExclusiveAccess {
+            var catalog = try readCatalog()
+            try recover(catalog: &catalog)
+            let context = try certificateRenewalContext(workspaceID: workspaceID, expectedRevision: expectedRevision,
+                credentialID: credentialID, catalog: catalog)
+            try WorkspaceCertificateRenewalOverlay.validatePolicy(renewed, replacing: context.current)
+            let routes = try WorkspaceCertificateRenewalOverlay.validateUse(renewed, credentialID: credentialID,
+                in: context.document, now: certificateRenewalNow())
+            try Task.checkCancellation()
+            return .init(id: UUID(), workspaceID: workspaceID, expectedRevision: expectedRevision,
+                workspaceName: context.document.name, credentialID: credentialID,
+                currentCertificate: context.current, renewedCertificate: renewed, affectedRouteIDs: routes,
+                sourceWitness: context.witness, owner: certificateRenewalOwner,
+                expires: ContinuousClock.now + .seconds(300))
+        }
+    }
+
+    /// The caller retires this workspace's existing sessions before approval.
+    /// Publication changes only its public local certificate and authorization
+    /// revision, and requires a fresh Connect. A failed write reports no success
+    /// even when the candidate can be read back; reload before another review.
+    @discardableResult
+    public func applyCertificateRenewal(_ review: WorkspaceCertificateRenewalReview,
+                                       confirmedByUser: Bool) throws -> InstalledWorkspace {
+        guard confirmedByUser else { throw WorkspaceStoreError.reviewRequired }
+        guard review.owner == certificateRenewalOwner else { throw WorkspaceStoreError.staleReview }
+        guard ContinuousClock.now < review.expires else { throw WorkspaceCertificateRenewalError.expiredReview }
+        try Task.checkCancellation()
+        return try persistence.withExclusiveAccess {
+            var catalog = try readCatalog()
+            try recover(catalog: &catalog)
+            let context = try certificateRenewalContext(workspaceID: review.workspaceID,
+                expectedRevision: review.expectedRevision, credentialID: review.credentialID, catalog: catalog)
+            guard context.current == review.currentCertificate, context.witness == review.sourceWitness else {
+                throw WorkspaceStoreError.staleReview
+            }
+            try WorkspaceCertificateRenewalOverlay.validatePolicy(review.renewedCertificate, replacing: context.current)
+            let routes = try WorkspaceCertificateRenewalOverlay.validateUse(review.renewedCertificate,
+                credentialID: review.credentialID, in: context.document, now: certificateRenewalNow())
+            guard routes == review.affectedRouteIDs else { throw WorkspaceStoreError.staleReview }
+            let saved = context.saved
+            let renewal = WorkspaceCertificateRenewal(credentialID: review.credentialID,
+                certificate: review.renewedCertificate.blob, sourceWitness: review.sourceWitness)
+            let renewals = saved.certificateRenewals.filter { $0.credentialID != renewal.credentialID } + [renewal]
+            guard renewals.count <= WorkspaceCertificateRenewalOverlay.limit,
+                  renewals.reduce(0, { $0 + $1.certificate.count }) <= WorkspaceCertificateRenewalOverlay.maximumCertificateBytes else {
+                throw FTError.limit("certificate.renewals")
+            }
+            let installed = InstalledWorkspace(id: saved.id, revision: UUID(), manifest: saved.manifest,
+                envelopeDigest: saved.envelopeDigest, bindings: saved.bindings,
+                inactiveSettings: saved.inactiveSettings, findings: saved.findings, connectLater: true,
+                deviceKeys: saved.deviceKeys, deviceKeyAssignments: saved.deviceKeyAssignments,
+                hostKeyPins: saved.hostKeyPins, certificateRenewals: renewals)
+            _ = try installed.document()
+            guard let index = catalog.workspaces.firstIndex(where: { $0.id == saved.id }) else {
+                throw WorkspaceStoreError.staleReview
+            }
+            catalog.workspaces[index] = installed
+            let next = try encode(catalog, limit: Self.catalogLimit)
+            try Task.checkCancellation()
+            guard ContinuousClock.now < review.expires else { throw WorkspaceCertificateRenewalError.expiredReview }
+            _ = try WorkspaceCertificateRenewalOverlay.validateUse(review.renewedCertificate,
+                credentialID: review.credentialID, in: context.document, now: certificateRenewalNow())
+            try persistence.write(next, to: .catalog)
+            return installed
+        }
+    }
+
+    private func certificateRenewalContext(workspaceID: UUID, expectedRevision: UUID, credentialID: String,
+        catalog: Catalog) throws -> (saved: InstalledWorkspace, document: WorkspaceDocument,
+                                    current: SSHUserCertificate, witness: Data) {
+        guard let saved = catalog.workspaces.first(where: { $0.id == workspaceID }),
+              saved.revision == expectedRevision else { throw WorkspaceStoreError.staleReview }
+        let imported = try saved.importedDocument(), effective = try saved.document()
+        guard imported.credentials.contains(where: { $0.id == credentialID && $0.userCertificate != nil }),
+              let credential = effective.credentials.first(where: { $0.id == credentialID }),
+              let current = credential.userCertificate else {
+            throw WorkspaceCertificateRenewalError.unavailableCredential
+        }
+        guard !catalog.revokedFingerprints.contains(credential.fingerprint) else { throw WorkspaceStoreError.revokedIdentity }
+        return (saved, effective, current,
+                try WorkspaceCertificateRenewalOverlay.witness(credentialID: credentialID, in: imported))
     }
 
     /// Local revocation persists before any cleanup. It is not remote revocation.
@@ -1385,13 +1503,14 @@ public actor WorkspaceStore {
     /// caller must still acquire the process-wide network lease. Imported
     /// auto-connect settings cannot call this on the user's behalf.
     public func hostKeyVerificationDocument(workspaceID: UUID, expectedRevision: UUID, routeID: String,
-                                           support: WorkspaceDocument.RouteSupport) throws -> WorkspaceDocument {
+                                           support: WorkspaceDocument.RouteSupport,
+                                           replacing expectedPin: WorkspaceHostKeyPin? = nil) throws -> WorkspaceDocument {
         try Task.checkCancellation()
         return try persistence.withExclusiveAccess {
             var catalog = try readCatalog()
             try recover(catalog: &catalog)
             return try hostKeyVerificationContext(workspaceID: workspaceID, expectedRevision: expectedRevision,
-                routeID: routeID, support: support, catalog: catalog).document
+                routeID: routeID, support: support, catalog: catalog, replacing: expectedPin).document
         }
     }
 
@@ -1399,19 +1518,20 @@ public actor WorkspaceStore {
     /// five minutes. A permit cannot authorize a normal destination login or
     /// survive an import, local trust/credential revocation, or explicit end.
     public func beginHostKeyVerification(workspaceID: UUID, expectedRevision: UUID, routeID: String,
-        confirmedByUser: Bool, support: WorkspaceDocument.RouteSupport) throws -> WorkspaceHostKeyProbe {
+        confirmedByUser: Bool, support: WorkspaceDocument.RouteSupport,
+        replacing expectedPin: WorkspaceHostKeyPin? = nil) throws -> WorkspaceHostKeyProbe {
         guard confirmedByUser else { throw WorkspaceStoreError.reviewRequired }
         try Task.checkCancellation()
         return try persistence.withExclusiveAccess {
             var catalog = try readCatalog()
             try recover(catalog: &catalog)
             _ = try hostKeyVerificationContext(workspaceID: workspaceID, expectedRevision: expectedRevision,
-                routeID: routeID, support: support, catalog: catalog)
+                routeID: routeID, support: support, catalog: catalog, replacing: expectedPin)
             let now = hostKeyProbeNow()
             hostKeyProbes = hostKeyProbes.filter { now < $0.value.expires }
             guard hostKeyProbes.count < 4 else { throw SSHAuthenticationError.busy }
             let probe = WorkspaceHostKeyProbe(id: UUID(), workspaceID: workspaceID,
-                expectedRevision: expectedRevision, routeID: routeID, owner: hostKeyPinOwner,
+                expectedRevision: expectedRevision, routeID: routeID, previousPin: expectedPin, owner: hostKeyPinOwner,
                 expires: now + .seconds(300))
             hostKeyProbes[probe.id] = probe
             return probe
@@ -1437,7 +1557,8 @@ public actor WorkspaceStore {
         guard probe.owner == hostKeyPinOwner, hostKeyProbes[probe.id] == probe,
               hostKeyProbeNow() < probe.expires else { throw SSHAuthenticationError.stale }
         return try hostKeyVerificationContext(workspaceID: probe.workspaceID,
-            expectedRevision: probe.expectedRevision, routeID: probe.routeID, support: support, catalog: catalog)
+            expectedRevision: probe.expectedRevision, routeID: probe.routeID, support: support, catalog: catalog,
+            replacing: probe.previousPin)
     }
 
     /// The public key comes from the completed SSH key exchange. This review
@@ -1445,26 +1566,29 @@ public actor WorkspaceStore {
     /// same untrusted connection does not authenticate the server's identity.
     public func reviewHostKeyPin(workspaceID: UUID, expectedRevision: UUID, routeID: String,
                                  key: WorkspaceDocument.HostKey,
-                                 support: WorkspaceDocument.RouteSupport) throws -> WorkspaceHostKeyPinReview {
+                                 support: WorkspaceDocument.RouteSupport,
+                                 replacing expectedPin: WorkspaceHostKeyPin? = nil) throws -> WorkspaceHostKeyPinReview {
         try Task.checkCancellation()
         return try persistence.withExclusiveAccess {
             var catalog = try readCatalog()
             try recover(catalog: &catalog)
             let context = try hostKeyVerificationContext(workspaceID: workspaceID, expectedRevision: expectedRevision,
-                routeID: routeID, support: support, catalog: catalog)
+                routeID: routeID, support: support, catalog: catalog, replacing: expectedPin)
             let pin = WorkspaceHostKeyPin(trustID: context.route.trustID, key: key,
                 sourceWitness: try WorkspaceHostKeyOverlay.witness(trustID: context.route.trustID,
                     in: context.saved.importedDocument()))
             try validateHostKeyPin(pin, context: context, catalog: catalog, support: support)
+            if expectedPin?.key == key { throw WorkspaceHostKeyPinError.unchangedKey }
             return .init(id: UUID(), workspaceID: workspaceID, expectedRevision: expectedRevision,
                 workspaceName: context.document.name, routeID: routeID, trustID: pin.trustID,
-                host: context.route.host, port: context.route.port, key: key,
+                host: context.route.host, port: context.route.port, key: key, previousPin: expectedPin,
                 sourceWitness: pin.sourceWitness, owner: hostKeyPinOwner)
         }
     }
 
-    /// Publish only the reviewed, still-unconfigured trust record. Existing
-    /// sessions must be retired by the caller before changing this revision.
+    /// Publish only the reviewed first-use pin or exact prior phone-pin
+    /// replacement. Imported trust never changes. Existing sessions must be
+    /// retired by the caller before changing this revision.
     /// New connections need a fresh deliberate Connect; no key is read here.
     @discardableResult
     public func acceptHostKeyPin(_ review: WorkspaceHostKeyPinReview, confirmedByUser: Bool,
@@ -1476,7 +1600,8 @@ public actor WorkspaceStore {
             var catalog = try readCatalog()
             try recover(catalog: &catalog)
             let context = try hostKeyVerificationContext(workspaceID: review.workspaceID,
-                expectedRevision: review.expectedRevision, routeID: review.routeID, support: support, catalog: catalog)
+                expectedRevision: review.expectedRevision, routeID: review.routeID, support: support, catalog: catalog,
+                replacing: review.previousPin)
             let saved = context.saved
             guard context.route.trustID == review.trustID, context.route.host == review.host,
                   context.route.port == review.port,
@@ -1488,7 +1613,8 @@ public actor WorkspaceStore {
             let installed = InstalledWorkspace(id: saved.id, revision: UUID(), manifest: saved.manifest,
                 envelopeDigest: saved.envelopeDigest, bindings: saved.bindings,
                 inactiveSettings: saved.inactiveSettings, findings: saved.findings, connectLater: true,
-                deviceKeys: saved.deviceKeys, deviceKeyAssignments: saved.deviceKeyAssignments, hostKeyPins: pins)
+                deviceKeys: saved.deviceKeys, deviceKeyAssignments: saved.deviceKeyAssignments, hostKeyPins: pins,
+                certificateRenewals: saved.certificateRenewals)
             _ = try installed.document()
             guard let index = catalog.workspaces.firstIndex(where: { $0.id == saved.id }) else {
                 throw WorkspaceStoreError.staleReview
@@ -1505,7 +1631,8 @@ public actor WorkspaceStore {
                                        route: WorkspaceDocument.Route)
 
     private func hostKeyVerificationContext(workspaceID: UUID, expectedRevision: UUID, routeID: String,
-        support: WorkspaceDocument.RouteSupport, catalog: Catalog) throws -> HostKeyContext {
+        support: WorkspaceDocument.RouteSupport, catalog: Catalog,
+        replacing expectedPin: WorkspaceHostKeyPin? = nil) throws -> HostKeyContext {
         guard let saved = catalog.workspaces.first(where: { $0.id == workspaceID }),
               saved.revision == expectedRevision else { throw WorkspaceStoreError.staleReview }
         let document = try saved.document()
@@ -1516,7 +1643,17 @@ public actor WorkspaceStore {
         guard route.mode == "direct_ssh" || route.mode == "frankenterm_mux" else {
             throw WorkspaceHostKeyPinError.unsupportedRoute
         }
-        guard trust.pins.isEmpty else { throw WorkspaceHostKeyPinError.alreadyConfigured }
+        if let expectedPin {
+            let imported = try saved.importedDocument()
+            guard imported.hostTrust.first(where: { $0.id == trust.id })?.pins.isEmpty == true else {
+                throw WorkspaceHostKeyPinError.alreadyConfigured
+            }
+            guard try saved.phoneHostKeyPin(forRouteID: routeID) == expectedPin else {
+                throw WorkspaceStoreError.staleReview
+            }
+        } else {
+            guard trust.pins.isEmpty else { throw WorkspaceHostKeyPinError.alreadyConfigured }
+        }
         let hops = try document.orderedJumpRoutes(forRouteID: routeID)
         guard hops.count <= support.maximumJumpHops else { throw WorkspaceHostKeyPinError.unsupportedRoute }
         // A direct key exchange never reads protected-key metadata. For a
@@ -1542,9 +1679,10 @@ public actor WorkspaceStore {
         return (saved, document, route)
     }
 
-    /// This exception applies only to the final destination's absent key and
-    /// credentials. Every transit peer still uses ordinary pinned host policy,
-    /// credential selection and live authorization. A destination login cannot
+    /// This exception applies only to the final destination's absent or
+    /// explicitly replaced phone pin and credentials. Every transit peer still
+    /// uses ordinary pinned host policy, credential selection and live
+    /// authorization. A destination login cannot
     /// carry a probe permit, even if that destination later becomes ready.
     private func validateHostKeyProbeTransit(_ probe: WorkspaceHostKeyProbe?, workspaceID: UUID,
         revision: UUID, routeID: String, destinationID: String?, support: WorkspaceDocument.RouteSupport,
@@ -2050,7 +2188,7 @@ public actor WorkspaceStore {
     }
     private func readCatalog() throws -> Catalog {
         guard let data = try persistence.read(.catalog, limit: Self.catalogLimit) else { return Catalog() }
-        guard let catalog = try? JSONDecoder().decode(Catalog.self, from: data), catalog.version == 8,
+        guard let catalog = try? JSONDecoder().decode(Catalog.self, from: data), catalog.version == 9,
               catalog.workspaces.count <= 32, catalog.revokedFingerprints.count <= 4096,
               catalog.revokedFingerprints.allSatisfy({ (try? WorkspaceDocument.fingerprint($0)) != nil }),
               catalog.acceptedImports.count <= Self.importHistoryLimit, catalog.hostRevocations.count <= Self.hostRevocationLimit,

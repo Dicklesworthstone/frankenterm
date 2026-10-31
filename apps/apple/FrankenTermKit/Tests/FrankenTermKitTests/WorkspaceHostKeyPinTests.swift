@@ -115,6 +115,13 @@ final class WorkspaceHostKeyPinTests: XCTestCase {
         return try await fixture.store.acceptHostKeyPin(review, confirmedByUser: true, support: support)
     }
 
+    private func rotationReview(_ fixture: Fixture, saved: InstalledWorkspace,
+                                key: WorkspaceDocument.HostKey? = nil) async throws -> WorkspaceHostKeyPinReview {
+        let pin = try XCTUnwrap(try saved.phoneHostKeyPin(forRouteID: "route"))
+        return try await fixture.store.reviewHostKeyPin(workspaceID: saved.id, expectedRevision: saved.revision,
+            routeID: "route", key: key ?? hostKey(33), support: support, replacing: pin)
+    }
+
     private func replace(_ fixture: Fixture, saved: InstalledWorkspace, document: WorkspaceDocument,
                          digestByte: UInt8, allowRollback: Bool = false) async throws -> InstalledWorkspace {
         let source = try AirGapArchive(workspace: document, keys: [], using: crypto)
@@ -223,6 +230,258 @@ final class WorkspaceHostKeyPinTests: XCTestCase {
                 presented: different, support: support)
             XCTAssertEqual(mismatch, .pinMismatch)
         }
+    }
+
+    func testReviewedPhonePinReplacementPersistsWithoutChangingSourceOrCredentials() async throws {
+        let f = try await fixture(), pinned = try await accept(f)
+        XCTAssertNil(try f.saved.phoneHostKeyPin(forRouteID: "route"))
+        let approved = try await f.store.approveConnections(workspaceID: pinned.id,
+            expectedRevision: pinned.revision, confirmedByUser: true)
+        let pin = try XCTUnwrap(try approved.phoneHostKeyPin(forRouteID: "route"))
+        let before = f.disk.bytes(.catalog)
+        let history = try JSONSerialization.data(withJSONObject: XCTUnwrap(try catalog(f.disk)["acceptedImports"]), options: [.sortedKeys])
+        let document = try await f.store.hostKeyVerificationDocument(workspaceID: approved.id,
+            expectedRevision: approved.revision, routeID: "route", support: support, replacing: pin)
+        XCTAssertEqual(document.hostTrust[0].pins, [try hostKey()], "probing does not remove the existing pin")
+        let checked = try await rotationReview(f, saved: approved)
+        XCTAssertEqual(checked.previousKey, pin.key); XCTAssertEqual(checked.key, try hostKey(33))
+        do {
+            _ = try await f.store.acceptHostKeyPin(checked, confirmedByUser: false, support: support)
+            XCTFail("an unconfirmed rotation changed trust")
+        } catch { XCTAssertEqual(error as? WorkspaceStoreError, .reviewRequired) }
+        let anotherOwner = WorkspaceStore(persistence: f.disk, vault: f.vault)
+        do {
+            _ = try await anotherOwner.acceptHostKeyPin(checked, confirmedByUser: true, support: support)
+            XCTFail("a different store accepted rotation authority")
+        } catch { XCTAssertEqual(error as? WorkspaceStoreError, .staleReview) }
+        XCTAssertEqual(f.disk.bytes(.catalog), before)
+
+        let rotated = try await f.store.acceptHostKeyPin(checked, confirmedByUser: true, support: support)
+        XCTAssertNotEqual(rotated.revision, approved.revision); XCTAssertTrue(rotated.connectLater)
+        XCTAssertEqual(rotated.manifest, approved.manifest); XCTAssertEqual(rotated.envelopeDigest, approved.envelopeDigest)
+        XCTAssertEqual(rotated.bindings, approved.bindings)
+        XCTAssertEqual(rotated.deviceKeys, approved.deviceKeys)
+        XCTAssertEqual(rotated.deviceKeyAssignments, approved.deviceKeyAssignments)
+        XCTAssertEqual(rotated.hostKeyPins.count, 1)
+        XCTAssertEqual(try rotated.phoneHostKeyPin(forRouteID: "route")?.key, try hostKey(33))
+        XCTAssertTrue(try rotated.importedDocument().hostTrust[0].pins.isEmpty)
+        XCTAssertEqual(try JSONSerialization.data(withJSONObject: XCTUnwrap(try catalog(f.disk)["acceptedImports"]), options: [.sortedKeys]), history)
+        XCTAssertEqual(f.vault.count, 1); XCTAssertEqual(f.vault.creates, 1); XCTAssertNil(f.disk.bytes(.journal))
+
+        let reopened = WorkspaceStore(persistence: f.disk, vault: f.vault)
+        let loaded = try await reopened.load(), saved = try XCTUnwrap(loaded.first)
+        XCTAssertEqual(saved.hostKeyPins, rotated.hostKeyPins); XCTAssertTrue(saved.connectLater)
+        let old = try await reopened.verifyHostKey(workspaceID: saved.id, routeID: "route", presented: hostKey(), support: support)
+        let new = try await reopened.verifyHostKey(workspaceID: saved.id, routeID: "route", presented: hostKey(33), support: support)
+        XCTAssertEqual(old, .pinMismatch); XCTAssertEqual(new, .trustedPin)
+        do {
+            _ = try await f.store.acceptHostKeyPin(checked, confirmedByUser: true, support: support)
+            XCTFail("rotation review was replayed after publication")
+        } catch { XCTAssertEqual(error as? WorkspaceStoreError, .staleReview) }
+    }
+
+    func testPhonePinReplacementRequiresTheExactActiveOverlayAndADifferentKey() async throws {
+        let f = try await fixture(), saved = try await accept(f)
+        let pin = try XCTUnwrap(try saved.phoneHostKeyPin(forRouteID: "route")), before = f.disk.bytes(.catalog)
+        let wrongPins = [
+            WorkspaceHostKeyPin(trustID: pin.trustID, key: try hostKey(17), sourceWitness: pin.sourceWitness),
+            WorkspaceHostKeyPin(trustID: "another-trust", key: pin.key, sourceWitness: pin.sourceWitness),
+            WorkspaceHostKeyPin(trustID: pin.trustID, key: pin.key, sourceWitness: Data(repeating: 0, count: 32))
+        ]
+        for wrong in wrongPins {
+            do {
+                _ = try await f.store.beginHostKeyVerification(workspaceID: saved.id, expectedRevision: saved.revision,
+                    routeID: "route", confirmedByUser: true, support: support, replacing: wrong)
+                XCTFail("a different prior pin authorized a probe")
+            } catch { XCTAssertEqual(error as? WorkspaceStoreError, .staleReview) }
+            do {
+                _ = try await f.store.reviewHostKeyPin(workspaceID: saved.id, expectedRevision: saved.revision,
+                    routeID: "route", key: hostKey(33), support: support, replacing: wrong)
+                XCTFail("a different prior pin authorized a rotation review")
+            } catch { XCTAssertEqual(error as? WorkspaceStoreError, .staleReview) }
+        }
+        do {
+            _ = try await rotationReview(f, saved: saved, key: pin.key)
+            XCTFail("an unchanged host key generated a destructive replacement review")
+        } catch { XCTAssertEqual(error as? WorkspaceHostKeyPinError, .unchangedKey) }
+        XCTAssertEqual(f.disk.bytes(.catalog), before)
+
+        let moved = try changed(f.archive.workspace, bundle: "changed-port") { workspace in
+            var routes = workspace["routes"] as! [[String: Any]], trusts = workspace["host_trust"] as! [[String: Any]]
+            routes[0]["port"] = 2222; trusts[0]["port"] = 2222
+            workspace["routes"] = routes; workspace["host_trust"] = trusts
+        }
+        let updated = try await replace(f, saved: saved, document: moved, digestByte: 220)
+        XCTAssertNil(try updated.phoneHostKeyPin(forRouteID: "route"))
+        do {
+            _ = try await f.store.reviewHostKeyPin(workspaceID: updated.id, expectedRevision: updated.revision,
+                routeID: "route", key: hostKey(33), support: support, replacing: pin)
+            XCTFail("an inactive pin from another endpoint authorized rotation")
+        } catch { XCTAssertEqual(error as? WorkspaceStoreError, .staleReview) }
+
+        let importedKey = try hostKey(17)
+        let source = try changed(moved, bundle: "imported-pin") { workspace in
+            var trusts = workspace["host_trust"] as! [[String: Any]]
+            trusts[0]["pins"] = [keyFields(importedKey)]; workspace["host_trust"] = trusts
+        }
+        let imported = try await replace(f, saved: updated, document: source, digestByte: 221)
+        XCTAssertNil(try imported.phoneHostKeyPin(forRouteID: "route"))
+        do {
+            _ = try await f.store.reviewHostKeyPin(workspaceID: imported.id, expectedRevision: imported.revision,
+                routeID: "route", key: hostKey(33), support: support, replacing: pin)
+            XCTFail("stored phone-pin metadata overrode an imported host key")
+        } catch { XCTAssertEqual(error as? WorkspaceHostKeyPinError, .alreadyConfigured) }
+        XCTAssertEqual(try imported.document().hostTrust[0].pins, [importedKey])
+    }
+
+    func testRevokingTheProposedReplacementAfterReviewWinsIncludingFailedWrites() async throws {
+        let faults: [StoreTestPersistence.Fault?] = [nil, .before(.catalog), .after(.catalog)]
+        for fault in faults {
+            let f = try await fixture(), saved = try await accept(f)
+            let checked = try await rotationReview(f, saved: saved)
+            f.disk.configure(fault)
+            do {
+                try await f.store.revokeHostLocally(workspaceID: saved.id, trustID: "trust", key: hostKey(33))
+                XCTAssertNil(fault)
+            } catch { XCTAssertEqual(error as? FTError, .storage) }
+            let denied = f.disk.bytes(.catalog)
+            do {
+                _ = try await f.store.acceptHostKeyPin(checked, confirmedByUser: true, support: support)
+                XCTFail("rotation erased a newer host-key refusal")
+            } catch { XCTAssertEqual(error as? WorkspaceHostKeyPinError, .revoked) }
+            do {
+                _ = try await rotationReview(f, saved: saved)
+                XCTFail("a fresh review bypassed a persistent or process-local refusal")
+            } catch { XCTAssertEqual(error as? WorkspaceHostKeyPinError, .revoked) }
+            XCTAssertEqual(f.disk.bytes(.catalog), denied)
+            let current = try await f.store.load()
+            XCTAssertEqual(current.first?.hostKeyPins, saved.hostKeyPins)
+            XCTAssertEqual(f.vault.creates, 1); XCTAssertEqual(f.vault.count, 1)
+        }
+    }
+
+    func testReplacingARevokedPhonePinKeepsTheDenialAndPreservesImportedRestrictions() async throws {
+        let f = try await fixture(), saved = try await accept(f)
+        try await f.store.revokeHostLocally(workspaceID: saved.id, trustID: "trust", key: hostKey())
+        let checked = try await rotationReview(f, saved: saved)
+        let rotated = try await f.store.acceptHostKeyPin(checked, confirmedByUser: true, support: support)
+        let old = try await f.store.verifyHostKey(workspaceID: rotated.id, routeID: "route", presented: hostKey(), support: support)
+        let new = try await f.store.verifyHostKey(workspaceID: rotated.id, routeID: "route", presented: hostKey(33), support: support)
+        XCTAssertEqual(old, .revoked); XCTAssertEqual(new, .trustedPin)
+
+        let deniedKey = try hostKey(33)
+        let denied = try await fixture(archive { workspace in
+            var trusts = workspace["host_trust"] as! [[String: Any]], negative = trusts[0]
+            negative["id"] = "other-trust"; negative["revoked_keys"] = [keyFields(deniedKey)]
+            trusts.append(negative); workspace["host_trust"] = trusts
+        })
+        let initialPin = try await accept(denied)
+        do { _ = try await rotationReview(denied, saved: initialPin); XCTFail("rotation bypassed an imported same-scope denial") }
+        catch { XCTAssertEqual(error as? WorkspaceHostKeyPinError, .revoked) }
+
+        let pending = try await rotationReview(f, saved: rotated, key: hostKey(44))
+        let restricted = try changed(f.archive.workspace, bundle: "required-host-policy") { workspace in
+            var trusts = workspace["host_trust"] as! [[String: Any]]
+            trusts[0]["required_capabilities"] = ["unavailable_host_policy"]; workspace["host_trust"] = trusts
+        }
+        let stronger = try await replace(f, saved: rotated, document: restricted, digestByte: 222)
+        let removed = try changed(f.archive.workspace, bundle: "removed-host-policy")
+        let current = try await replace(f, saved: stronger, document: removed, digestByte: 224)
+        XCTAssertEqual(try current.phoneHostKeyPin(forRouteID: "route")?.key, try hostKey(33))
+        do {
+            _ = try await f.store.acceptHostKeyPin(pending, confirmedByUser: true, support: support)
+            XCTFail("rotation survived a source revision change")
+        } catch { XCTAssertEqual(error as? WorkspaceStoreError, .staleReview) }
+        do {
+            _ = try await rotationReview(f, saved: current, key: hostKey(44))
+            XCTFail("a fresh rotation bypassed retained mandatory host policy")
+        } catch { XCTAssertEqual(error as? WorkspaceHostKeyPinError, .unsupportedPolicy) }
+    }
+
+    func testRotationProbeAuthorizesOnlyTrustedTransitAndExpiresOnPublication() async throws {
+        let original = try await fixture(jumpArchive()), saved = try await accept(original)
+        let f = Fixture(store: original.store, disk: original.disk, vault: original.vault, archive: original.archive, saved: saved)
+        let pin = try XCTUnwrap(try saved.phoneHostKeyPin(forRouteID: "route"))
+        let permit = try await f.store.beginHostKeyVerification(workspaceID: saved.id, expectedRevision: saved.revision,
+            routeID: "route", confirmedByUser: true, support: support, replacing: pin)
+        XCTAssertEqual(permit.previousPin, pin)
+        let authorization = try await hopAuthorization(f, probe: permit)
+        try await f.store.validateSSHAuthentication(authorization, support: support)
+        for (route, destination) in [("route", "route"), ("unrelated", "route"), ("jump", "unrelated")] {
+            do { _ = try await hopAuthorization(f, probe: permit, routeID: route, destination: destination); XCTFail("rotation probe authorized an unrelated or destination login") }
+            catch { XCTAssertEqual(error as? SSHAuthenticationError, .denied) }
+        }
+        let checked = try await rotationReview(f, saved: saved)
+        _ = try await f.store.acceptHostKeyPin(checked, confirmedByUser: true, support: support)
+        do { try await f.store.validateSSHAuthentication(authorization, support: support); XCTFail("rotation left the prior transit grant alive") }
+        catch { XCTAssertEqual(error as? SSHAuthenticationError, .stale) }
+        do { _ = try await f.store.validateHostKeyVerification(permit, support: support); XCTFail("old rotation probe survived publication") }
+        catch { XCTAssertEqual(error as? WorkspaceStoreError, .staleReview) }
+        await f.store.endHostKeyVerification(permit)
+    }
+
+    func testInterruptedRotationLeavesOldOrCompleteNewTrustWithoutKeyCleanup() async throws {
+        for (fault, published) in [(StoreTestPersistence.Fault.before(.catalog), false), (.after(.catalog), true)] {
+            let f = try await fixture(), pinned = try await accept(f)
+            let approved = try await f.store.approveConnections(workspaceID: pinned.id,
+                expectedRevision: pinned.revision, confirmedByUser: true)
+            let checked = try await rotationReview(f, saved: approved)
+            f.disk.configure(fault)
+            do {
+                _ = try await f.store.acceptHostKeyPin(checked, confirmedByUser: true, support: support)
+                XCTFail("rotation publication fault did not occur")
+            } catch { XCTAssertEqual(error as? FTError, .storage) }
+            let reopened = WorkspaceStore(persistence: f.disk, vault: f.vault)
+            let loaded = try await reopened.load(), saved = try XCTUnwrap(loaded.first)
+            XCTAssertEqual(try saved.phoneHostKeyPin(forRouteID: "route")?.key, try hostKey(published ? 33 : 0))
+            XCTAssertEqual(saved.revision == approved.revision, !published)
+            XCTAssertEqual(saved.connectLater, published)
+            XCTAssertEqual(saved.manifest, approved.manifest); XCTAssertEqual(saved.bindings, approved.bindings)
+            XCTAssertEqual(f.vault.count, 1); XCTAssertEqual(f.vault.creates, 1); XCTAssertNil(f.disk.bytes(.journal))
+        }
+    }
+
+    func testReimportAndRollbackKeepTheLatestPhonePinInsteadOfResurrectingTheOldOne() async throws {
+        let f = try await fixture(), pinned = try await accept(f)
+        let checked = try await rotationReview(f, saved: pinned)
+        let rotated = try await f.store.acceptHostKeyPin(checked, confirmedByUser: true, support: support)
+        let renamed = try changed(f.archive.workspace, bundle: "after-rotation") { $0["name"] = "Updated workspace" }
+        let replacement = try await replace(f, saved: rotated, document: renamed, digestByte: 223)
+        let rollback = try await replace(f, saved: replacement, document: f.archive.workspace, digestByte: 201, allowRollback: true)
+        for saved in [replacement, rollback] {
+            XCTAssertEqual(saved.hostKeyPins, rotated.hostKeyPins)
+            XCTAssertEqual(try saved.document().hostTrust[0].pins, [try hostKey(33)])
+            XCTAssertTrue(saved.connectLater)
+        }
+        XCTAssertEqual(f.vault.count, 1); XCTAssertEqual(f.vault.creates, 1)
+    }
+
+    func testRotationUpdatesSharedLocalTrustButNeverAnIndependentImportedPin() async throws {
+        let importedKey = try hostKey(17)
+        let f = try await fixture(archive { workspace in
+            var routes = workspace["routes"] as! [[String: Any]], shared = routes[0], independent = routes[0]
+            shared["id"] = "shared-trust-route"
+            independent["id"] = "imported-trust-route"; independent["host_trust_ref"] = "imported-trust"
+            routes += [shared, independent]; workspace["routes"] = routes
+            var trusts = workspace["host_trust"] as! [[String: Any]], imported = trusts[0]
+            imported["id"] = "imported-trust"; imported["pins"] = [keyFields(importedKey)]
+            trusts.append(imported); workspace["host_trust"] = trusts
+        })
+        let pinned = try await accept(f), checked = try await rotationReview(f, saved: pinned)
+        let rotated = try await f.store.acceptHostKeyPin(checked, confirmedByUser: true, support: support)
+        for route in ["route", "shared-trust-route"] {
+            XCTAssertEqual(try rotated.phoneHostKeyPin(forRouteID: route)?.key, try hostKey(33))
+            let decision = try await f.store.verifyHostKey(workspaceID: rotated.id, routeID: route,
+                presented: hostKey(33), support: support)
+            XCTAssertEqual(decision, .trustedPin)
+        }
+        XCTAssertNil(try rotated.phoneHostKeyPin(forRouteID: "imported-trust-route"))
+        let unchanged = try await f.store.verifyHostKey(workspaceID: rotated.id, routeID: "imported-trust-route",
+            presented: importedKey, support: support)
+        let unrelated = try await f.store.verifyHostKey(workspaceID: rotated.id, routeID: "imported-trust-route",
+            presented: hostKey(33), support: support)
+        XCTAssertEqual(unchanged, .trustedPin); XCTAssertEqual(unrelated, .pinMismatch)
+        XCTAssertEqual(rotated.manifest, f.saved.manifest); XCTAssertEqual(rotated.hostKeyPins.count, 1)
     }
 
     func testReviewIsInvalidatedByReplacementAndBySuccessfulAcceptance() async throws {
@@ -626,7 +885,7 @@ final class WorkspaceHostKeyPinTests: XCTestCase {
         XCTAssertTrue(saved.hostKeyPins.isEmpty)
         XCTAssertTrue(try saved.document().hostTrust[0].pins.isEmpty)
         let migrated = try catalog(f.disk)
-        XCTAssertEqual(migrated["version"] as? Int, 8)
+        XCTAssertEqual(migrated["version"] as? Int, 9)
         XCTAssertEqual(try JSONSerialization.data(withJSONObject: XCTUnwrap(migrated["acceptedImports"]), options: [.sortedKeys]), history)
         let stable = f.disk.bytes(.catalog)
         _ = try await WorkspaceStore(persistence: f.disk, vault: f.vault).load()

@@ -19,6 +19,9 @@ public struct SSHUserCertificate: Equatable, Sendable, CustomDebugStringConverti
     public let subject: SSHPublicIdentity, authority: SSHPublicIdentity
     public let serial: UInt64, validAfter: UInt64, validBefore: UInt64
     public let principals: [String], criticalOptions: [String: Data], extensions: Set<String>
+    /// Preserve signed extension payloads for exact renewal-policy comparison.
+    /// Unknown optional extensions are never interpreted as local permissions.
+    public let extensionOptions: [String: Data]
     public var debugDescription: String { "SSHUserCertificate([redacted])" }
 
     public init(blob: Data) throws {
@@ -75,6 +78,7 @@ public struct SSHUserCertificate: Equatable, Sendable, CustomDebugStringConverti
         self.blob = blob; self.algorithm = algorithm; self.subject = subject; self.authority = authority
         self.serial = serial; self.validAfter = validAfter; self.validBefore = validBefore
         self.principals = principals; self.criticalOptions = criticalOptions; self.extensions = Set(extensionValues.keys)
+        extensionOptions = extensionValues
         fingerprint = "SHA256:" + Data(SHA256.hash(data: blob)).base64EncodedString().replacingOccurrences(of: "=", with: "")
     }
 

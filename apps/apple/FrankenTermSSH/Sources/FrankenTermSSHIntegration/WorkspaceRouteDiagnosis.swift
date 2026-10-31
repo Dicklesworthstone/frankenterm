@@ -173,7 +173,7 @@ public enum WorkspaceRouteProbe {
         }
     }
 
-    /// Explicit first-use verification may sign in to already trusted jump
+    /// Explicit first-use or phone-pin replacement may sign in to already trusted jump
     /// hosts, using their ordinary policy and protected prompts. The final
     /// destination receives only a key exchange, never an account or credential.
     /// Teardown joins the entire chain before retiring its short-lived permit
@@ -183,7 +183,8 @@ public enum WorkspaceRouteProbe {
                            passwordPrompter: (any WorkspaceSSHPasswordPrompting)? = nil,
                            keyboardInteractivePrompter: (any WorkspaceSSHKeyboardInteractivePrompting)? = nil,
                            timeout: Duration = .seconds(8), authenticationTimeout: Duration = .seconds(60),
-                           networkActivity: WorkspaceNetworkActivity = .shared) async -> Result {
+                           networkActivity: WorkspaceNetworkActivity = .shared,
+                           replacing expectedPin: WorkspaceHostKeyPin? = nil) async -> Result {
         var network = WorkspaceRouteNetwork.internet
         var session: NativeSSHSession?
         var permit: WorkspaceHostKeyProbe?
@@ -196,7 +197,8 @@ public enum WorkspaceRouteProbe {
             lease = networkLease
             let support = WorkspaceNativeSSHAuthentication.routeSupport
             let probe = try await store.beginHostKeyVerification(workspaceID: workspaceID,
-                expectedRevision: expectedRevision, routeID: routeID, confirmedByUser: true, support: support)
+                expectedRevision: expectedRevision, routeID: routeID, confirmedByUser: true, support: support,
+                replacing: expectedPin)
             permit = probe
             let document = try await store.validateHostKeyVerification(probe, support: support)
             guard let route = document.routes.first(where: { $0.id == routeID }) else { throw SSHAuthenticationError.stale }
