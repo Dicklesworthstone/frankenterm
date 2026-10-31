@@ -67,8 +67,8 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         done.tap()
     }
 
-    /// Opens the restored machine and connects; an earlier session on it is
-    /// acknowledged without asking.
+    /// Opens the restored machine and connects; an earlier local owner is
+    /// retired while its recovery notice remains available.
     @MainActor
     private func connect(_ app: XCUIApplication, _ inputs: Inputs) -> XCUIElement {
         let saved = savedWorkspace(app, inputs)
@@ -696,7 +696,8 @@ final class OfflineRestoreConnectUITests: XCTestCase {
 
     /// iOS can end the whole app, not just a connection, before the machine
     /// answers what was typed. The killed launch cannot say so; the next one
-    /// does, once, and sends nothing again.
+    /// retains the durable notice across new output and relaunch until the
+    /// person dismisses it, and sends nothing again.
     @MainActor
     func test5BAKilledLaunchTellsInputThatHadNoAnswer() throws {
         let inputs = try inputs()
@@ -713,19 +714,46 @@ final class OfflineRestoreConnectUITests: XCTestCase {
 
         app = launch()
         terminal = reopen(app, inputs)
-        let notice = app.descendants(matching: .any)["terminal.input.delivery"]
+        var notice = app.descendants(matching: .any)["terminal.input.delivery"]
         XCTAssertTrue(notice.waitForExistence(timeout: 30), "the next launch tells the input that had no answer")
         let told = notice.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "It may or may not have arrived.")).firstMatch
         XCTAssertTrue(told.exists, "it says the input may or may not have arrived")
         snapshot("k1-told")
-        notice.buttons["Dismiss"].tap()
-        XCTAssertTrue(notice.waitForNonExistence(timeout: 5), "dismissed, it is gone")
         app.typeText("echo FRESH-$((6*7))\n")
         waitFor("FRESH-42", in: terminal, timeout: 30, "the new session runs commands")
         never("unanswered", in: terminal, "nothing typed before is sent again")
-        XCTAssertFalse(notice.exists, "told once")
+        XCTAssertTrue(notice.exists, "new output cannot establish the old command's outcome")
 
-        let list = app.buttons["Add machines"]
+        // Finish this new shell and wait for joined cleanup before killing
+        // the app again. Merely navigating away keeps sessions alive. A new
+        // crash marker must not mask loss of the original notice, and the
+        // consumed UserDefaults hint cannot supply it again.
+        app.typeText("exit\n")
+        let newSession = app.buttons["New Session"].firstMatch
+        XCTAssertTrue(newSession.waitForExistence(timeout: 30))
+        let settled = expectation(for: NSPredicate(format: "enabled == true"), evaluatedWith: newSession)
+        XCTAssertEqual(XCTWaiter().wait(for: [settled], timeout: 30), .completed,
+                       "New Session is enabled only after the old owner has fully settled")
+        var list = app.buttons["Add machines"]
+        for _ in 0..<3 where !list.exists {
+            app.navigationBars.buttons.element(boundBy: 0).tap()
+            _ = list.waitForExistence(timeout: 5)
+        }
+        XCTAssertTrue(savedWorkspace(app, inputs).waitForExistence(timeout: 20))
+        app.terminate()
+        app = launch()
+        terminal = connect(app, inputs)
+        notice = app.descendants(matching: .any)["terminal.input.delivery"]
+        XCTAssertTrue(notice.waitForExistence(timeout: 30), "the original durable notice survives another launch")
+        let durable = notice.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "Input may have been in flight")).firstMatch
+        XCTAssertTrue(durable.exists, "the journal speaks conservatively after the detail hint was consumed")
+        notice.buttons["Dismiss"].tap()
+        XCTAssertTrue(notice.waitForNonExistence(timeout: 5), "explicit durable dismissal removes the notice")
+        app.typeText("echo DISMISSED-$((6*7))\n")
+        waitFor("DISMISSED-42", in: terminal, timeout: 30, "dismissal does not interrupt the new connection")
+        XCTAssertFalse(notice.exists)
+
+        list = app.buttons["Add machines"]
         for _ in 0..<3 where !list.exists {
             app.navigationBars.buttons.element(boundBy: 0).tap()
             _ = list.waitForExistence(timeout: 5)

@@ -61,8 +61,12 @@ public struct TerminalInputDelivery: Hashable, Sendable {
     public private(set) var unanswered = false
     /// Input stopped after only part of it was sent.
     public private(set) var stoppedPartway = false
+    /// A prior epoch has durable uncertainty: a process ended before sealing its
+    /// marker, or the transport explicitly left an input outcome unknown. This
+    /// remains separate from evidence that particular input left the phone.
+    public private(set) var previousSessionUncertain = false
     public init() {}
-    public var isEmpty: Bool { !unsent && !unanswered && !stoppedPartway }
+    public var isEmpty: Bool { !unsent && !unanswered && !stoppedPartway && !previousSessionUncertain }
 
     /// Interrupted outcomes. Transport acceptance alone is not one: whoever
     /// saw the connection end reports unanswered input with `endedUnanswered`.
@@ -86,9 +90,16 @@ public struct TerminalInputDelivery: Hashable, Sendable {
     /// The connection ended while input that left this phone had no answer.
     public mutating func endedUnanswered() { unanswered = true }
 
+    /// Only the protected session journal supplies this notice. Output and
+    /// successful reconnection never resolve it; explicit dismissal does.
+    public mutating func setRecoveryNotice(_ present: Bool) { previousSessionUncertain = present }
+
     public func message(machine: String) -> String? {
         guard !isEmpty else { return nil }
         var sentences: [String] = []
+        if previousSessionUncertain {
+            sentences.append("An earlier session with \(machine) ended with an unknown input outcome. Input may have been in flight; check the machine before repeating a command.")
+        }
         if unanswered {
             sentences.append("Your last input left this phone, but the connection ended before \(machine) answered it. It may or may not have arrived.")
         }
@@ -102,11 +113,11 @@ public struct TerminalInputDelivery: Hashable, Sendable {
     }
 }
 
-/// Input on one machine that left this phone and has had no answer yet, kept
-/// where the next launch finds it if iOS ends this one first (plan 11.8). A
-/// session marks it as its input leaves and clears it at the machine's next
-/// output, so a kill at any moment leaves it as true as it was. Only which
-/// launch and session marked it is kept, never what was typed.
+/// A best-effort hint that observed input had no subsequent output when the
+/// earlier launch ended. It adds detail to the durable session-journal notice;
+/// it cannot protect the crash gap before an outcome callback or prove that
+/// unrelated output answered input. Only launch/session identity is kept.
+/// TerminalSessionJournal remains the authority for retained crash uncertainty.
 public final class TerminalUnansweredInput: @unchecked Sendable {
     public static let thisLaunch = UUID().uuidString
     private let lock = NSLock()

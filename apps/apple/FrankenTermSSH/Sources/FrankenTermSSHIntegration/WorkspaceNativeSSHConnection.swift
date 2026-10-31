@@ -83,7 +83,7 @@ public actor WorkspaceNativeSSHConnection {
         if let journal {
             let records = try await journal.records()
             guard !records.contains(where: {
-                $0.requiresReview && $0.scope.workspaceID == workspaceID && $0.scope.machineID == machineID
+                $0.blocksNewSession && $0.scope.workspaceID == workspaceID && $0.scope.machineID == machineID
             }) else { throw TerminalSessionJournalError.reviewRequired }
         }
         let lease = try networkActivity.beginConnection()

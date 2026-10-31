@@ -655,8 +655,8 @@ final class TerminalSessionControllerTests: XCTestCase {
     }
 
     /// A shell that exits ends the session from inside the pump task; teardown
-    /// must still finish there, and the next session on the machine needs the
-    /// user's acknowledgement of the first one's unknown outcome.
+    /// must still finish there, and the next approved session can start while
+    /// preserving the first one's content-free history.
     func testRemoteExitSettlesAndANewSessionStartsWithoutAReview() async throws {
         let live = try await liveScene(), connections = live.connections, scene = live.scene
         let first = try await connect(scene, "alpha")
@@ -677,7 +677,7 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertEqual(scene.navigation.navigation.machines.first?.panes.count, 0, "the ended source leaves navigation")
         await assertReleased(first, connections: connections)
 
-        // The ended session's record is acknowledged as the next one starts.
+        // Continuing the ended session's record is not user acknowledgement.
         let earlier = Set(try await connections.journal.records().map(\.id))
         XCTAssertFalse(earlier.isEmpty)
         let second = try await connect(scene, "alpha")
@@ -689,17 +689,20 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertTrue(output.contains("AGAIN-42"), "the new session must run commands (output: \(output))")
         // The new session's own record stays open while it is live.
         let records = try await connections.journal.records()
-        let unresolved = records.filter { earlier.contains($0.id) && $0.requiresReview }
-        XCTAssertTrue(unresolved.isEmpty, "starting the new session acknowledged the earlier one: \(describe(records))")
-        XCTAssertEqual(terminalRecords(records).filter(\.requiresReview).count, 1, describe(records))
+        let blocking = records.filter { earlier.contains($0.id) && $0.blocksNewSession }
+        XCTAssertTrue(blocking.isEmpty, "earlier owners have retired: \(describe(records))")
+        XCTAssertTrue(records.filter { earlier.contains($0.id) }.allSatisfy { $0.state == .continued },
+                      "retired shell and mux-probe epochs were continued, not silently acknowledged")
+        XCTAssertFalse(second.inputDelivery.previousSessionUncertain, "a sealed remote exit is not a process crash")
+        XCTAssertEqual(terminalRecords(records).filter(\.blocksNewSession).count, 1, describe(records))
         await scene.close()
         XCTAssertTrue(second.settled)
         await assertReleased(second, connections: connections)
     }
 
     /// After the app launches again, the machine page's Connect opens a new
-    /// shell: the earlier launch's session (cut off when iOS ended the app)
-    /// is acknowledged, not reported as still closing.
+    /// shell: the earlier launch's locally closed session is retired without
+    /// silently recording a user acknowledgement.
     func testConnectAfterRelaunchOpensANewShell() async throws {
         let first = try await liveScene()
         let earlier = try await connect(first.scene, "alpha")

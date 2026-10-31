@@ -195,11 +195,101 @@ final class TerminalInputJournalTests: XCTestCase {
         XCTAssertTrue(recovery[0].canResolve)
         XCTAssertEqual(recovery[0].state, .creationStarted)
         XCTAssertEqual(recovery[0].inputEvidence, []) // No invented per-operation observation.
+        XCTAssertTrue(recovery[0].hasRecoveryNotice, "the pre-input marker covers the missing callback")
         await expect(.reviewRequired) { _ = try await relaunched.beginCreation(scope: f.epoch.scope) }
-        try await relaunched.resolve(recovery[0])
-        _ = try await relaunched.beginCreation(scope: f.epoch.scope)
+        let continued = try await relaunched.continueAfterInterruption(recovery[0])
+        XCTAssertTrue(continued.hasRecoveryNotice)
+        XCTAssertFalse(continued.blocksNewSession)
+        let next = try await relaunched.beginCreation(scope: f.epoch.scope)
+        try await relaunched.markInterrupted(epoch: next)
+
+        // Another connection and another process still find the original
+        // uncertainty, even though no input-outcome preference was ever set.
+        let later = try TerminalSessionJournal(persistence: f.disk, processID: UUID())
+        let retained = try await later.records()
+        XCTAssertEqual(retained.filter(\.hasRecoveryNotice).map(\.id), [f.epoch.id])
+        var delivery = TerminalInputDelivery()
+        delivery.setRecoveryNotice(true)
+        XCTAssertFalse(delivery.unanswered, "a coarse marker does not assert that a key definitely left")
+        XCTAssertEqual(TerminalAttentionReason.observed(input: delivery), [.inputUncertain])
+        let message = try XCTUnwrap(delivery.message(machine: "Alpha"))
+        XCTAssertTrue(message.contains("Input may have been in flight"))
+        XCTAssertFalse(message.contains("Your last input left this phone"))
+        try await later.acknowledgeRecovery(retained.filter(\.hasRecoveryNotice))
+        let acknowledged = try await later.records()
+        XCTAssertFalse(acknowledged.contains(where: \.hasRecoveryNotice))
+        XCTAssertTrue(acknowledged.contains { $0.id == next.id && $0.blocksNewSession },
+                      "dismissing the old notice does not retire another epoch")
         let writes = await f.transport.calls()
         XCTAssertEqual(writes, 1) // Review/new readiness never replays the prior payload.
+    }
+
+    func testSealedUnknownTransportOutcomeSurvivesRelaunchAndContinuation() async throws {
+        let f = try await setup(maximumResolved: 1)
+        _ = try await f.coordinator.submit(f.focus, encodedBytes: Data("unknown-tail".utf8))
+        await f.transport.script(.failed)
+        _ = try await f.coordinator.drainOne(f.source)
+        let boundary = try await close(f)
+        let ended = try await f.journal.sealInput(epoch: f.epoch, boundary: boundary)
+        XCTAssertEqual(ended.state, .interrupted)
+        XCTAssertTrue(ended.inputEvidence.contains(.unknownTransportOutcome))
+        XCTAssertTrue(ended.hasRecoveryNotice)
+        let later = try TerminalSessionJournal(persistence: f.disk, maximumResolved: 1, processID: UUID())
+        let old = try await later.records()
+        let retained = try await later.continueAfterInterruption(old[0])
+        XCTAssertTrue(retained.hasRecoveryNotice, "sealing local teardown cannot prove remote input delivery")
+        for _ in 0..<3 {
+            let epoch = try await later.beginCreation(scope: f.epoch.scope)
+            try await later.markInterrupted(epoch: epoch)
+            let current = try await later.records()
+            _ = try await later.continueAfterInterruption(try XCTUnwrap(current.first { $0.id == epoch.id }))
+        }
+        let history = try await later.records()
+        XCTAssertEqual(history.filter(\.hasRecoveryNotice).map(\.id), [f.epoch.id])
+        XCTAssertEqual(history.count, 2, "normal history compacts without dropping unknown input")
+    }
+
+    func testSealedAcceptedInputDoesNotInventACrashOrUnknownOutcome() async throws {
+        let f = try await setup()
+        _ = try await f.coordinator.submit(f.focus, encodedBytes: Data("accepted".utf8))
+        _ = try await f.coordinator.drainOne(f.source)
+        let boundary = try await close(f)
+        let ended = try await f.journal.sealInput(epoch: f.epoch, boundary: boundary)
+        XCTAssertTrue(ended.inputEvidence.contains(.transportAccepted))
+        XCTAssertTrue(ended.inputEvidence.contains(.acceptedPrefix))
+        XCTAssertFalse(ended.hasRecoveryNotice, "cumulative acceptance is not evidence of a final failed input")
+        let later = try TerminalSessionJournal(persistence: f.disk, processID: UUID())
+        let records = try await later.records()
+        let continued = try await later.continueAfterInterruption(records[0])
+        XCTAssertFalse(continued.hasRecoveryNotice)
+        XCTAssertEqual(continued.state, .continued)
+    }
+
+    func testRecoveryAcknowledgementPersistsEvidenceFromAFailedFinalSeal() async throws {
+        let f = try await setup()
+        _ = try await f.coordinator.submit(f.focus, encodedBytes: Data("unpublished-tail".utf8))
+        await f.transport.script(.failed)
+        _ = try await f.coordinator.drainOne(f.source)
+        _ = try await f.coordinator.takeOutcomes(f.source)
+        let boundary = try await close(f)
+        XCTAssertTrue(boundary.hasUnknownTransportOutcome)
+        f.disk.configure(.before(.catalog))
+        await expect(.recoveryRequired) { _ = try await f.journal.sealInput(epoch: f.epoch, boundary: boundary) }
+        let shown = try await f.journal.records()
+        XCTAssertEqual(shown[0].state, .creationStarted)
+        XCTAssertTrue(shown[0].hasRecoveryNotice)
+        XCTAssertTrue(shown[0].inputEvidence.contains(.unknownTransportOutcome))
+        try await f.journal.acknowledgeRecovery(shown)
+
+        // A late cleanup retry clears the owner's in-memory pending seal. The
+        // acknowledged history must still retain the exact evidence reviewed.
+        _ = try await f.journal.sealInput(epoch: f.epoch, boundary: boundary)
+        let relaunched = try TerminalSessionJournal(persistence: f.disk, processID: UUID())
+        let persisted = try await relaunched.records()
+        XCTAssertEqual(persisted[0].state, .acknowledged)
+        XCTAssertEqual(persisted[0].inputEvidence, shown[0].inputEvidence)
+        XCTAssertTrue(persisted[0].inputEvidence.contains(.unknownTransportOutcome))
+        XCTAssertFalse(persisted[0].hasRecoveryNotice)
     }
 
     func testBoundEpochRequiresCoordinatorProofAndRejectsLookalikeSource() async throws {
@@ -342,7 +432,8 @@ final class TerminalInputJournalTests: XCTestCase {
         var root = try StrictJSON.decode(XCTUnwrap(f.disk.bytes(.catalog))).object()
         root["version"] = .number("1")
         root["records"] = .array(try root.required("records").array().map {
-            var row = try $0.object(); row["input_evidence"] = nil; return .object(row)
+            var row = try $0.object(); row["input_evidence"] = nil; row["unclean"] = nil
+            return .object(row)
         })
         f.disk.seed(try StrictJSON.encode(.object(root)), slot: .catalog)
         let relaunched = try TerminalSessionJournal(persistence: f.disk, processID: UUID())
@@ -352,7 +443,7 @@ final class TerminalInputJournalTests: XCTestCase {
         XCTAssertEqual(legacy[0].inputEvidence, [])
         try await relaunched.resolve(legacy[0])
         let migrated = try StrictJSON.decode(XCTUnwrap(f.disk.bytes(.catalog))).object()
-        XCTAssertEqual(migrated["version"], .number("2"))
+        XCTAssertEqual(migrated["version"], .number("3"))
         let row = try XCTUnwrap(migrated["records"]).array()[0].object()
         XCTAssertEqual(row["input_evidence"], .number("0"))
     }

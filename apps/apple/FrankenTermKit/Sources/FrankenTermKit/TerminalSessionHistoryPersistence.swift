@@ -62,7 +62,7 @@ struct FileTerminalSessionHistoryPersistence: WorkspacePersistence {
     func write(_ data: Data, to slot: WorkspaceStorageSlot) throws {
         guard slot == .catalog else { throw TerminalSessionJournalError.wrongNamespace }
         let header = try Self.header(data)
-        guard header.version == 2 else { throw TerminalSessionJournalError.corruptStore }
+        guard header.version == 3 else { throw TerminalSessionJournalError.corruptStore }
         let continuity = try anchor.read()
         let previous = try files.read(.catalog, limit: Self.maximumBytes)
         if let continuity {
@@ -109,7 +109,7 @@ struct FileTerminalSessionHistoryPersistence: WorkspacePersistence {
             let text = try root.text("id"), version = try root.required("version").uint()
             guard Set(root.keys) == ["format", "version", "id", "records"],
                   let id = UUID(uuidString: text), id.uuidString == text,
-                  version == 1 || version == 2 else {
+                  (1...3).contains(version) else {
                 throw TerminalSessionJournalError.corruptStore
             }
             return (id, version)

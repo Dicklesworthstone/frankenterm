@@ -91,7 +91,7 @@ final class TerminalSessionHistoryPersistenceTests: XCTestCase {
                     XCTAssertNil(bytes)
                 } else {
                     let object = try StrictJSON.decode(XCTUnwrap(bytes)).object()
-                    XCTAssertEqual(object["version"], .number(markerPublished ? "2" : "1"))
+                    XCTAssertEqual(object["version"], .number(markerPublished ? "3" : "1"))
                     XCTAssertEqual(try object.required("records").array().count, markerPublished ? 1 : 0)
                 }
 
@@ -138,7 +138,41 @@ final class TerminalSessionHistoryPersistenceTests: XCTestCase {
         let bytes = try Data(contentsOf: root.appendingPathComponent("catalog.json"))
         let attributes = try FileManager.default.attributesOfItem(atPath: root.appendingPathComponent("catalog.json").path)
         XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o600)
-        XCTAssertEqual(try StrictJSON.decode(bytes).object()["version"], .number("2"))
+        XCTAssertEqual(try StrictJSON.decode(bytes).object()["version"], .number("3"))
+    }
+
+    func testAnchoredVersionTwoMigratesAndRetainsNoticeAcrossMultipleRelaunches() async throws {
+        let root = directory(), identifier = "test-" + UUID().uuidString
+        let storage = try FileTerminalSessionHistoryPersistence(directory: root, identifier: identifier)
+        let first = try TerminalSessionJournal(persistence: storage, processID: UUID())
+        let connection = try scope(), epoch = try await first.beginCreation(scope: connection)
+        let files = try FileWorkspacePersistence(directory: root)
+        var legacy = try StrictJSON.decode(XCTUnwrap(files.read(.catalog, limit: 512 * 1024))).object()
+        legacy["version"] = .number("2")
+        legacy["records"] = .array(try legacy.required("records").array().map {
+            var row = try $0.object(); row["unclean"] = nil; return .object(row)
+        })
+        try files.write(StrictJSON.encode(.object(legacy)), to: .catalog)
+        let recoveredStorage = try FileTerminalSessionHistoryPersistence(directory: root, identifier: identifier)
+        let second = try TerminalSessionJournal(persistence: recoveredStorage, processID: UUID())
+        let recovered = try await second.records()
+        XCTAssertEqual(recovered.map(\.id), [epoch.id])
+        XCTAssertTrue(recovered[0].hasRecoveryNotice)
+        _ = try await second.continueAfterInterruption(recovered[0])
+        let migrated = try StrictJSON.decode(XCTUnwrap(files.read(.catalog, limit: 512 * 1024))).object()
+        XCTAssertEqual(migrated["version"], .number("3"))
+        let row = try migrated.required("records").array()[0].object()
+        XCTAssertEqual(row["unclean"], .boolean(true))
+        let third = try TerminalSessionJournal(persistence: recoveredStorage, processID: UUID())
+        let retained = try await third.records()
+        XCTAssertEqual(retained[0].scope, connection)
+        XCTAssertEqual(retained[0].state, .continued)
+        XCTAssertTrue(retained[0].hasRecoveryNotice)
+        try await third.acknowledgeRecovery(retained)
+        let fourth = try TerminalSessionJournal(persistence: recoveredStorage, processID: UUID())
+        let dismissed = try await fourth.records()
+        XCTAssertFalse(dismissed[0].hasRecoveryNotice)
+        XCTAssertEqual(dismissed[0].state, .acknowledged)
     }
 
     func testMissingCatalogAfterRelaunchCannotAuthorizeAnEmptyHistory() async throws {
@@ -205,7 +239,8 @@ final class TerminalSessionHistoryPersistenceTests: XCTestCase {
         var object = try StrictJSON.decode(XCTUnwrap(disk.bytes(.catalog))).object()
         object["version"] = .number("1")
         object["records"] = .array(try object.required("records").array().map {
-            var fields = try $0.object(); fields["input_evidence"] = nil; return .object(fields)
+            var fields = try $0.object(); fields["input_evidence"] = nil; fields["unclean"] = nil
+            return .object(fields)
         })
         let legacy = try StrictJSON.encode(.object(object)), files = try FileWorkspacePersistence(directory: root)
         try files.write(legacy, to: .catalog)

@@ -605,7 +605,16 @@ final class TerminalSessionController {
     /// session on this machine keeps it until they dismiss it: a new live
     /// frame says nothing about whether the earlier input arrived.
     private(set) var inputDelivery: TerminalInputDelivery
-    /// The same, kept for the next launch if iOS ends this one (plan 11.8).
+    private(set) var inputNoticeFailure: String?
+    var inputDeliveryMessage: String? {
+        guard let message = inputDelivery.message(machine: target.machineName) else { return nil }
+        return inputNoticeFailure.map { message + " " + $0 } ?? message
+    }
+    /// Exact durable epochs behind the recovery notice. Continuing a new
+    /// connection does not acknowledge them, and output cannot clear them.
+    @ObservationIgnored private var inputRecoveryRecords: [TerminalSessionRecord] = []
+    @ObservationIgnored private var inputNoticeDismissal: Task<Void, Never>?
+    /// A best-effort detail hint; the journal protects process-crash gaps.
     @ObservationIgnored private let unansweredInput: TerminalUnansweredInput
     private(set) var interactionProblem: String?
     private(set) var localInputRecovery: TerminalKeyboardRecovery?
@@ -897,8 +906,46 @@ final class TerminalSessionController {
         retainEndedOutput = false; retainedOutput = nil; retainedOutputFailure = nil
     }
 
-    /// The person has read what an ended connection left known about their input.
-    func dismissInputDelivery() { inputDelivery = .init() }
+    /// The person has read what an ended connection left known about their
+    /// input. A durable notice leaves the screen only after its exact epochs
+    /// have been acknowledged, without clearing any newer notice meanwhile.
+    func dismissInputDelivery() {
+        guard inputNoticeDismissal == nil else { return }
+        inputNoticeFailure = nil
+        guard inputDelivery.previousSessionUncertain else { inputDelivery = .init(); return }
+        let shown = inputDelivery, reviewed = inputRecoveryRecords
+        inputNoticeDismissal = Task { [self] in
+            defer { inputNoticeDismissal = nil }
+            do {
+                // Even an empty retry needs a successful durable publication:
+                // the earlier write may have committed before reporting failure.
+                try await connections.journal.acknowledgeRecovery(reviewed)
+                let current = try await connections.journal.records().filter {
+                    $0.hasRecoveryNotice && $0.scope.workspaceID == target.workspaceID
+                        && $0.scope.machineID == target.machineID
+                }
+                // A replacement controller can inherit the visible notice
+                // before it has loaded the exact journal snapshots. Present
+                // those records first; this tap must not dismiss unseen epochs.
+                let unchanged = inputRecoveryRecords == reviewed
+                inputRecoveryRecords = current
+                if unchanged && current.isEmpty && inputDelivery == shown {
+                    inputDelivery = .init()
+                } else if !current.isEmpty { inputDelivery.setRecoveryNotice(true) }
+            } catch {
+                // Even an error after atomic publication is not a durability
+                // receipt. Keep the banner until another explicit dismissal;
+                // a fresh snapshot lets that retry cope with ambiguous writes.
+                if let current = try? await connections.journal.records() {
+                    inputRecoveryRecords = current.filter {
+                        $0.hasRecoveryNotice && $0.scope.workspaceID == target.workspaceID
+                            && $0.scope.machineID == target.machineID
+                    }
+                }
+                inputNoticeFailure = "The earlier session notice could not be dismissed: \(Self.describe(error)) Try Dismiss again."
+            }
+        }
+    }
 
     private func inputFailed(_ error: Error) {
         if let recovery = keyboard?.recovery,
@@ -1378,10 +1425,10 @@ final class TerminalSessionController {
         do {
             try checkStarting()
             let prepared: WorkspaceSSHConnection
-            // Preparing acknowledges an ended session too (disconnected, or cut
-            // off when iOS ended the app), or Connect could never reach it.
+            // Preparing retires an ended local owner while preserving any
+            // recovery notice; the route's own creation consent still applies.
             if let connection { prepared = connection }
-            else { prepared = try await connectAcknowledgingEarlierSessions() }
+            else { prepared = try await connectContinuingEarlierSessions() }
             var attempt = prepared
             self.connection = attempt
             try checkStarting()
@@ -1411,7 +1458,7 @@ final class TerminalSessionController {
                 }
                 shellOnly = true
                 try checkStarting()
-                attempt = try await connectAcknowledgingEarlierSessions()
+                attempt = try await connectContinuingEarlierSessions()
                 self.connection = attempt
                 try checkStarting()
                 guard shouldOpenTerminal else { phase = .ready; return }
@@ -1700,23 +1747,31 @@ final class TerminalSessionController {
         }
     }
 
-    /// Earlier sessions on this machine are acknowledged as the new one
-    /// starts: their records only note that input may have been in flight
-    /// when they ended, and asking about it first just got in the way. A
-    /// record whose own cleanup is still running holds the start briefly.
-    private func connectAcknowledgingEarlierSessions() async throws -> WorkspaceSSHConnection {
+    /// Retire earlier owners so an independently approved connection can
+    /// start. This is not acknowledgement of earlier input: unclean epochs
+    /// retain their nonmodal recovery notice until the person dismisses it.
+    /// An owner whose cleanup is still running holds the start briefly.
+    private func connectContinuingEarlierSessions() async throws -> WorkspaceSSHConnection {
         for attempt in 0..<20 {
-            for record in try await connections.journal.records()
-                where record.requiresReview
+            let records = try await connections.journal.records()
+            inputRecoveryRecords = records.filter {
+                $0.hasRecoveryNotice && $0.scope.workspaceID == target.workspaceID
+                    && $0.scope.machineID == target.machineID
+            }
+            if !inputRecoveryRecords.isEmpty { inputDelivery.setRecoveryNotice(true) }
+            for record in records
+                where record.blocksNewSession
                     && record.scope.workspaceID == target.workspaceID && record.scope.machineID == target.machineID {
                 try checkStarting()
                 guard record.canResolve else {
                     Self.log.info("earlier session on \(self.target.machineID, privacy: .public) (\(record.state.rawValue, privacy: .public)) is still open")
                     continue
                 }
-                do { try await connections.journal.resolve(record) }
-                catch {
-                    Self.log.error("earlier session on \(self.target.machineID, privacy: .public) not acknowledged: \(String(describing: error), privacy: .public)")
+                let continued = try await connections.journal.continueAfterInterruption(record)
+                if continued.hasRecoveryNotice {
+                    inputRecoveryRecords.removeAll { $0.id == continued.id }
+                    inputRecoveryRecords.append(continued)
+                    inputDelivery.setRecoveryNotice(true)
                 }
             }
             do { return try await connectFirstReachable() }
@@ -2063,6 +2118,7 @@ final class TerminalSessionController {
         if let startup { await startup.value }
         startup = nil
         if let viewAttachment { await viewAttachment.value }
+        if let inputNoticeDismissal { await inputNoticeDismissal.value }
         if let localInputReset { await localInputReset.value; self.localInputReset = nil }
         if let pointerFocusActivation { await pointerFocusActivation.value; self.pointerFocusActivation = nil }
         if let paneHandoff { await paneHandoff.value; self.paneHandoff = nil }

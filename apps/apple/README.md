@@ -238,6 +238,14 @@ source discovery. This implementation passed scoped rustfmt parsing/formatting
 and diff checks; these new Rust tests have not yet run through RCH in this session.
 The source is the existing inventory snapshot, not a new running-GUI snapshot API.
 
+## Durable terminal input recovery
+
+An earlier session that disappeared before local teardown completed leaves a conservative **Input outcome unknown** notice, including when the app stopped between sending input and recording its outcome. An explicitly unknown transport outcome also survives a completed local close. The notice remains visible through new output, replacement connections and relaunch until **Dismiss** succeeds. Ordinary completed sessions and cumulative transport-acceptance counters do not invent a crash notice. Existing precise notices still distinguish input that never left the phone, stopped partway or left without a subsequent answer.
+
+Connecting again retires the earlier local owner without silently recording a user acknowledgement. Each route retains its existing connection and new-shell consent. **Dismiss** durably acknowledges only the exact epochs presented, and reports a storage failure in the retained banner. Even a retry after an ambiguously completed write requires a successful durable publication; reading the candidate back is insufficient. A newer epoch cannot be cleared by an older dismissal, and no recovery action replays input or assumes that a remote command completed.
+
+The protected session catalog migrates versions 1 and 2 to version 3 while preserving its continuity anchor and content-free source identities. Normal history compaction retains unresolved recovery notices; reaching their bounded capacity asks for review instead of evicting them. Portable regressions cover the pre-callback crash gap, sealed unknown outcomes, clean-session behavior, repeated reconnect/relaunch, stale and interrupted dismissal, anchored migration and the maximum catalog size. The native killed-launch UI regression now checks retention after unrelated output and a clean return/relaunch; it requires a fresh Apple-hosted run.
+
 ## Retained output and session completion
 
 **Search Output** searches canonical rows already retained by the selected terminal, using literal, case-sensitive text on physical screen rows. It neither reads the network nor sends a command. Reads do not move the selected viewport. Search is bounded to 4,096 rows, 4 MiB, 256 pages and 128 matches; the screen reports a reached limit or history changing during the scan. Concealed cells are excluded. Selecting a result revalidates its exact source, geometry, screen, row sequence and matched bytes in the same model transaction that navigates to it. Expired matches remain observations and cannot jump to unrelated output.

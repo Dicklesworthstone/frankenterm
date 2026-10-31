@@ -21,7 +21,7 @@ public enum TerminalAttentionReason: String, CaseIterable, Hashable, Sendable {
     public static func observed(input: TerminalInputDelivery = .init(), keyboardNeedsDecision: Bool = false,
                                 connectionNeedsAttention: Bool = false, newOutput: Bool = false) -> Set<Self> {
         var result = Set<Self>()
-        if input.unanswered { result.insert(.inputUncertain) }
+        if input.unanswered || input.previousSessionUncertain { result.insert(.inputUncertain) }
         if input.stoppedPartway { result.insert(.inputStopped) }
         if input.unsent { result.insert(.inputNotSent) }
         if keyboardNeedsDecision { result.insert(.keyboardDecision) }

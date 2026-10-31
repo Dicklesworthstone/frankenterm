@@ -1650,7 +1650,7 @@ struct WorkspaceTerminalScreen: View {
                 ProgressView("Resetting keyboard…")
                     .padding(14).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16)).padding()
             } else if let session = scene.selectedSession,
-                      let delivery = session.inputDelivery.message(machine: session.target.machineName) {
+                      let delivery = session.inputDeliveryMessage {
                 problemBanner(delivery) { session.dismissInputDelivery() }
                     .accessibilityElement(children: .contain)
                     .accessibilityIdentifier("terminal.input.delivery")
