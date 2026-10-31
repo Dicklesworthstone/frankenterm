@@ -33,7 +33,7 @@ final class MobileOpticalRestoreTests: XCTestCase {
 
     func testCameraFailureOffersRetryWithoutDiscardingCiphertextOrOfflineExclusion() async throws {
         let (restore, progress, persistence, network) = try await partialScan()
-        let model = MobileWorkspaceModel()
+        let model = MobileWorkspaceModel(restore: restore)
         let priorBookmark = UserDefaults.standard.data(forKey: "live-screen")
         defer {
             model.cameraRequested = false; model.active = false; model.showRestore = false
@@ -79,8 +79,10 @@ final class MobileOpticalRestoreTests: XCTestCase {
             XCTAssertEqual(error as? FTError, .unsupported("camera.unavailable"))
             delivered.fulfill()
         })
+        XCTAssertTrue(coordinator.permitsStart)
         coordinator.failed(FTError.storage)
         coordinator.failed(FTError.storage)
+        XCTAssertFalse(coordinator.permitsStart, "A failed scanner waits for an explicit replacement.")
         XCTAssertEqual(failures, 0, "UIViewRepresentable updates cannot synchronously mutate the model.")
         await fulfillment(of: [delivered], timeout: 2)
         XCTAssertEqual(failures, 1)
@@ -94,6 +96,7 @@ final class MobileOpticalRestoreTests: XCTestCase {
         coordinator.failed(FTError.storage)
         coordinator.retire()
         coordinator.failed(FTError.storage)
+        XCTAssertFalse(coordinator.permitsStart)
         await fulfillment(of: [obsolete], timeout: 0.1)
     }
 }

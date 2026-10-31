@@ -282,6 +282,10 @@ final class MobileWorkspaceModel {
     var hasPendingImport: Bool { pendingImport != nil }
     var pendingImportNeedsRetry: Bool { pendingImport?.needsExplicitRetry == true }
 
+    init(restore: OfflineRestore<AppleCryptography>? = nil) {
+        self.restore = restore
+    }
+
     private func updateIdleTimer() {
         let needsAwakeDisplay = active && showRestore && state?.isSuspended == false
             && (cameraRequested || state?.recipientRequest != nil)

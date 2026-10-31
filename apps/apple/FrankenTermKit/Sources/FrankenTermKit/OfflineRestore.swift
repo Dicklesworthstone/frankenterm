@@ -193,7 +193,11 @@ public actor OfflineRestore<C: AirGapCryptography> {
         try check(token)
         guard phase == .candidate, let candidate, candidate.identity.envelopeDigest == digest else { throw FTError.stale }
         var selected = OpticalReceiver(selecting: candidate)
-        try selected.receive(candidate, using: crypto)
+        do { try selected.receive(candidate, using: crypto) }
+        catch {
+            discardRejectedOpticalSource()
+            throw error
+        }
         receiver = selected; self.candidate = nil; phase = .collecting
         if selected.isComplete {
             try finishOpticalEnvelope(from: selected)
@@ -558,13 +562,17 @@ public actor OfflineRestore<C: AirGapCryptography> {
             envelope = data; encryptionMode = header.mode
             receiver = nil; candidate = nil; phase = .locked
         } catch {
-            // An invalid source, destination, or mode must not consume the
-            // active phone request. Fence its queued callbacks before the phone
-            // scans another encrypted response.
-            candidate = nil; receiver = nil; identity = nil; source = nil
-            envelope = nil; encryptionMode = nil; phase = .idle; generation = UUID()
+            discardRejectedOpticalSource()
             throw error
         }
+    }
+
+    /// Reject only the optical source, whether its first symbol or its complete
+    /// envelope failed validation. Retain the active phone request and offline
+    /// exclusion, and fence queued observations before accepting another frame.
+    private func discardRejectedOpticalSource() {
+        candidate = nil; receiver = nil; identity = nil; source = nil
+        envelope = nil; encryptionMode = nil; phase = .idle; generation = UUID()
     }
 
     private func checkRecipientDestination(_ header: FTAGHeader, envelopeLength: Int) throws {

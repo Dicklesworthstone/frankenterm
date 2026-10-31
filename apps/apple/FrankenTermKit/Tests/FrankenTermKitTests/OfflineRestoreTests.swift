@@ -260,6 +260,94 @@ final class OfflineRestoreTests: XCTestCase {
         let saved = try await store.load()
         XCTAssertEqual(saved.count, 1)
     }
+
+    func testMalformedFirstSymbolDoesNotStrandSelectionOrPublishAnything() async throws {
+        let exported = try export(), sender = try OpticalSender(envelope: exported.envelope, using: crypto)
+        let first = try sender.frame(page: 0, sequence: 1, using: crypto)
+        let fields = first.split(separator: "/", maxSplits: 6).map(String.init)
+        let prefix = fields.prefix(6).joined(separator: "/") + "/"
+        let ur = fields[6].split(separator: "/")
+        let part = try URPart(cbor: Bytewords.decode(ur[2]))
+        let shortPart = URPart(sequence: part.sequence, count: part.count, messageLength: part.messageLength,
+                               checksum: part.checksum, payload: Data(part.payload.dropLast()))
+        let malformed: [(String, FTError)] = [
+            ("UR:BYTES/AAAA", .malformed("bytewords.extent")),
+            ("UR:BYTES/2-\(part.count)/\(ur[2])", .malformed("ur.sequence_or_length")),
+            ("UR:BYTES/1-\(part.count)/" + Bytewords.encode(shortPart.encoded()), .malformed("ur.fragment_geometry")),
+            ("UR:BYTES/" + Bytewords.encode(CBORWriter.bytes(Data([1]))), .checksum)
+        ]
+        for (invalid, expected) in malformed {
+            let persistence = StoreTestPersistence(), vault = StoreTestVault(), network = WorkspaceNetworkActivity()
+            let store = WorkspaceStore(persistence: persistence, vault: vault)
+            let restore = OfflineRestore(using: crypto, store: store, networkActivity: network)
+            var state = await restore.status()
+            state = try await restore.observe(prefix + invalid, generation: state.generation)
+            XCTAssertEqual(state.phase, .candidate)
+            let rejectedGeneration = state.generation
+            do {
+                _ = try await restore.selectCandidate(generation: rejectedGeneration, digest: sender.identity.envelopeDigest)
+                XCTFail("selected a malformed first symbol")
+            } catch { XCTAssertEqual(error as? FTError, expected) }
+
+            state = await restore.status()
+            XCTAssertEqual(state.phase, .idle, "The camera must be able to offer the next healthy frame.")
+            XCTAssertNil(state.identity); XCTAssertNil(state.source); XCTAssertNil(state.encryptionMode)
+            XCTAssertNotEqual(state.generation, rejectedGeneration)
+            XCTAssertEqual(state.receivedParts, 0); XCTAssertEqual(state.verifiedBytes, 0)
+            XCTAssertNil(state.review); XCTAssertNil(state.receipt)
+            XCTAssertNil(persistence.bytes(.catalog)); XCTAssertEqual(vault.creates, 0)
+            XCTAssertEqual(network.accounting().offlineRestores, 1)
+            XCTAssertThrowsError(try network.beginConnection(), "A bad symbol cannot release offline exclusion.")
+            do {
+                _ = try await restore.observe(first, generation: rejectedGeneration)
+                XCTFail("a queued callback reselected the rejected source")
+            } catch { XCTAssertEqual(error as? FTError, .stale) }
+
+            // The very next healthy observation works without Start Over,
+            // including when it belongs to the same envelope as the bad part.
+            state = try await restore.observe(first, generation: state.generation)
+            state = try await restore.selectCandidate(generation: state.generation, digest: sender.identity.envelopeDigest)
+            for sequence in 2...(try sender.sourcePartCount(page: 0)) {
+                state = try await restore.observe(sender.frame(page: 0, sequence: UInt32(sequence), using: crypto),
+                                                  generation: state.generation)
+            }
+            XCTAssertEqual(state.phase, .locked); XCTAssertEqual(state.verifiedBytes, exported.envelope.count)
+            XCTAssertNil(state.review); XCTAssertNil(persistence.bytes(.catalog)); XCTAssertEqual(vault.creates, 0)
+            state = try await restore.unlock(enteredCode: exported.code.reveal(using: crypto), generation: state.generation)
+            XCTAssertEqual(state.phase, .review); XCTAssertEqual(vault.creates, 0)
+            state = try await restore.commit(reviewToken: XCTUnwrap(state.review).token, generation: state.generation,
+                                             sourceAndContentsConfirmed: true)
+            XCTAssertEqual(state.phase, .complete); XCTAssertEqual(vault.creates, 1)
+            XCTAssertTrue(try XCTUnwrap(state.receipt).workspace.connectLater)
+        }
+    }
+
+    func testStaleOrCancelledSelectionPreservesThePendingHealthyCandidate() async throws {
+        let (restore, _, persistence, vault) = environment(), exported = try export()
+        let sender = try OpticalSender(envelope: exported.envelope, using: crypto)
+        let initial = await restore.status()
+        let candidate = try await restore.observe(sender.frame(page: 0, sequence: 1, using: crypto),
+                                                   generation: initial.generation)
+        for (generation, digest) in [(UUID(), sender.identity.envelopeDigest), (candidate.generation, Data(count: 32))] {
+            do {
+                _ = try await restore.selectCandidate(generation: generation, digest: digest)
+                XCTFail("a stale selection was accepted")
+            } catch { XCTAssertEqual(error as? FTError, .stale) }
+        }
+        let cancelled = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await restore.selectCandidate(generation: candidate.generation, digest: sender.identity.envelopeDigest)
+        }
+        do { _ = try await cancelled.value; XCTFail("a cancelled selection was accepted") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        let unchanged = await restore.status()
+        XCTAssertEqual(unchanged.phase, .candidate); XCTAssertEqual(unchanged.identity, sender.identity)
+        XCTAssertEqual(unchanged.generation, candidate.generation); XCTAssertEqual(unchanged.receivedParts, 0)
+        XCTAssertNil(persistence.bytes(.catalog)); XCTAssertEqual(vault.creates, 0)
+        let selected = try await restore.selectCandidate(generation: candidate.generation, digest: sender.identity.envelopeDigest)
+        XCTAssertEqual(selected.phase, .collecting); XCTAssertEqual(selected.receivedParts, 1)
+    }
+
     /// After the import commits there is nothing left to read: exclusion ends
     /// (the phone may tell its Mac, or connect) and reset takes it back. The
     /// arrival proof key is the digest of the very manifest the Mac sealed.

@@ -226,6 +226,43 @@ final class RecipientTransferIntegrationTests: XCTestCase {
         XCTAssertEqual(reviewed.phase, .review); XCTAssertEqual(vault.creates, 0)
     }
 
+    func testMalformedFirstSymbolRetainsThePhoneRequestAndAcceptsTheNextHealthyResponse() async throws {
+        let (restore, _, persistence, vault) = environment()
+        let initial = await restore.status()
+        var state = try await restore.createRecipientRequest(generation: initial.generation)
+        let request = try XCTUnwrap(state.recipientRequest), envelope = try export(for: request)
+        let sender = try OpticalSender(envelope: envelope, using: crypto)
+        let first = try sender.frame(page: 0, sequence: 1, using: crypto)
+        let prefix = first.split(separator: "/", maxSplits: 6).prefix(6).joined(separator: "/") + "/"
+        state = try await restore.observe(prefix + "UR:BYTES/AAAA", generation: state.generation)
+        let rejectedGeneration = state.generation
+        do {
+            _ = try await restore.selectCandidate(generation: rejectedGeneration, digest: sender.identity.envelopeDigest)
+            XCTFail("selected a malformed recipient response")
+        } catch { XCTAssertEqual(error as? FTError, .malformed("bytewords.extent")) }
+        state = await restore.status()
+        XCTAssertEqual(state.phase, .idle); XCTAssertNil(state.identity)
+        XCTAssertNotEqual(state.generation, rejectedGeneration)
+        XCTAssertEqual(state.recipientRequest, request, "Only the bad source is discarded, not the phone's private request.")
+        XCTAssertEqual(state.receivedParts, 0); XCTAssertNil(state.review)
+        XCTAssertNil(persistence.bytes(.catalog)); XCTAssertEqual(vault.creates, 0)
+        do {
+            _ = try await restore.observe(first, generation: rejectedGeneration)
+            XCTFail("a queued response entered the retired selection generation")
+        } catch { XCTAssertEqual(error as? FTError, .stale) }
+        state = try await restore.observe(first, generation: state.generation)
+        state = try await restore.selectCandidate(generation: state.generation, digest: sender.identity.envelopeDigest)
+        for sequence in 2...(try sender.sourcePartCount(page: 0)) {
+            state = try await restore.observe(sender.frame(page: 0, sequence: UInt32(sequence), using: crypto),
+                                              generation: state.generation)
+        }
+        XCTAssertEqual(state.phase, .locked); XCTAssertTrue(state.canUnlockRecipient)
+        state = try await restore.unlockRecipient(generation: state.generation)
+        XCTAssertEqual(state.phase, .review)
+        XCTAssertEqual(state.review?.includedFingerprints.count, 1)
+        XCTAssertNil(persistence.bytes(.catalog)); XCTAssertEqual(vault.creates, 0)
+    }
+
     func testTemporarySuspensionRequiresManualResumeAndCancellationLosesTheKey() async throws {
         for suspendAfterReview in [false, true] {
             let (restore, store, persistence, vault) = environment()
