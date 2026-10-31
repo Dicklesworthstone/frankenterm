@@ -90,7 +90,17 @@ public struct MachineThemes: Sendable {
 
     /// The chosen theme; a name its source no longer has falls back.
     public func theme(for machine: WorkspaceDocument.Machine) -> WorkspaceDocument.Theme? {
-        choices[machine.id].flatMap(theme(chosen:)) ?? workspaceTheme(of: machine)
+        let original = workspaceTheme(of: machine)
+        guard let chosen = choices[machine.id].flatMap(theme(chosen:)) else { return original }
+        // Catalog color schemes have no font descriptor. Choosing colors,
+        // including automatic fleet distinction, must preserve the machine's
+        // exported typography. An explicitly font-bearing theme can replace it.
+        return .init(id: chosen.id, name: chosen.name, foreground: chosen.foreground,
+                     background: chosen.background, accent: chosen.accent,
+                     cursorForeground: chosen.cursorForeground, cursorBackground: chosen.cursorBackground,
+                     cursorBorder: chosen.cursorBorder, selectionForeground: chosen.selectionForeground,
+                     selectionBackground: chosen.selectionBackground, ansi: chosen.ansi, indexed: chosen.indexed,
+                     font: chosen.font ?? original?.font)
     }
 
     /// Whether a machine has a choice that still applies.

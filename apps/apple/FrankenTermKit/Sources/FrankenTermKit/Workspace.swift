@@ -331,7 +331,7 @@ public struct WorkspaceDocument: Sendable {
                 requiresPortForwarding: transit)) != nil
         }
     }
-    public struct Font: Sendable {
+    public struct Font: Hashable, Sendable {
         public let family: String, face: String?
         public let pointSize: Double?
         public let fallbacks: [String], variations: [String: Double]

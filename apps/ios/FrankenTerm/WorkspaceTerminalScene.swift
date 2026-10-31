@@ -1334,7 +1334,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     func applyTheme(_ theme: WorkspaceDocument.Theme, to machineID: String) {
         guard !closed, machines.contains(where: { $0.id == machineID }) else { return }
         themes[machineID] = theme
-        sessions[machineID]?.applyPalette(theme.terminalBasePalette)
+        sessions[machineID]?.applyTheme(theme)
     }
 
     /// Synchronously seal every scene-owned responder before scheduling joins.

@@ -2,6 +2,12 @@
 
 This directory contains the shared Swift 6 `FrankenTermKit` package and the native Xcode project for the first offline workspace-transfer slice. It is implementation source, not a signed or device-qualified terminal release.
 
+## Imported machine fonts
+
+Each machine's exported font family and face now reach the native Core Text/Metal renderer. Installed fallback families retain their exported order, followed by the bundled Nerd Font symbols, and ordinary cells preserve an explicitly selected bold or italic base face. Choosing another color scheme retains the machine's exported font unless that theme supplies its own. Appearance changes reuse the existing terminal and font-revision barrier, including when its view is recreated.
+
+Machine details show the resolved font and explain unavailable families, faces and fallbacks once. Unsupported variation axes remain in the workspace and are disclosed as using the selected face's defaults. Font files are not transferred or downloaded; point size remains the phone's local text-size preference. Portable tests cover resolution, substitution, all sixteen manifest fallbacks and color-choice preservation. Hosted tests exercise the actual Metal font and italic-cell rendering; those tests still require an Apple SDK and native execution.
+
 ## Source omissions survive the default Mac export
 
 The default **This Mac's FrankenTerm machines** source now carries a typed completeness report from the Rust helper through the Mac's review, group/machine selection, encrypted FTAG archive and installed workspace. Previously the helper's diagnostic notes were dropped by this path. Omitted routes and machines, desktop working-directory/icon/gradient settings, and the inventory source's limits now remain visible. Findings for removed entities attach to a surviving machine, group or workspace so narrowing the selection cannot discard them accidentally.

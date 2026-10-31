@@ -458,6 +458,7 @@ struct TerminalSessionTarget: Hashable, Sendable {
     let routes: [TerminalSessionRoute]
     /// The machine theme as the terminal's base palette, and its background.
     let basePalette: [UInt8]?, background: String?
+    let font: WorkspaceDocument.Font?
     var requiresAuthenticationPrompt: Bool { routes.contains(where: \.requiresAuthenticationPrompt) }
 
     init(workspaceID: UUID, revision: UUID, machineID: String, machineName: String,
@@ -466,6 +467,7 @@ struct TerminalSessionTarget: Hashable, Sendable {
         self.workspaceID = workspaceID; self.revision = revision; self.machineID = machineID
         self.machineName = machineName; self.routes = routes
         basePalette = theme?.terminalBasePalette; background = theme?.background
+        font = theme?.font
     }
 
     /// The same routes under another theme.
@@ -696,6 +698,7 @@ final class TerminalSessionController {
     @ObservationIgnored private var wantedFontRevision: UInt64 = 1
     @ObservationIgnored private var appliedFontRevision: UInt64 = 1
     @ObservationIgnored private var fontRevisionChange: Task<Void, Never>?
+    @ObservationIgnored private var requestedFont: WorkspaceDocument.Font?
     @ObservationIgnored private var historyReturn: Task<Void, Never>?
     @ObservationIgnored private var muxSearchPresented = false
     @ObservationIgnored private var retainedCaptureAttempted = false
@@ -721,6 +724,7 @@ final class TerminalSessionController {
          inputDelivery: TerminalInputDelivery = .init(),
          muxAccessMode: TerminalMuxAccessMode = .interactive, requiresExistingMux: Bool = false) {
         self.target = target; self.connections = connections; self.focus = focus
+        requestedFont = target.font
         self.muxAccessMode = muxAccessMode; self.requiresExistingMux = requiresExistingMux
         self.inputDelivery = inputDelivery
         unansweredInput = TerminalUnansweredInput(workspace: target.workspaceID.uuidString, machine: target.machineID)
@@ -750,11 +754,13 @@ final class TerminalSessionController {
     /// "Machine · Route", for labels that leave the session.
     private var destination: String { "\(target.machineName) · Machine \(target.machineID) · Route \(route.id)" }
 
-    /// Re-themes the terminal. Before the model exists, startup applies the
-    /// latest palette; after, one change at a time reaches the runtime and
-    /// the last pick wins.
-    func applyPalette(_ palette: [UInt8]) {
-        basePalette = palette
+    /// Re-themes the terminal. Startup and later view recreation both retain
+    /// the latest font. Palette and font revisions use their existing model
+    /// owners; changing appearance never creates another connection.
+    func applyTheme(_ theme: WorkspaceDocument.Theme) {
+        requestedFont = theme.font
+        terminal?.setFont(NativeTerminalFonts.resolve(requestedFont))
+        basePalette = theme.terminalBasePalette
         guard paletteChange == nil else { return }
         paletteChange = Task { [weak self] in
             while let self, !self.stopped, let runtime = self.runtime, let source = self.pump?.source,
@@ -1609,7 +1615,7 @@ final class TerminalSessionController {
             // than resetting it to one after a prior pinch/text-size change.
             await fontRevisionChange?.value
             try checkLive()
-            var configuration = Self.renderConfiguration
+            var configuration = Self.renderConfiguration(font: requestedFont)
             configuration.fontRevision = appliedFontRevision
             configuration.fitsRemoteGrid = keepsSharedMuxSize
             let view = try await NativeTerminalView(session: keyboard, configuration: configuration, readOnly: isViewingOnly)
@@ -1676,6 +1682,10 @@ final class TerminalSessionController {
                 guard let self, let view else { return }
                 self.restorePointerFocus(afterHiding: view)
             }
+            // The theme can change while Metal pipelines are being loaded.
+            // Reconcile after installing the revision callback so that the
+            // first visible frame cannot silently retain that earlier face.
+            view.setFont(NativeTerminalFonts.resolve(requestedFont))
             setPresentationVisible(presentationVisible)
             view.requestKeyboard(presentationVisible)
         } catch {
@@ -1925,12 +1935,16 @@ final class TerminalSessionController {
         return true
     }
 
-    /// The desktop's default terminal font, bundled with its license, when it
-    /// is registered; otherwise Kit's Menlo default, because Core Text would
-    /// replace an unknown name with a proportional system font.
+    /// A resolved installed face and the user's phone-local text size. Missing
+    /// desktop fonts have a visible substitution in machine details.
     static var renderConfiguration: NativeTerminalRenderConfiguration {
+        renderConfiguration(font: nil)
+    }
+    static func renderConfiguration(font: WorkspaceDocument.Font?) -> NativeTerminalRenderConfiguration {
         var configuration = NativeTerminalRenderConfiguration()
-        if UIFont(name: "PragmasevkaNF", size: 12) != nil { configuration.fontName = "PragmasevkaNF" }
+        let resolved = NativeTerminalFonts.resolve(font)
+        configuration.fontName = resolved.primary.postScriptName
+        configuration.fallbackFontNames = resolved.fallbackNames
         let saved = UserDefaults.standard.double(forKey: fontSizeKey)
         if NativeTerminalView.fontSizes.contains(saved) { configuration.fontPointSize = saved }
         return configuration

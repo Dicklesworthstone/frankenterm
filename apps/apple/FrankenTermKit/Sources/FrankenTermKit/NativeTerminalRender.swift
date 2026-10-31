@@ -3,6 +3,45 @@ import UIKit
 @preconcurrency import MetalKit
 import CoreText
 
+/// UIKit lookup deliberately returns only installed faces, including family
+/// names exported by the Mac and exact PostScript face names. Resolution stays
+/// off the frame preparation path and never registers or fetches font assets.
+@MainActor
+public enum NativeTerminalFonts {
+    public static func resolve(_ request: WorkspaceDocument.Font?) -> TerminalFontResolution {
+        let fallback = UIFont(name: "PragmasevkaNF", size: 12)
+            ?? UIFont(name: "Menlo-Regular", size: 12)
+            ?? UIFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        func face(_ font: UIFont) -> TerminalFontResolution.Face {
+            .init(postScriptName: font.fontName, familyName: font.familyName)
+        }
+        var installedFamilies: [String]?
+        return .resolve(request, defaultFace: face(fallback),
+                        symbolFace: UIFont(name: "SymbolsNFM", size: 12).map(face)) { family, style in
+            func matches(_ a: String, _ b: String) -> Bool {
+                a.compare(b, options: [.caseInsensitive]) == .orderedSame
+            }
+            let named = UIFont(name: family, size: 12)
+            if style == nil, let named { return face(named) }
+            if named == nil, installedFamilies == nil { installedFamilies = UIFont.familyNames }
+            let installedFamily = named?.familyName ?? installedFamilies?.first { matches($0, family) }
+            guard let installedFamily else { return nil }
+            let candidates = UIFont.fontNames(forFamilyName: installedFamily)
+                .compactMap { UIFont(name: $0, size: 12) }
+            if let style {
+                return candidates.first { font in
+                    matches(font.fontName, style)
+                        || matches(CTFontCopyStyleName(CTFontCreateWithName(font.fontName as CFString, 12, nil)) as String, style)
+                }.map(face)
+            }
+            let regular = candidates.first { font in
+                font.fontDescriptor.symbolicTraits.intersection([.traitBold, .traitItalic]).isEmpty
+            }
+            return (regular ?? candidates.sorted { $0.fontName < $1.fontName }.first).map(face)
+        }
+    }
+}
+
 public struct NativeTerminalRenderConfiguration: Equatable, Sendable {
     public var fontName = "Menlo"
     /// PostScript names tried, in order, for characters the base font lacks,
@@ -20,7 +59,8 @@ public struct NativeTerminalRenderConfiguration: Equatable, Sendable {
     public init() {}
     fileprivate func validate() throws {
         guard fontRevision > 0, !fontName.isEmpty, fontName.utf8.count <= 256,
-              fallbackFontNames.count <= 8, fallbackFontNames.allSatisfy({ !$0.isEmpty && $0.utf8.count <= 256 }),
+              fallbackFontNames.count <= TerminalFontResolution.maximumFallbacks,
+              fallbackFontNames.allSatisfy({ !$0.isEmpty && $0.utf8.count <= 256 }),
               fontPointSize.isFinite, (6...48).contains(fontPointSize)
         else { throw TerminalRenderError.capacity }
     }
@@ -1010,16 +1050,21 @@ private final class NativeTerminalFrameBuilder {
     private func font(for cell: TerminalRenderCell) throws -> CTFont {
         let key: UInt8 = (cell.intensity == 1 ? 1 : 0) | (cell.italic ? 2 : 0) | (cell.verticalAlignment == 0 ? 0 : 4)
         if let font = cellFonts[key] { return font }
-        var traits: CTFontSymbolicTraits = []
+        // A deliberately selected italic/bold face is the machine's base
+        // appearance. Terminal attributes add emphasis; ordinary cells must
+        // not strip that chosen face back to the family's regular variant.
+        let baseTraits = CTFontGetSymbolicTraits(baseFont).intersection([.traitBold, .traitItalic])
+        var traits = baseTraits
         if cell.intensity == 1 { traits.insert(.traitBold) }
         if cell.italic { traits.insert(.traitItalic) }
         let size = rasterFontSize * (cell.verticalAlignment == 0 ? 1 : 0.75)
         let derived: CTFont
-        if let font = CTFontCreateCopyWithSymbolicTraits(baseFont, size, nil, traits, [.traitBold,.traitItalic]) {
+        if traits == baseTraits {
+            derived = CTFontCreateCopyWithAttributes(baseFont, size, nil, nil)
+        } else if let font = CTFontCreateCopyWithSymbolicTraits(baseFont, size, nil, traits, [.traitBold,.traitItalic]) {
             derived = font
         } else {
-            guard traits.isEmpty else { throw TerminalRenderError.unsupported }
-            derived = CTFontCreateCopyWithAttributes(baseFont, size, nil, nil)
+            throw TerminalRenderError.unsupported
         }
         let font = cascade.map { CTFontCreateCopyWithAttributes(derived, size, nil, $0) } ?? derived
         cellFonts[key] = font
