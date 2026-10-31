@@ -5188,6 +5188,31 @@ impl GuardianCheckpointStageStore {
         Ok(retained - state.snapshots.len())
     }
 
+    /// Drop every replay snapshot `mux_incarnation` opened, once its last
+    /// connection is gone and its leases are retired. Only the opening mux may
+    /// ask for a snapshot's next page or acknowledge one, so these are
+    /// unreachable. The lease fence alone keeps the ones on exited, closed and
+    /// quarantined panes, which answer their last generation from any mux and
+    /// can never be claimed again. Those would otherwise hold their slots for
+    /// as long as the pane record lives. If the same mux comes back, its next
+    /// request finds the snapshot expired, which it already handles. Returns
+    /// how many went.
+    pub(crate) fn release_replay_snapshots_of_mux(
+        &self,
+        mux_incarnation: Uuid,
+    ) -> Result<usize, GuardianCheckpointStageStoreError> {
+        let mut state = self
+            .inner
+            .replay
+            .lock()
+            .map_err(|_| GuardianCheckpointStageStoreError::LockPoisoned)?;
+        let retained = state.snapshots.len();
+        state
+            .snapshots
+            .retain(|_, snapshot| snapshot.mux_incarnation != mux_incarnation);
+        Ok(retained - state.snapshots.len())
+    }
+
     /// Acknowledge only the exact page currently outstanding for a snapshot.
     /// This ledger transition never authorizes retention or compaction.
     pub(crate) fn apply_replay_ack(
@@ -20559,6 +20584,81 @@ mod tests {
             Uuid::from_u128(0xf603)
         ));
         assert_eq!(store.release_fenced_replay_snapshots(&protocol)?, 1);
+        assert_eq!(snapshots(&store)?, 0);
+        Ok(())
+    }
+
+    /// A pane that exits keeps its generation and can never be claimed again,
+    /// so a page in flight to a mux that then went away passes the lease fence
+    /// forever. Retiring that mux releases it, and only that mux's snapshots.
+    #[test]
+    fn retiring_a_mux_releases_its_replay_snapshot_of_an_exited_pane()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-replay-retired-mux-release-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let guardian = Uuid::from_u128(0xf640);
+        let mux = Uuid::from_u128(0xf641);
+        let pane = Uuid::from_u128(0xf642);
+        let generation = 1;
+        let journal = pipeline.prepare_pane(guardian, pane)?;
+        let mut protocol = checkpoint_catalog_claimed_protocol_state(guardian, mux, pane)?;
+        checkpoint_catalog_stage_and_publish(
+            &pipeline,
+            &store,
+            &journal,
+            &mut protocol,
+            guardian,
+            mux,
+            pane,
+            generation,
+            1,
+            0xf650,
+            b"retired-mux-release",
+            b"retired-mux-release",
+        )?;
+        let open_request = checkpoint_catalog_replay_request(
+            guardian,
+            mux,
+            Uuid::from_u128(0xf660),
+            pane,
+            generation,
+            GuardianReplayRequestV1::Open {
+                selector: GuardianReplaySelectorV1::LatestCompatible,
+                max_plaintext_bytes: 64 * 1024,
+                max_records: 4,
+                wait_millis: 0,
+            },
+        )?;
+        let _in_flight = store.apply_replay(
+            &open_request,
+            protocol.preflight_replay(&open_request)?,
+            Some(&journal),
+        )?;
+        let snapshots = |store: &GuardianCheckpointStageStore| {
+            store
+                .inner
+                .replay
+                .lock()
+                .map(|replay| replay.snapshots.len())
+                .map_err(|_| "replay ledger poisoned")
+        };
+        protocol.mark_exited(pane, 0)?;
+        assert!(guardian_replay_lease_is_current(
+            &protocol,
+            pane,
+            generation,
+            Uuid::from_u128(0xf643)
+        ));
+        assert_eq!(store.release_fenced_replay_snapshots(&protocol)?, 0);
+        assert_eq!(
+            store.release_replay_snapshots_of_mux(Uuid::from_u128(0xf643))?,
+            0
+        );
+        assert_eq!(snapshots(&store)?, 1);
+        assert_eq!(store.release_replay_snapshots_of_mux(mux)?, 1);
         assert_eq!(snapshots(&store)?, 0);
         Ok(())
     }

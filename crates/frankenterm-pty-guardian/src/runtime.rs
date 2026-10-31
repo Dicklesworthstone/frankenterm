@@ -3849,6 +3849,19 @@ impl GuardianRuntime {
             if let Some(connection) = self.broker_connections.get_mut(&mux_incarnation) {
                 connection.fully_retired_outer_owner = true;
             }
+            match self
+                .output_pipeline
+                .checkpoint_stage_store()
+                .release_replay_snapshots_of_mux(mux_incarnation)
+            {
+                Ok(0) => {}
+                Ok(released) => log::info!(
+                    "guardian released {released} replay snapshot(s) of disconnected mux {mux_incarnation}"
+                ),
+                Err(error) => log::warn!(
+                    "guardian could not release the replay snapshots of disconnected mux {mux_incarnation}: {error:?}"
+                ),
+            }
         }
         Ok(result)
     }
