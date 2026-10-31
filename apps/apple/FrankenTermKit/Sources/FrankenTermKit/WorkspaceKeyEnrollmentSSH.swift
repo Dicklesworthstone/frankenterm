@@ -1,17 +1,87 @@
 #if os(macOS) || os(Linux)
 import Foundation
+#if canImport(CryptoKit)
+import CryptoKit
+#elseif canImport(Crypto)
+import Crypto
+#endif
 
 public enum WorkspaceKeyEnrollmentSSHError: Error, LocalizedError, Sendable {
     case route, policy, certificate, trust, hostAlias
     public var errorDescription: String? {
         switch self {
-        case .route: "Enrollment currently supports direct SSH accounts without jump hosts or Via Mac."
+        case .route: "Enrollment requires a supported SSH route with at most three reviewed jump hosts. Via Mac is a different connection mode."
         case .policy: "This route requires authentication or capabilities that this enrollment flow cannot preserve."
         case .certificate: "This account requires a certificate. Use its approved certificate issuer to enroll the phone."
         case .trust: "This source contains a host revocation or required trust policy. Resolve it before enrollment."
-        case .hostAlias: "Enrollment cannot substitute an SSH host-key alias for the reviewed host."
+        case .hostAlias: "This host-key alias must be retained in the reviewed connection plan."
         }
     }
+}
+
+/// One explicitly reviewed SSH peer. This value names an endpoint and its
+/// known-host lookup; it does not prove reachability, host trust or login.
+public struct WorkspaceKeyEnrollmentSSHHost: Equatable, Hashable, Sendable, Identifiable {
+    public let target: WorkspaceKeyEnrollmentTarget
+    public let hostKeyAlias: String?
+    public var id: String {
+        enrollmentRouteDigest("frankenterm-phone-key-enrollment-hop-v1\0" + target.id + "\0" +
+            (hostKeyAlias ?? ""))
+    }
+
+    public init(target: WorkspaceKeyEnrollmentTarget, hostKeyAlias: String? = nil) throws {
+        // A digest cannot reconstruct an account's transport path. Only this
+        // plan may attach a fresh scope after reviewing all concrete peers.
+        guard target.routeScope == nil else { throw WorkspaceKeyEnrollmentSSHError.route }
+        if let hostKeyAlias {
+            guard !hostKeyAlias.isEmpty, hostKeyAlias.utf8.allSatisfy({ $0 < 128 }),
+                  hostKeyAlias.first != "-" else { throw WorkspaceKeyEnrollmentSSHError.hostAlias }
+            self.hostKeyAlias = try WorkspaceDocument.host(hostKeyAlias)
+        } else { self.hostKeyAlias = nil }
+        self.target = target
+    }
+}
+
+/// A bounded, immutable connection path. A private endpoint reached through a
+/// different bastion chain is a different durable enrollment scope; no fallback
+/// or route lookup is performed after this value has been approved.
+public struct WorkspaceKeyEnrollmentSSHPlan: Equatable, Hashable, Sendable, Identifiable {
+    public let destination: WorkspaceKeyEnrollmentSSHHost
+    public let jumpHosts: [WorkspaceKeyEnrollmentSSHHost]
+    public let target: WorkspaceKeyEnrollmentTarget
+    public let id: String
+
+    public init(target: WorkspaceKeyEnrollmentTarget, hostKeyAlias: String? = nil,
+                jumpHosts: [WorkspaceKeyEnrollmentSSHHost] = []) throws {
+        guard jumpHosts.count <= 3 else { throw WorkspaceKeyEnrollmentSSHError.route }
+        let destination = try WorkspaceKeyEnrollmentSSHHost(target: target, hostKeyAlias: hostKeyAlias)
+        let hosts = jumpHosts + [destination]
+        // A repeated private endpoint can name a different account in each
+        // forwarding namespace. Preserve every position; the three-hop bound
+        // and the document's route-ID graph check prevent unbounded expansion.
+        let witness = "frankenterm-phone-key-enrollment-route-v1\0" + String(hosts.count) + "\0" +
+            hosts.map { $0.target.id + "\0" + ($0.hostKeyAlias ?? "") + "\0" }.joined()
+        let scope = jumpHosts.isEmpty && destination.hostKeyAlias == nil ? nil : enrollmentRouteDigest(witness)
+        self.destination = destination; self.jumpHosts = jumpHosts
+        self.target = try WorkspaceKeyEnrollmentTarget(host: target.host, port: target.port, user: target.user,
+                                                       routeScope: scope)
+        self.id = enrollmentRouteDigest("frankenterm-phone-key-enrollment-plan-v1\0" + witness)
+    }
+
+    /// Each transit account is a separate optional remote edit, using only its
+    /// earlier prefix. Merely traversing a hop never enrolls the key there.
+    public var transitPlans: [WorkspaceKeyEnrollmentSSHPlan] {
+        get throws {
+            try jumpHosts.enumerated().map { index, host in
+                try WorkspaceKeyEnrollmentSSHPlan(target: host.target, hostKeyAlias: host.hostKeyAlias,
+                                                    jumpHosts: Array(jumpHosts.prefix(index)))
+            }
+        }
+    }
+}
+
+private func enrollmentRouteDigest(_ value: String) -> String {
+    SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
 }
 
 /// An explicit Mac operation using its existing OpenSSH authentication and host
@@ -20,12 +90,36 @@ public enum WorkspaceKeyEnrollmentSSHError: Error, LocalizedError, Sendable {
 /// read back; it does not prove that this server's authentication policy uses
 /// that file, or that the phone has successfully authenticated.
 public enum WorkspaceKeyEnrollmentSSH {
+    /// Retains the original direct-account API without discarding a route's
+    /// transit path or explicit host-key alias. Use `plan` for those routes.
     public static func target(for requestedRoute: WorkspaceDocument.Route,
                               in document: WorkspaceDocument) throws -> WorkspaceKeyEnrollmentTarget {
+        let planned = try plan(for: requestedRoute, in: document)
+        guard planned.jumpHosts.isEmpty else { throw WorkspaceKeyEnrollmentSSHError.route }
+        guard planned.destination.hostKeyAlias == nil else { throw WorkspaceKeyEnrollmentSSHError.hostAlias }
+        return planned.target
+    }
+
+    public static func plan(for requestedRoute: WorkspaceDocument.Route,
+                            in document: WorkspaceDocument) throws -> WorkspaceKeyEnrollmentSSHPlan {
         guard let route = document.routes.first(where: { $0.id == requestedRoute.id }),
               route.host == requestedRoute.host, route.port == requestedRoute.port,
-              route.user == requestedRoute.user,
-              ["direct_ssh", "frankenterm_mux"].contains(route.mode), route.jumpRoutes.isEmpty else {
+              route.user == requestedRoute.user, route.mode == requestedRoute.mode,
+              route.hostKeyAlias == requestedRoute.hostKeyAlias, route.jumpRoutes == requestedRoute.jumpRoutes,
+              route.credentialIDs == requestedRoute.credentialIDs, route.trustID == requestedRoute.trustID,
+              route.authenticationMethods == requestedRoute.authenticationMethods,
+              route.requiredCapabilities == requestedRoute.requiredCapabilities,
+              route.requiredExtensions == requestedRoute.requiredExtensions else {
+            throw WorkspaceKeyEnrollmentSSHError.route
+        }
+        let destination = try reviewedHost(route, in: document)
+        let hops = try document.orderedJumpRoutes(forRouteID: route.id).map { try reviewedHost($0, in: document) }
+        return try .init(target: destination.target, hostKeyAlias: destination.hostKeyAlias, jumpHosts: hops)
+    }
+
+    private static func reviewedHost(_ route: WorkspaceDocument.Route,
+                                     in document: WorkspaceDocument) throws -> WorkspaceKeyEnrollmentSSHHost {
+        guard ["direct_ssh", "frankenterm_mux"].contains(route.mode) else {
             throw WorkspaceKeyEnrollmentSSHError.route
         }
         guard route.authenticationMethods.contains(.publicKey), route.requiredCapabilities.isEmpty,
@@ -37,9 +131,8 @@ public enum WorkspaceKeyEnrollmentSSH {
         guard credentials.allSatisfy({ $0.requiredCapabilities.isEmpty && $0.requiredExtensions.isEmpty }) else {
             throw WorkspaceKeyEnrollmentSSHError.policy
         }
-        guard route.hostKeyAlias == nil else { throw WorkspaceKeyEnrollmentSSHError.hostAlias }
         guard let selected = document.hostTrust.first(where: { $0.id == route.trustID }),
-              selected.host == route.host, selected.port == route.port, selected.hostKeyAlias == nil else {
+              selected.host == route.host, selected.port == route.port, selected.hostKeyAlias == route.hostKeyAlias else {
             throw WorkspaceKeyEnrollmentSSHError.trust
         }
         let related = document.hostTrust.filter {
@@ -48,7 +141,8 @@ public enum WorkspaceKeyEnrollmentSSH {
         guard related.allSatisfy({ $0.revokedKeys.isEmpty && $0.requiredPolicyRequirements.isEmpty }) else {
             throw WorkspaceKeyEnrollmentSSHError.trust
         }
-        return try WorkspaceKeyEnrollmentTarget(host: route.host, port: route.port, user: route.user)
+        return try .init(target: WorkspaceKeyEnrollmentTarget(host: route.host, port: route.port, user: route.user),
+                         hostKeyAlias: route.hostKeyAlias)
     }
 
     /// Call on a worker, after persisting the journal's uncertain mutation entry.
@@ -61,19 +155,38 @@ public enum WorkspaceKeyEnrollmentSSH {
                     sshConfiguration: nil, isCancelled: isCancelled)
     }
 
+    public static func perform(request: WorkspaceKeyEnrollmentRequest, plan: WorkspaceKeyEnrollmentSSHPlan,
+                               action: WorkspaceKeyEnrollmentAction,
+                               isCancelled: () -> Bool = { Task<Never, Never>.isCancelled }) throws -> WorkspaceKeyEnrollmentResult {
+        try perform(request: request, plan: plan, action: action,
+                    sshConfiguration: nil, isCancelled: isCancelled)
+    }
+
     // The explicit configuration seam is internal: fixtures can supply isolated
     // identities and known_hosts without ever consulting the operator's files.
     static func perform(request: WorkspaceKeyEnrollmentRequest, target: WorkspaceKeyEnrollmentTarget,
                         action: WorkspaceKeyEnrollmentAction, sshConfiguration: URL?,
                         isCancelled: () -> Bool = { Task<Never, Never>.isCancelled }) throws -> WorkspaceKeyEnrollmentResult {
+        try perform(request: request, plan: WorkspaceKeyEnrollmentSSHPlan(target: target), action: action,
+                    sshConfiguration: sshConfiguration, isCancelled: isCancelled)
+    }
+
+    static func perform(request: WorkspaceKeyEnrollmentRequest, plan: WorkspaceKeyEnrollmentSSHPlan,
+                        action: WorkspaceKeyEnrollmentAction, sshConfiguration: URL?,
+                        isCancelled: () -> Bool = { Task<Never, Never>.isCancelled }) throws -> WorkspaceKeyEnrollmentResult {
+        let target = plan.target
         func result(_ state: WorkspaceKeyEnrollmentState, _ detail: String) throws -> WorkspaceKeyEnrollmentResult {
             try .init(operationID: request.operationID(for: target), target: target, state: state, detail: detail)
         }
         func invoke(_ operation: WorkspaceKeyEnrollmentAction) throws -> WorkspaceKeyEnrollmentResult {
-            let call = try invocation(request: request, target: target, action: operation,
+            let call = try invocation(request: request, plan: plan, action: operation,
                                       sshConfiguration: sshConfiguration)
             let data = try LocalHelperProcess.run(executable: call.executable, arguments: call.arguments,
-                maximumOutputBytes: 4096, maximumDiagnosticBytes: 4096, timeout: 20, isCancelled: isCancelled)
+                maximumOutputBytes: 4096, maximumDiagnosticBytes: 4096,
+                timeout: 20 + 8 * Double(plan.jumpHosts.count),
+                ownedProcessGroup: !plan.jumpHosts.isEmpty,
+                environmentOverrides: plan.jumpHosts.isEmpty ? [:] : ["SHELL": "/bin/sh"],
+                isCancelled: isCancelled)
             return try response(data, request: request, target: target, action: operation)
         }
         do {
@@ -113,9 +226,41 @@ public enum WorkspaceKeyEnrollmentSSH {
     static func invocation(request: WorkspaceKeyEnrollmentRequest, target: WorkspaceKeyEnrollmentTarget,
                            action: WorkspaceKeyEnrollmentAction, sshConfiguration: URL? = nil)
         throws -> (executable: URL, arguments: [String]) {
+        try invocation(request: request, plan: WorkspaceKeyEnrollmentSSHPlan(target: target),
+                       action: action, sshConfiguration: sshConfiguration)
+    }
+
+    static func invocation(request: WorkspaceKeyEnrollmentRequest, plan: WorkspaceKeyEnrollmentSSHPlan,
+                           action: WorkspaceKeyEnrollmentAction, sshConfiguration: URL? = nil)
+        throws -> (executable: URL, arguments: [String]) {
+        let hosts = plan.jumpHosts + [plan.destination]
+        var proxy: String?
+        for index in plan.jumpHosts.indices {
+            let hop = hosts[index], next = hosts[index + 1].target
+            var hopArguments = try sshArguments(host: hop, proxy: proxy, sshConfiguration: sshConfiguration)
+            hopArguments += ["-W", "[\(next.host)]:\(next.port)", "--", hop.target.host]
+            // OpenSSH percent-expands ProxyCommand even inside shell quotes.
+            // Protect every literal percent once per nesting layer, including
+            // a previously quoted child and the private fixture config path.
+            proxy = (["/usr/bin/ssh"] + hopArguments).map(shellArgument).joined(separator: " ")
+                .replacingOccurrences(of: "%", with: "%%")
+        }
+        var arguments = try sshArguments(host: plan.destination, proxy: proxy, sshConfiguration: sshConfiguration)
+        arguments += ["--", plan.destination.target.host,
+                      try remoteCommand(request: request, target: plan.target, action: action)]
+        return (URL(fileURLWithPath: "/usr/bin/ssh"), arguments)
+    }
+
+    private static func shellArgument(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    private static func sshArguments(host: WorkspaceKeyEnrollmentSSHHost, proxy: String?, sshConfiguration: URL?) throws -> [String] {
+        let target = host.target
         var arguments = ["-T"]
         if let sshConfiguration {
-            guard sshConfiguration.isFileURL, !sshConfiguration.path.utf8.contains(0) else {
+            guard sshConfiguration.isFileURL, sshConfiguration.path.utf8.count <= 4096,
+                  !sshConfiguration.path.utf8.contains(0) else {
                 throw LocalHelperProcessError.invalidInvocation
             }
             arguments += ["-F", sshConfiguration.path]
@@ -128,16 +273,16 @@ public enum WorkspaceKeyEnrollmentSSH {
             "UpdateHostKeys=no", "KnownHostsCommand=none", "ClearAllForwardings=yes", "ForwardAgent=no",
             "ForwardX11=no", "ForwardX11Trusted=no", "Tunnel=no", "RequestTTY=no", "RemoteCommand=none",
             "PermitLocalCommand=no", "ControlMaster=no", "ControlPath=none", "ControlPersist=no",
-            "ProxyCommand=none", "ProxyJump=none", "CanonicalizeHostname=no", "SessionType=default",
+            "ProxyCommand=" + (proxy ?? "none"), "ProxyJump=none", "ProxyUseFdpass=no",
+            "CanonicalizeHostname=no", "SessionType=default", "StdinNull=no", "ExitOnForwardFailure=yes",
             "PasswordAuthentication=no", "KbdInteractiveAuthentication=no", "PreferredAuthentications=publickey",
             "PubkeyAuthentication=yes", "NumberOfPasswordPrompts=0", "ConnectionAttempts=1", "ConnectTimeout=8",
             "ServerAliveInterval=5", "ServerAliveCountMax=1", "ForkAfterAuthentication=no", "LogLevel=ERROR",
             "HostName=" + target.host,
-            "HostKeyAlias=" + (target.port == 22 ? target.host : "[\(target.host)]:\(target.port)")
+            "HostKeyAlias=" + (host.hostKeyAlias ?? (target.port == 22 ? target.host : "[\(target.host)]:\(target.port)"))
         ] { arguments += ["-o", option] }
-        arguments += ["-p", String(target.port), "-l", target.user, "--", target.host,
-                      try remoteCommand(request: request, target: target, action: action)]
-        return (URL(fileURLWithPath: "/usr/bin/ssh"), arguments)
+        arguments += ["-p", String(target.port), "-l", target.user]
+        return arguments
     }
 
     static func remoteCommand(request: WorkspaceKeyEnrollmentRequest, target: WorkspaceKeyEnrollmentTarget,

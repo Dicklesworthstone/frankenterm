@@ -561,8 +561,9 @@ private actor MacPhoneKeyEnrollmentWorker {
         }
     }
 
-    func perform(request: WorkspaceKeyEnrollmentRequest, target: WorkspaceKeyEnrollmentTarget,
+    func perform(request: WorkspaceKeyEnrollmentRequest, plan: WorkspaceKeyEnrollmentSSHPlan,
                  action: WorkspaceKeyEnrollmentAction) throws -> WorkspaceKeyEnrollmentJournal {
+        let target = plan.target
         let persistence = try storage(request: request, target: target)
         return try persistence.withExclusiveAccess {
             var saved = try journal(in: persistence, request: request, target: target)
@@ -575,7 +576,7 @@ private actor MacPhoneKeyEnrollmentWorker {
             }
             let result: WorkspaceKeyEnrollmentResult
             do {
-                result = try WorkspaceKeyEnrollmentSSH.perform(request: request, target: target, action: action,
+                result = try WorkspaceKeyEnrollmentSSH.perform(request: request, plan: plan, action: action,
                     isCancelled: { Task<Never, Never>.isCancelled })
             } catch {
                 result = try WorkspaceKeyEnrollmentResult(operationID: request.operationID(for: target), target: target,
@@ -603,7 +604,8 @@ private actor MacPhoneKeyEnrollmentWorker {
 private struct MacPhoneKeyEnrollmentRow: Identifiable {
     let id: String
     var machines: [String]
-    let target: WorkspaceKeyEnrollmentTarget?
+    let plan: WorkspaceKeyEnrollmentSSHPlan?
+    var target: WorkspaceKeyEnrollmentTarget? { plan?.target }
     let unavailableReason: String?
     var journal: WorkspaceKeyEnrollmentJournal?
     var result: WorkspaceKeyEnrollmentResult? {
@@ -636,6 +638,7 @@ private final class MacPhoneKeyEnrollmentModel {
         let request: WorkspaceKeyEnrollmentRequest
         let sourceDigest: Data
         let targetIDs: [String]
+        let planIDs: [String]
         let action: WorkspaceKeyEnrollmentAction
     }
 
@@ -719,24 +722,37 @@ private final class MacPhoneKeyEnrollmentModel {
               !machines.isEmpty, machines.count <= WorkspaceKeyEnrollmentJournal.maximumTargets else { return }
         var candidates: [MacPhoneKeyEnrollmentRow] = []
         var existing: [String: Int] = [:]
+        func include(_ plan: WorkspaceKeyEnrollmentSSHPlan, purpose: String) {
+            if let index = existing[plan.target.id] {
+                if !candidates[index].machines.contains(purpose) { candidates[index].machines.append(purpose) }
+            } else {
+                existing[plan.target.id] = candidates.count
+                candidates.append(.init(id: plan.target.id, machines: [purpose], plan: plan,
+                    unavailableReason: nil, journal: nil))
+            }
+        }
         for machine in machines {
             do {
                 guard let route = document.routes.first(where: { $0.id == machine.preferredRouteID }) else {
                     throw WorkspaceKeyEnrollmentSSHError.route
                 }
-                let target = try WorkspaceKeyEnrollmentSSH.target(for: route, in: document)
-                if let index = existing[target.id] { candidates[index].machines.append(machine.name) }
-                else {
-                    existing[target.id] = candidates.count
-                    candidates.append(.init(id: target.id, machines: [machine.name], target: target,
-                        unavailableReason: nil, journal: nil))
-                }
+                let plan = try WorkspaceKeyEnrollmentSSH.plan(for: route, in: document)
+                let transit = try plan.transitPlans
+                // A forwarding hop does not authorize editing that account.
+                // It appears as its own initially unselected reviewed row.
+                for hop in transit { include(hop, purpose: "Bastion for " + machine.name) }
+                include(plan, purpose: machine.name)
             } catch {
                 let reason = (error as? WorkspaceKeyEnrollmentSSHError)?.localizedDescription
-                    ?? "This route cannot preserve its current policy during direct phone-key enrollment."
+                    ?? "This route cannot preserve its current policy during phone-key enrollment."
                 candidates.append(.init(id: "unavailable:" + machine.id, machines: [machine.name],
-                    target: nil, unavailableReason: reason, journal: nil))
+                    plan: nil, unavailableReason: reason, journal: nil))
             }
+        }
+        guard candidates.filter({ $0.target != nil }).count <= WorkspaceKeyEnrollmentJournal.maximumTargets else {
+            rows = []; selectedTargetIDs = []; confirmedFingerprint = false; reviewDigest = nil
+            message = "These machines and their bastions exceed the 256-account review limit. Select fewer machines and review again. No server was contacted."
+            return
         }
         rows = candidates; selectedTargetIDs = []; confirmedFingerprint = false; reviewDigest = nil
         perform(failure: "Saved enrollment receipts could not be verified. No server was contacted. Check local storage before continuing.") { [self] token in
@@ -749,7 +765,7 @@ private final class MacPhoneKeyEnrollmentModel {
             try requireCurrent(token)
             guard sourceDigest == Self.sourceWitness(document, machines: machines) else { throw FTError.stale }
             reviewDigest = sourceDigest
-            message = "Saved account receipts loaded for review. Select accounts and verify the phone-key fingerprint before contacting servers."
+            message = "Saved account receipts loaded for review. Select destination and bastion accounts separately and verify the phone-key fingerprint before contacting servers. Traversing a bastion never edits its key file unless its own row is selected."
         }
     }
 
@@ -758,7 +774,25 @@ private final class MacPhoneKeyEnrollmentModel {
               let sourceDigest, sourceDigest == reviewDigest, !selectedTargetIDs.isEmpty else { return nil }
         let eligible = Set(rows.compactMap { $0.target?.id })
         guard selectedTargetIDs.isSubset(of: eligible) else { return nil }
-        return .init(request: request, sourceDigest: sourceDigest, targetIDs: selectedTargetIDs.sorted(), action: action)
+        let plans = rows.compactMap { row -> WorkspaceKeyEnrollmentSSHPlan? in
+            guard selectedTargetIDs.contains(row.id) else { return nil }
+            return row.plan
+        }
+        guard plans.count == selectedTargetIDs.count else { return nil }
+        return .init(request: request, sourceDigest: sourceDigest, targetIDs: selectedTargetIDs.sorted(),
+            planIDs: plans.map(\.id).sorted(), action: action)
+    }
+
+    static func routeDescription(_ plan: WorkspaceKeyEnrollmentSSHPlan) -> String {
+        func account(_ host: WorkspaceKeyEnrollmentSSHHost) -> String {
+            let target = host.target
+            let name = target.host.contains(":") ? "[\(target.host)]" : target.host
+            let label = "\(target.user)@\(name):\(target.port)"
+            return host.hostKeyAlias.map { label + " (trust alias: " + $0 + ")" } ?? label
+        }
+        let destination = account(plan.destination)
+        return plan.jumpHosts.isEmpty ? "Direct: " + destination
+            : "Via " + plan.jumpHosts.map(account).joined(separator: " → ") + " → " + destination
     }
 
     func authorize() { confirmMutation(.install) }
@@ -768,8 +802,8 @@ private final class MacPhoneKeyEnrollmentModel {
     private func confirmMutation(_ action: WorkspaceKeyEnrollmentAction) {
         guard action != .inspect, let reviewed = approval(for: action) else { return }
         let accounts = rows.compactMap { row -> String? in
-            guard let target = row.target, reviewed.targetIDs.contains(target.id) else { return nil }
-            return "\(target.user)@\(target.host):\(target.port)"
+            guard let plan = row.plan, reviewed.targetIDs.contains(plan.target.id) else { return nil }
+            return Self.routeDescription(plan)
         }
         let alert = NSAlert()
         alert.alertStyle = action == .remove ? .critical : .informational
@@ -778,7 +812,7 @@ private final class MacPhoneKeyEnrollmentModel {
             : "Authorize this phone key on \(accounts.count) accounts?"
         let explanation = action == .remove
             ? "This Mac will disable only the unrestricted public-key entry installed by this exact enrollment, preserving it as a comment for audit. Independently installed or restricted matching entries remain and will be reported. Use the original enrollment request; a newly exported request does not identify the earlier installation. Existing SSH sessions and their remote processes are not terminated."
-            : "This Mac will sign in through its existing trusted SSH access and add only this public key to each account's standard authorized_keys file. Existing restrictions stay intact. Verify a connection from the phone after enrollment."
+            : "This Mac will sign in through each listed SSH path and add only this public key to the selected account's standard authorized_keys file. A bastion used only for forwarding is unchanged; select its separate account row to enroll the phone there too. Every hop uses this Mac's existing trusted public-key access. Existing restrictions stay intact. Verify a connection from the phone after enrollment."
         alert.informativeText = reviewed.request.key.fingerprint + "\nEnrollment request: " + reviewed.request.id + "\n\n"
             + accounts.prefix(12).joined(separator: "\n")
             + (accounts.count > 12 ? "\n…and \(accounts.count - 12) other reviewed accounts." : "")
@@ -799,13 +833,16 @@ private final class MacPhoneKeyEnrollmentModel {
     private func run(approval reviewed: Approval) {
         guard approval(for: reviewed.action) == reviewed else { return }
         let action = reviewed.action
-        let targets = rows.compactMap { row -> WorkspaceKeyEnrollmentTarget? in
-            guard let target = row.target, reviewed.targetIDs.contains(target.id) else { return nil }
-            return target
+        var plans = rows.compactMap { row -> WorkspaceKeyEnrollmentSSHPlan? in
+            guard let plan = row.plan, reviewed.targetIDs.contains(plan.target.id) else { return nil }
+            return plan
         }
-        guard targets.count == reviewed.targetIDs.count else { return }
+        guard plans.count == reviewed.targetIDs.count, plans.map(\.id).sorted() == reviewed.planIDs else { return }
+        // Retire destinations before transit accounts when both were selected.
+        if action == .remove { plans.reverse() }
         perform(failure: "The account batch stopped because its durable receipt could not be saved or verified. Reconcile any uncertain accounts before another change.") { [self] token in
-            for target in targets {
+            for plan in plans {
+                let target = plan.target
                 try requireCurrent(token)
                 guard request == reviewed.request, sourceDigest == reviewed.sourceDigest,
                       reviewDigest == reviewed.sourceDigest else { throw FTError.stale }
@@ -815,7 +852,7 @@ private final class MacPhoneKeyEnrollmentModel {
                     try pending.beginMutation(targetID: target.id, action: action)
                     rows[index].journal = pending
                 }
-                let updated = try await worker.perform(request: reviewed.request, target: target, action: action)
+                let updated = try await worker.perform(request: reviewed.request, plan: plan, action: action)
                 try requireCurrent(token)
                 if let index = rows.firstIndex(where: { $0.target?.id == target.id }) { rows[index].journal = updated }
             }
@@ -832,7 +869,7 @@ private final class MacPhoneKeyEnrollmentModel {
             case .remove: operation = "Scoped removal"
             case .inspect: operation = "Read-only reconciliation"
             }
-            message = "\(operation) results saved for \(targets.count) accounts: \(absent) have no live matching key entry, \(present) have matching entries, \(blocked) need attention, and \(unknown) have unknown outcomes. Review each account's receipt."
+            message = "\(operation) results saved for \(plans.count) accounts: \(absent) have no live matching key entry, \(present) have matching entries, \(blocked) need attention, and \(unknown) have unknown outcomes. Review each account's receipt."
                 + (unknown > 0 ? " Reconcile unknown outcomes before another change." : "")
                 + (action == .install
                     ? " Verify server acceptance with a connection from the phone."
@@ -856,7 +893,7 @@ private final class MacPhoneKeyEnrollmentModel {
             let bytes = try report.encoded()
             let panel = NSSavePanel(); panel.allowedContentTypes = [.json]
             panel.nameFieldStringValue = "FrankenTerm-Enrollment-\(request.id).json"
-            panel.message = "Save public account results, operation IDs and the last requested change. This report includes host names, accounts and public-key fingerprints, without private keys."
+            panel.message = "Save public account results, operation IDs and the last requested change. This report includes host names, accounts, route-scope digests and public-key fingerprints, without private keys. Reopen it with the original workspace routes to review scoped enrollments."
             guard panel.runModal() == .OK, let url = panel.url, windowOpen, active, canSaveResults,
                   self.request == request, sourceDigest == reviewedSource, reviewDigest == reviewedSource else { return }
             perform(failure: "Enrollment results could not be saved. Choose another local filename.") { [self] token in
@@ -1782,7 +1819,7 @@ private struct MacExportView: View {
                 }
                 if !enrollment.rows.isEmpty {
                     HStack {
-                        Button("Select All Available") { enrollment.selectAll() }
+                        Button("Select All Listed Accounts") { enrollment.selectAll() }
                         Button("Select None") { enrollment.selectNone() }
                         Text("\(enrollment.selectedTargetIDs.count) of \(enrollment.eligibleCount) available accounts selected")
                             .font(.caption).foregroundStyle(.secondary)
@@ -1790,6 +1827,8 @@ private struct MacExportView: View {
                     LazyVStack(alignment: .leading, spacing: 14) {
                         ForEach(enrollment.rows) { row in enrollmentRow(row) }
                     }
+                    Text("Destinations and bastions are separate accounts. To use a new phone identity through a bastion, enroll it on that bastion as well as the destination. Selecting only a destination leaves every forwarding account unchanged.")
+                        .font(.caption).foregroundStyle(.secondary)
                     Toggle("I verified this fingerprint against the phone or a trusted saved record", isOn: Binding(
                         get: { enrollment.confirmedFingerprint }, set: { enrollment.confirmFingerprint($0) }))
                         .disabled(enrollment.busy)
@@ -1808,7 +1847,7 @@ private struct MacExportView: View {
                     Text("Removal also requires a Linux server whose filesystem supports exclusive access to the key file. Unsupported servers need their normal administrator workflow; their result remains separate from other accounts.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
-                Text("Direct accounts require Python 3.8 or later and usable existing SSH authentication on this Mac. Enrollment preserves existing authorized-key restrictions and permissions. Reconcile reads account state without adding or removing access. Verify server acceptance with a connection from the phone; custom authorization files and certificate issuers need their approved workflow.")
+                Text("Selected accounts require Python 3.8 or later. Every SSH hop requires this Mac's existing trusted public-key authentication. Up to three reviewed bastions are supported, with no alternate-route fallback. Enrollment preserves existing authorized-key restrictions and permissions. Reconcile reads account state without adding or removing access. Verify server acceptance with a connection from the phone; custom authorization files and certificate issuers need their approved workflow.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             if let message = enrollment.message { Text(verbatim: message).font(.callout).textSelection(.enabled) }
@@ -1823,6 +1862,10 @@ private struct MacExportView: View {
                                      set: { enrollment.select(target.id, included: $0) })) {
                     Text(verbatim: "\(target.user) @ \(target.host) · port \(target.port)")
                 }.disabled(enrollment.busy)
+                if let plan = row.plan {
+                    Text(verbatim: MacPhoneKeyEnrollmentModel.routeDescription(plan))
+                        .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                }
                 if let result = row.result {
                     if let mutation = row.journal?.lastMutation(for: target.id) {
                         Text(verbatim: "Last requested change: " + Self.enrollmentAction(mutation)).font(.caption)
@@ -1838,10 +1881,16 @@ private struct MacExportView: View {
                     DisclosureGroup("Receipt") {
                         Text(verbatim: "Operation " + request.operationID(for: target))
                             .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                        if let scope = target.routeScope {
+                            Text(verbatim: "Route scope " + scope)
+                                .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                            Text("This receipt belongs to the displayed path and host-key aliases. A changed path is a separate enrollment; use the original workspace path to reconcile or remove this entry.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
                     }
                 }
             } else if let reason = row.unavailableReason {
-                Label("Unavailable for direct enrollment", systemImage: "exclamationmark.triangle").font(.callout)
+                Label("Unavailable for enrollment", systemImage: "exclamationmark.triangle").font(.callout)
                 Text(verbatim: reason).font(.caption).foregroundStyle(.secondary)
             }
         }

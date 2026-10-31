@@ -137,6 +137,12 @@ final class WorkspaceKeyEnrollmentSSHTests: XCTestCase {
     }
 
     func testLiveEnrollmentUsesTrustedSSHAndAccountsForRemoteEffects() throws {
+        struct FixtureHop: Decodable {
+            let host: String
+            let port: UInt16
+            let user: String
+            let hostKeyAlias: String?
+        }
         let environment = ProcessInfo.processInfo.environment
         guard let config = environment["FT_ENROLLMENT_CONFIG"],
               let requestFile = environment["FT_ENROLLMENT_REQUEST"],
@@ -148,12 +154,28 @@ final class WorkspaceKeyEnrollmentSSHTests: XCTestCase {
             throw XCTSkip("Run Tests/Interop/test_device_key_enrollment.py for the owned live SSH fixture.")
         }
         let request = try WorkspaceKeyEnrollmentRequest(data: Data(contentsOf: URL(fileURLWithPath: requestFile)))
-        let target = try WorkspaceKeyEnrollmentTarget(host: "127.0.0.1", port: port, user: account)
-        let result = try WorkspaceKeyEnrollmentSSH.perform(request: request, target: target,
-            action: action, sshConfiguration: URL(fileURLWithPath: config))
+        let target = try WorkspaceKeyEnrollmentTarget(host: environment["FT_ENROLLMENT_HOST"] ?? "127.0.0.1",
+            port: port, user: account)
+        let fixtureHops = try JSONDecoder().decode([FixtureHop].self,
+            from: Data((environment["FT_ENROLLMENT_JUMPS"] ?? "[]").utf8))
+        let jumps = try fixtureHops.map { hop in
+            try WorkspaceKeyEnrollmentSSHHost(target: WorkspaceKeyEnrollmentTarget(
+                host: hop.host, port: hop.port, user: hop.user), hostKeyAlias: hop.hostKeyAlias)
+        }
+        let plan = try WorkspaceKeyEnrollmentSSHPlan(target: target,
+            hostKeyAlias: environment["FT_ENROLLMENT_HOST_ALIAS"], jumpHosts: jumps)
+        let cancellationFile = environment["FT_ENROLLMENT_CANCEL_FILE"]
+        let result = try WorkspaceKeyEnrollmentSSH.perform(request: request, plan: plan,
+            action: action, sshConfiguration: URL(fileURLWithPath: config), isCancelled: {
+                cancellationFile.map { FileManager.default.fileExists(atPath: $0) } ?? false
+            })
         XCTAssertEqual(result.state.rawValue, expected, result.detail)
-        XCTAssertEqual(result.target, target)
-        XCTAssertEqual(result.operationID, request.operationID(for: target))
+        XCTAssertEqual(result.target, plan.target)
+        XCTAssertEqual(result.operationID, request.operationID(for: plan.target))
+        if !jumps.isEmpty {
+            XCTAssertNotEqual(plan.target, target, "The receipt must retain its complete bastion path.")
+            XCTAssertNotEqual(result.operationID, request.operationID(for: target))
+        }
         XCTAssertFalse(result.detail.contains(config))
     }
 }

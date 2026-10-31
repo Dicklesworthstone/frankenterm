@@ -79,14 +79,22 @@ public enum LocalHelperProcess {
         }
     }
 
+    /// `ownedProcessGroup` is an explicit opt-in for a fixed, locally generated
+    /// helper chain whose children remain in their inherited process group.
+    /// It is not permission to discover or chase arbitrary descendant PIDs.
+    /// Overrides affect only the spawned child's environment.
     public static func run(executable: URL, arguments: [String], maximumOutputBytes: Int,
                            maximumDiagnosticBytes: Int = 65_536, timeout: TimeInterval = 30,
+                           ownedProcessGroup: Bool = false, environmentOverrides: [String: String] = [:],
                            isCancelled: () -> Bool = { Task<Never, Never>.isCancelled }) throws -> Data {
         guard (0...67_108_864).contains(maximumOutputBytes),
               (0...1_048_576).contains(maximumDiagnosticBytes), timeout.isFinite,
               timeout > 0, timeout <= 300 else { throw LocalHelperProcessError.invalidLimits }
         guard executable.isFileURL, !executable.path.utf8.contains(0),
-              !arguments.contains(where: { $0.utf8.contains(0) }) else {
+              !arguments.contains(where: { $0.utf8.contains(0) }),
+              environmentOverrides.allSatisfy({ key, value in
+                  !key.isEmpty && !key.contains("=") && !key.utf8.contains(0) && !value.utf8.contains(0)
+              }) else {
             throw LocalHelperProcessError.invalidInvocation
         }
         if isCancelled() { throw CancellationError() }
@@ -102,16 +110,18 @@ public enum LocalHelperProcess {
         let started = DispatchTime.now().uptimeNanoseconds
         let budget = UInt64(timeout * 1_000_000_000)
         let child = try spawn(executable: executable.path, arguments: arguments,
-                              output: output, errors: errors)
+                              output: output, errors: errors, ownedProcessGroup: ownedProcessGroup,
+                              environmentOverrides: environmentOverrides)
         // Only the helper and its descendants may keep the writing ends open.
         try? output.fileHandleForWriting.close(); try? errors.fileHandleForWriting.close()
         var result = Data(), diagnostics = Data()
         var outputOpen = true, errorOpen = true
+        var captureError: (any Error)?
         do {
             while true {
                 if isCancelled() { throw CancellationError() }
-                let exitStatus = try child.pollExit()
-                if !outputOpen && !errorOpen && exitStatus != nil { break }
+                let exited = try child.pollExit()
+                if !outputOpen && !errorOpen && exited { break }
                 let elapsed = DispatchTime.now().uptimeNanoseconds &- started
                 guard elapsed < budget else { throw LocalHelperProcessError.timedOut }
                 // One fixed-size read per pipe per turn preserves fairness even
@@ -124,7 +134,7 @@ public enum LocalHelperProcess {
                     errorOpen = try drain(errorFD, into: &diagnostics, limit: maximumDiagnosticBytes,
                                           overflow: .diagnosticLimit)
                 }
-                if !outputOpen && !errorOpen && exitStatus != nil { break }
+                if !outputOpen && !errorOpen && exited { break }
                 var descriptors = [
                     pollfd(fd: outputOpen ? outputFD : -1, events: Int16(POLLIN), revents: 0),
                     pollfd(fd: errorOpen ? errorFD : -1, events: Int16(POLLIN), revents: 0)
@@ -138,43 +148,87 @@ public enum LocalHelperProcess {
                 }
             }
             if isCancelled() { throw CancellationError() }
-            guard child.exitStatus == 0 else {
-                let detail = String(decoding: diagnostics.prefix(2048), as: UTF8.self)
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                throw LocalHelperProcessError.failed(status: child.exitStatus ?? -1, diagnostic: detail)
-            }
-            return result
-        } catch {
-            // This object owns only this child. Never signal a process group or
-            // a descendant discovered by a system-wide process search.
-            guard child.stop() else {
+        } catch { captureError = error }
+
+        // An opted-in fixed helper chain may leave a grandchild alive even
+        // after its leader exits and both captured pipes close. Always retire
+        // that group before releasing its unreaped leader's PID. Other callers
+        // retain direct-child ownership and never signal a process group.
+        if ownedProcessGroup || captureError != nil {
+            guard child.stop(drain: {
+                if outputOpen { outputOpen = discard(outputFD) }
+                if errorOpen { errorOpen = discard(errorFD) }
+                return !outputOpen && !errorOpen
+            }) else {
                 child.reapWhenExited()
                 throw LocalHelperProcessError.terminationUnconfirmed
             }
-            throw error
         }
+        if let captureError { throw captureError }
+        if isCancelled() { throw CancellationError() }
+        guard child.exitStatus == 0 else {
+            let detail = String(decoding: diagnostics.prefix(2048), as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            throw LocalHelperProcessError.failed(status: child.exitStatus ?? -1, diagnostic: detail)
+        }
+        return result
     }
 
-    /// Own waitpid rather than Foundation Process's termination notification:
-    /// the direct child's exit and a descendant's inherited pipes are separate
-    /// events. Until we reap this PID, it cannot be recycled under our signals.
+    /// Own the child's wait operations rather than Foundation Process's
+    /// notification. Group mode observes exit with WNOWAIT: an exited leader
+    /// still reserves the PID used by every group signal until cleanup seals
+    /// that authority. A caller must never independently reap this child.
     private final class Child {
         let pid: pid_t
         private(set) var exitStatus: Int32?
+        private let ownsProcessGroup: Bool
         private var ownsPID = true
+        private var exitObserved = false
+        private var groupSignalsFinished = false
 
-        init(pid: pid_t) { self.pid = pid }
+        init(pid: pid_t, ownsProcessGroup: Bool) {
+            self.pid = pid; self.ownsProcessGroup = ownsProcessGroup
+        }
 
-        func pollExit() throws -> Int32? {
-            if let exitStatus { return exitStatus }
+        func pollExit() throws -> Bool {
+            if exitStatus != nil { return true }
             guard ownsPID else { throw LocalHelperProcessError.io(ECHILD) }
+            if ownsProcessGroup { return try observeWithoutReaping() }
+            return try reapExit()
+        }
+
+        private func observeWithoutReaping() throws -> Bool {
+            guard ownsPID else { throw LocalHelperProcessError.io(ECHILD) }
+            var information = siginfo_t()
+            let result = waitid(P_PID, id_t(pid), &information, WEXITED | WNOHANG | WNOWAIT)
+            if result == 0 {
+                // Both supported libc interfaces expose si_signo directly.
+                // Initial zero also covers implementations which leave an
+                // unavailable WNOHANG result untouched.
+                if information.si_signo == SIGCHLD { exitObserved = true }
+                return exitObserved
+            }
+            if errno == EINTR { return exitObserved }
+            let code = errno
+            if code == ECHILD { ownsPID = false }
+            throw LocalHelperProcessError.io(code)
+        }
+
+        private func reapExit() throws -> Bool {
+            if exitStatus != nil { return true }
+            guard ownsPID else { throw LocalHelperProcessError.io(ECHILD) }
+            // Group signalling must be permanently sealed before this call
+            // can free the leader PID for reuse by an unrelated process.
+            guard !ownsProcessGroup || groupSignalsFinished else {
+                throw LocalHelperProcessError.terminationUnconfirmed
+            }
             var status: Int32 = 0
             let result = waitpid(pid, &status, WNOHANG)
             if result == pid {
                 ownsPID = false
                 let signal = status & 0x7f
                 exitStatus = signal == 0 ? (status >> 8) & 0xff : 128 + signal
-                return exitStatus
+                return true
             }
             if result < 0 && errno != EINTR {
                 let code = errno
@@ -182,12 +236,13 @@ public enum LocalHelperProcess {
                 if code == ECHILD { ownsPID = false }
                 throw LocalHelperProcessError.io(code)
             }
-            return nil
+            return false
         }
 
-        func stop() -> Bool {
+        func stop(drain: () -> Bool) -> Bool {
+            if ownsProcessGroup { return stopGroup(drain: drain) }
             do {
-                if try pollExit() != nil { return true }
+                if try pollExit() { return true }
                 guard ownsPID else { return false }
                 _ = kill(pid, SIGTERM)
                 if try awaitExit(for: 100_000_000) { return true }
@@ -197,8 +252,48 @@ public enum LocalHelperProcess {
             } catch { return false }
         }
 
+        private func signalGroup(_ signal: Int32) -> Bool {
+            guard ownsProcessGroup, ownsPID, !groupSignalsFinished, pid > 1 else { return false }
+            // Re-observe even an already-exited leader, so a lost wait owner
+            // (ECHILD) retires group authority before another signal.
+            do { _ = try observeWithoutReaping() } catch { return false }
+            guard ownsPID else { return false }
+            return kill(-pid, signal) == 0 || errno == ESRCH
+        }
+
+        private func stopGroup(drain: () -> Bool) -> Bool {
+            guard ownsPID, !groupSignalsFinished else { return false }
+            let terminated = signalGroup(SIGTERM)
+            let graceStart = DispatchTime.now().uptimeNanoseconds
+            repeat {
+                let exited = (try? observeWithoutReaping()) == true
+                if drain() && exited { break }
+                if !ownsPID { break }
+                Thread.sleep(forTimeInterval: 0.005)
+            } while DispatchTime.now().uptimeNanoseconds &- graceStart < 100_000_000
+
+            // EOF and leader exit do not prove every proxy has retired: a
+            // descendant may have closed its inherited descriptors. Deliver
+            // the final group signal while the leader is still unreaped.
+            let killed = signalGroup(SIGKILL)
+            groupSignalsFinished = true
+            let killStart = DispatchTime.now().uptimeNanoseconds
+            repeat {
+                let exited = (try? observeWithoutReaping()) == true
+                if drain() && exited {
+                    return (try? reapExit()) == true && terminated && killed
+                }
+                if !ownsPID { return false }
+                Thread.sleep(forTimeInterval: 0.005)
+            } while DispatchTime.now().uptimeNanoseconds &- killStart < 500_000_000
+            return false
+        }
+
         func reapWhenExited() {
             guard ownsPID else { return }
+            // No asynchronous owner may ever signal a group, even when the
+            // leader or an inherited pipe outlives the bounded cleanup wait.
+            groupSignalsFinished = true
             ownsPID = false
             // A child stuck in the kernel may outlive even SIGKILL. Preserve
             // its sole reap owner after returning the bounded failure, without
@@ -209,10 +304,10 @@ public enum LocalHelperProcess {
         private func awaitExit(for nanoseconds: UInt64) throws -> Bool {
             let started = DispatchTime.now().uptimeNanoseconds
             repeat {
-                if try pollExit() != nil { return true }
+                if try pollExit() { return true }
                 Thread.sleep(forTimeInterval: 0.005)
             } while DispatchTime.now().uptimeNanoseconds &- started < nanoseconds
-            return try pollExit() != nil
+            return try pollExit()
         }
     }
 
@@ -240,7 +335,8 @@ public enum LocalHelperProcess {
     }
 
     private static func spawn(executable: String, arguments: [String], output: Pipe,
-                              errors: Pipe) throws -> Child {
+                              errors: Pipe, ownedProcessGroup: Bool,
+                              environmentOverrides: [String: String]) throws -> Child {
         #if canImport(Darwin)
         var actions: posix_spawn_file_actions_t?
         var attributes: posix_spawnattr_t?
@@ -270,6 +366,12 @@ public enum LocalHelperProcess {
         try checked(posix_spawnattr_setsigmask(&attributes, &mask))
         try checked(posix_spawnattr_setsigdefault(&attributes, &defaults))
         var flags = Int16(POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF)
+        if ownedProcessGroup {
+            // pgroup zero means the new child's PID. Creation is atomic with
+            // spawn: there is no parent-side setpgid race with exec or exit.
+            try checked(posix_spawnattr_setpgroup(&attributes, 0))
+            flags |= Int16(POSIX_SPAWN_SETPGROUP)
+        }
         #if canImport(Darwin)
         flags |= Int16(POSIX_SPAWN_CLOEXEC_DEFAULT)
         #endif
@@ -285,7 +387,8 @@ public enum LocalHelperProcess {
             guard let pointer = strdup(value) else { throw LocalHelperProcessError.io(ENOMEM) }
             argv.append(pointer)
         }
-        for (key, value) in ProcessInfo.processInfo.environment {
+        let childEnvironment = ProcessInfo.processInfo.environment.merging(environmentOverrides) { _, selected in selected }
+        for (key, value) in childEnvironment {
             guard let pointer = strdup("\(key)=\(value)") else { throw LocalHelperProcessError.io(ENOMEM) }
             environment.append(pointer)
         }
@@ -297,7 +400,7 @@ public enum LocalHelperProcess {
             }
         }
         try checked(code)
-        return Child(pid: pid)
+        return Child(pid: pid, ownsProcessGroup: ownedProcessGroup)
     }
 
     private static func nonblocking(_ descriptor: Int32) throws {
@@ -321,6 +424,14 @@ public enum LocalHelperProcess {
         if count == 0 { return false }
         if errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK { return true }
         throw LocalHelperProcessError.io(errno)
+    }
+
+    /// Cleanup discards at most one fixed-size chunk per turn, even after an
+    /// output-limit failure. Only actual EOF closes the pipe's ownership; an
+    /// I/O error or an escaped writer leaves bounded cleanup unconfirmed.
+    private static func discard(_ descriptor: Int32) -> Bool {
+        var bytes = [UInt8](repeating: 0, count: 16_384)
+        return read(descriptor, &bytes, bytes.count) != 0
     }
 
 }
