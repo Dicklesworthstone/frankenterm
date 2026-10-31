@@ -56,11 +56,11 @@ final class WorkspaceHostCertificateTests: XCTestCase {
             throw XCTSkip("Requires the versioned host-certificate KEX backend")
         }
         let authority = trustedAuthority ?? certificate.authority
-        return try await SSHWorkspaceTestFixture.make(hostBlob: certificate.subject.blob,
-            requiredCapabilities: [WorkspaceDocument.hostCertificateCapability]) { workspace in
+        return try await SSHWorkspaceTestFixture.make(hostBlob: certificate.subject.blob) { workspace in
             var trusts = workspace["host_trust"] as! [[String: Any]]
             if !mixed { trusts[0]["pins"] = [] as [[String: Any]] }
             trusts[0]["certificate_authorities"] = [["algorithm": authority.algorithm, "fingerprint": authority.fingerprint]]
+            trusts[0]["required_capabilities"] = [WorkspaceDocument.hostCertificateCapability]
             workspace["host_trust"] = trusts
             var routes = workspace["routes"] as! [[String: Any]]
             routes[0]["authentication_methods"] = [method]
@@ -134,7 +134,7 @@ final class WorkspaceHostCertificateTests: XCTestCase {
         XCTAssertEqual(fixture.vault.counts.reads, 1)
         XCTAssertEqual(fixture.vault.counts.signatures, 1)
 
-        let connections = WorkspaceSSHConnections(store: fixture.store, broker: fixture.broker,
+        let connections = WorkspaceSSHConnectionManager(store: fixture.store, broker: fixture.broker,
             journal: try TerminalSessionJournal(persistence: SSHWorkspaceTestPersistence()),
             coordinator: try TerminalInputCoordinator())
         _ = try await connections.revokeHostLocally(workspaceID: fixture.installed.id, trustID: "trust",

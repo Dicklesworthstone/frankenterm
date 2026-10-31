@@ -86,9 +86,21 @@ for all supported subject families, exact certificate retention, approval before
 authentication, frozen negotiation policy, mixed-profile preference, raw-key
 compatibility, raw downgrade refusal, and RSA-SHA1 refusal. The initial backport
 run passed seven test methods covering ten exchanges after a Release libssh2
-build and a C shim build with `-Wall -Wextra -Werror`. Portable Kit and native Swift
-regressions additionally cover signed evidence, policy persistence, and broker
-paths; Apple SDK and device qualification remain separate requirements.
+build and a C shim build with `-Wall -Wextra -Werror`; a fresh rebuild and rerun
+also passed. Swift 6.4.1 Linux qualification built all 90 Kit source files and
+both native production modules (eight source files) with warnings-as-errors.
+Targeted original-source regression suites passed:
+
+| Suite | Result | Coverage |
+| --- | --- | --- |
+| Kit and export | 149 passed, zero failures | Host/user certificate parsing, renewal, CA policy, all 67 SSH source exporter cases, and both workspace export classes |
+| Native authentication | 31 passed, zero failures | All six new CA cases plus existing authentication, user-certificate, and credential/host-revocation cases |
+
+The native tests link the actual Kit/dependency objects and patched C backend.
+The CA fixtures carry their requirement on `host_trust`, exactly as the real
+exporters do; v1 rejects unsupported global requirements. These are targeted
+portable runs, not a complete package-test or Apple application qualification.
+Apple-only conditional code still requires Apple SDK and device verification.
 
 Public-key authentication supports Ed25519, ECDSA P-256/P-384/P-521, and RSA
 with 2048–8192-bit moduli and a positive odd exponent of at most 64 bits. The callback
@@ -101,9 +113,10 @@ shell. Opening the shell is a separate explicit operation.
 
 RSA keeps the canonical `ssh-rsa` public blob and fingerprint but permits only
 `rsa-sha2-256` or `rsa-sha2-512` in the signed authentication preimage and returned
-signature. The native limits are 1,053 public-key bytes, 1,536 challenge bytes,
-and 1,044 encoded signature bytes. The raw RSA signature must have exactly the
-modulus width. A different hash, certificate name, malformed integer, or reused
+signature. The native limits distinguish a 1,053-byte raw public key from a
+32,768-byte certificate offer, with 33,792 challenge bytes and 1,044 encoded
+signature bytes. The raw RSA signature must have exactly the modulus width.
+An unnegotiated hash or certificate request name, malformed integer, or reused
 challenge cannot reach signing or consume the signature.
 
 libssh2 can offer an unsigned `ssh-rsa` request when the server does not advertise
@@ -473,10 +486,10 @@ the workspace's IDNA/trust canonicalization. It does not implement proxy-command
 execution, jump hosts, automatic reconnect, permission UI or session routing.
 Those remain separate features with explicit authority and continuity contracts.
 
-## Combined Swift validation
+## Earlier transport validation
 
-The current package run executes **41 tests: 40 pass and one live-server entry
-point skips**, with warnings as errors. Independent libssh harnesses separately
+An earlier package run executed **41 tests: 40 passed and one live-server entry
+point skipped**, with warnings as errors. Independent libssh harnesses separately
 pass **12 native-driver methods, 13 Swift interop methods, 12 workspace methods
 and 8 legacy-pump methods**. The completion scenarios cover delayed status after
 EOF, full UInt32 nonzero status, signal, reported zero, absent status, bounded
