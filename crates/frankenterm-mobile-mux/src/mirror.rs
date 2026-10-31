@@ -283,10 +283,13 @@ impl PaneMirror {
                 layout.seqno == facts.seqno && layout.dimensions == facts.dimensions
             })
             && self.target.as_ref().is_some_and(|target| {
-                target.dims == facts.dimensions
-                    && target.cursor == facts.cursor
-                    && target.alt == facts.alt_screen_active
-                    && target.mouse_grabbed == facts.mouse_grabbed
+                (target.dims, target.cursor, target.alt, target.mouse_grabbed)
+                    == (
+                        facts.dimensions,
+                        facts.cursor,
+                        facts.alt_screen_active,
+                        facts.mouse_grabbed,
+                    )
             })
             && before.is_none_or(|previous| previous == facts.as_ref());
         if !matches {

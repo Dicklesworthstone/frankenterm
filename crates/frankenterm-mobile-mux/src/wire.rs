@@ -351,7 +351,7 @@ pub struct PaneIdentity {
 /// The complete bounded publication carried by PDU71. The palette is a
 /// fixed tuple, not a peer-selected vector. Comparing only sequence/layout
 /// misses palette and configuration changes that preserve the sequence.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct PaneRenderMetadata {
     pub seqno: usize,
     pub dimensions: Dimensions,
