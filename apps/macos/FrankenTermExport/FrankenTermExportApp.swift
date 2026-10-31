@@ -94,6 +94,10 @@ private actor MacExportEngine {
         let hasTransferCode: Bool
         let isReplay: Bool
     }
+    enum Reopened: Sendable {
+        case ready(OpticalExportSession)
+        case partial(OpticalRecordingRecovery.Progress)
+    }
     struct SelectionState: Sendable {
         let source: WorkspaceDocument
         let selection: WorkspaceExportSelection
@@ -123,6 +127,7 @@ private actor MacExportEngine {
     private var decisions: [String: WorkspaceExportSelection.IdentityDecision] = [:]
     private var keys: [PrivateKeyRecord] = []
     private var transfer: OpticalExportSession?
+    private var recordingRecovery = OpticalRecordingRecovery()
 
     private func fingerprint(_ key: PrivateKeyRecord) -> String {
         "SHA256:" + crypto.sha256(key.publicBlob).base64EncodedString().replacingOccurrences(of: "=", with: "")
@@ -455,13 +460,47 @@ private actor MacExportEngine {
         transfer = preparedTransfer
         return metadata(preparedTransfer, recipientComparison: recipientComparison, isReplay: false)
     }
-    func openEncryptedTransfer(_ url: URL) throws -> Prepared {
-        let bytes = try SelectedLocalFile.read(url, limit: FTLimit.envelope)
-        let preparedTransfer = try OpticalExportSession(envelope: bytes, using: crypto)
+    func openEncryptedTransfer(_ url: URL,
+        onProgress: @escaping @Sendable (OpticalRecordingRecovery.Progress, OpticalRecordingProgress) async throws -> Void
+    ) async throws -> Reopened {
+        if !OpticalRecordingLimits.accepts(url) {
+            let bytes = try SelectedLocalFile.read(url, limit: FTLimit.envelope)
+            let candidate = try OpticalExportSession(envelope: bytes, using: crypto)
+            try Task.checkCancellation()
+            return .ready(candidate)
+        }
+        let lease = try recordingRecovery.beginRecording()
+        defer { recordingRecovery.endRecording(lease) }
+        let reader = NativeOpticalRecording()
+        _ = try await reader.read(url) { [self] texts, progress in
+            let recovered = try await observeRecording(texts, lease: lease)
+            try await onProgress(recovered, progress)
+            // Once complete, the exact reconstructed envelope is enough for
+            // fresh playback. Unread movie frames are not claimed as verified.
+            return !recovered.isComplete
+        }
+        try Task.checkCancellation()
+        recordingRecovery.endRecording(lease)
+        guard recordingRecovery.progress.isComplete else {
+            return .partial(recordingRecovery.progress)
+        }
+        return .ready(try recoveredRecordingTransfer())
+    }
+    private func observeRecording(_ texts: [String], lease: OpticalRecordingRecovery.Recording) throws -> OpticalRecordingRecovery.Progress {
+        try recordingRecovery.observe(texts, recording: lease, using: crypto)
+    }
+    func recordingRecoveryProgress() -> OpticalRecordingRecovery.Progress { recordingRecovery.progress }
+    func discardRecordingRecovery() { recordingRecovery.discard() }
+    func recoveredRecordingTransfer() throws -> OpticalExportSession {
+        try OpticalExportSession(envelope: recordingRecovery.envelope(using: crypto), using: crypto)
+    }
+    /// Parsing/reconstruction never replaces the selected source. Adopt only
+    /// after the window has accepted this completed, immutable candidate.
+    func adoptEncryptedTransfer(_ candidate: OpticalExportSession) throws -> Prepared {
         try Task.checkCancellation()
         clear()
-        transfer = preparedTransfer
-        return metadata(preparedTransfer, recipientComparison: nil, isReplay: true)
+        transfer = candidate
+        return metadata(candidate, recipientComparison: nil, isReplay: true)
     }
     private func metadata(_ value: OpticalExportSession, recipientComparison: String?, isReplay: Bool) -> Prepared {
         .init(id: value.id, comparison: FTAG.comparison(value.envelope, using: crypto), pages: value.identity.pageCount,
@@ -515,6 +554,7 @@ private actor MacExportEngine {
         retireKeyRequest(); document = nil; selection = nil; decisions = [:]; keys = []
         excludedMachineIDs = []
         sourceFindings = []; identityReferences = [:]; sshSource = nil; invalidateExport()
+        recordingRecovery.discard()
     }
 }
 
@@ -958,6 +998,9 @@ private final class MacExportModel {
     private(set) var scanningRecipient = false
     private(set) var requestingCameraAccess = false
     private(set) var recipientScanID = UUID()
+    private(set) var isReadingRecording = false
+    private(set) var recordingRecovery: OpticalRecordingRecovery.Progress?
+    private(set) var recordingReadProgress: OpticalRecordingProgress?
     @ObservationIgnored private let engine = MacExportEngine()
     @ObservationIgnored private let renderer = NativeOpticalPresentation()
     @ObservationIgnored private let videoRenderer = NativeOpticalVideo()
@@ -997,6 +1040,9 @@ private final class MacExportModel {
     }
     var filteredSSHAliases: [String] {
         sshSearch.isEmpty ? sshAliases : sshAliases.filter { $0.localizedCaseInsensitiveContains(sshSearch) }
+    }
+    var hasRecordingRecovery: Bool {
+        isReadingRecording || recordingRecovery?.identity != nil || recordingReadProgress != nil
     }
     private func apply(_ result: MacExportEngine.SelectionState) {
         document = result.source; selection = result.selection; identityDecisions = result.decisions
@@ -1124,6 +1170,7 @@ private final class MacExportModel {
         guard !busy, sourceSheet == nil else { return }
         cancelRecipientScan(); retireSourceKeyPrompt(); retireSSHSelection(); invalidatePrepared()
         perform { [self] operation in
+            try await discardRecordingRecoveryForSourceChange(operation)
             let result = try await engine.loadThisMac()
             try requireCurrentWork(operation)
             apply(result.state)
@@ -1137,8 +1184,9 @@ private final class MacExportModel {
     }
     private func loadDesktopHandoff() {
         guard !busy, sourceSheet == nil else { return }
-        clearVisibleMaterial()
         perform { [self] operation in
+            try await discardRecordingRecoveryForSourceChange(operation)
+            clearVisibleMaterial()
             let result = try await engine.loadDesktopHandoff()
             try requireCurrentWork(operation)
             guard let runtime = result.runtime else { throw FTError.malformed("machines.runtime_witness") }
@@ -1157,6 +1205,7 @@ private final class MacExportModel {
         guard panel.runModal() == .OK, let url = panel.url, windowOpen, foreground, !busy else { return }
         retireSourceKeyPrompt(); retireSSHSelection(); invalidatePrepared()
         perform { [self] operation in
+            try await discardRecordingRecoveryForSourceChange(operation)
             let result = try await engine.loadWorkspace(url)
             try requireCurrentWork(operation)
             apply(result)
@@ -1166,17 +1215,98 @@ private final class MacExportModel {
         guard !busy, sourceSheet == nil else { return }
         cancelRecipientScan()
         let panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
-        panel.allowedContentTypes = [.data]
-        panel.message = "Choose a local .ftairgap file to replay or repair its encrypted QR transfer. Its original code or matching iPhone request key is still required."
+        panel.allowedContentTypes = [.data, .movie, .png]
+        panel.message = "Open local .ftairgap ciphertext, or recover it from an MP4, MOV, M4V, PNG or APNG recording. Another recording can continue the same partial transfer. Its original code or matching iPhone request key is still required."
         guard panel.runModal() == .OK, let url = panel.url, windowOpen, foreground, !busy else { return }
-        retireSourceKeyPrompt(); retireSSHSelection(); invalidatePrepared()
+        retireSourceKeyPrompt(); retireSSHSelection(); pause()
+        let recording = OpticalRecordingLimits.accepts(url)
+        isReadingRecording = recording
+        if recording { recordingReadProgress = nil }
         perform { [self] operation in
-            let result = try await engine.openEncryptedTransfer(url)
-            try requireCurrentWork(operation)
-            guard foreground else { await engine.invalidateExport(); throw CancellationError() }
-            clearVisibleMaterial()
-            prepared = result
-            message = "Encrypted transfer opened. Playback and repair reuse these exact saved bytes. Verify its comparison value on the iPhone before restoring."
+            defer { if workOperationID == operation { isReadingRecording = false } }
+            do {
+                let result = try await engine.openEncryptedTransfer(url) { [weak self] recovered, progress in
+                    guard let self else { throw CancellationError() }
+                    try await self.receiveRecordingProgress(recovered, progress: progress, operation: operation)
+                }
+                try requireCurrentWork(operation)
+                switch result {
+                case let .ready(candidate):
+                    try await adoptReopenedTransfer(candidate, operation: operation)
+                case let .partial(progress):
+                    recordingRecovery = progress
+                    message = progress.identity == nil
+                        ? "No usable FrankenTerm transfer symbols were found. Choose another local recording or the original .ftairgap file."
+                        : "The recording ended before the encrypted transfer was complete. Accepted ciphertext pieces remain in this window. Read another recording of the same transfer, or discard this recovery to select a different one."
+                }
+            } catch {
+                guard recording else { throw error }
+                let retained = await engine.recordingRecoveryProgress()
+                guard windowOpen, workOperationID == operation else { return }
+                recordingRecovery = retained
+                reportRecordingRecovery(error)
+            }
+        }
+    }
+    private func receiveRecordingProgress(_ recovered: OpticalRecordingRecovery.Progress,
+        progress: OpticalRecordingProgress, operation: UUID
+    ) throws {
+        try requireCurrentWork(operation)
+        guard isReadingRecording, foreground, sessionActive, screensAwake else { throw CancellationError() }
+        recordingRecovery = recovered
+        recordingReadProgress = progress
+    }
+    private func adoptReopenedTransfer(_ candidate: OpticalExportSession, operation: UUID) async throws {
+        try requireCurrentWork(operation)
+        guard foreground, sessionActive, screensAwake else { throw CancellationError() }
+        let result = try await engine.adoptEncryptedTransfer(candidate)
+        // Adoption is the commit point. A cancellation arriving afterward
+        // cannot leave the visible old export pointing at a replaced engine.
+        // Window closure owns a separate joined cleanup and cannot publish.
+        guard windowOpen, workOperationID == operation else { return }
+        invalidatePrepared(); clearVisibleMaterial()
+        prepared = result
+        message = "Encrypted transfer opened. Playback and fresh repair reuse these exact recovered bytes; no workspace was decrypted or installed. The original code or matching iPhone request key is still required. Verify its comparison value on the iPhone before restoring."
+    }
+    func useRecoveredRecording() {
+        guard !busy, sourceSheet == nil, recordingRecovery?.isComplete == true else { return }
+        pause()
+        perform { [self] operation in
+            let candidate = try await engine.recoveredRecordingTransfer()
+            try await adoptReopenedTransfer(candidate, operation: operation)
+        }
+    }
+    func discardRecordingRecovery() {
+        guard !busy else { return }
+        perform { [self] operation in
+            await engine.discardRecordingRecovery()
+            guard windowOpen, workOperationID == operation else { return }
+            recordingRecovery = nil; recordingReadProgress = nil
+            message = "Partial recording recovery discarded. Choose another encrypted transfer or recording to start again."
+        }
+    }
+    private func discardRecordingRecoveryForSourceChange(_ operation: UUID) async throws {
+        await engine.discardRecordingRecovery()
+        guard windowOpen, workOperationID == operation else { throw CancellationError() }
+        recordingRecovery = nil; recordingReadProgress = nil
+        try requireCurrentWork(operation)
+    }
+    private func reportRecordingRecovery(_ error: Error) {
+        if error is CancellationError || error as? FTError == .cancelled {
+            if recordingRecovery?.isComplete == true {
+                message = "Reading stopped after ciphertext reconstruction. Choose Use Recovered Transfer to open those verified bytes."
+            } else if recordingRecovery?.identity != nil {
+                message = "Reading stopped. Accepted ciphertext pieces remain in this window; another recording of the same transfer can continue recovery."
+            } else {
+                message = "Reading stopped before any usable transfer pieces were recovered."
+            }
+        } else if error as? FTError == .malformed("recording.ambiguous_sources") {
+            message = "This recording shows more than one transfer, or differs from the selected partial recovery. Those sources were not combined. Read another recording of the same transfer, or discard this recovery before choosing a different one."
+        } else {
+            message = "Recording recovery stopped: \(error.localizedDescription) "
+                + (recordingRecovery?.identity != nil
+                    ? "Accepted ciphertext pieces remain available for another recording of the same transfer."
+                    : "No complete encrypted transfer was opened. Choose another recording or the original .ftairgap file.")
         }
     }
     func chooseSSHConfiguration() {
@@ -1189,6 +1319,7 @@ private final class MacExportModel {
         guard panel.runModal() == .OK, let url = panel.url, windowOpen, foreground, !busy else { return }
         retireSourceKeyPrompt(); retireSSHSelection(); invalidatePrepared()
         perform { [self] operation in
+            try await discardRecordingRecoveryForSourceChange(operation)
             let aliases = try await engine.inspectSSHConfiguration(url)
             do { try requireCurrentWork(operation) }
             catch { await engine.cancelSSHSelection(); throw error }
@@ -1498,11 +1629,11 @@ private final class MacExportModel {
     }
     func setSessionActive(_ value: Bool) {
         sessionActive = value
-        if !value { pause() }
+        if !value { pause(); if isReadingRecording { work?.cancel() } }
     }
     func setScreensAwake(_ value: Bool) {
         screensAwake = value
-        if !value { pause() }
+        if !value { pause(); if isReadingRecording { work?.cancel() } }
     }
     func setForeground(_ value: Bool) {
         foreground = value && windowOpen
@@ -1512,6 +1643,7 @@ private final class MacExportModel {
             // session lock and window closure pause it explicitly.
             hideTransferCode()
             cancelRecipientScan()
+            if isReadingRecording { work?.cancel() }
             if let token = sourceKeyOperation {
                 work?.cancel(); retireSourceKeyPrompt()
                 // The bounded worker checks cancellation before installing its
@@ -1609,14 +1741,19 @@ private final class MacExportModel {
     }
     func clear() {
         guard !busy else { return }
-        clearVisibleMaterial()
-        perform { [self] _ in await engine.clear() }
+        pause()
+        perform { [self] operation in
+            await engine.clear()
+            guard windowOpen, workOperationID == operation else { return }
+            clearVisibleMaterial()
+        }
     }
     private func clearVisibleMaterial() {
         retireSourceKeyPrompt(); retireSSHSelection(); resetRecipient(); protection = .code
         document = nil; selection = nil; identityDecisions = [:]; exportReview = nil
         includedFingerprints = []; prepared = nil; approveSelectedKeys = false; repairPage = -1
         identityReferences = [:]; message = nil
+        isReadingRecording = false; recordingRecovery = nil; recordingReadProgress = nil
     }
     func closeExport() {
         guard windowOpen else { return }
@@ -1738,15 +1875,18 @@ private struct MacExportView: View {
                                 Button("Reload This Mac's Machines") { model.loadThisMac() }
                                 Button("Import SSH Config…") { model.chooseSSHConfiguration() }
                                 Button("Open Workspace…") { model.chooseWorkspace() }
-                                Button("Open Encrypted Transfer…") { model.chooseEncryptedTransfer() }
+                                Button("Open Encrypted Transfer or Recording…") { model.chooseEncryptedTransfer() }
                             }.fixedSize().disabled(model.busy || enrollment.busy)
                         }
                         if let message = model.message { Text(verbatim: message).font(.callout).textSelection(.enabled) }
+                        if model.hasRecordingRecovery { recordingRecoveryCard }
                         if let document = model.document {
                             exportChoices(document).disabled(enrollment.busy)
                         } else if model.busy {
-                            ProgressView("Loading this Mac's machines…").frame(maxWidth: .infinity)
-                        } else {
+                            if !model.isReadingRecording {
+                                ProgressView("Loading this Mac's machines…").frame(maxWidth: .infinity)
+                            }
+                        } else if !model.hasRecordingRecovery {
                             ContentUnavailableView("No machines loaded", systemImage: "rectangle.3.group",
                                 description: Text("This Mac's FrankenTerm machines load automatically. Use Other Sources to open a workspace or SSH config instead."))
                         }
@@ -1930,6 +2070,7 @@ private struct MacExportView: View {
                                 .font(.callout).foregroundStyle(.secondary)
                         }
                         Spacer()
+                        Button("Open Transfer…") { model.chooseEncryptedTransfer() }.disabled(model.busy || enrollment.busy)
                         Button("Done") { model.stopSending() }.disabled(model.busy)
                     }
                     if let code = model.revealedTransferCode, let image = model.revealedCodeSymbol {
@@ -1986,11 +2127,52 @@ private struct MacExportView: View {
                     }.font(.caption).multilineTextAlignment(.center)
                     backupControls(prepared)
                     if let message = model.message { Text(verbatim: message).font(.callout).textSelection(.enabled) }
-                    if model.busy {
+                    if model.hasRecordingRecovery { recordingRecoveryCard }
+                    if model.busy && !model.isReadingRecording {
                         HStack { ProgressView().controlSize(.small); Button("Cancel Work") { model.cancelWork() } }
                     }
                 }.padding(24)
             }
+        }
+    }
+
+    private var recordingRecoveryCard: some View {
+        GroupBox("Recover Encrypted Recording") {
+            VStack(alignment: .leading, spacing: 10) {
+                if model.isReadingRecording { ProgressView("Reading local recording…").controlSize(.small) }
+                if let media = model.recordingReadProgress {
+                    if let total = media.totalFrames {
+                        Text("Read \(media.framesRead) of \(total) media frames").font(.caption).monospacedDigit()
+                    } else if let elapsed = media.elapsedSeconds, let duration = media.durationSeconds {
+                        Text("Read \(media.framesRead) media frames · \(String(format: "%.1f", elapsed)) of \(String(format: "%.1f", duration)) seconds")
+                            .font(.caption).monospacedDigit()
+                    }
+                }
+                if let recovered = model.recordingRecovery, recovered.identity != nil {
+                    ProgressView(value: Double(recovered.receivedParts), total: Double(max(1, recovered.totalParts)))
+                    Text("Ciphertext recovery: \(recovered.receivedParts) of \(recovered.totalParts) independent parts · \(recovered.verifiedPages) of \(recovered.totalPages) pages verified")
+                        .font(.caption).monospacedDigit()
+                    Text("\(ByteCountFormatter.string(fromByteCount: Int64(recovered.verifiedBytes), countStyle: .file)) of \(ByteCountFormatter.string(fromByteCount: Int64(recovered.totalBytes), countStyle: .file)) verified")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Text("These are encrypted pieces recovered on this Mac. A complete envelope can generate fresh repair symbols without its code or the phone’s private request key. Partial pieces stay only in this window; closing it discards them.")
+                    .font(.caption).foregroundStyle(.secondary)
+                HStack {
+                    if model.isReadingRecording {
+                        Button("Stop Reading") { model.cancelWork() }
+                    } else {
+                        if model.recordingRecovery?.isComplete == true {
+                            Button("Use Recovered Transfer") { model.useRecoveredRecording() }
+                                .buttonStyle(.borderedProminent).disabled(model.busy || enrollment.busy)
+                        } else {
+                            Button("Read Another Recording…") { model.chooseEncryptedTransfer() }
+                                .disabled(model.busy || enrollment.busy)
+                        }
+                        Button("Discard Recovery", role: .destructive) { model.discardRecordingRecovery() }
+                            .disabled(model.busy || enrollment.busy)
+                    }
+                }
+            }.frame(maxWidth: .infinity, alignment: .leading).padding(8)
         }
     }
 
