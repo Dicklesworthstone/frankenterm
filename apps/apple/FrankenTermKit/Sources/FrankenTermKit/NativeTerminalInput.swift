@@ -1003,8 +1003,11 @@ public final class NativeTerminalView: UIView {
     private let liveButton = UIButton(type: .system)
     private let panDelegate = NativeTerminalHistoryPanDelegate()
     private var panAnchor: (top: Int64, history: TerminalRenderHistory)?
+    private var localPan: (viewport: TerminalLocalViewport, geometry: UInt64, font: UInt64, alternate: Bool)?
+    private var applyingLocalPan = false
     private var remoteScroll: (column: Int, row: Int, sent: Int, source: TerminalSource,
-                               geometry: UInt64, font: UInt64, cellSize: CGSize, keyboardID: UUID)?
+                               geometry: UInt64, font: UInt64, cellSize: CGSize,
+                               viewport: TerminalLocalViewport, keyboardID: UUID)?
     private var lastHistoryRequest: Int64??
     private var lastCaret: NativeTerminalCaret?
     private var lastAppearance: (font: UIFont, foreground: UIColor)?
@@ -1021,6 +1024,11 @@ public final class NativeTerminalView: UIView {
     /// The user changed the text size (pinch or ⌘+ / ⌘- / ⌘0); the owner keeps
     /// it for this terminal's later sessions and the others.
     public var onFontSizeChange: (@MainActor (Double) -> Void)?
+    public var onLocalViewportChange: (@MainActor (Bool) -> Void)?
+    public var localViewportEnabled: Bool { renderer.localViewportEnabled }
+    /// The identity rail remains available while the canvas belongs to a
+    /// deliberate local pan instead of machine or pane navigation.
+    public var ownsViewportPan: Bool { localViewportEnabled }
     /// Each text-size change gives the renderer a new font revision; frames
     /// laid out for an older one are not drawn. The owner must hand this
     /// revision to the terminal model (TerminalModelRuntime.setFontRevision)
@@ -1083,6 +1091,7 @@ public final class NativeTerminalView: UIView {
         input.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         addSubview(renderer); addSubview(input); addSubview(selectionOverlay)
         bindInput()
+        panDelegate.permitsLocalPan = { [weak self] in self?.ownsViewportPan == true }
         // One finger drags through history with momentum; a trackpad or
         // mouse wheel scrolls it too.
         let pan = UIPanGestureRecognizer(target: self, action: #selector(panned(_:)))
@@ -1120,6 +1129,26 @@ public final class NativeTerminalView: UIView {
             guard let self, !self.retired else { return }
             self.liveButton.isHidden = frame.isLive
             self.frameAdmitted(frame)
+        }
+        renderer.onProjectionInvalidated = { [weak self] in
+            guard let self, !self.retired else { return }
+            // Our own drag retains its original translation anchor. Any
+            // other transform (font, window, reveal, accessible pan) cancels
+            // that capture before it can move a differently projected grid.
+            if !self.applyingLocalPan { self.localPan = nil }
+            self.remoteScroll = nil
+            self.clearSelection()
+        }
+        renderer.onLocalViewportChange = { [weak self] enabled in
+            guard let self, !self.retired else { return }
+            self.localPan = nil; self.panAnchor = nil; self.remoteScroll = nil
+            self.stopMomentum(); self.clearSelection()
+            self.onLocalViewportChange?(enabled)
+        }
+        renderer.onCursorRevealRequest = { [weak self] in
+            guard let self, self.isSceneActive, self.ownsViewportPan else { return false }
+            self.revealCursor()
+            return true
         }
         renderer.onFailure = { [weak self] error in
             guard let self, !self.retired else { return }
@@ -1186,7 +1215,10 @@ public final class NativeTerminalView: UIView {
         input.onInputWithoutProjection = { [weak self] in
             guard let self, !self.retired, self.sceneActive, let frame = self.renderer.admittedFrame else { return false }
             // A resize or new text size redraws the live screen it shows.
-            if frame.isLive { return true }
+            if frame.isLive {
+                if self.ownsViewportPan { self.revealCursor() }
+                return true
+            }
             self.returnToLiveOutput()
             return false
         }
@@ -1217,6 +1249,7 @@ public final class NativeTerminalView: UIView {
     }
     @objc private func panned(_ pan: UIPanGestureRecognizer) {
         guard isSceneActive else { return }
+        if ownsViewportPan { panLocalViewport(pan); return }
         let rowHeight = renderer.cellSize?.height ?? 0
         switch pan.state {
         case .began:
@@ -1235,10 +1268,10 @@ public final class NativeTerminalView: UIView {
                 // terminal also has history. History inspection stays local.
                 let cell = projection.cellSize
                 let point = pan.location(in: self)
-                remoteScroll = (min(max(Int(point.x / cell.width), 0), max(frame.columns - 1, 0)),
-                                min(max(Int(point.y / cell.height), 0), max(frame.lines.count - 1, 0)), 0,
+                guard let hit = projection.viewport.cell(atX: Double(point.x), y: Double(point.y)) else { return }
+                remoteScroll = (hit.column, hit.row, 0,
                                 projection.frame.source, projection.frame.geometryRevision,
-                                projection.frame.fontRevision, cell, input.session.id)
+                                projection.frame.fontRevision, cell, projection.viewport, input.session.id)
             }
         case .changed:
             if let remote = remoteScroll {
@@ -1246,7 +1279,8 @@ public final class NativeTerminalView: UIView {
                       projection.frame.isLive, projection.frame.source == remote.source,
                       projection.frame.geometryRevision == remote.geometry,
                       projection.frame.fontRevision == remote.font,
-                      projection.cellSize == remote.cellSize, input.session.id == remote.keyboardID else {
+                      projection.cellSize == remote.cellSize, projection.viewport == remote.viewport,
+                      input.session.id == remote.keyboardID else {
                     remoteScroll = nil; return
                 }
                 // Dragging down shows older rows: the wheel turns up.
@@ -1271,6 +1305,48 @@ public final class NativeTerminalView: UIView {
             panAnchor = nil; remoteScroll = nil
         default: panAnchor = nil; remoteScroll = nil
         }
+    }
+
+    private func panLocalViewport(_ pan: UIPanGestureRecognizer) {
+        switch pan.state {
+        case .began:
+            stopMomentum(); clearSelection(); panAnchor = nil; remoteScroll = nil; localPan = nil
+            guard let projection = renderer.pointerProjection else { return }
+            localPan = (projection.viewport, projection.frame.geometryRevision,
+                        projection.frame.fontRevision, projection.frame.alternateScreen)
+        case .changed, .ended:
+            guard let captured = localPan, let frame = renderer.admittedFrame,
+                  frame.geometryRevision == captured.geometry, frame.fontRevision == captured.font,
+                  frame.alternateScreen == captured.alternate else { localPan = nil; return }
+            let translation = pan.translation(in: self)
+            if let offset = captured.viewport.panning(byX: Double(translation.x), y: Double(translation.y)) {
+                do {
+                    applyingLocalPan = true
+                    defer { applyingLocalPan = false }
+                    try renderer.setLocalViewportOffset(offset)
+                }
+                catch { onFailure?(error) }
+            }
+            if pan.state == .ended { localPan = nil }
+        default: localPan = nil
+        }
+    }
+
+    /// Switch only this shared-grid presentation. The renderer retains the
+    /// drawable's bounds and suppresses viewport/PTY proposals in both modes.
+    public func setLocalViewportEnabled(_ enabled: Bool) {
+        guard !retired else { return }
+        do { try renderer.setLocalViewportEnabled(enabled) }
+        catch { onFailure?(error) }
+    }
+
+    public func revealCursor() {
+        guard !retired, ownsViewportPan else { return }
+        localPan = nil; panAnchor = nil; remoteScroll = nil
+        stopMomentum(); clearSelection()
+        if renderer.admittedFrame?.isLive == false { returnToLiveOutput() }
+        do { try renderer.revealLocalCursor() }
+        catch { onFailure?(error) }
     }
 
     // MARK: Momentum
@@ -1324,10 +1400,9 @@ public final class NativeTerminalView: UIView {
                 onFailure?(TerminalKeyboardError.unavailable)
                 return
             }
-            let frame = projection.frame, cell = projection.cellSize
             let point = tap.location(in: self)
-            onRemoteClick(min(max(Int(point.x / cell.width), 0), max(frame.columns - 1, 0)),
-                          min(max(Int(point.y / cell.height), 0), max(frame.lines.count - 1, 0)))
+            guard let hit = projection.viewport.cell(atX: Double(point.x), y: Double(point.y)) else { return }
+            onRemoteClick(hit.column, hit.row)
             return
         }
         // A link shows where it goes, with Open and Copy Link, instead.
@@ -1350,10 +1425,12 @@ public final class NativeTerminalView: UIView {
             // a clear change of spacing is a pinch.
             guard pinchEngaged || abs(log(Double(pinch.scale))) > 0.08 else { return }
             pinchEngaged = true
+            if renderer.configuration.fitsRemoteGrid, !localViewportEnabled { setLocalViewportEnabled(true) }
             let size = Self.clampedFontSize(start * Double(pinch.scale))
             showSizeBadge(size)
-            // Each size change re-lays out the terminal (and resizes the remote
-            // pane); a few per second keep the pinch live without a storm.
+            // A few local text updates per second keep the pinch live. Shared
+            // grids retain their remote size; only a controlling view proposes
+            // a different PTY geometry through its existing owner.
             let now = CACurrentMediaTime()
             if now - pinchApplied > 0.12 { pinchApplied = now; applyFontSize(size, notify: false) }
         case .ended:
@@ -1393,6 +1470,7 @@ public final class NativeTerminalView: UIView {
     private func applyFontSize(_ size: Double, notify: Bool) {
         guard !retired else { return }
         guard size.isFinite else { onFailure?(TerminalRenderError.capacity); return }
+        if notify, renderer.configuration.fitsRemoteGrid, !localViewportEnabled { setLocalViewportEnabled(true) }
         let clamped = Self.clampedFontSize(size)
         var configuration = renderer.configuration
         if configuration.fontPointSize != clamped {
@@ -1435,12 +1513,11 @@ public final class NativeTerminalView: UIView {
     // MARK: Selection
 
     /// The cell under `point`, by stable row; points past the edges clamp.
-    private func gridPoint(at point: CGPoint) -> TerminalGridPoint? {
-        guard let frame = renderer.admittedFrame, let cell = renderer.cellSize,
-              cell.width > 0, cell.height > 0, !frame.lines.isEmpty else { return nil }
-        let column = min(max(Int(point.x / cell.width), 0), frame.columns - 1)
-        let index = min(max(Int(point.y / cell.height), 0), frame.lines.count - 1)
-        return TerminalGridPoint(row: frame.lines[index].stableIndex, column: column)
+    private func gridPoint(at point: CGPoint, clamping: Bool = true) -> TerminalGridPoint? {
+        guard let projection = renderer.pointerProjection,
+              let hit = projection.viewport.cell(atX: Double(point.x), y: Double(point.y), clamping: clamping),
+              projection.frame.lines.indices.contains(hit.row) else { return nil }
+        return TerminalGridPoint(row: projection.frame.lines[hit.row].stableIndex, column: hit.column)
     }
 
     @objc private func pressed(_ press: UILongPressGestureRecognizer) {
@@ -1470,7 +1547,8 @@ public final class NativeTerminalView: UIView {
 
     @objc private func handleDragged(_ pan: UIPanGestureRecognizer) {
         guard !retired, let handle = pan.view as? NativeTerminalSelectionOverlay.SelectionHandle,
-              let current = selection, let cell = renderer.cellSize, let frame = renderer.admittedFrame else { return }
+              let current = selection, let projection = renderer.pointerProjection else { return }
+        let frame = projection.frame
         let point = pan.location(in: self)
         dragPoint = point
         switch pan.state {
@@ -1480,8 +1558,9 @@ public final class NativeTerminalView: UIView {
             // Keep the finger's offset from the cell it grabbed, so the end
             // under the knob does not jump to the knob's position.
             let moving = handle.atStart ? current.start : current.end
-            let index = frame.lines.firstIndex { $0.stableIndex == moving.row } ?? 0
-            let center = CGPoint(x: (CGFloat(moving.column) + 0.5) * cell.width, y: (CGFloat(index) + 0.5) * cell.height)
+            guard let index = frame.lines.firstIndex(where: { $0.stableIndex == moving.row }),
+                  let rect = projection.viewport.rectangle(column: moving.column, row: index) else { return }
+            let center = CGPoint(x: rect.x + rect.width / 2, y: rect.y + rect.height / 2)
             drag = .handle(fixed: handle.atStart ? current.end : current.start,
                            offset: CGPoint(x: center.x - point.x, y: center.y - point.y))
             startAutoScroll()
@@ -1521,7 +1600,7 @@ public final class NativeTerminalView: UIView {
         }
     }
     private func autoScrollTick() {
-        guard drag != nil, let cell = renderer.cellSize else { return }
+        guard !ownsViewportPan, drag != nil, let cell = renderer.cellSize else { return }
         let edge = max(cell.height, 24)
         // A press that starts at an edge selects there; the finger has to
         // move toward the edge to scroll.
@@ -1586,23 +1665,28 @@ public final class NativeTerminalView: UIView {
     }
 
     private func drawSelection() {
-        selectionOverlay.show(selection, frame: renderer.admittedFrame, cell: renderer.cellSize,
-                              tint: theme?.accent ?? tintColor)
+        let projection = renderer.pointerProjection
+        selectionOverlay.show(selection, frame: projection?.frame, cell: projection?.cellSize,
+            tint: theme?.accent ?? tintColor,
+            origin: projection.map { CGPoint(x: $0.viewport.originX, y: $0.viewport.originY) } ?? .zero)
     }
 
     /// Shows the link under `point`, if there is one: where it goes, then
     /// Open and Copy Link. Nothing opens without a second, deliberate tap.
     func showLink(at point: CGPoint) -> Bool {
-        guard let grid = gridPoint(at: point), let frame = renderer.admittedFrame, let cell = renderer.cellSize,
-              let link = TerminalLink.at(grid, in: frame) else { return false }
+        guard let grid = gridPoint(at: point, clamping: false), let projection = renderer.pointerProjection,
+              let link = TerminalLink.at(grid, in: projection.frame),
+              let row = projection.frame.lines.firstIndex(where: { $0.stableIndex == grid.row }),
+              let rectangle = projection.viewport.rectangle(column: grid.column, row: row),
+              let clipped = projection.viewport.clipped(rectangle) else { return false }
         // This terminal's own controller: a key-window lookup could show it
         // in another scene.
         var responder: UIResponder? = self
         while responder != nil && !(responder is UIViewController) { responder = responder?.next }
         guard let presenter = responder as? UIViewController, presenter.viewIfLoaded?.window === window,
               presenter.presentedViewController == nil else { return false }
-        let origin = CGPoint(x: floor(point.x / cell.width) * cell.width, y: floor(point.y / cell.height) * cell.height)
-        presenter.present(linkSheet(for: link, from: CGRect(origin: origin, size: cell)), animated: true)
+        let cell = CGRect(x: clipped.x, y: clipped.y, width: clipped.width, height: clipped.height)
+        presenter.present(linkSheet(for: link, from: cell), animated: true)
         return true
     }
 
@@ -1636,6 +1720,8 @@ public final class NativeTerminalView: UIView {
     /// Each admitted frame recolors the chrome when the palette changed, and
     /// moves a selection with its rows as output or scrolling shifts them.
     private func frameAdmitted(_ frame: TerminalRenderFrame) {
+        if let localPan, localPan.geometry != frame.geometryRevision || localPan.font != frame.fontRevision
+            || localPan.alternate != frame.alternateScreen { self.localPan = nil }
         if themedPalette != frame.paletteRevision || theme == nil, let next = TerminalChromeTheme(frame: frame) {
             themedPalette = frame.paletteRevision
             if next != theme {
@@ -1701,7 +1787,7 @@ public final class NativeTerminalView: UIView {
         renderer.setSceneActive(active)
         if active { hasActivated = true }
         else if hasActivated {
-            panAnchor = nil; remoteScroll = nil; stopMomentum()
+            panAnchor = nil; remoteScroll = nil; localPan = nil; stopMomentum()
             wantsKeyboard = false; input.retire()
         }
     }
@@ -1713,6 +1799,7 @@ public final class NativeTerminalView: UIView {
     public func requestKeyboard(_ visible: Bool) {
         guard !retired else { return }
         wantsKeyboard = visible && !input.isReadOnly
+        if wantsKeyboard, ownsViewportPan { revealCursor() }
         if !wantsKeyboard || sceneActive { input.requestKeyboard(wantsKeyboard) }
     }
     /// The caller owns the coordinator and creates the replacement focus only
@@ -1746,6 +1833,7 @@ public final class NativeTerminalView: UIView {
         clearSelection(); stopMomentum()
         onKeyboardRequest = nil; onFontSizeChange = nil; onFontRevision = nil; onRemoteScroll = nil; onRemoteClick = nil
         onKeyboardDismissed = nil; remoteScroll = nil; panAnchor = nil
+        onLocalViewportChange = nil; localPan = nil
         sceneActivityGeneration = UUID()
         retired = true; wantsKeyboard = false; sceneActive = false; lastCaret = nil; lastAppearance = nil
         input.canCopySelection = nil; input.copySelection = nil
@@ -1754,6 +1842,7 @@ public final class NativeTerminalView: UIView {
         onHistoryViewportRequest = nil; liveButton.isHidden = true
         renderer.onFailure = nil; renderer.onCaret = nil; renderer.onAppearance = nil
         renderer.onCaretUnavailable = nil; renderer.onViewportChange = nil; onViewportChange = nil
+        renderer.onProjectionInvalidated = nil; renderer.onLocalViewportChange = nil; renderer.onCursorRevealRequest = nil
         input.retire(); renderer.retire()
     }
 }
@@ -1788,8 +1877,14 @@ private final class NativeTerminalTouchFilter: NSObject, UIGestureRecognizerDele
 /// Only a mostly vertical drag scrolls history; sideways drags stay free.
 @MainActor
 private final class NativeTerminalHistoryPanDelegate: NSObject, UIGestureRecognizerDelegate {
+    var permitsLocalPan: (@MainActor () -> Bool)?
+    func gestureRecognizer(_ recognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+        !(touch.view is NativeTerminalSelectionOverlay.SelectionHandle)
+    }
     func gestureRecognizerShouldBegin(_ recognizer: UIGestureRecognizer) -> Bool {
         guard let pan = recognizer as? UIPanGestureRecognizer, let view = pan.view else { return false }
+        guard !UIAccessibility.isVoiceOverRunning else { return false }
+        if permitsLocalPan?() == true { return true }
         let velocity = pan.velocity(in: view)
         return abs(velocity.y) > abs(velocity.x)
     }

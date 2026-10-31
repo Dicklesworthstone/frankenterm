@@ -658,9 +658,19 @@ final class TerminalSessionController {
     let muxAccessMode: TerminalMuxAccessMode
     private(set) var requiresExistingMux: Bool
     var isViewingOnly: Bool { connection?.muxControl?.accessMode == .viewOnly }
-    /// Both observers and shared-size input clients fit the authoritative grid
-    /// locally. Keyboard permission alone never grants shared resize authority.
+    /// Observers and shared-size input clients keep the authoritative grid.
+    /// Keyboard permission alone never grants shared resize authority.
     var keepsSharedMuxSize: Bool { connection?.muxControl?.accessMode.controlsSize == false }
+    /// A local viewing preference for this controller, retained when its pane
+    /// view is rebuilt. It never changes the mux access mode or remote size.
+    private(set) var prefersReadableViewport = false
+    private(set) var viewportModeGeneration = UUID()
+    var ownsViewportPan: Bool { prefersReadableViewport && terminal?.ownsViewportPan == true }
+    var canAdjustLocalViewport: Bool {
+        !stopped && phase == .live && keepsSharedMuxSize && hasFocusedPresentation
+            && !overviewBlocking && !clipboardIsPresenting && !localInputNeedsDecision
+            && !paneNavigationBusy && terminal?.isSceneActive == true
+    }
     let target: TerminalSessionTarget
     /// The scene's hook for phase and settlement changes: it starts the next
     /// background connection and reconnects dropped sessions from here.
@@ -1624,6 +1634,7 @@ final class TerminalSessionController {
             var configuration = Self.renderConfiguration(font: requestedFont)
             configuration.fontRevision = appliedFontRevision
             configuration.fitsRemoteGrid = keepsSharedMuxSize
+            configuration.localViewportEnabled = keepsSharedMuxSize && prefersReadableViewport
             let view = try await NativeTerminalView(session: keyboard, configuration: configuration, readOnly: isViewingOnly)
             terminal = view
             try checkLive()
@@ -1648,6 +1659,16 @@ final class TerminalSessionController {
             view.onFontSizeChange = { [weak self] size in self?.focus?.fontSizeChanged(size) }
             view.onFontRevision = { [weak self] revision in self?.applyFontRevision(revision) }
             view.onViewportChange = { [weak self] viewport in self?.propose(viewport) }
+            view.onLocalViewportChange = { [weak self, weak view] enabled in
+                guard let self, let view, !self.stopped, self.terminal === view,
+                      self.displayedMuxDestination == expectedMux,
+                      self.connection?.muxControl?.inputRouting.current.destination == expectedMux else { return }
+                guard self.prefersReadableViewport != enabled else { return }
+                self.prefersReadableViewport = enabled
+                // A captured canvas swipe cannot revive if the user switches
+                // into local pan and back before its delayed completion.
+                self.viewportModeGeneration = UUID()
+            }
             if let control = connection?.muxControl, let expectedMux {
                 // The immutable view/visit pair survives a delayed callback;
                 // it must never be replaced with the newly selected pane.
@@ -1975,6 +1996,16 @@ final class TerminalSessionController {
 
     /// Shows this terminal's text at `size` points.
     func setFontSize(_ size: Double) { terminal?.setFontPointSize(size) }
+
+    func setReadableViewport(_ enabled: Bool) {
+        guard canAdjustLocalViewport else { return }
+        terminal?.setLocalViewportEnabled(enabled)
+    }
+
+    func revealViewportCursor() {
+        guard canAdjustLocalViewport, prefersReadableViewport else { return }
+        terminal?.revealCursor()
+    }
 
     /// The renderer took a new font; the model's next frames must say so or
     /// they are not drawn. One change at a time reaches the runtime, and the

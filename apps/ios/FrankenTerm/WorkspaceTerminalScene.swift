@@ -897,6 +897,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
             && selectedSession?.clipboardIsPresenting != true
             && selectedSession?.paneNavigationBusy != true
             && selectedSession?.terminal?.remoteMouseGrabbed != true
+            && selectedSession?.ownsViewportPan != true
     }
 
     /// Called once per direction at touch-down by the native finger classifier.
@@ -906,11 +907,13 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         guard permitsCanvasNavigation else { return nil }
         let generation = canvasGeneration, sourceMachine = selectedMachineID
         let sessionID = selectedSession?.id
+        let viewportGeneration = selectedSession?.viewportModeGeneration
         let sourcePane = selectedSession?.muxControl?.inputRouting.current.destination
         let stillCurrent: @MainActor () -> Bool = { [weak self] in
             guard let self else { return false }
             return self.permitsCanvasNavigation && self.canvasGeneration == generation
                 && self.selectedMachineID == sourceMachine && self.selectedSession?.id == sessionID
+                && self.selectedSession?.viewportModeGeneration == viewportGeneration
                 && self.selectedSession?.muxControl?.inputRouting.current.destination == sourcePane
         }
         switch axis {
@@ -1837,6 +1840,22 @@ struct WorkspaceTerminalScreen: View {
                         .disabled(session.clipboardIsPresenting || session.localInputNeedsDecision)
                     // Pinching the terminal does the same.
                     Menu("Text Size", systemImage: "textformat.size") {
+                        if session.keepsSharedMuxSize {
+                            Button("Fit Entire Pane", systemImage: session.prefersReadableViewport ? "arrow.down.right.and.arrow.up.left" : "checkmark") {
+                                session.setReadableViewport(false)
+                            }
+                            .disabled(!session.canAdjustLocalViewport)
+                            .accessibilityIdentifier("terminal.viewport.fit")
+                            Button("Readable Size", systemImage: session.prefersReadableViewport ? "checkmark" : "text.magnifyingglass") {
+                                session.setReadableViewport(true)
+                            }
+                            .disabled(!session.canAdjustLocalViewport)
+                            .accessibilityIdentifier("terminal.viewport.readable")
+                            Button("Reveal Cursor", systemImage: "scope") { session.revealViewportCursor() }
+                                .disabled(!session.canAdjustLocalViewport || !session.prefersReadableViewport)
+                                .accessibilityIdentifier("terminal.viewport.cursor")
+                            Divider()
+                        }
                         Button("Bigger", systemImage: "plus.magnifyingglass") { terminal.biggerText() }
                         Button("Smaller", systemImage: "minus.magnifyingglass") { terminal.smallerText() }
                         Button("Actual Size", systemImage: "1.magnifyingglass") { terminal.actualSize() }
@@ -1903,6 +1922,11 @@ struct WorkspaceTerminalScreen: View {
                 Text(session.isViewingOnly ? "Shared size · Input is off"
                     : session.muxAccessMode.controlsSize ? "Phone size · Input is on" : "Shared size · Input is on")
                     .font(.caption2).foregroundStyle(.secondary)
+                if session.keepsSharedMuxSize && session.prefersReadableViewport {
+                    Text("Readable view · Drag to pan; pinch to zoom")
+                        .font(.caption2).foregroundStyle(.secondary)
+                        .accessibilityIdentifier("terminal.viewport.status")
+                }
             }
             Spacer(minLength: 4)
             Button(session.isViewingOnly ? "Use Terminal" : "Change…") {

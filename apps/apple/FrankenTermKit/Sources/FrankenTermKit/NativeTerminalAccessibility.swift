@@ -53,7 +53,14 @@ final class NativeTerminalAccessibility: NSObject {
         if frame.revision != snapshot.revision { status += " Newer output is available." }
         if snapshot.omittedLines > 0 { status += " \(snapshot.omittedLines) earlier visible lines are outside the reading limit." }
         if snapshot.lines.isEmpty { status += " No visible text." }
+        if view.localViewportEnabled {
+            status += " Readable size. Actions can pan the local view, reveal the cursor, or fit the entire pane."
+        }
         header?.accessibilityValue = status
+        // A local transform does not change the captured text or its elements.
+        // Refresh the available view actions without moving reading focus.
+        header?.accessibilityCustomActions = actions()
+        for element in lineElements { element.accessibilityCustomActions = actions() }
         updateFrames(snapshot, in: view)
         return (header.map { [$0] } ?? []) + lineElements
     }
@@ -73,9 +80,43 @@ final class NativeTerminalAccessibility: NSObject {
     }
 
     private func actions() -> [UIAccessibilityCustomAction] {
-        [UIAccessibilityCustomAction(name: "Refresh terminal output") { [weak self] _ in self?.move(to: .refresh) ?? false },
+        var result = [UIAccessibilityCustomAction(name: "Refresh terminal output") { [weak self] _ in self?.move(to: .refresh) ?? false },
          UIAccessibilityCustomAction(name: "Read cursor line") { [weak self] _ in self?.move(to: .cursor) ?? false },
          UIAccessibilityCustomAction(name: "Read newest visible output") { [weak self] _ in self?.move(to: .newest) ?? false }]
+        if view?.localViewportEnabled == true {
+            result += [
+                UIAccessibilityCustomAction(name: "Pan left") { [weak self] _ in self?.pan(horizontal: -1, vertical: 0) ?? false },
+                UIAccessibilityCustomAction(name: "Pan right") { [weak self] _ in self?.pan(horizontal: 1, vertical: 0) ?? false },
+                UIAccessibilityCustomAction(name: "Pan up") { [weak self] _ in self?.pan(horizontal: 0, vertical: -1) ?? false },
+                UIAccessibilityCustomAction(name: "Pan down") { [weak self] _ in self?.pan(horizontal: 0, vertical: 1) ?? false },
+                UIAccessibilityCustomAction(name: "Reveal cursor") { [weak self] _ in self?.transform(revealCursor: true) ?? false },
+                UIAccessibilityCustomAction(name: "Fit entire pane") { [weak self] _ in self?.transform(revealCursor: false) ?? false }
+            ]
+        }
+        return result
+    }
+
+    private func pan(horizontal: Double, vertical: Double) -> Bool {
+        guard let view, view.permitsAccessibilityReading, let projection = view.pointerProjection else { return false }
+        return view.panLocalViewport(
+            columns: horizontal * max(1, projection.viewport.width / projection.viewport.cellWidth / 2),
+            rows: vertical * max(1, projection.viewport.height / projection.viewport.cellHeight / 2))
+    }
+
+    private func transform(revealCursor: Bool) -> Bool {
+        guard let view, view.permitsAccessibilityReading, view.localViewportEnabled else { return false }
+        if revealCursor {
+            // The owning terminal can return a history viewport to live
+            // output before revealing its cursor. A stale rotor never looks
+            // up a different scene or acquires its keyboard authority.
+            if let request = view.onCursorRevealRequest { return request() }
+            guard view.admittedFrame?.isLive == true else { return false }
+        }
+        do {
+            if revealCursor { try view.revealLocalCursor() }
+            else { try view.setLocalViewportEnabled(false) }
+            return true
+        } catch { view.onFailure?((error as? TerminalRenderError) ?? .unavailable); return false }
     }
 
     private enum Destination { case refresh, cursor, newest }
@@ -101,13 +142,33 @@ final class NativeTerminalAccessibility: NSObject {
         return true
     }
 
-    private func updateFrames(_ snapshot: TerminalAccessibilitySnapshot, in view: UIView) {
-        // The frozen text remains a reading snapshot if the visual terminal
-        // scrolls underneath it. Frames stay within the current container even
-        // after rotation; they never become remote selection coordinates.
+    private func updateFrames(_ snapshot: TerminalAccessibilitySnapshot, in view: NativeTerminalRenderView) {
         let height = view.bounds.height / CGFloat(max(1, snapshot.viewportRows))
         header?.accessibilityFrameInContainerSpace = CGRect(x: 0, y: 0,
             width: view.bounds.width, height: max(1, min(height, view.bounds.height)))
+        if let projection = view.pointerProjection,
+           snapshot.source == projection.frame.source, snapshot.revision == projection.frame.revision,
+           snapshot.geometryRevision == projection.frame.geometryRevision {
+            for (index, line) in snapshot.lines.enumerated() {
+                let first = line.firstRow.subtractingReportingOverflow(projection.frame.viewportFirst)
+                let last = line.lastRow.subtractingReportingOverflow(projection.frame.viewportFirst)
+                guard !first.overflow, !last.overflow, first.partialValue >= 0,
+                      last.partialValue >= first.partialValue, last.partialValue < Int64(projection.frame.rows),
+                      let row = projection.viewport.rectangle(column: 0, row: Int(first.partialValue),
+                          columns: projection.frame.columns, rows: Int(last.partialValue - first.partialValue + 1)),
+                      let visible = projection.viewport.clipped(row) else {
+                    // The bounded transcript remains readable with the rotor,
+                    // but offscreen text must not claim a visible touch target.
+                    lineElements[index].accessibilityFrameInContainerSpace = .zero
+                    continue
+                }
+                lineElements[index].accessibilityFrameInContainerSpace = CGRect(x: visible.x, y: visible.y,
+                    width: visible.width, height: visible.height).intersection(view.bounds)
+            }
+            return
+        }
+        // Frozen older output is a separate reading snapshot. Its bounded
+        // frames are not selection coordinates for the newer visual terminal.
         for (index, line) in snapshot.lines.enumerated() {
             lineElements[index].accessibilityFrameInContainerSpace = CGRect(x: 0,
                 y: CGFloat(line.viewportRows.lowerBound) * height, width: view.bounds.width,

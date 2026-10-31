@@ -1793,6 +1793,22 @@ final class TerminalSessionControllerTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(25))
         }
         let originalGrid = try XCTUnwrap(original.renderer.admittedFrame)
+        let originalViewportGeneration = observer.viewportModeGeneration
+        XCTAssertTrue(observer.canAdjustLocalViewport)
+        observer.setReadableViewport(true)
+        XCTAssertTrue(observer.prefersReadableViewport)
+        XCTAssertTrue(original.localViewportEnabled)
+        XCTAssertTrue(observer.ownsViewportPan)
+        XCTAssertNotEqual(observer.viewportModeGeneration, originalViewportGeneration)
+        XCTAssertFalse(scene.permitsCanvasNavigation, "A local pan cannot navigate to another machine or pane")
+        observer.revealViewportCursor()
+        XCTAssertTrue(original.input.isReadOnly, "Readable size does not acquire input authority")
+        let readableGeneration = observer.viewportModeGeneration
+        observer.setReadableViewport(false)
+        XCTAssertFalse(original.localViewportEnabled)
+        XCTAssertFalse(observer.ownsViewportPan)
+        XCTAssertNotEqual(observer.viewportModeGeneration, readableGeneration,
+                          "Returning to fit cannot revive a canvas action captured before local pan")
         await scene.activateKeyboard()
         original.requestKeyboard(true)
         original.input.insertText("must not type")
@@ -1824,6 +1840,13 @@ final class TerminalSessionControllerTests: XCTestCase {
         let received = try await hostFile(live.outPath, containing: marker)
         let sharedSize = "\(originalGrid.rows) \(originalGrid.columns)"
         XCTAssertEqual(received.split(separator: "\n").first.map(String.init), sharedSize)
+        interactive.setReadableViewport(true)
+        XCTAssertTrue(active.localViewportEnabled)
+        XCTAssertTrue(interactive.prefersReadableViewport)
+        XCTAssertFalse(scene.permitsCanvasNavigation)
+        let chosenSize = min(active.fontPointSize + 3, NativeTerminalView.fontSizes.upperBound)
+        active.setFontPointSize(chosenSize)
+        interactive.revealViewportCursor()
         for size in [CGSize(width: 390, height: 300), CGSize(width: 740, height: 360)] {
             active.frame = CGRect(origin: .zero, size: size)
             active.layoutIfNeeded()
@@ -1831,15 +1854,20 @@ final class TerminalSessionControllerTests: XCTestCase {
             await scene.activateKeyboard()
             try await Task.sleep(for: .milliseconds(250))
         }
+        interactive.revealViewportCursor()
         for _ in 0..<200 where active.renderer.pointerProjection == nil {
             try await Task.sleep(for: .milliseconds(25))
         }
         let projection = try XCTUnwrap(active.renderer.pointerProjection)
         XCTAssertEqual(projection.frame.rows, originalGrid.rows)
         XCTAssertEqual(projection.frame.columns, originalGrid.columns)
+        XCTAssertEqual(active.fontPointSize, chosenSize)
+        XCTAssertTrue(active.localViewportEnabled, "Rotation and keyboard layout retain the local readable mode")
+        interactive.setReadableViewport(false)
+        XCTAssertFalse(active.localViewportEnabled)
         try await type("stty size >> \(live.outPath); trap - WINCH; echo DONE-\(marker) >> \(live.outPath)", into: active)
         let afterLayout = try await hostFile(live.outPath, containing: "DONE-\(marker)")
-        XCTAssertFalse(afterLayout.contains("WINCH"), "keyboard and viewport changes must not resize the shared PTY")
+        XCTAssertFalse(afterLayout.contains("WINCH"), "local zoom, cursor reveal, fitting, keyboard and viewport changes must not resize the shared PTY")
         XCTAssertEqual(afterLayout.split(separator: "\n").filter { $0 == sharedSize }.count, 2)
         XCTAssertTrue(afterLayout.contains(marker), "Explicit shared-size input reaches the existing pane")
         active.removeFromSuperview()
