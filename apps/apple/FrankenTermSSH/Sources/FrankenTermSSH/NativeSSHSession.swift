@@ -325,6 +325,11 @@ public enum NativeSSHWriteAdmission: Sendable, Equatable { case accepted(Int), w
 /// output or a library packet is still pending; unavailable means this
 /// platform cannot prove a probe would not be left half sent.
 public enum NativeSSHKeepalive: Sendable, Equatable { case sent, deferred, unavailable }
+/// Negotiation is chosen from current trust for each distinct jump/destination
+/// peer. It never substitutes for certificate or pin verification after KEX.
+public enum NativeSSHHostKeyPolicy: Sendable, Equatable {
+    case rawKeys, certificates, certificatesAndRawKeys
+}
 public enum NativeSSHRemoteExit: Sendable, Equatable {
     case exitStatus(UInt32)
     case signal(String)
@@ -367,6 +372,11 @@ public actor NativeSSHSession {
     /// partial-success evidence. Method advertisements alone are insufficient.
     public nonisolated static var supportsPublicKeyInteractive: Bool {
         ftssh_supports_publickey_interactive() != 0
+    }
+    /// The complete supported host-certificate KEX profile is available only
+    /// with the source-verified, versioned backend extension.
+    public nonisolated static var supportsHostCertificates: Bool {
+        ftssh_supports_host_certificates() != 0
     }
     public nonisolated let transportID: UUID
     /// This session creates at most one shell channel. A replacement connection
@@ -514,6 +524,20 @@ public actor NativeSSHSession {
             try Task.checkCancellation()
             guard phase != .closed else { throw NativeSSHError.closed }
         }
+    }
+
+    /// Must run before any authentication or host-probe handshake. A new
+    /// forwarded child has its own fresh policy; its parent is unaffected.
+    public func setHostKeyPolicy(_ policy: NativeSSHHostKeyPolicy) throws {
+        try Task.checkCancellation()
+        guard phase == .fresh, operation == nil else { throw NativeSSHError.invalidInput }
+        let value: Int32
+        switch policy {
+        case .rawKeys: value = Int32(FTSSH_HOST_RAW)
+        case .certificates: value = Int32(FTSSH_HOST_CERTIFICATE)
+        case .certificatesAndRawKeys: value = Int32(FTSSH_HOST_MIXED)
+        }
+        try requireOK(ftssh_set_host_key_policy(native.pointer, value))
     }
 
     public func authenticate(using authority: any NativeSSHAuthentication, timeout: Duration = .seconds(60)) async throws -> NativeSSHPeer {

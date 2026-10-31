@@ -49,7 +49,7 @@ struct ftssh_session {
      * against a read-side WINDOW_ADJUST at another nesting level. */
     uint8_t *egress;
     size_t egress_head, egress_count, egress_flight, write_receipt;
-    int fd, phase, terminal_error, closing;
+    int fd, phase, terminal_error, closing, handshake_started;
     size_t limit, allocated, peak;
     char user[257], algorithm[65], offer_algorithm[65], signature_algorithm[65];
     uint8_t public_blob[FTSSH_PUBLIC_KEY_CAPACITY], challenge[FTSSH_CHALLENGE_CAPACITY], signature[1024];
@@ -444,6 +444,32 @@ static int result(ftssh_session *s, int rc, int failure) {
     return rc == 0 ? FTSSH_OK : fail(s, failure);
 }
 
+/* Certificate preference applies only to routes which import CA trust. Keep
+ * the raw default for existing callers and first-use fingerprint probes. */
+#define FTSSH_RAW_HOST_ALGORITHMS "ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,rsa-sha2-512,rsa-sha2-256"
+#define FTSSH_CERT_HOST_ALGORITHMS "ssh-ed25519-cert-v01@openssh.com,ecdsa-sha2-nistp256-cert-v01@openssh.com,ecdsa-sha2-nistp384-cert-v01@openssh.com,ecdsa-sha2-nistp521-cert-v01@openssh.com,rsa-sha2-512-cert-v01@openssh.com,rsa-sha2-256-cert-v01@openssh.com"
+
+int ftssh_supports_host_certificates(void) {
+#if defined(LIBSSH2_FRANKENTERM_HOST_CERTIFICATE_VERSION) && LIBSSH2_FRANKENTERM_HOST_CERTIFICATE_VERSION == 1
+    return libssh2_frankenterm_host_certificate_version() == 1;
+#else
+    return 0;
+#endif
+}
+int ftssh_set_host_key_policy(ftssh_session *s, int policy) {
+    int rc = check(s, HANDSHAKE); if(rc) return rc;
+    if(s->handshake_started) return FTSSH_STATE;
+    const char *allowed;
+    switch(policy) {
+    case FTSSH_HOST_RAW: allowed = FTSSH_RAW_HOST_ALGORITHMS; break;
+    case FTSSH_HOST_CERTIFICATE: allowed = FTSSH_CERT_HOST_ALGORITHMS; break;
+    case FTSSH_HOST_MIXED: allowed = FTSSH_CERT_HOST_ALGORITHMS "," FTSSH_RAW_HOST_ALGORITHMS; break;
+    default: return FTSSH_INVALID;
+    }
+    if(policy != FTSSH_HOST_RAW && !ftssh_supports_host_certificates()) return FTSSH_UNSUPPORTED;
+    return libssh2_session_method_pref(s->ssh, LIBSSH2_METHOD_HOSTKEY, allowed) ? FTSSH_UNSUPPORTED : FTSSH_OK;
+}
+
 int ftssh_create(int fd, size_t maximum, ftssh_session **out) {
     if(!out) return FTSSH_INVALID;
     *out = NULL;
@@ -481,7 +507,7 @@ int ftssh_create(int fd, size_t maximum, ftssh_session **out) {
     libssh2_session_callback_set2(s->ssh, LIBSSH2_CALLBACK_DISCONNECT, (libssh2_cb_generic *)socket_disconnected);
     const struct { int method; const char *allowed; } policies[] = {
         {LIBSSH2_METHOD_KEX, "curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521"},
-        {LIBSSH2_METHOD_HOSTKEY, "ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,rsa-sha2-512,rsa-sha2-256"},
+        {LIBSSH2_METHOD_HOSTKEY, FTSSH_RAW_HOST_ALGORITHMS},
         {LIBSSH2_METHOD_SIGN_ALGO, "rsa-sha2-512,rsa-sha2-256"},
         {LIBSSH2_METHOD_CRYPT_CS, "aes256-ctr,aes128-ctr"}, {LIBSSH2_METHOD_CRYPT_SC, "aes256-ctr,aes128-ctr"},
         {LIBSSH2_METHOD_MAC_CS, "hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com"},
@@ -499,6 +525,7 @@ int ftssh_create(int fd, size_t maximum, ftssh_session **out) {
 }
 int ftssh_handshake(ftssh_session *s) {
     int rc = check(s, HANDSHAKE); if(rc) return rc;
+    s->handshake_started = 1;
     rc = prepare_egress(s); if(rc) return rc;
     rc = libssh2_session_handshake(s->ssh, s->fd);
     /* libssh2 reports a transport lost mid-exchange as a key exchange failure;

@@ -65,6 +65,14 @@ typedef struct {
  * fails without consuming the descriptor.
  */
 int ftssh_create(int connected_fd, size_t max_allocated, ftssh_session **result);
+/* Select only from the audited modern algorithm profiles, before the first
+ * handshake call. RAW is the default. Certificate profiles require the linked
+ * versioned KEX extension. They prove subject-key possession only: the caller
+ * must validate the complete certificate under current endpoint policy before
+ * approve_host_key. A failed certificate never retries with a raw key. */
+enum { FTSSH_HOST_RAW = 0, FTSSH_HOST_CERTIFICATE = 1, FTSSH_HOST_MIXED = 2 };
+int ftssh_supports_host_certificates(void);
+int ftssh_set_host_key_policy(ftssh_session *session, int policy);
 /* FTSSH_NEGOTIATION: the server answered, and no exchange both accept was
  * agreed. A transport that failed or closed first, with no disconnect message
  * from the server, is FTSSH_IO. */
