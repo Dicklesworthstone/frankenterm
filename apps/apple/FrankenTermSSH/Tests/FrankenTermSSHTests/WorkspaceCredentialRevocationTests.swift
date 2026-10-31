@@ -124,6 +124,60 @@ final class WorkspaceCredentialRevocationTests: XCTestCase {
         }
     }
 
+    func testFailedDurableDenialBlocksAutomaticAndExplicitHopKeysBeforeAuthentication() async throws {
+        let persistence = RevocationFaultPersistence()
+        let fixture = try await SSHWorkspaceTestFixture.make(persistence: persistence) { workspace in
+            var routes = workspace["routes"] as! [[String: Any]], hop = routes[0]
+            hop["id"] = "jump"; hop["jump_routes"] = []
+            hop["authentication_methods"] = ["publickey", "password"]
+            routes[0]["credential_refs"] = []
+            routes[0]["authentication_methods"] = ["password"]
+            routes[0]["jump_routes"] = ["jump"]
+            workspace["routes"] = routes + [hop]
+        }
+        let manager = try manager(fixture), fingerprint = try SSHPublicIdentity(blob: fixture.publicBlob).fingerprint
+        await manager.resume()
+        persistence.failNextWrite(afterPublication: false)
+        let receipt = try await manager.revokeCredentialLocally(fingerprint: fingerprint, confirmedByUser: true)
+        XCTAssertFalse(receipt.durableDenialConfirmed)
+        let saved = try await fixture.store.locallyRevokedCredentialFingerprints()
+        XCTAssertTrue(saved.isEmpty, "Only the manager remembers the failed-write refusal")
+        await manager.suspend(); await manager.resume()
+        let states = try await fixture.store.loadWithLocalPolicy(support: WorkspaceNativeSSHAuthentication.routeSupport)
+        let local = try XCTUnwrap(states.first)
+        XCTAssertEqual(local.credentialIDs, ["key"], "The underlying key remains available after the failed write")
+        let options = try WorkspaceSSHRouteOptions(localState: local, machineID: "machine", routeID: "route",
+            support: WorkspaceNativeSSHAuthentication.routeSupport)
+        XCTAssertEqual(options.destination.authenticationChoices, [.password])
+        XCTAssertEqual(options.hops.first?.authenticationChoices, [.publicKey("key"), .password])
+        let keySelection = try options.select(authentication: .password, hopAuthentications: [.publicKey("key")])
+        let before = NativeSSHConnector.accounting()
+        for selection in [nil, keySelection] as [WorkspaceSSHConnectionSelection?] {
+            do {
+                _ = try await manager.connect(workspaceID: fixture.installed.id, expectedRevision: fixture.installed.revision,
+                    machineID: "machine", routeID: "route", authentication: .password, confirmedByUser: true,
+                    attachMux: false, selection: selection)
+                XCTFail("An unsaved local revocation revived the hop's private key")
+            } catch { XCTAssertEqual(error as? SSHAuthenticationError, .denied) }
+        }
+        // A deliberate keyless path does not offer the denied key. This
+        // fixture has no password prompter, so reaching unavailable proves
+        // method admission succeeded while still preventing any TCP traffic.
+        let keyless = try options.select(authentication: .password, hopAuthentications: [.password])
+        do {
+            _ = try await manager.connect(workspaceID: fixture.installed.id, expectedRevision: fixture.installed.revision,
+                machineID: "machine", routeID: "route", authentication: .password, confirmedByUser: true,
+                attachMux: false, selection: keyless)
+            XCTFail("A password connection proceeded without a prompter")
+        } catch { XCTAssertEqual(error as? SSHAuthenticationError, .unavailable) }
+        XCTAssertEqual(NativeSSHConnector.accounting().resolvingHosts, before.resolvingHosts)
+        XCTAssertEqual(NativeSSHConnector.accounting().connectingSockets, before.connectingSockets)
+        XCTAssertEqual(fixture.vault.counts.reads, 0)
+        XCTAssertEqual(fixture.vault.counts.signatures, 0)
+        let pending = await manager.pendingCount, connections = await manager.connections()
+        XCTAssertEqual(pending, 0); XCTAssertTrue(connections.isEmpty)
+    }
+
     func testRevocationRequiresExactInstalledIdentityAndFreshExplicitConfirmation() async throws {
         let fixture = try await SSHWorkspaceTestFixture.make(), manager = try manager(fixture)
         let fingerprint = try SSHPublicIdentity(blob: fixture.publicBlob).fingerprint

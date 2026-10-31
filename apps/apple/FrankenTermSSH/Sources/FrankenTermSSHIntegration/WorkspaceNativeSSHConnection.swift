@@ -76,9 +76,20 @@ public actor WorkspaceNativeSSHConnection {
                                liveness: WorkspaceSSHLiveness = .standard,
                                muxClientFactory: (@Sendable () throws -> any TerminalMuxClient)? = nil,
                                attachMux: Bool = true, muxAccessMode: TerminalMuxAccessMode = .interactive,
-                               requiresExistingMux: Bool = false) async throws -> WorkspaceNativeSSHConnection {
+                               requiresExistingMux: Bool = false,
+                               selection: WorkspaceSSHConnectionSelection? = nil) async throws -> WorkspaceNativeSSHConnection {
         guard confirmedByUser else { throw WorkspaceNetworkError.confirmationRequired }
         try Task.checkCancellation()
+        if let selection {
+            guard selection.workspaceID == workspaceID, selection.expectedRevision == expectedRevision,
+                  selection.machineID == machineID, selection.routeID == routeID,
+                  selection.authentication == authentication else {
+                throw WorkspaceSSHConnectionSelectionError.stale
+            }
+            guard selection.hops.count <= WorkspaceNativeSSHAuthentication.routeSupport.maximumJumpHops else {
+                throw WorkspaceSSHConnectionSelectionError.hopMismatch
+            }
+        }
         let foreground = try await broker.foregroundLease()
         if let journal {
             let records = try await journal.records()
@@ -87,7 +98,7 @@ public actor WorkspaceNativeSSHConnection {
             }) else { throw TerminalSessionJournalError.reviewRequired }
         }
         let lease = try networkActivity.beginConnection()
-        let entries = try await store.loadWithReadiness(support: WorkspaceNativeSSHAuthentication.routeSupport)
+        let entries = try await store.loadWithLocalPolicy(support: WorkspaceNativeSSHAuthentication.routeSupport)
         guard let entry = entries.first(where: { $0.workspace.id == workspaceID }),
               entry.workspace.revision == expectedRevision else { throw SSHAuthenticationError.stale }
         let document = try entry.workspace.document()
@@ -98,9 +109,14 @@ public actor WorkspaceNativeSSHConnection {
                 || (route.mode == "frankenterm_mux" && (route.attachPolicy ?? "existing_only") == "existing_only"),
               let ready = entry.routes.first(where: { $0.routeID == routeID }),
               ready.isLocallyReady,
-              WorkspaceSSHAuthenticationChoice.choices(for: route, usableCredentialIDs: ready.usableCredentialIDs)
-                .contains(authentication) else {
+              selection != nil || WorkspaceSSHAuthenticationChoice.choices(for: route,
+                usableCredentialIDs: ready.usableCredentialIDs).contains(authentication) else {
             throw SSHAuthenticationError.denied
+        }
+        if let selection {
+            let options = try WorkspaceSSHRouteOptions(localState: entry, machineID: machineID,
+                routeID: routeID, support: WorkspaceNativeSSHAuthentication.routeSupport)
+            try options.validate(selection)
         }
         // A mux route attaches to the machine's existing panes with the same
         // command the desktop runs. A plain SSH route tries the default mux
@@ -117,11 +133,19 @@ public actor WorkspaceNativeSSHConnection {
         guard !requiresExistingMux || muxCommand != nil else { throw TerminalMuxError.unavailable }
         let endpoint = try NativeSSHEndpoint(host: route.host, port: route.port)
         let hops = try document.orderedJumpRoutes(forRouteID: routeID)
-        let hopChoices = try hops.map { hop -> [WorkspaceSSHAuthenticationChoice] in
-            guard let readiness = entry.routes.first(where: { $0.routeID == hop.id }) else { throw SSHAuthenticationError.denied }
-            let choices = WorkspaceSSHAuthenticationChoice.choices(for: hop, usableCredentialIDs: readiness.usableCredentialIDs)
-            guard !choices.isEmpty else { throw SSHAuthenticationError.denied }
-            return choices
+        let hopChoices: [[WorkspaceSSHAuthenticationChoice]]
+        if let selection {
+            // The fresh review above validates every ordered occurrence. One
+            // selected method/key per peer means a refusal cannot choose a
+            // different identity or downgrade to another interactive method.
+            hopChoices = selection.hops.map { [$0.authentication] }
+        } else {
+            hopChoices = try hops.map { hop -> [WorkspaceSSHAuthenticationChoice] in
+                guard let readiness = entry.routes.first(where: { $0.routeID == hop.id }) else { throw SSHAuthenticationError.denied }
+                let choices = WorkspaceSSHAuthenticationChoice.choices(for: hop, usableCredentialIDs: readiness.usableCredentialIDs)
+                guard !choices.isEmpty else { throw SSHAuthenticationError.denied }
+                return choices
+            }
         }
         guard hops.count <= WorkspaceNativeSSHAuthentication.routeSupport.maximumJumpHops else {
             throw SSHAuthenticationError.denied
@@ -142,7 +166,7 @@ public actor WorkspaceNativeSSHConnection {
                 destination: endpoint, destinationRouteID: routeID, workspaceID: workspaceID,
                 revision: expectedRevision, store: store, broker: broker, foreground: foreground,
                 passwordPrompter: passwordPrompter, keyboardInteractivePrompter: keyboardInteractivePrompter, lease: lease,
-                connectionTimeout: connectionTimeout, authenticationTimeout: authenticationTimeout)
+                connectionTimeout: connectionTimeout, authenticationTimeout: authenticationTimeout, selection: selection)
             session = path.session; promptedHop = path.usedPrompt
         } else {
             session = try await NativeSSHConnector.connect(to: endpoint, timeout: connectionTimeout, networkLifetime: lease)
@@ -193,13 +217,21 @@ public actor WorkspaceNativeSSHConnection {
         passwordPrompter: (any WorkspaceSSHPasswordPrompting)?,
         keyboardInteractivePrompter: (any WorkspaceSSHKeyboardInteractivePrompting)?,
         lease: WorkspaceNetworkLease, connectionTimeout: Duration, authenticationTimeout: Duration,
-        hostKeyProbe: WorkspaceHostKeyProbe? = nil)
+        hostKeyProbe: WorkspaceHostKeyProbe? = nil, selection: WorkspaceSSHConnectionSelection? = nil)
         async throws -> (session: NativeSSHSession, usedPrompt: Bool) {
         var hadCredentialRefusal = false
         var usedPrompt = false
         do {
             guard (1...3).contains(hops.count), authenticationChoices.count == hops.count else {
                 throw SSHAuthenticationError.denied
+            }
+            if let selection {
+                guard selection.workspaceID == workspaceID, selection.expectedRevision == revision,
+                      selection.routeID == destinationRouteID, hostKeyProbe == nil,
+                      selection.hops.map(\.routeID) == hops.map(\.id),
+                      authenticationChoices == selection.hops.map({ [$0.authentication] }) else {
+                    throw WorkspaceSSHConnectionSelectionError.stale
+                }
             }
             // Validate every candidate list before any network operation.
             for index in hops.indices {
@@ -222,7 +254,7 @@ public actor WorkspaceNativeSSHConnection {
                         try await broker.validateForeground(foreground)
                         // Revalidate the complete destination graph before each
                         // login and after any chain reconstruction.
-                        let current = try await store.loadWithReadiness(support: WorkspaceNativeSSHAuthentication.routeSupport)
+                        let current = try await store.loadWithLocalPolicy(support: WorkspaceNativeSSHAuthentication.routeSupport)
                         if let hostKeyProbe {
                             _ = try await store.validateHostKeyVerification(hostKeyProbe,
                                 support: WorkspaceNativeSSHAuthentication.routeSupport)
@@ -231,10 +263,22 @@ public actor WorkspaceNativeSSHConnection {
                         }
                         guard let entry = current.first(where: { $0.workspace.id == workspaceID }),
                               entry.workspace.revision == revision,
-                              hostKeyProbe != nil || entry.routes.first(where: { $0.routeID == destinationRouteID })?.isLocallyReady == true,
-                              let readiness = entry.routes.first(where: { $0.routeID == hop.id }),
-                              WorkspaceSSHAuthenticationChoice.choices(for: hop, usableCredentialIDs: readiness.usableCredentialIDs)
-                                .contains(attempt.selection.authentication) else { throw SSHAuthenticationError.stale }
+                              hostKeyProbe != nil || entry.routes.first(where: { $0.routeID == destinationRouteID })?.isLocallyReady == true else {
+                            throw SSHAuthenticationError.stale
+                        }
+                        if let selection {
+                            let options = try WorkspaceSSHRouteOptions(localState: entry, machineID: selection.machineID,
+                                routeID: destinationRouteID, support: WorkspaceNativeSSHAuthentication.routeSupport)
+                            try options.validate(selection)
+                            guard selection.hops[index].routeID == hop.id,
+                                  selection.hops[index].authentication == attempt.selection.authentication else {
+                                throw WorkspaceSSHConnectionSelectionError.stale
+                            }
+                        } else {
+                            guard let readiness = entry.routes.first(where: { $0.routeID == hop.id }),
+                                  WorkspaceSSHAuthenticationChoice.choices(for: hop, usableCredentialIDs: readiness.usableCredentialIDs)
+                                    .contains(attempt.selection.authentication) else { throw SSHAuthenticationError.stale }
+                        }
                         try await broker.validateForeground(foreground)
                         try Task.checkCancellation()
                         let endpoint = try NativeSSHEndpoint(host: hop.host, port: hop.port)

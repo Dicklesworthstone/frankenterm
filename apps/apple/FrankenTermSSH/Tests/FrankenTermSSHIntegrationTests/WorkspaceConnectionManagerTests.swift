@@ -164,6 +164,89 @@ final class WorkspaceConnectionManagerTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(fixture.networkActivity.accounting().connections, 0)
     }
 
+    func testExplicitSelectionCannotBeReboundBeforeAnyStoreOrNetworkAccess() async throws {
+        let fixture = try fixture(), workspaceID = UUID(), revision = UUID()
+        await fixture.manager.resume()
+        let variants: [(UUID, UUID, String, String, WorkspaceSSHAuthenticationChoice)] = [
+            (UUID(), revision, "machine", "route", .password),
+            (workspaceID, UUID(), "machine", "route", .password),
+            (workspaceID, revision, "other-machine", "route", .password),
+            (workspaceID, revision, "machine", "other-route", .password),
+            (workspaceID, revision, "machine", "route", .keyboardInteractive)]
+        for (workspace, selectedRevision, machine, route, authentication) in variants {
+            let selection = WorkspaceSSHConnectionSelection(workspaceID: workspace, expectedRevision: selectedRevision,
+                machineID: machine, routeID: route, authentication: authentication)
+            do {
+                _ = try await fixture.manager.connect(workspaceID: workspaceID, expectedRevision: revision,
+                    machineID: "machine", routeID: "route", authentication: .password,
+                    confirmedByUser: true, selection: selection)
+                XCTFail("Mismatched explicit selection was admitted")
+            } catch { XCTAssertEqual(error as? WorkspaceSSHConnectionSelectionError, .stale) }
+        }
+        XCTAssertEqual(fixture.storePersistence.accesses, 0)
+        XCTAssertEqual(fixture.sessionPersistence.accesses, 0)
+        XCTAssertEqual(fixture.networkActivity.accounting().connections, 0)
+        let pending = await fixture.manager.pendingCount, connections = await fixture.manager.connections()
+        XCTAssertEqual(pending, 0); XCTAssertTrue(connections.isEmpty)
+    }
+
+    func testExplicitSelectionCannotExpandTheQualifiedHopBudget() async throws {
+        let fixture = try fixture(), workspaceID = UUID(), revision = UUID()
+        await fixture.manager.resume()
+        let selection = WorkspaceSSHConnectionSelection(workspaceID: workspaceID, expectedRevision: revision,
+            machineID: "machine", routeID: "route", authentication: .password,
+            hops: (0..<4).map { .init(routeID: "hop-\($0)", authentication: .password) })
+        do {
+            _ = try await fixture.manager.connect(workspaceID: workspaceID, expectedRevision: revision,
+                machineID: "machine", routeID: "route", authentication: .password,
+                confirmedByUser: true, selection: selection)
+            XCTFail("Explicit selection expanded the native hop budget")
+        } catch { XCTAssertEqual(error as? WorkspaceSSHConnectionSelectionError, .hopMismatch) }
+        XCTAssertEqual(fixture.storePersistence.accesses, 0)
+        XCTAssertEqual(fixture.sessionPersistence.accesses, 0)
+        XCTAssertEqual(fixture.networkActivity.accounting().connections, 0)
+    }
+
+    func testExplicitSelectionIsNotConnectConsentOrForegroundAuthority() async throws {
+        let fixture = try fixture(), workspaceID = UUID(), revision = UUID()
+        let selection = WorkspaceSSHConnectionSelection(workspaceID: workspaceID, expectedRevision: revision,
+            machineID: "machine", routeID: "route", authentication: .password)
+        do {
+            _ = try await fixture.manager.connect(workspaceID: workspaceID, expectedRevision: revision,
+                machineID: "machine", routeID: "route", authentication: .password,
+                confirmedByUser: true, selection: selection)
+            XCTFail("Explicit selection bypassed foreground admission")
+        } catch { XCTAssertEqual(error as? WorkspaceSSHConnectionError, .offline) }
+        await fixture.manager.resume()
+        do {
+            _ = try await fixture.manager.connect(workspaceID: workspaceID, expectedRevision: revision,
+                machineID: "machine", routeID: "route", authentication: .password,
+                confirmedByUser: false, selection: selection)
+            XCTFail("Explicit selection bypassed Connect confirmation")
+        } catch { XCTAssertEqual(error as? WorkspaceNetworkError, .confirmationRequired) }
+        XCTAssertEqual(fixture.storePersistence.accesses, 0)
+        XCTAssertEqual(fixture.sessionPersistence.accesses, 0)
+        XCTAssertEqual(fixture.networkActivity.accounting().connections, 0)
+    }
+
+    func testMatchingExplicitSelectionStillRequiresAFreshInstalledRevision() async throws {
+        let fixture = try fixture(), workspaceID = UUID(), revision = UUID()
+        await fixture.manager.resume()
+        let selection = WorkspaceSSHConnectionSelection(workspaceID: workspaceID, expectedRevision: revision,
+            machineID: "machine", routeID: "route", authentication: .password)
+        do {
+            _ = try await fixture.manager.connect(workspaceID: workspaceID, expectedRevision: revision,
+                machineID: "machine", routeID: "route", authentication: .password,
+                confirmedByUser: true, selection: selection)
+            XCTFail("Selection metadata substituted for an installed workspace")
+        } catch { XCTAssertEqual(error as? SSHAuthenticationError, .stale) }
+        XCTAssertGreaterThan(fixture.storePersistence.accesses, 0)
+        XCTAssertEqual(fixture.sessionPersistence.accesses, 0)
+        XCTAssertEqual(fixture.networkActivity.accounting().connections, 0)
+        let pending = await fixture.manager.pendingCount
+        XCTAssertEqual(pending, 0)
+    }
+
     func testRetiredAttemptCannotPublishItsOriginalFallbackEligibleError() async throws {
         for action in ["cancel", "invalidate", "suspend"] {
             let failure = ConnectionManagerFailureGate(), fixture = try fixture(failure: failure)
