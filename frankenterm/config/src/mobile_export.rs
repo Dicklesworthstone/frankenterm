@@ -6511,7 +6511,7 @@ ssh = "right"
         );
         let export = trust_export(&sources);
         let trust = route_trust(&export, "r.left.ssh");
-        assert!(trust["required_capabilities"].is_null(), "{trust}");
+        assert!(trust["required_capabilities"].is_null(), "{}", trust);
         assert_eq!(trust["pins"].as_array().unwrap().len(), 1);
         // A wildcard may match a file as well as directories; a file cannot
         // become an intermediate component or poison otherwise valid matches.
