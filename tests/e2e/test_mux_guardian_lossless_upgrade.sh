@@ -43,6 +43,12 @@
 # seconds before the rollback; it must publish a recovery generation in
 # that time, as a successor whose restore pinned the guardian's catalog
 # once never did.
+#
+# E2E_INPUT_LINES=N (default 40; 0 skips it) types N lines into pane 0 through
+# the mux before the upgrade, and one more after the upgrade and after the
+# rollback. A reader in the pane records what reached its PTY: every line must
+# arrive exactly once and in order, and recovery must go on publishing, as one
+# input that met a busy guardian once stopped its pane's captures for good.
 set -uo pipefail
 # The guardian refuses group- or world-writable directories on its paths
 # (a umask of 002 on some hosts); keep any stricter umask.
@@ -97,6 +103,13 @@ BURST=""
 # are per guardian, so one pane alone never meets them.
 PANES=${E2E_PANES:-1}
 IMAGES=${E2E_IMAGES:-0}
+INPUT_LINES=${E2E_INPUT_LINES:-40}
+RECEIVED=$S/input-received
+# Pane 0 reads what is typed at it without echoing it: the history checks
+# compare its rows exactly.
+READER=""
+[ "$INPUT_LINES" -gt 0 ] \
+  && READER="stty -echo; exec 3<&0; ( while IFS= read -r l <&3; do echo \$l >> $RECEIVED; done ) & "
 # A 16x16 PNG; and 2x2 RGBA pixels, for Kitty.
 PNG=iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAADpklEQVR42gXBC0AMBhzA4b8ep8fV5Vacyq10dFKkpRqXHjglIstql0iRmpbHNIWSpJgmLCF5tlqNZZEizwljWVbLGGtjNmOMMcZs9tv3iYjgYC64KQRfayFUKUxWCUlqYb6TkK8R1rsIu7TCZ+7CKZ3wtadww0v4w0eQnv2EPm498PQwI3CgOeMGWRDnbcmcoQoW+/WkeLgVm4Os+XikDc2jbPkiTMmVMXb8Os6eZ+NViP0IQRtsxpBQC0aNVhBttGJ6pA2ZE5TkTbJn3RQHdkxVUx/vyImE3rRP1/DDTGcezHLlvzlaxClOGGAyZ3iigrFJ1kxNUTI7VUVWuppVGU5smqeheqELh7K0nM125/JSHb/kefJ0hReWhT6I6yLBe7EFhiVWTMhVMi3fgYyVjiwr0lCyxpXKEjf2leo4tlHPxU3efL/Fl/vb/Pl3RxDK3QbEY4PwWpklozfb8EaFipTtjry7qy8rq7R8WONBVZ2eg/t8aN3vxzcHArl1yMCfh8MwP2rklRNRiFe9MKJBwfhGJaZmNW+3aFhyXMv7p3RUtHrxyTlfWi4E8OVFA9cuhfNbZwQvLkdjczUW5+smZFibENbek5gOe2Z2ObHgiisrrnmwoduL3TeG0XAriM9vh9Bx18jN+xN59DCWHo8T6PU0Gffn6UjQHSHinhXxDxxIe6Qh+4kbq5/p2fLCl9qXQRyWUM6bR3BVMZk71vE8VyZhpUpDo56P3ikbCbEUJllZM8NWzTx7F5b30lHq6MPOPgHsdw7hZL8ILrnF8KOHiYcDU2BQBirvLF4dmsdQv2LE2F94c4ANqXpH3huspWiInvJhftT4G2gKNHJuxGS+DTZxO3QWf43ORGHMpndkAQMnlBAwqRyZGCIkhtvyztje5Ea480GUN9ujA/k0JpzjsRP5Ki6eblMKvydm8jIpB7uUQvqlluKTXkFwRjUSO02YNUPJomQNhbN1lKX58tFcA42ZEZxZEEvXoiR+XpzBkyXZWOQW4pi/Ht3KSvyLahmzphFJyBHmLrNj6XJn1hZ4sm2VP3tXh3F0bTRt6xK4viGNe2VZ/LO5ANuKUly2VzJ4Vx0jq5qIqmlFksuFhVvtKah0ZeNOL/bsCeJAtZHTtbF07k3mp/r5PG7Iw6yxBHVzBf1bavE73kT4qTNMae1E0g8KOU0q1hzRsvWYD3UnDRw5HcWFsya+O5/O3bZs/m4vxrqjnL5d1Qy60sjr11qJ7O7krRs3+R/oey7fcMgA/AAAAABJRU5ErkJggg==
 RGBA=AAECAwQFBgcICQoLDA0ODw==
@@ -131,7 +144,7 @@ PROTECTED=${E2E_PROTECTED:-0}
 prog() {  # <pane index> -> its shell program
   local tag="" burst="" shown=""
   [ "$1" -gt 0 ] && tag="p$1 "
-  [ "$1" = 0 ] && burst=$BURST
+  [ "$1" = 0 ] && burst=$READER$BURST
   [ "$IMAGES" = 1 ] && [ $(( $1 % 2 )) = 1 ] && shown=$(images | tr -d '\n')
   [ "$PROTECTED" = 1 ] && [ "$1" -ge 2 ] && [ $(( $1 % 2 )) = 0 ] \
     && shown="printf '\\033[1\"qprotected\\033[0\"q\\n'; "
@@ -155,7 +168,7 @@ if [ "$PANES" -gt 1 ]; then
   } > "$FTG_MUX_TOML"
 else
   cat > "$XDG_CONFIG_HOME/frankenterm/mux-server-e2e.toml" <<TOML
-default_prog = ["/bin/bash", "-c", "${BURST}i=0; while :; do echo \\"$MARK tick \$i\\"; i=\$((i+1)); sleep 1; done"]
+default_prog = ["/bin/bash", "-c", "${READER}${BURST}i=0; while :; do echo \\"$MARK tick \$i\\"; i=\$((i+1)); sleep 1; done"]
 ${E2E_MUX_TOML_EXTRA:-}
 
 [[unix_domains]]
@@ -251,6 +264,34 @@ check_image_restores() {
     || fail "$1 restored images from $restored checkpoints holding $SHOWN images for $(( PANES / 2 )) image panes"
 }
 
+# A private workspace, so a send needs no watcher, and no prompt requirement,
+# as pane 0 runs a loop rather than a shell.
+mkdir -m 700 "$S/ft-ws"
+{
+  printf '[storage]\ndb_path = "ft.db"\n\n[vendored]\nmux_socket_path = "%s"\n\n' "$RUN/mux.sock"
+  printf '[safety]\nrate_limit_per_pane = 1000000\nrate_limit_global = 1000000\nrequire_prompt_active = false\n'
+} > "$S/ft-ws/ft.toml"
+chmod 600 "$S/ft-ws/ft.toml"
+ft_send() {  # <family dir> <line>; true when the mux applied it
+  local reply
+  reply=$(env -u RUST_LOG WEZTERM_UNIX_SOCKET="$RUN/mux.sock" FRANKENTERM_UNIX_SOCKET="$RUN/mux.sock" \
+    FT_WORKSPACE="$S/ft-ws" FT_WEZTERM_CLI="$S/external-cli-disabled" FT_METRICS_ENABLED=false \
+    "$1/ft" -c "$S/ft-ws/ft.toml" send 0 "$2" --no-paste 2>>"$S/ft-send.err")
+  case $reply in
+    *'"status": "allowed"'*) return 0 ;;
+    *) echo "$reply" | tee -a "$S/ft-send.refused" | grep -m1 '"error":' | cut -c1-200; return 1 ;;
+  esac
+}
+# <label> <family dir>: one more line reaches pane 0 exactly once, and last.
+check_one_input() {
+  ft_send "$2" "e2e-input-$1" || fail "input after $1 was refused"
+  sleep 1
+  [ "$(tail -1 "$RECEIVED" 2>/dev/null)" = "e2e-input-$1" ] \
+    && [ "$(grep -c "^e2e-input-$1\$" "$RECEIVED")" = 1 ] \
+    && pass "input reached pane 0 once after $1" \
+    || fail "input after $1 did not reach pane 0 exactly once"
+}
+
 step "install $(basename "$OLD")"
 if "$TOOL" install --family "$OLD" --manager direct; then pass "install"; else fail "install"; fi
 sleep 4
@@ -296,6 +337,33 @@ if [ "$SOAK" -gt 0 ]; then
     || fail "journal segments: guardian $RSEG, broker $BSEG for $PANES pane(s)"
 fi
 
+if [ "$INPUT_LINES" -gt 0 ]; then
+  step "input: $INPUT_LINES lines into pane 0"
+  LOG=$STATE/logs/mux-server.log
+  REFUSED=0
+  for k in $(seq "$INPUT_LINES"); do
+    ft_send "$OLD" "e2e-input-$k" || REFUSED=$((REFUSED + 1))
+  done
+  sleep 2
+  EXPECTED=$(for k in $(seq "$INPUT_LINES"); do echo "e2e-input-$k"; done)
+  ARRIVED=$(grep -c . "$RECEIVED")
+  [ "$REFUSED" = 0 ] && pass "the mux applied all $INPUT_LINES lines" \
+    || fail "the mux refused $REFUSED of $INPUT_LINES lines"
+  [ "$(cat "$RECEIVED")" = "$EXPECTED" ] \
+    && pass "pane 0 received all $INPUT_LINES lines once each, in order" \
+    || fail "pane 0 received $ARRIVED lines, not the $INPUT_LINES sent, once each and in order"
+  # A capture of 60 panes takes tens of seconds, so allow several.
+  BEFORE=$(grep -c "published local generation" "$LOG")
+  AFTER=$BEFORE
+  for k in $(seq 150); do
+    [ "$AFTER" -gt "$BEFORE" ] && break
+    sleep 1
+    AFTER=$(grep -c "published local generation" "$LOG")
+  done
+  [ "$AFTER" -gt "$BEFORE" ] && pass "recovery kept publishing after the input" \
+    || fail "recovery published nothing in the 150 s after the input"
+fi
+
 step "upgrade -> $(basename "$NEW")"
 UPGRADE_FLAGS=()
 # One available build: still prove a real lossless restart onto the same family.
@@ -313,6 +381,7 @@ PID2=$(child_pid)
 check_history upgrade "$NEW"
 check_other_panes upgrade "$NEW"
 check_image_restores upgrade "$RESTORES"
+[ "$INPUT_LINES" -gt 0 ] && check_one_input upgrade "$NEW"
 
 if [ "$POST_SOAK" -gt 0 ]; then
   # The successor must go on publishing recovery generations: a catalog
@@ -337,6 +406,7 @@ PID3=$(child_pid)
 check_history rollback "$OLD"
 check_other_panes rollback "$OLD"
 check_image_restores rollback "$RESTORES"
+[ "$INPUT_LINES" -gt 0 ] && check_one_input rollback "$OLD"
 
 step "power loss + reinstall"
 for f in "$STATE"/run.*.pid; do kill -KILL "$(cat "$f")" 2>/dev/null; done
