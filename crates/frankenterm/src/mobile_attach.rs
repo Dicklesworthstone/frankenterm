@@ -26,7 +26,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub(super) fn run(explicit_socket: Option<&Path>) -> anyhow::Result<()> {
+pub fn run(explicit_socket: Option<&Path>) -> anyhow::Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     ensure!(
