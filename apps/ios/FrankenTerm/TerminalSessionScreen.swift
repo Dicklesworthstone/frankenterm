@@ -392,7 +392,8 @@ final class MobileConnections {
         if hostKeyScope != nil { applyAuthenticationScope(nil) }
     }
 
-    func checkHostKey(workspaceID: UUID, revision: UUID, routeID: String) async throws -> WorkspaceRouteProbe.Result {
+    func checkHostKey(workspaceID: UUID, revision: UUID, routeID: String,
+                      replacing: WorkspaceHostKeyPin? = nil) async throws -> WorkspaceRouteProbe.Result {
         let scope = MobileSSHPasswordPrompt.Scope(workspaceID: workspaceID, revision: revision,
             machineID: "host-key-verification", destinationRouteIDs: [routeID], hostKeyVerification: true)
         return try await withHostKeyVerificationScope(scope) { [self] in
@@ -403,7 +404,8 @@ final class MobileConnections {
             try Task.checkCancellation()
             return await WorkspaceRouteProbe.run(workspaceID: workspaceID, expectedRevision: revision,
                 routeID: routeID, confirmedByUser: true, store: store, broker: broker,
-                passwordPrompter: passwordPrompt, keyboardInteractivePrompter: keyboardInteractivePrompt)
+                passwordPrompter: passwordPrompt, keyboardInteractivePrompter: keyboardInteractivePrompt,
+                replacing: replacing)
         }
     }
 
