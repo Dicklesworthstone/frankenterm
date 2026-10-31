@@ -50,6 +50,29 @@ struct LocalHostRevocationReview: Identifiable {
     fileprivate let epoch: UUID
 }
 
+/// The selected credential and foreground visit remain fixed while Files is
+/// open. A late picker callback cannot renew another key or workspace revision.
+struct LocalCertificateFileReview: Identifiable {
+    let id = UUID()
+    let workspaceID: UUID, revision: UUID
+    let credentialID: String
+    fileprivate let epoch: UUID
+}
+
+struct LocalCertificateRenewalReview: Identifiable {
+    let core: WorkspaceCertificateRenewalReview
+    fileprivate let epoch: UUID
+    var id: UUID { core.id }
+}
+
+private enum CertificateValidityLabel {
+    static func date(_ seconds: UInt64) -> String {
+        if seconds == UInt64.max { return "No expiry" }
+        guard seconds <= 253_402_300_799 else { return "Unix time \(seconds)" }
+        return Date(timeIntervalSince1970: TimeInterval(seconds)).formatted(date: .abbreviated, time: .shortened)
+    }
+}
+
 /// A deliberate check of one current destination through the listed, already
 /// trusted accounts. It cannot be replayed after a source or lifecycle change.
 struct LocalHostKeyCheckReview: Identifiable {
@@ -57,6 +80,7 @@ struct LocalHostKeyCheckReview: Identifiable {
     let workspaceID: UUID, revision: UUID
     let routeID: String, destination: String
     let jumpAccounts: [String]
+    let replacingPin: WorkspaceHostKeyPin?
     fileprivate let epoch: UUID
 
     static func endpoint(host: String, port: UInt16, user: String? = nil) -> String {
@@ -270,6 +294,9 @@ final class MobileWorkspaceModel {
     var enrollmentResults: LocalEnrollmentResults?
     @ObservationIgnored private var enrollmentFileReviewID: UUID?
     private var enrollmentResultsOperation: (id: UUID, task: Task<Void, Never>)?
+    var certificateRenewalReview: LocalCertificateRenewalReview?
+    @ObservationIgnored private var certificateFileReviewID: UUID?
+    private var certificateRenewalOperation: (id: UUID, task: Task<Void, Never>)?
     @ObservationIgnored private var keysPresentationWorkspaceID: UUID?
     @ObservationIgnored private var pendingDocumentURL: URL?
     private var documentRetryURL: URL?
@@ -300,7 +327,7 @@ final class MobileWorkspaceModel {
     /// Import settlement retains its own reservation across scene transitions
     /// and any older callback that releases the shared operation flag.
     var busy: Bool {
-        get { operationBusy || credentialImportOperation != nil || deviceKeyOperation != nil || hostKeyOperation != nil || enrollmentResultsOperation != nil || documentInspection != nil || isReadingRecording || connectionPreferenceBusy || connectionApproval != nil }
+        get { operationBusy || credentialImportOperation != nil || deviceKeyOperation != nil || hostKeyOperation != nil || enrollmentResultsOperation != nil || certificateRenewalOperation != nil || documentInspection != nil || isReadingRecording || connectionPreferenceBusy || connectionApproval != nil }
         set { operationBusy = newValue }
     }
     private(set) var isReadingRecording = false
@@ -559,6 +586,7 @@ final class MobileWorkspaceModel {
     func liveScene(workspaceID: UUID, revision: UUID, expectedTarget: TerminalSessionTarget? = nil,
                    make: () throws -> WorkspaceTerminalScene) throws -> WorkspaceTerminalScene {
         guard keyRevocation == nil, credentialImportOperation == nil, deviceKeyOperation == nil, hostKeyOperation == nil,
+              certificateRenewalOperation == nil,
               !showRestore, !requiresConnectionApproval(workspaceID),
               !deviceKeyConnectionHolds.contains(workspaceID) else { throw WorkspaceSSHConnectionError.busy }
         guard workspaces.contains(where: { $0.id == workspaceID && $0.revision == revision }) else {
@@ -859,6 +887,7 @@ final class MobileWorkspaceModel {
         pendingRecording?.cancel()
         let pendingDocument = documentInspection?.task
         let pendingEnrollment = enrollmentResultsOperation?.task
+        let pendingCertificate = certificateRenewalOperation?.task
         guard let restore else { return }
         let ticket = epoch, visible = active && showRestore, prior = lifecycle
         let pendingApproval = connectionApproval?.task
@@ -876,6 +905,7 @@ final class MobileWorkspaceModel {
             await pendingRecording?.value
             await pendingDocument?.value
             await pendingEnrollment?.value
+            await pendingCertificate?.value
             let next: OfflineRestoreStatus
             do {
                 if visible {
@@ -1469,6 +1499,7 @@ final class MobileWorkspaceModel {
         guard keysPresentationWorkspaceID == workspaceID else { return }
         keysPresentationWorkspaceID = nil
         enrollmentFileReviewID = nil
+        retireCertificateRenewal()
         if let report = enrollmentResults, report.presentingWorkspaceID == workspaceID {
             if report.isApplying { report.presentingWorkspaceID = nil }
             else { cancelEnrollmentResults(report.id) }
@@ -1486,6 +1517,145 @@ final class MobileWorkspaceModel {
 
     func cancelEnrollmentFile(_ review: LocalEnrollmentFileReview) {
         if enrollmentFileReviewID == review.id { enrollmentFileReviewID = nil }
+    }
+
+    func reviewCertificateFile(workspaceID: UUID, credentialID: String) -> LocalCertificateFileReview? {
+        guard active, !busy, !showRestore, credentialImport == nil, store != nil,
+              keysPresentationWorkspaceID == workspaceID,
+              let saved = workspaces.first(where: { $0.id == workspaceID }),
+              let document = try? saved.document(),
+              let credential = document.credentials.first(where: { $0.id == credentialID }),
+              credential.userCertificate != nil,
+              !locallyRevokedFingerprints.contains(credential.fingerprint),
+              !unconfirmedCredentialRevocations.contains(credential.fingerprint) else { return nil }
+        let review = LocalCertificateFileReview(workspaceID: workspaceID, revision: saved.revision,
+            credentialID: credentialID, epoch: epoch)
+        certificateFileReviewID = review.id; certificateRenewalReview = nil
+        return review
+    }
+
+    func cancelCertificateFile(_ review: LocalCertificateFileReview) {
+        if certificateFileReviewID == review.id { certificateFileReviewID = nil }
+    }
+
+    func importCertificateFile(_ url: URL, reviewed: LocalCertificateFileReview) {
+        guard active, !busy, !showRestore, credentialImport == nil, let store,
+              certificateFileReviewID == reviewed.id, epoch == reviewed.epoch,
+              keysPresentationWorkspaceID == reviewed.workspaceID,
+              workspaces.first(where: { $0.id == reviewed.workspaceID })?.revision == reviewed.revision else {
+            credentialMessage = "The key-settings visit changed. Choose the renewed certificate again."
+            return
+        }
+        certificateFileReviewID = nil; credentialMessage = nil
+        let operation = UUID()
+        let task = Task { [self] in
+            defer {
+                if certificateRenewalOperation?.id == operation { certificateRenewalOperation = nil }
+            }
+            do {
+                let bytes = try await Self.readSelectedDocument(url, limit: WorkspaceCertificateRenewal.maximumFileBytes)
+                try Task.checkCancellation()
+                guard active, !showRestore, epoch == reviewed.epoch,
+                      certificateRenewalOperation?.id == operation,
+                      keysPresentationWorkspaceID == reviewed.workspaceID else { throw WorkspaceStoreError.staleReview }
+                let core = try await store.reviewCertificateRenewal(workspaceID: reviewed.workspaceID,
+                    expectedRevision: reviewed.revision, credentialID: reviewed.credentialID, certificateFile: bytes)
+                try Task.checkCancellation()
+                guard active, !showRestore, epoch == reviewed.epoch,
+                      certificateRenewalOperation?.id == operation,
+                      keysPresentationWorkspaceID == reviewed.workspaceID,
+                      workspaces.first(where: { $0.id == reviewed.workspaceID })?.revision == reviewed.revision else {
+                    throw WorkspaceStoreError.staleReview
+                }
+                certificateRenewalReview = .init(core: core, epoch: epoch)
+            } catch {
+                guard !Task.isCancelled, active, epoch == reviewed.epoch,
+                      keysPresentationWorkspaceID == reviewed.workspaceID else { return }
+                credentialMessage = "The certificate could not be renewed. Choose the public OpenSSH certificate issued for this existing key. \(error.localizedDescription)"
+            }
+        }
+        certificateRenewalOperation = (operation, task)
+    }
+
+    func certificateRenewalIsCurrent(_ review: LocalCertificateRenewalReview) -> Bool {
+        guard active, !showRestore, epoch == review.epoch, certificateRenewalReview?.id == review.id,
+              keysPresentationWorkspaceID == review.core.workspaceID,
+              let saved = workspaces.first(where: { $0.id == review.core.workspaceID }),
+              saved.revision == review.core.expectedRevision,
+              let document = try? saved.document(),
+              let credential = document.credentials.first(where: { $0.id == review.core.credentialID }),
+              credential.userCertificate == review.core.currentCertificate,
+              !locallyRevokedFingerprints.contains(credential.fingerprint),
+              !unconfirmedCredentialRevocations.contains(credential.fingerprint) else { return false }
+        return true
+    }
+
+    func cancelCertificateRenewal(_ id: UUID) {
+        guard certificateRenewalReview?.id == id, certificateRenewalOperation == nil else { return }
+        certificateRenewalReview = nil
+    }
+
+    private func retireCertificateRenewal() {
+        certificateFileReviewID = nil; certificateRenewalReview = nil
+        // The exact task retains its reservation until the file read or
+        // catalog publication and reconciliation have joined.
+        certificateRenewalOperation?.task.cancel()
+    }
+
+    func acceptCertificateRenewal(_ review: LocalCertificateRenewalReview) {
+        guard !busy, credentialImport == nil, certificateRenewalIsCurrent(review), let store else { return }
+        let core = review.core, operation = UUID()
+        certificateRenewalReview = nil; credentialMessage = nil
+        workspaceRefreshEpoch = UUID(); workspaceRefresh?.cancel()
+        deviceKeyConnectionHolds.insert(core.workspaceID)
+        if returning?.workspaceID == core.workspaceID { returning = nil }
+        if let data = UserDefaults.standard.data(forKey: Self.liveScreenKey),
+           let screen = try? JSONDecoder().decode(LiveScreen.self, from: data), screen.workspaceID == core.workspaceID {
+            UserDefaults.standard.removeObject(forKey: Self.liveScreenKey)
+        }
+        let scene = liveScenes[core.workspaceID]
+        scene?.requestClose()
+        let task = Task { [self] in
+            let result: Result<Void, Error>
+            do {
+                if let scene {
+                    await scene.close()
+                    if liveScenes[core.workspaceID] === scene { liveScenes[core.workspaceID] = nil }
+                }
+                await connections?.manager.invalidate(workspaceID: core.workspaceID)
+                try Task.checkCancellation()
+                guard active, !showRestore, epoch == review.epoch,
+                      keysPresentationWorkspaceID == core.workspaceID else { throw WorkspaceStoreError.staleReview }
+                _ = try await store.applyCertificateRenewal(core, confirmedByUser: true)
+                result = .success(())
+            } catch { result = .failure(error) }
+            // Cancellation or an error after publication is not rollback.
+            // Reconcile in a fresh task while keeping the connection hold.
+            await Task { [self] in
+                guard certificateRenewalOperation?.id == operation else { return }
+                defer { certificateRenewalOperation = nil }
+                workspaceRefreshEpoch = UUID(); workspaceRefresh?.cancel()
+                availableCredentials.removeValue(forKey: core.workspaceID)
+                localPolicies.removeValue(forKey: core.workspaceID)
+                var refreshed = false
+                if active {
+                    do {
+                        try await refreshWorkspaces(using: store, epoch: epoch)
+                        refreshed = active && localPolicies[core.workspaceID] != nil
+                    } catch { }
+                }
+                switch result {
+                case .success:
+                    credentialMessage = "The renewed certificate is saved on this phone. Choose Connect to use it; the SSH server checks its authorization when you sign in."
+                case .failure(let error):
+                    credentialMessage = "Saving the renewed certificate could not be confirmed. \(error.localizedDescription) Review the saved certificate before trying again."
+                }
+                if !refreshed {
+                    credentialMessage = (credentialMessage ?? "") + " Reopen SSH Keys when the app is active to refresh its saved status."
+                }
+            }.value
+        }
+        certificateRenewalOperation = (operation, task)
     }
 
     /// A security-scoped file read owns its worker until cancellation has joined.
@@ -1575,6 +1745,7 @@ final class MobileWorkspaceModel {
     }
 
     private func retireEnrollmentReviews() {
+        retireCertificateRenewal()
         enrollmentFileReviewID = nil; deviceKeyReviewID = nil
         enrollmentResults?.review = nil; enrollmentResults = nil
         enrollmentResultsOperation?.task.cancel()
@@ -1938,12 +2109,17 @@ final class MobileWorkspaceModel {
     func hostKeyVerificationRoute(workspaceID: UUID, trustID: String) -> WorkspaceDocument.Route? {
         guard let saved = workspaces.first(where: { $0.id == workspaceID }),
               let document = try? saved.document(),
-              document.hostTrust.first(where: { $0.id == trustID })?.pins.isEmpty == true else { return nil }
+              let trust = document.hostTrust.first(where: { $0.id == trustID }) else { return nil }
         let local = localPolicies[workspaceID].flatMap { $0.workspace.revision == saved.revision ? $0 : nil }
         let support = WorkspaceNativeSSHAuthentication.routeSupport
         var best: (route: WorkspaceDocument.Route, hops: Int)?
         for route in document.routes where route.trustID == trustID
             && (route.mode == "direct_ssh" || route.mode == "frankenterm_mux") {
+            // Rotation is offered only for this phone's still-applicable pin.
+            // Imported trust remains under the workspace source's authority.
+            if !trust.pins.isEmpty {
+                guard (try? saved.phoneHostKeyPin(forRouteID: route.id)) != nil else { continue }
+            }
             // Direct checks need no credential inventory. Even if protected
             // metadata could not refresh, the store can preflight this route
             // without reading a key; no network opens on the UI's judgment.
@@ -1974,7 +2150,8 @@ final class MobileWorkspaceModel {
               let hops = try? document.orderedJumpRoutes(forRouteID: route.id) else { return nil }
         let review = LocalHostKeyCheckReview(workspaceID: workspaceID, revision: saved.revision, routeID: route.id,
             destination: LocalHostKeyCheckReview.endpoint(host: route.host, port: route.port),
-            jumpAccounts: hops.map { LocalHostKeyCheckReview.endpoint(host: $0.host, port: $0.port, user: $0.user) }, epoch: epoch)
+            jumpAccounts: hops.map { LocalHostKeyCheckReview.endpoint(host: $0.host, port: $0.port, user: $0.user) },
+            replacingPin: try? saved.phoneHostKeyPin(forRouteID: route.id), epoch: epoch)
         hostKeyCheckReviewID = review.id
         return review
     }
@@ -2015,10 +2192,11 @@ final class MobileWorkspaceModel {
             do {
                 let support = WorkspaceNativeSSHAuthentication.routeSupport
                 _ = try await store.hostKeyVerificationDocument(workspaceID: workspaceID,
-                    expectedRevision: saved.revision, routeID: routeID, support: support)
+                    expectedRevision: saved.revision, routeID: routeID, support: support, replacing: review.replacingPin)
                 try Task.checkCancellation()
                 guard active, !showRestore, hostKeyCheckID == operation else { throw FTError.stale }
-                let probe = try await connections.checkHostKey(workspaceID: workspaceID, revision: saved.revision, routeID: routeID)
+                let probe = try await connections.checkHostKey(workspaceID: workspaceID, revision: saved.revision,
+                    routeID: routeID, replacing: review.replacingPin)
                 try Task.checkCancellation()
                 if let failure = probe.failure { throw failure }
                 guard let identity = probe.observedIdentity else { throw FTError.stale }
@@ -2029,14 +2207,20 @@ final class MobileWorkspaceModel {
                 }
                 guard active, !showRestore, hostKeyCheckID == operation,
                       workspaces.first(where: { $0.id == workspaceID })?.revision == saved.revision else { throw FTError.stale }
-                let review = try await store.reviewHostKeyPin(workspaceID: workspaceID,
+                if review.replacingPin?.key.algorithm == identity.algorithm,
+                   review.replacingPin?.key.fingerprint == identity.fingerprint {
+                    credentialMessage = "The checked server presented the same public key. No trust change was saved."
+                    return
+                }
+                let pinReview = try await store.reviewHostKeyPin(workspaceID: workspaceID,
                     expectedRevision: saved.revision, routeID: routeID,
-                    key: .init(algorithm: identity.algorithm, fingerprint: identity.fingerprint), support: support)
+                    key: .init(algorithm: identity.algorithm, fingerprint: identity.fingerprint), support: support,
+                    replacing: review.replacingPin)
                 try Task.checkCancellation()
                 guard active, !showRestore, hostKeyCheckID == operation,
                       workspaces.first(where: { $0.id == workspaceID })?.revision == saved.revision else { throw FTError.stale }
                 credentialMessage = nil
-                hostKeyPinReview = review
+                hostKeyPinReview = pinReview
             } catch {
                 guard active, hostKeyCheckID == operation else { return }
                 credentialMessage = "The host key could not be checked. \(error.localizedDescription)"
@@ -4227,6 +4411,8 @@ private struct WorkspaceKeysSheet: View {
     @State private var exportingEnrollment = false
     @State private var enrollmentFile: LocalEnrollmentFileReview?
     @State private var choosingEnrollmentFile = false
+    @State private var certificateFile: LocalCertificateFileReview?
+    @State private var choosingCertificateFile = false
 
     private var saved: InstalledWorkspace? {
         model.workspaces.first(where: { $0.id == workspaceID })
@@ -4238,6 +4424,7 @@ private struct WorkspaceKeysSheet: View {
 
     var body: some View {
         let importing = model.credentialImport.flatMap { $0.isRetired ? nil : $0 }
+        let renewal = model.certificateRenewalReview.flatMap { $0.core.workspaceID == workspaceID ? $0 : nil }
         NavigationStack {
             Group {
                 if !model.active {
@@ -4296,6 +4483,9 @@ private struct WorkspaceKeysSheet: View {
                                         }
                                         let routeCount = document.routes.filter { $0.credentialIDs.contains(key.id) }.count
                                         Text("Used by \(routeCount) routes in this workspace").font(.caption).foregroundStyle(.secondary)
+                                        if let certificate = key.userCertificate {
+                                            certificateRenewalRow(key, certificate: certificate, blocked: revoked || pending)
+                                        }
                                         Button("Import Matching Key…", systemImage: "square.and.arrow.down") {
                                             reviewed = nil
                                             model.beginCredentialImport(workspaceID: workspaceID, credentialID: key.id)
@@ -4367,6 +4557,11 @@ private struct WorkspaceKeysSheet: View {
         .sheet(item: Binding(get: { importing }, set: { if $0 == nil { importing?.cancel() } })) { controller in
             WorkspaceKeyImportSheet(controller: controller)
         }
+        .sheet(item: Binding(get: { renewal }, set: { value in
+            if value == nil, let renewal { model.cancelCertificateRenewal(renewal.id) }
+        })) { review in
+            WorkspaceCertificateRenewalSheet(review: review, model: model)
+        }
         .sheet(item: $phoneKey) { choice in
             WorkspaceDeviceKeyRoutesSheet(workspaceID: workspaceID, credentialID: choice.id, model: model)
         }
@@ -4391,6 +4586,21 @@ private struct WorkspaceKeysSheet: View {
                 model.cancelEnrollmentFile(reviewed)
                 if (error as? CocoaError)?.code != .userCancelled, model.active {
                     model.credentialMessage = "Enrollment results could not be selected. Open the JSON saved by FrankenTerm Export again."
+                }
+            }
+        }
+        .fileImporter(isPresented: $choosingCertificateFile, allowedContentTypes: [.data, .plainText],
+                      allowsMultipleSelection: false) { result in
+            guard let reviewed = certificateFile else { return }
+            certificateFile = nil
+            switch result {
+            case .success(let urls):
+                if let url = urls.first { model.importCertificateFile(url, reviewed: reviewed) }
+                else { model.cancelCertificateFile(reviewed) }
+            case .failure(let error):
+                model.cancelCertificateFile(reviewed)
+                if (error as? CocoaError)?.code != .userCancelled, model.active {
+                    model.credentialMessage = "The renewed certificate could not be selected. Choose its public OpenSSH certificate file again."
                 }
             }
         }
@@ -4461,14 +4671,37 @@ private struct WorkspaceKeysSheet: View {
             if !active {
                 reviewed = nil; hostReview = nil; hostKeyCheck = nil; deviceReview = nil; copiedPhoneKeyID = nil
                 enrollmentFile = nil; choosingEnrollmentFile = false
+                certificateFile = nil; choosingCertificateFile = false
             }
         }
         .onChange(of: saved?.revision) { _, _ in
             if let enrollmentFile { model.cancelEnrollmentFile(enrollmentFile) }
             enrollmentFile = nil; choosingEnrollmentFile = false
+            if let certificateFile { model.cancelCertificateFile(certificateFile) }
+            certificateFile = nil; choosingCertificateFile = false
+            if let renewal { model.cancelCertificateRenewal(renewal.id) }
         }
         .onDisappear {
             reviewed = nil; hostReview = nil; hostKeyCheck = nil; deviceReview = nil; copiedPhoneKeyID = nil
+        }
+    }
+
+    private func certificateRenewalRow(_ key: WorkspaceDocument.Credential,
+                                       certificate: SSHUserCertificate, blocked: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label("SSH User Certificate", systemImage: "checkmark.seal")
+                .font(.callout)
+            Text(verbatim: "Expires \(CertificateValidityLabel.date(certificate.validBefore))")
+                .font(.caption).foregroundStyle(.secondary)
+                .accessibilityIdentifier("keys.certificate.expiry.\(key.id)")
+            Button("Import Renewed Certificate…", systemImage: "arrow.clockwise") {
+                reviewed = nil; hostReview = nil; hostKeyCheck = nil; deviceReview = nil
+                certificateFile = model.reviewCertificateFile(workspaceID: workspaceID, credentialID: key.id)
+                choosingCertificateFile = certificateFile != nil
+            }.disabled(blocked || model.credentialImport != nil)
+                .accessibilityIdentifier("keys.certificate.renew.\(key.id)")
+            Text("Choose the public certificate renewed by the same authority for this key. Its accounts and permissions must match the current certificate.")
+                .font(.caption).foregroundStyle(.secondary)
         }
     }
 
@@ -4609,7 +4842,86 @@ private struct WorkspaceKeysSheet: View {
                     }
                 }
             }
+            ForEach(endpoint.trusts.filter { !$0.pins.isEmpty }) { trust in
+                if let route = model.hostKeyVerificationRoute(workspaceID: workspaceID, trustID: trust.id) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(verbatim: "Phone verification · Route \(route.id)").font(.caption).foregroundStyle(.secondary)
+                        Button("Check for a Changed Host Key…", systemImage: "arrow.triangle.2.circlepath") {
+                            reviewed = nil; hostReview = nil; deviceReview = nil
+                            guard let review = model.reviewHostKeyVerification(workspaceID: workspaceID, trustID: trust.id) else { return }
+                            if review.jumpAccounts.isEmpty { model.beginHostKeyVerification(review) }
+                            else { hostKeyCheck = review }
+                        }.accessibilityIdentifier("hostkeys.replace.\(trust.id)")
+                        Text("For a rebuilt server or a planned key rotation, check its current public key and compare the old and new fingerprints before changing this phone's verification.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
         }.padding(.vertical, 6)
+    }
+}
+
+@MainActor
+private struct WorkspaceCertificateRenewalSheet: View {
+    let review: LocalCertificateRenewalReview
+    @Bindable var model: MobileWorkspaceModel
+
+    var body: some View {
+        let core = review.core
+        NavigationStack {
+            List {
+                Section("Existing Identity") {
+                    Text(verbatim: core.workspaceName).font(.headline)
+                    Text(verbatim: core.credentialID).font(.callout)
+                    Text(verbatim: core.renewedCertificate.subject.fingerprint)
+                        .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                        .accessibilityIdentifier("keys.certificate.subject")
+                    Text("The renewed certificate has a verified signature from the same issuing authority, for the same key, accounts, and signed permissions.")
+                }
+                Section("Certificate Validity") {
+                    LabeledContent("Current Expiry", value: CertificateValidityLabel.date(core.currentCertificate.validBefore))
+                    LabeledContent("Renewed From", value: CertificateValidityLabel.date(core.renewedCertificate.validAfter))
+                    LabeledContent("Renewed Until", value: CertificateValidityLabel.date(core.renewedCertificate.validBefore))
+                        .accessibilityIdentifier("keys.certificate.renewed-expiry")
+                    LabeledContent("Serial", value: String(core.renewedCertificate.serial))
+                }
+                Section("Routes Using This Certificate") {
+                    ForEach(core.affectedRouteIDs, id: \.self) { routeID in
+                        Text(verbatim: routeID).font(.system(.callout, design: .monospaced))
+                    }
+                }
+                Section {
+                    DisclosureGroup("Public Certificate Details") {
+                        Text("Issuing Authority").font(.caption).foregroundStyle(.secondary)
+                        Text(verbatim: core.renewedCertificate.authority.fingerprint)
+                            .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                        Text("Current Certificate").font(.caption).foregroundStyle(.secondary)
+                        Text(verbatim: core.currentCertificate.fingerprint)
+                            .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                        Text("Renewed Certificate").font(.caption).foregroundStyle(.secondary)
+                        Text(verbatim: core.renewedCertificate.fingerprint)
+                            .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                    }
+                } footer: {
+                    Text("Only this public certificate is saved. Your private key stays in its existing protected storage. The SSH server checks certificate authorization when you connect.")
+                }
+                Section {
+                    Button("Install Renewal and Disconnect") { model.acceptCertificateRenewal(review) }
+                        .disabled(model.busy || !model.certificateRenewalIsCurrent(review))
+                        .accessibilityIdentifier("keys.certificate.accept")
+                } footer: {
+                    Text(verbatim: "Saving ends any sessions in \(core.workspaceName). Direct SSH shells may end, and input already sent may have executed. The workspace stays offline until you choose Connect.")
+                }
+            }
+            .navigationTitle("Renew SSH Certificate").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { model.cancelCertificateRenewal(review.id) }
+                        .disabled(model.busy)
+                }
+            }
+        }
+        .interactiveDismissDisabled(model.busy)
     }
 }
 
@@ -4624,10 +4936,20 @@ private struct WorkspaceHostKeyVerificationSheet: View {
             List {
                 Section("Server Identity") {
                     Text(verbatim: "\(review.host) port \(review.port)").font(.headline)
+                    Text(verbatim: "Route \(review.routeID)").font(.caption).foregroundStyle(.secondary)
                     Text(verbatim: review.key.algorithm).font(.callout)
                     Text(verbatim: review.key.fingerprint)
                         .font(.system(.body, design: .monospaced)).textSelection(.enabled)
                         .accessibilityIdentifier("hostkeys.observed-fingerprint")
+                }
+                if let previous = review.previousKey {
+                    Section("Previously Verified on This Phone") {
+                        Text(verbatim: previous.algorithm).font(.callout)
+                        Text(verbatim: previous.fingerprint)
+                            .font(.system(.body, design: .monospaced)).textSelection(.enabled)
+                            .accessibilityIdentifier("hostkeys.previous-fingerprint")
+                        Text("Saving replaces this phone's verified key for this host trust record, including routes that share it. Compare the new fingerprint using an independent trusted source before accepting the change.")
+                    }
                 }
                 Section {
                     Text("All connections used for this check have closed. Any jump hosts were authenticated under their existing trust policy; no account, key, password or MFA answer was offered to this destination. Receiving this fingerprint alone does not prove the server's identity. Compare the complete fingerprint with your server administrator or an existing trusted connection.")
@@ -4635,7 +4957,9 @@ private struct WorkspaceHostKeyVerificationSheet: View {
                         .accessibilityIdentifier("hostkeys.confirm-comparison")
                 }
                 Section {
-                    Button("Trust Verified Host Key") { model.acceptVerifiedHostKey(review) }
+                    Button(review.previousKey == nil ? "Trust Verified Host Key" : "Replace Phone-Verified Key") {
+                        model.acceptVerifiedHostKey(review)
+                    }
                         .disabled(!comparedIndependently || model.busy || !model.active
                             || model.hostKeyPinReview?.id != review.id)
                         .accessibilityIdentifier("hostkeys.accept")

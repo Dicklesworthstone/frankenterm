@@ -82,6 +82,14 @@ The exporter verifies OpenSSH v01 user-certificate signatures with the existing 
 
 The phone still checks validity time, account principals, critical options and PTY/forwarding permissions before authentication; a verified CA signature does not establish that a remote server accepts that CA. Host certificates and host-CA trust remain outside this user-certificate implementation. New regressions cover independent OpenSSH certificate fixtures, renewal, source ordering, malformed signatures, candidate and byte limits, and preservation of private-key inclusion consent. Rust compilation and test execution still require the repository's remote RCH runner.
 
+### Renew an existing certificate on the phone
+
+In **Keys**, an imported certificate identity now shows its expiry and offers **Import Renewed Certificate…**. Select the public OpenSSH certificate file from Files, review its subject, issuing authority, old and new validity, and affected routes, then choose **Install Renewal and Disconnect**. This can repair an expired certificate without re-exporting the workspace or moving its private key. Selection reads at most 64 KiB from an already available local file; it does not download an unavailable cloud file, unlock a key, or contact a server.
+
+The certificate must have a verified signature, the same raw subject key and issuing authority, exactly the same account principals and signed permissions, a later expiry, and no earlier start time. It must be valid now for every route that uses it, including the actual PTY or forwarding role of each destination and bastion. A different key, issuer, account policy or permission set requires a reviewed workspace update. A five-minute review binds the exact credential, source policy, saved revision and issuing store; publication rechecks expiry, revocation and cancellation.
+
+The renewed public certificate is a phone-local overlay in catalog version 9. The imported manifest, envelope digest and protected-key binding remain unchanged. Unchanged and cosmetic reimports retain it; an authentication-path or source-policy change removes it and cannot later reactivate the old renewal. Saving closes this workspace's sessions, creates a new revision and keeps it offline until a fresh **Connect**. An ambiguous save reloads the durable state before another attempt. Certificate authorization on the SSH server is still checked during authentication.
+
 ## Complete SSH identity policies in machine exports
 
 The Rust machine-inventory exporter now admits each route's entire ordered public-key candidate set before publishing credentials or private-key file hints. Eight distinct identities are supported; duplicate references to the same key still share one credential. A ninth distinct key, an unreadable or over-budget source, an unresolved explicit identity, or malformed/multiple-key sidecar blocks the route instead of leaving a usable prefix. Mux copies retain the same mandatory refusal, and jump-route readiness propagates it to dependent connections. Other complete routes remain available.
@@ -104,13 +112,15 @@ Four portable policy/resource-lifetime regressions and two hosted Rust-to-Metal 
 
 Entering strict offline restore joins pending connection approval before persisting the gate for every saved workspace. Existing live sessions still require the explicit **Disconnect Sessions and Restore** choice. Cancelling that restore does not undo the choice or reopen a direct shell. Publication failures do not authorize a connection; retries reaffirm the durable write. Portable storage regressions cover approval, stale revisions, cancellation/relaunch, reimport and interrupted writes. The updated native restore UI journey also checks no automatic reconnect after cancellation or publication across relaunch, then deliberate Connect; it requires a fresh Apple-hosted run and is not covered by the historical native results below.
 
-## First-time host-key verification
+## Host-key verification and phone-local rotation
 
 When an imported SSH or FrankenTerm mux route has no trusted host key, **Keys → Check Host Key** performs a bounded SSH key exchange, directly or through up to three configured jump hosts. For a jump route, review the exact transit accounts and approve **Sign In and Check Host Key**. Each hop uses its existing verified host trust and permitted protected key, password or MFA method. The destination receives no account, key, password, MFA answer or terminal request. All connections opened for the check close before fingerprint review. Compare the complete displayed fingerprint with the server administrator or an existing trusted connection, then explicitly confirm the independent comparison and choose **Trust Verified Host Key**. Receiving the fingerprint from the same untrusted connection alone does not establish the server's identity.
 
 The phone saves a public pin separately from the original imported manifest and envelope digest. Approval retires this workspace's live sessions, creates a new saved revision and keeps it offline until a fresh **Connect**. Reviews cannot cross an app lifecycle change, workspace replacement or another store instance. Existing imported or local pins cannot be replaced through this first-use path, and late revocations, failed-write process-local refusals and mandatory source policy still win.
 
-Local pins survive relaunch and unchanged source-policy reimports. An endpoint, alias or trust-policy change deactivates the old local pin and requires a new review; newly imported positive pins take precedence. Every jump host must already have usable verified trust and an allowed sign-in method; verify missing hop trust first or import it from the Mac. A store-owned, five-minute permission covers only that exact transit path and is rechecked before signing and forwarding. Cancellation, revocation, workspace replacement and expiry retire it; normal destination authentication never inherits it. Backgrounding, restore and closing Keys cancel and join the check. Transient Face ID inactivity can finish without reopening the network or publishing a stale review. Catalog versions 1–7 migrate to version 8 without inventing positive trust or changing authenticated import history.
+For a server whose key was verified on this phone, **Check for a Changed Host Key…** uses the same bounded public-key exchange. Its review displays the previous and newly observed fingerprints, requires another independent comparison, and offers **Replace Phone-Verified Key**. An unchanged key reports that no trust change is needed. Replacement is bound to the exact previous phone pin and its source policy; it cannot replace imported pins, change required trust policy or override existing revocations. It updates one host trust record, including routes that share that record, while leaving other trust records for the same endpoint intact. Saving disconnects the workspace and requires a fresh **Connect**.
+
+Local pins survive relaunch and unchanged source-policy reimports. An endpoint, alias or trust-policy change deactivates the old local pin and requires a new review; newly imported positive pins take precedence. Every jump host must already have usable verified trust and an allowed sign-in method; verify missing hop trust first or import it from the Mac. A store-owned, five-minute permission covers only that exact transit path and is rechecked before signing and forwarding. Cancellation, revocation, workspace replacement and expiry retire it; normal destination authentication never inherits it. Backgrounding, restore and closing Keys cancel and join the check. Transient Face ID inactivity can finish without reopening the network or publishing a stale review. Catalog versions 1–8 migrate to version 9 without inventing positive trust or changing authenticated import history.
 
 ## Phone-generated SSH identities
 
@@ -118,7 +128,7 @@ Local pins survive relaunch and unchanged source-policy reimports. An endpoint, 
 
 A reviewed choice replaces one route's public-key candidates, including use as a jump host. Host trust, permitted password/MFA methods and required policies still apply; certificate-restricted identities cannot be replaced by a plain key. Changing a choice disconnects this workspace first and requires a fresh **Connect**. Generation alone does neither.
 
-The imported manifest/history stay unchanged. Catalog version 8 retains separate public key metadata and route-policy witnesses alongside locally verified host pins. Changed routes require review after reimport. Removed routes retain their choices in case they return; the user can explicitly forget them. Local revocation uses the existing fingerprint and session-retirement path. There are at most 16 generated keys and 256 route choices per workspace. Portable compiler checks do not establish Apple Keychain, server interoperability or device qualification.
+The imported manifest/history stay unchanged. Catalog version 9 retains separate public key metadata and route-policy witnesses alongside locally verified host pins and renewed certificates. Changed routes require review after reimport. Removed routes retain their choices in case they return; the user can explicitly forget them. Local revocation uses the existing fingerprint and session-retirement path. There are at most 16 generated keys and 256 route choices per workspace. Portable compiler checks do not establish Apple Keychain, server interoperability or device qualification.
 
 ### Authorize and remove phone-key access through the Mac
 
@@ -186,7 +196,7 @@ The iOS app provides a native camera scanner, explicit transfer selection, bound
 
 When launched independently, the Mac companion loads **this Mac's FrankenTerm machines**: it runs its bundled `frankenterm-machines` helper (built by `scripts/build-apple-machines-helper.sh` and copied in by the FrankenTermExport target; without it, an `ft` with `ft mobile source`), which reads `machines.toml` and reports each credential's private-key file. The companion selects every group and reads, validates and includes those keys itself; a passphrase-protected key waits for **Choose Matching Key…**. The user still approves the included keys before **Prepare Encrypted Transfer**. It can also open a local `.ftworkspace` JSON document or build one from **explicitly selected hosts in an SSH config**. Its searchable source chooser accepts up to 128 concrete aliases, reads their referenced public `.pub` identities and each route's effective `UserKnownHostsFile` and `GlobalKnownHostsFile` lists, and presents the resulting routes, host policy, and omissions for review. Trust files are selected independently for each host and jump, including quoted paths, default lists and explicit `none`; unavailable or unsupported required sources block the affected route. Local `Include` files support nested `*` and `?` patterns in lexical order, preserve the containing Host conditions, and resolve relative paths against the user's `~/.ssh`. The frozen source is bounded to 64 file reads, eight nested includes, 2 MiB, 16,384 lines, and 16,384 scanned directory entries; cycles, unsafe file permissions, nonlocal files and symbolic Include paths are refused. It preserves stable entity IDs between exports without evaluating commands, `Match`, environment expansion, DNS, or an SSH agent. Unresolved source semantics remain mandatory route blockers. This passive source uses an explicit default palette; it does not claim to capture live desktop themes or system configuration. The desktop's own machine colors come from `machines.toml` instead: `ft mobile export` writes a `.ftworkspace` from it with each machine's resolved theme (see `docs/cli-reference.md`). Both exports set `auto_connect` on every machine and group: opening the workspace on the phone signs every machine in, and a machine's terminal opens when it is chosen.
 
-Configured-alias `ProxyJump` chains expand to at most three ordered transit hops, including each hop's public identities, account, port, and host trust. Unselected hops do not become machines, and transit does not activate their shell preferences. Explicit earlier prefixes override later hops' configured proxies while the first hop's own configured chain is preserved. User/port override syntax, unresolved aliases, repeated hosts, cycles, and excessive depth remain explicit blockers; an unusable chain is never truncated into a usable prefix.
+Configured-alias `ProxyJump` chains expand to at most three ordered transit hops, including each hop's public identities, account, port, and host trust. Qualified accounts and ports such as `operator@bastion:2222` are preserved per hop. Unselected hops do not become machines, and transit does not activate their shell preferences. Explicit earlier prefixes override later hops' configured proxies while the first hop's own configured chain is preserved. Unresolved aliases, repeated hosts, cycles, and excessive depth remain explicit blockers; an unusable chain is never truncated into a usable prefix.
 
 Existing workspace documents support selection of one or more machine groups with their complete route, jump-host, trust, theme, and credential dependencies. Every canonical identity requires an explicit include-private-key or keep-reference-only decision before encryption. The companion accepts matching **OpenSSH Ed25519, ECDSA P-256/P-384/P-521, and RSA 2048–8192-bit key files**, including passphrase protection using **bcrypt with AES-CTR or AES-CBC at 128, 192, or 256 bits**. The selected file's public algorithm and fingerprint must match before the passphrase prompt appears; actual private-key derivation must match again after decryption. Unlocking runs on the export actor, entirely in memory, with no decrypted temporary file or passphrase-bearing subprocess. Private source files are read only after their own file-picker choice. The companion releases excluded key material and reports concrete omissions and blocked routes. Selection changes invalidate the previous approval, code, and QR presentation.
 
@@ -223,8 +233,19 @@ pins, revocations and mandatory policy. A first hop can contribute its configure
 prefix; the explicit preceding chain overrides proxy settings on later hops.
 Mux routes retain the same chain. Transit records cannot create terminal sessions.
 
+Qualified forms such as `operator@bastion`, `bastion:2222` and
+`operator@bastion:2222` override only that hop's account and port. A bracketed
+IPv6 target such as `operator@[2001:db8::1]:2222` uses an explicitly configured,
+unbracketed Host declaration. Overrides are applied before resolving `%r` and
+`%p` in identity filenames, so discovery and export use the same ordered public
+key candidates. Each hop keeps its own certificates, authentication policy,
+trust files and `HostKeyAlias`; ordinary known-host lookup uses its final port.
+Bare-alias route identifiers remain stable. The inventory path still requires
+concrete Host declarations; the alternate SSH-config importer also supports its
+existing static literal and wildcard-resolved hop profile.
+
 `ProxyJump` and `ProxyCommand` use their first effective assignment. Active proxy
-commands, inline jump account/port syntax, unknown aliases, cycles and excessive
+commands, malformed qualified targets, unknown aliases, cycles and excessive
 chains cannot become direct fallback routes or partly exported graphs. Group
 selection preserves known denials from other resolved routes in the same trust
 scope. Discovery reads bounded public key and trust files; the companion's existing
@@ -337,6 +358,51 @@ pre-network rejection of stale, mismatched or unpromptable choices. Its servers
 check exact authentication methods, terminal bytes, forwarding destinations and
 complete transport teardown.
 
+### Review a changed host key
+
+When a destination or jump host presents a different permitted-algorithm key,
+the phone stops that connection and offers **Host Key Changed → Review Host
+Identity**. The review uses the original failed handshake. It shows the exact
+machine and destination route, the affected jump-host occurrence or destination,
+its host, port, SSH account and host-key alias, and the full expected and
+presented algorithms and fingerprints. Expected keys are the selected trust
+record's currently usable pins; revoked and unsupported pins are excluded.
+
+**Copy Fingerprint** is an explicit, device-local clipboard action that expires
+after two minutes. Verify the complete fingerprint through a trusted console or
+the machine's administrator using an independent channel. For imported trust,
+update the Mac's trusted key, export the workspace again, and review the resulting
+workspace update on the phone. For a key previously verified on this phone,
+**Keys → Check for a Changed Host Key…** offers the separately reviewed rotation
+flow described above. The existing **Choose Route and Sign-In** flow can select
+another configured path. A retry checks the existing permitted keys again.
+Inspection and copying do not alter trust or approve the new key; local blocks
+and mandatory policies remain in force.
+
+The failed transport and its complete jump chain close before the diagnostic is
+published. It remains available after failed-start cleanup, but belongs only to
+that exact controller and workspace revision. Backgrounding, leaving the scene,
+replacing the controller or replacing the workspace retires it. An in-flight
+failure cannot repopulate a retired review, and stale copy controls write
+nothing. A temporary Face ID interruption hides the review and disables copying
+without discarding evidence from an otherwise admitted connection. Generic error
+descriptions omit the peer's identity details.
+
+The independent SSH runner
+FrankenTermSSH/Tests/Interop/test_host_mismatch.py exercises changed keys during
+public-key, password and keyboard-interactive sign-in, a destination after two
+verified hops, a middle-hop mismatch, a locally revoked presented key, and a
+separately reviewed workspace update followed by a new successful connection.
+It checks that mismatched peers receive no authentication or channel requests,
+downstream peers are never reached, and complete transport cleanup finishes.
+All nine new mismatch tests and eight existing host-trust regressions pass in a
+freshly compiled 45-source Store/authentication component with Swift 6 warnings
+treated as errors. All seven live scenarios also pass against the real native
+Swift and C backend, rebuilt with its 54-source Kit dependency component. These
+focused builds do not qualify the full Apple app or device behavior. Hosted iOS
+regressions cover review ownership, lifecycle retirement and stale clipboard
+actions; executing those new UI cases still requires an Apple SDK.
+
 ### Password-only machines and jump hosts
 
 Password routes can connect without an imported private key. A typed choice follows
@@ -380,7 +446,15 @@ The optional native SSH package separately passed 40 XCTest cases with warnings-
 
 ## Shared terminal input and size permissions
 
-Shared panes open in **View Only**. **Use Terminal** offers **Type at Shared Size**, which enables typing, paste and pointer input while preserving the remote grid, or **Type and Fit to Phone**, which also permits resizing the pane. Shared-size viewing and input fit the existing grid locally; keyboard, rotation, pane selection and disconnect never resize, adopt or restore a shared pane. Changing modes reconnects only after the previous owner settles. A grid too large to display waits for an explicit **Use at Phone Size** action. These are restrictions on this phone; other connected clients retain their own input and resize permissions.
+Shared panes open in **View Only**. **Use Terminal** offers **Type at Shared Size**, which enables typing, paste and pointer input while preserving the remote grid, or **Type and Fit to Phone**, which also permits resizing the pane. Shared-size viewing and input initially fit the existing grid locally; keyboard, rotation, pane selection and disconnect never resize, adopt or restore a shared pane. Changing access modes reconnects only after the previous owner settles. A grid beyond the supported terminal limits waits for an explicit **Use at Phone Size** action. These are restrictions on this phone; other connected clients retain their own input and resize permissions.
+
+### Read a wide shared pane at a useful size
+
+For **View Only** and **Type at Shared Size**, **More → Text Size → Readable Size** shows the grid at the chosen font size and clips it to the phone's viewport. Drag to pan across the pane, pinch or choose Bigger/Smaller to change the text size, and choose **Reveal Cursor** to bring the current cursor into view. **Fit Entire Pane** returns to the overview. A deliberate text-size gesture also enters readable mode from the fitted view. The mode stays with that session controller when its native view is rebuilt; changing the font preference on another machine does not switch this pane's viewing mode.
+
+Local pan owns canvas drags while readable mode is active. The machine/pane strips and hardware navigation remain available. Mouse targeting, links, selection, caret placement and accessibility use the same clamped offset as the drawn grid; a retired or superseded projection cannot direct input. Zoom, pan, cursor reveal and fitting use the existing bounded drawable and do not acquire input authority, reconnect, or propose a different shared PTY size.
+
+Portable viewport regressions cover bounds, coordinate conversions and clipping. Hosted renderer and live-controller coverage checks completed projection ownership, local navigation ownership and unchanged remote dimensions. These new native paths require an Apple-hosted run; historical simulator results elsewhere in this document do not qualify them.
 
 ## Bounded shared terminal output
 

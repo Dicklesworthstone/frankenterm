@@ -392,7 +392,8 @@ final class MobileConnections {
         if hostKeyScope != nil { applyAuthenticationScope(nil) }
     }
 
-    func checkHostKey(workspaceID: UUID, revision: UUID, routeID: String) async throws -> WorkspaceRouteProbe.Result {
+    func checkHostKey(workspaceID: UUID, revision: UUID, routeID: String,
+                      replacing: WorkspaceHostKeyPin? = nil) async throws -> WorkspaceRouteProbe.Result {
         let scope = MobileSSHPasswordPrompt.Scope(workspaceID: workspaceID, revision: revision,
             machineID: "host-key-verification", destinationRouteIDs: [routeID], hostKeyVerification: true)
         return try await withHostKeyVerificationScope(scope) { [self] in
@@ -403,7 +404,8 @@ final class MobileConnections {
             try Task.checkCancellation()
             return await WorkspaceRouteProbe.run(workspaceID: workspaceID, expectedRevision: revision,
                 routeID: routeID, confirmedByUser: true, store: store, broker: broker,
-                passwordPrompter: passwordPrompt, keyboardInteractivePrompter: keyboardInteractivePrompt)
+                passwordPrompter: passwordPrompt, keyboardInteractivePrompter: keyboardInteractivePrompt,
+                replacing: replacing)
         }
     }
 
@@ -555,6 +557,10 @@ protocol TerminalSessionFocus: AnyObject {
     /// Existing sessions may keep running while iOS permits it; starting a
     /// remote terminal requires the owning scene's current foreground admission.
     var permitsTerminalCreation: Bool { get }
+    /// Capture may finish through a temporary system prompt while this
+    /// workspace remains on screen. Actual backgrounding retires the evidence;
+    /// reviewing or copying it separately requires the foreground.
+    var permitsHostKeyMismatchCapture: Bool { get }
     /// Whether this machine is the one on screen now; a session connecting in
     /// the background waits to attach its view until it is.
     func shows(machineID: String) -> Bool
@@ -606,6 +612,11 @@ final class TerminalSessionController {
     private(set) var paneTooLargeToView = false
     @ObservationIgnored private let retriesDrop: Bool
     private(set) var cleanupFailure: String?
+    /// Details from this owner's actual refused handshake. Failed-start
+    /// cleanup closes its transport without erasing the review; explicit
+    /// retirement, replacement and app backgrounding discard it.
+    private(set) var hostKeyMismatch: WorkspaceSSHConnectionHostKeyMismatch?
+    @ObservationIgnored private var hostKeyMismatchGeneration = UUID()
     /// What an ended connection left known about the person's input. A later
     /// session on this machine keeps it until they dismiss it: a new live
     /// frame says nothing about whether the earlier input arrived.
@@ -656,9 +667,19 @@ final class TerminalSessionController {
     let muxAccessMode: TerminalMuxAccessMode
     private(set) var requiresExistingMux: Bool
     var isViewingOnly: Bool { connection?.muxControl?.accessMode == .viewOnly }
-    /// Both observers and shared-size input clients fit the authoritative grid
-    /// locally. Keyboard permission alone never grants shared resize authority.
+    /// Observers and shared-size input clients keep the authoritative grid.
+    /// Keyboard permission alone never grants shared resize authority.
     var keepsSharedMuxSize: Bool { connection?.muxControl?.accessMode.controlsSize == false }
+    /// A local viewing preference for this controller, retained when its pane
+    /// view is rebuilt. It never changes the mux access mode or remote size.
+    private(set) var prefersReadableViewport = false
+    private(set) var viewportModeGeneration = UUID()
+    var ownsViewportPan: Bool { prefersReadableViewport && terminal?.ownsViewportPan == true }
+    var canAdjustLocalViewport: Bool {
+        !stopped && phase == .live && keepsSharedMuxSize && hasFocusedPresentation
+            && !overviewBlocking && !clipboardIsPresenting && !localInputNeedsDecision
+            && !paneNavigationBusy && terminal?.isSceneActive == true
+    }
     let target: TerminalSessionTarget
     /// The scene's hook for phase and settlement changes: it starts the next
     /// background connection and reconnects dropped sessions from here.
@@ -1409,6 +1430,7 @@ final class TerminalSessionController {
     /// Each operation retains all partially constructed resources. Teardown
     /// cancels and joins it; a late connection/view cannot outlive a settled UI.
     private func startOwnedOperation() async {
+        discardHostKeyMismatch()
         phase = .connecting
         let id = UUID()
         startupID = id
@@ -1622,6 +1644,7 @@ final class TerminalSessionController {
             var configuration = Self.renderConfiguration(font: requestedFont)
             configuration.fontRevision = appliedFontRevision
             configuration.fitsRemoteGrid = keepsSharedMuxSize
+            configuration.localViewportEnabled = keepsSharedMuxSize && prefersReadableViewport
             let view = try await NativeTerminalView(session: keyboard, configuration: configuration, readOnly: isViewingOnly)
             terminal = view
             try checkLive()
@@ -1646,6 +1669,16 @@ final class TerminalSessionController {
             view.onFontSizeChange = { [weak self] size in self?.focus?.fontSizeChanged(size) }
             view.onFontRevision = { [weak self] revision in self?.applyFontRevision(revision) }
             view.onViewportChange = { [weak self] viewport in self?.propose(viewport) }
+            view.onLocalViewportChange = { [weak self, weak view] enabled in
+                guard let self, let view, !self.stopped, self.terminal === view,
+                      self.displayedMuxDestination == expectedMux,
+                      self.connection?.muxControl?.inputRouting.current.destination == expectedMux else { return }
+                guard self.prefersReadableViewport != enabled else { return }
+                self.prefersReadableViewport = enabled
+                // A captured canvas swipe cannot revive if the user switches
+                // into local pan and back before its delayed completion.
+                self.viewportModeGeneration = UUID()
+            }
             if let control = connection?.muxControl, let expectedMux {
                 // The immutable view/visit pair survives a delayed callback;
                 // it must never be replaced with the newly selected pane.
@@ -1836,6 +1869,7 @@ final class TerminalSessionController {
             }
             route = candidate
             credentialID = attempt.selection.credentialID
+            let hostKeyGeneration = hostKeyMismatchGeneration
             do {
                 let connected = try await connections.manager.connect(workspaceID: target.workspaceID,
                     expectedRevision: target.revision, machineID: target.machineID, routeID: candidate.id,
@@ -1860,6 +1894,26 @@ final class TerminalSessionController {
                 // The awaited manager owns and settles the failed transport.
                 // Local cancellation wins before another candidate is selected.
                 try checkStarting()
+                if let mismatch = error as? WorkspaceSSHConnectionHostKeyMismatch {
+                    passwordHopRetryPlan = nil; passwordMuxRetry = false
+                    _ = try plan.failed(.terminal, attempt: attempt)
+                    // A late refusal cannot repopulate details discarded while
+                    // the app entered the background or this presentation was
+                    // retired. A temporary system prompt does not retire it.
+                    // The factory binds the failed hop; retain it only for the
+                    // exact workspace and destination this owner attempted.
+                    if hostKeyGeneration == hostKeyMismatchGeneration,
+                       focus?.permitsHostKeyMismatchCapture == true,
+                       mismatch.workspaceID == target.workspaceID,
+                       mismatch.expectedRevision == target.revision,
+                       mismatch.machineID == target.machineID,
+                       mismatch.destinationRouteID == candidate.id {
+                        hostKeyMismatch = mismatch
+                    }
+                    Self.log.error("SSH host-key mismatch stopped a connection.")
+                    throw ConnectFailure(help: .init(title: "Host Key Changed",
+                        message: "This peer presented a different host key. The connection stopped before signing into it. Verify its identity independently before updating the workspace.", remedy: .none))
+                }
                 Self.log.error("route \(candidate.id, privacy: .public) sign-in failed: \(String(describing: error), privacy: .public)")
                 if error as? WorkspaceSSHConnectionError == .promptedHopRetryRequired {
                     let message: String
@@ -1974,6 +2028,16 @@ final class TerminalSessionController {
     /// Shows this terminal's text at `size` points.
     func setFontSize(_ size: Double) { terminal?.setFontPointSize(size) }
 
+    func setReadableViewport(_ enabled: Bool) {
+        guard canAdjustLocalViewport else { return }
+        terminal?.setLocalViewportEnabled(enabled)
+    }
+
+    func revealViewportCursor() {
+        guard canAdjustLocalViewport, prefersReadableViewport else { return }
+        terminal?.revealCursor()
+    }
+
     /// The renderer took a new font; the model's next frames must say so or
     /// they are not drawn. One change at a time reaches the runtime, and the
     /// newest revision wins (a pinch makes several).
@@ -2072,8 +2136,17 @@ final class TerminalSessionController {
         pump?.requestStop()
     }
 
+    /// Revokes even an in-flight handshake's authority to publish a diagnostic.
+    /// Failed transport cleanup intentionally does not call this: a refusal
+    /// remains reviewable after every network resource has closed.
+    func discardHostKeyMismatch() {
+        hostKeyMismatchGeneration = UUID()
+        hostKeyMismatch = nil
+    }
+
     /// Synchronous disappearance/close barrier, before SwiftUI schedules cleanup.
     func requestStop() {
+        discardHostKeyMismatch()
         passwordHopRetryPlan = nil; passwordMuxRetry = false
         stopCurrentOperation()
     }

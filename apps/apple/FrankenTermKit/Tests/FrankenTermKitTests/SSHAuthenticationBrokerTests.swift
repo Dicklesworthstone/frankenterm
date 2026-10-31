@@ -626,7 +626,15 @@ final class SSHAuthenticationBrokerTests: XCTestCase {
                 routeID: "route", credentialID: "key", presentedHostKey: wrong, transportID: UUID(),
                 sessionIdentifier: Data(repeating: 9, count: 32), publicBlob: f.key.publicBlob)
             XCTFail("An unpinned host key was accepted")
-        } catch { XCTAssertEqual(error as? SSHAuthenticationError, .hostKeyMismatch) }
+        } catch {
+            let mismatch = try XCTUnwrap(error as? WorkspaceSSHHostKeyMismatch)
+            XCTAssertEqual(mismatch.workspaceID, f.installed.id)
+            XCTAssertEqual(mismatch.expectedRevision, f.installed.revision)
+            XCTAssertEqual(mismatch.routeID, "route")
+            XCTAssertNil(mismatch.transitForRouteID)
+            XCTAssertEqual(mismatch.expectedKeys, [f.pin])
+            XCTAssertEqual(mismatch.presentedKey, wrong)
+        }
         let passwordOnly = try await fixture { workspace in
             var routes = workspace["routes"] as! [[String: Any]]
             routes[0]["authentication_methods"] = ["password"]

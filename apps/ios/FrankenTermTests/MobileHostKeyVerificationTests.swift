@@ -286,4 +286,76 @@ final class MobileHostKeyVerificationTests: XCTestCase {
             await f.store.endHostKeyVerification(f.probe)
         }
     }
+
+    func testPhonePinRotationKeepsImportedTrustIneligibleAndSnapshotsTheCurrentPin() async throws {
+        let support = WorkspaceNativeSSHAuthentication.routeSupport
+        let replacement = try WorkspaceDocument.HostKey(algorithm: "ssh-ed25519",
+            fingerprint: "SHA256:" + Data(repeating: 33, count: 32).base64EncodedString().replacingOccurrences(of: "=", with: ""))
+        for direct in [false, true] {
+            let f = try await fixture(includeDirect: direct), model = MobileWorkspaceModel()
+            await f.store.endHostKeyVerification(f.probe)
+            let firstUse = try await f.store.reviewHostKeyPin(workspaceID: f.saved.id,
+                expectedRevision: f.saved.revision, routeID: "destination", key: f.host, support: support)
+            let pinned = try await f.store.acceptHostKeyPin(firstUse, confirmedByUser: true, support: support)
+            let priorPin = try XCTUnwrap(try pinned.phoneHostKeyPin(forRouteID: "destination"))
+            model.setScenePhase(.active)
+            model.workspaces = [pinned]
+            XCTAssertEqual(model.hostKeyVerificationRoute(workspaceID: pinned.id, trustID: "target-trust")?.id,
+                           direct ? "direct" : nil,
+                           "A phone pin remains eligible; a trusted jump path still requires current local readiness")
+            model.localPolicies[pinned.id] = try await f.store.loadWithLocalPolicy(support: support).first
+
+            let reviewed = try XCTUnwrap(model.reviewHostKeyVerification(workspaceID: pinned.id, trustID: "target-trust"))
+            XCTAssertEqual(reviewed.revision, pinned.revision)
+            XCTAssertEqual(reviewed.routeID, direct ? "direct" : "destination")
+            XCTAssertEqual(reviewed.destination, "destination.example:22")
+            XCTAssertEqual(reviewed.jumpAccounts, direct ? [] : ["jump-user@jump.example:22"])
+            XCTAssertEqual(reviewed.replacingPin, priorPin, "The review must freeze the exact active overlay, including its source witness")
+            XCTAssertNil(try pinned.phoneHostKeyPin(forRouteID: "hop"))
+            XCTAssertNil(model.hostKeyVerificationRoute(workspaceID: pinned.id, trustID: "jump-trust"))
+            XCTAssertNil(model.reviewHostKeyVerification(workspaceID: pinned.id, trustID: "jump-trust"),
+                         "An imported jump-host pin cannot be offered as a phone-local replacement")
+
+            let checked = try await f.store.reviewHostKeyPin(workspaceID: reviewed.workspaceID,
+                expectedRevision: reviewed.revision, routeID: reviewed.routeID, key: replacement,
+                support: support, replacing: reviewed.replacingPin)
+            XCTAssertEqual(checked.previousKey, priorPin.key)
+            let rotated = try await f.store.acceptHostKeyPin(checked, confirmedByUser: true, support: support)
+            model.workspaces = [rotated]
+            model.localPolicies[rotated.id] = try await f.store.loadWithLocalPolicy(support: support).first
+            let currentPin = try XCTUnwrap(try rotated.phoneHostKeyPin(forRouteID: reviewed.routeID))
+            let fresh = try XCTUnwrap(model.reviewHostKeyVerification(workspaceID: rotated.id, trustID: "target-trust"))
+            XCTAssertNotEqual(fresh.id, reviewed.id)
+            XCTAssertNotEqual(fresh.revision, reviewed.revision)
+            XCTAssertEqual(fresh.revision, rotated.revision)
+            XCTAssertEqual(fresh.routeID, reviewed.routeID)
+            XCTAssertEqual(fresh.replacingPin, currentPin)
+            XCTAssertEqual(fresh.replacingPin?.key, replacement)
+            XCTAssertEqual(reviewed.replacingPin, priorPin, "Publishing a replacement cannot retarget an already displayed review")
+            XCTAssertNotEqual(reviewed.replacingPin, fresh.replacingPin)
+            XCTAssertNil(model.hostKeyVerificationRoute(workspaceID: rotated.id, trustID: "jump-trust"))
+            XCTAssertNil(model.reviewHostKeyVerification(workspaceID: rotated.id, trustID: "jump-trust"))
+            XCTAssertEqual(try rotated.document().hostTrust.first(where: { $0.id == "jump-trust" })?.pins, [f.host])
+            XCTAssertTrue(rotated.connectLater)
+
+            // The store is the authority before any network opens. Neither
+            // replaying this UI snapshot nor merely updating its revision may
+            // reuse a prior pin after another review publishes a replacement.
+            for revision in [reviewed.revision, rotated.revision] {
+                do {
+                    _ = try await f.store.hostKeyVerificationDocument(workspaceID: reviewed.workspaceID,
+                        expectedRevision: revision, routeID: reviewed.routeID, support: support,
+                        replacing: reviewed.replacingPin)
+                    XCTFail("A stale UI pin snapshot became eligible for another probe")
+                } catch { XCTAssertEqual(error as? WorkspaceStoreError, .staleReview) }
+            }
+            let current = try await f.store.hostKeyVerificationDocument(workspaceID: fresh.workspaceID,
+                expectedRevision: fresh.revision, routeID: fresh.routeID, support: support, replacing: fresh.replacingPin)
+            XCTAssertEqual(current.hostTrust.first(where: { $0.id == "target-trust" })?.pins, [replacement])
+            do {
+                _ = try await f.store.acceptHostKeyPin(checked, confirmedByUser: true, support: support)
+                XCTFail("The already published replacement review was replayed")
+            } catch { XCTAssertEqual(error as? WorkspaceStoreError, .staleReview) }
+        }
+    }
 }

@@ -3,8 +3,9 @@
 //! companion seals it together with the private keys the user selects.
 //!
 //! Exported: machines, groups, fully resolved themes, SSH routes with up to
-//! three configured jump hosts, public identities (`<identity>.pub`, never
-//! the private file), and each endpoint's host keys from `known_hosts`.
+//! three configured jump hosts with explicit account/port overrides, public
+//! identities (`<identity>.pub`, never the private file), and each endpoint's
+//! host keys from `known_hosts`.
 //! Mux routes use the same SSH graph to attach to existing panes. Unsupported
 //! routes remain on the desktop with an explanation; unresolved trust policy
 //! remains an explicit blocker in the exported document.
@@ -697,10 +698,10 @@ impl SshSources {
                             // prefix. Freeze every dependency's public identity
                             // and exact trust sources before constructing any
                             // route; an invalid graph contributes no prefix.
-                            let mut aliases = resolver.jump_chain(alias).unwrap_or_default();
-                            aliases.push(alias.clone());
-                            for name in aliases {
-                                let options = resolver.config.for_host(&name);
+                            let mut targets = resolver.jump_chain(alias).unwrap_or_default();
+                            targets.push(JumpTarget::unqualified(alias));
+                            for target in targets {
+                                let options = resolver.options_for_target(&target);
                                 if resolver
                                     .authentication_policy(&options)
                                     .methods
@@ -822,6 +823,116 @@ enum ProxySetting {
     Command { disabled: bool },
 }
 
+/// A static OpenSSH jump target. Brackets belong to the command syntax; the
+/// unbracketed alias still selects its own Host policy. These optional values
+/// have the precedence of the jump subprocess's -l and -p arguments.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct JumpTarget {
+    alias: String,
+    user: Option<String>,
+    port: Option<u16>,
+}
+
+impl JumpTarget {
+    fn unqualified(alias: &str) -> Self {
+        Self {
+            alias: alias.to_string(),
+            user: None,
+            port: None,
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, &'static str> {
+        const UNSUPPORTED: &str = "a jump requires static [user@]host[:port] syntax with a numeric port and brackets around IPv6";
+        if value.is_empty()
+            || value.len() > 4096
+            || value.chars().any(|character| {
+                character.is_whitespace()
+                    || character.is_control()
+                    || character.is_format()
+                    || "/\\%$`\"';&|<>!?*{}()".contains(character)
+            })
+        {
+            return Err(UNSUPPORTED);
+        }
+        // OpenSSH splits the last @, allowing an account such as user@realm.
+        let (user, host_port) = match value.rsplit_once('@') {
+            Some((user, host_port)) => {
+                if user.is_empty() || user.len() > 256 || user.contains([':', '[', ']']) {
+                    return Err(UNSUPPORTED);
+                }
+                (Some(user.to_string()), host_port)
+            }
+            None => (None, value),
+        };
+        let (alias, port_text) = if let Some(bracketed) = host_port.strip_prefix('[') {
+            let (alias, suffix) = bracketed.split_once(']').ok_or(UNSUPPORTED)?;
+            if alias.parse::<std::net::Ipv6Addr>().is_err() {
+                return Err(UNSUPPORTED);
+            }
+            let port = if suffix.is_empty() {
+                None
+            } else {
+                Some(suffix.strip_prefix(':').ok_or(UNSUPPORTED)?)
+            };
+            (alias, port)
+        } else {
+            let (alias, port) = match host_port.split_once(':') {
+                Some((alias, port)) => (alias, Some(port)),
+                None => (host_port, None),
+            };
+            if !alias
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_'))
+            {
+                return Err(UNSUPPORTED);
+            }
+            (alias, port)
+        };
+        if alias.is_empty()
+            || alias.len() > 255
+            || alias.starts_with('-')
+            || alias.eq_ignore_ascii_case("none")
+        {
+            return Err(UNSUPPORTED);
+        }
+        let port = match port_text {
+            // An empty trailing colon has no override in OpenSSH.
+            None | Some("") => None,
+            Some(value) if value.bytes().all(|byte| byte.is_ascii_digit()) => Some(
+                value
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|port| *port > 0)
+                    .ok_or(UNSUPPORTED)?,
+            ),
+            Some(_) => return Err(UNSUPPORTED),
+        };
+        Ok(Self {
+            alias: alias.to_string(),
+            user,
+            port,
+        })
+    }
+
+    fn cycle_identity(&self) -> String {
+        // Different accounts, ports or IPv6 spellings must not hide a cycle.
+        canonical_host(&self.alias)
+    }
+
+    fn route_identity(&self) -> String {
+        if self.user.is_none() && self.port.is_none() {
+            return self.alias.clone();
+        }
+        format!(
+            "{}\0{}\0{}",
+            self.alias,
+            self.user.as_deref().unwrap_or_default(),
+            self.port.map(|port| port.to_string()).unwrap_or_default()
+        )
+    }
+}
+
 struct AuthenticationPolicy {
     /// Empty means no usable policy, not permission to substitute a default.
     methods: Vec<&'static str>,
@@ -829,6 +940,24 @@ struct AuthenticationPolicy {
 }
 
 impl AliasResolver {
+    fn options_for_target(&self, target: &JumpTarget) -> frankenterm_ssh::ConfigMap {
+        if target.user.is_none() && target.port.is_none() {
+            return self.config.for_host(&target.alias);
+        }
+        // Apply -l/-p before resolving, not to the completed map: IdentityFile
+        // tokens such as %r and %p must name the same candidates we later read.
+        // Clone only this bounded, already parsed passive configuration; its
+        // denied Match-exec policy and isolated environment remain unchanged.
+        let mut config = self.config.clone();
+        if let Some(user) = &target.user {
+            config.set_option("user", user);
+        }
+        if let Some(port) = target.port {
+            config.set_option("port", port.to_string());
+        }
+        config.for_host(&target.alias)
+    }
+
     /// Every matching CertificateFile contributes in source order. Opaque,
     /// unique resolver slots preserve additive semantics and quoted paths
     /// without allowing the scalar resolver to discard later declarations.
@@ -989,19 +1118,21 @@ impl AliasResolver {
 
     /// Match OpenSSH's explicit ordered prefix: only the first named jump
     /// inherits its configured proxy chain. The preceding -J list overrides
-    /// any proxy configuration on later jumps. All hops must be concrete
-    /// configured aliases, with no inline account/port or token expansion.
-    fn jump_chain(&self, alias: &str) -> Result<Vec<String>, &'static str> {
+    /// any proxy configuration on later jumps. Every hop still requires a
+    /// concrete configured Host, with bounded optional account/port overrides.
+    /// Undeclared hosts, URI syntax, commands and expansions remain unsupported.
+    fn jump_chain(&self, alias: &str) -> Result<Vec<JumpTarget>, &'static str> {
         fn expand(
             resolver: &AliasResolver,
-            alias: &str,
+            target: &JumpTarget,
             path: &BTreeSet<String>,
             remaining: usize,
-        ) -> Result<Vec<String>, &'static str> {
-            if path.contains(alias) {
+        ) -> Result<Vec<JumpTarget>, &'static str> {
+            let identity = target.cycle_identity();
+            if path.contains(&identity) {
                 return Err("the chain returns to an earlier alias");
             }
-            let options = resolver.config.for_host(alias);
+            let options = resolver.options_for_target(target);
             let Some(token) = options.get("frankenterm_proxy") else {
                 return Ok(Vec::new());
             };
@@ -1013,40 +1144,47 @@ impl AliasResolver {
             if value.eq_ignore_ascii_case("none") {
                 return Ok(Vec::new());
             }
-            let hops: Vec<String> = value.split(',').map(str::to_string).collect();
-            if hops.iter().any(|name| {
-                name.is_empty()
-                    || name.len() > 255
-                    || name.starts_with('-')
-                    || name.eq_ignore_ascii_case("none")
-                    || !name.bytes().all(|byte| {
-                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_')
-                    })
-            }) {
-                return Err("only comma-separated configured aliases are supported");
+            if value.split(',').count() > remaining {
+                return Err("the complete chain exceeds three jump hosts");
             }
-            if hops.iter().any(|name| !resolver.aliases.contains(name)) {
+            let hops = value
+                .split(',')
+                .map(JumpTarget::parse)
+                .collect::<Result<Vec<_>, _>>()?;
+            if hops
+                .iter()
+                .any(|hop| !resolver.aliases.contains(&hop.alias))
+            {
                 return Err("a hop has no concrete Host declaration");
             }
-            let unique: BTreeSet<_> = hops.iter().collect();
+            let unique: BTreeSet<_> = hops.iter().map(JumpTarget::cycle_identity).collect();
             if unique.len() != hops.len()
-                || hops.iter().any(|name| name == alias || path.contains(name))
+                || unique.contains(&identity)
+                || unique.iter().any(|identity| path.contains(identity))
             {
                 return Err("the chain repeats or returns to an earlier alias");
             }
-            if hops.len() > remaining {
-                return Err("the complete chain exceeds three jump hosts");
-            }
             let mut path = path.clone();
-            path.insert(alias.to_string());
+            path.insert(identity);
             let mut chain = expand(resolver, &hops[0], &path, remaining - hops.len())?;
             chain.extend(hops);
-            if chain.iter().collect::<BTreeSet<_>>().len() != chain.len() {
+            if chain
+                .iter()
+                .map(JumpTarget::cycle_identity)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != chain.len()
+            {
                 return Err("the chain repeats a host alias");
             }
             Ok(chain)
         }
-        expand(self, alias, &BTreeSet::new(), MAX_JUMP_HOPS)
+        expand(
+            self,
+            &JumpTarget::unqualified(alias),
+            &BTreeSet::new(),
+            MAX_JUMP_HOPS,
+        )
     }
 
     fn trust_files(&self, options: &frankenterm_ssh::ConfigMap) -> (Vec<PathBuf>, bool) {
@@ -2096,14 +2234,15 @@ fn resolve_route(
     };
     let mut records = Vec::new();
     let mut jumps = Vec::new();
-    for (index, alias) in chain.iter().enumerate() {
-        let hop_name = format!("{} via {}", route, alias);
+    for (index, hop) in chain.iter().enumerate() {
+        let hop_name = format!("{} via {}", route, hop.alias);
         let Some(endpoint) = resolve_endpoint(
             machine,
             &hop_name,
-            &RouteTarget::Alias(alias.clone()),
+            &RouteTarget::Alias(hop.alias.clone()),
             sources,
             index > 0,
+            Some(hop),
             notes,
         ) else {
             exportable = false;
@@ -2113,7 +2252,12 @@ fn resolve_route(
         // host in another chain must not borrow its pins or proxy context.
         let id = format!(
             "j.{}",
-            short_digest(&format!("{}\0{}\0{}", machine.id, route, alias))
+            short_digest(&format!(
+                "{}\0{}\0{}",
+                machine.id,
+                route,
+                hop.route_identity()
+            ))
         );
         jumps.push(id.clone());
         records.push(ResolvedRoute {
@@ -2124,7 +2268,7 @@ fn resolve_route(
             destination: false,
         });
     }
-    if let Some(endpoint) = resolve_endpoint(machine, route, target, sources, false, notes) {
+    if let Some(endpoint) = resolve_endpoint(machine, route, target, sources, false, None, notes) {
         records.push(ResolvedRoute {
             id: format!("r.{}.{}", machine.id, route),
             endpoint,
@@ -2144,6 +2288,7 @@ fn resolve_endpoint(
     target: &RouteTarget,
     resolution: &EndpointSources<'_>,
     proxy_overridden: bool,
+    jump: Option<&JumpTarget>,
     notes: &mut Vec<ExportNote>,
 ) -> Option<Endpoint> {
     let sources = resolution.ssh;
@@ -2191,7 +2336,10 @@ fn resolve_endpoint(
                     return None;
                 }
             };
-            let options = resolver.config.for_host(alias);
+            let options = match jump {
+                Some(target) => resolver.options_for_target(target),
+                None => resolver.config.for_host(alias),
+            };
             if !proxy_overridden
                 && options.get("frankenterm_proxy").is_some_and(|token| {
                     matches!(
@@ -4928,8 +5076,16 @@ socket = "/run/frankenterm.sock"
                 "Host app\n ProxyJump NONE\n ProxyCommand touch /must-not-execute\n",
                 vec![],
             ),
+            (
+                "Host app\n ProxyJump middle@second:2202,inner@third:2203\nHost second\n ProxyJump outer@first:2201\nHost first\nHost third\n ProxyJump nonexistent\n",
+                vec!["outer@first:2201", "middle@second:2202", "inner@third:2203"],
+            ),
         ] {
             let resolver = alias_resolver(Some(text), &context().home).unwrap();
+            let expected: Vec<_> = expected
+                .into_iter()
+                .map(|target| JumpTarget::parse(target).unwrap())
+                .collect();
             assert_eq!(resolver.jump_chain("app").unwrap(), expected, "{}", text);
         }
         let mut sources = jump_sources();
@@ -4985,8 +5141,22 @@ socket = "/run/frankenterm.sock"
             "first,,second",
             "first,",
             ",first",
-            "user@first",
-            "first:2222",
+            "user@first,another@first:2222",
+            "user@app:2222",
+            "first,user@app:2222",
+            "user@first:1,user@second:2,user@third:3,user@fourth:4",
+            "first:0",
+            "first:65536",
+            "first:-1",
+            "first:+22",
+            "first:22x",
+            "first:22:23",
+            "@first",
+            "user@:22",
+            "user@[first]:22",
+            "user@[2001:db8::1]:2222",
+            "2001:db8::1",
+            "user@first%zone",
             "ssh://first",
             "first,none",
             "-first",
@@ -5009,6 +5179,10 @@ socket = "/run/frankenterm.sock"
             "Host app\n ProxyJump first,second\nHost first\n ProxyJump second\nHost second\n",
             "Host app\n ProxyJump second,third\nHost second\n ProxyJump first\nHost first\n ProxyJump fourth\nHost third fourth\n",
             "Host app\n ProxyJump first\nHost fir*\n User u\n",
+            "Host app\n ProxyJump user@first:2200\nHost first\n ProxyJump other@app:2201\n",
+            "Host app\n ProxyJump user@first:2200\nHost fir*\n User u\n",
+            "Host app\n ProxyJump user@[2001:db8::1]:2200,other@[2001:0db8::1]:2201\nHost 2001:db8::1 2001:0db8::1\n User u\n",
+            "Host app\n ProxyJump first\nHost first\n ProxyJump user@APP:2200\nHost APP\n User u\n",
         ] {
             let resolver = alias_resolver(Some(config), &context().home).unwrap();
             assert!(resolver.jump_chain("app").is_err(), "{}", config);
@@ -5046,27 +5220,349 @@ socket = "/run/frankenterm.sock"
     }
 
     #[test]
-    fn a_transit_hosts_required_policy_and_revocations_survive_in_the_workspace() {
-        for policy in [
-            "HostKeyAlgorithms ssh-ed25519",
-            "RevokedHostKeys /must-not-read",
-            "KnownHostsCommand touch /must-not-execute",
-            "CertificateFile ~/.ssh/second-cert.pub",
-            "PubkeyAuthentication host-bound",
+    fn qualified_jump_syntax_keeps_exact_accounts_and_checked_ports() {
+        // OpenSSH -G -J accepts the empty trailing colon and splits the last
+        // @ in a qualified jump. Neither spelling creates an implicit port.
+        for (value, user, port) in [
+            ("first", None, None),
+            ("first:", None, None),
+            ("operator@first", Some("operator"), None),
+            ("first:2200", None, Some(2200)),
+            ("operator@first:02200", Some("operator"), Some(2200)),
+            (
+                "operator@realm@first:65535",
+                Some("operator@realm"),
+                Some(65535),
+            ),
         ] {
-            let mut sources = jump_sources();
-            sources.config =
-                Some(JUMP_CONFIG.replace("Host second\n", &format!("Host second\n {}\n", policy)));
-            let export = jump_export(&sources).unwrap();
-            let route = exported_route(&export, "r.app.ssh");
-            let hop = route["jump_routes"][1].as_str().unwrap();
+            let target = JumpTarget::parse(value).unwrap();
+            assert_eq!(target.alias, "first", "{}", value);
+            assert_eq!(target.user.as_deref(), user, "{}", value);
+            assert_eq!(target.port, port, "{}", value);
+        }
+        assert_eq!(
+            JumpTarget::parse("operator@first:02200")
+                .unwrap()
+                .route_identity(),
+            JumpTarget::parse("operator@first:2200")
+                .unwrap()
+                .route_identity()
+        );
+        assert_eq!(
+            JumpTarget::parse("first:").unwrap(),
+            JumpTarget::unqualified("first")
+        );
+        for invalid in [
+            format!("{}@first", "u".repeat(257)),
+            format!("user@{}", "h".repeat(256)),
+            "user\u{202e}@first".to_string(),
+            "user\n@first".to_string(),
+            "user name@first".to_string(),
+            "user@first:999999999999999999999999999999999999".to_string(),
+            "user@[2001:db8::1]suffix".to_string(),
+            "user@[2001:db8::1]:22:23".to_string(),
+        ] {
+            assert!(JumpTarget::parse(&invalid).is_err(), "{}", invalid);
+        }
+    }
+
+    #[test]
+    fn qualified_proxyjump_keeps_each_hops_identity_trust_and_destination_separate() {
+        let mut sources = jump_sources();
+        sources.config = Some(JUMP_CONFIG.replace(
+            "ProxyJump first,second,third",
+            "ProxyJump outer-user@first:2201,transit@realm@second:2202,third:2203",
+        ));
+        supply(
+            &mut sources,
+            "/trust/second",
+            format!(
+                "middle.internal {}\n[middle.internal]:2202 {}\n",
+                fake_key(42),
+                fake_key(62)
+            ),
+        );
+        supply(
+            &mut sources,
+            "/trust/third",
+            format!(
+                "[inner.internal]:2223 {}\n[inner.internal]:2203 {}\n@revoked [inner.internal]:2223 {}\n",
+                fake_key(43),
+                fake_key(63),
+                fake_key(63)
+            ),
+        );
+        let exported = jump_export(&sources).unwrap();
+        assert_eq!(exported.machines, 1);
+        assert_eq!(exported.routes, 5);
+        let destination = exported_route(&exported, "r.app.ssh");
+        assert_eq!(destination["host"], "service.internal");
+        assert_eq!(destination["user"], "deploy");
+        assert_eq!(destination["port"], 2224);
+        assert_eq!(
+            exported_route(&exported, "r.app.mux")["jump_routes"],
+            destination["jump_routes"]
+        );
+        let jumps = destination["jump_routes"].as_array().unwrap();
+        for (index, (user, port, identity_seed, host_seed)) in [
+            ("outer-user", 2201, 1, 41),
+            ("transit@realm", 2202, 2, 62),
+            ("jump", 2203, 3, 63),
+        ]
+        .iter()
+        .copied()
+        .enumerate()
+        {
+            let id = jumps[index].as_str().unwrap();
+            let hop = exported_route(&exported, id);
+            assert_eq!(hop["user"], user);
+            assert_eq!(hop["port"], port);
+            assert!(hop["session_creation"].is_null());
+            let trust = route_trust(&exported, id);
+            assert_eq!(trust["port"], port);
+            assert_eq!(trust["pins"].as_array().unwrap().len(), 1);
             assert_eq!(
-                route_trust(&export, hop)["required_capabilities"],
-                json!([UNRESOLVED_POLICY]),
-                "{}",
-                policy
+                trust["pins"][0]["fingerprint"],
+                PublicKey::parse_line(&fake_key(host_seed))
+                    .unwrap()
+                    .fingerprint()
             );
-            assert!(route_trust(&export, "r.app.ssh")["required_capabilities"].is_null());
+            assert!(trust["revoked_keys"].as_array().unwrap().is_empty());
+            assert!(trust["required_capabilities"].is_null());
+            let credential_id = hop["credential_refs"][0].as_str().unwrap();
+            let credential = exported.document["workspace"]["credentials"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|value| value["id"] == credential_id)
+                .unwrap();
+            assert_eq!(
+                credential["public_fingerprint"],
+                PublicKey::parse_line(&fake_key(identity_seed))
+                    .unwrap()
+                    .fingerprint()
+            );
+        }
+        let first = exported_route(&exported, jumps[0].as_str().unwrap());
+        assert_eq!(
+            first["host_key_alias"], "outer-key",
+            "an explicit port does not replace HostKeyAlias lookup"
+        );
+        let repeated = jump_export(&sources).unwrap();
+        assert_eq!(
+            repeated.document["workspace"],
+            exported.document["workspace"]
+        );
+        assert_eq!(
+            repeated.document["source"]["configuration_revision"],
+            exported.document["source"]["configuration_revision"]
+        );
+
+        // A denial at the final endpoint wins; an old-port pin or denial may
+        // not be substituted just because it came from the same source file.
+        supply(
+            &mut sources,
+            "/trust/second",
+            format!(
+                "middle.internal {}\n[middle.internal]:2202 {}\n@revoked [middle.internal]:2202 {}\n",
+                fake_key(42),
+                fake_key(62),
+                fake_key(62)
+            ),
+        );
+        let denied = jump_export(&sources).unwrap();
+        let id = exported_route(&denied, "r.app.ssh")["jump_routes"][1]
+            .as_str()
+            .unwrap();
+        assert!(
+            route_trust(&denied, id)["pins"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            route_trust(&denied, id)["revoked_keys"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn qualified_proxyjump_discovers_exact_expanded_public_identity_candidates_in_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::create_dir_all(home.join("trust")).unwrap();
+        write_source(
+            &home.join(".ssh/config"),
+            "Host app\n HostName app.internal\n User deploy\n IdentityFile ~/.ssh/app\n UserKnownHostsFile ~/trust/app\n ProxyJump selected-user@first:2200\nHost first\n HostName jump.internal\n User configured-user\n Port 2022\n IdentityFile ~/.ssh/%r-%p\n IdentityFile ~/.ssh/backup\n PreferredAuthentications publickey\n UserKnownHostsFile ~/trust/first\nHost *\n GlobalKnownHostsFile none\n ProxyCommand none\n",
+        );
+        for (file, seed) in [
+            ("selected-user-2200", 1),
+            ("backup", 2),
+            ("app", 3),
+            ("configured-user-2022", 4),
+        ] {
+            // Private files deliberately do not exist. The snapshot must read
+            // only the exact expanded .pub candidates for these reviewed hops.
+            write_source(&home.join(format!(".ssh/{}.pub", file)), fake_key(seed));
+        }
+        write_source(
+            &home.join("trust/app"),
+            format!("app.internal {}\n", fake_key(43)),
+        );
+        write_source(
+            &home.join("trust/first"),
+            format!("[jump.internal]:2200 {}\n", fake_key(41)),
+        );
+        let context = InventoryContext {
+            directory: directory.path().to_path_buf(),
+            home,
+        };
+        let inventory = MachineInventory::parse(JUMP_INVENTORY, &context).unwrap();
+        let mut snapshot = SshSources::from_disk(&inventory, &context);
+        assert!(
+            snapshot
+                .public_keys
+                .contains_key(&context.home.join(".ssh/selected-user-2200.pub"))
+        );
+        assert!(
+            snapshot
+                .public_keys
+                .contains_key(&context.home.join(".ssh/backup.pub"))
+        );
+        assert!(
+            !snapshot
+                .public_keys
+                .contains_key(&context.home.join(".ssh/configured-user-2022.pub")),
+            "applying -l/-p after resolution would read the wrong identity"
+        );
+        // The fixture owns the user source; the build host's system policy is
+        // not an oracle for the exported authentication choices below.
+        snapshot.system_config = KnownHostsSource::Missing;
+        let exported = export(&inventory, None, &snapshot, &context).unwrap();
+        let id = exported_route(&exported, "r.app.ssh")["jump_routes"][0]
+            .as_str()
+            .unwrap();
+        let hop = exported_route(&exported, id);
+        assert_eq!(hop["user"], "selected-user");
+        assert_eq!(hop["port"], 2200);
+        assert_eq!(hop["authentication_methods"], json!(["publickey"]));
+        let fingerprints: Vec<_> = hop["credential_refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| {
+                let credential = exported.document["workspace"]["credentials"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|credential| credential["id"] == *id)
+                    .unwrap();
+                credential["public_fingerprint"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            fingerprints,
+            vec![
+                PublicKey::parse_line(&fake_key(1)).unwrap().fingerprint(),
+                PublicKey::parse_line(&fake_key(2)).unwrap().fingerprint()
+            ]
+        );
+        assert_eq!(
+            exported.identity_files[hop["credential_refs"][0].as_str().unwrap()],
+            context.home.join(".ssh/selected-user-2200")
+        );
+        assert!(exported.identity_files.values().all(|path| !path.exists()));
+        assert_eq!(
+            route_trust(&exported, id)["pins"][0]["fingerprint"],
+            PublicKey::parse_line(&fake_key(41)).unwrap().fingerprint()
+        );
+    }
+
+    #[test]
+    fn configured_ipv6_proxyjump_uses_unbracketed_host_policy_and_effective_port() {
+        let mut sources = jump_sources();
+        sources.config = Some(
+            JUMP_CONFIG
+                .replace(
+                    "ProxyJump first,second,third",
+                    "ProxyJump ipv6-user@[2001:db8::1]:2205,second,third",
+                )
+                .replace(
+                    "Host first\n HostName outer.example\n",
+                    "Host 2001:db8::1\n",
+                )
+                .replace(" HostKeyAlias outer-key\n", ""),
+        );
+        supply(
+            &mut sources,
+            "/trust/first",
+            format!(
+                "[2001:db8::1]:2221 {}\n[2001:db8::1]:2205 {}\n@revoked [2001:db8::1]:2205 {}\n",
+                fake_key(41),
+                fake_key(81),
+                fake_key(82)
+            ),
+        );
+        let exported = jump_export(&sources).unwrap();
+        let id = exported_route(&exported, "r.app.ssh")["jump_routes"][0]
+            .as_str()
+            .unwrap();
+        let hop = exported_route(&exported, id);
+        assert_eq!(hop["host"], "2001:db8::1");
+        assert_eq!(hop["user"], "ipv6-user");
+        assert_eq!(hop["port"], 2205);
+        let trust = route_trust(&exported, id);
+        assert_eq!(trust["pins"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            trust["pins"][0]["fingerprint"],
+            PublicKey::parse_line(&fake_key(81)).unwrap().fingerprint()
+        );
+        assert_eq!(trust["revoked_keys"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            trust["revoked_keys"][0]["fingerprint"],
+            PublicKey::parse_line(&fake_key(82)).unwrap().fingerprint()
+        );
+        assert!(trust["required_capabilities"].is_null());
+    }
+
+    #[test]
+    fn a_transit_hosts_required_policy_and_revocations_survive_in_the_workspace() {
+        for qualified in [false, true] {
+            for policy in [
+                "HostKeyAlgorithms ssh-ed25519",
+                "RevokedHostKeys /must-not-read",
+                "KnownHostsCommand touch /must-not-execute",
+                "CertificateFile ~/.ssh/second-cert.pub",
+                "PubkeyAuthentication host-bound",
+            ] {
+                let mut sources = jump_sources();
+                let mut config =
+                    JUMP_CONFIG.replace("Host second\n", &format!("Host second\n {}\n", policy));
+                if qualified {
+                    config = config.replace(
+                        "ProxyJump first,second,third",
+                        "ProxyJump outer@first:2221,transit@second:22,jump@third:2223",
+                    );
+                }
+                sources.config = Some(config);
+                let export = jump_export(&sources).unwrap();
+                let route = exported_route(&export, "r.app.ssh");
+                let hop = route["jump_routes"][1].as_str().unwrap();
+                assert_eq!(
+                    route_trust(&export, hop)["required_capabilities"],
+                    json!([UNRESOLVED_POLICY]),
+                    "{}",
+                    policy
+                );
+                assert!(route_trust(&export, "r.app.ssh")["required_capabilities"].is_null());
+            }
         }
         let mut sources = jump_sources();
         supply(

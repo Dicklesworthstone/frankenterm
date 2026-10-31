@@ -75,7 +75,8 @@ final class NativeTerminalSelectionOverlay: UIView {
     }
 
     /// Lays the highlight over `frame`'s rows; ends off screen hide their handle.
-    func show(_ selection: TerminalTextSelection?, frame: TerminalRenderFrame?, cell: CGSize?, tint: UIColor) {
+    func show(_ selection: TerminalTextSelection?, frame: TerminalRenderFrame?, cell: CGSize?, tint: UIColor,
+              origin: CGPoint = .zero) {
         guard let selection, let frame, let cell, cell.width > 0, cell.height > 0 else {
             highlight.path = nil; startHandle.isHidden = true; endHandle.isHidden = true; return
         }
@@ -83,11 +84,14 @@ final class NativeTerminalSelectionOverlay: UIView {
         var startRect: CGRect?, endRect: CGRect?
         for (index, row) in frame.lines.enumerated() {
             guard let columns = selection.columns(onRow: row.stableIndex, width: frame.columns) else { continue }
-            let rect = CGRect(x: CGFloat(columns.lowerBound) * cell.width, y: CGFloat(index) * cell.height,
+            let rect = CGRect(x: origin.x + CGFloat(columns.lowerBound) * cell.width,
+                              y: origin.y + CGFloat(index) * cell.height,
                               width: CGFloat(columns.count) * cell.width, height: cell.height)
-            path.append(UIBezierPath(rect: rect))
-            if row.stableIndex == selection.start.row { startRect = rect }
-            if row.stableIndex == selection.end.row { endRect = rect }
+            let visible = rect.intersection(bounds)
+            if !visible.isNull, !visible.isEmpty { path.append(UIBezierPath(rect: visible)) }
+            if row.stableIndex == selection.start.row, bounds.contains(CGPoint(x: rect.minX, y: rect.minY)) { startRect = rect }
+            if row.stableIndex == selection.end.row, rect.maxX >= 0, rect.maxX <= bounds.width,
+               rect.maxY > 0, rect.maxY <= bounds.height { endRect = rect }
         }
         highlight.path = path.cgPath
         highlight.fillColor = tint.withAlphaComponent(0.35).cgColor

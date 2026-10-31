@@ -14,12 +14,32 @@ public struct WorkspaceHostKeyPin: Codable, Equatable, Sendable {
     let sourceWitness: Data
 }
 
+public extension InstalledWorkspace {
+    /// Only a currently active phone choice can be replaced on this phone.
+    /// Imported pins and local choices whose source policy changed are never
+    /// returned, even when their old metadata remains in protected storage.
+    func phoneHostKeyPin(forRouteID routeID: String) throws -> WorkspaceHostKeyPin? {
+        let imported = try importedDocument()
+        guard let route = imported.routes.first(where: { $0.id == routeID }),
+              let trust = imported.hostTrust.first(where: { $0.id == route.trustID }), trust.pins.isEmpty,
+              let pin = hostKeyPins.first(where: { $0.trustID == trust.id }),
+              pin.sourceWitness == (try WorkspaceHostKeyOverlay.witness(trustID: trust.id, in: imported)) else { return nil }
+        // Validate the complete overlay rather than treating a stored record as
+        // proof that it still controls the effective host trust.
+        let effective = try document()
+        guard effective.hostTrust.first(where: { $0.id == trust.id })?.pins == [pin.key] else { return nil }
+        return pin
+    }
+}
+
 public enum WorkspaceHostKeyPinError: Error, Equatable, Sendable, LocalizedError {
-    case alreadyConfigured, revoked, unsupportedPolicy, unsupportedRoute, jumpNotReady
+    case alreadyConfigured, unchangedKey, revoked, unsupportedPolicy, unsupportedRoute, jumpNotReady
     public var errorDescription: String? {
         switch self {
         case .alreadyConfigured:
-            "This host already has a trusted key. A different key requires a reviewed workspace update."
+            "This host already has a trusted key. Replacing a phone-verified key needs a separate review; imported trust must be updated in its source workspace."
+        case .unchangedKey:
+            "The server still presents the host key already verified on this phone. No replacement is needed."
         case .revoked:
             "This host key is blocked on this phone or revoked by the workspace. It cannot be trusted again here."
         case .unsupportedPolicy:
@@ -33,14 +53,16 @@ public enum WorkspaceHostKeyPinError: Error, Equatable, Sendable, LocalizedError
 }
 
 /// Short-lived, store-issued permission to authenticate only the already
-/// trusted transit hosts of an unconfigured destination. It grants no account
-/// authentication at that destination, no shell, and no durable connection
-/// approval. The issuing store rechecks the complete path on every use.
+/// trusted transit hosts for first-use verification or explicit phone-pin
+/// replacement. It grants no account authentication at that destination, no
+/// shell, and no durable connection approval. The issuing store rechecks the
+/// complete path and any prior phone pin on every use.
 public struct WorkspaceHostKeyProbe: Equatable, Sendable {
     public let id: UUID
     public let workspaceID: UUID
     public let expectedRevision: UUID
     public let routeID: String
+    let previousPin: WorkspaceHostKeyPin?
     let owner: UUID
     let expires: ContinuousClock.Instant
 }
@@ -57,6 +79,9 @@ public struct WorkspaceHostKeyPinReview: Identifiable, Sendable {
     public let host: String
     public let port: UInt16
     public let key: WorkspaceDocument.HostKey
+    /// The exact phone-verified key this review replaces; nil is first use.
+    public var previousKey: WorkspaceDocument.HostKey? { previousPin?.key }
+    let previousPin: WorkspaceHostKeyPin?
     let sourceWitness: Data
     let owner: UUID
 }

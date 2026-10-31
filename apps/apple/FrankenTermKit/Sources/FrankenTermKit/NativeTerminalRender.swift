@@ -56,6 +56,9 @@ public struct NativeTerminalRenderConfiguration: Equatable, Sendable {
     /// Fit the received shared grid without changing its remote dimensions.
     /// The configured size remains the user's upper bound, not a PTY request.
     public var fitsRemoteGrid = false
+    /// Read a shared grid at the configured text size and pan locally. This
+    /// is effective only while fitsRemoteGrid preserves the remote geometry.
+    public var localViewportEnabled = false
     public init() {}
     fileprivate func validate() throws {
         guard fontRevision > 0, !fontName.isEmpty, fontName.utf8.count <= 256,
@@ -89,6 +92,9 @@ public final class NativeTerminalRenderView: MTKView {
     public var onFailure: (@MainActor (TerminalRenderError) -> Void)?
     /// Each decoded frame as it is admitted, before it is drawn.
     public var onFrameAdmitted: (@MainActor (TerminalRenderFrame) -> Void)?
+    var onProjectionInvalidated: (@MainActor () -> Void)?
+    var onLocalViewportChange: (@MainActor (Bool) -> Void)?
+    var onCursorRevealRequest: (@MainActor () -> Bool)?
     public private(set) var configuration: NativeTerminalRenderConfiguration
 
     private let commandQueue: any MTLCommandQueue
@@ -101,7 +107,9 @@ public final class NativeTerminalRenderView: MTKView {
     private var pending: Data?
     private var latest: TerminalRenderFrame?
     private var completedPointerProjection: (geometry: UInt64, font: UInt64, viewport: Int64,
-                                             live: Bool, cellSize: CGSize, generation: UInt64)?
+                                             live: Bool, alternate: Bool, grid: TerminalLocalViewport, generation: UInt64)?
+    private var localViewportOffset = TerminalLocalViewport.Offset.zero
+    private var revealCursorOnPreparation = false
     private var preparing = false
     private var preparationGeneration: UInt64 = 1
     private var deliveredCaret: UInt64 = 0
@@ -130,6 +138,7 @@ public final class NativeTerminalRenderView: MTKView {
         guard let queue = pipelines.device.makeCommandQueue() else { throw TerminalRenderError.unavailable }
         backgroundPipeline = pipelines.background; textPipeline = pipelines.text
         self.source = source; self.configuration = configuration; commandQueue = queue
+        revealCursorOnPreparation = configuration.fitsRemoteGrid && configuration.localViewportEnabled
         worker = NativeTerminalPreparation(device: pipelines.device)
         super.init(frame: .zero, device: pipelines.device)
         colorPixelFormat = .bgra8Unorm_srgb; framebufferOnly = true
@@ -167,19 +176,21 @@ public final class NativeTerminalRenderView: MTKView {
     /// The last admitted frame: what is shown, or about to be.
     public var admittedFrame: TerminalRenderFrame? { latest }
     /// One cell in points at the current font, once a frame has been laid
-    /// out. Cells start at the view's top-left corner.
+    /// out. Use pointerProjection for the current grid origin and hit testing.
     public private(set) var cellSize: CGSize?
     /// Mouse coordinates require a completed draw and its exact cell metrics.
     /// Admission may be ahead of Metal; never mix that newer grid with a
     /// previous font/layout, or keep a projection through a hidden scene.
-    public var pointerProjection: (frame: TerminalRenderFrame, cellSize: CGSize)? {
+    public var pointerProjection: (frame: TerminalRenderFrame, cellSize: CGSize, viewport: TerminalLocalViewport)? {
         guard active, !retired, let projected = completedPointerProjection, let latest,
               projected.generation == preparationGeneration,
               projected.geometry == latest.geometryRevision, projected.font == latest.fontRevision,
               projected.viewport == latest.viewportFirst, projected.live == latest.isLive,
+              projected.alternate == latest.alternateScreen,
               latest.flags & 8 == 0 else { return nil }
-        return (latest, projected.cellSize)
+        return (latest, .init(width: projected.grid.cellWidth, height: projected.grid.cellHeight), projected.grid)
     }
+    public var localViewportEnabled: Bool { configuration.fitsRemoteGrid && configuration.localViewportEnabled }
     var permitsAccessibilityReading: Bool { active && !retired }
 
     /// The last admitted screen, read on demand so steady output costs nothing.
@@ -231,9 +242,62 @@ public final class NativeTerminalRenderView: MTKView {
     public func setFitsRemoteGrid(_ fits: Bool) throws {
         guard !retired else { throw TerminalRenderError.unavailable }
         guard configuration.fitsRemoteGrid != fits else { return }
+        let wasLocal = localViewportEnabled
         configuration.fitsRemoteGrid = fits
+        if !fits { configuration.localViewportEnabled = false; localViewportOffset = .zero; revealCursorOnPreparation = false }
         try invalidatePreparation()
         requestPreparation()
+        if wasLocal != localViewportEnabled { onLocalViewportChange?(localViewportEnabled) }
+    }
+
+    func setLocalViewportEnabled(_ enabled: Bool) throws {
+        guard !retired else { throw TerminalRenderError.unavailable }
+        let next = enabled && configuration.fitsRemoteGrid
+        guard configuration.localViewportEnabled != next else { return }
+        configuration.localViewportEnabled = next
+        localViewportOffset = .zero; revealCursorOnPreparation = next
+        try invalidatePreparation(); requestPreparation()
+        onLocalViewportChange?(next)
+    }
+
+    func setLocalViewportOffset(_ offset: TerminalLocalViewport.Offset) throws {
+        guard localViewportEnabled, !retired else { return }
+        guard offset.columns.isFinite, offset.rows.isFinite else { throw TerminalRenderError.capacity }
+        guard localViewportOffset != offset || revealCursorOnPreparation else { return }
+        localViewportOffset = offset; revealCursorOnPreparation = false
+        try invalidatePreparation(); requestPreparation()
+    }
+
+    func revealLocalCursor() throws {
+        guard localViewportEnabled, !retired else { return }
+        // Repeated hardware/software input can arrive while the worker or GPU
+        // is busy. One pending reveal owns that generation until its draw
+        // completes; restarting it for every keystroke would starve the caret.
+        guard !revealCursorOnPreparation else { return }
+        if let projection = pointerProjection {
+            let delta = projection.frame.cursor.stableRow.subtractingReportingOverflow(projection.frame.viewportFirst)
+            if !delta.overflow, delta.partialValue >= 0, delta.partialValue < Int64(projection.frame.rows),
+               let offset = projection.viewport.revealing(column: projection.frame.cursor.column,
+                    row: Int(delta.partialValue),
+                    cellWidth: min(projection.frame.cursor.width, projection.frame.columns - projection.frame.cursor.column)),
+               offset == projection.viewport.offset { return }
+        }
+        revealCursorOnPreparation = true
+        try invalidatePreparation(); requestPreparation()
+    }
+
+    /// Accessible directional actions use the same completed projection as
+    /// touch. They change no remote cursor, history selection, or geometry.
+    @discardableResult
+    func panLocalViewport(columns: Double, rows: Double) -> Bool {
+        guard localViewportEnabled, let projection = pointerProjection,
+              let next = projection.viewport.panning(byX: -columns * projection.viewport.cellWidth,
+                    y: -rows * projection.viewport.cellHeight),
+              next != projection.viewport.offset else { return false }
+        do {
+            try setLocalViewportOffset(next)
+            return true
+        } catch { fail((error as? TerminalRenderError) ?? .unavailable); return false }
     }
 
     public func setSceneActive(_ active: Bool) {
@@ -247,6 +311,7 @@ public final class NativeTerminalRenderView: MTKView {
         else {
             accessibleOutput.discard()
             completedPointerProjection = nil
+            onProjectionInvalidated?()
             waitingForResources = false
             blinkTimer?.invalidate(); blinkTimer = nil
             displayLink?.isPaused = true
@@ -271,6 +336,7 @@ public final class NativeTerminalRenderView: MTKView {
         onCaretUnavailable?()
         onCaret = nil; onCaretUnavailable = nil; onAppearance = nil; onViewportChange = nil; onFailure = nil
         onFrameAdmitted = nil
+        onProjectionInvalidated = nil; onLocalViewportChange = nil; onCursorRevealRequest = nil
     }
 
     public override func layoutSubviews() {
@@ -295,6 +361,7 @@ public final class NativeTerminalRenderView: MTKView {
         completedPointerProjection = nil
         blinkTimer?.invalidate(); blinkTimer = nil
         onCaretUnavailable?()
+        onProjectionInvalidated?()
     }
 
     private func discardPrepared() {
@@ -325,10 +392,12 @@ public final class NativeTerminalRenderView: MTKView {
             let viewport = SIMD2<Int>(Int(drawableSize.width), Int(drawableSize.height))
             let scale = Double(window?.screen.scale ?? contentScaleFactor)
             let config = configuration, expected = source
+            let localOffset = localViewportOffset, revealCursor = revealCursorOnPreparation
             let phase = blinkPhase, minimumRevision = lastAdmittedRevision
             needsPreparation = false; preparing = true
             worker.enqueue(packet: packet, retained: retained, source: expected, lease: lease,
                 generation: generation, viewport: viewport, scale: scale, configuration: config,
+                localOffset: localOffset, revealCursor: revealCursor,
                 blinkPhase: phase, minimumRevision: minimumRevision) { [weak self] result in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
@@ -367,10 +436,13 @@ public final class NativeTerminalRenderView: MTKView {
                         }
                         self.prepared = frame
                         self.cellSize = frame.cellSize
+                        self.localViewportOffset = self.localViewportEnabled ? frame.projection.offset : .zero
                         let proposal = NativeTerminalViewport(source: self.source, revision: generation,
                             columns: frame.fittingColumns, rows: frame.fittingRows,
                             pixelWidth: frame.viewport.x, pixelHeight: frame.viewport.y)
-                        if self.lastViewport != proposal {
+                        // A shared-grid fit, local zoom, pan or cursor reveal
+                        // is presentation only and cannot propose a PTY size.
+                        if !self.configuration.fitsRemoteGrid, self.lastViewport != proposal {
                             self.lastViewport = proposal
                             self.onViewportChange?(proposal)
                         }
@@ -452,9 +524,11 @@ public final class NativeTerminalRenderView: MTKView {
                     if succeeded {
                         if frame.lease.serial > self.deliveredCaret {
                             self.deliveredCaret = frame.lease.serial
+                            if frame.revealedCursor { self.revealCursorOnPreparation = false }
                             self.completedPointerProjection = frame.semantic.flags & 8 == 0
                                 ? (frame.semantic.geometryRevision, frame.semantic.fontRevision,
-                                   frame.semantic.viewportFirst, frame.semantic.isLive, frame.cellSize, frame.generation) : nil
+                                   frame.semantic.viewportFirst, frame.semantic.isLive, frame.semantic.alternateScreen,
+                                   frame.projection, frame.generation) : nil
                             let color = frame.semantic.palette[frame.semantic.reverseVideo ? 257 : 256]
                             self.onAppearance?(UIFont(name: frame.fontName, size: frame.fontPointSize)
                                 ?? .monospacedSystemFont(ofSize: frame.fontPointSize, weight: .regular),
@@ -727,6 +801,24 @@ private final class NativeTerminalGPUReservation: Sendable {
     }
 }
 
+/// Judge caret visibility before converting pixels into UIKit points. A
+/// scale-three division can otherwise place a visible final cell a rounding
+/// error outside the view, or give a partly clipped cell an editable anchor.
+enum NativeTerminalCaretProjection {
+    static func rectangle(column: Int, row: Int, uniforms: TerminalRenderUniforms, scale: Double) -> CGRect? {
+        guard column >= 0, row >= 0, column < Int(uniforms.columns), row < Int(uniforms.rows),
+              scale.isFinite, (1...4).contains(scale) else { return nil }
+        let width = Double(uniforms.cellSize.0), height = Double(uniforms.cellSize.1)
+        let x = Double(uniforms.origin.0) + Double(column) * width
+        let y = Double(uniforms.origin.1) + Double(row) * height
+        let viewportWidth = Double(uniforms.viewport.0), viewportHeight = Double(uniforms.viewport.1)
+        guard x.isFinite, y.isFinite, width.isFinite, height.isFinite, width > 0, height > 0,
+              x >= 0, y >= 0, x + width <= viewportWidth, y + height <= viewportHeight else { return nil }
+        return CGRect(x: x / scale, y: y / scale, width: width / scale, height: height / scale)
+            .intersection(CGRect(x: 0, y: 0, width: viewportWidth / scale, height: viewportHeight / scale))
+    }
+}
+
 private struct NativePreparedTerminalFrame: @unchecked Sendable {
     let semantic: TerminalRenderFrame
     let lease: TerminalRenderSlots.Lease, generation: UInt64
@@ -735,11 +827,13 @@ private struct NativePreparedTerminalFrame: @unchecked Sendable {
     let instanceCount: Int
     let clear: [Float]
     let caret: CGRect?
+    let revealedCursor: Bool
     let fontName: String
     let fontPointSize: CGFloat
     let fittingColumns: Int, fittingRows: Int
-    /// One cell in points; cells start at the view's top-left corner.
+    /// One cell and the clipped grid projection, in UIKit points.
     let cellSize: CGSize
+    let projection: TerminalLocalViewport
 }
 
 private enum NativeTerminalPreparationResult: Sendable {
@@ -793,7 +887,8 @@ private final class NativeTerminalPreparation: @unchecked Sendable {
     }
     func enqueue(packet: Data?, retained: TerminalRenderFrame?, source: TerminalSource,
                  lease: TerminalRenderSlots.Lease, generation: UInt64, viewport: SIMD2<Int>,
-                 scale: Double, configuration: NativeTerminalRenderConfiguration, blinkPhase: UInt64,
+                 scale: Double, configuration: NativeTerminalRenderConfiguration,
+                 localOffset: TerminalLocalViewport.Offset, revealCursor: Bool, blinkPhase: UInt64,
                  minimumRevision: UInt64,
                  completion: @escaping @Sendable (Result<NativeTerminalPreparationResult, TerminalRenderError>) -> Void) {
         queue.async { [self] in
@@ -825,7 +920,8 @@ private final class NativeTerminalPreparation: @unchecked Sendable {
                             resources[lease.slot] = owned
                         }
                         let result = try NativeTerminalFrameBuilder(frame: frame, resources: owned,
-                            configuration: configuration, scale: scale, viewport: viewport, blinkPhase: blinkPhase)
+                            configuration: configuration, scale: scale, viewport: viewport, blinkPhase: blinkPhase,
+                            localOffset: localOffset, revealCursor: revealCursor)
                             .build(lease: lease, generation: generation)
                         completion(.success(.ready(result)))
                     } catch NativeTerminalResourceError.temporarilyUnavailable {
@@ -852,6 +948,7 @@ private final class NativeTerminalFrameBuilder {
     private let frame: TerminalRenderFrame, resources: NativeTerminalResources
     private let configuration: NativeTerminalRenderConfiguration, scale: Double
     private let viewport: SIMD2<Int>, blinkPhase: UInt64
+    private let localOffset: TerminalLocalViewport.Offset, revealCursor: Bool
     private let baseFont: CTFont
     private let rasterFontSize: Double
     /// Only kCTFontCascadeListAttribute; reapplied to every derived face, since
@@ -883,10 +980,12 @@ private final class NativeTerminalFrameBuilder {
 
     init(frame: TerminalRenderFrame, resources: NativeTerminalResources,
          configuration: NativeTerminalRenderConfiguration, scale: Double,
-         viewport: SIMD2<Int>, blinkPhase: UInt64) throws {
+         viewport: SIMD2<Int>, blinkPhase: UInt64,
+         localOffset: TerminalLocalViewport.Offset, revealCursor: Bool) throws {
         guard scale.isFinite, (1...4).contains(scale) else { throw TerminalRenderError.capacity }
         self.frame = frame; self.resources = resources; self.configuration = configuration
         self.scale = scale; self.viewport = viewport; self.blinkPhase = blinkPhase
+        self.localOffset = localOffset; self.revealCursor = revealCursor
         let size = configuration.fontPointSize * scale
         // An explicit cascade of the configured fallbacks that are actually
         // installed: an unknown name is skipped rather than letting Core Text
@@ -912,7 +1011,7 @@ private final class NativeTerminalFrameBuilder {
         }
         let initial = try metrics(original)
         var fitted = original, fittedSize = size, measured = initial
-        if configuration.fitsRemoteGrid {
+        if configuration.fitsRemoteGrid && !configuration.localViewportEnabled {
             let fit = try TerminalGridFit(columns: frame.columns, rows: frame.rows,
                 cellWidth: initial.width, cellHeight: initial.height, pixelWidth: viewport.x, pixelHeight: viewport.y)
             fittedSize *= fit.scale
@@ -980,14 +1079,29 @@ private final class NativeTerminalFrameBuilder {
         let cursorDelta = frame.cursor.stableRow.subtractingReportingOverflow(frame.viewportFirst)
         let cursorRow = cursorDelta.partialValue
         let inside = !cursorDelta.overflow && cursorRow >= 0 && cursorRow < Int64(frame.rows)
+        let isLocal = configuration.fitsRemoteGrid && configuration.localViewportEnabled
+        var layout = try TerminalLocalViewport(columns: frame.columns, rows: frame.rows,
+            cellWidth: cellWidth, cellHeight: cellHeight, width: Double(viewport.x), height: Double(viewport.y),
+            requestedOffset: isLocal ? localOffset : .zero)
+        if isLocal, revealCursor, inside,
+           let revealed = layout.revealing(column: frame.cursor.column, row: Int(cursorRow),
+                cellWidth: min(frame.cursor.width, frame.columns - frame.cursor.column)) {
+            layout = try TerminalLocalViewport(columns: frame.columns, rows: frame.rows,
+                cellWidth: cellWidth, cellHeight: cellHeight, width: Double(viewport.x), height: Double(viewport.y),
+                requestedOffset: revealed)
+        }
+        uniform.origin = (Float(layout.originX), Float(layout.originY))
+        // Publish the same Float origin consumed by Metal, in UIKit points.
+        // No enlarged off-screen drawable or second grid allocation is needed.
+        let projection = try TerminalLocalViewport(columns: frame.columns, rows: frame.rows,
+            cellWidth: cellWidth / scale, cellHeight: cellHeight / scale,
+            width: Double(viewport.x) / scale, height: Double(viewport.y) / scale,
+            requestedOffset: .init(columns: -Double(uniform.origin.0) / cellWidth,
+                                   rows: -Double(uniform.origin.1) / cellHeight))
         let showCursor = frame.cursor.visible && inside
             && (!configuration.cursorBlink || !frame.cursor.blinks || (blinkPhase / 2) % 2 == 0)
-        var caret: CGRect?
-        if inside, Double(frame.cursor.column + 1) * cellWidth <= Double(viewport.x),
-           Double(cursorRow + 1) * cellHeight <= Double(viewport.y) {
-            caret = CGRect(x: Double(frame.cursor.column) * cellWidth / scale,
-                y: Double(cursorRow) * cellHeight / scale, width: cellWidth / scale, height: cellHeight / scale)
-        }
+        let caret = inside ? NativeTerminalCaretProjection.rectangle(column: frame.cursor.column,
+            row: Int(cursorRow), uniforms: uniform, scale: scale) : nil
         if showCursor {
             let shape: UInt32 = [3,4].contains(frame.cursor.shape) ? 3 : [5,6].contains(frame.cursor.shape) ? 4 : 1
             uniform.cursorShape = shape
@@ -1009,11 +1123,12 @@ private final class NativeTerminalFrameBuilder {
         return NativePreparedTerminalFrame(semantic: frame, lease: lease, generation: generation,
             resources: resources, viewport: viewport, instanceCount: instances.count / 24,
             clear: uniform.clear.linearPremultiplied, caret: caret,
+            revealedCursor: isLocal && revealCursor && frame.isLive && caret != nil,
             fontName: CTFontCopyPostScriptName(baseFont) as String, fontPointSize: CGFloat(rasterFontSize / scale),
             fittingColumns: fittingColumns,
             fittingRows: max(1, min(512, TerminalSessionGeometry.maximumShownCells / fittingColumns,
                                     Int(Double(viewport.y) / cellHeight))),
-            cellSize: CGSize(width: cellWidth / scale, height: cellHeight / scale))
+            cellSize: CGSize(width: cellWidth / scale, height: cellHeight / scale), projection: projection)
     }
 
     private func append(_ bytes: [UInt8]) throws {

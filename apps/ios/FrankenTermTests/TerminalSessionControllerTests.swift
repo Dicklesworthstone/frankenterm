@@ -1668,6 +1668,36 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertEqual(scene.status(of: "alpha"), .attention)
         XCTAssertFalse(last.dropped, "meeting another host key is not a drop")
         guard case .couldNotConnect = last.phase else { return XCTFail("expected Couldn't connect, not \(last.phase)") }
+        for _ in 0..<400 where !last.settled { try await Task.sleep(for: .milliseconds(25)) }
+        XCTAssertTrue(last.settled, "the failed transport closes before its identity review")
+        let mismatch = try XCTUnwrap(scene.hostKeyMismatch(for: last))
+        XCTAssertEqual(mismatch.workspaceID, scene.workspaceID)
+        XCTAssertEqual(mismatch.expectedRevision, scene.revision)
+        XCTAssertEqual(mismatch.machineID, "alpha")
+        XCTAssertEqual(mismatch.destinationRouteID, "route-alpha")
+        XCTAssertEqual(mismatch.routeID, "route-alpha")
+        XCTAssertNil(mismatch.hopIndex)
+        XCTAssertEqual(mismatch.host, "127.0.0.1")
+        XCTAssertEqual(mismatch.port, relay.port)
+        XCTAssertEqual(mismatch.user, environment["FT_LIVE_SSH_USER"])
+        XCTAssertNil(mismatch.hostKeyAlias)
+        let trustedHost = try SSHPublicIdentity(blob: XCTUnwrap(
+            environment["FT_LIVE_SSH_HOST_KEY_B64"].flatMap { Data(base64Encoded: $0) }))
+        XCTAssertEqual(mismatch.expectedKeys, [try .init(algorithm: trustedHost.algorithm,
+                                                        fingerprint: trustedHost.fingerprint)])
+        XCTAssertFalse(mismatch.expectedKeys.contains(mismatch.presentedKey))
+        let transportsAfterRefusal = await live.connections.manager.connections()
+        XCTAssertTrue(transportsAfterRefusal.isEmpty, "review uses the closed attempt's evidence, not another connection")
+        let pendingAfterRefusal = await live.connections.manager.pendingCount
+        XCTAssertEqual(pendingAfterRefusal, 0, "stored evidence has no pending connection or authentication owner")
+        XCTAssertTrue(scene.copyHostKeyFingerprint(mismatch.presentedKey, from: last, expected: mismatch))
+        XCTAssertEqual(UIPasteboard.general.string, mismatch.presentedKey.fingerprint, "copy includes the complete fingerprint")
+        XCTAssertTrue(scene.copyHostKeyFingerprint(mismatch.expectedKeys[0], from: last, expected: mismatch))
+        XCTAssertEqual(UIPasteboard.general.string, trustedHost.fingerprint)
+        for detail in [mismatch.host, trustedHost.fingerprint, mismatch.presentedKey.fingerprint] {
+            XCTAssertFalse(TerminalSessionController.describe(mismatch).contains(detail))
+            XCTAssertFalse(String(reflecting: mismatch).contains(detail))
+        }
 
         // It is the last try: longer than any retry delay passes, and then
         // the network changes, with no other.
@@ -1676,6 +1706,72 @@ final class TerminalSessionControllerTests: XCTestCase {
         scene.networkPathChanged(.init(usable: true, interfaces: ["pdp_ip0"]))
         try await Task.sleep(for: .seconds(4))
         XCTAssertTrue(scene.sessions["alpha"] === last, "nor does a network change retry it")
+        XCTAssertEqual(scene.hostKeyMismatch(for: last), mismatch, "settled cleanup must not erase the review")
+
+        UIPasteboard.general.string = "unchanged by stale host identity actions"
+        let otherMachine = try WorkspaceSSHConnectionHostKeyMismatch(mismatch.mismatch, machineID: "other",
+            destinationRouteID: mismatch.destinationRouteID)
+        XCTAssertFalse(scene.copyHostKeyFingerprint(mismatch.presentedKey, from: last, expected: otherMachine))
+        let revisedScene = try WorkspaceTerminalScene(workspaceID: scene.workspaceID, revision: UUID(),
+            workspaceName: scene.workspaceName, machines: scene.machines, initialMachineID: "alpha",
+            connections: live.connections, autoConnect: false, watchesNetworkPath: false)
+        try await appear(revisedScene, selecting: "alpha")
+        XCTAssertNil(revisedScene.hostKeyMismatch(for: last))
+        XCTAssertFalse(revisedScene.copyHostKeyFingerprint(mismatch.presentedKey, from: last, expected: mismatch),
+                       "a new workspace revision cannot reuse another scene's reviewed failure")
+        await revisedScene.close()
+
+        func retryMismatch() async throws -> (TerminalSessionController, WorkspaceSSHConnectionHostKeyMismatch) {
+            let previous = scene.sessions["alpha"]
+            scene.connect("alpha")
+            for _ in 0..<400 where scene.sessions["alpha"] === previous || scene.sessions["alpha"]?.settled != true {
+                try await Task.sleep(for: .milliseconds(25))
+            }
+            let current = try XCTUnwrap(scene.sessions["alpha"])
+            XCTAssertFalse(current === previous, "an explicit retry owns a new host-key check")
+            XCTAssertNil(previous?.hostKeyMismatch, "replacement discards the previous owner's identity evidence")
+            return (current, try XCTUnwrap(scene.hostKeyMismatch(for: current)))
+        }
+
+        let (afterRetry, retryEvidence) = try await retryMismatch()
+        XCTAssertNil(scene.hostKeyMismatch(for: last))
+        XCTAssertFalse(scene.copyHostKeyFingerprint(mismatch.presentedKey, from: last, expected: mismatch),
+                       "the same key from a new attempt does not authorize a stale controller's copy action")
+        scene.disappear()
+        XCTAssertNil(afterRetry.hostKeyMismatch)
+        XCTAssertFalse(scene.copyHostKeyFingerprint(retryEvidence.presentedKey, from: afterRetry, expected: retryEvidence))
+        try await appear(scene, selecting: "alpha")
+        XCTAssertNil(scene.hostKeyMismatch(for: afterRetry), "returning cannot restore discarded evidence")
+
+        let (beforeBackground, backgroundEvidence) = try await retryMismatch()
+        scene.setForeground(false)
+        XCTAssertTrue(scene.permitsHostKeyMismatchCapture,
+                      "a temporary Keychain system prompt does not retire an admitted handshake's capture")
+        XCTAssertEqual(beforeBackground.hostKeyMismatch, backgroundEvidence)
+        XCTAssertNil(scene.hostKeyMismatch(for: beforeBackground), "inactive presentation hides retained details")
+        XCTAssertFalse(scene.copyHostKeyFingerprint(backgroundEvidence.presentedKey, from: beforeBackground,
+                                                   expected: backgroundEvidence))
+        XCTAssertEqual(UIPasteboard.general.string, "unchanged by stale host identity actions")
+        scene.setForeground(true)
+        XCTAssertEqual(scene.hostKeyMismatch(for: beforeBackground), backgroundEvidence,
+                       "returning from a temporary prompt can review the same closed handshake")
+        XCTAssertTrue(scene.copyHostKeyFingerprint(backgroundEvidence.presentedKey, from: beforeBackground,
+                                                  expected: backgroundEvidence))
+        XCTAssertEqual(UIPasteboard.general.string, backgroundEvidence.presentedKey.fingerprint)
+        UIPasteboard.general.string = "unchanged by stale host identity actions"
+        scene.setForeground(false); scene.enteredBackground()
+        XCTAssertFalse(scene.permitsHostKeyMismatchCapture)
+        XCTAssertNil(beforeBackground.hostKeyMismatch)
+        scene.setForeground(true)
+        XCTAssertNil(scene.hostKeyMismatch(for: beforeBackground))
+        XCTAssertFalse(scene.copyHostKeyFingerprint(backgroundEvidence.presentedKey, from: beforeBackground,
+                                                   expected: backgroundEvidence))
+
+        let (beforeStop, stopEvidence) = try await retryMismatch()
+        beforeStop.requestStop()
+        XCTAssertNil(beforeStop.hostKeyMismatch)
+        XCTAssertFalse(scene.copyHostKeyFingerprint(stopEvidence.presentedKey, from: beforeStop, expected: stopEvidence))
+        XCTAssertEqual(UIPasteboard.general.string, "unchanged by stale host identity actions")
         await scene.close()
         for session in scene.sessions.values { await assertReleased(session, connections: live.connections) }
     }
@@ -1793,6 +1889,22 @@ final class TerminalSessionControllerTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(25))
         }
         let originalGrid = try XCTUnwrap(original.renderer.admittedFrame)
+        let originalViewportGeneration = observer.viewportModeGeneration
+        XCTAssertTrue(observer.canAdjustLocalViewport)
+        observer.setReadableViewport(true)
+        XCTAssertTrue(observer.prefersReadableViewport)
+        XCTAssertTrue(original.localViewportEnabled)
+        XCTAssertTrue(observer.ownsViewportPan)
+        XCTAssertNotEqual(observer.viewportModeGeneration, originalViewportGeneration)
+        XCTAssertFalse(scene.permitsCanvasNavigation, "A local pan cannot navigate to another machine or pane")
+        observer.revealViewportCursor()
+        XCTAssertTrue(original.input.isReadOnly, "Readable size does not acquire input authority")
+        let readableGeneration = observer.viewportModeGeneration
+        observer.setReadableViewport(false)
+        XCTAssertFalse(original.localViewportEnabled)
+        XCTAssertFalse(observer.ownsViewportPan)
+        XCTAssertNotEqual(observer.viewportModeGeneration, readableGeneration,
+                          "Returning to fit cannot revive a canvas action captured before local pan")
         await scene.activateKeyboard()
         original.requestKeyboard(true)
         original.input.insertText("must not type")
@@ -1824,6 +1936,13 @@ final class TerminalSessionControllerTests: XCTestCase {
         let received = try await hostFile(live.outPath, containing: marker)
         let sharedSize = "\(originalGrid.rows) \(originalGrid.columns)"
         XCTAssertEqual(received.split(separator: "\n").first.map(String.init), sharedSize)
+        interactive.setReadableViewport(true)
+        XCTAssertTrue(active.localViewportEnabled)
+        XCTAssertTrue(interactive.prefersReadableViewport)
+        XCTAssertFalse(scene.permitsCanvasNavigation)
+        let chosenSize = min(active.fontPointSize + 3, NativeTerminalView.fontSizes.upperBound)
+        active.setFontPointSize(chosenSize)
+        interactive.revealViewportCursor()
         for size in [CGSize(width: 390, height: 300), CGSize(width: 740, height: 360)] {
             active.frame = CGRect(origin: .zero, size: size)
             active.layoutIfNeeded()
@@ -1831,15 +1950,20 @@ final class TerminalSessionControllerTests: XCTestCase {
             await scene.activateKeyboard()
             try await Task.sleep(for: .milliseconds(250))
         }
+        interactive.revealViewportCursor()
         for _ in 0..<200 where active.renderer.pointerProjection == nil {
             try await Task.sleep(for: .milliseconds(25))
         }
         let projection = try XCTUnwrap(active.renderer.pointerProjection)
         XCTAssertEqual(projection.frame.rows, originalGrid.rows)
         XCTAssertEqual(projection.frame.columns, originalGrid.columns)
+        XCTAssertEqual(active.fontPointSize, chosenSize)
+        XCTAssertTrue(active.localViewportEnabled, "Rotation and keyboard layout retain the local readable mode")
+        interactive.setReadableViewport(false)
+        XCTAssertFalse(active.localViewportEnabled)
         try await type("stty size >> \(live.outPath); trap - WINCH; echo DONE-\(marker) >> \(live.outPath)", into: active)
         let afterLayout = try await hostFile(live.outPath, containing: "DONE-\(marker)")
-        XCTAssertFalse(afterLayout.contains("WINCH"), "keyboard and viewport changes must not resize the shared PTY")
+        XCTAssertFalse(afterLayout.contains("WINCH"), "local zoom, cursor reveal, fitting, keyboard and viewport changes must not resize the shared PTY")
         XCTAssertEqual(afterLayout.split(separator: "\n").filter { $0 == sharedSize }.count, 2)
         XCTAssertTrue(afterLayout.contains(marker), "Explicit shared-size input reaches the existing pane")
         active.removeFromSuperview()

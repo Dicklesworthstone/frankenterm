@@ -276,6 +276,145 @@ final class NativeTerminalRenderTests: XCTestCase {
         XCTAssertEqual(view.admittedFrame?.columns, 180); XCTAssertEqual(view.admittedFrame?.rows, 60)
     }
 
+    private func redraw(_ view: NativeTerminalRenderView, name: String,
+                        change: () throws -> Void) async throws -> NativeTerminalCaret? {
+        let completed = expectation(description: name)
+        completed.assertForOverFulfill = false
+        var caret: NativeTerminalCaret?, failure: TerminalRenderError?
+        view.onCaret = { caret = $0 }
+        view.onCaretUnavailable = { caret = nil }
+        view.onAppearance = { _, _ in completed.fulfill() }
+        view.onFailure = { failure = $0 }
+        try change()
+        XCTAssertNil(view.pointerProjection, "a transform cannot reuse the previous completed draw")
+        await fulfillment(of: [completed], timeout: 20)
+        XCTAssertNil(failure)
+        return caret
+    }
+
+    func testReadableSharedGridPansRevealsAndFitsWithoutResizingTheTerminal() async throws {
+        var configuration = NativeTerminalRenderConfiguration()
+        configuration.fitsRemoteGrid = true; configuration.cursorBlink = false
+        _ = try await render("Upper left\u{1b}[60;180H", name: "shared-grid-before-readable-size",
+                             configuration: configuration, columns: 180, rows: 60)
+        let view = try XCTUnwrap(view), model = try XCTUnwrap(model)
+        let original = try XCTUnwrap(view.admittedFrame), fitted = try XCTUnwrap(view.pointerProjection)
+        var proposals: [NativeTerminalViewport] = [], modes: [Bool] = []
+        view.onViewportChange = { proposals.append($0) }
+        view.onLocalViewportChange = { modes.append($0) }
+        let readableCaret = try await redraw(view, name: "readable local view reveals the existing cursor") {
+            try view.setLocalViewportEnabled(true)
+        }
+        var projection = try XCTUnwrap(view.pointerProjection)
+        XCTAssertGreaterThan(projection.cellSize.width, fitted.cellSize.width)
+        XCTAssertGreaterThan(projection.viewport.offset.columns, 0)
+        XCTAssertGreaterThan(projection.viewport.offset.rows, 0)
+        let caret = try XCTUnwrap(readableCaret)
+        let cursorCell = try XCTUnwrap(projection.viewport.cell(atX: Double(caret.rect.midX), y: Double(caret.rect.midY)))
+        XCTAssertEqual(cursorCell.column, 179); XCTAssertEqual(cursorCell.row, 59)
+
+        let hiddenCaret = try await redraw(view, name: "pan to the beginning hides the distant caret") {
+            try view.setLocalViewportOffset(.zero)
+        }
+        XCTAssertNil(hiddenCaret, "an offscreen cursor must not become an editable UIKit anchor")
+        projection = try XCTUnwrap(view.pointerProjection)
+        XCTAssertEqual(projection.viewport.offset, .zero)
+        let reading = NativeTerminalAccessibility(view: view)
+        let lines = reading.elements().compactMap { $0 as? UIAccessibilityElement }
+        let first = try XCTUnwrap(lines.first { $0.accessibilityLabel == "Upper left" })
+        XCTAssertEqual(first.accessibilityFrameInContainerSpace.minY, 0, accuracy: 0.001)
+        XCTAssertEqual(first.accessibilityFrameInContainerSpace.height, projection.cellSize.height, accuracy: 0.001)
+        let actionNames = Set(lines.first?.accessibilityCustomActions?.map(\.name) ?? [])
+        XCTAssertTrue(Set(["Pan left", "Pan right", "Pan up", "Pan down", "Reveal cursor", "Fit entire pane"])
+            .isSubset(of: actionNames))
+        let revealAction = try XCTUnwrap(lines.first?.accessibilityCustomActions?.first { $0.name == "Reveal cursor" })
+        var forwardedReveal = 0
+        view.onCursorRevealRequest = { forwardedReveal += 1; return true }
+        XCTAssertEqual(revealAction.actionHandler?(revealAction), true)
+        XCTAssertEqual(forwardedReveal, 1, "the native owner must restore live output for the accessible reveal action")
+        view.onCursorRevealRequest = nil
+
+        _ = try await redraw(view, name: "selection follows the clipped local origin") {
+            try view.setLocalViewportOffset(.init(columns: 5))
+        }
+        projection = try XCTUnwrap(view.pointerProjection)
+        let row = try XCTUnwrap(projection.frame.lines.first)
+        let selection = TerminalTextSelection(.init(row: row.stableIndex, column: 0),
+                                              .init(row: row.stableIndex, column: 8))
+        let overlay = NativeTerminalSelectionOverlay(frame: view.bounds)
+        overlay.show(selection, frame: projection.frame, cell: projection.cellSize, tint: .blue,
+            origin: .init(x: projection.viewport.originX, y: projection.viewport.originY))
+        let selectedRect = try XCTUnwrap(overlay.selectionBounds)
+        XCTAssertEqual(selectedRect.minX, 0, accuracy: 0.001)
+        XCTAssertEqual(selectedRect.width, 4 * projection.cellSize.width, accuracy: 0.001)
+        XCTAssertTrue(overlay.startHandle.isHidden, "an offscreen selection end must not impersonate a visible cell")
+        XCTAssertFalse(overlay.endHandle.isHidden)
+
+        var revealInvalidations = 0
+        view.onProjectionInvalidated = { revealInvalidations += 1 }
+        let revealed = try await redraw(view, name: "coalesced reveal restores the existing remote cursor") {
+            try view.revealLocalCursor()
+            for _ in 0..<32 { try view.revealLocalCursor() }
+            XCTAssertEqual(revealInvalidations, 1, "repeated input while awaiting a draw must not restart its generation")
+        }
+        XCTAssertNotNil(revealed)
+        XCTAssertEqual(revealInvalidations, 1)
+        view.onProjectionInvalidated = nil
+        let movedLines = reading.elements().compactMap { $0 as? UIAccessibilityElement }
+        XCTAssertTrue(movedLines.contains { $0 === first }, "panning must not replace captured reading elements")
+        XCTAssertEqual(first.accessibilityFrameInContainerSpace, .zero,
+                       "offscreen text cannot claim a touch target on different visible output")
+
+        var zoom = view.configuration
+        zoom.fontPointSize += 4; zoom.fontRevision += 1
+        _ = try await redraw(view, name: "font change preserves and clamps the local anchor") {
+            try view.updateConfiguration(zoom)
+            try model.setFontRevision(zoom.fontRevision)
+            try view.submit(model.captureFrame(viewportTop: nil), source: model.source)
+        }
+        projection = try XCTUnwrap(view.pointerProjection)
+        XCTAssertGreaterThan(projection.cellSize.width, fitted.cellSize.width)
+        XCTAssertLessThanOrEqual(projection.viewport.offset.columns, projection.viewport.maximumOffset.columns)
+        XCTAssertLessThanOrEqual(projection.viewport.offset.rows, projection.viewport.maximumOffset.rows)
+
+        _ = try await redraw(view, name: "fit restores the entire unchanged desktop grid") {
+            try view.setLocalViewportEnabled(false)
+        }
+        projection = try XCTUnwrap(view.pointerProjection)
+        XCTAssertEqual(projection.viewport.offset, .zero)
+        XCTAssertLessThanOrEqual(projection.cellSize.width * 180, view.bounds.width + 0.01)
+        XCTAssertLessThanOrEqual(projection.cellSize.height * 60, view.bounds.height + 0.01)
+        XCTAssertEqual(projection.frame.source, original.source)
+        XCTAssertEqual(projection.frame.geometryRevision, original.geometryRevision)
+        XCTAssertEqual(projection.frame.columns, 180); XCTAssertEqual(projection.frame.rows, 60)
+        XCTAssertTrue(proposals.isEmpty, "fit, readable size, pan, zoom, and reveal cannot propose a PTY resize")
+        XCTAssertEqual(modes, [true, false])
+    }
+
+    func testCaretVisibilityUsesShaderPixelsAtScaleThreeAndRejectsClippedCells() throws {
+        var uniforms = TerminalRenderUniforms()
+        uniforms.columns = 80; uniforms.rows = 60
+        uniforms.cellSize = (20, 41); uniforms.viewport = (780, 601)
+        uniforms.origin = (-820, -1859)
+        let bottomRight = try XCTUnwrap(NativeTerminalCaretProjection.rectangle(column: 79, row: 59,
+                                                                               uniforms: uniforms, scale: 3))
+        XCTAssertEqual(bottomRight.maxX, 260, accuracy: 0.000000001)
+        XCTAssertEqual(bottomRight.maxY, CGFloat(601) / 3, accuracy: 0.000000001)
+        XCTAssertEqual(bottomRight.width, CGFloat(20) / 3, accuracy: 0.000000001)
+        // A fraction of a physical pixel outside is genuinely clipped. It
+        // cannot acquire a caret merely to compensate for point-space math.
+        uniforms.origin.0 += 0.125
+        XCTAssertNil(NativeTerminalCaretProjection.rectangle(column: 79, row: 59, uniforms: uniforms, scale: 3))
+        uniforms.origin = (-820, -41)
+        let topLeft = try XCTUnwrap(NativeTerminalCaretProjection.rectangle(column: 41, row: 1,
+                                                                          uniforms: uniforms, scale: 3))
+        XCTAssertEqual(topLeft.origin, .zero)
+        uniforms.origin.0 -= 0.125
+        XCTAssertNil(NativeTerminalCaretProjection.rectangle(column: 41, row: 1, uniforms: uniforms, scale: 3))
+        uniforms.origin = (-820, -41.125)
+        XCTAssertNil(NativeTerminalCaretProjection.rectangle(column: 41, row: 1, uniforms: uniforms, scale: 3))
+    }
+
     func testAccessibleOutputHasSeparateLinesAndDoesNotExposeConcealedText() async throws {
         _ = try await render("first line\r\nwide: 界 👩‍💻\r\n\u{1b}[8mprivate\u{1b}[0m\r\n$ ",
                              name: "accessible-terminal-lines")
