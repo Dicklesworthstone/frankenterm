@@ -1,4 +1,3 @@
-#if os(macOS) || os(Linux)
 import Foundation
 #if canImport(CryptoKit)
 import CryptoKit
@@ -145,6 +144,7 @@ public enum WorkspaceKeyEnrollmentSSH {
                          hostKeyAlias: route.hostKeyAlias)
     }
 
+    #if os(macOS) || os(Linux)
     /// Call on a worker, after persisting the journal's uncertain mutation entry.
     /// Every mutation starts with readback. Inspection never creates files or
     /// disables entries, and a lost response cannot become a successful retry.
@@ -776,5 +776,5 @@ except Exception as error:
     else:
         sys.exit(1)
 """#
+    #endif
 }
-#endif

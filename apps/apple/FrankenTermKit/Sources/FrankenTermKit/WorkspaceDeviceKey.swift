@@ -104,6 +104,21 @@ enum WorkspaceDeviceKeyOverlay {
         try PolicyIndex(document: document).witness(routeID: routeID)
     }
 
+    /// One bounded policy index for a fleet-sized atomic selection. Creating
+    /// metadata here does not publish it or grant access to a protected key.
+    static func assignments(routeIDs: Set<String>, credentialID: String,
+                            in document: WorkspaceDocument) throws -> [WorkspaceDeviceKeyAssignment] {
+        guard routeIDs.count <= assignmentLimit else { throw FTError.limit("device_key.assignments") }
+        let index = try PolicyIndex(document: document)
+        return try routeIDs.sorted().map { routeID in
+            guard let route = index.typed[routeID], canAssign(route, in: document) else {
+                throw FTError.unsupported("device_key.route_policy")
+            }
+            return .init(routeID: routeID, credentialID: credentialID,
+                         sourceWitness: try index.witness(routeID: routeID))
+        }
+    }
+
     /// Parse the bounded source once for a whole fleet, rather than once per
     /// assigned route during every local-policy reload and authentication check.
     private struct PolicyIndex {
@@ -112,6 +127,7 @@ enum WorkspaceDeviceKeyOverlay {
         let workspace: [String: JSONValue]
         let routes: [String: JSONValue], credentials: [String: JSONValue], trusts: [String: JSONValue]
         let typed: [String: WorkspaceDocument.Route]
+        let contexts: [String: [[String]]]
 
         init(document: WorkspaceDocument) throws {
             self.document = document
@@ -126,10 +142,31 @@ enum WorkspaceDeviceKeyOverlay {
             credentials = try indexed("credentials", workspace: workspace)
             trusts = try indexed("host_trust", workspace: workspace)
             typed = Dictionary(uniqueKeysWithValues: document.routes.map { ($0.id, $0) })
+            // A route can be a transit account behind several different
+            // prefixes. Its credential choice affects every actual use, not
+            // only the dependencies declared on that route in isolation.
+            var actual: [String: Set<[String]>] = [:]
+            let destinations = Set(document.machines.flatMap(\.routeIDs))
+            for destinationID in destinations.sorted() {
+                guard let destination = typed[destinationID],
+                      destination.mode == "direct_ssh" || destination.mode == "frankenterm_mux" else { continue }
+                let path = try document.orderedJumpRoutes(forRouteID: destinationID).map(\.id) + [destinationID]
+                for index in path.indices {
+                    actual[path[index], default: []].insert(Array(path.prefix(index + 1)))
+                }
+            }
+            contexts = actual.mapValues { $0.sorted { $0.lexicographicallyPrecedes($1) } }
         }
 
         func witness(routeID: String) throws -> Data {
         var pending = [routeID], visited = Set<String>()
+        let declared = try document.orderedJumpRoutes(forRouteID: routeID).map(\.id) + [routeID]
+        let actual = contexts[routeID] ?? []
+        // Keep existing direct-route witnesses stable. Distinct incoming
+        // prefixes add explicit context, including an exposed standalone use.
+        // Adding another machine that reaches the same prefix is cosmetic.
+        let hasContext = actual.contains { $0 != declared }
+        if hasContext { pending += actual.flatMap { $0 } }
         var routePolicy: [String: JSONValue] = [:], credentialPolicy: [String: JSONValue] = [:]
         var trustPolicy: [String: JSONValue] = [:]
         while let id = pending.popLast() {
@@ -153,15 +190,18 @@ enum WorkspaceDeviceKeyOverlay {
         }) {
             trustPolicy[trust.id] = trusts[trust.id]
         }
-        let identity: JSONValue = .object([
+        var identity: [String: JSONValue] = [
             "exporter": .string(document.exporterID), "workspace": .string(document.id),
             "routes": .object(routePolicy), "credentials": .object(credentialPolicy), "trust": .object(trustPolicy),
             "required_capabilities": root["required_capabilities"] ?? .array([]),
             "source_kind": .string(document.sourceKind ?? ""),
             "root_extensions": root["extensions"] ?? .object([:]),
             "workspace_extensions": workspace["extensions"] ?? .object([:])
-        ])
-        return Data(SHA256.hash(data: try StrictJSON.encode(identity)))
+        ]
+        if hasContext {
+            identity["authentication_contexts"] = .array(actual.map { .array($0.map(JSONValue.string)) })
+        }
+        return Data(SHA256.hash(data: try StrictJSON.encode(.object(identity))))
         }
     }
 
@@ -242,3 +282,4 @@ public extension InstalledWorkspace {
             || assignment.sourceWitness != expected
     }
 }
+

@@ -397,6 +397,7 @@ public actor WorkspaceStore {
     private let sshAuthorizationOwner = UUID()
     private let credentialImportOwner = UUID()
     private let hostKeyPinOwner = UUID()
+    private let enrollmentReportOwner = UUID()
     private var hostKeyProbes: [UUID: WorkspaceHostKeyProbe] = [:]
     private let hostKeyProbeNow: @Sendable () -> ContinuousClock.Instant
     /// Host-key refusals made in this process. A refusal whose write failed
@@ -1096,6 +1097,109 @@ public actor WorkspaceStore {
             do { try recover(catalog: &catalog) } catch { cleanupPending = true }
             return .init(workspace: installed, key: key, cleanupPending: cleanupPending)
         }
+    }
+
+    /// Opening a public report changes no credential choice, trust decision, or
+    /// connection approval. Its unsigned observations are matched only against
+    /// the exact local phone key and paths in the current imported workspace.
+    public func reviewEnrollmentResults(workspaceID: UUID, expectedRevision: UUID,
+                                        credentialID: String, data: Data) throws -> WorkspaceKeyEnrollmentReportReview {
+        guard !data.isEmpty, data.count <= WorkspaceKeyEnrollmentJournal.maximumBytes else {
+            throw FTError.limit("enrollment.journal_bytes")
+        }
+        try Task.checkCancellation()
+        return try persistence.withExclusiveAccess {
+            var catalog = try readCatalog()
+            try recover(catalog: &catalog)
+            return try makeEnrollmentReportReview(workspaceID: workspaceID, expectedRevision: expectedRevision,
+                credentialID: credentialID, data: data, catalog: catalog)
+        }
+    }
+
+    /// Publish every explicitly selected route in one catalog transaction and
+    /// one authorization revision. The UI retires existing workspace owners
+    /// before calling this. Unselected choices and the authenticated manifest
+    /// remain intact; a fresh deliberate Connect is required after publication.
+    /// A thrown write may already have published, so reload before retrying.
+    public func applyEnrollmentResults(_ review: WorkspaceKeyEnrollmentReportReview,
+                                       routeIDs: Set<String>, confirmedByUser: Bool) throws -> InstalledWorkspace {
+        guard confirmedByUser else { throw WorkspaceStoreError.reviewRequired }
+        guard review.owner == enrollmentReportOwner else { throw WorkspaceStoreError.staleReview }
+        guard !routeIDs.isEmpty else { throw WorkspaceKeyEnrollmentReportError.noSelection }
+        guard routeIDs.count <= WorkspaceDeviceKeyOverlay.assignmentLimit else {
+            throw FTError.limit("device_key.assignments")
+        }
+        try Task.checkCancellation()
+        return try persistence.withExclusiveAccess {
+            var catalog = try readCatalog()
+            try recover(catalog: &catalog)
+            let current = try makeEnrollmentReportReview(workspaceID: review.workspaceID,
+                expectedRevision: review.expectedRevision, credentialID: review.key.id,
+                data: review.reportData, catalog: catalog)
+            guard current.reportDigest == review.reportDigest, current.requestID == review.requestID,
+                  current.key == review.key, current.routes == review.routes,
+                  current.unmatchedObservations == review.unmatchedObservations else {
+                throw WorkspaceStoreError.staleReview
+            }
+            let selectable = Set(current.routes.filter(\.canAssign).map(\.id))
+            guard routeIDs.isSubset(of: selectable) else {
+                throw WorkspaceKeyEnrollmentReportError.unavailableSelection
+            }
+            guard let index = catalog.workspaces.firstIndex(where: { $0.id == review.workspaceID }) else {
+                throw WorkspaceStoreError.staleReview
+            }
+            let saved = catalog.workspaces[index], imported = try saved.importedDocument()
+            let replacements = try WorkspaceDeviceKeyOverlay.assignments(routeIDs: routeIDs,
+                credentialID: current.key.id, in: imported)
+            let assignments = saved.deviceKeyAssignments.filter { !routeIDs.contains($0.routeID) } + replacements
+            guard assignments.count <= WorkspaceDeviceKeyOverlay.assignmentLimit else {
+                throw FTError.limit("device_key.assignments")
+            }
+            let installed = InstalledWorkspace(id: saved.id, revision: UUID(), manifest: saved.manifest,
+                envelopeDigest: saved.envelopeDigest, bindings: saved.bindings,
+                inactiveSettings: saved.inactiveSettings, findings: saved.findings, connectLater: true,
+                deviceKeys: saved.deviceKeys, deviceKeyAssignments: assignments, hostKeyPins: saved.hostKeyPins)
+            _ = try installed.document()
+            catalog.workspaces[index] = installed
+            let next = try encode(catalog, limit: Self.catalogLimit)
+            try Task.checkCancellation()
+            try persistence.write(next, to: .catalog)
+            return installed
+        }
+    }
+
+    private func makeEnrollmentReportReview(workspaceID: UUID, expectedRevision: UUID,
+        credentialID: String, data: Data, catalog: Catalog) throws -> WorkspaceKeyEnrollmentReportReview {
+        guard let saved = catalog.workspaces.first(where: { $0.id == workspaceID }),
+              saved.revision == expectedRevision else { throw WorkspaceStoreError.staleReview }
+        let imported = try saved.importedDocument()
+        var blocked = WorkspacePortabilityPolicy.blockedRouteIDs(in: imported,
+            requiredEntityIDs: Set(saved.findings.filter { $0.disposition == 1 }.map(\.entityID)))
+        let rejected = hostRevocations(workspaceID, document: imported, catalog: catalog)
+        let requirements = hostRequirements(workspaceID, catalog: catalog)
+        for route in imported.routes {
+            guard let trust = imported.hostTrust.first(where: { $0.id == route.trustID }) else {
+                throw WorkspaceStoreError.corruptStore
+            }
+            if !(rejected[trust.canonicalTrustScope] ?? []).isEmpty
+                || !(requirements[trust.canonicalTrustScope] ?? []).isEmpty {
+                blocked.insert(route.id)
+            }
+        }
+        let review = try WorkspaceKeyEnrollmentReportReview(workspace: saved, credentialID: credentialID,
+            data: data, owner: enrollmentReportOwner, blockedRouteIDs: blocked)
+        guard !catalog.revokedFingerprints.contains(review.key.fingerprint) else {
+            throw WorkspaceStoreError.revokedIdentity
+        }
+        guard let binding = saved.bindings.first(where: { $0.credentialID == review.key.id }),
+              binding.fingerprint == review.key.fingerprint,
+              try vault.fingerprint(account: binding.account) == review.key.fingerprint else {
+            throw SSHAuthenticationError.unavailable
+        }
+        if let identity = try vault.publicIdentity(account: binding.account), identity.blob != review.key.publicBlob {
+            throw SSHAuthenticationError.identityMismatch
+        }
+        return review
     }
 
     /// After the person independently enrolls the public key, choose it for one
@@ -2142,3 +2246,4 @@ public struct FileWorkspacePersistence: WorkspacePersistence {
         guard fsync(fd) == 0 else { throw FTError.storage }
     }
 }
+
