@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 import Network
 import Observation
 import FrankenTermKit
@@ -188,6 +189,33 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
 
     var selectedMachine: SceneMachine? { machines.first { $0.id == selectedMachineID } }
     var selectedSession: TerminalSessionController? { selectedMachineID.flatMap { sessions[$0] } }
+    /// Review and copy actions must still belong to the visible machine's
+    /// exact failed controller and workspace revision. A captured sheet is
+    /// not authority after navigation or replacement, and cannot expose or
+    /// copy evidence while the app is inactive.
+    func hostKeyMismatch(for controller: TerminalSessionController) -> WorkspaceSSHConnectionHostKeyMismatch? {
+        guard !closed, foreground, !inBackground, onScreen,
+              selectedMachineID == controller.target.machineID,
+              sessions[controller.target.machineID] === controller,
+              controller.target.workspaceID == workspaceID, controller.target.revision == revision,
+              case .couldNotConnect = controller.phase,
+              let mismatch = controller.hostKeyMismatch,
+              mismatch.workspaceID == workspaceID, mismatch.expectedRevision == revision,
+              mismatch.machineID == controller.target.machineID,
+              mismatch.destinationRouteID == controller.route.id else { return nil }
+        return mismatch
+    }
+
+    @discardableResult
+    func copyHostKeyFingerprint(_ key: WorkspaceDocument.HostKey, from controller: TerminalSessionController,
+                               expected mismatch: WorkspaceSSHConnectionHostKeyMismatch) -> Bool {
+        guard hostKeyMismatch(for: controller) == mismatch,
+              key == mismatch.presentedKey || mismatch.expectedKeys.contains(key) else { return false }
+        UIPasteboard.general.setItems([[UTType.utf8PlainText.identifier: key.fingerprint]],
+            options: [.localOnly: true, .expirationDate: Date().addingTimeInterval(120)])
+        return true
+    }
+
     var displayedMachineIDs: [String] {
         splitLayout.visibleMachineIDs(selected: selectedMachineID, expanded: splitAvailable)
     }
@@ -560,6 +588,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// keyboard and rendering stop until it returns.
     func disappear() {
         guard !closed else { return }
+        for controller in sessions.values { controller.discardHostKeyMismatch() }
         splitGeneration = UUID(); splitJob?.cancel()
         cancelOverview()
         cancelGroupAppearance()
@@ -573,6 +602,9 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     func setForeground(_ active: Bool) {
         guard !closed else { return }
         if !active {
+            // Keychain authentication can make the app briefly inactive.
+            // Hide identity reviews and deny copying, but keep their evidence
+            // and an admitted handshake's capture generation until background.
             cancelOverview(); cancelGroupAppearance()
             splitGeneration = UUID(); splitJob?.cancel()
         }
@@ -609,6 +641,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// app run; a connection that drops meanwhile reconnects on return.
     func enteredBackground() {
         guard !closed else { return }
+        for controller in sessions.values { controller.discardHostKeyMismatch() }
         inBackground = true
         cancelGroupAppearance()
         // iOS may stop executing immediately after its grace period. Time we
@@ -985,6 +1018,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         let previous = sessions[machineID]
         let continuity = changedRouteMachines.remove(machineID) == nil ? previous : nil
         previous?.discardRetainedOutput()
+        previous?.discardHostKeyMismatch()
         let controller = TerminalSessionController(target: target, connections: connections, focus: self,
             reconnectingFrom: preservingSuccessfulCandidate ? continuity : nil,
             retryingAfterPasswordHop: preservingSuccessfulCandidate ? nil : continuity,
@@ -1504,6 +1538,8 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
 
     // MARK: TerminalSessionFocus
 
+    var permitsHostKeyMismatchCapture: Bool { !closed && !inBackground && onScreen }
+
     var permitsTerminalCreation: Bool {
         !closed && foreground && !inBackground && !overviewBlocksInput
             && !groupAppearanceBlocksInput && appearanceSelection == nil
@@ -1636,6 +1672,7 @@ struct WorkspaceTerminalScreen: View {
     /// A machine attached to its mux searches its panes' history on the server.
     @State private var muxSearch: TerminalSessionController?
     @State private var useTerminalReview: TerminalSessionController?
+    @State private var hostKeyReview: TerminalSessionController?
 
     var body: some View {
         let machine = scene.selectedMachine
@@ -1734,6 +1771,9 @@ struct WorkspaceTerminalScreen: View {
         .sheet(item: $historyInspection) { inspected in TerminalHistoryScreen(inspection: inspected) }
         .sheet(item: $muxSearch) { session in MuxSearchScreen(session: session) }
         .sheet(item: $retainedOutput) { output in TerminalRetainedOutputScreen(output: output) }
+        .sheet(item: $hostKeyReview) { session in
+            TerminalHostKeyMismatchScreen(scene: scene, session: session)
+        }
         .confirmationDialog("How should this phone use the shared terminal?",
             isPresented: Binding(get: { useTerminalReview != nil }, set: { if !$0 { useTerminalReview = nil } }),
             titleVisibility: .visible, presenting: useTerminalReview) { session in
@@ -1778,13 +1818,18 @@ struct WorkspaceTerminalScreen: View {
         .onChange(of: returnableMachineID, initial: true) { _, id in onShowing?(id) }
         .onDisappear {
             historyInspection?.retire(); historyInspection = nil; retainedOutput = nil
+            hostKeyReview = nil
             scene.disappear()
             if !scene.closed { onShowing?(nil) }
         }
         .onChange(of: scenePhase) { _, phase in
             // The app forwards its phase to the scene (MobileWorkspaceModel).
-            if phase != .active { historyInspection?.retire(); historyInspection = nil; retainedOutput = nil }
+            if phase != .active {
+                historyInspection?.retire(); historyInspection = nil; retainedOutput = nil
+                hostKeyReview = nil
+            }
         }
+        .onChange(of: scene.selectedSession?.id) { _, _ in hostKeyReview = nil }
     }
 
     @ToolbarContentBuilder private func toolbar(_ machine: SceneMachine?) -> some ToolbarContent {
@@ -2033,6 +2078,8 @@ struct WorkspaceTerminalScreen: View {
             case let .couldNotConnect(help):
                 if scene.status(of: machine.id) == .connecting {
                     connecting(machine, accent: accent, detail: "Reconnecting…")
+                } else if scene.hostKeyMismatch(for: session) != nil {
+                    hostKeyChangedCard(session, accent: accent)
                 } else {
                     connectionHelp(help, settled: session.settled) { scene.connect(machine.id) }
                 }
@@ -2185,6 +2232,23 @@ struct WorkspaceTerminalScreen: View {
         }
     }
 
+    private func hostKeyChangedCard(_ session: TerminalSessionController, accent: Color) -> some View {
+        sceneCard(symbol: "exclamationmark.shield", title: "Host Key Changed",
+            message: "A peer on this machine's connection path presented a different host key. Review the expected and presented fingerprints before updating the workspace.", accent: accent) {
+            Button("Review Host Identity", systemImage: "checkmark.shield") {
+                guard scene.hostKeyMismatch(for: session) != nil else { return }
+                hostKeyReview = session
+            }.buttonStyle(.borderedProminent)
+                .accessibilityIdentifier("terminal.host-key.review")
+            Button("Try Again", systemImage: "arrow.clockwise") {
+                guard scene.hostKeyMismatch(for: session) != nil else { return }
+                scene.connect(session.target.machineID)
+            }.buttonStyle(.bordered).disabled(!session.settled)
+            Text("Retry checks the same permitted keys. To change paths, return to the machine page and choose Choose Route and Sign-In.")
+                .font(.caption).multilineTextAlignment(.center)
+        }
+    }
+
     /// Nothing ran, so there is no session to review: the reason, the one
     /// change that fixes it, and Try Again once the attempt has settled.
     private func connectionHelp(_ help: WorkspaceConnectionHelp, settled: Bool,
@@ -2221,6 +2285,112 @@ struct WorkspaceTerminalScreen: View {
         guard let app = URL(string: "tailscale://"),
               let store = URL(string: "https://apps.apple.com/app/id1470499037") else { return }
         UIApplication.shared.open(app) { opened in if !opened { UIApplication.shared.open(store) } }
+    }
+}
+
+/// The failed handshake already supplied this evidence. Opening this review
+/// never probes the peer again, changes trust, or offers an acceptance action.
+@MainActor
+private struct TerminalHostKeyMismatchScreen: View {
+    @Bindable var scene: WorkspaceTerminalScene
+    @Bindable var session: TerminalSessionController
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var copiedKey: WorkspaceDocument.HostKey?
+
+    private var currentMismatch: WorkspaceSSHConnectionHostKeyMismatch? {
+        guard scenePhase == .active else { return nil }
+        return scene.hostKeyMismatch(for: session)
+    }
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if let mismatch = currentMismatch {
+                    Form {
+                        Section {
+                            Label("Connection Stopped", systemImage: "exclamationmark.shield")
+                                .font(.headline)
+                            Text("This peer presented a different host key. FrankenTerm stopped before signing into it. A planned server change, a different server, or interception can cause this; verify the identity independently.")
+                        }
+                        Section("Affected Connection") {
+                            detail("Workspace", scene.workspaceName)
+                            detail("Machine", session.target.machineName)
+                            detail("Machine ID", mismatch.machineID)
+                            detail("Destination Route", mismatch.destinationRouteID)
+                            detail("Peer", mismatch.hopIndex.map { "Jump host \($0 + 1)" } ?? "Destination")
+                            detail("Peer Route", mismatch.routeID)
+                            detail("Host", mismatch.host)
+                            detail("Port", String(mismatch.port))
+                            detail("SSH User", mismatch.user)
+                            detail("Host-Key Alias", mismatch.hostKeyAlias ?? "None — uses the host name")
+                        }
+                        Section {
+                            ForEach(Array(mismatch.expectedKeys.enumerated()), id: \.offset) { index, key in
+                                fingerprint(key, mismatch: mismatch, presented: false)
+                                    .accessibilityIdentifier("terminal.host-key.expected.\(index)")
+                            }
+                        } header: {
+                            Text("Expected on This Phone")
+                        } footer: {
+                            Text("These are the permitted host keys for this exact peer when the connection was checked.")
+                        }
+                        Section {
+                            fingerprint(mismatch.presentedKey, mismatch: mismatch, presented: true)
+                                .accessibilityIdentifier("terminal.host-key.presented")
+                        } header: {
+                            Text("Presented by This Peer")
+                        } footer: {
+                            Text("Copying a fingerprint does not trust it. Copied text stays on this device and expires from the clipboard after 2 minutes.")
+                        }
+                        Section("Verify Before Updating") {
+                            Text("Compare the complete new fingerprint with the machine's administrator or a trusted console using a separate channel. A fresh connection or ssh-keyscan alone does not verify identity.")
+                            Text("For a key imported from your Mac, update this peer's trusted host key on the Mac after independent verification, then export the workspace again with FrankenTerm Export.")
+                            Text("Return to the workspace list, tap Add machines (+), then choose Scan My Mac or Open a Workspace or Results File. Review the workspace update and its host-key changes before restoring.")
+                            Text("For a key you verified on this phone, return to the machine page, open Keys, and choose Check for a Changed Host Key… for this peer. Independently compare the new fingerprint before replacing the phone-verified key.")
+                            Text("Keys blocked on this phone remain blocked after a workspace update.")
+                        }
+                        Section("Check the Connection Path") {
+                            Text("If this is the wrong path, return to the machine page and choose Choose Route and Sign-In. Every jump host and the destination must still match their permitted keys.")
+                        }
+                    }
+                } else {
+                    ContentUnavailableView("Host Identity Review Unavailable", systemImage: "lock.shield",
+                        description: Text("This review is available only while FrankenTerm is in the foreground. Entering the background or replacing the connection clears its fingerprint details."))
+                }
+            }
+            .navigationTitle("Host Key Changed").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
+            }
+        }
+        .onChange(of: currentMismatch) { _, mismatch in
+            copiedKey = nil
+            if mismatch == nil { dismiss() }
+        }
+    }
+
+    private func detail(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(verbatim: label).font(.caption).foregroundStyle(.secondary)
+            Text(verbatim: value).fixedSize(horizontal: false, vertical: true)
+        }.frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func fingerprint(_ key: WorkspaceDocument.HostKey,
+                             mismatch: WorkspaceSSHConnectionHostKeyMismatch, presented: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(verbatim: key.algorithm).font(.caption).foregroundStyle(.secondary)
+            Text(verbatim: key.fingerprint).font(.system(.body, design: .monospaced))
+                .fixedSize(horizontal: false, vertical: true)
+            Button(copiedKey == key ? "Fingerprint Copied" : presented ? "Copy Fingerprint" : "Copy Expected Fingerprint",
+                   systemImage: "doc.on.doc") {
+                guard scenePhase == .active,
+                      scene.copyHostKeyFingerprint(key, from: session, expected: mismatch) else { return }
+                copiedKey = key
+            }
+            .accessibilityLabel(presented ? "Copy presented fingerprint" : "Copy expected fingerprint for \(key.algorithm)")
+        }.padding(.vertical, 4)
     }
 }
 

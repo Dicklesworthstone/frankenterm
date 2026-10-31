@@ -358,6 +358,51 @@ pre-network rejection of stale, mismatched or unpromptable choices. Its servers
 check exact authentication methods, terminal bytes, forwarding destinations and
 complete transport teardown.
 
+### Review a changed host key
+
+When a destination or jump host presents a different permitted-algorithm key,
+the phone stops that connection and offers **Host Key Changed → Review Host
+Identity**. The review uses the original failed handshake. It shows the exact
+machine and destination route, the affected jump-host occurrence or destination,
+its host, port, SSH account and host-key alias, and the full expected and
+presented algorithms and fingerprints. Expected keys are the selected trust
+record's currently usable pins; revoked and unsupported pins are excluded.
+
+**Copy Fingerprint** is an explicit, device-local clipboard action that expires
+after two minutes. Verify the complete fingerprint through a trusted console or
+the machine's administrator using an independent channel. For imported trust,
+update the Mac's trusted key, export the workspace again, and review the resulting
+workspace update on the phone. For a key previously verified on this phone,
+**Keys → Check for a Changed Host Key…** offers the separately reviewed rotation
+flow described above. The existing **Choose Route and Sign-In** flow can select
+another configured path. A retry checks the existing permitted keys again.
+Inspection and copying do not alter trust or approve the new key; local blocks
+and mandatory policies remain in force.
+
+The failed transport and its complete jump chain close before the diagnostic is
+published. It remains available after failed-start cleanup, but belongs only to
+that exact controller and workspace revision. Backgrounding, leaving the scene,
+replacing the controller or replacing the workspace retires it. An in-flight
+failure cannot repopulate a retired review, and stale copy controls write
+nothing. A temporary Face ID interruption hides the review and disables copying
+without discarding evidence from an otherwise admitted connection. Generic error
+descriptions omit the peer's identity details.
+
+The independent SSH runner
+FrankenTermSSH/Tests/Interop/test_host_mismatch.py exercises changed keys during
+public-key, password and keyboard-interactive sign-in, a destination after two
+verified hops, a middle-hop mismatch, a locally revoked presented key, and a
+separately reviewed workspace update followed by a new successful connection.
+It checks that mismatched peers receive no authentication or channel requests,
+downstream peers are never reached, and complete transport cleanup finishes.
+All nine new mismatch tests and eight existing host-trust regressions pass in a
+freshly compiled 45-source Store/authentication component with Swift 6 warnings
+treated as errors. All seven live scenarios also pass against the real native
+Swift and C backend, rebuilt with its 54-source Kit dependency component. These
+focused builds do not qualify the full Apple app or device behavior. Hosted iOS
+regressions cover review ownership, lifecycle retirement and stale clipboard
+actions; executing those new UI cases still requires an Apple SDK.
+
 ### Password-only machines and jump hosts
 
 Password routes can connect without an imported private key. A typed choice follows

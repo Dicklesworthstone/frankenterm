@@ -557,6 +557,10 @@ protocol TerminalSessionFocus: AnyObject {
     /// Existing sessions may keep running while iOS permits it; starting a
     /// remote terminal requires the owning scene's current foreground admission.
     var permitsTerminalCreation: Bool { get }
+    /// Capture may finish through a temporary system prompt while this
+    /// workspace remains on screen. Actual backgrounding retires the evidence;
+    /// reviewing or copying it separately requires the foreground.
+    var permitsHostKeyMismatchCapture: Bool { get }
     /// Whether this machine is the one on screen now; a session connecting in
     /// the background waits to attach its view until it is.
     func shows(machineID: String) -> Bool
@@ -608,6 +612,11 @@ final class TerminalSessionController {
     private(set) var paneTooLargeToView = false
     @ObservationIgnored private let retriesDrop: Bool
     private(set) var cleanupFailure: String?
+    /// Details from this owner's actual refused handshake. Failed-start
+    /// cleanup closes its transport without erasing the review; explicit
+    /// retirement, replacement and app backgrounding discard it.
+    private(set) var hostKeyMismatch: WorkspaceSSHConnectionHostKeyMismatch?
+    @ObservationIgnored private var hostKeyMismatchGeneration = UUID()
     /// What an ended connection left known about the person's input. A later
     /// session on this machine keeps it until they dismiss it: a new live
     /// frame says nothing about whether the earlier input arrived.
@@ -1421,6 +1430,7 @@ final class TerminalSessionController {
     /// Each operation retains all partially constructed resources. Teardown
     /// cancels and joins it; a late connection/view cannot outlive a settled UI.
     private func startOwnedOperation() async {
+        discardHostKeyMismatch()
         phase = .connecting
         let id = UUID()
         startupID = id
@@ -1859,6 +1869,7 @@ final class TerminalSessionController {
             }
             route = candidate
             credentialID = attempt.selection.credentialID
+            let hostKeyGeneration = hostKeyMismatchGeneration
             do {
                 let connected = try await connections.manager.connect(workspaceID: target.workspaceID,
                     expectedRevision: target.revision, machineID: target.machineID, routeID: candidate.id,
@@ -1883,6 +1894,26 @@ final class TerminalSessionController {
                 // The awaited manager owns and settles the failed transport.
                 // Local cancellation wins before another candidate is selected.
                 try checkStarting()
+                if let mismatch = error as? WorkspaceSSHConnectionHostKeyMismatch {
+                    passwordHopRetryPlan = nil; passwordMuxRetry = false
+                    _ = try plan.failed(.terminal, attempt: attempt)
+                    // A late refusal cannot repopulate details discarded while
+                    // the app entered the background or this presentation was
+                    // retired. A temporary system prompt does not retire it.
+                    // The factory binds the failed hop; retain it only for the
+                    // exact workspace and destination this owner attempted.
+                    if hostKeyGeneration == hostKeyMismatchGeneration,
+                       focus?.permitsHostKeyMismatchCapture == true,
+                       mismatch.workspaceID == target.workspaceID,
+                       mismatch.expectedRevision == target.revision,
+                       mismatch.machineID == target.machineID,
+                       mismatch.destinationRouteID == candidate.id {
+                        hostKeyMismatch = mismatch
+                    }
+                    Self.log.error("SSH host-key mismatch stopped a connection.")
+                    throw ConnectFailure(help: .init(title: "Host Key Changed",
+                        message: "This peer presented a different host key. The connection stopped before signing into it. Verify its identity independently before updating the workspace.", remedy: .none))
+                }
                 Self.log.error("route \(candidate.id, privacy: .public) sign-in failed: \(String(describing: error), privacy: .public)")
                 if error as? WorkspaceSSHConnectionError == .promptedHopRetryRequired {
                     let message: String
@@ -2105,8 +2136,17 @@ final class TerminalSessionController {
         pump?.requestStop()
     }
 
+    /// Revokes even an in-flight handshake's authority to publish a diagnostic.
+    /// Failed transport cleanup intentionally does not call this: a refusal
+    /// remains reviewable after every network resource has closed.
+    func discardHostKeyMismatch() {
+        hostKeyMismatchGeneration = UUID()
+        hostKeyMismatch = nil
+    }
+
     /// Synchronous disappearance/close barrier, before SwiftUI schedules cleanup.
     func requestStop() {
+        discardHostKeyMismatch()
         passwordHopRetryPlan = nil; passwordMuxRetry = false
         stopCurrentOperation()
     }
