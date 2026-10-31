@@ -301,6 +301,42 @@ The native connection follows the declared jump graph, including nested dependen
 
 Charged 64 KiB ciphertext queues remove the nested callback deadlock. Written input requires handoff through all ancestors to the root socket, without claiming remote delivery. All 30 native tests passed with libssh2 1.11.1, including large transfers through one to three hops, pin rejection, complete teardown, password failures and mixed password/key forwarding. The 13 live Swift password scenarios and 14 existing Swift actor interoperability tests also passed. These are portable protocol and ownership results; the new password UI still requires Apple SDK and device qualification.
 
+### Choose a route and sign-in method for one machine
+
+Open a machine and choose **Choose Route and Sign-In** to use a different
+configured route or an allowed sign-in method. The **Route and Sign-In** sheet
+shows the destination and every ordered jump host, including the account,
+endpoint, trusted host fingerprints and available key fingerprints. Choose a
+method for each account, then use **Review Connection** and confirm the complete
+path with **Use Route and Connect** or **Change Route and Connect**. Public-key
+sign-in can still require a separately permitted keyboard-interactive second
+factor; the review identifies that possibility.
+
+An explicit choice contains exactly one route and one method/key for each peer.
+A refused key or password does not try another identity, method or route.
+Configured automatic choices retain their existing order; **Use Configured
+Choices** restores them after another connection review. These choices live in
+the current workspace scene and do not rewrite imported settings or group
+defaults. Passwords and MFA answers are never part of the saved choice.
+
+Changing a connection retires and joins only that machine's existing controller,
+then starts the reviewed target. Other machine sessions continue. The new target
+does not inherit the previous route's retry or mux-pane identity, while any
+uncertain input outcome remains visible. Workspace replacement, changed local
+policy, backgrounding or a changed controller invalidates the pending review.
+The backend checks the exact workspace revision and ordered hop occurrences
+again before networking and before each hop sign-in. A key whose local revocation
+could not be saved remains refused by the running manager, including at a jump
+host.
+
+The independent SSH runner
+FrankenTermSSH/Tests/Interop/test_explicit_selection.py exercises password and
+keyboard-interactive choices with an imported key still first in every route,
+a mixed three-hop path, a refused destination after a prompted hop, and
+pre-network rejection of stale, mismatched or unpromptable choices. Its servers
+check exact authentication methods, terminal bytes, forwarding destinations and
+complete transport teardown.
+
 ### Password-only machines and jump hosts
 
 Password routes can connect without an imported private key. A typed choice follows

@@ -35,7 +35,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
 
     let workspaceID: UUID, revision: UUID
     let workspaceName: String
-    let machines: [SceneMachine]
+    private(set) var machines: [SceneMachine]
     private(set) var sessions: [String: TerminalSessionController] = [:]
     /// Each machine's theme now; a pick in the scene changes it live.
     private(set) var themes: [String: WorkspaceDocument.Theme] = [:]
@@ -133,6 +133,9 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// A user retry may replace an ended owner once its cleanup has joined;
     /// imported warm-up intent alone never restarts an authentication failure.
     @ObservationIgnored private var requestedConnections: Set<String> = []
+    /// A deliberate path change carries input uncertainty, but never the old
+    /// route's successful candidate, retry plan, shell or mux attachment mode.
+    @ObservationIgnored private var changedRouteMachines: Set<String> = []
     /// Local choices survive reconnects in this scene. A fresh scene begins
     /// shared panes in View Only; these are not restorable server leases.
     @ObservationIgnored private var muxAccessSelections: [String: TerminalMuxAccessMode] = [:]
@@ -977,13 +980,14 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         catch { report(error); return }
         requestedConnections.remove(machineID)
         let previous = sessions[machineID]
+        let continuity = changedRouteMachines.remove(machineID) == nil ? previous : nil
         previous?.discardRetainedOutput()
         let controller = TerminalSessionController(target: target, connections: connections, focus: self,
-            reconnectingFrom: preservingSuccessfulCandidate ? previous : nil,
-            retryingAfterPasswordHop: preservingSuccessfulCandidate ? nil : previous,
+            reconnectingFrom: preservingSuccessfulCandidate ? continuity : nil,
+            retryingAfterPasswordHop: preservingSuccessfulCandidate ? nil : continuity,
             inputDelivery: previous?.inputDelivery ?? .init(),
-            muxAccessMode: muxAccessSelections[machineID] ?? previous?.muxAccessMode ?? initialMuxAccessMode,
-            requiresExistingMux: existingMuxRequired.contains(machineID) || previous?.requiresExistingMux == true)
+            muxAccessMode: muxAccessSelections[machineID] ?? continuity?.muxAccessMode ?? initialMuxAccessMode,
+            requiresExistingMux: existingMuxRequired.contains(machineID) || continuity?.requiresExistingMux == true)
         controller.onChange = { [weak self, weak controller] in
             guard let self, let controller, self.sessions[machineID] === controller else { return }
             // Releasing an unused sign-in did not end a remote terminal and
@@ -1064,6 +1068,51 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
 
     func disconnectAll() {
         for machine in machines where machine.target != nil { disconnect(machine.id) }
+    }
+
+    /// The review names the exact controller, including its absence. Retire
+    /// only that machine and join every task that could still publish its old
+    /// connection. Failure leaves it disconnected with its cleanup owner.
+    func prepareRouteChange(machineID: String, expectedControllerID: UUID?) async throws {
+        guard permitsTerminalCreation,
+              machines.contains(where: { $0.id == machineID }),
+              sessions[machineID]?.id == expectedControllerID else { throw WorkspaceSSHConnectionError.stale }
+        let session = sessions[machineID]
+        let startup = controllerJobs[machineID]?.task
+        let muxChange = muxModeJobs[machineID]?.task
+        let reconnect = reconnectJobs[machineID]?.task
+        session?.requestRouteChange()
+        disconnect(machineID, expectedControllerID: expectedControllerID)
+        await session?.stop()
+        await startup?.value
+        await muxChange?.value
+        await reconnect?.value
+        guard !Task.isCancelled, permitsTerminalCreation,
+              sessions[machineID]?.id == expectedControllerID,
+              disconnected.contains(machineID), controllerJobs[machineID] == nil else {
+            throw WorkspaceSSHConnectionError.stale
+        }
+        guard session == nil || session?.settled == true else { throw WorkspaceSSHConnectionError.busy }
+    }
+
+    /// Publish only after current local policy was rechecked and the old owner
+    /// settled. Group preferences cannot reopen this machine; the following
+    /// explicit Connect action releases its disconnected intent.
+    func installRouteChange(_ target: TerminalSessionTarget, expectedControllerID: UUID?) throws {
+        guard permitsTerminalCreation, target.workspaceID == workspaceID, target.revision == revision,
+              let index = machines.firstIndex(where: { $0.id == target.machineID }),
+              sessions[target.machineID]?.id == expectedControllerID,
+              sessions[target.machineID] == nil || sessions[target.machineID]?.settled == true,
+              controllerJobs[target.machineID] == nil, disconnected.contains(target.machineID) else {
+            throw WorkspaceSSHConnectionError.stale
+        }
+        let old = machines[index]
+        machines[index] = .init(id: old.id, name: old.name, target: target, unavailable: old.unavailable,
+            theme: old.theme, autoConnect: old.autoConnect, tags: old.tags)
+        changedRouteMachines.insert(target.machineID)
+        muxAccessSelections[target.machineID] = nil
+        existingMuxRequired.remove(target.machineID)
+        sessions[target.machineID]?.discardRetainedOutput()
     }
 
     /// The mode a machine's shared pane is reconnecting in, while it is.
