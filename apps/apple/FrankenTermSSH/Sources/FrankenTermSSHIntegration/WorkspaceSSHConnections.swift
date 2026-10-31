@@ -11,7 +11,7 @@ public enum WorkspaceSSHConnectionError: Error, Equatable, Sendable, LocalizedEr
         case .capacity: return "The connection limit has been reached. Close a session before connecting another machine."
         case .stale: return "This connection changed or closed. Select the machine again."
         case .promptedHopRetryRequired:
-            return "The destination refused this key after an interactive sign-in to a jump host. Choose Retry to sign in again; the app will not automatically repeat authentication prompts."
+            return "The destination refused this sign-in after an interactive sign-in to a jump host. Choose Retry to sign in again; the app will not automatically repeat authentication prompts."
         }
     }
 }
@@ -305,10 +305,21 @@ public actor WorkspaceSSHConnectionManager {
                         connectionTimeout: Duration = .seconds(15),
                         authenticationTimeout: Duration = .seconds(60),
                         attachMux: Bool = true, muxAccessMode: TerminalMuxAccessMode = .interactive,
-                        requiresExistingMux: Bool = false) async throws -> WorkspaceSSHConnection {
+                        requiresExistingMux: Bool = false,
+                        selection: WorkspaceSSHConnectionSelection? = nil) async throws -> WorkspaceSSHConnection {
         guard confirmedByUser else { throw WorkspaceNetworkError.confirmationRequired }
         guard foreground else { throw WorkspaceSSHConnectionError.offline }
         guard retiringWorkspaces[workspaceID] == nil else { throw WorkspaceSSHConnectionError.stale }
+        if let selection {
+            guard selection.workspaceID == workspaceID, selection.expectedRevision == expectedRevision,
+                  selection.machineID == machineID, selection.routeID == routeID,
+                  selection.authentication == authentication else {
+                throw WorkspaceSSHConnectionSelectionError.stale
+            }
+            guard selection.hops.count <= WorkspaceNativeSSHAuthentication.routeSupport.maximumJumpHops else {
+                throw WorkspaceSSHConnectionSelectionError.hopMismatch
+            }
+        }
         guard connectionTimeout > .zero, connectionTimeout <= .seconds(120),
               authenticationTimeout > .zero, authenticationTimeout <= .seconds(120) else {
             throw NativeSSHError.invalidInput
@@ -326,7 +337,8 @@ public actor WorkspaceSSHConnectionManager {
         let keyboardInteractivePrompter = self.keyboardInteractivePrompter
         let task = Task<WorkspaceSSHConnection, Error> {
             let fingerprints = try await credentialSnapshot(machine: machine, attemptID: attemptID,
-                generation: generation, expectedRevision: expectedRevision, authentication: authentication)
+                generation: generation, expectedRevision: expectedRevision, routeID: routeID,
+                authentication: authentication, selection: selection)
             let native = try await WorkspaceNativeSSHConnection.connect(workspaceID: workspaceID,
                 expectedRevision: expectedRevision, machineID: machineID, routeID: routeID,
                 authentication: authentication, confirmedByUser: confirmedByUser,
@@ -334,7 +346,7 @@ public actor WorkspaceSSHConnectionManager {
                 keyboardInteractivePrompter: keyboardInteractivePrompter, journal: journal, networkActivity: networkActivity,
                 connectionTimeout: connectionTimeout, authenticationTimeout: authenticationTimeout,
                 liveness: liveness, muxClientFactory: muxClientFactory, attachMux: attachMux,
-                muxAccessMode: muxAccessMode, requiresExistingMux: requiresExistingMux)
+                muxAccessMode: muxAccessMode, requiresExistingMux: requiresExistingMux, selection: selection)
             do {
                 try Task.checkCancellation()
                 return WorkspaceSSHConnection(native: native, journal: journal, coordinator: coordinator,
@@ -381,14 +393,35 @@ public actor WorkspaceSSHConnectionManager {
     /// resolve a hostname or request a signer. Recheck after the store actor
     /// hop: a revocation admitted while this read was pending wins the race.
     private func credentialSnapshot(machine: Machine, attemptID: UUID, generation: UUID,
-                                    expectedRevision: UUID, authentication: WorkspaceSSHAuthenticationChoice) async throws -> Set<String> {
+                                    expectedRevision: UUID, routeID: String,
+                                    authentication: WorkspaceSSHAuthenticationChoice,
+                                    selection: WorkspaceSSHConnectionSelection?) async throws -> Set<String> {
         try Task.checkCancellation()
-        let workspaces = try await store.load()
+        let workspaces = try await store.loadWithLocalPolicy(support: WorkspaceNativeSSHAuthentication.routeSupport)
         try Task.checkCancellation()
-        guard let workspace = workspaces.first(where: { $0.id == machine.workspaceID }),
-              workspace.revision == expectedRevision else { throw SSHAuthenticationError.stale }
-        let document = try workspace.document()
-        if case let .publicKey(credentialID) = authentication {
+        guard let local = workspaces.first(where: { $0.workspace.id == machine.workspaceID }),
+              local.workspace.revision == expectedRevision else { throw SSHAuthenticationError.stale }
+        let document = try local.workspace.document()
+        var selectedChoices = [authentication]
+        if let selection {
+            let options = try WorkspaceSSHRouteOptions(localState: local, machineID: machine.machineID,
+                routeID: routeID, support: WorkspaceNativeSSHAuthentication.routeSupport)
+            try options.validate(selection)
+            selectedChoices += selection.hops.map(\.authentication)
+        } else {
+            for hop in try document.orderedJumpRoutes(forRouteID: routeID) {
+                guard let readiness = local.routes.first(where: { $0.routeID == hop.id }) else {
+                    throw SSHAuthenticationError.denied
+                }
+                selectedChoices += WorkspaceSSHAuthenticationChoice.choices(for: hop,
+                    usableCredentialIDs: readiness.usableCredentialIDs)
+            }
+        }
+        // A failed durable revocation remains denied by this manager. Apply
+        // that denial to every key the chosen path could offer, including
+        // transit candidates; selecting password explicitly does not offer it.
+        for choice in selectedChoices {
+            guard case let .publicKey(credentialID) = choice else { continue }
             guard let credential = document.credentials.first(where: { $0.id == credentialID }),
                   !deniedCredentials.contains(credential.fingerprint) else { throw SSHAuthenticationError.denied }
         }

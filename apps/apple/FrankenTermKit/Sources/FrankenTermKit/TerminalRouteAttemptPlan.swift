@@ -23,6 +23,30 @@ public enum WorkspaceSSHAuthenticationChoice: Hashable, Sendable {
         }
     }
 
+    public var method: WorkspaceDocument.AuthenticationMethod {
+        switch self {
+        case .publicKey: .publicKey
+        case .password: .password
+        case .keyboardInteractive: .keyboardInteractive
+        }
+    }
+
+    /// Every locally available choice expressly allowed by this route, for an
+    /// explicit user review. This is never the automatic fallback sequence:
+    /// choosing a password or another key must create a separately reviewed
+    /// attempt. Preserve imported method and key order and ignore foreign keys.
+    public static func permittedChoices(for route: WorkspaceDocument.Route,
+                                        usableCredentialIDs: [String]) -> [Self] {
+        let available = Set(usableCredentialIDs)
+        return route.authenticationMethods.flatMap { method -> [Self] in
+            switch method {
+            case .publicKey: return route.credentialIDs.filter(available.contains).map(Self.publicKey)
+            case .password: return [.password]
+            case .keyboardInteractive: return [.keyboardInteractive]
+            }
+        }
+    }
+
     /// Choose the first usable permitted method in the saved order. Exhausting
     /// keys never silently downgrades to a password, and keyboard-interactive is
     /// deliberately distinct from the SSH password method.

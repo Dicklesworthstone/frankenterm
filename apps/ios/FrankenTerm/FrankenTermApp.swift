@@ -65,6 +65,83 @@ struct LocalHostKeyCheckReview: Identifiable {
     }
 }
 
+/// A foreground visit to one machine's effective, phone-local route policy.
+/// Choices and public identity data survive only this visit and saved revision.
+struct LocalRouteChoiceContext: Identifiable {
+    let id = UUID()
+    let local: WorkspaceLocalState
+    let document: WorkspaceDocument
+    let machine: WorkspaceDocument.Machine
+    fileprivate let epoch: UUID
+}
+
+@MainActor
+struct LocalRouteConnectionReview: Identifiable {
+    let id = UUID()
+    let contextID: UUID
+    let target: TerminalSessionTarget
+    let selection: WorkspaceSSHConnectionSelection?
+    fileprivate let epoch: UUID
+    fileprivate let scene: WorkspaceTerminalScene?
+    fileprivate let controllerID: UUID?
+    let disconnectsSession: Bool
+}
+
+/// Use the same target construction for ordinary Connect, the choice review,
+/// and fresh-policy validation immediately before its publication.
+private enum WorkspaceTerminalTargets {
+    static func make(local: WorkspaceLocalState, machineID: String, theme: WorkspaceDocument.Theme?,
+                     selection: WorkspaceSSHConnectionSelection? = nil) throws -> TerminalSessionTarget {
+        let document = try local.workspace.document()
+        guard let machine = document.machines.first(where: { $0.id == machineID }) else { throw FTError.stale }
+        var routes: [TerminalSessionRoute] = []
+        if let selection {
+            let options = try WorkspaceSSHRouteOptions(localState: local, machineID: machineID,
+                routeID: selection.routeID, support: WorkspaceNativeSSHAuthentication.routeSupport)
+            try options.validate(selection)
+            let route = options.destination.route
+            let promptingJump = zip(options.hops, selection.hops).contains { peer, choice in
+                choice.authentication.requiresForegroundPrompt
+                    || peer.route.authenticationMethods.contains(.keyboardInteractive)
+            }
+            routes = [.init(id: route.id, credentialIDs: selection.authentication.credentialID.map { [$0] } ?? [],
+                host: route.host, port: route.port, authenticationChoices: [selection.authentication],
+                selectedConnection: selection,
+                allowsKeyboardInteractiveContinuation: route.authenticationMethods.contains(.keyboardInteractive),
+                promptingJump: promptingJump, mux: route.mode == "frankenterm_mux",
+                sessionCreation: route.mode == "frankenterm_mux" ? .existingOnly
+                    : (route.sessionCreation == "manual" ? .manual : .onSelect),
+                jumpHost: options.hops.first?.route.host, jumpPort: options.hops.first?.route.port)]
+        } else {
+            var seen = Set<String>()
+            for id in [machine.preferredRouteID] + machine.routeIDs where seen.insert(id).inserted {
+                guard let route = document.routes.first(where: { $0.id == id }),
+                      route.mode == "direct_ssh" || route.mode == "frankenterm_mux",
+                      let hops = try? document.orderedJumpRoutes(forRouteID: id),
+                      hops.count <= WorkspaceNativeSSHAuthentication.routeSupport.maximumJumpHops,
+                      let readiness = local.routes.first(where: { $0.routeID == id }), readiness.issues.isEmpty else { continue }
+                let choices = WorkspaceSSHAuthenticationChoice.choices(for: route, usableCredentialIDs: readiness.usableCredentialIDs)
+                guard !choices.isEmpty else { continue }
+                let promptingJump = hops.contains { hop in
+                    let usable = local.routes.first(where: { $0.routeID == hop.id })?.usableCredentialIDs ?? []
+                    return hop.authenticationMethods.contains(.keyboardInteractive)
+                        || WorkspaceSSHAuthenticationChoice.choices(for: hop, usableCredentialIDs: usable).contains(where: \.requiresForegroundPrompt)
+                }
+                routes.append(.init(id: id, credentialIDs: readiness.usableCredentialIDs, host: route.host, port: route.port,
+                    authenticationChoices: choices,
+                    allowsKeyboardInteractiveContinuation: route.authenticationMethods.contains(.keyboardInteractive),
+                    promptingJump: promptingJump, mux: route.mode == "frankenterm_mux",
+                    sessionCreation: route.mode == "frankenterm_mux" ? .existingOnly
+                        : (route.sessionCreation == "manual" ? .manual : .onSelect),
+                    jumpHost: hops.first?.host, jumpPort: hops.first?.port))
+            }
+        }
+        guard !routes.isEmpty else { throw WorkspaceSSHConnectionError.busy }
+        return .init(workspaceID: local.workspace.id, revision: local.workspace.revision,
+            machineID: machine.id, machineName: machine.name, routes: routes, theme: theme)
+    }
+}
+
 /// A deliberate phone-local credential change. The imported manifest and its
 /// source identity remain intact; the review names one exact local revision.
 struct LocalDeviceKeyReview: Identifiable {
@@ -177,6 +254,8 @@ final class MobileWorkspaceModel {
     private var connectionPreferenceBusy = false
     @ObservationIgnored private var connectionPreferenceUpdate: Task<Void, Never>?
     @ObservationIgnored private var connectionApproval: (id: UUID, task: Task<WorkspaceLocalState, Error>)?
+    @ObservationIgnored private var routeChoiceID: UUID?
+    @ObservationIgnored private var routeConnectionReviewID: UUID?
     /// A failed durable write cannot revive a terminal in this process. Its
     /// bookmark is cleared before explicit restore disconnection as well.
     private var offlineConnectionHolds = Set<UUID>()
@@ -477,7 +556,7 @@ final class MobileWorkspaceModel {
     /// every session running until the user disconnects it. A new revision of
     /// a workspace (a re-import) or its removal retires its scene.
     @ObservationIgnored private var liveScenes: [UUID: WorkspaceTerminalScene] = [:]
-    func liveScene(workspaceID: UUID, revision: UUID,
+    func liveScene(workspaceID: UUID, revision: UUID, expectedTarget: TerminalSessionTarget? = nil,
                    make: () throws -> WorkspaceTerminalScene) throws -> WorkspaceTerminalScene {
         guard keyRevocation == nil, credentialImportOperation == nil, deviceKeyOperation == nil, hostKeyOperation == nil,
               !showRestore, !requiresConnectionApproval(workspaceID),
@@ -489,7 +568,13 @@ final class MobileWorkspaceModel {
            document.credentials.contains(where: { unconfirmedCredentialRevocations.contains($0.fingerprint) }) {
             throw SSHAuthenticationError.denied
         }
-        if let scene = liveScenes[workspaceID], scene.revision == revision, !scene.closed { return scene }
+        if let scene = liveScenes[workspaceID], scene.revision == revision, !scene.closed {
+            if let expectedTarget {
+                guard scene.machines.first(where: { $0.id == expectedTarget.machineID })?.target?.routes == expectedTarget.routes
+                else { throw WorkspaceSSHConnectionError.stale }
+            }
+            return scene
+        }
         if let stale = liveScenes.removeValue(forKey: workspaceID) { retire(stale) }
         let scene = try make()
         liveScenes[workspaceID] = scene
@@ -499,6 +584,67 @@ final class MobileWorkspaceModel {
     func requiresConnectionApproval(_ workspaceID: UUID) -> Bool {
         offlineConnectionHolds.contains(workspaceID)
             || workspaces.first(where: { $0.id == workspaceID })?.connectLater != false
+    }
+
+    func beginRouteChoice(workspaceID: UUID, machineID: String) throws -> LocalRouteChoiceContext {
+        guard active, !busy, !showRestore, let local = localPolicies[workspaceID] else { throw FTError.stale }
+        let document = try local.workspace.document()
+        guard let machine = document.machines.first(where: { $0.id == machineID }),
+              !document.credentials.contains(where: { unconfirmedCredentialRevocations.contains($0.fingerprint) }) else {
+            throw SSHAuthenticationError.denied
+        }
+        let context = LocalRouteChoiceContext(local: local, document: document, machine: machine, epoch: epoch)
+        routeChoiceID = context.id; routeConnectionReviewID = nil
+        return context
+    }
+
+    func routeChoiceIsCurrent(_ context: LocalRouteChoiceContext) -> Bool {
+        active && !showRestore && routeChoiceID == context.id && context.epoch == epoch
+            && localPolicies[context.local.workspace.id]?.workspace.revision == context.local.workspace.revision
+            && workspaces.contains(where: { $0.id == context.local.workspace.id && $0.revision == context.local.workspace.revision })
+    }
+
+    func endRouteChoice(_ contextID: UUID) {
+        guard routeChoiceID == contextID else { return }
+        routeChoiceID = nil; routeConnectionReviewID = nil
+    }
+
+    func selectedTerminalTarget(workspaceID: UUID, revision: UUID, machineID: String) -> TerminalSessionTarget? {
+        guard let scene = liveScenes[workspaceID], !scene.closed, scene.revision == revision,
+              let target = scene.machines.first(where: { $0.id == machineID })?.target,
+              target.routes.contains(where: { $0.selectedConnection != nil }) else { return nil }
+        return target
+    }
+
+    func reviewRouteConnection(_ context: LocalRouteChoiceContext,
+                               selection: WorkspaceSSHConnectionSelection?,
+                               theme: WorkspaceDocument.Theme?) throws -> LocalRouteConnectionReview {
+        guard !busy, routeChoiceIsCurrent(context), let local = localPolicies[context.local.workspace.id] else { throw FTError.stale }
+        let target = try WorkspaceTerminalTargets.make(local: local, machineID: context.machine.id,
+            theme: theme, selection: selection)
+        let scene = liveScenes[local.workspace.id].flatMap { $0.closed ? nil : $0 }
+        guard scene == nil || scene?.revision == local.workspace.revision else { throw FTError.stale }
+        let controller = scene?.sessions[context.machine.id]
+        let review = LocalRouteConnectionReview(contextID: context.id, target: target, selection: selection,
+            epoch: epoch, scene: scene, controllerID: controller?.id, disconnectsSession: controller?.settled == false)
+        routeConnectionReviewID = review.id
+        return review
+    }
+
+    private func validateRouteConnection(_ review: LocalRouteConnectionReview, local: WorkspaceLocalState) throws {
+        let target = review.target
+        let scene = liveScenes[target.workspaceID].flatMap { $0.closed ? nil : $0 }
+        guard active, !showRestore, !Task.isCancelled, epoch == review.epoch,
+              routeChoiceID == review.contextID, routeConnectionReviewID == review.id,
+              local.workspace.id == target.workspaceID, local.workspace.revision == target.revision,
+              scene === review.scene, scene?.sessions[target.machineID]?.id == review.controllerID else { throw FTError.stale }
+        let document = try local.workspace.document()
+        guard !document.credentials.contains(where: { unconfirmedCredentialRevocations.contains($0.fingerprint) }) else {
+            throw SSHAuthenticationError.denied
+        }
+        let current = try WorkspaceTerminalTargets.make(local: local, machineID: target.machineID,
+            theme: nil, selection: review.selection)
+        guard current.routes == target.routes else { throw FTError.stale }
     }
 
     struct ConnectionApproval: Sendable {
@@ -517,12 +663,26 @@ final class MobileWorkspaceModel {
     /// opening a scene, and retain that operation so entering offline restore
     /// can join it before arming the durable gate. Remembered navigation and
     /// imported auto-connect preferences never obtain this approval themselves.
-    func approveConnections(workspaceID: UUID, expectedRevision: UUID) async throws -> ConnectionApproval {
+    func approveConnections(workspaceID: UUID, expectedRevision: UUID,
+                            routeReview: LocalRouteConnectionReview? = nil) async throws -> ConnectionApproval {
         guard active, !busy, !showRestore, let store else { throw WorkspaceSSHConnectionError.busy }
+        if let routeReview {
+            guard routeReview.target.workspaceID == workspaceID, routeReview.target.revision == expectedRevision,
+                  let local = localPolicies[workspaceID] else { throw FTError.stale }
+            try validateRouteConnection(routeReview, local: local)
+        }
         let id = UUID(), ticket = epoch, pendingLifecycle = lifecycle
         let task = Task<WorkspaceLocalState, Error> { [self] in
             await pendingLifecycle?.value
             guard active, !showRestore, epoch == ticket else { throw FTError.stale }
+            if let routeReview {
+                guard let local = localPolicies[workspaceID] else { throw FTError.stale }
+                try validateRouteConnection(routeReview, local: local)
+                try await routeReview.scene?.prepareRouteChange(machineID: routeReview.target.machineID,
+                    expectedControllerID: routeReview.controllerID)
+                guard let current = localPolicies[workspaceID] else { throw FTError.stale }
+                try validateRouteConnection(routeReview, local: current)
+            }
             _ = try await store.approveConnections(workspaceID: workspaceID,
                 expectedRevision: expectedRevision, confirmedByUser: true)
             guard active, !showRestore, epoch == ticket else { throw FTError.stale }
@@ -530,12 +690,19 @@ final class MobileWorkspaceModel {
             guard active, !showRestore, epoch == ticket,
                   let local = localPolicies[workspaceID], local.workspace.revision == expectedRevision,
                   !local.workspace.connectLater else { throw FTError.stale }
+            if let routeReview {
+                try validateRouteConnection(routeReview, local: local)
+                try routeReview.scene?.installRouteChange(routeReview.target, expectedControllerID: routeReview.controllerID)
+            }
             offlineConnectionHolds.remove(workspaceID)
             deviceKeyConnectionHolds.remove(workspaceID)
             return local
         }
         connectionApproval = (id, task)
-        defer { if connectionApproval?.id == id { connectionApproval = nil } }
+        defer {
+            if connectionApproval?.id == id { connectionApproval = nil }
+            if let routeReview, routeConnectionReviewID == routeReview.id { routeConnectionReviewID = nil }
+        }
         let approval = ConnectionApproval(local: try await task.value, generation: ticket)
         guard connectionApprovalIsCurrent(approval) else { throw FTError.stale }
         return approval
@@ -673,6 +840,7 @@ final class MobileWorkspaceModel {
     }
     private func updateLifecycle(discardRecipientRequest: Bool = false) {
         epoch = UUID()
+        routeChoiceID = nil; routeConnectionReviewID = nil
         retireEnrollmentReviews()
         keyReviewID = nil
         hostKeyCheckReviewID = nil
@@ -4601,6 +4769,281 @@ private struct WorkspaceDeviceKeyRoutesSheet: View {
 private struct WorkspaceDeviceKeyChoice: Identifiable { let id: String }
 
 @MainActor
+private struct WorkspaceRouteChoiceScreen: View {
+    let context: LocalRouteChoiceContext
+    @Bindable var model: MobileWorkspaceModel
+    let theme: WorkspaceDocument.Theme?
+    let onApproved: (MobileWorkspaceModel.ConnectionApproval, TerminalSessionTarget) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var routeID: String?
+    @State private var options: WorkspaceSSHRouteOptions?
+    @State private var authentication: WorkspaceSSHAuthenticationChoice?
+    @State private var hopAuthentications: [WorkspaceSSHAuthenticationChoice?] = []
+    @State private var review: LocalRouteConnectionReview?
+    @State private var applying = false
+    @State private var message: String?
+
+    private var workspaceID: UUID { context.local.workspace.id }
+    private var complete: Bool {
+        options != nil && authentication != nil && hopAuthentications.count == options?.hops.count
+            && hopAuthentications.allSatisfy { $0 != nil }
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                if let review { connectionReview(review) }
+                else { choices }
+                if let message { Section { Text(message).foregroundStyle(.red).accessibilityIdentifier("routes.error") } }
+                if applying {
+                    Section {
+                        ProgressView("Settling the previous connection and checking this choice…")
+                        Text("Keep this screen open until the connection choice is ready.").font(.caption)
+                    }
+                }
+            }
+            .navigationTitle(review == nil ? "Route and Sign-In" : "Review Connection")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button(review == nil ? "Cancel" : "Back") {
+                        if review != nil { review = nil; message = nil }
+                        else { dismiss() }
+                    }.disabled(applying)
+                }
+            }
+            .interactiveDismissDisabled(applying)
+        }
+        .onChange(of: model.active) { _, active in if !active { review = nil; dismiss() } }
+        .onChange(of: model.showRestore) { _, restoring in if restoring { review = nil; dismiss() } }
+        .onChange(of: model.localPolicies[workspaceID]?.workspace.revision) { _, revision in
+            if revision != context.local.workspace.revision { review = nil; dismiss() }
+        }
+        .onDisappear { model.endRouteChoice(context.id) }
+    }
+
+    @ViewBuilder private var choices: some View {
+        Section {
+            Text(verbatim: context.machine.name).font(.headline)
+            Text("Choose one route and one sign-in method for every account along its path. Only methods permitted by this workspace and keys available on this phone are offered.")
+            Text("The choice stays with this machine in its current live workspace. Passwords and MFA answers are requested only by the existing sign-in prompt and are never saved here.")
+                .font(.footnote).foregroundStyle(.secondary)
+        }
+        Section("Route") {
+            ForEach(context.machine.routeIDs, id: \.self) { id in
+                if let route = context.document.routes.first(where: { $0.id == id }) {
+                    Button { choose(route) } label: {
+                        HStack(alignment: .top) {
+                            Image(systemName: routeID == id ? "checkmark.circle.fill" : "circle")
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(verbatim: endpoint(route)).font(.system(.callout, design: .monospaced))
+                                Text(verbatim: "\(route.id) · " + (route.mode == "frankenterm_mux" ? "Existing mux panes" : "SSH terminal")
+                                    + (id == context.machine.preferredRouteID ? " · Preferred" : ""))
+                                    .font(.caption).foregroundStyle(.secondary)
+                                ForEach(Array((context.local.routes.first { $0.routeID == id }?.issues ?? []).enumerated()), id: \.offset) { _, issue in
+                                    Text(verbatim: issue.message).font(.caption).foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                    }.buttonStyle(.plain).disabled(model.busy).accessibilityIdentifier("routes.choose.\(id)")
+                }
+            }
+        }
+        if let options {
+            ForEach(Array(options.hops.enumerated()), id: \.offset) { index, peer in
+                Section("Jump \(index + 1)") {
+                    peerIdentity(peer.route)
+                    methodPicker(peer, selected: Binding(
+                        get: { hopAuthentications.indices.contains(index) ? hopAuthentications[index] : nil },
+                        set: { if hopAuthentications.indices.contains(index) { hopAuthentications[index] = $0 } }),
+                        identifier: "hop.\(index)")
+                }
+            }
+            Section("Destination") {
+                peerIdentity(options.destination.route)
+                methodPicker(options.destination, selected: $authentication, identifier: "destination")
+                routeBehavior(options.destination.route)
+            }
+        }
+        Section {
+            Button("Review Connection") { prepareReview() }
+                .disabled(!complete || model.busy || !model.routeChoiceIsCurrent(context))
+                .accessibilityIdentifier("routes.review")
+            if model.selectedTerminalTarget(workspaceID: workspaceID, revision: context.local.workspace.revision,
+                machineID: context.machine.id) != nil {
+                Button("Use Configured Choices") {
+                    do { review = try model.reviewRouteConnection(context, selection: nil, theme: theme); message = nil }
+                    catch { message = "The configured paths changed or are not ready. Reopen Route and Sign-In to review them again. \(error.localizedDescription)" }
+                }.disabled(model.busy || !model.routeChoiceIsCurrent(context))
+                    .accessibilityIdentifier("routes.use-configured")
+            }
+        }
+    }
+
+    private func choose(_ route: WorkspaceDocument.Route) {
+        routeID = route.id; options = nil; authentication = nil; hopAuthentications = []; review = nil; message = nil
+        guard model.routeChoiceIsCurrent(context) else { message = "Reopen Route and Sign-In for the current workspace."; return }
+        do {
+            let available = try WorkspaceSSHRouteOptions(localState: context.local, machineID: context.machine.id,
+                routeID: route.id, support: WorkspaceNativeSSHAuthentication.routeSupport)
+            options = available
+            hopAuthentications = Array(repeating: nil, count: available.hops.count)
+        } catch {
+            message = "This path is not ready for sign-in. Resolve its listed key, trust, or capability requirements in the workspace first. \(error.localizedDescription)"
+        }
+    }
+
+    private func prepareReview() {
+        guard let options, let authentication, complete else { return }
+        do {
+            let selected = try options.select(authentication: authentication, hopAuthentications: hopAuthentications.compactMap { $0 })
+            review = try model.reviewRouteConnection(context, selection: selected, theme: theme)
+            message = nil
+        } catch { message = "This choice is no longer available. Reopen Route and Sign-In to check the current paths and keys. \(error.localizedDescription)" }
+    }
+
+    @ViewBuilder private func methodPicker(_ peer: WorkspaceSSHRouteOptions.Peer,
+                                          selected: Binding<WorkspaceSSHAuthenticationChoice?>,
+                                          identifier: String) -> some View {
+        Picker("Sign-in method", selection: selected) {
+            Text("Choose sign-in method").tag(nil as WorkspaceSSHAuthenticationChoice?)
+            ForEach(peer.authenticationChoices, id: \.self) { choice in
+                Text(verbatim: methodName(choice)).tag(Optional(choice))
+            }
+        }.accessibilityIdentifier("routes.signin.\(identifier)").disabled(model.busy)
+        if let choice = selected.wrappedValue {
+            Text(verbatim: methodName(choice)).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+            continuation(peer.route, choices: [choice])
+        }
+    }
+
+    private func endpoint(_ route: WorkspaceDocument.Route) -> String {
+        LocalHostKeyCheckReview.endpoint(host: route.host, port: route.port, user: route.user)
+    }
+
+    private func methodName(_ choice: WorkspaceSSHAuthenticationChoice) -> String {
+        switch choice {
+        case .publicKey(let id):
+            if let key = context.document.credentials.first(where: { $0.id == id }) {
+                return "Public key · \(key.algorithm) · \(key.fingerprint) · \(id)"
+            }
+            return "Public key · \(id)"
+        case .password: return "SSH password"
+        case .keyboardInteractive: return "Keyboard-interactive / MFA"
+        }
+    }
+
+    @ViewBuilder private func peerIdentity(_ route: WorkspaceDocument.Route) -> some View {
+        Text(verbatim: endpoint(route)).font(.system(.callout, design: .monospaced)).textSelection(.enabled)
+        Text(verbatim: "Route: " + route.id).font(.caption).foregroundStyle(.secondary)
+        if let trust = context.document.hostTrust.first(where: { $0.id == route.trustID }) {
+            if let alias = route.hostKeyAlias ?? trust.hostKeyAlias {
+                Text(verbatim: "Host-key alias: " + alias).font(.caption).textSelection(.enabled)
+            }
+            let blocked = Set(trust.revokedKeys.map(\.fingerprint))
+                .union((context.local.revokedHostKeysByTrustScope[trust.canonicalTrustScope] ?? []).map(\.fingerprint))
+                .union((context.local.unsavedHostKeysByTrustScope[trust.canonicalTrustScope] ?? []).map(\.fingerprint))
+            ForEach(trust.pins.filter { !blocked.contains($0.fingerprint) }, id: \.self) { pin in
+                Text(verbatim: "Trusted host key · \(pin.algorithm) · \(pin.fingerprint)")
+                    .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+            }
+        }
+    }
+
+    @ViewBuilder private func continuation(_ route: WorkspaceDocument.Route,
+                                          choices: [WorkspaceSSHAuthenticationChoice]) -> some View {
+        if choices.contains(where: { $0.credentialID != nil }), route.authenticationMethods.contains(.keyboardInteractive) {
+            Text("This account also permits keyboard-interactive MFA after the server partially accepts the selected key. Its challenge will identify this exact account.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder private func routeBehavior(_ route: WorkspaceDocument.Route) -> some View {
+        if route.mode == "frankenterm_mux" {
+            Text("Attach to existing FrankenTerm panes in View Only. A new shell requires its own explicit action.").font(.caption)
+            Text(verbatim: "Mux command: " + (route.remoteCommand ?? WorkspaceNativeSSHConnection.defaultMuxCommand))
+                .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+        } else if route.sessionCreation == "manual" {
+            Text("Sign in first, then choose Open Terminal to create this route's shell.").font(.caption)
+        } else {
+            Text("Opening this route may create a new SSH terminal. A previously ended terminal still requires New Session.").font(.caption)
+        }
+    }
+
+    @ViewBuilder private func connectionReview(_ reviewed: LocalRouteConnectionReview) -> some View {
+        Section {
+            Text(verbatim: context.machine.name).font(.headline)
+            if reviewed.selection != nil {
+                Text("Connect through exactly the accounts and methods below. A refusal ends this attempt; another route or sign-in method needs a new choice.")
+            } else {
+                Text("Return this machine to its configured route priority and sign-in choices shown below. Automatic choices keep their existing reachability and key-refusal rules.")
+            }
+            if reviewed.disconnectsSession {
+                Text("This machine's current connection will disconnect before the choice is applied. Its direct SSH shell may end. Input already sent may have executed and will not be replayed.")
+                    .font(.callout)
+            }
+            Text("The choice applies to this machine until its live workspace closes or is replaced. Other machines retain their own connection choices.")
+                .font(.footnote).foregroundStyle(.secondary)
+            if model.requiresConnectionApproval(workspaceID) {
+                Text("Connect also enables this workspace's saved connection preferences on this phone after its offline restore.").font(.footnote)
+            }
+        }
+        ForEach(reviewed.target.routes, id: \.id) { candidate in
+            if let route = context.document.routes.first(where: { $0.id == candidate.id }) {
+                Section("Route \(candidate.id)") {
+                    let hops = (try? context.document.orderedJumpRoutes(forRouteID: route.id)) ?? []
+                    ForEach(Array(hops.enumerated()), id: \.offset) { index, hop in
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Jump \(index + 1)").font(.subheadline.bold())
+                            reviewedPeer(hop, choices: reviewed.selection.map { [$0.hops[index].authentication] }
+                                ?? WorkspaceSSHAuthenticationChoice.choices(for: hop,
+                                    usableCredentialIDs: context.local.routes.first(where: { $0.routeID == hop.id })?.usableCredentialIDs ?? []))
+                        }.padding(.vertical, 4)
+                    }
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Destination").font(.subheadline.bold())
+                        reviewedPeer(route, choices: candidate.choices)
+                        routeBehavior(route)
+                    }.padding(.vertical, 4)
+                }
+            }
+        }
+        Section {
+            Button(reviewed.selection == nil ? "Use Configured Choices and Connect"
+                : (reviewed.disconnectsSession ? "Change Route and Connect" : "Use Route and Connect")) { connect(reviewed) }
+                .disabled(applying || model.busy || !model.routeChoiceIsCurrent(context))
+                .accessibilityIdentifier("routes.confirm")
+        }
+    }
+
+    @ViewBuilder private func reviewedPeer(_ route: WorkspaceDocument.Route,
+                                         choices: [WorkspaceSSHAuthenticationChoice]) -> some View {
+        peerIdentity(route)
+        ForEach(choices, id: \.self) { choice in
+            Text(verbatim: methodName(choice)).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+        }
+        continuation(route, choices: choices)
+    }
+
+    private func connect(_ reviewed: LocalRouteConnectionReview) {
+        guard !applying else { return }
+        applying = true; message = nil
+        Task {
+            defer { applying = false }
+            do {
+                let approval = try await model.approveConnections(workspaceID: workspaceID,
+                    expectedRevision: context.local.workspace.revision, routeReview: reviewed)
+                guard model.connectionApprovalIsCurrent(approval), model.routeChoiceIsCurrent(context) else { return }
+                onApproved(approval, reviewed.target)
+            } catch {
+                review = nil
+                message = "The new connection choice was not opened. The previous connection may remain disconnected while cleanup finishes. Review the current choice and try again. \(error.localizedDescription)"
+            }
+        }
+    }
+}
+
+@MainActor
 private struct MachineWorkspaceView: View {
     let initialDocument: WorkspaceDocument
     let workspaceID: UUID
@@ -4613,6 +5056,7 @@ private struct MachineWorkspaceView: View {
     /// open scene, or a new one once a restore closed it.
     private struct OpenTerminal: Hashable {
         let machineID: String, local: WorkspaceLocalState, id = UUID()
+        var selectedTarget: TerminalSessionTarget? = nil
         static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
         func hash(into hasher: inout Hasher) { hasher.combine(id) }
     }
@@ -4623,6 +5067,9 @@ private struct MachineWorkspaceView: View {
     @State private var themeMachineID: String?
     @State private var showKeys = false
     @State private var orderReview: WorkspaceMachineOrderReview?
+    @State private var routeChoice: LocalRouteChoiceContext?
+    @State private var routeChoiceVisitID: UUID?
+    @State private var routeChoiceOpening: (approval: MobileWorkspaceModel.ConnectionApproval, target: TerminalSessionTarget)?
     /// Read so a return from Tailscale re-evaluates what Connect needs.
     @Environment(\.scenePhase) private var scenePhase
     private var document: WorkspaceDocument {
@@ -4675,6 +5122,14 @@ private struct MachineWorkspaceView: View {
                             }.accessibilityIdentifier("machine.font.\(machine.id)")
                         }
                         connectSection(machine, theme: theme)
+                        Button("Choose Route and Sign-In", systemImage: "point.topleft.down.to.point.bottomright.curvepath") {
+                            do {
+                                let context = try model.beginRouteChoice(workspaceID: workspaceID, machineID: machine.id)
+                                returnHandled = true; routeChoiceVisitID = context.id; routeChoice = context
+                            } catch { model.connectionPreferenceMessage = "Route choices are unavailable. \(error.localizedDescription)" }
+                        }.buttonStyle(.bordered).tint(Color(ftHex: theme?.accent ?? "#3B82F6"))
+                            .disabled(model.busy || !model.active || model.localPolicies[workspaceID] == nil)
+                            .accessibilityIdentifier("machine.route-choice.\(machine.id)")
                         VStack(alignment: .leading, spacing: 8) {
                             Toggle("Connect with Group", isOn: Binding(
                                 get: { model.automaticallyConnect(machine, workspaceID: workspaceID) },
@@ -4733,6 +5188,20 @@ private struct MachineWorkspaceView: View {
             .sheet(item: $orderReview) { review in
                 WorkspaceMachineOrderScreen(review: review, model: model)
             }
+            .sheet(item: $routeChoice, onDismiss: {
+                if let id = routeChoiceVisitID { model.endRouteChoice(id) }
+                routeChoiceVisitID = nil
+                let opening = routeChoiceOpening; routeChoiceOpening = nil
+                if let opening, model.connectionApprovalIsCurrent(opening.approval) {
+                    terminal = OpenTerminal(machineID: opening.target.machineID, local: opening.approval.local,
+                        selectedTarget: opening.target)
+                }
+            }) { context in
+                WorkspaceRouteChoiceScreen(context: context, model: model, theme: theme(for: context.machine)) { approval, target in
+                    guard routeChoice?.id == context.id, model.connectionApprovalIsCurrent(approval) else { return }
+                    routeChoiceOpening = (approval, target); routeChoice = nil
+                }
+            }
             .sheet(isPresented: Binding(get: { themeMachineID != nil }, set: { if !$0 { themeMachineID = nil } })) {
                 if let id = themeMachineID, let machine = document.machines.first(where: { $0.id == id }),
                    let themes = model.machineThemes(workspaceID, document: document) {
@@ -4749,7 +5218,8 @@ private struct MachineWorkspaceView: View {
                 if let connections = model.connections {
                     // Watched here: this page is not updated while the
                     // terminal covers it.
-                    liveWorkspace(connections: connections, local: open.local, initial: open.machineID).id(open.id)
+                    liveWorkspace(connections: connections, local: open.local, initial: open.machineID,
+                        selectedTarget: open.selectedTarget).id(open.id)
                         .onChange(of: model.showRestore) { _, _ in reopenClosedTerminal() }
                         .onChange(of: model.localPolicies[workspaceID]?.workspace.revision) { _, _ in reopenClosedTerminal() }
                 }
@@ -4846,6 +5316,10 @@ private struct MachineWorkspaceView: View {
                 } else {
                     Text(verbatim: WorkspaceTerminalScreen.via(first)).font(.callout).opacity(0.75)
                 }
+                if first.selectedConnection != nil {
+                    Text("Using your route and sign-in choice for this live workspace. Choose Route and Sign-In to change it or return to configured choices.")
+                        .font(.footnote).opacity(0.8).accessibilityIdentifier("machine.route-choice.active")
+                }
             }
         } else if model.localPolicies[workspaceID] == nil {
             Label("Unlock protected storage to connect.", systemImage: "lock.shield").font(.callout)
@@ -4932,7 +5406,8 @@ private struct MachineWorkspaceView: View {
     /// The workspace's live scene, kept by the app across visits, opening on
     /// `initial`. Every machine remains navigable, while only this group's
     /// opted-in peers prepare authenticated connections in the background.
-    private func liveWorkspace(connections: MobileConnections, local: WorkspaceLocalState, initial: String) -> some View {
+    private func liveWorkspace(connections: MobileConnections, local: WorkspaceLocalState, initial: String,
+                               selectedTarget: TerminalSessionTarget? = nil) -> some View {
         let themes = SceneThemeSource(
             themes: { [model, workspaceID, document] in model.machineThemes(workspaceID, document: document) },
             choose: { [model, workspaceID] machineID, choice in model.chooseTheme(choice, machineID: machineID, workspaceID: workspaceID) })
@@ -4945,15 +5420,18 @@ private struct MachineWorkspaceView: View {
                                  onShowing: { [model, workspaceID] machineID in
             model.showing(machineID.map { .init(workspaceID: workspaceID, machineID: $0) })
         }) { [model, workspaceID, document] in
-            try model.liveScene(workspaceID: workspaceID, revision: local.workspace.revision) {
+            try model.liveScene(workspaceID: workspaceID, revision: local.workspace.revision, expectedTarget: selectedTarget) {
                 try WorkspaceTerminalScene(workspaceID: workspaceID, revision: local.workspace.revision,
-                    workspaceName: document.name, machines: ordered.map { sceneMachine($0, local: local) },
+                    workspaceName: document.name, machines: ordered.map { machine in
+                        sceneMachine(machine, local: local, selectedTarget: machine.id == initial ? selectedTarget : nil)
+                    },
                     initialMachineID: initial, connections: connections, initialGroup: group)
             }
         }
     }
 
-    private func sceneMachine(_ machine: WorkspaceDocument.Machine, local: WorkspaceLocalState) -> SceneMachine {
+    private func sceneMachine(_ machine: WorkspaceDocument.Machine, local: WorkspaceLocalState,
+                              selectedTarget: TerminalSessionTarget? = nil) -> SceneMachine {
         let theme = theme(for: machine)
         let preferences: WorkspaceConnectionPreferences
         if let latest = model.localPolicies[workspaceID], latest.workspace.revision == local.workspace.revision {
@@ -4964,35 +5442,10 @@ private struct MachineWorkspaceView: View {
                   unavailable: "None of this machine's SSH routes is ready on this device. Open the machine from the workspace to see what each route needs.",
                   theme: theme, autoConnect: preferences.automaticallyConnect(machine), tags: machine.tags)
         }
-        // Every ready route, the preferred one first: mux routes attach to the
-        // machine's existing panes, direct-SSH routes to its mux if one answers.
-        var seen = Set<String>(), routes: [TerminalSessionRoute] = []
-        for id in [machine.preferredRouteID] + machine.routeIDs where seen.insert(id).inserted {
-            guard let route = document.routes.first(where: { $0.id == id }),
-                  route.mode == "direct_ssh" || route.mode == "frankenterm_mux",
-                  let hops = try? document.orderedJumpRoutes(forRouteID: id),
-                  hops.count <= WorkspaceNativeSSHAuthentication.routeSupport.maximumJumpHops,
-                  let readiness = local.routes.first(where: { $0.routeID == id }), readiness.issues.isEmpty else { continue }
-            let choices = WorkspaceSSHAuthenticationChoice.choices(for: route, usableCredentialIDs: readiness.usableCredentialIDs)
-            guard !choices.isEmpty else { continue }
-            let hop = hops.first
-            let promptingJump = hops.contains { hop in
-                let usable = local.routes.first(where: { $0.routeID == hop.id })?.usableCredentialIDs ?? []
-                return hop.authenticationMethods.contains(.keyboardInteractive)
-                    || WorkspaceSSHAuthenticationChoice.choices(for: hop, usableCredentialIDs: usable).contains(where: \.requiresForegroundPrompt)
-            }
-            routes.append(.init(id: id, credentialIDs: readiness.usableCredentialIDs, host: route.host, port: route.port,
-                                authenticationChoices: choices,
-                                allowsKeyboardInteractiveContinuation: route.authenticationMethods.contains(.keyboardInteractive),
-                                promptingJump: promptingJump,
-                                mux: route.mode == "frankenterm_mux",
-                                sessionCreation: route.mode == "frankenterm_mux" ? .existingOnly
-                                    : (route.sessionCreation == "manual" ? .manual : .onSelect),
-                                jumpHost: hop?.host, jumpPort: hop?.port))
-        }
-        guard !routes.isEmpty else { return scene(nil) }
-        return scene(.init(workspaceID: workspaceID, revision: local.workspace.revision, machineID: machine.id,
-                           machineName: machine.name, routes: routes, theme: theme))
+        let selected = selectedTarget ?? model.selectedTerminalTarget(workspaceID: workspaceID,
+            revision: local.workspace.revision, machineID: machine.id)
+        if let selected { return scene(theme.map { selected.wearing($0) } ?? selected) }
+        return scene(try? WorkspaceTerminalTargets.make(local: local, machineID: machine.id, theme: theme))
     }
 }
 

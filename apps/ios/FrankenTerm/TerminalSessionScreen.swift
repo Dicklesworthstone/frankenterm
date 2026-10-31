@@ -429,6 +429,9 @@ final class MobileConnections {
 struct TerminalSessionRoute: Hashable, Sendable {
     let id: String, credentialIDs: [String], host: String, port: UInt16
     var authenticationChoices: [WorkspaceSSHAuthenticationChoice]? = nil
+    /// A reviewed route pins the destination and every ordered jump occurrence
+    /// to one permitted method for this scene and revision, including retries.
+    var selectedConnection: WorkspaceSSHConnectionSelection? = nil
     /// A key-first choice can still require a foreground second factor. This
     /// permission never infers partial success or changes candidate ordering.
     var allowsKeyboardInteractiveContinuation = false
@@ -607,6 +610,7 @@ final class TerminalSessionController {
     /// session on this machine keeps it until they dismiss it: a new live
     /// frame says nothing about whether the earlier input arrived.
     private(set) var inputDelivery: TerminalInputDelivery
+    @ObservationIgnored private var preserveUnansweredOnStop = false
     private(set) var inputNoticeFailure: String?
     var inputDeliveryMessage: String? {
         guard let message = inputDelivery.message(machine: target.machineName) else { return nil }
@@ -1837,7 +1841,8 @@ final class TerminalSessionController {
                     expectedRevision: target.revision, machineID: target.machineID, routeID: candidate.id,
                     authentication: attempt.selection.authentication, confirmedByUser: true,
                     attachMux: requiresExistingMux || (!shellOnly && (!candidate.requiresAuthenticationPrompt || candidate.mux)),
-                    muxAccessMode: muxAccessMode, requiresExistingMux: requiresExistingMux)
+                    muxAccessMode: muxAccessMode, requiresExistingMux: requiresExistingMux,
+                    selection: candidate.selectedConnection)
                 // Retain the owner before any following operation can throw.
                 // performStart checks cancellation before opening the channel.
                 connection = connected
@@ -1857,17 +1862,31 @@ final class TerminalSessionController {
                 try checkStarting()
                 Self.log.error("route \(candidate.id, privacy: .public) sign-in failed: \(String(describing: error), privacy: .public)")
                 if error as? WorkspaceSSHConnectionError == .promptedHopRetryRequired {
-                    let hasNext = try rememberPasswordHopRefusal(attempt, plan: &plan)
-                    throw ConnectFailure(help: .init(title: "Couldn't connect to \(target.machineName)",
-                        message: hasNext
+                    let message: String
+                    if candidate.selectedConnection == nil, case .publicKey = attempt.selection.authentication {
+                        let hasNext = try rememberPasswordHopRefusal(attempt, plan: &plan)
+                        message = hasNext
                             ? "The destination refused this key. Choose Retry to try the next configured key; you will sign into the jump host again."
-                            : "The destination refused all available configured keys. Add the intended public key to ~/.ssh/authorized_keys on the destination before retrying.",
-                        remedy: .none))
+                            : "The destination refused all available configured keys. Add the intended public key to ~/.ssh/authorized_keys on the destination, or open Choose Route and Sign-In on the machine page to choose another permitted method."
+                    } else {
+                        passwordHopRetryPlan = nil
+                        _ = try plan.failed(.terminal, attempt: attempt)
+                        message = "The destination refused the chosen sign-in method. Retry uses this same route and methods and asks you to sign into the jump hosts again. To choose another permitted method or path, open Choose Route and Sign-In on the machine page."
+                    }
+                    throw ConnectFailure(help: .init(title: "Couldn't connect to \(target.machineName)",
+                        message: message, remedy: .none))
                 }
                 if let failure = error as? NativeSSHError, failure.isCredentialRefused {
-                    if try plan.failed(.credentialRefused, attempt: attempt) != nil { continue }
+                    let message: String
+                    if candidate.selectedConnection == nil, case .publicKey = attempt.selection.authentication {
+                        if try plan.failed(.credentialRefused, attempt: attempt) != nil { continue }
+                        message = "The machine refused all available configured keys for this route. Authorize the intended public key on the machine, or open Choose Route and Sign-In on the machine page to choose another permitted method."
+                    } else {
+                        _ = try plan.failed(.terminal, attempt: attempt)
+                        message = "Sign-in was refused on this path. Retry uses the same route and sign-in methods. To choose another permitted method or path, open Choose Route and Sign-In on the machine page."
+                    }
                     throw ConnectFailure(help: .init(title: "Couldn't connect to \(target.machineName)",
-                        message: "The machine refused all available configured keys for this route. Add the intended key's public half to ~/.ssh/authorized_keys on the machine.", remedy: .none))
+                        message: message, remedy: .none))
                 }
                 if let failure = error as? NativeSSHError, failure.isUnreachable {
                     let machine = candidate.jumpHost == nil ? target.machineName : "The jump host for \(target.machineName)"
@@ -2059,6 +2078,13 @@ final class TerminalSessionController {
         stopCurrentOperation()
     }
 
+    /// A different path must not turn unconfirmed input into permission to
+    /// replay it. Seal immediately and carry the settled warning to its owner.
+    func requestRouteChange() {
+        preserveUnansweredOnStop = true
+        requestStop()
+    }
+
     private func stopCurrentOperation() {
         if !stopped, phase == .connecting || phase == .ready || phase == .live {
             phase = .ended(Self.describe(TerminalSessionEnd.cancelled))
@@ -2206,7 +2232,8 @@ final class TerminalSessionController {
                 }
             }
             // A mux pane's server says below whether it confirmed the input.
-            if dropped, !attachedToMux, !inputDelivery.unanswered, await runtime.inputAwaitsAnswer() {
+            if dropped || preserveUnansweredOnStop, !attachedToMux, !inputDelivery.unanswered,
+               await runtime.inputAwaitsAnswer() {
                 inputDelivery.endedUnanswered()
             }
             do {
@@ -2226,7 +2253,8 @@ final class TerminalSessionController {
             do { try await connections.manager.close(connectionID: connection.id); self.connection = nil }
             catch { failure = failure ?? error }
             // Closing settles a mux pane's input: its server confirmed it or not.
-            if dropped, connection.muxControl?.current.inputUnconfirmed == true, !inputDelivery.unanswered {
+            if dropped || preserveUnansweredOnStop,
+               connection.muxControl?.current.inputUnconfirmed == true, !inputDelivery.unanswered {
                 inputDelivery.endedUnanswered()
             }
         }
