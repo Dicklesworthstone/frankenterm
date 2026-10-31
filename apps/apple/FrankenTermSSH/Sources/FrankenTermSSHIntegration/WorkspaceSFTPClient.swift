@@ -11,6 +11,10 @@ public struct WorkspaceFileTransferReceipt: Sendable, Equatable {
     public let direction: Direction
     public let remotePath: String
     public let transferredBytes: UInt64
+
+    public init(direction: Direction, remotePath: String, transferredBytes: UInt64) {
+        self.direction = direction; self.remotePath = remotePath; self.transferredBytes = transferredBytes
+    }
 }
 
 /// Counts only bytes received from the server or acknowledged by its SFTP
