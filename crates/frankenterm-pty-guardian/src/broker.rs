@@ -5659,6 +5659,14 @@ impl BrokerControlServiceV1 {
     ) -> Result<BrokerControlResponseV1, ()> {
         let mut header =
             self.response_header(request.header, BrokerControlResponseStatusV1::Rejected);
+        // A drain holds the pane's reader on the output worker, and the write
+        // checks the master's flags through it (ft-q1lol). Take back a
+        // finished drain first.
+        self.drain_output_completion();
+        let draining = self
+            .output_worker
+            .active
+            .is_some_and(|(pane_id, _)| pane_id == request.header.durable_pane_id);
         if let Some(live) = self.live_spawns.get_mut(&request.header.durable_pane_id) {
             if let Some(identity) = live.observes_owner(owner).filter(|identity| {
                 identity.lease_generation == request.header.lease_generation
@@ -5671,13 +5679,17 @@ impl BrokerControlServiceV1 {
                     .admit_proxy_write(&attachment, request.payload())
                 {
                     // The guardian's input WAL owns intent/disposition. This
-                    // route performs one attempt, never a Retryable raw write.
+                    // route performs one attempt. It is Retryable only when
+                    // the drain still holds the reader, before any byte moves.
                     header.status = match live
                         .adoption
                         .pane
                         .execute_proxy_write(permit, request.payload())
                     {
                         Ok(_) => BrokerControlResponseStatusV1::Applied,
+                        Err(BrokerError::ProxyWouldBlock) if draining => {
+                            BrokerControlResponseStatusV1::Retryable
+                        }
                         Err(_) => BrokerControlResponseStatusV1::Quarantined,
                     };
                 }
@@ -8684,14 +8696,33 @@ impl BrokerControlClientV1 {
             bytes,
         )
         .map_err(|_| BrokerControlClientError::Protocol)?;
-        let response = self.exchange_with_deadline(&request, Some(deadline))?;
-        if response.header.status == BrokerControlResponseStatusV1::Applied {
-            return Ok(());
+        loop {
+            match self
+                .exchange_with_deadline(&request, Some(deadline))?
+                .header
+                .status
+            {
+                BrokerControlResponseStatusV1::Applied => return Ok(()),
+                // The broker wrote nothing: an output drain held the pane's
+                // reader. The same request may go again until the deadline.
+                BrokerControlResponseStatusV1::Retryable => {
+                    if Instant::now() >= deadline {
+                        return Err(BrokerControlClientError::Io(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "broker input deadline",
+                        )));
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                // No other status permits retransmission of raw input. The
+                // outer canonical WAL records the failed/ambiguous attempt and
+                // resolves future Query.
+                _ => {
+                    self.poisoned = true;
+                    return Err(BrokerControlClientError::UnexpectedResponse);
+                }
+            }
         }
-        // No status permits retransmission of raw input. The outer canonical
-        // WAL records the failed/ambiguous attempt and resolves future Query.
-        self.poisoned = true;
-        Err(BrokerControlClientError::UnexpectedResponse)
     }
 
     /// Change geometry once under the exact attachment. Ambiguous transport
@@ -27523,11 +27554,65 @@ mod tests {
                 worker_deadline,
             )
             .expect("apply geometry through authenticated broker transport");
+        // ft-q1lol: while an output drain holds the pane's reader on the
+        // worker, a Write moves no byte and is Retryable, and the input
+        // adapter resends it until the drain returns the reader.
+        let pane_id = binding.durable_pane_id;
+        let held_reader = service.inspect(move |service| {
+            let settle = Instant::now() + Duration::from_secs(5);
+            while service.output_worker.active.is_some() && Instant::now() < settle {
+                service.drain_output_completion();
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(
+                service.output_worker.active.is_none(),
+                "prefetch drain settles"
+            );
+            let pane = &mut service.live_spawns.get_mut(&pane_id).unwrap().adoption.pane;
+            service.output_worker.active = Some((pane_id, pane.next_output_sequence));
+            pane.proxy_reader.take().expect("reader on the poll owner")
+        });
+        let client = &mut returned_session.client;
+        let raced_write = BrokerControlRequestV1::new(
+            BrokerControlRequestHeaderV1 {
+                operation: BrokerControlOperationV1::Write,
+                request_id: id(7_390),
+                broker_incarnation: output_handle.broker_incarnation,
+                guardian_incarnation: client.identity.guardian_incarnation,
+                connection_id: output_handle.connection_id,
+                mux_incarnation: client.identity.mux_incarnation,
+                guardian_build_identity_digest: client
+                    .identity
+                    .guardian_build_identity
+                    .into_bytes(),
+                mux_build_identity_digest: client.identity.mux_build_identity.into_bytes(),
+                durable_pane_id: output_handle.pane_id,
+                lease_generation: output_handle.lease_generation,
+                operation_id: output_handle.spawn_effect_id,
+            },
+            b"q",
+        )
+        .unwrap();
+        assert_eq!(
+            client.exchange(&raced_write).unwrap().header.status,
+            BrokerControlResponseStatusV1::Retryable,
+            "a Write that meets a drain is refused before any byte"
+        );
         // This fixture isolates transport ownership; runtime tests separately
         // require the canonical durable input permit before this adapter.
         let mut input_writer =
             BrokerPaneInputWriterV1::new(returned_session, output_handle, worker_deadline);
-        assert_eq!(input_writer.write(b"q").unwrap(), 1);
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                thread::sleep(Duration::from_millis(20));
+                service.inspect(move |service| {
+                    let pane = &mut service.live_spawns.get_mut(&pane_id).unwrap().adoption.pane;
+                    pane.proxy_reader = Some(held_reader);
+                    service.output_worker.active = None;
+                });
+            });
+            assert_eq!(input_writer.write(b"q").unwrap(), 1);
+        });
         assert!(
             input_writer.write(b"q").is_err(),
             "one input adapter must never replay raw bytes"
