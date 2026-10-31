@@ -185,8 +185,9 @@ public struct WorkspaceExportSelection: Sendable {
                 required.formUnion(candidate.requiredExtensions.map { "extension:" + $0 })
                 if let trust = trustMap[candidate.trustID] {
                     required.formUnion(requirements[trust.canonicalTrustScope] ?? [])
-                    if trust.pins.isEmpty { lacksPins = true }
-                    else if trust.pins.allSatisfy({ (revocations[trust.canonicalTrustScope] ?? []).contains($0.fingerprint) }) { deniesPins = true }
+                    let identities = trust.pins + trust.certificateAuthorities
+                    if identities.isEmpty { lacksPins = true }
+                    else if identities.allSatisfy({ (revocations[trust.canonicalTrustScope] ?? []).contains($0.fingerprint) }) { deniesPins = true }
                 }
                 if candidate.authenticationMethods == [.publicKey] {
                     let candidates = candidate.credentialIDs.compactMap { credentials[$0] }
@@ -207,6 +208,10 @@ public struct WorkspaceExportSelection: Sendable {
                 for id in candidate.jumpRoutes { if let hop = routeMap[id] { inspect(hop, transit: true) } }
             }
             inspect(route, transit: !destinations.contains(route.id))
+            // Certificate transport is checked again against the receiving
+            // build. An offline export must not persist its absence as an
+            // immutable source-policy blocker; the manifest keeps the marker.
+            required.remove(WorkspaceDocument.hostCertificateCapability)
             var reasons: [String] = []
             let lacksSessionPolicy = destinations.contains(route.id)
                 && ((route.mode == "direct_ssh" && route.sessionCreation == nil)
