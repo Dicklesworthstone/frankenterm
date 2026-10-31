@@ -205,7 +205,15 @@ final class MobileWorkspaceModel {
             updateIdleTimer()
         }
     }
-    var cameraRequested = false { didSet { updateIdleTimer() } }
+    var cameraRequested = false {
+        didSet {
+            // A restarted camera is a new callback owner, even when the same
+            // encrypted transfer remains selected throughout the interruption.
+            if cameraRequested != oldValue { cameraGeneration = UUID() }
+            updateIdleTimer()
+        }
+    }
+    private(set) var cameraGeneration = UUID()
     var active = false { didSet { updateIdleTimer() } }
     /// Not in the background (see setScenePhase): live connections may run.
     @ObservationIgnored private var connectionsForeground = false
@@ -334,6 +342,17 @@ final class MobileWorkspaceModel {
             else if granted { self.message = "Camera access is ready. Tap Open Camera or Resume Camera when you return." }
             else { self.message = "Camera access was not granted. The local encrypted-file import is still available." }
         }
+    }
+
+    /// An interrupted scanner must leave a visible way to try again. Retain
+    /// ciphertext progress and offline exclusion; retire only this camera.
+    /// Late failures from an old scanner cannot stop a replacement instance.
+    func cameraFailed(_ error: Error, generation: UUID) {
+        guard cameraRequested, cameraGeneration == generation else { return }
+        cameraRequested = false; lastObservation = nil
+        if let failure = error as? FTError, failure == .unsupported("camera.unavailable") {
+            message = "Camera scanning stopped. Your recovered progress is kept. Start the camera again when it is available."
+        } else { report(error) }
     }
 
     func bootstrap() async {
@@ -2137,7 +2156,8 @@ final class MobileWorkspaceModel {
     }
 
     /// At most eight bounded strings wait on one consumer. No task-per-frame fanout.
-    func observed(_ text: String) {
+    func observed(_ text: String, cameraGeneration: UUID) {
+        guard self.cameraGeneration == cameraGeneration else { return }
         if text.hasPrefix("FTCODE1:") {
             guard active, showRestore, cameraRequested, let frame = TransferCodeFrame.parse(text) else { return }
             if scannedCode?.digestPrefix != frame.digestPrefix || scannedCode?.code != frame.code {
@@ -2736,7 +2756,10 @@ struct OfflineRestoreSheet: View {
                             }
                             if [.idle, .candidate, .collecting, .locked].contains(state.phase), model.cameraRequested, !state.isSuspended {
                                 if DataScannerViewController.isSupported && DataScannerViewController.isAvailable {
-                                    OpticalCamera(onCode: model.observed, onError: model.report)
+                                    let cameraGeneration = model.cameraGeneration
+                                    OpticalCamera(onCode: { model.observed($0, cameraGeneration: cameraGeneration) },
+                                                  onError: { model.cameraFailed($0, generation: cameraGeneration) })
+                                        .id(cameraGeneration)
                                         .frame(maxWidth: .infinity).frame(height: 380)
                                         .clipShape(RoundedRectangle(cornerRadius: 24))
                                         .overlay(alignment: .bottom) {
@@ -2745,7 +2768,13 @@ struct OfflineRestoreSheet: View {
                                                 .background(.ultraThinMaterial, in: Capsule()).padding(14)
                                         }
                                 } else {
+                                    let cameraGeneration = model.cameraGeneration
                                     Text("Camera scanning is unavailable. Allow Camera access in Settings or open an already-local .ftairgap file.")
+                                        .task(id: cameraGeneration) {
+                                            // No scanner was mounted to report this failure.
+                                            // Retire the request once; retry remains explicit.
+                                            model.cameraFailed(FTError.unsupported("camera.unavailable"), generation: cameraGeneration)
+                                        }
                                 }
                             }
                             switch state.phase {
@@ -3282,7 +3311,7 @@ private struct ImportHostPolicyReview: View {
 }
 
 @MainActor
-private struct OpticalCamera: UIViewControllerRepresentable {
+struct OpticalCamera: UIViewControllerRepresentable {
     let onCode: (String) -> Void
     let onError: (Error) -> Void
     func makeCoordinator() -> Coordinator { Coordinator(onCode: onCode, onError: onError) }
@@ -3294,10 +3323,11 @@ private struct OpticalCamera: UIViewControllerRepresentable {
         return scanner
     }
     func updateUIViewController(_ scanner: DataScannerViewController, context: Context) {
-        guard !scanner.isScanning else { return }
+        guard !scanner.isScanning, context.coordinator.permitsStart else { return }
         do { try scanner.startScanning() } catch { context.coordinator.failed(error) }
     }
     static func dismantleUIViewController(_ scanner: DataScannerViewController, coordinator: Coordinator) {
+        coordinator.retire()
         scanner.stopScanning(); scanner.delegate = nil
     }
     @MainActor
@@ -3305,14 +3335,25 @@ private struct OpticalCamera: UIViewControllerRepresentable {
         private let onCode: (String) -> Void
         private let onError: (Error) -> Void
         private var reportedFailure = false
+        private var retired = false
+        private var failureDelivery: Task<Void, Never>?
+        var permitsStart: Bool { !retired && !reportedFailure }
         init(onCode: @escaping (String) -> Void, onError: @escaping (Error) -> Void) { self.onCode = onCode; self.onError = onError }
         func failed(_ error: Error) {
-            guard !reportedFailure else { return }
+            guard !retired, !reportedFailure else { return }
             reportedFailure = true
             // Defer model mutation out of a UIViewRepresentable update callback.
-            Task { @MainActor [onError] in onError(FTError.unsupported("camera.unavailable")) }
+            failureDelivery = Task { @MainActor [weak self] in
+                guard let self, !self.retired, !Task.isCancelled else { return }
+                self.onError(FTError.unsupported("camera.unavailable"))
+            }
+        }
+        func retire() {
+            retired = true
+            failureDelivery?.cancel(); failureDelivery = nil
         }
         private func submit(_ items: [RecognizedItem]) {
+            guard !retired, !reportedFailure else { return }
             for item in items.prefix(4) {
                 if case .barcode(let barcode) = item, let text = barcode.payloadStringValue,
                    text.hasPrefix("FTQR1/") || text.hasPrefix("FTCODE1:"), text.utf8.count <= FTLimit.qrText { onCode(text) }
