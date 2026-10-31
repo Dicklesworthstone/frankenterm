@@ -300,6 +300,8 @@ public struct WorkspaceDocument: Sendable {
     public struct Route: Identifiable, Sendable {
         public let id: String, mode: String, host: String, user: String
         public let displayHost: String
+        /// Exact effective name used for case-sensitive certificate principals.
+        public let certificatePrincipal: String
         public let port: UInt16
         public let credentialIDs: [String], trustID: String
         public let authenticationMethods: [AuthenticationMethod]
@@ -383,6 +385,7 @@ public struct WorkspaceDocument: Sendable {
                           fingerprint: fields.decode(String.self, forKey: .fingerprint))
         }
     }
+    public static let hostCertificateCapability = "ssh_host_certificate_v1"
     public enum HostTrustDecision: Equatable, Sendable {
         case trusted, reviewRequired, unconfigured, mismatch, revoked, requiredPolicyUnavailable
     }
@@ -390,12 +393,20 @@ public struct WorkspaceDocument: Sendable {
         public let id: String, host: String, displayHost: String
         public let port: UInt16
         public let hostKeyAlias: String?, claimedSource: String?
+        /// Preserve the effective source spelling separately from the
+        /// canonical network and denial scope. Normalization must not broaden
+        /// positive certificate trust.
+        public let certificatePrincipal: String
         public let pins: [HostKey], revokedKeys: [HostKey]
+        /// Reviewed authorities for this exact endpoint and HostKeyAlias.
+        public let certificateAuthorities: [HostKey]
+        public var hasConfiguredIdentity: Bool { !pins.isEmpty || !certificateAuthorities.isEmpty }
         public let requiredCapabilities: [String], requiredExtensions: [String]
         /// Reserved markers preserve mandatory unknown extensions across import.
         /// No v1 implementation may satisfy them merely by listing a capability.
         public var requiredPolicyRequirements: Set<String> {
             Set(requiredCapabilities).union(requiredExtensions.map { "extension:" + $0 })
+                .union(certificateAuthorities.isEmpty ? [] : [WorkspaceDocument.hostCertificateCapability])
         }
         /// OpenSSH HostKeyAlias replaces the hostname for known-host matching.
         /// The length framing avoids collisions with ports and IPv6 colons.
@@ -409,7 +420,7 @@ public struct WorkspaceDocument: Sendable {
             if revokedKeys.contains(where: { $0.fingerprint == presented.fingerprint })
                 || additionalRevocations.contains(where: { $0.fingerprint == presented.fingerprint }) { return .revoked }
             if !WorkspaceDocument.supports(requiredPolicyRequirements, using: supportedCapabilities) { return .requiredPolicyUnavailable }
-            if pins.isEmpty { return .unconfigured }
+            if !hasConfiguredIdentity { return .unconfigured }
             if !pins.contains(presented) { return .mismatch }
             return locallyAccepted ? .trusted : .reviewRequired
         }
@@ -478,8 +489,9 @@ public struct WorkspaceDocument: Sendable {
         public var isLocallyReady: Bool { issues.isEmpty }
     }
     public enum HostVerificationDecision: Equatable, Sendable {
-        case trustedPin, revoked, locallyRejected, reviewRequired, pinMismatch
+        case trustedPin, trustedCertificate, revoked, locallyRejected, reviewRequired, pinMismatch
         case unsupportedPolicy, unsupportedAlgorithm, unsupportedCertificate
+        public var isTrusted: Bool { self == .trustedPin || self == .trustedCertificate }
     }
     /// Public, validated configuration bytes. Unknown optional payloads are not
     /// persisted or re-exported. Fully understood manifests retain exact bytes.
@@ -612,7 +624,7 @@ public struct WorkspaceDocument: Sendable {
         }
         var pinCount = 0
         hostTrust = try records("host_trust", cap: 512).map { trust in
-            try trust.allowing(["id", "host", "port", "host_key_alias", "claimed_source", "pins", "revoked_keys", "required_capabilities"])
+            try trust.allowing(["id", "host", "port", "host_key_alias", "claimed_source", "pins", "revoked_keys", "certificate_authorities", "required_capabilities"])
             func keys(_ field: String, optional: Bool = false) throws -> [HostKey] {
                 let value: JSONValue
                 if let present = trust[field] { value = present }
@@ -634,7 +646,9 @@ public struct WorkspaceDocument: Sendable {
                              port: try Self.port(trust.required("port").uint()),
                              hostKeyAlias: try trust["host_key_alias"].map { try Self.host($0.string()) },
                              claimedSource: try trust["claimed_source"].map { try Self.displayText($0.string(), cap: 128) },
+                             certificatePrincipal: try trust["host_key_alias"]?.string() ?? originalHost,
                              pins: try keys("pins"), revokedKeys: try keys("revoked_keys", optional: true),
+                             certificateAuthorities: try keys("certificate_authorities", optional: true),
                              requiredCapabilities: try Self.capabilities(trust), requiredExtensions: try Self.requiredExtensions(trust))
         }
         routes = try records("routes", cap: 256).map {
@@ -666,7 +680,8 @@ public struct WorkspaceDocument: Sendable {
             let user = try Self.displayText($0.text("user"), cap: 256)
             guard !user.unicodeScalars.contains(where: { CharacterSet.whitespacesAndNewlines.contains($0) }) else { throw FTError.malformed("route.user") }
             return Route(id: try $0.text("id"), mode: mode, host: try Self.host(originalHost), user: user,
-                         displayHost: originalHost, port: try Self.port($0.required("port").uint()), credentialIDs: candidates,
+                         displayHost: originalHost, certificatePrincipal: try $0["host_key_alias"]?.string() ?? originalHost,
+                         port: try Self.port($0.required("port").uint()), credentialIDs: candidates,
                          trustID: try Self.identifier($0.text("host_trust_ref")), authenticationMethods: methods, jumpRoutes: jumps,
                          sessionCreation: creation, attachPolicy: attach,
                          hostKeyAlias: try $0["host_key_alias"].map { try Self.host($0.string()) },
@@ -678,7 +693,8 @@ public struct WorkspaceDocument: Sendable {
         let trustMap = Dictionary(uniqueKeysWithValues: hostTrust.map { ($0.id, $0) })
         for route in routes {
             guard route.credentialIDs.allSatisfy(credentialIDs.contains), let trust = trustMap[route.trustID],
-                  route.host == trust.host, route.port == trust.port, route.hostKeyAlias == trust.hostKeyAlias
+                  route.host == trust.host, route.port == trust.port, route.hostKeyAlias == trust.hostKeyAlias,
+                  trust.certificateAuthorities.isEmpty || route.certificatePrincipal.utf8.elementsEqual(trust.certificatePrincipal.utf8)
             else { throw FTError.malformed("route.credential_or_trust") }
             var expanded = 0
             func walk(_ candidate: Route, path: Set<String>) throws {
@@ -729,7 +745,7 @@ public struct WorkspaceDocument: Sendable {
         // A negative fingerprint remains a denial even when its self-asserted
         // algorithm label differs from that of the positive key it forbids.
         let publicIdentities = credentials.map { ($0.algorithm, $0.fingerprint) }
-            + hostTrust.flatMap(\.pins).map { ($0.algorithm, $0.fingerprint) }
+            + hostTrust.flatMap { $0.pins + $0.certificateAuthorities }.map { ($0.algorithm, $0.fingerprint) }
         for (algorithm, fingerprint) in publicIdentities {
             if let previous = algorithmsByFingerprint[fingerprint], previous != algorithm {
                 throw FTError.malformed("identity.algorithm_conflict")
@@ -836,11 +852,16 @@ public struct WorkspaceDocument: Sendable {
             if rejectedScopes.contains(trust.canonicalTrustScope) { add(.locallyRejectedTrust) }
             let revoked = Set((revocations[trust.canonicalTrustScope] ?? []).map(\.fingerprint))
             let acceptablePins = trust.pins.filter { !revoked.contains($0.fingerprint) }
-            if trust.pins.isEmpty { add(.hostTrustMissing) }
-            else if acceptablePins.isEmpty { add(.hostIdentityRevoked) }
+            let acceptableAuthorities = trust.certificateAuthorities.filter { !revoked.contains($0.fingerprint) }
+            if !trust.hasConfiguredIdentity { add(.hostTrustMissing) }
+            else if acceptablePins.isEmpty && acceptableAuthorities.isEmpty { add(.hostIdentityRevoked) }
             else {
                 if !reviewedTrustIDs.contains(trust.id) { add(.hostTrustNeedsReview) }
-                if !acceptablePins.contains(where: { support.hostKeyAlgorithms.contains($0.algorithm) }) { add(.hostAlgorithmUnavailable) }
+                let certificateSupported = support.capabilities.contains(Self.hostCertificateCapability)
+                    && !support.hostKeyAlgorithms.isDisjoint(with: SSHHostCertificate.supportedAlgorithms)
+                    && acceptableAuthorities.contains(where: { SSHHostCertificate.supportedAuthorityAlgorithms.contains($0.algorithm) })
+                if !acceptablePins.contains(where: { support.hostKeyAlgorithms.contains($0.algorithm) })
+                    && !certificateSupported { add(.hostAlgorithmUnavailable) }
             }
             for hop in route.jumpRoutes where !(try evaluate(hop, transit: true)).isLocallyReady { add(.blockedJumpRoute(hop)) }
             return .init(routeID: routeID, usableCredentialIDs: methods.contains(.publicKey) ? usable : [], issues: issues)
@@ -862,24 +883,41 @@ public struct WorkspaceDocument: Sendable {
     /// Each actual SSH peer and jump host must be verified before credentials
     /// are offered. Negative trust wins even for an unsupported certificate.
     public func verifyHostKey(forRouteID id: String, presented: HostKey, certificateAuthority: HostKey? = nil,
+                              hostCertificate: SSHHostCertificate? = nil,
                               reviewedTrustIDs: Set<String>, localRevokedFingerprints: Set<String> = [],
                               locallyRejectedTrustIDs: Set<String> = [],
                               locallyRevokedHostKeys: [String: Set<HostKey>] = [:], support: RouteSupport = .offlineOnly,
                               revokedHostKeysByTrustScope: [String: Set<HostKey>] = [:],
-                              requiredHostCapabilitiesByTrustScope: [String: Set<String>] = [:]) throws -> HostVerificationDecision {
+                              requiredHostCapabilitiesByTrustScope: [String: Set<String>] = [:],
+                              certificateTime: Date? = Date()) throws -> HostVerificationDecision {
         guard let route = routes.first(where: { $0.id == id }), let trust = hostTrust.first(where: { $0.id == route.trustID }) else { throw FTError.stale }
         let related = hostTrust.filter { $0.canonicalTrustScope == trust.canonicalTrustScope }
         let revoked = localRevokedFingerprints.union(related.flatMap(\.revokedKeys).map(\.fingerprint))
             .union((revokedHostKeysByTrustScope[trust.canonicalTrustScope] ?? []).map(\.fingerprint))
             .union(related.flatMap { locallyRevokedHostKeys[$0.id] ?? [] }.map(\.fingerprint))
         if revoked.contains(presented.fingerprint) || certificateAuthority.map({ revoked.contains($0.fingerprint) }) == true { return .revoked }
+        if let certificate = hostCertificate,
+           [certificate.fingerprint, certificate.subject.fingerprint, certificate.authority.fingerprint].contains(where: revoked.contains) {
+            return .revoked
+        }
         if related.contains(where: { locallyRejectedTrustIDs.contains($0.id) }) { return .locallyRejected }
-        if certificateAuthority != nil || presented.algorithm.contains("-cert-v01@") { return .unsupportedCertificate }
+        if hostCertificate == nil && (certificateAuthority != nil || presented.algorithm.contains("-cert-v01@")) { return .unsupportedCertificate }
         let required = Set(route.requiredCapabilities).union(related.flatMap(\.requiredPolicyRequirements))
             .union(requiredHostCapabilitiesByTrustScope[trust.canonicalTrustScope] ?? [])
         if !Self.supports(required, using: support.capabilities) || !route.requiredExtensions.isEmpty { return .unsupportedPolicy }
         if !support.hostKeyAlgorithms.contains(presented.algorithm) { return .unsupportedAlgorithm }
         if !reviewedTrustIDs.contains(trust.id) { return .reviewRequired }
+        if let certificate = hostCertificate {
+            guard support.capabilities.contains(Self.hostCertificateCapability),
+                  certificate.algorithm == presented.algorithm, certificate.fingerprint == presented.fingerprint,
+                  certificateAuthority == nil || (certificateAuthority?.algorithm == certificate.authority.algorithm
+                    && certificateAuthority?.fingerprint == certificate.authority.fingerprint) else { return .unsupportedCertificate }
+            do { try certificate.validate(host: trust.certificatePrincipal, now: certificateTime) }
+            catch { return .unsupportedCertificate }
+            return trust.certificateAuthorities.contains(where: {
+                $0.algorithm == certificate.authority.algorithm && $0.fingerprint == certificate.authority.fingerprint
+            }) ? .trustedCertificate : .pinMismatch
+        }
         return trust.pins.contains(presented) ? .trustedPin : .pinMismatch
     }
 
@@ -916,9 +954,14 @@ public struct WorkspaceDocument: Sendable {
                 if !acceptedTrustIDs.contains(trust.id) { issue(.hostTrustReviewRequired) }
                 let revoked = Set((revocations[trust.canonicalTrustScope] ?? []).map(\.fingerprint))
                 let allowed = trust.pins.filter { !revoked.contains($0.fingerprint) }
-                if trust.pins.isEmpty { issue(.hostTrustMissing) }
-                else if allowed.isEmpty { issue(.hostIdentityRevoked) }
-                else if !allowed.contains(where: { supportedHostKeyAlgorithms.contains($0.algorithm) }) { issue(.hostKeyAlgorithmUnsupported) }
+                let authorities = trust.certificateAuthorities.filter { !revoked.contains($0.fingerprint) }
+                let certificateSupported = supportedCapabilities.contains(Self.hostCertificateCapability)
+                    && !supportedHostKeyAlgorithms.isDisjoint(with: SSHHostCertificate.supportedAlgorithms)
+                    && authorities.contains(where: { SSHHostCertificate.supportedAuthorityAlgorithms.contains($0.algorithm) })
+                if !trust.hasConfiguredIdentity { issue(.hostTrustMissing) }
+                else if allowed.isEmpty && authorities.isEmpty { issue(.hostIdentityRevoked) }
+                else if !allowed.contains(where: { supportedHostKeyAlgorithms.contains($0.algorithm) })
+                    && !certificateSupported { issue(.hostKeyAlgorithmUnsupported) }
             } else { issue(.hostTrustMissing) }
 
             let keys = route.credentialIDs.filter { id in

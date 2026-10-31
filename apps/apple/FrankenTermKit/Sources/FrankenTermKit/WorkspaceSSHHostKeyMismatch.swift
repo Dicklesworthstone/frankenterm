@@ -18,14 +18,20 @@ public struct WorkspaceSSHHostKeyMismatch: Error, Equatable, Sendable,
     public let port: UInt16
     public let user: String
     public let hostKeyAlias: String?
+    public let certificatePrincipal: String
     /// The selected trust record's currently permitted pins, in source order.
     /// Revoked or unsupported configured pins are excluded.
     public let expectedKeys: [WorkspaceDocument.HostKey]
+    public let expectedCertificateAuthorities: [WorkspaceDocument.HostKey]
     public let presentedKey: WorkspaceDocument.HostKey
+    /// Verified contents of the exact refused exchange, never trust in its CA.
+    public let hostCertificate: SSHHostCertificate?
 
     init(workspaceID: UUID, expectedRevision: UUID, route: WorkspaceDocument.Route,
          transitForRouteID: String?, expectedKeys: [WorkspaceDocument.HostKey],
-         presentedKey: WorkspaceDocument.HostKey) {
+         presentedKey: WorkspaceDocument.HostKey,
+         expectedCertificateAuthorities: [WorkspaceDocument.HostKey] = [],
+         hostCertificate: SSHHostCertificate? = nil) {
         self.workspaceID = workspaceID
         self.expectedRevision = expectedRevision
         self.routeID = route.id
@@ -34,12 +40,15 @@ public struct WorkspaceSSHHostKeyMismatch: Error, Equatable, Sendable,
         self.port = route.port
         self.user = route.user
         self.hostKeyAlias = route.hostKeyAlias
+        self.certificatePrincipal = route.certificatePrincipal
         self.expectedKeys = expectedKeys
+        self.expectedCertificateAuthorities = expectedCertificateAuthorities
         self.presentedKey = presentedKey
+        self.hostCertificate = hostCertificate
     }
 
     public var description: String {
-        "The SSH host key did not match this workspace's permitted keys. Review the host identity before connecting again."
+        "The SSH host identity did not match this workspace's permitted keys or certificate authorities. Review the host identity before connecting again."
     }
     public var debugDescription: String { "WorkspaceSSHHostKeyMismatch" }
     public var errorDescription: String? { description }
@@ -87,8 +96,11 @@ public struct WorkspaceSSHConnectionHostKeyMismatch: Error, Equatable, Sendable,
     public var port: UInt16 { mismatch.port }
     public var user: String { mismatch.user }
     public var hostKeyAlias: String? { mismatch.hostKeyAlias }
+    public var certificatePrincipal: String { mismatch.certificatePrincipal }
     public var expectedKeys: [WorkspaceDocument.HostKey] { mismatch.expectedKeys }
+    public var expectedCertificateAuthorities: [WorkspaceDocument.HostKey] { mismatch.expectedCertificateAuthorities }
     public var presentedKey: WorkspaceDocument.HostKey { mismatch.presentedKey }
+    public var hostCertificate: SSHHostCertificate? { mismatch.hostCertificate }
     public var description: String { mismatch.description }
     public var debugDescription: String { "WorkspaceSSHConnectionHostKeyMismatch" }
     public var errorDescription: String? { description }

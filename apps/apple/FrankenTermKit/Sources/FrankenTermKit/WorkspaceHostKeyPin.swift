@@ -21,7 +21,7 @@ public extension InstalledWorkspace {
     func phoneHostKeyPin(forRouteID routeID: String) throws -> WorkspaceHostKeyPin? {
         let imported = try importedDocument()
         guard let route = imported.routes.first(where: { $0.id == routeID }),
-              let trust = imported.hostTrust.first(where: { $0.id == route.trustID }), trust.pins.isEmpty,
+              let trust = imported.hostTrust.first(where: { $0.id == route.trustID }), !trust.hasConfiguredIdentity,
               let pin = hostKeyPins.first(where: { $0.trustID == trust.id }),
               pin.sourceWitness == (try WorkspaceHostKeyOverlay.witness(trustID: trust.id, in: imported)) else { return nil }
         // Validate the complete overlay rather than treating a stored record as
@@ -143,7 +143,7 @@ enum WorkspaceHostKeyOverlay {
         workspace["host_trust"] = .array(try workspace.required("host_trust").array().map { value in
             var trust = try value.object()
             let id = try trust.text("id")
-            guard let pin = local[id], let original = importedTrust[id], original.pins.isEmpty,
+            guard let pin = local[id], let original = importedTrust[id], !original.hasConfiguredIdentity,
                   pin.sourceWitness == (try policy.witness(trustID: id)) else { return value }
             trust["pins"] = .array([.object([
                 "algorithm": .string(pin.key.algorithm), "fingerprint": .string(pin.key.fingerprint)
