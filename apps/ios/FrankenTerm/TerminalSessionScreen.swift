@@ -300,7 +300,12 @@ final class MobileConnections {
     let passwordPrompt = MobileSSHPasswordPrompt()
     let keyboardInteractivePrompt = MobileSSHKeyboardInteractivePrompt()
     var authenticationPrompt: MobileSSHAuthenticationSheetRequest? {
-        pendingAuthenticationPrompt.flatMap { $0.hostKeyVerification ? nil : $0 }
+        guard fileAuthenticationScope == nil else { return nil }
+        return pendingAuthenticationPrompt.flatMap { $0.hostKeyVerification ? nil : $0 }
+    }
+    func fileAuthenticationPrompt(for ownerID: UUID, target: TerminalRemoteFilesTarget) -> MobileSSHAuthenticationSheetRequest? {
+        guard let scope = fileAuthenticationScope, scope.ownerID == ownerID, scope.target == target else { return nil }
+        return pendingAuthenticationPrompt.flatMap { $0.hostKeyVerification ? nil : $0 }
     }
     var hostKeyVerificationPrompt: MobileSSHAuthenticationSheetRequest? {
         pendingAuthenticationPrompt.flatMap { $0.hostKeyVerification ? $0 : nil }
@@ -315,10 +320,12 @@ final class MobileConnections {
     private var passwordLifecycle: Task<Void, Never>?
     private var terminalAuthenticationScope: MobileSSHPasswordPrompt.Scope?
     private var hostKeyScope: (id: UUID, cancel: () -> Void)?
+    private var fileAuthenticationScope: (id: UUID, ownerID: UUID, target: TerminalRemoteFilesTarget, cancel: () -> Void)?
     // Failed cleanup retains its existing bounded connection/model owner even
     // after SwiftUI removes the screen. Never manufacture a replacement owner
     // or forget an unresolved protected-storage write to make room for a shell.
     private var pendingCleanup: [UUID: TerminalSessionController] = [:]
+    private var pendingFileCleanup: [UUID: TerminalRemoteFilesController] = [:]
 
     /// `signer` defaults to the protected Keychain signer; tests inject one,
     /// and may shorten how long an unanswering server takes to be reported.
@@ -352,7 +359,7 @@ final class MobileConnections {
     func setAuthenticationScope(_ scope: MobileSSHPasswordPrompt.Scope?) {
         guard scope?.hostKeyVerification != true else { return }
         terminalAuthenticationScope = scope
-        if hostKeyScope == nil { applyAuthenticationScope(scope) }
+        if hostKeyScope == nil, fileAuthenticationScope == nil { applyAuthenticationScope(scope) }
     }
 
     private func applyAuthenticationScope(_ scope: MobileSSHPasswordPrompt.Scope?) {
@@ -366,7 +373,7 @@ final class MobileConnections {
     func withHostKeyVerificationScope<Value: Sendable>(_ scope: MobileSSHPasswordPrompt.Scope,
         operation: @escaping @MainActor @Sendable () async throws -> Value) async throws -> Value {
         guard passwordPrompt.isActive, scope.hostKeyVerification, scope.destinationRouteIDs.count == 1,
-              hostKeyScope == nil else { throw SSHAuthenticationError.stale }
+              hostKeyScope == nil, fileAuthenticationScope == nil else { throw SSHAuthenticationError.stale }
         try Task.checkCancellation()
         let id = UUID()
         applyAuthenticationScope(scope)
@@ -414,6 +421,7 @@ final class MobileConnections {
     /// the manager (a dropped connection reconnects on return instead).
     func activate() async {
         for controller in Array(pendingCleanup.values) { await controller.retryCleanup() }
+        for controller in Array(pendingFileCleanup.values) { await controller.retryCleanup() }
         await manager.resume()
         await passwordLifecycle?.value
         await broker.setPasswordForeground(passwordPrompt.isActive)
@@ -423,6 +431,38 @@ final class MobileConnections {
         pendingCleanup[controller.id] = controller
     }
     fileprivate func releaseCleanup(_ id: UUID) { pendingCleanup[id] = nil }
+
+    /// A separate SFTP connection uses the current terminal's exact account
+    /// and reviewed route choices. Its exact owner presents password/MFA.
+    func connectFiles(_ target: TerminalRemoteFilesTarget, ownerID: UUID) async throws -> WorkspaceSSHConnection {
+        guard passwordPrompt.isActive, hostKeyScope == nil, fileAuthenticationScope == nil else {
+            throw SSHAuthenticationError.stale
+        }
+        try Task.checkCancellation()
+        let scope = MobileSSHPasswordPrompt.Scope(workspaceID: target.workspaceID, revision: target.revision,
+            machineID: target.machineID, destinationRouteIDs: [target.route.id])
+        let id = UUID(), manager = manager
+        applyAuthenticationScope(scope)
+        let task = Task {
+            try await manager.connect(workspaceID: target.workspaceID, expectedRevision: target.revision,
+                machineID: target.machineID, routeID: target.route.id, authentication: target.authentication,
+                confirmedByUser: true, attachMux: false, selection: target.route.selectedConnection,
+                purpose: .fileTransfer)
+        }
+        fileAuthenticationScope = (id, ownerID, target, { task.cancel() })
+        defer {
+            if fileAuthenticationScope?.id == id {
+                fileAuthenticationScope = nil
+                applyAuthenticationScope(terminalAuthenticationScope)
+            }
+        }
+        // A late successful return is retained by the file owner before its
+        // cancellation check, so cleanup never loses a published connection.
+        return try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
+    }
+
+    func retainFileCleanup(_ controller: TerminalRemoteFilesController) { pendingFileCleanup[controller.id] = controller }
+    func releaseFileCleanup(_ id: UUID) { pendingFileCleanup[id] = nil }
 }
 
 /// One ready route, with its available configured keys in the workspace's
@@ -501,6 +541,16 @@ struct TerminalSessionTarget: Hashable, Sendable {
         }
         return 0.2126 * linear(16) + 0.7152 * linear(8) + 0.0722 * linear(0) < 0.179
     }
+}
+
+/// Public metadata from one successful connection, never a credential or
+/// authority that may be reused after its source controller is replaced.
+struct TerminalRemoteFilesTarget: Equatable, Sendable {
+    let controllerID: UUID, connectionID: UUID, workspaceID: UUID, revision: UUID
+    let machineID: String, machineName: String, host: String, user: String
+    let port: UInt16
+    let route: TerminalSessionRoute
+    let authentication: WorkspaceSSHAuthenticationChoice
 }
 
 /// Publishes each owned FTSF frame from the Rust model to the native view.
@@ -612,6 +662,20 @@ final class TerminalSessionController {
     private(set) var paneTooLargeToView = false
     @ObservationIgnored private let retriesDrop: Bool
     private(set) var cleanupFailure: String?
+    var remoteFilesTarget: TerminalRemoteFilesTarget? {
+        guard !stopped, phase == .ready || phase == .live, let connection, let authenticatedSelection,
+              authenticatedSelection.routeID == route.id else { return nil }
+        return .init(controllerID: id, connectionID: connection.id, workspaceID: target.workspaceID,
+            revision: target.revision, machineID: target.machineID, machineName: target.machineName,
+            host: connection.host, user: connection.user, port: connection.port,
+            route: route, authentication: authenticatedSelection.authentication)
+    }
+
+    func makeRemoteFiles(scene: WorkspaceTerminalScene) throws -> TerminalRemoteFilesController {
+        guard let target = remoteFilesTarget else { throw WorkspaceSSHConnectionError.stale }
+        return TerminalRemoteFilesController(target: target, source: self, scene: scene, connections: connections)
+    }
+
     /// Details from this owner's actual refused handshake. Failed-start
     /// cleanup closes its transport without erasing the review; explicit
     /// retirement, replacement and app backgrounding discard it.

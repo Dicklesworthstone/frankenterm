@@ -331,6 +331,132 @@ final class TerminalSessionControllerTests: XCTestCase {
         return session
     }
 
+    private func openRemoteFiles(_ live: LiveScene) async throws -> TerminalRemoteFilesController {
+        guard NativeSSHSession.supportsSFTP else { throw XCTSkip("Rebuild the patched native SSH component to run SFTP tests") }
+        live.connections.setAuthenticationForeground(true)
+        live.scene.beginRemoteFiles()
+        let files = try XCTUnwrap(live.scene.remoteFiles)
+        try await waitForFileBrowser(files)
+        return files
+    }
+
+    private func waitForFileBrowser(_ files: TerminalRemoteFilesController) async throws {
+        for _ in 0..<400 where files.phase == .connecting || files.phase == .listing {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        XCTAssertEqual(files.phase, .browsing, files.message ?? "The live sshd must expose its SFTP subsystem")
+        guard files.phase == .browsing else { throw TerminalModelError.invalid }
+        XCTAssertNotNil(files.listing)
+    }
+
+    func testRemoteFilesKeepsASeparateOwnerAcrossTemporaryInactivityAndClosesOnBackground() async throws {
+        guard NativeSSHSession.supportsSFTP else { throw XCTSkip("SFTP dependency patch is unavailable") }
+        let live = try await liveScene(), scene = live.scene
+        defer { Task { await scene.close() } }
+        let terminal = try await connect(scene, "alpha")
+        XCTAssertEqual(terminal.phase, .live)
+        let terminalTarget = try XCTUnwrap(terminal.remoteFilesTarget)
+        let beforeOwners = await live.connections.manager.connections()
+        let beforeJournal = Set(try await live.connections.journal.records().map(\.id))
+        let files = try await openRemoteFiles(live)
+        let owners = await live.connections.manager.connections()
+        let fileOwner = try XCTUnwrap(owners.first { $0.purpose == .fileTransfer })
+        XCTAssertEqual(owners.count, beforeOwners.count + 1)
+        XCTAssertNotEqual(fileOwner.id, terminalTarget.connectionID)
+        XCTAssertEqual(files.target, terminalTarget)
+        XCTAssertEqual(fileOwner.host, files.target.host)
+        XCTAssertEqual(fileOwner.port, files.target.port)
+        XCTAssertEqual(fileOwner.user, files.target.user)
+        XCTAssertFalse(scene.permitsTerminalCreation, "the browser fences terminal input and shell creation")
+        let duringJournal = Set(try await live.connections.journal.records().map(\.id))
+        XCTAssertEqual(duringJournal, beforeJournal, "opening SFTP must not create a terminal input epoch")
+
+        let listingID = files.listingID
+        scene.setForeground(false)
+        XCTAssertFalse(files.visible)
+        XCTAssertFalse(files.canBrowse)
+        XCTAssertNil(files.beginImport(), "an inactive callback cannot open Files or start a transfer")
+        files.browse("/")
+        XCTAssertEqual(files.listingID, listingID)
+        XCTAssertTrue(scene.remoteFilesAreCurrent(files, requireForeground: false))
+        XCTAssertFalse(files.settled, "a temporary system prompt preserves the admitted file owner")
+        scene.setForeground(true)
+        XCTAssertTrue(scene.remoteFiles === files)
+        XCTAssertEqual(files.listingID, listingID)
+        XCTAssertTrue(files.canBrowse)
+        let afterInactive = await live.connections.manager.connections()
+        XCTAssertTrue(afterInactive.contains { $0.id == fileOwner.id }, "returning must not create a second SFTP channel")
+
+        scene.setForeground(false); scene.enteredBackground()
+        await files.retryCleanup()
+        XCTAssertTrue(files.settled)
+        XCTAssertEqual(files.phase, .closed)
+        XCTAssertFalse(files.canReconnect, "the closed background panel cannot silently reconnect")
+        let remaining = await live.connections.manager.connections()
+        XCTAssertFalse(remaining.contains { $0.purpose == .fileTransfer })
+        XCTAssertEqual(Set(remaining.map(\.id)), Set(beforeOwners.map(\.id)))
+        XCTAssertTrue(scene.sessions["alpha"] === terminal)
+        let afterJournal = Set(try await live.connections.journal.records().map(\.id))
+        XCTAssertEqual(afterJournal, beforeJournal)
+        await scene.close()
+    }
+
+    func testRemoteFilesFreezesUploadBytesAndRejectsStalePickerAndReviewCallbacks() async throws {
+        guard NativeSSHSession.supportsSFTP else { throw XCTSkip("SFTP dependency patch is unavailable") }
+        let live = try await liveScene(), scene = live.scene
+        defer { Task { await scene.close() } }
+        _ = try await connect(scene, "alpha")
+        let files = try await openRemoteFiles(live)
+        let source = FileManager.default.temporaryDirectory.appendingPathComponent("file-review-\(UUID().uuidString).bin")
+        let original = Data((0..<131_073).map { UInt8($0 % 251) })
+        try original.write(to: source, options: [.atomic])
+        defer { try? FileManager.default.removeItem(at: source) }
+
+        let request = try XCTUnwrap(files.beginImport())
+        files.prepareUpload(source, request: request)
+        for _ in 0..<400 where files.phase == .staging { try await Task.sleep(for: .milliseconds(10)) }
+        let review = try XCTUnwrap(files.uploadReview, files.message ?? "The selected source must be staged before review")
+        XCTAssertEqual(review.file.bytes, UInt64(original.count))
+        XCTAssertEqual(try Data(contentsOf: review.file.storage.url), original)
+        try Data("changed external provider contents".utf8).write(to: source, options: [.atomic])
+        XCTAssertEqual(try Data(contentsOf: review.file.storage.url), original, "reviewed bytes are independent of later provider edits")
+        let listingID = files.listingID
+        files.browse("/")
+        XCTAssertEqual(files.listingID, listingID, "the reviewed destination cannot move under the confirmation button")
+        files.createFile("stale-review-must-not-create", reviewID: UUID())
+        XCTAssertEqual(files.uploadReview?.id, review.id)
+        XCTAssertEqual(files.phase, .browsing)
+        files.cancelUploadReview(review.id)
+        XCTAssertNil(files.uploadReview)
+
+        let staleRequest = try XCTUnwrap(files.beginImport())
+        let path = try XCTUnwrap(files.listing?.path)
+        files.browse(path, listingID: files.listingID)
+        try await waitForFileBrowser(files)
+        XCTAssertNotEqual(files.listingID, listingID)
+        files.prepareUpload(source, request: staleRequest)
+        XCTAssertNil(files.uploadReview, "a picker result cannot attach to a replacement directory listing")
+        XCTAssertEqual(files.phase, .browsing)
+
+        let retiredRequest = try XCTUnwrap(files.beginImport())
+        files.cancel()
+        await files.retryCleanup()
+        XCTAssertTrue(files.settled)
+        scene.reconnectRemoteFiles(files)
+        let replacement = try XCTUnwrap(scene.remoteFiles)
+        XCTAssertFalse(replacement === files)
+        try await waitForFileBrowser(replacement)
+        files.prepareUpload(source, request: retiredRequest)
+        XCTAssertNil(files.uploadReview)
+        XCTAssertNil(replacement.uploadReview, "the retired owner's callback cannot publish into a new browser")
+        scene.disappear()
+        await replacement.retryCleanup()
+        XCTAssertTrue(replacement.settled)
+        let remaining = await live.connections.manager.connections()
+        XCTAssertFalse(remaining.contains { $0.purpose == .fileTransfer })
+        await scene.close()
+    }
+
     func testPreparedBackgroundConnectionOpensOnlyAfterCommittedSelection() async throws {
         let live = try await liveScene(), scene = live.scene
         scene.connect("beta")

@@ -3,7 +3,9 @@ import UIKit
 import UniformTypeIdentifiers
 import Network
 import Observation
+import Darwin
 import FrankenTermKit
+import FrankenTermSSH
 import FrankenTermSSHIntegration
 
 /// One machine of a live workspace scene, in the group's order. `target` is
@@ -55,7 +57,9 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     private(set) var problem: String?
     /// Native panels share one input fence. Their dismissal joins one owned
     /// navigation operation before the terminal keyboard can be enabled again.
-    enum Panel: Equatable { case fleet, hardwareKeyboard }
+    enum Panel: Equatable { case fleet, hardwareKeyboard, remoteFiles }
+    private(set) var remoteFiles: TerminalRemoteFilesController?
+    @ObservationIgnored private var fileTransferNotices: [String: (routeID: String, message: String)] = [:]
     private(set) var presentedPanel: Panel = .fleet
     private(set) var overviewPresented = false
     @ObservationIgnored private var overviewVisit: UUID?
@@ -247,6 +251,52 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
 
     // MARK: Fleet overview
 
+    func beginRemoteFiles() {
+        guard remoteFiles == nil, let session = selectedSession, session.remoteFilesTarget != nil else { return }
+        beginOverview(panel: .remoteFiles)
+        guard overviewPresented, presentedPanel == .remoteFiles else { return }
+        do {
+            let files = try session.makeRemoteFiles(scene: self)
+            remoteFiles = files
+            files.start()
+        } catch { report(error); dismissOverview() }
+    }
+
+    func remoteFilesAreCurrent(_ files: TerminalRemoteFilesController, requireForeground: Bool = true) -> Bool {
+        !closed && onScreen && !inBackground && (!requireForeground || foreground)
+            && overviewPresented && presentedPanel == .remoteFiles && remoteFiles === files
+            && selectedMachineID == files.target.machineID
+            && workspaceID == files.target.workspaceID && revision == files.target.revision
+            && sessions[files.target.machineID] === files.source
+            && files.source.remoteFilesTarget == files.target
+    }
+
+    func reconnectRemoteFiles(_ previous: TerminalRemoteFilesController) {
+        guard remoteFilesAreCurrent(previous), previous.settled else { return }
+        do {
+            let replacement = try previous.source.makeRemoteFiles(scene: self)
+            remoteFiles = replacement
+            replacement.start()
+        } catch { report(error) }
+    }
+
+    func fileTransferNotice(for target: TerminalRemoteFilesTarget) -> String? {
+        let notice = fileTransferNotices[target.machineID]
+        return notice?.routeID == target.route.id ? notice?.message : nil
+    }
+
+    func recordFileTransferNotice(_ message: String?, for target: TerminalRemoteFilesTarget) {
+        guard target.workspaceID == workspaceID, target.revision == revision else { return }
+        fileTransferNotices[target.machineID] = message.map { (target.route.id, $0) }
+    }
+
+    private func reconcileRemoteFiles() {
+        if let files = remoteFiles, !remoteFilesAreCurrent(files, requireForeground: false) {
+            files.retire()
+            dismissOverview()
+        }
+    }
+
     func beginOverview(panel: Panel = .fleet) {
         guard !closed, foreground, onScreen, !overviewBlocksInput, !groupAppearanceBlocksInput, !openingSplit,
               navigation.phase == .ready || navigation.phase == .inactive,
@@ -256,9 +306,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         // an unadmitted local key. Previously admitted bytes keep their owner.
         if let keyboard = owner.keyboard,
            keyboard.document.isMarked || keyboard.accounting.pendingEvents > 0 || keyboard.phase == .blocked {
-            problem = panel == .fleet
-                ? "Finish composing or let pending local input settle before opening the overview."
-                : "Finish composing or let pending local input settle before opening keyboard settings."
+            problem = "Finish composing or let pending local input settle before opening this panel."
             return
         }
         presentedPanel = panel
@@ -337,6 +385,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
 
     func dismissOverview() {
         guard overviewVisit != nil else { return }
+        remoteFiles?.retire()
         overviewChoice = nil; overviewPresented = false
     }
 
@@ -357,6 +406,8 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// pane handoff. Backgrounding/closing invalidates it and never replays it.
     func finishOverviewDismissal(_ expectedVisit: UUID) {
         guard let generation = overviewVisit, generation == expectedVisit, overviewJob == nil else { return }
+        let files = remoteFiles
+        files?.retire(); remoteFiles = nil
         let choice = overviewChoice
         overviewVisit = nil; overviewChoice = nil; overviewCatalogID = nil; overviewBuildID = nil
         let id = UUID()
@@ -372,6 +423,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
                 }
             }
             do {
+                await files?.retryCleanup()
                 try self.checkOverviewNavigation(generation)
                 await self.navigation.joinSuspension()
                 try self.checkOverviewNavigation(generation)
@@ -432,6 +484,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     }
 
     private func cancelOverview() {
+        remoteFiles?.retire()
         overviewGeneration = UUID(); overviewPresented = false
         // Keep the closing sheet's slot until its exact dismissal arrives.
         // Otherwise an old onDismiss could consume a newly opened picker.
@@ -611,11 +664,13 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
             // Keychain authentication can make the app briefly inactive.
             // Hide identity reviews and deny copying, but keep their evidence
             // and an admitted handshake's capture generation until background.
-            cancelOverview(); cancelGroupAppearance()
+            if presentedPanel != .remoteFiles || remoteFiles == nil || !overviewPresented { cancelOverview() }
+            cancelGroupAppearance()
             splitGeneration = UUID(); splitJob?.cancel()
         }
         if foreground != active { canvasGeneration = UUID() }
         foreground = active
+        remoteFiles?.foregroundChanged(active)
         if active {
             if inBackground {
                 for (id, session) in sessions where session.phase == .live {
@@ -647,6 +702,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     /// app run; a connection that drops meanwhile reconnects on return.
     func enteredBackground() {
         guard !closed else { return }
+        cancelOverview()
         for controller in sessions.values { controller.discardHostKeyMismatch() }
         inBackground = true
         cancelGroupAppearance()
@@ -1033,6 +1089,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
             requiresExistingMux: existingMuxRequired.contains(machineID) || continuity?.requiresExistingMux == true)
         controller.onChange = { [weak self, weak controller] in
             guard let self, let controller, self.sessions[machineID] === controller else { return }
+            self.reconcileRemoteFiles()
             // Releasing an unused sign-in did not end a remote terminal and
             // must not add the New Session gate or replenish reconnect intent.
             if self.residency.wasReleased(machineID: machineID, ownerID: controller.id) {
@@ -1454,7 +1511,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
     func close() async {
         requestClose()
         if let closing { await closing.value; return }
-        let controllers = Array(sessions.values), navigation = self.navigation
+        let controllers = Array(sessions.values), navigation = self.navigation, files = remoteFiles
         let reconnects = reconnectJobs.values.map(\.task)
         let operations = controllerJobs.values.map(\.task)
         let modeChanges = muxModeJobs.values.map(\.task)
@@ -1463,6 +1520,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         let release = capacityReleaseJob
         let split = splitJob
         let job = Task {
+            await files?.retryCleanup()
             if let split { await split.value }
             if let release { await release.value }
             if let appearance { await appearance.value }
@@ -1475,6 +1533,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         }
         closing = job
         await job.value
+        remoteFiles = nil
         closing = nil
     }
 
@@ -1501,6 +1560,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
         if selectedMachineID != selection?.machineID {
             canvasGeneration = UUID()
             selectedMachineID = selection?.machineID
+            reconcileRemoteFiles()
             do { try connectionIntent.select(selectedMachineID) } catch { report(error) }
         }
         if !groupAppearanceBlocksInput, appearanceSelection == selectedMachineID { appearanceSelection = nil }
@@ -1811,6 +1871,12 @@ struct WorkspaceTerminalScreen: View {
             switch scene.presentedPanel {
             case .fleet: WorkspaceFleetOverviewScreen(scene: scene)
             case .hardwareKeyboard: TerminalHardwareSettingsScreen()
+            case .remoteFiles:
+                if let files = scene.remoteFiles {
+                    TerminalRemoteFilesScreen(scene: scene, files: files).id(files.id)
+                } else {
+                    ContentUnavailableView("Remote Files Closed", systemImage: "folder")
+                }
             }
         }
         .toolbarBackground(.visible, for: .navigationBar)
@@ -1858,6 +1924,11 @@ struct WorkspaceTerminalScreen: View {
                     .disabled(session.isViewingOnly || session.clipboardIsPresenting || session.localInputNeedsDecision)
             }
             Menu {
+                if let session = scene.selectedSession, session.remoteFilesTarget != nil {
+                    Button("Remote Files", systemImage: "folder") { scene.beginRemoteFiles() }
+                        .disabled(scene.openingSplit || session.clipboardIsPresenting || session.localInputNeedsDecision)
+                        .accessibilityIdentifier("terminal.files.open")
+                }
                 Button("Next Attention", systemImage: "exclamationmark.circle") { scene.showNextAttention() }
                     .disabled(!scene.hasAttentionElsewhere)
                     .accessibilityIdentifier("terminal.attention.menu")
@@ -2292,6 +2363,762 @@ struct WorkspaceTerminalScreen: View {
               let store = URL(string: "https://apps.apple.com/app/id1470499037") else { return }
         UIApplication.shared.open(app) { opened in if !opened { UIApplication.shared.open(store) } }
     }
+}
+
+/// Remote paths are byte identities. Swift String equality intentionally
+/// folds canonical Unicode spellings, which a remote filesystem need not do.
+enum TerminalRemoteFilesPath {
+    static func same(_ lhs: String, _ rhs: String) -> Bool { lhs.utf8.elementsEqual(rhs.utf8) }
+    static func validName(_ name: String) -> Bool {
+        !name.isEmpty && name != "." && name != ".." && name.utf8.count <= 255
+            && !name.utf8.contains(0) && !name.utf8.contains(47)
+    }
+    static func joining(_ directory: String, name: String) throws -> String {
+        guard validName(name), directory.utf8.first == 47 else { throw NativeSFTPError.invalidPath }
+        let path = directory + (directory.utf8.last == 47 ? "" : "/") + name
+        guard path.utf8.count <= 4_096, !path.utf8.contains(0) else { throw NativeSFTPError.invalidPath }
+        return path
+    }
+    static func parent(of path: String) -> String {
+        var bytes = Array(path.utf8)
+        while bytes.count > 1, bytes.last == 47 { bytes.removeLast() }
+        guard let slash = bytes.lastIndex(of: 47), slash > 0 else { return "/" }
+        return String(decoding: bytes[..<slash], as: UTF8.self)
+    }
+}
+
+/// A lease on one app-owned, protected staging directory. Export controllers
+/// retain the lease until their system UI has finished reading the file.
+final class TerminalFileStorage: @unchecked Sendable {
+    let directory: URL
+    let url: URL
+    init(name: String) throws {
+        guard TerminalRemoteFilesPath.validName(name) else { throw TerminalFileStaging.Failure.invalidName }
+        let cache = try FileManager.default.url(for: .cachesDirectory, in: .userDomainMask,
+                                               appropriateFor: nil, create: true)
+        var directory = cache.appendingPathComponent("RemoteFiles-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700, .protectionKey: FileProtectionType.complete])
+        do {
+            var values = URLResourceValues(); values.isExcludedFromBackup = true
+            try directory.setResourceValues(values)
+        } catch {
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
+        self.directory = directory
+        url = directory.appendingPathComponent(name, isDirectory: false)
+    }
+    deinit { try? FileManager.default.removeItem(at: directory) }
+}
+
+struct TerminalLocalFile: Identifiable, Sendable {
+    let id = UUID()
+    let storage: TerminalFileStorage
+    let name: String
+    let bytes: UInt64
+}
+
+/// Freeze a Files-provider selection before review. No provider URL, symlink,
+/// changing source or unbounded Data buffer reaches the upload operation.
+enum TerminalFileStaging {
+    enum Failure: Error, LocalizedError {
+        case invalidSource, invalidName, tooLarge, changed, storage
+        var errorDescription: String? {
+            switch self {
+            case .invalidSource: "Choose a regular file from Files. Folders and symbolic links cannot be uploaded."
+            case .invalidName: "Use a filename of at most 255 UTF-8 bytes without a slash or NUL."
+            case .tooLarge: "Remote Files supports files up to 256 MiB."
+            case .changed: "The selected file changed while it was being prepared. Choose it again."
+            case .storage: "The selected file could not be prepared in protected local storage."
+            }
+        }
+    }
+
+    private final class ReadAccess: @unchecked Sendable {
+        let coordinator = NSFileCoordinator(filePresenter: nil)
+        private let lock = NSLock()
+        private var cancelled = false
+        func cancel() {
+            lock.lock(); cancelled = true; lock.unlock()
+            coordinator.cancel()
+        }
+        func check() throws {
+            lock.lock(); let cancelled = cancelled; lock.unlock()
+            if cancelled { throw CancellationError() }
+            try Task.checkCancellation()
+        }
+    }
+
+    static func copy(_ source: URL,
+                     onProgress: @escaping @Sendable (UInt64, UInt64?) async -> Void) async throws -> TerminalLocalFile {
+        let scoped = source.startAccessingSecurityScopedResource()
+        defer { if scoped { source.stopAccessingSecurityScopedResource() } }
+        guard source.isFileURL, !source.path.utf8.contains(0) else { throw Failure.invalidSource }
+        try Task.checkCancellation()
+        let access = ReadAccess()
+        return try await withTaskCancellationHandler {
+            var coordinationError: NSError?
+            var result: Result<TerminalLocalFile, any Error>?
+            // A Files provider may materialize or move its representation.
+            // Keep the complete bounded read inside its coordinated accessor.
+            access.coordinator.coordinate(readingItemAt: source, options: [], error: &coordinationError) { coordinatedURL in
+                result = Result {
+                    try copyCoordinated(coordinatedURL, access: access) { bytes, total in
+                        Task { await onProgress(bytes, total) }
+                    }
+                }
+            }
+            try access.check()
+            if coordinationError != nil { throw Failure.invalidSource }
+            guard let result else { throw Failure.invalidSource }
+            let file = try result.get()
+            await onProgress(file.bytes, file.bytes)
+            return file
+        } onCancel: { access.cancel() }
+    }
+
+    private static func copyCoordinated(_ source: URL, access: ReadAccess,
+        onProgress: @Sendable (UInt64, UInt64?) -> Void) throws -> TerminalLocalFile {
+        try access.check()
+        guard source.isFileURL, !source.path.utf8.contains(0) else { throw Failure.invalidSource }
+        let descriptor = source.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return -1 }
+            return open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
+        }
+        guard descriptor >= 0 else { throw Failure.invalidSource }
+        let input = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        defer { try? input.close() }
+        var before = stat()
+        guard fstat(descriptor, &before) == 0, before.st_size >= 0,
+              before.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG) else { throw Failure.invalidSource }
+        let expected = UInt64(before.st_size)
+        guard expected <= WorkspaceSFTPClient.maximumFileBytes else { throw Failure.tooLarge }
+        let name = source.lastPathComponent
+        let storage = try TerminalFileStorage(name: name)
+        let outputDescriptor = storage.url.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return -1 }
+            return open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, mode_t(0o600))
+        }
+        guard outputDescriptor >= 0 else { throw Failure.storage }
+        let output = FileHandle(fileDescriptor: outputDescriptor, closeOnDealloc: true)
+        defer { try? output.close() }
+        try FileManager.default.setAttributes([.protectionKey: FileProtectionType.complete],
+                                              ofItemAtPath: storage.url.path)
+        var count: UInt64 = 0, reported: UInt64 = 0
+        onProgress(0, expected)
+        while true {
+            try access.check()
+            let bytes: Data
+            do { bytes = try input.read(upToCount: 64 * 1_024) ?? Data() }
+            catch { throw Failure.storage }
+            if bytes.isEmpty { break }
+            guard UInt64(bytes.count) <= expected - min(count, expected),
+                  UInt64(bytes.count) <= WorkspaceSFTPClient.maximumFileBytes - count else { throw Failure.changed }
+            do { try output.write(contentsOf: bytes) }
+            catch { throw Failure.storage }
+            count += UInt64(bytes.count)
+            // Bound cross-actor updates even when local reads are much faster
+            // than screen rendering. At most 256 chunk updates per file.
+            if count - reported >= 1_024 * 1_024 {
+                reported = count; onProgress(count, expected)
+            }
+        }
+        try access.check()
+        var after = stat()
+        guard fstat(descriptor, &after) == 0, count == expected,
+              before.st_dev == after.st_dev, before.st_ino == after.st_ino,
+              before.st_mode == after.st_mode, before.st_size == after.st_size,
+              before.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec,
+              before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec,
+              before.st_ctimespec.tv_sec == after.st_ctimespec.tv_sec,
+              before.st_ctimespec.tv_nsec == after.st_ctimespec.tv_nsec else { throw Failure.changed }
+        guard fsync(outputDescriptor) == 0 else { throw Failure.storage }
+        try output.close()
+        return .init(storage: storage, name: name, bytes: count)
+    }
+}
+
+/// Owns a dedicated file connection and its exact reviewed terminal source.
+/// Cancellation retires that owner; no retry can replay a remote create.
+@MainActor
+@Observable
+final class TerminalRemoteFilesController {
+    enum Phase: Equatable { case connecting, listing, browsing, staging, downloading, uploading, closing, closed }
+    struct UploadReview: Identifiable {
+        let id = UUID()
+        let file: TerminalLocalFile
+        let directory: String
+        let listingID: UUID
+    }
+    let id = UUID()
+    let target: TerminalRemoteFilesTarget
+    let source: TerminalSessionController
+    let connections: MobileConnections
+    private(set) var phase: Phase = .connecting
+    private(set) var listing: NativeSFTPDirectoryListing?
+    private(set) var listingID = UUID()
+    private(set) var uploadReview: UploadReview?
+    private(set) var completedDownload: TerminalLocalFile?
+    private(set) var transferredBytes: UInt64 = 0
+    private(set) var totalBytes: UInt64?
+    private(set) var transferPath: String?
+    private(set) var message: String?
+    private(set) var cleanupFailure: String?
+    private(set) var foreground = true
+    private(set) var settled = false
+    @ObservationIgnored private weak var scene: WorkspaceTerminalScene?
+    @ObservationIgnored private var connection: WorkspaceSSHConnection?
+    @ObservationIgnored private var client: WorkspaceSFTPClient?
+    @ObservationIgnored private var work: (id: UUID, task: Task<Void, Never>)?
+    @ObservationIgnored private var cleanup: (id: UUID, task: Task<Void, Never>)?
+    @ObservationIgnored private var retired = false
+    @ObservationIgnored private var openingPending = false
+    @ObservationIgnored private var importRequest: (id: UUID, directory: String, listingID: UUID)?
+    @ObservationIgnored private var activeUploadPath: String?
+
+    init(target: TerminalRemoteFilesTarget, source: TerminalSessionController,
+         scene: WorkspaceTerminalScene, connections: MobileConnections) {
+        self.target = target; self.source = source; self.scene = scene; self.connections = connections
+        message = scene.fileTransferNotice(for: target)
+    }
+
+    var visible: Bool { foreground && scene?.remoteFilesAreCurrent(self) == true }
+    var canBrowse: Bool { visible && !retired && phase == .browsing && work == nil && uploadReview == nil }
+    var canReview: Bool { visible && !retired && phase == .browsing && work == nil && uploadReview != nil }
+    var canReconnect: Bool { visible && retired && settled }
+    var authenticationPrompt: MobileSSHAuthenticationSheetRequest? {
+        visible ? connections.fileAuthenticationPrompt(for: id, target: target) : nil
+    }
+
+    func start() {
+        guard visible, !retired, work == nil, connection == nil else { return }
+        perform(.connecting) { owner, _ in
+            let connection = try await owner.connections.connectFiles(owner.target, ownerID: owner.id)
+            // Retain before any cancellation/lifecycle check: a late successful
+            // handshake still occupies the manager and must be closed by ID.
+            owner.connection = connection
+            try owner.checkCurrent()
+            guard TerminalRemoteFilesPath.same(connection.host, owner.target.host),
+                  TerminalRemoteFilesPath.same(connection.user, owner.target.user),
+                  connection.port == owner.target.port else { throw WorkspaceSSHConnectionError.stale }
+            if !owner.visible { owner.openingPending = true; return }
+            try await owner.openAndList(connection)
+        }
+    }
+
+    func foregroundChanged(_ active: Bool) {
+        foreground = active
+        if !active { importRequest = nil }
+        guard active, openingPending, !retired, work == nil, let connection, visible else { return }
+        openingPending = false
+        perform(.connecting) { owner, _ in try await owner.openAndList(connection) }
+    }
+
+    private func openAndList(_ connection: WorkspaceSSHConnection) async throws {
+        try checkCurrent(requireForeground: true)
+        let files: WorkspaceSFTPClient
+        if let client { files = client }
+        else {
+            files = try await connection.openFiles()
+            client = files
+        }
+        try checkCurrent()
+        // A Face ID interruption may finish the admitted handshake. Only
+        // foreground demand starts a new SFTP operation.
+        if !visible { openingPending = true; return }
+        phase = .listing
+        try await receiveListing(files, path: ".")
+    }
+
+    private func receiveListing(_ client: WorkspaceSFTPClient, path: String) async throws {
+        try checkCurrent(requireForeground: true)
+        let result = try await client.listDirectory(path: path, limit: 512)
+        try checkCurrent()
+        listing = result; listingID = UUID(); phase = .browsing
+    }
+
+    func browse(_ path: String, listingID expected: UUID? = nil) {
+        guard canBrowse, let client else { return }
+        guard expected == nil || expected == listingID else { return }
+        guard !path.isEmpty, path.utf8.count <= 4_096, !path.utf8.contains(0) else {
+            message = NativeSFTPError.invalidPath.localizedDescription; return
+        }
+        perform(.listing) { owner, _ in try await owner.receiveListing(client, path: path) }
+    }
+
+    func enter(_ entry: NativeSFTPDirectoryEntry, listingID expected: UUID) {
+        guard canBrowse, listingID == expected, let listing,
+              listing.entries.contains(where: { $0.id == entry.id && $0.attributes.kind == .directory }) else { return }
+        do { browse(try TerminalRemoteFilesPath.joining(listing.path, name: entry.name)) }
+        catch { message = error.localizedDescription }
+    }
+
+    func download(_ entry: NativeSFTPDirectoryEntry, listingID expected: UUID) {
+        guard canBrowse, listingID == expected, let listing, let client,
+              listing.entries.contains(where: { $0.id == entry.id && $0.attributes.kind == .regularFile }) else { return }
+        if let size = entry.attributes.size, size > WorkspaceSFTPClient.maximumFileBytes {
+            message = TerminalFileStaging.Failure.tooLarge.localizedDescription; return
+        }
+        do {
+            let path = try TerminalRemoteFilesPath.joining(listing.path, name: entry.name)
+            let storage = try TerminalFileStorage(name: entry.name)
+            completedDownload = nil; transferPath = path
+            perform(.downloading) { owner, workID in
+                let receipt = try await client.download(path: path, to: storage.url) { [weak owner] bytes, total in
+                    await owner?.progress(bytes, total: total, workID: workID)
+                }
+                try owner.checkCurrent()
+                owner.completedDownload = .init(storage: storage, name: entry.name, bytes: receipt.transferredBytes)
+                owner.message = "Download complete. Save the file to Files or share it before closing this browser."
+                owner.phase = .browsing
+            }
+        } catch { message = error.localizedDescription }
+    }
+
+    func beginImport() -> UUID? {
+        guard canBrowse, let listing else { return nil }
+        let request = UUID()
+        importRequest = (request, listing.path, listingID)
+        return request
+    }
+
+    func importFailed(_ error: any Error, request: UUID) {
+        guard visible, importRequest?.id == request else { return }
+        importRequest = nil
+        if (error as NSError).code != NSUserCancelledError { message = "The selected file could not be opened from Files." }
+    }
+
+    func prepareUpload(_ url: URL, request: UUID) {
+        guard canBrowse, let selected = importRequest, selected.id == request,
+              selected.listingID == listingID, let listing,
+              TerminalRemoteFilesPath.same(selected.directory, listing.path) else { return }
+        importRequest = nil; transferPath = nil
+        perform(.staging, retireOnFailure: false) { owner, workID in
+            let task = Task.detached(priority: .userInitiated) { [weak owner] in
+                try await TerminalFileStaging.copy(url) { bytes, total in
+                    await owner?.progress(bytes, total: total, workID: workID)
+                }
+            }
+            let file = try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
+            try owner.checkCurrent()
+            guard owner.listingID == selected.listingID,
+                  owner.listing.map({ TerminalRemoteFilesPath.same($0.path, selected.directory) }) == true else {
+                throw WorkspaceSSHConnectionError.stale
+            }
+            owner.uploadReview = .init(file: file, directory: selected.directory, listingID: selected.listingID)
+            owner.phase = .browsing
+        }
+    }
+
+    func cancelUploadReview(_ id: UUID) {
+        guard canReview, uploadReview?.id == id else { return }
+        uploadReview = nil
+    }
+
+    func createFile(_ name: String, reviewID: UUID) {
+        guard canReview, let review = uploadReview, review.id == reviewID,
+              review.listingID == listingID, let listing, let client,
+              TerminalRemoteFilesPath.same(review.directory, listing.path) else { return }
+        do {
+            let path = try TerminalRemoteFilesPath.joining(review.directory, name: name)
+            guard !listing.entries.contains(where: { $0.id == Data(name.utf8) }) else {
+                message = "That filename is already listed. Choose a new name; Remote Files never overwrites an existing file."
+                return
+            }
+            uploadReview = nil; transferPath = path
+            perform(.uploading) { owner, workID in
+                // Retain uncertainty before the first remote create, including
+                // an OPEN whose acknowledgement never reached the phone.
+                owner.activeUploadPath = path
+                owner.recordUploadUncertainty(path: path, bytes: 0)
+                let receipt = try await client.upload(from: review.file.storage.url, to: path) { [weak owner] bytes, total in
+                    await owner?.progress(bytes, total: total, workID: workID)
+                }
+                try owner.checkCurrent()
+                owner.activeUploadPath = nil
+                owner.scene?.recordFileTransferNotice(nil, for: owner.target)
+                owner.message = "Created \(receipt.remotePath) · \(Self.formatBytes(receipt.transferredBytes))."
+                owner.phase = .browsing
+                // Refresh is a separate deliberate action; a successful create
+                // must never be reported as failed because a later list failed.
+            }
+        } catch { message = error.localizedDescription }
+    }
+
+    func fileForExport(_ id: UUID) -> TerminalLocalFile? {
+        guard canBrowse, let file = completedDownload, file.id == id else { return nil }
+        return file
+    }
+
+    func cancel() {
+        guard visible, !retired else { return }
+        message = "Cancelled. Reconnect to browse or transfer another file."
+        retire()
+    }
+
+    func retire() {
+        guard !retired else { return }
+        retired = true; settled = false; openingPending = false; importRequest = nil
+        uploadReview = nil; completedDownload = nil
+        phase = .closing
+        work?.task.cancel()
+        beginCleanup()
+    }
+
+    func retryCleanup() async {
+        if !retired { retire() }
+        if let cleanup { await cleanup.task.value }
+        if connection != nil || work != nil {
+            beginCleanup()
+            await cleanup?.task.value
+        }
+    }
+
+    private func checkCurrent(requireForeground: Bool = false) throws {
+        try Task.checkCancellation()
+        guard !retired, scene?.remoteFilesAreCurrent(self, requireForeground: requireForeground) == true else {
+            throw WorkspaceSSHConnectionError.stale
+        }
+    }
+
+    private func perform(_ phase: Phase, retireOnFailure: Bool = true,
+                         operation: @escaping @MainActor (TerminalRemoteFilesController, UUID) async throws -> Void) {
+        guard !retired, work == nil, visible else { return }
+        self.phase = phase; transferredBytes = 0; totalBytes = nil
+        let workID = UUID()
+        let task = Task { [self] in
+            do {
+                // The scene can change after the button callback schedules
+                // this task, before it starts any file or network operation.
+                try checkCurrent(requireForeground: true)
+                try await operation(self, workID)
+            }
+            catch {
+                if let failure = error as? WorkspaceFileTransferFailure, let path = activeUploadPath {
+                    if failure.remoteFileMayRemain {
+                        recordUploadUncertainty(path: path, bytes: failure.transferredBytes)
+                    } else { scene?.recordFileTransferNotice(nil, for: target) }
+                    activeUploadPath = nil
+                }
+                if !retired {
+                    if (error as? WorkspaceFileTransferFailure)?.remoteFileMayRemain != true {
+                        message = error.localizedDescription
+                    }
+                    if retireOnFailure || error is CancellationError
+                        || scene?.remoteFilesAreCurrent(self, requireForeground: false) != true { retire() }
+                    else { self.phase = .browsing }
+                }
+            }
+            if work?.id == workID { work = nil }
+            if retired { beginCleanup() }
+            else if openingPending, visible, let connection {
+                openingPending = false
+                perform(.connecting) { owner, _ in try await owner.openAndList(connection) }
+            }
+        }
+        work = (workID, task)
+    }
+
+    private func progress(_ bytes: UInt64, total: UInt64?, workID: UUID) {
+        guard !retired, work?.id == workID,
+              scene?.remoteFilesAreCurrent(self, requireForeground: false) == true else { return }
+        transferredBytes = max(transferredBytes, bytes); totalBytes = total
+    }
+
+    private func recordUploadUncertainty(path: String, bytes: UInt64) {
+        let notice = "Upload to \(path) has no confirmed completion (\(Self.formatBytes(bytes)) acknowledged). "
+            + "A partial or complete remote file may remain. Inspect that path before choosing a new filename; this app will not overwrite it."
+        scene?.recordFileTransferNotice(notice, for: target)
+        message = notice
+    }
+
+    private func beginCleanup() {
+        guard retired, cleanup == nil else { return }
+        let cleanupID = UUID(), pending = work?.task
+        connections.retainFileCleanup(self)
+        let task = Task { [self] in
+            // Close promptly to interrupt a blocked native call, then join its
+            // owner and close any connection returned by a late handshake.
+            await closeManagedConnection()
+            await pending?.value
+            await closeManagedConnection()
+            guard cleanup?.id == cleanupID else { return }
+            cleanup = nil; phase = .closed
+            settled = connection == nil && work == nil
+            if settled { connections.releaseFileCleanup(id) }
+        }
+        cleanup = (cleanupID, task)
+    }
+
+    private func closeManagedConnection() async {
+        guard let connection else { return }
+        do {
+            try await connections.manager.close(connectionID: connection.id)
+            if self.connection?.id == connection.id { self.connection = nil; client = nil }
+            cleanupFailure = nil
+        } catch {
+            cleanupFailure = "The file connection is still closing. Retry closing it before reconnecting."
+        }
+    }
+
+    static func formatBytes(_ value: UInt64) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(clamping: value), countStyle: .file)
+    }
+}
+
+@MainActor
+private struct TerminalRemoteFilesScreen: View {
+    @Bindable var scene: WorkspaceTerminalScene
+    @Bindable var files: TerminalRemoteFilesController
+    @State private var path = ""
+    @State private var uploadName = ""
+    @State private var importing = false
+    @State private var importRequestID: UUID?
+    @State private var saveFile: TerminalLocalFile?
+    @State private var shareFile: TerminalLocalFile?
+    @Environment(\.scenePhase) private var scenePhase
+
+    private var visible: Bool { scenePhase == .active && files.visible }
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if visible { browser }
+                else {
+                    ContentUnavailableView("Remote Files Paused", systemImage: "lock",
+                        description: Text("Return to FrankenTerm to view files."))
+                }
+            }
+            .navigationTitle("Remote Files")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") { scene.dismissOverview() }
+                        .accessibilityIdentifier("terminal.files.done")
+                }
+            }
+        }
+        .onAppear {
+            path = files.listing?.path ?? ""
+            uploadName = files.uploadReview?.file.name ?? ""
+        }
+        .onChange(of: files.listingID) { _, _ in path = files.listing?.path ?? "" }
+        .onChange(of: files.uploadReview?.id) { _, _ in uploadName = files.uploadReview?.file.name ?? "" }
+        .fileImporter(isPresented: $importing, allowedContentTypes: [.item], allowsMultipleSelection: false) { result in
+            guard let request = importRequestID else { return }
+            importRequestID = nil
+            switch result {
+            case .success(let urls):
+                if let url = urls.first { files.prepareUpload(url, request: request) }
+            case .failure(let error): files.importFailed(error, request: request)
+            }
+        }
+        .sheet(item: $saveFile) { file in TerminalFileSavePicker(file: file) }
+        .sheet(item: Binding(get: { visible ? files.authenticationPrompt : nil }, set: { _ in })) { request in
+            switch request {
+            case .password(let value):
+                MobileSSHPasswordSheet(prompt: files.connections.passwordPrompt, request: value)
+            case .keyboardInteractive(let value):
+                MobileSSHKeyboardInteractiveSheet(prompt: files.connections.keyboardInteractivePrompt, request: value)
+            }
+        }
+    }
+
+    private var browser: some View {
+        List {
+            Section("Connected Account") {
+                LabeledContent("Machine", value: files.target.machineName)
+                LabeledContent("Host", value: files.target.host)
+                LabeledContent("Port", value: String(files.target.port))
+                LabeledContent("Account", value: files.target.user)
+                LabeledContent("Route", value: files.target.route.id)
+                Text("Files use this account through a separate SSH connection. Transfers stop when you close this browser or leave the app.")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+            if let message = files.message {
+                Section { Text(message).font(.callout).accessibilityIdentifier("terminal.files.message") }
+            }
+            switch files.phase {
+            case .connecting, .listing:
+                Section {
+                    ProgressView(files.phase == .connecting ? "Connecting to Remote Files…" : "Reading directory…")
+                    Button("Cancel", role: .cancel) { files.cancel() }
+                }
+            case .staging, .downloading, .uploading:
+                transferProgress
+            case .closing:
+                Section { ProgressView("Closing file connection…") }
+            case .closed:
+                Section {
+                    if let failure = files.cleanupFailure {
+                        Text(failure)
+                        Button("Retry Closing Connection") { Task { await files.retryCleanup() } }
+                    } else {
+                        Text("The file connection is closed. Your terminal session has its own connection.")
+                        Button("Reconnect") { scene.reconnectRemoteFiles(files) }
+                            .disabled(!files.canReconnect)
+                            .accessibilityIdentifier("terminal.files.reconnect")
+                    }
+                }
+            case .browsing:
+                if let review = files.uploadReview { uploadReview(review) }
+                else if let listing = files.listing { directory(listing, listingID: files.listingID) }
+            }
+            if let file = files.completedDownload {
+                Section("Completed Download") {
+                    Text(file.name).font(.body.monospaced())
+                    Text(TerminalRemoteFilesController.formatBytes(file.bytes)).foregroundStyle(.secondary)
+                    Button("Save to Files", systemImage: "folder") {
+                        saveFile = files.fileForExport(file.id)
+                    }
+                        .disabled(!files.canBrowse)
+                        .accessibilityIdentifier("terminal.files.save")
+                    Button("Share File", systemImage: "square.and.arrow.up") {
+                        shareFile = files.fileForExport(file.id)
+                    }
+                        .disabled(!files.canBrowse)
+                        .popover(item: $shareFile, attachmentAnchor: .rect(.bounds), arrowEdge: .bottom) { file in
+                            TerminalFileShareSheet(file: file).presentationCompactAdaptation(.sheet)
+                        }
+                }
+            }
+        }
+        .accessibilityIdentifier("terminal.files.browser")
+    }
+
+    @ViewBuilder
+    private func directory(_ listing: NativeSFTPDirectoryListing, listingID: UUID) -> some View {
+        Section("Directory") {
+            Text(listing.path).font(.body.monospaced())
+            TextField("Remote directory path", text: $path)
+                .font(.body.monospaced()).textInputAutocapitalization(.never).autocorrectionDisabled()
+                .submitLabel(.go).onSubmit { files.browse(path) }
+                .accessibilityIdentifier("terminal.files.path")
+            HStack {
+                Button("Up", systemImage: "arrow.up") {
+                    files.browse(TerminalRemoteFilesPath.parent(of: listing.path), listingID: listingID)
+                }.disabled(listing.path.utf8.elementsEqual("/".utf8))
+                Spacer()
+                Button("Go") { files.browse(path) }
+                Button("Refresh", systemImage: "arrow.clockwise") { files.browse(listing.path, listingID: listingID) }
+            }.buttonStyle(.borderless).disabled(!files.canBrowse)
+            Button("Upload from Files", systemImage: "square.and.arrow.up") {
+                guard let request = files.beginImport() else { return }
+                importRequestID = request; importing = true
+            }.disabled(!files.canBrowse).accessibilityIdentifier("terminal.files.upload.pick")
+            Text("Regular files up to 256 MiB. Uploads create a new filename and never overwrite. Symbolic links are not opened.")
+                .font(.footnote).foregroundStyle(.secondary)
+        }
+        Section("Contents") {
+            if listing.entries.isEmpty { Text("This directory is empty.").foregroundStyle(.secondary) }
+            ForEach(listing.entries, id: \.id) { entry in
+                switch entry.attributes.kind {
+                case .directory:
+                    Button { files.enter(entry, listingID: listingID) } label: {
+                        Label(entry.name, systemImage: "folder")
+                    }.disabled(!files.canBrowse)
+                case .regularFile:
+                    Button { files.download(entry, listingID: listingID) } label: {
+                        HStack {
+                            Label(entry.name, systemImage: "doc")
+                            Spacer(minLength: 8)
+                            VStack(alignment: .trailing) {
+                                if let size = entry.attributes.size {
+                                    Text(TerminalRemoteFilesController.formatBytes(size)).font(.caption)
+                                }
+                                Text("Download").font(.caption)
+                            }.foregroundStyle(.secondary)
+                        }
+                    }.disabled(!files.canBrowse)
+                        .accessibilityLabel("Download \(entry.name)")
+                case .symbolicLink, .other, .unknown:
+                    VStack(alignment: .leading, spacing: 3) {
+                        Label(entry.name, systemImage: entry.attributes.kind == .symbolicLink ? "link" : "doc.questionmark")
+                        Text(entry.attributes.kind == .symbolicLink ? "Symbolic link · not opened" : "Not a regular file")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            if listing.isTruncated {
+                Text("Showing the first 512 entries. Other entries may exist. Enter a directory path above to navigate directly.")
+                    .font(.footnote).accessibilityIdentifier("terminal.files.truncated")
+            }
+        }
+    }
+
+    private func uploadReview(_ review: TerminalRemoteFilesController.UploadReview) -> some View {
+        Section("Review Upload") {
+            LabeledContent("Selected file", value: review.file.name)
+            LabeledContent("Size", value: "\(review.file.bytes.formatted()) bytes")
+            Text("Destination directory").font(.caption).foregroundStyle(.secondary)
+            Text(review.directory).font(.body.monospaced())
+            TextField("New remote filename", text: $uploadName)
+                .font(.body.monospaced()).textInputAutocapitalization(.never).autocorrectionDisabled()
+                .accessibilityIdentifier("terminal.files.upload.name")
+            if let destination = try? TerminalRemoteFilesPath.joining(review.directory, name: uploadName) {
+                Text("Create at").font(.caption).foregroundStyle(.secondary)
+                Text(destination).font(.body.monospaced())
+            }
+            Text("The reviewed file is a protected copy of the selected bytes. If this transfer stops, a remote file may remain; inspect it before trying a new filename.")
+                .font(.footnote).foregroundStyle(.secondary)
+            Button("Create New File", systemImage: "plus") { files.createFile(uploadName, reviewID: review.id) }
+                .disabled(!files.canReview || !TerminalRemoteFilesPath.validName(uploadName))
+                .accessibilityIdentifier("terminal.files.upload.create")
+            Button("Discard Upload", role: .cancel) { files.cancelUploadReview(review.id) }
+                .disabled(!files.canReview)
+        }
+    }
+
+    private var transferProgress: some View {
+        Section(files.phase == .staging ? "Preparing Review" : files.phase == .uploading ? "Uploading" : "Downloading") {
+            if let path = files.transferPath { Text(path).font(.body.monospaced()) }
+            if let total = files.totalBytes, total > 0 {
+                ProgressView(value: Double(min(files.transferredBytes, total)), total: Double(total))
+            } else { ProgressView() }
+            Text(progressText).monospacedDigit()
+                .accessibilityIdentifier("terminal.files.progress")
+            Button("Cancel Transfer", role: .cancel) { files.cancel() }
+                .accessibilityIdentifier("terminal.files.cancel")
+        }
+    }
+
+    private var progressText: String {
+        let done = TerminalRemoteFilesController.formatBytes(files.transferredBytes)
+        if let total = files.totalBytes { return "\(done) of \(TerminalRemoteFilesController.formatBytes(total))" }
+        return done
+    }
+
+}
+
+/// Retaining the lease on the system controller keeps completed bytes alive
+/// even when backgrounding retires the browser while a provider finishes.
+private final class TerminalFileExportPicker: UIDocumentPickerViewController {
+    var fileLease: TerminalLocalFile?
+}
+
+private struct TerminalFileSavePicker: UIViewControllerRepresentable {
+    let file: TerminalLocalFile
+    func makeUIViewController(context: Context) -> TerminalFileExportPicker {
+        let picker = TerminalFileExportPicker(forExporting: [file.storage.url], asCopy: true)
+        picker.fileLease = file
+        return picker
+    }
+    func updateUIViewController(_ uiViewController: TerminalFileExportPicker, context: Context) {}
+}
+
+private final class TerminalFileActivityController: UIActivityViewController {
+    var fileLease: TerminalLocalFile?
+}
+
+private struct TerminalFileShareSheet: UIViewControllerRepresentable {
+    let file: TerminalLocalFile
+    func makeUIViewController(context: Context) -> TerminalFileActivityController {
+        let controller = TerminalFileActivityController(activityItems: [file.storage.url], applicationActivities: nil)
+        controller.fileLease = file
+        return controller
+    }
+    func updateUIViewController(_ uiViewController: TerminalFileActivityController, context: Context) {}
 }
 
 /// The failed handshake already supplied this evidence. Opening this review

@@ -12,6 +12,23 @@ admits at most two file owners inside its existing connection and attempt limits
 File owners create no shell, PTY, exec request, terminal input source or session
 creation journal, and workspace invalidation and suspension close both kinds.
 
+On iPhone and iPad, the selected connected terminal's **More → Remote Files**
+action opens a foreground file browser for that exact account and route.
+Directory navigation, parent navigation and refresh retain canonical paths and
+show when the bounded listing is incomplete. Opening the browser fences terminal
+input. Its password and MFA prompts belong to that exact file owner, including
+in multiple windows. Temporary system inactivity retains an admitted owner;
+backgrounding, dismissal, workspace replacement or loss of the source terminal
+retires it. Reconnect is an explicit action after cleanup has settled.
+
+**Upload from Files** coordinates a provider read into a private, protected local
+copy before showing its exact byte count, destination directory and editable new
+filename. The confirmation uploads those staged bytes even if the provider's
+original changes. Progress and cancellation stay attached to the admitted owner,
+and an interrupted create warns that a remote partial file may remain. Completed
+downloads offer **Save to Files** and **Share**, retaining their local file until
+the system presentation finishes. Incomplete downloads are never exported.
+
 `WorkspaceSFTPClient` resolves a directory to its canonical server path and
 returns at most 512 entries, with an explicit indication when more exist. Remote
 names keep their exact UTF-8 byte identity. Regular-file downloads and uploads
@@ -44,9 +61,12 @@ scenarios: exact-byte download/upload and nonoverwrite, a jump route, stalled
 read cancellation, partial-startup cancellation, upload cancellation after a
 server write, read expiry, separate terminal/file ownership and capacity, host
 revocation, and workspace replacement. The nine existing connection-manager
-regressions also pass. A shared-memory interruption affected four cases in one
-run; those unchanged cases passed when repeated after pressure subsided.
-These Linux results do not qualify Apple SDK integration or device behavior.
+regressions also pass. The final merged-source run passes all nine live scenarios
+in one invocation, with no skipped fixture tests. Hosted iOS tests cover separate
+file ownership, the terminal input fence, temporary inactivity and background
+cleanup, immutable upload staging and stale picker/review callbacks. Swift
+frontend parsing checks the app sources; the hosted tests still require an Apple
+SDK and live SFTP fixture. These Linux results do not qualify device behavior.
 
 ## Imported machine fonts
 
