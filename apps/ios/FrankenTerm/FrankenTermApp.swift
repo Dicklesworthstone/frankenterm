@@ -72,6 +72,7 @@ struct LocalDeviceKeyReview: Identifiable {
         case generate
         case assign(credentialID: String, routeID: String)
         case remove(routeID: String)
+        case enrollment(WorkspaceKeyEnrollmentReportReview, routeIDs: Set<String>)
     }
     let id = UUID()
     let workspaceID: UUID, revision: UUID
@@ -87,6 +88,7 @@ struct LocalDeviceKeyReview: Identifiable {
         case .generate: "Create a Phone SSH Key?"
         case .assign: "Use This Phone Key?"
         case .remove: "Use Imported Key Choices?"
+        case .enrollment(_, let routes): "Use Phone Key on \(routes.count) Routes?"
         }
     }
     var confirmationTitle: String {
@@ -94,6 +96,7 @@ struct LocalDeviceKeyReview: Identifiable {
         case .generate: "Create Phone Key"
         case .assign: disconnectsSessions ? "Use Phone Key and Disconnect" : "Use Phone Key"
         case .remove: disconnectsSessions ? "Use Imported Keys and Disconnect" : "Use Imported Keys"
+        case .enrollment: disconnectsSessions ? "Apply Selected Routes and Disconnect" : "Apply Selected Routes"
         }
     }
     var explanation: String {
@@ -111,8 +114,43 @@ struct LocalDeviceKeyReview: Identifiable {
         case .remove:
             return scope + "Restore this route's imported public-key candidates. The generated private key stays on this phone. Removing the choice does not remove its public key from any server or revoke the server's authorization."
                 + effects
+        case .enrollment(_, let routes):
+            return scope + "Use this phone key as the only public-key candidate on the \(routes.count) selected routes, including their use as jump hosts. The complete selected set is saved together. Host trust and permitted password or MFA methods still apply."
+                + effects + "\n\nThe public report records the Mac's observations; it does not prove this phone can sign in. This workspace stays offline until you choose Connect."
         case .generate: return ""
         }
+    }
+}
+
+/// The Files callback retains the exact key-settings visit that requested it.
+struct LocalEnrollmentFileReview: Identifiable {
+    let id = UUID()
+    let workspaceID: UUID, revision: UUID
+    fileprivate let epoch: UUID
+}
+
+/// Read-only public input and a store-issued review. A presentation may identify
+/// a workspace, but cannot select routes or approve a credential change itself.
+@MainActor
+@Observable
+final class LocalEnrollmentResults: Identifiable {
+    let id = UUID()
+    let bytes: Data
+    let key: WorkspaceDeviceKey
+    let requestID: String
+    var presentingWorkspaceID: UUID?
+    let preferredWorkspaceID: UUID?
+    fileprivate let epoch: UUID
+    var review: WorkspaceKeyEnrollmentReportReview?
+    var message: String?
+    var isApplying = false
+    var isFinished = false
+
+    init(bytes: Data, journal: WorkspaceKeyEnrollmentJournal, presentingWorkspaceID: UUID?,
+         preferredWorkspaceID: UUID?, epoch: UUID) {
+        self.bytes = bytes; key = journal.request.key; requestID = journal.request.id
+        self.presentingWorkspaceID = presentingWorkspaceID
+        self.preferredWorkspaceID = preferredWorkspaceID; self.epoch = epoch
     }
 }
 
@@ -150,6 +188,13 @@ final class MobileWorkspaceModel {
     @ObservationIgnored private var deviceKeyReviewID: UUID?
     @ObservationIgnored private var deviceKeyOperation: (id: UUID, task: Task<Void, Never>)?
     private(set) var deviceKeyConnectionHolds = Set<UUID>()
+    var enrollmentResults: LocalEnrollmentResults?
+    @ObservationIgnored private var enrollmentFileReviewID: UUID?
+    private var enrollmentResultsOperation: (id: UUID, task: Task<Void, Never>)?
+    @ObservationIgnored private var keysPresentationWorkspaceID: UUID?
+    @ObservationIgnored private var pendingDocumentURL: URL?
+    private var documentRetryURL: URL?
+    private var documentInspection: (id: UUID, task: Task<Void, Never>)?
     var state: OfflineRestoreStatus? { didSet { updateIdleTimer(); reconcileScanSaving() } }
     var message: String?
     var showRestore = false {
@@ -168,7 +213,7 @@ final class MobileWorkspaceModel {
     /// Import settlement retains its own reservation across scene transitions
     /// and any older callback that releases the shared operation flag.
     var busy: Bool {
-        get { operationBusy || credentialImportOperation != nil || deviceKeyOperation != nil || hostKeyOperation != nil || isReadingRecording || connectionPreferenceBusy || connectionApproval != nil }
+        get { operationBusy || credentialImportOperation != nil || deviceKeyOperation != nil || hostKeyOperation != nil || enrollmentResultsOperation != nil || documentInspection != nil || isReadingRecording || connectionPreferenceBusy || connectionApproval != nil }
         set { operationBusy = newValue }
     }
     private(set) var isReadingRecording = false
@@ -223,6 +268,7 @@ final class MobileWorkspaceModel {
     private struct PendingFileImport: Sendable {
         let id = UUID()
         let url: URL
+        var bytes: Data?
         var needsExplicitRetry = false
     }
     var hasPendingImport: Bool { pendingImport != nil }
@@ -488,6 +534,7 @@ final class MobileWorkspaceModel {
         active = value
         if !value {
             credentialImport?.cancel()
+            retireEnrollmentReviews()
             deviceKeyReviewID = nil
             deviceKeyOperation?.task.cancel()
             scannedCode = nil; stopSavingScanProgress()
@@ -510,6 +557,7 @@ final class MobileWorkspaceModel {
     }
     func setRestoreVisible(_ value: Bool) {
         if value { credentialImport?.cancel() }
+        if value { retireEnrollmentReviews() }
         if value { deviceKeyReviewID = nil; deviceKeyOperation?.task.cancel() }
         if value { connections?.setAuthenticationScope(nil) }
         showRestore = value
@@ -602,6 +650,7 @@ final class MobileWorkspaceModel {
     }
     private func updateLifecycle(discardRecipientRequest: Bool = false) {
         epoch = UUID()
+        retireEnrollmentReviews()
         keyReviewID = nil
         hostKeyCheckReviewID = nil
         hostKeyPinReview = nil
@@ -617,6 +666,8 @@ final class MobileWorkspaceModel {
         observationTask?.cancel(); observationTask = nil; lastObservation = nil
         let pendingRecording = recordingRead?.task
         pendingRecording?.cancel()
+        let pendingDocument = documentInspection?.task
+        let pendingEnrollment = enrollmentResultsOperation?.task
         guard let restore else { return }
         let ticket = epoch, visible = active && showRestore, prior = lifecycle
         let pendingApproval = connectionApproval?.task
@@ -632,6 +683,8 @@ final class MobileWorkspaceModel {
             // The exact reader retires before a lifecycle transition rotates
             // receive authority. A background callback cannot start more work.
             await pendingRecording?.value
+            await pendingDocument?.value
+            await pendingEnrollment?.value
             let next: OfflineRestoreStatus
             do {
                 if visible {
@@ -658,6 +711,7 @@ final class MobileWorkspaceModel {
             }
             guard self.epoch == ticket else { return }
             self.openPendingFileIfReady()
+            self.openPendingDocumentIfReady()
             if self.active { await self.refreshSavedScan(epoch: ticket) }
         }
     }
@@ -1072,6 +1126,11 @@ final class MobileWorkspaceModel {
             applyConnectionPreferences(local.connectionPreferences, workspace: local.workspace)
         }
         locallyRevokedFingerprints = revoked
+        if let report = enrollmentResults, report.review != nil, !report.isApplying, !report.isFinished,
+           !enrollmentResultsAreCurrent(report) {
+            report.review = nil; deviceKeyReviewID = nil
+            report.message = "The workspace or phone key changed. Review its current routes again."
+        }
         restoreLiveScreen()
         if let importing = credentialImport, !importing.isCommitting, !importing.isFinished,
            !credentialImportIsCurrent(importing) {
@@ -1200,10 +1259,159 @@ final class MobileWorkspaceModel {
                 "\($0.user)@\($0.host):\($0.port)"
             } ?? "Removed route · \(routeID)"
             disconnects = hasOpenScene(workspaceID)
+        case .enrollment:
+            // Only the current report presentation may mint a batch approval.
+            return nil
         }
         let review = LocalDeviceKeyReview(workspaceID: workspaceID, revision: saved.revision,
             workspaceName: document.name, action: action, fingerprint: fingerprint,
             destination: destination, disconnectsSessions: disconnects, epoch: epoch)
+        deviceKeyReviewID = review.id
+        return review
+    }
+
+    func beginKeysPresentation(workspaceID: UUID) {
+        keysPresentationWorkspaceID = workspaceID
+    }
+
+    func endKeysPresentation(workspaceID: UUID) {
+        guard keysPresentationWorkspaceID == workspaceID else { return }
+        keysPresentationWorkspaceID = nil
+        enrollmentFileReviewID = nil
+        if let report = enrollmentResults, report.presentingWorkspaceID == workspaceID {
+            if report.isApplying { report.presentingWorkspaceID = nil }
+            else { cancelEnrollmentResults(report.id) }
+        }
+    }
+
+    func reviewEnrollmentFile(workspaceID: UUID) -> LocalEnrollmentFileReview? {
+        guard active, !busy, !showRestore, credentialImport == nil, store != nil,
+              let saved = workspaces.first(where: { $0.id == workspaceID }) else { return nil }
+        let review = LocalEnrollmentFileReview(workspaceID: workspaceID, revision: saved.revision, epoch: epoch)
+        enrollmentFileReviewID = review.id
+        deviceKeyReviewID = nil
+        return review
+    }
+
+    func cancelEnrollmentFile(_ review: LocalEnrollmentFileReview) {
+        if enrollmentFileReviewID == review.id { enrollmentFileReviewID = nil }
+    }
+
+    /// A security-scoped file read owns its worker until cancellation has joined.
+    /// SelectedLocalFile refuses unavailable cloud files instead of fetching them.
+    nonisolated private static func readSelectedDocument(_ url: URL, limit: Int) async throws -> Data {
+        let reader = Task.detached(priority: .userInitiated) { try SelectedLocalFile.read(url, limit: limit) }
+        return try await withTaskCancellationHandler {
+            let bytes = try await reader.value
+            try Task.checkCancellation()
+            return bytes
+        } onCancel: { reader.cancel() }
+    }
+
+    func importEnrollmentFile(_ url: URL, reviewed: LocalEnrollmentFileReview) {
+        guard active, !busy, !showRestore, credentialImport == nil,
+              enrollmentFileReviewID == reviewed.id, epoch == reviewed.epoch,
+              workspaces.first(where: { $0.id == reviewed.workspaceID })?.revision == reviewed.revision else {
+            credentialMessage = "The key-settings visit changed. Open Enrollment Results again."
+            return
+        }
+        enrollmentFileReviewID = nil; deviceKeyReviewID = nil; credentialMessage = nil
+        let id = UUID()
+        let task = Task { [self] in
+            defer { if enrollmentResultsOperation?.id == id { enrollmentResultsOperation = nil } }
+            do {
+                let bytes = try await Self.readSelectedDocument(url, limit: WorkspaceKeyEnrollmentJournal.maximumBytes)
+                let journal = try WorkspaceKeyEnrollmentJournal(data: bytes)
+                guard !Task.isCancelled, active, !showRestore, epoch == reviewed.epoch,
+                      enrollmentResultsOperation?.id == id,
+                      workspaces.first(where: { $0.id == reviewed.workspaceID })?.revision == reviewed.revision else { return }
+                enrollmentResults = LocalEnrollmentResults(bytes: bytes, journal: journal,
+                    presentingWorkspaceID: reviewed.workspaceID, preferredWorkspaceID: reviewed.workspaceID, epoch: epoch)
+            } catch {
+                guard !Task.isCancelled, active, epoch == reviewed.epoch else { return }
+                credentialMessage = "Enrollment results could not be opened. Choose the JSON saved with Save Results in FrankenTerm Export. \(error.localizedDescription)"
+            }
+        }
+        enrollmentResultsOperation = (id, task)
+    }
+
+    func enrollmentWorkspaces(for report: LocalEnrollmentResults) -> [InstalledWorkspace] {
+        workspaces.filter { saved in
+            (report.preferredWorkspaceID == nil || report.preferredWorkspaceID == saved.id)
+                && saved.deviceKeys.contains(report.key)
+        }
+    }
+
+    func prepareEnrollmentResults(_ report: LocalEnrollmentResults, workspaceID: UUID) {
+        guard active, !busy, !showRestore, credentialImport == nil, let store,
+              enrollmentResults === report, report.epoch == epoch, !report.isApplying, !report.isFinished,
+              let saved = enrollmentWorkspaces(for: report).first(where: { $0.id == workspaceID }) else { return }
+        report.review = nil; report.message = nil; deviceKeyReviewID = nil
+        let id = UUID(), ticket = epoch
+        let task = Task { [self] in
+            defer { if enrollmentResultsOperation?.id == id { enrollmentResultsOperation = nil } }
+            do {
+                let review = try await store.reviewEnrollmentResults(workspaceID: saved.id,
+                    expectedRevision: saved.revision, credentialID: report.key.id, data: report.bytes)
+                guard !Task.isCancelled, active, !showRestore, epoch == ticket,
+                      enrollmentResults === report, enrollmentResultsOperation?.id == id,
+                      workspaces.first(where: { $0.id == saved.id })?.revision == saved.revision else { return }
+                report.review = review
+            } catch {
+                guard !Task.isCancelled, active, epoch == ticket, enrollmentResults === report else { return }
+                report.message = "These results cannot select routes in this workspace. \(error.localizedDescription)"
+            }
+        }
+        enrollmentResultsOperation = (id, task)
+    }
+
+    func enrollmentResultsAreCurrent(_ report: LocalEnrollmentResults) -> Bool {
+        guard active, !showRestore, enrollmentResults === report, epoch == report.epoch,
+              !report.isApplying, !report.isFinished, let review = report.review,
+              !locallyRevokedFingerprints.contains(report.key.fingerprint),
+              !unconfirmedCredentialRevocations.contains(report.key.fingerprint),
+              let saved = workspaces.first(where: { $0.id == review.workspaceID }),
+              saved.revision == review.expectedRevision, saved.deviceKeys.contains(report.key) else { return false }
+        return true
+    }
+
+    func cancelEnrollmentResults(_ id: UUID) {
+        guard let report = enrollmentResults, report.id == id, !report.isApplying else { return }
+        report.review = nil
+        enrollmentResults = nil; deviceKeyReviewID = nil
+        enrollmentResultsOperation?.task.cancel()
+        // The reservation is released by the exact worker after its read joins.
+    }
+
+    private func retireEnrollmentReviews() {
+        enrollmentFileReviewID = nil; deviceKeyReviewID = nil
+        enrollmentResults?.review = nil; enrollmentResults = nil
+        enrollmentResultsOperation?.task.cancel()
+        documentInspection?.task.cancel()
+    }
+
+    func reviewEnrollmentKeyChange(_ report: LocalEnrollmentResults, routeIDs: Set<String>,
+                                   fingerprintConfirmed: Bool) -> LocalDeviceKeyReview? {
+        guard !busy, fingerprintConfirmed, !routeIDs.isEmpty, enrollmentResultsAreCurrent(report),
+              let core = report.review,
+              routeIDs.isSubset(of: Set(core.routes.filter(\.canAssign).map(\.id))) else { return nil }
+        let accounts = core.routes.filter { routeIDs.contains($0.id) }.map { route in
+            let account = LocalHostKeyCheckReview.endpoint(host: route.account.host,
+                port: route.account.port, user: route.account.user)
+            let paths = route.paths.enumerated().map { offset, path in
+                let hosts = path.plan.jumpHosts + [path.plan.destination]
+                return "Path \(offset + 1):\n" + hosts.enumerated().map { index, host in
+                    "  \(index + 1). " + LocalHostKeyCheckReview.endpoint(host: host.target.host,
+                        port: host.target.port, user: host.target.user)
+                        + (host.hostKeyAlias.map { " · host-key alias " + $0 } ?? "")
+                }.joined(separator: "\n")
+            }.joined(separator: "\n")
+            return account + "\nRoute: " + route.id + "\n" + paths
+        }
+        let review = LocalDeviceKeyReview(workspaceID: core.workspaceID, revision: core.expectedRevision,
+            workspaceName: core.workspaceName, action: .enrollment(core, routeIDs: routeIDs),
+            fingerprint: core.key.fingerprint, destination: accounts.joined(separator: "\n\n"),
+            disconnectsSessions: hasOpenScene(core.workspaceID), epoch: epoch)
         deviceKeyReviewID = review.id
         return review
     }
@@ -1219,6 +1427,17 @@ final class MobileWorkspaceModel {
             credentialMessage = "The workspace changed. Review this phone-key choice again."
             completed(false); return
         }
+        let reportOwner: LocalEnrollmentResults?
+        if case .enrollment(let core, let routeIDs) = review.action {
+            guard let owner = enrollmentResults, enrollmentResultsAreCurrent(owner),
+                  owner.review?.id == core.id, !routeIDs.isEmpty,
+                  routeIDs.isSubset(of: Set(core.routes.filter(\.canAssign).map(\.id))) else {
+                credentialMessage = "The enrollment review changed. Open the results and choose routes again."
+                completed(false); return
+            }
+            reportOwner = owner
+            owner.isApplying = true
+        } else { reportOwner = nil }
         deviceKeyReviewID = nil; keyReviewID = nil; credentialMessage = nil; busy = true
         workspaceRefreshEpoch = UUID(); workspaceRefresh?.cancel()
         let changesRoute: Bool
@@ -1264,11 +1483,20 @@ final class MobileWorkspaceModel {
                     _ = try await store.removeDeviceKeyAssignment(workspaceID: review.workspaceID,
                         expectedRevision: review.revision, routeID: routeID, confirmedByUser: true)
                     result = .success("This route uses its imported key choices again. The phone key remains saved, and its public key remains authorized wherever you installed it.")
+                case .enrollment(let core, let routeIDs):
+                    _ = try await store.applyEnrollmentResults(core, routeIDs: routeIDs, confirmedByUser: true)
+                    result = .success("The \(routeIDs.count) selected routes now use this phone key. The workspace remains offline until you choose Connect. The report records public file observations; actual sign-in is checked when you connect.")
                 }
             } catch { result = .failure(error) }
             let settlement = Task { [self] in
                 guard deviceKeyOperation?.id == operation else { return false }
-                defer { deviceKeyOperation = nil; busy = false }
+                defer {
+                    if let reportOwner {
+                        reportOwner.isApplying = false; reportOwner.isFinished = true
+                        reportOwner.review = nil; reportOwner.message = credentialMessage
+                    }
+                    deviceKeyOperation = nil; busy = false
+                }
                 workspaceRefreshEpoch = UUID(); workspaceRefresh?.cancel()
                 availableCredentials.removeValue(forKey: review.workspaceID)
                 localPolicies.removeValue(forKey: review.workspaceID)
@@ -1803,7 +2031,8 @@ final class MobileWorkspaceModel {
     private func restoreLiveScreen() {
         guard !liveScreenChecked else { return }
         liveScreenChecked = true
-        guard returning == nil, pendingImport == nil,
+        guard returning == nil, pendingImport == nil, pendingDocumentURL == nil,
+              documentInspection == nil, documentRetryURL == nil, enrollmentResults == nil,
               let data = UserDefaults.standard.data(forKey: Self.liveScreenKey),
               let screen = try? JSONDecoder().decode(LiveScreen.self, from: data),
               workspaces.contains(where: { $0.id == screen.workspaceID && !$0.connectLater }),
@@ -1966,10 +2195,83 @@ final class MobileWorkspaceModel {
     }
     func importFile(_ url: URL) {
         guard url.isFileURL else { report(FTError.malformed("file.local_url_required")); return }
-        guard !busy else { message = "Finish the current import before opening another workspace."; return }
+        guard !busy else { message = "Finish the current operation before opening another file."; return }
+        documentRetryURL = nil
+        if OpticalRecordingLimits.accepts(url) { importWorkspaceFile(url); return }
+        // A public result JSON is not a workspace. Identify it before entering
+        // offline restore, which may otherwise ask to end unrelated sessions.
+        retireEnrollmentReviews()
+        pendingDocumentURL = url
+        guard active, store != nil, restore != nil else {
+            if !bootstrapStarted { Task { await bootstrap() } }
+            return
+        }
+        openPendingDocumentIfReady()
+    }
+
+    var canRetryDocument: Bool { documentRetryURL != nil }
+
+    func retrySelectedDocument() {
+        guard active, !busy, let url = documentRetryURL else { return }
+        message = nil
+        importFile(url)
+    }
+
+    func discardSelectedDocument() {
+        documentRetryURL = nil; message = nil
+    }
+
+    private func openPendingDocumentIfReady() {
+        guard active, !busy, store != nil, restore != nil, let url = pendingDocumentURL else { return }
+        pendingDocumentURL = nil
+        let id = UUID(), ticket = epoch, presenter = keysPresentationWorkspaceID
+        let task = Task { [self] in
+            defer { if documentInspection?.id == id { documentInspection = nil } }
+            do {
+                let dedicatedResults = url.pathExtension.lowercased() == "ftkeyresults"
+                let bytes = try await Self.readSelectedDocument(url,
+                    limit: dedicatedResults ? WorkspaceKeyEnrollmentJournal.maximumBytes : FTLimit.envelope)
+                try Task.checkCancellation()
+                guard active, epoch == ticket, documentInspection?.id == id else { throw CancellationError() }
+                let isResults: Bool
+                if bytes.starts(with: Data("FTAG".utf8)) {
+                    isResults = false
+                } else {
+                    let object = try StrictJSON.decode(bytes).object()
+                    isResults = try object["format"]?.string() == "ft-phone-key-enrollment-journal"
+                }
+                if dedicatedResults || isResults {
+                    // A recognized, malformed report always stays a report
+                    // error; it can never fall through to workspace admission.
+                    let journal = try WorkspaceKeyEnrollmentJournal(data: bytes)
+                    guard !showRestore, credentialImport == nil else {
+                        message = "Finish Offline Restore or the current key import, then open these enrollment results again."
+                        return
+                    }
+                    enrollmentResults = LocalEnrollmentResults(bytes: bytes, journal: journal,
+                        presentingWorkspaceID: presenter, preferredWorkspaceID: nil, epoch: ticket)
+                } else {
+                    documentInspection = nil
+                    importWorkspaceFile(url, bytes: bytes)
+                }
+            } catch {
+                guard documentInspection?.id == id else { return }
+                if Task.isCancelled || !active || epoch != ticket {
+                    documentRetryURL = url
+                    message = "Opening the selected file was interrupted. Choose Retry File to read it again, or cancel this selection. No results or workspace were admitted."
+                    return
+                }
+                message = "The selected file could not be opened. Enrollment results must be the complete JSON saved by FrankenTerm Export. \(error.localizedDescription)"
+            }
+        }
+        documentInspection = (id, task)
+    }
+
+    private func importWorkspaceFile(_ url: URL, bytes: Data? = nil) {
+        guard !busy else { return }
         scannedCode = nil
         if !OpticalRecordingLimits.accepts(url) { stopSavingScanProgress() }
-        pendingImport = PendingFileImport(url: url)
+        pendingImport = PendingFileImport(url: url, bytes: bytes)
         guard active, restore != nil else {
             if !bootstrapStarted { Task { await bootstrap() } }
             return
@@ -2015,9 +2317,9 @@ final class MobileWorkspaceModel {
                     self.markPendingImportInterrupted(selected.id)
                     return
                 }
-                let bytes = try await Task.detached(priority: .userInitiated) {
-                    try SelectedLocalFile.read(selected.url, limit: FTLimit.envelope)
-                }.value
+                let bytes: Data
+                if let inspected = selected.bytes { bytes = inspected }
+                else { bytes = try await Self.readSelectedDocument(selected.url, limit: FTLimit.envelope) }
                 guard self.active, self.epoch == ticket, self.pendingImport?.id == selected.id else {
                     self.markPendingImportInterrupted(selected.id)
                     return
@@ -2225,7 +2527,7 @@ struct MobileWorkspaceRoot: View {
                     ToolbarItem(placement: .primaryAction) {
                         Menu {
                             Button { model.requestCamera() } label: { Label("Scan My Mac", systemImage: "qrcode.viewfinder") }
-                            Button { chooseFile = true } label: { Label("Open a Workspace File", systemImage: "doc") }
+                            Button { chooseFile = true } label: { Label("Open a Workspace or Results File", systemImage: "doc") }
                             Button { model.requestRecipient() } label: {
                                 Label("Encrypt Only for This Phone", systemImage: "lock.iphone")
                             }.disabled(model.busy || ![.idle, .complete].contains(model.state?.phase ?? .idle))
@@ -2274,7 +2576,16 @@ struct MobileWorkspaceRoot: View {
             }
         }
         .onChange(of: scenePhase) { _, phase in model.setScenePhase(phase) }
-        .onOpenURL { model.importFile($0) }
+        .onOpenURL { showIncludedMac = false; model.importFile($0) }
+        .sheet(item: Binding(get: {
+            model.enrollmentResults.flatMap { $0.presentingWorkspaceID == nil ? $0 : nil }
+        }, set: { value in
+            if value == nil, let report = model.enrollmentResults, report.presentingWorkspaceID == nil {
+                model.cancelEnrollmentResults(report.id)
+            }
+        })) { report in
+            WorkspaceEnrollmentResultsSheet(model: model, report: report)
+        }
         .sheet(isPresented: Binding(get: { model.showRestore }, set: { model.setRestoreVisible($0) })) {
             OfflineRestoreSheet(model: model)
         }
@@ -2295,7 +2606,10 @@ struct MobileWorkspaceRoot: View {
             }
         }
         .alert("FrankenTerm", isPresented: Binding(get: { !model.showRestore && model.message != nil }, set: { if !$0 { model.message = nil } })) {
-            Button("OK") { model.message = nil }
+            if model.canRetryDocument {
+                Button("Retry File") { model.retrySelectedDocument() }.disabled(model.busy || !model.active)
+                Button("Cancel File", role: .cancel) { model.discardSelectedDocument() }
+            } else { Button("OK") { model.message = nil } }
         } message: { Text(verbatim: model.message ?? "") }
     }
 
@@ -3456,6 +3770,236 @@ private struct PhoneKeyEnrollmentDocument: FileDocument {
 }
 
 @MainActor
+private struct WorkspaceEnrollmentResultsSheet: View {
+    @Bindable var model: MobileWorkspaceModel
+    @Bindable var report: LocalEnrollmentResults
+    @State private var selectedRoutes = Set<String>()
+    @State private var comparedFingerprint = false
+    @State private var approval: LocalDeviceKeyReview?
+
+    private var canChoose: Bool { !model.busy && model.enrollmentResultsAreCurrent(report) }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("Phone Key") {
+                    Text(verbatim: report.key.fingerprint).font(.system(.callout, design: .monospaced))
+                        .textSelection(.enabled)
+                    Text(verbatim: report.key.algorithm).font(.caption).foregroundStyle(.secondary)
+                    Text(verbatim: "Request: " + report.requestID).font(.caption).textSelection(.enabled)
+                    Text("Compare this fingerprint with the phone key and the results shown on your Mac. This public report may be stale or edited. It records observations of server key files; it does not prove that this phone can sign in.")
+                        .font(.callout)
+                }
+                if let message = report.message {
+                    Section(report.isFinished ? "Saved-State Result" : "Review Status") {
+                        Text(verbatim: message)
+                    }
+                }
+                if report.isApplying {
+                    Section {
+                        ProgressView("Disconnecting and saving selected routes…")
+                        Text("The operation retains ownership until session cleanup and saved-state reconciliation finish.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                } else if let review = report.review {
+                    Section {
+                        Text(verbatim: review.workspaceName).font(.headline)
+                        Text("No route is selected automatically. Select each account that should use this phone key. A route may also be used as a jump host; all of its current paths must have a suitable positive result.")
+                            .font(.callout)
+                    } header: { Text("Current Workspace") }
+                    if review.routes.isEmpty {
+                        Section { Text("This workspace has no SSH routes that can be reviewed from these results.") }
+                    }
+                    ForEach(review.routes) { route in
+                        Section { routeRow(route, key: review.key) }
+                    }
+                    if !review.unmatchedObservations.isEmpty {
+                        Section {
+                            ForEach(review.unmatchedObservations) { observation in
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Text(verbatim: Self.account(observation.target)).font(.headline)
+                                    observationRow(observation)
+                                    if let scope = observation.target.routeScope {
+                                        Text("Saved path identifier; no matching current path")
+                                            .font(.caption).foregroundStyle(.secondary)
+                                        Text(verbatim: scope).font(.system(.caption2, design: .monospaced))
+                                            .textSelection(.enabled)
+                                    } else {
+                                        Text("Direct account without a matching current workspace path")
+                                            .font(.caption).foregroundStyle(.secondary)
+                                    }
+                                }.padding(.vertical, 6)
+                            }
+                        } header: { Text("Unmatched Report Accounts") }
+                        footer: { Text("These entries cannot select a route. The report does not provide authority to add a host, trust alias, or jump path to this workspace.") }
+                    }
+                    Section {
+                        Toggle("I compared the fingerprint and reviewed the selected accounts and paths", isOn: $comparedFingerprint)
+                            .disabled(!canChoose)
+                            .accessibilityIdentifier("keys.enrollment.fingerprint-confirmed")
+                        Button("Review \(selectedRoutes.count) Selected Routes…") {
+                            approval = model.reviewEnrollmentKeyChange(report, routeIDs: selectedRoutes,
+                                fingerprintConfirmed: comparedFingerprint)
+                        }.disabled(!canChoose || !comparedFingerprint || selectedRoutes.isEmpty)
+                            .accessibilityIdentifier("keys.enrollment.review-selected")
+                    } footer: {
+                        Text("Applying the selection saves every selected route together, disconnects this workspace's sessions, and leaves it offline until a fresh Connect. Opening or reviewing results never signs in or edits a server.")
+                    }
+                } else if !report.isFinished {
+                    workspaceChoices
+                }
+            }
+            .navigationTitle("Enrollment Results").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(report.isFinished ? "Done" : "Cancel") { model.cancelEnrollmentResults(report.id) }
+                        .disabled(report.isApplying)
+                }
+            }
+        }
+        .privacySensitive()
+        .interactiveDismissDisabled(report.isApplying)
+        .task(id: report.id) {
+            let candidates = model.enrollmentWorkspaces(for: report)
+            if candidates.count == 1, let candidate = candidates.first, report.review == nil {
+                model.prepareEnrollmentResults(report, workspaceID: candidate.id)
+            }
+        }
+        .onChange(of: report.review?.id) { _, _ in clearSelection() }
+        .onChange(of: report.isFinished) { _, _ in clearSelection() }
+        .onChange(of: model.active) { _, active in if !active { clearSelection() } }
+        .sheet(item: $approval) { review in
+            NavigationStack {
+                ScrollView {
+                    Text(verbatim: review.explanation).frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled).padding()
+                }
+                .navigationTitle(review.title).navigationBarTitleDisplayMode(.inline)
+                .safeAreaInset(edge: .bottom) {
+                    Button(review.confirmationTitle) {
+                        approval = nil
+                        model.performDeviceKeyChange(review)
+                    }.buttonStyle(.borderedProminent).disabled(!canChoose).padding()
+                }
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Cancel") { approval = nil }
+                    }
+                }
+            }.privacySensitive()
+        }
+    }
+
+    @ViewBuilder private var workspaceChoices: some View {
+        let candidates = model.enrollmentWorkspaces(for: report)
+        Section("Choose a Saved Workspace") {
+            if model.busy {
+                ProgressView("Reviewing saved key and route policies…")
+            } else if candidates.isEmpty {
+                Text("The exact generated phone key in this report is not saved in this workspace. Open results for a key created on this phone. A matching fingerprint alone does not import or replace a private key.")
+            } else {
+                ForEach(candidates) { saved in
+                    Button {
+                        clearSelection()
+                        model.prepareEnrollmentResults(report, workspaceID: saved.id)
+                    } label: {
+                        Text(verbatim: (try? saved.importedDocument().name) ?? saved.id.uuidString)
+                    }
+                }
+            }
+        }
+    }
+
+    private func routeRow(_ route: WorkspaceKeyEnrollmentReportReview.Route, key: WorkspaceDeviceKey) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Toggle(isOn: Binding(get: { selectedRoutes.contains(route.id) }, set: { selected in
+                guard canChoose, route.canAssign else { return }
+                approval = nil; comparedFingerprint = false
+                if selected { selectedRoutes.insert(route.id) } else { selectedRoutes.remove(route.id) }
+            })) {
+                Text(verbatim: Self.account(route.account)).font(.headline)
+            }.disabled(!canChoose || !route.canAssign)
+                .accessibilityIdentifier("keys.enrollment.route.\(route.id)")
+            Text(verbatim: "Route: " + route.id).font(.caption).foregroundStyle(.secondary)
+            Text(verbatim: "Used by: " + route.machineNames.joined(separator: ", ")).font(.caption)
+            if route.assignedCredentialID == key.id {
+                Text("This phone key is already selected for this route").font(.caption)
+            } else if let assigned = route.assignedCredentialID {
+                Text(verbatim: "Current phone-key choice: " + assigned).font(.caption)
+            } else {
+                Text("Currently uses imported key choices").font(.caption)
+            }
+            ForEach(route.issues, id: \.self) { issue in
+                Label(issue.message, systemImage: "exclamationmark.triangle").font(.callout)
+            }
+            ForEach(route.paths) { path in pathRow(path) }
+        }.padding(.vertical, 6)
+    }
+
+    private func pathRow(_ path: WorkspaceKeyEnrollmentReportReview.Path) -> some View {
+        let accounts = path.plan.jumpHosts + [path.plan.destination]
+        return VStack(alignment: .leading, spacing: 6) {
+            Text(path.plan.jumpHosts.isEmpty ? "Direct Path" : "Ordered Path").font(.subheadline.bold())
+            ForEach(Array(accounts.enumerated()), id: \.offset) { index, host in
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(verbatim: "\(index + 1). " + Self.account(host.target)
+                        + (index == accounts.count - 1 ? " · this account" : " · jump host"))
+                        .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                    if let alias = host.hostKeyAlias {
+                        Text(verbatim: "Host-key alias: " + alias).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            if let observation = path.observation { observationRow(observation) }
+            else { Label("No observation for this exact path", systemImage: "questionmark.circle").font(.callout) }
+        }.padding(.vertical, 6)
+    }
+
+    private func observationRow(_ observation: WorkspaceKeyEnrollmentReportReview.Observation) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(verbatim: Self.state(observation.state)).font(.callout.bold())
+            Text(verbatim: "Last observation: " + Self.action(observation.action)
+                + " · Last requested change: " + Self.action(observation.lastMutation))
+                .font(.caption).foregroundStyle(.secondary)
+            if let detail = observation.detail, !detail.isEmpty {
+                Text(verbatim: "Reported detail: " + detail).font(.caption).textSelection(.enabled)
+            }
+        }
+    }
+
+    private func clearSelection() {
+        selectedRoutes.removeAll(); comparedFingerprint = false; approval = nil
+    }
+
+    private static func account(_ target: WorkspaceKeyEnrollmentTarget) -> String {
+        LocalHostKeyCheckReview.endpoint(host: target.host, port: target.port, user: target.user)
+    }
+
+    private static func action(_ value: WorkspaceKeyEnrollmentAction?) -> String {
+        switch value {
+        case .inspect?: "Inspect"
+        case .install?: "Install"
+        case .remove?: "Remove"
+        case nil: "Not recorded"
+        }
+    }
+
+    private static func state(_ value: WorkspaceKeyEnrollmentState?) -> String {
+        switch value {
+        case .installed?: "Unrestricted entry reported installed"
+        case .alreadyPresent?: "Unrestricted entry reported present"
+        case .absent?: "Key reported absent"
+        case .restricted?: "Restricted entry reported; cannot select from this result"
+        case .blocked?: "Inspection or change blocked"
+        case .uncertain?: "Outcome uncertain; inspect again on the Mac"
+        case .removed?: "This enrollment's entry removed; no other live copy reported"
+        case .stillAuthorized?: "Another live copy remains; its permissions are not confirmed"
+        case nil: "No result recorded"
+        }
+    }
+}
+
+@MainActor
 private struct WorkspaceKeysSheet: View {
     let workspaceID: UUID
     @Bindable var model: MobileWorkspaceModel
@@ -3468,6 +4012,8 @@ private struct WorkspaceKeysSheet: View {
     @State private var copiedPhoneKeyID: String?
     @State private var enrollmentDocument: PhoneKeyEnrollmentDocument?
     @State private var exportingEnrollment = false
+    @State private var enrollmentFile: LocalEnrollmentFileReview?
+    @State private var choosingEnrollmentFile = false
 
     private var saved: InstalledWorkspace? {
         model.workspaces.first(where: { $0.id == workspaceID })
@@ -3504,10 +4050,16 @@ private struct WorkspaceKeysSheet: View {
                                         deviceReview = model.reviewDeviceKeyChange(.generate, workspaceID: workspaceID)
                                     }.disabled(saved.deviceKeys.count >= 16 || model.credentialImport != nil)
                                         .accessibilityIdentifier("keys.phone.create")
+                                    Button("Open Enrollment Results…", systemImage: "doc.badge.arrow.up") {
+                                        reviewed = nil; hostReview = nil; hostKeyCheck = nil; deviceReview = nil
+                                        enrollmentFile = model.reviewEnrollmentFile(workspaceID: workspaceID)
+                                        choosingEnrollmentFile = enrollmentFile != nil
+                                    }.disabled(saved.deviceKeys.isEmpty || model.credentialImport != nil)
+                                        .accessibilityIdentifier("keys.enrollment.open-results")
                                 } header: {
                                     Text("Phone Keys")
                                 } footer: {
-                                    Text("A separate phone identity can be revoked on a server without revoking your Mac's key. Export its public enrollment request to FrankenTerm Export on your Mac, compare the fingerprint, and authorize selected server accounts before choosing routes. Private keys stay in protected storage on this device. Up to 16 phone keys can be retained in a workspace.")
+                                    Text("A separate phone identity can be revoked on a server without revoking your Mac's key. Export its public enrollment request to FrankenTerm Export on your Mac, compare the fingerprint, and authorize selected server accounts. Use Save Results on the Mac, open that JSON here, then review and select the routes to use. Private keys stay in protected storage on this device. Up to 16 phone keys can be retained in a workspace.")
                                 }
                             }
                             Section {
@@ -3605,6 +4157,30 @@ private struct WorkspaceKeysSheet: View {
         .sheet(item: $phoneKey) { choice in
             WorkspaceDeviceKeyRoutesSheet(workspaceID: workspaceID, credentialID: choice.id, model: model)
         }
+        .sheet(item: Binding(get: {
+            model.enrollmentResults.flatMap { $0.presentingWorkspaceID == workspaceID ? $0 : nil }
+        }, set: { value in
+            if value == nil, let report = model.enrollmentResults, report.presentingWorkspaceID == workspaceID {
+                model.cancelEnrollmentResults(report.id)
+            }
+        })) { report in
+            WorkspaceEnrollmentResultsSheet(model: model, report: report)
+        }
+        .fileImporter(isPresented: $choosingEnrollmentFile, allowedContentTypes: [.json, .data],
+                      allowsMultipleSelection: false) { result in
+            guard let reviewed = enrollmentFile else { return }
+            enrollmentFile = nil
+            switch result {
+            case .success(let urls):
+                if let url = urls.first { model.importEnrollmentFile(url, reviewed: reviewed) }
+                else { model.cancelEnrollmentFile(reviewed) }
+            case .failure(let error):
+                model.cancelEnrollmentFile(reviewed)
+                if (error as? CocoaError)?.code != .userCancelled, model.active {
+                    model.credentialMessage = "Enrollment results could not be selected. Open the JSON saved by FrankenTerm Export again."
+                }
+            }
+        }
         .fileExporter(isPresented: $exportingEnrollment, document: enrollmentDocument,
                       contentType: .data, defaultFilename: "FrankenTerm-Phone-Key.ftkeyrequest") { result in
             let keyID = enrollmentDocument?.keyID
@@ -3671,7 +4247,12 @@ private struct WorkspaceKeysSheet: View {
         .onChange(of: model.active) { _, active in
             if !active {
                 reviewed = nil; hostReview = nil; hostKeyCheck = nil; deviceReview = nil; copiedPhoneKeyID = nil
+                enrollmentFile = nil; choosingEnrollmentFile = false
             }
+        }
+        .onChange(of: saved?.revision) { _, _ in
+            if let enrollmentFile { model.cancelEnrollmentFile(enrollmentFile) }
+            enrollmentFile = nil; choosingEnrollmentFile = false
         }
         .onDisappear {
             reviewed = nil; hostReview = nil; hostKeyCheck = nil; deviceReview = nil; copiedPhoneKeyID = nil
@@ -4087,7 +4668,10 @@ private struct MachineWorkspaceView: View {
             }
         }.tabViewStyle(.page(indexDisplayMode: .always))
             .background(Color(ftHex: shownBackground).ignoresSafeArea())
-            .sheet(isPresented: $showKeys, onDismiss: { model.cancelHostKeyVerification() }) {
+            .sheet(isPresented: $showKeys, onDismiss: {
+                model.cancelHostKeyVerification()
+                model.endKeysPresentation(workspaceID: workspaceID)
+            }) {
                 WorkspaceKeysSheet(workspaceID: workspaceID, model: model)
             }
             .sheet(item: $orderReview) { review in
@@ -4127,7 +4711,10 @@ private struct MachineWorkspaceView: View {
             }
             .toolbar {
                 if !document.credentials.isEmpty || !document.hostTrust.isEmpty {
-                    Button("Keys", systemImage: "key") { showKeys = true }.disabled(model.busy)
+                    Button("Keys", systemImage: "key") {
+                        model.beginKeysPresentation(workspaceID: workspaceID)
+                        showKeys = true
+                    }.disabled(model.busy)
                 }
                 Menu("Groups", systemImage: "rectangle.3.group") {
                     ForEach(document.groups) { group in
