@@ -1839,12 +1839,9 @@ public actor WorkspaceStore {
                 selected = state
             }
             guard selected.isLocallyReady, selected.usableCredentialIDs.contains(credentialID) else { throw SSHAuthenticationError.denied }
-            let decision = try document.verifyHostKey(forRouteID: routeID, presented: presentedHostKey,
-                reviewedTrustIDs: Set(document.hostTrust.map(\.id)), support: support,
-                revokedHostKeysByTrustScope: hostRevocations(workspaceID, document: document, catalog: catalog),
-                requiredHostCapabilitiesByTrustScope: hostRequirements(workspaceID, catalog: catalog))
-            guard decision != .pinMismatch else { throw SSHAuthenticationError.hostKeyMismatch }
-            guard decision == .trustedPin else { throw SSHAuthenticationError.denied }
+            try requireSSHHostTrust(saved: saved, document: document, route: route,
+                presentedHostKey: presentedHostKey, support: support, catalog: catalog,
+                transitForRouteID: transitForRouteID)
             return .init(storeOwner: sshAuthorizationOwner, account: binding.account,
                 workspaceID: workspaceID, workspaceRevision: saved.revision, routeID: routeID,
                 credentialID: credentialID, host: route.host, port: route.port, user: route.user,
@@ -1958,14 +1955,42 @@ public actor WorkspaceStore {
                 selected = state
             }
             guard selected.isLocallyReady else { throw SSHAuthenticationError.denied }
-            let decision = try document.verifyHostKey(forRouteID: routeID, presented: presentedHostKey,
-                reviewedTrustIDs: Set(document.hostTrust.map(\.id)), support: support,
-                revokedHostKeysByTrustScope: hostRevocations(workspaceID, document: document, catalog: catalog),
-                requiredHostCapabilitiesByTrustScope: hostRequirements(workspaceID, catalog: catalog))
-            guard decision != .pinMismatch else { throw SSHAuthenticationError.hostKeyMismatch }
-            guard decision == .trustedPin else { throw SSHAuthenticationError.denied }
+            try requireSSHHostTrust(saved: saved, document: document, route: route,
+                presentedHostKey: presentedHostKey, support: support, catalog: catalog,
+                transitForRouteID: transitForRouteID)
             return (route, saved.revision)
         }
+    }
+
+    /// Classify the actual handshake key and capture usable expected pins under
+    /// the caller's existing catalog lease. A later read could describe a
+    /// different revision or miss a revocation, so no second snapshot is used.
+    private func requireSSHHostTrust(saved: InstalledWorkspace, document: WorkspaceDocument,
+        route: WorkspaceDocument.Route, presentedHostKey: WorkspaceDocument.HostKey,
+        support: WorkspaceDocument.RouteSupport, catalog: Catalog, transitForRouteID: String?) throws {
+        let reviewed = Set(document.hostTrust.map(\.id))
+        let revoked = hostRevocations(saved.id, document: document, catalog: catalog)
+        let required = hostRequirements(saved.id, catalog: catalog)
+        let decision = try document.verifyHostKey(forRouteID: route.id, presented: presentedHostKey,
+            reviewedTrustIDs: reviewed, support: support, revokedHostKeysByTrustScope: revoked,
+            requiredHostCapabilitiesByTrustScope: required)
+        if decision == .pinMismatch {
+            guard let trust = document.hostTrust.first(where: { $0.id == route.trustID }) else {
+                throw SSHAuthenticationError.denied
+            }
+            let expected = try trust.pins.filter {
+                try document.verifyHostKey(forRouteID: route.id, presented: $0,
+                    reviewedTrustIDs: reviewed, support: support, revokedHostKeysByTrustScope: revoked,
+                    requiredHostCapabilitiesByTrustScope: required) == .trustedPin
+            }
+            // Missing or unusable trust is a policy refusal, not a changed-key
+            // review. The preceding readiness check normally rules this out.
+            guard !expected.isEmpty else { throw SSHAuthenticationError.denied }
+            throw WorkspaceSSHHostKeyMismatch(workspaceID: saved.id, expectedRevision: saved.revision,
+                route: route, transitForRouteID: transitForRouteID, expectedKeys: expected,
+                presentedKey: presentedHostKey)
+        }
+        guard decision == .trustedPin else { throw SSHAuthenticationError.denied }
     }
 
     public func validateSSHPasswordAuthentication(_ authorization: WorkspaceSSHPasswordAuthorization,

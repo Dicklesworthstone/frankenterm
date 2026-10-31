@@ -166,7 +166,8 @@ public actor WorkspaceNativeSSHConnection {
                 destination: endpoint, destinationRouteID: routeID, workspaceID: workspaceID,
                 revision: expectedRevision, store: store, broker: broker, foreground: foreground,
                 passwordPrompter: passwordPrompter, keyboardInteractivePrompter: keyboardInteractivePrompter, lease: lease,
-                connectionTimeout: connectionTimeout, authenticationTimeout: authenticationTimeout, selection: selection)
+                connectionTimeout: connectionTimeout, authenticationTimeout: authenticationTimeout,
+                selection: selection, machineID: machineID)
             session = path.session; promptedHop = path.usedPrompt
         } else {
             session = try await NativeSSHConnector.connect(to: endpoint, timeout: connectionTimeout, networkLifetime: lease)
@@ -199,6 +200,17 @@ public actor WorkspaceNativeSSHConnection {
             await session.close()
             // Keep exclusion until cancellation/readiness teardown has joined.
             withExtendedLifetime(lease) {}
+            if let mismatch = error as? WorkspaceSSHHostKeyMismatch {
+                try Task.checkCancellation()
+                try await broker.validateForeground(foreground)
+                try Task.checkCancellation()
+                guard mismatch.workspaceID == workspaceID, mismatch.expectedRevision == expectedRevision,
+                      mismatch.routeID == routeID, mismatch.transitForRouteID == nil else {
+                    throw SSHAuthenticationError.denied
+                }
+                throw try WorkspaceSSHConnectionHostKeyMismatch(mismatch, machineID: machineID,
+                    destinationRouteID: routeID)
+            }
             if (error as? NativeSSHError)?.isCredentialRefused == true, promptedHop {
                 throw WorkspaceSSHConnectionError.promptedHopRetryRequired
             }
@@ -217,7 +229,8 @@ public actor WorkspaceNativeSSHConnection {
         passwordPrompter: (any WorkspaceSSHPasswordPrompting)?,
         keyboardInteractivePrompter: (any WorkspaceSSHKeyboardInteractivePrompting)?,
         lease: WorkspaceNetworkLease, connectionTimeout: Duration, authenticationTimeout: Duration,
-        hostKeyProbe: WorkspaceHostKeyProbe? = nil, selection: WorkspaceSSHConnectionSelection? = nil)
+        hostKeyProbe: WorkspaceHostKeyProbe? = nil, selection: WorkspaceSSHConnectionSelection? = nil,
+        machineID: String? = nil)
         async throws -> (session: NativeSSHSession, usedPrompt: Bool) {
         var hadCredentialRefusal = false
         var usedPrompt = false
@@ -314,6 +327,16 @@ public actor WorkspaceNativeSSHConnection {
                     await session?.close()
                     try Task.checkCancellation()
                     try await broker.validateForeground(foreground)
+                    if let mismatch = error as? WorkspaceSSHHostKeyMismatch, let failed = pending,
+                       let machineID {
+                        guard mismatch.workspaceID == workspaceID, mismatch.expectedRevision == revision,
+                              mismatch.routeID == hops[failed.index].id,
+                              mismatch.transitForRouteID == destinationRouteID else {
+                            throw SSHAuthenticationError.denied
+                        }
+                        throw try WorkspaceSSHConnectionHostKeyMismatch(mismatch, machineID: machineID,
+                            destinationRouteID: destinationRouteID, hopIndex: failed.index)
+                    }
                     if !usedPrompt, (error as? NativeSSHError)?.isCredentialRefused == true, var refused = pending {
                         hadCredentialRefusal = true
                         if try refused.plan.failed(.credentialRefused, attempt: refused.attempt) != nil {
@@ -326,6 +349,9 @@ public actor WorkspaceNativeSSHConnection {
             }
         } catch {
             if Task.isCancelled { throw CancellationError() }
+            // Preserve the actual refused peer after the complete chain has
+            // closed. This terminal outcome never enters credential fallback.
+            if let mismatch = error as? WorkspaceSSHConnectionHostKeyMismatch { throw mismatch }
             // No answer from the hop stays that: the caller tries the next
             // route and says the jump host could not be reached.
             if !hadCredentialRefusal, !usedPrompt, let failure = error as? NativeSSHError, failure.isUnreachable { throw failure }
