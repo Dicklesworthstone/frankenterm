@@ -230,4 +230,100 @@ final class MachineThemesTests: XCTestCase {
         XCTAssertEqual(MachineThemes.hueDistance("#FF0010", "#FF1000"), 7.5, accuracy: 0.5)
         XCTAssertEqual(MachineThemes.hueDistance("#808080", "#FF0000"), 180)
     }
+
+    func testColorChoicesPreserveEachMachinesExportedFont() throws {
+        let document = try export { themes in
+            themes[0]["font"] = ["family": "Operator Mono", "face": "Book", "point_size": 19,
+                                   "fallbacks": ["CJK Mono"], "variations": ["wght": 450]] as [String: Any]
+        }
+        let machine = try XCTUnwrap(document.machines.first { $0.themeID == document.themes[0].id })
+        let catalog = try catalog()
+        let original = try XCTUnwrap(document.themes.first { $0.id == machine.themeID }?.font)
+        for automatic in [false, true] {
+            let themes = MachineThemes(document: document, catalog: catalog,
+                choices: [machine.id: .init(name: "Dracula", catalog: true, automatic: automatic)])
+            let chosen = try XCTUnwrap(themes.theme(for: machine))
+            XCTAssertEqual(chosen.background, catalog.theme(named: "Dracula")?.background)
+            XCTAssertEqual(chosen.font, original, "choosing colors cannot discard exported typography")
+        }
+    }
+
+    func testInstalledFontAndOrderedFallbacksResolveWithoutChangingTheDescriptor() throws {
+        let document = try export { themes in
+            themes[0]["font"] = ["family": "Operator Mono", "face": "Book", "point_size": 24,
+                                   "fallbacks": ["CJK Mono", "CJKMono-Regular", "Symbols Nerd Font Mono"]] as [String: Any]
+        }
+        let request = try XCTUnwrap(document.themes[0].font)
+        let primary = TerminalFontResolution.Face(postScriptName: "OperatorMono-Book", familyName: "Operator Mono")
+        let cjk = TerminalFontResolution.Face(postScriptName: "CJKMono-Regular", familyName: "CJK Mono")
+        let symbols = TerminalFontResolution.Face(postScriptName: "SymbolsNFM", familyName: "Symbols Nerd Font Mono")
+        let resolution = TerminalFontResolution.resolve(request,
+            defaultFace: .init(postScriptName: "PragmasevkaNF", familyName: "Pragmasevka NF"),
+            symbolFace: symbols) { family, face in
+                if family == "Operator Mono", face == "Book" { return primary }
+                if ["CJK Mono", "CJKMono-Regular"].contains(family) { return cjk }
+                if family == "Symbols Nerd Font Mono" { return symbols }
+                return nil
+            }
+        XCTAssertEqual(resolution.primary, primary)
+        XCTAssertEqual(resolution.fallbackNames, ["CJKMono-Regular", "SymbolsNFM"])
+        XCTAssertTrue(resolution.notices.isEmpty)
+        XCTAssertEqual(request.pointSize, 24, "resolution preserves the export; native size is a separate local preference")
+    }
+
+    func testUnavailableFontReportsItsActualSubstitutionAndInactiveSettings() throws {
+        let request = WorkspaceDocument.Font(family: "Unavailable Mono", face: nil, pointSize: nil,
+            fallbacks: ["Missing Symbols"], variations: ["wght": 500, "wdth": 80])
+        let fallback = TerminalFontResolution.Face(postScriptName: "PragmasevkaNF", familyName: "Pragmasevka NF")
+        let resolution = TerminalFontResolution.resolve(request, defaultFace: fallback,
+            symbolFace: .init(postScriptName: "SymbolsNFM", familyName: "Symbols Nerd Font Mono")) { _, _ in nil }
+        XCTAssertEqual(resolution.primary, fallback)
+        XCTAssertEqual(resolution.fallbackNames, ["SymbolsNFM"])
+        XCTAssertEqual(resolution.notices.count, 3)
+        XCTAssertTrue(resolution.notices[0].contains("Unavailable Mono"))
+        XCTAssertTrue(resolution.notices[0].contains("Pragmasevka NF"))
+        XCTAssertTrue(resolution.notices[1].contains("Missing Symbols"))
+        XCTAssertTrue(resolution.notices[2].contains("wdth, wght"))
+    }
+
+    func testMissingFaceUsesTheInstalledFamilyAndDisclosesTheDifference() {
+        let request = WorkspaceDocument.Font(family: "Installed Mono", face: "Unavailable Light", pointSize: nil,
+                                              fallbacks: [], variations: [:])
+        let regular = TerminalFontResolution.Face(postScriptName: "InstalledMono-Regular", familyName: "Installed Mono")
+        let resolution = TerminalFontResolution.resolve(request,
+            defaultFace: .init(postScriptName: "PragmasevkaNF", familyName: "Pragmasevka NF"),
+            symbolFace: nil) { family, face in
+                family == "Installed Mono" && face == nil ? regular : nil
+            }
+        XCTAssertEqual(resolution.primary, regular)
+        XCTAssertEqual(resolution.notices.count, 1)
+        XCTAssertTrue(resolution.notices[0].contains("Unavailable Light"))
+        XCTAssertTrue(resolution.notices[0].contains(regular.postScriptName))
+    }
+
+    func testAllSixteenManifestFallbacksFitBesideTheBundledSymbols() throws {
+        let names = (0..<16).map { "Fallback-\($0)" }
+        let document = try export { themes in
+            themes[0]["font"] = ["family": "Primary", "fallbacks": names] as [String: Any]
+        }
+        let primary = TerminalFontResolution.Face(postScriptName: "Primary", familyName: "Primary")
+        let resolution = TerminalFontResolution.resolve(try XCTUnwrap(document.themes[0].font),
+            defaultFace: primary, symbolFace: .init(postScriptName: "SymbolsNFM", familyName: "Symbols")) { family, _ in
+                .init(postScriptName: family, familyName: family)
+            }
+        XCTAssertEqual(resolution.fallbackNames, names + ["SymbolsNFM"])
+        XCTAssertEqual(resolution.fallbackNames.count, TerminalFontResolution.maximumFallbacks)
+        XCTAssertTrue(resolution.notices.isEmpty)
+    }
+
+    func testUnspecifiedFontUsesTheDeviceDefaultWithoutASubstitutionNotice() {
+        let fallback = TerminalFontResolution.Face(postScriptName: "Menlo-Regular", familyName: "Menlo")
+        let resolution = TerminalFontResolution.resolve(nil, defaultFace: fallback, symbolFace: nil) { _, _ in
+            XCTFail("an unspecified font should not enumerate installed fonts")
+            return nil
+        }
+        XCTAssertEqual(resolution.primary, fallback)
+        XCTAssertTrue(resolution.fallbackNames.isEmpty)
+        XCTAssertTrue(resolution.notices.isEmpty)
+    }
 }

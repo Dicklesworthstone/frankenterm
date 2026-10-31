@@ -1377,20 +1377,40 @@ public final class NativeTerminalView: UIView {
     /// `fontSizes`); the owner applies the cells that now fit, as on rotation.
     public func setFontPointSize(_ size: Double) { applyFontSize(size, notify: false) }
 
+    /// An appearance change uses the same canonical revision barrier as zoom.
+    /// A color-theme switch cannot leave caret/selection geometry bound to the
+    /// old face, or reset the user's phone-local point size.
+    public func setFont(_ font: TerminalFontResolution) {
+        guard !retired else { return }
+        var configuration = renderer.configuration
+        guard configuration.fontName != font.primary.postScriptName
+                || configuration.fallbackFontNames != font.fallbackNames else { return }
+        configuration.fontName = font.primary.postScriptName
+        configuration.fallbackFontNames = font.fallbackNames
+        applyTypography(configuration)
+    }
+
     private func applyFontSize(_ size: Double, notify: Bool) {
         guard !retired else { return }
+        guard size.isFinite else { onFailure?(TerminalRenderError.capacity); return }
         let clamped = Self.clampedFontSize(size)
         var configuration = renderer.configuration
         if configuration.fontPointSize != clamped {
-            clearSelection()
             configuration.fontPointSize = clamped
-            configuration.fontRevision += 1
-            do {
-                try renderer.updateConfiguration(configuration)
-                onFontRevision?(configuration.fontRevision)
-            } catch { onFailure?(error) }
+            applyTypography(configuration)
         }
         if notify { onFontSizeChange?(clamped) }
+    }
+
+    private func applyTypography(_ desired: NativeTerminalRenderConfiguration) {
+        var configuration = desired
+        guard configuration.fontRevision < UInt64.max else { onFailure?(TerminalRenderError.exhausted); return }
+        configuration.fontRevision += 1
+        do {
+            try renderer.updateConfiguration(configuration)
+            clearSelection()
+            onFontRevision?(configuration.fontRevision)
+        } catch { onFailure?(error) }
     }
 
     private func showSizeBadge(_ size: Double) {

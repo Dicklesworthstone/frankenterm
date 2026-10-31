@@ -33,6 +33,7 @@ private struct Snapshot {
 final class NativeTerminalRenderTests: XCTestCase {
     private var model: NativeTerminalModel?
     private var view: NativeTerminalRenderView?
+    private var renderedFontName: String?
     override func tearDown() async throws {
         view?.removeFromSuperview(); view = nil
         try? model?.close(); model = nil
@@ -61,7 +62,11 @@ final class NativeTerminalRenderTests: XCTestCase {
         let drawn = expectation(description: "a submitted Metal command buffer completed")
         drawn.assertForOverFulfill = false
         var failure: TerminalRenderError?, caret: NativeTerminalCaret?
-        view.onAppearance = { _, _ in drawn.fulfill() }
+        renderedFontName = nil
+        view.onAppearance = { [weak self] font, _ in
+            self?.renderedFontName = font.fontName
+            drawn.fulfill()
+        }
         view.onCaret = { caret = $0 }
         view.onFailure = { failure = $0 }
         // Apply after window attachment refreshes system policy and before the
@@ -109,6 +114,51 @@ final class NativeTerminalRenderTests: XCTestCase {
         XCTAssertGreaterThan(green, 200, "SGR 42 background cells were not drawn")
         XCTAssertGreaterThan(blue, 200, "SGR 44 background cells were not drawn")
         XCTAssertGreaterThan(light, 50, "default-foreground glyphs were not rasterized")
+    }
+
+    func testExportedFamilyAndFaceReachTheActualMetalGlyphFont() async throws {
+        let installed = try XCTUnwrap(UIFont(name: "PragmasevkaNF-Italic", size: 12))
+        let request = WorkspaceDocument.Font(family: installed.familyName, face: installed.fontName,
+                                            pointSize: 30, fallbacks: [], variations: [:])
+        let resolved = NativeTerminalFonts.resolve(request)
+        XCTAssertEqual(resolved.primary.postScriptName, installed.fontName)
+        XCTAssertTrue(resolved.notices.isEmpty)
+        var configuration = NativeTerminalRenderConfiguration()
+        configuration.fontName = resolved.primary.postScriptName
+        configuration.fallbackFontNames = resolved.fallbackNames
+        configuration.fontPointSize = 14
+        let (shot, _) = try await render("Machine-specific font: MWi 0123", name: "exported-machine-font",
+                                         configuration: configuration)
+        XCTAssertEqual(renderedFontName, installed.fontName, "the completed draw must use the requested face")
+        XCTAssertEqual(view?.configuration.fontPointSize, 14, "desktop point size does not replace phone zoom")
+        XCTAssertTrue((0..<shot.height).contains { y in (0..<shot.width).contains { shot.isLight($0, y) } })
+    }
+
+    func testUnavailableExportedFontUsesTheDisclosedBundledSubstitution() async throws {
+        let request = WorkspaceDocument.Font(family: "FrankenTerm-Missing-Font-7FC27D", face: nil,
+                                            pointSize: nil, fallbacks: [], variations: [:])
+        let resolved = NativeTerminalFonts.resolve(request)
+        XCTAssertEqual(resolved.primary.postScriptName, "PragmasevkaNF")
+        XCTAssertTrue(resolved.notices.contains { $0.contains(request.family) && $0.contains(resolved.primary.familyName) })
+        var configuration = NativeTerminalRenderConfiguration()
+        configuration.fontName = resolved.primary.postScriptName
+        configuration.fallbackFontNames = resolved.fallbackNames
+        _ = try await render("Readable installed fallback", name: "missing-machine-font", configuration: configuration)
+        XCTAssertEqual(renderedFontName, resolved.primary.postScriptName)
+    }
+
+    func testOrdinaryCellsKeepAnExplicitItalicBaseFace() async throws {
+        var configuration = NativeTerminalRenderConfiguration()
+        configuration.fontName = "PragmasevkaNF-Italic"
+        configuration.cursorBlink = false
+        let text = "\u{1b}[?25lMWi ff 0123"
+        let (plain, _) = try await render(text, name: "italic-base-ordinary-cells", configuration: configuration)
+        let (emphasized, _) = try await render("\u{1b}[3m" + text,
+            name: "italic-base-emphasized-cells", configuration: configuration)
+        XCTAssertEqual(plain.width, emphasized.width)
+        XCTAssertEqual(plain.height, emphasized.height)
+        XCTAssertEqual(plain.bytes, emphasized.bytes,
+            "ordinary cells in an italic base face must not silently become the regular face")
     }
 
     func testMemoryWarningReclaimsIdleCachesAndPreservesPendingTerminalOutput() async throws {

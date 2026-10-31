@@ -4663,6 +4663,17 @@ private struct MachineWorkspaceView: View {
                         }
                         HStack(spacing: 0) { ForEach(0..<16) { index in Color(ftHex: theme?.ansi[index] ?? "#000000") } }
                             .frame(height: 10).clipShape(Capsule()).accessibilityHidden(true)
+                        if let font = theme?.font {
+                            let resolution = NativeTerminalFonts.resolve(font)
+                            VStack(alignment: .leading, spacing: 6) {
+                                Label("Terminal font", systemImage: "textformat").font(.caption.bold())
+                                Text(verbatim: resolution.primary.familyName).font(.callout)
+                                Text("Uses the text size you choose on this phone.").font(.caption).opacity(0.75)
+                                ForEach(Array(resolution.notices.enumerated()), id: \.offset) { _, notice in
+                                    Text(verbatim: notice).font(.caption)
+                                }
+                            }.accessibilityIdentifier("machine.font.\(machine.id)")
+                        }
                         connectSection(machine, theme: theme)
                         VStack(alignment: .leading, spacing: 8) {
                             Toggle("Connect with Group", isOn: Binding(

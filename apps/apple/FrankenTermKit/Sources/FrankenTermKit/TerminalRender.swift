@@ -4,6 +4,58 @@ public enum TerminalRenderError: Error, Equatable, Sendable {
     case malformed, capacity, staleSource, staleFrame, unsupported, unavailable, exhausted
 }
 
+/// Resolves the portable font descriptor once, when a machine's appearance is
+/// selected. The platform supplies actual installed faces; an unknown family
+/// must never reach Core Text and silently become a proportional system font.
+/// Font files are neither downloaded nor imported with a workspace.
+public struct TerminalFontResolution: Equatable, Sendable {
+    public struct Face: Equatable, Sendable {
+        public let postScriptName: String, familyName: String
+        public init(postScriptName: String, familyName: String) {
+            self.postScriptName = postScriptName; self.familyName = familyName
+        }
+    }
+
+    /// Sixteen manifest fallbacks plus the app's bundled symbol face.
+    public static let maximumFallbacks = 17
+    public let primary: Face
+    public let fallbackNames: [String]
+    /// Shown in machine details, never emitted for individual frames or glyphs.
+    public let notices: [String]
+
+    public static func resolve(_ request: WorkspaceDocument.Font?, defaultFace: Face,
+                               symbolFace: Face?, lookup: (String, String?) -> Face?) -> Self {
+        var primary = defaultFace, notices: [String] = [], fallbacks: [String] = []
+        if let request {
+            if let requested = lookup(request.family, request.face) {
+                primary = requested
+            } else if let face = request.face, let family = lookup(request.family, nil) {
+                primary = family
+                notices.append("The \(face) face of \(request.family) is unavailable on this device. Using \(family.postScriptName).")
+            } else {
+                notices.append("\(request.family) is unavailable on this device. Using \(defaultFace.familyName).")
+            }
+            for name in request.fallbacks {
+                if let face = lookup(name, nil) {
+                    if face.postScriptName != primary.postScriptName, !fallbacks.contains(face.postScriptName) {
+                        fallbacks.append(face.postScriptName)
+                    }
+                } else {
+                    notices.append("The fallback font \(name) is unavailable on this device; the installed fallbacks and system fonts are used instead.")
+                }
+            }
+            if !request.variations.isEmpty {
+                notices.append("Custom font axes (\(request.variations.keys.sorted().joined(separator: ", "))) are preserved in the workspace. This device uses the selected face's default axes.")
+            }
+        }
+        if let symbolFace, symbolFace.postScriptName != primary.postScriptName,
+           !fallbacks.contains(symbolFace.postScriptName) {
+            fallbacks.append(symbolFace.postScriptName)
+        }
+        return .init(primary: primary, fallbackNames: fallbacks, notices: notices)
+    }
+}
+
 /// Limits apply before copying the input or allocating its decoded tables.
 public struct TerminalRenderLimits: Sendable {
     public var maximumFrameBytes = 8 * 1024 * 1024
