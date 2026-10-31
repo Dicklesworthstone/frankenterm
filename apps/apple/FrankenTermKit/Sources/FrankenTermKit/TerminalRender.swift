@@ -478,9 +478,18 @@ enum TerminalRenderPacking {
               value.cursorRow < value.rows, (1...2).contains(value.cursorWidth),
               value.cellSize.0 > 0, value.cellSize.1 > 0
         else { throw TerminalRenderError.capacity }
-        let scalars = [value.cellSize.0,value.cellSize.1,value.origin.0,value.origin.1,
+        let scalars = [value.cellSize.0,value.cellSize.1,
                        value.cursorThickness,value.underlinePosition,value.lineThickness,value.strikethroughPosition]
         guard scalars.allSatisfy({ $0.isFinite && abs($0) <= 32768 }) else { throw TerminalRenderError.malformed }
+        // Local pan can expose the last row of a tall bounded grid without
+        // enlarging its drawable. Only the origin admits that larger negative
+        // translation; other shader scalars retain their original bounds.
+        guard value.origin.0.isFinite, value.origin.1.isFinite,
+              value.origin.0 <= 32768, value.origin.1 <= 32768,
+              value.origin.0 >= -min(262144, Float(value.columns) * value.cellSize.0),
+              value.origin.1 >= -min(262144, Float(value.rows) * value.cellSize.1) else {
+            throw TerminalRenderError.malformed
+        }
         var bytes = [UInt8](repeating: 0, count: uniformBytes)
         u64(value.frame, into: &bytes, at: 0)
         u32(value.viewport.0, into: &bytes, at: 8); u32(value.viewport.1, into: &bytes, at: 12)
