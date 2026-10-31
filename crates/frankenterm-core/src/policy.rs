@@ -11397,7 +11397,8 @@ mod tests {
         run_async_test(async {
             let (_directory, storage, injector) = persisted_stop_injector().await;
             let cx = crate::cx::for_request();
-            let mock = injector.client.clone();
+            let mock = std::sync::Arc::new(injector.client);
+            let client: std::sync::Arc<dyn crate::wezterm::WeztermInterface> = mock.clone();
             let now_ms = checked_now_ms_i64();
             for attempt in 0..3 {
                 let sent_at = now_ms - 10_000 + attempt * 1_000;
@@ -11441,7 +11442,7 @@ mod tests {
             for detached in [false, true] {
                 let mut fresh = PolicyGatedInjector::with_storage(
                     PolicyEngine::permissive(),
-                    mock.clone(),
+                    client.clone(),
                     storage.clone(),
                 );
                 let result = if detached {
@@ -11478,7 +11479,7 @@ mod tests {
 
             let mut disabled = PolicyGatedInjector::with_storage(
                 PolicyEngine::permissive().with_trauma_guard_enabled(false),
-                mock.clone(),
+                client.clone(),
                 storage.clone(),
             );
             assert!(matches!(
@@ -11489,7 +11490,7 @@ mod tests {
             ));
             let mut bypass = PolicyGatedInjector::with_storage(
                 PolicyEngine::permissive(),
-                mock.clone(),
+                client,
                 storage.clone(),
             );
             assert!(matches!(
