@@ -3394,6 +3394,51 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertEqual(value, Data("second".utf8))
     }
 
+    func testFilesPasswordOwnerRejectsSameRouteTerminalRequestsAndRestoresOrdinaryPrompt() async throws {
+        let (broker, selected, prompt) = try await passwordPromptFixture()
+        let scope = MobileSSHPasswordPrompt.Scope(workspaceID: selected.authorization.workspaceID,
+            revision: selected.authorization.workspaceRevision, machineID: "machine-alpha",
+            destinationRouteIDs: [selected.authorization.routeID])
+        let original = Task { try await broker.password(for: selected, transportID: UUID(), prompter: prompt) }
+        // Use metadata issued by the real broker for the prompt-layer checks;
+        // no caller constructs an authorization or changes its trusted route.
+        let request = try await waitForPasswordPrompt(prompt)
+        let owner = UUID()
+        prompt.setScope(scope, ownerID: owner)
+        do { _ = try await original.value; XCTFail("Changing only the owner must retire the old prompt") }
+        catch { XCTAssertTrue(error is CancellationError) }
+
+        do { _ = try await prompt.password(for: request); XCTFail("A terminal request borrowed the same-route Files editor") }
+        catch { XCTAssertEqual(error as? SSHAuthenticationError, .stale) }
+        XCTAssertNil(prompt.request)
+
+        let accepted = Task { try await prompt.password(for: request, ownerID: owner) }
+        let current = try await waitForPasswordPrompt(prompt)
+        prompt.editSecret("files secret", requestID: current.id); prompt.submit(requestID: current.id)
+        let filesValue = try await accepted.value
+        XCTAssertEqual(filesValue, Data("files secret".utf8))
+        XCTAssertNil(prompt.request); XCTAssertTrue(prompt.secret.isEmpty)
+
+        let retiring = Task { try await prompt.password(for: request, ownerID: owner) }
+        let pending = try await waitForPasswordPrompt(prompt)
+        prompt.editSecret("must clear on owner rotation", requestID: pending.id)
+        prompt.setScope(scope, ownerID: UUID())
+        do { _ = try await retiring.value; XCTFail("A replaced Files owner returned its password") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertNil(prompt.request); XCTAssertTrue(prompt.secret.isEmpty)
+
+        prompt.setScope(scope)
+        do { _ = try await prompt.password(for: request, ownerID: owner); XCTFail("A stale Files owner survived restoration") }
+        catch { XCTAssertEqual(error as? SSHAuthenticationError, .stale) }
+        let restored = Task { try await prompt.password(for: request) }
+        let ordinary = try await waitForPasswordPrompt(prompt)
+        prompt.editSecret("terminal secret", requestID: ordinary.id); prompt.submit(requestID: ordinary.id)
+        let restoredValue = try await restored.value
+        XCTAssertEqual(restoredValue, Data("terminal secret".utf8))
+        XCTAssertNil(prompt.request); XCTAssertTrue(prompt.secret.isEmpty)
+        await broker.suspend()
+    }
+
     private func interactivePromptFixture() async throws -> (SSHAuthenticationBroker, WorkspaceSSHKeyboardInteractiveIdentity, MobileSSHKeyboardInteractivePrompt) {
         let crypto = AppleCryptography()
         let point = try crypto.ed25519PublicKey(seed: Data(0..<32))
@@ -3517,6 +3562,55 @@ final class TerminalSessionControllerTests: XCTestCase {
             do { _ = try await task.value; XCTFail("A retired round returned an answer") } catch {}
             await broker.finishKeyboardInteractiveAttempt(selected)
         }
+    }
+
+    func testFilesInteractiveOwnerRejectsSameRouteTerminalRequestsAndClearsOnRotation() async throws {
+        let (broker, selected, prompt) = try await interactivePromptFixture()
+        let scope = MobileSSHPasswordPrompt.Scope(workspaceID: selected.authorization.workspaceID,
+            revision: selected.authorization.workspaceRevision, machineID: "machine-alpha",
+            destinationRouteIDs: [selected.authorization.routeID])
+        let challenge = try SSHKeyboardInteractiveChallenge(round: 1, name: "Verification", instruction: "",
+            prompts: [.init(text: "One-time code", echo: false)])
+        let original = Task {
+            try await broker.keyboardInteractiveResponses(for: selected, transportID: UUID(),
+                attemptID: UUID(), challenge: challenge, prompter: prompt)
+        }
+        let request = try await waitForInteractivePrompt(prompt)
+        let owner = UUID()
+        prompt.setScope(scope, ownerID: owner)
+        do { _ = try await original.value; XCTFail("Changing only the owner must retire the old round") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        await broker.finishKeyboardInteractiveAttempt(selected)
+
+        do { _ = try await prompt.responses(for: request); XCTFail("A terminal request borrowed the same-route Files editor") }
+        catch { XCTAssertEqual(error as? SSHAuthenticationError, .stale) }
+        XCTAssertNil(prompt.request)
+
+        let accepted = Task { try await prompt.responses(for: request, ownerID: owner) }
+        let current = try await waitForInteractivePrompt(prompt)
+        prompt.editAnswer("files code", index: 0, requestID: current.id); prompt.submit(requestID: current.id)
+        let filesValue = try await accepted.value
+        XCTAssertEqual(filesValue, [Data("files code".utf8)])
+        XCTAssertNil(prompt.request); XCTAssertTrue(prompt.answers.isEmpty)
+
+        let retiring = Task { try await prompt.responses(for: request, ownerID: owner) }
+        let pending = try await waitForInteractivePrompt(prompt)
+        prompt.editAnswer("must clear on owner rotation", index: 0, requestID: pending.id)
+        prompt.setScope(scope, ownerID: UUID())
+        do { _ = try await retiring.value; XCTFail("A replaced Files owner returned its answers") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertNil(prompt.request); XCTAssertTrue(prompt.answers.isEmpty)
+
+        prompt.setScope(scope)
+        do { _ = try await prompt.responses(for: request, ownerID: owner); XCTFail("A stale Files owner survived restoration") }
+        catch { XCTAssertEqual(error as? SSHAuthenticationError, .stale) }
+        let restored = Task { try await prompt.responses(for: request) }
+        let ordinary = try await waitForInteractivePrompt(prompt)
+        prompt.editAnswer("terminal code", index: 0, requestID: ordinary.id); prompt.submit(requestID: ordinary.id)
+        let restoredValue = try await restored.value
+        XCTAssertEqual(restoredValue, [Data("terminal code".utf8)])
+        XCTAssertNil(prompt.request); XCTAssertTrue(prompt.answers.isEmpty)
+        await broker.suspend()
     }
 
     func testInteractiveRoutesRequireForegroundPromptOwnership() {

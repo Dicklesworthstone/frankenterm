@@ -2873,7 +2873,6 @@ private struct TerminalRemoteFilesScreen: View {
     @Bindable var files: TerminalRemoteFilesController
     @State private var path = ""
     @State private var uploadName = ""
-    @State private var importing = false
     @State private var importRequestID: UUID?
     @State private var saveFile: TerminalLocalFile?
     @State private var shareFile: TerminalLocalFile?
@@ -2905,15 +2904,27 @@ private struct TerminalRemoteFilesScreen: View {
         }
         .onChange(of: files.listingID) { _, _ in path = files.listing?.path ?? "" }
         .onChange(of: files.uploadReview?.id) { _, _ in uploadName = files.uploadReview?.file.name ?? "" }
-        .fileImporter(isPresented: $importing, allowedContentTypes: [.item], allowsMultipleSelection: false) { result in
-            guard let request = importRequestID else { return }
-            importRequestID = nil
-            switch result {
-            case .success(let urls):
-                if let url = urls.first { files.prepareUpload(url, request: request) }
-            case .failure(let error): files.importFailed(error, request: request)
+        .background {
+            if let request = importRequestID {
+                RemoteFilesImportPicker(requestID: request, selected: { id, result in
+                    guard importRequestID == id else { return }
+                    importRequestID = nil
+                    switch result {
+                    case .success(let urls):
+                        if urls.count == 1, let url = urls.first { files.prepareUpload(url, request: id) }
+                    case .failure(let error): files.importFailed(error, request: id)
+                    }
+                }, cancelled: { id in
+                    guard importRequestID == id else { return }
+                    importRequestID = nil
+                    files.importFailed(NSError(domain: NSCocoaErrorDomain, code: NSUserCancelledError), request: id)
+                }).id(request)
             }
         }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .background { importRequestID = nil }
+        }
+        .onDisappear { importRequestID = nil }
         .sheet(item: $saveFile) { file in TerminalFileSavePicker(file: file) }
         .sheet(item: Binding(get: { visible ? files.authenticationPrompt : nil }, set: { _ in })) { request in
             switch request {
@@ -3005,7 +3016,7 @@ private struct TerminalRemoteFilesScreen: View {
             }.buttonStyle(.borderless).disabled(!files.canBrowse)
             Button("Upload from Files", systemImage: "square.and.arrow.up") {
                 guard let request = files.beginImport() else { return }
-                importRequestID = request; importing = true
+                importRequestID = request
             }.disabled(!files.canBrowse).accessibilityIdentifier("terminal.files.upload.pick")
             Text("Regular files up to 256 MiB. Uploads create a new filename and never overwrite. Symbolic links are not opened.")
                 .font(.footnote).foregroundStyle(.secondary)
@@ -3091,30 +3102,49 @@ private struct TerminalRemoteFilesScreen: View {
 
 }
 
-/// Retaining the lease on the system controller keeps completed bytes alive
-/// even when backgrounding retires the browser while a provider finishes.
-private final class TerminalFileExportPicker: UIDocumentPickerViewController {
-    var fileLease: TerminalLocalFile?
+/// Both entry points retain the exact completed file on the system controller.
+/// Closing its SSH owner cannot remove bytes a Files provider is still reading.
+struct TerminalFileExportLease: Identifiable, Sendable {
+    let id = UUID()
+    let url: URL
+    private let terminalFile: TerminalLocalFile?
+    private let workspaceFile: WorkspaceFilesCompletion?
+
+    init(file: TerminalLocalFile) {
+        url = file.storage.url; terminalFile = file; workspaceFile = nil
+    }
+    init?(completion: WorkspaceFilesCompletion) {
+        guard let url = completion.downloadURL else { return nil }
+        self.url = url; terminalFile = nil; workspaceFile = completion
+    }
 }
 
-private struct TerminalFileSavePicker: UIViewControllerRepresentable {
-    let file: TerminalLocalFile
+final class TerminalFileExportPicker: UIDocumentPickerViewController {
+    var fileLease: TerminalFileExportLease?
+}
+
+struct TerminalFileSavePicker: UIViewControllerRepresentable {
+    let file: TerminalFileExportLease
+    init(file: TerminalLocalFile) { self.file = .init(file: file) }
+    init(file: TerminalFileExportLease) { self.file = file }
     func makeUIViewController(context: Context) -> TerminalFileExportPicker {
-        let picker = TerminalFileExportPicker(forExporting: [file.storage.url], asCopy: true)
+        let picker = TerminalFileExportPicker(forExporting: [file.url], asCopy: true)
         picker.fileLease = file
         return picker
     }
     func updateUIViewController(_ uiViewController: TerminalFileExportPicker, context: Context) {}
 }
 
-private final class TerminalFileActivityController: UIActivityViewController {
-    var fileLease: TerminalLocalFile?
+final class TerminalFileActivityController: UIActivityViewController {
+    var fileLease: TerminalFileExportLease?
 }
 
-private struct TerminalFileShareSheet: UIViewControllerRepresentable {
-    let file: TerminalLocalFile
+struct TerminalFileShareSheet: UIViewControllerRepresentable {
+    let file: TerminalFileExportLease
+    init(file: TerminalLocalFile) { self.file = .init(file: file) }
+    init(file: TerminalFileExportLease) { self.file = file }
     func makeUIViewController(context: Context) -> TerminalFileActivityController {
-        let controller = TerminalFileActivityController(activityItems: [file.storage.url], applicationActivities: nil)
+        let controller = TerminalFileActivityController(activityItems: [file.url], applicationActivities: nil)
         controller.fileLease = file
         return controller
     }

@@ -105,6 +105,7 @@ struct LocalRouteConnectionReview: Identifiable {
     let contextID: UUID
     let target: TerminalSessionTarget
     let selection: WorkspaceSSHConnectionSelection?
+    let purpose: WorkspaceSSHConnectionPurpose
     fileprivate let epoch: UUID
     fileprivate let scene: WorkspaceTerminalScene?
     fileprivate let controllerID: UUID?
@@ -280,6 +281,7 @@ final class MobileWorkspaceModel {
     @ObservationIgnored private var connectionApproval: (id: UUID, task: Task<WorkspaceLocalState, Error>)?
     @ObservationIgnored private var routeChoiceID: UUID?
     @ObservationIgnored private var routeConnectionReviewID: UUID?
+    @ObservationIgnored private var fileSessions: [UUID: WorkspaceFilesSession] = [:]
     /// A failed durable write cannot revive a terminal in this process. Its
     /// bookmark is cleared before explicit restore disconnection as well.
     private var offlineConnectionHolds = Set<UUID>()
@@ -548,6 +550,7 @@ final class MobileWorkspaceModel {
     func setScenePhase(_ phase: ScenePhase) {
         connections?.setAuthenticationForeground(phase == .active)
         if phase == .background {
+            closeFileSessions()
             cancelHostKeyVerification()
             AppleSSHCredentialSigner.endApproval()
             beginBackgroundRun()
@@ -646,14 +649,19 @@ final class MobileWorkspaceModel {
 
     func reviewRouteConnection(_ context: LocalRouteChoiceContext,
                                selection: WorkspaceSSHConnectionSelection?,
-                               theme: WorkspaceDocument.Theme?) throws -> LocalRouteConnectionReview {
+                               theme: WorkspaceDocument.Theme?,
+                               purpose: WorkspaceSSHConnectionPurpose = .terminal) throws -> LocalRouteConnectionReview {
         guard !busy, routeChoiceIsCurrent(context), let local = localPolicies[context.local.workspace.id] else { throw FTError.stale }
+        if purpose == .fileTransfer {
+            guard NativeSSHSession.supportsSFTP else { throw WorkspaceSSHConnectionError.filesUnavailable }
+            guard selection != nil else { throw WorkspaceSSHConnectionSelectionError.stale }
+        }
         let target = try WorkspaceTerminalTargets.make(local: local, machineID: context.machine.id,
             theme: theme, selection: selection)
-        let scene = liveScenes[local.workspace.id].flatMap { $0.closed ? nil : $0 }
+        let scene = purpose == .terminal ? liveScenes[local.workspace.id].flatMap { $0.closed ? nil : $0 } : nil
         guard scene == nil || scene?.revision == local.workspace.revision else { throw FTError.stale }
         let controller = scene?.sessions[context.machine.id]
-        let review = LocalRouteConnectionReview(contextID: context.id, target: target, selection: selection,
+        let review = LocalRouteConnectionReview(contextID: context.id, target: target, selection: selection, purpose: purpose,
             epoch: epoch, scene: scene, controllerID: controller?.id, disconnectsSession: controller?.settled == false)
         routeConnectionReviewID = review.id
         return review
@@ -661,7 +669,7 @@ final class MobileWorkspaceModel {
 
     private func validateRouteConnection(_ review: LocalRouteConnectionReview, local: WorkspaceLocalState) throws {
         let target = review.target
-        let scene = liveScenes[target.workspaceID].flatMap { $0.closed ? nil : $0 }
+        let scene = review.purpose == .terminal ? liveScenes[target.workspaceID].flatMap { $0.closed ? nil : $0 } : nil
         guard active, !showRestore, !Task.isCancelled, epoch == review.epoch,
               routeChoiceID == review.contextID, routeConnectionReviewID == review.id,
               local.workspace.id == target.workspaceID, local.workspace.revision == target.revision,
@@ -673,6 +681,37 @@ final class MobileWorkspaceModel {
         let current = try WorkspaceTerminalTargets.make(local: local, machineID: target.machineID,
             theme: nil, selection: review.selection)
         guard current.routes == target.routes else { throw FTError.stale }
+    }
+
+    /// A Files visit consumes the explicit route approval once. Its subsequent
+    /// lifetime is independent of the terminal and survives only brief system
+    /// UI interruptions, never backgrounding, restore or workspace replacement.
+    func makeFilesSession(approval: ConnectionApproval, target: TerminalSessionTarget) throws -> WorkspaceFilesSession {
+        guard connectionApprovalIsCurrent(approval), let connections,
+              target.workspaceID == approval.local.workspace.id,
+              target.revision == approval.local.workspace.revision,
+              target.routes.count == 1, let selection = target.routes.first?.selectedConnection,
+              fileSessions.count < 2, !deviceKeyConnectionHolds.contains(target.workspaceID),
+              keyRevocation == nil, credentialImportOperation == nil, deviceKeyOperation == nil,
+              hostKeyOperation == nil, certificateRenewalOperation == nil else { throw FTError.stale }
+        let current = try WorkspaceTerminalTargets.make(local: approval.local, machineID: target.machineID,
+            theme: nil, selection: selection)
+        guard current.routes == target.routes else { throw FTError.stale }
+        let id = UUID()
+        let session = WorkspaceFilesSession(id: id, target: target, connections: connections,
+            isCurrent: { [weak self] in
+                guard let self else { return false }
+                return self.fileSessions[id] != nil && self.connectionsForeground && !self.showRestore
+                    && !self.requiresConnectionApproval(target.workspaceID)
+                    && !self.deviceKeyConnectionHolds.contains(target.workspaceID)
+                    && self.workspaces.contains { $0.id == target.workspaceID && $0.revision == target.revision }
+            }, onRetired: { [weak self] in self?.fileSessions[id] = nil })
+        fileSessions[id] = session
+        return session
+    }
+
+    private func closeFileSessions() {
+        for session in fileSessions.values { session.requestClose() }
     }
 
     struct ConnectionApproval: Sendable {
@@ -770,10 +809,12 @@ final class MobileWorkspaceModel {
         let prior = connectionLifecycle
         connectionLifecycle = Task {
             await prior?.value
+            for session in Array(fileSessions.values) { await session.retryCleanup() }
             await connections.activate()
         }
     }
     func setRestoreVisible(_ value: Bool) {
+        if value { closeFileSessions() }
         if value { credentialImport?.cancel() }
         if value { retireEnrollmentReviews() }
         if value { deviceKeyReviewID = nil; deviceKeyOperation?.task.cancel() }
@@ -892,6 +933,7 @@ final class MobileWorkspaceModel {
         let ticket = epoch, visible = active && showRestore, prior = lifecycle
         let pendingApproval = connectionApproval?.task
         let pendingHostKey = showRestore || !connectionsForeground ? hostKeyOperation?.task : nil
+        let pendingFiles = showRestore || !connectionsForeground ? Array(fileSessions.values) : []
         lifecycle = Task { [weak self] in
             await prior?.value
             // A Connect admitted just before the restore sheet appeared must
@@ -900,6 +942,9 @@ final class MobileWorkspaceModel {
             // A cancelled check still owns its jump path until teardown joins;
             // let it release the network lease before arming offline restore.
             await pendingHostKey?.value
+            // Files are foreground-only. Join their admitted owners before
+            // asking the optical restore coordinator for network exclusion.
+            for session in pendingFiles { await session.close() }
             // The exact reader retires before a lifecycle transition rotates
             // receive authority. A background callback cannot start more work.
             await pendingRecording?.value
@@ -1341,6 +1386,9 @@ final class MobileWorkspaceModel {
         for (id, scene) in liveScenes where !workspaces.contains(where: { $0.id == id && $0.revision == scene.revision }) {
             liveScenes[id] = nil; retire(scene)
         }
+        for session in fileSessions.values where !workspaces.contains(where: {
+            $0.id == session.target.workspaceID && $0.revision == session.target.revision
+        }) { session.requestClose() }
         availableCredentials = Dictionary(uniqueKeysWithValues: snapshot.map { ($0.workspace.id, $0.credentialIDs) })
         localPolicies = Dictionary(uniqueKeysWithValues: snapshot.map { ($0.workspace.id, $0) })
         for local in snapshot {
@@ -5116,6 +5164,7 @@ private struct WorkspaceRouteChoiceScreen: View {
     let context: LocalRouteChoiceContext
     @Bindable var model: MobileWorkspaceModel
     let theme: WorkspaceDocument.Theme?
+    var purpose: WorkspaceSSHConnectionPurpose = .terminal
     let onApproved: (MobileWorkspaceModel.ConnectionApproval, TerminalSessionTarget) -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var routeID: String?
@@ -5140,12 +5189,13 @@ private struct WorkspaceRouteChoiceScreen: View {
                 if let message { Section { Text(message).foregroundStyle(.red).accessibilityIdentifier("routes.error") } }
                 if applying {
                     Section {
-                        ProgressView("Settling the previous connection and checking this choice…")
+                        ProgressView(purpose == .fileTransfer ? "Checking the Files connection choice…"
+                            : "Settling the previous connection and checking this choice…")
                         Text("Keep this screen open until the connection choice is ready.").font(.caption)
                     }
                 }
             }
-            .navigationTitle(review == nil ? "Route and Sign-In" : "Review Connection")
+            .navigationTitle(review == nil ? (purpose == .fileTransfer ? "Files Route and Sign-In" : "Route and Sign-In") : "Review Connection")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -5169,7 +5219,9 @@ private struct WorkspaceRouteChoiceScreen: View {
         Section {
             Text(verbatim: context.machine.name).font(.headline)
             Text("Choose one route and one sign-in method for every account along its path. Only methods permitted by this workspace and keys available on this phone are offered.")
-            Text("The choice stays with this machine in its current live workspace. Passwords and MFA answers are requested only by the existing sign-in prompt and are never saved here.")
+            Text(purpose == .fileTransfer
+                ? "This choice opens a separate Files connection for this visit. Passwords and MFA answers are requested during sign-in and are never saved here."
+                : "The choice stays with this machine in its current live workspace. Passwords and MFA answers are requested only by the existing sign-in prompt and are never saved here.")
                 .font(.footnote).foregroundStyle(.secondary)
         }
         Section("Route") {
@@ -5180,7 +5232,8 @@ private struct WorkspaceRouteChoiceScreen: View {
                             Image(systemName: routeID == id ? "checkmark.circle.fill" : "circle")
                             VStack(alignment: .leading, spacing: 4) {
                                 Text(verbatim: endpoint(route)).font(.system(.callout, design: .monospaced))
-                                Text(verbatim: "\(route.id) · " + (route.mode == "frankenterm_mux" ? "Existing mux panes" : "SSH terminal")
+                                Text(verbatim: "\(route.id) · " + (purpose == .fileTransfer ? "SFTP files"
+                                    : (route.mode == "frankenterm_mux" ? "Existing mux panes" : "SSH terminal"))
                                     + (id == context.machine.preferredRouteID ? " · Preferred" : ""))
                                     .font(.caption).foregroundStyle(.secondary)
                                 ForEach(Array((context.local.routes.first { $0.routeID == id }?.issues ?? []).enumerated()), id: \.offset) { _, issue in
@@ -5212,7 +5265,7 @@ private struct WorkspaceRouteChoiceScreen: View {
             Button("Review Connection") { prepareReview() }
                 .disabled(!complete || model.busy || !model.routeChoiceIsCurrent(context))
                 .accessibilityIdentifier("routes.review")
-            if model.selectedTerminalTarget(workspaceID: workspaceID, revision: context.local.workspace.revision,
+            if purpose == .terminal, model.selectedTerminalTarget(workspaceID: workspaceID, revision: context.local.workspace.revision,
                 machineID: context.machine.id) != nil {
                 Button("Use Configured Choices") {
                     do { review = try model.reviewRouteConnection(context, selection: nil, theme: theme); message = nil }
@@ -5240,7 +5293,7 @@ private struct WorkspaceRouteChoiceScreen: View {
         guard let options, let authentication, complete else { return }
         do {
             let selected = try options.select(authentication: authentication, hopAuthentications: hopAuthentications.compactMap { $0 })
-            review = try model.reviewRouteConnection(context, selection: selected, theme: theme)
+            review = try model.reviewRouteConnection(context, selection: selected, theme: theme, purpose: purpose)
             message = nil
         } catch { message = "This choice is no longer available. Reopen Route and Sign-In to check the current paths and keys. \(error.localizedDescription)" }
     }
@@ -5306,7 +5359,9 @@ private struct WorkspaceRouteChoiceScreen: View {
     }
 
     @ViewBuilder private func routeBehavior(_ route: WorkspaceDocument.Route) -> some View {
-        if route.mode == "frankenterm_mux" {
+        if purpose == .fileTransfer {
+            Text("Browse and transfer files using this account's SFTP service. Uploads require a separate destination review. Transfers stop when FrankenTerm enters the background.").font(.caption)
+        } else if route.mode == "frankenterm_mux" {
             Text("Attach to existing FrankenTerm panes in View Only. A new shell requires its own explicit action.").font(.caption)
             Text(verbatim: "Mux command: " + (route.remoteCommand ?? WorkspaceNativeSSHConnection.defaultMuxCommand))
                 .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
@@ -5329,7 +5384,9 @@ private struct WorkspaceRouteChoiceScreen: View {
                 Text("This machine's current connection will disconnect before the choice is applied. Its direct SSH shell may end. Input already sent may have executed and will not be replayed.")
                     .font(.callout)
             }
-            Text("The choice applies to this machine until its live workspace closes or is replaced. Other machines retain their own connection choices.")
+            Text(purpose == .fileTransfer
+                ? "The Files connection closes when you leave Remote Files. Your terminal sessions keep their current routes."
+                : "The choice applies to this machine until its live workspace closes or is replaced. Other machines retain their own connection choices.")
                 .font(.footnote).foregroundStyle(.secondary)
             if model.requiresConnectionApproval(workspaceID) {
                 Text("Connect also enables this workspace's saved connection preferences on this phone after its offline restore.").font(.footnote)
@@ -5356,8 +5413,8 @@ private struct WorkspaceRouteChoiceScreen: View {
             }
         }
         Section {
-            Button(reviewed.selection == nil ? "Use Configured Choices and Connect"
-                : (reviewed.disconnectsSession ? "Change Route and Connect" : "Use Route and Connect")) { connect(reviewed) }
+            Button(purpose == .fileTransfer ? "Connect to Remote Files" : (reviewed.selection == nil ? "Use Configured Choices and Connect"
+                : (reviewed.disconnectsSession ? "Change Route and Connect" : "Use Route and Connect"))) { connect(reviewed) }
                 .disabled(applying || model.busy || !model.routeChoiceIsCurrent(context))
                 .accessibilityIdentifier("routes.confirm")
         }
@@ -5373,7 +5430,7 @@ private struct WorkspaceRouteChoiceScreen: View {
     }
 
     private func connect(_ reviewed: LocalRouteConnectionReview) {
-        guard !applying else { return }
+        guard !applying, review?.id == reviewed.id else { return }
         applying = true; message = nil
         Task {
             defer { applying = false }
@@ -5384,7 +5441,9 @@ private struct WorkspaceRouteChoiceScreen: View {
                 onApproved(approval, reviewed.target)
             } catch {
                 review = nil
-                message = "The new connection choice was not opened. The previous connection may remain disconnected while cleanup finishes. Review the current choice and try again. \(error.localizedDescription)"
+                message = purpose == .fileTransfer
+                    ? "The Files connection choice could not be confirmed. Review the current route and sign-in method again. \(error.localizedDescription)"
+                    : "The new connection choice was not opened. The previous connection may remain disconnected while cleanup finishes. Review the current choice and try again. \(error.localizedDescription)"
             }
         }
     }
@@ -5416,7 +5475,9 @@ private struct MachineWorkspaceView: View {
     @State private var orderReview: WorkspaceMachineOrderReview?
     @State private var routeChoice: LocalRouteChoiceContext?
     @State private var routeChoiceVisitID: UUID?
+    @State private var routeChoicePurpose: WorkspaceSSHConnectionPurpose = .terminal
     @State private var routeChoiceOpening: (approval: MobileWorkspaceModel.ConnectionApproval, target: TerminalSessionTarget)?
+    @State private var fileSession: WorkspaceFilesSession?
     /// Read so a return from Tailscale re-evaluates what Connect needs.
     @Environment(\.scenePhase) private var scenePhase
     private var document: WorkspaceDocument {
@@ -5472,11 +5533,21 @@ private struct MachineWorkspaceView: View {
                         Button("Choose Route and Sign-In", systemImage: "point.topleft.down.to.point.bottomright.curvepath") {
                             do {
                                 let context = try model.beginRouteChoice(workspaceID: workspaceID, machineID: machine.id)
-                                returnHandled = true; routeChoiceVisitID = context.id; routeChoice = context
+                                returnHandled = true; routeChoicePurpose = .terminal
+                                routeChoiceVisitID = context.id; routeChoice = context
                             } catch { model.connectionPreferenceMessage = "Route choices are unavailable. \(error.localizedDescription)" }
                         }.buttonStyle(.bordered).tint(Color(ftHex: theme?.accent ?? "#3B82F6"))
                             .disabled(model.busy || !model.active || model.localPolicies[workspaceID] == nil)
                             .accessibilityIdentifier("machine.route-choice.\(machine.id)")
+                        Button("Remote Files", systemImage: "folder") {
+                            do {
+                                let context = try model.beginRouteChoice(workspaceID: workspaceID, machineID: machine.id)
+                                returnHandled = true; routeChoicePurpose = .fileTransfer
+                                routeChoiceVisitID = context.id; routeChoice = context
+                            } catch { model.connectionPreferenceMessage = "Remote Files is unavailable. \(error.localizedDescription)" }
+                        }.buttonStyle(.bordered).tint(Color(ftHex: theme?.accent ?? "#3B82F6"))
+                            .disabled(model.busy || !model.active || model.localPolicies[workspaceID] == nil || !NativeSSHSession.supportsSFTP)
+                            .accessibilityIdentifier("machine.files.\(machine.id)")
                         VStack(alignment: .leading, spacing: 8) {
                             Toggle("Connect with Group", isOn: Binding(
                                 get: { model.automaticallyConnect(machine, workspaceID: workspaceID) },
@@ -5540,11 +5611,17 @@ private struct MachineWorkspaceView: View {
                 routeChoiceVisitID = nil
                 let opening = routeChoiceOpening; routeChoiceOpening = nil
                 if let opening, model.connectionApprovalIsCurrent(opening.approval) {
-                    terminal = OpenTerminal(machineID: opening.target.machineID, local: opening.approval.local,
-                        selectedTarget: opening.target)
+                    if routeChoicePurpose == .fileTransfer {
+                        do { fileSession = try model.makeFilesSession(approval: opening.approval, target: opening.target) }
+                        catch { model.connectionPreferenceMessage = "Remote Files could not be opened. \(error.localizedDescription)" }
+                    } else {
+                        terminal = OpenTerminal(machineID: opening.target.machineID, local: opening.approval.local,
+                            selectedTarget: opening.target)
+                    }
                 }
             }) { context in
-                WorkspaceRouteChoiceScreen(context: context, model: model, theme: theme(for: context.machine)) { approval, target in
+                WorkspaceRouteChoiceScreen(context: context, model: model, theme: theme(for: context.machine),
+                    purpose: routeChoicePurpose) { approval, target in
                     guard routeChoice?.id == context.id, model.connectionApprovalIsCurrent(approval) else { return }
                     routeChoiceOpening = (approval, target); routeChoice = nil
                 }
@@ -5570,6 +5647,9 @@ private struct MachineWorkspaceView: View {
                         .onChange(of: model.showRestore) { _, _ in reopenClosedTerminal() }
                         .onChange(of: model.localPolicies[workspaceID]?.workspace.revision) { _, _ in reopenClosedTerminal() }
                 }
+            }
+            .navigationDestination(item: $fileSession) { session in
+                WorkspaceFilesSessionScreen(session: session)
             }
             .onAppear {
                 if selection.isEmpty {

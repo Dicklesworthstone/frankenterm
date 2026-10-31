@@ -12,6 +12,15 @@ admits at most two file owners inside its existing connection and attempt limits
 File owners create no shell, PTY, exec request, terminal input source or session
 creation journal, and workspace invalidation and suspension close both kinds.
 
+The machine page's **Remote Files** action also works before opening a terminal,
+including accounts that only provide SFTP. Choose the route and the sign-in
+method for every account along its jump path, review the destination, then
+choose **Connect to Remote Files**. This visit has its own connection lifetime
+and leaves the machine's terminal route unchanged. Directory navigation and
+transfers retain the exact workspace revision, connection and listing identity.
+Both uploads and downloads require a path review; old picker callbacks or
+replaced listings cannot redirect a confirmation.
+
 On iPhone and iPad, the selected connected terminal's **More → Remote Files**
 action opens a foreground file browser for that exact account and route.
 Directory navigation, parent navigation and refresh retain canonical paths and
@@ -28,6 +37,16 @@ original changes. Progress and cancellation stay attached to the admitted owner,
 and an interrupted create warns that a remote partial file may remain. Completed
 downloads offer **Save to Files** and **Share**, retaining their local file until
 the system presentation finishes. Incomplete downloads are never exported.
+
+The reusable `WorkspaceFilesController` validates receipt direction, exact path
+bytes, sizes and progress before publishing a completed local file. Upload
+reviews take ownership of the coordinated staging copy through an atomic move
+into private, read-only storage, avoiding a second full-file copy. Closing an
+unfinished upload preserves its remote path and acknowledged-byte uncertainty,
+even when no OPEN acknowledgement arrived. Per-attempt password and MFA
+delegates carry a separate editor-owner token: a queued terminal prompt for the
+same route cannot borrow a Files sign-in sheet, and a retired Files owner cannot
+borrow the restored terminal editor.
 
 `WorkspaceSFTPClient` resolves a directory to its canonical server path and
 returns at most 512 entries, with an explicit indication when more exist. Remote
@@ -54,17 +73,24 @@ is available; an older native library is refused before file-connection
 networking or authentication. Preparation retains the host-certificate patch
 and verifies the combined patched dependency.
 
-The complete shared Kit and native SSH package, including their SSH test
-bodies, compile with Swift 6.4.2 and warnings treated as errors. The independent
-`FrankenTermSSH/Tests/Interop/test_sftp.py` runner passes nine real OpenSSH SFTP
+The latest extension validation rebuilt both native Swift modules with Swift
+6.4.1 and warnings treated as errors, reusing the unchanged, previously built
+90-source Kit module. The focused run passed 45 tests: 31 existing native
+authentication/trust regressions, 12 Files controller tests and two missing-
+delegate policy tests, with no failures or skips. Two additional tests compiled
+the exact app password/MFA editor and proxy declarations against the real broker
+and verified queued same-route rejection, owner rotation and restoration.
+The independent `FrankenTermSSH/Tests/Interop/test_sftp.py` runner passes twelve real OpenSSH SFTP
 scenarios: exact-byte download/upload and nonoverwrite, a jump route, stalled
 read cancellation, partial-startup cancellation, upload cancellation after a
 server write, read expiry, separate terminal/file ownership and capacity, host
-revocation, and workspace replacement. The nine existing connection-manager
-regressions also pass. The final merged-source run passes all nine live scenarios
-in one invocation, with no skipped fixture tests. Hosted iOS tests cover separate
+revocation, workspace replacement, and three two-login prompt-owner cases for
+password, keyboard-interactive and public-key-plus-interactive authentication.
+The final run passes all twelve live scenarios in one invocation, with no
+skipped fixture tests. Hosted iOS tests cover separate
 file ownership, the terminal input fence, temporary inactivity and background
-cleanup, immutable upload staging and stale picker/review callbacks. Swift
+cleanup, immutable upload staging, stale picker/review callbacks, inactive
+picker completion, close-before-confirm and editor ownership. Swift
 frontend parsing checks the app sources; the hosted tests still require an Apple
 SDK and live SFTP fixture. These Linux results do not qualify device behavior.
 
