@@ -759,7 +759,10 @@ completion to the readiness loop. The loop delivers that completion only to the
 still-matching connection route. Saturation or an unavailable pre-submit worker
 or pane authority closes retryably before submission, without a write or a
 fabricated terminal rejection; a panic or indeterminate completion quarantines
-the effect instead of authorizing a retry.
+the effect instead of authorizing a retry. An `Input` that meets the protocol
+state out with a job does not close: it waits for that state, like every other
+request, for less than the client's I/O deadline, and takes it ahead of the
+other waits.
 The borrowed `dispatch` path still rejects `Input` so transport cannot bypass
 this owned continuation; `input_activation_rejections` counts that invalid
 bypass, not ordinary live input activation. The generic in-memory transaction

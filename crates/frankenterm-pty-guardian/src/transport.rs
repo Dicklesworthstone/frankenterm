@@ -306,6 +306,9 @@ struct DeferredGuardianReplay {
     /// that met the protocol authority out with a job: served by `dispatch`,
     /// not the checkpoint worker, once the authority returns.
     dispatch: bool,
+    /// An Input that met the protocol authority out with a job: submitted to
+    /// the input worker once the authority returns, before the other waits.
+    input: Option<GuardianInputRoute>,
     #[cfg(test)]
     wipe_probe: Option<Arc<AtomicBool>>,
 }
@@ -325,9 +328,22 @@ impl DeferredGuardianReplay {
             deadline,
             parked_at: Instant::now(),
             dispatch: false,
+            input: None,
             #[cfg(test)]
             wipe_probe: None,
         }
+    }
+
+    fn new_input(
+        request: AuthenticatedGuardianRequest,
+        route: GuardianCheckpointRoute,
+        input_route: GuardianInputRoute,
+        effect_lease: GuardianTokenEffectLease,
+        deadline: Instant,
+    ) -> Self {
+        let mut deferred = Self::new(request, route, effect_lease, deadline);
+        deferred.input = Some(input_route);
+        deferred
     }
 
     fn new_dispatch(
@@ -394,6 +410,14 @@ fn order_deferred_replays_for_pop(tokens: &mut [(Token, Instant)]) {
     tokens.sort_unstable_by(|left, right| {
         right.1.cmp(&left.1).then_with(|| right.0.0.cmp(&left.0.0))
     });
+}
+
+/// When a ready wait takes its turn at the authority: at its deadline, or at
+/// once for an Input. A mux main thread is blocked on that Input, and every
+/// wait served ahead of it can hold the authority for a job, which adds up
+/// with 60 panes replaying after a mux swap.
+fn deferred_wait_turn(input: bool, deadline: Instant, now: Instant) -> Instant {
+    if input { now } else { deadline }
 }
 
 enum GuardianReadState {
@@ -1685,6 +1709,45 @@ impl GuardianService {
                         request.zeroize_payload();
                         return FrameProcessing::Response(response);
                     };
+                    if matches!(
+                        self.runtime.replay_wait_readiness(&request),
+                        GuardianReplayWaitReadiness::AuthorityInFlight
+                    ) {
+                        // Closing an Input that met the authority out with a
+                        // job left the mux to retry into the next job, and an
+                        // input it gave up on stopped that pane's input,
+                        // captures and retirement. Wait as every other request
+                        // does.
+                        let (Some(checkpoint_route), Some(deadline)) = (
+                            GuardianCheckpointRoute::new(
+                                token,
+                                connection.generation,
+                                request.header().request_id,
+                            ),
+                            Instant::now().checked_add(CHECKPOINT_AUTHORITY_WAIT),
+                        ) else {
+                            request.zeroize_payload();
+                            return FrameProcessing::Close;
+                        };
+                        if connection.deferred_replay.is_some() {
+                            request.zeroize_payload();
+                            return FrameProcessing::Close;
+                        }
+                        let Some(effect_lease) = effect_lease.take() else {
+                            request.zeroize_payload();
+                            return FrameProcessing::Close;
+                        };
+                        connection.pending_checkpoint = Some(checkpoint_route);
+                        connection.deferred_replay = Some(DeferredGuardianReplay::new_input(
+                            request,
+                            checkpoint_route,
+                            route,
+                            effect_lease,
+                            deadline,
+                        ));
+                        self.runtime.record_replay_wait_deferred();
+                        return FrameProcessing::PendingCheckpoint;
+                    }
                     let Some(effect_lease) = effect_lease.take() else {
                         request.zeroize_payload();
                         return FrameProcessing::Close;
@@ -1998,8 +2061,10 @@ impl GuardianService {
                 || wait_elapsed
                 || matches!(readiness, GuardianReplayWaitReadiness::Immediate)
             {
-                self.deferred_replay_tokens
-                    .push((*token, deferred.deadline));
+                self.deferred_replay_tokens.push((
+                    *token,
+                    deferred_wait_turn(deferred.input.is_some(), deferred.deadline, now),
+                ));
             }
         }
 
@@ -2065,6 +2130,34 @@ impl GuardianService {
                 continue;
             }
             let route = deferred.route;
+            if let Some(input_route) = deferred.input {
+                let Some((request, effect_lease)) = deferred.take_submission() else {
+                    self.finish_connection(token, connection);
+                    continue;
+                };
+                match self
+                    .runtime
+                    .submit_input_with_token_lease(request, input_route, effect_lease)
+                {
+                    GuardianInputSubmission::Pending => {
+                        connection.pending_checkpoint = None;
+                        connection.pending_input = Some(input_route);
+                        self.connections.insert(token, connection);
+                        // A broker pane's Input starts when completions are
+                        // drained, which this pass has already done. The
+                        // other waits stay parked: the authority is out.
+                        self.handle_input_completions();
+                        break;
+                    }
+                    GuardianInputSubmission::Respond(response) => {
+                        self.route_checkpoint_response(token, connection, Some(response));
+                    }
+                    GuardianInputSubmission::CloseRetryably => {
+                        self.finish_connection(token, connection);
+                    }
+                }
+                continue;
+            }
             if deferred.dispatch {
                 let Some((mut request, mut effect_lease)) = deferred.take_submission() else {
                     self.finish_connection(token, connection);
@@ -6496,6 +6589,104 @@ mod tests {
             "the parked census is answered by the protocol: {result:?}"
         );
         client.join().unwrap();
+    }
+
+    /// An Input that meets the authority out with a job is answered once the
+    /// job gives it back. It used to lose its connection, unrecorded.
+    #[test]
+    fn input_waits_for_the_protocol_authority_a_job_holds() {
+        let directory = tempfile::Builder::new()
+            .prefix("ft-guardian-input-wait-")
+            .tempdir_in(crate::canonical_test_temp_root())
+            .unwrap()
+            .keep();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let token = directory.join("token");
+        let socket = directory.join("guardian.sock");
+        provision_guardian_token(&token).unwrap();
+        let config = GuardianServiceConfig::new(
+            socket.clone(),
+            token.clone(),
+            8,
+            1,
+            65_536,
+            65_536,
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        let mut service = GuardianService::bind(config).unwrap();
+        let (connected_tx, connected_rx) = std::sync::mpsc::sync_channel(1);
+        let (send_tx, send_rx) = std::sync::mpsc::sync_channel(1);
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let client = std::thread::spawn(move || {
+            let mut client = GuardianClient::connect(&socket, &token, Uuid::new_v4()).unwrap();
+            connected_tx.send(()).unwrap();
+            send_rx.recv().unwrap();
+            result_tx
+                .send(client.input(
+                    Uuid::new_v4(),
+                    1,
+                    1,
+                    Uuid::new_v4(),
+                    Uuid::new_v4(),
+                    b"typed".to_vec(),
+                ))
+                .unwrap();
+        });
+        let deadline = Instant::now() + CLIENT_IO_TIMEOUT;
+        while connected_rx.try_recv().is_err() {
+            assert!(Instant::now() < deadline, "client never connected");
+            service.poll_once().unwrap();
+        }
+
+        let held = service.runtime.take_protocol_for_test().unwrap();
+        let deferred_before = service.runtime.counters().replay_waits_deferred;
+        send_tx.send(()).unwrap();
+        let deadline = Instant::now() + CLIENT_IO_TIMEOUT;
+        while service.runtime.counters().replay_waits_deferred == deferred_before {
+            assert!(Instant::now() < deadline, "input was never parked");
+            service.poll_once().unwrap();
+        }
+        for _ in 0..20 {
+            service.poll_once().unwrap();
+        }
+        assert!(
+            result_rx.try_recv().is_err(),
+            "a parked input is neither answered nor closed while the authority is out"
+        );
+
+        service.runtime.restore_protocol_for_test(held);
+        let mut result = None;
+        let deadline = Instant::now() + CLIENT_IO_TIMEOUT;
+        while result.is_none() {
+            assert!(Instant::now() < deadline, "parked input never answered");
+            service.poll_once().unwrap();
+            result = result_rx.try_recv().ok();
+        }
+        assert!(
+            matches!(
+                result,
+                Some(Err(GuardianClientError::Rejected(
+                    GuardianRejectionCode::PaneNotFound
+                )))
+            ),
+            "the parked input reaches the runtime: {result:?}"
+        );
+        client.join().unwrap();
+    }
+
+    #[test]
+    fn a_ready_input_takes_the_authority_before_earlier_deadlines() {
+        let now = Instant::now();
+        let soon = now + Duration::from_millis(1);
+        let later = now + Duration::from_secs(4);
+        let mut tokens = [
+            (Token(1), deferred_wait_turn(false, soon, now)),
+            (Token(2), deferred_wait_turn(true, later, now)),
+            (Token(3), deferred_wait_turn(false, later, now)),
+        ];
+        order_deferred_replays_for_pop(&mut tokens);
+        assert_eq!(tokens.map(|(token, _)| token.0), [3, 1, 2]);
     }
 
     /// A guardian of this release admits a Hello requiring compact
