@@ -17860,6 +17860,9 @@ mod tests {
             tab.assign_pane(&original_dyn);
             let (mux, _mux_guard) = install_tab_with_window(&tab);
             let stale = conditional_resize_request(&mux, tab.tab_id(), original.pane_id);
+            // The replacement takes the tab's root slot, so the original leaves
+            // the tab before its registration retires.
+            assert!(tab.remove_pane(original.pane_id).is_some());
             assert!(
                 mux.capture_current_pane(original.pane_id)
                     .unwrap()
