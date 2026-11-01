@@ -227,9 +227,19 @@ impl ActivityPruneState {
                     "outcome" => "dispatch_drop_recovery"
                 )
                 .increment(1);
-                log::error!(
-                    "main-thread scheduler rejected activity prune; invoking bounded dispatch recovery: {rejected:?}"
-                );
+                // A retired scheduler generation is the mux shutting down.
+                if matches!(
+                    rejected,
+                    promise::spawn::MainThreadReservationOutcome::RetiredGeneration(_)
+                ) {
+                    log::debug!(
+                        "main-thread scheduler retired before activity prune; invoking bounded dispatch recovery: {rejected:?}"
+                    );
+                } else {
+                    log::error!(
+                        "main-thread scheduler rejected activity prune; invoking bounded dispatch recovery: {rejected:?}"
+                    );
+                }
                 drop(dispatch);
             }
         }

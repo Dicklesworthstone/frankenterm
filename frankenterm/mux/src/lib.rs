@@ -13325,9 +13325,20 @@ fn schedule_pane_reader_eof(
                     "outcome" => "inline_fallback"
                 )
                 .increment(1);
-                log::error!(
-                    "mux main-thread scheduler rejected pane reader EOF finalization; preserving cleanup inline: {rejected:?}"
-                );
+                // A retired scheduler generation is the mux shutting down,
+                // where inline cleanup is the design.
+                if matches!(
+                    rejected,
+                    promise::spawn::MainThreadReservationOutcome::RetiredGeneration(_)
+                ) {
+                    log::debug!(
+                        "mux main-thread scheduler retired before pane reader EOF finalization; finishing cleanup inline: {rejected:?}"
+                    );
+                } else {
+                    log::error!(
+                        "mux main-thread scheduler rejected pane reader EOF finalization; preserving cleanup inline: {rejected:?}"
+                    );
+                }
                 finish_pane_reader_eof(&pane, &generation, pane_id, exit_behavior);
             }
         }
