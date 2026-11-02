@@ -7790,30 +7790,38 @@ impl WholeMuxRecoveryVerifier {
                             });
                         }
                         #[cfg(unix)]
-                        if matches!(
+                        let selector =
+                            frankenterm_pty_guardian::GuardianCheckpointAdoptionSelectorV1 {
+                                checkpoint_id: publication.checkpoint_identity,
+                                capturing_mux_incarnation: publication.mux_incarnation,
+                                capture_generation: *guardian_generation,
+                                adoption_effect_id: publication.effect_id,
+                                adoption_sequence: *catalog_generation,
+                            };
+                        // A successor's custody is always reopened. Its witness
+                        // is the one the unregistered branch below would reopen
+                        // again, scanning the pane's catalog under the guardian
+                        // store's lock a second time, so keep it (ft-4wrv7).
+                        #[cfg(unix)]
+                        let successor_witness = if matches!(
                             &pane.spawn_custody,
                             crate::mux_recovery_image::RecoverySpawnCustody::Original(custody)
                                 if custody.acknowledged_successor.is_some()
                         ) {
-                            self.reopen_manifest_guardian_capture(
-                                pane,
-                                frankenterm_pty_guardian::GuardianCheckpointAdoptionSelectorV1 {
-                                    checkpoint_id: publication.checkpoint_identity,
-                                    capturing_mux_incarnation: publication.mux_incarnation,
-                                    capture_generation: *guardian_generation,
-                                    adoption_effect_id: publication.effect_id,
-                                    adoption_sequence: *catalog_generation,
-                                },
-                            )?
-                            .ok_or_else(|| {
-                                WholeMuxRecoveryError::UnprovedGuardianAuthority {
-                                    pane_id: pane.pane_id as u64,
-                                    reason:
-                                        "successor selector requires existing encrypted custody"
-                                            .to_owned(),
-                                }
-                            })?;
-                        }
+                            Some(
+                                self.reopen_manifest_guardian_capture(pane, selector)?
+                                    .ok_or_else(|| {
+                                        WholeMuxRecoveryError::UnprovedGuardianAuthority {
+                                            pane_id: pane.pane_id as u64,
+                                            reason:
+                                                "successor selector requires existing encrypted custody"
+                                                    .to_owned(),
+                                        }
+                                    })?,
+                            )
+                        } else {
+                            None
+                        };
                         let pane_uuid = uuid::Uuid::parse_str(&pane.pane_uuid).ok();
                         if let Some(witness) =
                             pane_uuid.and_then(|id| self.published_guardian_captures.get(&id))
@@ -7854,19 +7862,12 @@ impl WholeMuxRecoveryVerifier {
                             {
                                 let registered = pane_uuid
                                     .and_then(|id| self.reopened_guardian_captures.get(&id));
-                                let discovered = if registered.is_none() {
-                                    self.reopen_manifest_guardian_capture(
-                                        pane,
-                                        frankenterm_pty_guardian::GuardianCheckpointAdoptionSelectorV1 {
-                                            checkpoint_id: publication.checkpoint_identity,
-                                            capturing_mux_incarnation: publication.mux_incarnation,
-                                            capture_generation: *guardian_generation,
-                                            adoption_effect_id: publication.effect_id,
-                                            adoption_sequence: *catalog_generation,
-                                        },
-                                    )?
-                                } else {
-                                    None
+                                let discovered = match (registered, successor_witness) {
+                                    (Some(_), _) => None,
+                                    (None, Some(witness)) => Some(witness),
+                                    (None, None) => {
+                                        self.reopen_manifest_guardian_capture(pane, selector)?
+                                    }
                                 };
                                 let witness =
                                     registered.or(discovered.as_ref()).ok_or_else(|| {
