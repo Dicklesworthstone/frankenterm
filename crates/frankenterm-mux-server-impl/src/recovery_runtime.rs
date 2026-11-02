@@ -417,7 +417,8 @@ impl CaptureState {
 
 struct AttemptResult {
     state: Option<CaptureState>,
-    published_generation: Option<u64>,
+    /// And how long verifying the roots after it took (ft-4wrv7).
+    published_generation: Option<(u64, Duration)>,
     error: Option<&'static str>,
     terminal: bool,
     /// The store's outcome is unknown: reconcile before the next capture.
@@ -576,7 +577,7 @@ impl PeriodicRecovery {
                             // No root will lift the live checkpoint gate.
                             self.mux.set_guardian_root_retention(false);
                         }
-                        if let Some(generation) = result.published_generation {
+                        if let Some((generation, verified_in)) = result.published_generation {
                             // The optimistic cut happened no earlier than the
                             // attempt start. Do not understate RPO age by
                             // refreshing it at the end of encode/verification.
@@ -588,7 +589,8 @@ impl PeriodicRecovery {
                                 now.saturating_duration_since(started).as_millis()
                             });
                             log::info!(
-                                "mux periodic recovery published local generation={generation} in {took_ms} ms; replica durability unproven"
+                                "mux periodic recovery published local generation={generation} in {took_ms} ms ({} ms of it verifying the roots); replica durability unproven",
+                                verified_in.as_millis()
                             );
                         }
                         if let Some(error) = result.error {
@@ -725,11 +727,13 @@ impl PeriodicRecovery {
                 Ok(receipt) => {
                     // Verification settlement must finish even if shutdown
                     // arrived after durable publication. It never writes.
+                    let verifying = Instant::now();
                     match state.select_predecessor(
                         &cx::for_request(),
                         Some((receipt.generation, &receipt.sha256)),
                     ) {
                         Ok(()) => {
+                            let verified_in = verifying.elapsed();
                             #[cfg(unix)]
                             if let Err(error) =
                                 crate::guardian_proxy::release_unrooted_guardian_panes(&mux)
@@ -738,7 +742,7 @@ impl PeriodicRecovery {
                                     "mux periodic recovery could not release ended guardian panes: {error:#}"
                                 );
                             }
-                            (Some(receipt.generation), None, false, false)
+                            (Some((receipt.generation, verified_in)), None, false, false)
                         }
                         Err(_) => (
                             None,
