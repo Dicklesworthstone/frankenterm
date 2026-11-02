@@ -235,6 +235,11 @@ const BROKER_CONTROL_MAX_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const BROKER_CONTROL_AUTHENTICATION_DEADLINE: Duration = Duration::from_secs(5);
 const BROKER_CONTROL_CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const BROKER_CONTROL_CENSUS_COLLECTION_TIMEOUT: Duration = Duration::from_secs(5);
+// The least time an exchange of a repeated request gets for its own I/O,
+// however near its caller's deadline (`repeated_exchange_budget`), and the
+// longest pause between RetirePane asks while the broker is retiring.
+const BROKER_REPEATED_EXCHANGE_MIN: Duration = Duration::from_secs(1);
+const BROKER_RETIRE_POLL_MAX: Duration = Duration::from_millis(25);
 const BROKER_GENESIS_BINDING_BYTES: usize = 256;
 const BROKER_SPAWN_CONTROL_MAGIC: [u8; 4] = *b"BSP1";
 const BROKER_SPAWN_CONTROL_FIXED_BYTES: usize = 332;
@@ -8300,7 +8305,9 @@ impl BrokerPaneIoWorkerV1 {
             return Err(command);
         };
         // A caller cannot turn worker teardown into an unbounded socket wait.
-        // Queue capacity and the deadline apply to the whole connection.
+        // Queue capacity and the deadline apply to the whole connection; a
+        // Retire's last ask can end one exchange's I/O bound past the
+        // deadline (`repeated_exchange_budget`).
         let deadline = match &mut *command {
             BrokerPaneIoCommandV1::OpenInitial { .. } => None,
             BrokerPaneIoCommandV1::Resize { deadline, .. }
@@ -9067,25 +9074,26 @@ impl BrokerControlClientV1 {
             bytes,
         )
         .map_err(|_| BrokerControlClientError::Protocol)?;
+        let budget = repeated_exchange_budget(deadline);
         loop {
             match self
-                .exchange_with_deadline(&request, Some(deadline))?
+                .exchange_with_deadline(&request, Some(Instant::now() + budget))?
                 .header
                 .status
             {
                 BrokerControlResponseStatusV1::Applied => return Ok(()),
                 // The broker wrote nothing: an output drain held the pane's
-                // reader. The same request may go again until the deadline,
-                // checked after the pause so no resend starts past it (an
-                // expired exchange would poison a connection that is clean).
+                // reader. The same request may go again; none starts once the
+                // pause would reach the deadline.
                 BrokerControlResponseStatusV1::Retryable => {
-                    thread::sleep(Duration::from_millis(1));
-                    if Instant::now() >= deadline {
+                    let pause = Duration::from_millis(1);
+                    if Instant::now() + pause >= deadline {
                         return Err(BrokerControlClientError::Io(std::io::Error::new(
                             std::io::ErrorKind::TimedOut,
                             "broker input deadline",
                         )));
                     }
+                    thread::sleep(pause);
                 }
                 // No other status permits retransmission of raw input. The
                 // outer canonical WAL records the failed/ambiguous attempt and
@@ -9172,7 +9180,9 @@ impl BrokerControlClientV1 {
     /// Ask the broker to forget a settled pane and delete its files
     /// (ft-9ojeh). Ok(true) once it has; Ok(false) when it declines, so the
     /// caller keeps the files. The request repeats while the broker is busy
-    /// with it; retirement is idempotent.
+    /// with it, until `deadline`; retirement is idempotent. The deadline only
+    /// stops further asks, so the call can end up to one exchange's I/O bound
+    /// past it (`repeated_exchange_budget`).
     pub fn retire_pane(
         &mut self,
         handle: &BrokerPaneOutputHandleV1,
@@ -9200,22 +9210,27 @@ impl BrokerControlClientV1 {
             &[],
         )
         .map_err(|_| BrokerControlClientError::Protocol)?;
+        let budget = repeated_exchange_budget(deadline);
+        // A retirement syncs several files; asking every millisecond until it
+        // ends would cost the broker's dispatch loop thousands of exchanges.
+        let mut pause = Duration::from_millis(1);
         loop {
             match self
-                .exchange_with_deadline(&request, Some(deadline))?
+                .exchange_with_deadline(&request, Some(Instant::now() + budget))?
                 .header
                 .status
             {
                 BrokerControlResponseStatusV1::Applied => return Ok(true),
                 BrokerControlResponseStatusV1::Rejected => return Ok(false),
                 BrokerControlResponseStatusV1::Retryable => {
-                    thread::sleep(Duration::from_millis(1));
-                    if Instant::now() >= deadline {
+                    if Instant::now() + pause >= deadline {
                         return Err(BrokerControlClientError::Io(std::io::Error::new(
                             std::io::ErrorKind::TimedOut,
                             "broker retirement deadline",
                         )));
                     }
+                    thread::sleep(pause);
+                    pause = (pause * 2).min(BROKER_RETIRE_POLL_MAX);
                 }
                 _ => {
                     self.poisoned = true;
@@ -9780,6 +9795,7 @@ impl BrokerControlClientV1 {
             secret.as_wire(),
         )
         .map_err(|_| BrokerControlClientError::Protocol)?;
+        let budget = repeated_exchange_budget(deadline);
         loop {
             if Instant::now() >= deadline {
                 return Err(BrokerControlClientError::Io(std::io::Error::new(
@@ -9788,7 +9804,7 @@ impl BrokerControlClientV1 {
                 )));
             }
             match self
-                .exchange_with_deadline(&fence, Some(deadline))?
+                .exchange_with_deadline(&fence, Some(Instant::now() + budget))?
                 .header
                 .status
             {
@@ -9810,7 +9826,7 @@ impl BrokerControlClientV1 {
                 next_generation,
                 &secret,
                 BrokerControlOperationV1::ClaimMuxSuccessor,
-                Some(deadline),
+                Some(Instant::now() + budget),
             )? {
                 BrokerSuccessorClaimQueryV1::Claim(claim) => {
                     let custody = successor
@@ -9840,7 +9856,7 @@ impl BrokerControlClientV1 {
                             ack_id,
                             next_generation,
                             &stored_secret,
-                            Some(deadline),
+                            Some(Instant::now() + budget),
                         )? {
                             BrokerSuccessorAcknowledgementV1::Acknowledged => {
                                 return Ok(BrokerPaneOutputHandleV1 {
@@ -10771,6 +10787,18 @@ fn read_broker_control_frame_with(
     frame[..prefix.len()].copy_from_slice(&prefix);
     read_exact(stream, &mut frame[prefix.len()..])?;
     Ok(frame)
+}
+
+/// The I/O bound for each exchange of a request that repeats until
+/// `deadline` (a Write or RetirePane the broker answers Retryable, the steps
+/// of a mux ownership rotation): as long as the first exchange had, and at
+/// least [`BROKER_REPEATED_EXCHANGE_MIN`]. The deadline only stops further
+/// asks, so the last can end up to this long past it. One the deadline cut
+/// mid-way would poison the connection, which every pane of its mux shares.
+fn repeated_exchange_budget(deadline: Instant) -> Duration {
+    deadline
+        .saturating_duration_since(Instant::now())
+        .max(BROKER_REPEATED_EXCHANGE_MIN)
 }
 
 fn blocking_io_deadline_remaining(deadline: Instant) -> Result<Duration, std::io::Error> {
