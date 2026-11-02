@@ -151,7 +151,11 @@ const BROKER_SPAWN_CATALOG_WAL_SUFFIX: &str = ".wal.v1";
 const BROKER_SPAWN_CATALOG_HEAD_SUFFIX: &str = ".head.v1";
 const BROKER_SPAWN_CREATION_MARKER_PREFIX: &str = "c1-";
 const BROKER_SPAWN_COMPLETED_MARKER_PREFIX: &str = "d1-";
+/// A retired pane's tombstone (ft-9ojeh): the creation marker's encoding
+/// under its own MAC domain.
+const BROKER_SPAWN_RETIRED_MARKER_PREFIX: &str = "r1-";
 const BROKER_SPAWN_CREATION_MARKER_MAGIC: [u8; 8] = *b"FTBSC001";
+const BROKER_SPAWN_RETIRED_MARKER_MAGIC: [u8; 8] = *b"FTBST001";
 const BROKER_SPAWN_CREATION_IDENTITY_BYTES: usize = 168;
 const BROKER_SPAWN_CREATION_MARKER_BYTES: usize =
     BROKER_SPAWN_CREATION_IDENTITY_BYTES + BROKER_SPAWN_WAL_MAC_BYTES;
@@ -160,7 +164,9 @@ const BROKER_SPAWN_CREATION_MARKER_NAME_BYTES: usize =
     BROKER_SPAWN_CREATION_MARKER_PREFIX.len() + BROKER_SPAWN_CREATION_MARKER_ENCODED_BYTES;
 const BROKER_SPAWN_CREATION_BASE85: &[u8; 85] =
     b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()+,-.;:=@[]^_{}~?";
-const BROKER_SPAWN_CATALOG_MAX_ENTRIES: usize = GUARDIAN_MAX_PANES * 3 + 1;
+/// Three members per pane, a tombstone beside them while it retires, and
+/// the lock.
+const BROKER_SPAWN_CATALOG_MAX_ENTRIES: usize = GUARDIAN_MAX_PANES * 4 + 1;
 const BROKER_SPAWN_CATALOG_MAX_PHYSICAL_BYTES: u64 = GUARDIAN_MAX_PANES as u64
     * (BROKER_SPAWN_WAL_MAX_PHYSICAL_BYTES + BROKER_SPAWN_HEAD_MAX_PHYSICAL_BYTES);
 const BROKER_LEASE_WAL_FILE_MAGIC: [u8; 8] = *b"FTBLW001";
@@ -192,6 +198,9 @@ const BROKER_LEASE_CATALOG_WAL_SUFFIX: &str = ".wal.v1";
 const BROKER_LEASE_CATALOG_HEAD_SUFFIX: &str = ".head.v1";
 const BROKER_LEASE_CATALOG_CREATING_SUFFIX: &str = ".creating.v1";
 const BROKER_LEASE_CATALOG_COMPLETED_SUFFIX: &str = ".completed.v1";
+/// A retiring pane's completed marker, renamed (ft-9ojeh). Its members may
+/// be partly unlinked already.
+const BROKER_LEASE_CATALOG_RETIRED_SUFFIX: &str = ".retired.v1";
 const BROKER_LEASE_CREATION_MARKER_MAGIC: [u8; 8] = *b"FTBLC001";
 const BROKER_LEASE_CREATION_MARKER_BYTES: u64 = BROKER_LEASE_WAL_FILE_HEADER_BYTES_U64;
 const BROKER_LEASE_CATALOG_MAX_ENTRIES: usize = GUARDIAN_MAX_PANES * 3 + 1;
@@ -1365,6 +1374,10 @@ pub(crate) enum BrokerControlOperationV1 {
     QuerySuccessorRecovery = 15,
     FenceMuxOwner = 16,
     ClaimMuxSuccessor = 17,
+    /// Forget a settled pane: its child exited and its owner acknowledged
+    /// every output byte. The broker deletes the pane's files and frees its
+    /// slot of the pane bound (ft-9ojeh).
+    RetirePane = 18,
 }
 
 impl BrokerControlOperationV1 {
@@ -1387,6 +1400,7 @@ impl BrokerControlOperationV1 {
             15 => Ok(Self::QuerySuccessorRecovery),
             16 => Ok(Self::FenceMuxOwner),
             17 => Ok(Self::ClaimMuxSuccessor),
+            18 => Ok(Self::RetirePane),
             _ => Err(BrokerControlProtocolError::InvalidOperation),
         }
     }
@@ -1619,7 +1633,8 @@ impl BrokerControlRequestHeaderV1 {
             }
             BrokerControlOperationV1::ClosePane
             | BrokerControlOperationV1::QueryChildStatus
-            | BrokerControlOperationV1::SignalTerminate => {
+            | BrokerControlOperationV1::SignalTerminate
+            | BrokerControlOperationV1::RetirePane => {
                 !self.broker_incarnation.is_nil()
                     && !self.durable_pane_id.is_nil()
                     && self.lease_generation > 0
@@ -1837,7 +1852,8 @@ impl BrokerControlResponseHeaderV1 {
             BrokerControlOperationV1::Write
             | BrokerControlOperationV1::Resize
             | BrokerControlOperationV1::SignalTerminate
-            | BrokerControlOperationV1::AcknowledgeOutput => {
+            | BrokerControlOperationV1::AcknowledgeOutput
+            | BrokerControlOperationV1::RetirePane => {
                 pane_scoped
                     && self.lease_generation > 0
                     && empty_effect
@@ -2789,6 +2805,22 @@ struct BrokerLeaseWorkerSubmitErrorV1 {
     job: BrokerLeaseWorkerJobV1,
 }
 
+/// Retire one settled pane (ft-9ojeh). The readiness loop holds the pane
+/// itself aside meanwhile; the worker only touches the catalogs.
+struct BrokerRetireWorkerJobV1 {
+    fingerprint: BrokerSpawnWorkerFingerprintV1,
+    identity: BrokerSpawnWalIdentityV1,
+    token_effect_lease: GuardianTokenEffectLease,
+}
+
+struct BrokerRetireWorkerCompletionV1 {
+    fingerprint: BrokerSpawnWorkerFingerprintV1,
+    /// The tombstone is durable, so the pane is retired whatever the file
+    /// cleanup after it did.
+    committed: bool,
+    token_authority_failed: bool,
+}
+
 // Keep the admitted Spawn job inline so queue admission cannot fail after a
 // separate allocation. This capacity-one control lane deliberately trades a
 // bounded move for allocation-free transfer into the effect worker.
@@ -2797,6 +2829,7 @@ enum BrokerSpawnWorkerCommandV1 {
     Spawn(BrokerSpawnWorkerJobV1),
     Acknowledge(BrokerSpawnAckWorkerJobV1),
     Lease(BrokerLeaseWorkerJobV1),
+    Retire(BrokerRetireWorkerJobV1),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2807,6 +2840,7 @@ enum BrokerSpawnWorkerActiveV1 {
     Spawn(BrokerSpawnWorkerFingerprintV1),
     Acknowledge(BrokerSpawnAckFingerprintV1),
     Lease(BrokerLeaseWorkerFingerprintV1),
+    Retire(BrokerSpawnWorkerFingerprintV1),
 }
 
 // The worker must publish a completed external effect without allocating after
@@ -2817,6 +2851,7 @@ enum BrokerSpawnWorkerEventV1 {
     Spawn(BrokerSpawnWorkerCompletionV1),
     Acknowledge(BrokerSpawnAckWorkerCompletionV1),
     Lease(BrokerLeaseWorkerCompletionV1),
+    Retire(BrokerRetireWorkerCompletionV1),
 }
 
 impl BrokerSpawnWorkerEventV1 {
@@ -2827,6 +2862,7 @@ impl BrokerSpawnWorkerEventV1 {
                 BrokerSpawnWorkerActiveV1::Acknowledge(completion.fingerprint)
             }
             Self::Lease(completion) => BrokerSpawnWorkerActiveV1::Lease(completion.fingerprint),
+            Self::Retire(completion) => BrokerSpawnWorkerActiveV1::Retire(completion.fingerprint),
         }
     }
 }
@@ -2874,7 +2910,64 @@ impl BrokerSpawnWorkerStateV1 {
             BrokerSpawnWorkerCommandV1::Lease(job) => {
                 BrokerSpawnWorkerEventV1::Lease(self.execute_lease_transition(job))
             }
+            BrokerSpawnWorkerCommandV1::Retire(job) => {
+                BrokerSpawnWorkerEventV1::Retire(self.execute_retirement(job))
+            }
         }
+    }
+
+    fn execute_retirement(
+        &self,
+        mut job: BrokerRetireWorkerJobV1,
+    ) -> BrokerRetireWorkerCompletionV1 {
+        let authority_valid_before = job.token_effect_lease.validate().is_ok();
+        let committed = authority_valid_before
+            && catch_recoverable(
+                RecoverablePanicSite::StorageWriter,
+                AssertUnwindSafe(|| {
+                    self.spawn_catalog
+                        .write_retirement_tombstone(job.identity, &self.spawn_authenticator)
+                }),
+            )
+            .is_ok_and(|written| written.is_ok());
+        if committed {
+            // A failure leaves the tombstone, which the next retirement or
+            // bind finishes. The guardian also deletes its own files.
+            let _ = catch_recoverable(
+                RecoverablePanicSite::StorageWriter,
+                AssertUnwindSafe(|| self.finish_retirements()),
+            );
+        }
+        let authority_valid_after = job.token_effect_lease.validate().is_ok();
+        BrokerRetireWorkerCompletionV1 {
+            fingerprint: job.fingerprint,
+            committed,
+            token_authority_failed: !authority_valid_before || !authority_valid_after,
+        }
+    }
+
+    /// Finish every committed retirement: the lease journal, the pane's
+    /// output and custody files, then the Spawn pair and its tombstone last.
+    fn finish_retirements(&self) -> Result<(), BrokerControlServiceError> {
+        let checkpoint_store = self.output_pipeline.checkpoint_stage_store();
+        for pair in self.spawn_catalog.scan_retirements()?.values() {
+            let Some(tombstone) = pair.retired.as_ref() else {
+                continue;
+            };
+            validate_broker_spawn_retired_marker(tombstone, &self.spawn_authenticator)?;
+            let identity = tombstone.identity;
+            self.lease_catalog.retire(identity.journal_id())?;
+            checkpoint_store
+                .delete_retired_pane_files(identity.durable_pane_id(), identity.spawn_effect_id())
+                .map_err(|_| {
+                    BrokerControlServiceError::InvalidConfiguration(
+                        "retired pane file deletion failed",
+                    )
+                })?;
+            self.spawn_catalog
+                .finish_retirement(pair, &self.spawn_authenticator)?;
+        }
+        Ok(())
     }
 
     #[cfg_attr(not(test), allow(clippy::unused_self))]
@@ -3260,6 +3353,9 @@ impl BrokerSpawnWorkerV1 {
         if let Some(current) = *active {
             return if current == authority {
                 Ok(BrokerSpawnWorkerSubmissionV1::RecoveredInFlight)
+            } else if matches!(current, BrokerSpawnWorkerActiveV1::Retire(_)) {
+                // A retirement is brief and concerns another pane: retry.
+                Err(BrokerSpawnWorkerSubmitErrorV1::Saturated)
             } else {
                 Err(BrokerSpawnWorkerSubmitErrorV1::ConflictingInFlight)
             };
@@ -3300,9 +3396,13 @@ impl BrokerSpawnWorkerV1 {
                 });
             }
         };
-        if active.is_some() {
+        if let Some(current) = *active {
             return Err(BrokerSpawnAckWorkerSubmitErrorV1 {
-                kind: BrokerSpawnWorkerSubmitErrorV1::ConflictingInFlight,
+                kind: if matches!(current, BrokerSpawnWorkerActiveV1::Retire(_)) {
+                    BrokerSpawnWorkerSubmitErrorV1::Saturated
+                } else {
+                    BrokerSpawnWorkerSubmitErrorV1::ConflictingInFlight
+                },
                 job,
             });
         }
@@ -3417,6 +3517,7 @@ impl BrokerSpawnWorkerV1 {
             BrokerSpawnWorkerActiveV1::Spawn(fingerprint) => fingerprint,
             BrokerSpawnWorkerActiveV1::Acknowledge(fingerprint) => fingerprint.spawn,
             BrokerSpawnWorkerActiveV1::Lease(fingerprint) => fingerprint.spawn,
+            BrokerSpawnWorkerActiveV1::Retire(fingerprint) => fingerprint,
         }))
     }
 
@@ -3430,8 +3531,36 @@ impl BrokerSpawnWorkerV1 {
         Ok(active.and_then(|authority| match authority {
             BrokerSpawnWorkerActiveV1::Spawn(_) => None,
             BrokerSpawnWorkerActiveV1::Acknowledge(fingerprint) => Some(fingerprint),
-            BrokerSpawnWorkerActiveV1::Lease(_) => None,
+            BrokerSpawnWorkerActiveV1::Lease(_) | BrokerSpawnWorkerActiveV1::Retire(_) => None,
         }))
+    }
+
+    /// Admit one retirement if the lane is idle. A busy lane hands the job
+    /// back, and the caller answers Retryable.
+    fn try_submit_retire(
+        &self,
+        job: BrokerRetireWorkerJobV1,
+    ) -> Result<(), BrokerSpawnWorkerSubmitErrorV1> {
+        let mut active = self
+            .active
+            .lock()
+            .map_err(|_| BrokerSpawnWorkerSubmitErrorV1::Poisoned)?;
+        if active.is_some() {
+            return Err(BrokerSpawnWorkerSubmitErrorV1::ConflictingInFlight);
+        }
+        let jobs = self
+            .jobs
+            .as_ref()
+            .ok_or(BrokerSpawnWorkerSubmitErrorV1::Disconnected)?;
+        *active = Some(BrokerSpawnWorkerActiveV1::Retire(job.fingerprint));
+        jobs.try_send(BrokerSpawnWorkerCommandV1::Retire(job))
+            .map_err(|error| {
+                *active = None;
+                match error {
+                    TrySendError::Full(_) => BrokerSpawnWorkerSubmitErrorV1::Saturated,
+                    TrySendError::Disconnected(_) => BrokerSpawnWorkerSubmitErrorV1::Disconnected,
+                }
+            })
     }
 }
 
@@ -3662,6 +3791,7 @@ fn open_and_scan_broker_lease_catalog_under_token_authority(
     token_authority: &mut GuardianTokenPathAuthority,
     lease_catalog_path: PathBuf,
     authenticator: &GuardianBrokerLeaseWalAuthenticatorV1,
+    retiring_journals: &[Uuid],
 ) -> Result<(BrokerPaneLeaseWalCatalogV1, Vec<BrokerPaneLeaseJournalV1>), BrokerControlServiceError>
 {
     let mut token_effect_lease = token_authority.acquire_effect_lease()?;
@@ -3669,6 +3799,11 @@ fn open_and_scan_broker_lease_catalog_under_token_authority(
     token_authority.validate()?;
     let result = (|| {
         let lease_catalog = BrokerPaneLeaseWalCatalogV1::open(lease_catalog_path)?;
+        // A tombstoned pane's lease journal has no Spawn pair left to bind
+        // to, so it retires before admission.
+        for journal_id in retiring_journals {
+            lease_catalog.retire(*journal_id)?;
+        }
         let recovered_journals = lease_catalog.scan_all_for_admission(authenticator)?;
         Ok((lease_catalog, recovered_journals))
     })();
@@ -3826,6 +3961,9 @@ enum BrokerOutputDrainFailureV1 {
 
 /// How long drains pause after one found the disk full.
 const BROKER_OUTPUT_STORAGE_FULL_RETRY: Duration = Duration::from_millis(250);
+
+/// How many recent retirements answer a repeated RetirePane with Applied.
+const BROKER_RETIRED_PANE_RECEIPTS: usize = 64;
 
 /// What one drain job read from its pane's PTY.
 #[derive(Debug, Eq, PartialEq)]
@@ -4514,6 +4652,11 @@ pub struct BrokerControlServiceV1 {
     spawn_completion_token: Token,
     retained_spawns: HashMap<Uuid, BrokerSpawnWorkerCompletionV1>,
     live_spawns: HashMap<Uuid, BrokerLiveSpawnV1>,
+    /// The pane the worker is retiring, out of the census meanwhile.
+    retiring_spawn: Option<BrokerLiveSpawnV1>,
+    /// Recent retirements by pane and birth, so a retried request whose
+    /// answer was lost still hears Applied.
+    retired_panes: VecDeque<(Uuid, Uuid)>,
     retained_spawn_by_effect: HashMap<Uuid, Uuid>,
     retained_spawn_by_journal: HashMap<Uuid, Uuid>,
     retained_spawn_by_origin_request: HashMap<Uuid, Uuid>,
@@ -4619,11 +4762,21 @@ impl BrokerControlServiceV1 {
                 config.spawn_catalog_path,
                 &spawn_authenticator,
             )?;
+        let mut retiring_journals = Vec::new();
+        for pair in spawn_catalog.scan_retirements()?.values() {
+            let tombstone = pair
+                .retired
+                .as_ref()
+                .ok_or(BrokerControlServiceError::InvalidRecoveredSpawnState)?;
+            validate_broker_spawn_retired_marker(tombstone, &spawn_authenticator)?;
+            retiring_journals.push(tombstone.identity.journal_id());
+        }
         let (lease_catalog, mut recovered_lease_journals) =
             open_and_scan_broker_lease_catalog_under_token_authority(
                 &mut token_authority,
                 config.lease_catalog_path,
                 &lease_authenticator,
+                &retiring_journals,
             )?;
         let recovered_catalog =
             BrokerRecoveredSpawnCatalogV1::admit(recovered_journals, &spawn_authenticator)?;
@@ -4762,21 +4915,36 @@ impl BrokerControlServiceV1 {
             config.token_path.clone(),
             control_authenticator.clone(),
         )?;
-        let spawn_worker = BrokerSpawnWorkerV1::start(
-            BrokerSpawnWorkerStateV1 {
-                spawn_catalog,
-                spawn_authenticator,
-                lease_catalog,
-                lease_authenticator,
-                output_pipeline,
-                exec_launch,
-                broker_incarnation,
-                limits: BrokerResourceLimitsV1::default(),
-                #[cfg(test)]
-                effect_lease_probe: None,
-            },
-            Arc::clone(&spawn_completion_waker),
-        )?;
+        let spawn_worker_state = BrokerSpawnWorkerStateV1 {
+            spawn_catalog,
+            spawn_authenticator,
+            lease_catalog,
+            lease_authenticator,
+            output_pipeline,
+            exec_launch,
+            broker_incarnation,
+            limits: BrokerResourceLimitsV1::default(),
+            #[cfg(test)]
+            effect_lease_probe: None,
+        };
+        // Retirements a previous broker committed but did not finish. One
+        // that fails again keeps its tombstone and slot for the next try.
+        {
+            let mut token_effect_lease = token_authority.acquire_effect_lease()?;
+            if token_effect_lease.validate().is_ok() {
+                let _ = spawn_worker_state.finish_retirements();
+            }
+        }
+        let spawn_worker =
+            BrokerSpawnWorkerV1::start(spawn_worker_state, Arc::clone(&spawn_completion_waker))?;
+        let mut retired_panes = VecDeque::new();
+        retired_panes
+            .try_reserve_exact(BROKER_RETIRED_PANE_RECEIPTS)
+            .map_err(|_| {
+                BrokerControlServiceError::InvalidConfiguration(
+                    "retired pane receipt allocation failed",
+                )
+            })?;
 
         let output_worker = BrokerOutputWorkerV1::start(spawn_completion_waker)?;
 
@@ -4807,6 +4975,8 @@ impl BrokerControlServiceV1 {
             spawn_completion_token,
             retained_spawns,
             live_spawns,
+            retiring_spawn: None,
+            retired_panes,
             retained_spawn_by_effect,
             retained_spawn_by_journal,
             retained_spawn_by_origin_request,
@@ -4885,6 +5055,17 @@ impl BrokerControlServiceV1 {
         while !stop.load(Ordering::Acquire) {
             self.poll_once()?;
         }
+        // A drain job carries its pane's sole reader. A killed child's last
+        // terminal close on macOS waits until the master is read or closed,
+        // so close every reader before waiting for a child.
+        #[cfg(test)]
+        {
+            drop(self.output_worker.retained.take());
+            drop(self.output_worker.jobs.take());
+            while let Ok(job) = self.output_worker.completions.recv() {
+                drop(job);
+            }
+        }
         #[cfg(test)]
         for retained in self.retained_spawns.values_mut() {
             if let BrokerSpawnWorkerOutcomeV1::Applied { adoption, .. } = &mut retained.outcome {
@@ -4913,7 +5094,9 @@ impl BrokerControlServiceV1 {
             let retained = match event {
                 BrokerSpawnWorkerEventV1::Spawn(completion) => completion,
                 BrokerSpawnWorkerEventV1::Acknowledge(completion) => completion.retained.as_mut(),
-                BrokerSpawnWorkerEventV1::Lease(_) => continue,
+                BrokerSpawnWorkerEventV1::Lease(_) | BrokerSpawnWorkerEventV1::Retire(_) => {
+                    continue;
+                }
             };
             if let BrokerSpawnWorkerOutcomeV1::Applied { adoption, .. } = &mut retained.outcome {
                 adoption.pane.terminate_and_wait_for_test();
@@ -5254,6 +5437,9 @@ impl BrokerControlServiceV1 {
                 self.retain_ack_completion(completion);
             }
             BrokerSpawnWorkerEventV1::Lease(completion) => self.retain_lease_completion(completion),
+            BrokerSpawnWorkerEventV1::Retire(completion) => {
+                self.retain_retire_completion(completion);
+            }
         }
     }
 
@@ -5652,6 +5838,9 @@ impl BrokerControlServiceV1 {
             BrokerControlOperationV1::ClosePane | BrokerControlOperationV1::SignalTerminate => {
                 return self.dispatch_termination(owner, request);
             }
+            BrokerControlOperationV1::RetirePane => {
+                return self.dispatch_retire(owner, request);
+            }
             _ => {}
         }
         BrokerControlResponseV1::new(
@@ -5686,6 +5875,113 @@ impl BrokerControlServiceV1 {
             }
         }
         BrokerControlResponseV1::new(header, &[]).map_err(|_| ())
+    }
+
+    /// Forget a settled pane and delete its files (ft-9ojeh), freeing its
+    /// slot. Its owner asks once the child has exited and every output byte
+    /// is acknowledged, and repeats the request while it is Retryable. The
+    /// pane leaves the census as the worker starts, so nothing can recover it
+    /// meanwhile.
+    fn dispatch_retire(
+        &mut self,
+        owner: BrokerGuardianOwnerIdentity,
+        request: &BrokerControlRequestV1,
+    ) -> Result<BrokerControlResponseV1, ()> {
+        let pane_id = request.header.durable_pane_id;
+        let effect_id = request.header.operation_id;
+        self.drain_output_completion();
+        let draining = self
+            .output_worker
+            .active
+            .is_some_and(|(active_pane, _)| active_pane == pane_id);
+        let status = if self.retired_panes.contains(&(pane_id, effect_id)) {
+            BrokerControlResponseStatusV1::Applied
+        } else if self
+            .retiring_spawn
+            .as_ref()
+            .is_some_and(|live| live.fingerprint.binding.durable_pane_id == pane_id)
+        {
+            BrokerControlResponseStatusV1::Retryable
+        } else if let Some(live) = self.live_spawns.get_mut(&pane_id).filter(|live| {
+            live.fingerprint.binding.spawn_effect_id == effect_id
+                && live.observes_owner(owner).is_some_and(|identity| {
+                    identity.lease_generation == request.header.lease_generation
+                })
+        }) {
+            if draining || self.retiring_spawn.is_some() {
+                BrokerControlResponseStatusV1::Retryable
+            } else if self.spawn_worker_unavailable
+                || live.lease_journal.is_none()
+                || live.lease_transition.is_some()
+                || live.pending_successor.is_some()
+                || !live.adoption.pane.settled_for_retirement()
+            {
+                BrokerControlResponseStatusV1::Rejected
+            } else if let Ok(token_effect_lease) = self.token_authority.acquire_effect_lease() {
+                let job = BrokerRetireWorkerJobV1 {
+                    fingerprint: live.fingerprint,
+                    identity: live.journal.identity(),
+                    token_effect_lease,
+                };
+                match self.spawn_worker.try_submit_retire(job) {
+                    Ok(()) => {
+                        self.retiring_spawn = self.live_spawns.remove(&pane_id);
+                        BrokerControlResponseStatusV1::Retryable
+                    }
+                    Err(
+                        BrokerSpawnWorkerSubmitErrorV1::ConflictingInFlight
+                        | BrokerSpawnWorkerSubmitErrorV1::Saturated,
+                    ) => BrokerControlResponseStatusV1::Retryable,
+                    Err(_) => {
+                        self.spawn_worker_unavailable = true;
+                        BrokerControlResponseStatusV1::Rejected
+                    }
+                }
+            } else {
+                BrokerControlResponseStatusV1::Rejected
+            }
+        } else {
+            BrokerControlResponseStatusV1::Rejected
+        };
+        BrokerControlResponseV1::new(self.response_header(request.header, status), &[])
+            .map_err(|_| ())
+    }
+
+    fn retain_retire_completion(&mut self, completion: BrokerRetireWorkerCompletionV1) {
+        let Some(live) = self
+            .retiring_spawn
+            .take_if(|live| live.fingerprint == completion.fingerprint)
+        else {
+            self.blocked_worker_events
+                .push(BrokerSpawnWorkerEventV1::Retire(completion));
+            self.spawn_worker_unavailable = true;
+            return;
+        };
+        let binding = live.fingerprint.binding;
+        if !completion.committed {
+            self.live_spawns.insert(binding.durable_pane_id, live);
+            return;
+        }
+        for (index, key) in [
+            (&mut self.retained_spawn_by_effect, binding.spawn_effect_id),
+            (
+                &mut self.retained_spawn_by_journal,
+                live.fingerprint.journal_id,
+            ),
+            (
+                &mut self.retained_spawn_by_origin_request,
+                binding.origin_request_id,
+            ),
+        ] {
+            if index.get(&key) == Some(&binding.durable_pane_id) {
+                index.remove(&key);
+            }
+        }
+        if self.retired_panes.len() == BROKER_RETIRED_PANE_RECEIPTS {
+            self.retired_panes.pop_front();
+        }
+        self.retired_panes
+            .push_back((binding.durable_pane_id, binding.spawn_effect_id));
     }
 
     fn dispatch_write(
@@ -8828,6 +9124,62 @@ impl BrokerControlClientV1 {
         self.terminate_once(handle, deadline, BrokerControlOperationV1::ClosePane)
     }
 
+    /// Ask the broker to forget a settled pane and delete its files
+    /// (ft-9ojeh). Ok(true) once it has; Ok(false) when it declines, so the
+    /// caller keeps the files. The request repeats while the broker is busy
+    /// with it; retirement is idempotent.
+    pub fn retire_pane(
+        &mut self,
+        handle: &BrokerPaneOutputHandleV1,
+        deadline: Instant,
+    ) -> Result<bool, BrokerControlClientError> {
+        if handle.broker_incarnation != self.broker_incarnation
+            || handle.connection_id != self.connection_id
+        {
+            return Err(BrokerControlClientError::AuthenticationAuthority);
+        }
+        let request = BrokerControlRequestV1::new(
+            BrokerControlRequestHeaderV1 {
+                operation: BrokerControlOperationV1::RetirePane,
+                request_id: Uuid::new_v4(),
+                broker_incarnation: self.broker_incarnation,
+                guardian_incarnation: self.identity.guardian_incarnation,
+                connection_id: self.connection_id,
+                mux_incarnation: self.identity.mux_incarnation,
+                guardian_build_identity_digest: self.identity.guardian_build_identity.into_bytes(),
+                mux_build_identity_digest: self.identity.mux_build_identity.into_bytes(),
+                durable_pane_id: handle.pane_id,
+                lease_generation: handle.lease_generation,
+                operation_id: handle.spawn_effect_id,
+            },
+            &[],
+        )
+        .map_err(|_| BrokerControlClientError::Protocol)?;
+        loop {
+            match self
+                .exchange_with_deadline(&request, Some(deadline))?
+                .header
+                .status
+            {
+                BrokerControlResponseStatusV1::Applied => return Ok(true),
+                BrokerControlResponseStatusV1::Rejected => return Ok(false),
+                BrokerControlResponseStatusV1::Retryable => {
+                    thread::sleep(Duration::from_millis(1));
+                    if Instant::now() >= deadline {
+                        return Err(BrokerControlClientError::Io(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "broker retirement deadline",
+                        )));
+                    }
+                }
+                _ => {
+                    self.poisoned = true;
+                    return Err(BrokerControlClientError::UnexpectedResponse);
+                }
+            }
+        }
+    }
+
     fn terminate_once(
         &mut self,
         handle: &BrokerPaneOutputHandleV1,
@@ -11757,6 +12109,7 @@ struct BrokerSpawnWalCatalogPairV1 {
     head_name: Option<OsString>,
     creating: Option<BrokerSpawnCreationMarkerV1>,
     completed: Option<BrokerSpawnCreationMarkerV1>,
+    retired: Option<BrokerSpawnCreationMarkerV1>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -12376,6 +12729,7 @@ struct BrokerPaneLeaseWalCatalogPairV1 {
     head_name: Option<OsString>,
     creating_name: Option<OsString>,
     completed_name: Option<OsString>,
+    retired_name: Option<OsString>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -12384,6 +12738,7 @@ enum BrokerPaneLeaseCatalogMemberV1 {
     Head(Uuid),
     Creating(Uuid),
     Completed(Uuid),
+    Retired(Uuid),
 }
 
 struct BrokerPaneLeaseJournalV1 {
@@ -12549,6 +12904,10 @@ fn broker_lease_catalog_completed_name(journal_id: Uuid) -> OsString {
         .into()
 }
 
+fn broker_lease_catalog_retired_name(journal_id: Uuid) -> OsString {
+    format!("{BROKER_LEASE_CATALOG_PREFIX}{journal_id}{BROKER_LEASE_CATALOG_RETIRED_SUFFIX}").into()
+}
+
 fn parse_broker_lease_catalog_name(
     name: &OsStr,
 ) -> Result<BrokerPaneLeaseCatalogMemberV1, BrokerPaneLeaseWalErrorV1> {
@@ -12572,6 +12931,10 @@ fn parse_broker_lease_catalog_name(
             BROKER_LEASE_CATALOG_COMPLETED_SUFFIX,
             BrokerPaneLeaseCatalogMemberV1::Completed as fn(Uuid) -> _,
         ),
+        (
+            BROKER_LEASE_CATALOG_RETIRED_SUFFIX,
+            BrokerPaneLeaseCatalogMemberV1::Retired as fn(Uuid) -> _,
+        ),
     ];
     let (identifier, constructor) = variants
         .into_iter()
@@ -12592,6 +12955,7 @@ fn parse_broker_lease_catalog_name(
         BrokerPaneLeaseCatalogMemberV1::Head(id) => broker_lease_catalog_head_name(id),
         BrokerPaneLeaseCatalogMemberV1::Creating(id) => broker_lease_catalog_creating_name(id),
         BrokerPaneLeaseCatalogMemberV1::Completed(id) => broker_lease_catalog_completed_name(id),
+        BrokerPaneLeaseCatalogMemberV1::Retired(id) => broker_lease_catalog_retired_name(id),
     };
     if canonical != name {
         return Err(BrokerPaneLeaseWalErrorV1::UnexpectedCatalogEntry);
@@ -12613,6 +12977,7 @@ fn validate_broker_lease_catalog_name_capacity(
         broker_lease_catalog_head_name(maximum_id),
         broker_lease_catalog_creating_name(maximum_id),
         broker_lease_catalog_completed_name(maximum_id),
+        broker_lease_catalog_retired_name(maximum_id),
         OsString::from(BROKER_LEASE_CATALOG_LOCK_NAME),
     ]
     .into_iter()
@@ -14018,7 +14383,47 @@ impl BrokerPaneLeaseWalCatalogV1 {
         Ok(())
     }
 
+    /// The live pairs; a retiring pair is gone whatever members remain.
     fn scan_states(
+        &self,
+    ) -> Result<BTreeMap<Uuid, BrokerPaneLeaseWalCatalogPairV1>, BrokerPaneLeaseWalErrorV1> {
+        let mut states = self.scan_entries()?;
+        states.retain(|_, pair| pair.retired_name.is_none());
+        Ok(states)
+    }
+
+    /// Retire one pane's lease journal (ft-9ojeh): rename its completed
+    /// marker without replacement, then unlink the members and the retired
+    /// marker last. Idempotent, so bind can repeat an interrupted one.
+    fn retire(&self, journal_id: Uuid) -> Result<(), BrokerPaneLeaseWalErrorV1> {
+        let Some(pair) = self.scan_entries()?.remove(&journal_id) else {
+            return Ok(());
+        };
+        if pair.creating_name.is_some() {
+            return Err(BrokerPaneLeaseWalErrorV1::InvalidCreationState);
+        }
+        let retired_name = broker_lease_catalog_retired_name(journal_id);
+        if let Some(completed_name) = pair.completed_name.as_ref() {
+            publish_broker_spawn_completed_marker_noreplace(
+                &self.directory,
+                completed_name,
+                &retired_name,
+            )?;
+            self.directory.sync_all()?;
+        }
+        for name in [
+            broker_lease_catalog_wal_name(journal_id),
+            broker_lease_catalog_head_name(journal_id),
+        ] {
+            unlink_broker_catalog_member_at(&self.directory, &name)?;
+        }
+        self.directory.sync_all()?;
+        unlink_broker_catalog_member_at(&self.directory, &retired_name)?;
+        self.directory.sync_all()?;
+        Ok(())
+    }
+
+    fn scan_entries(
         &self,
     ) -> Result<BTreeMap<Uuid, BrokerPaneLeaseWalCatalogPairV1>, BrokerPaneLeaseWalErrorV1> {
         self.validate_pinned_directory()?;
@@ -14076,6 +14481,13 @@ impl BrokerPaneLeaseWalCatalogV1 {
                     }
                     (journal_id, BROKER_LEASE_CREATION_MARKER_BYTES)
                 }
+                BrokerPaneLeaseCatalogMemberV1::Retired(journal_id) => {
+                    let pair = pairs.entry(journal_id).or_default();
+                    if pair.retired_name.replace(name.to_os_string()).is_some() {
+                        return Err(BrokerPaneLeaseWalErrorV1::InvalidCreationState);
+                    }
+                    (journal_id, BROKER_LEASE_CREATION_MARKER_BYTES)
+                }
             };
             debug_assert!(pairs.contains_key(&journal_id));
             let identity = broker_spawn_catalog_stat_recoverable_creation_identity_at(
@@ -14096,6 +14508,12 @@ impl BrokerPaneLeaseWalCatalogV1 {
         for pair in pairs.values() {
             if pair.creating_name.is_some() && pair.completed_name.is_some() {
                 return Err(BrokerPaneLeaseWalErrorV1::InvalidCreationState);
+            }
+            if pair.retired_name.is_some() {
+                if pair.creating_name.is_some() || pair.completed_name.is_some() {
+                    return Err(BrokerPaneLeaseWalErrorV1::InvalidCreationState);
+                }
+                continue;
             }
             if let Some(creating_name) = pair.creating_name.as_ref() {
                 broker_spawn_catalog_stat_recoverable_creation_identity_at(
@@ -15042,6 +15460,83 @@ fn validate_broker_spawn_creation_marker(
     Ok(())
 }
 
+fn broker_spawn_retired_authenticated_bytes(
+    identity_bytes: &[u8; BROKER_SPAWN_CREATION_IDENTITY_BYTES],
+) -> [u8; 8 + BROKER_SPAWN_CREATION_IDENTITY_BYTES] {
+    let mut authenticated = [0_u8; 8 + BROKER_SPAWN_CREATION_IDENTITY_BYTES];
+    authenticated[..8].copy_from_slice(&BROKER_SPAWN_RETIRED_MARKER_MAGIC);
+    authenticated[8..].copy_from_slice(identity_bytes);
+    authenticated
+}
+
+/// The tombstone that commits a pane's retirement. Its empty file's name
+/// carries the complete authenticated identity, so bind can finish an
+/// interrupted retirement from the name alone, and a forged name can never
+/// make it delete another pane's journals.
+fn broker_spawn_retired_marker_name(
+    identity: BrokerSpawnWalIdentityV1,
+    authenticator: &GuardianBrokerSpawnWalAuthenticatorV1,
+) -> Result<OsString, BrokerSpawnWalError> {
+    let identity_bytes = encode_broker_spawn_creation_identity(identity)?;
+    let authentication_tag = broker_spawn_wal_authenticate(
+        authenticator,
+        &broker_spawn_retired_authenticated_bytes(&identity_bytes),
+    )?;
+    let mut marker = [0_u8; BROKER_SPAWN_CREATION_MARKER_BYTES];
+    marker[..BROKER_SPAWN_CREATION_IDENTITY_BYTES].copy_from_slice(&identity_bytes);
+    marker[BROKER_SPAWN_CREATION_IDENTITY_BYTES..].copy_from_slice(&authentication_tag);
+    let encoded = encode_broker_spawn_creation_base85(&marker);
+    let encoded =
+        std::str::from_utf8(&encoded).map_err(|_| BrokerSpawnWalError::InvalidCreationMarker)?;
+    let name = format!("{BROKER_SPAWN_RETIRED_MARKER_PREFIX}{encoded}");
+    if name.len() != BROKER_SPAWN_CREATION_MARKER_NAME_BYTES {
+        return Err(BrokerSpawnWalError::InvalidCreationMarker);
+    }
+    Ok(name.into())
+}
+
+fn decode_broker_spawn_retired_marker_name(
+    name: &OsStr,
+) -> Result<BrokerSpawnCreationMarkerV1, BrokerSpawnWalError> {
+    let text = name
+        .to_str()
+        .ok_or(BrokerSpawnWalError::InvalidCreationMarker)?;
+    if text.len() != BROKER_SPAWN_CREATION_MARKER_NAME_BYTES {
+        return Err(BrokerSpawnWalError::InvalidCreationMarker);
+    }
+    let encoded = text
+        .strip_prefix(BROKER_SPAWN_RETIRED_MARKER_PREFIX)
+        .ok_or(BrokerSpawnWalError::InvalidCreationMarker)?;
+    let decoded = decode_broker_spawn_creation_base85(encoded.as_bytes())?;
+    let mut identity_bytes = [0_u8; BROKER_SPAWN_CREATION_IDENTITY_BYTES];
+    identity_bytes.copy_from_slice(&decoded[..BROKER_SPAWN_CREATION_IDENTITY_BYTES]);
+    let identity = decode_broker_spawn_creation_identity(&identity_bytes)?;
+    let mut authentication_tag = [0_u8; BROKER_SPAWN_WAL_MAC_BYTES];
+    authentication_tag.copy_from_slice(&decoded[BROKER_SPAWN_CREATION_IDENTITY_BYTES..]);
+    Ok(BrokerSpawnCreationMarkerV1 {
+        name: name.to_os_string(),
+        identity,
+        authentication_tag,
+    })
+}
+
+fn validate_broker_spawn_retired_marker(
+    marker: &BrokerSpawnCreationMarkerV1,
+    authenticator: &GuardianBrokerSpawnWalAuthenticatorV1,
+) -> Result<(), BrokerSpawnWalError> {
+    let identity_bytes = encode_broker_spawn_creation_identity(marker.identity)?;
+    broker_spawn_wal_verify(
+        authenticator,
+        &broker_spawn_retired_authenticated_bytes(&identity_bytes),
+        &marker.authentication_tag,
+    )
+    .map_err(|_| BrokerSpawnWalError::CreationMarkerAuthenticationFailed)?;
+    if marker.name != broker_spawn_retired_marker_name(marker.identity, authenticator)? {
+        return Err(BrokerSpawnWalError::InvalidCreationMarker);
+    }
+    Ok(())
+}
+
 fn validate_broker_spawn_creation_header_prefix(
     file: &mut File,
     expected: &[u8; BROKER_SPAWN_WAL_FILE_HEADER_BYTES],
@@ -15665,6 +16160,7 @@ enum BrokerSpawnCatalogNameV1 {
     Head(Uuid),
     Creating(BrokerSpawnCreationMarkerV1),
     Completed(BrokerSpawnCreationMarkerV1),
+    Retired(BrokerSpawnCreationMarkerV1),
 }
 
 fn parse_broker_spawn_catalog_name(
@@ -15673,6 +16169,11 @@ fn parse_broker_spawn_catalog_name(
     let text = name
         .to_str()
         .ok_or(BrokerSpawnWalError::UnexpectedCatalogEntry)?;
+    if text.starts_with(BROKER_SPAWN_RETIRED_MARKER_PREFIX) {
+        return decode_broker_spawn_retired_marker_name(name)
+            .map(BrokerSpawnCatalogNameV1::Retired)
+            .map_err(|_| BrokerSpawnWalError::UnexpectedCatalogEntry);
+    }
     if text.starts_with(BROKER_SPAWN_CREATION_MARKER_PREFIX)
         || text.starts_with(BROKER_SPAWN_COMPLETED_MARKER_PREFIX)
     {
@@ -15746,7 +16247,9 @@ fn validate_broker_spawn_catalog_path(path: &Path) -> Result<(), BrokerSpawnWalE
 fn validate_broker_spawn_catalog_name_capacity(
     directory: &File,
 ) -> Result<(), BrokerSpawnWalError> {
-    if BROKER_SPAWN_CREATION_MARKER_PREFIX.len() != BROKER_SPAWN_COMPLETED_MARKER_PREFIX.len() {
+    if BROKER_SPAWN_CREATION_MARKER_PREFIX.len() != BROKER_SPAWN_COMPLETED_MARKER_PREFIX.len()
+        || BROKER_SPAWN_RETIRED_MARKER_PREFIX.len() != BROKER_SPAWN_COMPLETED_MARKER_PREFIX.len()
+    {
         return Err(BrokerSpawnWalError::InvalidCreationMarker);
     }
     let observed = fpathconf(directory, PathconfVar::NAME_MAX)
@@ -16042,6 +16545,15 @@ fn open_broker_spawn_catalog_file_at(
     Ok(file)
 }
 
+/// Unlink one retiring catalog member; one an earlier attempt already
+/// removed is fine.
+fn unlink_broker_catalog_member_at(directory: &File, name: &OsStr) -> std::io::Result<()> {
+    match rustix::fs::unlinkat(directory, name, rustix::fs::AtFlags::empty()) {
+        Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn open_revalidated_broker_spawn_catalog_file(
     directory: &File,
     name: &OsStr,
@@ -16252,7 +16764,8 @@ impl BrokerSpawnWalCatalogV1 {
     ) -> Result<BrokerSpawnJournalV1, BrokerSpawnWalError> {
         identity.validate()?;
         self.validate_pinned_directory()?;
-        let states = self.scan_catalog_states()?;
+        // A retirement still holding its tombstone keeps its id and slot.
+        let states = self.scan_catalog_entries()?;
         if states.len() >= GUARDIAN_MAX_PANES || states.contains_key(&identity.journal_id) {
             return Err(BrokerSpawnWalError::CapacityExhausted);
         }
@@ -16333,6 +16846,73 @@ impl BrokerSpawnWalCatalogV1 {
         journal.reconcile_recovered_head_and_activate(authority)?;
         self.validate_pinned_directory()?;
         Ok(journal)
+    }
+
+    /// Commit one pane's retirement (ft-9ojeh): an exclusively created,
+    /// empty tombstone whose name carries the authenticated identity, synced
+    /// with its directory before anything is unlinked. From then on every
+    /// scan leaves the id out of the live pairs.
+    fn write_retirement_tombstone(
+        &self,
+        identity: BrokerSpawnWalIdentityV1,
+        authenticator: &GuardianBrokerSpawnWalAuthenticatorV1,
+    ) -> Result<(), BrokerSpawnWalError> {
+        self.validate_pinned_directory()?;
+        let pair = self
+            .scan_catalog_entries()?
+            .remove(&identity.journal_id)
+            .ok_or(BrokerSpawnWalError::InvalidCreationState)?;
+        if pair.creating.is_some()
+            || pair
+                .completed
+                .as_ref()
+                .is_some_and(|completed| completed.identity != identity)
+        {
+            return Err(BrokerSpawnWalError::InvalidCreationState);
+        }
+        if pair.retired.is_none() {
+            let name = broker_spawn_retired_marker_name(identity, authenticator)?;
+            let tombstone = open_broker_spawn_catalog_file_at(&self.directory, &name, true)?;
+            revalidate_open_broker_spawn_catalog_file(&self.directory, &name, &tombstone, 0, 0)?;
+            tombstone.sync_all()?;
+        }
+        self.directory.sync_all()?;
+        Ok(())
+    }
+
+    /// Unlink a committed retirement's members, then its tombstone. The
+    /// caller has already retired everything else keyed by this pane.
+    fn finish_retirement(
+        &self,
+        pair: &BrokerSpawnWalCatalogPairV1,
+        authenticator: &GuardianBrokerSpawnWalAuthenticatorV1,
+    ) -> Result<(), BrokerSpawnWalError> {
+        let tombstone = pair
+            .retired
+            .as_ref()
+            .ok_or(BrokerSpawnWalError::InvalidCreationState)?;
+        validate_broker_spawn_retired_marker(tombstone, authenticator)?;
+        let journal_id = tombstone.identity.journal_id();
+        let completed_name =
+            broker_spawn_creation_marker_name(tombstone.identity, authenticator, true)?;
+        if pair
+            .completed
+            .as_ref()
+            .is_some_and(|completed| completed.name != completed_name)
+        {
+            return Err(BrokerSpawnWalError::InvalidCreationState);
+        }
+        for name in [
+            broker_spawn_catalog_wal_name(journal_id),
+            broker_spawn_catalog_head_name(journal_id),
+            completed_name,
+        ] {
+            unlink_broker_catalog_member_at(&self.directory, &name)?;
+        }
+        self.directory.sync_all()?;
+        unlink_broker_catalog_member_at(&self.directory, &tombstone.name)?;
+        self.directory.sync_all()?;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -16997,7 +17577,25 @@ impl BrokerSpawnWalCatalogV1 {
             .collect())
     }
 
+    /// The live pairs. A tombstoned id is retired whatever members remain,
+    /// so no lifecycle path can see it.
     fn scan_catalog_states(
+        &self,
+    ) -> Result<BTreeMap<Uuid, BrokerSpawnWalCatalogPairV1>, BrokerSpawnWalError> {
+        let mut states = self.scan_catalog_entries()?;
+        states.retain(|_, pair| pair.retired.is_none());
+        Ok(states)
+    }
+
+    fn scan_retirements(
+        &self,
+    ) -> Result<BTreeMap<Uuid, BrokerSpawnWalCatalogPairV1>, BrokerSpawnWalError> {
+        let mut states = self.scan_catalog_entries()?;
+        states.retain(|_, pair| pair.retired.is_some());
+        Ok(states)
+    }
+
+    fn scan_catalog_entries(
         &self,
     ) -> Result<BTreeMap<Uuid, BrokerSpawnWalCatalogPairV1>, BrokerSpawnWalError> {
         let mut directory =
@@ -17086,6 +17684,17 @@ impl BrokerSpawnWalCatalogV1 {
                         return Err(BrokerSpawnWalError::InvalidCreationState);
                     }
                 }
+                BrokerSpawnCatalogNameV1::Retired(marker) => {
+                    let identity =
+                        broker_spawn_catalog_stat_identity_at(&self.directory, name, 0, 0)?;
+                    observed_bytes = observed_bytes
+                        .checked_add(identity.bytes)
+                        .ok_or(BrokerSpawnWalError::CapacityExhausted)?;
+                    let pair = pairs.entry(marker.identity.journal_id()).or_default();
+                    if pair.retired.replace(marker).is_some() {
+                        return Err(BrokerSpawnWalError::InvalidCreationState);
+                    }
+                }
             }
         }
         if pairs.len() > GUARDIAN_MAX_PANES
@@ -17094,8 +17703,13 @@ impl BrokerSpawnWalCatalogV1 {
             return Err(BrokerSpawnWalError::CapacityExhausted);
         }
         for pair in pairs.values() {
-            if pair.creating.is_some() && pair.completed.is_some() {
+            if pair.creating.is_some() && (pair.completed.is_some() || pair.retired.is_some()) {
                 return Err(BrokerSpawnWalError::InvalidCreationState);
+            }
+            if pair.retired.is_some() {
+                // An interrupted retirement may have unlinked any subset of
+                // the members already.
+                continue;
             }
             if pair.creating.is_some() {
                 if let Some(wal_name) = pair.wal_name.as_ref() {
@@ -20089,6 +20703,17 @@ impl BrokerAdoptedPaneV1 {
         }
     }
 
+    /// Nothing is left here for anyone (ft-9ojeh): the child is reaped, the
+    /// PTY reached end of output, the owner acknowledged every byte, and no
+    /// drain holds the journal.
+    fn settled_for_retirement(&mut self) -> bool {
+        self.output_terminal.is_some()
+            && self.output_journal.is_some()
+            && self.output_buffer.is_empty()
+            && self.buffer_start_sequence == self.next_output_sequence
+            && matches!(self.child.try_wait(), Ok(Some(_)))
+    }
+
     /// Admit one bounded write under the current logical attachment lease.
     pub fn admit_proxy_write(
         &self,
@@ -21532,7 +22157,8 @@ mod tests {
                 BrokerSpawnWorkerCompletionStateV1::Ready(event) => match *event {
                     BrokerSpawnWorkerEventV1::Spawn(completion) => return completion,
                     BrokerSpawnWorkerEventV1::Acknowledge(_)
-                    | BrokerSpawnWorkerEventV1::Lease(_) => {
+                    | BrokerSpawnWorkerEventV1::Lease(_)
+                    | BrokerSpawnWorkerEventV1::Retire(_) => {
                         panic!("Spawn worker helper received an acknowledgement completion")
                     }
                 },
@@ -21827,7 +22453,7 @@ mod tests {
         assert_eq!(decoded.identity, identity);
         validate_broker_spawn_creation_marker(&decoded, &authenticator, true)
             .expect("verify full completed-marker MAC");
-        assert_eq!(BROKER_SPAWN_CATALOG_MAX_ENTRIES, GUARDIAN_MAX_PANES * 3 + 1);
+        assert_eq!(BROKER_SPAWN_CATALOG_MAX_ENTRIES, GUARDIAN_MAX_PANES * 4 + 1);
         assert_eq!(
             BROKER_SPAWN_CATALOG_MAX_PHYSICAL_BYTES,
             GUARDIAN_MAX_PANES as u64
@@ -21908,6 +22534,155 @@ mod tests {
         ));
         assert!(split_directory.path().join(&creating_name).exists());
         assert!(split_directory.path().join(&completed_name).exists());
+    }
+
+    #[test]
+    fn retirement_tombstone_commits_and_every_interrupted_cut_finishes() {
+        let (spawn_authenticator, lease_authenticator) = lease_wal_authenticators(0xe9);
+        let retired = lease_catalog_identity(&spawn_authenticator, 0x49);
+        let kept = lease_catalog_identity(&spawn_authenticator, 0x4a);
+        let journal_id = retired.spawn.journal_id();
+
+        // Every broker record and marker has its own MAC domain.
+        let magics = [
+            BROKER_SPAWN_WAL_FILE_MAGIC,
+            BROKER_SPAWN_HEAD_FILE_MAGIC,
+            BROKER_SPAWN_WAL_RECORD_MAGIC,
+            BROKER_SPAWN_HEAD_RECORD_MAGIC,
+            BROKER_SPAWN_CREATION_MARKER_MAGIC,
+            BROKER_SPAWN_RETIRED_MARKER_MAGIC,
+            BROKER_LEASE_WAL_FILE_MAGIC,
+            BROKER_LEASE_HEAD_FILE_MAGIC,
+            BROKER_LEASE_WAL_RECORD_MAGIC,
+            BROKER_LEASE_HEAD_RECORD_MAGIC,
+            BROKER_LEASE_CREATION_MARKER_MAGIC,
+            BROKER_EXEC_BOOTSTRAP_MAGIC,
+        ];
+        for (index, magic) in magics.iter().enumerate() {
+            assert!(!magics[..index].contains(magic), "{magic:?} is reused");
+        }
+
+        let name = broker_spawn_retired_marker_name(retired.spawn, &spawn_authenticator)
+            .expect("encode tombstone");
+        assert_eq!(
+            name.as_bytes().len(),
+            BROKER_SPAWN_CREATION_MARKER_NAME_BYTES
+        );
+        let decoded = decode_broker_spawn_retired_marker_name(&name).expect("decode tombstone");
+        assert_eq!(decoded.identity, retired.spawn);
+        validate_broker_spawn_retired_marker(&decoded, &spawn_authenticator)
+            .expect("verify tombstone MAC");
+        let mut forged = decoded.clone();
+        forged.authentication_tag[0] ^= 1;
+        assert!(validate_broker_spawn_retired_marker(&forged, &spawn_authenticator).is_err());
+        // A tombstone and a creation certificate never authenticate each other.
+        assert!(
+            validate_broker_spawn_creation_marker(&decoded, &spawn_authenticator, true).is_err()
+        );
+
+        // Cut k: the retirement stopped after k of its steps.
+        for cut in 0..=4 {
+            let root = private_catalog_directory();
+            let spawn_path = root.path().join("spawn-catalog");
+            fs::create_dir(&spawn_path).expect("create Spawn catalog");
+            fs::set_permissions(&spawn_path, fs::Permissions::from_mode(0o700))
+                .expect("make Spawn catalog private");
+            let lease_path = create_private_lease_catalog(root.path());
+            let mut spawn_catalog =
+                BrokerSpawnWalCatalogV1::open(spawn_path.clone()).expect("open Spawn catalog");
+            let lease_catalog =
+                BrokerPaneLeaseWalCatalogV1::open(lease_path.clone()).expect("open lease catalog");
+            for identity in [retired, kept] {
+                drop(
+                    spawn_catalog
+                        .create_spawn_journal(identity.spawn, spawn_authenticator.clone())
+                        .expect("create Spawn pair"),
+                );
+                drop(
+                    lease_catalog
+                        .create_lease_journal(&identity, lease_authenticator.clone())
+                        .expect("create lease pair"),
+                );
+            }
+            spawn_catalog
+                .write_retirement_tombstone(retired.spawn, &spawn_authenticator)
+                .expect("commit retirement");
+            spawn_catalog
+                .write_retirement_tombstone(retired.spawn, &spawn_authenticator)
+                .expect("a repeated commit is idempotent");
+            assert!(
+                !spawn_catalog
+                    .scan_catalog_states()
+                    .expect("scan live pairs")
+                    .contains_key(&journal_id)
+            );
+            if cut >= 1 {
+                publish_broker_spawn_completed_marker_noreplace(
+                    &lease_catalog.directory,
+                    &broker_lease_catalog_completed_name(journal_id),
+                    &broker_lease_catalog_retired_name(journal_id),
+                )
+                .expect("rename the lease marker");
+            }
+            if cut >= 2 {
+                fs::remove_file(lease_path.join(broker_lease_catalog_wal_name(journal_id)))
+                    .expect("unlink the lease WAL");
+            }
+            if cut >= 3 {
+                lease_catalog.retire(journal_id).expect("finish the lease");
+            }
+            if cut >= 4 {
+                fs::remove_file(spawn_path.join(broker_spawn_catalog_wal_name(journal_id)))
+                    .expect("unlink the Spawn WAL");
+            }
+            drop(spawn_catalog);
+            drop(lease_catalog);
+
+            // A restarted broker, as bind runs it: retire the tombstoned
+            // lease before admission, then finish everything else.
+            let mut spawn_catalog =
+                reopen_test_catalog_after_owner_drop(&spawn_path).expect("reopen Spawn catalog");
+            let retirements = spawn_catalog.scan_retirements().expect("scan tombstones");
+            assert_eq!(retirements.len(), 1, "cut {cut}");
+            let pair = &retirements[&journal_id];
+            let lease_catalog =
+                reopen_test_lease_catalog_after_owner_drop(&lease_path).expect("reopen leases");
+            lease_catalog.retire(journal_id).expect("retire the lease");
+            let leases = lease_catalog
+                .scan_all_for_admission(&lease_authenticator)
+                .expect("admit the remaining lease");
+            assert_eq!(leases.len(), 1, "cut {cut}");
+            assert_eq!(leases[0].status().identity, kept);
+            let spawns = spawn_catalog
+                .scan_all_for_admission(&spawn_authenticator)
+                .expect("admit the remaining Spawn pair");
+            assert_eq!(spawns.len(), 1, "cut {cut}");
+            assert_eq!(spawns[0].identity(), kept.spawn);
+            drop((leases, spawns));
+            spawn_catalog
+                .finish_retirement(pair, &spawn_authenticator)
+                .expect("finish the Spawn pair");
+            assert!(spawn_catalog.scan_retirements().unwrap().is_empty());
+            let journal = journal_id.to_string();
+            for path in [&spawn_path, &lease_path] {
+                let names = names_of_dir(path);
+                // The kept pane's three members and the lock.
+                assert_eq!(names.len(), 4, "cut {cut}: {names:?}");
+                assert!(!names.iter().any(|name| name.contains(&journal)));
+            }
+            assert!(
+                !names_of_dir(&spawn_path)
+                    .iter()
+                    .any(|name| name.starts_with(BROKER_SPAWN_RETIRED_MARKER_PREFIX))
+            );
+        }
+    }
+
+    fn names_of_dir(path: &Path) -> Vec<String> {
+        fs::read_dir(path)
+            .expect("list directory")
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
     }
 
     #[test]
@@ -25583,7 +26358,9 @@ mod tests {
             match worker.try_completion() {
                 BrokerSpawnWorkerCompletionStateV1::AuthorityLost(event) => match *event {
                     BrokerSpawnWorkerEventV1::Acknowledge(completion) => break completion,
-                    BrokerSpawnWorkerEventV1::Spawn(_) | BrokerSpawnWorkerEventV1::Lease(_) => {
+                    BrokerSpawnWorkerEventV1::Spawn(_)
+                    | BrokerSpawnWorkerEventV1::Lease(_)
+                    | BrokerSpawnWorkerEventV1::Retire(_) => {
                         panic!("authority-loss proof received a Spawn completion")
                     }
                 },
@@ -27296,6 +28073,99 @@ mod tests {
             assert_eq!(fs::read_to_string(geometry_path).unwrap().trim(), "37 109");
             assert_eq!(fs::read(input_path).unwrap(), b"one-physical-input");
             assert_eq!(fs::read(&sentinel).unwrap(), b"C");
+
+            // ft-9ojeh: the pane retires only once its owner holds every
+            // byte, and then nothing of it is left on the broker's side.
+            assert!(
+                !session
+                    .client
+                    .retire_pane(&handle, output_deadline)
+                    .unwrap(),
+                "unacknowledged output must refuse retirement"
+            );
+            let guardian_journal = custody_pipeline
+                .prepare_pane(
+                    connection_identity.guardian_incarnation,
+                    binding.durable_pane_id,
+                )
+                .unwrap();
+            loop {
+                match session
+                    .client
+                    .read_output(&handle, 64, output_deadline)
+                    .unwrap()
+                {
+                    BrokerPaneOutputV1::Data(delivery) => {
+                        assert!(
+                            custody_pipeline
+                                .try_submit_broker_output(guardian_journal.clone(), delivery)
+                                .is_ok()
+                        );
+                        let mut completion = loop {
+                            match custody_pipeline.try_completion() {
+                                crate::output::GuardianOutputCompletionState::Ready(completion) => {
+                                    break completion;
+                                }
+                                crate::output::GuardianOutputCompletionState::Empty
+                                    if Instant::now() < output_deadline =>
+                                {
+                                    thread::sleep(Duration::from_millis(1));
+                                }
+                                _ => panic!("canonical output worker did not settle"),
+                            }
+                        };
+                        completion.result.unwrap();
+                        let ack = completion.broker_ack.take().unwrap();
+                        session
+                            .client
+                            .acknowledge_output(&ack, output_deadline)
+                            .unwrap();
+                    }
+                    BrokerPaneOutputV1::Terminal { .. } => break,
+                    BrokerPaneOutputV1::Pending if Instant::now() < output_deadline => {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    BrokerPaneOutputV1::Pending => {
+                        panic!("exited pane did not drain to its end")
+                    }
+                }
+            }
+            assert!(
+                session
+                    .client
+                    .retire_pane(&handle, output_deadline)
+                    .unwrap()
+            );
+            assert!(
+                session
+                    .client
+                    .retire_pane(&handle, output_deadline)
+                    .unwrap(),
+                "a repeated request whose answer was lost still hears Applied"
+            );
+            assert!(matches!(
+                session.client.child_status(&handle, output_deadline),
+                Err(BrokerControlClientError::AuthenticationAuthority)
+            ));
+            service.inspect(|service| {
+                assert!(service.live_spawns.is_empty());
+                assert!(service.retiring_spawn.is_none());
+            });
+            for catalog in [&spawn_catalog_path, &lease_catalog_path] {
+                assert_eq!(
+                    names_of_dir(catalog).len(),
+                    1,
+                    "only the lock may remain in {}",
+                    catalog.display()
+                );
+            }
+            let pane = binding.durable_pane_id.to_string();
+            assert!(
+                !names_of_dir(&root.join("guardian-output-v3"))
+                    .iter()
+                    .any(|name| name.contains(&pane)),
+                "the broker's output journal outlived its pane"
+            );
             drop(session);
             service.finish();
             return;

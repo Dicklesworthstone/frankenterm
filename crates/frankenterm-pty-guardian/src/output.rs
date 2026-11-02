@@ -3608,6 +3608,56 @@ impl GuardianCheckpointStageStore {
         self.with_exclusive_directory(|inner| read_spawn_custody_locked(inner, expected))
     }
 
+    /// Delete every file a retired pane left in this directory: its output
+    /// chain and input journal, its spawn and successor custody, its
+    /// recovery-claim intents and its checkpoint catalog members, by pane and
+    /// by birth. Nothing removed these, so every pane an install ever ran
+    /// kept its files, and the custody records alone refused new panes once
+    /// 8,216 had accumulated (ft-9ojeh). The caller has settled the pane and
+    /// the broker has forgotten it, so no request can name these files
+    /// again. Returns how many went.
+    pub(crate) fn delete_retired_pane_files(
+        &self,
+        pane_id: Uuid,
+        spawn_effect_id: Uuid,
+    ) -> Result<usize, GuardianCheckpointStageStoreError> {
+        let prefixes = [
+            format!("pane-{pane_id}."),
+            format!("input-pane-{pane_id}."),
+            format!("spawn-custody-v1-{pane_id}-"),
+            format!("successor-custody-v2-{pane_id}-"),
+            format!("{CHECKPOINT_CATALOG_FILE_PREFIX}pane-{pane_id}."),
+            format!("{CHECKPOINT_CATALOG_FILE_PREFIX}genesis-{spawn_effect_id}."),
+        ];
+        // recovery-claim-v1-<root digest>-<pane>-<request>.bin
+        let claim_pane = format!("-{pane_id}-");
+        self.with_exclusive_directory(|inner| {
+            let mut deleted = 0;
+            for name in read_directory_names(&inner.directory)? {
+                let Some(text) = name.to_str() else {
+                    continue;
+                };
+                let owned = prefixes
+                    .iter()
+                    .any(|prefix| text.starts_with(prefix.as_str()))
+                    || text
+                        .strip_prefix("recovery-claim-v1-")
+                        .and_then(|rest| rest.find('-').map(|at| &rest[at..]))
+                        .is_some_and(|rest| rest.starts_with(claim_pane.as_str()));
+                if owned {
+                    checkpoint_unlink_record_path(inner, &inner.directory_path.join(&name))?;
+                    deleted += 1;
+                }
+            }
+            if deleted != 0 {
+                inner.directory.sync_all().map_err(|error| {
+                    GuardianCheckpointStageStoreError::io("retired-pane-directory-sync", error)
+                })?;
+            }
+            Ok(deleted)
+        })
+    }
+
     pub(crate) fn authenticate_mux_rotation_payload(
         &self,
         payload: &[u8],
@@ -16394,6 +16444,92 @@ mod tests {
                 .is_err()
         );
         println!("HISTORICAL_GENESIS_AUTHENTICATION_AND_V2_MIGRATION_SUCCESS");
+        Ok(())
+    }
+
+    #[test]
+    fn retired_pane_files_go_and_other_panes_files_stay() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use mux::guardian_checkpoint::GuardianRecoveryClaimIntentV1;
+        let (directory, _poll, pipeline) =
+            pipeline_with_policy("ft-retired-pane-", OutputSegmentPolicy::production())?;
+        let store = pipeline.checkpoint_stage_store();
+        let retired = spawn_custody_context();
+        let kept = GuardianSpawnCustodyContextV1 {
+            pane_id: Uuid::from_u128(15),
+            effect_id: Uuid::from_u128(16),
+            ..retired
+        };
+        for context in [retired, kept] {
+            drop(pipeline.prepare_pane(context.guardian_incarnation, context.pane_id)?);
+            let admission = store
+                .persist_spawn_custody(&context, &[0x93; 32])?
+                .admit_recovery()?;
+            admission.prepare_recovery_claim_intent(
+                GuardianRecoveryClaimIntentV1 {
+                    root_envelope_sha256: [1; 32],
+                    image_digest: [2; 32],
+                    checkpoint_id: [3; 32],
+                    guardian_build: context.guardian_build,
+                    predecessor_mux_build: context.mux_build,
+                    target_mux_build: [6; 32],
+                    image_generation: 1,
+                    source_generation: 1,
+                    predecessor_generation: 1,
+                    adoption_sequence: 1,
+                    pane_id: context.pane_id,
+                    guardian_incarnation: context.guardian_incarnation,
+                    parent_request_id: Uuid::nil(),
+                    predecessor_mux_incarnation: context.mux_incarnation,
+                    target_mux_incarnation: Uuid::new_v4(),
+                    request_id: Uuid::new_v4(),
+                    effect_id: Uuid::new_v4(),
+                    adoption_effect_id: Uuid::new_v4(),
+                },
+                true,
+            )?;
+        }
+        let output_directory = directory.join(OUTPUT_DIRECTORY_NAME);
+        let named = |pane: Uuid, prefix: &str| -> Result<usize, std::io::Error> {
+            let pane = pane.to_string();
+            let mut count = 0;
+            for entry in std::fs::read_dir(&output_directory)? {
+                let name = entry?.file_name().to_string_lossy().into_owned();
+                count += usize::from(name.starts_with(prefix) && name.contains(&pane));
+            }
+            Ok(count)
+        };
+        let prefixes = ["pane-", "spawn-custody-v1-", "recovery-claim-v1-"];
+        for prefix in prefixes {
+            assert!(
+                named(retired.pane_id, prefix)? > 0,
+                "no {prefix} file to retire"
+            );
+            assert!(named(kept.pane_id, prefix)? > 0, "no {prefix} file to keep");
+        }
+        let kept_before = prefixes
+            .iter()
+            .map(|prefix| named(kept.pane_id, prefix))
+            .sum::<Result<usize, _>>()?;
+        assert!(store.delete_retired_pane_files(retired.pane_id, retired.effect_id)? >= 3);
+        for prefix in prefixes {
+            assert_eq!(
+                named(retired.pane_id, prefix)?,
+                0,
+                "{prefix} file outlived its pane"
+            );
+        }
+        assert_eq!(
+            prefixes
+                .iter()
+                .map(|prefix| named(kept.pane_id, prefix))
+                .sum::<Result<usize, _>>()?,
+            kept_before
+        );
+        assert_eq!(
+            store.delete_retired_pane_files(retired.pane_id, retired.effect_id)?,
+            0
+        );
         Ok(())
     }
 
