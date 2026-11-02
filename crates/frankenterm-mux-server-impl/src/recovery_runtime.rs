@@ -726,7 +726,17 @@ impl PeriodicRecovery {
                         &cx::for_request(),
                         Some((receipt.generation, &receipt.sha256)),
                     ) {
-                        Ok(()) => (Some(receipt.generation), None, false, false),
+                        Ok(()) => {
+                            #[cfg(unix)]
+                            if let Err(error) =
+                                crate::guardian_proxy::release_unrooted_guardian_panes(&mux)
+                            {
+                                log::warn!(
+                                    "mux periodic recovery could not release ended guardian panes: {error:#}"
+                                );
+                            }
+                            (Some(receipt.generation), None, false, false)
+                        }
                         Err(_) => (
                             None,
                             Some("published_root_verification_failed"),

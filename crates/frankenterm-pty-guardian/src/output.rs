@@ -3610,12 +3610,14 @@ impl GuardianCheckpointStageStore {
 
     /// Delete every file a retired pane left in this directory: its output
     /// chain and input journal, its spawn and successor custody, its
-    /// recovery-claim intents and its checkpoint catalog members, by pane and
-    /// by birth. Nothing removed these, so every pane an install ever ran
-    /// kept its files, and the custody records alone refused new panes once
-    /// 8,216 had accumulated (ft-9ojeh). The caller has settled the pane and
-    /// the broker has forgotten it, so no request can name these files
-    /// again. Returns how many went.
+    /// recovery-claim intents, and its checkpoint uploads, catalog members
+    /// and their ACK proofs, by pane and by birth. Nothing removed these, so
+    /// every pane an install ever ran kept its files, and the custody records
+    /// alone refused new panes once 8,216 had accumulated (ft-9ojeh). An ACK
+    /// proof goes with its member, which the stage's reclaim does for a live
+    /// pane; a retired pane's members go here. The caller has settled the
+    /// pane and the broker has forgotten it, so no request can name these
+    /// files again. Returns how many went.
     pub(crate) fn delete_retired_pane_files(
         &self,
         pane_id: Uuid,
@@ -3626,8 +3628,16 @@ impl GuardianCheckpointStageStore {
             format!("input-pane-{pane_id}."),
             format!("spawn-custody-v1-{pane_id}-"),
             format!("successor-custody-v2-{pane_id}-"),
+            format!("checkpoint-pane-{pane_id}."),
+            format!("checkpoint-genesis-{spawn_effect_id}."),
             format!("{CHECKPOINT_CATALOG_FILE_PREFIX}pane-{pane_id}."),
             format!("{CHECKPOINT_CATALOG_FILE_PREFIX}genesis-{spawn_effect_id}."),
+            format!(
+                "{CHECKPOINT_CATALOG_ACK_PROOF_PREFIX}{CHECKPOINT_CATALOG_FILE_PREFIX}pane-{pane_id}."
+            ),
+            format!(
+                "{CHECKPOINT_CATALOG_ACK_PROOF_PREFIX}{CHECKPOINT_CATALOG_FILE_PREFIX}genesis-{spawn_effect_id}."
+            ),
         ];
         // recovery-claim-v1-<root digest>-<pane>-<request>.bin
         let claim_pane = format!("-{pane_id}-");
@@ -16530,6 +16540,95 @@ mod tests {
             store.delete_retired_pane_files(retired.pane_id, retired.effect_id)?,
             0
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_retired_panes_checkpoints_and_their_ack_proofs_go_too()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-retired-pane-checkpoints-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let guardian = Uuid::from_u128(0x9e100);
+        let mux = Uuid::from_u128(0x9e101);
+        let retired = Uuid::from_u128(0x9e102);
+        let kept = Uuid::from_u128(0x9e103);
+        for (pane, identity_base) in [(retired, 0x9e_0000), (kept, 0x9f_0000)] {
+            let journal = pipeline.prepare_pane(guardian, pane)?;
+            let mut state = checkpoint_catalog_claimed_protocol_state(guardian, mux, pane)?;
+            checkpoint_catalog_stage_and_publish(
+                &pipeline,
+                &store,
+                &journal,
+                &mut state,
+                guardian,
+                mux,
+                pane,
+                1,
+                1,
+                identity_base,
+                b"ended;",
+                b"ended;",
+            )?;
+            let (begin, completion) = checkpoint_catalog_newest_begin(&store, pane)?;
+            store.apply_ack_from_committed_catalog(
+                GuardianCheckpointStageRequestV1::ack(
+                    begin.scope(),
+                    begin.upload_id(),
+                    begin.descriptor(),
+                    begin.chunk_bytes(),
+                    completion,
+                )?,
+                mux,
+            )?;
+        }
+        let output_directory = directory.join(OUTPUT_DIRECTORY_NAME);
+        let named = |prefix: String| -> Result<usize, std::io::Error> {
+            let mut count = 0;
+            for entry in std::fs::read_dir(&output_directory)? {
+                count += usize::from(entry?.file_name().to_string_lossy().starts_with(&prefix));
+            }
+            Ok(count)
+        };
+        // Its upload, its catalog members and the proofs of their ACKs.
+        let prefixes = |pane: Uuid| {
+            [
+                format!("checkpoint-pane-{pane}."),
+                format!("checkpoint-catalog-pane-{pane}."),
+                format!("acked-checkpoint-catalog-pane-{pane}."),
+            ]
+        };
+        for prefix in prefixes(retired).into_iter().chain(prefixes(kept)) {
+            assert!(named(prefix.clone())? > 0, "no {prefix} file");
+        }
+        let kept_before = prefixes(kept)
+            .into_iter()
+            .map(&named)
+            .sum::<Result<usize, _>>()?;
+        store.delete_retired_pane_files(retired, Uuid::from_u128(0x9e1ff))?;
+        for prefix in prefixes(retired) {
+            assert_eq!(named(prefix.clone())?, 0, "{prefix} file outlived its pane");
+        }
+        assert_eq!(
+            prefixes(kept)
+                .into_iter()
+                .map(&named)
+                .sum::<Result<usize, _>>()?,
+            kept_before
+        );
+        // The stage still reads, and so does the kept pane's acknowledged member.
+        store.with_exclusive_directory(|inner| {
+            checkpoint_stage_census(inner)?;
+            let catalog =
+                checkpoint_catalog_scan(inner, CheckpointCatalogScope::Pane { pane_id: kept })?;
+            let member = catalog
+                .published
+                .last()
+                .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
+            checkpoint_catalog_require_ack_proof(inner, member)
+        })?;
         Ok(())
     }
 

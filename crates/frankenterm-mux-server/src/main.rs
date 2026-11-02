@@ -419,6 +419,12 @@ fn run(generation_lifetime: &mut Option<GenerationLifetimeLease>) -> anyhow::Res
             )
         },
     ));
+    #[cfg(unix)]
+    frankenterm_mux_server_impl::guardian_proxy::set_guardian_releases(
+        guardian_paths.as_ref().is_some_and(|(socket, token)| {
+            frankenterm_mux_server_impl::guardian_proxy::guardian_admits_release(socket, token)
+        }),
+    );
     let executor = promise::spawn::SimpleExecutor::with_io_runtime()
         .context("initialize headless mux I/O reactor")?;
     let (mux, restored) = if opts.recovery_restore {

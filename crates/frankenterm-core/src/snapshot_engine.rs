@@ -664,6 +664,19 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
         .handoff_state
         .store(AUTHORITY_HANDOFF_STARTED, Ordering::Release);
     let result = publish_whole_mux_recovery(cx, store, &captured, &inputs, key, expected);
+    // Only the mux knows when no root names an ended guardian pane, after
+    // which the guardian may forget it (ft-9ojeh).
+    let named_guardian_panes = || {
+        checkpoints
+            .iter()
+            .filter_map(|checkpoint| match checkpoint {
+                CapturedPaneCheckpoint::Guardian(published) => {
+                    Some(published.capture().durable_pane_id())
+                }
+                CapturedPaneCheckpoint::Model(_) => None,
+            })
+            .collect()
+    };
     match result {
         Ok(receipt) => {
             attempt.settle();
@@ -673,6 +686,7 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
                     mux.note_guardian_root_committed(pane.pane_id, published);
                 }
             }
+            mux.note_recovery_root_guardian_panes(named_guardian_panes(), true);
             Ok(receipt)
         }
         Err(error) => {
@@ -680,6 +694,7 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
                 // A filesystem error may follow root rename. Do not turn an
                 // unknown durable outcome into permission for another writer.
                 attempt.latch_and_settle();
+                mux.note_recovery_root_guardian_panes(named_guardian_panes(), false);
             } else {
                 attempt.settle();
             }

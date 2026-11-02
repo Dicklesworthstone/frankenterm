@@ -44,7 +44,7 @@ use std::fmt;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -455,6 +455,123 @@ impl GuardianDomain {
         );
         Ok(())
     }
+}
+
+/// Most ended panes one pass asks about; the rest wait for the next root.
+const GUARDIAN_RELEASES_PER_PASS: usize = 64;
+
+/// Whether this mux's guardian forgets ended panes (`set_guardian_releases`).
+static GUARDIAN_RELEASES: AtomicBool = AtomicBool::new(false);
+
+/// Where the next pass starts among the candidates, so panes the guardian
+/// keeps for a long time (a PTY some other process holds open) cannot take
+/// every pass's asks from the rest.
+static NEXT_RELEASE_CANDIDATE: AtomicUsize = AtomicUsize::new(0);
+
+/// Release ended panes from now on. The caller learned that this mux's
+/// guardian admits Release (`guardian_admits_release`); one predating it
+/// drops the connection on that request, after every recovery commit.
+pub fn set_guardian_releases(enabled: bool) {
+    GUARDIAN_RELEASES.store(enabled, Ordering::Release);
+}
+
+/// Whether the guardian at `socket` forgets an ended pane when its mux
+/// releases it, for `set_guardian_releases`; a probe like
+/// `guardian_admits_compact_checkpoints`.
+pub fn guardian_admits_release(socket: &Path, token: &Path) -> bool {
+    let admitted = GuardianClient::admits_release(socket, token);
+    log::info!(
+        "guardian panes: {}",
+        if admitted {
+            "an ended pane is released once no recovery root names it"
+        } else {
+            "ended panes stay (the guardian, or this build, predates Release)"
+        }
+    );
+    admitted
+}
+
+/// Ask the guardian to forget the ended panes no recovery root of this mux
+/// can name any more; its broker then retires them and deletes their files
+/// (ft-9ojeh). Call after a root commits: it does guardian socket I/O.
+/// Returns how many the guardian released.
+pub fn release_unrooted_guardian_panes(mux: &mux::Mux) -> anyhow::Result<usize> {
+    if !GUARDIAN_RELEASES.load(Ordering::Acquire) {
+        return Ok(0);
+    }
+    let mut candidates = mux.guardian_panes_to_release();
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    let Some((socket, token, mux_incarnation)) = mux.iter_domains().iter().find_map(|domain| {
+        domain.downcast_ref::<GuardianDomain>().map(|domain| {
+            (
+                domain.socket_path.clone(),
+                domain.token_path.clone(),
+                domain.mux_incarnation,
+            )
+        })
+    }) else {
+        return Ok(0);
+    };
+    let mut client = GuardianClient::connect(&socket, &token, mux_incarnation)
+        .context("connect to the guardian to release ended panes")?;
+    let census: HashMap<Uuid, GuardianCensusEntry> = client
+        .census_snapshot()
+        .context("guardian census before releasing ended panes")?
+        .into_iter()
+        .map(|entry| (entry.pane_id, entry))
+        .collect();
+    let start = NEXT_RELEASE_CANDIDATE.load(Ordering::Relaxed) % candidates.len();
+    candidates.rotate_left(start);
+    let mut released = 0;
+    let mut asked = 0;
+    for pane in candidates {
+        let Some(entry) = census.get(&pane) else {
+            mux.note_guardian_pane_released(pane);
+            continue;
+        };
+        // A live pane went to another mux; an unresolved input or checkpoint
+        // keeps an ended one until it settles.
+        if !matches!(
+            entry.status,
+            GuardianCensusPaneStatus::ExitedUnclaimed | GuardianCensusPaneStatus::ClosedTerminal
+        ) || entry.pending_input_effect.is_some()
+            || entry.indeterminate_checkpoint_effect.is_some()
+        {
+            log::debug!(
+                "ended guardian pane {pane} is not releasable yet: {:?}, pending input {:?}, indeterminate checkpoint {:?}",
+                entry.status,
+                entry.pending_input_effect,
+                entry.indeterminate_checkpoint_effect
+            );
+            continue;
+        }
+        if asked == GUARDIAN_RELEASES_PER_PASS {
+            break;
+        }
+        asked += 1;
+        match client.release(pane) {
+            Ok(GuardianReply::Released { pane_id }) if pane_id == pane => {
+                mux.note_guardian_pane_released(pane);
+                released += 1;
+            }
+            Ok(_) => anyhow::bail!("the guardian answered a release with another reply"),
+            Err(GuardianClientError::Rejected(GuardianRejectionCode::PaneNotFound)) => {
+                mux.note_guardian_pane_released(pane);
+            }
+            // Its output has not settled yet: the next pass asks again.
+            Err(GuardianClientError::Rejected(code)) => {
+                log::debug!("the guardian kept ended pane {pane} for now: {code:?}");
+            }
+            Err(error) => return Err(error).context("release an ended guardian pane"),
+        }
+    }
+    NEXT_RELEASE_CANDIDATE.store(start.wrapping_add(asked), Ordering::Relaxed);
+    if released > 0 {
+        log::info!("the guardian released {released} ended panes no recovery root names");
+    }
+    Ok(released)
 }
 
 #[async_trait::async_trait(?Send)]
@@ -3236,8 +3353,10 @@ impl GuardianPaneLeaseActor {
                         self.disposition = GuardianLeaseDisposition::RestoreRequired;
                         GuardianProxyError::ReplaySnapshotExpired
                     }
+                    // Only Release hears PaneOutputPending, and it is retryable.
                     GuardianRejectionCode::CapacityExhausted
-                    | GuardianRejectionCode::RequestAliasCapacityExhausted => {
+                    | GuardianRejectionCode::RequestAliasCapacityExhausted
+                    | GuardianRejectionCode::PaneOutputPending => {
                         GuardianProxyError::Client(GuardianClientError::Rejected(code))
                     }
                     GuardianRejectionCode::CheckpointOutcomeIndeterminate => {
@@ -6953,6 +7072,9 @@ pub fn restore_authenticated_topology(
     let mut staged = Vec::new();
     staged.try_reserve_exact(plans.len())?;
     let mut ended = Vec::new();
+    // The source root names these panes; this mux releases the ended ones
+    // once no root of its own does (ft-9ojeh).
+    let restored_panes: Vec<Uuid> = plans.iter().map(|(_, pane, _)| *pane).collect();
     for (plan, pane, generation) in plans {
         checkpoint()?;
         match plan.claim(pane, generation, Uuid::new_v4(), Uuid::new_v4()) {
@@ -6967,6 +7089,7 @@ pub fn restore_authenticated_topology(
         }
     }
     checkpoint()?;
+    let mux = Arc::clone(&owner);
     let prepared = PreparedGuardianWholeMuxTopology::prepare_with_budget(
         owner,
         recovery,
@@ -6976,7 +7099,9 @@ pub fn restore_authenticated_topology(
         GuardianRestoreBudget { cx, deadline },
     )?;
     checkpoint()?;
-    Ok(prepared.publish_with_budget(Some(GuardianRestoreBudget { cx, deadline }))?)
+    let published = prepared.publish_with_budget(Some(GuardianRestoreBudget { cx, deadline }))?;
+    mux.note_restored_guardian_panes(restored_panes);
+    Ok(published)
 }
 
 impl PreparedGuardianWholeMuxTopology {

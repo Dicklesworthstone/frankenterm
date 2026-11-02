@@ -111,11 +111,13 @@ const HELLO_REQUIRES_COMPACT_CHECKPOINTS: u8 = 2;
 const HELLO_REQUIRES_GRAPHICS_CHECKPOINTS: u8 = 4;
 const HELLO_REQUIRES_PROTECTION_CHECKPOINTS: u8 = 8;
 const HELLO_REQUIRES_IMAGE_SCROLLBACK_ROWS: u8 = 16;
+const HELLO_REQUIRES_RELEASE: u8 = 32;
 const HELLO_KNOWN_REQUIREMENTS: u8 = HELLO_REQUIRES_SUCCESSOR_ROTATION
     | HELLO_REQUIRES_COMPACT_CHECKPOINTS
     | HELLO_REQUIRES_GRAPHICS_CHECKPOINTS
     | HELLO_REQUIRES_PROTECTION_CHECKPOINTS
-    | HELLO_REQUIRES_IMAGE_SCROLLBACK_ROWS;
+    | HELLO_REQUIRES_IMAGE_SCROLLBACK_ROWS
+    | HELLO_REQUIRES_RELEASE;
 const RESIZE_PAYLOAD_BYTES: usize = 12;
 const SIGNAL_PAYLOAD_BYTES: usize = 5;
 const INPUT_EFFECT_QUERY_PAYLOAD_BYTES: usize = 64;
@@ -568,6 +570,11 @@ pub enum GuardianOperation {
     CheckpointStage = 15,
     /// Cumulative acknowledgement for one deterministic replay page.
     ReplayAck = 16,
+    /// Forget a terminal pane (closed, or exited with no lease) that no
+    /// committed recovery root names any more, so its broker journals and
+    /// guardian files can be retired (ft-9ojeh). Needs no lease and creates
+    /// no effect: a repeat finds the pane gone.
+    Release = 17,
 }
 
 impl GuardianOperation {
@@ -589,6 +596,7 @@ impl GuardianOperation {
             14 => Ok(Self::GuardedStop),
             15 => Ok(Self::CheckpointStage),
             16 => Ok(Self::ReplayAck),
+            17 => Ok(Self::Release),
             other => Err(GuardianProtocolError::UnknownOperation(other)),
         }
     }
@@ -846,6 +854,9 @@ pub enum GuardianRejectionCode {
     /// The process-local replay snapshot named by a ReplayAck is unavailable.
     /// The caller must abandon that snapshot and reopen from durable artifacts.
     ReplaySnapshotExpired = 26,
+    /// An ended pane's output or PTY I/O has not settled, so it cannot be
+    /// released yet. Ask again later.
+    PaneOutputPending = 27,
 }
 
 impl GuardianRejectionCode {
@@ -859,7 +870,8 @@ impl GuardianRejectionCode {
             | Self::InputDurabilityPending
             | Self::CheckpointOutcomeIndeterminate
             | Self::OwnedPanesPresent
-            | Self::ReplaySnapshotExpired => GuardianResponseStatus::Rejected,
+            | Self::ReplaySnapshotExpired
+            | Self::PaneOutputPending => GuardianResponseStatus::Rejected,
             _ => GuardianResponseStatus::Terminal,
         }
     }
@@ -911,6 +923,7 @@ impl GuardianRejectionCode {
             24 => Self::OwnedPanesPresent,
             25 => Self::InputKnownNotApplied,
             26 => Self::ReplaySnapshotExpired,
+            27 => Self::PaneOutputPending,
             _ => return Err(GuardianProtocolError::InvalidRejectionPayload),
         };
         if code.status() != status {
@@ -1247,6 +1260,16 @@ impl GuardianHelloBuildIdentityV1 {
     ) -> [u8; HELLO_BUILD_IDENTITY_PAYLOAD_BYTES] {
         let mut payload = self.encode();
         payload[5] |= HELLO_REQUIRES_IMAGE_SCROLLBACK_ROWS;
+        payload
+    }
+
+    /// Require a guardian that forgets an ended pane when its mux releases
+    /// it (op Release). A guardian predating it cannot decode that request
+    /// and drops the connection, so a mux asks only one that accepted this.
+    #[must_use]
+    pub fn encode_requiring_release(self) -> [u8; HELLO_BUILD_IDENTITY_PAYLOAD_BYTES] {
+        let mut payload = self.encode();
+        payload[5] |= HELLO_REQUIRES_RELEASE;
         payload
     }
 
@@ -6926,6 +6949,10 @@ pub enum GuardianReply {
         pane_id: Uuid,
         generation: u64,
     },
+    /// The guardian forgot this terminal pane (`Release`).
+    Released {
+        pane_id: Uuid,
+    },
     InputEffect {
         effect_id: Uuid,
         state: InputEffectState,
@@ -7023,7 +7050,7 @@ impl GuardianReply {
     ) -> Result<Vec<u8>, GuardianProtocolError> {
         self.require_operation(operation)?;
         let capacity = match self {
-            Self::Hello { .. } => 16,
+            Self::Hello { .. } | Self::Released { .. } => 16,
             Self::GuardedStopAccepted => 0,
             Self::CensusPage { entries, .. } => usize::try_from(GUARDIAN_CENSUS_PAGE_HEADER_BYTES)
                 .ok()
@@ -7051,6 +7078,7 @@ impl GuardianReply {
             Self::Hello {
                 guardian_incarnation,
             } => push_uuid(&mut payload, *guardian_incarnation),
+            Self::Released { pane_id } => push_uuid(&mut payload, *pane_id),
             Self::GuardedStopAccepted => {}
             Self::Spawned {
                 pane_id,
@@ -7306,6 +7334,12 @@ impl GuardianReply {
                     generation: read_u64(payload, 16)?,
                 }
             }
+            GuardianOperation::Release => {
+                require_reply_len(payload, 16)?;
+                Self::Released {
+                    pane_id: read_required_uuid(payload, 0)?,
+                }
+            }
             GuardianOperation::ReplayAck => {
                 Self::ReplayAcked(GuardianReplayAckReceiptV1::decode(payload)?)
             }
@@ -7342,6 +7376,7 @@ impl GuardianReply {
                     Self::InputEffect { .. }
                 )
                 | (GuardianOperation::RetireLease, Self::LeaseRetired { .. })
+                | (GuardianOperation::Release, Self::Released { .. })
                 | (
                     GuardianOperation::Spawn
                         | GuardianOperation::Claim
@@ -7427,6 +7462,7 @@ impl GuardianReply {
                     pane_id,
                     generation,
                 } => !pane_id.is_nil() && *generation > 0,
+                Self::Released { pane_id } => !pane_id.is_nil(),
                 Self::InputEffect { effect_id, state } => {
                     !effect_id.is_nil() && state.has_canonical_wire_count()
                 }
@@ -7540,6 +7576,7 @@ impl GuardianReply {
                 pane_id,
                 generation,
             } => header.pane_id == Some(*pane_id) && header.lease_generation == *generation,
+            Self::Released { pane_id } => header.pane_id == Some(*pane_id),
             Self::InputEffect { effect_id, .. } => header.effect_id == Some(*effect_id),
             Self::ReplayAcked(_) => {
                 header.pane_id.is_some()
@@ -9635,6 +9672,7 @@ impl GuardianProtocolState {
             GuardianOperation::Attach => self.attach(request),
             GuardianOperation::Replay => self.replay(request),
             GuardianOperation::QueryInputEffect => self.query_input_effect(request),
+            GuardianOperation::Release => self.release(request),
             operation => Err(GuardianProtocolError::InvalidOperationScope { operation }),
         }
     }
@@ -10915,6 +10953,49 @@ impl GuardianProtocolState {
         }
     }
 
+    /// Forget an ended pane that no committed recovery root names any more.
+    ///
+    /// Only the mux knows when its roots stop naming a pane, so it asks. A
+    /// pane with an input or checkpoint outcome still unresolved stays, and so
+    /// does a quarantined one. A pane already gone answers `PaneNotFound`,
+    /// which the mux treats as released.
+    fn release(
+        &mut self,
+        request: &AuthenticatedGuardianRequest,
+    ) -> Result<GuardianReply, GuardianProtocolError> {
+        let pane_id =
+            request
+                .header
+                .pane_id
+                .ok_or(GuardianProtocolError::InvalidOperationScope {
+                    operation: request.header.operation,
+                })?;
+        match self.panes.get(&pane_id) {
+            Some(GuardianPaneState::ExitedUnclaimed {
+                pending_input_effect: Some(_),
+                ..
+            }) => return Err(GuardianProtocolError::InputDurabilityPending),
+            Some(GuardianPaneState::ExitedUnclaimed { .. })
+            | Some(GuardianPaneState::ClosedTerminal { .. }) => {}
+            Some(GuardianPaneState::LiveUnclaimed { .. })
+            | Some(GuardianPaneState::LiveClaimed { .. }) => {
+                return Err(GuardianProtocolError::StaleLease);
+            }
+            Some(GuardianPaneState::Quarantined { .. }) => {
+                return Err(GuardianProtocolError::PaneTerminal);
+            }
+            None => return Err(GuardianProtocolError::PaneNotFound(pane_id)),
+        }
+        if self
+            .indeterminate_checkpoints_by_pane
+            .contains_key(&pane_id)
+        {
+            return Err(GuardianProtocolError::CheckpointOutcomeIndeterminate);
+        }
+        self.panes.remove(&pane_id);
+        Ok(GuardianReply::Released { pane_id })
+    }
+
     fn replay(
         &self,
         request: &AuthenticatedGuardianRequest,
@@ -12148,6 +12229,7 @@ fn validate_request_envelope(
         | GuardianOperation::Attach
         | GuardianOperation::Close
         | GuardianOperation::RetireLease
+        | GuardianOperation::Release
             if !request.payload.is_empty() =>
         {
             return Err(GuardianProtocolError::InvalidOperationPayload);
@@ -13939,7 +14021,7 @@ mod tests {
         let mut both = hello.encode_requiring_successor_rotation();
         both[5] |= compact[5];
         assert!(GuardianHelloBuildIdentityV1::decode(&both).is_ok());
-        both[5] |= 32;
+        both[5] |= 64;
         assert!(GuardianHelloBuildIdentityV1::decode(&both).is_err());
     }
 
@@ -13970,11 +14052,21 @@ mod tests {
         assert!(GuardianHelloBuildIdentityV1::decode(&rows).is_ok());
         // Guardians predating image scrollback rows knew bits 1, 2, 4 and 8.
         assert_ne!(rows[5] & !15, 0);
+        let release = hello.encode_requiring_release();
+        assert_eq!(release[5], 32);
+        assert_eq!(release[..5], ordinary[..5]);
+        assert_eq!(release[6..], ordinary[6..]);
+        assert!(GuardianHelloBuildIdentityV1::decode(&release).is_ok());
+        // Guardians predating Release knew bits 1 through 16.
+        assert_ne!(release[5] & !31, 0);
         let mut all = hello.encode_requiring_successor_rotation();
-        all[5] |=
-            hello.encode_requiring_compact_checkpoints()[5] | graphics[5] | protection[5] | rows[5];
+        all[5] |= hello.encode_requiring_compact_checkpoints()[5]
+            | graphics[5]
+            | protection[5]
+            | rows[5]
+            | release[5];
         assert!(GuardianHelloBuildIdentityV1::decode(&all).is_ok());
-        all[5] |= 32;
+        all[5] |= 64;
         assert!(GuardianHelloBuildIdentityV1::decode(&all).is_err());
     }
 
@@ -13991,7 +14083,7 @@ mod tests {
         // Hello remains byte-for-byte unchanged; requiring the extension cannot
         // be mistaken for an ordinary connection by a historical guardian.
         assert!(extended[5..8].iter().any(|byte| *byte != 0));
-        extended[5] = 32;
+        extended[5] = 64;
         assert!(GuardianHelloBuildIdentityV1::decode(&extended).is_err());
         for generation in [1, 2, 3, u64::MAX] {
             for delta in [-1_isize, 0, 1] {
@@ -14190,6 +14282,7 @@ mod tests {
             GuardianOperation::Attach,
             GuardianOperation::Close,
             GuardianOperation::RetireLease,
+            GuardianOperation::Release,
         ]
         .iter()
         .copied()
@@ -14205,7 +14298,7 @@ mod tests {
                 mux,
                 request_id,
                 Some(pane),
-                u64::from(operation != GuardianOperation::Claim),
+                u64::from(operation.requires_lease()),
                 u64::from(operation.uses_mutation_sequence()),
                 effect_id,
                 b"hidden-trailing-byte",
@@ -15583,6 +15676,7 @@ mod tests {
             GuardianRejectionCode::OwnedPanesPresent,
             GuardianRejectionCode::InputKnownNotApplied,
             GuardianRejectionCode::ReplaySnapshotExpired,
+            GuardianRejectionCode::PaneOutputPending,
         ];
         for code in all_codes {
             let response = GuardianResponseEnvelope::rejection(&authenticated_request, code);
@@ -17356,6 +17450,124 @@ mod tests {
                 exit_status: Some(0),
             })
         ));
+    }
+
+    #[test]
+    fn release_forgets_only_a_settled_ended_pane() {
+        let guardian = id(1);
+        let mux = id(2);
+        let pane = id(3);
+        let closed_pane = id(50);
+        let release = |request_byte: u8, pane_id: Uuid| {
+            request(
+                GuardianOperation::Release,
+                guardian,
+                mux,
+                id(request_byte),
+                Some(pane_id),
+                0,
+                0,
+                None,
+                b"",
+            )
+        };
+        let mut state = GuardianProtocolState::new(guardian).unwrap();
+        apply_request(&mut state, &spawn_request(guardian, mux, pane)).unwrap();
+        apply_request(&mut state, &claim_request(guardian, mux, pane, 0, 6, 7)).unwrap();
+        assert_eq!(
+            apply_request(&mut state, &release(60, pane)),
+            Err(GuardianProtocolError::StaleLease),
+            "a live pane is never released"
+        );
+
+        let input = request(
+            GuardianOperation::Input,
+            guardian,
+            mux,
+            id(41),
+            Some(pane),
+            1,
+            1,
+            Some(id(40)),
+            b"exit-after-input",
+        );
+        apply_request(&mut state, &input).unwrap();
+        state.mark_exited(pane, 0).unwrap();
+        assert_eq!(
+            apply_request(&mut state, &release(61, pane)),
+            Err(GuardianProtocolError::InputDurabilityPending),
+            "an input whose outcome is unresolved keeps its pane"
+        );
+        state
+            .mark_input_durable_full(input_effect_identity(&input))
+            .unwrap();
+        let settled = release(62, pane);
+        assert_eq!(
+            apply_request(&mut state, &settled),
+            Ok(GuardianReply::Released { pane_id: pane })
+        );
+        assert_eq!(state.pane_state(pane), None);
+        assert_eq!(
+            apply_request(&mut state, &release(63, pane)),
+            Err(GuardianProtocolError::PaneNotFound(pane)),
+            "a repeat finds the pane already gone"
+        );
+        let authenticated = authenticate(&settled);
+        assert!(GuardianResponseEnvelope::success(
+            &authenticated,
+            &GuardianReply::Released { pane_id: pane }
+        )
+        .is_ok());
+        assert!(GuardianResponseEnvelope::success(
+            &authenticated,
+            &GuardianReply::Released {
+                pane_id: closed_pane
+            }
+        )
+        .is_err());
+
+        let spawn_payload = spawn_payload("bounded-command");
+        let spawn = request(
+            GuardianOperation::Spawn,
+            guardian,
+            mux,
+            id(51),
+            Some(closed_pane),
+            0,
+            0,
+            Some(id(52)),
+            &spawn_payload,
+        );
+        apply_request(&mut state, &spawn).unwrap();
+        apply_request(
+            &mut state,
+            &claim_request(guardian, mux, closed_pane, 0, 53, 54),
+        )
+        .unwrap();
+        state.mark_exited(closed_pane, 0).unwrap();
+        let close = request(
+            GuardianOperation::Close,
+            guardian,
+            mux,
+            id(55),
+            Some(closed_pane),
+            1,
+            0,
+            Some(id(56)),
+            b"",
+        );
+        apply_request(&mut state, &close).unwrap();
+        assert!(matches!(
+            state.pane_state(closed_pane),
+            Some(GuardianPaneState::ClosedTerminal { .. })
+        ));
+        assert_eq!(
+            apply_request(&mut state, &release(64, closed_pane)),
+            Ok(GuardianReply::Released {
+                pane_id: closed_pane
+            })
+        );
+        assert_eq!(state.pane_state(closed_pane), None);
     }
 
     #[test]

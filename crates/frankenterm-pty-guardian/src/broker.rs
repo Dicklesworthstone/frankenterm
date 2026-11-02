@@ -8062,6 +8062,12 @@ pub(crate) enum BrokerPaneIoCommandV1 {
         claim: crate::output::GuardianDurableBrokerOutputAckV1,
         deadline: Instant,
     },
+    /// Retire a released pane, then delete what the guardian kept of it.
+    Retire {
+        handle: BrokerPaneOutputHandleV1,
+        store: crate::output::GuardianCheckpointStageStore,
+        deadline: Instant,
+    },
 }
 
 pub(crate) enum BrokerPaneIoCompletionV1 {
@@ -8083,6 +8089,10 @@ pub(crate) enum BrokerPaneIoCompletionV1 {
     Acknowledge {
         claim: crate::output::GuardianDurableBrokerOutputAckV1,
         result: Result<(), BrokerControlClientError>,
+    },
+    Retire {
+        handle: BrokerPaneOutputHandleV1,
+        result: Result<bool, BrokerControlClientError>,
     },
 }
 
@@ -8208,6 +8218,40 @@ impl BrokerPaneIoWorkerV1 {
                             };
                             BrokerPaneIoCompletionV1::Acknowledge { claim, result }
                         }
+                        BrokerPaneIoCommandV1::Retire {
+                            handle,
+                            store,
+                            deadline,
+                        } => {
+                            let result = catch_recoverable(
+                                RecoverablePanicSite::StorageWriter,
+                                AssertUnwindSafe(|| {
+                                    let retired = session.client.retire_pane(&handle, deadline)?;
+                                    if retired {
+                                        // The broker deleted its own copies;
+                                        // these are the guardian's.
+                                        if let Err(error) = store.delete_retired_pane_files(
+                                            handle.pane_id,
+                                            handle.spawn_effect_id,
+                                        ) {
+                                            log::warn!(
+                                                "guardian could not delete retired pane {}'s files: {error:?}",
+                                                handle.pane_id
+                                            );
+                                        }
+                                    }
+                                    Ok(retired)
+                                }),
+                            );
+                            let result = match result {
+                                Ok(result) => result,
+                                Err(_) => {
+                                    session.client.poisoned = true;
+                                    Err(BrokerControlClientError::ConnectionPoisoned)
+                                }
+                            };
+                            BrokerPaneIoCompletionV1::Retire { handle, result }
+                        }
                     };
                     if sender.send(completion).is_err() {
                         break;
@@ -8262,7 +8306,8 @@ impl BrokerPaneIoWorkerV1 {
             BrokerPaneIoCommandV1::Resize { deadline, .. }
             | BrokerPaneIoCommandV1::ChildStatus { deadline, .. }
             | BrokerPaneIoCommandV1::Read { deadline, .. }
-            | BrokerPaneIoCommandV1::Acknowledge { deadline, .. } => Some(deadline),
+            | BrokerPaneIoCommandV1::Acknowledge { deadline, .. }
+            | BrokerPaneIoCommandV1::Retire { deadline, .. } => Some(deadline),
         };
         if let Some(deadline) = deadline {
             *deadline = (*deadline).min(Instant::now() + BROKER_CONTROL_CLIENT_IO_TIMEOUT);

@@ -10673,6 +10673,76 @@ impl RecoveredTopologyPublication {
     }
 }
 
+/// The guardian panes named by the recovery roots the root slots may still
+/// hold (ft-9ojeh). The two slots hold the last two roots that committed, but
+/// a publication whose outcome is unknown may be one of them or not, so every
+/// root from the second newest certain commit on counts.
+#[derive(Default)]
+struct RecoveryRootGuardianPanes {
+    /// Oldest first, each with whether its root certainly committed.
+    roots: VecDeque<(HashSet<uuid::Uuid>, bool)>,
+    /// Panes this mux's roots, or the root it was restored from, ever named
+    /// and not yet released. The guardian may serve other muxes, whose panes
+    /// this mux must leave alone.
+    owned: HashSet<uuid::Uuid>,
+}
+
+impl RecoveryRootGuardianPanes {
+    /// Unknown outcomes between commits are few (periodic recovery stops
+    /// after three in a row); past this many roots, start over.
+    const MAX_ROOTS: usize = 8;
+
+    fn record(&mut self, panes: HashSet<uuid::Uuid>, committed: bool) {
+        if self.roots.len() == Self::MAX_ROOTS {
+            // Forgetting one root is never safe; forgetting all is, since
+            // nothing is released again until two more roots commit.
+            self.roots.clear();
+        }
+        self.owned.extend(panes.iter().copied());
+        self.roots.push_back((panes, committed));
+        while self
+            .roots
+            .iter()
+            .skip(1)
+            .filter(|(_, committed)| *committed)
+            .count()
+            >= 2
+        {
+            self.roots.pop_front();
+        }
+    }
+
+    fn named(&self) -> Option<HashSet<uuid::Uuid>> {
+        let committed = self
+            .roots
+            .iter()
+            .filter(|(_, committed)| *committed)
+            .count();
+        (committed >= 2).then(|| {
+            self.roots
+                .iter()
+                .flat_map(|(panes, _)| panes.iter().copied())
+                .collect()
+        })
+    }
+
+    /// Owned panes no root the slots may hold names and the mux no longer
+    /// shows, in identity order; none until two roots have committed.
+    fn releasable(&self, shown: &HashSet<uuid::Uuid>) -> Vec<uuid::Uuid> {
+        let Some(named) = self.named() else {
+            return Vec::new();
+        };
+        let mut releasable: Vec<_> = self
+            .owned
+            .iter()
+            .filter(|pane| !named.contains(pane) && !shown.contains(pane))
+            .copied()
+            .collect();
+        releasable.sort_unstable();
+        releasable
+    }
+}
+
 pub struct Mux {
     topology: Mutex<MuxTopologyAuthority>,
     tabs: RwLock<HashMap<TabId, Arc<Tab>>>,
@@ -10700,6 +10770,9 @@ pub struct Mux {
     /// This mux's guardian validates checkpoints holding character
     /// protection (`set_guardian_protection_checkpoints`).
     guardian_protection_checkpoints: AtomicBool,
+    /// The guardian panes each recovery root this process published names
+    /// (`guardian_panes_recovery_roots_may_name`).
+    recovery_root_guardian_panes: Mutex<RecoveryRootGuardianPanes>,
     retiring_pane_ids: Mutex<HashSet<PaneId>>,
     pane_removal_cleanup_fences: Mutex<HashMap<PaneId, Arc<PaneRemovalCleanupToken>>>,
     pane_removal_cleanup_outstanding_leases: AtomicUsize,
@@ -13938,6 +14011,7 @@ impl Mux {
             guardian_compact_checkpoints: AtomicBool::new(false),
             guardian_graphics_checkpoints: AtomicBool::new(false),
             guardian_protection_checkpoints: AtomicBool::new(false),
+            recovery_root_guardian_panes: Mutex::new(RecoveryRootGuardianPanes::default()),
             retiring_pane_ids: Mutex::new(HashSet::new()),
             pane_removal_cleanup_fences: Mutex::new(HashMap::new()),
             pane_removal_cleanup_outstanding_leases: AtomicUsize::new(0),
@@ -22251,6 +22325,52 @@ impl Mux {
         }
     }
 
+    /// A recovery root naming these guardian panes committed, or, when not
+    /// `committed`, may have: its publication failed after the root could
+    /// have been renamed into its slot.
+    pub fn note_recovery_root_guardian_panes(&self, panes: HashSet<uuid::Uuid>, committed: bool) {
+        self.recovery_root_guardian_panes
+            .lock()
+            .record(panes, committed);
+    }
+
+    /// The recovery root this mux was restored from names these guardian
+    /// panes: this mux owns their release once no root of its own does.
+    pub fn note_restored_guardian_panes(&self, panes: impl IntoIterator<Item = uuid::Uuid>) {
+        self.recovery_root_guardian_panes.lock().owned.extend(panes);
+    }
+
+    /// The guardian panes this mux may ask its guardian to forget (ft-9ojeh):
+    /// owned, not shown, and named by no recovery root the root slots may
+    /// still hold. Empty until this process has seen two roots commit.
+    pub fn guardian_panes_to_release(&self) -> Vec<uuid::Uuid> {
+        let shown = self
+            .iter_panes()
+            .iter()
+            .filter_map(|pane| pane.durable_pane_id())
+            .map(uuid::Uuid::from_bytes)
+            .collect();
+        let tracker = self.recovery_root_guardian_panes.lock();
+        let releasable = tracker.releasable(&shown);
+        let ended = tracker
+            .owned
+            .iter()
+            .filter(|pane| !shown.contains(pane))
+            .count();
+        if ended > releasable.len() {
+            log::debug!(
+                "{} ended guardian panes wait for recovery roots that no longer name them",
+                ended - releasable.len()
+            );
+        }
+        releasable
+    }
+
+    /// The guardian forgot this pane, or never knew it: stop tracking it.
+    pub fn note_guardian_pane_released(&self, pane: uuid::Uuid) {
+        self.recovery_root_guardian_panes.lock().owned.remove(&pane);
+    }
+
     /// A committed recovery root names `published` for `pane_id`. Returns
     /// whether the pane's current registration adopted it.
     pub fn note_guardian_root_committed(
@@ -25413,6 +25533,74 @@ mod tests {
         crate::MUX_TEST_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner())
+    }
+
+    #[test]
+    fn recovery_roots_name_their_panes_until_two_later_roots_commit_then_owned_panes_go() {
+        let panes = |ids: &[u128]| {
+            ids.iter()
+                .map(|id| uuid::Uuid::from_u128(*id))
+                .collect::<HashSet<_>>()
+        };
+        let mut roots = RecoveryRootGuardianPanes::default();
+        assert_eq!(roots.named(), None, "a fresh process knows no root");
+        roots.record(panes(&[1, 2]), true);
+        assert_eq!(
+            roots.named(),
+            None,
+            "one commit leaves the other slot unknown"
+        );
+        roots.record(panes(&[2, 3]), true);
+        assert_eq!(roots.named(), Some(panes(&[1, 2, 3])));
+        roots.record(panes(&[3]), true);
+        assert_eq!(
+            roots.named(),
+            Some(panes(&[2, 3])),
+            "the oldest slot was replaced"
+        );
+
+        // A root that may have committed counts, and keeps the root it may
+        // not have replaced.
+        roots.record(panes(&[4]), false);
+        assert_eq!(roots.named(), Some(panes(&[2, 3, 4])));
+        roots.record(panes(&[5]), true);
+        assert_eq!(roots.named(), Some(panes(&[3, 4, 5])));
+        roots.record(panes(&[6]), true);
+        assert_eq!(roots.named(), Some(panes(&[5, 6])));
+
+        // Too many unknown outcomes start over rather than forget one.
+        for id in 10..10 + RecoveryRootGuardianPanes::MAX_ROOTS as u128 {
+            roots.record(panes(&[id]), false);
+        }
+        assert_eq!(roots.named(), None);
+        roots.record(panes(&[30]), true);
+        roots.record(panes(&[31]), true);
+        assert!(roots
+            .named()
+            .is_some_and(|named| named.contains(&uuid::Uuid::from_u128(30))));
+
+        // Only owned panes, which no root the slots may hold names and the mux
+        // no longer shows, are released.
+        let ids = |ids: &[u128]| {
+            ids.iter()
+                .map(|id| uuid::Uuid::from_u128(*id))
+                .collect::<Vec<_>>()
+        };
+        let mut roots = RecoveryRootGuardianPanes::default();
+        roots.owned.insert(uuid::Uuid::from_u128(9));
+        roots.record(panes(&[1, 2]), true);
+        assert!(roots.releasable(&HashSet::new()).is_empty());
+        roots.record(panes(&[2]), true);
+        assert_eq!(roots.releasable(&HashSet::new()), ids(&[9]));
+        roots.record(panes(&[2]), true);
+        assert_eq!(roots.releasable(&HashSet::new()), ids(&[1, 9]));
+        assert_eq!(
+            roots.releasable(&panes(&[9])),
+            ids(&[1]),
+            "a shown pane stays"
+        );
+        roots.owned.remove(&uuid::Uuid::from_u128(1));
+        assert_eq!(roots.releasable(&HashSet::new()), ids(&[9]));
     }
 
     #[test]

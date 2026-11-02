@@ -2766,6 +2766,23 @@ impl GuardianClient {
         .is_ok()
     }
 
+    /// Whether the guardian at `socket_path` forgets an ended pane its mux
+    /// releases (op Release), probed as `admits_compact_checkpoints` probes
+    /// version 4. Every failure reads as no, and the mux never asks: a
+    /// guardian predating Release drops the connection on it.
+    pub fn admits_release(socket_path: &Path, token_path: &Path) -> bool {
+        let Ok(hello) = GuardianHelloBuildIdentityV1::for_compiled_mux() else {
+            return false;
+        };
+        Self::connect_with_hello(
+            socket_path,
+            token_path,
+            Uuid::new_v4(),
+            hello.encode_requiring_release().to_vec(),
+        )
+        .is_ok()
+    }
+
     /// Authenticate the build compiled into this mux for Genesis staging.
     /// This does not reserve or start a child.
     pub fn connect_for_genesis(
@@ -3414,6 +3431,21 @@ impl GuardianClient {
             generation,
             sequence,
             Some(effect_id),
+            Vec::new(),
+        );
+        self.exchange(request)
+    }
+
+    /// Ask the guardian to forget an ended pane no committed recovery root
+    /// names any more (ft-9ojeh).
+    pub fn release(&mut self, pane_id: Uuid) -> Result<GuardianReply, GuardianClientError> {
+        let request = self.request(
+            GuardianOperation::Release,
+            Uuid::new_v4(),
+            Some(pane_id),
+            0,
+            0,
+            None,
             Vec::new(),
         );
         self.exchange(request)
@@ -6751,11 +6783,13 @@ mod tests {
             let graphics = GuardianClient::admits_graphics_checkpoints(&socket, &token);
             let protection = GuardianClient::admits_protection_checkpoints(&socket, &token);
             let rows = GuardianClient::admits_image_scrollback_rows(&socket, &token);
+            let release = GuardianClient::admits_release(&socket, &token);
             let sealed = GuardianClient::connect_for_genesis(&socket, &token, Uuid::new_v4());
             assert_eq!(compact, sealed.is_ok());
             assert_eq!(graphics, sealed.is_ok());
             assert_eq!(protection, sealed.is_ok());
             assert_eq!(rows, sealed.is_ok());
+            assert_eq!(release, sealed.is_ok());
             drop(sealed);
             GuardianClient::connect(&socket, &token, Uuid::new_v4())
                 .expect("the guardian still serves an ordinary connection");

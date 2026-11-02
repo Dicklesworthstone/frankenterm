@@ -128,6 +128,8 @@ pub struct GuardianRuntimeCounters {
     pub pty_records_durably_committed: u64,
     pub broker_output_acknowledgements: u64,
     pub broker_starting_panes_adopted: u64,
+    /// Released panes the broker retired, their files deleted (ft-9ojeh).
+    pub broker_panes_retired: u64,
     pub broker_control_failures: u64,
     pub pty_read_failures: u64,
     pub output_commit_failures: u64,
@@ -244,6 +246,16 @@ struct StartingBrokerPane {
     retry_before_publication: Option<Box<GenesisSpawnJob>>,
     activation: Option<GuardianGenesisActivationContinuationV1>,
     replay_origin: Option<GuardianGenesisReplayOriginV1>,
+}
+
+/// What the guardian keeps of a settled broker pane once the rest goes: enough
+/// to ask the broker to retire it after the mux releases it (ft-9ojeh).
+struct SettledBrokerPane {
+    mux_incarnation: Uuid,
+    /// `None` while its Retire is with the pane I/O worker.
+    handle: Option<BrokerPaneOutputHandleV1>,
+    /// The mux released it: ask the broker once, then forget it.
+    retire_due: bool,
 }
 
 /// The first wait after a broker Read finds no output (ft-2pgul).
@@ -371,6 +383,8 @@ struct RuntimeBrokerConnection {
     retained_session: Option<Box<BrokerPaneIoSessionV1>>,
     active_pane: Option<Uuid>,
     last_pane: Option<Uuid>,
+    /// The last command was a released pane's retirement: a read goes next.
+    retired_last: bool,
     failed: bool,
     fully_retired_outer_owner: bool,
 }
@@ -1777,6 +1791,7 @@ pub struct GuardianRuntime {
     broker_endpoint: Option<GuardianBrokerEndpoint>,
     broker_connections: HashMap<Uuid, RuntimeBrokerConnection>,
     starting_broker_panes: HashMap<Uuid, StartingBrokerPane>,
+    settled_broker_panes: HashMap<Uuid, SettledBrokerPane>,
     rotation_admission_owner: Option<Uuid>,
     completion_waker: Arc<Waker>,
     // This slot is reachable only if the pane map violates the invariant that
@@ -1895,6 +1910,7 @@ impl GuardianRuntime {
             broker_endpoint: None,
             broker_connections: HashMap::new(),
             starting_broker_panes: HashMap::new(),
+            settled_broker_panes: HashMap::new(),
             rotation_admission_owner: None,
             completion_waker,
             orphaned_input_authority: None,
@@ -2164,6 +2180,7 @@ impl GuardianRuntime {
                     Err(GuardianRejectionCode::InvalidRequest)
                 }
             }
+            GuardianOperation::Release => self.apply_release(request),
         };
 
         match result {
@@ -2849,6 +2866,7 @@ impl GuardianRuntime {
                     retained_session: None,
                     active_pane: None,
                     last_pane: None,
+                    retired_last: false,
                     failed: false,
                     fully_retired_outer_owner: false,
                 });
@@ -3641,6 +3659,7 @@ impl GuardianRuntime {
                                             retained_session: Some(session),
                                             active_pane: None,
                                             last_pane: None,
+                                            retired_last: false,
                                             failed,
                                             fully_retired_outer_owner: false,
                                         },
@@ -3938,12 +3957,16 @@ impl GuardianRuntime {
     /// An idle worker's join returns at once, as its job channel closes.
     fn release_idle_broker_connections(&mut self) {
         let panes = &self.starting_broker_panes;
+        let settled = &self.settled_broker_panes;
         self.broker_connections
             .retain(|mux_incarnation, connection| {
                 !connection.fully_retired_outer_owner
                     || connection.active_pane.is_some()
                     || panes.values().any(|pane| {
                         pane.mux_incarnation == *mux_incarnation && pane.needs_broker_connection()
+                    })
+                    || settled.values().any(|settled| {
+                        settled.mux_incarnation == *mux_incarnation && settled.retire_due
                     })
             });
     }
@@ -4288,6 +4311,32 @@ impl GuardianRuntime {
                         connection.failed = true;
                         continue;
                     };
+                    if let BrokerPaneIoCompletionV1::Retire { result, .. } = &completion {
+                        // Either answer lets the pane go; a broker that
+                        // declined keeps its files, as before ft-9ojeh.
+                        if self.settled_broker_panes.remove(&pane_id).is_none() {
+                            connection.failed = true;
+                        }
+                        match result {
+                            Ok(true) => {
+                                self.counters.broker_panes_retired =
+                                    self.counters.broker_panes_retired.saturating_add(1);
+                                log::info!(
+                                    "guardian: broker retired released pane {pane_id} and \
+                                     deleted its files"
+                                );
+                            }
+                            Ok(false) => log::info!(
+                                "guardian: broker declined to retire released pane {pane_id}; \
+                                 its files stay"
+                            ),
+                            Err(error) => log::info!(
+                                "guardian: retiring released pane {pane_id} failed: {error}; \
+                                 its files stay"
+                            ),
+                        }
+                        continue;
+                    }
                     let Some(pane) = self.starting_broker_panes.get_mut(&pane_id) else {
                         connection.failed = true;
                         continue;
@@ -4410,6 +4459,8 @@ impl GuardianRuntime {
                             pane.handle = Some(handle);
                             output.failed = true;
                         }
+                        // Answered above, for a settled pane.
+                        BrokerPaneIoCompletionV1::Retire { .. } => connection.failed = true,
                     }
                 }
                 Err(TryRecvError::Empty) => {}
@@ -4535,6 +4586,37 @@ impl GuardianRuntime {
                         .map(|(id, _)| *id)
                         .min()
                 });
+            // A retirement syncs several files, so retirements take turns
+            // with the live panes' commands: closing many panes at once must
+            // not stop the rest of the mux's output until every one retires.
+            if !rotation_wait
+                && (!connection.retired_last || pane_id.is_none())
+                && let Some((retiring, settled)) =
+                    self.settled_broker_panes.iter_mut().find(|(_, settled)| {
+                        settled.retire_due
+                            && settled.handle.is_some()
+                            && settled.mux_incarnation == *mux_incarnation
+                    })
+                && let Some(handle) = settled.handle.take()
+            {
+                let command = BrokerPaneIoCommandV1::Retire {
+                    handle,
+                    store: self.output_pipeline.checkpoint_stage_store(),
+                    deadline: Instant::now() + BROKER_IO_DEADLINE,
+                };
+                match worker.try_submit(Box::new(command)) {
+                    Ok(()) => {
+                        connection.active_pane = Some(*retiring);
+                        connection.retired_last = true;
+                    }
+                    Err(command) => {
+                        if let BrokerPaneIoCommandV1::Retire { handle, .. } = *command {
+                            settled.handle = Some(handle);
+                        }
+                    }
+                }
+                continue;
+            }
             let Some(pane_id) = pane_id else {
                 continue;
             };
@@ -4594,6 +4676,7 @@ impl GuardianRuntime {
                 Ok(()) => {
                     connection.active_pane = Some(pane_id);
                     connection.last_pane = Some(pane_id);
+                    connection.retired_last = false;
                 }
                 Err(command) => match *command {
                     BrokerPaneIoCommandV1::OpenInitial { .. } => {}
@@ -4607,6 +4690,8 @@ impl GuardianRuntime {
                     BrokerPaneIoCommandV1::ChildStatus { handle, .. } => {
                         pane.handle = Some(handle);
                     }
+                    // Never built for a starting pane.
+                    BrokerPaneIoCommandV1::Retire { .. } => {}
                     BrokerPaneIoCommandV1::Resize { handle, .. } => {
                         pane.handle = Some(handle);
                         if let Some(output) = pane.output.as_mut() {
@@ -4774,22 +4859,50 @@ impl GuardianRuntime {
             pty_tokens,
             counters,
             starting_broker_panes,
+            settled_broker_panes,
             broker_connections,
             ..
         } = self;
         let Some(protocol) = protocol.as_ref() else {
             return;
         };
+        let connected = |mux_incarnation: &Uuid| {
+            broker_connections
+                .get(mux_incarnation)
+                .is_some_and(|connection| !connection.failed)
+        };
         // A settled broker pane would hold its journal descriptors and memory
         // for the rest of the guardian's life, and spend a slot of its pane
-        // bound. The protocol answers whatever a mux still asks about it.
+        // bound. The protocol answers whatever a mux still asks about it. Its
+        // handle stays while its connection does, so the broker can retire it
+        // and delete its files once the mux releases it (ft-9ojeh).
         starting_broker_panes.retain(|pane_id, pane| {
-            !pane.is_settled(matches!(
+            if !pane.is_settled(matches!(
                 protocol.pane_state(*pane_id),
                 Some(GuardianPaneState::ClosedTerminal { .. })
             )) || broker_connections
                 .values()
                 .any(|connection| connection.active_pane == Some(*pane_id))
+            {
+                return true;
+            }
+            if connected(&pane.mux_incarnation) {
+                settled_broker_panes.insert(
+                    *pane_id,
+                    SettledBrokerPane {
+                        mux_incarnation: pane.mux_incarnation,
+                        handle: pane.handle.take(),
+                        retire_due: false,
+                    },
+                );
+            }
+            false
+        });
+        settled_broker_panes.retain(|pane_id, settled| {
+            connected(&settled.mux_incarnation)
+                || broker_connections
+                    .values()
+                    .any(|connection| connection.active_pane == Some(*pane_id))
         });
         panes.retain(|pane_id, pane| {
             let release = TerminalResourceReadiness {
@@ -4819,6 +4932,93 @@ impl GuardianRuntime {
             .ok_or(GuardianRejectionCode::InternalInvariant)?
             .apply_observation(request)
             .map_err(|error| GuardianRejectionCode::from_protocol_error(&error))
+    }
+
+    /// Forget an ended pane no committed recovery root of the mux names any
+    /// more (ft-9ojeh). Its child and output must have settled: until then
+    /// its I/O still reports to the protocol state this removes. A broker
+    /// pane is then retired by the broker, which deletes its files.
+    fn apply_release(
+        &mut self,
+        request: &AuthenticatedGuardianRequest,
+    ) -> Result<GuardianReply, GuardianRejectionCode> {
+        let pane_id = request
+            .header()
+            .pane_id
+            .ok_or(GuardianRejectionCode::InvalidRequest)?;
+        if !request.payload().is_empty() {
+            return Err(GuardianRejectionCode::InvalidRequest);
+        }
+        let io_active = self
+            .broker_connections
+            .values()
+            .any(|connection| connection.active_pane == Some(pane_id));
+        let unsettled_broker = self
+            .starting_broker_panes
+            .get(&pane_id)
+            .is_some_and(|pane| io_active || !pane.is_settled(true));
+        let unsettled_direct = self.panes.get(&pane_id).is_some_and(|pane| {
+            !(pane.exit_observed && pane.pty_eof_observed && pane.output.is_quiescent())
+        });
+        // An exit observed while the protocol was away waits in this queue,
+        // already counted as observed. Forgetting the pane first would turn
+        // that exit's replay into an unknown pane, which quarantines every
+        // pane's mutations.
+        let exit_queued = self
+            .pending_child_exits
+            .iter()
+            .any(|(pane, _)| *pane == pane_id);
+        if unsettled_broker || unsettled_direct || exit_queued {
+            if let Some(pane) = self.starting_broker_panes.get(&pane_id) {
+                log::debug!(
+                    "guardian: broker pane {pane_id} is not settled for release: exit queued {exit_queued}, I/O active {io_active}, activated {}, child exited {}, terminal {}, delivery pending {}, ack pending {}, reserved reads {}, handle {}, output quiescent {}",
+                    pane.activated,
+                    pane.child_exit_observed,
+                    pane.terminal,
+                    pane.pending_delivery.is_some(),
+                    pane.pending_ack.is_some(),
+                    pane.read_reservation,
+                    pane.handle.is_some(),
+                    pane.output
+                        .as_ref()
+                        .is_some_and(RuntimePaneOutput::is_quiescent)
+                );
+            } else {
+                log::debug!(
+                    "guardian: pane {pane_id} is not settled for release: exit queued {exit_queued}"
+                );
+            }
+            return Err(GuardianRejectionCode::PaneOutputPending);
+        }
+        let reply = self.apply_observation(request)?;
+        if let Some(mut pane) = self.starting_broker_panes.remove(&pane_id)
+            && self
+                .broker_connections
+                .get(&pane.mux_incarnation)
+                .is_some_and(|connection| !connection.failed)
+        {
+            self.settled_broker_panes.insert(
+                pane_id,
+                SettledBrokerPane {
+                    mux_incarnation: pane.mux_incarnation,
+                    handle: pane.handle.take(),
+                    retire_due: false,
+                },
+            );
+        }
+        if let Some(mut pane) = self.panes.remove(&pane_id) {
+            deregister_reader(&self.registry, &mut pane, &mut self.counters);
+            self.pty_tokens.remove(&pane.token);
+            log::info!("guardian: released pane {pane_id}");
+        } else if let Some(settled) = self.settled_broker_panes.get_mut(&pane_id) {
+            settled.retire_due = true;
+            log::info!("guardian: released pane {pane_id}; asking the broker to retire it");
+        } else {
+            // A pane from an earlier owner, or one whose connection is gone:
+            // the broker keeps its files (ft-rkn8v).
+            log::info!("guardian: released pane {pane_id}; no broker connection to retire it on");
+        }
+        Ok(reply)
     }
 
     fn apply_spawn(
@@ -5769,6 +5969,29 @@ mod tests {
                 0,
                 0,
                 Some(effect_id),
+                &[],
+            ),
+            Vec::new(),
+        );
+        let secret = GuardianSecret::from_bytes([0x5a; 32]).expect("test secret is strong");
+        let frame = encode_guardian_request(&secret, &request).expect("test request encodes");
+        decode_guardian_request(&secret, &frame).expect("test request authenticates")
+    }
+
+    fn authenticated_release_request(
+        request_id: Uuid,
+        pane_id: Uuid,
+    ) -> AuthenticatedGuardianRequest {
+        let request = GuardianRequestEnvelope::new(
+            GuardianRequestHeader::new(
+                GuardianOperation::Release,
+                Uuid::from_u128(1),
+                Uuid::from_u128(2),
+                request_id,
+                Some(pane_id),
+                0,
+                0,
+                None,
                 &[],
             ),
             Vec::new(),
@@ -7513,6 +7736,7 @@ mod tests {
             retained_session: None,
             active_pane: None,
             last_pane: None,
+            retired_last: false,
             failed: false,
             fully_retired_outer_owner,
         }
@@ -7541,6 +7765,7 @@ mod tests {
         let exited = Uuid::new_v4();
         let busy = Uuid::new_v4();
         let idle = Uuid::new_v4();
+        let retiring = Uuid::new_v4();
         let with_panes = [
             (live_owner, false),
             (reading, true),
@@ -7548,6 +7773,7 @@ mod tests {
             (exited, true),
             (busy, true),
             (idle, true),
+            (retiring, true),
         ];
         for (mux, retired) in with_panes {
             runtime
@@ -7582,15 +7808,138 @@ mod tests {
         runtime
             .starting_broker_panes
             .insert(Uuid::new_v4(), unspawned);
+        // A released pane whose broker has yet to retire it.
+        runtime.settled_broker_panes.insert(
+            Uuid::new_v4(),
+            SettledBrokerPane {
+                mux_incarnation: retiring,
+                handle: None,
+                retire_due: true,
+            },
+        );
 
         runtime.release_idle_broker_connections();
 
-        for mux in [live_owner, reading, unfinished, busy] {
+        for mux in [live_owner, reading, unfinished, busy, retiring] {
             assert!(runtime.broker_connections.contains_key(&mux));
         }
         for mux in [exited, idle] {
             assert!(!runtime.broker_connections.contains_key(&mux));
         }
+    }
+
+    #[test]
+    fn release_waits_for_a_settled_pane_then_forgets_it_and_retires_a_broker_pane() {
+        let (_directory, _poll, mut runtime, pane_id) =
+            claimed_runtime_with_writer(Box::new(std::io::sink()));
+        let rejection = |response: Option<GuardianResponseEnvelope>| {
+            let response = response.expect("release response");
+            GuardianRejectionCode::decode(response.header().status, response.payload())
+                .expect("typed release rejection")
+        };
+        let pane_state = |runtime: &GuardianRuntime, pane_id| {
+            runtime
+                .protocol
+                .as_ref()
+                .and_then(|protocol| protocol.pane_state(pane_id))
+                .cloned()
+        };
+
+        assert_eq!(
+            rejection(
+                runtime.dispatch(&authenticated_release_request(Uuid::from_u128(40), pane_id))
+            ),
+            GuardianRejectionCode::PaneOutputPending,
+            "a pane whose child and PTY have not ended stays"
+        );
+        assert!(matches!(
+            pane_state(&runtime, pane_id),
+            Some(GuardianPaneState::LiveClaimed { .. })
+        ));
+
+        runtime
+            .protocol
+            .as_mut()
+            .expect("protocol")
+            .mark_exited(pane_id, 0)
+            .expect("exit recorded");
+        let pane = runtime.panes.get_mut(&pane_id).expect("spawned pane");
+        pane.exit_observed = true;
+        pane.pty_eof_observed = true;
+        runtime.pending_child_exits.push((pane_id, 0));
+        assert_eq!(
+            rejection(
+                runtime.dispatch(&authenticated_release_request(Uuid::from_u128(43), pane_id))
+            ),
+            GuardianRejectionCode::PaneOutputPending,
+            "an exit the protocol has yet to replay holds the pane"
+        );
+        runtime.replay_deferred_child_exits();
+        assert!(!runtime.indeterminate_effect, "the replay found its pane");
+        let released = runtime
+            .dispatch(&authenticated_release_request(Uuid::from_u128(41), pane_id))
+            .expect("release response");
+        assert_eq!(released.header().status, GuardianResponseStatus::Success);
+        assert_eq!(pane_state(&runtime, pane_id), None);
+        assert!(!runtime.panes.contains_key(&pane_id), "its PTY is let go");
+        assert_eq!(
+            rejection(
+                runtime.dispatch(&authenticated_release_request(Uuid::from_u128(42), pane_id))
+            ),
+            GuardianRejectionCode::PaneNotFound,
+            "a repeat finds it gone"
+        );
+
+        // A settled broker pane keeps only its handle; on release the broker
+        // is asked to retire it, unless its connection has gone by then.
+        let broker_pane = Uuid::from_u128(51);
+        let spawn = successful_spawn_request(Uuid::from_u128(52), broker_pane, Uuid::from_u128(53));
+        assert_eq!(
+            runtime
+                .dispatch(&spawn)
+                .expect("spawn response")
+                .header()
+                .status,
+            GuardianResponseStatus::Success
+        );
+        let mut direct = runtime.panes.remove(&broker_pane).expect("spawned pane");
+        deregister_reader(&runtime.registry, &mut direct, &mut runtime.counters);
+        runtime.pty_tokens.remove(&direct.token);
+        runtime
+            .protocol
+            .as_mut()
+            .expect("protocol")
+            .mark_exited(broker_pane, 0)
+            .expect("exit recorded");
+        let mux = Uuid::from_u128(2);
+        runtime
+            .broker_connections
+            .insert(mux, broker_connection(false));
+        runtime.settled_broker_panes.insert(
+            broker_pane,
+            SettledBrokerPane {
+                mux_incarnation: mux,
+                handle: None,
+                retire_due: false,
+            },
+        );
+        let released = runtime
+            .dispatch(&authenticated_release_request(
+                Uuid::from_u128(54),
+                broker_pane,
+            ))
+            .expect("release response");
+        assert_eq!(released.header().status, GuardianResponseStatus::Success);
+        assert_eq!(pane_state(&runtime, broker_pane), None);
+        assert!(runtime.settled_broker_panes[&broker_pane].retire_due);
+
+        runtime
+            .broker_connections
+            .get_mut(&mux)
+            .expect("inserted connection")
+            .failed = true;
+        runtime.release_silent_closed_panes();
+        assert!(runtime.settled_broker_panes.is_empty());
     }
 
     #[test]

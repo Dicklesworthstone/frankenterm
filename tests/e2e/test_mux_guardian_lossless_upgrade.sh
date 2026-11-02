@@ -59,6 +59,11 @@
 # than three panes, the last one never prints and the one before it ends just
 # before the first crash; with more than four, another ends while no mux runs.
 # One pane ending must cost nothing but that pane.
+#
+# With more than five panes, one more pane ends after the crashes, while its
+# mux runs. Within 300 s the broker must retire it, its Spawn and lease
+# journals and every output-v3 file naming it must be gone, and after one
+# more mux crash every other pane must come back with its history.
 set -uo pipefail
 # The guardian refuses group- or world-writable directories on its paths
 # (a umask of 002 on some hosts); keep any stricter umask.
@@ -540,6 +545,52 @@ for (( round = 1; round <= ${E2E_MUX_CRASHES:-2}; round++ )); do
   [ "$AFTER" -gt "$CRASH_BEFORE" ] && pass "recovery published again after crash $round" \
     || fail "recovery published nothing in the 150 s after crash $round"
 done
+
+# A pane whose child ends while its mux runs: once two recovery roots without
+# it commit, the mux releases it, the guardian forgets it, and the broker
+# retires it and deletes its Spawn and lease journals (ft-9ojeh).
+if [ "$PANES_AT_START" -gt 5 ]; then
+  step "a pane ends while the mux runs"
+  GLOG=$STATE/logs/pty-guardian.log
+  RETIRED=$(grep -c "broker retired released pane" "$GLOG")
+  SPAWN_FILES=$(ls "$STATE/broker/spawn" | grep -c .)
+  LEASE_FILES=$(ls "$STATE/broker/lease" | grep -c .)
+  end_pane $((PANES_AT_START - 4))
+  T0=$(date +%s)
+  for _ in $(seq 300); do
+    [ "$(grep -c "broker retired released pane" "$GLOG")" -gt "$RETIRED" ] && break
+    sleep 1
+  done
+  if [ "$(grep -c "broker retired released pane" "$GLOG")" -gt "$RETIRED" ]; then
+    pass "the broker retired the ended pane $(( $(date +%s) - T0 )) s after it ended"
+  else
+    fail "no pane retired in the 300 s after one ended: $(grep "released pane" "$GLOG" | tail -2)"
+  fi
+  [ "$(ls "$STATE/broker/spawn" | grep -c .)" -lt "$SPAWN_FILES" ] \
+    && [ "$(ls "$STATE/broker/lease" | grep -c .)" -lt "$LEASE_FILES" ] \
+    && pass "its Spawn and lease journals are gone" \
+    || fail "broker journals: spawn $SPAWN_FILES -> $(ls "$STATE/broker/spawn" | grep -c .), lease $LEASE_FILES -> $(ls "$STATE/broker/lease" | grep -c .)"
+  GONE=$(grep "broker retired released pane" "$GLOG" | tail -1 | sed 's/.*released pane \([0-9a-f-]*\).*/\1/')
+  LEFT_FILES=$(ls "$STATE/broker/guardian-output-v3" "$STATE/receiver/guardian-output-v3" | grep -c -- "$GONE")
+  [ -n "$GONE" ] && [ "$LEFT_FILES" = 0 ] && pass "no output, custody or checkpoint file names it" \
+    || fail "$LEFT_FILES output-v3 file(s) still name retired pane ${GONE:-?}"
+  # A restart restores from the roots that let the pane go, and a root that
+  # still named it would refuse to restore: every other pane must come back.
+  MUX=$(cat "$STATE/run.mux-server.pid")
+  kill -KILL "$MUX" && pass "mux $MUX killed after the retirement"
+  for _ in $(seq 40); do kill -0 "$MUX" 2>/dev/null || break; sleep 0.25; done
+  if "$TOOL" install --family "$OLD" --manager direct; then pass "the mux came back"; else fail "the mux did not come back after the retirement"; fi
+  IDS=""
+  for _ in $(seq 120); do
+    IDS=$(pane_ids "$OLD" | grep -c .)
+    [ "$IDS" = "$PANES" ] && break
+    sleep 1
+  done
+  [ "$IDS" = "$PANES" ] && pass "all $PANES panes back after the retirement" \
+    || fail "only ${IDS:-0} of $PANES panes after the retirement"
+  check_history "the-retirement" "$OLD"
+  check_other_panes "the retirement" "$OLD"
+fi
 
 step "power loss + reinstall"
 for f in "$STATE"/run.*.pid; do kill -KILL "$(cat "$f")" 2>/dev/null; done
