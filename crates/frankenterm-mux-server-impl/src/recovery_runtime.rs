@@ -594,9 +594,12 @@ impl PeriodicRecovery {
                         if let Some(error) = result.error {
                             metrics::counter!("mux.recovery.publication", "outcome" => error)
                                 .increment(1);
-                            // A capture that met a spawn in flight, or that
-                            // shutdown cancelled, runs again next period.
-                            if matches!(error, "capture_busy" | "cancelled") && !self.failed {
+                            // A capture that met a spawn in flight or a pane
+                            // that changed under it, or that shutdown
+                            // cancelled, runs again next period.
+                            if matches!(error, "capture_busy" | "capture_stale" | "cancelled")
+                                && !self.failed
+                            {
                                 log::info!(
                                     "mux periodic recovery outcome={error}; the next period retries"
                                 );
@@ -748,9 +751,14 @@ impl PeriodicRecovery {
                 Err(error) if capture_was_busy(&error) => {
                     (None, Some("capture_busy"), false, false)
                 }
+                // A pane closed, or an upgrade took it over, under the capture.
+                // The warning above names the change; the next period captures
+                // the panes that remain.
+                Err(WholeMuxCaptureError::StaleCapture(_)) => {
+                    (None, Some("capture_stale"), false, false)
+                }
                 Err(
                     WholeMuxCaptureError::CaptureDeadline { .. }
-                    | WholeMuxCaptureError::StaleCapture(_)
                     | WholeMuxCaptureError::Topology(_)
                     | WholeMuxCaptureError::Pane { .. }
                     | WholeMuxCaptureError::GuardianPane { .. },

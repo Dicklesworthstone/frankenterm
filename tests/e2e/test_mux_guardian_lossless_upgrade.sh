@@ -356,7 +356,7 @@ if [ "$SOAK" -gt 0 ]; then
   HALFWAY=$(grep -c "published local generation" "$LOG")
   sleep $(( SOAK - SOAK / 2 ))
   PUBLISHED=$(grep -c "published local generation" "$LOG")
-  REJECTED=$(grep -cE "capture_rejected|admission exhausted" "$LOG")
+  REJECTED=$(grep -cE "capture_rejected|capture_stale|admission exhausted" "$LOG")
   DISABLED=$(grep -cE "disabled=true|publication lane disabled" "$LOG")
   RECV=$STATE/receiver/guardian-output-v3
   BROK=$STATE/broker/guardian-output-v3
