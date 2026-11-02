@@ -8712,14 +8712,22 @@ pub struct GuardianProtocolState {
     effects: HashMap<Uuid, StoredEffect>,
     effect_request_ids: HashMap<Uuid, HashSet<Uuid>>,
     indeterminate_checkpoints_by_pane: HashMap<Uuid, Uuid>,
-    // Original spawn identities are deliberately absent from these queues:
-    // forgetting one could turn a delayed retry into a second child. Every
-    // other effect is protected after eviction by its pane generation and
-    // mutation sequence, so the finite replay window may rotate safely.
+    // Original spawn identities are deliberately absent from these queues
+    // until their pane is released: forgetting one could turn a delayed retry
+    // into a second child. Every other effect is protected after eviction by
+    // its pane generation and mutation sequence, so the finite replay window
+    // may rotate safely.
     transient_request_order: VecDeque<Uuid>,
     transient_effect_order: VecDeque<Uuid>,
     protected_spawn_requests: HashSet<Uuid>,
     protected_spawn_effects: HashSet<Uuid>,
+    // The protected Spawn request and effect of each pane, so that releasing
+    // the pane can let them rotate out.
+    spawn_receipts_by_pane: HashMap<Uuid, (Uuid, Uuid)>,
+    // Every pane released in this guardian process. A released pane's Spawn
+    // receipts may rotate out and its Genesis and restart fences are dropped,
+    // so this alone refuses a Spawn or reservation that names it again.
+    released_panes: HashSet<Uuid>,
     genesis_reservations_by_request: HashMap<Uuid, GuardianGenesisReservationRecordV1>,
     genesis_reservation_effects: HashMap<Uuid, Uuid>,
     genesis_reservation_panes: HashMap<Uuid, Uuid>,
@@ -8746,6 +8754,8 @@ impl GuardianProtocolState {
             transient_effect_order: VecDeque::new(),
             protected_spawn_requests: HashSet::new(),
             protected_spawn_effects: HashSet::new(),
+            spawn_receipts_by_pane: HashMap::new(),
+            released_panes: HashSet::new(),
             genesis_reservations_by_request: HashMap::new(),
             genesis_reservation_effects: HashMap::new(),
             genesis_reservation_panes: HashMap::new(),
@@ -8880,7 +8890,9 @@ impl GuardianProtocolState {
                 GuardianProtocolError::PaneAlreadyExists(candidate.durable_pane_id)
             });
         }
-        if self.panes.contains_key(&candidate.durable_pane_id) {
+        if self.panes.contains_key(&candidate.durable_pane_id)
+            || self.released_panes.contains(&candidate.durable_pane_id)
+        {
             return Err(GuardianProtocolError::PaneAlreadyExists(
                 candidate.durable_pane_id,
             ));
@@ -9161,7 +9173,9 @@ impl GuardianProtocolState {
     /// Borrowing the opaque continuation permits retry after a preflight
     /// capacity refusal. Once applied or indeterminate, exact retries return
     /// the retained outcome without invoking the callback again. The generic
-    /// Spawn entrypoint remains permanently fenced for this reservation.
+    /// Spawn entrypoint stays fenced for this reservation until its pane is
+    /// released; after that, a Spawn of the pane can only get its retained
+    /// receipt back or be refused.
     pub fn finalize_genesis_spawn_transactionally<E>(
         &mut self,
         request: &AuthenticatedGuardianRequest,
@@ -9223,7 +9237,26 @@ impl GuardianProtocolState {
             .get(&request.header.request_id)
         else {
             self.fence_reserved_genesis_spawn(request)?;
-            return Ok(None);
+            // A released pane's reservation is gone. Its exact Spawn receipt
+            // answers a retry while it lasts; after that the id is refused.
+            let Some(pane_id) = request
+                .header
+                .pane_id
+                .filter(|pane| self.released_panes.contains(pane))
+            else {
+                return Ok(None);
+            };
+            let fingerprint = EffectFingerprint::from_authenticated_request(request)?;
+            return match self.requests.get(&request.header.request_id) {
+                Some(stored)
+                    if stored.fingerprint == fingerprint
+                        && request.header.effect_id == Some(stored.effect_id) =>
+                {
+                    Ok(Some(stored.reply.clone()))
+                }
+                Some(_) => Err(GuardianProtocolError::RequestIdentityConflict),
+                None => Err(GuardianProtocolError::PaneAlreadyExists(pane_id)),
+            };
         };
         if !reservation.matches_authenticated_spawn(request) {
             return Err(GuardianProtocolError::RequestIdentityConflict);
@@ -9368,7 +9401,9 @@ impl GuardianProtocolState {
                 GuardianProtocolError::PaneAlreadyExists(candidate.durable_pane_id)
             });
         }
-        if self.panes.contains_key(&candidate.durable_pane_id) {
+        if self.panes.contains_key(&candidate.durable_pane_id)
+            || self.released_panes.contains(&candidate.durable_pane_id)
+        {
             return Err(GuardianProtocolError::PaneAlreadyExists(
                 candidate.durable_pane_id,
             ));
@@ -10959,6 +10994,11 @@ impl GuardianProtocolState {
     /// pane with an input or checkpoint outcome still unresolved stays, and so
     /// does a quarantined one. A pane already gone answers `PaneNotFound`,
     /// which the mux treats as released.
+    ///
+    /// A released pane gives back its pane slot and its share of the receipt
+    /// window. Its id stays fenced, so no Spawn or Genesis reservation can
+    /// name it again: an exact retry gets its retained receipt while that
+    /// lasts, and `PaneAlreadyExists` after.
     fn release(
         &mut self,
         request: &AuthenticatedGuardianRequest,
@@ -10992,7 +11032,45 @@ impl GuardianProtocolState {
         {
             return Err(GuardianProtocolError::CheckpointOutcomeIndeterminate);
         }
+        self.released_panes
+            .try_reserve(1)
+            .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+        self.transient_request_order
+            .try_reserve(1)
+            .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+        self.transient_effect_order
+            .try_reserve(1)
+            .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
         self.panes.remove(&pane_id);
+        self.released_panes.insert(pane_id);
+        // The fence above now refuses every Spawn of this pane, so its Spawn
+        // receipts need no protection: they rotate out like any other. Its
+        // Genesis reservation and restart fence would otherwise hold its slot
+        // for the rest of this process.
+        if let Some((request_id, effect_id)) = self.spawn_receipts_by_pane.remove(&pane_id) {
+            if self.protected_spawn_requests.remove(&request_id)
+                && self.requests.contains_key(&request_id)
+            {
+                self.transient_request_order.push_back(request_id);
+            }
+            if self.protected_spawn_effects.remove(&effect_id)
+                && self.effects.contains_key(&effect_id)
+            {
+                self.transient_effect_order.push_back(effect_id);
+            }
+        }
+        if let Some(request_id) = self.genesis_reservation_panes.remove(&pane_id) {
+            if let Some(record) = self.genesis_reservations_by_request.remove(&request_id) {
+                self.genesis_reservation_effects
+                    .remove(&record.spawn_effect_id);
+            }
+        }
+        if let Some(request_id) = self.durable_spawn_fence_panes.remove(&pane_id) {
+            if let Some(fence) = self.durable_spawn_fences_by_request.remove(&request_id) {
+                self.durable_spawn_fence_effects
+                    .remove(&fence.spawn_effect_id);
+            }
+        }
         Ok(GuardianReply::Released { pane_id })
     }
 
@@ -11263,6 +11341,9 @@ impl GuardianProtocolState {
             self.protected_spawn_effects
                 .try_reserve(1)
                 .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+            self.spawn_receipts_by_pane
+                .try_reserve(1)
+                .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
         } else if request.header.operation != GuardianOperation::Input {
             self.transient_request_order
                 .try_reserve(1)
@@ -11382,6 +11463,8 @@ impl GuardianProtocolState {
             self.protected_spawn_requests
                 .insert(request.header.request_id);
             self.protected_spawn_effects.insert(effect_id);
+            self.spawn_receipts_by_pane
+                .insert(pane_id, (request.header.request_id, effect_id));
         } else if !outcome_is_indeterminate && request.header.operation != GuardianOperation::Input
         {
             self.transient_request_order
@@ -11403,7 +11486,7 @@ impl GuardianProtocolState {
     ) -> Result<(GuardianReply, GuardianPaneState), GuardianProtocolError> {
         match request.header.operation {
             GuardianOperation::Spawn => {
-                if self.panes.contains_key(&pane_id) {
+                if self.panes.contains_key(&pane_id) || self.released_panes.contains(&pane_id) {
                     return Err(GuardianProtocolError::PaneAlreadyExists(pane_id));
                 }
                 let occupied = self.occupied_pane_slots()?;
@@ -17568,6 +17651,239 @@ mod tests {
             })
         );
         assert_eq!(state.pane_state(closed_pane), None);
+    }
+
+    #[test]
+    fn a_released_genesis_pane_gives_back_its_slot_and_is_never_spawned_again() {
+        let (mut state, spawn, continuation) = genesis_activation_fixture();
+        state
+            .install_durable_spawn_fence(GuardianDurableSpawnFenceV1::from_genesis_record(
+                &continuation.reservation,
+            ))
+            .unwrap();
+        state
+            .finalize_genesis_spawn_transactionally(&spawn, &continuation, |_| {
+                GuardianEffectOutcome::<()>::Applied
+            })
+            .unwrap();
+        state.mark_exited(id(3), 0).unwrap();
+        let release = request(
+            GuardianOperation::Release,
+            id(1),
+            id(2),
+            id(60),
+            Some(id(3)),
+            0,
+            0,
+            None,
+            b"",
+        );
+        assert_eq!(
+            apply_request(&mut state, &release),
+            Ok(GuardianReply::Released { pane_id: id(3) })
+        );
+        assert_eq!(state.occupied_pane_slots().unwrap(), 0);
+        assert!(state.genesis_reservations_by_request.is_empty());
+        assert!(state.genesis_reservation_effects.is_empty());
+        assert!(state.genesis_reservation_panes.is_empty());
+        assert!(state.durable_spawn_fences_by_request.is_empty());
+        assert!(state.durable_spawn_fence_effects.is_empty());
+        assert!(state.durable_spawn_fence_panes.is_empty());
+        assert!(state.protected_spawn_requests.is_empty());
+        assert!(state.protected_spawn_effects.is_empty());
+        assert!(state.spawn_receipts_by_pane.is_empty());
+
+        // While the Spawn receipt lasts, an exact retry gets it back, on the
+        // Genesis path the runtime asks first and on the generic path.
+        let spawned = GuardianReply::Spawned {
+            pane_id: id(3),
+            generation: 0,
+        };
+        assert_eq!(
+            state.completed_genesis_spawn_reply(&spawn),
+            Ok(Some(spawned.clone()))
+        );
+        assert_eq!(
+            state
+                .apply_effect_transactionally(&spawn, |_| -> GuardianEffectOutcome<()> {
+                    panic!("a released pane must never be spawned again")
+                })
+                .unwrap(),
+            spawned
+        );
+
+        // Another pane's Spawn rotates that receipt out of a one-receipt
+        // window. From then on every way back to a child refuses the id.
+        state.receipt_capacity = 1;
+        let mut other = spawn_request(id(1), id(2), id(8));
+        other.header.request_id = id(80);
+        other.header.effect_id = Some(id(81));
+        apply_request(&mut state, &other).unwrap();
+        assert!(!state.requests.contains_key(&spawn.header.request_id));
+        assert_eq!(
+            state.completed_genesis_spawn_reply(&spawn),
+            Err(GuardianProtocolError::PaneAlreadyExists(id(3)))
+        );
+        assert!(matches!(
+            state.apply_effect_transactionally(&spawn, |_| -> GuardianEffectOutcome<()> {
+                panic!("a released pane must never be spawned again")
+            }),
+            Err(GuardianEffectTransactionError::Protocol(
+                GuardianProtocolError::PaneAlreadyExists(pane)
+            )) if pane == id(3)
+        ));
+        let begin = authenticate(&genesis_begin_request(
+            id(1),
+            id(2),
+            id(71),
+            id(5),
+            id(72),
+            &terminal_checkpoint(),
+        ));
+        let mux = mux_genesis_authority(&state, id(2), 0x51);
+        let guardian = live_genesis_authority(&state, 0x52);
+        assert!(matches!(
+            state.reserve_genesis_spawn_for_activation(
+                &spawn,
+                &begin,
+                Some(GuardianGenesisMuxAuthorityV1::AuthenticatedConnection(&mux)),
+                Some(&guardian),
+            ),
+            Err(GuardianProtocolError::PaneAlreadyExists(pane)) if pane == id(3)
+        ));
+        assert!(matches!(
+            state.finalize_genesis_spawn_transactionally(
+                &spawn,
+                &continuation,
+                |_| -> GuardianEffectOutcome<()> {
+                    panic!("a released pane's continuation must not install a backend")
+                }
+            ),
+            Err(GuardianEffectTransactionError::Protocol(
+                GuardianProtocolError::InvalidGenesisReservation
+            ))
+        ));
+        assert_eq!(
+            state.install_durable_spawn_fence(GuardianDurableSpawnFenceV1::from_genesis_record(
+                &continuation.reservation,
+            )),
+            Err(GuardianProtocolError::PaneAlreadyExists(id(3)))
+        );
+        assert!(state.pane_state(id(3)).is_none());
+
+        // Its slot is free: the guardian holds the full number of panes again.
+        state.receipt_capacity = GUARDIAN_MAX_EFFECT_RECEIPTS;
+        for ordinal in 0..GUARDIAN_MAX_PANES - 2 {
+            state.panes.insert(
+                Uuid::from_u128(1_000 + u128::try_from(ordinal).unwrap()),
+                GuardianPaneState::LiveUnclaimed { generation: 0 },
+            );
+        }
+        let mut last = spawn_request(id(1), id(2), id(9));
+        last.header.request_id = id(90);
+        last.header.effect_id = Some(id(91));
+        apply_request(&mut state, &last).unwrap();
+        assert_eq!(state.occupied_pane_slots().unwrap(), GUARDIAN_MAX_PANES);
+    }
+
+    #[test]
+    fn released_panes_let_their_spawn_receipts_rotate_out() {
+        let guardian = id(1);
+        let mux = id(2);
+        let mut state = GuardianProtocolState::new_with_receipt_capacity(guardian, 2).unwrap();
+        let pane = |ordinal: u128| Uuid::from_u128(1_000 + ordinal);
+        let spawn = |ordinal: u128| {
+            let mut spawn = spawn_request(guardian, mux, pane(ordinal));
+            spawn.header.request_id = Uuid::from_u128(2_000 + ordinal);
+            spawn.header.effect_id = Some(Uuid::from_u128(3_000 + ordinal));
+            spawn
+        };
+        // Protected Spawn receipts never rotate out, so before release freed
+        // them two of them filled this window and the third Spawn failed.
+        for ordinal in 0..8 {
+            assert_eq!(
+                apply_request(&mut state, &spawn(ordinal)),
+                Ok(GuardianReply::Spawned {
+                    pane_id: pane(ordinal),
+                    generation: 0
+                })
+            );
+            state.mark_exited(pane(ordinal), 0).unwrap();
+            let release = request(
+                GuardianOperation::Release,
+                guardian,
+                mux,
+                Uuid::from_u128(4_000 + ordinal),
+                Some(pane(ordinal)),
+                0,
+                0,
+                None,
+                b"",
+            );
+            assert_eq!(
+                apply_request(&mut state, &release),
+                Ok(GuardianReply::Released {
+                    pane_id: pane(ordinal)
+                })
+            );
+        }
+        assert!(state.panes.is_empty());
+        assert!(state.requests.len() <= 2);
+        assert!(state.effects.len() <= 2);
+        assert!(state.protected_spawn_requests.is_empty());
+        assert!(state.protected_spawn_effects.is_empty());
+        assert_eq!(state.released_panes.len(), 8);
+
+        // The newest receipt still answers its exact retry. The oldest has
+        // rotated out and the fence refuses it, as it does a new Spawn that
+        // reuses a released id. None of them starts a child.
+        assert_eq!(
+            apply_request(&mut state, &spawn(7)),
+            Ok(GuardianReply::Spawned {
+                pane_id: pane(7),
+                generation: 0
+            })
+        );
+        assert_eq!(
+            apply_request(&mut state, &spawn(0)),
+            Err(GuardianProtocolError::PaneAlreadyExists(pane(0)))
+        );
+        let mut reused = spawn(9);
+        reused.header.pane_id = Some(pane(3));
+        assert_eq!(
+            apply_request(&mut state, &reused),
+            Err(GuardianProtocolError::PaneAlreadyExists(pane(3)))
+        );
+        assert!(state.panes.is_empty());
+
+        // An alias request of the released Spawn's effect answers too, and
+        // rotates out with that effect when live panes need the window.
+        let mut alias = spawn(7);
+        alias.header.request_id = Uuid::from_u128(5_000);
+        assert_eq!(
+            apply_request(&mut state, &alias),
+            Ok(GuardianReply::Spawned {
+                pane_id: pane(7),
+                generation: 0
+            })
+        );
+        for ordinal in [10, 11] {
+            assert_eq!(
+                apply_request(&mut state, &spawn(ordinal)),
+                Ok(GuardianReply::Spawned {
+                    pane_id: pane(ordinal),
+                    generation: 0
+                })
+            );
+        }
+        assert!(!state.effects.contains_key(&Uuid::from_u128(3_007)));
+        let retry = spawn(7);
+        for request in [&alias, &retry] {
+            assert_eq!(
+                apply_request(&mut state, request),
+                Err(GuardianProtocolError::PaneAlreadyExists(pane(7)))
+            );
+        }
     }
 
     #[test]
