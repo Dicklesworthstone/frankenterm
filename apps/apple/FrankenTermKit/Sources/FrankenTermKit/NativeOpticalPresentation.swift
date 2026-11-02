@@ -1,4 +1,9 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 /// One immutable encrypted export, with separate ownership of its optional
 /// generated code. Live frames and saved media read ciphertext only. A code
@@ -125,11 +130,46 @@ public struct OpticalAnimationPlan: Sendable {
     }
 }
 
-/// Reads only an explicitly selected, already-local regular file, with a hard
-/// byte bound. Cloud/provider downloads are not initiated by this helper.
+/// Reads one stable snapshot of an explicitly selected, already-local regular
+/// file, with a hard byte bound. Cloud/provider downloads are not initiated.
+/// URL metadata is only a preflight: admission and reads use the same opened
+/// descriptor, so replacing a selected path cannot turn the import into a
+/// blocking FIFO/device read or follow a newly substituted final symlink.
 public enum SelectedLocalFile {
     public static func read(_ url: URL, limit: Int) throws -> Data {
+        try read(url, limit: limit, operations: .system)
+    }
+
+    /// Fault injection retains real descriptors and filesystem admission, as in
+    /// LocalExportFile. Native reads remain synchronous on their owning actor.
+    struct Operations {
+        var open: (String, Int32) -> Int32
+        var read: (Int32, UnsafeMutableRawBufferPointer) -> Int
+        var checkCancellation: () throws -> Void
+
+        static var system: Self {
+            Self(open: { path, flags in
+                path.withCString {
+                    #if canImport(Darwin)
+                    Darwin.open($0, flags)
+                    #else
+                    Glibc.open($0, flags)
+                    #endif
+                }
+            }, read: { descriptor, buffer in
+                #if canImport(Darwin)
+                Darwin.read(descriptor, buffer.baseAddress, buffer.count)
+                #else
+                Glibc.read(descriptor, buffer.baseAddress, buffer.count)
+                #endif
+            }, checkCancellation: { try Task.checkCancellation() })
+        }
+    }
+
+    static func read(_ url: URL, limit: Int, operations: Operations) throws -> Data {
         guard url.isFileURL, limit > 0, limit <= FTLimit.archive else { throw FTError.limit("file.input") }
+        guard !url.path.utf8.contains(0) else { throw FTError.malformed("file.path") }
+        try operations.checkCancellation()
         #if os(iOS) || os(macOS)
         let access = url.startAccessingSecurityScopedResource()
         defer { if access { url.stopAccessingSecurityScopedResource() } }
@@ -140,14 +180,54 @@ public enum SelectedLocalFile {
         #endif
         let values = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
         guard values.isRegularFile == true, let size = values.fileSize, size <= limit else { throw FTError.limit("file.bytes") }
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
+        try operations.checkCancellation()
+        // O_NONBLOCK prevents an admitted regular path replaced by a FIFO from
+        // hanging inside open before descriptor validation/cancellation can run.
+        let descriptor = operations.open(url.path, O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW)
+        guard descriptor >= 0 else { throw FTError.storage }
+        defer { _ = close(descriptor) }
+        var initial = stat()
+        guard fstat(descriptor, &initial) == 0 else { throw FTError.storage }
+        guard initial.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+              initial.st_size >= 0, initial.st_size <= off_t(limit) else { throw FTError.limit("file.bytes") }
+
         var result = Data()
-        while let bytes = try handle.read(upToCount: min(65536, limit + 1 - result.count)), !bytes.isEmpty {
-            try Task.checkCancellation()
-            result += bytes
+        result.reserveCapacity(Int(initial.st_size))
+        var buffer = [UInt8](repeating: 0, count: min(65_536, limit + 1))
+        var interruptions = 0
+        while true {
+            try operations.checkCancellation()
+            let amount = min(buffer.count, limit + 1 - result.count)
+            let received = buffer.withUnsafeMutableBytes { bytes in
+                operations.read(descriptor, UnsafeMutableRawBufferPointer(rebasing: bytes[..<amount]))
+            }
+            if received < 0, errno == EINTR, interruptions < 64 {
+                interruptions += 1
+                continue
+            }
+            guard received >= 0, received <= amount else { throw FTError.storage }
+            if received == 0 { break }
+            result.append(contentsOf: buffer.prefix(received))
             guard result.count <= limit else { throw FTError.limit("file.bytes") }
         }
+        try operations.checkCancellation()
+        var completed = stat()
+        guard fstat(descriptor, &completed) == 0 else { throw FTError.storage }
+        #if canImport(Darwin)
+        let unchangedTimes = initial.st_mtimespec.tv_sec == completed.st_mtimespec.tv_sec
+            && initial.st_mtimespec.tv_nsec == completed.st_mtimespec.tv_nsec
+            && initial.st_ctimespec.tv_sec == completed.st_ctimespec.tv_sec
+            && initial.st_ctimespec.tv_nsec == completed.st_ctimespec.tv_nsec
+        #else
+        let unchangedTimes = initial.st_mtim.tv_sec == completed.st_mtim.tv_sec
+            && initial.st_mtim.tv_nsec == completed.st_mtim.tv_nsec
+            && initial.st_ctim.tv_sec == completed.st_ctim.tv_sec
+            && initial.st_ctim.tv_nsec == completed.st_ctim.tv_nsec
+        #endif
+        guard completed.st_dev == initial.st_dev, completed.st_ino == initial.st_ino,
+              completed.st_size == initial.st_size, result.count == Int(initial.st_size),
+              unchangedTimes else { throw FTError.malformed("file.changed_during_read") }
+        try operations.checkCancellation()
         return result
     }
 }

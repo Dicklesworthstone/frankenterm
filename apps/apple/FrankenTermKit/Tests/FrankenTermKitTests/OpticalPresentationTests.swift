@@ -1,4 +1,9 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 import XCTest
 @testable import FrankenTermKit
 
@@ -187,6 +192,191 @@ final class OpticalPresentationTests: XCTestCase {
         XCTAssertThrowsError(try SelectedLocalFile.read(URL(string: "https://example.invalid/export")!, limit: 1024))
         XCTAssertThrowsError(try SelectedLocalFile.read(file, limit: 0))
     }
+    private func selectedFile(_ bytes: Data) throws -> URL {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("ft-selected-file-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        let file = root.appendingPathComponent("selected.ftairgap")
+        try bytes.write(to: file, options: .withoutOverwriting)
+        return file
+    }
+
+    func testSelectedRegularFileReplacedByFIFOIsRejectedWithoutBlockingOrReading() throws {
+        let file = try selectedFile(Data("original workspace".utf8))
+        var operations = SelectedLocalFile.Operations.system
+        let systemOpen = operations.open
+        var reads = 0
+        operations.open = { path, flags in
+            // Fail without opening the FIFO if nonblocking admission regresses;
+            // the regression test itself must never hang waiting for a writer.
+            guard flags & O_NONBLOCK != 0 else {
+                XCTFail("selected imports must not block while opening a replaced path")
+                errno = EINVAL
+                return -1
+            }
+            do {
+                try FileManager.default.moveItem(at: file, to: file.appendingPathExtension("original"))
+            } catch {
+                XCTFail("could not replace synthetic selected path: \(error)")
+                return -1
+            }
+            XCTAssertEqual(path.withCString { mkfifo($0, 0o600) }, 0)
+            return systemOpen(path, flags)
+        }
+        operations.read = { _, _ in reads += 1; return 0 }
+        XCTAssertThrowsError(try SelectedLocalFile.read(file, limit: 1024, operations: operations)) {
+            XCTAssertEqual($0 as? FTError, .limit("file.bytes"))
+        }
+        XCTAssertEqual(reads, 0, "descriptor type must be admitted before any read")
+    }
+
+    func testSelectedPathSubstitutedWithSymlinkCannotReadAnotherFile() throws {
+        let file = try selectedFile(Data("selected".utf8))
+        let other = file.deletingLastPathComponent().appendingPathComponent("other")
+        try Data("unselected key material".utf8).write(to: other, options: .withoutOverwriting)
+        var operations = SelectedLocalFile.Operations.system
+        let systemOpen = operations.open
+        var reads = 0
+        operations.open = { path, flags in
+            do {
+                try FileManager.default.moveItem(at: file, to: file.appendingPathExtension("original"))
+                try FileManager.default.createSymbolicLink(at: file, withDestinationURL: other)
+            } catch {
+                XCTFail("could not substitute synthetic symlink: \(error)")
+                return -1
+            }
+            return systemOpen(path, flags)
+        }
+        operations.read = { _, _ in reads += 1; return 0 }
+        XCTAssertThrowsError(try SelectedLocalFile.read(file, limit: 1024, operations: operations)) {
+            XCTAssertEqual($0 as? FTError, .storage)
+        }
+        XCTAssertEqual(reads, 0)
+        XCTAssertEqual(try Data(contentsOf: other), Data("unselected key material".utf8))
+    }
+
+    func testSelectedFileLimitAppliesToTheOpenedDescriptorAfterPathReplacement() throws {
+        let file = try selectedFile(Data(repeating: 1, count: 16))
+        let replacement = file.deletingLastPathComponent().appendingPathComponent("replacement")
+        try Data(repeating: 2, count: 1025).write(to: replacement, options: .withoutOverwriting)
+        var operations = SelectedLocalFile.Operations.system
+        let systemOpen = operations.open
+        var reads = 0
+        operations.open = { path, flags in
+            do {
+                try FileManager.default.moveItem(at: file, to: file.appendingPathExtension("original"))
+                try FileManager.default.moveItem(at: replacement, to: file)
+            } catch {
+                XCTFail("could not replace synthetic file: \(error)")
+                return -1
+            }
+            return systemOpen(path, flags)
+        }
+        operations.read = { _, _ in reads += 1; return 0 }
+        XCTAssertThrowsError(try SelectedLocalFile.read(file, limit: 1024, operations: operations)) {
+            XCTAssertEqual($0 as? FTError, .limit("file.bytes"))
+        }
+        XCTAssertEqual(reads, 0)
+    }
+
+    func testSelectedFileCannotPublishPartialOrMixedBytesWhenItChangesDuringRead() throws {
+        for mutation in ["grow", "shrink", "rewrite"] {
+            let file = try selectedFile(Data(repeating: 7, count: 80_000))
+            var operations = SelectedLocalFile.Operations.system
+            let systemRead = operations.read
+            var changed = false
+            operations.read = { descriptor, buffer in
+                let count = systemRead(descriptor, buffer)
+                if count > 0, !changed {
+                    changed = true
+                    do {
+                        let writer = try FileHandle(forWritingTo: file)
+                        defer { try? writer.close() }
+                        switch mutation {
+                        case "grow":
+                            _ = try writer.seekToEnd()
+                            try writer.write(contentsOf: Data([9]))
+                        case "shrink":
+                            try writer.truncate(atOffset: 1024)
+                        default:
+                            try writer.seek(toOffset: 70_000)
+                            try writer.write(contentsOf: Data([9]))
+                        }
+                        // Make the metadata distinction deterministic even on
+                        // filesystems with coarse modification-time resolution.
+                        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1)],
+                                                              ofItemAtPath: file.path)
+                    } catch {
+                        XCTFail("could not mutate synthetic file: \(error)")
+                        return -1
+                    }
+                }
+                return count
+            }
+            XCTAssertThrowsError(try SelectedLocalFile.read(file, limit: 100_000, operations: operations), mutation) {
+                XCTAssertEqual($0 as? FTError, .malformed("file.changed_during_read"), mutation)
+            }
+            XCTAssertTrue(changed)
+        }
+    }
+
+    func testSelectedFileReadsAStableMultiChunkSnapshotAndRetriesInterruptedRead() throws {
+        let bytes = Data((0..<150_000).map { UInt8(truncatingIfNeeded: $0) })
+        let file = try selectedFile(bytes)
+        var operations = SelectedLocalFile.Operations.system
+        let systemRead = operations.read
+        var reads = 0
+        operations.read = { descriptor, buffer in
+            reads += 1
+            if reads == 1 { errno = EINTR; return -1 }
+            return systemRead(descriptor, buffer)
+        }
+        XCTAssertEqual(try SelectedLocalFile.read(file, limit: bytes.count, operations: operations), bytes)
+        XCTAssertGreaterThan(reads, 3)
+    }
+
+    func testSelectedFileInterruptedReadBudgetAndReadErrorsNeverReturnAPrefix() throws {
+        let file = try selectedFile(Data(repeating: 7, count: 80_000))
+        var interrupted = SelectedLocalFile.Operations.system
+        var attempts = 0
+        interrupted.read = { _, _ in attempts += 1; errno = EINTR; return -1 }
+        XCTAssertThrowsError(try SelectedLocalFile.read(file, limit: 100_000, operations: interrupted)) {
+            XCTAssertEqual($0 as? FTError, .storage)
+        }
+        XCTAssertEqual(attempts, 65)
+
+        var failed = SelectedLocalFile.Operations.system
+        let systemRead = failed.read
+        var reads = 0
+        failed.read = { descriptor, buffer in
+            reads += 1
+            if reads == 2 { errno = EIO; return -1 }
+            return systemRead(descriptor, buffer)
+        }
+        XCTAssertThrowsError(try SelectedLocalFile.read(file, limit: 100_000, operations: failed)) {
+            XCTAssertEqual($0 as? FTError, .storage)
+        }
+        XCTAssertEqual(reads, 2)
+    }
+
+    func testCancellationAfterLastSelectedFileReadStillRejectsPublication() throws {
+        let file = try selectedFile(Data("complete bytes".utf8))
+        var operations = SelectedLocalFile.Operations.system
+        let systemRead = operations.read
+        var reachedEOF = false
+        operations.read = { descriptor, buffer in
+            let count = systemRead(descriptor, buffer)
+            reachedEOF = count == 0
+            return count
+        }
+        operations.checkCancellation = {
+            if reachedEOF { throw CancellationError() }
+        }
+        XCTAssertThrowsError(try SelectedLocalFile.read(file, limit: 1024, operations: operations)) {
+            XCTAssertTrue($0 is CancellationError)
+        }
+        XCTAssertTrue(reachedEOF)
+    }
+
     func testManifestPublishesTheExplicitInitialGroupRatherThanGuessingByMembership() throws {
         var root = try XCTUnwrap(JSONSerialization.jsonObject(with: sampleManifest()) as? [String: Any])
         var workspace = try XCTUnwrap(root["workspace"] as? [String: Any])
