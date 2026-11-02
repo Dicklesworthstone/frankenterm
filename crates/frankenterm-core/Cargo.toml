@@ -191,7 +191,7 @@ roaring = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 frankenterm-uds = { workspace = true, features = ["async-asupersync"] }
-sysinfo = { version = "0.39.3", default-features = false, features = ["system", "disk"] }
+sysinfo = { version = "0.40.1", default-features = false, features = ["system", "disk"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
