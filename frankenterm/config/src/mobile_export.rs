@@ -45,6 +45,7 @@ const USER_CERTIFICATE_CAPABILITY: &str = "ssh_user_certificate_v1";
 const HOST_CERTIFICATE_CAPABILITY: &str = "ssh_host_certificate_v1";
 const HOST_ALGORITHM_POLICY_CAPABILITY: &str = "ssh_host_algorithm_policy_v1";
 const TRANSPORT_ALGORITHM_POLICY_CAPABILITY: &str = "ssh_transport_algorithm_policy_v1";
+const PUBLIC_KEY_ALGORITHM_POLICY_CAPABILITY: &str = "ssh_public_key_algorithm_policy_v1";
 const HOST_REVOCATION_CAPABILITY: &str = "ssh_host_revocation_v1";
 const MAX_REVOCATION_SOURCE_BYTES: usize = 256 * 1024;
 const MAX_REVOCATION_ENTRIES: usize = 8192;
@@ -1471,6 +1472,8 @@ fn alias_resolver(config: Option<&str>, home: &Path) -> Option<AliasResolver> {
                 }
                 "preferredauthentications"
                 | "pubkeyauthentication"
+                | "pubkeyacceptedalgorithms"
+                | "pubkeyacceptedkeytypes"
                 | "passwordauthentication"
                 | "kbdinteractiveauthentication"
                 | "challengeresponseauthentication"
@@ -1496,11 +1499,10 @@ fn alias_resolver(config: Option<&str>, home: &Path) -> Option<AliasResolver> {
                     authentication_values.insert(token.clone(), value);
                     // The deprecated spelling controls the same OpenSSH slot;
                     // whichever matching spelling appears first takes effect.
-                    let keyword = if keyword.eq_ignore_ascii_case("challengeresponseauthentication")
-                    {
-                        "kbdinteractiveauthentication"
-                    } else {
-                        keyword
+                    let keyword = match keyword.to_ascii_lowercase().as_str() {
+                        "challengeresponseauthentication" => "kbdinteractiveauthentication",
+                        "pubkeyacceptedkeytypes" => "pubkeyacceptedalgorithms",
+                        _ => keyword,
                     };
                     passive.push_str(&format!("{} {}\n", keyword, token));
                     continue;
@@ -2621,6 +2623,9 @@ struct Endpoint {
     port: u16,
     user: String,
     authentication_methods: Vec<&'static str>,
+    // Account authentication belongs to this route, not the host-trust scope:
+    // two users of one server may require different signing algorithms.
+    pubkey_accepted_algorithms: Option<Vec<String>>,
     identities: Vec<PathBuf>,
     certificates: Vec<UserCertificate>,
     identity_policy_complete: bool,
@@ -2926,6 +2931,7 @@ fn resolve_endpoint(
             // Literal inventory routes have an explicit file-key contract,
             // independent of SSH alias defaults and interactive methods.
             authentication_methods: vec!["publickey"],
+            pubkey_accepted_algorithms: None,
             identities: if identity_files.is_empty() {
                 default_identities(context)
             } else {
@@ -3121,6 +3127,34 @@ fn resolve_endpoint(
                     }
                 }
             }
+            // Userauth uses the same finite raw/certificate algorithm-name
+            // vocabulary as host signatures, but keeps its own route policy.
+            // In particular, an RSA key name is not an RSA-SHA2 request name.
+            let public_key_policy =
+                match resolver.authentication_value(&options, "pubkeyacceptedalgorithms") {
+                    Ok(Some(value)) => Some(host_algorithm_selection(value, false)),
+                    Ok(None) => None,
+                    Err(()) => Some(AlgorithmSelection::Unresolved),
+                };
+            let pubkey_accepted_algorithms = match public_key_policy {
+                Some(AlgorithmSelection::Allowlist(algorithms)) => Some(algorithms),
+                Some(AlgorithmSelection::PreferenceOnly) => {
+                    note(
+                        notes,
+                        "pubkeyacceptedalgorithms: the source's prepended algorithm preference is inactive on the phone; the phone keeps its qualified modern signing algorithms and does not enable additional or weaker algorithms from this preference".into(),
+                    );
+                    None
+                }
+                Some(AlgorithmSelection::Unresolved) => {
+                    unresolved_policy = true;
+                    note(
+                        notes,
+                        "pubkeyacceptedalgorithms is not a qualified literal allowlist; default-dependent additions/removals, patterns, unknown names and malformed lists remain unresolved and this route remains blocked".into(),
+                    );
+                    None
+                }
+                None => None,
+            };
             // Do not silently substitute the phone's defaults for mandatory
             // source trust, revocation, or algorithm constraints. These are
             // preserved by a required-capability marker in the document itself.
@@ -3128,8 +3162,6 @@ fn resolve_endpoint(
                 "knownhostscommand",
                 "required_rsasize",
                 "requiredrsasize",
-                "pubkeyacceptedalgorithms",
-                "pubkeyacceptedkeytypes",
                 "verifyhostkeydns",
                 "checkhostip",
                 "canonicalizehostname",
@@ -3142,13 +3174,6 @@ fn resolve_endpoint(
                         | "checkhostip"
                         | "canonicalizehostname"
                         | "refuseconnection" => value.eq_ignore_ascii_case("no"),
-                        // Authentication-signature policy is separate from
-                        // the qualified host/transport policies above. Its
-                        // existing nonrestrictive preference remains inactive;
-                        // `+`, `-` and a full list still block.
-                        "pubkeyacceptedalgorithms" | "pubkeyacceptedkeytypes" => {
-                            value.starts_with('^')
-                        }
                         _ => false,
                     };
                     if !disabled {
@@ -3173,6 +3198,7 @@ fn resolve_endpoint(
                     Vec::new()
                 },
                 authentication_methods: authentication.methods,
+                pubkey_accepted_algorithms,
                 certificates,
                 identity_policy_complete,
                 // ssh.c also lowercases HostKeyAlias before it replaces the
@@ -3537,8 +3563,16 @@ impl EndpointRecords {
         if let Some(alias) = &endpoint.host_key_alias {
             record["host_key_alias"] = json!(alias);
         }
+        let mut required_capabilities = Vec::new();
+        if let Some(algorithms) = &endpoint.pubkey_accepted_algorithms {
+            record["pubkey_accepted_algorithms"] = json!(algorithms);
+            required_capabilities.push(PUBLIC_KEY_ALGORITHM_POLICY_CAPABILITY);
+        }
         if !identities_complete {
-            record["required_capabilities"] = json!([UNRESOLVED_POLICY]);
+            required_capabilities.push(UNRESOLVED_POLICY);
+        }
+        if !required_capabilities.is_empty() {
+            record["required_capabilities"] = json!(required_capabilities);
         }
         record
     }
@@ -8776,6 +8810,213 @@ ssh = "right"
                 json!([UNRESOLVED_POLICY]),
                 "{constraint}"
             );
+        }
+    }
+
+    #[test]
+    fn public_key_algorithm_lists_preserve_first_assignment_and_exact_request_names() {
+        for (first, later) in [
+            ("PubkeyAcceptedKeyTypes", "PubkeyAcceptedAlgorithms"),
+            ("PubkeyAcceptedAlgorithms", "PubkeyAcceptedKeyTypes"),
+        ] {
+            let mut sources = sources(Some(&format!(
+                "Host left\n {first} = \"rsa-sha2-256-cert-v01@openssh.com,rsa-sha2-256,ssh-ed25519,rsa-sha2-256\" # reviewed\nHost right\n {first} ssh-ed25519\nHost *\n HostName box\n User u\n UserKnownHostsFile /trust/keys\n GlobalKnownHostsFile none\n {later} unknown\n"
+            )));
+            supply(
+                &mut sources,
+                "/trust/keys",
+                format!("box {}\n", fake_key(50)),
+            );
+            let exported = trust_export(&sources);
+            assert_eq!(
+                exported_route(&exported, "r.left.ssh")["pubkey_accepted_algorithms"],
+                json!([
+                    "rsa-sha2-256-cert-v01@openssh.com",
+                    "rsa-sha2-256",
+                    "ssh-ed25519"
+                ]),
+                "{first}"
+            );
+            assert_eq!(
+                exported_route(&exported, "r.right.ssh")["pubkey_accepted_algorithms"],
+                json!(["ssh-ed25519"]),
+                "different account policies on the same host must not be intersected"
+            );
+            for id in ["r.left.ssh", "r.right.ssh"] {
+                assert_eq!(
+                    exported_route(&exported, id)["required_capabilities"],
+                    json!([PUBLIC_KEY_ALGORITHM_POLICY_CAPABILITY])
+                );
+                assert!(route_trust(&exported, id)["required_capabilities"].is_null());
+            }
+            assert_eq!(
+                companion_source(&exported, Path::new("/inventory/machines.toml"))["document"],
+                exported.document,
+                "the desktop handoff must retain the exact authentication policy"
+            );
+        }
+    }
+
+    #[test]
+    fn public_key_algorithms_stay_with_their_destination_and_qualified_jump() {
+        let mut sources = sources(Some(
+            "Host left\n HostName app.corp\n ProxyJump operator@gate:2200\n PubkeyAcceptedAlgorithms rsa-sha2-256\nHost gate\n HostName gate.corp\n PubkeyAcceptedKeyTypes ssh-ed25519\nHost right\n HostName plain.corp\nHost *\n User u\n UserKnownHostsFile /trust/keys\n GlobalKnownHostsFile none\n",
+        ));
+        supply(
+            &mut sources,
+            "/trust/keys",
+            format!(
+                "app.corp {}\n[gate.corp]:2200 {}\nplain.corp {}\n",
+                fake_key(50),
+                fake_key(51),
+                fake_key(52)
+            ),
+        );
+        let exported = trust_export(&sources);
+        let app = exported_route(&exported, "r.left.ssh");
+        let gate = exported_route(&exported, app["jump_routes"][0].as_str().unwrap());
+        assert_eq!(app["pubkey_accepted_algorithms"], json!(["rsa-sha2-256"]));
+        assert_eq!(gate["pubkey_accepted_algorithms"], json!(["ssh-ed25519"]));
+        assert_eq!(gate["user"], "operator");
+        assert_eq!(gate["port"], 2200);
+        for route in [app, gate] {
+            assert_eq!(
+                route["required_capabilities"],
+                json!([PUBLIC_KEY_ALGORITHM_POLICY_CAPABILITY])
+            );
+        }
+        let ordinary = exported_route(&exported, "r.right.ssh");
+        assert!(ordinary["pubkey_accepted_algorithms"].is_null());
+        assert!(ordinary["required_capabilities"].is_null());
+    }
+
+    #[test]
+    fn public_key_algorithm_policy_survives_mux_copy_and_identity_refusal() {
+        let mut sources = jump_sources();
+        sources.config = Some(format!(
+            "PubkeyAcceptedAlgorithms rsa-sha2-256,ssh-ed25519\n{}",
+            sources.config.as_deref().unwrap()
+        ));
+        sources
+            .unavailable_public_keys
+            .insert(context().home.join(".ssh/app.pub"));
+        let exported = jump_export(&sources).unwrap();
+        for route in exported.document["workspace"]["routes"].as_array().unwrap() {
+            assert_eq!(
+                route["pubkey_accepted_algorithms"],
+                json!(["rsa-sha2-256", "ssh-ed25519"])
+            );
+            let blocked = route["host"] == "service.internal";
+            assert_eq!(
+                route["required_capabilities"],
+                if blocked {
+                    json!([PUBLIC_KEY_ALGORITHM_POLICY_CAPABILITY, UNRESOLVED_POLICY])
+                } else {
+                    json!([PUBLIC_KEY_ALGORITHM_POLICY_CAPABILITY])
+                }
+            );
+        }
+        for id in ["r.app.ssh", "r.app.mux"] {
+            let route = exported_route(&exported, id);
+            assert!(route["credential_refs"].as_array().unwrap().is_empty());
+            assert_eq!(
+                route["pubkey_accepted_algorithms"],
+                json!(["rsa-sha2-256", "ssh-ed25519"]),
+                "an identity-read failure cannot erase mandatory signing policy"
+            );
+        }
+    }
+
+    #[test]
+    fn public_key_algorithm_expressions_fail_closed_before_later_aliases() {
+        let base = "Host *\n HostName box\n User u\n UserKnownHostsFile /trust/keys\n GlobalKnownHostsFile none\n";
+        let oversized = std::iter::repeat_n("ssh-ed25519", 65)
+            .collect::<Vec<_>>()
+            .join(",");
+        for (first, later) in [
+            ("PubkeyAcceptedAlgorithms", "PubkeyAcceptedKeyTypes"),
+            ("PubkeyAcceptedKeyTypes", "PubkeyAcceptedAlgorithms"),
+        ] {
+            for expression in [
+                "",
+                "+ssh-ed25519",
+                "-ssh-rsa",
+                "rsa-sha2-*",
+                "ssh-ed25519,",
+                ",ssh-ed25519",
+                "ssh-ed25519,,rsa-sha2-256",
+                "unknown,ssh-ed25519",
+                "ssh-ed25519 unknown",
+                "\"ssh-ed25519 rsa-sha2-256\"",
+                "^",
+                "^unknown,ssh-ed25519",
+                "^ssh-ed25519,",
+                &oversized,
+            ] {
+                let mut sources = sources(Some(&format!(
+                    "{base}{first} {expression}\n{later} ssh-ed25519\n"
+                )));
+                supply(
+                    &mut sources,
+                    "/trust/keys",
+                    format!("box {}\n", fake_key(50)),
+                );
+                let exported = trust_export(&sources);
+                let route = exported_route(&exported, "r.left.ssh");
+                assert!(
+                    route["pubkey_accepted_algorithms"].is_null(),
+                    "{first} {expression}"
+                );
+                assert_eq!(
+                    route_trust(&exported, "r.left.ssh")["required_capabilities"],
+                    json!([UNRESOLVED_POLICY]),
+                    "{first} {expression}"
+                );
+                assert!(exported.notes.iter().any(|note| {
+                    note.message.contains("pubkeyacceptedalgorithms")
+                        && note.message.contains("remains blocked")
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn public_key_preferences_are_disclosed_and_unsupported_literal_names_are_preserved() {
+        let base = "Host *\n HostName box\n User u\n UserKnownHostsFile /trust/keys\n GlobalKnownHostsFile none\n";
+        for keyword in ["PubkeyAcceptedAlgorithms", "PubkeyAcceptedKeyTypes"] {
+            for (expression, expected) in [
+                ("^rsa-sha2-256,ssh-rsa", None),
+                (
+                    "ssh-rsa,ssh-dss,sk-ssh-ed25519@openssh.com",
+                    Some(json!(["ssh-rsa", "ssh-dss", "sk-ssh-ed25519@openssh.com"])),
+                ),
+            ] {
+                let mut sources = sources(Some(&format!("{base}{keyword} {expression}\n")));
+                supply(
+                    &mut sources,
+                    "/trust/keys",
+                    format!("box {}\n", fake_key(50)),
+                );
+                let exported = trust_export(&sources);
+                let route = exported_route(&exported, "r.left.ssh");
+                assert!(route_trust(&exported, "r.left.ssh")["required_capabilities"].is_null());
+                if let Some(expected) = expected {
+                    assert_eq!(route["pubkey_accepted_algorithms"], expected);
+                    assert_eq!(
+                        route["required_capabilities"],
+                        json!([PUBLIC_KEY_ALGORITHM_POLICY_CAPABILITY]),
+                        "preserved source names never grant native support"
+                    );
+                } else {
+                    assert!(route["pubkey_accepted_algorithms"].is_null());
+                    assert!(route["required_capabilities"].is_null());
+                    assert!(exported.portability.iter().any(|finding| {
+                        finding.disposition == 0
+                            && finding.reason.contains("pubkeyacceptedalgorithms")
+                            && finding.reason.contains("inactive")
+                    }));
+                }
+            }
         }
     }
 
