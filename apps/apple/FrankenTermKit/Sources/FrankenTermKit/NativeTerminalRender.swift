@@ -78,6 +78,22 @@ public struct NativeTerminalViewport: Equatable, Sendable {
     public let columns: Int, rows: Int, pixelWidth: Int, pixelHeight: Int
 }
 
+/// The production provider uses MetalKit's paired descriptor/drawable lifecycle.
+/// Keeping this boundary internal allows hosted tests to withhold a drawable
+/// before returning the real surface; no renderer or GPU result is simulated.
+@MainActor
+protocol NativeTerminalDrawableProviding {
+    func acquire(in view: MTKView) -> (descriptor: MTLRenderPassDescriptor, drawable: any CAMetalDrawable)?
+}
+
+@MainActor
+struct NativeTerminalDrawables: NativeTerminalDrawableProviding {
+    func acquire(in view: MTKView) -> (descriptor: MTLRenderPassDescriptor, drawable: any CAMetalDrawable)? {
+        guard let descriptor = view.currentRenderPassDescriptor, let drawable = view.currentDrawable else { return nil }
+        return (descriptor, drawable)
+    }
+}
+
 /// One native scene surface. Admission, source identity and UIKit stay on
 /// MainActor; Core Text, rasterization, atlas writes and buffer preparation stay
 /// on one dedicated serial worker. The three GPU slots are never written while
@@ -129,15 +145,28 @@ public final class NativeTerminalRenderView: MTKView {
     private lazy var displayTarget = NativeTerminalDisplayTarget(self)
     private lazy var accessibleOutput = NativeTerminalAccessibility(view: self)
     private(set) var powerPolicy = TerminalRenderPowerPolicy(thermalState: .nominal, lowPower: false)
+    private let drawables: any NativeTerminalDrawableProviding
+    private var drawableRetry = TerminalDrawableRetry()
+    private var drawableRetryTimer: Timer?
+    private let retryDisplayButton = UIButton(type: .system)
+    private(set) var isDisplayStalled = false
 
-    public init(source: TerminalSource, bundle: Bundle = .main,
-                configuration: NativeTerminalRenderConfiguration = .init()) async throws {
+    public convenience init(source: TerminalSource, bundle: Bundle = .main,
+                            configuration: NativeTerminalRenderConfiguration = .init()) async throws {
+        try await self.init(source: source, bundle: bundle, configuration: configuration,
+                            drawables: NativeTerminalDrawables())
+    }
+
+    init(source: TerminalSource, bundle: Bundle,
+         configuration: NativeTerminalRenderConfiguration,
+         drawables: any NativeTerminalDrawableProviding) async throws {
         try configuration.validate()
         let pipelines = try await NativeTerminalPipelineLoader.shared.load(bundle: bundle)
         try Task.checkCancellation()
         guard let queue = pipelines.device.makeCommandQueue() else { throw TerminalRenderError.unavailable }
         backgroundPipeline = pipelines.background; textPipeline = pipelines.text
         self.source = source; self.configuration = configuration; commandQueue = queue
+        self.drawables = drawables
         revealCursorOnPreparation = configuration.fitsRemoteGrid && configuration.localViewportEnabled
         worker = NativeTerminalPreparation(device: pipelines.device)
         super.init(frame: .zero, device: pipelines.device)
@@ -168,6 +197,24 @@ public final class NativeTerminalRenderView: MTKView {
         NotificationCenter.default.addObserver(self, selector: #selector(memoryWarning),
             name: UIApplication.didReceiveMemoryWarningNotification, object: nil)
         refreshPowerPolicy()
+        var retryStyle = UIButton.Configuration.filled()
+        retryStyle.title = "Retry display"
+        retryStyle.subtitle = "Display temporarily unavailable"
+        retryStyle.cornerStyle = .capsule
+        retryDisplayButton.configuration = retryStyle
+        retryDisplayButton.accessibilityLabel = "Display temporarily unavailable. Retry display"
+        retryDisplayButton.accessibilityHint = "Tries to show your terminal without reconnecting."
+        retryDisplayButton.accessibilityIdentifier = "terminal.display.retry"
+        retryDisplayButton.isHidden = true
+        retryDisplayButton.translatesAutoresizingMaskIntoConstraints = false
+        retryDisplayButton.addAction(UIAction { [weak self] _ in self?.retryDisplay() }, for: .touchUpInside)
+        addSubview(retryDisplayButton)
+        NSLayoutConstraint.activate([
+            retryDisplayButton.centerXAnchor.constraint(equalTo: centerXAnchor),
+            retryDisplayButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            retryDisplayButton.leadingAnchor.constraint(greaterThanOrEqualTo: layoutMarginsGuide.leadingAnchor),
+            retryDisplayButton.trailingAnchor.constraint(lessThanOrEqualTo: layoutMarginsGuide.trailingAnchor)
+        ])
     }
     @available(*, unavailable)
     public required init(coder: NSCoder) { fatalError("Use init(source:bundle:configuration:)") }
@@ -201,6 +248,7 @@ public final class NativeTerminalRenderView: MTKView {
 
     public override var accessibilityElements: [Any]? {
         get {
+            if isDisplayStalled { return active && !retired ? [retryDisplayButton] : [] }
             guard UIAccessibility.isVoiceOverRunning else { return super.accessibilityElements }
             guard active, !retired else { return [] }
             return accessibleOutput.elements()
@@ -210,8 +258,8 @@ public final class NativeTerminalRenderView: MTKView {
 
     @objc private func accessibilityModeChanged() {
         accessibleOutput.discard()
-        isAccessibilityElement = !UIAccessibility.isVoiceOverRunning
-        accessibilityCustomRotors = UIAccessibility.isVoiceOverRunning ? [accessibleOutput.rotor()] : nil
+        isAccessibilityElement = !retired && !isDisplayStalled && !UIAccessibility.isVoiceOverRunning
+        accessibilityCustomRotors = !retired && !isDisplayStalled && UIAccessibility.isVoiceOverRunning ? [accessibleOutput.rotor()] : nil
     }
 
     /// Complete replacements can supersede an unprepared frame. No byte stream
@@ -365,6 +413,7 @@ public final class NativeTerminalRenderView: MTKView {
     }
 
     private func discardPrepared() {
+        resetDrawableRecovery()
         if let prepared { try? slots.abandon(prepared.lease) }
         prepared = nil
     }
@@ -461,7 +510,9 @@ public final class NativeTerminalRenderView: MTKView {
     }
 
     private func requestDisplay() {
-        guard active, !retired else { return }
+        // A flood may replace pending semantic output, but cannot bypass a
+        // missing drawable's delay or restart an exhausted recovery episode.
+        guard active, !retired, !drawableRetry.isWaiting, !drawableRetry.isExhausted else { return }
         if displayLink == nil {
             let link = CADisplayLink(target: displayTarget, selector: #selector(NativeTerminalDisplayTarget.tick(_:)))
             link.preferredFrameRateRange = displayRateRange
@@ -471,6 +522,90 @@ public final class NativeTerminalRenderView: MTKView {
         displayLink?.isPaused = false
     }
 
+    private func resetDrawableRecovery() {
+        drawableRetryTimer?.invalidate(); drawableRetryTimer = nil
+        drawableRetry.reset()
+        // A new attempt is not proof that the screen is visible again. Keep
+        // input fenced through retries and geometry changes until a current
+        // command buffer actually completes. Inactive/retired owners cannot
+        // admit input and must dismiss their recovery control.
+        if !active || retired { setDisplayStalled(false) }
+        else { retryDisplayButton.isEnabled = false }
+    }
+
+    private func setDisplayStalled(_ stalled: Bool) {
+        let changed = isDisplayStalled != stalled
+        isDisplayStalled = stalled
+        retryDisplayButton.isHidden = !stalled
+        retryDisplayButton.isEnabled = stalled && drawableRetry.isExhausted
+        guard changed else { return }
+        accessibilityModeChanged()
+        if stalled {
+            // The session and the last coherent screen remain owned. Close
+            // stale pointer/caret admission without treating display pressure
+            // as an SSH failure or discarding the prepared GPU slot.
+            completedPointerProjection = nil
+            onProjectionInvalidated?()
+            onCaretUnavailable?()
+            if active, !retired, window != nil {
+                UIAccessibility.post(notification: .layoutChanged, argument: retryDisplayButton)
+            }
+        }
+    }
+
+    /// Explicit local recovery after the bounded automatic burst. New output
+    /// may have superseded the retained prepared screen while it was waiting.
+    func retryDisplay() {
+        guard isDisplayStalled, drawableRetry.isExhausted, active, !retired, window != nil else { return }
+        if pending != nil {
+            discardPrepared()
+            requestPreparation()
+        } else {
+            resetDrawableRecovery()
+            if prepared != nil { requestDisplay() }
+            else { requestPreparation() }
+        }
+    }
+
+    /// The native host has a transparent input view above Metal. Forward only
+    /// this visible control's hits, without making the terminal surface itself
+    /// intercept input, selection, or another overlay.
+    func displayRecoveryControl(at point: CGPoint, with event: UIEvent?) -> UIView? {
+        guard active, !retired, isDisplayStalled else { return nil }
+        return retryDisplayButton.hitTest(convert(point, to: retryDisplayButton), with: event)
+    }
+
+    private func drawableUnavailable() {
+        guard active, !retired, window != nil, prepared != nil else { return }
+        switch drawableRetry.unavailable() {
+        case let .schedule(id, delay):
+            let generation = preparationGeneration
+            // One one-shot wake, not another rendering loop. Only displayTick
+            // acquires and submits a frame, at the current display/power policy.
+            let timer = Timer(timeInterval: delay, repeats: false) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.wakeDrawableRetry(id, generation: generation)
+                }
+            }
+            timer.tolerance = min(0.01, delay / 10)
+            drawableRetryTimer = timer
+            RunLoop.main.add(timer, forMode: .common)
+        case .pending: break
+        case .exhausted: setDisplayStalled(true)
+        }
+    }
+
+    private func wakeDrawableRetry(_ id: UUID, generation: UInt64) {
+        let result = drawableRetry.wake(id)
+        guard result != .stale else { return }
+        drawableRetryTimer = nil
+        guard active, !retired, window != nil, generation == preparationGeneration, prepared != nil else {
+            resetDrawableRecovery(); return
+        }
+        if result == .exhausted { setDisplayStalled(true) }
+        else { requestDisplay() }
+    }
+
     fileprivate func displayTick() {
         displayLink?.isPaused = true
         guard active, !retired, prepared != nil else { return }
@@ -478,14 +613,18 @@ public final class NativeTerminalRenderView: MTKView {
     }
 
     public override func draw(_ rect: CGRect) {
-        guard active, !retired, let frame = prepared,
-              frame.generation == preparationGeneration, submitted.count < 1 else { return }
-        guard let descriptor = currentRenderPassDescriptor, let drawable = currentDrawable,
-              let commands = commandQueue.makeCommandBuffer()
-        else {
-            // A missing drawable keeps exactly one prepared frame. Retry only on
-            // a later output/layout/lifecycle request, not an idle spinning loop.
+        guard active, !retired, !drawableRetry.isWaiting, !drawableRetry.isExhausted,
+              let frame = prepared, frame.generation == preparationGeneration, submitted.count < 1 else { return }
+        guard let surface = drawables.acquire(in: self) else {
+            drawableUnavailable()
             return
+        }
+        let descriptor = surface.descriptor, drawable = surface.drawable
+        // Allocation pressure can refuse a command buffer before submission.
+        // Preserve the prepared lease and the same bounded recovery budget;
+        // acquiring a drawable alone must not replenish it or close SSH.
+        guard let commands = commandQueue.makeCommandBuffer() else {
+            drawableUnavailable(); return
         }
         let clear = frame.clear
         descriptor.colorAttachments[0].clearColor = MTLClearColor(red: Double(clear[0]), green: Double(clear[1]), blue: Double(clear[2]), alpha: Double(clear[3]))
@@ -522,6 +661,8 @@ public final class NativeTerminalRenderView: MTKView {
                 try? self.slots.complete(frame.lease)
                 if !self.retired, self.active, frame.generation == self.preparationGeneration {
                     if succeeded {
+                        self.resetDrawableRecovery()
+                        self.setDisplayStalled(false)
                         if frame.lease.serial > self.deliveredCaret {
                             self.deliveredCaret = frame.lease.serial
                             if frame.revealedCursor { self.revealCursorOnPreparation = false }

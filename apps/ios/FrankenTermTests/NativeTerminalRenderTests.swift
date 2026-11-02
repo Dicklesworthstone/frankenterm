@@ -1,5 +1,6 @@
 import XCTest
 import UIKit
+@preconcurrency import MetalKit
 @testable import FrankenTermKit
 import FrankenTermTerminal
 
@@ -13,8 +14,41 @@ private actor InertTransport: TerminalByteTransport {
         identity = try .init(workspaceID: "render-test", machineID: "machine", routeID: "direct",
                              routeRevision: 1, transportID: UUID(), channelID: UUID())
     }
-    func writeSome(_ bytes: Data) -> TerminalTransportWrite { .accepted(bytes.count) }
-    func close() {}
+    private var output = Data()
+    private var closed = false
+    func writeSome(_ bytes: Data) -> TerminalTransportWrite { output += bytes; return .accepted(bytes.count) }
+    func close() { closed = true }
+    func written() -> Data { output }
+    func isClosed() -> Bool { closed }
+}
+
+@MainActor
+private final class WithheldTerminalDrawables: NativeTerminalDrawableProviding {
+    var alwaysUnavailable = false
+    private var remainingRefusals: Int
+    private(set) var attempts = 0
+    init(refusals: Int = 0) { remainingRefusals = refusals }
+    func acquire(in view: MTKView) -> (descriptor: MTLRenderPassDescriptor, drawable: any CAMetalDrawable)? {
+        attempts += 1
+        if alwaysUnavailable { return nil }
+        if remainingRefusals > 0 { remainingRefusals -= 1; return nil }
+        return NativeTerminalDrawables().acquire(in: view)
+    }
+}
+
+private actor RenderFrameDelivery: TerminalModelDelivery {
+    private var frame: Data?
+    func present(_ presentation: TerminalModelPresentation, source: TerminalSource) async throws {
+        switch presentation {
+        case let .frame(bytes): frame = bytes
+        case let .unavailable(error): throw error
+        }
+    }
+    func receive(_ outcomes: [TerminalInputOutcome], source: TerminalSource) async throws {}
+    func latestFrame() throws -> Data {
+        guard let frame else { throw TerminalRenderError.unavailable }
+        return frame
+    }
 }
 
 private struct Snapshot {
@@ -44,6 +78,7 @@ final class NativeTerminalRenderTests: XCTestCase {
     private func render(_ output: String, name: String,
                         configuration: NativeTerminalRenderConfiguration = .init(),
                         powerPolicy: TerminalRenderPowerPolicy? = nil,
+                        drawables: (any NativeTerminalDrawableProviding)? = nil,
                         columns: UInt32 = 40, rows: UInt32 = 12) async throws -> (Snapshot, NativeTerminalCaret?) {
         let coordinator = try TerminalInputCoordinator()
         let source = try await coordinator.attach(InertTransport())
@@ -53,7 +88,13 @@ final class NativeTerminalRenderTests: XCTestCase {
         let frame = try model.captureFrame(viewportTop: nil)
 
         view?.removeFromSuperview()
-        let view = try await NativeTerminalRenderView(source: source, bundle: .main, configuration: configuration)
+        let view: NativeTerminalRenderView
+        if let drawables {
+            view = try await NativeTerminalRenderView(source: source, bundle: .main,
+                configuration: configuration, drawables: drawables)
+        } else {
+            view = try await NativeTerminalRenderView(source: source, bundle: .main, configuration: configuration)
+        }
         self.view = view
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
         let window = try XCTUnwrap(scenes.flatMap(\.windows).first { $0.isKeyWindow } ?? scenes.first?.windows.first)
@@ -91,6 +132,174 @@ final class NativeTerminalRenderTests: XCTestCase {
         attachment.name = name; attachment.lifetime = .keepAlways
         add(attachment)
         return (Snapshot(image: image, bytes: bytes, width: width, height: height), caret)
+    }
+
+
+    private func waitFor(_ description: String, _ condition: () -> Bool) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(10))
+        while !condition(), ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(condition(), description)
+    }
+
+    private func drainInput(_ coordinator: TerminalInputCoordinator, source: TerminalSource) async throws {
+        for _ in 0..<128 {
+            if try await coordinator.drainOne(source) == .idle { return }
+        }
+        XCTFail("bounded test input did not drain")
+    }
+
+    func testIdleTerminalRecoversAfterMissingDrawablesWithoutAnotherOutputOrLayout() async throws {
+        var configuration = NativeTerminalRenderConfiguration()
+        configuration.cursorBlink = false
+        let drawables = WithheldTerminalDrawables(refusals: 3)
+        let (shot, _) = try await render("The prompt has no more output", name: "drawable-recovery",
+            configuration: configuration, drawables: drawables)
+        let view = try XCTUnwrap(view), frame = try XCTUnwrap(view.admittedFrame)
+        XCTAssertGreaterThanOrEqual(drawables.attempts, 4)
+        XCTAssertFalse(view.isDisplayStalled)
+        XCTAssertTrue(frame.readableText.contains("The prompt has no more output"))
+        XCTAssertTrue((0..<shot.height).contains { y in (0..<shot.width).contains { shot.isLight($0, y) } },
+            "the retained canonical frame must actually reach the real Metal surface")
+        let attempts = drawables.attempts
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(drawables.attempts, attempts, "successful recovery must return a steady prompt to sleep")
+    }
+
+    func testDrawableRetryStopsOnDeactivationAndRetirementAndResumesTheRetainedScreen() async throws {
+        var configuration = NativeTerminalRenderConfiguration()
+        configuration.cursorBlink = false
+        let drawables = WithheldTerminalDrawables()
+        _ = try await render("Initial screen", name: "drawable-lifecycle",
+            configuration: configuration, drawables: drawables)
+        let view = try XCTUnwrap(view), model = try XCTUnwrap(model)
+        drawables.alwaysUnavailable = true
+        let initialAttempts = drawables.attempts
+        try model.feed(Data("\r\nRetained through deactivation".utf8))
+        try view.submit(model.captureFrame(viewportTop: nil), source: view.source)
+        try await waitFor("a missing drawable must start recovery") { drawables.attempts > initialAttempts }
+        view.setSceneActive(false)
+        let inactiveAttempts = drawables.attempts
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(drawables.attempts, inactiveAttempts)
+        XCTAssertFalse(view.isDisplayStalled)
+        XCTAssertNil(view.pointerProjection)
+
+        let resumed = expectation(description: "retained frame presented after reactivation")
+        resumed.assertForOverFulfill = false
+        view.onAppearance = { _, _ in resumed.fulfill() }
+        drawables.alwaysUnavailable = false
+        view.setSceneActive(true)
+        await fulfillment(of: [resumed], timeout: 20)
+        XCTAssertTrue(view.admittedFrame?.readableText.contains("Retained through deactivation") == true)
+
+        drawables.alwaysUnavailable = true
+        let resumedAttempts = drawables.attempts
+        try model.feed(Data("\r\nRetire with a pending retry".utf8))
+        try view.submit(model.captureFrame(viewportTop: nil), source: view.source)
+        try await waitFor("second missing drawable must start recovery") { drawables.attempts > resumedAttempts }
+        view.retire()
+        let retiredAttempts = drawables.attempts
+        view.setSceneActive(true)
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(drawables.attempts, retiredAttempts)
+        XCTAssertFalse(view.isDisplayStalled)
+        XCTAssertNil(view.admittedFrame)
+    }
+
+    func testExhaustedDrawableRecoveryKeepsTheSessionAndOffersATappableLocalRetry() async throws {
+        let coordinator = try TerminalInputCoordinator()
+        let transport = try InertTransport()
+        let source = try await coordinator.attach(transport)
+        let model = try NativeTerminalModel(source: source, geometry: .init(columns: 40, rows: 12), scrollbackRows: 16)
+        self.model = model
+        let delivery = RenderFrameDelivery()
+        let runtime = TerminalModelRuntime(model: model, coordinator: coordinator, delivery: delivery)
+        let stream = try await coordinator.makeStream(sceneID: UUID())
+        let focus = try await coordinator.changeFocus(stream, to: source)
+        let keyboard = try TerminalKeyboardSession(focus: focus, coordinator: coordinator, encoder: runtime)
+        var configuration = NativeTerminalRenderConfiguration()
+        configuration.cursorBlink = false
+        let drawables = WithheldTerminalDrawables()
+        let terminal = try await NativeTerminalView(session: keyboard, bundle: .main,
+            configuration: configuration, readOnly: false, drawables: drawables)
+        let view = terminal.renderer
+        self.view = view
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let window = try XCTUnwrap(scenes.flatMap(\.windows).first { $0.isKeyWindow } ?? scenes.first?.windows.first)
+        terminal.frame = CGRect(x: 0, y: 0, width: min(window.bounds.width, 402), height: 260)
+        window.addSubview(terminal)
+        terminal.setSceneActive(true)
+        terminal.layoutIfNeeded()
+        defer { terminal.retire(); terminal.removeFromSuperview() }
+        var failure: Error?
+        terminal.onFailure = { failure = $0 }
+        try await runtime.receive(.init(output: Data("Ready".utf8)), source: source)
+        try terminal.submit(try await delivery.latestFrame(), source: source)
+        try await waitFor("real Metal completion must enable the source-matching input") { terminal.input.isEditable }
+
+        drawables.alwaysUnavailable = true
+        try await runtime.receive(.init(output: Data("\r\nWaiting for a drawable".utf8)), source: source)
+        try terminal.submit(try await delivery.latestFrame(), source: source)
+        try await waitFor("persistent drawable refusal must expose recovery and stop scheduling") { view.isDisplayStalled }
+        XCTAssertNil(failure, "display pressure must not enter the session-closing failure callback")
+        XCTAssertNil(view.pointerProjection)
+        XCTAssertFalse(terminal.input.isEditable)
+        XCTAssertTrue(keyboard.acceptsInput, "presentation recovery must preserve the session's input identity")
+
+        terminal.input.insertText("unseen")
+        await keyboard.waitUntilSettled()
+        try await drainInput(coordinator, source: source)
+        let hiddenInput = await transport.written()
+        XCTAssertTrue(hiddenInput.isEmpty, "the temporary-redraw input exception cannot admit blind input after exhaustion")
+        let wasClosed = await transport.isClosed()
+        XCTAssertFalse(wasClosed, "a missing drawable must not close the SSH transport")
+
+        let attempts = drawables.attempts
+        for index in 0..<32 {
+            try await runtime.receive(.init(output: Data("\r\nnewest-\(index)".utf8)), source: source)
+            try terminal.submit(try await delivery.latestFrame(), source: source)
+        }
+        view.draw() // an external draw request must not bypass the exhausted budget
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(drawables.attempts, attempts, "new output cannot keep a permanently unavailable display awake")
+
+        terminal.layoutIfNeeded()
+        let button = try XCTUnwrap(view.accessibilityElements?.first as? UIButton)
+        XCTAssertEqual(button.accessibilityIdentifier, "terminal.display.retry")
+        let point = button.convert(CGPoint(x: button.bounds.midX, y: button.bounds.midY), to: terminal)
+        XCTAssertTrue(terminal.hitTest(point, with: nil) === button,
+            "the transparent input view must not cover the renderer's recovery control")
+        button.sendActions(for: .touchUpInside)
+        XCTAssertTrue(view.isDisplayStalled, "starting a retry cannot prove the terminal is visible")
+        XCTAssertFalse(button.isEnabled, "repeated taps cannot replenish an ongoing recovery burst")
+        XCTAssertFalse(terminal.input.isEditable)
+        try await waitFor("explicit retry must attempt the prepared screen") { drawables.attempts > attempts }
+        terminal.input.insertText("still unseen")
+        await keyboard.waitUntilSettled()
+        try await drainInput(coordinator, source: source)
+        let retryInput = await transport.written()
+        XCTAssertTrue(retryInput.isEmpty, "input stays fenced while an explicit retry still cannot draw")
+        try await waitFor("a failed retry must offer another explicit attempt") { button.isEnabled }
+        XCTAssertTrue(view.isDisplayStalled)
+        XCTAssertNil(failure)
+        drawables.alwaysUnavailable = false
+        button.sendActions(for: .touchUpInside)
+        try await waitFor("explicit retry must draw the newest retained frame and reopen its input") {
+            !view.isDisplayStalled && terminal.input.isEditable
+                && view.admittedFrame?.readableText.contains("newest-31") == true
+        }
+        XCTAssertNil(failure)
+        XCTAssertEqual(view.admittedFrame?.source, source)
+        terminal.input.insertText("after")
+        await keyboard.waitUntilSettled()
+        try await drainInput(coordinator, source: source)
+        let recoveredInput = await transport.written()
+        XCTAssertEqual(recoveredInput, Data("after".utf8), "only fresh input is admitted after display recovery")
+        terminal.retire()
+        await keyboard.waitUntilSuspended()
+        try await runtime.close()
     }
 
     func testCanonicalTerminalFrameIsDrawnThroughMetal() async throws {

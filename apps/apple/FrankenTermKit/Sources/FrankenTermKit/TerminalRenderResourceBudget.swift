@@ -84,3 +84,55 @@ final class TerminalRenderResourceBudget: @unchecked Sendable {
         }
     }
 }
+
+/// One bounded presentation-acquisition episode. Output arriving while the screen
+/// is unavailable cannot create another retry or replenish the deadline. A
+/// successful presentation, explicit retry, or changed presentation lifecycle
+/// starts a new episode. The native owner wakes its existing display scheduler;
+/// this value owns neither a task nor a rendering loop.
+struct TerminalDrawableRetry: Sendable {
+    enum Decision: Equatable, Sendable {
+        case schedule(id: UUID, after: TimeInterval)
+        case pending
+        case exhausted
+    }
+    enum Wake: Equatable, Sendable { case ready, stale, exhausted }
+
+    private static let delaysMilliseconds = [25, 50, 100, 200, 400, 800]
+    private var deadline: ContinuousClock.Instant?
+    private var nextDelay = 0
+    private var pendingID: UUID?
+    private(set) var isExhausted = false
+    var isWaiting: Bool { pendingID != nil }
+
+    mutating func unavailable(at now: ContinuousClock.Instant = ContinuousClock.now) -> Decision {
+        guard !isExhausted else { return .exhausted }
+        guard pendingID == nil else { return .pending }
+        if deadline == nil { deadline = now.advanced(by: .seconds(2)) }
+        guard nextDelay < Self.delaysMilliseconds.count,
+              let deadline,
+              now.advanced(by: .milliseconds(Self.delaysMilliseconds[nextDelay])) <= deadline else {
+            isExhausted = true
+            return .exhausted
+        }
+        let delay = Self.delaysMilliseconds[nextDelay]
+        nextDelay += 1
+        let id = UUID()
+        pendingID = id
+        return .schedule(id: id, after: Double(delay) / 1_000)
+    }
+
+    mutating func wake(_ id: UUID, at now: ContinuousClock.Instant = ContinuousClock.now) -> Wake {
+        guard pendingID == id else { return .stale }
+        pendingID = nil
+        guard let deadline, now < deadline else {
+            isExhausted = true
+            return .exhausted
+        }
+        return .ready
+    }
+
+    mutating func reset() {
+        deadline = nil; nextDelay = 0; pendingID = nil; isExhausted = false
+    }
+}

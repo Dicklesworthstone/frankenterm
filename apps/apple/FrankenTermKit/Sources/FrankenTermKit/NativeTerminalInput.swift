@@ -1070,13 +1070,20 @@ public final class NativeTerminalView: UIView {
     /// The fingers' spacing changed enough to be a pinch, not a two-finger swipe.
     private var pinchEngaged = false
 
-    public init(session: TerminalKeyboardSession, bundle: Bundle = .main,
-                configuration: NativeTerminalRenderConfiguration = .init(), readOnly: Bool = false) async throws {
+    public convenience init(session: TerminalKeyboardSession, bundle: Bundle = .main,
+                            configuration: NativeTerminalRenderConfiguration = .init(), readOnly: Bool = false) async throws {
+        try await self.init(session: session, bundle: bundle, configuration: configuration,
+                            readOnly: readOnly, drawables: NativeTerminalDrawables())
+    }
+
+    init(session: TerminalKeyboardSession, bundle: Bundle,
+         configuration: NativeTerminalRenderConfiguration, readOnly: Bool,
+         drawables: any NativeTerminalDrawableProviding) async throws {
         guard let source = session.originalFocus.source, session.acceptsInput else {
             throw TerminalKeyboardError.unavailable
         }
         let renderer = try await NativeTerminalRenderView(source: source, bundle: bundle,
-                                                           configuration: configuration)
+                                                           configuration: configuration, drawables: drawables)
         guard !Task.isCancelled, session.acceptsInput else {
             renderer.retire()
             throw TerminalKeyboardError.unavailable
@@ -1194,6 +1201,11 @@ public final class NativeTerminalView: UIView {
     public required init?(coder: NSCoder) { fatalError("Use init(session:bundle:configuration:)") }
     deinit { NotificationCenter.default.removeObserver(self) }
 
+    public override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        guard let ordinary = super.hitTest(point, with: event) else { return nil }
+        return renderer.displayRecoveryControl(at: convert(point, to: renderer), with: event) ?? ordinary
+    }
+
     private func bindInput() {
         input.onFailure = { [weak self] error in
             guard let self, !self.retired else { return }
@@ -1213,7 +1225,8 @@ public final class NativeTerminalView: UIView {
             self.onKeyboardDismissed?()
         }
         input.onInputWithoutProjection = { [weak self] in
-            guard let self, !self.retired, self.sceneActive, let frame = self.renderer.admittedFrame else { return false }
+            guard let self, !self.retired, self.sceneActive, !self.renderer.isDisplayStalled,
+                  let frame = self.renderer.admittedFrame else { return false }
             // A resize or new text size redraws the live screen it shows.
             if frame.isLive {
                 if self.ownsViewportPan { self.revealCursor() }
@@ -1870,7 +1883,15 @@ extension NativeTerminalView: @preconcurrency UIEditMenuInteractionDelegate {
 @MainActor
 private final class NativeTerminalTouchFilter: NSObject, UIGestureRecognizerDelegate {
     func gestureRecognizer(_ recognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
-        !(touch.view is NativeTerminalSelectionOverlay.SelectionHandle)
+        var target = touch.view
+        while let view = target {
+            // Retry display and other native controls own their taps. A
+            // terminal recognizer must not cancel the button or send its touch
+            // through to the remote application.
+            if view is UIControl || view is NativeTerminalSelectionOverlay.SelectionHandle { return false }
+            target = view.superview
+        }
+        return true
     }
 }
 

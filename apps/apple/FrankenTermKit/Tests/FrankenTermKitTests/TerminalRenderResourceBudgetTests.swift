@@ -184,4 +184,89 @@ final class TerminalRenderResourceBudgetTests: XCTestCase {
         XCTAssertGreaterThan(peak, 0); XCTAssertLessThanOrEqual(peak, 6)
         XCTAssertEqual(budget.retainedResources, 0)
     }
+
+    func testDrawableRecoveryCoalescesRequestsAndStopsAfterABoundedBurst() {
+        var recovery = TerminalDrawableRetry()
+        let start = ContinuousClock.now
+        var now = start, previousDelay: TimeInterval = 0
+        var scheduled = 0
+        for _ in 0..<32 {
+            switch recovery.unavailable(at: now) {
+            case let .schedule(id, delay):
+                scheduled += 1
+                XCTAssertGreaterThan(delay, 0)
+                XCTAssertGreaterThanOrEqual(delay, previousDelay)
+                previousDelay = delay
+                XCTAssertTrue(recovery.isWaiting)
+                for _ in 0..<100 {
+                    XCTAssertEqual(recovery.unavailable(at: now), .pending,
+                        "new output cannot add a wake or replenish a waiting episode")
+                }
+                now = now.advanced(by: .seconds(delay))
+                XCTAssertEqual(recovery.wake(id, at: now), .ready)
+                XCTAssertFalse(recovery.isWaiting)
+            case .exhausted: break
+            case .pending: XCTFail("each scheduled wake was consumed")
+            }
+            if recovery.isExhausted { break }
+        }
+        XCTAssertGreaterThan(scheduled, 1, "a transient refusal must receive automatic recovery")
+        XCTAssertLessThan(scheduled, 32, "a permanently missing drawable must stop requesting frames")
+        XCTAssertTrue(recovery.isExhausted)
+        XCTAssertFalse(recovery.isWaiting)
+        XCTAssertLessThanOrEqual(start.duration(to: now), .seconds(2))
+        for _ in 0..<100 {
+            XCTAssertEqual(recovery.unavailable(at: now), .exhausted,
+                "an output flood cannot silently restart the exhausted burst")
+        }
+    }
+
+    func testLateDrawableWakeExhaustsInsteadOfRenderingAfterItsDeadline() {
+        var recovery = TerminalDrawableRetry()
+        let now = ContinuousClock.now
+        guard case let .schedule(id, _) = recovery.unavailable(at: now) else {
+            return XCTFail("first refusal should schedule recovery")
+        }
+        XCTAssertEqual(recovery.wake(id, at: now.advanced(by: .seconds(3))), .exhausted)
+        XCTAssertTrue(recovery.isExhausted)
+        XCTAssertFalse(recovery.isWaiting)
+        XCTAssertEqual(recovery.wake(id, at: now.advanced(by: .seconds(4))), .stale)
+        XCTAssertEqual(recovery.unavailable(at: now.advanced(by: .seconds(4))), .exhausted)
+    }
+
+    func testDrawableLifecycleResetCannotReviveAnEarlierTimerOrConsumeANewerOne() {
+        var recovery = TerminalDrawableRetry()
+        let now = ContinuousClock.now
+        guard case let .schedule(retired, _) = recovery.unavailable(at: now) else {
+            return XCTFail("first refusal should schedule recovery")
+        }
+        recovery.reset()
+        XCTAssertFalse(recovery.isWaiting); XCTAssertFalse(recovery.isExhausted)
+        guard case let .schedule(current, delay) = recovery.unavailable(at: now) else {
+            return XCTFail("a new presentation owns a new recovery episode")
+        }
+        XCTAssertNotEqual(retired, current)
+        XCTAssertEqual(recovery.wake(retired, at: now), .stale)
+        XCTAssertTrue(recovery.isWaiting, "the old callback cannot consume the new timer")
+        XCTAssertEqual(recovery.wake(current, at: now.advanced(by: .seconds(delay))), .ready)
+        recovery.reset() // successful acquisition has the same cancellation boundary
+        XCTAssertEqual(recovery.wake(current, at: now), .stale)
+        XCTAssertFalse(recovery.isWaiting); XCTAssertFalse(recovery.isExhausted)
+    }
+
+    func testTimeSpentWithoutADrawableCountsAgainstTheWholeRecoveryEpisode() {
+        var recovery = TerminalDrawableRetry()
+        let now = ContinuousClock.now
+        guard case let .schedule(id, delay) = recovery.unavailable(at: now) else {
+            return XCTFail("first refusal should schedule recovery")
+        }
+        XCTAssertEqual(recovery.wake(id, at: now.advanced(by: .seconds(delay))), .ready)
+        // Acquiring a drawable can itself take time. A later failure does not
+        // earn another full deadline, even though it was only the second try.
+        XCTAssertEqual(recovery.unavailable(at: now.advanced(by: .seconds(3))), .exhausted)
+        recovery.reset() // a deliberate Retry display starts over
+        guard case .schedule = recovery.unavailable(at: now.advanced(by: .seconds(4))) else {
+            return XCTFail("explicit recovery should admit a fresh bounded episode")
+        }
+    }
 }
