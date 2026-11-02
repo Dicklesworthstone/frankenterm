@@ -38,7 +38,16 @@ def main() -> None:
     start, end = source.index(first), source.index(last)
     if end <= start:
         raise RuntimeError("invalid patched helper extent")
-    (work / "libssh2-algorithms-under-test.h").write_text(source[start:end])
+    policy_first = "/* Exact request names are distinct from key-blob and signature-wrapper names."
+    policy_last = "int\n_libssh2_userauth_publickey("
+    if source.count(policy_first) != 1 or source.count(policy_last) != 1:
+        raise RuntimeError("public-key policy helper boundaries changed; review the extraction")
+    policy_start, policy_end = source.index(policy_first), source.index(policy_last)
+    if policy_end <= policy_start:
+        raise RuntimeError("invalid public-key policy helper extent")
+    (work / "libssh2-algorithms-under-test.h").write_text(
+        source[start:end] + "\n" + source[policy_start:policy_end]
+    )
     compiler = shlex.split(args.cc)
     if not compiler:
         raise RuntimeError("a C compiler is required")

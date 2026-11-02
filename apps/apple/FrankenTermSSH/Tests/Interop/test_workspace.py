@@ -89,14 +89,19 @@ class WorkspaceInteropTests(unittest.TestCase):
             self.assertNotIn("skipped", output.lower())
             authentication = [event for event in server.events if event[0] == "authentication"]
             side_effects = [event[0] for event in server.events if event[0] in ["channel", "pty", "shell"]]
-            expected_authentication = [0, 1] if mode in ["rsa-success", "mux-owner-auth"] or pin_then_connect else []
+            opens_terminal = mode in ["rsa-success", "publickey-policy-allowed"]
+            expected_authentication = [0, 1] if opens_terminal or mode == "mux-owner-auth" or pin_then_connect else []
             self.assertEqual([event[1] for event in authentication], expected_authentication)
             self.assertEqual([event[3] for event in authentication],
                              [fixture.public_blob(key)] * len(expected_authentication))
-            self.assertEqual(side_effects, ["channel", "pty", "shell"] if mode == "rsa-success" else [])
+            self.assertEqual(side_effects, ["channel", "pty", "shell"] if opens_terminal else [])
             self.assertEqual(server.received,
-                             "Imported key → real SSH.\rEND-SESSION\r".encode() if mode == "rsa-success" else b"")
+                             "Imported key → real SSH.\rEND-SESSION\r".encode() if opens_terminal else b"")
             self.assertEqual(server.accepted_connections, 0 if mode == "mux-revoked" else (2 if pin_then_connect else 1))
+            if mode == "publickey-policy-denied":
+                self.assertTrue(server.done.wait(2))
+                self.assertEqual([event for event in server.events if event[0] != "connection"], [],
+                                 "a disallowed imported credential must fail before any account probe, key offer or channel")
             if mode in ["host-pin", "rsa-host-pin"] or pin_then_connect:
                 connections = [index for index, event in enumerate(server.events) if event[0] == "connection"]
                 probe_end = connections[1] if pin_then_connect else len(server.events)
@@ -104,6 +109,11 @@ class WorkspaceInteropTests(unittest.TestCase):
                                  "the initial host-key exchange must close before offering an account or creating a channel")
         finally:
             server.close()
+
+    def test_publickey_algorithm_policy_through_imported_workspace(self):
+        for mode in ["publickey-policy-allowed", "publickey-policy-denied"]:
+            with self.subTest(mode=mode):
+                self.run_host_mode(mode)
 
     def test_rsa_hosts_use_each_sha2_signature_and_open_a_real_terminal(self):
         for bits, algorithm in [(2048, "rsa-sha2-256"), (4096, "rsa-sha2-512")]:

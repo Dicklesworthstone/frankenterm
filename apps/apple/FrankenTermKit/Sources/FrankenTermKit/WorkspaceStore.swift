@@ -2006,8 +2006,8 @@ public actor WorkspaceStore {
                 routeMode: route.mode, jumpRouteIDs: route.jumpRoutes,
                 transitForRouteID: transitForRouteID, hostKeyProbe: hostKeyProbe,
                 algorithm: credential.algorithm, fingerprint: credential.fingerprint, presentedHostKey: presentedHostKey,
-                userCertificate: credential.userCertificate, hostCertificate: hostCertificate,
-                rawHostIdentity: rawHostIdentity,
+                userCertificate: credential.userCertificate, publicKeyAlgorithmPolicy: route.publicKeyAlgorithmPolicy,
+                hostCertificate: hostCertificate, rawHostIdentity: rawHostIdentity,
                 negotiatedHostSignature: negotiatedHostSignature, negotiatedTransport: negotiatedTransport)
         }
     }

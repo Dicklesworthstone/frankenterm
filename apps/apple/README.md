@@ -347,6 +347,37 @@ names remain required unresolved findings. See the
 [native transport contract](FrankenTermSSH/README.md#mandatory-ssh-transport-algorithms)
 for exact names, bounds and validation coverage.
 
+### Mandatory public-key signing policy
+
+Both desktop exporters preserve literal `PubkeyAcceptedAlgorithms` lists,
+including the deprecated `PubkeyAcceptedKeyTypes` spelling. The first matching
+assignment across both spellings wins. Each destination and jump route carries
+its own ordered `pubkey_accepted_algorithms` field and requires
+`ssh_public_key_algorithm_policy_v1`; different accounts on the same host do not
+merge their authentication restrictions. The field survives public workspace
+export, encrypted transfer, machine selection and mux-route copies.
+
+The policy names the exact SSH authentication request algorithm. In particular,
+`rsa-sha2-256`, `rsa-sha2-512` and their `-cert-v01@openssh.com` forms remain
+distinct; allowing a raw RSA key does not authorize its certificate, or the
+reverse. The native backend checks the selected request before sending even an
+unsigned key offer, including when the server omits its signature-algorithm
+extension. The protected-key broker independently checks the request before
+signing, and a changed workspace revision invalidates earlier authorization.
+
+Omitting the field adds no restriction. An empty list denies public-key
+authentication; separately permitted password or keyboard-interactive methods
+remain available. A literal list cannot enable algorithms absent from the
+phone's qualified profile. Phone-generated key assignments must satisfy the
+same route policy. Source expressions that depend on OpenSSH defaults (`+`,
+`-` or patterns), malformed lists and unknown source names remain explicit
+blockers; validated `^` preferences are disclosed as inactive.
+
+The Mac export preview and iPhone import and connection reviews show the
+signing restrictions for the relevant accounts. **None allowed** identifies an
+empty list. These are account-signing restrictions; host-key, host-certificate
+authority and transport policies continue to apply independently.
+
 ## Phone-generated SSH identities
 
 **Keys → Create Phone SSH Key** creates an independent Ed25519 key in protected storage. Generation preserves existing sessions and does not connect or change a server. **Export Enrollment Request…** saves a public `.ftkeyrequest` for the Mac-assisted enrollment flow below. **Copy Public Key** remains available for your existing trusted administration method, locally with a two-minute clipboard lifetime. After authorizing the intended server account, use **Choose Routes**. The phone's private key stays in protected storage; Secure Enclave keys remain separate work.

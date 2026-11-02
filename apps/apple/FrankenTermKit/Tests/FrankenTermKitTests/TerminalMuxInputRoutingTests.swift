@@ -133,17 +133,26 @@ final class TerminalMuxInputRoutingTests: XCTestCase {
 
 private actor MuxOutputConsumer: TerminalSessionConsumer {
     private var release: CheckedContinuation<Void, Never>?
+    private var arrival: CheckedContinuation<Void, Never>?
+    private var entered = false, finished = false
     private(set) var waiting = false
     var failure = false
+    func waitUntilReceiving() async {
+        guard !entered else { return }
+        await withCheckedContinuation { arrival = $0 }
+    }
     func receive(_ update: TerminalSessionUpdate, source: TerminalSource) async throws {
-        waiting = true
-        await withCheckedContinuation { release = $0 }
+        entered = true; waiting = true
+        let started = arrival; arrival = nil; started?.resume()
+        // Completion is a latched event, including when the test releases the
+        // consumer before this continuation has been installed.
+        if !finished { await withCheckedContinuation { release = $0 } }
         waiting = false
         if failure { throw TerminalInputError.unavailable }
     }
     func receive(_ outcomes: [TerminalInputOutcome], source: TerminalSource) async throws {}
     func finish(failing: Bool = false) {
-        failure = failing
+        failure = failing; finished = true
         let pending = release; release = nil; pending?.resume()
     }
 }
@@ -154,6 +163,7 @@ private actor MuxOutputTransport: TerminalSessionTransport {
     nonisolated let routing = TerminalMuxInputRouting()
     private var update: TerminalSessionUpdate?
     private var idle: CheckedContinuation<TerminalSessionUpdate, Error>?
+    private var closed = false, woken = false
     private(set) var applications = 0
     init() throws {
         identity = try .init(workspaceID: "workspace", machineID: "machine", routeID: "route", routeRevision: 1,
@@ -163,16 +173,25 @@ private actor MuxOutputTransport: TerminalSessionTransport {
         update = .init(output: Data("complete redraw".utf8), muxDestination: destination)
     }
     func service() async throws -> TerminalSessionUpdate {
+        guard !closed else { throw TerminalInputError.unavailable }
         if let update { self.update = nil; return update }
+        if woken { woken = false; return .init(output: Data()) }
         return try await withCheckedThrowingContinuation { idle = $0 }
     }
-    func wakeService() async { let pending = idle; idle = nil; pending?.resume(returning: .init(output: Data())) }
+    func wakeService() async {
+        guard !closed else { return }
+        let pending = idle; idle = nil
+        if pending == nil { woken = true }
+        pending?.resume(returning: .init(output: Data()))
+    }
     func writeSome(_ bytes: Data) async throws -> TerminalTransportWrite { .accepted(bytes.count) }
     func didApplyOutput(_ update: TerminalSessionUpdate) async {
         applications += 1
         if let destination = update.muxDestination { routing.didApplyOutput(destination) }
     }
     func close() async {
+        guard !closed else { return }
+        closed = true; woken = false; update = nil
         routing.retire(); inputSignal.finish()
         let pending = idle; idle = nil; pending?.resume(throwing: TerminalInputError.unavailable)
     }
@@ -184,7 +203,7 @@ final class TerminalMuxOutputFenceTests: XCTestCase, @unchecked Sendable {
         let consumer = MuxOutputConsumer()
         let pump = try await TerminalSessionPump.attach(transport, coordinator: coordinator)
         let run = Task { try await pump.run(consumer: consumer) }
-        for _ in 0..<10_000 { if await consumer.waiting { break }; await Task.yield() }
+        await consumer.waitUntilReceiving()
         let waiting = await consumer.waiting
         XCTAssertTrue(waiting)
         XCTAssertFalse(transport.routing.current.ready)
@@ -201,7 +220,7 @@ final class TerminalMuxOutputFenceTests: XCTestCase, @unchecked Sendable {
         let consumer = MuxOutputConsumer()
         let pump = try await TerminalSessionPump.attach(transport, coordinator: coordinator)
         let run = Task { try await pump.run(consumer: consumer) }
-        for _ in 0..<10_000 { if await consumer.waiting { break }; await Task.yield() }
+        await consumer.waitUntilReceiving()
         await consumer.finish(failing: true)
         let result = try await run.value, applied = await transport.applications
         XCTAssertEqual(result, .consumerFailed); XCTAssertEqual(applied, 0)
@@ -213,7 +232,7 @@ final class TerminalMuxOutputFenceTests: XCTestCase, @unchecked Sendable {
         let consumer = MuxOutputConsumer()
         let pump = try await TerminalSessionPump.attach(transport, coordinator: coordinator)
         let run = Task { try await pump.run(consumer: consumer) }
-        for _ in 0..<10_000 { if await consumer.waiting { break }; await Task.yield() }
+        await consumer.waitUntilReceiving()
         pump.requestStop()
         await consumer.finish()
         _ = try await run.value
@@ -227,7 +246,7 @@ final class TerminalMuxOutputFenceTests: XCTestCase, @unchecked Sendable {
         let consumer = MuxOutputConsumer()
         let pump = try await TerminalSessionPump.attach(transport, coordinator: coordinator)
         let run = Task { try await pump.run(consumer: consumer) }
-        for _ in 0..<10_000 { if await consumer.waiting { break }; await Task.yield() }
+        await consumer.waitUntilReceiving()
         _ = try transport.routing.select(pane: 2)
         await consumer.finish()
         for _ in 0..<10_000 { if await transport.applications > 0 { break }; await Task.yield() }

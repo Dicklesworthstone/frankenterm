@@ -3819,6 +3819,24 @@ private struct WorkspaceHostAlgorithmPolicyView: View {
 }
 
 @MainActor
+private struct WorkspacePublicKeyAlgorithmPolicyView: View {
+    let route: WorkspaceDocument.Route
+    var body: some View {
+        if let algorithms = route.publicKeyAlgorithmPolicy.acceptedAlgorithms {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Public-key signing algorithms").font(.caption).foregroundStyle(.secondary)
+                Text(verbatim: algorithms.isEmpty ? "None allowed" : algorithms.joined(separator: ", "))
+                    .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                    .foregroundStyle(algorithms.isEmpty ? Color.red : Color.primary)
+                    .accessibilityIdentifier("route.policy.\(route.id).publickey")
+                Text("Applies to signing in to this account. Other permitted sign-in methods remain available.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+@MainActor
 private struct ImportHostPolicyReview: View {
     let document: WorkspaceDocument
     let routeReadiness: [WorkspaceDocument.RouteReadiness]
@@ -3863,6 +3881,7 @@ private struct ImportHostPolicyReview: View {
                     VStack(alignment: .leading, spacing: 5) {
                         Text(verbatim: "\(route.user)@\(route.host):\(route.port)").font(.headline)
                         Text("\(route.credentialIDs.count) permitted key references · \(route.jumpRoutes.count) jump routes").font(.caption)
+                        WorkspacePublicKeyAlgorithmPolicyView(route: route)
                         if route.mode == "frankenterm_mux" {
                             // What this route runs on the machine each time it connects.
                             Text(verbatim: "Runs on connect: \(route.remoteCommand ?? WorkspaceNativeSSHConnection.defaultMuxCommand)")
@@ -5497,6 +5516,7 @@ private struct WorkspaceRouteChoiceScreen: View {
     @ViewBuilder private func peerIdentity(_ route: WorkspaceDocument.Route) -> some View {
         Text(verbatim: endpoint(route)).font(.system(.callout, design: .monospaced)).textSelection(.enabled)
         Text(verbatim: "Route: " + route.id).font(.caption).foregroundStyle(.secondary)
+        WorkspacePublicKeyAlgorithmPolicyView(route: route)
         if let trust = context.document.hostTrust.first(where: { $0.id == route.trustID }) {
             if let alias = route.hostKeyAlias ?? trust.hostKeyAlias {
                 Text(verbatim: "Host-key alias: " + alias).font(.caption).textSelection(.enabled)
@@ -5994,6 +6014,19 @@ private struct MachineWorkspaceView: View {
                     .font(.system(.caption2, design: .monospaced)).opacity(0.6)
                     .lineLimit(2).truncationMode(.middle).textSelection(.enabled)
                     .accessibilityLabel("Runs \(route.remoteCommand ?? WorkspaceNativeSSHConnection.defaultMuxCommand)")
+            }
+            let signingPeers = (((try? document.orderedJumpRoutes(forRouteID: route.id)) ?? []) + [route])
+                .filter { $0.publicKeyAlgorithmPolicy.isConstrained }
+            if !signingPeers.isEmpty {
+                DisclosureGroup("Public-key signing restrictions") {
+                    ForEach(Array(signingPeers.enumerated()), id: \.offset) { _, peer in
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(verbatim: LocalHostKeyCheckReview.endpoint(host: peer.host, port: peer.port, user: peer.user))
+                                .font(.caption.bold())
+                            WorkspacePublicKeyAlgorithmPolicyView(route: peer)
+                        }.padding(.vertical, 4)
+                    }
+                }.font(.caption)
             }
             let policies = algorithmPolicies(for: route)
             if !policies.isEmpty {

@@ -2508,7 +2508,7 @@ private struct MacExportView: View {
         let required = Set(route.requiredCapabilities).union(route.requiredExtensions.map { "extension:" + $0 })
             .union(related.flatMap(\.requiredPolicyRequirements))
             .subtracting([WorkspaceDocument.hostCertificateCapability, WorkspaceDocument.hostAlgorithmPolicyCapability,
-                          WorkspaceDocument.transportAlgorithmPolicyCapability])
+                          WorkspaceDocument.transportAlgorithmPolicyCapability, WorkspaceDocument.publicKeyAlgorithmPolicyCapability])
         let revoked = Array(Set(related.flatMap(\.revokedKeys))).sorted {
             $0.algorithm == $1.algorithm ? $0.fingerprint < $1.fingerprint : $0.algorithm < $1.algorithm
         }
@@ -2518,6 +2518,7 @@ private struct MacExportView: View {
                 .font(.caption).foregroundStyle(.secondary)
             Text("Permitted authentication: \(route.authenticationMethods.map(\.rawValue).joined(separator: ", "))")
                 .font(.caption).foregroundStyle(.secondary)
+            algorithmPolicyPreview("Public-key signing algorithms", algorithms: route.publicKeyAlgorithmPolicy.acceptedAlgorithms)
             if !required.isEmpty {
                 Label("Required policy: \(required.sorted().joined(separator: ", "))", systemImage: "exclamationmark.shield")
                     .font(.caption).foregroundStyle(.orange)

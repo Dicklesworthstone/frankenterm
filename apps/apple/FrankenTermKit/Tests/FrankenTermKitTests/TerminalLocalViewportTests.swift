@@ -81,20 +81,26 @@ final class TerminalLocalViewportTests: XCTestCase {
         }
         XCTAssertThrowsError(try TerminalLocalViewport(columns: 512, rows: 512,
             cellWidth: 8, cellHeight: 16, width: 390, height: 600))
+        XCTAssertThrowsError(try TerminalLocalViewport(columns: 65, rows: 512,
+            cellWidth: 8, cellHeight: 16, width: 390, height: 600),
+            "one column beyond the shown-cell budget must be refused")
         XCTAssertThrowsError(try TerminalLocalViewport(columns: 80, rows: 24,
             cellWidth: 8, cellHeight: 16, width: 390, height: 600, requestedOffset: .init(columns: .nan)))
-        let tall = try TerminalLocalViewport(columns: 128, rows: 512, cellWidth: 256, cellHeight: 512,
+        // Both primary and alternate grids share the model's resident budget.
+        // Exercise the maximum row/origin extent at the supported shown size.
+        XCTAssertEqual(64 * 512, TerminalSessionGeometry.maximumShownCells)
+        let tall = try TerminalLocalViewport(columns: 64, rows: 512, cellWidth: 256, cellHeight: 512,
             width: 390, height: 600, requestedOffset: .init(columns: 512, rows: 512))
         XCTAssertEqual(tall.visibleRows.upperBound, 512)
-        XCTAssertEqual(tall.cell(atX: 389, y: 599), .init(column: 127, row: 511))
+        XCTAssertEqual(tall.cell(atX: 389, y: 599), .init(column: 63, row: 511))
         XCTAssertNil(tall.panning(byX: .infinity, y: 0))
     }
 
     func testExistingShaderOriginCanReachTheLastRowWithoutAnOversizedDrawable() throws {
-        let view = try TerminalLocalViewport(columns: 128, rows: 512, cellWidth: 256, cellHeight: 512,
+        let view = try TerminalLocalViewport(columns: 64, rows: 512, cellWidth: 256, cellHeight: 512,
             width: 390, height: 600, requestedOffset: .init(columns: 512, rows: 512))
         var uniforms = TerminalRenderUniforms()
-        uniforms.rows = 512; uniforms.columns = 128; uniforms.viewport = (390, 600)
+        uniforms.rows = 512; uniforms.columns = 64; uniforms.viewport = (390, 600)
         uniforms.cellSize = (256, 512); uniforms.origin = (Float(view.originX), Float(view.originY))
         let packed = try TerminalRenderPacking.uniforms(uniforms)
         let bits = packed[60..<64].enumerated().reduce(UInt32(0)) { $0 | UInt32($1.element) << ($1.offset * 8) }

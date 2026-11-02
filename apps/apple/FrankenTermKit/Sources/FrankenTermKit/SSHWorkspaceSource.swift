@@ -1129,7 +1129,14 @@ public struct SSHWorkspaceSource: Sendable {
                 "host": .string(sourceHost), "port": .number(String(port)), "user": .string(user), "credential_refs": .array(credentialIDs),
                 "authentication_methods": .array(methods.map(JSONValue.string)), "host_trust_ref": .string(trustID), "jump_routes": .array(jumps)]
             if item.key.context == .destination { route["session_creation"] = .string("on_select") }
-            if problems.contains(where: \.required) { route["required_capabilities"] = .array([.string("ssh_config.unresolved_policy")]) }
+            var routeCapabilities: [JSONValue] = []
+            if let values = resolved.options["pubkeyacceptedalgorithms"],
+               case .allowlist(let algorithms) = Self.hostAlgorithmSelection(values, certificateAuthority: false) {
+                route["pubkey_accepted_algorithms"] = .array(algorithms.map(JSONValue.string))
+                routeCapabilities.append(.string(WorkspaceDocument.publicKeyAlgorithmPolicyCapability))
+            }
+            if problems.contains(where: \.required) { routeCapabilities.append(.string("ssh_config.unresolved_policy")) }
+            if !routeCapabilities.isEmpty { route["required_capabilities"] = .array(routeCapabilities) }
             // The parser canonicalizes endpoint identity and denial scopes.
             // Certificate principals retain OpenSSH's effective spelling,
             // including a trailing dot. OpenSSH lowercases the configured
@@ -1380,7 +1387,7 @@ public struct SSHWorkspaceSource: Sendable {
                 if arguments != ["no"] { problems.append(Problem(key, "This enabled SSH behavior is not represented by the mobile route and must be resolved explicitly.")) }
             case "stricthostkeychecking":
                 if arguments.count != 1 || !["yes", "ask"].contains(value) { problems.append(Problem(key, "Automatic or disabled host verification is not a portable trust policy. Review the route's host identity explicitly.")) }
-            case "hostkeyalgorithms", "casignaturealgorithms":
+            case "hostkeyalgorithms", "casignaturealgorithms", "pubkeyacceptedalgorithms":
                 switch Self.hostAlgorithmSelection(arguments, certificateAuthority: key == "casignaturealgorithms") {
                 case .allowlist: break
                 case .preferenceOnly:
@@ -1590,6 +1597,9 @@ public struct SSHWorkspaceSource: Sendable {
         }
         var keyword = String(decoding: keywordBytes, as: UTF8.self).lowercased()
         if keyword == "challengeresponseauthentication" { keyword = "kbdinteractiveauthentication" }
+        // OpenSSH aliases share one first-obtained option. Keeping two slots
+        // would let a later spelling override a restrictive earlier policy.
+        if keyword == "pubkeyacceptedkeytypes" { keyword = "pubkeyacceptedalgorithms" }
         while i < bytes.count, bytes[i] == 32 || bytes[i] == 9 { i += 1 }
         if i < bytes.count, bytes[i] == 61 { i += 1 }
         var result: [String] = [], token: [UInt8] = [], quoted = false, active = false

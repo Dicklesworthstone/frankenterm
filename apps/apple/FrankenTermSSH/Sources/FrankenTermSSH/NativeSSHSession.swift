@@ -92,11 +92,21 @@ public struct NativeSSHPeer: Sendable, Equatable {
 
 public struct NativeSSHIdentity: Sendable, Equatable {
     public let user: String, publicKey: Data
-    public init(user: String, publicKey: Data) throws {
+    /// Exact request algorithms already narrowed to this identity. Nil keeps
+    /// the existing native defaults; an empty or unsupported list is refused.
+    public let acceptedAlgorithms: [String]?
+    public init(user: String, publicKey: Data, acceptedAlgorithms: [String]? = nil) throws {
         guard !user.isEmpty, user.utf8.count <= 256,
               !user.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
               (1...Int(FTSSH_PUBLIC_KEY_CAPACITY)).contains(publicKey.count) else { throw NativeSSHError.invalidInput }
-        self.user = user; self.publicKey = publicKey
+        if let acceptedAlgorithms {
+            let qualified = Set(NativeSSHSession.supportedPublicKeySignatureAlgorithms)
+            guard !acceptedAlgorithms.isEmpty, acceptedAlgorithms.count <= qualified.count,
+                  Set(acceptedAlgorithms).count == acceptedAlgorithms.count,
+                  acceptedAlgorithms.allSatisfy(qualified.contains),
+                  NativeSSHSession.supportsPublicKeyAlgorithmPolicy else { throw NativeSSHError.invalidInput }
+        }
+        self.user = user; self.publicKey = publicKey; self.acceptedAlgorithms = acceptedAlgorithms
     }
 }
 
@@ -154,6 +164,7 @@ public struct NativeSSHChallenge: Sendable {
             throw NativeSSHError.invalidChallenge
         }
         guard let algorithm = String(data: algorithmBytes, encoding: .ascii), permittedAlgorithms.contains(algorithm),
+              identity.acceptedAlgorithms?.contains(algorithm) ?? true,
               try field() == identity.publicKey, offset == bytes.count else { throw NativeSSHError.invalidChallenge }
         self.transportID = transportID; sessionIdentifier = session
         self.identity = identity; publicKeyAlgorithm = subjectAlgorithm; self.algorithm = algorithm; signedData = bytes
@@ -167,8 +178,9 @@ public struct NativeSSHChallenge: Sendable {
 public protocol NativeSSHAuthentication: Sendable {
     func identity(for peer: NativeSSHPeer) async throws -> NativeSSHIdentity
     func signature(for challenge: NativeSSHChallenge, peer: NativeSSHPeer) async throws -> Data
-    /// Rechecks time-sensitive credentials before signature admission and after
-    /// the server completes login. Established channels use validate instead.
+    /// Rechecks time-sensitive policy after identity selection, before the
+    /// unsigned offer and signature admission, and after the server completes
+    /// login. Established channels use validate instead.
     func validateForAuthentication(peer: NativeSSHPeer, identity: NativeSSHIdentity) async throws
     func validate(peer: NativeSSHPeer, identity: NativeSSHIdentity) async throws
     func cancel(transportID: UUID)
@@ -475,6 +487,16 @@ public actor NativeSSHSession {
     public nonisolated static var supportsTransportAlgorithmPolicy: Bool {
         ftssh_supports_transport_algorithm_policy() == 1
     }
+    public nonisolated static var supportsPublicKeyAlgorithmPolicy: Bool {
+        ftssh_supports_publickey_algorithm_policy() == 1
+    }
+    public nonisolated static let supportedPublicKeySignatureAlgorithms = [
+        "ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521",
+        "rsa-sha2-512", "rsa-sha2-256",
+        "ssh-ed25519-cert-v01@openssh.com", "ecdsa-sha2-nistp256-cert-v01@openssh.com",
+        "ecdsa-sha2-nistp384-cert-v01@openssh.com", "ecdsa-sha2-nistp521-cert-v01@openssh.com",
+        "rsa-sha2-512-cert-v01@openssh.com", "rsa-sha2-256-cert-v01@openssh.com"
+    ]
     /// The existing qualified defaults, in preference order. A workspace may
     /// narrow or reorder these lists, but cannot add another transport profile.
     public nonisolated static let supportedKeyExchangeAlgorithms = [
@@ -729,10 +751,20 @@ public actor NativeSSHSession {
                 try current(token, deadline)
                 let selected = try await authority.identity(for: found)
                 try await validateForwardingPath()
+                // Identity selection and hop validation can suspend while a
+                // workspace is replaced. Recheck the exact selected route
+                // policy before publishing even its unsigned public offer.
+                try await authority.validateForAuthentication(peer: found, identity: selected)
                 try current(token, deadline)
                 try requireOK(found.hostKey.withUnsafeBytes {
                     ftssh_approve_host_key(native.pointer, $0.bindMemory(to: UInt8.self).baseAddress, found.hostKey.count)
                 })
+                if let algorithms = selected.acceptedAlgorithms {
+                    let encoded = Data(algorithms.joined(separator: ",").utf8)
+                    try requireOK(encoded.withUnsafeBytes {
+                        ftssh_set_publickey_algorithms(native.pointer, $0.bindMemory(to: UInt8.self).baseAddress, encoded.count)
+                    })
+                }
                 let remainingMilliseconds = authenticationMilliseconds(until: deadline)
                 try requireOK(selected.user.withCString { user in selected.publicKey.withUnsafeBytes { key in
                     if continuation != nil {

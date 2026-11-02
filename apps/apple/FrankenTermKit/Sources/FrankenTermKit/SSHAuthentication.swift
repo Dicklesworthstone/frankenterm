@@ -270,6 +270,9 @@ public struct WorkspaceSSHAuthorization: Equatable, Sendable, CustomDebugStringC
     /// Exact public offer selected by the reviewed credential, never inferred
     /// from a filename or supplied by the transport's signing callback.
     public let userCertificate: SSHUserCertificate?
+    /// Immutable route restriction carried through identity selection, every
+    /// suspension point, signing, and store revalidation.
+    public let publicKeyAlgorithmPolicy: WorkspacePublicKeyAlgorithmPolicy
     /// The exact verified certificate of this peer, distinct from the user's
     /// authentication certificate. Store revalidation retains this evidence.
     public let hostCertificate: SSHHostCertificate?
@@ -974,6 +977,9 @@ public actor SSHAuthenticationBroker {
             guard challenge.userCertificate?.blob == authorization.userCertificate?.blob else {
                 throw SSHAuthenticationError.identityMismatch
             }
+            guard authorization.publicKeyAlgorithmPolicy.permits(authenticationAlgorithm: challenge.authenticationAlgorithm) else {
+                throw SSHAuthenticationError.denied
+            }
             try validateCertificate(authorization)
             pending?.authorization = authorization; pending?.challenge = challenge; pending?.preparing = false
             return .init(id: id, transportID: transportID, authorization: authorization)
@@ -993,6 +999,9 @@ public actor SSHAuthenticationBroker {
         defer { releaseWorker(requestID) }
         try await store.validateSSHAuthentication(authorization, support: support)
         try checkCurrent(requestID)
+        guard authorization.publicKeyAlgorithmPolicy.permits(authenticationAlgorithm: challenge.authenticationAlgorithm) else {
+            throw SSHAuthenticationError.denied
+        }
         try validateCertificate(authorization)
         let signer = self.signer
         let signature = try await withTaskCancellationHandler {

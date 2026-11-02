@@ -64,6 +64,8 @@ struct ftssh_session {
     int fd, phase, terminal_error, closing, handshake_started;
     size_t limit, allocated, peak;
     char user[257], algorithm[65], offer_algorithm[65], signature_algorithm[65];
+    char publickey_algorithms[1024];
+    int publickey_policy_set;
     uint8_t public_blob[FTSSH_PUBLIC_KEY_CAPACITY], challenge[FTSSH_CHALLENGE_CAPACITY], signature[1024];
     size_t public_length, challenge_length, signature_length, rsa_signature_length;
     uint8_t password[FTSSH_PASSWORD_CAPACITY];
@@ -703,6 +705,85 @@ int ftssh_approve_host_key(ftssh_session *s, const uint8_t *key, size_t length) 
     if(!actual || n != length || !equal((const uint8_t *)actual, key, n)) return fail(s, FTSSH_HOST_REJECTED);
     s->phase = APPROVED; return FTSSH_OK;
 }
+int ftssh_supports_publickey_algorithm_policy(void) {
+#if defined(LIBSSH2_FRANKENTERM_PUBLICKEY_POLICY_VERSION) && LIBSSH2_FRANKENTERM_PUBLICKEY_POLICY_VERSION == 1
+    return libssh2_frankenterm_publickey_policy_version() == 1;
+#else
+    return 0;
+#endif
+}
+
+static int publickey_algorithm_allowed(ftssh_session *s, const uint8_t *algorithm, size_t length) {
+    if(!s->publickey_policy_set) return 1;
+    const char *start = s->publickey_algorithms;
+    while(*start) {
+        const char *end = strchr(start, ',');
+        size_t count = end ? (size_t)(end - start) : strlen(start);
+        if(count == length && !memcmp(start, algorithm, length)) return 1;
+        if(!end) break;
+        start = end + 1;
+    }
+    return 0;
+}
+
+int ftssh_set_publickey_algorithms(ftssh_session *s, const uint8_t *algorithms, size_t length) {
+    int rc = check(s, APPROVED); if(rc) return rc;
+    if(s->publickey_policy_set) return FTSSH_STATE;
+    if(!algorithms || !length || length >= sizeof(s->publickey_algorithms) ||
+       memchr(algorithms, 0, length)) return FTSSH_INVALID;
+    if(!ftssh_supports_publickey_algorithm_policy()) return FTSSH_UNSUPPORTED;
+#if defined(LIBSSH2_FRANKENTERM_PUBLICKEY_POLICY_VERSION) && LIBSSH2_FRANKENTERM_PUBLICKEY_POLICY_VERSION == 1
+    static const char *const qualified[] = {
+        "ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521",
+        "rsa-sha2-512", "rsa-sha2-256",
+        "ssh-ed25519-cert-v01@openssh.com", "ecdsa-sha2-nistp256-cert-v01@openssh.com",
+        "ecdsa-sha2-nistp384-cert-v01@openssh.com", "ecdsa-sha2-nistp521-cert-v01@openssh.com",
+        "rsa-sha2-512-cert-v01@openssh.com", "rsa-sha2-256-cert-v01@openssh.com"
+    };
+    unsigned int seen = 0, rsa_seen = 0;
+    char signatures[32] = {0}, allowed[1024];
+    size_t signature_length = 0;
+    for(size_t start = 0; start < length;) {
+        size_t end = start;
+        while(end < length && algorithms[end] != ',') ++end;
+        if(end == start || (end < length && end + 1 == length)) return FTSSH_INVALID;
+        size_t method;
+        for(method = 0; method < sizeof(qualified) / sizeof(qualified[0]); ++method) {
+            if(strlen(qualified[method]) == end - start &&
+               !memcmp(algorithms + start, qualified[method], end - start)) break;
+        }
+        if(method == sizeof(qualified) / sizeof(qualified[0])) return FTSSH_UNSUPPORTED;
+        unsigned int bit = 1u << method;
+        if(seen & bit) return FTSSH_INVALID;
+        seen |= bit;
+        if(method == 4 || method == 5 || method == 10 || method == 11) {
+            unsigned int rsa_bit = (method == 4 || method == 10) ? 1u : 2u;
+            if(!(rsa_seen & rsa_bit)) {
+                if(signature_length) signatures[signature_length++] = ',';
+                memcpy(signatures + signature_length, qualified[method], 12);
+                signature_length += 12;
+                signatures[signature_length] = 0;
+                rsa_seen |= rsa_bit;
+            }
+        }
+        start = end + 1;
+    }
+    memcpy(allowed, algorithms, length); allowed[length] = 0;
+    /* SIGN_ALGO is consumed during publickey selection, after handshake.
+     * The patched exact-name guard also checks the resulting request before
+     * any unsigned offer, covering missing server-sig-algs and fallback. */
+    if(signature_length && libssh2_session_method_pref(s->ssh, LIBSSH2_METHOD_SIGN_ALGO, signatures))
+        return fail(s, FTSSH_UNSUPPORTED);
+    rc = libssh2_frankenterm_publickey_policy(s->ssh, allowed, length);
+    if(rc) return fail(s, FTSSH_UNSUPPORTED);
+    memcpy(s->publickey_algorithms, allowed, length + 1);
+    s->publickey_policy_set = 1;
+    return FTSSH_OK;
+#else
+    return FTSSH_UNSUPPORTED;
+#endif
+}
+
 int ftssh_begin_authentication(ftssh_session *s, const char *user, size_t user_length,
                               const uint8_t *blob, size_t length) {
     int rc = check(s, APPROVED); if(rc) return rc;
@@ -717,6 +798,18 @@ int ftssh_begin_authentication(ftssh_session *s, const char *user, size_t user_l
      * too: an await after identity selection may have crossed its expiry.
      * Established channels never call this admission function. */
     if(certificate && !certificate_time_valid(validity, time(NULL))) return FTSSH_AUTH_FAILED;
+    if(s->publickey_policy_set) {
+        int permitted;
+        if(!strcmp(algorithm, "ssh-rsa")) {
+            const char *sha512 = certificate ? "rsa-sha2-512-cert-v01@openssh.com" : "rsa-sha2-512";
+            const char *sha256 = certificate ? "rsa-sha2-256-cert-v01@openssh.com" : "rsa-sha2-256";
+            permitted = publickey_algorithm_allowed(s, (const uint8_t *)sha512, strlen(sha512)) ||
+                publickey_algorithm_allowed(s, (const uint8_t *)sha256, strlen(sha256));
+        } else {
+            permitted = publickey_algorithm_allowed(s, (const uint8_t *)offer_algorithm, strlen(offer_algorithm));
+        }
+        if(!permitted) return FTSSH_AUTH_FAILED;
+    }
     memcpy(s->algorithm, algorithm, strlen(algorithm) + 1);
     memcpy(s->offer_algorithm, offer_algorithm, strlen(offer_algorithm) + 1);
     memcpy(s->user, user, user_length); s->user[user_length] = 0;
@@ -785,6 +878,7 @@ static int sign_callback(LIBSSH2_SESSION *ssh, unsigned char **signature, size_t
     const uint8_t *selected_algorithm; size_t selected_length;
     if(!field(&cursor, &left, &selected_algorithm, &selected_length) ||
        !selected_length || selected_length >= sizeof(s->signature_algorithm) ||
+       !publickey_algorithm_allowed(s, selected_algorithm, selected_length) ||
        !expected_field(&cursor, &left, s->public_blob, s->public_length) || left) return reject_challenge(s);
     const uint8_t *signature_algorithm = selected_algorithm;
     size_t signature_algorithm_length = selected_length;

@@ -405,6 +405,56 @@ final class WorkspaceAuthenticationTests: XCTestCase {
         await refuse { _ = try await authority.signature(for: replay, peer: peer) }
     }
 
+    func testSelectedIdentityRevalidatesBeforeOfferWithoutGrantingEstablishedAccess() async throws {
+        for replace in [false, true] {
+            let f = try await SSHWorkspaceTestFixture.make(), transport = UUID()
+            let authority = f.authority(transport: transport), peer = f.peer(transport: transport)
+            let identity = try await authority.identity(for: peer)
+            try await authority.validateForAuthentication(peer: peer, identity: identity)
+            await refuse { try await authority.validate(peer: peer, identity: identity) }
+            await refuse { try await authority.validateCurrent() }
+            if replace {
+                let archive = try AirGapArchive(workspace: f.archive.workspace.reissuingBundle(id: "before-offer-replacement"),
+                    keys: [], using: SSHWorkspaceTestCryptography())
+                _ = try await f.store.install(archive, envelopeDigest: Data(repeating: 3, count: 32),
+                    expectedRevision: f.installed.revision, sourceAndContentsConfirmed: true,
+                    securityChangesConfirmed: true, associateWithExistingWorkspace: true)
+            } else {
+                try await f.store.revokeLocally(fingerprint: f.archive.workspace.credentials[0].fingerprint)
+            }
+            await refuse { try await authority.validateForAuthentication(peer: peer, identity: identity) }
+            XCTAssertEqual(f.vault.counts.reads, 1)
+            XCTAssertEqual(f.vault.counts.signatures, 0)
+        }
+    }
+
+    func testSigningInFlightCannotBorrowSelectedAdmissionValidation() async throws {
+        let f = try await SSHWorkspaceTestFixture.make(), transport = UUID()
+        let signer = SSHJumpPausedSigner(f.vault)
+        let broker = SSHAuthenticationBroker(store: f.store, signer: signer, support: WorkspaceNativeSSHAuthentication.routeSupport)
+        await broker.resume()
+        let authority = WorkspaceNativeSSHAuthentication(broker: broker, workspaceID: f.installed.id,
+            revision: f.installed.revision, routeID: "route", credentialID: "key", transportID: transport, endpoint: f.endpoint)
+        let peer = f.peer(transport: transport), identity = try await authority.identity(for: peer)
+        let typed = try SSHUserAuthenticationChallenge(sessionIdentifier: Data(repeating: 7, count: 32),
+            user: identity.user, publicBlob: identity.publicKey)
+        let challenge = try NativeSSHChallenge(bytes: typed.signedData, transportID: transport, identity: identity)
+        let signing = Task { try await authority.signature(for: challenge, peer: peer) }
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !(await signer.isPaused), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(1)) }
+        guard await signer.isPaused else {
+            signing.cancel(); _ = try? await signing.value
+            return XCTFail("The protected signer did not reach the controlled wait")
+        }
+        await refuse { try await authority.validateForAuthentication(peer: peer, identity: identity) }
+        await refuse { try await authority.validate(peer: peer, identity: identity) }
+        await signer.release()
+        _ = try await signing.value
+        try await authority.validateForAuthentication(peer: peer, identity: identity)
+        try await authority.validateCurrent()
+        XCTAssertEqual(f.vault.counts.signatures, 1)
+    }
+
     func testImportedRSACredentialsSignBothSHA2AlgorithmsWithIndependentExactVectors() async throws {
         let fixtures = try RSAFixtures.load()
         XCTAssertEqual(Set(fixtures.keys.map(\.bits)), [2048, 4096, 8192])
@@ -638,6 +688,13 @@ final class WorkspaceAuthenticationTests: XCTestCase {
         let f = try await SSHWorkspaceTestFixture.make(port: port,
             hostBlob: ["wrong-host", "rsa-wrong-host"].contains(mode) ? nil : host,
             routeMode: mode.hasPrefix("mux-") ? "frankenterm_mux" : "direct_ssh") { workspace in
+                if mode.hasPrefix("publickey-policy-") {
+                    var routes = workspace["routes"] as! [[String: Any]]
+                    routes[0]["pubkey_accepted_algorithms"] = mode == "publickey-policy-allowed"
+                        ? ["ssh-ed25519"] : ["rsa-sha2-256"]
+                    routes[0]["required_capabilities"] = [WorkspaceDocument.publicKeyAlgorithmPolicyCapability]
+                    workspace["routes"] = routes
+                }
                 if firstHostVerification {
                     var trusts = workspace["host_trust"] as! [[String: Any]]
                     trusts[0]["pins"] = [] as [[String: Any]]
@@ -729,11 +786,14 @@ final class WorkspaceAuthenticationTests: XCTestCase {
             if mode == "revoked" || mode == "rsa-revoked" {
                 try await f.store.revokeHostLocally(workspaceID: f.installed.id, trustID: "trust", key: f.host)
             }
-            if ["wrong-host", "revoked", "rsa-wrong-host", "rsa-revoked", "rsa-sha1-only"].contains(mode) {
+            if ["wrong-host", "revoked", "rsa-wrong-host", "rsa-revoked", "rsa-sha1-only", "publickey-policy-denied"].contains(mode) {
                 do {
                     _ = try await session.authenticate(using: authority, timeout: .seconds(5))
-                    XCTFail("An untrusted or SHA-1-only host must not authenticate")
+                    XCTFail("An untrusted host or prohibited credential algorithm must not authenticate")
                 } catch {
+                    if mode == "publickey-policy-denied" {
+                        XCTAssertEqual(error as? SSHAuthenticationError, .denied)
+                    }
                     if mode == "rsa-sha1-only" {
                         let failure = try XCTUnwrap(error as? NativeSSHError)
                         XCTAssertFalse(failure.isCredentialRefused)
@@ -743,6 +803,12 @@ final class WorkspaceAuthenticationTests: XCTestCase {
                 XCTAssertEqual(f.vault.counts.reads, 0); XCTAssertEqual(f.vault.counts.signatures, 0)
             } else {
                 let peer = try await session.authenticate(using: authority, timeout: .seconds(5))
+                if mode == "publickey-policy-allowed" {
+                    XCTAssertTrue(NativeSSHSession.supportsPublicKeyAlgorithmPolicy)
+                    let authorization = try await f.broker.authorization(workspaceID: f.installed.id,
+                        expectedRevision: f.installed.revision, routeID: "route", credentialID: "key", presentedHostKey: f.host)
+                    XCTAssertEqual(authorization.publicKeyAlgorithmPolicy.acceptedAlgorithms, ["ssh-ed25519"])
+                }
                 if mode == "rsa-success" {
                     XCTAssertEqual(peer.hostKey, host)
                     XCTAssertEqual(peer.hostSignature, try XCTUnwrap(expectedHostSignature))
@@ -758,7 +824,7 @@ final class WorkspaceAuthenticationTests: XCTestCase {
                     try await f.store.revokeLocally(fingerprint: f.archive.workspace.credentials[0].fingerprint)
                     await refuse { try await session.openShell(geometry: .init(columns: 80, rows: 24), timeout: .seconds(5)) }
                 } else {
-                    XCTAssertTrue(mode == "success" || mode == "rsa-success")
+                    XCTAssertTrue(mode == "success" || mode == "rsa-success" || mode == "publickey-policy-allowed")
                     try await session.openShell(geometry: .init(columns: 80, rows: 24), timeout: .seconds(5))
                     let bytes = Data("Imported key → real SSH.\rEND-SESSION\r".utf8)
                     let admission = try await session.admit(bytes)

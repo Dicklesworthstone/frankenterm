@@ -355,6 +355,9 @@ public final class AppleSSHCredentialSigner: WorkspaceSSHSigning, @unchecked Sen
                      challenge: SSHUserAuthenticationChallenge) async throws -> Data {
         guard challenge.user.utf8.elementsEqual(authorization.user.utf8), challenge.publicKeyAlgorithm == authorization.algorithm,
               challenge.fingerprint == authorization.fingerprint else { throw SSHAuthenticationError.identityMismatch }
+        guard authorization.publicKeyAlgorithmPolicy.permits(authenticationAlgorithm: challenge.authenticationAlgorithm) else {
+            throw SSHAuthenticationError.denied
+        }
         return try await perform(requestID: requestID, authorization: authorization, operation: .signature(challenge))
     }
 

@@ -11,6 +11,12 @@
 #define LIBSSH2_ERROR_NONE 0
 #define LIBSSH2_ERROR_ALLOC (-6)
 #define LIBSSH2_ERROR_METHOD_NONE (-33)
+#define LIBSSH2_ERROR_INVAL (-34)
+#define LIBSSH2_API
+#define LIBSSH2_FRANKENTERM_PUBLICKEY_POLICY_VERSION 1
+#define LIBSSH2_FRANKENTERM_PUBLICKEY_ALGORITHMS_MAX 1024
+#define LIBSSH2_STATE_AUTHENTICATED 1
+#define libssh2_NB_state_idle 0
 #define GUARD_BYTES 128
 
 typedef struct {
@@ -20,6 +26,9 @@ typedef struct {
     const char *banner;
     size_t allocations, fail_allocation, live_allocations;
     int last_error;
+    int userauth_pblc_state, state, ft_publickey_policy_active;
+    size_t ft_publickey_policy_length;
+    char ft_publickey_algorithms[LIBSSH2_FRANKENTERM_PUBLICKEY_ALGORITHMS_MAX];
 } LIBSSH2_SESSION;
 
 struct allocation {
@@ -128,6 +137,56 @@ static void run_case(const char *name, const char *input, const char *server,
     case_count++;
 }
 
+static void test_exact_publickey_policy_after_selection(void)
+{
+    LIBSSH2_SESSION session = {0};
+    const char *cert = "ssh-rsa-cert-v01@openssh.com";
+    const char *allowed = "rsa-sha2-256-cert-v01@openssh.com";
+    size_t length = strlen(cert);
+    unsigned char *method = checked_alloc(&session, length);
+    memcpy(method, cert, length);
+    session.supported_algorithms = "rsa-sha2-512,rsa-sha2-256,ssh-rsa";
+    session.sign_algo_prefs = "rsa-sha2-256";
+    session.banner = "SSH-2.0-OpenSSH_9.9";
+    assert(libssh2_frankenterm_publickey_policy_version() == 1);
+    assert(libssh2_frankenterm_publickey_policy(&session, allowed, strlen(allowed)) == 0);
+
+    /* No server-sig-algs leaves the original SHA-1 request unchanged. The
+     * exact post-selection guard must deny it before the offer, independent
+     * of the sign callback that would run only after the peer accepted it. */
+    assert(_libssh2_key_sign_algorithm(&session, &method, &length) == 0);
+    assert(!frankenterm_publickey_algorithm_permitted(&session, method, length));
+    session.server_sign_algorithms = "rsa-sha2-512,rsa-sha2-256";
+    assert(_libssh2_key_sign_algorithm(&session, &method, &length) == 0);
+    assert(length == strlen(allowed) && !memcmp(method, allowed, length));
+    assert(frankenterm_publickey_algorithm_permitted(&session, method, length));
+    assert(!frankenterm_publickey_algorithm_permitted(&session,
+        (const unsigned char *)"rsa-sha2-256", 12));
+
+    /* The fallback's default key name is subject to the same exact check. */
+    assert(!frankenterm_publickey_algorithm_permitted(&session,
+        (const unsigned char *)cert, strlen(cert)));
+    assert(libssh2_frankenterm_publickey_policy(&session, "", 0) == 0);
+    assert(!frankenterm_publickey_algorithm_permitted(&session, method, length));
+    assert(libssh2_frankenterm_publickey_policy(&session, "unknown-key", 11) == 0);
+    assert(!frankenterm_publickey_algorithm_permitted(&session, method, length));
+
+    /* Invalid mutation preserves the previous restriction; an in-flight or
+     * already authenticated session cannot have its policy replaced. */
+    assert(libssh2_frankenterm_publickey_policy(&session, "rsa-sha2-256,", 13) == LIBSSH2_ERROR_INVAL);
+    assert(!frankenterm_publickey_algorithm_permitted(&session, method, length));
+    session.userauth_pblc_state = 1;
+    assert(libssh2_frankenterm_publickey_policy(&session, NULL, 0) == LIBSSH2_ERROR_INVAL);
+    session.userauth_pblc_state = 0; session.state = LIBSSH2_STATE_AUTHENTICATED;
+    assert(libssh2_frankenterm_publickey_policy(&session, NULL, 0) == LIBSSH2_ERROR_INVAL);
+    session.state = 0;
+    assert(libssh2_frankenterm_publickey_policy(&session, NULL, 0) == 0);
+    assert(frankenterm_publickey_algorithm_permitted(&session, method, length));
+    checked_free(&session, method);
+    assert(session.live_allocations == 0);
+    case_count++;
+}
+
 int main(void)
 {
     const char *cert = "ssh-rsa-cert-v01@openssh.com";
@@ -182,6 +241,7 @@ int main(void)
     run_case("raw upgrade allocation failure clears method", "ssh-rsa",
              supported, NULL, modern, supported, 2,
              LIBSSH2_ERROR_ALLOC, NULL, NULL);
-    printf("Patched libssh2 negotiation: %u cases passed\n", case_count);
+    test_exact_publickey_policy_after_selection();
+    printf("Patched libssh2 negotiation and policy: %u cases passed\n", case_count);
     return 0;
 }

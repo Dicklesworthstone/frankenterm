@@ -91,6 +91,7 @@ enum WorkspaceDeviceKeyOverlay {
 
     static func canAssign(_ route: WorkspaceDocument.Route, in document: WorkspaceDocument) -> Bool {
         guard route.authenticationMethods.contains(.publicKey),
+              route.publicKeyAlgorithmPolicy.permits(authenticationAlgorithm: "ssh-ed25519"),
               route.mode == "direct_ssh" || route.mode == "frankenterm_mux" else { return false }
         // A plain generated identity cannot fulfill a required certificate or
         // silently shed mandatory policy attached to the imported identity.

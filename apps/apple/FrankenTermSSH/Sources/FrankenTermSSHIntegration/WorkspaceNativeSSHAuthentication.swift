@@ -374,6 +374,7 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
         if NativeSSHSession.supportsHostCertificates { capabilities.insert(WorkspaceDocument.hostCertificateCapability) }
         if NativeSSHSession.supportsHostAlgorithmPolicy { capabilities.insert(WorkspaceDocument.hostAlgorithmPolicyCapability) }
         if NativeSSHSession.supportsTransportAlgorithmPolicy { capabilities.insert(WorkspaceDocument.transportAlgorithmPolicyCapability) }
+        if NativeSSHSession.supportsPublicKeyAlgorithmPolicy { capabilities.insert(WorkspaceDocument.publicKeyAlgorithmPolicyCapability) }
         let profile: NativeSSHHostKeyPolicy = NativeSSHSession.supportsHostCertificates ? .certificatesAndRawKeys : .rawKeys
         return .init(routeModes: ["direct_ssh", "frankenterm_mux"], authenticationMethods: [.publicKey, .password, .keyboardInteractive],
             credentialAlgorithms: ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521", "ssh-rsa"],
@@ -381,7 +382,9 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
                 NativeSSHSession.supportsHostCertificates ? SSHHostCertificate.supportedAlgorithms : []),
             capabilities: capabilities, maximumJumpHops: 3, hostSignatureAlgorithms: Set(profile.algorithms),
             keyExchangeAlgorithms: Set(NativeSSHSession.supportedKeyExchangeAlgorithms),
-            ciphers: Set(NativeSSHSession.supportedCiphers), macs: Set(NativeSSHSession.supportedMACs))
+            ciphers: Set(NativeSSHSession.supportedCiphers), macs: Set(NativeSSHSession.supportedMACs),
+            publicKeySignatureAlgorithms: NativeSSHSession.supportsPublicKeyAlgorithmPolicy
+                ? Set(NativeSSHSession.supportedPublicKeySignatureAlgorithms) : [])
     }()
 
     fileprivate final class Retirement: @unchecked Sendable {
@@ -479,7 +482,11 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
             guard value.authorization == authorization else { throw SSHAuthenticationError.stale }
             try await broker.validateForAuthentication(value)
             try checkCurrent()
-            let identity = try NativeSSHIdentity(user: authorization.user, publicKey: value.authenticationBlob)
+            let policy = authorization.publicKeyAlgorithmPolicy
+            let algorithms = policy.isConstrained ? policy.filterAlgorithms(forKeyAlgorithm: value.authenticationAlgorithm,
+                qualified: NativeSSHSession.supportedPublicKeySignatureAlgorithms) : nil
+            let identity = try NativeSSHIdentity(user: authorization.user, publicKey: value.authenticationBlob,
+                acceptedAlgorithms: algorithms)
             selected = value; selectedPeer = peer; selectedIdentity = identity; phase = .selected
             return identity
         } catch { cancel(transportID: transportID); throw error }
@@ -549,12 +556,18 @@ public actor WorkspaceNativeSSHAuthentication: NativeSSHAuthentication, Workspac
 
     public func validateForAuthentication(peer: NativeSSHPeer, identity: NativeSSHIdentity) async throws {
         try checkCurrent()
-        guard phase == .signed, let selected, peer == selectedPeer, identity == selectedIdentity else {
+        // A selected identity needs current policy before its unsigned offer.
+        // This does not grant established access or authorize an MFA factor;
+        // those paths still require the completed signed phase below.
+        guard phase == .selected || phase == .signed, let selected,
+              peer == selectedPeer, identity == selectedIdentity else {
             throw SSHAuthenticationError.stale
         }
+        let admittedPhase = phase
         _ = try validatePeer(peer); try validateRoute(selected.authorization)
         try await broker.validateForAuthentication(selected)
         try checkCurrent()
+        guard phase == admittedPhase else { throw SSHAuthenticationError.stale }
     }
 
     /// A live session owner repeats this before byte admission, service, and

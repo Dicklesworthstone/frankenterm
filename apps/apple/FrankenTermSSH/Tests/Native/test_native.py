@@ -90,6 +90,8 @@ for name, result, args in [
     ("ftssh_approve_host_key", I, [P, P, Z]),
     ("ftssh_begin_authentication", I, [P, P, Z, P, Z]), ("ftssh_authentication_step", I, [P]),
     ("ftssh_supports_publickey_interactive", I, []),
+    ("ftssh_supports_publickey_algorithm_policy", I, []),
+    ("ftssh_set_publickey_algorithms", I, [P, P, Z]),
     ("ftssh_begin_publickey_interactive_authentication", I, [P, P, Z, P, Z, C.c_uint32]),
     ("ftssh_continue_interactive_authentication", I, [P]),
     ("ftssh_begin_password_authentication", I, [P, P, Z]), ("ftssh_supply_password", I, [P, P, Z]),
@@ -1223,6 +1225,56 @@ class NativeSSHTests(unittest.TestCase):
         self.assertEqual(DRIVER.ftssh_begin_authentication(handle, b"operator", 8, blob, len(blob)), 0)
         self.assertEqual(self.advance(handle, DRIVER.ftssh_authentication_step, (2,)), 2)
         return self.data(handle, DRIVER.ftssh_copy_challenge, 1536)
+
+    def test_publickey_policy_selects_sha256_instead_of_default_sha512(self):
+        self.assertEqual(DRIVER.ftssh_supports_publickey_algorithm_policy(), 1)
+        handle, server, key = self.start(rsa_client_key(2048))
+        self.advance(handle, DRIVER.ftssh_handshake)
+        self.assertEqual(self.data(handle, DRIVER.ftssh_copy_host_key), server.host_blob)
+        self.assertEqual(DRIVER.ftssh_approve_host_key(handle, server.host_blob, len(server.host_blob)), 0)
+        allowed = b"rsa-sha2-256"
+        self.assertEqual(DRIVER.ftssh_set_publickey_algorithms(handle, allowed, len(allowed)), 0)
+        blob = public_blob(key)
+        self.assertEqual(DRIVER.ftssh_begin_authentication(handle, b"operator", 8, blob, len(blob)), 0)
+        self.assertEqual(self.advance(handle, DRIVER.ftssh_authentication_step, (2,)), 2)
+        challenge = self.data(handle, DRIVER.ftssh_copy_challenge, 1536)
+        signed = signature(key, challenge)
+        algorithm, _ = take_string(signed)
+        self.assertEqual(algorithm, allowed)
+        self.assertEqual(DRIVER.ftssh_supply_signature(handle, signed, len(signed)), 0)
+        self.assertEqual(self.advance(handle, DRIVER.ftssh_authentication_step), 0)
+        self.assertEqual([event[1] for event in server.events if event[0] == "authentication"], [0, 1])
+
+    def test_publickey_policy_denies_disjoint_server_before_unsigned_offer(self):
+        self.assertEqual(DRIVER.ftssh_supports_publickey_algorithm_policy(), 1)
+        handle, server, key = self.start(rsa_client_key(2048), user_signature="rsa-sha2-512")
+        self.advance(handle, DRIVER.ftssh_handshake)
+        self.assertEqual(self.data(handle, DRIVER.ftssh_copy_host_key), server.host_blob)
+        self.assertEqual(DRIVER.ftssh_approve_host_key(handle, server.host_blob, len(server.host_blob)), 0)
+        allowed = b"rsa-sha2-256"
+        self.assertEqual(DRIVER.ftssh_set_publickey_algorithms(handle, allowed, len(allowed)), 0)
+        blob = public_blob(key)
+        self.assertEqual(DRIVER.ftssh_begin_authentication(handle, b"operator", 8, blob, len(blob)), 0)
+        self.assertEqual(self.advance(handle, DRIVER.ftssh_authentication_step, (-1010,)), -1010)
+        self.assertEqual(DRIVER.ftssh_begin_shell(handle, 80, 24, 0, 0), -1010)
+        self.assertEqual(DRIVER.ftssh_close(handle), 0)
+        self.assertTrue(server.done.wait(2))
+        self.assertEqual([event for event in server.events if event[0] == "authentication"], [])
+        self.assertEqual([event for event in server.events if event[0] in ("channel", "pty", "shell")], [])
+
+    def test_publickey_policy_refuses_wrong_identity_family_before_authentication(self):
+        self.assertEqual(DRIVER.ftssh_supports_publickey_algorithm_policy(), 1)
+        handle, server, key = self.start()
+        self.advance(handle, DRIVER.ftssh_handshake)
+        self.assertEqual(self.data(handle, DRIVER.ftssh_copy_host_key), server.host_blob)
+        self.assertEqual(DRIVER.ftssh_approve_host_key(handle, server.host_blob, len(server.host_blob)), 0)
+        allowed = b"ssh-ed25519-cert-v01@openssh.com"
+        self.assertEqual(DRIVER.ftssh_set_publickey_algorithms(handle, allowed, len(allowed)), 0)
+        blob = public_blob(key)
+        self.assertEqual(DRIVER.ftssh_begin_authentication(handle, b"operator", 8, blob, len(blob)), -1011)
+        self.assertEqual(DRIVER.ftssh_close(handle), 0)
+        self.assertTrue(server.done.wait(2))
+        self.assertEqual([event for event in server.events if event[0].startswith("authentication")], [])
 
     def test_rsa_sha2_authentication_and_real_terminal_for_2048_4096_and_8192_bits(self):
         for bits in [2048, 4096, 8192]:

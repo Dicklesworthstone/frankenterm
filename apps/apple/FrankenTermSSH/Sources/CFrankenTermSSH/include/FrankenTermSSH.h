@@ -117,6 +117,15 @@ int ftssh_approve_host_key(ftssh_session *session, const uint8_t *key, size_t le
  * libssh2 cannot expose the offered algorithm before its signing callback. */
 int ftssh_begin_authentication(ftssh_session *session, const char *user, size_t user_length,
                              const uint8_t *public_blob, size_t blob_length);
+/* Optional exact ordered user-authentication request algorithm restriction.
+ * Call once after host approval and before begin_authentication (including its
+ * explicit MFA variant). Nonempty CSV <=1023 bytes; only the existing modern
+ * raw/certificate profile is accepted. The linked versioned guard enforces the
+ * resulting name BEFORE an unsigned offer, including libssh2 fallback paths.
+ * No intersection or no required backend support fails closed. Nil/default
+ * callers retain the existing authentication behavior. */
+int ftssh_supports_publickey_algorithm_policy(void);
+int ftssh_set_publickey_algorithms(ftssh_session *session, const uint8_t *algorithms, size_t length);
 /* Available only with the versioned FrankenTerm libssh2 evidence extension.
  * An unpatched backend remains usable for the other explicit auth methods. */
 int ftssh_supports_publickey_interactive(void);

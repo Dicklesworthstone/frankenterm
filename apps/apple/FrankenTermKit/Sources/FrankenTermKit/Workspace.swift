@@ -305,6 +305,7 @@ public struct WorkspaceDocument: Sendable {
         public let port: UInt16
         public let credentialIDs: [String], trustID: String
         public let authenticationMethods: [AuthenticationMethod]
+        public let publicKeyAlgorithmPolicy: WorkspacePublicKeyAlgorithmPolicy
         public let jumpRoutes: [String]
         public let sessionCreation: String?, attachPolicy: String?, hostKeyAlias: String?
         /// A frankenterm_mux route's command on the machine that reaches its
@@ -313,6 +314,7 @@ public struct WorkspaceDocument: Sendable {
         public let requiredCapabilities: [String], requiredExtensions: [String]
     }
     public static let userCertificateCapability = "ssh_user_certificate_v1"
+    public static let publicKeyAlgorithmPolicyCapability = "ssh_public_key_algorithm_policy_v1"
     public struct Credential: Identifiable, Sendable {
         public let id: String, algorithm: String, fingerprint: String
         /// The offer is public, immutable workspace policy. The protected item
@@ -480,6 +482,9 @@ public struct WorkspaceDocument: Sendable {
         /// Negotiated signature names, distinct from host-key blob families.
         /// An explicit host algorithm policy needs actual qualified support.
         public let hostSignatureAlgorithms: Set<String>
+        /// Exact raw/certificate user-authentication request names supported by
+        /// the linked adapter, independently of credential key-blob families.
+        public let publicKeySignatureAlgorithms: Set<String>
         public let keyExchangeAlgorithms: Set<String>, ciphers: Set<String>, macs: Set<String>
         /// A working direct transport does not imply nested SSH support. The
         /// profile must explicitly qualify the complete expanded jump chain.
@@ -487,11 +492,13 @@ public struct WorkspaceDocument: Sendable {
         public init(routeModes: Set<String>, authenticationMethods: Set<AuthenticationMethod>,
                     credentialAlgorithms: Set<String>, hostKeyAlgorithms: Set<String>, capabilities: Set<String> = [],
                     maximumJumpHops: Int = 0, hostSignatureAlgorithms: Set<String> = [],
-                    keyExchangeAlgorithms: Set<String> = [], ciphers: Set<String> = [], macs: Set<String> = []) {
+                    keyExchangeAlgorithms: Set<String> = [], ciphers: Set<String> = [], macs: Set<String> = [],
+                    publicKeySignatureAlgorithms: Set<String> = []) {
             self.routeModes = routeModes; self.authenticationMethods = authenticationMethods
             self.credentialAlgorithms = credentialAlgorithms; self.hostKeyAlgorithms = hostKeyAlgorithms; self.capabilities = capabilities
             self.maximumJumpHops = max(0, min(maximumJumpHops, 3))
             self.hostSignatureAlgorithms = hostSignatureAlgorithms
+            self.publicKeySignatureAlgorithms = publicKeySignatureAlgorithms
             self.keyExchangeAlgorithms = keyExchangeAlgorithms; self.ciphers = ciphers; self.macs = macs
         }
         public static let offlineOnly = RouteSupport(routeModes: [], authenticationMethods: [], credentialAlgorithms: [], hostKeyAlgorithms: [])
@@ -506,7 +513,7 @@ public struct WorkspaceDocument: Sendable {
             case .unsupportedRequirement: "A required security policy or extension is not supported by this build."
             case .authenticationUnavailable: "None of the permitted authentication methods is supported by this build."
             case .credentialUnavailable: "No permitted matching credential is available for this route."
-            case .credentialAlgorithmUnavailable: "The available credential needs an SSH key algorithm not supported by this build."
+            case .credentialAlgorithmUnavailable: "No available credential has a supported authentication algorithm allowed by this route."
             case .credentialCertificateUnavailable: "The user certificate is expired, not yet valid, or does not permit this account or connection. Import a renewed or suitable certificate from your Mac."
             case .hostTrustMissing: "This route needs a verified host identity."
             case .hostTrustNeedsReview: "Review the imported host identity before authentication."
@@ -831,7 +838,7 @@ public struct WorkspaceDocument: Sendable {
         routes = try records("routes", cap: 256).map {
             try $0.allowing(["id", "mode", "host", "port", "user", "credential_refs", "authentication_methods", "host_trust_ref",
                              "jump_routes", "session_creation", "attach_policy", "remote_command", "host_key_alias",
-                             "required_capabilities"])
+                             "pubkey_accepted_algorithms", "required_capabilities"])
             let mode = try $0.text("mode")
             // Via Mac has a different authentication schema; never reinterpret it as SSH.
             guard ["direct_ssh", "frankenterm_mux"].contains(mode) else { throw FTError.unsupported("route.mode") }
@@ -842,6 +849,14 @@ public struct WorkspaceDocument: Sendable {
                 return method
             }
             guard !methods.isEmpty else { throw FTError.malformed("route.authentication_policy") }
+            let publicKeyAlgorithms = try $0["pubkey_accepted_algorithms"]?.array().map { try $0.string() }
+            let publicKeyPolicy = try WorkspacePublicKeyAlgorithmPolicy(acceptedAlgorithms: publicKeyAlgorithms)
+            // The field itself requires enforcement even if an older or
+            // hand-authored manifest omitted the capability advertisement.
+            var requiredCapabilities = try Self.capabilities($0)
+            if publicKeyPolicy.isConstrained, !requiredCapabilities.contains(Self.publicKeyAlgorithmPolicyCapability) {
+                requiredCapabilities.append(Self.publicKeyAlgorithmPolicyCapability)
+            }
             let creation = try $0["session_creation"]?.string(), attach = try $0["attach_policy"]?.string()
             let command = try $0["remote_command"]?.string()
             if mode == "direct_ssh" {
@@ -859,11 +874,12 @@ public struct WorkspaceDocument: Sendable {
             return Route(id: try $0.text("id"), mode: mode, host: try Self.host(originalHost), user: user,
                          displayHost: originalHost, certificatePrincipal: try $0["host_key_alias"]?.string() ?? originalHost,
                          port: try Self.port($0.required("port").uint()), credentialIDs: candidates,
-                         trustID: try Self.identifier($0.text("host_trust_ref")), authenticationMethods: methods, jumpRoutes: jumps,
+                         trustID: try Self.identifier($0.text("host_trust_ref")), authenticationMethods: methods,
+                         publicKeyAlgorithmPolicy: publicKeyPolicy, jumpRoutes: jumps,
                          sessionCreation: creation, attachPolicy: attach,
                          hostKeyAlias: try $0["host_key_alias"].map { try Self.host($0.string()) },
                          remoteCommand: command,
-                         requiredCapabilities: try Self.capabilities($0), requiredExtensions: try Self.requiredExtensions($0))
+                         requiredCapabilities: requiredCapabilities, requiredExtensions: try Self.requiredExtensions($0))
         }
         let routeMap = Dictionary(uniqueKeysWithValues: routes.map { ($0.id, $0) })
         let credentialIDs = Set(credentials.map(\.id))
@@ -1026,7 +1042,11 @@ public struct WorkspaceDocument: Sendable {
             let policyCandidates = candidates.filter {
                 Self.supports(Set($0.requiredCapabilities), using: support.capabilities) && $0.requiredExtensions.isEmpty
             }
-            let algorithmCandidates = policyCandidates.filter { support.credentialAlgorithms.contains($0.algorithm) }
+            let algorithmCandidates = policyCandidates.filter {
+                support.credentialAlgorithms.contains($0.algorithm)
+                    && route.publicKeyAlgorithmPolicy.permits(keyAlgorithm: $0.userCertificate?.algorithm ?? $0.algorithm,
+                        qualifiedAlgorithms: support.publicKeySignatureAlgorithms)
+            }
             let usable = algorithmCandidates.filter {
                 $0.permitsCertificate(user: route.user, transit: transit, routeMode: route.mode, now: certificateTime)
             }.map(\.id)
@@ -1162,7 +1182,8 @@ public struct WorkspaceDocument: Sendable {
                           hostRevocationSourcesByTrustScope: [String: [WorkspaceHostRevocationSource]] = [:],
                           supportedHostSignatureAlgorithms: Set<String> = [],
                           supportedKeyExchangeAlgorithms: Set<String> = [], supportedCiphers: Set<String> = [],
-                          supportedMACs: Set<String> = []) throws -> RouteReadinessDetail {
+                          supportedMACs: Set<String> = [],
+                          supportedPublicKeySignatureAlgorithms: Set<String> = []) throws -> RouteReadinessDetail {
         let routeMap = Dictionary(uniqueKeysWithValues: routes.map { ($0.id, $0) })
         let trustMap = Dictionary(uniqueKeysWithValues: hostTrust.map { ($0.id, $0) })
         let credentialMap = Dictionary(uniqueKeysWithValues: credentials.map { ($0.id, $0) })
@@ -1214,6 +1235,8 @@ public struct WorkspaceDocument: Sendable {
             let keys = route.credentialIDs.filter { id in
                 guard availableCredentialIDs.contains(id), let key = credentialMap[id] else { return false }
                 return supportedCredentialAlgorithms.contains(key.algorithm) && !revokedCredentialFingerprints.contains(key.fingerprint)
+                    && route.publicKeyAlgorithmPolicy.permits(keyAlgorithm: key.userCertificate?.algorithm ?? key.algorithm,
+                        qualifiedAlgorithms: supportedPublicKeySignatureAlgorithms)
                     && Self.supports(Set(key.requiredCapabilities), using: supportedCapabilities) && key.requiredExtensions.isEmpty
                     && key.permitsCertificate(user: route.user, transit: transit, routeMode: route.mode, now: certificateTime)
             }
@@ -1225,7 +1248,11 @@ public struct WorkspaceDocument: Sendable {
                     guard availableCredentialIDs.contains(id) else { return nil }
                     return credentialMap[id]
                 }
-                if !existing.isEmpty, existing.allSatisfy({ !supportedCredentialAlgorithms.contains($0.algorithm) }) {
+                if !existing.isEmpty, existing.allSatisfy({
+                    !supportedCredentialAlgorithms.contains($0.algorithm)
+                        || !route.publicKeyAlgorithmPolicy.permits(keyAlgorithm: $0.userCertificate?.algorithm ?? $0.algorithm,
+                            qualifiedAlgorithms: supportedPublicKeySignatureAlgorithms)
+                }) {
                     issue(.credentialAlgorithmUnsupported)
                 } else if existing.contains(where: { $0.userCertificate != nil
                     && !$0.permitsCertificate(user: route.user, transit: transit, routeMode: route.mode, now: certificateTime) }) {

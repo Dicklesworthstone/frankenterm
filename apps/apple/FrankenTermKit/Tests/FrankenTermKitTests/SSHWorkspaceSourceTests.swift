@@ -1340,6 +1340,64 @@ final class SSHWorkspaceSourceTests: XCTestCase {
         }
     }
 
+    func testPublicKeyAlgorithmPolicyRoundTripAndDeprecatedFirstAssignment() throws {
+        for directives in [
+            "PubkeyAcceptedKeyTypes rsa-sha2-256,ssh-ed25519,rsa-sha2-256\nPubkeyAcceptedAlgorithms ssh-rsa",
+            "PubkeyAcceptedAlgorithms rsa-sha2-256,ssh-ed25519,rsa-sha2-256\nPubkeyAcceptedKeyTypes ssh-rsa"
+        ] {
+            let result = try exported("Host build\nIdentityFile ~/.ssh/key\n\(directives)\n",
+                keys: ["~/.ssh/key": publicFile()], known: Data(try hostLine("build").utf8))
+            let route = try XCTUnwrap(result.workspace.routes.first)
+            XCTAssertEqual(route.publicKeyAlgorithmPolicy.acceptedAlgorithms, ["rsa-sha2-256", "ssh-ed25519"])
+            XCTAssertEqual(route.requiredCapabilities, [WorkspaceDocument.publicKeyAlgorithmPolicyCapability])
+            XCTAssertTrue(result.workspace.hostTrust[0].requiredCapabilities.isEmpty)
+            XCTAssertFalse(result.portability.contains { $0.disposition == 1 })
+            let archive = try AirGapArchive(workspace: result.workspace, keys: [], portability: result.portability, using: crypto)
+            let sealed = try FTAG.seal(archive, using: crypto)
+            let restored = try FTAG.open(sealed.envelope, code: sealed.code, using: crypto)
+            XCTAssertEqual(restored.workspace.routes[0].publicKeyAlgorithmPolicy, route.publicKeyAlgorithmPolicy)
+        }
+    }
+
+    func testPublicKeyAlgorithmPoliciesAreSeparateForEachJumpAndDestination() throws {
+        let result = try exported("""
+        Host target
+          HostName target.example.invalid
+          IdentityFile none
+          ProxyJump gateway
+          PubkeyAcceptedAlgorithms rsa-sha2-256-cert-v01@openssh.com
+        Host gateway
+          HostName gateway.example.invalid
+          IdentityFile none
+          PubkeyAcceptedAlgorithms ssh-ed25519
+        """, aliases: ["target"])
+        let route = try destination("target", in: result.workspace)
+        let hop = try XCTUnwrap(hops(route, in: result.workspace).first)
+        XCTAssertEqual(route.publicKeyAlgorithmPolicy.acceptedAlgorithms, ["rsa-sha2-256-cert-v01@openssh.com"])
+        XCTAssertEqual(hop.publicKeyAlgorithmPolicy.acceptedAlgorithms, ["ssh-ed25519"])
+        XCTAssertTrue(route.requiredCapabilities.contains(WorkspaceDocument.publicKeyAlgorithmPolicyCapability))
+        XCTAssertTrue(hop.requiredCapabilities.contains(WorkspaceDocument.publicKeyAlgorithmPolicyCapability))
+    }
+
+    func testMalformedPublicKeyAlgorithmPolicyCannotBorrowLaterAliasOrNativeDefaults() throws {
+        for expression in ["+ssh-rsa", "-ssh-rsa", "rsa-sha2-*", "^", "^unknown-key",
+                           "^ssh-ed25519,", "unknown-key,ssh-ed25519", "ssh-ed25519 extra"] {
+            let result = try exported("Host build\nIdentityFile none\nPubkeyAcceptedKeyTypes \(expression)\nPubkeyAcceptedAlgorithms ssh-ed25519\n")
+            let route = try XCTUnwrap(result.workspace.routes.first)
+            XCTAssertNil(route.publicKeyAlgorithmPolicy.acceptedAlgorithms)
+            XCTAssertTrue(route.requiredCapabilities.contains("ssh_config.unresolved_policy"))
+            XCTAssertTrue(result.portability.contains {
+                $0.setting == "ssh_config.pubkeyacceptedalgorithms" && $0.disposition == 1
+            })
+        }
+        let preference = try exported("Host build\nIdentityFile none\nPubkeyAcceptedAlgorithms ^rsa-sha2-256,ssh-rsa\n")
+        XCTAssertNil(preference.workspace.routes[0].publicKeyAlgorithmPolicy.acceptedAlgorithms)
+        XCTAssertFalse(preference.portability.contains { $0.disposition == 1 })
+        XCTAssertTrue(preference.portability.contains {
+            $0.setting == "ssh_config.pubkeyacceptedalgorithms" && $0.disposition == 0
+        })
+    }
+
     func testLiteralHostAlgorithmListsPreserveSignatureOrderAndEncryptedRoundTrip() throws {
         let result = try exported("""
         Host build

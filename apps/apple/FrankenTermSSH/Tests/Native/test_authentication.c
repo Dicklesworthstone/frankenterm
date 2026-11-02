@@ -368,6 +368,30 @@ static void test_certificate_request_and_signature_algorithms_are_distinct(void)
     assert(session.sign_error == FTSSH_UNSUPPORTED && !session.challenge_length && !signature);
 }
 
+static void test_publickey_policy_checks_exact_certificate_request_before_signing(void) {
+    test_wire certificate = test_certificate("ssh-rsa", 1, 0);
+    ftssh_session session = test_certificate_session(&certificate);
+    session.publickey_policy_set = 1;
+    strcpy(session.publickey_algorithms, "rsa-sha2-256-cert-v01@openssh.com");
+    test_wire challenge = test_certificate_challenge(&certificate, "rsa-sha2-512-cert-v01@openssh.com");
+    void *context = &session; unsigned char *signature = NULL; size_t length = 0;
+    assert(sign_callback(NULL, &signature, &length, challenge.bytes, challenge.length, &context) == LIBSSH2_ERROR_INVAL);
+    assert(!session.challenge_length && !signature);
+
+    session = test_certificate_session(&certificate);
+    session.publickey_policy_set = 1;
+    strcpy(session.publickey_algorithms, "rsa-sha2-256-cert-v01@openssh.com");
+    challenge = test_certificate_challenge(&certificate, "rsa-sha2-256-cert-v01@openssh.com");
+    assert(sign_callback(NULL, &signature, &length, challenge.bytes, challenge.length, &context) == LIBSSH2_ERROR_EAGAIN);
+    assert(!strcmp(session.signature_algorithm, "rsa-sha2-256"));
+
+    session = test_certificate_session(&certificate);
+    session.publickey_policy_set = 1;
+    strcpy(session.publickey_algorithms, "rsa-sha2-256");
+    assert(sign_callback(NULL, &signature, &length, challenge.bytes, challenge.length, &context) == LIBSSH2_ERROR_INVAL);
+    assert(!session.challenge_length && !signature);
+}
+
 int main(void) {
     test_authentication_allocations_are_erased_before_free();
     test_method_tokens();
@@ -379,6 +403,7 @@ int main(void) {
     test_certificate_offer_time_rechecks_after_identity_selection();
     test_certificate_rsa_authority_allows_only_bounded_short_signatures();
     test_certificate_request_and_signature_algorithms_are_distinct();
+    test_publickey_policy_checks_exact_certificate_request_before_signing();
     puts("authentication boundary assertions passed");
     return 0;
 }

@@ -85,16 +85,7 @@ public struct WorkspaceHostAlgorithmPolicy: Sendable, Equatable, Codable {
     /// Current verified raw/certificate signature families. These mappings are
     /// not backend qualification; callers must intersect actual linked support.
     public static func signatures(forHostKeyAlgorithm algorithm: String) -> Set<String> {
-        switch algorithm {
-        case "ssh-rsa": return ["rsa-sha2-512", "rsa-sha2-256"]
-        case "ssh-rsa-cert-v01@openssh.com":
-            return ["rsa-sha2-512-cert-v01@openssh.com", "rsa-sha2-256-cert-v01@openssh.com"]
-        case "ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521",
-             "ssh-ed25519-cert-v01@openssh.com", "ecdsa-sha2-nistp256-cert-v01@openssh.com",
-             "ecdsa-sha2-nistp384-cert-v01@openssh.com", "ecdsa-sha2-nistp521-cert-v01@openssh.com":
-            return [algorithm]
-        default: return []
-        }
+        Set(WorkspacePublicKeyAlgorithmPolicy.signatureAlgorithms(forKeyAlgorithm: algorithm))
     }
 
     public func permitsHostKeyFamily(_ algorithm: String, qualifiedSignatures: Set<String>) -> Bool {

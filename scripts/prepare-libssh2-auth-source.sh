@@ -1,6 +1,7 @@
 #!/bin/bash
 # Prepare libssh2's signed-key MFA evidence, corrected RSA-certificate
-# signature negotiation, host-certificate KEX, and bounded SFTP responses.
+# signature negotiation, exact public-key algorithm policy, host-certificate
+# KEX, and bounded SFTP responses.
 # One digest binds all patches and their linked capability markers.
 # The Cargo registry remains untouched. The patch accepts only the reviewed
 # source bytes, and every cached result is checked before reuse.
@@ -10,6 +11,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PATCH="$SCRIPT_DIR/patches/libssh2-auth-partial.patch"
 HOST_PATCH="$SCRIPT_DIR/patches/libssh2-host-certificates.patch"
+PUBLICKEY_PATCH="$SCRIPT_DIR/patches/libssh2-publickey-policy.patch"
 UPSTREAM_SUMS="$SCRIPT_DIR/patches/libssh2-auth-partial.upstream.sha256"
 [ "$#" -eq 2 ] || { echo "usage: $0 UPSTREAM_SOURCE CACHE_DIR" >&2; exit 1; }
 for tool in shasum patch; do
@@ -21,7 +23,7 @@ CACHE="$(cd "$2" && pwd)"
 
 # A changed Cargo vendor snapshot must receive a deliberate patch review.
 (cd "$SOURCE" && shasum -a 256 -c "$UPSTREAM_SUMS" >&2)
-SOURCE_DIGEST="$(cat "$PATCH" "$HOST_PATCH" "$UPSTREAM_SUMS" | shasum -a 256 | awk '{print $1}')"
+SOURCE_DIGEST="$(cat "$PATCH" "$HOST_PATCH" "$PUBLICKEY_PATCH" "$UPSTREAM_SUMS" | shasum -a 256 | awk '{print $1}')"
 PREPARED="$CACHE/libssh2-auth-$SOURCE_DIGEST"
 if [ -e "$PREPARED" ]; then
     [ -f "$PREPARED/.frankenterm-auth-source.sha256" ] || {
@@ -30,6 +32,7 @@ if [ -e "$PREPARED" ]; then
     }
     cmp "$PATCH" "$PREPARED/.frankenterm-auth.patch" >/dev/null
     cmp "$HOST_PATCH" "$PREPARED/.frankenterm-host-certificate.patch" >/dev/null
+    cmp "$PUBLICKEY_PATCH" "$PREPARED/.frankenterm-publickey-policy.patch" >/dev/null
     (cd "$PREPARED" && shasum -a 256 -c .frankenterm-auth-source.sha256 >&2)
 else
     # Retain incomplete staging on failure for diagnosis; no source is removed.
@@ -37,8 +40,10 @@ else
     cp -R "$SOURCE/." "$STAGING/"
     (cd "$STAGING" && patch -N -f -F 0 -p1 -i "$PATCH" >&2)
     (cd "$STAGING" && patch -N -f -F 0 -p1 -i "$HOST_PATCH" >&2)
+    (cd "$STAGING" && patch -N -f -F 0 -p1 -i "$PUBLICKEY_PATCH" >&2)
     cp "$PATCH" "$STAGING/.frankenterm-auth.patch"
     cp "$HOST_PATCH" "$STAGING/.frankenterm-host-certificate.patch"
+    cp "$PUBLICKEY_PATCH" "$STAGING/.frankenterm-publickey-policy.patch"
     (cd "$STAGING" && shasum -a 256 include/libssh2.h src/libssh2_priv.h src/userauth.c src/hostkey.c src/sftp.c \
         > .frankenterm-auth-source.sha256)
     mv "$STAGING" "$PREPARED"
