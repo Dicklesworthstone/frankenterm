@@ -1,9 +1,9 @@
 //! Guardian-owned PTY and child lifetime state.
 
 use crate::broker::{
-    BrokerControlClientV1, BrokerGuardianConnectionIdentityV1, BrokerOutputDeliveryV1,
-    BrokerPaneChildStatusV1, BrokerPaneInputWriterV1, BrokerPaneIoCommandV1,
-    BrokerPaneIoCompletionV1, BrokerPaneIoSessionV1, BrokerPaneIoWorkerV1,
+    BrokerControlClientError, BrokerControlClientV1, BrokerGuardianConnectionIdentityV1,
+    BrokerOutputDeliveryV1, BrokerPaneChildStatusV1, BrokerPaneInputWriterV1,
+    BrokerPaneIoCommandV1, BrokerPaneIoCompletionV1, BrokerPaneIoSessionV1, BrokerPaneIoWorkerV1,
     BrokerPaneOutputHandleV1, BrokerPaneOutputV1,
 };
 use crate::output::{
@@ -52,6 +52,14 @@ use zeroize::{Zeroize as _, Zeroizing};
 // the next mux every pane, so the bound stays well clear of a host's crashes.
 const MAX_BROKER_CONNECTIONS: usize = 64;
 const BROKER_IO_DEADLINE: Duration = Duration::from_secs(5);
+// The broker declines a released pane while a lease handoff or another
+// retirement is in flight, and a retirement can outlast one ask's deadline,
+// after which the broker has deleted its files but the guardian has not. A
+// later ask finds it done (ft-rkn8v). It needs only that answer, and an ask
+// holds the mux's pane I/O worker while it waits, so it waits less.
+const BROKER_RETIRE_ASKS: u8 = 6;
+const BROKER_RETIRE_RETRY_AFTER: Duration = Duration::from_secs(10);
+const BROKER_RETIRE_RETRY_DEADLINE: Duration = Duration::from_secs(1);
 
 /// Bounded resources assigned to one guardian runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -254,8 +262,43 @@ struct SettledBrokerPane {
     mux_incarnation: Uuid,
     /// `None` while its Retire is with the pane I/O worker.
     handle: Option<BrokerPaneOutputHandleV1>,
-    /// The mux released it: ask the broker once, then forget it.
+    /// The mux released it: ask the broker, up to [`BROKER_RETIRE_ASKS`]
+    /// times, then forget it.
     retire_due: bool,
+    retire_asks: u8,
+    /// The next ask waits until then.
+    retire_after: Option<Instant>,
+}
+
+impl SettledBrokerPane {
+    /// Count a Retire answer and say whether to ask again, after
+    /// [`BROKER_RETIRE_RETRY_AFTER`]: a decline, or an ask that ran out of
+    /// time while the broker was still retiring the pane, asks again until
+    /// [`BROKER_RETIRE_ASKS`] asks. A retirement or any other error ends it.
+    fn retire_again(
+        &mut self,
+        result: &Result<bool, BrokerControlClientError>,
+        now: Instant,
+    ) -> bool {
+        self.retire_asks = self.retire_asks.saturating_add(1);
+        let again = match result {
+            Ok(false) => true,
+            Err(BrokerControlClientError::Io(error)) => error.kind() == ErrorKind::TimedOut,
+            Ok(true) | Err(_) => false,
+        } && self.retire_asks < BROKER_RETIRE_ASKS;
+        if again {
+            self.retire_after = Some(now + BROKER_RETIRE_RETRY_AFTER);
+        }
+        again
+    }
+
+    fn retire_deadline(&self) -> Duration {
+        if self.retire_asks == 0 {
+            BROKER_IO_DEADLINE
+        } else {
+            BROKER_RETIRE_RETRY_DEADLINE
+        }
+    }
 }
 
 /// The first wait after a broker Read finds no output (ft-2pgul).
@@ -4311,12 +4354,23 @@ impl GuardianRuntime {
                         connection.failed = true;
                         continue;
                     };
-                    if let BrokerPaneIoCompletionV1::Retire { result, .. } = &completion {
-                        // Either answer lets the pane go; a broker that
-                        // declined keeps its files, as before ft-9ojeh.
-                        if self.settled_broker_panes.remove(&pane_id).is_none() {
+                    if let BrokerPaneIoCompletionV1::Retire { handle, result } = completion {
+                        let Some(settled) = self.settled_broker_panes.get_mut(&pane_id) else {
                             connection.failed = true;
+                            continue;
+                        };
+                        if settled.retire_again(&result, Instant::now()) {
+                            settled.handle = Some(handle);
+                            log::info!(
+                                "guardian: broker has not retired released pane {pane_id} yet; \
+                                 asking again in {} s",
+                                BROKER_RETIRE_RETRY_AFTER.as_secs()
+                            );
+                            continue;
                         }
+                        // The last answer lets the pane go; a broker that
+                        // declined keeps its files, as before ft-9ojeh.
+                        self.settled_broker_panes.remove(&pane_id);
                         match result {
                             Ok(true) => {
                                 self.counters.broker_panes_retired =
@@ -4359,7 +4413,6 @@ impl GuardianRuntime {
                             Err(_error) => {
                                 #[cfg(test)]
                                 {
-                                    use crate::broker::BrokerControlClientError;
                                     let label = match &_error {
                                         BrokerControlClientError::Endpoint(_) => "endpoint",
                                         BrokerControlClientError::Io(_) => "io",
@@ -4596,13 +4649,14 @@ impl GuardianRuntime {
                         settled.retire_due
                             && settled.handle.is_some()
                             && settled.mux_incarnation == *mux_incarnation
+                            && settled.retire_after.is_none_or(|at| at <= now)
                     })
                 && let Some(handle) = settled.handle.take()
             {
                 let command = BrokerPaneIoCommandV1::Retire {
                     handle,
                     store: self.output_pipeline.checkpoint_stage_store(),
-                    deadline: Instant::now() + BROKER_IO_DEADLINE,
+                    deadline: Instant::now() + settled.retire_deadline(),
                 };
                 match worker.try_submit(Box::new(command)) {
                     Ok(()) => {
@@ -4893,6 +4947,8 @@ impl GuardianRuntime {
                         mux_incarnation: pane.mux_incarnation,
                         handle: pane.handle.take(),
                         retire_due: false,
+                        retire_asks: 0,
+                        retire_after: None,
                     },
                 );
             }
@@ -5003,6 +5059,8 @@ impl GuardianRuntime {
                     mux_incarnation: pane.mux_incarnation,
                     handle: pane.handle.take(),
                     retire_due: false,
+                    retire_asks: 0,
+                    retire_after: None,
                 },
             );
         }
@@ -7815,6 +7873,8 @@ mod tests {
                 mux_incarnation: retiring,
                 handle: None,
                 retire_due: true,
+                retire_asks: 0,
+                retire_after: None,
             },
         );
 
@@ -7921,6 +7981,8 @@ mod tests {
                 mux_incarnation: mux,
                 handle: None,
                 retire_due: false,
+                retire_asks: 0,
+                retire_after: None,
             },
         );
         let released = runtime
@@ -7940,6 +8002,43 @@ mod tests {
             .failed = true;
         runtime.release_silent_closed_panes();
         assert!(runtime.settled_broker_panes.is_empty());
+    }
+
+    #[test]
+    fn a_declined_or_timed_out_retire_asks_again_until_its_asks_run_out() {
+        let released = || SettledBrokerPane {
+            mux_incarnation: Uuid::from_u128(2),
+            handle: None,
+            retire_due: true,
+            retire_asks: 0,
+            retire_after: None,
+        };
+        let now = Instant::now();
+        let mut settled = released();
+        assert_eq!(settled.retire_deadline(), BROKER_IO_DEADLINE);
+        // The broker was still retiring it when the first ask ran out.
+        let ran_out = Err(BrokerControlClientError::Io(std::io::Error::new(
+            ErrorKind::TimedOut,
+            "broker retirement deadline",
+        )));
+        assert!(settled.retire_again(&ran_out, now));
+        assert_eq!(settled.retire_after, Some(now + BROKER_RETIRE_RETRY_AFTER));
+        assert_eq!(settled.retire_deadline(), BROKER_RETIRE_RETRY_DEADLINE);
+        for _ in 2..BROKER_RETIRE_ASKS {
+            assert!(settled.retire_again(&Ok(false), now));
+        }
+        assert!(!settled.retire_again(&Ok(false), now));
+        assert_eq!(settled.retire_asks, BROKER_RETIRE_ASKS);
+
+        for ended in [
+            Ok(true),
+            Err(BrokerControlClientError::ConnectionPoisoned),
+            Err(BrokerControlClientError::Io(ErrorKind::WouldBlock.into())),
+        ] {
+            let mut settled = released();
+            assert!(!settled.retire_again(&ended, now));
+            assert_eq!(settled.retire_after, None);
+        }
     }
 
     #[test]
