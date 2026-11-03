@@ -11312,6 +11312,36 @@ mod tests {
     }
 
     #[test]
+    fn trauma_recurrence_window_bounds_how_far_apart_attempts_count() {
+        // Three failed attempts two minutes apart; the fourth is proposed
+        // two minutes after the third.
+        let minute = 60_000;
+        let history = || crate::storage::TraumaHistory {
+            audit_actions: (1..=3)
+                .map(|attempt| trauma_test_audit(42, attempt * 2 * minute, "npm test\n"))
+                .collect(),
+            events: (1..=3)
+                .map(|attempt| trauma_test_failure(42, attempt * 2 * minute + 500, "test.failed"))
+                .collect(),
+        };
+        let now = 8 * minute;
+        let default = crate::config::TraumaGuardConfig::default().to_trauma_config();
+        assert!(
+            !trauma_decision_from_history(Ok(history()), &default, 42, "npm test\n", now)
+                .should_intervene,
+            "attempts minutes apart are no loop in the default window"
+        );
+        let wide = crate::config::TraumaGuardConfig {
+            recurrence_window_secs: 600,
+            ..Default::default()
+        }
+        .to_trauma_config();
+        let decision = trauma_decision_from_history(Ok(history()), &wide, 42, "npm test\n", now);
+        assert!(decision.should_intervene);
+        assert_eq!(decision.repeat_count, 3);
+    }
+
+    #[test]
     fn trauma_history_does_not_fuzz_redacted_or_truncated_commands() {
         let text = format!("npm test -- {}", "long-argument ".repeat(20));
         let config = TraumaConfig::default();
