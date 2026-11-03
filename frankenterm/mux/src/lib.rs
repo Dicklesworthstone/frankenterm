@@ -28848,9 +28848,10 @@ mod tests {
         let stream = chunks.concat();
         let expected = two_stage_reference(&stream);
         let drains = esu_drains_in(&stream);
+        // The pane's parse thread reads the override when it starts, which
+        // can be after new() returns, so it stays set until the run ends.
         SYNC_FRAME_RAW_HOLDS_FOR_TEST.store(if raw_frames { 1 } else { 2 }, Ordering::Relaxed);
         let pane = QuietLocalPane::new()?;
-        SYNC_FRAME_RAW_HOLDS_FOR_TEST.store(0, Ordering::Relaxed);
         let control = Arc::clone(&pane.generation.live_parser_checkpoint);
         let owned = chunks.to_vec();
         let delivery = std::thread::spawn(move || {
@@ -28894,6 +28895,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         delivery.join().expect("delivery thread");
+        SYNC_FRAME_RAW_HOLDS_FOR_TEST.store(0, Ordering::Relaxed);
         let events = pane
             .sync_events()
             .into_iter()
@@ -29037,9 +29039,9 @@ mod tests {
         let all = two_stage_reference(&[before, opened, closed].concat()).snapshot;
         assert_ne!(held, all);
         for raw_frames in [true, false] {
+            // Set until the pane's parse thread has surely read it.
             SYNC_FRAME_RAW_HOLDS_FOR_TEST.store(if raw_frames { 1 } else { 2 }, Ordering::Relaxed);
             let pane = QuietLocalPane::new()?;
-            SYNC_FRAME_RAW_HOLDS_FOR_TEST.store(0, Ordering::Relaxed);
             pane.deliver(before);
             pane.deliver(opened);
             let delivered = (before.len() + opened.len()) as u64;
@@ -29075,6 +29077,7 @@ mod tests {
                 while executor.try_tick()? {}
                 std::thread::sleep(Duration::from_millis(1));
             }
+            SYNC_FRAME_RAW_HOLDS_FOR_TEST.store(0, Ordering::Relaxed);
             assert_eq!(pane.esu_drains(), 1, "raw frames {}", raw_frames);
             let total = delivered + closed.len() as u64;
             let (fused, two_stage) = pane.parse_paths();
@@ -29133,9 +29136,9 @@ mod tests {
         let expected = two_stage_reference(&stream).snapshot;
         let mut times: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
         for raw_frames in [true, false, false, true, true, false, false, true] {
+            // Set until the pane's parse thread has surely read it.
             SYNC_FRAME_RAW_HOLDS_FOR_TEST.store(if raw_frames { 1 } else { 2 }, Ordering::Relaxed);
             let pane = QuietLocalPane::new()?;
-            SYNC_FRAME_RAW_HOLDS_FOR_TEST.store(0, Ordering::Relaxed);
             let control = Arc::clone(&pane.generation.live_parser_checkpoint);
             let owned = stream.clone();
             let start = Instant::now();
@@ -29160,6 +29163,7 @@ mod tests {
             }
             let secs = start.elapsed().as_secs_f64();
             delivery.join().expect("delivery thread");
+            SYNC_FRAME_RAW_HOLDS_FOR_TEST.store(0, Ordering::Relaxed);
             let (fused, two_stage) = pane.parse_paths();
             eprintln!(
                 "[BENCH] sync frames drain {}: {:.3} s, {:.0} MiB/s, {} fused {} two-stage",
