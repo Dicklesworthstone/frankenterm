@@ -30,8 +30,10 @@ public enum NativeTerminalFonts {
                 .compactMap { UIFont(name: $0, size: 12) }
             if let style {
                 return candidates.first { font in
-                    matches(font.fontName, style)
-                        || matches(CTFontCopyStyleName(CTFontCreateWithName(font.fontName as CFString, 12, nil)) as String, style)
+                    if matches(font.fontName, style) { return true }
+                    let coreFont = CTFontCreateWithName(font.fontName as CFString, 12, nil)
+                    guard let styleName = CTFontCopyName(coreFont, kCTFontStyleNameKey) else { return false }
+                    return matches(styleName as String, style)
                 }.map(face)
             }
             let regular = candidates.first { font in

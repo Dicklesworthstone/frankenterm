@@ -4657,9 +4657,7 @@ private struct WorkspaceKeysSheet: View {
         try? model.workspaces.first(where: { $0.id == workspaceID })?.document()
     }
 
-    var body: some View {
-        let importing = model.credentialImport.flatMap { $0.isRetired ? nil : $0 }
-        let renewal = model.certificateRenewalReview.flatMap { $0.core.workspaceID == workspaceID ? $0 : nil }
+    private var keysNavigation: some View {
         NavigationStack {
             Group {
                 if !model.active {
@@ -4788,6 +4786,12 @@ private struct WorkspaceKeysSheet: View {
                 }
             }
         }
+    }
+
+    private var keysPresentations: some View {
+        let importing = model.credentialImport.flatMap { $0.isRetired ? nil : $0 }
+        let renewal = model.certificateRenewalReview.flatMap { $0.core.workspaceID == workspaceID ? $0 : nil }
+        return keysNavigation
         .interactiveDismissDisabled(model.busy)
         .sheet(item: Binding(get: { importing }, set: { if $0 == nil { importing?.cancel() } })) { controller in
             WorkspaceKeyImportSheet(controller: controller)
@@ -4868,6 +4872,11 @@ private struct WorkspaceKeysSheet: View {
                 }
             }
         }
+    }
+
+    var body: some View {
+        let renewal = model.certificateRenewalReview.flatMap { $0.core.workspaceID == workspaceID ? $0 : nil }
+        keysPresentations
         .confirmationDialog("Check Through Trusted Jump Hosts?",
             isPresented: Binding(get: { hostKeyCheck != nil }, set: { if !$0 { hostKeyCheck = nil } }),
             titleVisibility: .visible, presenting: hostKeyCheck) { review in

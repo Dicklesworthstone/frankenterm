@@ -343,6 +343,15 @@ final class NativeTerminalRenderTests: XCTestCase {
         XCTAssertTrue((0..<shot.height).contains { y in (0..<shot.width).contains { shot.isLight($0, y) } })
     }
 
+    func testExportedStyleNameResolvesTheInstalledItalicFace() throws {
+        let installed = try XCTUnwrap(UIFont(name: "PragmasevkaNF-Italic", size: 12))
+        let request = WorkspaceDocument.Font(family: installed.familyName, face: "Italic",
+                                            pointSize: nil, fallbacks: [], variations: [:])
+        let resolved = NativeTerminalFonts.resolve(request)
+        XCTAssertEqual(resolved.primary.postScriptName, installed.fontName)
+        XCTAssertTrue(resolved.notices.isEmpty)
+    }
+
     func testUnavailableExportedFontUsesTheDisclosedBundledSubstitution() async throws {
         let request = WorkspaceDocument.Font(family: "FrankenTerm-Missing-Font-7FC27D", face: nil,
                                             pointSize: nil, fallbacks: [], variations: [:])
