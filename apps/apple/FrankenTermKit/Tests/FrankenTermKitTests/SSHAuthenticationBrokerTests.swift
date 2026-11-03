@@ -1069,7 +1069,7 @@ final class SSHAuthenticationBrokerTests: XCTestCase {
         await broker.finishKeyboardInteractiveAttempt(selected)
     }
 
-    func testKeyboardInteractiveChallengeBoundsRejectBeforeAnyPrompt() throws {
+    func testKeyboardInteractiveChallengeBoundsRejectBeforeAnyPrompt() async throws {
         let empty: [SSHKeyboardInteractiveChallenge.Prompt] = []
         for round in [UInt32(0), 5, .max] {
             XCTAssertThrowsError(try SSHKeyboardInteractiveChallenge(round: round, name: "", instruction: "", prompts: empty))

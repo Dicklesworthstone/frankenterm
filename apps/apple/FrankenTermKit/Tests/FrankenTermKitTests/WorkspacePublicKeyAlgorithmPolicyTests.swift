@@ -73,7 +73,7 @@ final class WorkspacePublicKeyAlgorithmPolicyTests: XCTestCase {
         return (store, saved)
     }
 
-    func testAbsentEmptyUnknownAndBoundedPoliciesRemainDistinct() throws {
+    func testAbsentEmptyUnknownAndBoundedPoliciesRemainDistinct() async throws {
         let unconstrained = try document(nil)
         XCTAssertFalse(unconstrained.routes[0].publicKeyAlgorithmPolicy.isConstrained)
         XCTAssertTrue(try readiness(unconstrained, support: profile(capabilities: [], signatures: [])).isLocallyReady)
@@ -94,7 +94,7 @@ final class WorkspacePublicKeyAlgorithmPolicyTests: XCTestCase {
         XCTAssertTrue(try readiness(allowed, support: profile(signatures: [])).issues.contains(.credentialAlgorithmUnavailable))
     }
 
-    func testExplicitPasswordRemainsUsableWhenPublicKeyPolicyDeniesEveryKey() throws {
+    func testExplicitPasswordRemainsUsableWhenPublicKeyPolicyDeniesEveryKey() async throws {
         let restricted = try document([]) { workspace in
             var routes = workspace["routes"] as! [[String: Any]]
             routes[0]["authentication_methods"] = ["publickey", "password"]
@@ -116,7 +116,7 @@ final class WorkspacePublicKeyAlgorithmPolicyTests: XCTestCase {
         XCTAssertEqual(detail.usableCredentialIDs, [])
     }
 
-    func testEveryHopKeepsItsOwnPolicyAndCredentialFamily() throws {
+    func testEveryHopKeepsItsOwnPolicyAndCredentialFamily() async throws {
         let fixture = try XCTUnwrap(RSAFixtures.load().keys.first)
         let rsa = try PrivateKeyRecord.fromPEM(Data(fixture.clearPEM.utf8), credentialID: "key", using: crypto)
         let (_, edFingerprint) = try sampleKey(using: crypto)

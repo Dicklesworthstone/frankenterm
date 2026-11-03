@@ -26,7 +26,7 @@ final class OpticalRecordingTests: XCTestCase {
         return try OpticalSender(envelope: envelope, using: crypto)
     }
 
-    func testRecordingAdmitsOnlyBoundedLocalFormatsAndDecodedDimensions() throws {
+    func testRecordingAdmitsOnlyBoundedLocalFormatsAndDecodedDimensions() async throws {
         for ext in ["mp4", "MP4", "mov", "m4v", "png", "apng"] {
             XCTAssertTrue(OpticalRecordingLimits.accepts(URL(fileURLWithPath: "/tmp/transfer.\(ext)")))
         }
@@ -49,7 +49,7 @@ final class OpticalRecordingTests: XCTestCase {
         return header
     }
 
-    func testPNGCanvasPreflightAcceptsCanonicalBoundedHeaderWithoutImageMetadata() throws {
+    func testPNGCanvasPreflightAcceptsCanonicalBoundedHeaderWithoutImageMetadata() async throws {
         let dimensions: [(UInt32, UInt32)] = [(1, 1), (1024, 1024), (3840, 2160), (4096, 2048), (2048, 4096)]
         for (width, height) in dimensions {
             let header = pngCanvasHeader(width: width, height: height)
@@ -60,7 +60,7 @@ final class OpticalRecordingTests: XCTestCase {
         }
     }
 
-    func testPNGCanvasPreflightRejectsTruncationSignatureAndFirstChunkMismatch() throws {
+    func testPNGCanvasPreflightRejectsTruncationSignatureAndFirstChunkMismatch() async throws {
         let valid = pngCanvasHeader(width: 1024, height: 1024)
         for count in 0..<valid.count {
             XCTAssertThrowsError(try OpticalRecordingLimits.checkPNGCanvasHeader(Data(valid.prefix(count)))) { error in
@@ -78,7 +78,7 @@ final class OpticalRecordingTests: XCTestCase {
         XCTAssertThrowsError(try OpticalRecordingLimits.checkPNGCanvasHeader(valid + Data([0])))
     }
 
-    func testPNGCanvasPreflightRejectsZeroOversizedAndHugeUnsignedDimensions() throws {
+    func testPNGCanvasPreflightRejectsZeroOversizedAndHugeUnsignedDimensions() async throws {
         let dimensions: [(UInt32, UInt32)] = [
             (0, 1), (1, 0), (4097, 1), (1, 4097), (4096, 2049), (4096, 4096),
             (0x80000000, 1), (1, 0x80000000), (.max, .max)

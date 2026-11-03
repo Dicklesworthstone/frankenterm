@@ -117,7 +117,7 @@ final class WorkspaceSSHTransportAlgorithmPolicyTests: XCTestCase {
             negotiatedTransport: transport, reviewedTrustIDs: Set(document.hostTrust.map(\.id)), support: support ?? profile())
     }
 
-    func testLiteralBoundsOrderedIntersectionAndCodablePreserveNilVersusDenyAll() throws {
+    func testLiteralBoundsOrderedIntersectionAndCodablePreserveNilVersusDenyAll() async throws {
         let policy = try WorkspaceSSHTransportAlgorithmPolicy(keyExchangeAlgorithms: [otherKEX, kex],
             ciphers: [otherCipher, cipher], macs: [otherMAC, mac])
         XCTAssertEqual(policy.filterKeyExchangeAlgorithms([kex, otherKEX]), [otherKEX, kex])
@@ -136,7 +136,7 @@ final class WorkspaceSSHTransportAlgorithmPolicyTests: XCTestCase {
         }
     }
 
-    func testEverySuppliedNegotiatedNameIsValidatedAndBothDirectionsMustMatch() throws {
+    func testEverySuppliedNegotiatedNameIsValidatedAndBothDirectionsMustMatch() async throws {
         let policy = try WorkspaceSSHTransportAlgorithmPolicy(keyExchangeAlgorithms: [kex], ciphers: [cipher], macs: [mac])
         XCTAssertTrue(policy.permits(evidence())); XCTAssertFalse(policy.permits(nil))
         for invalid in [evidence(kex: otherKEX), evidence(outbound: otherCipher), evidence(inbound: otherCipher),
@@ -154,7 +154,7 @@ final class WorkspaceSSHTransportAlgorithmPolicyTests: XCTestCase {
         XCTAssertFalse(evidence(inbound: otherCipher).isSupported(keyExchangeAlgorithms: [kex], ciphers: [cipher], macs: [mac]))
     }
 
-    func testManifestCapabilityIsImplicitDistinctAndCannotExistWithoutItsPayload() throws {
+    func testManifestCapabilityIsImplicitDistinctAndCannotExistWithoutItsPayload() async throws {
         let original = try document(kex: [kex], ciphers: [cipher], macs: [mac])
         let implicit = try changed(original) { workspace in
             var trusts = workspace["host_trust"] as! [[String: Any]]
@@ -177,7 +177,7 @@ final class WorkspaceSSHTransportAlgorithmPolicyTests: XCTestCase {
         }, "Transport fields cannot masquerade as a host-signature policy.")
     }
 
-    func testReadinessRequiresActualQualifiedAlgorithmsRatherThanOnlyCapability() throws {
+    func testReadinessRequiresActualQualifiedAlgorithmsRatherThanOnlyCapability() async throws {
         let configured = try document(kex: [kex], ciphers: [cipher], macs: [mac])
         XCTAssertTrue(try readiness(configured).isLocallyReady)
         XCTAssertTrue(try readiness(configured, support: profile(capability: false)).issues.contains(.unsupportedRequirement))
@@ -196,7 +196,7 @@ final class WorkspaceSSHTransportAlgorithmPolicyTests: XCTestCase {
         XCTAssertEqual(try verify(legacy, nil, support: profile(capability: false)), .trustedPin)
     }
 
-    func testRawAndCertificateHostChecksRequireTheExactTransportEvidence() throws {
+    func testRawAndCertificateHostChecksRequireTheExactTransportEvidence() async throws {
         let configured = try document(kex: [kex], ciphers: [cipher], macs: [mac])
         XCTAssertEqual(try verify(configured, evidence()), .trustedPin)
         for refused in [nil, evidence(inbound: otherCipher), evidence(inboundMAC: otherMAC)] as [SSHTransportAlgorithms?] {
@@ -227,7 +227,7 @@ final class WorkspaceSSHTransportAlgorithmPolicyTests: XCTestCase {
         }
     }
 
-    func testSameScopeAliasesConjoinTransportWhileOtherPortsRemainIndependent() throws {
+    func testSameScopeAliasesConjoinTransportWhileOtherPortsRemainIndependent() async throws {
         let configured = try document(ciphers: [cipher, otherCipher]) { workspace in
             var trusts = workspace["host_trust"] as! [[String: Any]], alias = trusts[0]
             alias["id"] = "same-scope"; alias["ciphers"] = [otherCipher]

@@ -423,7 +423,7 @@ final class WorkspaceMultiGroupExportTests: XCTestCase {
         return try WorkspaceDocument(data: JSONSerialization.data(withJSONObject: root, options: [.sortedKeys]))
     }
 
-    func testCertificateAuthorityPreviewAndSelectionPreserveDenialsAndOtherRequiredPolicy() throws {
+    func testCertificateAuthorityPreviewAndSelectionPreserveDenialsAndOtherRequiredPolicy() async throws {
         let authority = try WorkspaceDocument.HostKey(algorithm: "ssh-ed25519",
             fingerprint: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
         let other = try WorkspaceDocument.HostKey(algorithm: "ssh-ed25519",
@@ -546,7 +546,7 @@ final class WorkspaceMultiGroupExportTests: XCTestCase {
         XCTAssertNil(installed.raw.range(of: Data("unused.invalid".utf8)))
     }
 
-    func testMachineSubsetKeepsSameEndpointDenialsAndRequiredSourceFindings() throws {
+    func testMachineSubsetKeepsSameEndpointDenialsAndRequiredSourceFindings() async throws {
         let source = try fixture { workspace in
             var trusts = workspace["host_trust"] as! [[String: Any]], detached = trusts[2]
             detached["id"] = "detached-negative"
@@ -684,7 +684,7 @@ final class WorkspaceMultiGroupExportTests: XCTestCase {
         XCTAssertEqual(alternativeReview.missingIdentityRouteIDs, ["route"])
     }
 
-    func testSourceFindingsSurviveSelectedEncryptedAndPublicExports() throws {
+    func testSourceFindingsSurviveSelectedEncryptedAndPublicExports() async throws {
         let source = try fixture()
         let findings: [AirGapArchive.Portability] = [
             .init(entityID: "hop-one", setting: "ssh_config.proxy", disposition: 1, reason: "The source proxy requires a supported adapter."),
@@ -718,7 +718,7 @@ final class WorkspaceMultiGroupExportTests: XCTestCase {
         XCTAssertThrowsError(try selection.publicDocument(bundleID: source.bundleID))
     }
 
-    func testSourceReportsAreValidatedBeforeFilteringAndCannotDemoteBlockers() throws {
+    func testSourceReportsAreValidatedBeforeFilteringAndCannotDemoteBlockers() async throws {
         let source = try fixture { workspace in
             var routes = workspace["routes"] as! [[String: Any]]
             let index = routes.firstIndex { $0["id"] as? String == "alternate" }!
@@ -738,7 +738,7 @@ final class WorkspaceMultiGroupExportTests: XCTestCase {
         XCTAssertEqual(review.findings.filter { $0.entityID == advisory.entityID && $0.setting == advisory.setting }.count, 1)
     }
 
-    func testMissingDestinationSessionPolicyDoesNotDemandAPTYForTransitHops() throws {
+    func testMissingDestinationSessionPolicyDoesNotDemandAPTYForTransitHops() async throws {
         var root = try StrictJSON.decode(fixture().raw).object()
         var content = try root.required("workspace").object()
         content["routes"] = .array(try content.required("routes").array().map { value in

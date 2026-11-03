@@ -186,7 +186,7 @@ final class TerminalHistorySearchTests: XCTestCase {
             } catch { XCTAssertEqual(error as? TerminalHistorySearchError, .invalidQuery) }
         }
     }
-    func testPageRejectsOverflowOverlapAndOutOfOrderCellGeometry() throws {
+    func testPageRejectsOverflowOverlapAndOutOfOrderCellGeometry() async throws {
         let source = UUID(), valid = try row("x")
         XCTAssertThrowsError(try TerminalSearchPage(source: source, geometryRevision: 1, sequence: 1,
             alternateScreen: false, columns: 20, first: 0, live: Int64.max, top: 0, rows: [valid, valid]))

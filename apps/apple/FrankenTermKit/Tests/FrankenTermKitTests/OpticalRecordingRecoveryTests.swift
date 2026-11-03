@@ -20,7 +20,7 @@ final class OpticalRecordingRecoveryTests: XCTestCase {
         return fields.joined(separator: "/")
     }
 
-    func testPartialRecordingsRecoverExactCiphertextAndGenerateFreshTargetedRepair() throws {
+    func testPartialRecordingsRecoverExactCiphertextAndGenerateFreshTargetedRepair() async throws {
         let bytes = try envelope(size: 40_000)
         let sender = try OpticalSender(envelope: bytes, using: crypto)
         XCTAssertEqual(sender.identity.pageCount, 2)
@@ -79,7 +79,7 @@ final class OpticalRecordingRecoveryTests: XCTestCase {
         XCTAssertEqual(try recovery.envelope(using: crypto), bytes)
     }
 
-    func testSameFrameCompetingSourcesRejectBeforeSelectingEitherTransfer() throws {
+    func testSameFrameCompetingSourcesRejectBeforeSelectingEitherTransfer() async throws {
         let a = try OpticalSender(envelope: envelope(marker: 51), using: crypto)
         let b = try OpticalSender(envelope: envelope(marker: 52), using: crypto)
         var recovery = OpticalRecordingRecovery()
@@ -95,7 +95,7 @@ final class OpticalRecordingRecoveryTests: XCTestCase {
         XCTAssertEqual(recovery.progress.identity, a.identity)
     }
 
-    func testLaterForeignFramesNeverSwitchOrPartiallyEnterTheSelectedTransfer() throws {
+    func testLaterForeignFramesNeverSwitchOrPartiallyEnterTheSelectedTransfer() async throws {
         let a = try OpticalSender(envelope: envelope(size: 100, marker: 53), using: crypto)
         // Reusing the same transfer ID does not weaken the full identity check.
         let b = try OpticalSender(envelope: envelope(size: 150, marker: 53), using: crypto)
@@ -116,7 +116,7 @@ final class OpticalRecordingRecoveryTests: XCTestCase {
         XCTAssertEqual(recovery.progress.identity, a.identity)
     }
 
-    func testUnrelatedCodesMalformedWrappersAndOversizedTextDoNotSelectOrUnlock() throws {
+    func testUnrelatedCodesMalformedWrappersAndOversizedTextDoNotSelectOrUnlock() async throws {
         let sender = try OpticalSender(envelope: envelope(), using: crypto)
         let valid = try sender.frame(page: 0, sequence: 1, using: crypto)
         var recovery = OpticalRecordingRecovery()
@@ -134,7 +134,7 @@ final class OpticalRecordingRecoveryTests: XCTestCase {
         XCTAssertEqual(recovery.progress.receivedParts, 1)
     }
 
-    func testCancelledAndDiscardedReaderLeasesCannotContaminateResumedRecovery() throws {
+    func testCancelledAndDiscardedReaderLeasesCannotContaminateResumedRecovery() async throws {
         let sender = try OpticalSender(envelope: envelope(), using: crypto)
         let other = try OpticalSender(envelope: envelope(marker: 54), using: crypto)
         var recovery = OpticalRecordingRecovery()
@@ -185,7 +185,7 @@ final class OpticalRecordingRecoveryTests: XCTestCase {
         XCTAssertEqual(resumed.progress.receivedParts, before.receivedParts + 1)
     }
 
-    func testIncorrectPageDigestNeverPublishesAndGoodRecordingCanRepairPage() throws {
+    func testIncorrectPageDigestNeverPublishesAndGoodRecordingCanRepairPage() async throws {
         let bytes = try envelope()
         let sender = try OpticalSender(envelope: bytes, using: crypto)
         let count = try sender.sourcePartCount(page: 0)
@@ -213,7 +213,7 @@ final class OpticalRecordingRecoveryTests: XCTestCase {
         XCTAssertEqual(try recovery.envelope(using: crypto), bytes)
     }
 
-    func testChangedPageDigestDoesNotKeepPoisonedEquations() throws {
+    func testChangedPageDigestDoesNotKeepPoisonedEquations() async throws {
         let sender = try OpticalSender(envelope: envelope(), using: crypto)
         var recovery = OpticalRecordingRecovery()
         let recording = try recovery.beginRecording()
@@ -227,7 +227,7 @@ final class OpticalRecordingRecoveryTests: XCTestCase {
         XCTAssertEqual(recovery.progress.identity, sender.identity)
     }
 
-    func testWrongWholeDigestOrHeaderTransferIDCannotBecomeComplete() throws {
+    func testWrongWholeDigestOrHeaderTransferIDCannotBecomeComplete() async throws {
         let sender = try OpticalSender(envelope: envelope(), using: crypto)
         let count = try sender.sourcePartCount(page: 0)
         for (field, length) in [(4, 64), (1, 32)] {
@@ -249,7 +249,7 @@ final class OpticalRecordingRecoveryTests: XCTestCase {
         }
     }
 
-    func testRecipientBoundRecordingReopensWithoutReceivingARecipientSecret() throws {
+    func testRecipientBoundRecordingReopensWithoutReceivingARecipientSecret() async throws {
         let recipient = try RecipientSession(using: crypto)
         let bytes = try FTAG.sealArchiveBytes(Data("synthetic opaque recipient archive".utf8),
             recipient: recipient.request, transferID: Data(repeating: 71, count: 16), compress: false, using: crypto)

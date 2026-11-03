@@ -57,7 +57,7 @@ final class NativeTerminalNavigationTests: XCTestCase {
         XCTAssertEqual(coordinator.phase, .suspended)
     }
 
-    func testFailedObserverReservationDoesNotInstallCanvasRecognizer() throws {
+    func testFailedObserverReservationDoesNotInstallCanvasRecognizer() async throws {
         let coordinator = try coordinator(), canvas = UIView()
         var tokens: [UUID] = []
         for _ in 0..<16 { tokens.append(try coordinator.observe {}) }
@@ -70,7 +70,7 @@ final class NativeTerminalNavigationTests: XCTestCase {
         controls.retire()
     }
 
-    func testCanvasInteractionCanDeclineNavigationWithoutRemovingRail() throws {
+    func testCanvasInteractionCanDeclineNavigationWithoutRemovingRail() async throws {
         let coordinator = try coordinator(); coordinator.resume()
         let canvas = UIView(frame: CGRect(x: 0, y: 0, width: 320, height: 600))
         var allowed = false

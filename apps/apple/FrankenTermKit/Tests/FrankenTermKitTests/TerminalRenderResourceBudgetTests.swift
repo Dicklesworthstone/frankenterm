@@ -4,7 +4,7 @@ import XCTest
 
 @MainActor
 final class TerminalRenderResourceBudgetTests: XCTestCase {
-    func testLowPowerCapsPresentationAndStopsIdleBlinkingAtEveryTemperature() {
+    func testLowPowerCapsPresentationAndStopsIdleBlinkingAtEveryTemperature() async {
         for state in TerminalRenderPowerPolicy.ThermalState.allCases {
             let ordinary = TerminalRenderPowerPolicy(thermalState: state, lowPower: false)
             let conserving = TerminalRenderPowerPolicy(thermalState: state, lowPower: true)
@@ -15,7 +15,7 @@ final class TerminalRenderResourceBudgetTests: XCTestCase {
         }
     }
 
-    func testIncreasingHeatNeverIncreasesWorkAndCriticalHeatStillPresentsOutput() {
+    func testIncreasingHeatNeverIncreasesWorkAndCriticalHeatStillPresentsOutput() async {
         for lowPower in [false, true] {
             let policies = TerminalRenderPowerPolicy.ThermalState.allCases.map {
                 TerminalRenderPowerPolicy(thermalState: $0, lowPower: lowPower)
@@ -36,7 +36,7 @@ final class TerminalRenderResourceBudgetTests: XCTestCase {
         }
     }
 
-    func testBatteryAndThermalConstraintsMustBothClearBeforeBlinkingResumes() {
+    func testBatteryAndThermalConstraintsMustBothClearBeforeBlinkingResumes() async {
         let normal = TerminalRenderPowerPolicy(thermalState: .nominal, lowPower: false)
         XCTAssertEqual(normal.preferredFramesPerSecond, 60)
         XCTAssertTrue(normal.animatesBlink)
@@ -48,7 +48,7 @@ final class TerminalRenderResourceBudgetTests: XCTestCase {
         XCTAssertFalse(stillConserving.animatesBlink)
     }
 
-    func testExactCapacityNeverGrantsAnExtraResource() {
+    func testExactCapacityNeverGrantsAnExtraResource() async {
         let budget = TerminalRenderResourceBudget(maximumResources: 6) {}
         var leases = (0..<6).compactMap { _ in budget.acquire() }
         XCTAssertEqual(leases.count, 6); XCTAssertEqual(budget.retainedResources, 6)
@@ -60,7 +60,7 @@ final class TerminalRenderResourceBudgetTests: XCTestCase {
         leases.removeAll(); XCTAssertEqual(budget.retainedResources, 0)
     }
 
-    func testCacheEvictionDoesNotReleaseCommandOwnedLease() {
+    func testCacheEvictionDoesNotReleaseCommandOwnedLease() async {
         let budget = TerminalRenderResourceBudget(maximumResources: 1) {}
         var cache = [0: budget.acquire()!]
         var submitted = cache[0]
@@ -73,7 +73,7 @@ final class TerminalRenderResourceBudgetTests: XCTestCase {
         XCTAssertNotNil(budget.acquire())
     }
 
-    func testMemoryPressureReclaimsIdleSlotsButPreservesPreparedAndSubmittedOwners() {
+    func testMemoryPressureReclaimsIdleSlotsButPreservesPreparedAndSubmittedOwners() async {
         let budget = TerminalRenderResourceBudget(maximumResources: 3) {}
         var cache = Dictionary(uniqueKeysWithValues: (0..<3).map { ($0, budget.acquire()!) })
         var prepared = cache[0], submitted = cache[1]
@@ -132,7 +132,7 @@ final class TerminalRenderResourceBudgetTests: XCTestCase {
         budget = nil
     }
 
-    func testReleaseBeforeWaiterInstallationIsVisibleInCapacityCheck() {
+    func testReleaseBeforeWaiterInstallationIsVisibleInCapacityCheck() async {
         let budget = TerminalRenderResourceBudget(maximumResources: 1) {}
         var owner = budget.acquire()
         XCTAssertNotNil(owner); XCTAssertNil(budget.acquire())
@@ -145,7 +145,7 @@ final class TerminalRenderResourceBudgetTests: XCTestCase {
         withExtendedLifetime(resumed) { XCTAssertFalse(budget.hasCapacity) }
     }
 
-    func testRepeatedFleetEvictionReusesBudgetWithoutRaisingItsLimit() {
+    func testRepeatedFleetEvictionReusesBudgetWithoutRaisingItsLimit() async {
         let budget = TerminalRenderResourceBudget(maximumResources: 6) {}
         var submitted: [TerminalRenderResourceBudget.Lease] = []
         for _ in 0..<200 {
@@ -185,7 +185,7 @@ final class TerminalRenderResourceBudgetTests: XCTestCase {
         XCTAssertEqual(budget.retainedResources, 0)
     }
 
-    func testDrawableRecoveryCoalescesRequestsAndStopsAfterABoundedBurst() {
+    func testDrawableRecoveryCoalescesRequestsAndStopsAfterABoundedBurst() async {
         var recovery = TerminalDrawableRetry()
         let start = ContinuousClock.now
         var now = start, previousDelay: TimeInterval = 0
@@ -221,7 +221,7 @@ final class TerminalRenderResourceBudgetTests: XCTestCase {
         }
     }
 
-    func testLateDrawableWakeExhaustsInsteadOfRenderingAfterItsDeadline() {
+    func testLateDrawableWakeExhaustsInsteadOfRenderingAfterItsDeadline() async {
         var recovery = TerminalDrawableRetry()
         let now = ContinuousClock.now
         guard case let .schedule(id, _) = recovery.unavailable(at: now) else {
@@ -234,7 +234,7 @@ final class TerminalRenderResourceBudgetTests: XCTestCase {
         XCTAssertEqual(recovery.unavailable(at: now.advanced(by: .seconds(4))), .exhausted)
     }
 
-    func testDrawableLifecycleResetCannotReviveAnEarlierTimerOrConsumeANewerOne() {
+    func testDrawableLifecycleResetCannotReviveAnEarlierTimerOrConsumeANewerOne() async {
         var recovery = TerminalDrawableRetry()
         let now = ContinuousClock.now
         guard case let .schedule(retired, _) = recovery.unavailable(at: now) else {
@@ -254,7 +254,7 @@ final class TerminalRenderResourceBudgetTests: XCTestCase {
         XCTAssertFalse(recovery.isWaiting); XCTAssertFalse(recovery.isExhausted)
     }
 
-    func testTimeSpentWithoutADrawableCountsAgainstTheWholeRecoveryEpisode() {
+    func testTimeSpentWithoutADrawableCountsAgainstTheWholeRecoveryEpisode() async {
         var recovery = TerminalDrawableRetry()
         let now = ContinuousClock.now
         guard case let .schedule(id, delay) = recovery.unavailable(at: now) else {

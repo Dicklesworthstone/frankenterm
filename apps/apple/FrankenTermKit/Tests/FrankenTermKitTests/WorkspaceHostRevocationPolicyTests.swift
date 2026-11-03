@@ -131,7 +131,7 @@ final class WorkspaceHostRevocationPolicyTests: XCTestCase {
         catch { XCTAssertEqual(error as? SSHAuthenticationError, .denied, file: file, line: line) }
     }
 
-    func testManifestReferencesRequireBoundedCompleteSnapshotsAndCapability() throws {
+    func testManifestReferencesRequireBoundedCompleteSnapshotsAndCapability() async throws {
         let snapshot = try source("empty-snapshot"), original = try document(sources: [snapshot])
         XCTAssertEqual(original.hostRevocationSources, [snapshot])
         XCTAssertEqual(try original.hostRevocationSources(forTrustID: "trust"), [snapshot])
@@ -186,7 +186,7 @@ final class WorkspaceHostRevocationPolicyTests: XCTestCase {
         XCTAssertEqual(accepted.rawHostIdentity, actual)
     }
 
-    func testCertificateSerialKeyIDSubjectAndIssuerDenialsPrecedePositiveCATrust() throws {
+    func testCertificateSerialKeyIDSubjectAndIssuerDenialsPrecedePositiveCATrust() async throws {
         let id = Data([0xff, 0x65, 0xcc, 0x81])
         let certificate = try SSHHostCertificate(blob: workspaceTestHostCertificate(serial: 42, keyID: id))
         let differentCA = try SSHHostCertificate(blob: workspaceTestHostCertificate(authoritySeed: Data(64..<96))).authority
@@ -326,7 +326,7 @@ final class WorkspaceHostRevocationPolicyTests: XCTestCase {
         XCTAssertTrue(otherWorkspaceSources.isEmpty)
     }
 
-    func testCurrentAliasesUnionPoliciesOnlyWithinTheCanonicalTrustScope() throws {
+    func testCurrentAliasesUnionPoliciesOnlyWithinTheCanonicalTrustScope() async throws {
         let snapshot = try source("alias-denial", policy: Policy(revokedSHA256: [Data(SHA256.hash(data: identity().blob))]))
         let original = try document(sources: [snapshot])
         let aliases = try changed(original) { workspace in
@@ -492,7 +492,7 @@ final class WorkspaceHostRevocationPolicyTests: XCTestCase {
         XCTAssertEqual(f.disk.bytes(.catalog), bytes); XCTAssertEqual(f.vault.creates, 1)
     }
 
-    func testResourcePortabilityFollowsAliasScopeAndJumpDependenciesOnly() throws {
+    func testResourcePortabilityFollowsAliasScopeAndJumpDependenciesOnly() async throws {
         let required = try source("required-hop-source"), unused = try source("unreferenced-source")
         let graph = try document(sources: [required, unused]) { workspace in
             var trusts = workspace["host_trust"] as! [[String: Any]], routes = workspace["routes"] as! [[String: Any]]

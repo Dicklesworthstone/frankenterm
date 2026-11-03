@@ -221,7 +221,7 @@ final class TransferCompletionTests: XCTestCase {
 
     /// The proof binds both the transfer and its decrypted manifest; the tag
     /// only finds the Mac and is what the animation already shows.
-    func testTheProofNeedsTheDecryptedManifestAndThisTransfer() {
+    func testTheProofNeedsTheDecryptedManifestAndThisTransfer() async {
         XCTAssertEqual(TransferCompletion.tag(arrival), "A5A5A5A5A5A5A5A5")
         let proof = TransferCompletion.proof(arrival)
         XCTAssertEqual(proof.count, 32)

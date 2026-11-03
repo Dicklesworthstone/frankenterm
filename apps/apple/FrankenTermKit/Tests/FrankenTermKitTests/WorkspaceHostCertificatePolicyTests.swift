@@ -149,7 +149,7 @@ final class WorkspaceHostCertificatePolicyTests: XCTestCase {
         }
     }
 
-    func testSignedAuthorityOnlyTrustRequiresReviewAndQualifiedCertificateTransport() throws {
+    func testSignedAuthorityOnlyTrustRequiresReviewAndQualifiedCertificateTransport() async throws {
         let certificate = try SSHHostCertificate(blob: workspaceTestHostCertificate())
         let document = try document(certificate), trust = try XCTUnwrap(document.hostTrust.first)
         XCTAssertTrue(trust.pins.isEmpty)
@@ -180,7 +180,7 @@ final class WorkspaceHostCertificatePolicyTests: XCTestCase {
         XCTAssertTrue(detail.issues.isEmpty)
     }
 
-    func testCertificateEvidenceMustMatchTheExactPresentedBlobAndAuthority() throws {
+    func testCertificateEvidenceMustMatchTheExactPresentedBlobAndAuthority() async throws {
         let certificate = try SSHHostCertificate(blob: workspaceTestHostCertificate())
         let renewed = try SSHHostCertificate(blob: workspaceTestHostCertificate(serial: 2))
         let otherSubject = try SSHHostCertificate(blob: workspaceTestHostCertificate(subjectSeed: Data(repeating: 7, count: 32)))
@@ -207,7 +207,7 @@ final class WorkspaceHostCertificatePolicyTests: XCTestCase {
         XCTAssertThrowsError(try SSHHostCertificate(blob: forged), "a supplied CA label cannot turn an invalid signature into a witness")
     }
 
-    func testAliasPrincipalUsesOriginalBytesWhileDenialsUseCanonicalScope() throws {
+    func testAliasPrincipalUsesOriginalBytesWhileDenialsUseCanonicalScope() async throws {
         let matching = try SSHHostCertificate(blob: workspaceTestHostCertificate(principals: ["Verified-Alias."]))
         let aliasDocument = try document(matching) { workspace in
             var routes = workspace["routes"] as! [[String: Any]], trusts = workspace["host_trust"] as! [[String: Any]]
@@ -233,7 +233,7 @@ final class WorkspaceHostCertificatePolicyTests: XCTestCase {
             revokedHostKeysByTrustScope: [canonical.hostTrust[0].canonicalTrustScope: [key(matching.authority)]]), .revoked)
     }
 
-    func testHostnamePrincipalDoesNotLoseTheOriginalTrailingDot() throws {
+    func testHostnamePrincipalDoesNotLoseTheOriginalTrailingDot() async throws {
         let dotted = try SSHHostCertificate(blob: workspaceTestHostCertificate(principals: ["host.example.invalid."]))
         let document = try document(dotted) { workspace in
             var routes = workspace["routes"] as! [[String: Any]], trusts = workspace["host_trust"] as! [[String: Any]]
@@ -246,7 +246,7 @@ final class WorkspaceHostCertificatePolicyTests: XCTestCase {
         XCTAssertEqual(try verify(document, SSHHostCertificate(blob: workspaceTestHostCertificate())), .unsupportedCertificate)
     }
 
-    func testAuthorityIsNeverBorrowedFromAnotherPortOrTrustRecord() throws {
+    func testAuthorityIsNeverBorrowedFromAnotherPortOrTrustRecord() async throws {
         let certificate = try SSHHostCertificate(blob: workspaceTestHostCertificate())
         for otherPort in [22, 2222] {
             let scoped = try document(certificate) { workspace in
@@ -297,7 +297,7 @@ final class WorkspaceHostCertificatePolicyTests: XCTestCase {
         }, "raw-pin workspaces retain their existing canonical endpoint semantics")
     }
 
-    func testMixedPinsAndAuthoritiesVerifySeparatelyAndRevocationNeverFallsBack() throws {
+    func testMixedPinsAndAuthoritiesVerifySeparatelyAndRevocationNeverFallsBack() async throws {
         let certificate = try SSHHostCertificate(blob: workspaceTestHostCertificate())
         let subject = try key(certificate.subject), authority = try key(certificate.authority)
         let mixed = try document(certificate, pins: [subject])
@@ -319,7 +319,7 @@ final class WorkspaceHostCertificatePolicyTests: XCTestCase {
         XCTAssertEqual(try verify(subjectRevoked, certificate), .revoked)
     }
 
-    func testNegativeAuthoritySubjectAndCertificateWinBeforeQualificationOrReview() throws {
+    func testNegativeAuthoritySubjectAndCertificateWinBeforeQualificationOrReview() async throws {
         let certificate = try SSHHostCertificate(blob: workspaceTestHostCertificate())
         let source = try document(certificate)
         for revoked in try [key(certificate.authority), key(certificate.subject), key(certificate)] {

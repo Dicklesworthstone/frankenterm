@@ -154,7 +154,7 @@ final class WorkspaceHostAlgorithmPolicyTests: XCTestCase {
         return try SSHHostCertificate(blob: XCTUnwrap(Data(base64Encoded: String(line.split(separator: " ")[1]))))
     }
 
-    func testStrictSchemaPreservesUnconstrainedDenyAllAndOrderedLiteralPolicy() throws {
+    func testStrictSchemaPreservesUnconstrainedDenyAllAndOrderedLiteralPolicy() async throws {
         let unrestricted = try document(), denied = try document(host: []), ordered = try document(host: ["rsa-sha2-256", "rsa-sha2-512"])
         XCTAssertNil(unrestricted.hostTrust[0].hostKeyAlgorithms)
         XCTAssertEqual(denied.hostTrust[0].hostKeyAlgorithms, [])
@@ -181,7 +181,7 @@ final class WorkspaceHostAlgorithmPolicyTests: XCTestCase {
         })
     }
 
-    func testRSAHostPolicyRequiresExactQualifiedNegotiatedSignatureNotBlobName() throws {
+    func testRSAHostPolicyRequiresExactQualifiedNegotiatedSignatureNotBlobName() async throws {
         let document = try document(host: ["rsa-sha2-512"])
         XCTAssertTrue(try readiness(document).isLocallyReady)
         XCTAssertEqual(try verify(document, signature: "rsa-sha2-512"), .trustedPin)
@@ -200,7 +200,7 @@ final class WorkspaceHostAlgorithmPolicyTests: XCTestCase {
         XCTAssertEqual(try verify(self.document(), signature: nil), .trustedPin, "legacy unqualified manifests keep existing behavior")
     }
 
-    func testSignedCertificatePolicyChecksActualCASignatureAndKeepsRawTrustIndependent() throws {
+    func testSignedCertificatePolicyChecksActualCASignatureAndKeepsRawTrustIndependent() async throws {
         let rsa256 = try signedFixture("rsa-by-rsa-sha256"), rsa512 = try signedFixture("ed25519-by-rsa-sha512")
         XCTAssertEqual(rsa256.authority.algorithm, "ssh-rsa"); XCTAssertEqual(rsa512.authority.algorithm, "ssh-rsa")
         XCTAssertEqual(rsa256.signatureAlgorithm, "rsa-sha2-256"); XCTAssertEqual(rsa512.signatureAlgorithm, "rsa-sha2-512")
@@ -223,7 +223,7 @@ final class WorkspaceHostAlgorithmPolicyTests: XCTestCase {
         XCTAssertFalse(try readiness(document(ca: [], certificate: rsa512, rawPins: false)).isLocallyReady)
     }
 
-    func testCurrentAliasPoliciesConjoinOnlyWithinExactCanonicalTrustScope() throws {
+    func testCurrentAliasPoliciesConjoinOnlyWithinExactCanonicalTrustScope() async throws {
         let document = try document(host: ["rsa-sha2-512", "rsa-sha2-256"]) { workspace in
             var trusts = workspace["host_trust"] as! [[String: Any]], alias = trusts[0]
             alias["id"] = "same-scope"; alias["host_key_algorithms"] = ["rsa-sha2-256"]
