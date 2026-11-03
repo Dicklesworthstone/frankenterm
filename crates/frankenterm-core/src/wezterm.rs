@@ -6321,12 +6321,19 @@ mod tests {
             let crate::Error::Wezterm(WeztermError::MuxRejection(rejection)) = error else {
                 panic!("pre-effect refusal must retain typed authority");
             };
-            // The pool conservatively marks an admitted operation uncertain,
-            // even for a remote refusal. Preserve that existing authority:
+            // The pool keeps a validated remote NOT_APPLIED refusal
+            // determinate (532db2676), as a single operation reports it:
             // without an acknowledged body, there is no composite promotion.
             assert_eq!(
                 rejection,
-                MuxRejection::indeterminate(MuxOperation::SendText, None)
+                MuxRejection {
+                    code: MuxRejectionCode::PolicyRejected,
+                    operation: MuxOperation::SendText,
+                    object: None,
+                    effect: MuxEffectCertainty::NotApplied,
+                    retry: MuxRetryAuthority::Never,
+                },
+                "{text:?} no_paste={no_paste} no_newline={no_newline} {fault:?}"
             );
             assert!(rejection.has_consistent_authority());
             assert_eq!(trace.requests, vec![request]);
