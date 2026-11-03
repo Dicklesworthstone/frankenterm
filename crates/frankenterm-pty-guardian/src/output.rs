@@ -12775,6 +12775,80 @@ fn open_private_file_read_only_at_identity(
     Ok(file)
 }
 
+/// Whether `path` still names the exact file `identity` pinned, from one
+/// no-follow stat. Opening the file only to fstat it was most of what replay
+/// Opens and journal authority checks cost on macOS (ft-6wm86). The stat names
+/// the same object, a symbolic link fails as the no-follow open failed, and a
+/// missing name is still `NotFound`.
+#[cfg(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+))]
+fn validate_file_identity_at(
+    directory: &File,
+    directory_path: &Path,
+    path: &Path,
+    identity: FileIdentity,
+) -> Result<(), GuardianOutputError> {
+    let changed = || {
+        GuardianOutputError::FilesystemAuthority(
+            "guardian output read-only descriptor-relative file identity changed",
+        )
+    };
+    let name = output_child_name(directory_path, path)?;
+    let metadata = rustix::fs::statat(directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|error| {
+            GuardianOutputError::io(
+                "output-private-file-identity-at",
+                std::io::Error::from(error),
+            )
+        })?;
+    let file_type = rustix::fs::FileType::from_raw_mode(metadata.st_mode);
+    if file_type == rustix::fs::FileType::Symlink {
+        return Err(GuardianOutputError::io(
+            "output-private-file-identity-at",
+            std::io::Error::from_raw_os_error(libc::ELOOP),
+        ));
+    }
+    let device = u64::try_from(metadata.st_dev).map_err(|_| changed())?;
+    let inode = u64::try_from(metadata.st_ino).map_err(|_| changed())?;
+    let len = u64::try_from(metadata.st_size).map_err(|_| changed())?;
+    let mode = u32::from(metadata.st_mode);
+    let owner = u32::try_from(metadata.st_uid).map_err(|_| changed())?;
+    let links = u64::from(metadata.st_nlink);
+    validate_private_file_fields(
+        file_type == rustix::fs::FileType::RegularFile,
+        owner,
+        mode,
+        links,
+        len,
+        identity.expected_len,
+    )?;
+    if identity.device != device
+        || identity.inode != inode
+        || identity.mode != mode
+        || identity.owner != owner
+        || identity.links != links
+    {
+        return Err(changed());
+    }
+    Ok(())
+}
+
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+)))]
 fn validate_file_identity_at(
     directory: &File,
     directory_path: &Path,
@@ -13008,12 +13082,29 @@ fn validate_private_file_metadata(
     metadata: &Metadata,
     expected_len: Option<u64>,
 ) -> Result<(), GuardianOutputError> {
-    if !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.uid() != geteuid().as_raw()
-        || metadata.mode() & 0o777 != 0o600
-        || metadata.nlink() != 1
-        || expected_len.is_some_and(|expected| expected != metadata.len())
+    validate_private_file_fields(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        metadata.uid(),
+        metadata.mode(),
+        metadata.nlink(),
+        metadata.len(),
+        expected_len,
+    )
+}
+
+fn validate_private_file_fields(
+    regular: bool,
+    owner: u32,
+    mode: u32,
+    links: u64,
+    len: u64,
+    expected_len: Option<u64>,
+) -> Result<(), GuardianOutputError> {
+    if !regular
+        || owner != geteuid().as_raw()
+        || mode & 0o777 != 0o600
+        || links != 1
+        || expected_len.is_some_and(|expected| expected != len)
     {
         return Err(GuardianOutputError::FilesystemAuthority(
             "output files must be current-user mode-0600 single-link regular files with the exact expected length",
@@ -24849,6 +24940,81 @@ mod tests {
                 .join("descriptor-bound-artifact")
                 .exists()
         );
+        Ok(())
+    }
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+    ))]
+    #[test]
+    fn file_identity_check_refuses_each_drift_the_no_follow_open_refused()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // validate_file_identity_at stats the name instead of opening it
+        // (ft-6wm86); every case here is one the open-based check refused.
+        let parent = kept_private_directory("ft-guardian-output-identity-stat-")?;
+        let output_directory = parent.join(OUTPUT_DIRECTORY_NAME);
+        std::fs::create_dir(&output_directory)?;
+        std::fs::set_permissions(&output_directory, std::fs::Permissions::from_mode(0o700))?;
+        let pinned = open_directory_no_follow(&output_directory)?;
+        let path = output_directory.join("identity-artifact");
+        let mut artifact = create_private_file_new_at(&pinned, &output_directory, &path)?;
+        artifact.write_all(b"identity")?;
+        artifact.sync_all()?;
+        let identity = FileIdentity::capture(&artifact.metadata()?, Some(8));
+        let check =
+            |identity| validate_file_identity_at(&pinned, &output_directory, &path, identity);
+        check(identity)?;
+        check(FileIdentity {
+            expected_len: None,
+            ..identity
+        })?;
+        assert!(matches!(
+            check(FileIdentity {
+                expected_len: Some(9),
+                ..identity
+            }),
+            Err(GuardianOutputError::FilesystemAuthority(_))
+        ));
+
+        // A symbolic link to the very same file.
+        let retained = output_directory.join("identity-artifact-retained");
+        std::fs::rename(&path, &retained)?;
+        symlink(&retained, &path)?;
+        assert!(matches!(
+            check(identity),
+            Err(GuardianOutputError::Io { source, .. }) if source.raw_os_error() == Some(libc::ELOOP)
+        ));
+
+        // A missing name still reads as reclaimed.
+        std::fs::rename(&path, output_directory.join("identity-artifact-symlink"))?;
+        let missing = check(identity).expect_err("a missing name fails the check");
+        assert!(output_name_was_reclaimed(&missing));
+
+        // A second link to the pinned file.
+        hard_link(&retained, &path)?;
+        assert!(matches!(
+            check(identity),
+            Err(GuardianOutputError::FilesystemAuthority(_))
+        ));
+
+        // A different file with the same bytes under the same name.
+        std::fs::rename(
+            &path,
+            output_directory.join("identity-artifact-second-link"),
+        )?;
+        let mut replacement = create_private_file_new_at(&pinned, &output_directory, &path)?;
+        replacement.write_all(b"identity")?;
+        replacement.sync_all()?;
+        assert!(matches!(
+            check(identity),
+            Err(GuardianOutputError::FilesystemAuthority(_))
+        ));
         Ok(())
     }
 
