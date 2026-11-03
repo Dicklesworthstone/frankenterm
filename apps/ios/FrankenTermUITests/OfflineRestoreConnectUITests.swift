@@ -114,8 +114,17 @@ final class OfflineRestoreConnectUITests: XCTestCase {
 
     /// A machine's chip in the strip, by name and state.
     @MainActor
-    private func chip(_ app: XCUIApplication, _ machine: String, _ state: String) -> XCUIElement {
-        app.buttons["\(machine), \(state)"].firstMatch
+    private func chip(_ app: XCUIApplication, _ machine: String, _ state: String,
+                      attention: String? = nil) -> XCUIElement {
+        let status = "\(machine), \(state)"
+        // Recovery attention is appended to the accessible label. Match the
+        // complete machine/state fields, retaining any additional warning.
+        let stateMatch = NSPredicate(format: "label == %@ OR label BEGINSWITH %@", status, status + ", ")
+        guard let attention else { return app.buttons.matching(stateMatch).firstMatch }
+        let attentionMatch = NSPredicate(format: "label ENDSWITH %@ OR label CONTAINS %@",
+                                         ", " + attention, ", " + attention + ", ")
+        return app.buttons.matching(NSCompoundPredicate(andPredicateWithSubpredicates:
+            [stateMatch, attentionMatch])).firstMatch
     }
 
     private func screen(_ terminal: XCUIElement) -> String { terminal.value as? String ?? "" }
@@ -427,7 +436,7 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         // A hardware key hides the software keyboard, which resizes the
         // terminal just before the switch; the machine left redraws. That is
         // not news.
-        XCTAssertFalse(chip(app, second, "connected, new output").waitForExistence(timeout: 2),
+        XCTAssertFalse(chip(app, second, "connected", attention: "New output").waitForExistence(timeout: 2),
                        "a machine just left is not marked for its redraw")
         snapshot("14-keyboard-switch")
 
@@ -437,14 +446,14 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         waitFor("sleep 6; echo AWAY", in: screen, timeout: 10, "the command is running before the switch")
         app.typeKey("]", modifierFlags: [.command, .shift])
         waitForSwitch(app, to: second, who: "second", in: screen, "⇧⌘] shows the next machine")
-        let marked = chip(app, inputs.machine, "connected, new output")
+        let marked = chip(app, inputs.machine, "connected", attention: "New output")
         XCTAssertTrue(marked.waitForExistence(timeout: 20), "the first machine printed while away and is marked")
-        XCTAssertFalse(chip(app, second, "connected, new output").exists, "the machine on screen is never marked")
+        XCTAssertFalse(chip(app, second, "connected", attention: "New output").exists, "the machine on screen is never marked")
         snapshot("15-unread-mark")
         // The fleet overview's New output filter lists the marked machine alone.
         app.buttons["terminal.fleet.open"].tap()
         XCTAssertTrue(app.navigationBars["Fleet Overview"].waitForExistence(timeout: 10), "the fleet overview opens")
-        app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "Status at refresh")).firstMatch.tap()
+        app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "Show at refresh")).firstMatch.tap()
         app.buttons["New output"].firstMatch.tap()
         func overviewRow(_ machine: String) -> XCUIElement {
             app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@ AND label CONTAINS %@", machine, "New output")).firstMatch
@@ -460,6 +469,8 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         nextNew.tap()
         waitFor("AWAY-first-10", in: screen, timeout: 10, "Next New Output leads to the new output")
         XCTAssertTrue(chip(app, inputs.machine, "connected").waitForExistence(timeout: 5), "being on screen clears the mark")
+        XCTAssertFalse(chip(app, inputs.machine, "connected", attention: "New output").exists,
+                       "viewing the first machine clears its unseen-output reason")
         XCTAssertTrue(nextNew.waitForNonExistence(timeout: 5), "with nothing unseen, Next New Output goes away")
         XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 10), "the returned machine gets the keyboard")
 
@@ -470,11 +481,13 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         waitFor("sleep 6; echo LATER", in: screen, timeout: 10, "the command is running before the switch")
         app.typeKey("[", modifierFlags: [.command, .shift])
         waitForSwitch(app, to: inputs.machine, who: "first", in: screen, "⇧⌘[ shows the first machine")
-        XCTAssertTrue(chip(app, second, "connected, new output").waitForExistence(timeout: 20),
+        XCTAssertTrue(chip(app, second, "connected", attention: "New output").waitForExistence(timeout: 20),
                       "the second machine printed while away and is marked")
         app.typeKey("j", modifierFlags: .command)
         waitFor("LATER-second-12", in: screen, timeout: 10, "⌘J leads to the new output")
         XCTAssertTrue(chip(app, second, "connected").waitForExistence(timeout: 5), "being on screen clears the mark")
+        XCTAssertFalse(chip(app, second, "connected", attention: "New output").exists,
+                       "viewing the second machine clears its unseen-output reason")
         app.typeKey("j", modifierFlags: .command)
         never("AWAY-first-10", in: screen, "with nothing unseen, ⌘J stays put")
         snapshot("15b-next-new-output")
@@ -530,7 +543,12 @@ final class OfflineRestoreConnectUITests: XCTestCase {
         XCTAssertTrue(field.waitForExistence(timeout: 20), "the newer package must reach the unlock step")
         // Closing restore is not permission to reconnect a detached shell.
         app.navigationBars["Restore"].buttons["Close"].tap()
-        XCTAssertTrue(app.buttons["Connect"].firstMatch.waitForExistence(timeout: 20))
+        // This launch restored its navigation through model.returning. Ending
+        // the sessions clears that destination and returns to saved workspaces.
+        XCTAssertTrue(savedWorkspace(app, inputs).waitForExistence(timeout: 20),
+                      "cancelling restore must return to the retained saved workspace")
+        XCTAssertFalse(app.descendants(matching: .any)["Terminal output"].firstMatch.exists,
+                       "cancelling restore must dismiss the detached terminal")
         XCTAssertFalse(chip(app, inputs.machine, "connected").waitForExistence(timeout: 3),
                        "cancelling restore must leave every detached machine offline")
         snapshot("r0-restore-cancelled")
@@ -624,8 +642,12 @@ final class OfflineRestoreConnectUITests: XCTestCase {
             return onPage(switches)
         }
         func warmed() -> XCUIElement {
-            app.buttons.matching(NSPredicate(format: "label IN %@",
-                ["\(second), signed in, terminal not open", "\(second), connected", "\(second), connecting"])).firstMatch
+            let states = ["signed in, terminal not open", "connected", "connecting"]
+            let predicates = states.map { state in
+                let label = "\(second), \(state)"
+                return NSPredicate(format: "label == %@ OR label BEGINSWITH %@", label, label + ", ")
+            }
+            return app.buttons.matching(NSCompoundPredicate(orPredicateWithSubpredicates: predicates)).firstMatch
         }
         func reset() -> XCUIElement { app.buttons["Use Workspace Default (On)"] }
         func openTerminal() {
