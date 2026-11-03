@@ -265,6 +265,21 @@ final class TerminalModelRuntimeTests: XCTestCase, @unchecked Sendable {
         return (coordinator, transport, try await coordinator.attach(transport))
     }
 
+    func testMaximumSlicedOutputPreservesEveryByteBeforeTheNextUpdate() async throws {
+        let (coordinator, _, source) = try await source()
+        let model = OwnedModelFixture(source: source)
+        let runtime = TerminalModelRuntime(model: model, coordinator: coordinator, delivery: ModelRuntimeDelivery())
+        try await runtime.setVisible(false, source: source)
+        let storage = Data((0..<16_401).map { UInt8(truncatingIfNeeded: $0) })
+        let payload = storage[17..<16_401]
+        XCTAssertEqual(payload.startIndex, 17)
+        try await runtime.receive(.init(output: payload), source: source)
+        try await runtime.receive(.init(output: Data([0x1B, 0x5B, 0x30, 0x6D])), source: source)
+        XCTAssertEqual(model.snapshot().fed, Data(payload) + Data([0x1B, 0x5B, 0x30, 0x6D]))
+        XCTAssertEqual(model.snapshot().captures, 0)
+        try await runtime.close()
+    }
+
     func testHiddenModelKeepsAnswerbacksInTheUserInputFIFOWithoutCapturing() async throws {
         let (coordinator, transport, source) = try await source()
         let model = OwnedModelFixture(source: source, replies: [

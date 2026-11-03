@@ -260,7 +260,20 @@ public actor TerminalModelRuntime: TerminalKeyboardTransactions, TerminalPointer
         if let geometry = update.resized { try model.resize(geometry) }
         if let palette = update.muxPalette { try model.setMuxPalette(Array(palette)) }
         if !update.output.isEmpty {
-            try model.feed(update.output)
+            // Native models share a registry lock. Release it between bounded
+            // slices so a noisy offscreen session cannot monopolize another
+            // session's keyboard or frame work. Keep this runtime's operation
+            // lease for the whole update: byte order and reply ownership stay
+            // atomic to its other consumers, without dropping or queuing bytes.
+            var offset = 0
+            while offset < update.output.count {
+                let end = min(offset + 2048, update.output.count)
+                let startIndex = update.output.startIndex + offset
+                let endIndex = update.output.startIndex + end
+                try model.feed(update.output.subdata(in: startIndex..<endIndex))
+                offset = end
+                if offset < update.output.count { await Task.yield() }
+            }
             if !update.muxPreparation, inputUnanswered { inputUnanswered = false; awaitingAnswer?(false) }
             if !update.muxPreparation, !visible, shownOnce, !hiddenOutputReported,
                hiddenAt.map({ ContinuousClock.now - $0 >= hiddenOutputSettle }) ?? true {
