@@ -4061,9 +4061,11 @@ fn drain_pty_reader(
 
 /// Whether a drain of this nonblocking PTY reader would find anything now:
 /// bytes, the end of output, or an error. A drain costs a token effect lease
-/// and a trip through the output worker, and an idle pane's guardian asks for
-/// output several times a second, so a drain waits until the PTY is ready
-/// (ft-2pgul). A failed poll counts as ready and leaves the answer to the drain.
+/// and a trip through the output worker. An idle pane's guardian asks for
+/// output several times a second, and every Read that returns bytes queues a
+/// prefetch, so neither starts a drain before the PTY is ready, unless bytes a
+/// full disk left held need journaling (ft-2pgul). A failed poll counts as
+/// ready and leaves the answer to the drain.
 fn pty_reader_ready(reader: &dyn PollablePtyReader) -> bool {
     let mut fds = [nix::poll::PollFd::new(
         reader.as_fd(),
@@ -6336,6 +6338,21 @@ impl BrokerControlServiceV1 {
                 .ok()
                 .and_then(|count| pane.next_output_sequence.checked_add(count))
                 .is_none()
+        {
+            return;
+        }
+        // Nothing to drain: the buffer holds only readable bytes, none a full
+        // disk left held, and the PTY is idle.
+        let holds_only_readable = pane
+            .next_output_sequence
+            .checked_sub(pane.buffer_start_sequence)
+            .and_then(|readable| usize::try_from(readable).ok())
+            .is_some_and(|readable| pane.output_buffer.len() <= readable);
+        if holds_only_readable
+            && pane
+                .proxy_reader
+                .as_deref()
+                .is_some_and(|reader| !pty_reader_ready(reader))
         {
             return;
         }
