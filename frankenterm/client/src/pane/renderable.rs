@@ -581,6 +581,9 @@ pub struct RenderableInner {
     pub dead: bool,
     poll_in_progress: AtomicBool,
     poll_interval: Duration,
+    /// How long one liveness poll may wait for its answer
+    /// ([`LIVENESS_POLL_RPC_DEADLINE`]; tests shorten it).
+    liveness_deadline: Duration,
 
     cursor_position: StableCursorPosition,
     pub dimensions: RenderableDimensions,
@@ -700,6 +703,7 @@ impl RenderableInner {
             dead: false,
             poll_in_progress: AtomicBool::new(false),
             poll_interval: base_poll_interval(),
+            liveness_deadline: LIVENESS_POLL_RPC_DEADLINE,
             cursor_position: StableCursorPosition::default(),
             dimensions,
             tiered_scrollback_status: None,
@@ -2587,29 +2591,39 @@ impl RenderableInner {
         // `spawn`, not `spawn_local`: renderer queries call `poll` from any
         // thread, including the Metal render thread (see
         // `schedule_fetch_lines_reserved`).
+        let deadline = self.liveness_deadline;
         reservation
             .spawn(async move {
-                let response = with_rpc_deadline(
-                    LIVENESS_POLL_RPC_DEADLINE,
-                    "pane liveness poll",
-                    request,
-                )
-                .await;
-                if let Err(error) = &response {
-                    if is_rpc_deadline_timeout(error) {
-                        // The transport is attached but silent. Fence this exact
-                        // generation so the reader exits, the proxy is reaped and
-                        // reconnect (or the domain watchdog) takes over, instead of
-                        // leaving the domain "attached" with nothing flowing.
-                        let abort = client.client.abort_rpc_transport_generation(
-                            &rpc,
-                            "pane liveness poll deadline missed",
-                        );
-                        log::warn!(
-                            "liveness poll for remote pane {remote_pane_id} got no answer within {:?}; aborted its RPC generation ({abort:?})",
-                            LIVENESS_POLL_RPC_DEADLINE
-                        );
-                    }
+                let response = with_rpc_deadline(deadline, "pane liveness poll", request).await;
+                let deadline_missed =
+                    matches!(&response, Err(error) if is_rpc_deadline_timeout(error));
+                // A plain local unix socket (no proxy_command) cannot go silent
+                // because its mux died: the kernel hangs it up as the process
+                // exits and the reader turns that EOF into a detach. A missed
+                // deadline there is a stalled mux that still holds every pane,
+                // and this client has no successor to hand them to, so fencing
+                // the generation or declaring the pane dead would close the
+                // windows of a live mux (ft-qvt9l). The miss proves nothing:
+                // keep the pane, leave the lag indicator counting, and poll
+                // again a backstop interval later.
+                let stalled_local_mux =
+                    deadline_missed && client.client.is_local && !client.client.is_reconnectable;
+                if stalled_local_mux {
+                    log::warn!(
+                        "liveness poll for remote pane {remote_pane_id} got no answer within {deadline:?} from a local mux whose socket is still open; keeping the pane and polling again"
+                    );
+                } else if deadline_missed {
+                    // The transport is attached but silent. Fence this exact
+                    // generation so the reader exits, the proxy is reaped and
+                    // reconnect (or the domain watchdog) takes over, instead of
+                    // leaving the domain "attached" with nothing flowing.
+                    let abort = client.client.abort_rpc_transport_generation(
+                        &rpc,
+                        "pane liveness poll deadline missed",
+                    );
+                    log::warn!(
+                        "liveness poll for remote pane {remote_pane_id} got no answer within {deadline:?}; aborted its RPC generation ({abort:?})"
+                    );
                 }
                 let cleared = registration.try_with_current(|_| {
                     let renderable = renderable.lock();
@@ -2621,6 +2635,9 @@ impl RenderableInner {
                         "discarding liveness poll completion for stale client pane registration {}",
                         local_pane_id
                     );
+                }
+                if stalled_local_mux {
+                    return Ok(());
                 }
                 let alive = match response {
                     Ok(response) if response.pane_id == remote_pane_id => response.is_alive,
@@ -7434,6 +7451,91 @@ mod tests {
                         .poll_in_progress
                         .load(Ordering::SeqCst),
                     "the liveness poll task must complete on the main thread"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn a_missed_liveness_deadline_on_a_local_mux_socket_keeps_the_pane_and_its_connection() {
+        // ft-qvt9l: a plain local unix-socket mux that stalls past the poll
+        // deadline is still alive (its socket hangs up if the process exits).
+        // Fencing the generation or declaring the pane dead would close the
+        // window of a mux that still holds the pane.
+        with_pane_queried_off_the_main_thread(
+            "stalled-local-mux",
+            |executor, peer, pane, _registered| {
+                let due_poll = || {
+                    let state = pane.renderable.lock();
+                    let mut inner = state.inner.borrow_mut();
+                    let overdue = inner.poll_interval + Duration::from_millis(1);
+                    inner.last_poll = Instant::now()
+                        .checked_sub(overdue)
+                        .expect("monotonic clock is past one poll interval");
+                    inner.poll().unwrap();
+                    assert!(inner.poll_in_progress.load(Ordering::SeqCst));
+                    inner.last_recv_time
+                };
+                let polling = || {
+                    pane.renderable
+                        .lock()
+                        .inner
+                        .borrow()
+                        .poll_in_progress
+                        .load(Ordering::SeqCst)
+                };
+                let client = Arc::clone(&pane.renderable.lock().inner.borrow().client);
+                assert!(client.client.is_local && !client.client.is_reconnectable);
+                pane.renderable.lock().inner.borrow_mut().liveness_deadline =
+                    Duration::from_millis(20);
+
+                // The stalled mux never reads the poll, which stays queued.
+                let last_answer = due_poll();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while polling() {
+                    while executor.try_tick().unwrap() {}
+                    assert!(
+                        Instant::now() < deadline,
+                        "the liveness poll never reached its deadline"
+                    );
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                assert_eq!(peer.queued_len(), 1, "the unanswered poll was sent");
+                {
+                    let state = pane.renderable.lock();
+                    let inner = state.inner.borrow();
+                    assert!(
+                        !inner.dead,
+                        "a missed deadline must not declare the pane dead"
+                    );
+                    assert_eq!(
+                        inner.last_recv_time, last_answer,
+                        "nothing was received, so the lag indicator keeps counting"
+                    );
+                }
+                assert!(
+                    client.client.rpc_scope().is_ready(),
+                    "a missed deadline must not fence the local mux connection"
+                );
+
+                // The mux catches up: the next poll is answered on the same
+                // connection and the pane is still alive.
+                promise::spawn::block_on(peer.discard_next_queued_rpc()).unwrap();
+                due_poll();
+                let requests =
+                    peer.answer_pane_registration(|| while executor.try_tick().unwrap() {});
+                assert!(
+                    matches!(requests.as_slice(), [codec::Pdu::GetPaneRenderChanges(_)]),
+                    "the next poll must reach the same connection: {:?}",
+                    requests
+                );
+                let state = pane.renderable.lock();
+                let inner = state.inner.borrow();
+                assert!(!inner.poll_in_progress.load(Ordering::SeqCst));
+                assert!(!inner.dead);
+                assert!(
+                    inner.last_recv_time > last_answer,
+                    "the answered poll must commit"
                 );
             },
         );
