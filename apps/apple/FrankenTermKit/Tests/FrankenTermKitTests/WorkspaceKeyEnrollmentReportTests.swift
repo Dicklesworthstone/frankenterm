@@ -495,7 +495,7 @@ final class WorkspaceKeyEnrollmentReportTests: XCTestCase {
         XCTAssertFalse(try row(partial, "jump").canAssign)
     }
 
-    func testChangingAnIncomingBastionOrExposingStandaloneInvalidatesTheChoice() throws {
+    func testChangingAnIncomingBastionOrExposingStandaloneInvalidatesTheChoice() async throws {
         let left = Spec("left", "left.fixture.invalid"), jump = Spec("jump", "10.0.0.8")
         let final = Spec("final", "10.0.0.9", jumps: ["left", "jump"])
         let initial = try document([left, jump, final], machines: [("machine", ["final"])])
@@ -521,7 +521,7 @@ final class WorkspaceKeyEnrollmentReportTests: XCTestCase {
         XCTAssertEqual(try replaced.document().routes.first { $0.id == "jump" }?.credentialIDs, [f.key.id])
     }
 
-    func testLegacyDirectWitnessRemainsCompatible() throws {
+    func testLegacyDirectWitnessRemainsCompatible() async throws {
         let source = try document([one])
         // The published v1 direct witness, computed independently from the
         // fixed public fixture with sorted UTF-8 JSON and SHA-256.

@@ -29,7 +29,7 @@ final class TerminalSessionJournalTests: XCTestCase {
         catch { XCTAssertEqual(error as? TerminalSessionJournalError, expected, file: file, line: line) }
     }
 
-    func testScopeAndCapacityConfigurationAreBounded() throws {
+    func testScopeAndCapacityConfigurationAreBounded() async throws {
         for machine in ["", "has spaces", "command\ninput", String(repeating: "x", count: 129)] {
             XCTAssertThrowsError(try scope(machine: machine)) {
                 XCTAssertEqual($0 as? TerminalSessionJournalError, .invalidScope)

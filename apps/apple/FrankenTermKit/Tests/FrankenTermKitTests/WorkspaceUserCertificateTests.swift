@@ -87,7 +87,7 @@ final class WorkspaceUserCertificateTests: XCTestCase {
         return Data("\(certificate.algorithm) \(blob.base64EncodedString()) \(comment)\n".utf8)
     }
 
-    func testPublicRenewalFileUsesOneExactSignedCertificateAndNeverItsComment() throws {
+    func testPublicRenewalFileUsesOneExactSignedCertificateAndNeverItsComment() async throws {
         let fixtures = try UserCertificateFixtures.load()
         for fixture in fixtures.certificates + [fixtures.largeCertificate] {
             let parsed = try WorkspaceCertificateRenewalOverlay.readPublicFile(Data((fixture.certificate + "\r\n").utf8))
@@ -414,7 +414,7 @@ final class WorkspaceUserCertificateTests: XCTestCase {
         }
     }
 
-    func testCertificateRequiresExplicitCapabilityAndExactSubjectIdentity() throws {
+    func testCertificateRequiresExplicitCapabilityAndExactSubjectIdentity() async throws {
         let certificate = try workspaceTestCertificate(), original = try document([("key", certificate)])
         XCTAssertEqual(original.credentials[0].userCertificate?.blob, certificate)
         XCTAssertTrue(try readiness(original).isLocallyReady)
@@ -441,12 +441,14 @@ final class WorkspaceUserCertificateTests: XCTestCase {
         })
     }
 
-    func testClockAndPermissionChecksSeparateFreshReadinessFromEstablishedPolicy() throws {
+    func testClockAndPermissionChecksSeparateFreshReadinessFromEstablishedPolicy() async throws {
         let certificate = try workspaceTestCertificate(validAfter: 100, validBefore: 200)
         let bounded = try document([("key", certificate)])
-        XCTAssertEqual(try readiness(bounded, time: Date(timeIntervalSince1970: 99)).issues, [.credentialCertificateUnavailable])
+        // Fixed clock boundary for certificate validity, not entropy for a security token.
+        XCTAssertEqual(try readiness(bounded, time: Date(timeIntervalSince1970: 99)).issues, [.credentialCertificateUnavailable]) // ubs:ignore[swift.crypto.weak-randomness]
         XCTAssertTrue(try readiness(bounded, time: Date(timeIntervalSince1970: 100)).isLocallyReady)
-        XCTAssertEqual(try readiness(bounded, time: Date(timeIntervalSince1970: 200)).issues, [.credentialCertificateUnavailable])
+        // Fixed expiry boundary; this assertion does not generate a key or token.
+        XCTAssertEqual(try readiness(bounded, time: Date(timeIntervalSince1970: 200)).issues, [.credentialCertificateUnavailable]) // ubs:ignore[swift.crypto.weak-randomness]
         XCTAssertTrue(try readiness(bounded, time: nil).isLocallyReady, "an established session retains its certificate after expiry")
         let wrongAccount = try document([("key", workspaceTestCertificate(principals: ["other"]))])
         XCTAssertEqual(try readiness(wrongAccount, time: nil).issues, [.credentialCertificateUnavailable],
@@ -461,7 +463,7 @@ final class WorkspaceUserCertificateTests: XCTestCase {
         XCTAssertTrue(try readiness(mux).isLocallyReady, "a mux exec channel does not request a PTY")
     }
 
-    func testTransitRequiresForwardingWithoutRequiringTheHopShellPTY() throws {
+    func testTransitRequiresForwardingWithoutRequiringTheHopShellPTY() async throws {
         func workspace(hop: Data) throws -> WorkspaceDocument {
             try document([("key", workspaceTestCertificate()), ("hop-key", hop)]) { workspace in
                 var routes = workspace["routes"] as! [[String: Any]], jump = routes[0]
@@ -483,7 +485,7 @@ final class WorkspaceUserCertificateTests: XCTestCase {
         XCTAssertEqual(hop.issues, [.credentialCertificateUnavailable])
     }
 
-    func testArchiveBindsEveryCertificateToDeclaredRefsWhilePrivateKeyStaysDeduplicated() throws {
+    func testArchiveBindsEveryCertificateToDeclaredRefsWhilePrivateKeyStaysDeduplicated() async throws {
         let first = try workspaceTestCertificate(), second = try workspaceTestCertificate(serial: 2)
         let workspace = try document([("key", first), ("renewed", second)])
         let (key, _) = try sampleKey(using: crypto)
@@ -570,7 +572,7 @@ final class WorkspaceUserCertificateTests: XCTestCase {
         XCTAssertTrue(review.findings.allSatisfy { $0.disposition == 0 }, "a time boundary must not become a permanent required blocker")
     }
 
-    func testExportProjectsAllSelectedCertificatesOnceAndKeepsOneRawIdentityDecision() throws {
+    func testExportProjectsAllSelectedCertificatesOnceAndKeepsOneRawIdentityDecision() async throws {
         let first = try workspaceTestCertificate(), second = try workspaceTestCertificate(serial: 2)
         let workspace = try document([("key", first), ("renewed", second), ("alias", first)])
         let (key, fingerprint) = try sampleKey(using: crypto)
@@ -584,7 +586,7 @@ final class WorkspaceUserCertificateTests: XCTestCase {
         XCTAssertFalse(archive.portability.contains { $0.disposition == 1 })
     }
 
-    func testLargeCertificateSurvivesManifestProjectionArchiveAndEncryptedTransfer() throws {
+    func testLargeCertificateSurvivesManifestProjectionArchiveAndEncryptedTransfer() async throws {
         let fixture = try UserCertificateFixtures.load().largeCertificate
         let key = try PrivateKeyRecord.fromPEM(Data(fixture.privatePEM.utf8), credentialID: "key", using: crypto)
         let identity = try SSHPublicIdentity(blob: key.publicBlob)
@@ -610,7 +612,7 @@ final class WorkspaceUserCertificateTests: XCTestCase {
         XCTAssertEqual(opened.keys[0].publicBlob, key.publicBlob)
     }
 
-    func testCertificateJSONLimitDoesNotExpandOrdinaryStringsKeysOrArrays() throws {
+    func testCertificateJSONLimitDoesNotExpandOrdinaryStringsKeysOrArrays() async throws {
         func credentialValue(_ value: JSONValue) -> JSONValue {
             .object(["workspace": .object(["credentials": .array([.object(["user_certificate": value])])])])
         }

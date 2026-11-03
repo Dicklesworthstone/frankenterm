@@ -163,7 +163,7 @@ final class WorkspaceCredentialMetadataTests: XCTestCase {
             expectedRevision: f.installed.revision, sourceAndContentsConfirmed: true)
     }
 
-    func testPublishedMetadataFormatRoundtripsEveryIndependentlyDerivedKeyFamily() throws {
+    func testPublishedMetadataFormatRoundtripsEveryIndependentlyDerivedKeyFamily() async throws {
         for key in try keys() + rsaKeys() {
             let identity = try SSHUserAuthenticationSigner.publicIdentity(privateContainer: key.record.container)
             XCTAssertEqual(identity.blob, key.record.publicBlob); XCTAssertEqual(identity.algorithm, key.algorithm)
@@ -180,7 +180,7 @@ final class WorkspaceCredentialMetadataTests: XCTestCase {
         }
     }
 
-    func testMetadataAcceptsTheCompleteRSAPublicProfileAndRejectsTrailingBytes() throws {
+    func testMetadataAcceptsTheCompleteRSAPublicProfileAndRejectsTrailingBytes() async throws {
         // Exercise the admitted 8192-bit modulus and 64-bit exponent boundary.
         // This is public parser material only; no private key or authorization
         // is inferred from these structurally valid integers.
@@ -234,7 +234,7 @@ final class WorkspaceCredentialMetadataTests: XCTestCase {
         }
     }
 
-    func testMalformedPresentMetadataNeverBecomesLegacyOrChangesIdentity() throws {
+    func testMalformedPresentMetadataNeverBecomesLegacyOrChangesIdentity() async throws {
         let key = try keys()[0], prefix = WorkspaceCredentialMetadata.commentPrefix
         let encoded = key.record.publicBlob.base64EncodedString()
         for comment in ["", "ft-ssh-public-v2:" + encoded, prefix, prefix + encoded + "=",
