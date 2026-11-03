@@ -2005,6 +2005,11 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
             try Task.checkCancellation()
             do { return try await body() }
             catch TerminalNavigationError.busy where attempt < 99 { try await Task.sleep(for: .milliseconds(50)) }
+            // A mux snapshot can temporarily fence the old keyboard's model
+            // transaction before its focus handoff is admitted. The keyboard
+            // retains its original focus on this refusal, so retry the same
+            // validated navigation rather than dropping the user's gesture.
+            catch TerminalModelError.busy where attempt < 99 { try await Task.sleep(for: .milliseconds(50)) }
         }
     }
 
@@ -3278,7 +3283,7 @@ final class TerminalRemoteFilesController {
         importRequest = nil; transferPath = nil
         perform(.staging, retireOnFailure: false) { owner, workID in
             let task = Task.detached(priority: .userInitiated) { [weak owner] in
-                try await TerminalFileStaging.copy(url) { bytes, total in
+                try await TerminalFileStaging.copy(url) { [weak owner] bytes, total in
                     await owner?.progress(bytes, total: total, workID: workID)
                 }
             }

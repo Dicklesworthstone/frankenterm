@@ -1211,6 +1211,18 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         }
         let visible = state.control.current.visible
         guard !visible || state.identifiedPanes.contains(pane) else { return }
+        // Inventory already carries the authenticated shared geometry. Reject
+        // an oversized View Only pane while its mirror is starting: waiting
+        // for render bytes can leave the session live without a usable view.
+        if visible, state.showing, !state.control.controlsSize,
+           let size = state.panes.first(where: { $0.paneId == pane })?.size,
+           size.rows > 0, size.cols > 0,
+           (size.rows > 512 || size.cols > 512
+            || size.rows > TerminalSessionGeometry.maximumShownCells / size.cols) {
+            let reason = "This shared pane is too large to view on this phone. Its size was not changed."
+            state.control.recordPaneTooLargeToView(reason)
+            throw TerminalMuxError.failed(reason)
+        }
         let controlsSize = visible && state.control.controlsSize
         if controlsSize, !state.controllingSize || !state.showing {
             try state.client.resize(pane: pane, rows: Int(state.geometry.rows), columns: Int(state.geometry.columns))

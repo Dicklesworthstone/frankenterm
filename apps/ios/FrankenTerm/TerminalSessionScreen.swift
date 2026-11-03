@@ -1425,7 +1425,11 @@ final class TerminalSessionController {
         guard state.ready, !state.retired, let selected = state.destination else {
             if state.destination == nil, phase == .live {
                 requestedMuxPane = nil; requestedMuxNavigation = nil
-                interactionProblem = "The selected pane is no longer available. Choose another pane; pending input was not redirected."
+                // A reconnect can deliberately leave selection empty when the
+                // server restarted or could not prove the saved pane's identity.
+                // Preserve that explanation instead of claiming the pane closed.
+                interactionProblem = control.current.notice
+                    ?? "The selected pane is no longer available. Choose another pane; pending input was not redirected."
             }
             return
         }

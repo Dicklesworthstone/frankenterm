@@ -126,7 +126,7 @@ final class MobileHostKeyVerificationTests: XCTestCase {
 
         var root = try JSONSerialization.jsonObject(with: document.raw) as! [String: Any]
         var workspace = root["workspace"] as! [String: Any]
-        workspace["host_revocation_sources"] = [try JSONSerialization.jsonObject(with: source.json.encoded())]
+        workspace["host_revocation_sources"] = [try JSONSerialization.jsonObject(with: StrictJSON.encode(source.json))]
         var trusts = workspace["host_trust"] as! [[String: Any]]
         let index = try XCTUnwrap(trusts.firstIndex { $0["id"] as? String == trust.id })
         trusts[index]["revocation_source_refs"] = [source.id]

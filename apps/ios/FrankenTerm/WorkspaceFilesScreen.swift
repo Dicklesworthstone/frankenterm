@@ -369,7 +369,7 @@ final class WorkspaceFilesNativeState {
                     return
                 }
                 let copying = Task.detached(priority: .userInitiated) { [weak self] in
-                    try await TerminalFileStaging.copy(source) { bytes, total in
+                    try await TerminalFileStaging.copy(source) { [weak self] bytes, total in
                         await self?.stagingProgress(bytes, total: total, id: id)
                     }
                 }

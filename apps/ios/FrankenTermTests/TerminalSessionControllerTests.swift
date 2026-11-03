@@ -2699,8 +2699,11 @@ final class TerminalSessionControllerTests: XCTestCase {
     /// typed on the one on screen show their output promptly, the flood is
     /// read through to its end, and the app does not grow with what it reads.
     func testAMachineFloodingOffScreenLeavesTheOneOnScreenResponsive() async throws {
-        let live = try await liveScene(), scene = live.scene, marks = live.outPath + ".flood"
+        let live = try await liveScene(), scene = live.scene
         let run = UUID().uuidString.prefix(8)
+        // Retained output from a previous invocation must not satisfy this
+        // invocation's progress assertions or short-circuit its memory check.
+        let marks = live.outPath + ".flood." + run
         func halves() -> Int { ((try? String(contentsOfFile: marks, encoding: .utf8)) ?? "").split(separator: "\n").count }
         let alphaSession = try await connect(scene, "alpha")
         let alpha = try shown(alphaSession)
@@ -3248,10 +3251,13 @@ final class TerminalSessionControllerTests: XCTestCase {
     }
 
     /// A direct route first tries the machine's mux. The loopback host has none,
-    /// so that attempt leaves an acknowledged record with no input before the
-    /// shell's own record. These are the records of terminals that ran.
+    /// so that attempt leaves a clean continued record with no input before
+    /// the shell's own record. Preserve every input-bearing or recovery record.
     private func terminalRecords(_ records: [TerminalSessionRecord]) -> [TerminalSessionRecord] {
-        records.filter { $0.state != .acknowledged || !$0.inputEvidence.isEmpty }
+        records.filter {
+            !($0.state == .acknowledged || $0.state == .continued)
+                || !$0.inputEvidence.isEmpty || $0.hasRecoveryNotice
+        }
     }
 
     private func describe(_ records: [TerminalSessionRecord]) -> String {
@@ -3439,10 +3445,9 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertEqual(pending, 0)
     }
 
-    /// A new session acknowledges its own machine's earlier records as it
-    /// starts, whatever the connection then does; other machines' records
-    /// stay as they are.
-    func testANewSessionAcknowledgesOnlyItsMachinesEarlierRecords() async throws {
+    /// A replacement continues its own machine's earlier records without
+    /// claiming the user acknowledged them; other machines remain interrupted.
+    func testANewSessionContinuesOnlyItsMachinesEarlierRecords() async throws {
         let (connections, scene, target) = try dormantScene()
         let journal = connections.journal
         func scope(_ machineID: String) throws -> TerminalSessionScope {
@@ -3458,7 +3463,10 @@ final class TerminalSessionControllerTests: XCTestCase {
         let attempt = try await connect(scene, "machine")
         XCTAssertNotEqual(attempt.phase, .idle)
         let records = try await journal.records()
-        XCTAssertEqual(records.first(where: { $0.id == earlier.id })?.state, .acknowledged)
+        let continued = try XCTUnwrap(records.first(where: { $0.id == earlier.id }))
+        XCTAssertEqual(continued.state, .continued)
+        XCTAssertFalse(continued.blocksNewSession)
+        XCTAssertEqual(continued.scope.machineID, target.machineID)
         XCTAssertEqual(records.first(where: { $0.id == elsewhere.id })?.state, .interrupted)
         await scene.close()
     }
