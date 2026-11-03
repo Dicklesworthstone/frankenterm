@@ -8965,7 +8965,9 @@ ssh = "right"
                 let route = exported_route(&exported, "r.left.ssh");
                 assert!(
                     route["pubkey_accepted_algorithms"].is_null(),
-                    "{first} {expression}"
+                    "{} {}",
+                    first,
+                    expression
                 );
                 assert_eq!(
                     route_trust(&exported, "r.left.ssh")["required_capabilities"],
@@ -9132,11 +9134,15 @@ ssh = "right"
                 let trust = route_trust(&exported, "r.left.ssh");
                 assert!(
                     trust["host_key_algorithms"].is_null(),
-                    "{keyword} {expression}"
+                    "{} {}",
+                    keyword,
+                    expression
                 );
                 assert!(
                     trust["ca_signature_algorithms"].is_null(),
-                    "{keyword} {expression}"
+                    "{} {}",
+                    keyword,
+                    expression
                 );
                 assert_eq!(
                     trust["required_capabilities"],
@@ -9331,7 +9337,7 @@ ssh = "right"
                 let exported = trust_export(&sources);
                 let trust = route_trust(&exported, "r.left.ssh");
                 for field in ["kex_algorithms", "ciphers", "macs"] {
-                    assert!(trust[field].is_null(), "{keyword} {expression}");
+                    assert!(trust[field].is_null(), "{} {}", keyword, expression);
                 }
                 assert_eq!(
                     trust["required_capabilities"],
@@ -9344,7 +9350,9 @@ ssh = "right"
                         .iter()
                         .any(|note| note.message.contains(&keyword.to_ascii_lowercase())
                             && note.message.contains("remains blocked")),
-                    "{keyword} {expression}"
+                    "{} {}",
+                    keyword,
+                    expression
                 );
             }
         }
