@@ -4059,6 +4059,22 @@ fn drain_pty_reader(
     Ok(BrokerPtyDrainV1::Bytes(filled))
 }
 
+/// Whether a drain of this nonblocking PTY reader would find anything now:
+/// bytes, the end of output, or an error. A drain costs a token effect lease
+/// and a trip through the output worker, and an idle pane's guardian asks for
+/// output several times a second, so a drain waits until the PTY is ready
+/// (ft-2pgul). A failed poll counts as ready and leaves the answer to the drain.
+fn pty_reader_ready(reader: &dyn PollablePtyReader) -> bool {
+    let mut fds = [nix::poll::PollFd::new(
+        reader.as_fd(),
+        nix::poll::PollFlags::POLLIN,
+    )];
+    !matches!(
+        nix::poll::poll(&mut fds, nix::poll::PollTimeout::ZERO),
+        Ok(0)
+    )
+}
+
 impl BrokerOutputDrainJobV1 {
     fn run(&mut self) -> Result<Option<BrokerOutputTerminalReasonV1>, BrokerOutputDrainFailureV1> {
         use BrokerOutputDrainFailureV1::{Failed, StorageFull};
@@ -6176,6 +6192,15 @@ impl BrokerControlServiceV1 {
                 .is_none_or(|journal| journal.failed)
             {
                 header.status = BrokerControlResponseStatusV1::Quarantined;
+                return BrokerControlResponseV1::new(header, &[]).map_err(|_| ());
+            }
+            // Nothing to drain: no bytes a full disk left held, and an idle PTY.
+            if pane.output_buffer.is_empty()
+                && pane
+                    .proxy_reader
+                    .as_deref()
+                    .is_some_and(|reader| !pty_reader_ready(reader))
+            {
                 return BrokerControlResponseV1::new(header, &[]).map_err(|_| ());
             }
             let remaining = pane
@@ -30340,6 +30365,32 @@ mod tests {
                 BrokerOutputTerminalReasonV1::ZeroLengthRead
             ))
         );
+    }
+
+    #[test]
+    fn a_pty_is_ready_for_a_drain_only_with_bytes_or_its_end() {
+        let (mut reader, mut writer) = nonblocking_test_pipe();
+        assert!(!pty_reader_ready(&*reader), "an idle PTY is not ready");
+        writer.write_all(b"x").expect("write a byte");
+        assert!(pty_reader_ready(&*reader), "a PTY with bytes is ready");
+        let mut record = [0_u8; 8];
+        assert_eq!(
+            drain_pty_reader(&mut *reader, &mut record),
+            Ok(BrokerPtyDrainV1::Bytes(1))
+        );
+        assert!(!pty_reader_ready(&*reader), "a drained PTY is idle again");
+        // The end of output is ready too, so a drain reports it. A child
+        // another test forks before its exec briefly holds a copy of the write
+        // end, so the end may show only after a while.
+        drop(writer);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !pty_reader_ready(&*reader) {
+            assert!(
+                Instant::now() < deadline,
+                "the end of output is never ready"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]
