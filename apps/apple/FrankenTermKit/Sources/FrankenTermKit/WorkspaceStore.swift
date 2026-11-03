@@ -459,6 +459,9 @@ public actor WorkspaceStore {
         let retiredAccounts: [String]
     }
     private let persistence: any WorkspacePersistence
+    // Reuse only a fully validated value for exactly the bytes read this time.
+    // Never cache storage availability, journal recovery, or credential access.
+    private var validatedCatalog: (bytes: Data, value: Catalog)?
     private let vault: any WorkspaceCredentialVault
     private let sshAuthorizationOwner = UUID()
     private let credentialImportOwner = UUID()
@@ -2539,7 +2542,12 @@ public actor WorkspaceStore {
         return result
     }
     private func readCatalog() throws -> Catalog {
-        guard let data = try persistence.read(.catalog, limit: Self.catalogLimit) else { return Catalog() }
+        guard let data = try persistence.read(.catalog, limit: Self.catalogLimit) else {
+            validatedCatalog = nil
+            return Catalog()
+        }
+        if let cached = validatedCatalog, cached.bytes == data { return cached.value }
+        validatedCatalog = nil
         guard let catalog = try? JSONDecoder().decode(Catalog.self, from: data), catalog.version == 12,
               catalog.workspaces.count <= 32, catalog.revokedFingerprints.count <= 4096,
               catalog.revokedFingerprints.allSatisfy({ (try? WorkspaceDocument.fingerprint($0)) != nil }),
@@ -2697,6 +2705,8 @@ public actor WorkspaceStore {
         // pass. Failure never authorizes deleting journal-owned credentials.
         if catalog.needsSanitizedPublication {
             try persistence.write(encode(catalog, limit: Self.catalogLimit), to: .catalog)
+        } else {
+            validatedCatalog = (data, catalog)
         }
         return catalog
     }

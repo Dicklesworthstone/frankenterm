@@ -93,6 +93,33 @@ final class WorkspaceStoreTests: XCTestCase {
         XCTAssertEqual(available, ["key"])
     }
 
+    func testRepeatedCatalogReadsObserveOtherWritersCorruptionAndReadFailure() async throws {
+        let disk = StoreTestPersistence(), vault = StoreTestVault()
+        let store = WorkspaceStore(persistence: disk, vault: vault)
+        let installed = try await store.install(archive(), envelopeDigest: digest, expectedRevision: nil,
+            sourceAndContentsConfirmed: true).workspace
+        let first = try await store.load()
+        XCTAssertTrue(try XCTUnwrap(first.first).connectLater)
+        _ = try await store.load()
+        let other = WorkspaceStore(persistence: disk, vault: vault)
+        _ = try await other.approveConnections(workspaceID: installed.id, expectedRevision: installed.revision,
+            confirmedByUser: true)
+        let changed = try await store.load()
+        XCTAssertFalse(try XCTUnwrap(changed.first).connectLater)
+        let valid = try XCTUnwrap(disk.bytes(.catalog))
+        disk.seed(Data("{}".utf8), slot: .catalog)
+        do { _ = try await store.load(); XCTFail("A prior valid read cannot hide corrupt replacement bytes") }
+        catch { XCTAssertEqual(error as? WorkspaceStoreError, .corruptStore) }
+        disk.seed(valid, slot: .catalog)
+        _ = try await store.load()
+        disk.configure(nil, failedRead: true)
+        do { _ = try await store.load(); XCTFail("A prior valid read cannot authorize an unreadable store") }
+        catch { }
+        disk.configure(nil)
+        let restored = try await store.load()
+        XCTAssertFalse(try XCTUnwrap(restored.first).connectLater)
+    }
+
     func testConnectLaterRequiresDeliberateApprovalOfTheExactRevisionAndPersistsIt() async throws {
         let disk = StoreTestPersistence(), vault = StoreTestVault()
         let store = WorkspaceStore(persistence: disk, vault: vault)
