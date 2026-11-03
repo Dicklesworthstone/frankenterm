@@ -959,7 +959,7 @@ mod tests {
 
         // Fill each original page with one page-sized rectangle. The page
         // holding ABC cannot fit one, so this necessarily grows the texture.
-        let atlas = frankenterm_renderer_metal::AtlasConfig::for_kind(AtlasKind::Grayscale);
+        let atlas = frankenterm_renderer_metal::atlas::AtlasConfig::for_kind(AtlasKind::Grayscale);
         let width = atlas.width - atlas.padding;
         let height = atlas.page_height - atlas.padding;
         let pixels = vec![0; width as usize * height as usize];
