@@ -87,11 +87,11 @@ mkdir -p "$HOME" "$XDG_RUNTIME_DIR" "$TMPDIR"
 chmod 700 "$HOME" "$XDG_RUNTIME_DIR" "$TMPDIR"
 unset WEZTERM_UNIX_SOCKET WEZTERM_PANE FRANKENTERM_UNIX_SOCKET FT_WORKSPACE FT_GRID_ENGINE
 # Services started directly inherit this shell's environment. An RCH
-# worker's RUST_LOG hid the mux's capture-failure warnings, so the
-# services log at their own default (info) unless E2E_RUST_LOG names a
+# worker's RUST_LOG hid the mux's capture-failure warnings, and the
+# guardian logs only warnings by default while the retirement step reads
+# its info line. So the services log at info unless E2E_RUST_LOG names a
 # filter (say info,frankenterm_term::line_read=debug).
-unset RUST_LOG
-[ -n "${E2E_RUST_LOG:-}" ] && export RUST_LOG=$E2E_RUST_LOG
+export RUST_LOG=${E2E_RUST_LOG:-info}
 cd "$HOME" || exit 1
 
 FAILS=0
@@ -571,9 +571,13 @@ if [ "$PANES_AT_START" -gt 5 ]; then
     && pass "its Spawn and lease journals are gone" \
     || fail "broker journals: spawn $SPAWN_FILES -> $(ls "$STATE/broker/spawn" | grep -c .), lease $LEASE_FILES -> $(ls "$STATE/broker/lease" | grep -c .)"
   GONE=$(grep "broker retired released pane" "$GLOG" | tail -1 | sed 's/.*released pane \([0-9a-f-]*\).*/\1/')
-  LEFT_FILES=$(ls "$STATE/broker/guardian-output-v3" "$STATE/receiver/guardian-output-v3" | grep -c -- "$GONE")
-  [ -n "$GONE" ] && [ "$LEFT_FILES" = 0 ] && pass "no output, custody or checkpoint file names it" \
-    || fail "$LEFT_FILES output-v3 file(s) still name retired pane ${GONE:-?}"
+  if [ -z "$GONE" ]; then
+    fail "the guardian log names no retired pane, so its files cannot be checked"
+  else
+    LEFT_FILES=$(ls "$STATE/broker/guardian-output-v3" "$STATE/receiver/guardian-output-v3" | grep -c -- "$GONE")
+    [ "$LEFT_FILES" = 0 ] && pass "no output, custody or checkpoint file names it" \
+      || fail "$LEFT_FILES output-v3 file(s) still name retired pane $GONE"
+  fi
   # A restart restores from the roots that let the pane go, and a root that
   # still named it would refuse to restore: every other pane must come back.
   MUX=$(cat "$STATE/run.mux-server.pid")
