@@ -310,12 +310,15 @@ final class OfflineRestoreConnectUITests: XCTestCase {
 
         // A full-screen program on the alternate screen, left with Esc: if Esc
         // is lost, ":q!" is inserted as text and vim never exits.
-        app.typeText("vim -u NONE -N\n")
+        app.typeText("vim -u NONE -N; printf '\\nFT-VIM-EXIT-%s\\n' $((40+2))\n")
         waitFor("\n~\n~\n~", in: terminal, "vim must draw its empty buffer")
         snapshot("7-vim")
         app.typeText("iFT-INSERT")
+        waitFor("FT-INSERT", in: terminal, "vim must accept insert-mode input before Escape")
         app.buttons["terminal.key.Escape"].tap()
         app.typeText(":q!\n")
+        waitFor("FT-VIM-EXIT-42", in: terminal,
+                "the remote shell must confirm Vim exited before the next command")
         app.typeText("echo ESC-$((40+2))\n")
         waitFor("ESC-42", in: terminal, "Esc must leave insert mode so :q! exits vim")
         XCTAssertFalse(screen(terminal).contains("FT-INSERT"), "leaving vim must restore the primary screen")
