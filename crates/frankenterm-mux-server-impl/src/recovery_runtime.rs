@@ -10,7 +10,8 @@ use clap::Args;
 use frankenterm_core::cx::{self, Cx};
 use frankenterm_core::runtime_async;
 use frankenterm_core::session_restore::{
-    WholeMuxRecoveryVerifier, WholeMuxTrustedIdentityConfig, select_verified_recovery_roots_with_cx,
+    WholeMuxRecoveryVerifier, WholeMuxTrustedIdentityConfig,
+    select_newest_verified_recovery_root_with_cx, select_verified_recovery_roots_with_cx,
 };
 use frankenterm_core::snapshot_engine::{
     WholeMuxCaptureError, WholeMuxPublicationError, WholeMuxPublicationIdentity,
@@ -302,7 +303,7 @@ impl CaptureState {
             },
         };
         state
-            .select_predecessor_with_restore(cx, None, restored)
+            .select_predecessor_with_restore(cx, None, restored, false)
             .inspect_err(|_| {
                 log::error!("mux recovery authority rejection stage=predecessor_selection");
             })?;
@@ -330,8 +331,16 @@ impl CaptureState {
         Ok(state)
     }
 
-    fn select_predecessor(&mut self, cx: &Cx, receipt: Option<(u64, &str)>) -> anyhow::Result<()> {
-        self.select_predecessor_with_restore(cx, receipt, None)
+    fn select_predecessor(&mut self, cx: &Cx) -> anyhow::Result<()> {
+        self.select_predecessor_with_restore(cx, None, None, false)
+    }
+
+    /// After this mux's own publication, verify only the newest root, which
+    /// must be the one the receipt names. The publication verified both
+    /// committed roots under its lock just before, so verifying the older
+    /// one again would only repeat that (ft-4wrv7).
+    fn select_published(&mut self, cx: &Cx, receipt: (u64, &str)) -> anyhow::Result<()> {
+        self.select_predecessor_with_restore(cx, Some(receipt), None, true)
     }
 
     /// Verify both retained generations under the trusted key/root/session.
@@ -355,7 +364,7 @@ impl CaptureState {
     /// whether or not the failed attempt's root committed.
     fn reconcile(&mut self, cx: &Cx) -> anyhow::Result<()> {
         reconcile_whole_mux_publication_authority(cx, &self.store, &self.verifier())?;
-        self.select_predecessor(cx, None)
+        self.select_predecessor(cx)
     }
 
     fn select_predecessor_with_restore(
@@ -363,9 +372,14 @@ impl CaptureState {
         cx: &Cx,
         receipt: Option<(u64, &str)>,
         restored: Option<&RestoredPredecessor>,
+        newest_only: bool,
     ) -> anyhow::Result<()> {
         let verifier = self.verifier();
-        let selected = select_verified_recovery_roots_with_cx(cx, &self.store, &verifier)?;
+        let selected = if newest_only {
+            select_newest_verified_recovery_root_with_cx(cx, &self.store, &verifier)?
+        } else {
+            select_verified_recovery_roots_with_cx(cx, &self.store, &verifier)?
+        };
         log_unresolved_root_authority("predecessor selection", &selected);
         // Never silently fall back past corruption and overwrite a newer root.
         anyhow::ensure!(
@@ -417,7 +431,7 @@ impl CaptureState {
 
 struct AttemptResult {
     state: Option<CaptureState>,
-    /// And how long verifying the roots after it took (ft-4wrv7).
+    /// And how long verifying the newest root after it took (ft-4wrv7).
     published_generation: Option<(u64, Duration)>,
     error: Option<&'static str>,
     terminal: bool,
@@ -589,7 +603,7 @@ impl PeriodicRecovery {
                                 now.saturating_duration_since(started).as_millis()
                             });
                             log::info!(
-                                "mux periodic recovery published local generation={generation} in {took_ms} ms ({} ms of it verifying the roots); replica durability unproven",
+                                "mux periodic recovery published local generation={generation} in {took_ms} ms ({} ms of it verifying the newest root); replica durability unproven",
                                 verified_in.as_millis()
                             );
                         }
@@ -728,10 +742,9 @@ impl PeriodicRecovery {
                     // Verification settlement must finish even if shutdown
                     // arrived after durable publication. It never writes.
                     let verifying = Instant::now();
-                    match state.select_predecessor(
-                        &cx::for_request(),
-                        Some((receipt.generation, &receipt.sha256)),
-                    ) {
+                    match state
+                        .select_published(&cx::for_request(), (receipt.generation, &receipt.sha256))
+                    {
                         Ok(()) => {
                             let verified_in = verifying.elapsed();
                             #[cfg(unix)]

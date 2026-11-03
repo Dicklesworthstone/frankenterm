@@ -8357,11 +8357,35 @@ pub fn select_verified_recovery_roots(
 /// Select from the two fixed root slots and their authenticated repair discovery.
 /// Keep one verified graph per slot; a failed newer candidate may fall back to
 /// that slot's older committed discovery without retaining a third full graph.
-#[allow(clippy::too_many_lines)]
 pub fn select_verified_recovery_roots_with_cx(
     cx: &crate::cx::Cx,
     store: &SnapshotPublicationStore,
     verifier: &WholeMuxRecoveryVerifier,
+) -> Result<VerifiedRootSelection<ValidatedWholeMuxRecovery>, WholeMuxRecoveryError> {
+    select_recovery_roots_with_cx(cx, store, verifier, false)
+}
+
+/// Like [`select_verified_recovery_roots_with_cx`], but once the newest root
+/// verifies, an older slot that inspected cleanly is not verified, so
+/// `previous` is `None` and that slot leaves no diagnostic. Each verification
+/// reopens every guardian pane's custody and catalog under the guardian
+/// store's lock. For a publisher that has just verified both committed roots
+/// while publishing, the older one again repeats that work and only the
+/// newest is news (ft-4wrv7).
+pub fn select_newest_verified_recovery_root_with_cx(
+    cx: &crate::cx::Cx,
+    store: &SnapshotPublicationStore,
+    verifier: &WholeMuxRecoveryVerifier,
+) -> Result<VerifiedRootSelection<ValidatedWholeMuxRecovery>, WholeMuxRecoveryError> {
+    select_recovery_roots_with_cx(cx, store, verifier, true)
+}
+
+#[allow(clippy::too_many_lines)]
+fn select_recovery_roots_with_cx(
+    cx: &crate::cx::Cx,
+    store: &SnapshotPublicationStore,
+    verifier: &WholeMuxRecoveryVerifier,
+    newest_only: bool,
 ) -> Result<VerifiedRootSelection<ValidatedWholeMuxRecovery>, WholeMuxRecoveryError> {
     use crate::snapshot_publication::{RootDiagnosticAuthority, RootSlot, TornRootDiagnostic};
     use crate::snapshot_repair::{
@@ -8392,7 +8416,36 @@ pub fn select_verified_recovery_roots_with_cx(
     let mut accepted_roots = Vec::with_capacity(2);
     // Indices into `diagnostics` of roots rejected for guardian evidence.
     let mut guardian_rejections = Vec::new();
-    for slot in [RootSlot::SlotA, RootSlot::SlotB] {
+    // The newest generation a slot can yield, as committed or repaired.
+    let newest_in = |slot: RootSlot| {
+        let committed = candidates
+            .iter()
+            .filter(|candidate| candidate.slot == slot)
+            .map(|candidate| candidate.generation);
+        let repaired = discoveries
+            .iter()
+            .filter(|discovery| discovery.slot == slot)
+            .map(|discovery| discovery.generation);
+        committed.chain(repaired).max()
+    };
+    let mut slots = [RootSlot::SlotA, RootSlot::SlotB];
+    if newest_only {
+        slots.sort_by_key(|slot| std::cmp::Reverse(newest_in(*slot)));
+    }
+    for slot in slots {
+        // A root verified above a generation the other slot can reach
+        // settles a newest-only selection, if that slot inspected cleanly. At
+        // an equal generation the other slot is still verified, so two roots
+        // of one generation stay ambiguous, and a slot with a torn envelope
+        // or discovery still gets its repair attempt.
+        if newest_only
+            && accepted_roots
+                .first()
+                .is_some_and(|(generation, _)| newest_in(slot) < Some(*generation))
+            && !diagnostics.iter().any(|diagnostic| diagnostic.slot == slot)
+        {
+            break;
+        }
         let ordinary = candidates.iter().find(|candidate| candidate.slot == slot);
         let discovery = discoveries.iter().find(|discovery| discovery.slot == slot);
         let mut attempts = Vec::with_capacity(2);
@@ -15250,6 +15303,214 @@ mod tests {
             current.image.header.generation, 1,
             "generation 1 must be selected as current"
         );
+    }
+
+    /// Once the newest root verifies, a newest-only selection leaves the older
+    /// slot unverified; a newest root that fails still falls back to it
+    /// (ft-4wrv7).
+    #[test]
+    #[cfg(feature = "frankenterm-deps")]
+    #[allow(clippy::too_many_lines)]
+    fn newest_only_root_selection_skips_the_older_slot_once_the_newest_verifies() {
+        let temp_dir = private_test_directory();
+        let store = SnapshotPublicationStore::open(temp_dir.path(), Default::default())
+            .expect("open publication store");
+        let verifier = whole_mux_test_verifier();
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 480,
+            dpi: 96,
+        };
+        let publish = |generation: u64, predecessor: Option<&(MuxRecoveryImage, Vec<u8>)>| {
+            let object_id = format!("obj-newest-{generation}");
+            let (plaintext, _) =
+                create_test_terminal_checkpoint_payload(b"newest content\r\n", 24, 80);
+            let ciphertext = encrypted_test_payload(
+                &plaintext,
+                semantic_object_id_from_str(&object_id),
+                RecoveryObjectKind::TerminalCheckpoint,
+                generation,
+                None,
+            );
+            let digest: [u8; 32] = Sha256::digest(&ciphertext).into();
+            let object = RecoveryObjectPayload {
+                object_id: object_id.clone(),
+                expected_sha256: hex::encode(digest),
+                ciphertext_bytes: ciphertext,
+            };
+            store
+                .publish_object(&object)
+                .expect("publish checkpoint object");
+            let mut image = MuxRecoveryImage {
+                header: RecoveryImageHeader {
+                    magic: MUX_RECOVERY_IMAGE_MAGIC,
+                    schema_version: MUX_RECOVERY_IMAGE_SCHEMA_VERSION,
+                    generation,
+                    predecessor_digest: predecessor.map(|(image, _)| image.image_digest),
+                    created_at_epoch_ms: 1700000000000,
+                    mux_incarnation_id: "inc-newest".to_string(),
+                    ft_version: "0.1.0".to_string(),
+                    session_id: "sess-newest".to_string(),
+                },
+                topology: RecoveryTopology {
+                    domains: vec![RecoveryDomain {
+                        incarnation_domain_id: 1,
+                        domain_name: "local".to_string(),
+                        is_attached: true,
+                        recovery_policy: Some(
+                            crate::mux_recovery_image::RecoveryDomainPolicy::local_test_fixture(),
+                        ),
+                    }],
+                    domain_state: Some(Default::default()),
+                    windows: vec![RecoveryWindow {
+                        window_id: 1,
+                        stable_window_id: "00000000-0000-0000-0000-000000000001".to_string(),
+                        workspace: "default".to_string(),
+                        order_revision: 1,
+                        gui_position: None,
+                        tabs: vec![RecoveryTab {
+                            tab_id: 1,
+                            stable_tab_id: "00000000-0000-0000-0000-000000000001".to_string(),
+                            title: "tab-1".to_string(),
+                            working_dir: None,
+                            size,
+                            size_before_zoom: size,
+                            zoomed_pane_id: None,
+                            root_split: Some(RecoverySplitNode::Leaf {
+                                pane_id: 1,
+                                pane_uuid: "uuid-pane-1".to_string(),
+                            }),
+                            floating_panes: vec![],
+                            pane_stacks: vec![],
+                            floating_focus: None,
+                            active_pane_id: 1,
+                            underlying_tiled_active_pane_id: None,
+                            runtime_state: Some(Default::default()),
+                        }],
+                        active_tab_index: 0,
+                        title: String::new(),
+                        last_active_tab_id: None,
+                        tab_stacks: vec![],
+                    }],
+                    focused_window_id: Some(1),
+                    client_workspace: None,
+                    workspace_state: recovery_test_workspace_state(&[("default", 1)]),
+                },
+                panes: vec![RecoveryPane {
+                    pane_id: 1,
+                    pane_uuid: "uuid-pane-1".to_string(),
+                    spawn_custody: crate::mux_recovery_image::RecoverySpawnCustody::Absent,
+                    domain_name: "local".to_string(),
+                    title: "frankenterm".to_string(),
+                    cwd: None,
+                    size,
+                    cursor_position: (0, 1),
+                    alt_screen_active: false,
+                    checkpoint: PaneCheckpointBinding {
+                        topology_incarnation_id: "inc-newest".to_string(),
+                        pane_uuid: "uuid-pane-1".to_string(),
+                        registration_wire_identity: [1; 16],
+                        parser_capture: ParserCaptureIdentity {
+                            watermark_bytes: 100,
+                            segment_id: None,
+                            parser_seqno: Some(1),
+                        },
+                        checkpoint_ref: RecoveryObjectRef {
+                            object_id,
+                            byte_length: object.ciphertext_bytes.len() as u64,
+                            payload_digest: digest,
+                            schema_version: 3,
+                        },
+                        authority: CheckpointAuthority::ModelOnly {
+                            captured_at_epoch_ms: 1700000000000,
+                            parser_seqno: Some(1),
+                        },
+                    },
+                }],
+                image_digest: [0u8; 32],
+            };
+            image.image_digest = image.compute_digest().expect("digest");
+            let manifest = encrypted_test_image(&image);
+            store
+                .publish_generation_root(
+                    &GenerationRootPublishRequest {
+                        generation,
+                        publisher_id: format!("pub-{generation}"),
+                        predecessor: predecessor.map(|(_, manifest)| PredecessorBinding {
+                            expected_generation: generation - 1,
+                            expected_hash: sha256_hex(manifest),
+                        }),
+                        manifest_bytes: manifest.clone(),
+                        created_at_ms: 1700000000000,
+                    },
+                    &verifier,
+                )
+                .expect("publish generation root");
+            ((image, manifest), object)
+        };
+        let generations = |selection: &VerifiedRootSelection<ValidatedWholeMuxRecovery>| {
+            (
+                selection
+                    .current
+                    .as_ref()
+                    .map(|root| root.image.header.generation),
+                selection
+                    .previous
+                    .as_ref()
+                    .map(|root| root.image.header.generation),
+            )
+        };
+        let select_full = || select_verified_recovery_roots(&store, &verifier).expect("select");
+        let select_newest = || {
+            select_newest_verified_recovery_root_with_cx(
+                &crate::cx::for_request(),
+                &store,
+                &verifier,
+            )
+            .expect("select the newest")
+        };
+        let checkpoint_path = |generation: u64| {
+            store
+                .root_path()
+                .join(crate::snapshot_publication::OBJECTS_DIR_NAME)
+                .join(format!("obj-newest-{generation}.obj"))
+        };
+        let (first, _) = publish(1, None);
+        let (_, second_object) = publish(2, Some(&first));
+
+        let full = select_full();
+        assert_eq!(generations(&full), (Some(2), Some(1)));
+        assert!(!full.has_unresolved_authority());
+        let newest = select_newest();
+        assert_eq!(generations(&newest), (Some(2), None));
+        assert!(newest.torn_or_rejected.is_empty());
+        assert!(!newest.has_unresolved_authority());
+
+        // A newest root that no longer verifies: both selections fall back to
+        // the older root and both report the newer one as blocking.
+        std::fs::remove_file(checkpoint_path(2)).expect("drop generation 2's checkpoint");
+        for selection in [select_full(), select_newest()] {
+            assert_eq!(generations(&selection), (Some(1), None));
+            assert!(selection.has_unresolved_authority());
+        }
+        store
+            .publish_object(&second_object)
+            .expect("restore generation 2's checkpoint");
+
+        // An older root that no longer verifies blocks a full selection. A
+        // newest-only one never reads it once the newest verifies. (A whole-mux
+        // publication verifies both committed roots against their repair
+        // discovery and refuses it as CommittedGraphRejected.)
+        std::fs::remove_file(checkpoint_path(1)).expect("drop generation 1's checkpoint");
+        let full = select_full();
+        assert_eq!(generations(&full), (Some(2), None));
+        assert!(full.has_unresolved_authority());
+        let newest = select_newest();
+        assert_eq!(generations(&newest), (Some(2), None));
+        assert!(newest.torn_or_rejected.is_empty());
+        assert!(!newest.has_unresolved_authority());
     }
 
     #[test]
