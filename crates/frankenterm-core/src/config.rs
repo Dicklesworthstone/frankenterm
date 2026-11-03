@@ -3326,6 +3326,11 @@ pub struct TraumaGuardConfig {
     pub similarity_threshold: f64,
     /// Maximum history window size retained per pane.
     pub window_size: usize,
+    /// Seconds back from a proposed send that its trailing run of failed
+    /// attempts may reach. Attempts further apart never add up to a loop, so
+    /// the default 60 catches only tight retry loops. Widening it also blocks
+    /// fix-and-retest loops: file edits between attempts are not observed.
+    pub recurrence_window_secs: u64,
 }
 
 impl Default for TraumaGuardConfig {
@@ -3335,6 +3340,7 @@ impl Default for TraumaGuardConfig {
             max_consecutive_failures: 3,
             similarity_threshold: 0.88,
             window_size: 128,
+            recurrence_window_secs: 60,
         }
     }
 }
@@ -3348,6 +3354,8 @@ impl TraumaGuardConfig {
         config.command_similarity_threshold = self.similarity_threshold;
         config.history_limit = self.window_size.max(1);
         config.signature_retention = config.signature_retention.max(config.history_limit);
+        config.signature_window.window_duration_ms =
+            self.recurrence_window_secs.max(1).saturating_mul(1000);
         config
     }
 }
@@ -5492,6 +5500,20 @@ impl Config {
             });
         }
 
+        if self.safety.trauma_guard.recurrence_window_secs
+            != new_config.safety.trauma_guard.recurrence_window_secs
+        {
+            changes.push(HotReloadChange {
+                name: "safety.trauma_guard.recurrence_window_secs".to_string(),
+                old_value: self.safety.trauma_guard.recurrence_window_secs.to_string(),
+                new_value: new_config
+                    .safety
+                    .trauma_guard
+                    .recurrence_window_secs
+                    .to_string(),
+            });
+        }
+
         // The classifier carries a hash salt, so the change report names the
         // section and policy counts but never echoes its values.
         if self.safety.data_classifier != new_config.safety.data_classifier {
@@ -6872,12 +6894,14 @@ enabled = false
 max_consecutive_failures = 6
 similarity_threshold = 0.91
 window_size = 256
+recurrence_window_secs = 900
 ";
         let config = Config::from_toml(toml).expect("Failed to parse");
         assert!(!config.safety.trauma_guard.enabled);
         assert_eq!(config.safety.trauma_guard.max_consecutive_failures, 6);
         assert!((config.safety.trauma_guard.similarity_threshold - 0.91).abs() < f64::EPSILON);
         assert_eq!(config.safety.trauma_guard.window_size, 256);
+        assert_eq!(config.safety.trauma_guard.recurrence_window_secs, 900);
     }
 
     #[test]
@@ -8658,6 +8682,7 @@ max_bytes_per_sec = 1048576
         config2.safety.trauma_guard.max_consecutive_failures = 7;
         config2.safety.trauma_guard.similarity_threshold = 0.93;
         config2.safety.trauma_guard.window_size = 222;
+        config2.safety.trauma_guard.recurrence_window_secs = 600;
 
         let result = config1.diff_for_hot_reload(&config2);
 
@@ -8685,6 +8710,12 @@ max_bytes_per_sec = 1048576
                 .changes
                 .iter()
                 .any(|c| c.name == "safety.trauma_guard.window_size")
+        );
+        assert!(
+            result
+                .changes
+                .iter()
+                .any(|c| c.name == "safety.trauma_guard.recurrence_window_secs")
         );
     }
 
@@ -11138,6 +11169,14 @@ mode = "periodic"
         assert_eq!(tg.max_consecutive_failures, 3);
         assert!((tg.similarity_threshold - 0.88).abs() < f64::EPSILON);
         assert_eq!(tg.window_size, 128);
+        assert_eq!(tg.recurrence_window_secs, 60);
+        assert_eq!(
+            tg.to_trauma_config().signature_window.window_duration_ms,
+            crate::trauma_guard::TraumaConfig::default()
+                .signature_window
+                .window_duration_ms,
+            "the default window is the runtime's own"
+        );
     }
 
     #[test]
@@ -11147,11 +11186,21 @@ mode = "periodic"
             max_consecutive_failures: 5,
             similarity_threshold: 0.91,
             window_size: 200,
+            recurrence_window_secs: 900,
         };
         let runtime = tg.to_trauma_config();
         assert_eq!(runtime.loop_threshold, 5);
         assert!((runtime.command_similarity_threshold - 0.91).abs() < f64::EPSILON);
         assert_eq!(runtime.history_limit, 200);
+        assert_eq!(runtime.signature_window.window_duration_ms, 900_000);
+        let zero = TraumaGuardConfig {
+            recurrence_window_secs: 0,
+            ..TraumaGuardConfig::default()
+        };
+        assert_eq!(
+            zero.to_trauma_config().signature_window.window_duration_ms,
+            1_000
+        );
     }
 
     #[test]
