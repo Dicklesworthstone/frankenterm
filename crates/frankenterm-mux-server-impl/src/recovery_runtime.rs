@@ -431,7 +431,8 @@ impl CaptureState {
 
 struct AttemptResult {
     state: Option<CaptureState>,
-    /// And how long verifying the newest root after it took (ft-4wrv7).
+    /// The generation this attempt published, and how long verifying the
+    /// newest root after it took (ft-4wrv7).
     published_generation: Option<(u64, Duration)>,
     error: Option<&'static str>,
     terminal: bool,

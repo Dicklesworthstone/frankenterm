@@ -8369,8 +8369,8 @@ pub fn select_verified_recovery_roots_with_cx(
 /// verifies, an older slot that inspected cleanly is not verified, so
 /// `previous` is `None` and that slot leaves no diagnostic. Each verification
 /// reopens every guardian pane's custody and catalog under the guardian
-/// store's lock. For a publisher that has just verified both committed roots
-/// while publishing, the older one again repeats that work and only the
+/// store's lock. A publisher that has just verified both committed roots
+/// while publishing would only repeat that work on the older one; only the
 /// newest is news (ft-4wrv7).
 pub fn select_newest_verified_recovery_root_with_cx(
     cx: &crate::cx::Cx,
