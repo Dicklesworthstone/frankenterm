@@ -3,6 +3,8 @@
 #include <libssh2_sftp.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <pthread.h>
 #include <poll.h>
 #include <stdalign.h>
@@ -620,6 +622,12 @@ int ftssh_create(int fd, size_t maximum, ftssh_session **out) {
     struct sockaddr_storage peer; socklen_t peer_length = sizeof(peer);
     if(getsockopt(fd, SOL_SOCKET, SO_TYPE, &kind, &kind_length) || kind != SOCK_STREAM ||
        getpeername(fd, (struct sockaddr *)&peer, &peer_length)) return FTSSH_INVALID;
+    /* Interactive keystrokes must not wait for Nagle's outstanding-packet
+     * batching and the peer's delayed ACK. Preserve Unix socket transports. */
+    if(peer.ss_family == AF_INET || peer.ss_family == AF_INET6) {
+        int no_delay = 1;
+        if(setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &no_delay, sizeof(no_delay))) return FTSSH_IO;
+    }
     int flags = fcntl(fd, F_GETFL), fd_flags = fcntl(fd, F_GETFD);
     if(flags < 0 || fd_flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0 ||
        fcntl(fd, F_SETFD, fd_flags | FD_CLOEXEC) < 0) return FTSSH_IO;
