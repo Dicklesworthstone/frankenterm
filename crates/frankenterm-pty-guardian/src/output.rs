@@ -75,7 +75,12 @@ use thiserror::Error;
 use uuid::Uuid;
 use zeroize::{Zeroize as _, Zeroizing};
 
-pub const OUTPUT_RECORD_BYTES: usize = 8 * 1024;
+// The most one output record holds, in a guardian journal and in a broker's
+// chain alike. Each record costs a full sync, and a broker pane's record also a
+// Read and an Ack round trip, so bulk output that fits more in a record goes
+// several times faster (ft-2pgul: 8 KiB records held a pane near 1.5 MB/s).
+// Replay pages carry whole records, and a mux asks for pages of up to 256 KiB.
+pub const OUTPUT_RECORD_BYTES: usize = 64 * 1024;
 const OUTPUT_DIRECTORY_NAME: &str = "guardian-output-v3";
 const OUTPUT_KEY_NAME: &str = "journal.key";
 const INPUT_JOURNAL_SUFFIX: &str = "ftgin";
@@ -2310,7 +2315,7 @@ impl OutputSegmentPolicy {
     const fn production() -> Self {
         Self {
             journal_limits: GuardianOutputJournalLimits {
-                max_record_bytes: 8 * 1024,
+                max_record_bytes: 64 * 1024,
                 max_log_bytes: OUTPUT_SEGMENT_LOG_BYTES,
                 max_records: OUTPUT_SEGMENT_MAX_RECORDS,
             },

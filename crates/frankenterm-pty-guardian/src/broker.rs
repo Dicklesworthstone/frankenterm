@@ -61,7 +61,7 @@
 use crate::SealedAtomicBuildIdentity;
 use crate::output::{
     GuardianBrokerOutputChainV1, GuardianOutputPipeline, GuardianPaneOutputJournal,
-    GuardianPublishedGenesisAdmissionPermitV1,
+    GuardianPublishedGenesisAdmissionPermitV1, OUTPUT_RECORD_BYTES,
 };
 use crate::transport::{
     GuardianServiceError, GuardianTokenEffectLease, GuardianTokenPathAuthority,
@@ -120,7 +120,13 @@ const BROKER_CATALOG_CHECKSUM_BYTES: usize = 32;
 const BROKER_DEFAULT_MAX_PROXY_OPERATION_BYTES: usize = 64 * 1024;
 const BROKER_DEFAULT_MAX_BUFFERED_OUTPUT_BYTES: usize = 1024 * 1024;
 const BROKER_ABSOLUTE_MAX_BUFFERED_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
-const BROKER_OUTPUT_PUMP_CHUNK_BYTES: usize = 8 * 1024;
+// One drain's journal record and one Read's reply. A guardian asks for up to a
+// whole record, so a Read reply and a proxy operation must hold one.
+const BROKER_OUTPUT_PUMP_CHUNK_BYTES: usize = OUTPUT_RECORD_BYTES;
+const _: () = assert!(
+    BROKER_OUTPUT_PUMP_CHUNK_BYTES <= BROKER_CONTROL_MAX_PAYLOAD_BYTES
+        && BROKER_OUTPUT_PUMP_CHUNK_BYTES <= BROKER_DEFAULT_MAX_PROXY_OPERATION_BYTES
+);
 const BROKER_SPAWN_WAL_FILE_MAGIC: [u8; 8] = *b"FTBSW001";
 const BROKER_SPAWN_HEAD_FILE_MAGIC: [u8; 8] = *b"FTBSH001";
 const BROKER_SPAWN_WAL_RECORD_MAGIC: [u8; 8] = *b"FTBSR001";
@@ -30272,8 +30278,11 @@ mod tests {
 
     #[test]
     fn drain_fills_a_record_from_a_full_pty_and_ends_one_at_a_small_burst() {
+        // Smaller than a production record: the bulk write below must fit in
+        // the unread pipe, which holds 64 KiB on Linux.
+        const RECORD: usize = 8 * 1024;
         let (mut reader, mut writer) = nonblocking_test_pipe();
-        let mut record = [0_u8; BROKER_OUTPUT_PUMP_CHUNK_BYTES];
+        let mut record = [0_u8; RECORD];
         assert_eq!(
             drain_pty_reader(&mut *reader, &mut record),
             Ok(BrokerPtyDrainV1::Empty)
@@ -30288,21 +30297,21 @@ mod tests {
 
         // More than a record: the first drain fills its buffer, the second
         // takes the rest after its full burst waits in vain for more.
-        let bulk: Vec<u8> = (0..BROKER_OUTPUT_PUMP_CHUNK_BYTES + 1500)
+        let bulk: Vec<u8> = (0..RECORD + 1500)
             .map(|index| u8::try_from(index % 251).expect("byte"))
             .collect();
         writer.write_all(&bulk).expect("write more than a record");
         assert_eq!(
             drain_pty_reader(&mut *reader, &mut record),
-            Ok(BrokerPtyDrainV1::Bytes(BROKER_OUTPUT_PUMP_CHUNK_BYTES))
+            Ok(BrokerPtyDrainV1::Bytes(RECORD))
         );
-        assert_eq!(record[..], bulk[..BROKER_OUTPUT_PUMP_CHUNK_BYTES]);
+        assert_eq!(record[..], bulk[..RECORD]);
         let started = Instant::now();
         assert_eq!(
             drain_pty_reader(&mut *reader, &mut record),
             Ok(BrokerPtyDrainV1::Bytes(1500))
         );
-        assert_eq!(record[..1500], bulk[BROKER_OUTPUT_PUMP_CHUNK_BYTES..]);
+        assert_eq!(record[..1500], bulk[RECORD..]);
         assert!(started.elapsed() < Duration::from_secs(5));
 
         // Output that ends after some bytes yields those bytes first; the next

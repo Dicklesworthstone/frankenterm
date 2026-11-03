@@ -318,6 +318,10 @@ const OUTPUT_STORAGE_FULL_RETRY: Duration = Duration::from_millis(250);
 const BROKER_READ_STREAMING_WINDOW: Duration = Duration::from_millis(20);
 /// The longest a pane goes without a ChildStatus while its PTY stays open.
 const BROKER_CHILD_STATUS_INTERVAL: Duration = Duration::from_secs(1);
+/// The most one read of a guardian-owned PTY takes, as one record. A PTY read
+/// returns a few KiB at most, and its buffer is zeroed before every read.
+const PTY_READ_BYTES: usize = 8 * 1024;
+const _: () = assert!(PTY_READ_BYTES <= OUTPUT_RECORD_BYTES);
 
 impl StartingBrokerPane {
     /// Whether nothing is left to do for this pane, whose protocol state is
@@ -4075,7 +4079,7 @@ impl GuardianRuntime {
             }
 
             let read_len = remaining
-                .min(OUTPUT_RECORD_BYTES)
+                .min(PTY_READ_BYTES)
                 .min(pane.output.max_append_bytes);
             let mut bytes = Zeroizing::new(Vec::new());
             if bytes.try_reserve_exact(read_len).is_err() {
