@@ -4809,7 +4809,10 @@ std::thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-fn validate_private_parent(path: &Path) -> Result<(), GuardianServiceError> {
+/// Returns the immediate parent's no-follow metadata that passed the owner and
+/// mode check, so a pinned-descriptor check can compare against it instead of
+/// resolving the path once more.
+fn validate_private_parent(path: &Path) -> Result<Metadata, GuardianServiceError> {
     validate_absolute_path(path)?;
     let parent = path
         .parent()
@@ -4865,7 +4868,7 @@ fn validate_private_parent(path: &Path) -> Result<(), GuardianServiceError> {
             walks.push((parent.to_path_buf(), now));
         });
     }
-    Ok(())
+    Ok(metadata)
 }
 
 fn open_private_parent(path: &Path) -> Result<std::fs::File, GuardianServiceError> {
@@ -4920,17 +4923,10 @@ fn validate_pinned_private_parent(
     path: &Path,
     directory: &std::fs::File,
 ) -> Result<(), GuardianServiceError> {
-    validate_private_parent(path)?;
-    let parent = path
-        .parent()
-        .ok_or(GuardianServiceError::FilesystemSecurity(
-            "guardian path has no parent directory",
-        ))?;
+    let named = validate_private_parent(path)?;
     let opened = directory
         .metadata()
         .map_err(|error| GuardianServiceError::io("pinned-parent-metadata", error))?;
-    let named = std::fs::symlink_metadata(parent)
-        .map_err(|error| GuardianServiceError::io("pinned-parent-path-metadata", error))?;
     require_same_directory_identity(&opened, &named)
 }
 
