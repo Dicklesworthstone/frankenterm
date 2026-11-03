@@ -520,6 +520,13 @@ class EnrollmentServer:
             if client_eof and upstream_eof and not to_client and not to_upstream:
                 code = SERVER.ssh_channel_close(channel)
                 if code not in (0, -2):
+                    # The peer can close between our state sample and this
+                    # close call. Both directions have reached EOF and every
+                    # queued byte was delivered; confirm the disconnected
+                    # state rather than killing the fixture listener.
+                    if not SERVER.ssh_is_connected(session) or SERVER.ssh_channel_is_closed(channel):
+                        finished("peer_closed_during_close", code)
+                        return
                     finished("forward_close_failed", code)
                     raise RuntimeError("fixture forwarding channel close failed")
                 code = SERVER.ssh_blocking_flush(session, 1000)
@@ -622,7 +629,8 @@ class DeviceKeyEnrollmentInteropTests(unittest.TestCase):
             FT_ENROLLMENT_EXPECTED=expected)
         command = (["xcrun", "xctest", "-XCTest", SELECTOR, TEST_BUNDLE]
                    if os.path.isdir(TEST_BUNDLE) else [TEST_BUNDLE, SELECTOR])
-        result = subprocess.run(command, capture_output=True, text=True, timeout=35, env=environment)
+        # The operator selects the XCTest executable; fixture/network data never selects argv[0], and no shell is used.
+        result = subprocess.run(command, capture_output=True, text=True, timeout=35, env=environment)  # ubs:ignore[py.security.command-injection,python.taint.command]
         output = result.stdout + result.stderr
         self.assertEqual(result.returncode, 0, output[-16000:])
         self.assertIn("Executed 1 test", output)
@@ -971,7 +979,8 @@ class DeviceKeyEnrollmentBastionInteropTests(unittest.TestCase):
         command = (["xcrun", "xctest", "-XCTest", SELECTOR, TEST_BUNDLE]
                    if os.path.isdir(TEST_BUNDLE) else [TEST_BUNDLE, SELECTOR])
         started = time.monotonic()
-        result = subprocess.run(command, capture_output=True, text=True, timeout=35, env=environment)
+        # The operator selects the XCTest executable; fixture/network data never selects argv[0], and no shell is used.
+        result = subprocess.run(command, capture_output=True, text=True, timeout=35, env=environment)  # ubs:ignore[py.security.command-injection,python.taint.command]
         output = result.stdout + result.stderr
         self.assertEqual(result.returncode, 0, output[-16000:])
         self.assertIn("Executed 1 test", output)
