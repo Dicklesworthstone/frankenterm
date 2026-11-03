@@ -152,6 +152,15 @@ final class LocalHelperProcessTests: XCTestCase {
         XCTAssertEqual(bytes, Data(argument.utf8))
     }
 
+    func testOwnedGroupConfirmsAlreadyExitedLeaderWithoutOutput() throws {
+        for _ in 0..<20 {
+            let output = try LocalHelperProcess.run(executable: shell,
+                arguments: ["-c", "exit 0"], maximumOutputBytes: 0,
+                timeout: 3, ownedProcessGroup: true)
+            XCTAssertTrue(output.isEmpty)
+        }
+    }
+
     func testOwnedGroupIsCreatedAtSpawnAndDefaultGroupIsUnchanged() throws {
         let script = "printf '%s ' \"$$\"; /bin/ps -o pgid= -p \"$$\""
         let isolated = try LocalHelperProcess.run(executable: shell, arguments: ["-c", script],
