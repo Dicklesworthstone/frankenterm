@@ -896,12 +896,9 @@ fn validate_guardian_token_authority(
         .map_err(|error| GuardianServiceError::io("token-authority-metadata-before", error))?;
     let before_identity = guardian_token_path_identity(&before)?;
     require_same_guardian_token_path_identity(identity, before_identity)?;
-    require_descriptor_relative_binding(
-        parent,
-        leaf_name,
-        &before,
-        validate_token_metadata,
-        "token-authority-binding-before",
+    require_same_guardian_token_path_identity(
+        before_identity,
+        guardian_token_path_identity_at(parent, leaf_name, "token-authority-binding-before")?,
     )?;
     if token_material_digest(token)? != material_digest {
         return Err(GuardianServiceError::FilesystemSecurity(
@@ -914,12 +911,9 @@ fn validate_guardian_token_authority(
     let after_identity = guardian_token_path_identity(&after)?;
     require_same_guardian_token_path_identity(identity, after_identity)?;
     require_same_guardian_token_path_identity(before_identity, after_identity)?;
-    require_descriptor_relative_binding(
-        parent,
-        leaf_name,
-        &after,
-        validate_token_metadata,
-        "token-authority-binding-after",
+    require_same_guardian_token_path_identity(
+        after_identity,
+        guardian_token_path_identity_at(parent, leaf_name, "token-authority-binding-after")?,
     )?;
     validate_pinned_private_parent(token_path, parent)
 }
@@ -5249,17 +5243,101 @@ fn read_guardian_secret_from_open_file_at(
 }
 
 fn validate_token_metadata(metadata: &Metadata) -> Result<(), GuardianServiceError> {
-    if !metadata.is_file()
-        || metadata.uid() != geteuid().as_raw()
-        || metadata.mode() & 0o777 != 0o600
-        || metadata.nlink() != 1
-        || metadata.len() != u64::try_from(GUARDIAN_AUTH_TOKEN_BYTES).unwrap_or(u64::MAX)
+    validate_token_fields(
+        metadata.is_file(),
+        metadata.uid(),
+        metadata.mode(),
+        metadata.nlink(),
+        metadata.len(),
+    )
+}
+
+fn validate_token_fields(
+    regular: bool,
+    owner: u32,
+    mode: u32,
+    links: u64,
+    bytes: u64,
+) -> Result<(), GuardianServiceError> {
+    if !regular
+        || owner != geteuid().as_raw()
+        || mode & 0o777 != 0o600
+        || links != 1
+        || bytes != u64::try_from(GUARDIAN_AUTH_TOKEN_BYTES).unwrap_or(u64::MAX)
     {
         return Err(GuardianServiceError::FilesystemSecurity(
             "guardian token must be a current-user, mode-0600, single-link 32-byte regular file",
         ));
     }
     Ok(())
+}
+
+/// The identity of the file `name` names in the pinned parent now, from one
+/// no-follow stat. Checking that the name still binds the token used to open
+/// it only to fstat it, and that open was most of a token check's cost on
+/// macOS, where every checkpoint job checks its token twice (ft-6wm86). The
+/// stat names the same object, and a symbolic link fails as the no-follow
+/// open failed.
+#[cfg(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+))]
+fn guardian_token_path_identity_at(
+    parent: &File,
+    name: &OsStr,
+    site: &'static str,
+) -> Result<GuardianTokenPathIdentity, GuardianServiceError> {
+    let metadata = rustix::fs::statat(parent, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|error| nofollow_open_error(site, std::io::Error::from(error)))?;
+    let file_type = rustix::fs::FileType::from_raw_mode(metadata.st_mode);
+    if file_type == rustix::fs::FileType::Symlink {
+        return Err(nofollow_open_error(
+            site,
+            std::io::Error::from_raw_os_error(libc::ELOOP),
+        ));
+    }
+    let unrepresentable =
+        || GuardianServiceError::FilesystemSecurity("guardian token identity is not representable");
+    let identity = GuardianTokenPathIdentity {
+        device: u64::try_from(metadata.st_dev).map_err(|_| unrepresentable())?,
+        inode: u64::try_from(metadata.st_ino).map_err(|_| unrepresentable())?,
+        bytes: u64::try_from(metadata.st_size).map_err(|_| unrepresentable())?,
+        mode: u32::from(metadata.st_mode),
+        owner: u32::try_from(metadata.st_uid).map_err(|_| unrepresentable())?,
+        links: u64::from(metadata.st_nlink),
+    };
+    validate_token_fields(
+        file_type == rustix::fs::FileType::RegularFile,
+        identity.owner,
+        identity.mode,
+        identity.links,
+        identity.bytes,
+    )?;
+    Ok(identity)
+}
+
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+)))]
+fn guardian_token_path_identity_at(
+    _parent: &File,
+    _name: &OsStr,
+    _site: &'static str,
+) -> Result<GuardianTokenPathIdentity, GuardianServiceError> {
+    Err(GuardianServiceError::FilesystemSecurity(
+        "descriptor-relative guardian token identity is unsupported on this Unix target",
+    ))
 }
 
 fn guardian_token_path_identity(
@@ -9136,6 +9214,47 @@ mod tests {
             Err(GuardianServiceError::FilesystemSecurity(_))
         ));
         assert_eq!(std::fs::read(&retained_link).unwrap(), original);
+    }
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+    ))]
+    #[test]
+    fn retained_token_authority_rejects_a_symbolic_link_to_its_own_token() {
+        // The name check stats without following links, so a link to the very
+        // file the authority holds still fails, as the no-follow open did.
+        let (token_path, original, mut authority) = retained_token_authority_fixture("symlink");
+        let retained = token_path.with_file_name(format!(
+            "guardian-retained-symlink-{}.token",
+            Uuid::new_v4()
+        ));
+        std::fs::rename(&token_path, &retained).unwrap();
+        symlink(&retained, &token_path).unwrap();
+        assert!(matches!(
+            authority.validate(),
+            Err(GuardianServiceError::FilesystemSecurity(_))
+        ));
+        let mut lease_authority = retained_token_authority_fixture("symlink-lease").2;
+        let lease_token = lease_authority.token_path.clone();
+        let mut lease = lease_authority.acquire_effect_lease().unwrap();
+        let lease_retained = lease_token.with_file_name(format!(
+            "guardian-retained-symlink-lease-{}.token",
+            Uuid::new_v4()
+        ));
+        std::fs::rename(&lease_token, &lease_retained).unwrap();
+        symlink(&lease_retained, &lease_token).unwrap();
+        assert!(matches!(
+            lease.validate(),
+            Err(GuardianServiceError::FilesystemSecurity(_))
+        ));
+        drop(lease);
+        assert_eq!(std::fs::read(&retained).unwrap(), original);
     }
 
     #[test]
