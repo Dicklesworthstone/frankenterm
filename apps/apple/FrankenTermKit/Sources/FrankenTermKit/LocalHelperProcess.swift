@@ -258,7 +258,24 @@ public enum LocalHelperProcess {
             // (ECHILD) retires group authority before another signal.
             do { _ = try observeWithoutReaping() } catch { return false }
             guard ownsPID else { return false }
-            return kill(-pid, signal) == 0 || errno == ESRCH
+            if kill(-pid, signal) == 0 { return true }
+            let code = errno
+            if code == ESRCH { return true }
+            #if canImport(Darwin)
+            // Darwin returns EPERM for a group containing only its zombie
+            // leader. WNOWAIT still reserves that PID. Accept this case only
+            // when the kernel lists exactly that exited, unreaped child: any
+            // other member, truncated census, or inspection failure refuses it.
+            if code == EPERM && exitObserved {
+                var members = [pid_t](repeating: 0, count: 2)
+                let bytes = members.withUnsafeMutableBytes { buffer in
+                    proc_listpids(UInt32(PROC_PGRP_ONLY), UInt32(pid),
+                                  buffer.baseAddress, Int32(buffer.count))
+                }
+                return bytes == MemoryLayout<pid_t>.stride && members[0] == pid
+            }
+            #endif
+            return false
         }
 
         private func stopGroup(drain: () -> Bool) -> Bool {
