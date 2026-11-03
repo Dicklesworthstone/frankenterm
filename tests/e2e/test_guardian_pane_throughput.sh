@@ -13,8 +13,9 @@
 #   guardian: a broker + guardian pair owns it (mux-guardian-host.sh install
 #             --manager direct), so every record is journaled before delivery.
 # Prints one RESULT line per mode. MIN_GUARDIAN_KBPS=N fails the run when the
-# guardian pane is slower than N KB/s. Nothing is deleted; every started
-# process is stopped.
+# guardian pane is slower than N KB/s. E2E_ROOT=DIR puts the sandboxes in DIR:
+# on a tmpfs /tmp a journal sync costs nothing, so measure on a real disk.
+# Nothing is deleted; every started process is stopped.
 set -uo pipefail
 umask "$(printf '%04o' $(( 8#$(umask) | 8#022 )))"
 FAMILY=${1:?family dir}
@@ -22,6 +23,7 @@ BYTES=${2:-2000000}
 TOOL=${3:-$(cd "$(dirname "$0")/../.." && pwd)/scripts/mux-guardian-host.sh}
 [ -x "$TOOL" ] || { echo "FAIL: tool $TOOL not executable"; exit 1; }
 case $(uname -s) in Darwin) ROOT=/private/tmp ;; *) ROOT=/tmp ;; esac
+ROOT=${E2E_ROOT:-$ROOT}
 
 measure() {  # <plain|guardian> -> "RESULT: <mode> <bytes> bytes in <s> s = <KB/s> KB/s"
   local mode=$1 S line=""
