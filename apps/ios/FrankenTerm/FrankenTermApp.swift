@@ -4976,6 +4976,7 @@ private struct WorkspaceKeysSheet: View {
             Button(copiedPhoneKeyID == key.id ? "Public Key Copied" : "Copy Public Key", systemImage: "doc.on.doc") {
                 guard model.active, !model.busy,
                       saved?.deviceKeys.contains(where: { $0 == key }) == true else { return }
+                // ubs:ignore[swift.crypto.weak-randomness] — Date expires an existing public-key clipboard item; it generates no key or token.
                 UIPasteboard.general.setItems([[UTType.utf8PlainText.identifier: key.authorizedKey]],
                     options: [.localOnly: true, .expirationDate: Date().addingTimeInterval(120)])
                 copiedPhoneKeyID = key.id
