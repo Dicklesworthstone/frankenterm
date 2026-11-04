@@ -53,6 +53,10 @@ const AUTHENTICATION_DEADLINE: Duration = Duration::from_secs(5);
 /// A connection refused for want of a slot is logged at most this often.
 const CAPACITY_REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a capability probe keeps asking a guardian that closes without a
+/// reply, and how long it pauses between asks (see `GuardianClient::admits_hello`).
+const PROBE_BUSY_BUDGET: Duration = Duration::from_secs(5);
+const PROBE_BUSY_PAUSE: Duration = Duration::from_millis(50);
 /// A checkpoint Stage step can make the guardian authenticate and publish a
 /// whole checkpoint before it replies. A missed I/O deadline on a pane's own
 /// connection costs the pane its lease, so these steps wait as long as a
@@ -2690,8 +2694,8 @@ impl GuardianClient {
     /// Whether the guardian at `socket_path` validates version 4 (compact)
     /// terminal checkpoints: it accepted an authenticated Hello requiring
     /// them. A guardian predating them refuses that Hello, as any guardian
-    /// refuses a build-bearing Hello from an unsealed build; every failure
-    /// reads as no, and the mux keeps publishing version 3.
+    /// refuses a build-bearing Hello from an unsealed build; a failure reads
+    /// as no, and the mux keeps publishing version 3.
     ///
     /// The probe connects as a throwaway mux incarnation that owns nothing,
     /// so the guardian's retirement of it on disconnect retires nothing of
@@ -2700,81 +2704,95 @@ impl GuardianClient {
         let Ok(hello) = GuardianHelloBuildIdentityV1::for_compiled_mux() else {
             return false;
         };
-        Self::connect_with_hello(
+        Self::admits_hello(
             socket_path,
             token_path,
-            Uuid::new_v4(),
             hello.encode_requiring_compact_checkpoints().to_vec(),
         )
-        .is_ok()
     }
 
     /// Whether the guardian at `socket_path` validates terminal checkpoints
     /// holding graphics state, probed as `admits_compact_checkpoints` probes
-    /// version 4. Every failure reads as no, and the mux keeps refusing to
+    /// version 4. A failure reads as no, and the mux keeps refusing to
     /// checkpoint a pane that shows an image.
     pub fn admits_graphics_checkpoints(socket_path: &Path, token_path: &Path) -> bool {
         let Ok(hello) = GuardianHelloBuildIdentityV1::for_compiled_mux() else {
             return false;
         };
-        Self::connect_with_hello(
+        Self::admits_hello(
             socket_path,
             token_path,
-            Uuid::new_v4(),
             hello.encode_requiring_graphics_checkpoints().to_vec(),
         )
-        .is_ok()
     }
 
     /// Whether the guardian at `socket_path` validates terminal checkpoints
     /// holding character protection, probed as `admits_compact_checkpoints`
-    /// probes version 4. Every failure reads as no, and the mux keeps
-    /// refusing to checkpoint a pane holding protected cells.
+    /// probes version 4. A failure reads as no, and the mux keeps refusing to
+    /// checkpoint a pane holding protected cells.
     pub fn admits_protection_checkpoints(socket_path: &Path, token_path: &Path) -> bool {
         let Ok(hello) = GuardianHelloBuildIdentityV1::for_compiled_mux() else {
             return false;
         };
-        Self::connect_with_hello(
+        Self::admits_hello(
             socket_path,
             token_path,
-            Uuid::new_v4(),
             hello.encode_requiring_protection_checkpoints().to_vec(),
         )
-        .is_ok()
     }
 
     /// Whether the guardian at `socket_path` comes from a build that reads
     /// durable scrollback rows showing images in their own schema, probed as
-    /// `admits_compact_checkpoints` probes version 4. Every failure reads as
-    /// no, and the mux keeps writing such rows as before.
+    /// `admits_compact_checkpoints` probes version 4. A failure reads as no,
+    /// and the mux keeps writing such rows as before.
     pub fn admits_image_scrollback_rows(socket_path: &Path, token_path: &Path) -> bool {
         let Ok(hello) = GuardianHelloBuildIdentityV1::for_compiled_mux() else {
             return false;
         };
-        Self::connect_with_hello(
+        Self::admits_hello(
             socket_path,
             token_path,
-            Uuid::new_v4(),
             hello.encode_requiring_image_scrollback_rows().to_vec(),
         )
-        .is_ok()
     }
 
     /// Whether the guardian at `socket_path` forgets an ended pane its mux
     /// releases (op Release), probed as `admits_compact_checkpoints` probes
-    /// version 4. Every failure reads as no, and the mux never asks: a
-    /// guardian predating Release drops the connection on it.
+    /// version 4. A failure reads as no, and the mux never asks: a guardian
+    /// predating Release drops the connection on it.
     pub fn admits_release(socket_path: &Path, token_path: &Path) -> bool {
         let Ok(hello) = GuardianHelloBuildIdentityV1::for_compiled_mux() else {
             return false;
         };
-        Self::connect_with_hello(
+        Self::admits_hello(
             socket_path,
             token_path,
-            Uuid::new_v4(),
             hello.encode_requiring_release().to_vec(),
         )
-        .is_ok()
+    }
+
+    /// Whether the guardian accepts `hello`. The mux keeps this answer for its
+    /// whole life. A close without a reply is no answer: it is how a guardian
+    /// meets a build-bearing Hello while a job holds its protocol authority,
+    /// and a flooded pane keeps such jobs running. So that one is asked again
+    /// until `PROBE_BUSY_BUDGET` ends; a refusal, or any other failure, is a
+    /// no at once.
+    fn admits_hello(socket_path: &Path, token_path: &Path, hello: Vec<u8>) -> bool {
+        let mux_incarnation = Uuid::new_v4();
+        let started = Instant::now();
+        loop {
+            match Self::connect_with_hello(socket_path, token_path, mux_incarnation, hello.clone())
+            {
+                Ok(_) => return true,
+                Err(GuardianClientError::Io(error))
+                    if error.kind() == ErrorKind::UnexpectedEof
+                        && started.elapsed() < PROBE_BUSY_BUDGET =>
+                {
+                    std::thread::sleep(PROBE_BUSY_PAUSE);
+                }
+                Err(_) => return false,
+            }
+        }
     }
 
     /// Authenticate the build compiled into this mux for Genesis staging.
@@ -6710,6 +6728,91 @@ mod tests {
             "the parked census is answered by the protocol: {result:?}"
         );
         client.join().unwrap();
+    }
+
+    /// A guardian out with a job closes a probe's Hello without a reply, which
+    /// says nothing about what it admits: the probe asks again until the job
+    /// is back, and only a job outlasting its budget reads as no. A refusal is
+    /// a no at once.
+    #[test]
+    fn a_probe_waits_out_the_job_holding_the_protocol_authority() {
+        fn answer_of(
+            service: &mut GuardianService,
+            answer: &std::sync::mpsc::Receiver<bool>,
+        ) -> bool {
+            let deadline = Instant::now() + PROBE_BUSY_BUDGET + CLIENT_IO_TIMEOUT;
+            loop {
+                if let Ok(answer) = answer.try_recv() {
+                    return answer;
+                }
+                assert!(Instant::now() < deadline, "the probe never answered");
+                service.poll_once().unwrap();
+            }
+        }
+
+        let directory = tempfile::Builder::new()
+            .prefix("ft-guardian-probe-busy-")
+            .tempdir_in(crate::canonical_test_temp_root())
+            .unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let token = directory.path().join("token");
+        let socket = directory.path().join("guardian.sock");
+        provision_guardian_token(&token).unwrap();
+        let config = GuardianServiceConfig::new(
+            socket.clone(),
+            token.clone(),
+            8,
+            1,
+            65_536,
+            65_536,
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        let mut service = GuardianService::bind(config).unwrap();
+        let probe = || {
+            let (socket, token) = (socket.clone(), token.clone());
+            let (answer_tx, answer_rx) = std::sync::mpsc::sync_channel(1);
+            let worker = std::thread::spawn(move || {
+                answer_tx
+                    .send(GuardianClient::admits_release(&socket, &token))
+                    .unwrap();
+            });
+            (worker, answer_rx)
+        };
+
+        // With the authority home, whatever this build gets back is final.
+        let started = Instant::now();
+        let (worker, answer) = probe();
+        let settled = answer_of(&mut service, &answer);
+        worker.join().unwrap();
+        assert!(
+            started.elapsed() < PROBE_BUSY_BUDGET,
+            "an answer is not asked again"
+        );
+
+        // Out for several closes, back within the budget: the same answer.
+        let held = service.runtime.take_protocol_for_test().unwrap();
+        let (worker, answer) = probe();
+        let back_at = Instant::now() + PROBE_BUSY_PAUSE * 10;
+        while Instant::now() < back_at {
+            service.poll_once().unwrap();
+            assert!(
+                answer.try_recv().is_err(),
+                "a close without a reply is no answer"
+            );
+        }
+        service.runtime.restore_protocol_for_test(held);
+        assert_eq!(answer_of(&mut service, &answer), settled);
+        worker.join().unwrap();
+
+        // Out past the budget: a no, in about that long.
+        let held = service.runtime.take_protocol_for_test().unwrap();
+        let started = Instant::now();
+        let (worker, answer) = probe();
+        assert!(!answer_of(&mut service, &answer));
+        worker.join().unwrap();
+        assert!(started.elapsed() >= PROBE_BUSY_BUDGET);
+        service.runtime.restore_protocol_for_test(held);
     }
 
     /// An Input that meets the authority out with a job is answered once the
