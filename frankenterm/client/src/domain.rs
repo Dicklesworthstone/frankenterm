@@ -3053,12 +3053,18 @@ impl ClientDomain {
             // passphrase, keyboard-interactive authentication, or MFA. Keep
             // exactly one interactive prompt surface per domain across retry
             // attempts, and disable the implicit 120-second linger because
-            // this exact sender slot owns its lifetime explicitly.
-            let candidate = ConnectionUI::with_params(ConnectionUIParams {
-                disable_close_delay: true,
-                window_id: None,
-                ..Default::default()
-            });
+            // this exact sender slot owns its lifetime explicitly. Its window
+            // opens only for a prompt or once the connect has taken
+            // CONNECTION_UI_DELAY, so a connect that succeeds quickly (every
+            // reachable domain at GUI startup) flashes no window (ft-h38m4).
+            let candidate = ConnectionUI::with_params_deferred(
+                ConnectionUIParams {
+                    disable_close_delay: true,
+                    window_id: None,
+                    ..Default::default()
+                },
+                crate::client::CONNECTION_UI_DELAY,
+            );
             if !candidate.is_interactive() {
                 candidate.close();
                 bail!(

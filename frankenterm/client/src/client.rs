@@ -10194,10 +10194,15 @@ fn local_mux_restart_grace_exhausted(
         && now.saturating_duration_since(outage_started) >= PLAIN_LOCAL_MUX_RESTART_GRACE
 }
 
-/// How long an outage lasts before its reconnect window opens. A lossless
-/// mux upgrade redials and reattaches within about a second, so it shows no
-/// window; an outage that runs longer still gets one (ft-9zthd).
-const RECONNECT_UI_DELAY: Duration = Duration::from_secs(3);
+/// How long a reconnect, or an automatic domain connect, runs before its
+/// connection window opens. With the default 1 s base backoff a reconnect
+/// dials at 1 s, 3 s and 7 s into the outage, and a lossless mux upgrade
+/// is back by the 3 s dial and reattached a moment later. At 3 s the window
+/// opened just before that reattach closed it again; 5 s sits between the
+/// second and third dials, so an upgrade, or a connect to a reachable host,
+/// shows no window, and an outage that runs longer still gets one (ft-9zthd,
+/// ft-h38m4).
+pub(crate) const CONNECTION_UI_DELAY: Duration = Duration::from_secs(5);
 
 /// The reconnect window for the current outage: at most one per outage. A
 /// new outage replaces a window an earlier one closed (its reattach closed
@@ -10307,7 +10312,7 @@ impl Client {
 
                 let mut backoff = base_interval;
                 // One connection window per outage (reconnect_ui_for_outage),
-                // shown only once the outage outlasts RECONNECT_UI_DELAY. It
+                // shown only once the outage outlasts CONNECTION_UI_DELAY. It
                 // used to be constructed inside the loop, so every reconnect
                 // cycle spawned a *new* window: a host that accepts the
                 // connection and then immediately drops the session cycles
@@ -10447,7 +10452,7 @@ impl Client {
                         }
 
                         let ui = reconnect_ui_for_outage(&mut reconnect_ui, new_outage, || {
-                            let ui = ConnectionUI::new_deferred(RECONNECT_UI_DELAY);
+                            let ui = ConnectionUI::new_deferred(CONNECTION_UI_DELAY);
                             ui.title("FrankenTerm: Reconnecting...");
                             ui
                         });

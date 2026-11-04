@@ -306,11 +306,13 @@ where
                     output.push(changes);
                 }
             }
+            // From when the sleep arrives: `now` predates the wait for it, and
+            // a sleep timed from that ended early by as long as the wait.
             Ok(UIRequest::Sleep {
                 reason,
                 duration,
                 respond,
-            }) => match now.checked_add(duration) {
+            }) => match Instant::now().checked_add(duration) {
                 Some(end) => sleeps.push((end, reason, respond)),
                 None => {
                     let _ = respond.send(Err(anyhow!("sleep duration is too large: {duration:?}")));
@@ -464,14 +466,25 @@ impl ConnectionUI {
 
     /// A connection UI whose window opens only once `delay` has passed, or
     /// at once when a prompt needs the operator. Closed before then, it
-    /// never shows a window, so a reconnect that completes quickly (a
-    /// lossless mux upgrade redials and reattaches within about a second)
-    /// does not flash one. Output sent while it waits is shown when the
+    /// never shows a window, so a connect or reconnect that completes
+    /// quickly (a lossless mux upgrade redials and reattaches within about a
+    /// second) does not flash one. Output sent while it waits is shown when the
     /// window opens, and a sleep under way then continues in the window. An
     /// owner that goes away without closing it, after sending output, gets
     /// the window opened to show that output, as an open window would have.
     pub fn new_deferred(delay: Duration) -> Self {
-        Self::deferred_with_opener(delay, ConnectionUI::new)
+        Self::with_params_deferred(Default::default(), delay)
+    }
+
+    /// [`ConnectionUI::new_deferred`] with the window's params. Without a
+    /// mux scheduler it is the same headless UI that
+    /// [`ConnectionUI::with_params`] returns, so a caller that needs an
+    /// interactive surface still sees `is_interactive()` false up front.
+    pub fn with_params_deferred(params: ConnectionUIParams, delay: Duration) -> Self {
+        if !promise::spawn::is_scheduler_configured() || Mux::try_get().is_none() {
+            return Self::with_params(params);
+        }
+        Self::deferred_with_opener(delay, move || ConnectionUI::with_params(params))
     }
 
     fn deferred_with_opener<F>(delay: Duration, open: F) -> Self
@@ -935,11 +948,34 @@ mod tests {
     }
 
     #[test]
+    fn a_deferred_ui_without_a_mux_is_the_headless_ui_with_params_returns() {
+        let _guard = crate::MUX_TEST_LOCK.lock().unwrap();
+        // No mux, whatever an earlier test left behind.
+        Mux::shutdown();
+        let params = ConnectionUIParams {
+            disable_close_delay: true,
+            ..Default::default()
+        };
+        let deferred = ConnectionUI::with_params_deferred(params, Duration::from_secs(600));
+        let direct = ConnectionUI::with_params(params);
+        assert!(
+            !deferred.is_interactive(),
+            "a background attach must still see that no prompt surface is available"
+        );
+        assert_eq!(deferred.is_interactive(), direct.is_interactive());
+        deferred.close();
+        direct.close();
+    }
+
+    #[test]
     fn a_deferred_ui_closed_before_its_delay_never_opens_a_window() {
         let (open, window, opened) = recording_opener();
         let ui = ConnectionUI::deferred_with_opener(Duration::from_secs(600), open);
         ui.title("FrankenTerm: Reconnecting...");
         ui.output_str("Connect to the mux\n");
+        // Let the deferred UI wait well past the sleep's length before the
+        // sleep arrives: a sleep timed from before that wait ends at once.
+        std::thread::sleep(Duration::from_millis(200));
         // On another thread, so a sleep handed to a window (which nothing
         // here answers) fails the test instead of hanging it.
         let sleeper = {
@@ -955,7 +991,11 @@ mod tests {
         });
         let (result, slept) = sleeper.join().expect("the sleeper finishes");
         result.expect("a sleep completes while the window is deferred");
-        assert!(slept >= Duration::from_millis(20));
+        assert!(
+            slept >= Duration::from_millis(20),
+            "the 20 ms sleep ended after {:?}",
+            slept
+        );
         ui.close();
 
         wait_until("the deferred UI to close", || !ui.is_open());
