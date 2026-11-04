@@ -271,6 +271,89 @@ impl HeadlessImpl {
     }
 }
 
+/// The thread behind [`ConnectionUI::new_deferred`]: hold requests until the
+/// window is due, then open it and forward everything to it.
+fn run_deferred<F>(rx: Receiver<UIRequest>, delay: Duration, open: F)
+where
+    F: FnOnce() -> ConnectionUI,
+{
+    let deadline = Instant::now()
+        .checked_add(delay)
+        .unwrap_or_else(Instant::now);
+    let mut output: Vec<Vec<Change>> = Vec::new();
+    // Sleeps under way: when each ends, its reason, and its caller's reply.
+    let mut sleeps: Vec<(Instant, String, Sender<anyhow::Result<()>>)> = Vec::new();
+    let first = loop {
+        let now = Instant::now();
+        sleeps.retain(|(end, _, respond)| {
+            if *end > now {
+                return true;
+            }
+            let _ = respond.send(Ok(()));
+            false
+        });
+        if now >= deadline {
+            break None;
+        }
+        let wake = sleeps
+            .iter()
+            .map(|(end, ..)| *end)
+            .fold(deadline, std::cmp::min);
+        match rx.recv_timeout(wake.saturating_duration_since(now)) {
+            Ok(UIRequest::Close) => return,
+            Ok(UIRequest::Output(changes)) => {
+                if !changes.is_empty() {
+                    output.push(changes);
+                }
+            }
+            Ok(UIRequest::Sleep {
+                reason,
+                duration,
+                respond,
+            }) => match now.checked_add(duration) {
+                Some(end) => sleeps.push((end, reason, respond)),
+                None => {
+                    let _ = respond.send(Err(anyhow!("sleep duration is too large: {duration:?}")));
+                }
+            },
+            Ok(input @ UIRequest::Input { .. }) => break Some(input),
+            Err(err) if err.is_timeout() => {}
+            // The owner went away without closing the UI.
+            Err(_) if output.is_empty() => return,
+            Err(_) => break None,
+        }
+    };
+
+    let ui = open();
+    for changes in output {
+        ui.output(changes);
+    }
+    for (end, reason, respond) in sleeps {
+        let duration = end.saturating_duration_since(Instant::now());
+        let sleep = UIRequest::Sleep {
+            reason,
+            duration,
+            respond,
+        };
+        if ui.tx.send(sleep).is_err() {
+            return;
+        }
+    }
+    if let Some(request) = first {
+        if ui.tx.send(request).is_err() {
+            return;
+        }
+    }
+    // A window the operator closed refuses the next request, which ends this
+    // thread, so the deferred UI then reports itself closed too.
+    while let Ok(request) = rx.recv() {
+        let close = matches!(request, UIRequest::Close);
+        if ui.tx.send(request).is_err() || close {
+            return;
+        }
+    }
+}
+
 #[derive(Default, Clone, Copy, Debug)]
 pub struct ConnectionUIParams {
     pub size: TerminalSize,
@@ -376,6 +459,43 @@ impl ConnectionUI {
         Self {
             tx,
             response_requires_main_thread: false,
+        }
+    }
+
+    /// A connection UI whose window opens only once `delay` has passed, or
+    /// at once when a prompt needs the operator. Closed before then, it
+    /// never shows a window, so a reconnect that completes quickly (a
+    /// lossless mux upgrade redials and reattaches within about a second)
+    /// does not flash one. Output sent while it waits is shown when the
+    /// window opens, and a sleep under way then continues in the window. An
+    /// owner that goes away without closing it, after sending output, gets
+    /// the window opened to show that output, as an open window would have.
+    pub fn new_deferred(delay: Duration) -> Self {
+        Self::deferred_with_opener(delay, ConnectionUI::new)
+    }
+
+    fn deferred_with_opener<F>(delay: Duration, open: F) -> Self
+    where
+        F: FnOnce() -> ConnectionUI + Clone + Send + 'static,
+    {
+        let (tx, rx) = unbounded();
+        let fallback = open.clone();
+        let spawned = std::thread::Builder::new()
+            .name("connection-ui-deferred".to_string())
+            .spawn(move || run_deferred(rx, delay, open));
+        match spawned {
+            Ok(_) => Self {
+                tx,
+                // Once the window is open, its replies come from the GUI's
+                // main thread, so blocking requests must not come from it.
+                response_requires_main_thread: true,
+            },
+            Err(err) => {
+                log::error!(
+                    "failed to spawn the deferred ConnectionUI thread; opening its window now: {err:#}"
+                );
+                fallback()
+            }
         }
     }
 
@@ -584,6 +704,7 @@ pub fn show_configuration_error_message(err: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     #[test]
@@ -762,5 +883,204 @@ mod tests {
         ui.sleep_with_reason("headless", Duration::ZERO)
             .expect("the headless worker owns its reply progress");
         ui.close();
+    }
+
+    /// An opener for a deferred UI whose "window" is a channel the test
+    /// reads, and a count of how many times it was opened.
+    fn recording_opener() -> (
+        impl FnOnce() -> ConnectionUI + Clone + Send + 'static,
+        Receiver<UIRequest>,
+        Arc<AtomicUsize>,
+    ) {
+        let (tx, rx) = unbounded();
+        let opened = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&opened);
+        let open = move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            ConnectionUI {
+                tx,
+                response_requires_main_thread: false,
+            }
+        };
+        (open, rx, opened)
+    }
+
+    fn next_request(window: &Receiver<UIRequest>, what: &str) -> UIRequest {
+        window
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|err| panic!("{}: {}", what, err))
+    }
+
+    fn output_text(request: UIRequest) -> String {
+        match request {
+            UIRequest::Output(changes) => format!("{:?}", changes),
+            _ => panic!("expected output"),
+        }
+    }
+
+    /// The opener is gone (its thread ended) with no further request sent.
+    fn nothing_more_reaches(window: &Receiver<UIRequest>) -> bool {
+        window
+            .recv_timeout(Duration::from_secs(10))
+            .err()
+            .is_some_and(|err| err.is_disconnected())
+    }
+
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {}", what);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_deferred_ui_closed_before_its_delay_never_opens_a_window() {
+        let (open, window, opened) = recording_opener();
+        let ui = ConnectionUI::deferred_with_opener(Duration::from_secs(600), open);
+        ui.title("FrankenTerm: Reconnecting...");
+        ui.output_str("Connect to the mux\n");
+        // On another thread, so a sleep handed to a window (which nothing
+        // here answers) fails the test instead of hanging it.
+        let sleeper = {
+            let ui = ui.clone();
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                let result = ui.sleep_with_reason("reconnecting", Duration::from_millis(20));
+                (result, started.elapsed())
+            })
+        };
+        wait_until("the sleep to finish while the window is deferred", || {
+            sleeper.is_finished()
+        });
+        let (result, slept) = sleeper.join().expect("the sleeper finishes");
+        result.expect("a sleep completes while the window is deferred");
+        assert!(slept >= Duration::from_millis(20));
+        ui.close();
+
+        wait_until("the deferred UI to close", || !ui.is_open());
+        assert_eq!(opened.load(Ordering::SeqCst), 0);
+        assert!(nothing_more_reaches(&window));
+    }
+
+    #[test]
+    fn a_deferred_ui_opens_after_its_delay_with_the_output_it_held() {
+        let (open, window, opened) = recording_opener();
+        let ui = ConnectionUI::deferred_with_opener(Duration::from_millis(50), open);
+        ui.output_str("first\n");
+        ui.output_str("second\n");
+
+        let held = next_request(&window, "the window opens after the delay");
+        assert!(output_text(held).contains("first"));
+        assert!(output_text(next_request(&window, "the second line")).contains("second"));
+        assert_eq!(opened.load(Ordering::SeqCst), 1);
+
+        ui.output_str("third\n");
+        assert!(output_text(next_request(&window, "later output")).contains("third"));
+        ui.close();
+        assert!(matches!(
+            next_request(&window, "the close"),
+            UIRequest::Close
+        ));
+        wait_until("the deferred UI to close", || !ui.is_open());
+    }
+
+    #[test]
+    fn a_sleep_under_way_when_the_window_opens_continues_in_it() {
+        let (open, window, _opened) = recording_opener();
+        let ui = ConnectionUI::deferred_with_opener(Duration::from_secs(1), open);
+        let sleeper = {
+            let ui = ui.clone();
+            std::thread::spawn(move || ui.sleep_with_reason("reconnecting", Duration::from_secs(5)))
+        };
+
+        match next_request(&window, "the window opens during the sleep") {
+            UIRequest::Sleep {
+                reason,
+                duration,
+                respond,
+            } => {
+                assert_eq!(reason, "reconnecting");
+                assert!(
+                    duration < Duration::from_secs(5),
+                    "only the rest of the sleep moves to the window: {:?}",
+                    duration
+                );
+                respond
+                    .send(Ok(()))
+                    .expect("the sleeper waits for the window");
+            }
+            _ => panic!("expected the sleep"),
+        }
+        sleeper
+            .join()
+            .expect("the sleeper finishes")
+            .expect("the window completes the sleep");
+        ui.close();
+    }
+
+    #[test]
+    fn a_prompt_opens_a_deferred_window_at_once() {
+        let (open, window, opened) = recording_opener();
+        let ui = ConnectionUI::deferred_with_opener(Duration::from_secs(600), open);
+        ui.output_str("The host key changed\n");
+        let asker = {
+            let ui = ui.clone();
+            std::thread::spawn(move || ui.input("Enter [y/n]> "))
+        };
+
+        let held = next_request(&window, "a prompt opens the window");
+        assert!(output_text(held).contains("The host key changed"));
+        match next_request(&window, "the prompt reaches the window") {
+            UIRequest::Input {
+                prompt,
+                echo,
+                respond,
+            } => {
+                assert_eq!(prompt, "Enter [y/n]> ");
+                assert!(echo);
+                respond
+                    .send(Ok("y".to_string()))
+                    .expect("the asker waits for the answer");
+            }
+            _ => panic!("expected the prompt"),
+        }
+        let answer = asker.join().expect("the asker finishes");
+        assert_eq!(answer.expect("the prompt was answered"), "y");
+        assert_eq!(opened.load(Ordering::SeqCst), 1);
+        ui.close();
+    }
+
+    #[test]
+    fn a_deferred_ui_dropped_with_output_opens_to_show_it() {
+        let (open, window, opened) = recording_opener();
+        let ui = ConnectionUI::deferred_with_opener(Duration::from_secs(600), open);
+        ui.output_str("Giving up: the local mux has not come back\n");
+        drop(ui);
+
+        let held = next_request(&window, "the window opens to show the output");
+        assert!(output_text(held).contains("Giving up"));
+        assert_eq!(opened.load(Ordering::SeqCst), 1);
+        assert!(nothing_more_reaches(&window));
+
+        let (open, window, opened) = recording_opener();
+        drop(ConnectionUI::deferred_with_opener(
+            Duration::from_secs(600),
+            open,
+        ));
+        assert!(nothing_more_reaches(&window));
+        assert_eq!(opened.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_deferred_ui_whose_window_was_closed_reports_itself_closed() {
+        let (open, window, _opened) = recording_opener();
+        let ui = ConnectionUI::deferred_with_opener(Duration::ZERO, open);
+        ui.output_str("connecting\n");
+        let _ = next_request(&window, "the window opens at once");
+        // The operator closes the window.
+        drop(window);
+
+        wait_until("the deferred UI to see the closed window", || !ui.is_open());
     }
 }
