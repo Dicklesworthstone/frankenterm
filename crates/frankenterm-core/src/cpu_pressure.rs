@@ -185,7 +185,7 @@ pub struct CpuPressureMonitor {
     /// docs/proposals/windows-unsafe-policy.md). Unix reads pressure from /proc
     /// PSI (Linux) or load average (macOS) and needs no held state.
     #[cfg(windows)]
-    cpu_system: std::sync::Mutex<sysinfo::System>,
+    cpu_system: std::sync::Mutex<Option<sysinfo::System>>,
 }
 
 impl CpuPressureMonitor {
@@ -197,13 +197,7 @@ impl CpuPressureMonitor {
             ncpu: detect_ncpu(),
             telemetry: CpuPressureTelemetry::default(),
             #[cfg(windows)]
-            cpu_system: {
-                let mut sys = sysinfo::System::new();
-                // Establish the baseline; the first sample therefore reads ~0
-                // (same gentle-start shape as the previous P1 stub).
-                sys.refresh_cpu_usage();
-                std::sync::Mutex::new(sys)
-            },
+            cpu_system: std::sync::Mutex::new(new_windows_cpu_system()),
         }
     }
 
@@ -370,7 +364,15 @@ impl CpuPressureMonitor {
             // branches produce. The refresh computes the delta since the
             // previous refresh (i.e. over the inter-sample interval).
             match self.cpu_system.lock() {
-                Ok(mut sys) => {
+                Ok(mut slot) => {
+                    // Retry a failed initialization on the next sample rather
+                    // than permanently disabling CPU monitoring.
+                    if slot.is_none() {
+                        *slot = new_windows_cpu_system();
+                    }
+                    let Some(sys) = slot.as_mut() else {
+                        return 0.0;
+                    };
                     sys.refresh_cpu_usage();
                     normalize_sysinfo_cpu_usage(sys.global_cpu_usage())
                 }
@@ -381,6 +383,21 @@ impl CpuPressureMonitor {
         {
             let _ = self.ncpu; // suppress unused warning
             0.0
+        }
+    }
+}
+
+#[cfg(windows)]
+fn new_windows_cpu_system() -> Option<sysinfo::System> {
+    match sysinfo::System::new() {
+        Ok(mut system) => {
+            // Persist the baseline for delta-based utilization samples.
+            system.refresh_cpu_usage();
+            Some(system)
+        }
+        Err(error) => {
+            tracing::warn!(?error, "Windows CPU monitoring initialization failed");
+            None
         }
     }
 }
@@ -476,7 +493,7 @@ fn detect_ncpu() -> u32 {
     }
     #[cfg(windows)]
     {
-        (sysinfo::System::new_all().cpus().len() as u32).max(1)
+        std::thread::available_parallelism().map_or(1, |count| count.get() as u32)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
@@ -1025,5 +1042,21 @@ mod tests {
                 );
             });
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_initialization_tests {
+    use super::*;
+
+    #[test]
+    fn missing_cpu_sampler_is_reinitialized_on_next_sample() {
+        let monitor = CpuPressureMonitor::new(CpuPressureConfig::default());
+        *monitor.cpu_system.lock().unwrap() = None;
+        let pressure = monitor.read_cpu_pressure();
+        assert!(pressure.is_finite());
+        assert!((0.0..=100.0).contains(&pressure));
+        assert!(monitor.cpu_system.lock().unwrap().is_some());
+        assert!(detect_ncpu() > 0);
     }
 }

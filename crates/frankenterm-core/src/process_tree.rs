@@ -318,7 +318,7 @@ trait ProcessSnapshotProvider {
 
 struct PlatformProcessSnapshotProvider {
     #[cfg(windows)]
-    system: sysinfo::System,
+    system: Option<sysinfo::System>,
 }
 
 impl PlatformProcessSnapshotProvider {
@@ -329,8 +329,16 @@ impl PlatformProcessSnapshotProvider {
 
     #[cfg(windows)]
     fn new() -> Self {
-        let mut system = sysinfo::System::new_all();
-        system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        let system = match sysinfo::System::new_all() {
+            Ok(mut system) => {
+                system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+                Some(system)
+            }
+            Err(error) => {
+                tracing::warn!(?error, "Windows process snapshot initialization failed");
+                None
+            }
+        };
         Self { system }
     }
 }
@@ -576,7 +584,10 @@ fn read_process_info(
     provider: &PlatformProcessSnapshotProvider,
     pid: u32,
 ) -> Option<RawProcessInfo> {
-    let process = provider.system.process(sysinfo::Pid::from_u32(pid))?;
+    let process = provider
+        .system
+        .as_ref()?
+        .process(sysinfo::Pid::from_u32(pid))?;
     let argv = process
         .cmd()
         .iter()
@@ -595,8 +606,10 @@ fn read_process_info(
 
 #[cfg(windows)]
 fn find_children(provider: &PlatformProcessSnapshotProvider, pid: u32) -> Vec<u32> {
-    provider
-        .system
+    let Some(system) = provider.system.as_ref() else {
+        return Vec::new();
+    };
+    system
         .processes()
         .iter()
         .filter_map(|(child_pid, process)| {
@@ -1711,5 +1724,26 @@ mod tests {
             }],
         };
         assert_eq!(node.subtree_rss_kb(), 3500);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_initialization_tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_snapshot_does_not_fabricate_processes() {
+        let provider = PlatformProcessSnapshotProvider { system: None };
+        assert!(read_process_info(&provider, std::process::id()).is_none());
+        assert!(find_children(&provider, std::process::id()).is_empty());
+    }
+
+    #[test]
+    fn real_snapshot_contains_current_process() {
+        let provider = PlatformProcessSnapshotProvider::new();
+        let process = read_process_info(&provider, std::process::id())
+            .expect("the current process must be visible in a real Windows snapshot");
+        assert_eq!(process.pid, std::process::id());
+        assert!(!process.name.is_empty());
     }
 }
