@@ -1545,7 +1545,13 @@ fn read_memory_info() -> (u64, u64) {
 /// reclaimable-memory estimate, the closest analogue to Linux `MemAvailable`.
 #[cfg(windows)]
 fn read_windows_memory() -> (u64, u64) {
-    let mut sys = sysinfo::System::new();
+    let mut sys = match sysinfo::System::new() {
+        Ok(system) => system,
+        Err(error) => {
+            tracing::warn!(?error, "Windows memory monitoring initialization failed");
+            return (0, 0);
+        }
+    };
     sys.refresh_memory();
     memory_bytes_to_kib(sys.total_memory(), sys.available_memory())
 }
@@ -2746,5 +2752,17 @@ Call graph:
                 );
             });
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_initialization_tests {
+    use super::*;
+
+    #[test]
+    fn real_memory_snapshot_reports_physical_memory() {
+        let (total, available) = read_windows_memory();
+        assert!(total > 0, "Windows memory initialization must succeed");
+        assert!(available <= total);
     }
 }

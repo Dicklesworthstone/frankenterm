@@ -744,7 +744,13 @@ fn read_disk_space_statvfs(path: &Path) -> Option<(u64, u64)> {
 /// back to an unavailable Unix `df` command on Windows.
 #[cfg(windows)]
 fn read_windows_disk_space(path: &Path) -> Option<(u64, u64)> {
-    let disks = sysinfo::Disks::new_with_refreshed_list();
+    let disks = match sysinfo::Disks::new_with_refreshed_list() {
+        Ok(disks) => disks,
+        Err(error) => {
+            tracing::warn!(?error, "Windows disk monitoring initialization failed");
+            return None;
+        }
+    };
     select_disk_space_for_path(
         path,
         disks.list().iter().map(|disk| DiskSpaceCandidate {
@@ -1564,5 +1570,19 @@ mod tests {
             DiskPressureTier::Green,
             "Sub-yellow usage must still classify as Green under all-NaN defaults"
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_initialization_tests {
+    use super::*;
+
+    #[test]
+    fn real_disk_snapshot_reports_current_volume() {
+        let path = std::env::current_dir().unwrap();
+        let (available, total) =
+            read_windows_disk_space(&path).expect("the current Windows volume must be visible");
+        assert!(total > 0);
+        assert!(available <= total);
     }
 }
