@@ -2676,109 +2676,6 @@ mod deferred_scrollback {
                 .unwrap_or(0)
         }
 
-        fn snapshot_scrollback(
-            &self,
-            newest: StableRowIndex,
-            limits: ScrollbackSnapshotLimits,
-        ) -> Result<ScrollbackSnapshot, ScrollbackSpillError> {
-            let _operation = self
-                .operation
-                .lock()
-                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
-            let _drain = self
-                .drain_gate
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            self.drain()?;
-            let (gaps, mut skip) = {
-                let state = self
-                    .state
-                    .lock()
-                    .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
-                (
-                    state.written_gaps.iter().copied().collect::<Vec<_>>(),
-                    state.pruned_gap_skip,
-                )
-            };
-            if gaps.is_empty() && skip == 0 {
-                return self.backing.snapshot_scrollback(newest, limits);
-            }
-            // The store holds each written gap as one marker row
-            // (ft-yccm0.2.1.6): read the store's rows, then expand every marker
-            // back into the gap's stable rows.
-            if gaps
-                .iter()
-                .any(|gap| gap.start < newest && newest < gap.end)
-            {
-                return Err(ScrollbackSpillError::SnapshotRangeMismatch);
-            }
-            let newest_skip = skip
-                + gaps
-                    .iter()
-                    .filter(|gap| gap.end <= newest)
-                    .map(|gap| gap.rows() - 1)
-                    .sum::<StableRowIndex>();
-            let snapshot = self
-                .backing
-                .snapshot_scrollback(newest - newest_skip, limits)?;
-            let Some(store_oldest) = snapshot.oldest_stable_row() else {
-                return ScrollbackSnapshot::from_contiguous_rows(
-                    snapshot.generation(),
-                    snapshot.fidelity(),
-                    None,
-                    newest,
-                    snapshot.stored_bytes(),
-                    snapshot.decoded_bytes(),
-                    Vec::new(),
-                );
-            };
-            let mut next_gap = 0;
-            while next_gap < gaps.len() && gaps[next_gap].start - skip < store_oldest {
-                skip += gaps[next_gap].rows() - 1;
-                next_gap += 1;
-            }
-            let oldest = store_oldest + skip;
-            let generation = snapshot.generation();
-            let fidelity = snapshot.fidelity();
-            let stored_bytes = snapshot.stored_bytes();
-            let decoded_bytes = snapshot.decoded_bytes();
-            let store_rows = snapshot.into_rows();
-            let mut rows = Vec::with_capacity(store_rows.len());
-            for (offset, line) in store_rows.into_iter().enumerate() {
-                rows.push(line);
-                let store_row = store_oldest + offset as StableRowIndex;
-                if let Some(gap) = gaps.get(next_gap) {
-                    if gap.start - skip == store_row {
-                        rows.extend((gap.start + 1..gap.end).map(|row| gap.line_at(row)));
-                        skip += gap.rows() - 1;
-                        next_gap += 1;
-                    }
-                }
-            }
-            if oldest + rows.len() as StableRowIndex != newest {
-                return Err(ScrollbackSpillError::SnapshotRangeMismatch);
-            }
-            // The store's contract is every retained row or a ResourceLimit,
-            // never a truncated snapshot. It checked its own (marker-compact)
-            // row count; the expanded stable rows must pass the same limit.
-            if rows.len() > limits.max_rows {
-                return Err(ScrollbackSpillError::ResourceLimit {
-                    resource: "rows",
-                    observed: u64::try_from(rows.len()).unwrap_or(u64::MAX),
-                    maximum: u64::try_from(limits.max_rows).unwrap_or(u64::MAX),
-                });
-            }
-            ScrollbackSnapshot::from_contiguous_rows(
-                generation,
-                fidelity,
-                (!rows.is_empty()).then_some(oldest),
-                newest,
-                stored_bytes,
-                decoded_bytes,
-                rows,
-            )
-        }
-
         fn replace_scrollback_prefix(
             &self,
             expected: Option<ScrollbackSnapshotGeneration>,
@@ -2858,9 +2755,139 @@ mod deferred_scrollback {
             self.publish_progress();
             Ok(receipt)
         }
+
+        fn snapshot_scrollback(
+            &self,
+            newest: StableRowIndex,
+            limits: ScrollbackSnapshotLimits,
+        ) -> Result<ScrollbackSnapshot, ScrollbackSpillError> {
+            self.snapshot_expanded(newest, limits, false)
+        }
+
+        fn snapshot_newest_scrollback(
+            &self,
+            newest: StableRowIndex,
+            limits: ScrollbackSnapshotLimits,
+        ) -> Result<ScrollbackSnapshot, ScrollbackSpillError> {
+            self.snapshot_expanded(newest, limits, true)
+        }
     }
 
     impl DeferredScrollbackSpillSink {
+        /// The backing store's rows, read as `keep_newest` says, with each
+        /// marker row expanded back into its gap's stable rows.
+        fn snapshot_expanded(
+            &self,
+            newest: StableRowIndex,
+            limits: ScrollbackSnapshotLimits,
+            keep_newest: bool,
+        ) -> Result<ScrollbackSnapshot, ScrollbackSpillError> {
+            let read_backing = |newest, limits| {
+                if keep_newest {
+                    self.backing.snapshot_newest_scrollback(newest, limits)
+                } else {
+                    self.backing.snapshot_scrollback(newest, limits)
+                }
+            };
+            let _operation = self
+                .operation
+                .lock()
+                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+            let _drain = self
+                .drain_gate
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            self.drain()?;
+            let (gaps, mut skip) = {
+                let state = self
+                    .state
+                    .lock()
+                    .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+                (
+                    state.written_gaps.iter().copied().collect::<Vec<_>>(),
+                    state.pruned_gap_skip,
+                )
+            };
+            if gaps.is_empty() && skip == 0 {
+                return read_backing(newest, limits);
+            }
+            // The store holds each written gap as one marker row
+            // (ft-yccm0.2.1.6): read the store's rows, then expand every marker
+            // back into the gap's stable rows.
+            if gaps
+                .iter()
+                .any(|gap| gap.start < newest && newest < gap.end)
+            {
+                return Err(ScrollbackSpillError::SnapshotRangeMismatch);
+            }
+            let newest_skip = skip
+                + gaps
+                    .iter()
+                    .filter(|gap| gap.end <= newest)
+                    .map(|gap| gap.rows() - 1)
+                    .sum::<StableRowIndex>();
+            let snapshot = read_backing(newest - newest_skip, limits)?;
+            let Some(store_oldest) = snapshot.oldest_stable_row() else {
+                return ScrollbackSnapshot::from_contiguous_rows(
+                    snapshot.generation(),
+                    snapshot.fidelity(),
+                    None,
+                    newest,
+                    snapshot.stored_bytes(),
+                    snapshot.decoded_bytes(),
+                    Vec::new(),
+                );
+            };
+            let mut next_gap = 0;
+            while next_gap < gaps.len() && gaps[next_gap].start - skip < store_oldest {
+                skip += gaps[next_gap].rows() - 1;
+                next_gap += 1;
+            }
+            let oldest = store_oldest + skip;
+            let generation = snapshot.generation();
+            let fidelity = snapshot.fidelity();
+            let stored_bytes = snapshot.stored_bytes();
+            let decoded_bytes = snapshot.decoded_bytes();
+            let store_rows = snapshot.into_rows();
+            let mut rows = Vec::with_capacity(store_rows.len());
+            for (offset, line) in store_rows.into_iter().enumerate() {
+                rows.push(line);
+                let store_row = store_oldest + offset as StableRowIndex;
+                if let Some(gap) = gaps.get(next_gap) {
+                    if gap.start - skip == store_row {
+                        rows.extend((gap.start + 1..gap.end).map(|row| gap.line_at(row)));
+                        skip += gap.rows() - 1;
+                        next_gap += 1;
+                    }
+                }
+            }
+            if oldest + rows.len() as StableRowIndex != newest {
+                return Err(ScrollbackSpillError::SnapshotRangeMismatch);
+            }
+            // The store's contract is every retained row or a ResourceLimit,
+            // never a truncated snapshot, unless it was asked for the newest.
+            // It checked its own (marker-compact) row count; the expanded
+            // stable rows must pass the same limit.
+            let over_limit = rows.len().saturating_sub(limits.max_rows);
+            if over_limit != 0 && !keep_newest {
+                return Err(ScrollbackSpillError::ResourceLimit {
+                    resource: "rows",
+                    observed: u64::try_from(rows.len()).unwrap_or(u64::MAX),
+                    maximum: u64::try_from(limits.max_rows).unwrap_or(u64::MAX),
+                });
+            }
+            rows.drain(..over_limit);
+            ScrollbackSnapshot::from_contiguous_rows(
+                generation,
+                fidelity,
+                (!rows.is_empty()).then_some(oldest + over_limit as StableRowIndex),
+                newest,
+                stored_bytes,
+                decoded_bytes,
+                rows,
+            )
+        }
+
         /// Both replacement entry points; `supersede` passes an expected
         /// generation to the backing sink as an ancestor.
         fn replace_prefix_with(
@@ -3854,6 +3881,20 @@ mod deferred_scrollback {
                 maximum: kept as u64,
             }
         );
+        // Asked for the newest instead, both limits keep the rows they hold:
+        // the store's, and the expansion's.
+        for max_rows in [5, kept] {
+            let tail = deferred
+                .snapshot_newest_scrollback(100, limits(max_rows))
+                .unwrap();
+            assert_eq!(
+                tail.oldest_stable_row(),
+                Some(100 - max_rows as StableRowIndex)
+            );
+            assert_eq!(tail.newest_stable_row_exclusive(), 100);
+            let tail_rows: Vec<String> = tail.rows().iter().map(text).collect();
+            assert_eq!(tail_rows, rows[100 - max_rows..]);
+        }
 
         // Recovery: the reopened store carries the marker in order, between
         // the rows before and after the gap.
@@ -17007,284 +17048,6 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
             .unwrap_or(usize::MAX)
     }
 
-    fn snapshot_scrollback(
-        &self,
-        expected_newest_exclusive: wezterm_term::StableRowIndex,
-        limits: wezterm_term::config::ScrollbackSnapshotLimits,
-    ) -> Result<wezterm_term::config::ScrollbackSnapshot, wezterm_term::config::ScrollbackSpillError>
-    {
-        use wezterm_term::config::{
-            ScrollbackSnapshot, ScrollbackSnapshotFidelity, ScrollbackSpillError,
-        };
-
-        let _mutation_gate = self.lock_mutation_gate("snapshot_scrollback")?;
-        let _filesystem_mutation_lease = self.lock_filesystem_mutation("snapshot_scrollback")?;
-        let mut state = *self.lock_state("snapshot_scrollback state")?;
-        if state.published.is_some() && !state.transaction_quarantined {
-            // A snapshot reads the ledger exactly as its manifest describes
-            // it, so a durable tail is published first, as a flush does
-            // (ft-yccm0.2.1.2).
-            if !self.publish_pending_tail("snapshot") {
-                return Err(ScrollbackSpillError::StorageUnavailable);
-            }
-            state = *self.lock_state("snapshot_scrollback published state")?;
-        }
-
-        if state.transaction_quarantined {
-            return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
-        }
-        if state
-            .newest_stable_row_exclusive
-            .is_some_and(|newest| newest != expected_newest_exclusive)
-        {
-            return Err(ScrollbackSpillError::SnapshotRangeMismatch);
-        }
-        let ledger_pane_id = self.active_ledger_pane_id();
-        let manifest_before = self.authenticated_manifest_for_snapshot(&state, ledger_pane_id)?;
-        if state.clear_manifest_published {
-            if let Some(manifest) = manifest_before.as_ref() {
-                let store = self.lock_store("snapshot_scrollback cleared digest")?;
-                Self::verify_logical_ledger_digest_from_store(manifest, ledger_pane_id, &store)
-                    .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
-                drop(store);
-                self.revalidate_snapshot_manifest(manifest)?;
-            }
-            return ScrollbackSnapshot::from_contiguous_rows(
-                state.snapshot_generation(),
-                if state.authenticated_manifest {
-                    ScrollbackSnapshotFidelity::ExactSemantic
-                } else {
-                    ScrollbackSnapshotFidelity::LegacyRedacted
-                },
-                None,
-                expected_newest_exclusive,
-                0,
-                0,
-                Vec::new(),
-            );
-        }
-        let store = self.lock_store("snapshot_scrollback store")?;
-        if let Some(manifest) = manifest_before.as_ref() {
-            Self::verify_logical_ledger_digest_from_store(manifest, ledger_pane_id, &store)
-                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
-        }
-
-        let retained_rows = store.line_count(ledger_pane_id);
-        let retained_rows_u64 = u64::try_from(retained_rows)
-            .map_err(|_| ScrollbackSpillError::ArithmeticOverflow("row_count"))?;
-        if retained_rows > limits.max_rows {
-            return Err(ScrollbackSpillError::ResourceLimit {
-                resource: "rows",
-                observed: retained_rows_u64,
-                maximum: u64::try_from(limits.max_rows).unwrap_or(u64::MAX),
-            });
-        }
-        let stored_bytes = store.retained_bytes(ledger_pane_id);
-        if stored_bytes > limits.max_stored_bytes {
-            return Err(ScrollbackSpillError::ResourceLimit {
-                resource: "stored_bytes",
-                observed: stored_bytes,
-                maximum: limits.max_stored_bytes,
-            });
-        }
-        let physical_bytes = store.file_bytes(ledger_pane_id);
-        if physical_bytes > limits.max_physical_bytes {
-            return Err(ScrollbackSpillError::ResourceLimit {
-                resource: "physical_bytes",
-                observed: physical_bytes,
-                maximum: limits.max_physical_bytes,
-            });
-        }
-
-        let next_seq = store
-            .next_seq(ledger_pane_id)
-            .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
-        let Some(initial_stable_row) = state.initial_stable_row else {
-            if retained_rows != 0 || store.oldest_seq(ledger_pane_id).is_some() || next_seq != 0 {
-                return Err(ScrollbackSpillError::SnapshotRangeMismatch);
-            }
-            let snapshot = ScrollbackSnapshot::from_contiguous_rows(
-                state.snapshot_generation(),
-                if state.authenticated_manifest {
-                    ScrollbackSnapshotFidelity::ExactSemantic
-                } else {
-                    ScrollbackSnapshotFidelity::LegacyRedacted
-                },
-                None,
-                expected_newest_exclusive,
-                stored_bytes,
-                0,
-                Vec::new(),
-            )?;
-            drop(store);
-            if let Some(manifest) = manifest_before.as_ref() {
-                self.revalidate_snapshot_manifest(manifest)?;
-            }
-            return Ok(snapshot);
-        };
-        let next_stable_offset = wezterm_term::StableRowIndex::try_from(next_seq)
-            .map_err(|_| ScrollbackSpillError::ArithmeticOverflow("stable_row_range"))?;
-        let observed_newest_exclusive = initial_stable_row
-            .checked_add(next_stable_offset)
-            .ok_or(ScrollbackSpillError::ArithmeticOverflow("stable_row_range"))?;
-        if observed_newest_exclusive != expected_newest_exclusive {
-            return Err(ScrollbackSpillError::SnapshotRangeMismatch);
-        }
-
-        let oldest_seq = store.oldest_seq(ledger_pane_id);
-        if (retained_rows == 0) != oldest_seq.is_none() {
-            return Err(ScrollbackSpillError::SnapshotRangeMismatch);
-        }
-        let oldest_stable_row = match oldest_seq {
-            Some(oldest_seq) => {
-                let oldest_offset = wezterm_term::StableRowIndex::try_from(oldest_seq)
-                    .map_err(|_| ScrollbackSpillError::ArithmeticOverflow("stable_row_range"))?;
-                Some(
-                    initial_stable_row
-                        .checked_add(oldest_offset)
-                        .ok_or(ScrollbackSpillError::ArithmeticOverflow("stable_row_range"))?,
-                )
-            }
-            None => None,
-        };
-
-        let mut rows = Vec::new();
-        rows.try_reserve_exact(retained_rows)
-            .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
-        let mut decoded_bytes = 0usize;
-        let mut fidelity = if state.authenticated_manifest {
-            ScrollbackSnapshotFidelity::ExactSemantic
-        } else {
-            ScrollbackSnapshotFidelity::LegacyRedacted
-        };
-        let keyring = self.lock_keyring("snapshot_scrollback decrypt")?;
-        let mut cipher_cache = GuardianScrollbackCipherCache::new(&keyring, &state.row_segments);
-        let (physical_oldest, segment_next) = store_segment_bounds(&store, ledger_pane_id)
-            .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
-        let mut segments = LiveScrollbackSegmentReader::default();
-        if let Some(oldest_seq) = oldest_seq {
-            for offset in 0..retained_rows_u64 {
-                let seq = oldest_seq
-                    .checked_add(offset)
-                    .ok_or(ScrollbackSpillError::ArithmeticOverflow("sequence"))?;
-                let record = store
-                    .line_at(ledger_pane_id, seq)
-                    .map_err(|_| ScrollbackSpillError::StorageUnavailable)?
-                    .ok_or(ScrollbackSpillError::SnapshotRowMissing)?;
-                let remaining_decoded_bytes =
-                    limits
-                        .max_decoded_bytes
-                        .checked_sub(decoded_bytes)
-                        .ok_or_else(|| ScrollbackSpillError::ResourceLimit {
-                            resource: "decoded_bytes",
-                            observed: u64::try_from(decoded_bytes).unwrap_or(u64::MAX),
-                            maximum: u64::try_from(limits.max_decoded_bytes).unwrap_or(u64::MAX),
-                        })?;
-                let plaintext_bytes = if mux::guardian_output_journal::is_compact_scrollback_row(
-                    &record,
-                ) {
-                    Some(
-                        mux::guardian_output_journal::compact_scrollback_row_plaintext_bytes(
-                            &record,
-                        )
-                        .map_err(|_| ScrollbackSpillError::StorageUnavailable)?,
-                    )
-                } else if mux::guardian_output_journal::is_scrollback_segment_record(&record) {
-                    Some(
-                        mux::guardian_output_journal::scrollback_segment_record_plaintext_bytes(
-                            &record,
-                            mux::guardian_output_journal::is_scrollback_segment_tail(&record),
-                        )
-                        .map_err(|_| ScrollbackSpillError::StorageUnavailable)?,
-                    )
-                } else if mux::guardian_output_journal::GuardianEncryptedScrollbackRow::has_encrypted_prefix(
-                    &record,
-                ) {
-                    Some(
-                        mux::guardian_output_journal::GuardianEncryptedScrollbackRow::parse(
-                            &record,
-                        )
-                        .map_err(|_| ScrollbackSpillError::StorageUnavailable)?
-                        .plaintext_bytes(),
-                    )
-                } else {
-                    None
-                };
-                if let Some(plaintext_bytes) = plaintext_bytes {
-                    let line_bytes = usize::try_from(plaintext_bytes)
-                        .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
-                    if line_bytes > remaining_decoded_bytes {
-                        return Err(ScrollbackSpillError::ResourceLimit {
-                            resource: "decoded_bytes",
-                            observed: u64::try_from(decoded_bytes.saturating_add(line_bytes))
-                                .unwrap_or(u64::MAX),
-                            maximum: u64::try_from(limits.max_decoded_bytes).unwrap_or(u64::MAX),
-                        });
-                    }
-                }
-                let stable_offset = wezterm_term::StableRowIndex::try_from(seq)
-                    .map_err(|_| ScrollbackSpillError::ArithmeticOverflow("stable_row_range"))?;
-                let stable_row = initial_stable_row
-                    .checked_add(stable_offset)
-                    .ok_or(ScrollbackSpillError::ArithmeticOverflow("stable_row_range"))?;
-                let (line, line_decoded_bytes, row_fidelity) = decode_stored_scrollback_row(
-                    &record,
-                    &mut segments,
-                    &mut |range| store_segment_records(&store, ledger_pane_id, range),
-                    physical_oldest,
-                    segment_next,
-                    &mut cipher_cache,
-                    self.durable_pane_id,
-                    state.content_epoch,
-                    stable_row,
-                    seq,
-                    remaining_decoded_bytes,
-                )
-                .map_err(|error| {
-                    if let Some(budget) = error.downcast_ref::<ScrollbackDecodedBudgetExceeded>() {
-                        ScrollbackSpillError::ResourceLimit {
-                            resource: "decoded_bytes",
-                            observed: u64::try_from(
-                                decoded_bytes.saturating_add(budget.minimum_required),
-                            )
-                            .unwrap_or(u64::MAX),
-                            maximum: u64::try_from(limits.max_decoded_bytes).unwrap_or(u64::MAX),
-                        }
-                    } else {
-                        ScrollbackSpillError::StorageUnavailable
-                    }
-                })?;
-                if row_fidelity == DecodedScrollbackRecordFidelity::LegacyRedacted {
-                    fidelity = ScrollbackSnapshotFidelity::LegacyRedacted;
-                }
-                decoded_bytes = decoded_bytes
-                    .checked_add(line_decoded_bytes)
-                    .ok_or(ScrollbackSpillError::ArithmeticOverflow("decoded_bytes"))?;
-                rows.push(line);
-            }
-        }
-
-        let snapshot = ScrollbackSnapshot::from_contiguous_rows(
-            state.snapshot_generation(),
-            fidelity,
-            oldest_stable_row,
-            expected_newest_exclusive,
-            stored_bytes,
-            decoded_bytes,
-            rows,
-        )?;
-        // Reauthentication takes the same keyring mutex. Release the decode
-        // cache and its borrowed keyring guard before attempting that lock.
-        // The mutation and filesystem leases still protect this snapshot.
-        drop(cipher_cache);
-        drop(keyring);
-        drop(store);
-        if let Some(manifest) = manifest_before.as_ref() {
-            self.revalidate_snapshot_manifest(manifest)?;
-        }
-        Ok(snapshot)
-    }
-
     fn replace_scrollback_prefix(
         &self,
         expected_generation: Option<wezterm_term::config::ScrollbackSnapshotGeneration>,
@@ -17380,9 +17143,342 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
         }
         Ok(ScrollbackClearCommit::new(clear_generation))
     }
+
+    fn snapshot_scrollback(
+        &self,
+        expected_newest_exclusive: wezterm_term::StableRowIndex,
+        limits: wezterm_term::config::ScrollbackSnapshotLimits,
+    ) -> Result<wezterm_term::config::ScrollbackSnapshot, wezterm_term::config::ScrollbackSpillError>
+    {
+        self.snapshot_rows(expected_newest_exclusive, limits, false)
+    }
+
+    fn snapshot_newest_scrollback(
+        &self,
+        expected_newest_exclusive: wezterm_term::StableRowIndex,
+        limits: wezterm_term::config::ScrollbackSnapshotLimits,
+    ) -> Result<wezterm_term::config::ScrollbackSnapshot, wezterm_term::config::ScrollbackSpillError>
+    {
+        self.snapshot_rows(expected_newest_exclusive, limits, true)
+    }
 }
 
 impl LiveScrollbackSpillSink {
+    /// One snapshot of the store. Over the limits it refuses, unless
+    /// `keep_newest`: then it reads back from the newest row until one does
+    /// not fit, and the bytes it reports are those of the rows it kept.
+    fn snapshot_rows(
+        &self,
+        expected_newest_exclusive: wezterm_term::StableRowIndex,
+        limits: wezterm_term::config::ScrollbackSnapshotLimits,
+        keep_newest: bool,
+    ) -> Result<wezterm_term::config::ScrollbackSnapshot, wezterm_term::config::ScrollbackSpillError>
+    {
+        use wezterm_term::config::{
+            ScrollbackSnapshot, ScrollbackSnapshotFidelity, ScrollbackSpillError,
+        };
+
+        let _mutation_gate = self.lock_mutation_gate("snapshot_scrollback")?;
+        let _filesystem_mutation_lease = self.lock_filesystem_mutation("snapshot_scrollback")?;
+        let mut state = *self.lock_state("snapshot_scrollback state")?;
+        if state.published.is_some() && !state.transaction_quarantined {
+            // A snapshot reads the ledger exactly as its manifest describes
+            // it, so a durable tail is published first, as a flush does
+            // (ft-yccm0.2.1.2).
+            if !self.publish_pending_tail("snapshot") {
+                return Err(ScrollbackSpillError::StorageUnavailable);
+            }
+            state = *self.lock_state("snapshot_scrollback published state")?;
+        }
+
+        if state.transaction_quarantined {
+            return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
+        }
+        if state
+            .newest_stable_row_exclusive
+            .is_some_and(|newest| newest != expected_newest_exclusive)
+        {
+            return Err(ScrollbackSpillError::SnapshotRangeMismatch);
+        }
+        let ledger_pane_id = self.active_ledger_pane_id();
+        let manifest_before = self.authenticated_manifest_for_snapshot(&state, ledger_pane_id)?;
+        if state.clear_manifest_published {
+            if let Some(manifest) = manifest_before.as_ref() {
+                let store = self.lock_store("snapshot_scrollback cleared digest")?;
+                Self::verify_logical_ledger_digest_from_store(manifest, ledger_pane_id, &store)
+                    .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+                drop(store);
+                self.revalidate_snapshot_manifest(manifest)?;
+            }
+            return ScrollbackSnapshot::from_contiguous_rows(
+                state.snapshot_generation(),
+                if state.authenticated_manifest {
+                    ScrollbackSnapshotFidelity::ExactSemantic
+                } else {
+                    ScrollbackSnapshotFidelity::LegacyRedacted
+                },
+                None,
+                expected_newest_exclusive,
+                0,
+                0,
+                Vec::new(),
+            );
+        }
+        let store = self.lock_store("snapshot_scrollback store")?;
+        if let Some(manifest) = manifest_before.as_ref() {
+            Self::verify_logical_ledger_digest_from_store(manifest, ledger_pane_id, &store)
+                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+        }
+
+        let retained_rows = store.line_count(ledger_pane_id);
+        let retained_rows_u64 = u64::try_from(retained_rows)
+            .map_err(|_| ScrollbackSpillError::ArithmeticOverflow("row_count"))?;
+        if !keep_newest && retained_rows > limits.max_rows {
+            return Err(ScrollbackSpillError::ResourceLimit {
+                resource: "rows",
+                observed: retained_rows_u64,
+                maximum: u64::try_from(limits.max_rows).unwrap_or(u64::MAX),
+            });
+        }
+        let stored_bytes = store.retained_bytes(ledger_pane_id);
+        if !keep_newest && stored_bytes > limits.max_stored_bytes {
+            return Err(ScrollbackSpillError::ResourceLimit {
+                resource: "stored_bytes",
+                observed: stored_bytes,
+                maximum: limits.max_stored_bytes,
+            });
+        }
+        let physical_bytes = store.file_bytes(ledger_pane_id);
+        if !keep_newest && physical_bytes > limits.max_physical_bytes {
+            return Err(ScrollbackSpillError::ResourceLimit {
+                resource: "physical_bytes",
+                observed: physical_bytes,
+                maximum: limits.max_physical_bytes,
+            });
+        }
+
+        let next_seq = store
+            .next_seq(ledger_pane_id)
+            .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+        let Some(initial_stable_row) = state.initial_stable_row else {
+            if retained_rows != 0 || store.oldest_seq(ledger_pane_id).is_some() || next_seq != 0 {
+                return Err(ScrollbackSpillError::SnapshotRangeMismatch);
+            }
+            let snapshot = ScrollbackSnapshot::from_contiguous_rows(
+                state.snapshot_generation(),
+                if state.authenticated_manifest {
+                    ScrollbackSnapshotFidelity::ExactSemantic
+                } else {
+                    ScrollbackSnapshotFidelity::LegacyRedacted
+                },
+                None,
+                expected_newest_exclusive,
+                stored_bytes,
+                0,
+                Vec::new(),
+            )?;
+            drop(store);
+            if let Some(manifest) = manifest_before.as_ref() {
+                self.revalidate_snapshot_manifest(manifest)?;
+            }
+            return Ok(snapshot);
+        };
+        let next_stable_offset = wezterm_term::StableRowIndex::try_from(next_seq)
+            .map_err(|_| ScrollbackSpillError::ArithmeticOverflow("stable_row_range"))?;
+        let observed_newest_exclusive = initial_stable_row
+            .checked_add(next_stable_offset)
+            .ok_or(ScrollbackSpillError::ArithmeticOverflow("stable_row_range"))?;
+        if observed_newest_exclusive != expected_newest_exclusive {
+            return Err(ScrollbackSpillError::SnapshotRangeMismatch);
+        }
+
+        let oldest_seq = store.oldest_seq(ledger_pane_id);
+        if (retained_rows == 0) != oldest_seq.is_none() {
+            return Err(ScrollbackSpillError::SnapshotRangeMismatch);
+        }
+        let oldest_stable_row = match oldest_seq {
+            Some(oldest_seq) => {
+                let oldest_offset = wezterm_term::StableRowIndex::try_from(oldest_seq)
+                    .map_err(|_| ScrollbackSpillError::ArithmeticOverflow("stable_row_range"))?;
+                Some(
+                    initial_stable_row
+                        .checked_add(oldest_offset)
+                        .ok_or(ScrollbackSpillError::ArithmeticOverflow("stable_row_range"))?,
+                )
+            }
+            None => None,
+        };
+
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(retained_rows.min(limits.max_rows))
+            .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+        let mut decoded_bytes = 0usize;
+        let mut kept_stored_bytes = 0u64;
+        let mut fidelity = if state.authenticated_manifest {
+            ScrollbackSnapshotFidelity::ExactSemantic
+        } else {
+            ScrollbackSnapshotFidelity::LegacyRedacted
+        };
+        let keyring = self.lock_keyring("snapshot_scrollback decrypt")?;
+        let mut cipher_cache = GuardianScrollbackCipherCache::new(&keyring, &state.row_segments);
+        let (physical_oldest, segment_next) = store_segment_bounds(&store, ledger_pane_id)
+            .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+        let mut segments = LiveScrollbackSegmentReader::default();
+        if let Some(oldest_seq) = oldest_seq {
+            for index in 0..retained_rows_u64 {
+                if keep_newest && rows.len() == limits.max_rows {
+                    break;
+                }
+                let offset = if keep_newest {
+                    retained_rows_u64 - 1 - index
+                } else {
+                    index
+                };
+                let seq = oldest_seq
+                    .checked_add(offset)
+                    .ok_or(ScrollbackSpillError::ArithmeticOverflow("sequence"))?;
+                let record = store
+                    .line_at(ledger_pane_id, seq)
+                    .map_err(|_| ScrollbackSpillError::StorageUnavailable)?
+                    .ok_or(ScrollbackSpillError::SnapshotRowMissing)?;
+                let stored_with_record = kept_stored_bytes
+                    .saturating_add(u64::try_from(record.len()).unwrap_or(u64::MAX));
+                if keep_newest && stored_with_record > limits.max_stored_bytes {
+                    break;
+                }
+                let remaining_decoded_bytes =
+                    limits
+                        .max_decoded_bytes
+                        .checked_sub(decoded_bytes)
+                        .ok_or_else(|| ScrollbackSpillError::ResourceLimit {
+                            resource: "decoded_bytes",
+                            observed: u64::try_from(decoded_bytes).unwrap_or(u64::MAX),
+                            maximum: u64::try_from(limits.max_decoded_bytes).unwrap_or(u64::MAX),
+                        })?;
+                let plaintext_bytes = if mux::guardian_output_journal::is_compact_scrollback_row(
+                    &record,
+                ) {
+                    Some(
+                        mux::guardian_output_journal::compact_scrollback_row_plaintext_bytes(
+                            &record,
+                        )
+                        .map_err(|_| ScrollbackSpillError::StorageUnavailable)?,
+                    )
+                } else if mux::guardian_output_journal::is_scrollback_segment_record(&record) {
+                    Some(
+                        mux::guardian_output_journal::scrollback_segment_record_plaintext_bytes(
+                            &record,
+                            mux::guardian_output_journal::is_scrollback_segment_tail(&record),
+                        )
+                        .map_err(|_| ScrollbackSpillError::StorageUnavailable)?,
+                    )
+                } else if mux::guardian_output_journal::GuardianEncryptedScrollbackRow::has_encrypted_prefix(
+                    &record,
+                ) {
+                    Some(
+                        mux::guardian_output_journal::GuardianEncryptedScrollbackRow::parse(
+                            &record,
+                        )
+                        .map_err(|_| ScrollbackSpillError::StorageUnavailable)?
+                        .plaintext_bytes(),
+                    )
+                } else {
+                    None
+                };
+                if let Some(plaintext_bytes) = plaintext_bytes {
+                    let line_bytes = usize::try_from(plaintext_bytes)
+                        .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+                    if line_bytes > remaining_decoded_bytes {
+                        if keep_newest {
+                            break;
+                        }
+                        return Err(ScrollbackSpillError::ResourceLimit {
+                            resource: "decoded_bytes",
+                            observed: u64::try_from(decoded_bytes.saturating_add(line_bytes))
+                                .unwrap_or(u64::MAX),
+                            maximum: u64::try_from(limits.max_decoded_bytes).unwrap_or(u64::MAX),
+                        });
+                    }
+                }
+                let stable_offset = wezterm_term::StableRowIndex::try_from(seq)
+                    .map_err(|_| ScrollbackSpillError::ArithmeticOverflow("stable_row_range"))?;
+                let stable_row = initial_stable_row
+                    .checked_add(stable_offset)
+                    .ok_or(ScrollbackSpillError::ArithmeticOverflow("stable_row_range"))?;
+                let decoded = decode_stored_scrollback_row(
+                    &record,
+                    &mut segments,
+                    &mut |range| store_segment_records(&store, ledger_pane_id, range),
+                    physical_oldest,
+                    segment_next,
+                    &mut cipher_cache,
+                    self.durable_pane_id,
+                    state.content_epoch,
+                    stable_row,
+                    seq,
+                    remaining_decoded_bytes,
+                )
+                .map_err(|error| {
+                    if let Some(budget) = error.downcast_ref::<ScrollbackDecodedBudgetExceeded>() {
+                        ScrollbackSpillError::ResourceLimit {
+                            resource: "decoded_bytes",
+                            observed: u64::try_from(
+                                decoded_bytes.saturating_add(budget.minimum_required),
+                            )
+                            .unwrap_or(u64::MAX),
+                            maximum: u64::try_from(limits.max_decoded_bytes).unwrap_or(u64::MAX),
+                        }
+                    } else {
+                        ScrollbackSpillError::StorageUnavailable
+                    }
+                });
+                let (line, line_decoded_bytes, row_fidelity) = match decoded {
+                    Err(ScrollbackSpillError::ResourceLimit { .. }) if keep_newest => break,
+                    decoded => decoded?,
+                };
+                if row_fidelity == DecodedScrollbackRecordFidelity::LegacyRedacted {
+                    fidelity = ScrollbackSnapshotFidelity::LegacyRedacted;
+                }
+                decoded_bytes = decoded_bytes
+                    .checked_add(line_decoded_bytes)
+                    .ok_or(ScrollbackSpillError::ArithmeticOverflow("decoded_bytes"))?;
+                kept_stored_bytes = stored_with_record;
+                rows.push(line);
+            }
+        }
+
+        let (oldest_stable_row, stored_bytes) = if keep_newest {
+            rows.reverse();
+            let kept = wezterm_term::StableRowIndex::try_from(rows.len())
+                .map_err(|_| ScrollbackSpillError::ArithmeticOverflow("stable_row_range"))?;
+            let oldest = expected_newest_exclusive
+                .checked_sub(kept)
+                .ok_or(ScrollbackSpillError::ArithmeticOverflow("stable_row_range"))?;
+            ((!rows.is_empty()).then_some(oldest), kept_stored_bytes)
+        } else {
+            (oldest_stable_row, stored_bytes)
+        };
+        let snapshot = ScrollbackSnapshot::from_contiguous_rows(
+            state.snapshot_generation(),
+            fidelity,
+            oldest_stable_row,
+            expected_newest_exclusive,
+            stored_bytes,
+            decoded_bytes,
+            rows,
+        )?;
+        // Reauthentication takes the same keyring mutex. Release the decode
+        // cache and its borrowed keyring guard before attempting that lock.
+        // The mutation and filesystem leases still protect this snapshot.
+        drop(cipher_cache);
+        drop(keyring);
+        drop(store);
+        if let Some(manifest) = manifest_before.as_ref() {
+            self.revalidate_snapshot_manifest(manifest)?;
+        }
+        Ok(snapshot)
+    }
+
     /// The compare-and-swap behind both replacement entry points. With
     /// `supersede`, the published generation is accepted when the ancestry
     /// admits it (the ancestor's epoch at a revision no older than its, or a
@@ -29602,6 +29698,72 @@ mod tests {
                 resource: "decoded_bytes",
                 ..
             }
+        ));
+
+        // Taken newest first, each limit leaves out the oldest row and no
+        // other, under the same generation.
+        let tail_of = |limits| {
+            let tail = sink.snapshot_newest_scrollback(6, limits).unwrap();
+            assert_eq!(tail.generation(), snapshot.generation());
+            assert_eq!(tail.newest_stable_row_exclusive(), 6);
+            tail
+        };
+        let full = tail_of(limits);
+        assert_eq!(full.rows().len(), 2);
+        assert_eq!(full.oldest_stable_row(), Some(4));
+        assert_eq!(full.rows()[0].as_str().as_ref(), "snapshot-row-four");
+        assert_eq!(full.rows()[1].as_str().as_ref(), "snapshot-row-five");
+        for tight in [
+            wezterm_term::config::ScrollbackSnapshotLimits {
+                max_rows: 1,
+                ..limits
+            },
+            wezterm_term::config::ScrollbackSnapshotLimits {
+                max_stored_bytes: full.stored_bytes() - 1,
+                ..limits
+            },
+            wezterm_term::config::ScrollbackSnapshotLimits {
+                max_decoded_bytes: full.decoded_bytes() - 1,
+                ..limits
+            },
+        ] {
+            let tail = tail_of(tight);
+            assert_eq!(tail.oldest_stable_row(), Some(5), "under {tight:?}");
+            assert_eq!(tail.rows().len(), 1, "under {tight:?}");
+            assert_eq!(tail.rows()[0].as_str().as_ref(), "snapshot-row-five");
+            assert!(tail.stored_bytes() <= tight.max_stored_bytes);
+            assert!(tail.stored_bytes() < full.stored_bytes());
+            assert!(tail.decoded_bytes() <= tight.max_decoded_bytes);
+        }
+        let none = tail_of(wezterm_term::config::ScrollbackSnapshotLimits {
+            max_rows: 0,
+            ..limits
+        });
+        assert_eq!(none.oldest_stable_row(), None);
+        assert!(none.rows().is_empty());
+        // The ledger's file size says nothing of the rows kept, so it leaves
+        // none out.
+        assert_eq!(
+            tail_of(wezterm_term::config::ScrollbackSnapshotLimits {
+                max_physical_bytes: 0,
+                ..limits
+            })
+            .rows()
+            .len(),
+            2
+        );
+        assert!(matches!(
+            sink.snapshot_scrollback(
+                6,
+                wezterm_term::config::ScrollbackSnapshotLimits {
+                    max_rows: 1,
+                    ..limits
+                },
+            ),
+            Err(wezterm_term::config::ScrollbackSpillError::ResourceLimit {
+                resource: "rows",
+                ..
+            })
         ));
 
         let generation_before_clear = snapshot.generation();

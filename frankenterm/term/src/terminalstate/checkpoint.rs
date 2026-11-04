@@ -3252,11 +3252,6 @@ impl PendingReplayConfigV2 {
             custom_widths,
             limits.max_total_custom_cell_widths,
         )?;
-        ensure_limit(
-            "config.scrollback_size",
-            scrollback_size,
-            limits.max_total_lines,
-        )?;
         ensure_limit("config.max_user_vars", max_user_vars, limits.max_user_vars)?;
         ensure_limit(
             "config.max_unicode_version_stack_depth",
@@ -3296,15 +3291,25 @@ impl PendingReplayConfigV2 {
         Ok(projection)
     }
 
-    /// `graphics`: the checkpoint holds graphics state.
+    /// `graphics`: the checkpoint holds graphics state. A replay holds its
+    /// retention in rows, which the limits have to cover along with both
+    /// screens at `physical_rows`, so a retention past that replays at what fits.
     fn into_checkpoint(
         self,
         tables: &[CheckpointCustomCellWidthMap],
         graphics: bool,
+        limits: TerminalCheckpointLimits,
+        physical_rows: usize,
     ) -> Result<CheckpointReplayConfigV2, TerminalCheckpointError> {
+        let fitting_retention = u64_from_usize(
+            limits
+                .max_total_lines
+                .saturating_sub(physical_rows.saturating_mul(2)),
+            "config.scrollback_size",
+        )?;
         Ok(CheckpointReplayConfigV2 {
             version: self.version,
-            scrollback_size: self.scrollback_size,
+            scrollback_size: self.scrollback_size.min(fitting_retention),
             color_palette: self.color_palette,
             enable_kitty_keyboard: self.enable_kitty_keyboard,
             max_user_vars: self.max_user_vars,
@@ -3321,11 +3326,24 @@ impl PendingReplayConfigV2 {
     fn matches_checkpoint(
         &self,
         checkpoint: &CheckpointReplayConfigV2,
+        limits: TerminalCheckpointLimits,
         tables: &[Arc<HashMap<u32, u8>>],
     ) -> Result<bool, TerminalCheckpointError> {
         let expected_unicode = checkpoint.unicode_version.clone().into_live(tables)?;
+        // A retention the limits cover at every height is recorded as it is. A
+        // larger one can be recorded smaller, by a height the checkpoint alone
+        // knows: once activated, the terminal takes the live one back.
+        let fits_at_every_height = u64_from_usize(
+            limits
+                .max_total_lines
+                .saturating_sub(limits.max_rows.saturating_mul(2)),
+            "config.scrollback_size",
+        )?;
+        let retention_matches = checkpoint.scrollback_size == self.scrollback_size
+            || (checkpoint.scrollback_size < self.scrollback_size
+                && self.scrollback_size > fits_at_every_height);
         Ok(checkpoint.version == self.version
-            && checkpoint.scrollback_size == self.scrollback_size
+            && retention_matches
             && checkpoint.color_palette == self.color_palette
             && checkpoint.enable_kitty_keyboard == self.enable_kitty_keyboard
             && checkpoint.max_user_vars == self.max_user_vars
@@ -3465,7 +3483,7 @@ impl CheckpointReplayConfigV2 {
         limits: TerminalCheckpointLimits,
         tables: &[Arc<HashMap<u32, u8>>],
     ) -> Result<bool, TerminalCheckpointError> {
-        PendingReplayConfigV2::capture(config, limits)?.matches_checkpoint(self, tables)
+        PendingReplayConfigV2::capture(config, limits)?.matches_checkpoint(self, limits, tables)
     }
 }
 
@@ -5638,8 +5656,12 @@ impl TerminalCheckpointV3 {
             width_table_builder.register(&entry.vers, limits)?;
         }
         let custom_cell_width_maps = width_table_builder.finish();
-        let replay_config = pending_replay_config
-            .into_checkpoint(&custom_cell_width_maps, limits.capture_graphics)?;
+        let replay_config = pending_replay_config.into_checkpoint(
+            &custom_cell_width_maps,
+            limits.capture_graphics,
+            limits,
+            terminal.screen.screen.physical_rows,
+        )?;
         let mut screen_usage = crate::screen::ScreenCheckpointUsage::default();
         validate_custom_cell_width_maps(&custom_cell_width_maps, limits, &mut screen_usage)?;
         replay_config.validate(limits, custom_cell_width_maps.len(), &mut screen_usage)?;
@@ -8711,6 +8733,146 @@ mod tests {
         };
         assert_eq!(sink.retained_scrollback_rows(), 0);
         assert_eq!(activated.screen().phys_to_stable_row_index(0), kept_oldest);
+    }
+
+    /// A store can retain more rows than a checkpoint holds at all: the capture
+    /// takes the newest it can hold, and a restore from it comes back with the
+    /// store holding those alone. A snapshot of every row or none stopped
+    /// whole-mux recovery for as long as the pane kept that history.
+    #[test]
+    fn a_store_past_the_checkpoint_row_limit_gives_the_capture_its_newest_rows() {
+        use crate::config::ScrollbackSpillSink;
+
+        let (mut live, sink) = tiered_terminal_with_cold_rows();
+        for index in 20..60 {
+            live.advance_bytes(format!("r{:02}\r\n", index).as_bytes());
+        }
+        // Each screen's resident rows come out of the limits first: the
+        // primary's, and the alternate's one screenful.
+        let max_total_lines = 20;
+        let limits = TerminalCheckpointLimits {
+            max_total_lines,
+            ..TerminalCheckpointLimits::default()
+        };
+        let checkpoint = TerminalCheckpointV3::capture_with_limits(&live, limits).unwrap();
+        let kept = checkpoint.primary_screen.cold_prefix_line_count as usize;
+        let resident = live.screen().scrollback_rows() + live.screen().physical_rows;
+        assert_eq!(kept, max_total_lines - resident);
+        assert!(kept < sink.retained_scrollback_rows());
+        let live_oldest = live.screen().phys_to_stable_row_index(0);
+
+        let payload = checkpoint.to_canonical_json(limits).unwrap();
+        let mut inert = TerminalCheckpointV3::decode_canonical_json(&payload, limits)
+            .unwrap()
+            .restore_inert(live.get_config())
+            .unwrap();
+        inert.supersede_cold_scrollback_successors();
+        let activated = match inert.into_live(Box::new(std::io::sink())) {
+            Ok(activated) => activated,
+            Err(failure) => panic!("the capture must restore: {:?}", failure.error()),
+        };
+        assert_eq!(
+            sink.oldest_scrollback_row(),
+            Some(live_oldest - kept as StableRowIndex)
+        );
+        assert_eq!(sink.retained_scrollback_rows(), kept);
+        assert_eq!(activated.screen().phys_to_stable_row_index(0), live_oldest);
+    }
+
+    #[derive(Debug)]
+    struct RetentionConfig(usize);
+
+    impl TerminalConfiguration for RetentionConfig {
+        fn scrollback_size(&self) -> usize {
+            self.0
+        }
+
+        fn color_palette(&self) -> ColorPalette {
+            ColorPalette::default()
+        }
+    }
+
+    /// `scrollback_lines` can ask for more than a checkpoint holds at all. A
+    /// capture records the retention that fits at the terminal's height and a
+    /// restore accepts it. Refusing the configuration stopped whole-mux recovery
+    /// for as long as the mux ran, however little any pane held.
+    #[test]
+    fn a_retention_past_the_limits_captures_and_restores_within_them() {
+        let limits = TerminalCheckpointLimits::default();
+        let retention = 200_000;
+        let config = Arc::new(RetentionConfig(retention));
+        let mut live = Terminal::new(
+            TerminalSize::default(),
+            config.clone(),
+            "FrankenTerm",
+            "retention-past-the-limits",
+            Box::new(Vec::<u8>::new()),
+        );
+        live.advance_bytes(b"row\r\n");
+
+        let fitting = |rows: usize| (limits.max_total_lines - 2 * rows) as u64;
+        let checkpoint = TerminalCheckpointV3::capture_with_limits(&live, limits).unwrap();
+        assert_eq!(
+            checkpoint.replay_config.scrollback_size,
+            fitting(live.screen().physical_rows)
+        );
+
+        let payload = checkpoint.to_canonical_json(limits).unwrap();
+        let restore = |config: Arc<RetentionConfig>| {
+            TerminalCheckpointV3::decode_canonical_json(&payload, limits)
+                .unwrap()
+                .restore_inert(config)
+        };
+        let inert = restore(config.clone()).unwrap();
+        let activated = match inert.into_live(Box::new(std::io::sink())) {
+            Ok(activated) => activated,
+            Err(failure) => panic!("the capture must restore: {:?}", failure.error()),
+        };
+        assert_eq!(activated.get_config().scrollback_size(), retention);
+
+        // A live retention below the checkpoint's would not keep what it holds.
+        assert!(matches!(
+            restore(Arc::new(RetentionConfig(100))),
+            Err(TerminalCheckpointError::ReplayConfigurationMismatch)
+        ));
+
+        // A taller terminal has less of the limits left for its retention.
+        live.resize(TerminalSize {
+            rows: 4_096,
+            ..TerminalSize::default()
+        });
+        let tall = TerminalCheckpointV3::capture_with_limits(&live, limits).unwrap();
+        assert_eq!(tall.replay_config.scrollback_size, fitting(4_096));
+    }
+
+    /// A retention the limits cover at every height is recorded as it is, so
+    /// it still has to match the live one exactly.
+    #[test]
+    fn a_retention_within_the_limits_still_has_to_match() {
+        let limits = TerminalCheckpointLimits::default();
+        let retention = 100;
+        let live = Terminal::new(
+            TerminalSize::default(),
+            Arc::new(RetentionConfig(retention)),
+            "FrankenTerm",
+            "retention-within-the-limits",
+            Box::new(Vec::<u8>::new()),
+        );
+        let checkpoint = TerminalCheckpointV3::capture_with_limits(&live, limits).unwrap();
+        assert_eq!(checkpoint.replay_config.scrollback_size, retention as u64);
+        let payload = checkpoint.to_canonical_json(limits).unwrap();
+        let restore = |retention: usize| {
+            TerminalCheckpointV3::decode_canonical_json(&payload, limits)
+                .unwrap()
+                .restore_inert(Arc::new(RetentionConfig(retention)))
+        };
+        assert!(restore(retention).is_ok());
+        for other in [retention - 1, retention + 1] {
+            assert!(matches!(
+                restore(other),
+                Err(TerminalCheckpointError::ReplayConfigurationMismatch)
+            ));
+        }
     }
 
     /// A row the visible screen needs cannot give way.

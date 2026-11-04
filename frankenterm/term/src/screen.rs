@@ -6317,7 +6317,7 @@ impl StagedScreenCheckpoint {
             if let Some(cold) = self.cold_source {
                 let snapshot = cold
                     .sink
-                    .snapshot_scrollback(
+                    .snapshot_newest_scrollback(
                         cold.expected_newest_exclusive,
                         ScrollbackSnapshotLimits {
                             max_rows: limits.max_total_lines.saturating_sub(usage.lines),
@@ -6379,6 +6379,8 @@ impl StagedScreenCheckpoint {
                 let oldest_stable = StableRowIndex::try_from(oldest).map_err(|_| {
                     ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent
                 })?;
+                // The snapshot can begin after the store's oldest row, when the
+                // store holds more than the limits do, but never before it.
                 if cold_prefix_line_count > 0
                     && (!after.retains(
                         &cold.before_interval,
@@ -6386,8 +6388,8 @@ impl StagedScreenCheckpoint {
                     ) || cold
                         .before_interval
                         .rows()
-                        .is_none_or(|rows| rows.start != oldest_stable)
-                        || after.rows().is_none_or(|rows| rows.start != oldest_stable))
+                        .is_none_or(|rows| rows.start > oldest_stable)
+                        || after.rows().is_none_or(|rows| rows.start > oldest_stable))
                 {
                     return Err(ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent);
                 }
@@ -6418,9 +6420,12 @@ impl StagedScreenCheckpoint {
                         first_kept = index;
                     }
                 }
-                if first_kept != 0 {
-                    note_history_over_checkpoint_limits(first_kept);
-                    cold_lines.drain(..first_kept);
+                cold_lines.drain(..first_kept);
+                let left_out_of_snapshot = cold.before_interval.rows().map_or(0, |rows| {
+                    usize::try_from(oldest_stable - rows.start).unwrap_or(0)
+                });
+                if first_kept + left_out_of_snapshot != 0 {
+                    note_history_over_checkpoint_limits(first_kept + left_out_of_snapshot);
                 }
                 (
                     self.resident_oldest - cold_lines.len(),
@@ -18142,6 +18147,38 @@ pub(crate) mod tests {
                 .values()
                 .map(Screen::estimate_line_bytes)
                 .sum()
+        }
+
+        /// The newest rows within `limits.max_rows`; the other limits refuse.
+        fn snapshot_newest_scrollback(
+            &self,
+            expected_newest_exclusive: StableRowIndex,
+            limits: crate::config::ScrollbackSnapshotLimits,
+        ) -> Result<crate::config::ScrollbackSnapshot, crate::config::ScrollbackSpillError>
+        {
+            let full = self.snapshot_scrollback(
+                expected_newest_exclusive,
+                crate::config::ScrollbackSnapshotLimits {
+                    max_rows: usize::MAX,
+                    ..limits
+                },
+            )?;
+            let generation = full.generation();
+            let fidelity = full.fidelity();
+            let stored_bytes = full.stored_bytes();
+            let decoded_bytes = full.decoded_bytes();
+            let mut rows = full.into_rows();
+            rows.drain(..rows.len().saturating_sub(limits.max_rows));
+            crate::config::ScrollbackSnapshot::from_contiguous_rows(
+                generation,
+                fidelity,
+                (!rows.is_empty())
+                    .then_some(expected_newest_exclusive - rows.len() as StableRowIndex),
+                expected_newest_exclusive,
+                stored_bytes,
+                decoded_bytes,
+                rows,
+            )
         }
 
         fn snapshot_scrollback(
