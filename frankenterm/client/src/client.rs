@@ -10184,6 +10184,32 @@ fn is_plain_local_socket(config: &ClientDomainConfig) -> bool {
     matches!(config, ClientDomainConfig::Unix(unix) if unix.proxy_command.is_none())
 }
 
+/// The first pause before a plain local socket redials, and the longest. Its
+/// panes stay frozen until a dial finds the mux back, and dialing a local socket
+/// costs next to nothing. So the general schedule, meant for a remote host, only
+/// added waiting: a mux restarted 9 s into an outage stayed unreachable until
+/// that schedule's next dial, 15 s in.
+const PLAIN_LOCAL_MUX_REDIAL_BASE: Duration = Duration::from_millis(500);
+const PLAIN_LOCAL_MUX_REDIAL_MAX: Duration = Duration::from_secs(1);
+
+/// The base and ceiling of a domain's reconnect backoff, from the configured
+/// ones. A plain local socket never waits longer than its own.
+#[must_use]
+fn reconnect_backoff_bounds(
+    config: &ClientDomainConfig,
+    base_interval: Duration,
+    max_interval: Duration,
+) -> (Duration, Duration) {
+    if is_plain_local_socket(config) {
+        (
+            base_interval.min(PLAIN_LOCAL_MUX_REDIAL_BASE),
+            max_interval.min(PLAIN_LOCAL_MUX_REDIAL_MAX),
+        )
+    } else {
+        (base_interval, max_interval)
+    }
+}
+
 #[must_use]
 fn local_mux_restart_grace_exhausted(
     config: &ClientDomainConfig,
@@ -10195,13 +10221,12 @@ fn local_mux_restart_grace_exhausted(
 }
 
 /// How long a reconnect, or an automatic domain connect, runs before its
-/// connection window opens. With the default 1 s base backoff a reconnect
-/// dials at 1 s, 3 s and 7 s into the outage, and a lossless mux upgrade
-/// is back by the 3 s dial and reattached a moment later. At 3 s the window
-/// opened just before that reattach closed it again; 5 s sits between the
-/// second and third dials, so an upgrade, or a connect to a reachable host,
-/// shows no window, and an outage that runs longer still gets one (ft-9zthd,
-/// ft-h38m4).
+/// connection window opens. A lossless mux upgrade has reattached about 3 s in,
+/// and at 3 s the window opened just before that reattach closed it again. At
+/// 5 s an upgrade, or a connect to a reachable host, shows no window, and an
+/// outage that runs longer still gets one. It also sits between the dials a
+/// remote domain makes 3 s and 7 s into its outage at the default backoff
+/// (ft-9zthd, ft-h38m4).
 pub(crate) const CONNECTION_UI_DELAY: Duration = Duration::from_secs(5);
 
 /// A new reconnect window, which opens only if the outage outlasts
@@ -10323,8 +10348,11 @@ impl Client {
             .name("client-reconnect".to_string())
             .spawn(move || {
                 let cfg = configuration();
-                let base_interval = Duration::from_millis(cfg.client_reconnect_base_interval_ms);
-                let max_interval = Duration::from_millis(cfg.client_reconnect_max_interval_ms);
+                let (base_interval, max_interval) = reconnect_backoff_bounds(
+                    &reconnectable.config,
+                    Duration::from_millis(cfg.client_reconnect_base_interval_ms),
+                    Duration::from_millis(cfg.client_reconnect_max_interval_ms),
+                );
 
                 let max_attempts = cfg.client_reconnect_max_attempts;
                 let healthy_session =
@@ -12127,6 +12155,47 @@ mod tests {
         assert!(reconnect_ui_for_outage(&mut slot, true, open).is_open());
         assert_eq!(opened.get(), 3);
         slot.expect("the new outage's window").close();
+    }
+
+    #[test]
+    fn a_plain_local_socket_redials_on_its_own_short_schedule() {
+        let ms = Duration::from_millis;
+        let plain = ClientDomainConfig::Unix(UnixDomain::default());
+        let proxied = ClientDomainConfig::Unix(UnixDomain {
+            proxy_command: Some(vec!["nc".to_string()]),
+            ..UnixDomain::default()
+        });
+        let tls = ClientDomainConfig::Tls(config::TlsDomainClient::default());
+
+        // At the configured defaults it reaches a restored mux within a second.
+        let (mut backoff, max) = reconnect_backoff_bounds(&plain, ms(1_000), ms(10_000));
+        let mut at = Duration::ZERO;
+        let mut dials = Vec::new();
+        for _ in 0..4 {
+            at += backoff;
+            dials.push(at);
+            backoff = next_reconnect_backoff(backoff, max);
+        }
+        assert_eq!(dials, [ms(500), ms(1_500), ms(2_500), ms(3_500)]);
+
+        // A remote domain keeps the schedule it is configured with.
+        for config in [&proxied, &tls] {
+            assert_eq!(
+                reconnect_backoff_bounds(config, ms(1_000), ms(10_000)),
+                (ms(1_000), ms(10_000))
+            );
+        }
+
+        // A faster configured schedule stands, and a slower one is cut down
+        // with its base still within its ceiling.
+        assert_eq!(
+            reconnect_backoff_bounds(&plain, ms(100), ms(200)),
+            (ms(100), ms(200))
+        );
+        assert_eq!(
+            reconnect_backoff_bounds(&plain, ms(800), ms(800)),
+            (ms(500), ms(800))
+        );
     }
 
     #[test]
