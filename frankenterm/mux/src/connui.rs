@@ -56,6 +56,11 @@ pub enum UIRequest {
         duration: Duration,
         respond: Sender<anyhow::Result<()>>,
     },
+    /// Open a window still held back, if it has text to show, and reply once
+    /// it is up.
+    Show {
+        respond: Sender<()>,
+    },
     Close,
 }
 
@@ -97,6 +102,10 @@ impl ConnectionUIImpl {
                     respond,
                 }) => {
                     let _ = respond.send(self.sleep(&reason, duration));
+                }
+                // This loop starts only after the window's pane is in the mux.
+                Ok(UIRequest::Show { respond }) => {
+                    let _ = respond.send(());
                 }
                 Err(err) if err.is_timeout() => {}
                 Err(err) => bail!("recv_timeout: {}", err),
@@ -263,6 +272,9 @@ impl HeadlessImpl {
                     std::thread::sleep(duration);
                     let _ = respond.send(Ok(()));
                 }
+                Ok(UIRequest::Show { respond }) => {
+                    let _ = respond.send(());
+                }
                 Err(err) if err.is_timeout() => {}
                 Err(err) => bail!("recv_timeout: {}", err),
             }
@@ -270,6 +282,15 @@ impl HeadlessImpl {
 
         Ok(())
     }
+}
+
+/// Whether held output has something to read: for a title alone, a window would
+/// be blank.
+fn holds_text(output: &[Vec<Change>]) -> bool {
+    !output
+        .iter()
+        .flatten()
+        .all(|change| matches!(change, Change::Title(_)))
 }
 
 /// The thread behind [`ConnectionUI::new_deferred`]: hold requests until the
@@ -319,21 +340,18 @@ where
                 }
             },
             Ok(input @ UIRequest::Input { .. }) => break Some(input),
+            Ok(show @ UIRequest::Show { .. }) if holds_text(&output) => break Some(show),
+            Ok(UIRequest::Show { respond }) => {
+                let _ = respond.send(());
+            }
             Err(err) if err.is_timeout() => {
                 if now >= deadline {
                     break None;
                 }
             }
             // The owner went away without closing the UI. Open the window only
-            // for something to read: a title alone would be a blank window.
-            Err(_)
-                if output
-                    .iter()
-                    .flatten()
-                    .all(|change| matches!(change, Change::Title(_))) =>
-            {
-                return
-            }
+            // for something to read.
+            Err(_) if !holds_text(&output) => return,
             Err(_) => break None,
         }
     };
@@ -703,6 +721,29 @@ impl ConnectionUI {
     #[must_use]
     pub fn showed_window(&self) -> bool {
         self.window_shown.load(Ordering::Acquire)
+    }
+
+    /// Open this UI's window now if it is holding text back, and return once
+    /// the window's pane is in the mux, or after `wait`. An owner about to
+    /// retire the last of a mux's panes calls this first: the GUI quits on an
+    /// empty mux, so a window left to open afterwards can lose that race, and
+    /// its text and the GUI's other windows are gone with no word why.
+    pub fn show_held_text(&self, wait: Duration) {
+        if let Err(err) = self.ensure_blocking_response_is_safe("show_held_text") {
+            log::error!("{err:#}");
+            return;
+        }
+        let (respond, response) = bounded(1);
+        if self.tx.send(UIRequest::Show { respond }).is_err() {
+            return;
+        }
+        // No reply otherwise means the window went away, or there is none.
+        if response
+            .recv_timeout(wait)
+            .is_err_and(|err| err.is_timeout())
+        {
+            log::warn!("connection window did not come up within {wait:?}");
+        }
     }
 
     pub fn test_alive(&self) -> bool {
@@ -1176,6 +1217,124 @@ mod tests {
 
         assert!(nothing_more_reaches(&window));
         assert_eq!(opened.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn showing_held_text_opens_the_window_and_waits_until_it_is_up() {
+        let (open, window, opened) = recording_opener();
+        let ui = ConnectionUI::deferred_with_opener(Duration::from_secs(600), open);
+        ui.output_str("why it gave up\n");
+        let shower = {
+            let ui = ui.clone();
+            std::thread::spawn(move || ui.show_held_text(Duration::from_secs(600)))
+        };
+
+        assert!(output_text(next_request(&window, "the held text")).contains("why it gave up"));
+        let show = next_request(&window, "the request to show");
+        assert!(!shower.is_finished(), "the window has not answered yet");
+        match show {
+            UIRequest::Show { respond } => respond.send(()).expect("the caller is waiting"),
+            _ => panic!("expected the request to show"),
+        }
+        shower.join().expect("the caller returns once answered");
+        assert_eq!(opened.load(Ordering::SeqCst), 1);
+        assert!(ui.showed_window());
+    }
+
+    #[test]
+    fn a_window_shown_for_held_text_keeps_the_mux_from_being_empty() {
+        let _guard = crate::MUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let (shown_tx, shown_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel::<()>();
+        let owner = std::thread::spawn(move || {
+            let ui = ConnectionUI::new_deferred(Duration::from_secs(600));
+            ui.output_str("why it gave up\n");
+            ui.show_held_text(Duration::from_secs(10));
+            shown_tx.send(ui.showed_window()).unwrap();
+            let _ = finish_rx.recv();
+            ui.close();
+        });
+        assert!(mux.is_empty());
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            executor.try_tick().expect("poll GUI tasks on their owner");
+            if let Ok(shown) = shown_rx.try_recv() {
+                assert!(shown, "this UI's window must be real");
+                break;
+            }
+            assert!(Instant::now() < deadline, "the owner did not return");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            !mux.is_empty(),
+            "the window's pane must be in the mux when show_held_text returns"
+        );
+
+        finish_tx.send(()).unwrap();
+        owner.join().expect("the owner must finish");
+        while executor.try_tick().expect("drain GUI cleanup") {}
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn showing_held_text_with_nothing_to_read_opens_no_window() {
+        let (open, window, opened) = recording_opener();
+        let ui = ConnectionUI::deferred_with_opener(Duration::from_secs(600), open);
+        ui.title("FrankenTerm: Reconnecting...");
+        let wait = Duration::from_secs(10);
+        let started = Instant::now();
+
+        ui.show_held_text(wait);
+
+        assert!(started.elapsed() < wait, "nothing to wait for");
+        assert_eq!(opened.load(Ordering::SeqCst), 0);
+        assert!(ui.is_open());
+
+        // A closed UI has nothing to show either.
+        ui.close();
+        wait_until("the UI to close", || !ui.is_open());
+        let started = Instant::now();
+        ui.show_held_text(wait);
+        assert!(started.elapsed() < wait, "nothing to wait for");
+        assert!(nothing_more_reaches(&window));
+    }
+
+    #[test]
+    fn showing_held_text_stops_waiting_for_a_window_that_never_comes_up() {
+        // Kept alive and never answering, as a stalled GUI would be.
+        let (open, _window, opened) = recording_opener();
+        let ui = ConnectionUI::deferred_with_opener(Duration::from_secs(600), open);
+        ui.output_str("why it gave up\n");
+        let wait = Duration::from_millis(200);
+        let started = Instant::now();
+
+        ui.show_held_text(wait);
+
+        assert!(started.elapsed() >= wait);
+        assert_eq!(opened.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn showing_held_text_returns_when_the_window_is_refused() {
+        let ui = ConnectionUI::deferred_with_opener(
+            Duration::from_secs(600),
+            ConnectionUI::new_headless,
+        );
+        ui.output_str("why it gave up\n");
+        let wait = Duration::from_secs(10);
+        let started = Instant::now();
+
+        ui.show_held_text(wait);
+
+        assert!(started.elapsed() < wait, "the headless sink answers");
+        wait_until("the refused UI to report itself closed", || !ui.is_open());
+        assert!(!ui.showed_window());
     }
 
     #[test]

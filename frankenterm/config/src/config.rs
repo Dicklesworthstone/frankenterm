@@ -797,6 +797,10 @@ pub struct Config {
     /// fresh connection window, so a machine that was down but still reachable
     /// produced an endless stream of windows.
     ///
+    /// A plain local unix socket redials about once a second, so there a dial
+    /// budget of N runs out in about N seconds, which can be less than its mux
+    /// takes to restart. Without a budget it gives up after two minutes.
+    ///
     /// A connection that stays up for at least
     /// `client_reconnect_healthy_session_ms` is treated as genuinely
     /// recovered and resets the counter, so ordinary transient drops over a

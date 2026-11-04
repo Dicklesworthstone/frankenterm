@@ -10229,6 +10229,10 @@ fn local_mux_restart_grace_exhausted(
 /// (ft-9zthd, ft-h38m4).
 pub(crate) const CONNECTION_UI_DELAY: Duration = Duration::from_secs(5);
 
+/// How long a finished reconnect loop waits for its window to come up before
+/// detaching its domain. A GUI stalled past this still gets the detach.
+const RECONNECT_UI_SHOW_WAIT: Duration = Duration::from_secs(5);
+
 /// A new reconnect window, which opens only if the outage outlasts
 /// [`CONNECTION_UI_DELAY`].
 fn new_reconnect_ui() -> ConnectionUI {
@@ -10597,7 +10601,7 @@ impl Client {
                                                                         "FrankenTerm: {domain_name} mux restarted"
                                                                     ));
                                                                     result_ui.output_str(&format!(
-                                                                        "The remote mux for domain {domain_name} restarted, so its earlier tabs are gone. If the domain reconnects automatically, it reopens in a new window shortly; otherwise attach it again.\n"
+                                                                        "The mux for domain {domain_name} restarted, so its earlier tabs are gone. If the domain reconnects automatically, it reopens in a new window shortly; otherwise attach it again.\n"
                                                                     ));
                                                                 } else {
                                                                     result_ui.output_str(&format!(
@@ -10724,6 +10728,14 @@ impl Client {
                     }
                 }
 
+                // The detach below can empty the mux, and the GUI quits on an
+                // empty mux. So what this loop still holds back gets its window
+                // first: why it gave up, or that the mux came back as a new
+                // session. That window's pane keeps the GUI up to show it, and
+                // for the auto-connect supervisor to reopen the domain.
+                if let Some(ui) = &reconnect_ui {
+                    ui.show_held_text(RECONNECT_UI_SHOW_WAIT);
+                }
                 reconnect_dispatch_authority
                     .close_rpc_transport(&receiver, "mux client reconnect loop terminated");
                 match reconnect_dispatch_authority.resolve_current() {
