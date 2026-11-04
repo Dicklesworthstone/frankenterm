@@ -5843,29 +5843,31 @@ impl GuardianProxyLeasePlan {
         mux_incarnation: Uuid,
     ) -> Result<GuardianClient, GuardianClientError> {
         let started = Instant::now();
-        for attempt in 0..GUARDIAN_CONNECT_ATTEMPTS {
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
             match GuardianClient::connect_for_genesis(socket_path, token_path, mux_incarnation) {
                 Err(GuardianClientError::Io(error))
-                    if error.kind() == io::ErrorKind::UnexpectedEof
-                        && attempt + 1 < GUARDIAN_CONNECT_ATTEMPTS
-                        && started.elapsed() < GUARDIAN_CONNECT_RETRY_BUDGET =>
+                    if error.kind() == io::ErrorKind::UnexpectedEof =>
                 {
                     // The guardian deliberately closes a build-bearing Hello
                     // while its sole protocol authority belongs to a durable
                     // worker. Retry only this pre-Claim handshake, retaining
                     // the exact endpoint, mux and compiled-build authority.
-                    // No pane effect or Claim intent has been sent here.
+                    // No pane effect or Claim intent has been sent here. The
+                    // budget ends this, not a count of 10 ms pauses: 32 of
+                    // those gave up after 0.3 s, and one failed Hello fails
+                    // the whole restore, while a worker holds the protocol
+                    // for seconds at a time.
                     metrics::counter!("mux.guardian_proxy.plan_hello_busy_retry_total")
                         .increment(1);
-                    thread::sleep(GUARDIAN_CONNECT_RETRY_DELAY);
-                    if started.elapsed() >= GUARDIAN_CONNECT_RETRY_BUDGET {
+                    if !wait_for_genesis_retry(started, GUARDIAN_CONNECT_RETRY_BUDGET, attempts) {
                         return Err(GuardianClientError::Io(error));
                     }
                 }
                 result => return result,
             }
         }
-        unreachable!("the final build-authenticated Hello attempt returns its result")
     }
 
     /// Bind independently authenticated existing custody to this unpublished
@@ -14052,11 +14054,14 @@ mod tests {
             frame
         }
 
+        // A guardian that stays busy has no exact attempt count: its Hellos are
+        // paced by the budget.
         for (case, expected_attempts) in [
-            ("busy-then-ready", 2),
-            ("exhausted", GUARDIAN_CONNECT_ATTEMPTS),
-            ("rejected", 1),
-            ("wrong-guardian", 1),
+            ("busy-then-ready", Some(2)),
+            ("busy-past-a-count-of-short-pauses", None),
+            ("exhausted", None),
+            ("rejected", Some(1)),
+            ("wrong-guardian", Some(1)),
         ] {
             let directory = tempfile::Builder::new()
                 .prefix("ft-plan-hello-")
@@ -14078,13 +14083,18 @@ mod tests {
             let expected_build = GuardianHelloBuildIdentityV1::for_compiled_mux()
                 .unwrap()
                 .encode();
+            let plan_finished = Arc::new(AtomicBool::new(false));
+            let finished = Arc::clone(&plan_finished);
             let server = thread::spawn(move || {
-                let deadline = Instant::now() + Duration::from_secs(10);
+                let deadline = Instant::now() + Duration::from_secs(30);
                 let accept = || {
                     let stream = loop {
                         match listener.accept() {
                             Ok((stream, _)) => break stream,
                             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                if finished.load(Ordering::SeqCst) {
+                                    return None;
+                                }
                                 assert!(Instant::now() < deadline, "bounded Hello accept: {case}");
                                 thread::sleep(Duration::from_millis(1));
                             }
@@ -14099,9 +14109,9 @@ mod tests {
                     stream
                         .set_write_timeout(Some(Duration::from_secs(2)))
                         .unwrap();
-                    stream
+                    Some(stream)
                 };
-                let mut census = accept();
+                let mut census = accept().expect("the census connects first");
                 let hello = decode_guardian_request(&secret, &receive(&mut census)).unwrap();
                 assert_eq!(hello.header().operation, GuardianOperation::Hello);
                 assert_eq!(hello.header().mux_incarnation, owner);
@@ -14116,13 +14126,24 @@ mod tests {
                 census
                     .write_all(&encode_guardian_response(&secret, &response).unwrap())
                     .unwrap();
-                for attempt in 0..expected_attempts {
-                    let mut stream = accept();
+                let busy_since = Instant::now();
+                let mut attempts = 0;
+                while let Some(mut stream) = accept() {
+                    attempts += 1;
                     let hello = decode_guardian_request(&secret, &receive(&mut stream)).unwrap();
                     assert_eq!(hello.header().operation, GuardianOperation::Hello);
                     assert_eq!(hello.header().mux_incarnation, owner);
                     assert_eq!(hello.payload(), expected_build.as_slice());
-                    if case == "exhausted" || (case == "busy-then-ready" && attempt == 0) {
+                    let busy = match case {
+                        "exhausted" => true,
+                        "busy-then-ready" => attempts == 1,
+                        // Far past 32 pauses of 10 ms, well inside the budget.
+                        "busy-past-a-count-of-short-pauses" => {
+                            busy_since.elapsed() < Duration::from_millis(1500)
+                        }
+                        _ => false,
+                    };
+                    if busy {
                         // Exact busy behavior of a build-bearing Hello while
                         // the real guardian's protocol is worker-owned.
                         continue;
@@ -14154,12 +14175,14 @@ mod tests {
                         0,
                         "plan sent a mutation"
                     );
+                    break;
                 }
-                expected_attempts
+                attempts
             });
             let census = Arc::new(
                 GuardianCensusCoordinator::connect(&socket, &token, guardian, owner).unwrap(),
             );
+            let started = Instant::now();
             let result = GuardianProxyLeasePlan::prepare_with_build(
                 &socket,
                 &token,
@@ -14167,13 +14190,23 @@ mod tests {
                 census,
                 true,
             );
+            let took = started.elapsed();
+            plan_finished.store(true, Ordering::SeqCst);
             match case {
-                "busy-then-ready" => drop(result.expect("pre-Claim Hello recovers")),
-                "exhausted" => assert!(matches!(
-                    result,
-                    Err(GuardianProxyError::Client(GuardianClientError::Io(ref error)))
-                        if error.kind() == io::ErrorKind::UnexpectedEof
-                )),
+                "busy-then-ready" | "busy-past-a-count-of-short-pauses" => {
+                    drop(result.expect("pre-Claim Hello recovers"));
+                }
+                "exhausted" => {
+                    assert!(matches!(
+                        result,
+                        Err(GuardianProxyError::Client(GuardianClientError::Io(ref error)))
+                            if error.kind() == io::ErrorKind::UnexpectedEof
+                    ));
+                    assert!(
+                        took >= GUARDIAN_CONNECT_RETRY_BUDGET,
+                        "a busy guardian's budget ends the retry, not a count: gave up after {took:?}"
+                    );
+                }
                 "rejected" => assert!(matches!(
                     result,
                     Err(GuardianProxyError::Client(GuardianClientError::Rejected(
@@ -14186,7 +14219,15 @@ mod tests {
                 )),
                 _ => unreachable!(),
             }
-            assert_eq!(server.join().unwrap(), expected_attempts);
+            let attempts = server.join().unwrap();
+            match expected_attempts {
+                Some(expected) => assert_eq!(attempts, expected, "{case}"),
+                None => assert!(
+                    attempts > 1
+                        && attempts <= genesis_retry_attempts(GUARDIAN_CONNECT_RETRY_BUDGET),
+                    "{case}: {attempts} Hellos"
+                ),
+            }
         }
     }
 
