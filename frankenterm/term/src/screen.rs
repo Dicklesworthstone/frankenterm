@@ -2904,8 +2904,8 @@ pub struct Screen {
     scrollback_tiering: ScrollbackTieringState,
     /// Authenticated cold-store identity and original half-open prefix boundary
     /// retained while a checkpoint is restored and raw output is replayed off
-    /// topology. Its presence also prevents replay from evicting any resident
-    /// recovery row before checked activation can repartition the history.
+    /// topology. The cold store is untouched until checked activation
+    /// repartitions the history, so until then every retained row is resident.
     recovery_scrollback: Option<RecoveryScrollbackBoundary>,
 
     /// Whether scrollback is allowed; this is another way of saying
@@ -3028,7 +3028,7 @@ pub(crate) struct ScreenCheckpointLimits {
 }
 
 #[cfg(feature = "use_serde")]
-#[derive(Default, Debug)]
+#[derive(Clone, Copy, Default, Debug)]
 pub(crate) struct ScreenCheckpointUsage {
     pub lines: usize,
     pub cell_records: usize,
@@ -4219,6 +4219,32 @@ fn accumulate_checkpoint_usage(
     }
     *current = observed;
     Ok(())
+}
+
+/// Charge a whole line, or nothing if it does not fit.
+#[cfg(feature = "use_serde")]
+fn charge_checkpoint_line(
+    line: &Line,
+    limits: &ScreenCheckpointLimits,
+    usage: &mut ScreenCheckpointUsage,
+) -> Result<(), ScreenCheckpointCaptureError> {
+    let mut charged = *usage;
+    inspect_checkpoint_line(line, limits, &mut charged)?;
+    *usage = charged;
+    Ok(())
+}
+
+/// Say once per process that a checkpoint is leaving history out: a restore
+/// from it brings back only the newest rows, with no other sign of why.
+#[cfg(feature = "use_serde")]
+fn note_history_over_checkpoint_limits(rows: usize) {
+    static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        warn!(
+            "scrollback is over what a recovery checkpoint holds, here by {rows} rows; a restore \
+             brings back only the newest rows"
+        );
+    }
 }
 
 #[cfg(feature = "use_serde")]
@@ -6032,15 +6058,16 @@ impl Screen {
     /// Validate and account only the resident screen model.
     ///
     /// This is intentionally non-cloning and never crosses the cold-storage
-    /// capability boundary. Inert replay uses it after each raw journal record
-    /// to fail before an attacker can accumulate semantic state beyond the
-    /// checkpoint admission envelope.
+    /// capability boundary. Returns how many of the oldest rows the limits
+    /// leave out: a checkpoint holds the newest history that fits, because
+    /// `scrollback_lines` can retain more than the limits hold and a recovery
+    /// image of the newest history beats none.
     #[cfg(feature = "use_serde")]
     pub(crate) fn preflight_resident_checkpoint_usage(
         &self,
         limits: &ScreenCheckpointLimits,
         usage: &mut ScreenCheckpointUsage,
-    ) -> Result<(), ScreenCheckpointCaptureError> {
+    ) -> Result<usize, ScreenCheckpointCaptureError> {
         if self.physical_rows == 0 || self.physical_rows > limits.max_rows {
             return Err(ScreenCheckpointCaptureError::ResourceLimit {
                 resource: "physical_rows",
@@ -6085,8 +6112,37 @@ impl Screen {
             limits.max_retained_capture_bytes,
             "retained_capture_bytes",
         )?;
-        for line in &self.lines {
-            inspect_checkpoint_line(line, limits, usage)?;
+        // Newest first, so that what the limits leave out is the oldest
+        // history. Only history can give way: a visible row that does not fit
+        // is still an error.
+        let history = self.lines.len().saturating_sub(self.physical_rows);
+        for (index, line) in self.lines.iter().enumerate().rev() {
+            match charge_checkpoint_line(line, limits, usage) {
+                Ok(()) => {}
+                Err(ScreenCheckpointCaptureError::ResourceLimit { .. }) if index < history => {
+                    return Ok(index + 1);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(0)
+    }
+
+    /// Drop the oldest rows of a recovered screen that the checkpoint limits
+    /// leave out, as a capture of it would. `scrollback_lines` can retain more
+    /// than a checkpoint holds, so a replay can legitimately get here.
+    #[cfg(feature = "use_serde")]
+    pub(crate) fn fit_recovered_history_to_checkpoint(
+        &mut self,
+        limits: &ScreenCheckpointLimits,
+        usage: &mut ScreenCheckpointUsage,
+    ) -> Result<(), ScreenCheckpointCaptureError> {
+        let over_limits = self.preflight_resident_checkpoint_usage(limits, usage)?;
+        if over_limits != 0 {
+            note_history_over_checkpoint_limits(over_limits);
+            self.lines.drain(..over_limits);
+            self.advance_stable_row_index_offset(over_limits);
+            self.raise_recovery_boundary_to_oldest_row();
         }
         Ok(())
     }
@@ -6110,7 +6166,13 @@ impl Screen {
         // Inspect every resident line before asking the sink to allocate or
         // decode a cold snapshot. This also establishes the remaining global
         // checkpoint budget supplied to the sink.
-        self.preflight_resident_checkpoint_usage(limits, usage)?;
+        let over_limits = self.preflight_resident_checkpoint_usage(limits, usage)?;
+        if over_limits != 0 {
+            note_history_over_checkpoint_limits(over_limits);
+        }
+        let kept_oldest = resident_oldest.checked_add(over_limits).ok_or(
+            ScreenCheckpointCaptureError::ArithmeticOverflow("stable_row_index_offset"),
+        )?;
 
         if let Some(recovery) = self.recovery_scrollback {
             let oldest_stable = StableRowIndex::try_from(resident_oldest)
@@ -6125,7 +6187,8 @@ impl Screen {
                 return Err(ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent);
             }
             let cold_prefix_line_count = usize::try_from(boundary - oldest_stable)
-                .map_err(|_| ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent)?;
+                .map_err(|_| ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent)?
+                .saturating_sub(over_limits);
             if !self.allow_scrollback
                 && (cold_prefix_line_count != 0 || recovery.expected_generation.is_some())
             {
@@ -6141,9 +6204,10 @@ impl Screen {
                 resident_lines: self
                     .lines
                     .iter()
+                    .skip(over_limits)
                     .map(Line::semantic_checkpoint_clone)
                     .collect(),
-                resident_oldest,
+                resident_oldest: kept_oldest,
                 cold_snapshot_generation: recovery.expected_generation,
                 cold_prefix_line_count,
                 allow_scrollback: self.allow_scrollback,
@@ -6215,9 +6279,10 @@ impl Screen {
             resident_lines: self
                 .lines
                 .iter()
+                .skip(over_limits)
                 .map(Line::semantic_checkpoint_clone)
                 .collect(),
-            resident_oldest,
+            resident_oldest: kept_oldest,
             cold_snapshot_generation: None,
             cold_prefix_line_count: 0,
             allow_scrollback: self.allow_scrollback,
@@ -6278,8 +6343,14 @@ impl StagedScreenCheckpoint {
                 {
                     return Err(ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent);
                 }
+                // The store ends where the resident rows began, which is
+                // before the first row kept if the limits left some out.
+                let store_newest =
+                    usize::try_from(cold.expected_newest_exclusive).map_err(|_| {
+                        ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent
+                    })?;
                 let oldest = match (snapshot.oldest_stable_row(), snapshot.rows().is_empty()) {
-                    (None, true) => self.resident_oldest,
+                    (None, true) => store_newest,
                     (Some(oldest), false) => usize::try_from(oldest).map_err(|_| {
                         ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent
                     })?,
@@ -6289,8 +6360,8 @@ impl StagedScreenCheckpoint {
                         );
                     }
                 };
-                if oldest > self.resident_oldest
-                    || self.resident_oldest.checked_sub(oldest) != Some(snapshot.rows().len())
+                if oldest > store_newest
+                    || store_newest.checked_sub(oldest) != Some(snapshot.rows().len())
                 {
                     return Err(ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent);
                 }
@@ -6321,28 +6392,42 @@ impl StagedScreenCheckpoint {
                     return Err(ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent);
                 }
 
+                // Newest first, as for the resident rows: the oldest history
+                // is what the limits leave out. A row the resident rows left
+                // no room for leaves every older row out as well.
                 let mut cold_lines = snapshot.into_rows();
-                for (index, line) in cold_lines.iter_mut().enumerate() {
-                    let stable_idx =
-                        match oldest_stable.checked_add(index as StableRowIndex) {
+                let mut first_kept = cold_prefix_line_count;
+                if self.resident_oldest == store_newest {
+                    for (index, line) in cold_lines.iter_mut().enumerate().rev() {
+                        let stable_idx = match oldest_stable.checked_add(index as StableRowIndex) {
                             Some(idx) => idx,
                             None => return Err(
                                 ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent,
                             ),
                         };
-                    if let Some(replacement) = cold
-                        .fragments
-                        .as_ref()
-                        .and_then(|fragments| fragments.rows.get(&stable_idx))
-                    {
-                        inspect_checkpoint_line(replacement, limits, usage)?;
-                        *line = replacement.semantic_checkpoint_clone();
-                    } else {
-                        inspect_checkpoint_line(line, limits, usage)?;
-                        *line = line.semantic_checkpoint_clone();
+                        let replacement = cold
+                            .fragments
+                            .as_ref()
+                            .and_then(|fragments| fragments.rows.get(&stable_idx));
+                        match charge_checkpoint_line(replacement.unwrap_or(&*line), limits, usage) {
+                            Ok(()) => {}
+                            Err(ScreenCheckpointCaptureError::ResourceLimit { .. }) => break,
+                            Err(error) => return Err(error),
+                        }
+                        *line = replacement.unwrap_or(&*line).semantic_checkpoint_clone();
+                        first_kept = index;
                     }
                 }
-                (oldest, Some(generation), cold_prefix_line_count, cold_lines)
+                if first_kept != 0 {
+                    note_history_over_checkpoint_limits(first_kept);
+                    cold_lines.drain(..first_kept);
+                }
+                (
+                    self.resident_oldest - cold_lines.len(),
+                    Some(generation),
+                    cold_lines.len(),
+                    cold_lines,
+                )
             } else {
                 (
                     self.resident_oldest,
@@ -6693,6 +6778,18 @@ impl Screen {
         }
     }
 
+    /// Rows a replay let go can be part of the recovered cold prefix, which
+    /// then starts at the oldest row left.
+    fn raise_recovery_boundary_to_oldest_row(&mut self) {
+        if let Some(recovery) = self.recovery_scrollback.as_mut() {
+            // An offset too large to name fails the boundary check, closed.
+            let oldest = StableRowIndex::try_from(self.stable_row_index_offset)
+                .unwrap_or(StableRowIndex::MAX);
+            recovery.original_cold_prefix_newest_exclusive =
+                recovery.original_cold_prefix_newest_exclusive.max(oldest);
+        }
+    }
+
     #[cfg(feature = "use_serde")]
     pub(crate) fn finish_recovery_without_scrollback(&mut self) {
         debug_assert!(!self.allow_scrollback);
@@ -6704,11 +6801,10 @@ impl Screen {
     /// precedes the in-memory split, so an error leaves the complete model
     /// available for retry.
     ///
-    /// Recovered rows stay resident while a replay runs, so a model can hold
-    /// more scrollback than the live configuration retains: a child that
-    /// printed thousands of lines during its guardian birth, or a busy pane
-    /// replaying what it printed during an upgrade. Those oldest rows are the
-    /// ones the live terminal would have dropped as they scrolled, so they
+    /// A replay lets rows go as it scrolls past the retention, and a recovered
+    /// model can still hold more scrollback than the live configuration
+    /// retains: its resize can have rewrapped rows into more of them. Those
+    /// oldest rows are the ones the live terminal would have dropped, so they
     /// are dropped here and never published. Refusing them instead failed the
     /// pane's spawn or restore outright (ft-gufg7).
     #[cfg(feature = "use_serde")]
@@ -10443,14 +10539,13 @@ impl Screen {
             // No scrollback available for these;
             // Remove the scrolled lines
             num_rows
-        } else if self.recovery_scrollback.is_some() {
-            // Authenticated recovery rows remain resident until checked
-            // activation has durably replaced the exact cold prefix. The
-            // post-record recovery audit enforces the global line envelope;
-            // evicting here would destroy the only replay copy before that
-            // audit can fail closed.
-            0
         } else {
+            // A replay's model has no tier, so its hot size is the whole
+            // retention, which restore requires to equal the live terminal's.
+            // A row it lets go is one the live terminal would have dropped,
+            // and a failed replay leaves the checkpoint and the journal to
+            // replay from. Holding every row made one chatty pane's restore
+            // fail at the checkpoint limits, and with it the whole mux's.
             let max_allowed = self.physical_rows + self.hot_scrollback_size();
             if self.lines.len() + num_rows >= max_allowed {
                 (self.lines.len() + num_rows) - max_allowed
@@ -10558,6 +10653,7 @@ impl Screen {
 
         if remove_idx == 0 && scrollback_ok {
             self.advance_stable_row_index_offset(removed_from_top);
+            self.raise_recovery_boundary_to_oldest_row();
         }
 
         for _ in 0..to_add {
@@ -18364,6 +18460,86 @@ pub(crate) mod tests {
             "hot-replayed"
         );
         assert!(screen.recovery_scrollback.is_none());
+    }
+
+    /// Two visible rows and a retention of five: at seven rows a replay lets
+    /// the oldest go as the live terminal would, and the cold prefix it was
+    /// part of ends at the oldest row left.
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn recovery_replay_lets_rows_go_at_the_retention_and_moves_the_cold_boundary() {
+        let generation = crate::config::ScrollbackSnapshotGeneration::new([0; 16], 0);
+        let mut screen = recovered_scrollback_screen(Some(generation));
+        let region = 0..2;
+        screen.scroll_up(&region, 2, 3, CellAttributes::blank(), bidi_mode());
+        assert_eq!(screen.lines.len(), 7);
+        assert_eq!(screen.stable_row_index_offset, 10);
+        assert_eq!(
+            screen
+                .recovery_scrollback
+                .unwrap()
+                .original_cold_prefix_newest_exclusive,
+            11
+        );
+
+        screen.scroll_up(&region, 2, 3, CellAttributes::blank(), bidi_mode());
+        assert_eq!(screen.lines.len(), 7);
+        assert_eq!(screen.stable_row_index_offset, 12);
+        assert_eq!(screen.lines.front().unwrap().as_str(), "hot-replayed");
+        assert_eq!(
+            screen
+                .recovery_scrollback
+                .unwrap()
+                .original_cold_prefix_newest_exclusive,
+            12
+        );
+        screen.preflight_recovery_checkpoint_boundary().unwrap();
+    }
+
+    /// The rows a checkpoint's limits leave out are the oldest history, and
+    /// never a visible row.
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn checkpoint_limits_leave_out_the_oldest_history_only() {
+        let generation = crate::config::ScrollbackSnapshotGeneration::new([0; 16], 0);
+        let mut screen = recovered_scrollback_screen(Some(generation));
+        let limits_of = |max_total_lines| ScreenCheckpointLimits {
+            max_total_lines,
+            ..crate::terminalstate::checkpoint::TerminalCheckpointLimits::default().screen_limits()
+        };
+
+        let mut usage = ScreenCheckpointUsage::default();
+        assert_eq!(
+            screen.preflight_resident_checkpoint_usage(&limits_of(5), &mut usage),
+            Ok(0)
+        );
+        assert_eq!(usage.lines, 5);
+
+        let mut usage = ScreenCheckpointUsage::default();
+        assert_eq!(
+            screen.preflight_resident_checkpoint_usage(&limits_of(3), &mut usage),
+            Ok(2)
+        );
+        // Only what stays is charged.
+        assert_eq!(usage.lines, 3);
+
+        let mut usage = ScreenCheckpointUsage::default();
+        assert!(matches!(
+            screen.preflight_resident_checkpoint_usage(&limits_of(1), &mut usage),
+            Err(ScreenCheckpointCaptureError::ResourceLimit {
+                resource: "screen_lines",
+                ..
+            })
+        ));
+
+        let mut usage = ScreenCheckpointUsage::default();
+        screen
+            .fit_recovered_history_to_checkpoint(&limits_of(3), &mut usage)
+            .unwrap();
+        assert_eq!(screen.lines.len(), 3);
+        assert_eq!(screen.stable_row_index_offset, 12);
+        assert_eq!(screen.lines.front().unwrap().as_str(), "hot-replayed");
+        screen.preflight_recovery_checkpoint_boundary().unwrap();
     }
 
     #[cfg(feature = "use_serde")]

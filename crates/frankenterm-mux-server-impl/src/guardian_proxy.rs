@@ -683,6 +683,13 @@ impl Domain for GuardianDomain {
             capture_protection: mux_limits.capture_protection,
             ..TerminalCheckpointLimits::default()
         };
+        // Its Genesis capture of an empty terminal stays in the encoding every
+        // guardian reads. What activation captures can hold the child's first
+        // thousands of rows, too many for the per-cell encoding's budget.
+        let activation_limits = TerminalCheckpointLimits {
+            line_encoding: mux_limits.line_encoding,
+            ..birth_limits
+        };
         let socket = self.socket_path.clone();
         let token = self.token_path.clone();
         let mux_incarnation = self.mux_incarnation;
@@ -890,7 +897,7 @@ impl Domain for GuardianDomain {
                     .context("claim guardian birth lease")?;
                 claimed = true;
                 let activated = staging
-                    .restore_and_activate(config, birth_limits)
+                    .restore_and_activate(config, activation_limits)
                     .context("restore and activate guardian birth")?;
                 UnpublishedPane::from_guardian_birth(activated.into_local_pane(
                     pane_id,

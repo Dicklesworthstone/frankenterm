@@ -4405,7 +4405,7 @@ impl TerminalCheckpointLimits {
         Ok(())
     }
 
-    fn screen_limits(self) -> crate::screen::ScreenCheckpointLimits {
+    pub(crate) fn screen_limits(self) -> crate::screen::ScreenCheckpointLimits {
         crate::screen::ScreenCheckpointLimits {
             max_total_lines: self.max_total_lines,
             max_total_cell_records: self.max_total_cell_records,
@@ -5482,12 +5482,16 @@ impl TerminalCheckpointV3 {
     ///
     /// Guardian replay uses this after each bounded journal record.  The inert
     /// replay configuration has no spill sink, so all reachable state is
-    /// resident and this is a complete allocation-accounting pass.
+    /// resident. With `audit_rows` this also walks every row, drops the oldest
+    /// history the limits leave out, and counts the images the rows show; that
+    /// walk's cost grows with the scrollback, so a replay does not make it
+    /// after every record.
     pub(crate) fn validate_inert_replay_resources(
-        terminal: &TerminalState,
+        terminal: &mut TerminalState,
         replay_projection: &CheckpointReplayConfigV2,
         custom_cell_width_maps: &[Arc<HashMap<u32, u8>>],
         limits: TerminalCheckpointLimits,
+        audit_rows: bool,
     ) -> Result<(), TerminalCheckpointError> {
         limits.validate_policy()?;
         // This checks resources, which protection holds none of: whether a
@@ -5514,23 +5518,7 @@ impl TerminalCheckpointV3 {
             }
         }
         Self::preflight_terminal_fields(terminal, limits, &mut usage, false)?;
-        if limits.capture_graphics {
-            // A chunked transmission may span records; its chunks are
-            // bounded by the transmission cap. The images replay holds stay
-            // within what a capture of them may hold.
-            let mut registry = CheckpointImageRegistry::default();
-            for data in terminal.kitty_img.stored_images() {
-                registry.pin(data)?;
-            }
-            for screen in [&terminal.screen.screen, &terminal.screen.alt_screen] {
-                for line in screen.lines_with_images() {
-                    registry.pin_lines(std::slice::from_ref(line))?;
-                }
-            }
-            let (count, bytes) = registry.usage();
-            ensure_limit("images", count, limits.max_images)?;
-            ensure_limit("image_bytes", bytes, limits.max_total_image_bytes)?;
-        } else {
+        if !limits.capture_graphics {
             terminal
                 .kitty_img
                 .checkpoint_high_water_if_quiescent()
@@ -5547,19 +5535,40 @@ impl TerminalCheckpointV3 {
         {
             Self::preflight_checkpoint_attributes(&saved.pen, limits, &mut usage)?;
         }
-        let screen_limits = limits.screen_limits();
-        terminal
-            .screen
-            .screen
-            .preflight_resident_checkpoint_usage(&screen_limits, &mut usage)?;
+        if audit_rows {
+            // The alternate screen first: what gives way is the primary
+            // screen's oldest history.
+            let screen_limits = limits.screen_limits();
+            terminal
+                .screen
+                .alt_screen
+                .fit_recovered_history_to_checkpoint(&screen_limits, &mut usage)?;
+            terminal
+                .screen
+                .screen
+                .fit_recovered_history_to_checkpoint(&screen_limits, &mut usage)?;
+            if limits.capture_graphics {
+                // A chunked transmission may span records; its chunks are
+                // bounded by the transmission cap. The images replay holds
+                // stay within what a capture of them may hold.
+                let mut registry = CheckpointImageRegistry::default();
+                for data in terminal.kitty_img.stored_images() {
+                    registry.pin(data)?;
+                }
+                for screen in [&terminal.screen.screen, &terminal.screen.alt_screen] {
+                    for line in screen.lines_with_images() {
+                        registry.pin_lines(std::slice::from_ref(line))?;
+                    }
+                }
+                let (count, bytes) = registry.usage();
+                ensure_limit("images", count, limits.max_images)?;
+                ensure_limit("image_bytes", bytes, limits.max_total_image_bytes)?;
+            }
+        }
         terminal
             .screen
             .screen
             .preflight_recovery_checkpoint_boundary()?;
-        terminal
-            .screen
-            .alt_screen
-            .preflight_resident_checkpoint_usage(&screen_limits, &mut usage)?;
         terminal
             .screen
             .alt_screen
@@ -6350,7 +6359,7 @@ impl TerminalCheckpointV3 {
     /// `drop_oldest_primary_history_to_fit`). A recovery image of the newest
     /// history beats none: a payload its decoder refused used to poison the
     /// pane's live parser and end the pane.
-    fn encode_trimming_history(
+    pub(crate) fn encode_trimming_history(
         &mut self,
         limits: TerminalCheckpointLimits,
     ) -> Result<Zeroizing<Vec<u8>>, TerminalCheckpointError> {
@@ -8498,6 +8507,267 @@ mod tests {
             .map(|line| line.as_str().into_owned())
             .rfind(|text| !text.trim().is_empty());
         assert_eq!(last.as_deref(), Some("r99"));
+    }
+
+    /// A terminal with no tier retaining 128 rows, and an inert model restored
+    /// from a capture of the same birth under `limits`.
+    fn untiered_replay_fixture(
+        limits: TerminalCheckpointLimits,
+    ) -> (Terminal, crate::InertTerminal) {
+        let config = Arc::new(ReplacementActivationConfig {
+            tier_enabled: false,
+            sink: Arc::new(MalformedReplacementReceiptSink::default()),
+        });
+        let terminal = |name: &str| {
+            Terminal::new(
+                TerminalSize::default(),
+                Arc::clone(&config) as Arc<dyn TerminalConfiguration + Send + Sync>,
+                "FrankenTerm",
+                name,
+                Box::new(Vec::<u8>::new()),
+            )
+        };
+        let canonical =
+            TerminalCheckpointV3::capture_with_limits(&terminal("replay-fixture-birth"), limits)
+                .unwrap()
+                .to_canonical_json(limits)
+                .unwrap();
+        let inert = TerminalCheckpointV3::decode_canonical_json(&canonical, limits)
+            .unwrap()
+            .restore_inert(Arc::clone(&config) as Arc<dyn TerminalConfiguration>)
+            .unwrap();
+        (terminal("replay-fixture-oracle"), inert)
+    }
+
+    fn screen_row_texts(terminal: &Terminal) -> Vec<String> {
+        let screen = terminal.screen();
+        screen
+            .lines_in_phys_range(0..screen.scrollback_rows())
+            .iter()
+            .map(|line| line.as_str().into_owned())
+            .collect()
+    }
+
+    /// A pane writing flat out replays far more than the checkpoint limits
+    /// hold. That is no reason to refuse it: scrolling keeps its model at the
+    /// retention, exactly as the live terminal's. Holding every row until
+    /// activation made replay fail at screen_cells, on every restart, and the
+    /// whole mux with it.
+    #[test]
+    fn a_replay_past_the_checkpoint_limits_stays_at_the_retention() {
+        let limits = TerminalCheckpointLimits::default();
+        let (mut oracle, mut inert) = untiered_replay_fixture(limits);
+        let line = format!("{}\r\n", "x".repeat(64));
+        let rows = limits.max_total_cells / 64 + 1000;
+        let output = line.repeat(rows).into_bytes();
+        // In records as a journal holds them.
+        for record in output.chunks(64 * 1024) {
+            inert.replay_bytes(record).unwrap();
+        }
+        oracle.advance_bytes(&output);
+
+        // The model, not only what activation leaves of it.
+        let replayed = inert.checkpoint().unwrap();
+        assert_eq!(
+            replayed.primary_screen.lines.len(),
+            oracle.screen().physical_rows + 128
+        );
+        let activated = match inert.into_live(Box::new(std::io::sink())) {
+            Ok(activated) => activated,
+            Err(failure) => panic!("the replay must activate: {:?}", failure.error()),
+        };
+        assert_eq!(screen_row_texts(&activated), screen_row_texts(&oracle));
+        assert_eq!(
+            activated.screen().phys_to_stable_row_index(0),
+            oracle.screen().phys_to_stable_row_index(0)
+        );
+    }
+
+    /// `scrollback_lines` can retain more than a checkpoint holds, and a
+    /// replay can then fill both: the model keeps the newest rows that fit,
+    /// short of its next walk of the rows only until activation makes one.
+    #[test]
+    fn a_replay_keeps_the_newest_history_the_checkpoint_limits_hold() {
+        let limits = TerminalCheckpointLimits {
+            max_total_cells: 1000,
+            ..TerminalCheckpointLimits::default()
+        };
+        let (mut oracle, mut inert) = untiered_replay_fixture(limits);
+        // 300 rows of 8 or 9 cells against a retention of 128: the 128 alone
+        // are over 1000 cells.
+        let output: Vec<u8> = (0..300)
+            .flat_map(|index| format!("row-{:04}\r\n", index).into_bytes())
+            .collect();
+        for record in output.chunks(1024) {
+            inert.replay_bytes(record).unwrap();
+        }
+        oracle.advance_bytes(&output);
+        let activated = match inert.into_live(Box::new(std::io::sink())) {
+            Ok(activated) => activated,
+            Err(failure) => panic!("the replay must activate: {:?}", failure.error()),
+        };
+        let kept = screen_row_texts(&activated);
+        let full = screen_row_texts(&oracle);
+        let left_out = full.len() - kept.len();
+        assert!(left_out > 0, "the limits must leave some history out");
+        // Exactly the oldest rows go.
+        assert_eq!(kept[..], full[left_out..]);
+        assert_eq!(
+            activated.screen().phys_to_stable_row_index(0),
+            oracle.screen().phys_to_stable_row_index(0) + left_out as StableRowIndex
+        );
+        assert!(kept.iter().map(String::len).sum::<usize>() <= 1000);
+        // It captures, and its decoder admits the capture.
+        let payload = activated.capture_recovery_checkpoint(limits).unwrap();
+        TerminalCheckpointV3::decode_canonical_json(payload.canonical_payload(), limits).unwrap();
+    }
+
+    /// A tiered pane well past its hot tier.
+    fn tiered_terminal_with_cold_rows(
+    ) -> (Terminal, Arc<crate::screen::tests::TestColdScrollbackSink>) {
+        let (mut live, sink) = crate::screen::tests::cold_seam_test_terminal();
+        for index in 0..20 {
+            live.advance_bytes(format!("r{:02}\r\n", index).as_bytes());
+        }
+        (live, sink)
+    }
+
+    fn cell_limits(max_total_cells: usize) -> TerminalCheckpointLimits {
+        TerminalCheckpointLimits {
+            max_total_cells,
+            ..TerminalCheckpointLimits::default()
+        }
+    }
+
+    /// A pane's cold rows can outgrow a checkpoint: the capture keeps the
+    /// newest that fit instead of refusing, which stopped whole-mux recovery
+    /// for as long as the pane kept that history. A restore then activates
+    /// with those rows, and the store holds nothing older.
+    #[test]
+    fn a_capture_over_the_limits_keeps_the_newest_cold_rows_and_restores() {
+        use crate::config::ScrollbackSpillSink;
+
+        let (live, sink) = tiered_terminal_with_cold_rows();
+        let limits = cell_limits(30);
+        let checkpoint = TerminalCheckpointV3::capture_with_limits(&live, limits).unwrap();
+        let cold_before = sink.retained_scrollback_rows();
+        let kept = checkpoint.primary_screen.cold_prefix_line_count as usize;
+        assert!(kept > 0, "the newest cold rows fit");
+        assert!(kept < cold_before, "the oldest cold rows do not");
+        let live_oldest = live.screen().phys_to_stable_row_index(0);
+        assert_eq!(
+            checkpoint.primary_screen.stable_row_index_offset as StableRowIndex,
+            live_oldest - kept as StableRowIndex
+        );
+
+        let payload = checkpoint.to_canonical_json(limits).unwrap();
+        let mut inert = TerminalCheckpointV3::decode_canonical_json(&payload, limits)
+            .unwrap()
+            .restore_inert(live.get_config())
+            .unwrap();
+        inert.supersede_cold_scrollback_successors();
+        let activated = match inert.into_live(Box::new(std::io::sink())) {
+            Ok(activated) => activated,
+            Err(failure) => panic!("the capture must restore: {:?}", failure.error()),
+        };
+        assert_eq!(
+            sink.oldest_scrollback_row(),
+            Some(live_oldest - kept as StableRowIndex),
+            "the store must hold only what the checkpoint kept"
+        );
+        assert_eq!(sink.retained_scrollback_rows(), kept);
+        assert_eq!(activated.screen().phys_to_stable_row_index(0), live_oldest);
+    }
+
+    /// The same when the limits have no room for all the hot rows: no cold row
+    /// comes back, though the capture still names the store's generation.
+    #[test]
+    fn a_capture_with_no_room_for_its_hot_rows_keeps_no_cold_row_and_restores() {
+        use crate::config::ScrollbackSpillSink;
+
+        let (live, sink) = tiered_terminal_with_cold_rows();
+        // The tightest limit a capture takes holds the visible rows alone.
+        let limits = (1..)
+            .map(cell_limits)
+            .find(|limits| TerminalCheckpointV3::capture_with_limits(&live, *limits).is_ok())
+            .unwrap();
+        let checkpoint = TerminalCheckpointV3::capture_with_limits(&live, limits).unwrap();
+        assert!(sink.retained_scrollback_rows() > 0);
+        assert_eq!(checkpoint.primary_screen.cold_prefix_line_count, 0);
+        assert!(checkpoint.primary_screen.cold_snapshot_generation.is_some());
+        let live_oldest = live.screen().phys_to_stable_row_index(0);
+        let kept_oldest = checkpoint.primary_screen.stable_row_index_offset as StableRowIndex;
+        assert!(kept_oldest > live_oldest, "the oldest hot row does not fit");
+
+        let payload = checkpoint.to_canonical_json(limits).unwrap();
+        let mut inert = TerminalCheckpointV3::decode_canonical_json(&payload, limits)
+            .unwrap()
+            .restore_inert(live.get_config())
+            .unwrap();
+        inert.supersede_cold_scrollback_successors();
+        let activated = match inert.into_live(Box::new(std::io::sink())) {
+            Ok(activated) => activated,
+            Err(failure) => panic!("the capture must restore: {:?}", failure.error()),
+        };
+        assert_eq!(sink.retained_scrollback_rows(), 0);
+        assert_eq!(activated.screen().phys_to_stable_row_index(0), kept_oldest);
+    }
+
+    /// A row the visible screen needs cannot give way.
+    #[test]
+    fn a_capture_refuses_a_visible_row_over_the_limits() {
+        let (mut live, _sink) = crate::screen::tests::cold_seam_test_terminal();
+        live.advance_bytes(b"abc\r\ndef");
+        let limits = TerminalCheckpointLimits {
+            max_total_cells: 3,
+            ..TerminalCheckpointLimits::default()
+        };
+        assert!(matches!(
+            TerminalCheckpointV3::capture_with_limits(&live, limits),
+            Err(TerminalCheckpointError::ResourceLimit {
+                resource: "screen_cells",
+                ..
+            })
+        ));
+    }
+
+    /// A restore's and a birth's own capture binds the activated model to its
+    /// parser. It must not fail them for a model over the encoding's budget,
+    /// and capturing again must give the same payload, which is what shows
+    /// the model did not change before registration.
+    #[test]
+    fn a_recovery_capture_over_the_encoding_budget_trims_identically() {
+        let mut terminal = Terminal::new(
+            TerminalSize::default(),
+            Arc::new(RichCheckpointTestConfig),
+            "FrankenTerm",
+            "over-budget-capture",
+            Box::new(Vec::<u8>::new()),
+        );
+        let output: Vec<u8> = (0..200)
+            .flat_map(|index| format!("row-{:04}\r\n", index).into_bytes())
+            .collect();
+        terminal.advance_bytes(&output);
+        let whole = terminal
+            .capture_recovery_checkpoint(TerminalCheckpointLimits::default())
+            .unwrap();
+        let charged = json_structural_retained_bytes(
+            whole.canonical_payload(),
+            TerminalCheckpointLimits::default(),
+        )
+        .unwrap();
+        let tight = limits_with_retained_budget(charged / 2);
+
+        let trimmed = terminal.capture_recovery_checkpoint(tight).unwrap();
+        assert!(trimmed.canonical_payload().len() < whole.canonical_payload().len());
+        TerminalCheckpointV3::decode_canonical_json(trimmed.canonical_payload(), tight).unwrap();
+        assert_eq!(
+            terminal
+                .capture_recovery_checkpoint(tight)
+                .unwrap()
+                .canonical_payload(),
+            trimmed.canonical_payload()
+        );
     }
 
     #[test]

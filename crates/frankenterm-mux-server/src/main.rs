@@ -435,11 +435,17 @@ fn run(generation_lifetime: &mut Option<GenerationLifetimeLease>) -> anyhow::Res
             mux.set_guardian_graphics_checkpoints(graphics_checkpoints);
             mux.set_guardian_protection_checkpoints(protection_checkpoints);
             frankenterm_mux_server_impl::install_scrollback_spill_sink_factory();
+            // Activation captures every pane again, in this encoding. It reads
+            // a checkpoint in whichever encoding that checkpoint was written.
+            let limits = wezterm_term::terminalstate::checkpoint::TerminalCheckpointLimits {
+                line_encoding: mux.guardian_checkpoint_limits().line_encoding,
+                ..Default::default()
+            };
             let restored = frankenterm_mux_server_impl::guardian_proxy::restore_from_options(
                 Arc::clone(&mux),
                 &opts.recovery,
                 guardian_paths,
-                wezterm_term::terminalstate::checkpoint::TerminalCheckpointLimits::default(),
+                limits,
             )?;
             (mux, Some(restored))
         }
