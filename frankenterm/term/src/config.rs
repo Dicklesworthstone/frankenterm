@@ -1340,6 +1340,21 @@ pub trait ScrollbackSpillSink: std::fmt::Debug + Send + Sync {
         limits: ScrollbackSnapshotLimits,
     ) -> Result<ScrollbackSnapshot, ScrollbackSpillError>;
 
+    /// As [`Self::snapshot_scrollback`], except that the limits leave out the
+    /// oldest rows instead of refusing: the result is the newest rows that fit,
+    /// `[oldest_stable_row, expected_newest_exclusive)`, under the same
+    /// generation. A recovery checkpoint takes its rows this way, because a
+    /// store can retain more than one checkpoint holds.
+    ///
+    /// A sink that does not override this refuses as `snapshot_scrollback` does.
+    fn snapshot_newest_scrollback(
+        &self,
+        expected_newest_exclusive: StableRowIndex,
+        limits: ScrollbackSnapshotLimits,
+    ) -> Result<ScrollbackSnapshot, ScrollbackSpillError> {
+        self.snapshot_scrollback(expected_newest_exclusive, limits)
+    }
+
     /// Compare-and-swap the complete logical cold store to one exact prefix.
     ///
     /// The implementation must hold a single mutation boundary while it:
