@@ -7109,6 +7109,9 @@ pub fn prepare_unpublished_whole_mux_topology(
             .clone(),
         &expected_panes,
         panes,
+        mux::MuxSessionIncarnation::from_bytes(
+            *uuid::Uuid::parse_str(&image.header.mux_incarnation_id)?.as_bytes(),
+        ),
     )?;
     Ok(PreparedWholeMuxTopology { source, topology })
 }
@@ -7941,6 +7944,7 @@ impl WholeMuxRecoveryVerifier {
             let payload: Zeroizing<Vec<u8>> = match read_result {
                 Ok(bytes) => {
                     let computed: [u8; 32] = Sha256::digest(&bytes).into();
+                    // ubs:ignore[rust.security.constant-time-compare] Persisted content digest, not a secret or MAC.
                     if computed != obj_ref.payload_digest {
                         if let Some((repaired, permit)) = self.attempt_raptorq_repair(
                             cx,
@@ -7988,6 +7992,7 @@ impl WholeMuxRecoveryVerifier {
 
             // Verify SHA-256 payload digest
             let computed_digest: [u8; 32] = Sha256::digest(payload.as_slice()).into();
+            // ubs:ignore[rust.security.constant-time-compare] Persisted content digest, not a secret or MAC.
             if computed_digest != obj_ref.payload_digest {
                 return Err(WholeMuxRecoveryError::CheckpointDigestMismatch {
                     object_id: obj_ref.object_id.clone(),
@@ -8053,6 +8058,7 @@ impl WholeMuxRecoveryVerifier {
                 let checkpoint = validated.checkpoint();
                 let (pixel_width, pixel_height, dpi) = checkpoint.pixel_dimensions_and_dpi();
                 let (row, column) = checkpoint.cursor_position();
+                // ubs:ignore[rust.security.constant-time-compare] Compare restored display metadata, not credentials.
                 let mismatch = if obj_ref.schema_version != checkpoint.version() {
                     Some(TerminalProjectionField::SchemaVersion)
                 } else if pane.size.rows != checkpoint.primary_rows()
@@ -8488,6 +8494,7 @@ fn select_recovery_roots_with_cx(
                         key.as_ref(),
                         limits,
                     )?;
+                    // ubs:ignore[rust.security.constant-time-compare] Public envelope lengths; authentication already succeeded.
                     if descriptor.payload_len != discovery.outer_envelope_len {
                         return Err(PublicationError::InvalidDiscovery(
                             "root repair length mismatch",
