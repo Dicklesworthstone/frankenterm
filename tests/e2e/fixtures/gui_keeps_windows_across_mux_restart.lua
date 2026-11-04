@@ -6,10 +6,11 @@
 --   phase|<mux window id>|<gui window count>|<tab id>:<pane id>:<title>,...
 -- The ids are the GUI's own: a domain that detaches and reattaches gets new
 -- ones, so equal ids across a mux restart mean the GUI kept its objects.
--- Each such update also writes every GUI window's active pane to
+-- A status update of any window also writes every GUI window's active pane to
 -- $FT_KW_DIR/windows.log:
 --   phase|<domain>:<title>;<domain>:<title>;...
--- which shows a connection window ("FrankenTerm: Connecting...") by title.
+-- which shows a connection window ("FrankenTerm: Connecting...") by title, even
+-- once it is the only window left.
 local ft = require 'frankenterm'
 local config = ft.config_builder()
 local E = os.getenv('FT_KW_DIR')
@@ -62,19 +63,7 @@ local function tab_cmd(n)
 end
 
 ft.on('update-status', function(window, pane)
-  if pane:get_domain_name() ~= 'e2e' then
-    return
-  end
   local phase = read1(E .. '/phase') or 'none'
-  local mw = window:mux_window()
-  local tabs = {}
-  for _, tab in ipairs(mw:tabs()) do
-    local p = tab:active_pane()
-    table.insert(tabs, tab:tab_id() .. ':' .. p:pane_id() .. ':' .. p:get_title())
-  end
-  local log = io.open(E .. '/gui.log', 'a')
-  log:write(phase .. '|' .. mw:window_id() .. '|' .. #ft.gui.gui_windows() .. '|' .. table.concat(tabs, ',') .. '\n')
-  log:close()
   -- A window still opening has no pane yet, and one closing refuses the
   -- query; either still counts, so a flash is never lost to an error here.
   local shown = {}
@@ -88,6 +77,19 @@ ft.on('update-status', function(window, pane)
   local wlog = io.open(E .. '/windows.log', 'a')
   wlog:write(phase .. '|' .. table.concat(shown, ';') .. '\n')
   wlog:close()
+
+  if pane:get_domain_name() ~= 'e2e' then
+    return
+  end
+  local mw = window:mux_window()
+  local tabs = {}
+  for _, tab in ipairs(mw:tabs()) do
+    local p = tab:active_pane()
+    table.insert(tabs, tab:tab_id() .. ':' .. p:pane_id() .. ':' .. p:get_title())
+  end
+  local log = io.open(E .. '/gui.log', 'a')
+  log:write(phase .. '|' .. mw:window_id() .. '|' .. #ft.gui.gui_windows() .. '|' .. table.concat(tabs, ',') .. '\n')
+  log:close()
 
   if phase == 'spawn' and not exists(E .. '/spawned') then
     touch(E .. '/spawned')

@@ -37,6 +37,11 @@
 #      of a domain whose proxy takes 1.5 s opens no connection window, and
 #   8. one whose proxy takes 8 s shows its connection window, then closes it
 #      once attached (ft-h38m4).
+#   9. A GUI whose only domain's mux is killed and comes back at once as a new
+#      session, which it cannot rebind to, stays up and shows a window saying
+#      the mux restarted. The detach empties its mux, and the GUI quits on that.
+#      A race the window lost in most runs, so this takes several rounds, each
+#      a new GUI on a plain mux and a HOME that remembers no other domain.
 #
 # Exit codes: 0 pass, 1 regression, 2 environment unusable.
 #
@@ -86,12 +91,21 @@ log() { printf '[keeps-windows %s] %s\n' "$(date +%T)" "$*" >&2; }
 pass() { log "PASS: $*"; }
 fail() { log "FAIL: $*"; FAILS=$((FAILS + 1)); }
 gui_pids() { pgrep -f -- "--config-file $E/gui.lua" || true; }
+PLAIN=
 cleanup() {
     gui_pids | xargs kill -9 2>/dev/null
+    [[ -z "$PLAIN" ]] || kill -9 "$PLAIN" 2>/dev/null
     "$TOOL" stop-all --i-accept-pane-loss >/dev/null 2>&1 || true
     log "sandbox left at $S"
 }
 trap cleanup EXIT
+start_gui() { # <home> <runtime dir> <stderr file>
+    open -g -n --env HOME="$1" --env XDG_CONFIG_HOME="$1/.config" \
+        --env XDG_DATA_HOME="$1/.local/share" --env XDG_RUNTIME_DIR="$2" \
+        --env FT_KW_HOME="$1" --env FT_KW_DIR="$E" --env FT_KW_SOCK="$SOCK" \
+        --env FRANKENTERM_LUA_CONFIG=1 --env RUST_LOG="$RUST_LOG" --stderr "$3" \
+        -a "$APP" --args --config-file "$E/gui.lua" connect e2e
+}
 lines() { grep -c "^$1|" "$E/gui.log"; }
 last() { grep "^$1|" "$E/gui.log" | tail -1; }
 # "<window>|<gui windows>|<tab:pane:title,...>" of the newest line of a phase.
@@ -126,11 +140,7 @@ for _ in $(seq 40); do [[ -S "$SOCK" ]] && break; sleep 0.25; done
 [[ -S "$SOCK" ]] || { log "the mux socket $SOCK never appeared"; exit 2; }
 
 echo spawn > "$E/phase"
-open -g -n --env HOME="$HOME" --env XDG_CONFIG_HOME="$XDG_CONFIG_HOME" \
-    --env XDG_DATA_HOME="$XDG_DATA_HOME" --env XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
-    --env FT_KW_HOME="$HOME" --env FT_KW_DIR="$E" --env FT_KW_SOCK="$SOCK" \
-    --env FRANKENTERM_LUA_CONFIG=1 --env RUST_LOG="$RUST_LOG" --stderr "$E/gui.err" \
-    -a "$APP" --args --config-file "$E/gui.lua" connect e2e
+start_gui "$HOME" "$XDG_RUNTIME_DIR" "$E/gui.err"
 wait_for spawn '[0-9]+\|1\|[0-9]+:[0-9]+:A,[0-9]+:[0-9]+:B,[0-9]+:[0-9]+:C$' 60 \
     || { log "the GUI never showed A,B,C"; exit 2; }
 pass "the GUI shows A,B,C: $(shown spawn)"
@@ -243,8 +253,79 @@ if background_attach slow; then
     fi
 fi
 
+# A mux back as a new session cannot be rebound, so its domain detaches, and a
+# GUI with no other domain is left with an empty mux. Each round needs a new GUI:
+# the last one's window stays open for 120 s, so its mux can no longer empty.
+gui_pids | xargs kill -9 2>/dev/null
+"$TOOL" stop-all --i-accept-pane-loss >/dev/null 2>&1 || true
+H2=$S/h2
+mkdir -p "$H2/.config/frankenterm" "$H2/.local/share" "$S/r2"
+chmod 700 "$H2" "$S/r2"
+plain_mux() {
+    local i=0
+    "$FAM/frankenterm-mux-server" --daemonize=false \
+        --config-file "$XDG_CONFIG_HOME/frankenterm/mux-server-e2e.toml" >> "$E/plain-mux.log" 2>&1 &
+    PLAIN=$!
+    # A stale socket file proves nothing; the lock names the mux that holds it.
+    until grep -qw "pid=$PLAIN" "$SOCK.lock" 2>/dev/null; do
+        i=$((i + 1))
+        if ((i > 10 * 20)); then
+            log "the plain mux $PLAIN never took $SOCK"
+            exit 2
+        fi
+        sleep 0.05
+    done
+}
+new_session_round() { # <round>
+    local phase=fresh$1 gui i=0
+    plain_mux
+    echo "$phase" > "$E/phase"
+    start_gui "$H2" "$S/r2" "$E/$phase.err"
+    until shows_domain "$phase" e2e; do
+        i=$((i + 1))
+        if ((i > 60 * 4)); then
+            log "round $1: the GUI never showed the domain"
+            exit 2
+        fi
+        sleep 0.25
+    done
+    gui=$(gui_pids | head -1)
+    # Sooner, the Connecting window's pane can still keep the mux from emptying,
+    # and this round proves nothing (a GUI without the fix passed 4 of 4 at 1 s).
+    sleep 3
+    kill -KILL "$PLAIN"
+    wait "$PLAIN" 2>/dev/null
+    plain_mux
+    i=0
+    until grep "^$phase|" "$E/windows.log" | grep -q 'mux restarted'; do
+        if ! kill -0 "$gui" 2>/dev/null; then
+            fail "round $1: the GUI quit when its mux came back as a new session, with no window saying why"
+            return
+        fi
+        i=$((i + 1))
+        if ((i > 20 * 4)); then
+            fail "round $1: no window said the mux restarted; the GUI shows $(grep "^$phase|" "$E/windows.log" | tail -1)"
+            return
+        fi
+        sleep 0.25
+    done
+    # Still up with that window showing, once the detach has run its course.
+    sleep 2
+    if kill -0 "$gui" 2>/dev/null; then
+        pass "round $1: the GUI stayed up and said its mux restarted"
+    else
+        fail "round $1: the GUI quit after showing that its mux restarted"
+    fi
+}
+for round in 1 2 3 4 5 6; do
+    new_session_round "$round"
+    gui_pids | xargs kill -9 2>/dev/null
+    kill -9 "$PLAIN" 2>/dev/null
+    wait "$PLAIN" 2>/dev/null
+done
+
 if ((FAILS == 0)); then
-    log "PASS: the GUI kept its window across a lossless upgrade and a crash restart, and showed connection windows only for slow connects"
+    log "PASS: the GUI kept its window across a lossless upgrade and a crash restart, showed connection windows only for slow connects, and stayed up when its mux came back as a new session"
     exit 0
 fi
 log "FAIL: $FAILS check(s) failed; GUI log $E/gui.err"
