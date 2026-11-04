@@ -7325,7 +7325,7 @@ fn deserialize_list_panes_coherent_response(
 ) -> Result<ListPanesCoherentResponse, Error> {
     let response: ListPanesCoherentResponse =
         deserialize_exact_payload(data, is_compressed, "ListPanesCoherentResponse")?;
-    if let ListPanesCoherentOutcome::Snapshot(snapshot) = &response.outcome {
+    if let Some(snapshot) = response.outcome.snapshot() {
         snapshot.panes.validate_floating_panes()?;
     }
     Ok(response)
@@ -7622,13 +7622,19 @@ impl TopologyCapabilities {
     /// The peer understands exact generation-bound render delivery, typed
     /// settlement, and bounded immutable snapshot continuation.
     pub const EXACT_RENDER_DELIVERY_V1: Self = Self(1 << 3);
+    /// The peer understands [`ListPanesCoherentOutcome::RestoredSnapshot`]: a
+    /// mux restored by whole-mux recovery names the session it continues, so
+    /// a client bound to that session keeps its windows (ft-zy6g7).
+    pub const RESTORED_LINEAGE_V1: Self = Self(1 << 4);
 
     /// Runtime-advertised capabilities.
     ///
     /// The current codec knows the ordered-window and exact-render bits, but none
     /// may be advertised until their mux authority, server dispatch, and client
-    /// reconciliation beads complete. Keep this mask intentionally unchanged.
-    pub const SERVER_SUPPORTED: Self = Self::FENCED_SNAPSHOT_V1;
+    /// reconciliation beads complete. Keep those bits out of this mask.
+    /// [`Self::RESTORED_LINEAGE_V1`] is complete on all three sides.
+    pub const SERVER_SUPPORTED: Self =
+        Self(Self::FENCED_SNAPSHOT_V1.0 | Self::RESTORED_LINEAGE_V1.0);
 
     pub const fn from_bits(bits: u64) -> Self {
         Self(bits)
@@ -7766,6 +7772,32 @@ pub enum ListPanesCoherentOutcome {
     Unsupported {
         supported: TopologyCapabilities,
     },
+    /// A [`Self::Snapshot`] from a mux that whole-mux recovery restored,
+    /// with the session it continues. Sent only when
+    /// [`TopologyCapabilities::RESTORED_LINEAGE_V1`] was negotiated; every
+    /// other peer receives the same snapshot as [`Self::Snapshot`].
+    RestoredSnapshot {
+        snapshot: CoherentPaneSnapshot,
+        lineage: mux::RestoredTopologyLineage,
+    },
+}
+
+impl ListPanesCoherentOutcome {
+    /// The authoritative snapshot of a [`Self::Snapshot`] or a
+    /// [`Self::RestoredSnapshot`].
+    pub fn snapshot(&self) -> Option<&CoherentPaneSnapshot> {
+        match self {
+            Self::Snapshot(snapshot) | Self::RestoredSnapshot { snapshot, .. } => Some(snapshot),
+            Self::Contended { .. } | Self::RevisionExhausted | Self::Unsupported { .. } => None,
+        }
+    }
+
+    pub fn snapshot_mut(&mut self) -> Option<&mut CoherentPaneSnapshot> {
+        match self {
+            Self::Snapshot(snapshot) | Self::RestoredSnapshot { snapshot, .. } => Some(snapshot),
+            Self::Contended { .. } | Self::RevisionExhausted | Self::Unsupported { .. } => None,
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
@@ -21250,9 +21282,11 @@ mod test {
             1 << 1
         );
         assert_eq!(TopologyCapabilities::WINDOW_REORDER_CAS_V1.bits(), 1 << 2);
-        assert_eq!(
-            TopologyCapabilities::SERVER_SUPPORTED,
-            TopologyCapabilities::FENCED_SNAPSHOT_V1,
+        assert!(
+            !TopologyCapabilities::SERVER_SUPPORTED
+                .contains(TopologyCapabilities::ORDERED_WINDOW_STREAM_V1)
+                && !TopologyCapabilities::SERVER_SUPPORTED
+                    .contains(TopologyCapabilities::WINDOW_REORDER_CAS_V1),
             "codec knowledge must not activate ordered-window runtime support"
         );
         assert!(ordered_window_all_capabilities().validate().is_ok());
@@ -23093,9 +23127,12 @@ mod test {
             <ListPanesOrderedV1 as PduWireIdent>::WIRE_SPEC.min_codec_version,
             54
         );
+        // A peer that offers only the fenced snapshot negotiates exactly it:
+        // the server's additive bits never reach a peer that did not ask.
         assert_eq!(
-            TopologyCapabilities::SERVER_SUPPORTED.bits(),
-            TopologyCapabilities::FENCED_SNAPSHOT_V1.bits()
+            TopologyCapabilities::FENCED_SNAPSHOT_V1
+                .intersection(TopologyCapabilities::SERVER_SUPPORTED),
+            TopologyCapabilities::FENCED_SNAPSHOT_V1
         );
 
         let legacy = Pdu::ListPanesCoherent(ListPanesCoherent {
@@ -23477,7 +23514,43 @@ mod test {
             ListPanesCoherentOutcome::Unsupported {
                 supported: TopologyCapabilities::NONE,
             },
+            ListPanesCoherentOutcome::RestoredSnapshot {
+                snapshot: CoherentPaneSnapshot {
+                    session_incarnation: MuxSessionIncarnation::from_bytes([0xb6; 16]),
+                    snapshot_revision: TopologyRevision::new(1),
+                    panes: ListPanesResponse {
+                        tabs: vec![PaneNode::Leaf(sample_pane_entry(0))],
+                        tab_titles: vec!["restored-tab".to_string()],
+                        window_titles: HashMap::new(),
+                        floating_panes: Vec::new(),
+                    },
+                },
+                lineage: mux::RestoredTopologyLineage {
+                    predecessor: MuxSessionIncarnation::from_bytes([0xa5; 16]),
+                    max_pane_id: Some(7),
+                    max_tab_id: Some(3),
+                    max_window_id: None,
+                },
+            },
         ];
+        let snapshots: Vec<_> = outcomes
+            .iter()
+            .map(|outcome| {
+                outcome
+                    .snapshot()
+                    .map(|snapshot| snapshot.session_incarnation)
+            })
+            .collect();
+        assert_eq!(
+            snapshots,
+            [
+                Some(MuxSessionIncarnation::from_bytes([0xa5; 16])),
+                None,
+                None,
+                None,
+                Some(MuxSessionIncarnation::from_bytes([0xb6; 16])),
+            ]
+        );
 
         for (offset, outcome) in outcomes.iter().cloned().enumerate() {
             for (mode_offset, mode) in [CompressionMode::Never, CompressionMode::Always]
@@ -27293,7 +27366,14 @@ mod test {
             );
         }
 
-        assert_eq!(TopologyCapabilities::SERVER_SUPPORTED, fenced);
+        // Restored lineage (ft-zy6g7) is the one additive bit the server
+        // advertises; the ordered-window and exact-render bits stay dormant.
+        assert_eq!(
+            TopologyCapabilities::SERVER_SUPPORTED,
+            TopologyCapabilities::from_bits(
+                fenced.bits() | TopologyCapabilities::RESTORED_LINEAGE_V1.bits()
+            )
+        );
         assert!(!TopologyCapabilities::SERVER_SUPPORTED
             .contains(TopologyCapabilities::ORDERED_WINDOW_STREAM_V1));
         assert!(!TopologyCapabilities::SERVER_SUPPORTED

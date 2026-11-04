@@ -7109,6 +7109,9 @@ pub fn prepare_unpublished_whole_mux_topology(
             .clone(),
         &expected_panes,
         panes,
+        mux::MuxSessionIncarnation::from_bytes(
+            *uuid::Uuid::parse_str(&image.header.mux_incarnation_id)?.as_bytes(),
+        ),
     )?;
     Ok(PreparedWholeMuxTopology { source, topology })
 }

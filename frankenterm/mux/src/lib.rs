@@ -218,6 +218,27 @@ impl Default for MuxSessionIncarnation {
     }
 }
 
+/// The session a mux restored by whole-mux recovery continues (ft-zy6g7).
+///
+/// A restored mux has a fresh [`MuxSessionIncarnation`], but every pane, tab
+/// and window it restored keeps the ID the predecessor gave it, and every one
+/// it creates later gets a higher ID. A client bound to `predecessor` may
+/// therefore keep its mappings for IDs up to these maximums and must drop the
+/// rest: the predecessor may have allocated them after its capture, and this
+/// mux may hand them out again. This is part of the topology wire contract
+/// (`ListPanesCoherentOutcome::RestoredSnapshot`), so its shape is fixed.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RestoredTopologyLineage {
+    /// The session incarnation that captured the restored recovery image.
+    pub predecessor: MuxSessionIncarnation,
+    /// The highest restored pane ID, if any pane was restored.
+    pub max_pane_id: Option<PaneId>,
+    /// The highest restored tab ID, if any tab was restored.
+    pub max_tab_id: Option<TabId>,
+    /// The highest restored window ID, if any window was restored.
+    pub max_window_id: Option<WindowId>,
+}
+
 /// Session-global revision of the mux topology publication stream.
 ///
 /// Revision zero names the initial empty state. Every topology notification
@@ -439,6 +460,8 @@ struct MuxTopologyAuthority {
     session_incarnation: MuxSessionIncarnation,
     revision: TopologyRevision,
     exhausted: bool,
+    /// Set once, by the recovery commit of a restored mux.
+    restored_lineage: Option<RestoredTopologyLineage>,
 }
 
 impl MuxTopologyAuthority {
@@ -447,6 +470,7 @@ impl MuxTopologyAuthority {
             session_incarnation: MuxSessionIncarnation::new(),
             revision: TopologyRevision::INITIAL,
             exhausted: false,
+            restored_lineage: None,
         }
     }
 
@@ -15580,6 +15604,12 @@ impl Mux {
         self.topology.lock().snapshot()
     }
 
+    /// The session this mux continues, if whole-mux recovery restored it
+    /// ([`RestoredTopologyLineage`]). Fixed from the recovery commit on.
+    pub fn restored_topology_lineage(&self) -> Option<RestoredTopologyLineage> {
+        self.topology.lock().restored_lineage
+    }
+
     /// Reserve the authoritative topology stamp for `notification`.
     ///
     /// Topology mutations that must defer subscriber callbacks call this while
@@ -18385,6 +18415,19 @@ impl Mux {
             .map(|window| (window.window_id(), window))
             .collect();
 
+        // Clients bound to the predecessor keep exactly the IDs restored here;
+        // the reservations below put every later ID above these maximums.
+        let lineage = RestoredTopologyLineage {
+            predecessor: recovered.predecessor(),
+            max_pane_id: pane_ids.iter().max().copied(),
+            max_tab_id: recovered.tabs.keys().max().copied(),
+            max_window_id: staged_windows.keys().max().copied(),
+        };
+        anyhow::ensure!(
+            lineage.predecessor != incarnation,
+            "recovered topology names this mux's own session as its predecessor"
+        );
+
         // Reserve global high water marks only after expensive preparation.
         // A later refusal may leave gaps; IDs must never be rolled backward.
         if let Some(id) = pane_ids.iter().max() {
@@ -18466,7 +18509,8 @@ impl Mux {
             anyhow::ensure!(
                 topology.session_incarnation == incarnation
                     && topology.revision == TopologyRevision::INITIAL
-                    && !topology.exhausted,
+                    && !topology.exhausted
+                    && topology.restored_lineage.is_none(),
                 "recovery target topology changed"
             );
             let mut pending_windows = self.pending_window_notifications.lock();
@@ -18478,6 +18522,7 @@ impl Mux {
             check_deadline()?;
             let revision = topology.reserve_revision()?;
             // No fallible calls or external callbacks after this point.
+            topology.restored_lineage = Some(lineage);
             pending_windows.owner = Arc::downgrade(self);
             *live_domains = staged_domains;
             *live_names = staged_domain_names;
@@ -29399,9 +29444,14 @@ mod tests {
             "recovered-workspace".into(),
             &expected,
             custody,
+            RECOVERED_FIXTURE_PREDECESSOR,
         )?;
         Ok((topology, domains, panes))
     }
+
+    /// The session incarnation that "captured" the recovered fixtures.
+    const RECOVERED_FIXTURE_PREDECESSOR: MuxSessionIncarnation =
+        MuxSessionIncarnation::from_bytes([0x5e; 16]);
 
     #[cfg(unix)]
     #[test]
@@ -29447,11 +29497,22 @@ mod tests {
             }
             true
         })?;
+        assert_eq!(owner.restored_topology_lineage(), None);
         let receipt = owner.publish_recovered_topology(topology, domains, None, None)?;
         assert!(before.load(Ordering::Acquire));
         assert!(receipt.matches_owner(&owner));
         assert!(!receipt.matches_owner(&Arc::new(Mux::new(None))));
         assert_eq!(receipt.counts(), (2, 2, 2));
+        // A client bound to the capturing session learns which IDs carried over.
+        assert_eq!(
+            owner.restored_topology_lineage(),
+            Some(RestoredTopologyLineage {
+                predecessor: RECOVERED_FIXTURE_PREDECESSOR,
+                max_pane_id: panes.iter().map(|pane| pane.pane_id()).max(),
+                max_tab_id: expected_tabs.iter().map(|tab| tab.tab_id).max(),
+                max_window_id: expected_windows.iter().map(|window| window.window_id).max(),
+            })
+        );
         assert_eq!(observed.load(Ordering::Acquire), 2);
         assert_eq!(owner.default_domain()?.domain_id(), expected_default);
         assert!(domain::alloc_domain_id() > expected_default);
@@ -29568,6 +29629,7 @@ mod tests {
             .err()
             .expect("expired deadline must refuse before preparation");
         assert!(format!("{error:#}").contains("deadline expired"));
+        assert_eq!(owner.restored_topology_lineage(), None);
         assert!(owner.iter_domains().is_empty());
         assert!(owner.iter_panes().is_empty());
         assert!(owner.iter_windows().is_empty());

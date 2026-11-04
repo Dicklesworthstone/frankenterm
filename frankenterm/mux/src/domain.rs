@@ -107,12 +107,16 @@ pub struct UnpublishedRecoveredTopology {
     captured_domains: Vec<crate::MuxCapturedDomain>,
     default_domain_id: Option<DomainId>,
     default_workspace: String,
+    predecessor: crate::MuxSessionIncarnation,
 }
 
 impl UnpublishedRecoveredTopology {
     /// Assemble already-authenticated metadata without granting its caller
     /// publication authority. The core recovery adapter retains the typed root
     /// verification alongside this value; these DTOs alone are not that proof.
+    /// `predecessor` is the session incarnation that captured the image; the
+    /// publication records it as the restored mux's lineage.
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare(
         captured_windows: Vec<crate::MuxCapturedWindow>,
         captured_tabs: Vec<crate::tab::MuxCapturedTab>,
@@ -121,7 +125,12 @@ impl UnpublishedRecoveredTopology {
         default_workspace: String,
         expected_panes: &HashMap<PaneId, ([u8; 16], DomainId)>,
         panes: Vec<UnpublishedPane>,
+        predecessor: crate::MuxSessionIncarnation,
     ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            predecessor.as_bytes() != [0; 16],
+            "recovered topology names the reserved zero predecessor session"
+        );
         anyhow::ensure!(
             panes.len() <= 4096
                 && captured_windows.len() <= 4096
@@ -283,7 +292,12 @@ impl UnpublishedRecoveredTopology {
             captured_domains,
             default_domain_id,
             default_workspace,
+            predecessor,
         })
+    }
+
+    pub fn predecessor(&self) -> crate::MuxSessionIncarnation {
+        self.predecessor
     }
 
     pub fn counts(&self) -> (usize, usize, usize) {
@@ -2408,6 +2422,7 @@ mod tests {
                 "restored workspace".into(),
                 &HashMap::from([(id, (*durable.as_bytes(), 1))]),
                 vec![UnpublishedPane::new(pane)],
+                crate::MuxSessionIncarnation::from_bytes([0x5e; 16]),
             );
             if invalid_revision {
                 assert!(prepared.is_err());

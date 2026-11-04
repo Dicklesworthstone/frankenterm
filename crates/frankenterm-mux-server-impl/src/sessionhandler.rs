@@ -6549,6 +6549,24 @@ async fn collect_list_panes_snapshot(mux: &Mux) -> anyhow::Result<ListPanesRespo
 
 const COHERENT_SNAPSHOT_ATTEMPTS: u8 = 3;
 
+/// Name the session a restored mux continues, for a peer that negotiated
+/// [`TopologyCapabilities::RESTORED_LINEAGE_V1`] (ft-zy6g7). The lineage is
+/// fixed before the listener starts, so it belongs to the snapshot's session.
+fn with_restored_lineage(
+    outcome: ListPanesCoherentOutcome,
+    negotiated: TopologyCapabilities,
+    lineage: Option<mux::RestoredTopologyLineage>,
+) -> ListPanesCoherentOutcome {
+    match (outcome, lineage) {
+        (ListPanesCoherentOutcome::Snapshot(snapshot), Some(lineage))
+            if negotiated.contains(TopologyCapabilities::RESTORED_LINEAGE_V1) =>
+        {
+            ListPanesCoherentOutcome::RestoredSnapshot { snapshot, lineage }
+        }
+        (outcome, _) => outcome,
+    }
+}
+
 async fn collect_coherent_list_panes_snapshot(
     mux: &Mux,
 ) -> anyhow::Result<ListPanesCoherentOutcome> {
@@ -8601,7 +8619,11 @@ impl SessionHandler {
                                 && negotiated.contains(required)
                             {
                                 let mux = session_mux(&authority)?;
-                                collect_coherent_list_panes_snapshot(&mux).await?
+                                with_restored_lineage(
+                                    collect_coherent_list_panes_snapshot(&mux).await?,
+                                    negotiated,
+                                    mux.restored_topology_lineage(),
+                                )
                             } else {
                                 ListPanesCoherentOutcome::Unsupported {
                                     supported: TopologyCapabilities::SERVER_SUPPORTED,
@@ -20701,6 +20723,58 @@ mod tests {
                 supported: TopologyCapabilities::SERVER_SUPPORTED
             }
         ));
+    }
+
+    #[test]
+    fn a_restored_mux_names_its_lineage_only_to_peers_that_negotiated_it() {
+        let snapshot = CoherentPaneSnapshot {
+            session_incarnation: mux::MuxSessionIncarnation::from_bytes([0x61; 16]),
+            snapshot_revision: mux::TopologyRevision::new(4),
+            panes: ListPanesResponse {
+                tabs: Vec::new(),
+                tab_titles: Vec::new(),
+                window_titles: HashMap::new(),
+                floating_panes: Vec::new(),
+            },
+        };
+        let lineage = mux::RestoredTopologyLineage {
+            predecessor: mux::MuxSessionIncarnation::from_bytes([0x60; 16]),
+            max_pane_id: Some(12),
+            max_tab_id: Some(5),
+            max_window_id: Some(2),
+        };
+        let fenced = TopologyCapabilities::FENCED_SNAPSHOT_V1;
+        let with_lineage = TopologyCapabilities::from_bits(
+            fenced.bits() | TopologyCapabilities::RESTORED_LINEAGE_V1.bits(),
+        );
+        let plain = ListPanesCoherentOutcome::Snapshot(snapshot.clone());
+
+        assert_eq!(
+            with_restored_lineage(plain.clone(), with_lineage, Some(lineage)),
+            ListPanesCoherentOutcome::RestoredSnapshot {
+                snapshot: snapshot.clone(),
+                lineage,
+            }
+        );
+        // A peer that did not ask, or a mux that was not restored, gets the
+        // snapshot exactly as before.
+        assert_eq!(
+            with_restored_lineage(plain.clone(), fenced, Some(lineage)),
+            plain
+        );
+        assert_eq!(
+            with_restored_lineage(plain.clone(), with_lineage, None),
+            plain
+        );
+        let contended = ListPanesCoherentOutcome::Contended {
+            attempts: 3,
+            first_revision: mux::TopologyRevision::new(4),
+            last_revision: mux::TopologyRevision::new(9),
+        };
+        assert_eq!(
+            with_restored_lineage(contended.clone(), with_lineage, Some(lineage)),
+            contended
+        );
     }
 
     #[test]

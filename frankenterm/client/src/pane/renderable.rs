@@ -2599,15 +2599,14 @@ impl RenderableInner {
                     matches!(&response, Err(error) if is_rpc_deadline_timeout(error));
                 // A plain local unix socket (no proxy_command) cannot go silent
                 // because its mux died: the kernel hangs it up as the process
-                // exits and the reader turns that EOF into a detach. A missed
-                // deadline there is a stalled mux that still holds every pane,
-                // and this client has no successor to hand them to, so fencing
-                // the generation or declaring the pane dead would close the
-                // windows of a live mux (ft-qvt9l). The miss proves nothing:
-                // keep the pane, leave the lag indicator counting, and poll
-                // again a backstop interval later.
-                let stalled_local_mux =
-                    deadline_missed && client.client.is_local && !client.client.is_reconnectable;
+                // exits and the reader turns that EOF into a redial. A missed
+                // deadline there is a stalled mux that still holds every pane:
+                // fencing the generation would only redial that same stalled
+                // mux until the restart grace closes the windows, and declaring
+                // the pane dead would close them at once (ft-qvt9l). The miss
+                // proves nothing: keep the pane, leave the lag indicator
+                // counting, and poll again a backstop interval later.
+                let stalled_local_mux = deadline_missed && client.client.is_plain_local_socket();
                 if stalled_local_mux {
                     log::warn!(
                         "liveness poll for remote pane {remote_pane_id} got no answer within {deadline:?} from a local mux whose socket is still open; keeping the pane and polling again"
@@ -7485,7 +7484,7 @@ mod tests {
                         .load(Ordering::SeqCst)
                 };
                 let client = Arc::clone(&pane.renderable.lock().inner.borrow().client);
-                assert!(client.client.is_local && !client.client.is_reconnectable);
+                assert!(client.client.is_plain_local_socket());
                 pane.renderable.lock().inner.borrow_mut().liveness_deadline =
                     Duration::from_millis(20);
 
