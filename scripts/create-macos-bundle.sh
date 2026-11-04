@@ -955,7 +955,7 @@ bash "$ATOMIC_MANIFEST_TOOL" generate \
     --optional-tree asset:native-libraries:Contents/Frameworks \
     --tree metadata:native-dependencies:Contents/Resources/native-dependencies \
     --optional-tree signature:codesign:Contents/_CodeSignature \
-    "${NOTARIZATION_ENTRIES[@]}" \
+    ${NOTARIZATION_ENTRIES[@]+"${NOTARIZATION_ENTRIES[@]}"} \
     --source-match Contents/Resources/frankenterm.toml=crates/frankenterm-gui/frankenterm.toml \
     --source-match Contents/Resources/frankenterm.lua=crates/frankenterm-gui/frankenterm.lua \
     --source-match Contents/Resources/ft.icns=assets/macos/ft.icns \
