@@ -775,12 +775,14 @@ pub struct Config {
     pub ssh_max_poll_delay_ms: u64,
 
     /// Base interval for client reconnect backoff in milliseconds. Must be
-    /// greater than zero. Default: 1000.
+    /// greater than zero. Default: 1000. A plain local unix socket, with no
+    /// `proxy_command`, uses at most 500 here.
     #[dynamic(default = "default_client_reconnect_base_interval_ms")]
     pub client_reconnect_base_interval_ms: u64,
 
     /// Maximum interval for client reconnect backoff in milliseconds. Must be
-    /// at least `client_reconnect_base_interval_ms`. Default: 10000.
+    /// at least `client_reconnect_base_interval_ms`. Default: 10000. A plain
+    /// local unix socket, with no `proxy_command`, uses at most 1000 here.
     #[dynamic(default = "default_client_reconnect_max_interval_ms")]
     pub client_reconnect_max_interval_ms: u64,
 
@@ -794,6 +796,10 @@ pub struct Config {
     /// drops the session. Each such cycle used to reset the backoff and open a
     /// fresh connection window, so a machine that was down but still reachable
     /// produced an endless stream of windows.
+    ///
+    /// A plain local unix socket redials about once a second, so there a dial
+    /// budget of N runs out in about N seconds, which can be less than its mux
+    /// takes to restart. Without a budget it gives up after two minutes.
     ///
     /// A connection that stays up for at least
     /// `client_reconnect_healthy_session_ms` is treated as genuinely

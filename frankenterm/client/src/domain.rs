@@ -2058,6 +2058,20 @@ impl ClientInner {
         &self,
         incoming: ClientTopologySession,
     ) -> Result<(), ClientTopologySessionError> {
+        self.pin_topology_session_with_lineage(incoming, None)
+            .map(|_| ())
+    }
+
+    /// Pin `incoming` as this attachment's topology session. A different
+    /// current session is accepted only when `lineage` names the bound
+    /// session as the one it restored; the attachment then rebinds to the
+    /// restored mux, and the lineage is returned so the caller retires every
+    /// mapping the restore did not carry over (ft-zy6g7).
+    fn pin_topology_session_with_lineage(
+        &self,
+        incoming: ClientTopologySession,
+        lineage: Option<mux::RestoredTopologyLineage>,
+    ) -> Result<Option<mux::RestoredTopologyLineage>, ClientTopologySessionError> {
         if matches!(incoming, ClientTopologySession::Current(id) if id.as_bytes() == [0; 16]) {
             return Err(ClientTopologySessionError::ReservedIdentity);
         }
@@ -2067,12 +2081,17 @@ impl ClientInner {
                 // Retain this identity even if subsequent application fails:
                 // a partially applied snapshot still owns its numeric ids.
                 *pinned = ClientTopologySessionState::Bound(incoming);
-                return Ok(());
+                return Ok(None);
             }
-            ClientTopologySessionState::Bound(current) if current == incoming => return Ok(()),
-            ClientTopologySessionState::Bound(ClientTopologySession::Current(_))
+            ClientTopologySessionState::Bound(current) if current == incoming => return Ok(None),
+            ClientTopologySessionState::Bound(ClientTopologySession::Current(bound))
                 if matches!(incoming, ClientTopologySession::Current(_)) =>
             {
+                if let Some(lineage) = lineage.filter(|lineage| lineage.predecessor == bound) {
+                    *pinned = ClientTopologySessionState::Bound(incoming);
+                    metrics::counter!("mux.client.topology_session_rebound.total").increment(1);
+                    return Ok(Some(lineage));
+                }
                 ClientTopologySessionError::Changed
             }
             ClientTopologySessionState::Bound(_) => ClientTopologySessionError::DialectChanged,
@@ -3034,12 +3053,18 @@ impl ClientDomain {
             // passphrase, keyboard-interactive authentication, or MFA. Keep
             // exactly one interactive prompt surface per domain across retry
             // attempts, and disable the implicit 120-second linger because
-            // this exact sender slot owns its lifetime explicitly.
-            let candidate = ConnectionUI::with_params(ConnectionUIParams {
-                disable_close_delay: true,
-                window_id: None,
-                ..Default::default()
-            });
+            // this exact sender slot owns its lifetime explicitly. Its window
+            // opens only for a prompt or once the connect has taken
+            // CONNECTION_UI_DELAY, so a connect that succeeds quickly (every
+            // reachable domain at GUI startup) flashes no window (ft-h38m4).
+            let candidate = ConnectionUI::with_params_deferred(
+                ConnectionUIParams {
+                    disable_close_delay: true,
+                    window_id: None,
+                    ..Default::default()
+                },
+                crate::client::CONNECTION_UI_DELAY,
+            );
             if !candidate.is_interactive() {
                 candidate.close();
                 bail!(
@@ -4467,6 +4492,49 @@ impl ClientDomain {
         )
     }
 
+    /// After a rebind to a restored mux, forget everything above the
+    /// restored maximums (ft-zy6g7). The predecessor allocated those IDs after
+    /// its capture and the restored mux may hand them out again, so a kept
+    /// mapping would show a stranger's pane in an old tab. Each such pane is
+    /// marked dead before it is removed: a dead pane is pruned, never killed on
+    /// the server, which may already run a new pane under its remote ID.
+    fn retire_unrestored_topology(
+        mux: &Mux,
+        inner: &ClientInner,
+        lineage: &mux::RestoredTopologyLineage,
+    ) {
+        let unrestored = |id: usize, max: Option<usize>| max.is_none_or(|max| id > max);
+        let mut retired = Vec::new();
+        for pane in mux.iter_panes() {
+            if pane.domain_id() != inner.local_domain_id {
+                continue;
+            }
+            let Some(client_pane) = pane.downcast_ref::<ClientPane>() else {
+                continue;
+            };
+            if client_pane.belongs_to_client(inner)
+                && unrestored(client_pane.remote_pane_id(), lineage.max_pane_id)
+            {
+                client_pane.renderable.lock().inner.borrow_mut().dead = true;
+                retired.push(pane.pane_id());
+            }
+        }
+        lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane")
+            .retain(|remote, _| !unrestored(*remote, lineage.max_pane_id));
+        lock_or_recover(&inner.remote_to_local_tab, "remote_to_local_tab")
+            .retain(|remote, _| !unrestored(*remote, lineage.max_tab_id));
+        lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window")
+            .retain(|remote, _| !unrestored(*remote, lineage.max_window_id));
+        log::info!(
+            "domain {}: rebound to the restored mux; retired {} pane(s) it did not restore",
+            inner.local_domain_id,
+            retired.len()
+        );
+        for local_pane_id in retired {
+            mux.remove_pane(local_pane_id);
+        }
+    }
+
     fn process_topology_snapshot(
         mux: &Arc<Mux>,
         inner: Arc<ClientInner>,
@@ -4479,9 +4547,17 @@ impl ClientDomain {
         match snapshot {
             RpcTopologySnapshot::Current {
                 session_incarnation,
+                lineage,
                 panes,
             } => {
-                inner.pin_topology_session(ClientTopologySession::Current(session_incarnation))?;
+                if let Some(lineage) = inner.pin_topology_session_with_lineage(
+                    ClientTopologySession::Current(session_incarnation),
+                    lineage,
+                )? {
+                    // Retire in the same step as the rebind: once the
+                    // successor is bound, no later snapshot of it would.
+                    Self::retire_unrestored_topology(mux, &inner, &lineage);
+                }
                 panes
                     .validate_floating_panes()
                     .context("validating bounded floating-pane snapshot")?;
@@ -8641,6 +8717,7 @@ mod tests {
                 Arc::clone(&inner),
                 RpcTopologySnapshot::Current {
                     session_incarnation,
+                    lineage: None,
                     panes,
                 },
                 None,
@@ -8709,6 +8786,7 @@ mod tests {
             Arc::clone(&fresh),
             RpcTopologySnapshot::Current {
                 session_incarnation: replacement_session,
+                lineage: None,
                 panes: listing(),
             },
             None,
@@ -8717,6 +8795,149 @@ mod tests {
         assert_ne!(fresh.remote_to_local_tab_id(52), Some(second_id));
         assert_eq!(remote_tab_order(&mux, &inner, window_id), vec![52, 51]);
         assert_eq!(mux.iter_panes().len(), panes_before.len() * 2);
+    }
+
+    #[test]
+    fn restored_successor_rebinds_and_retires_only_what_it_did_not_restore() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_025);
+        let _domain = register_test_client_domain(&mux, &inner);
+        let original_session = MuxSessionIncarnation::from_bytes([0xa1; 16]);
+        let restored_session = MuxSessionIncarnation::from_bytes([0xa2; 16]);
+        // Tab 52 and pane 62 opened after the last checkpoint: the restored
+        // mux never saw them and hands their ids to whatever it opens next.
+        let listing = |second_title: &str| {
+            let mut panes = sample_remote_tab_listing();
+            let PaneNode::Leaf(mut second) = panes.tabs[0].clone() else {
+                panic!("sample must contain one leaf");
+            };
+            second.tab_id = 52;
+            second.pane_id = 62;
+            second.title = second_title.to_string();
+            panes.tabs.push(PaneNode::Leaf(second));
+            panes.tab_titles.push(second_title.to_string());
+            panes
+        };
+        let apply = |session_incarnation, lineage, panes| {
+            ClientDomain::process_topology_snapshot(
+                &mux,
+                Arc::clone(&inner),
+                RpcTopologySnapshot::Current {
+                    session_incarnation,
+                    lineage,
+                    panes,
+                },
+                None,
+            )
+        };
+        let checkpointed = mux::RestoredTopologyLineage {
+            predecessor: original_session,
+            max_pane_id: Some(61),
+            max_tab_id: Some(51),
+            max_window_id: Some(41),
+        };
+        apply(original_session, None, listing("opened before the outage"))
+            .expect("initial session attaches");
+        let window_id = inner.remote_to_local_window(41).unwrap();
+        let kept_tab = mux
+            .get_tab(inner.remote_to_local_tab_id(51).unwrap())
+            .unwrap();
+        let kept_pane = mux
+            .get_pane(inner.remote_to_local_pane_id(&mux, 61).unwrap())
+            .unwrap();
+        let stale_tab_id = inner.remote_to_local_tab_id(52).unwrap();
+        let stale_pane = mux
+            .get_pane(inner.remote_to_local_pane_id(&mux, 62).unwrap())
+            .unwrap();
+
+        apply(
+            restored_session,
+            Some(checkpointed),
+            listing("opened after the restore"),
+        )
+        .expect("the restored successor of the bound session rebinds");
+
+        // What the restore carried over is the very same window, tab and pane.
+        assert_eq!(inner.remote_to_local_window(41), Some(window_id));
+        assert_eq!(mux.iter_windows().len(), 1);
+        assert!(Arc::ptr_eq(
+            &mux.get_tab(inner.remote_to_local_tab_id(51).unwrap())
+                .unwrap(),
+            &kept_tab
+        ));
+        assert!(Arc::ptr_eq(
+            &mux.get_pane(inner.remote_to_local_pane_id(&mux, 61).unwrap())
+                .unwrap(),
+            &kept_pane
+        ));
+        assert!(!kept_pane.is_dead());
+        // What it did not is retired as dead (so never killed remotely), and
+        // the reused ids name new local objects for the new remote ones.
+        assert!(stale_pane.is_dead());
+        assert!(mux.get_pane(stale_pane.pane_id()).is_none());
+        assert!(mux.get_tab(stale_tab_id).is_none());
+        let reused_pane = mux
+            .get_pane(inner.remote_to_local_pane_id(&mux, 62).unwrap())
+            .unwrap();
+        assert!(!Arc::ptr_eq(&reused_pane, &stale_pane));
+        assert_eq!(reused_pane.get_title(), "opened after the restore");
+        assert_ne!(inner.remote_to_local_tab_id(52), Some(stale_tab_id));
+        assert_eq!(remote_tab_order(&mux, &inner, window_id), vec![51, 52]);
+        assert_eq!(mux.iter_panes().len(), 2);
+
+        // The attachment now belongs to the restored session alone.
+        apply(restored_session, None, listing("opened after the restore"))
+            .expect("same-session resync after the rebind");
+        assert_eq!(mux.iter_panes().len(), 2);
+        let error = apply(
+            MuxSessionIncarnation::from_bytes([0xa3; 16]),
+            Some(checkpointed),
+            listing("opened after the restore"),
+        )
+        .expect_err("a lineage naming a session this attachment left must not rebind");
+        assert_eq!(
+            error.downcast_ref::<ClientTopologySessionError>(),
+            Some(&ClientTopologySessionError::Changed)
+        );
+        assert!(Arc::ptr_eq(
+            &mux.get_pane(reused_pane.pane_id()).unwrap(),
+            &reused_pane
+        ));
+        assert!(!reused_pane.is_dead());
+    }
+
+    #[test]
+    fn a_lineage_on_a_first_attachment_only_binds() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_026);
+        let _domain = register_test_client_domain(&mux, &inner);
+        let restored_session = MuxSessionIncarnation::from_bytes([0xa2; 16]);
+        let lineage = mux::RestoredTopologyLineage {
+            predecessor: MuxSessionIncarnation::from_bytes([0xa1; 16]),
+            max_pane_id: Some(1),
+            max_tab_id: Some(1),
+            max_window_id: Some(1),
+        };
+        ClientDomain::process_topology_snapshot(
+            &mux,
+            Arc::clone(&inner),
+            RpcTopologySnapshot::Current {
+                session_incarnation: restored_session,
+                lineage: Some(lineage),
+                panes: sample_remote_tab_listing(),
+            },
+            None,
+        )
+        .expect("a first attachment binds whatever lineage the mux names");
+        // Remote ids above the lineage's marks are this session's own.
+        assert!(inner.remote_to_local_pane_id(&mux, 61).is_some());
+        assert!(inner.remote_to_local_tab_id(51).is_some());
+        assert_eq!(mux.iter_panes().len(), 1);
+        assert!(!mux.iter_panes()[0].is_dead());
     }
 
     #[test]
@@ -8732,6 +8953,7 @@ mod tests {
                 Arc::clone(&inner),
                 RpcTopologySnapshot::Current {
                     session_incarnation: MuxSessionIncarnation::from_bytes(bytes),
+                    lineage: None,
                     panes: sample_remote_tab_listing(),
                 },
                 None,
@@ -8814,6 +9036,7 @@ mod tests {
                     Arc::clone(&inner),
                     RpcTopologySnapshot::Current {
                         session_incarnation: MuxSessionIncarnation::from_bytes([0x92; 16]),
+                        lineage: None,
                         panes,
                     },
                     None,
@@ -9000,6 +9223,7 @@ mod tests {
                 Arc::clone(&inner),
                 RpcTopologySnapshot::Current {
                     session_incarnation: MuxSessionIncarnation::from_bytes([0x93; 16]),
+                    lineage: None,
                     panes,
                 },
                 preferred_window,
@@ -9118,6 +9342,7 @@ mod tests {
                     Arc::clone(&inner),
                     RpcTopologySnapshot::Current {
                         session_incarnation: MuxSessionIncarnation::from_bytes([0x91; 16]),
+                        lineage: None,
                         panes,
                     },
                     None,

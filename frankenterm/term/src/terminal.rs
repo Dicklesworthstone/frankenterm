@@ -648,11 +648,21 @@ pub struct InertTerminal {
     checkpoint_limits: crate::terminalstate::checkpoint::TerminalCheckpointLimits,
     replayed_records: usize,
     replayed_bytes: usize,
+    replayed_bytes_since_row_audit: usize,
     replay_failed: bool,
     activation_poisoned: bool,
     #[cfg(test)]
     force_writer_preparation_failure: bool,
 }
+
+/// How many replayed bytes may pass between walks of a replaying model's rows.
+/// A walk visits every cell of the scrollback, and a pane writing flat out
+/// leaves about 16 000 records of 64 KiB for a restore: a walk per record
+/// outran the restore's whole deadline. The rows between walks cost no more
+/// memory than the same rows of a live terminal, since scrolling lets rows go
+/// at the same retention.
+#[cfg(feature = "use_serde")]
+const INERT_REPLAY_ROW_AUDIT_BYTES: usize = 16 * 1024 * 1024;
 
 #[cfg(feature = "use_serde")]
 #[derive(Debug, Eq, PartialEq)]
@@ -828,6 +838,7 @@ impl InertTerminal {
             checkpoint_limits,
             replayed_records: 0,
             replayed_bytes: 0,
+            replayed_bytes_since_row_audit: 0,
             replay_failed: false,
             activation_poisoned: false,
             #[cfg(test)]
@@ -1013,20 +1024,46 @@ impl InertTerminal {
             self.replay_failed = true;
             return Err(InertTerminalError::UnsupportedGraphicsAction);
         }
+        // An image is the one thing a record can add that is limited as soon
+        // as it arrives.
+        let adds_image = actions.iter().any(|action| match action {
+            Action::Sixel(_) | Action::KittyImage(_) => true,
+            Action::OperatingSystemCommand(command) => matches!(
+                command.as_ref(),
+                OperatingSystemCommand::ITermProprietary(ITermProprietary::File(file))
+                    if file.inline
+            ),
+            _ => false,
+        });
         self.terminal.perform_actions(actions);
-        if let Err(error) =
-            crate::terminalstate::checkpoint::TerminalCheckpointV3::validate_inert_replay_resources(
-                &self.terminal,
-                &self.replay_projection,
-                &self.custom_cell_width_maps,
-                self.checkpoint_limits,
-            )
-        {
+        self.replayed_bytes_since_row_audit = self
+            .replayed_bytes_since_row_audit
+            .saturating_add(bytes.len());
+        let audit_rows =
+            adds_image || self.replayed_bytes_since_row_audit >= INERT_REPLAY_ROW_AUDIT_BYTES;
+        if let Err(error) = self.validate_replay_resources(audit_rows) {
             self.replay_failed = true;
             return Err(InertTerminalError::Checkpoint(error));
         }
         self.replayed_bytes = next_total_bytes;
         self.replayed_records = next_record_count;
+        Ok(())
+    }
+
+    fn validate_replay_resources(
+        &mut self,
+        audit_rows: bool,
+    ) -> Result<(), crate::terminalstate::checkpoint::TerminalCheckpointError> {
+        crate::terminalstate::checkpoint::TerminalCheckpointV3::validate_inert_replay_resources(
+            &mut self.terminal.state,
+            &self.replay_projection,
+            &self.custom_cell_width_maps,
+            self.checkpoint_limits,
+            audit_rows,
+        )?;
+        if audit_rows {
+            self.replayed_bytes_since_row_audit = 0;
+        }
         Ok(())
     }
 
@@ -1083,6 +1120,15 @@ impl InertTerminal {
                 error: InertTerminalError::ParserNotRecoveryGround,
                 inert_terminal: self,
             });
+        }
+        if self.replayed_bytes_since_row_audit != 0 {
+            if let Err(error) = self.validate_replay_resources(true) {
+                self.replay_failed = true;
+                return Err(InertTerminalActivationFailure {
+                    error: InertTerminalError::Checkpoint(error),
+                    inert_terminal: self,
+                });
+            }
         }
         #[cfg(test)]
         if self.force_writer_preparation_failure {
@@ -1268,14 +1314,16 @@ impl Terminal {
         parser_stream_bytes: u64,
         limits: crate::terminalstate::checkpoint::TerminalCheckpointLimits,
     ) -> Result<RecoveryTerminalCheckpointV3, RecoveryTerminalCheckpointError> {
-        let checkpoint =
+        let mut checkpoint =
             crate::terminalstate::checkpoint::TerminalCheckpointV3::capture_with_limits(
                 &self.state,
                 limits,
             )
             .map_err(RecoveryTerminalCheckpointError::Checkpoint)?;
+        // As a live capture does: a model over the encoding's budget is no
+        // reason to refuse a restore or a birth that has come this far.
         let canonical_payload = checkpoint
-            .to_canonical_json(limits)
+            .encode_trimming_history(limits)
             .map_err(RecoveryTerminalCheckpointError::Checkpoint)?;
         let size = self.state.get_size();
         Ok(RecoveryTerminalCheckpointV3 {

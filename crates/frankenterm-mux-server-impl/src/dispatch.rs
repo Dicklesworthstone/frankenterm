@@ -1891,7 +1891,7 @@ fn pane_node_metadata_retained_bytes(
 fn coherent_snapshot_metadata_retained_bytes(
     response: &ListPanesCoherentResponse,
 ) -> anyhow::Result<usize> {
-    let ListPanesCoherentOutcome::Snapshot(snapshot) = &response.outcome else {
+    let Some(snapshot) = response.outcome.snapshot() else {
         return Ok(0);
     };
     let panes = &snapshot.panes;
@@ -3579,11 +3579,22 @@ impl TopologyStreamCoordinator {
             Unsupported,
         }
 
+        if matches!(
+            &response.outcome,
+            ListPanesCoherentOutcome::RestoredSnapshot { .. }
+        ) && !negotiated.contains(TopologyCapabilities::RESTORED_LINEAGE_V1)
+        {
+            self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
+            anyhow::bail!("restored mux snapshot lineage was not negotiated by its request fence");
+        }
         let outcome = match &response.outcome {
-            ListPanesCoherentOutcome::Snapshot(snapshot) => FenceOutcomeAuthority::Snapshot {
-                session_incarnation: snapshot.session_incarnation,
-                snapshot_revision: snapshot.snapshot_revision,
-            },
+            ListPanesCoherentOutcome::Snapshot(snapshot)
+            | ListPanesCoherentOutcome::RestoredSnapshot { snapshot, .. } => {
+                FenceOutcomeAuthority::Snapshot {
+                    session_incarnation: snapshot.session_incarnation,
+                    snapshot_revision: snapshot.snapshot_revision,
+                }
+            }
             ListPanesCoherentOutcome::Contended { .. } => FenceOutcomeAuthority::Contended,
             ListPanesCoherentOutcome::RevisionExhausted => FenceOutcomeAuthority::RevisionExhausted,
             ListPanesCoherentOutcome::Unsupported { .. } => FenceOutcomeAuthority::Unsupported,
@@ -5648,10 +5659,8 @@ fn encode_write_payload(
         WritePayload::Typed(mut typed) => {
             let is_coherent_snapshot = matches!(
                 &typed.decoded.pdu,
-                Pdu::ListPanesCoherentResponse(ListPanesCoherentResponse {
-                    outcome: ListPanesCoherentOutcome::Snapshot(_),
-                    ..
-                })
+                Pdu::ListPanesCoherentResponse(ListPanesCoherentResponse { outcome, .. })
+                    if outcome.snapshot().is_some()
             );
             let authority = EncodedPduAuthority::capture(
                 &typed.decoded.pdu,
@@ -16404,7 +16413,10 @@ mod tests {
 
         assert_eq!(
             TopologyCapabilities::SERVER_SUPPORTED,
-            TopologyCapabilities::FENCED_SNAPSHOT_V1
+            TopologyCapabilities::from_bits(
+                TopologyCapabilities::FENCED_SNAPSHOT_V1.bits()
+                    | TopologyCapabilities::RESTORED_LINEAGE_V1.bits()
+            )
         );
         assert!(
             !TopologyCapabilities::SERVER_SUPPORTED

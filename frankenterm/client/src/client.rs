@@ -1147,7 +1147,8 @@ enum OrdinaryMuxProtocolError {
     },
     #[error(
         "ordinary mux outbound ListPanesCoherent advertised supported={supported:#x}, \
-         required={required:#x}; the exact activated mask is {activated:#x}"
+         required={required:#x}; it must offer exactly the activated mask {activated:#x} \
+         and require only the fenced snapshot"
     )]
     CapabilityAdvertisementMismatch {
         supported: u64,
@@ -1321,9 +1322,14 @@ impl RpcProtocolAuthority {
     }
 
     const fn locally_activated_capabilities() -> TopologyCapabilities {
-        // Every additive capability remains deliberately inactive. Do not
-        // replace this exact mask with decoder support or a broad server mask.
-        TopologyCapabilities::FENCED_SNAPSHOT_V1
+        // Every other additive capability remains deliberately inactive. Do
+        // not replace this exact mask with decoder support or a broad server
+        // mask. Restored lineage has its client consumer: a domain bound to
+        // the predecessor session rebinds to the restored mux (ft-zy6g7).
+        TopologyCapabilities::from_bits(
+            TopologyCapabilities::FENCED_SNAPSHOT_V1.bits()
+                | TopologyCapabilities::RESTORED_LINEAGE_V1.bits(),
+        )
     }
 
     fn endpoint_is_activated(spec: &PduWireSpec) -> bool {
@@ -1495,8 +1501,13 @@ impl RpcProtocolAuthority {
         let spec = assigned_pdu_spec(pdu, RpcProtocolDirection::Outbound)?;
         self.validate_outbound(spec, point)?;
         if let Pdu::ListPanesCoherent(request) = pdu {
+            // Offer exactly what is activated, but require only the fence:
+            // restored lineage is optional, so a server without it still
+            // answers with a plain fenced snapshot (ft-zy6g7).
             let activated = Self::locally_activated_capabilities();
-            if request.supported != activated || request.required != activated {
+            if request.supported != activated
+                || request.required != TopologyCapabilities::FENCED_SNAPSHOT_V1
+            {
                 return Err(OrdinaryMuxProtocolError::CapabilityAdvertisementMismatch {
                     supported: request.supported.bits(),
                     required: request.required.bits(),
@@ -2675,6 +2686,8 @@ enum PendingRpcReply {
 pub(crate) enum RpcTopologySnapshot {
     Current {
         session_incarnation: MuxSessionIncarnation,
+        /// Present when a restored mux named the session it continues.
+        lineage: Option<mux::RestoredTopologyLineage>,
         panes: ListPanesResponse,
     },
     Legacy46(Legacy46ListPanesResponse),
@@ -3609,15 +3622,21 @@ impl RpcGenerationScope {
         );
         let response = self
             .list_panes_coherent(ListPanesCoherent {
-                supported: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+                supported: COHERENT_TOPOLOGY_OFFER,
                 required: TopologyCapabilities::FENCED_SNAPSHOT_V1,
             })
             .await?;
-        let authority = matches!(&response.outcome, ListPanesCoherentOutcome::Snapshot(_))
+        let authority = response
+            .outcome
+            .snapshot()
+            .is_some()
             .then(|| TopologyFenceAuthority::from_response(&response))
             .transpose()?;
-        let snapshot = match response.outcome {
-            ListPanesCoherentOutcome::Snapshot(snapshot) => snapshot,
+        let (snapshot, lineage) = match response.outcome {
+            ListPanesCoherentOutcome::Snapshot(snapshot) => (snapshot, None),
+            ListPanesCoherentOutcome::RestoredSnapshot { snapshot, lineage } => {
+                (snapshot, Some(lineage))
+            }
             ListPanesCoherentOutcome::Contended {
                 attempts,
                 first_revision,
@@ -3653,6 +3672,7 @@ impl RpcGenerationScope {
             .commit_sync(consumer, || {
                 apply(RpcTopologySnapshot::Current {
                     session_incarnation: authority.session_incarnation,
+                    lineage,
                     panes: snapshot.panes,
                 })
             })
@@ -5437,9 +5457,18 @@ struct TopologyFenceAuthority {
     snapshot_revision: TopologyRevision,
 }
 
+/// What every coherent topology request offers: exactly the activated mask,
+/// the fenced snapshot it requires plus the restored lineage the domain
+/// consumes (ft-zy6g7). A server that knows no lineage negotiates the fenced
+/// snapshot alone.
+const COHERENT_TOPOLOGY_OFFER: TopologyCapabilities =
+    RpcProtocolAuthority::locally_activated_capabilities();
+
 impl TopologyFenceAuthority {
     fn from_response(response: &ListPanesCoherentResponse) -> anyhow::Result<Self> {
-        if response.negotiated != TopologyCapabilities::FENCED_SNAPSHOT_V1 {
+        if response.negotiated != TopologyCapabilities::FENCED_SNAPSHOT_V1
+            && response.negotiated != COHERENT_TOPOLOGY_OFFER
+        {
             bail!(
                 "coherent topology snapshot negotiated unexpected capability bits {:#x}",
                 response.negotiated.bits()
@@ -5448,9 +5477,25 @@ impl TopologyFenceAuthority {
         if response.stream_id.as_bytes() == [0; 16] {
             bail!("coherent topology snapshot carried the reserved zero stream identity");
         }
-        let ListPanesCoherentOutcome::Snapshot(snapshot) = &response.outcome else {
+        if matches!(
+            &response.outcome,
+            ListPanesCoherentOutcome::RestoredSnapshot { .. }
+        ) && !response
+            .negotiated
+            .contains(TopologyCapabilities::RESTORED_LINEAGE_V1)
+        {
+            bail!("coherent topology snapshot carried a restored lineage it did not negotiate");
+        }
+        let Some(snapshot) = response.outcome.snapshot() else {
             bail!("coherent topology authority requires a snapshot outcome");
         };
+        if let ListPanesCoherentOutcome::RestoredSnapshot { lineage, .. } = &response.outcome {
+            if lineage.predecessor.as_bytes() == [0; 16]
+                || lineage.predecessor == snapshot.session_incarnation
+            {
+                bail!("restored topology lineage names a reserved or its own session");
+            }
+        }
         if snapshot.session_incarnation.as_bytes() == [0; 16] {
             bail!("coherent topology snapshot carried the reserved zero session incarnation");
         }
@@ -5791,7 +5836,8 @@ impl ClientTopologyCoordinator {
 
         match pdu {
             Pdu::ListPanesCoherentResponse(response) => match &response.outcome {
-                ListPanesCoherentOutcome::Snapshot(_) => {
+                ListPanesCoherentOutcome::Snapshot(_)
+                | ListPanesCoherentOutcome::RestoredSnapshot { .. } => {
                     let authority = TopologyFenceAuthority::from_response(response)?;
                     let (legacy, events) = match in_flight.prior {
                         ClientTopologyPrior::Legacy { buffered } => {
@@ -9664,15 +9710,16 @@ impl Reconnectable {
 
     fn reconnectable(&mut self) -> bool {
         match &self.config {
-            // A plain local unix socket only disconnects when its server dies,
-            // so reconnecting can't preserve the set of tabs and would leave us
-            // with confusing, inconsistent state. BUT when the unix domain uses
-            // a proxy_command (our remote frankenterm-mux-server reached over
-            // `ssh ... nc -U <sock>`), the *remote* mux is persistent: a dropped
-            // ssh/nc pipe is a transient transport failure, and reconnecting
-            // re-runs the proxy_command and re-syncs the exact same remote tabs.
-            // So reconnect iff there is a proxy_command.
-            ClientDomainConfig::Unix(unix) => unix.proxy_command.is_some(),
+            // With a proxy_command (a remote mux reached over `ssh ... nc -U
+            // <sock>`) a dropped pipe is a transient transport failure while
+            // the remote mux keeps running. A plain local socket closes when
+            // its mux is replaced or restarted, and the restored mux names
+            // the session it restored, so the attachment rebinds to it and
+            // keeps its windows (ft-zy6g7); a mux that comes back without
+            // that lineage is refused as a changed session and reattached
+            // fresh. Redials never auto-start a mux, and a plain local socket
+            // stops redialing after `PLAIN_LOCAL_MUX_RESTART_GRACE`.
+            ClientDomainConfig::Unix(_) => true,
             ClientDomainConfig::Tls(_) => true,
             // It *does* make sense to reconnect with an ssh session, but we
             // need to grow some smarts about whether the disconnect was because
@@ -10124,6 +10171,104 @@ fn next_reconnect_backoff(backoff: Duration, max_interval: Duration) -> Duration
     backoff.saturating_mul(2).min(max_interval)
 }
 
+/// How long a plain local socket keeps redialing a mux that went away: long
+/// enough for a lossless upgrade or a launchd crash restart to bring up the
+/// restored mux, short enough that a mux stopped for good releases its
+/// windows (ft-zy6g7). It is measured from the start of the outage and reset
+/// by any session that stays up `client_reconnect_healthy_session_ms`.
+const PLAIN_LOCAL_MUX_RESTART_GRACE: Duration = Duration::from_secs(120);
+
+/// A plain local unix socket, with no proxy_command between it and its mux:
+/// the kernel hangs it up exactly when that mux exits.
+fn is_plain_local_socket(config: &ClientDomainConfig) -> bool {
+    matches!(config, ClientDomainConfig::Unix(unix) if unix.proxy_command.is_none())
+}
+
+/// The first pause before a plain local socket redials, and the longest. Its
+/// panes stay frozen until a dial finds the mux back, and dialing a local socket
+/// costs next to nothing. So the general schedule, meant for a remote host, only
+/// added waiting: a mux restarted 9 s into an outage stayed unreachable until
+/// that schedule's next dial, 15 s in.
+const PLAIN_LOCAL_MUX_REDIAL_BASE: Duration = Duration::from_millis(500);
+const PLAIN_LOCAL_MUX_REDIAL_MAX: Duration = Duration::from_secs(1);
+
+/// The base and ceiling of a domain's reconnect backoff, from the configured
+/// ones. A plain local socket never waits longer than its own.
+#[must_use]
+fn reconnect_backoff_bounds(
+    config: &ClientDomainConfig,
+    base_interval: Duration,
+    max_interval: Duration,
+) -> (Duration, Duration) {
+    if is_plain_local_socket(config) {
+        (
+            base_interval.min(PLAIN_LOCAL_MUX_REDIAL_BASE),
+            max_interval.min(PLAIN_LOCAL_MUX_REDIAL_MAX),
+        )
+    } else {
+        (base_interval, max_interval)
+    }
+}
+
+#[must_use]
+fn local_mux_restart_grace_exhausted(
+    config: &ClientDomainConfig,
+    outage_started: std::time::Instant,
+    now: std::time::Instant,
+) -> bool {
+    is_plain_local_socket(config)
+        && now.saturating_duration_since(outage_started) >= PLAIN_LOCAL_MUX_RESTART_GRACE
+}
+
+/// How long a reconnect, or an automatic domain connect, runs before its
+/// connection window opens. A lossless mux upgrade has reattached about 3 s in,
+/// and at 3 s the window opened just before that reattach closed it again. At
+/// 5 s an upgrade, or a connect to a reachable host, shows no window, and an
+/// outage that runs longer still gets one. It also sits between the dials a
+/// remote domain makes 3 s and 7 s into its outage at the default backoff
+/// (ft-9zthd, ft-h38m4).
+pub(crate) const CONNECTION_UI_DELAY: Duration = Duration::from_secs(5);
+
+/// How long a finished reconnect loop waits for its window to come up before
+/// detaching its domain. A GUI stalled past this still gets the detach.
+const RECONNECT_UI_SHOW_WAIT: Duration = Duration::from_secs(5);
+
+/// A new reconnect window, which opens only if the outage outlasts
+/// [`CONNECTION_UI_DELAY`].
+fn new_reconnect_ui() -> ConnectionUI {
+    let ui = ConnectionUI::new_deferred(CONNECTION_UI_DELAY);
+    ui.title("FrankenTerm: Reconnecting...");
+    ui
+}
+
+/// Whether a reconnect window must make way for a new one. A new outage
+/// replaces a window an earlier one closed (its reattach closed it, or the
+/// operator did). Within one outage a closed window that was shown stays
+/// closed, so a host that keeps dropping its sessions cannot raise a stream of
+/// windows. One never shown cost the operator nothing, so it is replaced: a
+/// crash soon after a lossless upgrade counts as the same outage until a
+/// session has lasted `client_reconnect_healthy_session_ms`, and it still
+/// needs a window.
+fn reconnect_ui_is_spent(is_open: bool, showed_window: bool, new_outage: bool) -> bool {
+    !is_open && (new_outage || !showed_window)
+}
+
+/// The reconnect window for the current outage: at most one shown per outage
+/// (see [`reconnect_ui_is_spent`]).
+fn reconnect_ui_for_outage(
+    slot: &mut Option<ConnectionUI>,
+    new_outage: bool,
+    open: impl FnOnce() -> ConnectionUI,
+) -> &mut ConnectionUI {
+    if slot
+        .as_ref()
+        .is_some_and(|ui| reconnect_ui_is_spent(ui.is_open(), ui.showed_window(), new_outage))
+    {
+        *slot = None;
+    }
+    slot.get_or_insert_with(open)
+}
+
 /// Enforce reconnect cadence independently of the optional rendering UI.
 ///
 /// A connection window can be closed by the operator or can lose its render
@@ -10145,6 +10290,12 @@ fn wait_for_reconnect_backoff(
 }
 
 impl Client {
+    /// Whether this client reaches its mux over a plain local unix socket
+    /// (see [`is_plain_local_socket`]).
+    pub fn is_plain_local_socket(&self) -> bool {
+        is_plain_local_socket(&self.client_domain_config)
+    }
+
     fn matches_dispatch_authority(&self, authority: &ClientDispatchAuthority) -> bool {
         Arc::ptr_eq(&self.incarnation, &authority.client_incarnation)
             && Arc::ptr_eq(
@@ -10201,24 +10352,31 @@ impl Client {
             .name("client-reconnect".to_string())
             .spawn(move || {
                 let cfg = configuration();
-                let base_interval = Duration::from_millis(cfg.client_reconnect_base_interval_ms);
-                let max_interval = Duration::from_millis(cfg.client_reconnect_max_interval_ms);
+                let (base_interval, max_interval) = reconnect_backoff_bounds(
+                    &reconnectable.config,
+                    Duration::from_millis(cfg.client_reconnect_base_interval_ms),
+                    Duration::from_millis(cfg.client_reconnect_max_interval_ms),
+                );
 
                 let max_attempts = cfg.client_reconnect_max_attempts;
                 let healthy_session =
                     Duration::from_millis(cfg.client_reconnect_healthy_session_ms);
 
                 let mut backoff = base_interval;
-                // One connection window for the whole domain, opened lazily on
-                // the first disconnect. It used to be constructed inside the
-                // loop, so every reconnect cycle spawned a *new* window: a
-                // host that accepts the connection and then immediately drops
-                // the session cycles forever, and the user gets an endless
-                // stream of "Reconnecting..." windows at startup.
+                // At most one connection window shown per outage
+                // (reconnect_ui_for_outage), and only once the outage outlasts
+                // CONNECTION_UI_DELAY. It used to be constructed inside the
+                // loop, so every reconnect cycle spawned a *new* window: a host
+                // that accepts the connection and then immediately drops the
+                // session cycles forever, and the user gets an endless stream
+                // of "Reconnecting..." windows at startup.
                 let mut reconnect_ui: Option<ConnectionUI> = None;
                 // Cycles since the last connection that stayed up long enough
                 // to count as recovered. Bounds the churn above.
                 let mut failed_cycles: u32 = 0;
+                // When the current outage began; it bounds a plain local
+                // socket's redialing to PLAIN_LOCAL_MUX_RESTART_GRACE.
+                let mut outage_started: Option<std::time::Instant> = None;
                 loop {
                     let session_started = std::time::Instant::now();
                     let (thread_result, returned_reconnectable, returned_receiver) = client_thread(
@@ -10283,6 +10441,7 @@ impl Client {
                     // across ordinary transient drops.
                     if session_started.elapsed() >= healthy_session {
                         failed_cycles = 0;
+                        outage_started = None;
                     }
                     if let Err(e) = thread_result {
                         if !reconnectable.reconnectable() || local_domain_id.is_none() {
@@ -10291,29 +10450,46 @@ impl Client {
                         }
 
                         let local_domain_id = local_domain_id.expect("checked above");
+                        let new_outage = outage_started.is_none();
+                        let outage_start =
+                            *outage_started.get_or_insert_with(std::time::Instant::now);
 
                         if let Some(ioerr) = e.root_cause().downcast_ref::<std::io::Error>() {
                             if let std::io::ErrorKind::UnexpectedEof = ioerr.kind() {
-                                // A clean server shutdown surfaces as EOF; for a
-                                // TLS or plain-local connection that means "stop,
-                                // don't reconnect". But for a unix proxy_command
-                                // domain (remote mux reached over ssh+nc) an EOF
-                                // just means the transport pipe dropped while the
-                                // remote mux keeps running, so we reconnect and
-                                // re-sync rather than give up.
-                                let is_unix_proxy = matches!(
-                                    &reconnectable.config,
-                                    ClientDomainConfig::Unix(u) if u.proxy_command.is_some()
-                                );
-                                if !is_unix_proxy {
+                                // A clean TLS server shutdown surfaces as EOF and
+                                // means "stop, don't reconnect". Over a unix
+                                // socket it means the mux is being replaced or
+                                // restarted (or, with a proxy_command, that the
+                                // ssh+nc pipe dropped while the remote mux keeps
+                                // running), so redial and rebind instead.
+                                if !matches!(&reconnectable.config, ClientDomainConfig::Unix(_)) {
                                     log::error!("server closed connection ({})", e);
                                     break;
                                 }
-                                log::warn!(
-                                    "proxy_command connection closed ({}); will reconnect",
-                                    e
-                                );
+                                log::warn!("mux connection closed ({}); will reconnect", e);
                             }
+                        }
+
+                        if local_mux_restart_grace_exhausted(
+                            &reconnectable.config,
+                            outage_start,
+                            std::time::Instant::now(),
+                        ) {
+                            log::error!(
+                                "giving up on domain {local_domain_id}: its local mux has not \
+                                 stayed up within {PLAIN_LOCAL_MUX_RESTART_GRACE:?} (last error: {e})"
+                            );
+                            // Never into a window the reattach closed unseen:
+                            // dropped with this text, a new one opens to show it.
+                            reconnect_ui_for_outage(
+                                &mut reconnect_ui,
+                                new_outage,
+                                new_reconnect_ui,
+                            )
+                            .output_str(&format!(
+                                "Giving up: the local mux has not come back within {PLAIN_LOCAL_MUX_RESTART_GRACE:?}: {e}\n"
+                            ));
+                            break;
                         }
 
                         failed_cycles = failed_cycles.saturating_add(1);
@@ -10324,19 +10500,22 @@ impl Client {
                                  (last error: {e}). Set \
                                  client_reconnect_max_attempts to 0 to keep retrying."
                             );
-                            if let Some(ui) = reconnect_ui.as_ref() {
-                                ui.output_str(&format!(
-                                    "Giving up after {failed_cycles} reconnect attempts: {e}\n"
-                                ));
-                            }
+                            reconnect_ui_for_outage(
+                                &mut reconnect_ui,
+                                new_outage,
+                                new_reconnect_ui,
+                            )
+                            .output_str(&format!(
+                                "Giving up after {failed_cycles} reconnect attempts: {e}\n"
+                            ));
                             break;
                         }
 
-                        let ui = reconnect_ui.get_or_insert_with(|| {
-                            let ui = ConnectionUI::new();
-                            ui.title("FrankenTerm: Reconnecting...");
-                            ui
-                        });
+                        let ui = reconnect_ui_for_outage(
+                            &mut reconnect_ui,
+                            new_outage,
+                            new_reconnect_ui,
+                        );
 
                         // The default zero budget deliberately retries until
                         // recovery or app exit. Operators that explicitly set
@@ -10344,6 +10523,7 @@ impl Client {
                         // well as the rapid connect/drop cycles above.
                         let mut reconnected = false;
                         let mut dial_attempts: u32 = 0;
+                        let mut restart_grace_exhausted = false;
                         let mut ui_backoff_failure_reported = false;
                         loop {
                             let reason = format!("client disconnected {}; will reconnect", e);
@@ -10421,7 +10601,7 @@ impl Client {
                                                                         "FrankenTerm: {domain_name} mux restarted"
                                                                     ));
                                                                     result_ui.output_str(&format!(
-                                                                        "The remote mux for domain {domain_name} restarted, so its earlier tabs are gone. If the domain reconnects automatically, it reopens in a new window shortly; otherwise attach it again.\n"
+                                                                        "The mux for domain {domain_name} restarted, so its earlier tabs are gone. If the domain reconnects automatically, it reopens in a new window shortly; otherwise attach it again.\n"
                                                                     ));
                                                                 } else {
                                                                     result_ui.output_str(&format!(
@@ -10507,6 +10687,17 @@ impl Client {
                                         ));
                                         break;
                                     }
+                                    if local_mux_restart_grace_exhausted(
+                                        &reconnectable.config,
+                                        outage_start,
+                                        std::time::Instant::now(),
+                                    ) {
+                                        restart_grace_exhausted = true;
+                                        ui.output_str(&format!(
+                                            "giving up: the local mux did not come back within {PLAIN_LOCAL_MUX_RESTART_GRACE:?}: {err}\n"
+                                        ));
+                                        break;
+                                    }
                                     backoff = next_reconnect_backoff(backoff, max_interval);
                                     ui.output_str(&format!(
                                         "problem reconnecting: {}; will reconnect in {:?}\n",
@@ -10516,11 +10707,19 @@ impl Client {
                             }
                         }
                         if !reconnected {
-                            log::error!(
-                                "giving up on domain {local_domain_id}: could not reconnect \
-                                 after {dial_attempts} attempts (last error: {e}). Set \
-                                 client_reconnect_max_attempts to 0 to keep retrying."
-                            );
+                            if restart_grace_exhausted {
+                                log::error!(
+                                    "giving up on domain {local_domain_id}: its local mux did \
+                                     not come back within {PLAIN_LOCAL_MUX_RESTART_GRACE:?} \
+                                     ({dial_attempts} attempts; last error: {e})"
+                                );
+                            } else {
+                                log::error!(
+                                    "giving up on domain {local_domain_id}: could not reconnect \
+                                     after {dial_attempts} attempts (last error: {e}). Set \
+                                     client_reconnect_max_attempts to 0 to keep retrying."
+                                );
+                            }
                             break;
                         }
                     } else {
@@ -10529,6 +10728,14 @@ impl Client {
                     }
                 }
 
+                // The detach below can empty the mux, and the GUI quits on an
+                // empty mux. So what this loop still holds back gets its window
+                // first: why it gave up, or that the mux came back as a new
+                // session. That window's pane keeps the GUI up to show it, and
+                // for the auto-connect supervisor to reopen the domain.
+                if let Some(ui) = &reconnect_ui {
+                    ui.show_held_text(RECONNECT_UI_SHOW_WAIT);
+                }
                 reconnect_dispatch_authority
                     .close_rpc_transport(&receiver, "mux client reconnect loop terminated");
                 match reconnect_dispatch_authority.resolve_current() {
@@ -11861,6 +12068,146 @@ mod tests {
         assert!(reconnect_cycle_budget_exhausted(3, 4));
         assert!(!reconnect_dial_budget_exhausted(3, 2));
         assert!(reconnect_dial_budget_exhausted(3, 3));
+    }
+
+    #[test]
+    fn every_unix_socket_redials_and_only_a_plain_local_one_has_a_restart_grace() {
+        let plain = ClientDomainConfig::Unix(UnixDomain::default());
+        let proxied = ClientDomainConfig::Unix(UnixDomain {
+            proxy_command: Some(vec!["nc".to_string(), "-U".to_string(), "sock".to_string()]),
+            ..UnixDomain::default()
+        });
+        let tls = ClientDomainConfig::Tls(config::TlsDomainClient::default());
+        for config in [&plain, &proxied, &tls] {
+            assert!(Reconnectable::new(config.clone(), None).reconnectable());
+        }
+        assert!(is_plain_local_socket(&plain));
+        assert!(!is_plain_local_socket(&proxied));
+        assert!(!is_plain_local_socket(&tls));
+
+        let outage = std::time::Instant::now();
+        let within = outage + PLAIN_LOCAL_MUX_RESTART_GRACE - Duration::from_millis(1);
+        let past = outage + PLAIN_LOCAL_MUX_RESTART_GRACE;
+        assert!(!local_mux_restart_grace_exhausted(&plain, outage, within));
+        assert!(local_mux_restart_grace_exhausted(&plain, outage, past));
+        // A clock reading from before the outage never exhausts it.
+        assert!(!local_mux_restart_grace_exhausted(&plain, past, outage));
+        for remote in [&proxied, &tls] {
+            assert!(!local_mux_restart_grace_exhausted(
+                remote,
+                outage,
+                past + PLAIN_LOCAL_MUX_RESTART_GRACE
+            ));
+        }
+    }
+
+    #[test]
+    fn a_closed_reconnect_window_makes_way_for_a_new_outage_or_if_it_was_never_shown() {
+        // (is open, was shown, new outage, must be replaced)
+        for (is_open, showed_window, new_outage, spent) in [
+            // An open window is reused, whatever it has shown.
+            (true, false, false, false),
+            (true, false, true, false),
+            (true, true, false, false),
+            (true, true, true, false),
+            // A shown window stays closed for the rest of its outage, so a
+            // churning host cannot raise a stream of them.
+            (false, true, false, false),
+            // The next outage gets a window again.
+            (false, true, true, true),
+            // The reattach closed this one unseen, so the outage has not had
+            // its window yet: a crash soon after a lossless upgrade.
+            (false, false, false, true),
+            (false, false, true, true),
+        ] {
+            assert_eq!(
+                reconnect_ui_is_spent(is_open, showed_window, new_outage),
+                spent,
+                "is_open={} showed_window={} new_outage={}",
+                is_open,
+                showed_window,
+                new_outage
+            );
+        }
+    }
+
+    #[test]
+    fn reconnect_ui_for_outage_reuses_an_open_window_and_replaces_a_spent_one() {
+        fn wait_closed(ui: &ConnectionUI) {
+            ui.close();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while ui.is_open() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the closed window must report itself closed"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let opened = std::cell::Cell::new(0_u32);
+        let open = || {
+            opened.set(opened.get() + 1);
+            ConnectionUI::new_headless()
+        };
+        let mut slot = None;
+        assert!(reconnect_ui_for_outage(&mut slot, true, open).is_open());
+        // Churn within the outage, and a later outage whose window is still
+        // open, reuse that window.
+        reconnect_ui_for_outage(&mut slot, false, open);
+        reconnect_ui_for_outage(&mut slot, true, open);
+        assert_eq!(opened.get(), 1);
+
+        // A headless UI never shows a window, so even within the outage a
+        // closed one is replaced.
+        wait_closed(slot.as_ref().expect("the outage's window"));
+        assert!(reconnect_ui_for_outage(&mut slot, false, open).is_open());
+        assert_eq!(opened.get(), 2);
+        // And so is one closed before the next outage.
+        wait_closed(slot.as_ref().expect("the replacement"));
+        assert!(reconnect_ui_for_outage(&mut slot, true, open).is_open());
+        assert_eq!(opened.get(), 3);
+        slot.expect("the new outage's window").close();
+    }
+
+    #[test]
+    fn a_plain_local_socket_redials_on_its_own_short_schedule() {
+        let ms = Duration::from_millis;
+        let plain = ClientDomainConfig::Unix(UnixDomain::default());
+        let proxied = ClientDomainConfig::Unix(UnixDomain {
+            proxy_command: Some(vec!["nc".to_string()]),
+            ..UnixDomain::default()
+        });
+        let tls = ClientDomainConfig::Tls(config::TlsDomainClient::default());
+
+        // At the configured defaults it reaches a restored mux within a second.
+        let (mut backoff, max) = reconnect_backoff_bounds(&plain, ms(1_000), ms(10_000));
+        let mut at = Duration::ZERO;
+        let mut dials = Vec::new();
+        for _ in 0..4 {
+            at += backoff;
+            dials.push(at);
+            backoff = next_reconnect_backoff(backoff, max);
+        }
+        assert_eq!(dials, [ms(500), ms(1_500), ms(2_500), ms(3_500)]);
+
+        // A remote domain keeps the schedule it is configured with.
+        for config in [&proxied, &tls] {
+            assert_eq!(
+                reconnect_backoff_bounds(config, ms(1_000), ms(10_000)),
+                (ms(1_000), ms(10_000))
+            );
+        }
+
+        // A faster configured schedule stands, and a slower one is cut down
+        // with its base still within its ceiling.
+        assert_eq!(
+            reconnect_backoff_bounds(&plain, ms(100), ms(200)),
+            (ms(100), ms(200))
+        );
+        assert_eq!(
+            reconnect_backoff_bounds(&plain, ms(800), ms(800)),
+            (ms(500), ms(800))
+        );
     }
 
     #[test]
@@ -14200,28 +14547,42 @@ mod tests {
     fn capability_policy_keeps_only_the_exact_topology_fence_active() {
         let generation = NonZeroU64::new(17).expect("test generation is nonzero");
         let mut protocol = RpcProtocolAuthority::established_for_test(generation, CODEC_VERSION);
+        let fenced = TopologyCapabilities::FENCED_SNAPSHOT_V1;
         let coherent_request = Pdu::ListPanesCoherent(ListPanesCoherent {
-            supported: TopologyCapabilities::FENCED_SNAPSHOT_V1,
-            required: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+            supported: COHERENT_TOPOLOGY_OFFER,
+            required: fenced,
         });
         protocol
             .validate_outbound_pdu(&coherent_request, RpcOutboundAdmissionPoint::Preflight)
-            .expect("the exact fenced snapshot offer remains active");
+            .expect("the exact activated offer requiring only the fence remains active");
+        assert_eq!(
+            COHERENT_TOPOLOGY_OFFER,
+            TopologyCapabilities::from_bits(
+                fenced.bits() | TopologyCapabilities::RESTORED_LINEAGE_V1.bits()
+            )
+        );
 
         let overbroad = TopologyCapabilities::from_bits(
-            TopologyCapabilities::FENCED_SNAPSHOT_V1.bits()
-                | TopologyCapabilities::ORDERED_WINDOW_STREAM_V1.bits(),
+            COHERENT_TOPOLOGY_OFFER.bits() | TopologyCapabilities::ORDERED_WINDOW_STREAM_V1.bits(),
         );
-        assert!(matches!(
-            protocol.validate_outbound_pdu(
-                &Pdu::ListPanesCoherent(ListPanesCoherent {
-                    supported: overbroad,
-                    required: TopologyCapabilities::FENCED_SNAPSHOT_V1,
-                }),
-                RpcOutboundAdmissionPoint::Preflight,
-            ),
-            Err(OrdinaryMuxProtocolError::CapabilityAdvertisementMismatch { .. })
-        ));
+        // An offer narrower or broader than the activated mask, or one that
+        // requires the optional lineage, is refused before it is sent.
+        for (supported, required) in [
+            (overbroad, fenced),
+            (fenced, fenced),
+            (COHERENT_TOPOLOGY_OFFER, COHERENT_TOPOLOGY_OFFER),
+        ] {
+            assert!(matches!(
+                protocol.validate_outbound_pdu(
+                    &Pdu::ListPanesCoherent(ListPanesCoherent {
+                        supported,
+                        required
+                    }),
+                    RpcOutboundAdmissionPoint::Preflight,
+                ),
+                Err(OrdinaryMuxProtocolError::CapabilityAdvertisementMismatch { .. })
+            ));
+        }
 
         assert!(matches!(
             protocol.validate_common(
@@ -20663,6 +21024,57 @@ mod tests {
             .on_response(serial, &Pdu::ListPanesCoherentResponse(response))
             .expect_err("a legacy or partially negotiated peer must fail closed");
         assert!(error.to_string().contains("unexpected capability bits"));
+    }
+
+    #[test]
+    fn a_restored_lineage_is_authority_only_when_negotiated_and_well_formed() {
+        let stream_id = TopologyStreamId::from_bytes([0x5c; 16]);
+        let session_incarnation = MuxSessionIncarnation::from_bytes([0xac; 16]);
+        let restored = |negotiated, predecessor| {
+            let Pdu::ListPanesCoherentResponse(mut response) =
+                coherent_snapshot_response(stream_id, session_incarnation, 5)
+            else {
+                unreachable!("helper always returns a coherent response");
+            };
+            let ListPanesCoherentOutcome::Snapshot(snapshot) = response.outcome else {
+                unreachable!("helper always returns a snapshot outcome");
+            };
+            response.negotiated = negotiated;
+            response.outcome = ListPanesCoherentOutcome::RestoredSnapshot {
+                snapshot,
+                lineage: mux::RestoredTopologyLineage {
+                    predecessor: MuxSessionIncarnation::from_bytes(predecessor),
+                    max_pane_id: Some(61),
+                    max_tab_id: Some(51),
+                    max_window_id: Some(41),
+                },
+            };
+            response
+        };
+
+        let authority =
+            TopologyFenceAuthority::from_response(&restored(COHERENT_TOPOLOGY_OFFER, [0xab; 16]))
+                .expect("a negotiated lineage naming another session is authority");
+        assert_eq!(authority.session_incarnation, session_incarnation);
+        assert_eq!(authority.snapshot_revision, TopologyRevision::new(5));
+
+        for (negotiated, predecessor, expected) in [
+            (
+                TopologyCapabilities::FENCED_SNAPSHOT_V1,
+                [0xab; 16],
+                "did not negotiate",
+            ),
+            (COHERENT_TOPOLOGY_OFFER, [0; 16], "reserved or its own"),
+            (COHERENT_TOPOLOGY_OFFER, [0xac; 16], "reserved or its own"),
+        ] {
+            let error = TopologyFenceAuthority::from_response(&restored(negotiated, predecessor))
+                .expect_err("a lineage the peer may not name must fail closed");
+            assert!(
+                error.to_string().contains(expected),
+                "unexpected lineage error: {:#}",
+                error,
+            );
+        }
     }
 
     #[test]
