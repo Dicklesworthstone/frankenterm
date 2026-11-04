@@ -6,7 +6,8 @@ use crossbeam::channel::{bounded, unbounded, Receiver, Sender};
 use finl_unicode::grapheme_clusters::Graphemes;
 use frankenterm_term::TerminalSize;
 use std::convert::TryFrom;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use termwiz::cell::{unicode_column_width, CellAttributes};
 use termwiz::lineedit::*;
@@ -273,7 +274,7 @@ impl HeadlessImpl {
 
 /// The thread behind [`ConnectionUI::new_deferred`]: hold requests until the
 /// window is due, then open it and forward everything to it.
-fn run_deferred<F>(rx: Receiver<UIRequest>, delay: Duration, open: F)
+fn run_deferred<F>(rx: Receiver<UIRequest>, delay: Duration, window_shown: Arc<AtomicBool>, open: F)
 where
     F: FnOnce() -> ConnectionUI,
 {
@@ -292,13 +293,12 @@ where
             let _ = respond.send(Ok(()));
             false
         });
-        if now >= deadline {
-            break None;
-        }
         let wake = sleeps
             .iter()
             .map(|(end, ..)| *end)
             .fold(deadline, std::cmp::min);
+        // This takes what is already queued even with no time left, so a close
+        // that arrived before this thread woke for the deadline opens no window.
         match rx.recv_timeout(wake.saturating_duration_since(now)) {
             Ok(UIRequest::Close) => return,
             Ok(UIRequest::Output(changes)) => {
@@ -319,14 +319,27 @@ where
                 }
             },
             Ok(input @ UIRequest::Input { .. }) => break Some(input),
-            Err(err) if err.is_timeout() => {}
-            // The owner went away without closing the UI.
-            Err(_) if output.is_empty() => return,
+            Err(err) if err.is_timeout() => {
+                if now >= deadline {
+                    break None;
+                }
+            }
+            // The owner went away without closing the UI. Open the window only
+            // for something to read: a title alone would be a blank window.
+            Err(_)
+                if output
+                    .iter()
+                    .flatten()
+                    .all(|change| matches!(change, Change::Title(_))) =>
+            {
+                return
+            }
             Err(_) => break None,
         }
     };
 
     let ui = open();
+    window_shown.store(ui.is_interactive(), Ordering::Release);
     for changes in output {
         ui.output(changes);
     }
@@ -345,6 +358,14 @@ where
         if ui.tx.send(request).is_err() {
             return;
         }
+    }
+    // The scheduler refused the window, so this is a headless sink that cannot
+    // prompt. Ending here makes the deferred UI report itself closed, so its
+    // owner's next attempt opens another, as a headless UI's `is_interactive`
+    // tells it to. Otherwise a retained prompt surface would fail every prompt
+    // from now on. The sink still answers what was just forwarded.
+    if !ui.is_interactive() {
+        return;
     }
     // A window the operator closed refuses the next request, which ends this
     // thread, so the deferred UI then reports itself closed too.
@@ -367,6 +388,7 @@ pub struct ConnectionUIParams {
 pub struct ConnectionUI {
     tx: Sender<UIRequest>,
     response_requires_main_thread: bool,
+    window_shown: Arc<AtomicBool>,
 }
 
 impl ConnectionUI {
@@ -435,6 +457,7 @@ impl ConnectionUI {
         Self {
             tx,
             response_requires_main_thread: true,
+            window_shown: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -461,17 +484,18 @@ impl ConnectionUI {
         Self {
             tx,
             response_requires_main_thread: false,
+            window_shown: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// A connection UI whose window opens only once `delay` has passed, or
     /// at once when a prompt needs the operator. Closed before then, it
     /// never shows a window, so a connect or reconnect that completes
-    /// quickly (a lossless mux upgrade redials and reattaches within about a
-    /// second) does not flash one. Output sent while it waits is shown when the
-    /// window opens, and a sleep under way then continues in the window. An
-    /// owner that goes away without closing it, after sending output, gets
-    /// the window opened to show that output, as an open window would have.
+    /// quickly (a lossless mux upgrade reconnects a few seconds in) does not
+    /// flash one. Output sent while it waits is shown when the window opens,
+    /// and a sleep under way then continues in the window. An owner that goes
+    /// away without closing it, after sending text, gets the window opened to
+    /// show that text, as an open window would have.
     pub fn new_deferred(delay: Duration) -> Self {
         Self::with_params_deferred(Default::default(), delay)
     }
@@ -493,15 +517,18 @@ impl ConnectionUI {
     {
         let (tx, rx) = unbounded();
         let fallback = open.clone();
+        let window_shown = Arc::new(AtomicBool::new(false));
+        let shown = Arc::clone(&window_shown);
         let spawned = std::thread::Builder::new()
             .name("connection-ui-deferred".to_string())
-            .spawn(move || run_deferred(rx, delay, open));
+            .spawn(move || run_deferred(rx, delay, shown, open));
         match spawned {
             Ok(_) => Self {
                 tx,
                 // Once the window is open, its replies come from the GUI's
                 // main thread, so blocking requests must not come from it.
                 response_requires_main_thread: true,
+                window_shown,
             },
             Err(err) => {
                 log::error!(
@@ -671,6 +698,13 @@ impl ConnectionUI {
         self.response_requires_main_thread
     }
 
+    /// Whether this UI has put a window in front of the operator. A deferred
+    /// UI closed before its delay never has, and neither has a headless one.
+    #[must_use]
+    pub fn showed_window(&self) -> bool {
+        self.window_shown.load(Ordering::Acquire)
+    }
+
     pub fn test_alive(&self) -> bool {
         if !self.tx.send(UIRequest::Output(vec![])).is_ok() {
             return false;
@@ -717,8 +751,7 @@ pub fn show_configuration_error_message(err: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn reconnect_ui_created_on_reader_thread_runs_on_gui_owner() {
@@ -877,6 +910,7 @@ mod tests {
         let ui = ConnectionUI {
             tx,
             response_requires_main_thread: true,
+            window_shown: Arc::new(AtomicBool::new(true)),
         };
         let _dispatch = promise::spawn::enter_main_thread_dispatch_scope();
 
@@ -912,7 +946,8 @@ mod tests {
             count.fetch_add(1, Ordering::SeqCst);
             ConnectionUI {
                 tx,
-                response_requires_main_thread: false,
+                response_requires_main_thread: true,
+                window_shown: Arc::new(AtomicBool::new(true)),
             }
         };
         (open, rx, opened)
@@ -949,7 +984,9 @@ mod tests {
 
     #[test]
     fn a_deferred_ui_without_a_mux_is_the_headless_ui_with_params_returns() {
-        let _guard = crate::MUX_TEST_LOCK.lock().unwrap();
+        let _guard = crate::MUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         // No mux, whatever an earlier test left behind.
         Mux::shutdown();
         let params = ConnectionUIParams {
@@ -1000,6 +1037,21 @@ mod tests {
 
         wait_until("the deferred UI to close", || !ui.is_open());
         assert_eq!(opened.load(Ordering::SeqCst), 0);
+        assert!(!ui.showed_window());
+        assert!(nothing_more_reaches(&window));
+    }
+
+    #[test]
+    fn a_close_queued_by_the_deadline_still_opens_no_window() {
+        let (open, window, opened) = recording_opener();
+        let (tx, rx) = unbounded();
+        tx.send(UIRequest::Close).expect("the receiver is here");
+        let shown = Arc::new(AtomicBool::new(false));
+
+        run_deferred(rx, Duration::ZERO, Arc::clone(&shown), open);
+
+        assert_eq!(opened.load(Ordering::SeqCst), 0);
+        assert!(!shown.load(Ordering::SeqCst));
         assert!(nothing_more_reaches(&window));
     }
 
@@ -1014,6 +1066,7 @@ mod tests {
         assert!(output_text(held).contains("first"));
         assert!(output_text(next_request(&window, "the second line")).contains("second"));
         assert_eq!(opened.load(Ordering::SeqCst), 1);
+        assert!(ui.showed_window());
 
         ui.output_str("third\n");
         assert!(output_text(next_request(&window, "later output")).contains("third"));
@@ -1028,7 +1081,9 @@ mod tests {
     #[test]
     fn a_sleep_under_way_when_the_window_opens_continues_in_it() {
         let (open, window, _opened) = recording_opener();
-        let ui = ConnectionUI::deferred_with_opener(Duration::from_secs(1), open);
+        // Long enough that the sleep arrives before the window opens, even on
+        // a busy machine: only a sleep held until then has a remainder to move.
+        let ui = ConnectionUI::deferred_with_opener(Duration::from_secs(2), open);
         let sleeper = {
             let ui = ui.clone();
             std::thread::spawn(move || ui.sleep_with_reason("reconnecting", Duration::from_secs(5)))
@@ -1110,6 +1165,37 @@ mod tests {
         ));
         assert!(nothing_more_reaches(&window));
         assert_eq!(opened.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_deferred_ui_dropped_with_only_its_title_opens_no_blank_window() {
+        let (open, window, opened) = recording_opener();
+        let ui = ConnectionUI::deferred_with_opener(Duration::from_secs(600), open);
+        ui.title("FrankenTerm: Reconnecting...");
+        drop(ui);
+
+        assert!(nothing_more_reaches(&window));
+        assert_eq!(opened.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_deferred_ui_whose_window_was_refused_closes_so_its_owner_can_retry() {
+        // The scheduler refusing the window leaves `with_params` a headless UI.
+        let ui = ConnectionUI::deferred_with_opener(
+            Duration::from_secs(600),
+            ConnectionUI::new_headless,
+        );
+        assert!(ui.is_interactive());
+
+        let refused = ui.input("Enter [y/n]> ");
+
+        assert!(
+            refused.is_err(),
+            "a headless sink cannot answer a prompt: {:?}",
+            refused
+        );
+        wait_until("the refused UI to report itself closed", || !ui.is_open());
+        assert!(!ui.showed_window());
     }
 
     #[test]

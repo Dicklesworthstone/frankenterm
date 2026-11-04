@@ -10204,17 +10204,37 @@ fn local_mux_restart_grace_exhausted(
 /// ft-h38m4).
 pub(crate) const CONNECTION_UI_DELAY: Duration = Duration::from_secs(5);
 
-/// The reconnect window for the current outage: at most one per outage. A
-/// new outage replaces a window an earlier one closed (its reattach closed
-/// it, or the operator did). Within one outage a closed window stays closed,
-/// so a host that keeps dropping its sessions cannot raise a stream of
-/// windows.
+/// A new reconnect window, which opens only if the outage outlasts
+/// [`CONNECTION_UI_DELAY`].
+fn new_reconnect_ui() -> ConnectionUI {
+    let ui = ConnectionUI::new_deferred(CONNECTION_UI_DELAY);
+    ui.title("FrankenTerm: Reconnecting...");
+    ui
+}
+
+/// Whether a reconnect window must make way for a new one. A new outage
+/// replaces a window an earlier one closed (its reattach closed it, or the
+/// operator did). Within one outage a closed window that was shown stays
+/// closed, so a host that keeps dropping its sessions cannot raise a stream of
+/// windows. One never shown cost the operator nothing, so it is replaced: a
+/// crash soon after a lossless upgrade counts as the same outage until a
+/// session has lasted `client_reconnect_healthy_session_ms`, and it still
+/// needs a window.
+fn reconnect_ui_is_spent(is_open: bool, showed_window: bool, new_outage: bool) -> bool {
+    !is_open && (new_outage || !showed_window)
+}
+
+/// The reconnect window for the current outage: at most one shown per outage
+/// (see [`reconnect_ui_is_spent`]).
 fn reconnect_ui_for_outage(
     slot: &mut Option<ConnectionUI>,
     new_outage: bool,
     open: impl FnOnce() -> ConnectionUI,
 ) -> &mut ConnectionUI {
-    if new_outage && slot.as_ref().is_some_and(|ui| !ui.is_open()) {
+    if slot
+        .as_ref()
+        .is_some_and(|ui| reconnect_ui_is_spent(ui.is_open(), ui.showed_window(), new_outage))
+    {
         *slot = None;
     }
     slot.get_or_insert_with(open)
@@ -10311,13 +10331,13 @@ impl Client {
                     Duration::from_millis(cfg.client_reconnect_healthy_session_ms);
 
                 let mut backoff = base_interval;
-                // One connection window per outage (reconnect_ui_for_outage),
-                // shown only once the outage outlasts CONNECTION_UI_DELAY. It
-                // used to be constructed inside the loop, so every reconnect
-                // cycle spawned a *new* window: a host that accepts the
-                // connection and then immediately drops the session cycles
-                // forever, and the user gets an endless stream of
-                // "Reconnecting..." windows at startup.
+                // At most one connection window shown per outage
+                // (reconnect_ui_for_outage), and only once the outage outlasts
+                // CONNECTION_UI_DELAY. It used to be constructed inside the
+                // loop, so every reconnect cycle spawned a *new* window: a host
+                // that accepts the connection and then immediately drops the
+                // session cycles forever, and the user gets an endless stream
+                // of "Reconnecting..." windows at startup.
                 let mut reconnect_ui: Option<ConnectionUI> = None;
                 // Cycles since the last connection that stayed up long enough
                 // to count as recovered. Bounds the churn above.
@@ -10427,11 +10447,16 @@ impl Client {
                                 "giving up on domain {local_domain_id}: its local mux has not \
                                  stayed up within {PLAIN_LOCAL_MUX_RESTART_GRACE:?} (last error: {e})"
                             );
-                            if let Some(ui) = reconnect_ui.as_ref() {
-                                ui.output_str(&format!(
-                                    "Giving up: the local mux has not come back within {PLAIN_LOCAL_MUX_RESTART_GRACE:?}: {e}\n"
-                                ));
-                            }
+                            // Never into a window the reattach closed unseen:
+                            // dropped with this text, a new one opens to show it.
+                            reconnect_ui_for_outage(
+                                &mut reconnect_ui,
+                                new_outage,
+                                new_reconnect_ui,
+                            )
+                            .output_str(&format!(
+                                "Giving up: the local mux has not come back within {PLAIN_LOCAL_MUX_RESTART_GRACE:?}: {e}\n"
+                            ));
                             break;
                         }
 
@@ -10443,19 +10468,22 @@ impl Client {
                                  (last error: {e}). Set \
                                  client_reconnect_max_attempts to 0 to keep retrying."
                             );
-                            if let Some(ui) = reconnect_ui.as_ref() {
-                                ui.output_str(&format!(
-                                    "Giving up after {failed_cycles} reconnect attempts: {e}\n"
-                                ));
-                            }
+                            reconnect_ui_for_outage(
+                                &mut reconnect_ui,
+                                new_outage,
+                                new_reconnect_ui,
+                            )
+                            .output_str(&format!(
+                                "Giving up after {failed_cycles} reconnect attempts: {e}\n"
+                            ));
                             break;
                         }
 
-                        let ui = reconnect_ui_for_outage(&mut reconnect_ui, new_outage, || {
-                            let ui = ConnectionUI::new_deferred(CONNECTION_UI_DELAY);
-                            ui.title("FrankenTerm: Reconnecting...");
-                            ui
-                        });
+                        let ui = reconnect_ui_for_outage(
+                            &mut reconnect_ui,
+                            new_outage,
+                            new_reconnect_ui,
+                        );
 
                         // The default zero budget deliberately retries until
                         // recovery or app exit. Operators that explicitly set
@@ -12034,7 +12062,48 @@ mod tests {
     }
 
     #[test]
-    fn each_outage_gets_one_reconnect_window_and_only_a_new_outage_replaces_a_closed_one() {
+    fn a_closed_reconnect_window_makes_way_for_a_new_outage_or_if_it_was_never_shown() {
+        // (is open, was shown, new outage, must be replaced)
+        for (is_open, showed_window, new_outage, spent) in [
+            // An open window is reused, whatever it has shown.
+            (true, false, false, false),
+            (true, false, true, false),
+            (true, true, false, false),
+            (true, true, true, false),
+            // A shown window stays closed for the rest of its outage, so a
+            // churning host cannot raise a stream of them.
+            (false, true, false, false),
+            // The next outage gets a window again.
+            (false, true, true, true),
+            // The reattach closed this one unseen, so the outage has not had
+            // its window yet: a crash soon after a lossless upgrade.
+            (false, false, false, true),
+            (false, false, true, true),
+        ] {
+            assert_eq!(
+                reconnect_ui_is_spent(is_open, showed_window, new_outage),
+                spent,
+                "is_open={} showed_window={} new_outage={}",
+                is_open,
+                showed_window,
+                new_outage
+            );
+        }
+    }
+
+    #[test]
+    fn reconnect_ui_for_outage_reuses_an_open_window_and_replaces_a_spent_one() {
+        fn wait_closed(ui: &ConnectionUI) {
+            ui.close();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while ui.is_open() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the closed window must report itself closed"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
         let opened = std::cell::Cell::new(0_u32);
         let open = || {
             opened.set(opened.get() + 1);
@@ -12048,24 +12117,15 @@ mod tests {
         reconnect_ui_for_outage(&mut slot, true, open);
         assert_eq!(opened.get(), 1);
 
-        // The successful reattach closes it.
-        slot.as_ref().expect("the outage's window").close();
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while slot.as_ref().is_some_and(|ui| ui.is_open()) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the closed window must report itself closed"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        // A session that drops again before it counts as healthy is the same
-        // outage: no second window, so a churning host cannot raise a stream
-        // of them.
-        assert!(!reconnect_ui_for_outage(&mut slot, false, open).is_open());
-        assert_eq!(opened.get(), 1);
-        // The next outage gets a window again.
-        assert!(reconnect_ui_for_outage(&mut slot, true, open).is_open());
+        // A headless UI never shows a window, so even within the outage a
+        // closed one is replaced.
+        wait_closed(slot.as_ref().expect("the outage's window"));
+        assert!(reconnect_ui_for_outage(&mut slot, false, open).is_open());
         assert_eq!(opened.get(), 2);
+        // And so is one closed before the next outage.
+        wait_closed(slot.as_ref().expect("the replacement"));
+        assert!(reconnect_ui_for_outage(&mut slot, true, open).is_open());
+        assert_eq!(opened.get(), 3);
         slot.expect("the new outage's window").close();
     }
 
