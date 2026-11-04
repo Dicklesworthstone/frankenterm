@@ -26,6 +26,17 @@
 #      order, with the same titles, and no other window. The ids are the
 #      GUI's own; a domain that detaches and reattaches gets new ones.
 #   4. A tab opened after both (D) shows its own output next to A, B and C.
+#   5. The lossless upgrade, back within a few seconds, opens no other window
+#      at any status update, up to the crash: no "Reconnecting..." window
+#      flashes (ft-9zthd).
+#   6. The crash outage, held for 6 s (longer than the GUI's 5 s connection
+#      window delay), shows a reconnect window while the mux is down, though
+#      it comes under the default 30 s after the upgrade, so it counts as the
+#      same outage, whose reattach already closed its unseen window (ft-9zthd).
+#   7. A background attach (no window, as the auto-connect supervisor makes)
+#      of a domain whose proxy takes 1.5 s opens no connection window, and
+#   8. one whose proxy takes 8 s shows its connection window, then closes it
+#      once attached (ft-h38m4).
 #
 # Exit codes: 0 pass, 1 regression, 2 environment unusable.
 #
@@ -85,6 +96,9 @@ lines() { grep -c "^$1|" "$E/gui.log"; }
 last() { grep "^$1|" "$E/gui.log" | tail -1; }
 # "<window>|<gui windows>|<tab:pane:title,...>" of the newest line of a phase.
 shown() { last "$1" | cut -d'|' -f2-; }
+# The most GUI windows any line of a phase showed after its first <n> lines;
+# empty when there is no such line.
+most_windows() { grep "^$1|" "$E/gui.log" | tail -n +"$(($2 + 1))" | cut -d'|' -f3 | sort -n | tail -1; }
 wait_for() { # <phase> <ERE for what follows "phase|"> <timeout s>
     local i=0
     until last "$1" | grep -qE "^$1\|$2"; do
@@ -152,17 +166,39 @@ kept_after() { # <phase> <what happened> <rebind count before it>
 }
 
 R=$(rebinds)
+N=$(lines settled)
 log "lossless upgrade onto the same family"
 "$TOOL" upgrade --family "$FAM" --force >/dev/null || fail "the upgrade failed"
 kept_after upgraded "the lossless upgrade" "$R"
+# From the upgrade up to the crash, so a window that comes late counts too.
+MOST=$(printf '%s\n%s\n' "$(most_windows settled "$N")" "$(most_windows upgraded 0)" | sort -n | tail -1)
+if [[ -z "$MOST" ]]; then
+    fail "the GUI reported nothing during the lossless upgrade"
+elif ((MOST == 1)); then
+    pass "the lossless upgrade opened no other window ($(($(lines settled) - N + $(lines upgraded))) status updates)"
+else
+    fail "a reconnect window flashed during the lossless upgrade: $MOST GUI windows"
+fi
 
 R=$(rebinds)
+N=$(lines upgraded)
 MUX=$(cat "$STATE/run.mux-server.pid")
 kill -KILL "$MUX" && log "mux $MUX killed"
 for _ in $(seq 40); do kill -0 "$MUX" 2>/dev/null || break; sleep 0.25; done
-sleep 2
+# Down for longer than the GUI's 5 s connection window delay.
+sleep 6
 "$TOOL" install --family "$FAM" --manager direct >/dev/null || fail "the mux did not come back"
+BACK=$SECONDS
+wait_rebind "$R" 30 && log "the GUI rebound $((SECONDS - BACK)) s after the mux was back"
 kept_after restarted "a crash and restart" "$R"
+MOST=$(most_windows upgraded "$N")
+if [[ -z "$MOST" ]]; then
+    fail "the GUI reported nothing during the crash outage"
+elif ((MOST == 2)); then
+    pass "the crash outage showed one reconnect window while the mux was down"
+else
+    fail "the crash outage showed at most $MOST GUI window(s), not its own and one reconnect window"
+fi
 
 echo more > "$E/phase"
 if wait_for more "${BEFORE//|/\\|},[0-9]+:[0-9]+:D$" 30; then
@@ -171,8 +207,44 @@ else
     fail "the GUI never showed a new tab D: $(shown more)"
 fi
 
+# Background attaches, as the auto-connect supervisor makes at GUI startup,
+# through a proxy as slow as a remote domain's ssh (ft-h38m4).
+connecting() { grep "^$1|" "$E/windows.log" | grep -c 'FrankenTerm: Connecting'; }
+# Whether the newest windows.log line of a phase shows a window of a domain.
+shows_domain() { grep "^$1|" "$E/windows.log" | tail -1 | grep -qE "^$1\|(.*;)?$2:"; }
+background_attach() { # <domain, also the phase>
+    local i=0
+    echo "$1" > "$E/phase"
+    until shows_domain "$1" "$1"; do
+        i=$((i + 1))
+        if ((i > 30 * 4)); then
+            fail "the background attach of $1 never showed its window"
+            return 1
+        fi
+        sleep 0.25
+    done
+    # A few more status updates, so a lingering connection window shows.
+    sleep 2
+}
+if background_attach fast; then
+    if (($(connecting fast) == 0)); then
+        pass "a 1.5 s background connect opened no connection window"
+    else
+        fail "a 1.5 s background connect flashed a connection window ($(connecting fast) status updates)"
+    fi
+fi
+if background_attach slow; then
+    if (($(connecting slow) == 0)); then
+        fail "an 8 s background connect never showed its connection window"
+    elif grep "^slow|" "$E/windows.log" | tail -1 | grep -q 'FrankenTerm: Connecting'; then
+        fail "the 8 s background connect left its connection window open"
+    else
+        pass "an 8 s background connect showed its connection window and closed it once attached"
+    fi
+fi
+
 if ((FAILS == 0)); then
-    log "PASS: the GUI kept its window across a lossless upgrade and a crash restart"
+    log "PASS: the GUI kept its window across a lossless upgrade and a crash restart, and showed connection windows only for slow connects"
     exit 0
 fi
 log "FAIL: $FAILS check(s) failed; GUI log $E/gui.err"
