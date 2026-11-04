@@ -157,7 +157,7 @@
         "cosmetic": 21,
         "docs": 1,
         "feat": 57,
-        "fix": 137,
+        "fix": 138,
         "other": 17,
         "refactor": 5,
         "rename": 2,
@@ -165,13 +165,13 @@
         "security-fix": 2,
         "test": 42
       },
-      "fork_side_commit_count": 293,
+      "fork_side_commit_count": 294,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-11-01T07:52:58-05:00",
-        "sha": "9613efc91971f3cf35cd889c94618591ce78367a",
-        "subject": "test(client): await metadata scheduling"
+        "classification": "fix",
+        "committed_at": "2026-11-03T14:36:33-05:00",
+        "sha": "660d549bdaae9ce404840fe02dcc68772f3d834b",
+        "subject": "fix(client): a missed liveness deadline on a local mux socket keeps the pane and its connection (ft-qvt9l)"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -234,22 +234,22 @@
         "cleanup": 1,
         "cosmetic": 9,
         "docs": 1,
-        "feat": 75,
+        "feat": 76,
         "fix": 63,
         "other": 17,
         "refactor": 5,
         "rename": 1,
         "runtime-swap": 8,
         "security-fix": 2,
-        "test": 15
+        "test": 16
       },
-      "fork_side_commit_count": 200,
+      "fork_side_commit_count": 202,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-11-01T06:28:42-05:00",
-        "sha": "fc506f17fd61ca428405d616daf1beef1e895d4d",
-        "subject": "fix(mobile): stabilize theme catalog JSON order"
+        "classification": "test",
+        "committed_at": "2026-11-03T04:16:29-05:00",
+        "sha": "fce0fba393aedc98cbc7a6623e692c90ad75b78b",
+        "subject": "test(config): five export assertions print their keyword and expression (ft-5qgrk)"
       },
       "name": "config",
       "path": "frankenterm/config",
@@ -784,22 +784,22 @@
         "cleanup": 3,
         "cosmetic": 33,
         "docs": 7,
-        "feat": 229,
-        "fix": 342,
+        "feat": 230,
+        "fix": 344,
         "other": 82,
         "refactor": 12,
         "rename": 2,
         "runtime-swap": 3,
         "security-fix": 7,
-        "test": 116
+        "test": 117
       },
-      "fork_side_commit_count": 846,
+      "fork_side_commit_count": 850,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-11-01T06:00:56-05:00",
-        "sha": "e9bf5b79d705600472acca6d8c884cf10eb14b7f",
-        "subject": "fix(guardian): a full disk stalls a guardian pane's output instead of freezing it for good"
+        "classification": "test",
+        "committed_at": "2026-11-03T04:25:49-05:00",
+        "sha": "05c558241f6357311e84ab9298d060688f40ab1e",
+        "subject": "test(mux): keep the raw-holds override set until the parse thread has read it"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -1210,8 +1210,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 3468,
-  "generated_at": "2026-11-01T15:56:29.112223Z",
+  "fork_side_commit_total": 3475,
+  "generated_at": "2026-11-04T01:06:29.782814Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 55,
