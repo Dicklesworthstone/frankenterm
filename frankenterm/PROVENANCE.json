@@ -157,7 +157,7 @@
         "cosmetic": 21,
         "docs": 1,
         "feat": 57,
-        "fix": 138,
+        "fix": 140,
         "other": 17,
         "refactor": 5,
         "rename": 2,
@@ -165,13 +165,13 @@
         "security-fix": 2,
         "test": 42
       },
-      "fork_side_commit_count": 294,
+      "fork_side_commit_count": 296,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-11-03T14:36:33-05:00",
-        "sha": "660d549bdaae9ce404840fe02dcc68772f3d834b",
-        "subject": "fix(client): a missed liveness deadline on a local mux socket keeps the pane and its connection (ft-qvt9l)"
+        "committed_at": "2026-11-03T20:27:11-05:00",
+        "sha": "9a3593e74d22bf34104449f78514e9c4d5c35e53",
+        "subject": "fix: preserve Mac windows across local mux restart"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -185,7 +185,7 @@
         "cosmetic": 22,
         "docs": 2,
         "feat": 48,
-        "fix": 68,
+        "fix": 70,
         "other": 21,
         "refactor": 2,
         "rename": 2,
@@ -193,13 +193,13 @@
         "security-fix": 1,
         "test": 87
       },
-      "fork_side_commit_count": 260,
+      "fork_side_commit_count": 262,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-11-01T08:43:44-05:00",
-        "sha": "7671c6038f3097ffae56581770d19e2b97cda816",
-        "subject": "test(codec): move the non-canonical LEB128 fixture off ident 117"
+        "classification": "fix",
+        "committed_at": "2026-11-03T20:27:11-05:00",
+        "sha": "9a3593e74d22bf34104449f78514e9c4d5c35e53",
+        "subject": "fix: preserve Mac windows across local mux restart"
       },
       "name": "codec",
       "path": "frankenterm/codec",
@@ -785,7 +785,7 @@
         "cosmetic": 33,
         "docs": 7,
         "feat": 230,
-        "fix": 344,
+        "fix": 345,
         "other": 82,
         "refactor": 12,
         "rename": 2,
@@ -793,13 +793,13 @@
         "security-fix": 7,
         "test": 117
       },
-      "fork_side_commit_count": 850,
+      "fork_side_commit_count": 851,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-11-03T04:25:49-05:00",
-        "sha": "05c558241f6357311e84ab9298d060688f40ab1e",
-        "subject": "test(mux): keep the raw-holds override set until the parse thread has read it"
+        "classification": "fix",
+        "committed_at": "2026-11-03T19:26:41-05:00",
+        "sha": "52a28d12ceb885407ce0d852a2e4511f4ca35d7b",
+        "subject": "fix(client): a GUI keeps its windows when its local mux is replaced or restarted (ft-zy6g7)"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -1210,8 +1210,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 3475,
-  "generated_at": "2026-11-04T01:06:29.782814Z",
+  "fork_side_commit_total": 3480,
+  "generated_at": "2026-11-04T01:27:25.334685Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 55,
