@@ -290,7 +290,7 @@ snapshot_published() { ls "$REC/store/roots/"*.root >/dev/null 2>&1; }
 
 mux_args() {  # common mux flags, one per line
   # shellcheck disable=SC1091
-  . "$REC/ids.env"
+  . "$REC/ids.env" || return 1
   printf '%s\n' --daemonize=false --config-file "$MUX_TOML" \
     --guardian-socket-path "$GUARDIAN_SOCK" --guardian-token-path "$STATE/receiver/token" \
     --recovery-store "$REC/store" --recovery-enrollment "$REC/enroll" --recovery-kek "$REC/kek" \
@@ -300,21 +300,31 @@ mux_args() {  # common mux flags, one per line
 }
 
 run_mux() {
-  local probe panes args=()
+  local probe panes children recovery_args args=()
   # The broker check below needs the manager that runs the broker.
   load_manager
   probe=$(wait_guardian_ready 60) || die "guardian not ready at $GUARDIAN_SOCK"
   case "$probe" in ready\ [0-9]*) ;; *) die "guardian not ready at $GUARDIAN_SOCK" ;; esac
   panes=$(echo "$probe" | awk '{print $2}')
-  while IFS= read -r a; do args+=("$a"); done < <(mux_args)
-  # Restore only when there is something to restore: a published snapshot AND
-  # live guardian panes. After a reboot the guardian is empty; a restore would
-  # fail on every start, so start fresh and let periodic recovery publish anew.
-  if snapshot_published && [ "$panes" -gt 0 ]; then
+  # Process substitution hides a failing mux_args status. Without the required
+  # identities that could execute the mux with no guardian/recovery flags.
+  recovery_args=$(mux_args) || die "cannot load the mux recovery configuration"
+  while IFS= read -r a; do args+=("$a"); done <<< "$recovery_args"
+  if [ "$panes" -gt 0 ]; then
+    # A crash before the first root commits leaves real children in guardian
+    # custody. Fresh startup would run hooks again and duplicate those panes.
+    snapshot_published \
+      || die "guardian holds $panes live pane(s), but no committed recovery snapshot exists; refusing a fresh mux start"
     log "restoring $panes guardian pane(s) with $(readlink "$BASE/mux-current")"
     args+=(--recovery-restore)
   else
-    if snapshot_published && [ "$panes" = 0 ] && [ -z "$(broker_children)" ]; then
+    # A guardian may not yet know about children that survived in its broker.
+    # Neither that state nor a failed census establishes a safe fresh start.
+    children=$(broker_children) \
+      || die "cannot verify that the broker is empty; refusing a fresh mux start"
+    [ -z "$children" ] \
+      || die "guardian reports no panes, but the broker still owns pane processes [$children]; refusing a fresh mux start"
+    if snapshot_published; then
       # The snapshot's panes died with the broker (a reboot or a broker
       # restart), so its lineage cannot continue in a new mux incarnation:
       # periodic recovery would refuse its predecessor for good. Set it aside
@@ -683,10 +693,28 @@ mux_socket() {
 }
 
 broker_children() {  # sorted pids of pane processes
-  local b
-  b=$(svc_pid pty-broker)
-  [ -n "$b" ] || return 0
-  { pgrep -P "$b" || true; } | sort -n | tr '\n' ' '
+  local b current children status
+  b=$(svc_pid pty-broker) || return 1
+  case "$b" in ''|*[!0-9]*|0) log "cannot identify the running PTY broker"; return 1 ;; esac
+  kill -0 "$b" 2>/dev/null || { log "PTY broker pid $b is not running"; return 1; }
+  if children=$(pgrep -P "$b"); then
+    :
+  else
+    status=$?
+    [ "$status" = 1 ] || { log "PTY broker child census failed (exit $status)"; return 1; }
+    children=""
+  fi
+  # pgrep also returns 1 for a vanished parent. A restarted or uninspectable
+  # broker must not authorize retiring its recovery store or verifying a swap.
+  current=$(svc_pid pty-broker) || return 1
+  if [ "$current" != "$b" ] || ! kill -0 "$b" 2>/dev/null; then
+    log "PTY broker changed or exited during its child census"
+    return 1
+  fi
+  if [ -n "$children" ]; then
+    printf '%s\n' "$children" | sort -n | tr '\n' ' ' || return 1
+  fi
+  return 0
 }
 
 mux_pane_ids() {  # sorted pane ids reported by the running mux
@@ -734,7 +762,7 @@ verify_mux() {  # <expected family dir> <expected panes> <expected pane ids> <ex
     case "$exe" in "$fam"/*|"$(cd "$fam" && pwd -P)"/*) ;; *) continue ;; esac
     panes=$(guardian_probe | awk '{print $2}')
     ids=$(mux_pane_ids)
-    children=$(broker_children)
+    children=$(broker_children) || continue
     if [ "$panes" = "$want_panes" ] && [ "$ids" = "$want_ids" ] && [ "$children" = "$want_children" ]; then
       log "verified: mux pid $pid from $fam, $panes guardian pane(s), pane ids [$ids], same pane processes"
       return 0
@@ -869,7 +897,7 @@ swap_mux() {  # <from dir> <to dir> <timeout> <verb>
   case "$probe" in ready\ [0-9]*) ;; *) die "guardian is not ready; refusing" ;; esac
   panes=$(echo "$probe" | awk '{print $2}')
   ids=$(mux_pane_ids)
-  children=$(broker_children)
+  children=$(broker_children) || die "cannot verify the running broker's pane processes; refusing to $verb"
   [ "${panes:-0}" -gt 0 ] || die "guardian holds no panes; nothing to preserve (use install for a fresh start)"
   [ -n "$ids" ] || die "cannot read the running mux's pane ids"
   log "before: $panes guardian pane(s), pane ids [$ids], pane processes [$children]"
@@ -956,10 +984,14 @@ cmd_status() {
     echo "$n: $(svc_active $n && echo "active pid $(svc_pid $n)" || echo inactive)"
   done
   echo "guardian probe:  $(guardian_probe)"
-  local ids p age stale_after
+  local ids children p age stale_after
   ids=$(mux_pane_ids)
   echo "pane ids:        [$ids]"
-  echo "pane processes:  [$(broker_children)]"
+  if children=$(broker_children); then
+    echo "pane processes:  [$children]"
+  else
+    echo "pane processes:  unavailable (broker custody could not be verified)"
+  fi
   p=$(newest_publication)
   if [ "$p" -gt 0 ]; then
     age=$(( $(date +%s) - p ))
