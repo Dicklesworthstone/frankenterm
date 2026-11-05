@@ -71,29 +71,67 @@ default_manager() {
 MANAGER=${FTG_MANAGER:-}
 
 # ---------------------------------------------------------------- families ---
+family_component_version() {  # <dir> <binary> -> <package version> <revision or unknown>
+  local d=$1 b=$2 output value version suffix revision=unknown
+  # Do not pipe through head/awk: a failed probe must remain a failure even
+  # when it printed a plausible version before exiting. publish_family runs
+  # in a command substitution, where errexit alone cannot enforce that.
+  output=$("$d/$b" --version) || die "cannot read $b version from $d"
+  case "$output" in "$b "*) ;; *) die "family $d has invalid $b --version output" ;; esac
+  value=${output#"$b "}
+  version=${value%% *}
+  suffix=${value#"$version"}
+  local version_pattern='^[0-9]+[.][0-9]+[.][0-9]+(-[0-9A-Za-z-]+([.][0-9A-Za-z-]+)*)?([+][0-9A-Za-z-]+([.][0-9A-Za-z-]+)*)?$'
+  [[ $version =~ $version_pattern ]] || die "family $d has invalid $b package version"
+  if [ -n "$suffix" ]; then
+    local revision_pattern='^ [(]([0-9a-f]{7,40}|unknown)([+]dirty)?[)]$'
+    [[ $suffix =~ $revision_pattern ]] || die "family $d has invalid $b source revision"
+    revision=${BASH_REMATCH[1]}
+  fi
+  printf '%s %s\n' "$version" "$revision"
+}
+
 family_tag() {  # <dir> -> <version>-<id7>, from the mux server's own --version
-  local v ver rev
-  v=$("$1/frankenterm-mux-server" --version 2>/dev/null | head -1) || return 1
+  local metadata ver rev
+  metadata=$(family_component_version "$1" frankenterm-mux-server) || return 1
+  ver=${metadata%% *}
+  rev=${metadata#* }
   # "frankenterm-mux-server 0.15.21 (d2ec2d45aa2e...)"; builds without a git
   # checkout say "(unknown)", so fall back to the binary's content hash.
-  ver=$(echo "$v" | awk '{print $2}')
-  rev=$(echo "$v" | sed -nE 's/.*\(([0-9a-f]{7})[0-9a-f]*\).*/\1/p')
-  if [ -z "$rev" ]; then
-    rev=b$( (sha256sum "$1/frankenterm-mux-server" 2>/dev/null || shasum -a 256 "$1/frankenterm-mux-server") | cut -c1-6)
+  if [ "$rev" = unknown ]; then
+    rev=$(content_hash "$1/frankenterm-mux-server") || return 1
+    rev=b$rev
+  else
+    rev=${rev:0:7}
   fi
-  [ -n "$ver" ] || return 1
-  echo "$ver-$rev"
+  printf '%s-%s\n' "$ver" "$rev"
 }
 
 check_family() {  # <dir>
-  local d=$1 b
+  local d=$1 b metadata version="" revision=unknown observed_version observed_revision
   for b in frankenterm-mux-server frankenterm-pty-guardian ft; do
     [ -x "$d/$b" ] || die "family $d lacks executable $b"
   done
-  local m g
-  m=$("$d/frankenterm-mux-server" --version | head -1 | awk '{print $2}')
-  g=$("$d/frankenterm-pty-guardian" --version | head -1 | awk '{print $2}')
-  [ "$m" = "$g" ] || die "family $d mixes versions (mux $m, guardian $g)"
+  for b in frankenterm-mux-server frankenterm-pty-guardian ft; do
+    metadata=$(family_component_version "$d" "$b") || return 1
+    observed_version=${metadata%% *}
+    observed_revision=${metadata#* }
+    [ -z "$version" ] || [ "$version" = "$observed_version" ] \
+      || die "family $d mixes versions ($version versus $observed_version from $b)"
+    version=$observed_version
+    # The guardian currently reports only its package version. Gitless and
+    # unsealed developer builds remain usable: these are declared metadata
+    # checks, not proof of a shared sealed build identity. Whenever sources
+    # are known, reject a mismatch and retain the longest available revision
+    # so two full hashes sharing a seven-character prefix are not conflated.
+    [ "$observed_revision" != unknown ] || continue
+    if [ "$revision" = unknown ] || [[ $observed_revision = "$revision"* ]]; then
+      revision=$observed_revision
+    elif [[ $revision != "$observed_revision"* ]]; then
+      die "family $d mixes source revisions ($revision versus $observed_revision from $b)"
+    fi
+  done
+  return 0
 }
 
 content_hash() {  # <file> -> first 6 hex of its sha256
@@ -110,7 +148,7 @@ same_family() {  # <dir> <dir>: the three binaries are byte-identical
 publish_family() {  # <src dir> -> echoes installed dir; immutable once published
   # Runs inside $(...), where bash suspends set -e: every step checks itself.
   local src=$1 tag dest b
-  check_family "$src"
+  check_family "$src" || return 1
   tag=$(family_tag "$src") || die "cannot read family version from $src"
   dest=$BASE/families/$tag
   # The tag names a commit, not the bytes: a build from a dirty tree shares
