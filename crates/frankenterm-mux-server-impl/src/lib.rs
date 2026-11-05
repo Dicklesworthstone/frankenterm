@@ -993,6 +993,57 @@ mod deferred_scrollback {
                 Line::new(0)
             }
         }
+
+        /// The gap `line` is the marker of, read back from its text, when it
+        /// is exactly the marker that gap writes (ft-om96t). Output can print
+        /// the same text, so where the row sits must confirm it.
+        fn from_marker(line: &Line, retention: usize) -> Option<Self> {
+            let text = line.as_str();
+            let rest = text.trim_end().strip_prefix(GAP_MARKER_PREFIX)?;
+            let (rows, rest) = rest.split_once(" rows (")?;
+            let (start, rest) = rest.split_once("..")?;
+            let (end, rest) = rest.split_once("), ")?;
+            let (bytes, at_unix_ms) = rest.split_once(" bytes, reason=overload, at_unix_ms=")?;
+            let gap = Self {
+                start: start.parse().ok()?,
+                end: end.parse().ok()?,
+                retention,
+                bytes: bytes.parse().ok()?,
+                at_unix_ms: at_unix_ms.strip_suffix(']')?.parse().ok()?,
+            };
+            let rows: StableRowIndex = rows.parse().ok()?;
+            (rows > 0
+                && gap.end.checked_sub(gap.start) == Some(rows)
+                && same_semantic_row(&gap.line_at(gap.start), line))
+            .then_some(gap)
+        }
+    }
+
+    /// A recovered prefix lined up with a store whose gaps a restarted sink
+    /// has not written (ft-om96t).
+    struct UnwrittenGapAlignment {
+        /// The gaps the store's markers stand for, oldest first.
+        gaps: VecDeque<GapSpan>,
+        /// How far the store rows older than every gap sit below their stable
+        /// rows: the rows of gaps whose markers retention pruned.
+        older_skip: StableRowIndex,
+        /// The prefix's rows without its gaps' empty rows, one per store row
+        /// from `first_store_row` to `store_newest`.
+        rows: Vec<Line>,
+        first_store_row: StableRowIndex,
+        store_newest: StableRowIndex,
+    }
+
+    /// Whether two rows carry the same cells and attributes, as the store
+    /// compares a stored row with a recovered one.
+    fn same_semantic_row(a: &Line, b: &Line) -> bool {
+        matches!(
+            (
+                super::serialize_cell_semantic_scrollback_line(a),
+                super::serialize_cell_semantic_scrollback_line(b),
+            ),
+            (Some(a), Some(b)) if a == b
+        )
     }
 
     enum Pending {
@@ -2726,16 +2777,31 @@ mod deferred_scrollback {
                     state.publication_uncertain =
                         *error == ScrollbackSpillError::CommitOutcomeIndeterminate;
                 })?;
-            let Some(receipt) = extended else {
-                return Ok(None);
-            };
-            *state = State {
-                interval_identity,
-                ..State::empty(
-                    self.backing.retained_scrollback_bytes(),
-                    receipt.oldest_stable_row(),
-                    Some(receipt.newest_stable_row_exclusive()),
-                )
+            let receipt = match extended {
+                Some(receipt) => {
+                    *state = State {
+                        interval_identity,
+                        ..State::empty(
+                            self.backing.retained_scrollback_bytes(),
+                            receipt.oldest_stable_row(),
+                            Some(receipt.newest_stable_row_exclusive()),
+                        )
+                    };
+                    receipt
+                }
+                None => {
+                    let Some(receipt) = self.extend_across_unwritten_gaps(
+                        &mut state,
+                        interval_identity,
+                        ancestry,
+                        prefix,
+                        retention,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    receipt
+                }
             };
             self.pending_rows.store(0, Ordering::Release);
             drop(state);
@@ -2976,6 +3042,176 @@ mod deferred_scrollback {
                 decoded_bytes,
                 rows,
             )
+        }
+
+        /// Extends the store to `prefix` across overload gaps this sink has
+        /// not written, once a plain extension was refused (ft-om96t). A mux
+        /// that restarts builds its sink over the store with no written gaps,
+        /// since only the process that wrote a gap knew where it went. Each
+        /// marker stands in one store row for all of its gap's rows, so the
+        /// store's later rows sit below their stable rows and the plain
+        /// comparison lines up the wrong rows. The restore then replaced the
+        /// store and lost every row its checkpoint left out. On success this
+        /// sink takes the gaps as written. Runs under this sink's locks.
+        fn extend_across_unwritten_gaps(
+            &self,
+            state: &mut State,
+            interval_identity: ScrollbackIntervalIdentity,
+            ancestry: ScrollbackAncestry,
+            prefix: &ScrollbackPrefix<'_>,
+            retention: usize,
+        ) -> Result<Option<ScrollbackReplaceCommit>, ScrollbackSpillError> {
+            if !state.written_gaps.is_empty() || state.pruned_gap_skip != 0 {
+                return Ok(None);
+            }
+            let Some(aligned) = self.align_with_unwritten_gaps(prefix, retention) else {
+                return Ok(None);
+            };
+            let compact = ScrollbackPrefix::from_slices(
+                Some(aligned.first_store_row),
+                aligned.store_newest,
+                &aligned.rows,
+                &[],
+            )?;
+            let extended = self
+                .backing
+                .extend_scrollback_to_prefix(ancestry, &compact, retention)
+                .inspect_err(|error| {
+                    state.publication_uncertain =
+                        *error == ScrollbackSpillError::CommitOutcomeIndeterminate;
+                })?;
+            let Some(receipt) = extended else {
+                return Ok(None);
+            };
+            let newest = prefix.newest_stable_row_exclusive();
+            let markers = aligned.gaps.len();
+            let mut installed = State {
+                interval_identity,
+                written_gaps: aligned.gaps,
+                pruned_gap_skip: aligned.older_skip,
+                ..State::empty(self.backing.retained_scrollback_bytes(), None, Some(newest))
+            };
+            installed.prune_written_gaps(receipt.oldest_stable_row());
+            installed.oldest = receipt
+                .oldest_stable_row()
+                .map(|row| row.saturating_add(installed.pruned_gap_skip));
+            let oldest = installed.oldest;
+            *state = installed;
+            log::info!(
+                "pane {} store continues into its recovered rows across {markers} overload gap markers",
+                self.pane_label
+            );
+            Ok(Some(ScrollbackReplaceCommit::new(
+                receipt.generation(),
+                oldest,
+                newest,
+            )))
+        }
+
+        /// `prefix` in the store's own rows, when the store's gap markers
+        /// explain why its newest row sits below the prefix's (ft-om96t).
+        ///
+        /// This holds for a store that caught up with its pane, whose newest
+        /// row is the prefix's newest. Walking back from there, a store row
+        /// counts as a gap's marker only when it is exactly one whose rows end
+        /// where the next store row begins, and, where the gap falls inside
+        /// `prefix`, the prefix holds it as a snapshot expands it: the marker,
+        /// then empty rows. Any other row is an ordinary row, such as output
+        /// that printed a marker's text. A checkpoint that kept the rows the
+        /// store lost lines up with no gap, so a replacement keeps them. The
+        /// backing then compares every row the compact prefix shares with the
+        /// store.
+        fn align_with_unwritten_gaps(
+            &self,
+            prefix: &ScrollbackPrefix<'_>,
+            retention: usize,
+        ) -> Option<UnwrittenGapAlignment> {
+            const READ_BATCH: StableRowIndex = 32;
+            let store_oldest = self.backing.oldest_scrollback_row()?;
+            let store_newest = StableRowIndex::try_from(self.backing.retained_scrollback_rows())
+                .ok()
+                .and_then(|rows| store_oldest.checked_add(rows))?;
+            let first = prefix.oldest_stable_row()?;
+            let newest = prefix.newest_stable_row_exclusive();
+            // How far the newest store rows sit below their stable rows.
+            let mut skip = newest.checked_sub(store_newest).filter(|skip| *skip > 0)?;
+            let rows: Vec<&Line> = prefix.rows().collect();
+            let prefix_row = |stable: StableRowIndex| {
+                stable
+                    .checked_sub(first)
+                    .and_then(|index| usize::try_from(index).ok())
+                    .and_then(|index| rows.get(index).copied())
+            };
+            // Before reading the whole store: the newest rows must match.
+            let last = self.backing.load_scrollback_line(store_newest - 1)?;
+            if !same_semantic_row(&last, prefix_row(newest - 1)?) {
+                return None;
+            }
+            let mut gaps = VecDeque::new();
+            let mut end = store_newest;
+            while end > store_oldest {
+                let start = end.saturating_sub(READ_BATCH).max(store_oldest);
+                // A store read returns at most 32 rows, fewer past its
+                // decoded-byte budget.
+                let mut batch = Vec::new();
+                while batch.len() < usize::try_from(end - start).ok()? {
+                    let from = start.checked_add(StableRowIndex::try_from(batch.len()).ok()?)?;
+                    let more = self.backing.load_scrollback_lines(from..end);
+                    if more.is_empty() {
+                        return None;
+                    }
+                    batch.extend(more);
+                }
+                for (store_row, line) in (start..end).zip(&batch).rev() {
+                    let Some(gap) = GapSpan::from_marker(line, retention) else {
+                        continue;
+                    };
+                    let shrink = gap.rows() - 1;
+                    if shrink == 0
+                        || shrink > skip
+                        || gap.end != store_row.checked_add(skip)?.checked_add(1)?
+                    {
+                        continue;
+                    }
+                    let expanded = (gap.start.max(first)..gap.end).all(|row| {
+                        prefix_row(row).is_some_and(|held| {
+                            if row == gap.start {
+                                same_semantic_row(held, line)
+                            } else {
+                                held.is_whitespace()
+                            }
+                        })
+                    });
+                    if !expanded {
+                        continue;
+                    }
+                    skip -= shrink;
+                    gaps.push_front(gap);
+                }
+                end = start;
+            }
+            if gaps.is_empty() {
+                return None;
+            }
+            let mut kept = Vec::with_capacity(rows.len());
+            let mut next = gaps.iter().peekable();
+            for (stable, line) in (first..).zip(&rows) {
+                while next.next_if(|gap| gap.end <= stable).is_some() {}
+                // A gap's empty rows: the store holds only its marker.
+                if next.peek().is_some_and(|gap| gap.start < stable) {
+                    continue;
+                }
+                kept.push(Line::clone(line));
+            }
+            let first_store_row =
+                store_newest.checked_sub(StableRowIndex::try_from(kept.len()).ok()?)?;
+            (!kept.is_empty()).then_some(UnwrittenGapAlignment {
+                gaps,
+                older_skip: skip,
+                rows: kept,
+                first_store_row,
+                store_newest,
+            })
         }
 
         /// Both replacement entry points; `supersede` passes an expected
@@ -4079,6 +4315,255 @@ mod deferred_scrollback {
             text(&reopened.load_scrollback_line(11).unwrap()),
             format!("flood {}", gap.end)
         );
+    }
+
+    #[cfg(test)]
+    fn flood_row(row: StableRowIndex) -> Line {
+        Line::from_text(
+            &format!("flood {row}"),
+            &wezterm_term::CellAttributes::blank(),
+            0,
+            None,
+        )
+    }
+
+    /// A store of rows 0..100 whose rows 10..gap.end an overload dropped,
+    /// then `extra` rows, reopened under a new sink as a restarted mux builds
+    /// it (ft-om96t). Also returns the rows a recovered checkpoint holds:
+    /// every stable row, with the gap as its marker and empty rows.
+    #[cfg(test)]
+    fn restarted_sink_over_an_overload_gap(
+        extra: &[Line],
+    ) -> (
+        tempfile::TempDir,
+        Arc<super::LiveScrollbackSpillSink>,
+        Arc<DeferredScrollbackSpillSink>,
+        GapSpan,
+        Vec<Line>,
+    ) {
+        let (dir, backing, deferred) = super::tests::deferred_test_sink();
+        let mut model: Vec<Line> = (0..100).map(flood_row).collect();
+        for (row, line) in (0..10).zip(&model) {
+            assert!(deferred.store_scrollback_line(row, line, 1_000));
+        }
+        deferred.flush_scrollback().unwrap();
+        // Nothing drains until the explicit flush, so admission alone sheds.
+        let charge = DeferredScrollbackSpillSink::row_charge(&model[99]).unwrap();
+        deferred.writer.set_queue_budget(charge * 40);
+        for (row, line) in (10..).zip(&model[10..]) {
+            assert!(deferred.store_scrollback_line(row, line, 1_000));
+        }
+        let queued = deferred.queued_gaps();
+        assert_eq!(queued.len(), 1, "one overload gap");
+        deferred.flush_scrollback().unwrap();
+        let gap = deferred.state.lock().unwrap().written_gaps[0];
+        assert_eq!(gap.start..gap.end, queued[0]);
+        deferred.writer.set_queue_budget(DEFAULT_QUEUE_BUDGET_BYTES);
+        for (row, line) in (100..).zip(extra) {
+            assert!(deferred.store_scrollback_line(row, line, 1_000));
+        }
+        deferred.flush_scrollback().unwrap();
+        for row in gap.start..gap.end {
+            model[row as usize] = gap.line_at(row);
+        }
+        model.extend(extra.iter().cloned());
+        drop(deferred);
+        drop(backing);
+        let context = config::ScrollbackSpillSinkContext {
+            pane_id: 913,
+            domain_id: 3,
+            durable_pane_id: [0xd3; 16],
+            command_description: "deferred-scrollback-test".to_string(),
+        };
+        let backing = Arc::new(
+            super::LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context).unwrap(),
+        );
+        let deferred = DeferredScrollbackSpillSink::with_writer(
+            backing.clone(),
+            context.durable_pane_id,
+            DurabilityWriter::spawn(),
+        )
+        .unwrap();
+        (dir, backing, deferred, gap, model)
+    }
+
+    #[cfg(test)]
+    fn strict_ancestry(backing: &super::LiveScrollbackSpillSink) -> ScrollbackAncestry {
+        ScrollbackAncestry {
+            ancestor: backing
+                .lock_state("gap continuation")
+                .unwrap()
+                .snapshot_generation(),
+            cleared_since: false,
+        }
+    }
+
+    /// ft-om96t: a restarted mux's sink knows none of its store's gaps, yet a
+    /// restore whose checkpoint left stored rows out keeps them across the
+    /// gap, wherever the checkpoint's first row falls. Before, the store's
+    /// rows lined up below their stable rows, the comparison failed, and the
+    /// replacement that followed lost them.
+    #[test]
+    fn a_restarted_sink_continues_its_store_across_an_overload_gap() {
+        for case in ["after the gap", "before the gap", "inside the gap"] {
+            let (_dir, backing, deferred, gap, model) = restarted_sink_over_an_overload_gap(&[]);
+            let first = match case {
+                "after the gap" => gap.end + 3,
+                "before the gap" => gap.start - 5,
+                _ => gap.start + 2,
+            };
+            let prefix =
+                ScrollbackPrefix::from_slices(Some(first), 100, &model[first as usize..], &[])
+                    .unwrap();
+            let receipt = deferred
+                .extend_scrollback_to_prefix(strict_ancestry(&backing), &prefix, 1_000)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{case}: the store continues across its gap"));
+            assert_eq!(
+                (
+                    receipt.oldest_stable_row(),
+                    receipt.newest_stable_row_exclusive()
+                ),
+                (Some(0), 100),
+                "{case}"
+            );
+            assert_eq!(deferred.retained_scrollback_rows(), 100, "{case}");
+            for (row, expected) in (0..).zip(&model) {
+                assert_eq!(
+                    deferred.load_scrollback_line(row).as_ref(),
+                    Some(expected),
+                    "{case}: row {row}"
+                );
+            }
+            let written: Vec<_> = deferred
+                .state
+                .lock()
+                .unwrap()
+                .written_gaps
+                .iter()
+                .map(|gap| gap.start..gap.end)
+                .collect();
+            assert_eq!(written, vec![gap.start..gap.end], "{case}");
+            // A checkpoint after the restore sees every stable row again.
+            let snapshot = deferred
+                .snapshot_scrollback(
+                    100,
+                    ScrollbackSnapshotLimits {
+                        max_rows: 1_000,
+                        max_stored_bytes: 1 << 20,
+                        max_decoded_bytes: 1 << 20,
+                        max_physical_bytes: 1 << 20,
+                    },
+                )
+                .unwrap();
+            assert_eq!(snapshot.oldest_stable_row(), Some(0), "{case}");
+            assert_eq!(snapshot.rows(), model.as_slice(), "{case}");
+            // The sink carries on from the prefix's newest row.
+            assert!(deferred.store_scrollback_line(100, &flood_row(100), 1_000));
+            deferred.flush_scrollback().unwrap();
+            assert_eq!(
+                deferred.load_scrollback_line(100),
+                Some(flood_row(100)),
+                "{case}"
+            );
+        }
+    }
+
+    /// A restarted sink continues a store across a gap only where the rows
+    /// line up. A checkpoint that still held the rows the store lost (a
+    /// replacement keeps them) or a store behind its pane's checkpoint is
+    /// left as it was, for the replacement that follows.
+    #[test]
+    fn a_restarted_sink_leaves_a_store_it_cannot_line_up_with_its_gap() {
+        for case in ["the checkpoint holds the gap's rows", "the store is behind"] {
+            let (_dir, backing, deferred, gap, mut model) =
+                restarted_sink_over_an_overload_gap(&[]);
+            let first = if case == "the store is behind" {
+                model.extend((100..103).map(flood_row));
+                5
+            } else {
+                for row in gap.start..gap.end {
+                    model[row as usize] = flood_row(row);
+                }
+                gap.start + 2
+            };
+            let ancestry = strict_ancestry(&backing);
+            let stored = backing.retained_scrollback_rows();
+            let newest = model.len() as StableRowIndex;
+            let prefix =
+                ScrollbackPrefix::from_slices(Some(first), newest, &model[first as usize..], &[])
+                    .unwrap();
+            assert!(
+                deferred
+                    .extend_scrollback_to_prefix(ancestry, &prefix, 1_000)
+                    .unwrap()
+                    .is_none(),
+                "{case}"
+            );
+            assert_eq!(
+                strict_ancestry(&backing).ancestor,
+                ancestry.ancestor,
+                "{case}"
+            );
+            assert_eq!(backing.retained_scrollback_rows(), stored, "{case}");
+            assert!(
+                deferred.state.lock().unwrap().written_gaps.is_empty(),
+                "{case}"
+            );
+        }
+    }
+
+    /// Output that prints a gap marker's text writes an ordinary row. A store
+    /// continuing across its real gap keeps such rows as printed: one naming
+    /// an older span, and one naming a span that ends just past it.
+    #[test]
+    fn printed_gap_marker_text_stays_an_ordinary_row_across_a_continuation() {
+        let printed = |start, end| {
+            GapSpan {
+                start,
+                end,
+                retention: 1_000,
+                bytes: 7,
+                at_unix_ms: 1,
+            }
+            .line_at(start)
+        };
+        let extra: Vec<Line> = (100..120)
+            .map(|row| match row {
+                105 => printed(10, 15),
+                112 => printed(108, 113),
+                _ => flood_row(row),
+            })
+            .collect();
+        let (_dir, backing, deferred, gap, model) = restarted_sink_over_an_overload_gap(&extra);
+        let prefix = ScrollbackPrefix::from_slices(Some(103), 120, &model[103..], &[]).unwrap();
+        let receipt = deferred
+            .extend_scrollback_to_prefix(strict_ancestry(&backing), &prefix, 1_000)
+            .unwrap()
+            .expect("the store continues across its real gap");
+        assert_eq!(
+            (
+                receipt.oldest_stable_row(),
+                receipt.newest_stable_row_exclusive()
+            ),
+            (Some(0), 120)
+        );
+        for (row, expected) in (0..).zip(&model) {
+            assert_eq!(
+                deferred.load_scrollback_line(row).as_ref(),
+                Some(expected),
+                "row {row}"
+            );
+        }
+        let written: Vec<_> = deferred
+            .state
+            .lock()
+            .unwrap()
+            .written_gaps
+            .iter()
+            .map(|gap| gap.start..gap.end)
+            .collect();
+        assert_eq!(written, vec![gap.start..gap.end]);
     }
 
     /// ft-yccm0.2.1.6: `ft session list-durable` reports, from the manifest
