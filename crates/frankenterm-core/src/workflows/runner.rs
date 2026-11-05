@@ -3265,7 +3265,8 @@ impl WorkflowRunner {
     ///
     /// Legacy [`run`](Self::run) preserved unchanged.
     pub async fn run_with_cx(&self, cx: &crate::cx::Cx, event_bus: &crate::events::EventBus) {
-        self.run_loop_with_cx(cx, event_bus, None).await;
+        let subscriber = event_bus.subscribe_detections();
+        self.run_subscribed_with_cx(cx, subscriber, None).await;
     }
 
     /// Run the event loop with an explicit cooperative shutdown channel.
@@ -3282,14 +3283,25 @@ impl WorkflowRunner {
         shutdown_flag: &std::sync::atomic::AtomicBool,
         shutdown_notify: &crate::runtime_async::notify::Notify,
     ) {
-        self.run_loop_with_cx(cx, event_bus, Some((shutdown_flag, shutdown_notify)))
+        let subscriber = event_bus.subscribe_detections();
+        self.run_subscribed_with_cx(cx, subscriber, Some((shutdown_flag, shutdown_notify)))
             .await;
     }
 
-    async fn run_loop_with_cx(
+    /// Recover unfinished workflows and run with an already-owned detection
+    /// subscription. Watcher startup must create this subscription before
+    /// spawning the runner or starting observation: subscribing inside an
+    /// asynchronous task leaves a window where initial detections are lost.
+    ///
+    /// The same subscription buffers detections while recovery awaits stored
+    /// workflows. Its capacity and lag reporting remain those of the event
+    /// bus; this does not replay events from storage after a process crash.
+    /// When supplied, the shutdown flag and notification must be the pair
+    /// owned by the surrounding [`crate::watchdog::WatchdogHandle`].
+    pub async fn run_subscribed_with_cx(
         &self,
         cx: &crate::cx::Cx,
-        event_bus: &crate::events::EventBus,
+        mut subscriber: crate::events::EventSubscriber,
         shutdown: Option<(
             &std::sync::atomic::AtomicBool,
             &crate::runtime_async::notify::Notify,
@@ -3334,7 +3346,6 @@ impl WorkflowRunner {
             }
         }
 
-        let mut subscriber = event_bus.subscribe_detections();
         let mut child_tasks = crate::runtime_async::task::JoinSet::new();
 
         loop {
@@ -5828,70 +5839,469 @@ mod tests {
         });
     }
 
-    #[test]
-    fn workflow_runner_shutdown_notify_wakes_idle_loop_and_settles() {
-        run_async_test(async {
-            let temp_dir = tempfile::TempDir::new().expect("tempdir");
-            let db_path = temp_dir
-                .path()
-                .join("runner_cooperative_shutdown.db")
-                .to_string_lossy()
-                .to_string();
-            let (storage, runner, _lock_manager) = unlimited_gate_runner(&db_path).await;
-            let event_bus = Arc::new(crate::events::EventBus::new(8));
-            let task_event_bus = Arc::clone(&event_bus);
-            let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let task_shutdown_flag = Arc::clone(&shutdown_flag);
-            let shutdown_notify = Arc::new(crate::runtime_async::notify::Notify::new());
-            let task_shutdown_notify = Arc::clone(&shutdown_notify);
-            let runner_cx = crate::cx::for_testing();
-            let (ready_tx, ready_rx) = crate::runtime_async::oneshot::channel();
+    struct StartupIngressProbeWorkflow {
+        recovery_entered: std::sync::atomic::AtomicBool,
+        recovery_released: std::sync::atomic::AtomicBool,
+        recovery_notify: crate::runtime_async::notify::Notify,
+        detections: std::sync::atomic::AtomicUsize,
+        executions: Mutex<Vec<(u64, String)>>,
+    }
 
-            let runner_task = crate::runtime_async::task::spawn(async move {
-                let mut running = std::pin::pin!(runner.run_with_shutdown_with_cx(
-                    &runner_cx,
-                    &task_event_bus,
-                    &task_shutdown_flag,
-                    &task_shutdown_notify,
-                ));
-                let mut ready_tx = Some(ready_tx);
-                futures::future::poll_fn(|poll_cx| {
-                    let result = std::future::Future::poll(running.as_mut(), poll_cx);
-                    // Startup performs real database work before subscribing.
-                    // A pending poll after that subscription proves the actual
-                    // idle wait has registered its wakers, regardless of how
-                    // many scheduler turns startup needed.
-                    if result.is_pending()
-                        && task_event_bus.stats().detection_subscribers > 0
-                        && let Some(ready_tx) = ready_tx.take()
-                    {
-                        let _ = ready_tx.send(());
-                    }
-                    result
-                })
-                .await;
-            });
+    impl StartupIngressProbeWorkflow {
+        fn new() -> Self {
+            Self {
+                recovery_entered: std::sync::atomic::AtomicBool::new(false),
+                recovery_released: std::sync::atomic::AtomicBool::new(false),
+                recovery_notify: crate::runtime_async::notify::Notify::new(),
+                detections: std::sync::atomic::AtomicUsize::new(0),
+                executions: Mutex::new(Vec::new()),
+            }
+        }
+    }
 
-            let readiness_cx = crate::cx::for_testing();
-            crate::runtime_async::timeout_with_cx(
-                &readiness_cx,
-                Duration::from_secs(5),
-                crate::runtime_async::oneshot_recv(ready_rx),
+    impl Workflow for StartupIngressProbeWorkflow {
+        fn name(&self) -> &'static str {
+            "startup_ingress_probe"
+        }
+
+        fn description(&self) -> &'static str {
+            "Pauses durable recovery while new detections arrive"
+        }
+
+        fn handles(&self, detection: &crate::patterns::Detection) -> bool {
+            self.detections.fetch_add(1, Ordering::SeqCst);
+            detection.rule_id == "startup_ingress.trigger"
+        }
+
+        fn steps(&self) -> Vec<WorkflowStep> {
+            vec![WorkflowStep::new("finish", "Finish")]
+        }
+
+        fn execute_step(
+            &self,
+            ctx: &mut WorkflowContext,
+            step_idx: usize,
+        ) -> BoxFuture<'_, StepResult> {
+            let pane_id = ctx.pane_id();
+            let execution_id = ctx.execution_id().to_string();
+            Box::pin(async move {
+                if step_idx != 0 {
+                    return StepResult::abort("unexpected step");
+                }
+                self.executions
+                    .lock()
+                    .unwrap()
+                    .push((pane_id, execution_id));
+                if pane_id == 77 {
+                    self.recovery_entered.store(true, Ordering::SeqCst);
+                    self.recovery_notify.notify_waiters();
+                    self.recovery_notify
+                        .wait_until(|| self.recovery_released.load(Ordering::SeqCst))
+                        .await;
+                }
+                StepResult::done(serde_json::json!({ "ok": true }))
+            })
+        }
+    }
+
+    fn startup_ingress_event(pane_id: u64) -> crate::events::Event {
+        crate::events::Event::PatternDetected {
+            pane_id,
+            pane_uuid: None,
+            detection: crate::patterns::Detection {
+                rule_id: "startup_ingress.trigger".to_string(),
+                ..unlimited_gate_detection()
+            },
+            event_id: None,
+        }
+    }
+
+    async fn seed_startup_recovery(runner: &WorkflowRunner) {
+        let cx = crate::cx::for_testing();
+        seed_test_pane(&runner.storage, 77, now_ms()).await;
+        let execution = runner
+            .engine
+            .start_with_id_cx(
+                &cx,
+                &runner.storage,
+                super::super::engine::WorkflowStartInput {
+                    execution_id: "startup-recovery".to_string(),
+                    workflow_name: "startup_ingress_probe".to_string(),
+                    pane_id: 77,
+                    trigger_event_id: None,
+                    context: None,
+                },
             )
             .await
-            .expect("runner startup must reach its idle wait within the readiness bound")
-            .expect("runner must not exit before registering its idle wait");
+            .expect("persist unfinished workflow");
+        runner
+            .initialize_execution_budget_with_cx(&cx, &execution.id, execution.started_at)
+            .await
+            .expect("persist unfinished workflow budget");
+    }
 
+    async fn wait_for_startup_executions(
+        storage: &StorageHandle,
+        probe: &StartupIngressProbeWorkflow,
+        expected_panes: &[u64],
+    ) {
+        let cx = crate::cx::for_testing();
+        crate::runtime_async::timeout_with_cx(&cx, Duration::from_secs(5), async {
+            loop {
+                let executions = probe.executions.lock().unwrap().clone();
+                assert!(
+                    executions.len() <= expected_panes.len(),
+                    "duplicate execution"
+                );
+                if executions.len() == expected_panes.len() {
+                    let mut completed = true;
+                    for (_, execution_id) in &executions {
+                        let record = storage
+                            .get_workflow_with_cx(&cx, execution_id)
+                            .await
+                            .unwrap()
+                            .expect("executed workflow must be durable");
+                        assert!(
+                            !matches!(record.status.as_str(), "failed" | "aborted"),
+                            "workflow must complete: {record:?}"
+                        );
+                        completed &= record.status == "completed";
+                    }
+                    if completed {
+                        let mut panes = executions
+                            .into_iter()
+                            .map(|(pane_id, _)| pane_id)
+                            .collect::<Vec<_>>();
+                        panes.sort_unstable();
+                        assert_eq!(panes.as_slice(), expected_panes);
+                        return;
+                    }
+                }
+                crate::runtime_async::sleep_with_cx(&cx, Duration::from_millis(1))
+                    .await
+                    .unwrap();
+            }
+        })
+        .await
+        .expect("buffered detections must reach completed workflow records");
+    }
+
+    #[derive(Clone, Copy)]
+    enum StartupRunnerEntry {
+        Cx,
+        Shutdown,
+        Subscribed,
+    }
+
+    async fn assert_startup_detections_retained(entry: StartupRunnerEntry) {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("startup_ingress.db");
+        let (storage, runner, locks) = unlimited_gate_runner(db_path.to_str().unwrap()).await;
+        let probe = Arc::new(StartupIngressProbeWorkflow::new());
+        runner.register_workflow(probe.clone());
+        seed_startup_recovery(&runner).await;
+        seed_test_pane(&storage, 78, now_ms()).await;
+        seed_test_pane(&storage, 79, now_ms()).await;
+
+        let event_bus = Arc::new(crate::events::EventBus::new(8));
+        let subscriber = if matches!(entry, StartupRunnerEntry::Subscribed) {
+            let subscriber = event_bus.subscribe_detections();
+            assert_eq!(event_bus.publish(startup_ingress_event(78)), 1);
+            Some(subscriber)
+        } else {
+            None
+        };
+        let task_event_bus = Arc::clone(&event_bus);
+        let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_shutdown_flag = Arc::clone(&shutdown_flag);
+        let shutdown_notify = Arc::new(crate::runtime_async::notify::Notify::new());
+        let task_shutdown_notify = Arc::clone(&shutdown_notify);
+        let runner_cx = crate::cx::for_testing();
+        let task_cx = runner_cx.clone();
+        let runner_task = crate::runtime_async::task::spawn(async move {
+            match entry {
+                StartupRunnerEntry::Cx => runner.run_with_cx(&task_cx, &task_event_bus).await,
+                StartupRunnerEntry::Shutdown => {
+                    runner
+                        .run_with_shutdown_with_cx(
+                            &task_cx,
+                            &task_event_bus,
+                            &task_shutdown_flag,
+                            &task_shutdown_notify,
+                        )
+                        .await;
+                }
+                StartupRunnerEntry::Subscribed => {
+                    runner
+                        .run_subscribed_with_cx(
+                            &task_cx,
+                            subscriber.expect("watcher must subscribe before spawning"),
+                            Some((&task_shutdown_flag, &task_shutdown_notify)),
+                        )
+                        .await;
+                }
+            }
+        });
+
+        let observer_cx = crate::cx::for_testing();
+        crate::runtime_async::timeout_with_cx(
+            &observer_cx,
+            Duration::from_secs(5),
+            probe
+                .recovery_notify
+                .wait_until(|| probe.recovery_entered.load(Ordering::SeqCst)),
+        )
+        .await
+        .expect("runner must enter the actual unfinished workflow");
+        assert_eq!(probe.detections.load(Ordering::SeqCst), 0);
+        // This publication occurs while the durable recovery step is pending,
+        // not merely before or after an artificial startup delay.
+        assert_eq!(event_bus.publish(startup_ingress_event(79)), 1);
+        probe.recovery_released.store(true, Ordering::SeqCst);
+        probe.recovery_notify.notify_waiters();
+
+        let expected_panes: &[u64] = if matches!(entry, StartupRunnerEntry::Subscribed) {
+            &[77, 78, 79]
+        } else {
+            &[77, 79]
+        };
+        wait_for_startup_executions(&storage, &probe, expected_panes).await;
+        assert_eq!(
+            probe.detections.load(Ordering::SeqCst),
+            expected_panes.len() - 1
+        );
+        assert_eq!(
+            event_bus.metrics().snapshot().events_dropped_no_subscribers,
+            0
+        );
+
+        if matches!(entry, StartupRunnerEntry::Cx) {
+            runner_cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("startup ingress regression complete"),
+            );
+        } else {
             shutdown_flag.store(true, Ordering::SeqCst);
             shutdown_notify.notify_waiters();
-            let join_cx = crate::cx::for_testing();
-            crate::runtime_async::timeout_with_cx(&join_cx, Duration::from_secs(1), runner_task)
-                .await
-                .expect("cooperative shutdown must remain bounded")
-                .expect("workflow runner task must settle cleanly");
+        }
+        crate::runtime_async::timeout_with_cx(&observer_cx, Duration::from_secs(1), runner_task)
+            .await
+            .expect("runner stop must remain bounded")
+            .expect("runner task must settle");
+        assert_eq!(event_bus.stats().detection_subscribers, 0);
+        assert_eq!(probe.executions.lock().unwrap().len(), expected_panes.len());
+        for pane_id in expected_panes {
+            assert!(locks.is_locked(*pane_id).is_none());
+        }
+        storage.shutdown().await.unwrap();
+    }
 
-            storage.shutdown().await.expect("shutdown workflow storage");
+    #[test]
+    fn workflow_runner_subscribes_before_resuming_incomplete_workflows() {
+        run_async_test(async {
+            assert_startup_detections_retained(StartupRunnerEntry::Cx).await;
+            assert_startup_detections_retained(StartupRunnerEntry::Shutdown).await;
         });
+    }
+
+    #[test]
+    fn workflow_runner_retains_detections_before_spawn_and_during_recovery() {
+        run_async_test(assert_startup_detections_retained(
+            StartupRunnerEntry::Subscribed,
+        ));
+    }
+
+    #[test]
+    fn workflow_runner_pre_stopped_subscription_dispatches_nothing() {
+        run_async_test(async {
+            for cancelled in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let db_path = directory.path().join("startup_stopped.db");
+                let (storage, runner, locks) =
+                    unlimited_gate_runner(db_path.to_str().unwrap()).await;
+                let probe = Arc::new(StartupIngressProbeWorkflow::new());
+                runner.register_workflow(probe.clone());
+                seed_startup_recovery(&runner).await;
+                let event_bus = crate::events::EventBus::new(8);
+                let subscriber = event_bus.subscribe_detections();
+                assert_eq!(event_bus.publish(startup_ingress_event(78)), 1);
+                let shutdown_flag = std::sync::atomic::AtomicBool::new(!cancelled);
+                let shutdown_notify = crate::runtime_async::notify::Notify::new();
+                let runner_cx = crate::cx::for_testing();
+                if cancelled {
+                    runner_cx.cancel_with(
+                        crate::outcome::CancelKind::User,
+                        Some("cancel before runner startup"),
+                    );
+                }
+                let observer_cx = crate::cx::for_testing();
+                crate::runtime_async::timeout_with_cx(
+                    &observer_cx,
+                    Duration::from_secs(1),
+                    runner.run_subscribed_with_cx(
+                        &runner_cx,
+                        subscriber,
+                        Some((&shutdown_flag, &shutdown_notify)),
+                    ),
+                )
+                .await
+                .expect("pre-stopped runner must return without resuming or dispatching");
+                assert_eq!(probe.detections.load(Ordering::SeqCst), 0);
+                assert!(probe.executions.lock().unwrap().is_empty());
+                assert_eq!(event_bus.stats().detection_subscribers, 0);
+                assert!(locks.is_locked(77).is_none());
+                assert_eq!(
+                    storage
+                        .get_workflow("startup-recovery")
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    "running",
+                    "an execution skipped before startup remains available for recovery"
+                );
+                storage.shutdown().await.unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn workflow_runner_startup_buffer_keeps_lag_and_channel_close_semantics() {
+        run_async_test(async {
+            let directory = tempfile::tempdir().unwrap();
+            let db_path = directory.path().join("startup_lag.db");
+            let (storage, runner, _locks) = unlimited_gate_runner(db_path.to_str().unwrap()).await;
+            let probe = Arc::new(StartupIngressProbeWorkflow::new());
+            runner.register_workflow(probe.clone());
+            let event_bus = crate::events::EventBus::new(1);
+            let subscriber = event_bus.subscribe_detections();
+            for pane_id in 78..=80 {
+                seed_test_pane(&storage, pane_id, now_ms()).await;
+                assert_eq!(event_bus.publish(startup_ingress_event(pane_id)), 1);
+            }
+            let runner_task = crate::runtime_async::task::spawn(async move {
+                let cx = crate::cx::for_testing();
+                runner.run_subscribed_with_cx(&cx, subscriber, None).await;
+            });
+            wait_for_startup_executions(&storage, &probe, &[80]).await;
+            assert_eq!(probe.detections.load(Ordering::SeqCst), 1);
+            assert!(event_bus.metrics().snapshot().subscriber_lag_events > 0);
+            // The owned subscription must observe closure; retaining a bus in
+            // the runner merely to subscribe again would keep it alive here.
+            drop(event_bus);
+            let observer_cx = crate::cx::for_testing();
+            crate::runtime_async::timeout_with_cx(
+                &observer_cx,
+                Duration::from_secs(1),
+                runner_task,
+            )
+            .await
+            .expect("closed event bus must stop the runner")
+            .expect("runner task must settle after bus closure");
+            assert_eq!(probe.executions.lock().unwrap().len(), 1);
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn workflow_runner_shutdown_notify_wakes_idle_loop_and_settles() {
+        run_async_test(assert_idle_runner_stops(false));
+    }
+
+    #[test]
+    fn workflow_runner_cancellation_wakes_idle_loop_and_settles() {
+        run_async_test(assert_idle_runner_stops(true));
+    }
+
+    async fn assert_idle_runner_stops(cancelled: bool) {
+        let temp_dir = tempfile::TempDir::new().expect("tempdir");
+        let db_path = temp_dir
+            .path()
+            .join("runner_cooperative_shutdown.db")
+            .to_string_lossy()
+            .to_string();
+        let (storage, runner, _lock_manager) = unlimited_gate_runner(&db_path).await;
+        let probe = Arc::new(StartupIngressProbeWorkflow::new());
+        runner.register_workflow(probe.clone());
+        let task_probe = Arc::clone(&probe);
+        let event_bus = Arc::new(crate::events::EventBus::new(8));
+        let task_event_bus = Arc::clone(&event_bus);
+        let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_shutdown_flag = Arc::clone(&shutdown_flag);
+        let shutdown_notify = Arc::new(crate::runtime_async::notify::Notify::new());
+        let task_shutdown_notify = Arc::clone(&shutdown_notify);
+        let runner_cx = crate::cx::for_testing();
+        let cancel_cx = runner_cx.clone();
+        let (ready_tx, ready_rx) = crate::runtime_async::oneshot::channel();
+
+        let runner_task = crate::runtime_async::task::spawn(async move {
+            let mut running = std::pin::pin!(runner.run_with_shutdown_with_cx(
+                &runner_cx,
+                &task_event_bus,
+                &task_shutdown_flag,
+                &task_shutdown_notify,
+            ));
+            let mut ready_tx = Some(ready_tx);
+            let mut readiness_published = false;
+            futures::future::poll_fn(|poll_cx| {
+                let result = std::future::Future::poll(running.as_mut(), poll_cx);
+                if result.is_pending()
+                    && !readiness_published
+                    && task_event_bus.stats().detection_subscribers > 0
+                {
+                    assert_eq!(
+                        task_event_bus.publish(crate::events::Event::PatternDetected {
+                            pane_id: 78,
+                            pane_uuid: None,
+                            detection: unlimited_gate_detection(),
+                            event_id: None,
+                        }),
+                        1
+                    );
+                    readiness_published = true;
+                }
+                // Subscription now precedes recovery. Only a pending
+                // poll after consuming this non-matching detection proves
+                // recovery finished and the actual idle wait registered.
+                if result.is_pending()
+                    && task_probe.detections.load(Ordering::SeqCst) > 0
+                    && let Some(ready_tx) = ready_tx.take()
+                {
+                    let _ = ready_tx.send(());
+                }
+                result
+            })
+            .await;
+        });
+
+        let readiness_cx = crate::cx::for_testing();
+        crate::runtime_async::timeout_with_cx(
+            &readiness_cx,
+            Duration::from_secs(5),
+            crate::runtime_async::oneshot_recv(ready_rx),
+        )
+        .await
+        .expect("runner startup must reach its idle wait within the readiness bound")
+        .expect("runner must not exit before registering its idle wait");
+
+        if cancelled {
+            cancel_cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("cancel idle workflow runner"),
+            );
+        } else {
+            shutdown_flag.store(true, Ordering::SeqCst);
+            shutdown_notify.notify_waiters();
+        }
+        let join_cx = crate::cx::for_testing();
+        crate::runtime_async::timeout_with_cx(&join_cx, Duration::from_secs(1), runner_task)
+            .await
+            .expect("cooperative shutdown must remain bounded")
+            .expect("workflow runner task must settle cleanly");
+
+        assert_eq!(event_bus.stats().detection_subscribers, 0);
+        assert!(probe.executions.lock().unwrap().is_empty());
+        storage.shutdown().await.expect("shutdown workflow storage");
     }
 
     async fn seed_test_pane(
