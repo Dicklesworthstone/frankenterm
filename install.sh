@@ -1694,6 +1694,13 @@ force_ps_census = (
     os.environ.get("FT_INSTALL_TEST_ENABLE_RESOURCE_OVERRIDES") == "1" and
     os.environ.get("FT_INSTALL_TEST_FORCE_PS_CENSUS") == "1"
 )
+# A real proc-shaped fixture exercises the Linux branch without touching
+# another process. These overrides are available only to sourced tests;
+# executing the installer with LIBRARY_ONLY is rejected before any operation.
+proc_root = "/proc"
+if (os.environ.get("FT_INSTALL_TEST_LIBRARY_ONLY") == "1" and
+        os.environ.get("FT_INSTALL_TEST_ENABLE_RESOURCE_OVERRIDES") == "1"):
+    proc_root = os.environ.get("FT_INSTALL_TEST_PROC_ROOT", proc_root)
 
 names = {
     "ft",
@@ -1715,7 +1722,7 @@ def frankenterm_owned(command):
     return bool(destination) and (
         real == destination or real.startswith(destination.rstrip(os.sep) + os.sep))
 
-def classify(command):
+def classify(command, *, matched_process_name=False):
     if command.endswith(" (deleted)"):
         command = command[:-len(" (deleted)")]
     basename = os.path.basename(command)
@@ -1729,10 +1736,13 @@ def classify(command):
         return "active"
     if basename in truncated:
         return "ambiguous"
-    return "inactive"
+    # Linux first recognizes comm, then resolves exe. A rename or a race can
+    # leave that known process name pointing at an unrecognized executable;
+    # it is not positive evidence that the process owns no FrankenTerm state.
+    return "ambiguous" if matched_process_name else "inactive"
 
 if sys.platform.startswith("linux") and not force_ps_census:
-    proc = pathlib.Path("/proc")
+    proc = pathlib.Path(proc_root)
     if not proc.is_dir():
         print("ambiguous")
         raise SystemExit(0)
@@ -1752,7 +1762,7 @@ if sys.platform.startswith("linux") and not force_ps_census:
         if comm not in names and comm not in truncated:
             continue
         try:
-            outcome = classify(os.readlink(process / "exe"))
+            outcome = classify(os.readlink(process / "exe"), matched_process_name=True)
         except (FileNotFoundError, ProcessLookupError):
             continue
         except OSError:
@@ -1761,7 +1771,10 @@ if sys.platform.startswith("linux") and not force_ps_census:
         if outcome == "active":
             print("active")
             raise SystemExit(0)
-        ambiguous = True
+        # A resolved stock WezTerm executable is positively unrelated. Keep
+        # prior uncertainty, but do not turn this inactive result into a
+        # refusal merely because its comm matched a compatibility name.
+        ambiguous = ambiguous or outcome == "ambiguous"
     print("ambiguous" if ambiguous else "inactive")
     raise SystemExit(0)
 
