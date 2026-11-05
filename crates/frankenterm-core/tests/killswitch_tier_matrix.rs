@@ -47,7 +47,7 @@ const TIERS: [KillSwitchLevel; 4] = [
 
 /// Every `ActionKind` variant. Adding a variant without listing it here
 /// fails `every_action_kind_is_in_the_matrix` below.
-const ACTIONS: [ActionKind; 24] = [
+const ACTIONS: [ActionKind; 25] = [
     ActionKind::SendText,
     ActionKind::SendCtrlC,
     ActionKind::SendCtrlD,
@@ -72,6 +72,7 @@ const ACTIONS: [ActionKind; 24] = [
     ActionKind::ConnectorAuditLog,
     ActionKind::ConnectorInvoke,
     ActionKind::ConnectorCredentialAction,
+    ActionKind::TxReconcile,
 ];
 
 /// `ActionKind::is_read_only` as documented in the contract: observation plus

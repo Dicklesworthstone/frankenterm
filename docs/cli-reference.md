@@ -129,10 +129,18 @@ ft tx plan [--contract-file <path>] [-f <plain|json>]
 ft tx run [--contract-file <path>] [--fail-step <step>] [--paused] [--kill-switch <level>] [--dry-run] [-f <plain|json>]
 ft tx rollback [--contract-file <path>] [--fail-compensation-for-step <step>] [-f <plain|json>]
 ft tx show [--contract-file <path>] [--include-contract] [-f <plain|json>]
+ft tx reconcile --step <step> --outcome <success|failed|compensated> --evidence <text> [--execution <id>] [--approval-code <code>] [--contract-file <path>] [-f <plain|json>]
 ```
 
 The contract defaults to `.ft/mission/tx-active.json` in the workspace. Robot
 callers use the same subcommands as `ft robot tx plan|run|rollback|show`.
+
+`ft tx reconcile` settles an effect a crash left unknown, after a person has
+looked at what really happened. The first run prints an allow-once code bound
+to that exact claim; running it again with `--approval-code` settles the record
+and writes a receipt under the ledger's hash chain. It has no robot form. Like
+any failed commit, one settled as `failed` can run again an hour after its
+dispatch, and `ft tx run` refuses it until then.
 
 ### Proof queue and deferred replay
 

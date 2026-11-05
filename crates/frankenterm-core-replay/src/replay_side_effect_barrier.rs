@@ -67,7 +67,9 @@ impl EffectType {
             | ActionKind::ConnectorAuditLog
             | ActionKind::ConnectorInvoke
             | ActionKind::ConnectorCredentialAction => Self::ApiCall,
-            ActionKind::WriteFile | ActionKind::DeleteFile => Self::FileWrite,
+            ActionKind::WriteFile | ActionKind::DeleteFile | ActionKind::TxReconcile => {
+                Self::FileWrite
+            }
             ActionKind::ExecCommand => Self::ExecCommand,
             ActionKind::ReservePane
             | ActionKind::ReleasePane

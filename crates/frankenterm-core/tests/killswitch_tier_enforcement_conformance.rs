@@ -46,6 +46,7 @@ const ALL_ACTIONS: &[ActionKind] = &[
     ActionKind::ConnectorAuditLog,
     ActionKind::ConnectorInvoke,
     ActionKind::ConnectorCredentialAction,
+    ActionKind::TxReconcile,
 ];
 
 /// In ascending severity order (`KillSwitchLevel` derives `Ord`).

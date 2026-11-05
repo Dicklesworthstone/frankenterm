@@ -29,9 +29,10 @@
     "ConnectorTriggerWorkflow",
     "ConnectorAuditLog",
     "ConnectorInvoke",
-    "ConnectorCredentialAction"
+    "ConnectorCredentialAction",
+    "TxReconcile"
   ],
-  "row_count": 192,
+  "row_count": 200,
   "verdict": {
     "disarmed_gates_nothing": true,
     "soft_stop_denies_only_workflow_launches": true,
@@ -425,6 +426,22 @@
       "rule_id": "policy.credential_broker"
     },
     {
+      "tier": "disarmed",
+      "action": "TxReconcile",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "disarmed",
+      "action": "TxReconcile",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
       "tier": "soft_stop",
       "action": "SendText",
       "pane": null,
@@ -809,6 +826,22 @@
       "rule_id": "policy.credential_broker"
     },
     {
+      "tier": "soft_stop",
+      "action": "TxReconcile",
+      "pane": null,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
+      "tier": "soft_stop",
+      "action": "TxReconcile",
+      "pane": 1,
+      "kill_switch_denied": false,
+      "decision": "allow",
+      "rule_id": null
+    },
+    {
       "tier": "hard_stop",
       "action": "SendText",
       "pane": null,
@@ -1193,6 +1226,22 @@
       "rule_id": "policy.kill_switch"
     },
     {
+      "tier": "hard_stop",
+      "action": "TxReconcile",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "hard_stop",
+      "action": "TxReconcile",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
       "tier": "emergency_halt",
       "action": "SendText",
       "pane": null,
@@ -1571,6 +1620,22 @@
     {
       "tier": "emergency_halt",
       "action": "ConnectorCredentialAction",
+      "pane": 1,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "TxReconcile",
+      "pane": null,
+      "kill_switch_denied": true,
+      "decision": "deny",
+      "rule_id": "policy.kill_switch"
+    },
+    {
+      "tier": "emergency_halt",
+      "action": "TxReconcile",
       "pane": 1,
       "kill_switch_denied": true,
       "decision": "deny",

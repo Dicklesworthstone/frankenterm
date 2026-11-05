@@ -105,6 +105,8 @@ pub enum ActionKind {
     ConnectorInvoke,
     /// Rotate or revoke credentials via a connector
     ConnectorCredentialAction,
+    /// Settle a transaction record a crash left `Pending`, from external proof
+    TxReconcile,
 }
 
 impl ActionKind {
@@ -191,6 +193,7 @@ impl ActionKind {
                 | Self::ConnectorAuditLog
                 | Self::ConnectorInvoke
                 | Self::ConnectorCredentialAction
+                | Self::TxReconcile
         )
     }
 
@@ -261,6 +264,7 @@ impl ActionKind {
             Self::ConnectorAuditLog => "connector_audit_log",
             Self::ConnectorInvoke => "connector_invoke",
             Self::ConnectorCredentialAction => "connector_credential_action",
+            Self::TxReconcile => "tx_reconcile",
         }
     }
 
@@ -289,7 +293,8 @@ impl ActionKind {
             | Self::ConnectorNotify
             | Self::ConnectorTicket
             | Self::ConnectorAuditLog
-            | Self::ConnectorInvoke => AuthAction::Write,
+            | Self::ConnectorInvoke
+            | Self::TxReconcile => AuthAction::Write,
         }
     }
 }
@@ -14969,10 +14974,11 @@ mod tests {
             ActionKind::ConnectorAuditLog,
             ActionKind::ConnectorInvoke,
             ActionKind::ConnectorCredentialAction,
+            ActionKind::TxReconcile,
         ];
         assert_eq!(
             all.len(),
-            24,
+            25,
             "ActionKind variant count drifted — update this guard and reconsider gating"
         );
         for a in all {
@@ -15001,7 +15007,8 @@ mod tests {
                 | ActionKind::ConnectorTriggerWorkflow
                 | ActionKind::ConnectorAuditLog
                 | ActionKind::ConnectorInvoke
-                | ActionKind::ConnectorCredentialAction => {}
+                | ActionKind::ConnectorCredentialAction
+                | ActionKind::TxReconcile => {}
             }
             if a.is_mutating() {
                 assert!(

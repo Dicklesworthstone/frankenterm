@@ -6489,6 +6489,44 @@ enum TxCommands {
         #[arg(long, short = 'f', default_value = "plain", value_parser = ["plain", "json"])]
         format: String,
     },
+
+    /// Settle a step a crash left Pending, from proof of what it did
+    ///
+    /// Dispatches nothing. The first run prints an allow-once code for this
+    /// exact claim; run the same command again with --approval-code to settle
+    /// the record. `ft tx run` and `ft tx rollback` then read the outcome.
+    Reconcile {
+        /// Step whose Pending record to settle
+        #[arg(long)]
+        step: String,
+
+        /// What the evidence shows the effect did. A commit is success or
+        /// failed; failed lets it be dispatched again once an hour has passed
+        /// since its dispatch, and also covers an effect undone by hand. An
+        /// undo is compensated or failed.
+        #[arg(long, value_parser = ["success", "failed", "compensated"])]
+        outcome: String,
+
+        /// What shows it. Stored redacted in the ledger, with a digest
+        #[arg(long)]
+        evidence: String,
+
+        /// Execution holding the record, when several do
+        #[arg(long)]
+        execution: Option<String>,
+
+        /// Allow-once code printed by the first run
+        #[arg(long)]
+        approval_code: Option<String>,
+
+        /// Tx contract JSON file (default: .ft/mission/tx-active.json)
+        #[arg(long)]
+        contract_file: Option<PathBuf>,
+
+        /// Output format: plain or json
+        #[arg(long, short = 'f', default_value = "plain", value_parser = ["plain", "json"])]
+        format: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -80882,9 +80920,189 @@ async fn handle_tx_command(
             ];
             emit_mission_success(output_format, serde_json::to_value(&data)?, &plain_lines)?;
         }
+        TxCommands::Reconcile {
+            step,
+            outcome,
+            evidence,
+            execution,
+            approval_code,
+            contract_file,
+            format,
+        } => {
+            let output_format = MissionCommandOutputFormat::from_flag(&format);
+            let contract_path = resolve_mission_tx_file_path(layout, contract_file);
+            match run_tx_reconcile(
+                layout,
+                config,
+                &contract_path,
+                TxReconcileClaim {
+                    step: &step,
+                    outcome: &outcome,
+                    evidence: &evidence,
+                    execution: execution.as_deref(),
+                },
+                approval_code.as_deref(),
+            )
+            .await
+            {
+                Ok((data, plain_lines)) => {
+                    emit_mission_success(output_format, data, &plain_lines)?;
+                }
+                Err(err) => emit_mission_error(output_format, err),
+            }
+        }
     }
 
     Ok(())
+}
+
+/// What `ft tx reconcile` says about one step.
+struct TxReconcileClaim<'a> {
+    step: &'a str,
+    outcome: &'a str,
+    evidence: &'a str,
+    execution: Option<&'a str>,
+}
+
+/// The first run issues an allow-once code for exactly this claim about exactly
+/// this record; the run holding the code consumes it and settles the record.
+async fn run_tx_reconcile(
+    layout: &frankenterm_core::config::WorkspaceLayout,
+    config: &frankenterm_core::config::Config,
+    contract_path: &Path,
+    claim: TxReconcileClaim<'_>,
+    approval_code: Option<&str>,
+) -> Result<(serde_json::Value, Vec<String>), MissionCommandError> {
+    use frankenterm_core::tx_execution::{
+        PendingEffectResolution, TxExecutionError, begin_pending_reconciliation,
+    };
+
+    let failed = |error_code: &'static str, message: String| MissionCommandError {
+        exit_code: MISSION_EXIT_IO,
+        error_code,
+        message,
+        hint: None,
+    };
+    let TxReconcileClaim {
+        step,
+        outcome,
+        evidence,
+        execution,
+    } = claim;
+    let resolution = match outcome {
+        "success" => PendingEffectResolution::Success,
+        "failed" => PendingEffectResolution::Failed,
+        _ => PendingEffectResolution::Compensated,
+    };
+    let contract_lock = lock_mission_tx_contract(&layout.root, contract_path)?;
+    let contract = load_mission_tx_contract_from_guard(&contract_lock)?;
+    let policy = frankenterm_core::tx_idempotency::IdempotencyPolicy::default();
+    let retry_after_minutes = policy.dedup_ttl_ms / 60_000;
+    let mut store = contract_lock
+        .open_idempotency_store(policy)
+        .map_err(|err| {
+            failed(
+                "mission.tx.store_open_failed",
+                format!("tx idempotency store open failed: {err}"),
+            )
+        })?;
+    let now_ms = u64::try_from(mission_now_ms()).unwrap_or(0);
+    let pending = begin_pending_reconciliation(
+        &contract, &mut store, execution, step, resolution, evidence, now_ms,
+    )
+    .map_err(|err| match err {
+        TxExecutionError::InvalidContract(message) => MissionCommandError {
+            exit_code: MISSION_EXIT_INVALID_INPUT,
+            error_code: "mission.tx.reconcile_invalid",
+            message,
+            hint: Some(
+                "Run `ft tx show --include-contract` for the step IDs of this contract."
+                    .to_string(),
+            ),
+        },
+        other => failed("mission.tx.reconcile_failed", other.to_string()),
+    })?;
+    let execution_id = pending.execution_id().to_string();
+
+    let storage_cx =
+        frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
+    let storage = frankenterm_core::storage::StorageHandle::new_with_cx(
+        &storage_cx,
+        &layout.db_path.to_string_lossy(),
+    )
+    .await
+    .map_err(|err| {
+        failed(
+            "mission.tx.reconcile_failed",
+            format!("failed to open the approval database: {err}"),
+        )
+    })?;
+    let approvals = frankenterm_core::approval::ApprovalStore::new(
+        &storage,
+        config.safety.approval.clone(),
+        layout.root.to_string_lossy().to_string(),
+    );
+
+    let Some(code) = approval_code else {
+        let issued = pending.issue_approval(&approvals).await;
+        storage.shutdown().await.ok();
+        let request = issued.map_err(|err| {
+            failed(
+                "mission.tx.reconcile_failed",
+                format!("failed to issue an approval code: {err}"),
+            )
+        })?;
+        let data = serde_json::json!({
+            "status": "approval_required",
+            "step_id": step,
+            "execution_id": execution_id,
+            "outcome": outcome,
+            "allow_once_code": request.allow_once_code,
+            "expires_at": request.expires_at,
+        });
+        let plain_lines = vec![
+            format!("Proof required to settle step {step} of {execution_id} as {outcome}."),
+            "  Nothing has changed. To settle it, run the same command with the same evidence and:"
+                .to_string(),
+            format!("  --approval-code {}", request.allow_once_code),
+        ];
+        return Ok((data, plain_lines));
+    };
+
+    let proven = pending.prove_with_approval(&approvals, code).await;
+    storage.shutdown().await.ok();
+    let proof = proven.map_err(|err| MissionCommandError {
+        exit_code: MISSION_EXIT_VALIDATION,
+        error_code: "mission.tx.reconcile_not_proven",
+        message: err.to_string(),
+        hint: Some(
+            "A code proves one claim, once: rerun without --approval-code for a new one."
+                .to_string(),
+        ),
+    })?;
+    let reconciled_by = std::env::var("USER").unwrap_or_else(|_| "operator".to_string());
+    let receipt = store
+        .reconcile_pending(pending, proof, &reconciled_by, now_ms)
+        .map_err(|err| failed("mission.tx.reconcile_failed", err.to_string()))?;
+    let mut plain_lines = vec![
+        format!("Settled step {step} of {execution_id} as {outcome}. Nothing was dispatched."),
+        format!("  Pending record: {}", receipt.pending_record_hash),
+        format!("  Evidence digest: {}", receipt.evidence_digest),
+        "  `ft tx run` and `ft tx rollback` now read this outcome.".to_string(),
+    ];
+    if outcome == "failed" {
+        plain_lines.push(format!(
+            "  `ft tx run` refuses a commit settled as failed until {retry_after_minutes} minutes after its dispatch."
+        ));
+    }
+    let data = serde_json::json!({
+        "status": "reconciled",
+        "step_id": step,
+        "execution_id": execution_id,
+        "outcome": outcome,
+        "receipt": receipt,
+    });
+    Ok((data, plain_lines))
 }
 
 fn mission_run_transition_plan(
@@ -106967,6 +107185,82 @@ reason = "overly conservative pending threshold"
             }
             _ => panic!("unexpected human tx show parse result"),
         }
+    }
+
+    #[test]
+    fn human_tx_reconcile_parses_a_claim_and_its_code() {
+        let claim = [
+            "ft",
+            "tx",
+            "reconcile",
+            "--step",
+            "s2",
+            "--outcome",
+            "failed",
+            "--evidence",
+            "never reached the host",
+        ];
+        let with_code =
+            claim
+                .iter()
+                .copied()
+                .chain(["--execution", "txe-1", "--approval-code", "ABC123"]);
+        match Cli::try_parse_from(with_code)
+            .expect("a claim with its code should parse")
+            .command
+            .map(|cmd| *cmd)
+        {
+            Some(Commands::Tx {
+                command:
+                    TxCommands::Reconcile {
+                        step,
+                        outcome,
+                        evidence,
+                        execution,
+                        approval_code,
+                        contract_file,
+                        format,
+                    },
+            }) => {
+                assert_eq!(step, "s2");
+                assert_eq!(outcome, "failed");
+                assert_eq!(evidence, "never reached the host");
+                assert_eq!(execution.as_deref(), Some("txe-1"));
+                assert_eq!(approval_code.as_deref(), Some("ABC123"));
+                assert_eq!(contract_file, None);
+                assert_eq!(format, "plain");
+            }
+            _ => panic!("unexpected human tx reconcile parse result"),
+        }
+        assert!(Cli::try_parse_from(claim).is_ok(), "the code is optional");
+        assert!(
+            Cli::try_parse_from([
+                "ft",
+                "tx",
+                "reconcile",
+                "--step",
+                "s2",
+                "--outcome",
+                "failed"
+            ])
+            .is_err(),
+            "a claim needs evidence"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "ft",
+                "tx",
+                "reconcile",
+                "--step",
+                "s2",
+                "--outcome",
+                "probably",
+                "--evidence",
+                "e"
+            ])
+            .is_err(),
+            "only an unambiguous outcome settles a record"
+        );
     }
 
     #[test]

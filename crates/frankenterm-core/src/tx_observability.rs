@@ -274,6 +274,13 @@ pub fn build_timeline(
             StepOutcome::Compensated { .. } => "compensated".to_string(),
             StepOutcome::Pending => unreachable!(),
         };
+        let summary = match &record.reconciliation {
+            Some(receipt) => format!(
+                "{summary}; reconciled by {} at {}",
+                receipt.reconciled_by, receipt.reconciled_at_ms
+            ),
+            None => summary,
+        };
 
         entries.push(TxTimelineEntry {
             timestamp_ms: record.timestamp_ms,

@@ -25,12 +25,14 @@ use serde::de;
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::approval::ApprovalStore;
+use crate::policy::{ActionKind, ActorKind, ApprovalRequest, PolicyInput};
 use crate::tx_plan_compiler::{StepRisk, TxPlan};
 
 // ── Idempotency Key ──────────────────────────────────────────────────────────
@@ -394,6 +396,28 @@ pub struct StepExecutionRecord {
     pub prev_hash: String,
     /// Agent that executed this step.
     pub agent_id: String,
+    /// How this outcome was proven, when a crash left the record `Pending` and
+    /// an operator settled it. Absent otherwise, so existing records keep their
+    /// hashes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconciliation: Option<PendingReconciliationReceipt>,
+}
+
+/// The durable account of settling a crash-orphaned `Pending` record, kept in
+/// that record and so under the ledger's hash chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingReconciliationReceipt {
+    /// Hash of the `Pending` record this settled, as it stood when proven.
+    pub pending_record_hash: String,
+    /// When it was settled. The record's own timestamp stays that of the
+    /// dispatch, since later records may follow it in the chain.
+    pub reconciled_at_ms: u64,
+    /// Who settled it.
+    pub reconciled_by: String,
+    /// Digest of the evidence as the operator gave it.
+    pub evidence_digest: String,
+    /// Hash of the allow-once code consumed as proof.
+    pub approval_hash: String,
 }
 
 impl StepExecutionRecord {
@@ -1151,6 +1175,7 @@ impl TxExecutionLedger {
             risk,
             prev_hash: self.last_hash.clone(),
             agent_id: agent_id.to_string(),
+            reconciliation: None,
         };
 
         let record_hash = record.hash();
@@ -1174,6 +1199,71 @@ impl TxExecutionLedger {
         outcome: StepOutcome,
         timestamp_ms: u64,
     ) -> Result<String, IdempotencyError> {
+        let index = self.pending_record_index(idem_key)?;
+        let ordinal = self.records[index].ordinal;
+        if outcome.is_ambiguous_replay_outcome() {
+            return Err(IdempotencyError::LedgerRecordInvariant {
+                reason: "a Pending reservation must complete with an unambiguous outcome"
+                    .to_string(),
+            });
+        }
+        let previous_timestamp = index
+            .checked_sub(1)
+            .and_then(|previous| self.records.get(previous))
+            .map(|record| record.timestamp_ms)
+            .unwrap_or(0);
+        let minimum_timestamp = previous_timestamp.max(self.records[index].timestamp_ms);
+        let next_timestamp = self
+            .records
+            .get(index + 1)
+            .map(|record| record.timestamp_ms);
+        if timestamp_ms < minimum_timestamp
+            || next_timestamp.is_some_and(|next| timestamp_ms > next)
+        {
+            return Err(IdempotencyError::LedgerRecordInvariant {
+                reason: format!(
+                    "completion timestamp {timestamp_ms} would violate ledger timestamp order around ordinal {ordinal}"
+                ),
+            });
+        }
+
+        self.records[index].outcome = outcome;
+        self.records[index].timestamp_ms = timestamp_ms;
+        self.rehash_records_from(index);
+
+        Ok(self.records[index].hash())
+    }
+
+    /// Settle the exact `Pending` record a crash left behind, with its proof's
+    /// receipt. The record keeps its dispatch timestamp, because records after
+    /// it can be older than the reconciliation.
+    fn reconcile_pending(
+        &mut self,
+        idem_key: &IdempotencyKey,
+        ordinal: u64,
+        outcome: StepOutcome,
+        receipt: PendingReconciliationReceipt,
+    ) -> Result<(), IdempotencyError> {
+        let index = self.pending_record_index(idem_key)?;
+        let record = &mut self.records[index];
+        if record.ordinal != ordinal || record.hash() != receipt.pending_record_hash {
+            return Err(IdempotencyError::ReconciliationNotProven {
+                key: idem_key.as_str().to_string(),
+                reason: "the Pending record is not the one the proof binds".to_string(),
+            });
+        }
+        record.outcome = outcome;
+        record.reconciliation = Some(receipt);
+        self.rehash_records_from(index);
+        Ok(())
+    }
+
+    /// Index of this key's record, which must still be `Pending` in a ledger
+    /// that is not sealed.
+    fn pending_record_index(
+        &mut self,
+        idem_key: &IdempotencyKey,
+    ) -> Result<usize, IdempotencyError> {
         if self.phase.is_terminal() {
             return Err(IdempotencyError::LedgerSealed { phase: self.phase });
         }
@@ -1210,34 +1300,11 @@ impl TxExecutionLedger {
                 key: idem_key.as_str().to_string(),
             });
         }
-        if outcome.is_ambiguous_replay_outcome() {
-            return Err(IdempotencyError::LedgerRecordInvariant {
-                reason: "a Pending reservation must complete with an unambiguous outcome"
-                    .to_string(),
-            });
-        }
-        let previous_timestamp = index
-            .checked_sub(1)
-            .and_then(|previous| self.records.get(previous))
-            .map(|record| record.timestamp_ms)
-            .unwrap_or(0);
-        let minimum_timestamp = previous_timestamp.max(self.records[index].timestamp_ms);
-        let next_timestamp = self
-            .records
-            .get(index + 1)
-            .map(|record| record.timestamp_ms);
-        if timestamp_ms < minimum_timestamp
-            || next_timestamp.is_some_and(|next| timestamp_ms > next)
-        {
-            return Err(IdempotencyError::LedgerRecordInvariant {
-                reason: format!(
-                    "completion timestamp {timestamp_ms} would violate ledger timestamp order around ordinal {ordinal}"
-                ),
-            });
-        }
+        Ok(index)
+    }
 
-        self.records[index].outcome = outcome;
-        self.records[index].timestamp_ms = timestamp_ms;
+    /// Relink the chain after an in-place change to the record at `index`.
+    fn rehash_records_from(&mut self, index: usize) {
         for idx in index..self.records.len() {
             self.records[idx].prev_hash = if idx == 0 {
                 String::new()
@@ -1250,8 +1317,6 @@ impl TxExecutionLedger {
             .last()
             .map(StepExecutionRecord::hash)
             .unwrap_or_default();
-
-        Ok(self.records[index].hash())
     }
 
     /// Verify the hash chain integrity. Returns details of any breaks.
@@ -1745,9 +1810,18 @@ impl DurableKeyLease {
 pub(crate) struct DurableKeyLeaseSet {
     leases: BTreeMap<IdempotencyKey, DurableKeyLease>,
     proof_barrier: Arc<ProofBarrierGuard>,
+    settled_by_proof: BTreeSet<IdempotencyKey>,
 }
 
 impl DurableKeyLeaseSet {
+    /// Whether an operator's proof settled the outcome observed for this key,
+    /// instead of a dispatch's reply. A crash can then have kept the outcome
+    /// from ever reaching the contract's receipts.
+    #[must_use]
+    pub(crate) fn settled_by_proof(&self, idem_key: &IdempotencyKey) -> bool {
+        self.settled_by_proof.contains(idem_key)
+    }
+
     /// Number of logical key leases currently retained by the set.
     #[cfg(test)]
     #[must_use]
@@ -1838,6 +1912,116 @@ impl IdempotencyReservation {
     }
 }
 
+/// The most evidence one reconciliation can carry.
+const MAX_RECONCILIATION_EVIDENCE_BYTES: usize = 4096;
+
+/// One durable `Pending` record a crash left behind, held under its normal
+/// plan barrier, key and execution locks while an operator's claim about it is
+/// proven. A dispatch still in flight holds the key lock, so this cannot be
+/// acquired over one.
+#[derive(Debug)]
+pub struct PendingReconciliation {
+    idem_key: IdempotencyKey,
+    ordinal: u64,
+    pending_record_hash: String,
+    outcome: StepOutcome,
+    evidence_digest: String,
+    reservation: IdempotencyReservation,
+}
+
+/// An allow-once approval consumed for one exact reconciliation. Only
+/// [`PendingReconciliation::prove_with_approval`] makes one, and
+/// [`IdempotencyStore::reconcile_pending`] consumes it.
+#[derive(Debug)]
+pub struct ReconciliationProof {
+    fingerprint: String,
+    approval_hash: String,
+}
+
+impl PendingReconciliation {
+    /// The key being settled.
+    #[must_use]
+    pub fn idem_key(&self) -> &IdempotencyKey {
+        &self.idem_key
+    }
+
+    /// The execution holding the record.
+    #[must_use]
+    pub fn execution_id(&self) -> &str {
+        &self.reservation.execution_id
+    }
+
+    /// The outcome the record would take.
+    #[must_use]
+    pub fn outcome(&self) -> &StepOutcome {
+        &self.outcome
+    }
+
+    /// Digest of exactly what is being claimed: this record as it stands now,
+    /// the outcome, and the evidence.
+    #[must_use]
+    pub fn fingerprint(&self) -> String {
+        let outcome = serde_json::to_vec(&self.outcome)
+            .expect("StepOutcome serialization is infallible for its typed primitive fields");
+        sha256_domain_digest(
+            b"frankenterm.tx.pending-reconciliation.v1",
+            &[
+                self.reservation.execution_id.as_bytes(),
+                self.idem_key.as_str().as_bytes(),
+                &self.ordinal.to_be_bytes(),
+                self.pending_record_hash.as_bytes(),
+                &outcome,
+                self.evidence_digest.as_bytes(),
+            ],
+        )
+    }
+
+    fn approval_input(&self) -> PolicyInput {
+        PolicyInput::new(ActionKind::TxReconcile, ActorKind::Human)
+            .with_text_summary(format!(
+                "settle step {} of execution {}",
+                self.idem_key.step_id(),
+                self.reservation.execution_id
+            ))
+            .with_command_text(self.fingerprint())
+    }
+
+    /// Issue the allow-once approval that can prove this reconciliation, and
+    /// nothing else: changing the record, the outcome or the evidence makes it
+    /// useless.
+    pub async fn issue_approval(
+        &self,
+        approvals: &ApprovalStore<'_>,
+    ) -> crate::Result<ApprovalRequest> {
+        approvals.issue(&self.approval_input(), None).await
+    }
+
+    /// Consume the approval issued for this reconciliation. A failure afterwards
+    /// leaves the record `Pending` with the approval spent, so the operator asks
+    /// for another.
+    pub async fn prove_with_approval(
+        &self,
+        approvals: &ApprovalStore<'_>,
+        allow_once_code: &str,
+    ) -> Result<ReconciliationProof, IdempotencyError> {
+        let not_proven = |reason: String| IdempotencyError::ReconciliationNotProven {
+            key: self.idem_key.as_str().to_string(),
+            reason,
+        };
+        let record = approvals
+            .consume(allow_once_code, &self.approval_input())
+            .await
+            .map_err(|error| not_proven(format!("approval could not be consumed: {error}")))?
+            .ok_or_else(|| {
+                not_proven("no unused approval matches this code and claim".to_string())
+            })?;
+        Ok(ReconciliationProof {
+            fingerprint: self.fingerprint(),
+            approval_hash: record.code_hash,
+        })
+    }
+}
+
 /// Exclusive cross-process lock for one execution ledger.
 ///
 /// Durable writer lock order is always plan barrier first, optional
@@ -1912,6 +2096,7 @@ struct DurableOutcomeObservation {
     execution_id: String,
     ordinal: u64,
     outcome: StepOutcome,
+    settled_by_proof: bool,
 }
 
 fn select_authoritative_durable_outcome(
@@ -3296,6 +3481,7 @@ impl IdempotencyStore {
                         execution_id: execution_id.clone(),
                         ordinal: record.ordinal,
                         outcome: record.outcome.clone(),
+                        settled_by_proof: record.reconciliation.is_some(),
                     });
             }
         }
@@ -3765,15 +3951,22 @@ impl IdempotencyStore {
         let proof_barrier =
             self.acquire_plan_proof_barrier(&plan_id, ProofBarrierMode::Exclusive)?;
         let mut observed = self.refresh_durable_outcomes_for_keys(&keys, now_ms)?;
+        let mut settled_by_proof = BTreeSet::new();
         let leases = keys
             .into_iter()
             .map(|idem_key| {
-                let observed_outcome = observed
+                let observation = observed
                     .remove(&idem_key)
                     .expect("bulk refresh returns one entry per requested unique key");
+                if observation
+                    .as_ref()
+                    .is_some_and(|observation| observation.settled_by_proof)
+                {
+                    settled_by_proof.insert(idem_key.clone());
+                }
                 let lease = DurableKeyLease {
                     idem_key: idem_key.clone(),
-                    observed_outcome,
+                    observed_outcome: observation.map(|observation| observation.outcome),
                     key_lock: None,
                     proof_barrier: Arc::clone(&proof_barrier),
                 };
@@ -3783,6 +3976,7 @@ impl IdempotencyStore {
         Ok(DurableKeyLeaseSet {
             leases,
             proof_barrier,
+            settled_by_proof,
         })
     }
 
@@ -3950,6 +4144,7 @@ impl IdempotencyStore {
     ) -> Result<Option<StepOutcome>, IdempotencyError> {
         self.refresh_durable_outcomes_for_keys(std::slice::from_ref(idem_key), now_ms)?
             .remove(idem_key)
+            .map(|observation| observation.map(|observation| observation.outcome))
             .ok_or_else(|| IdempotencyError::LedgerRecordInvariant {
                 reason: format!(
                     "bulk durable refresh omitted requested idempotency key {}",
@@ -3964,7 +4159,7 @@ impl IdempotencyStore {
         &mut self,
         idem_keys: &[IdempotencyKey],
         now_ms: u64,
-    ) -> Result<BTreeMap<IdempotencyKey, Option<StepOutcome>>, IdempotencyError> {
+    ) -> Result<BTreeMap<IdempotencyKey, Option<DurableOutcomeObservation>>, IdempotencyError> {
         let mut matching_records = idem_keys
             .iter()
             .cloned()
@@ -4082,6 +4277,7 @@ impl IdempotencyStore {
                             execution_id: stem.clone(),
                             ordinal: record.ordinal,
                             outcome: record.outcome.clone(),
+                            settled_by_proof: record.reconciliation.is_some(),
                         });
                     }
                 }
@@ -4112,7 +4308,7 @@ impl IdempotencyStore {
                         authoritative.outcome.clone(),
                         authoritative.timestamp_ms,
                     );
-                    Some(authoritative.outcome)
+                    Some(authoritative)
                 }
                 Some(_) | None => None,
             };
@@ -4649,6 +4845,142 @@ impl IdempotencyStore {
         Ok(hash)
     }
 
+    /// The executions this store holds with a `Pending` record for `idem_key`.
+    #[must_use]
+    pub fn executions_pending_on(&self, idem_key: &IdempotencyKey) -> Vec<String> {
+        let mut executions: Vec<String> = self
+            .ledgers
+            .iter()
+            .filter(|(_, ledger)| {
+                ledger
+                    .records()
+                    .iter()
+                    .any(|record| record.outcome.is_pending() && &record.idem_key == idem_key)
+            })
+            .map(|(execution_id, _)| execution_id.clone())
+            .collect();
+        executions.sort();
+        executions
+    }
+
+    /// Lock one `Pending` record and bind a claim about it.
+    ///
+    /// A normal run stays fail-closed on such a record: this is the only way
+    /// past it, and it dispatches nothing. Only an unambiguous outcome can be
+    /// claimed, and an undo can only be claimed as `Compensated` or `Failed`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdempotencyError::ReservationInProgress`] while another process
+    /// owns the key, [`IdempotencyError::ReconciliationNotPending`] when this
+    /// execution holds no `Pending` record for it, or an invariant error for a
+    /// claim that cannot settle it.
+    pub fn acquire_pending_reconciliation(
+        &mut self,
+        execution_id: &str,
+        idem_key: &IdempotencyKey,
+        outcome: StepOutcome,
+        evidence: &str,
+        now_ms: u64,
+    ) -> Result<PendingReconciliation, IdempotencyError> {
+        let settles = match &outcome {
+            StepOutcome::Success { .. } => !idem_key.is_compensation(),
+            StepOutcome::Failed {
+                compensated: false, ..
+            } => true,
+            StepOutcome::Compensated {
+                original_outcome, ..
+            } => {
+                idem_key.is_compensation()
+                    && matches!(original_outcome.as_ref(), StepOutcome::Success { .. })
+            }
+            _ => false,
+        };
+        if !settles {
+            return Err(IdempotencyError::LedgerRecordInvariant {
+                reason: format!("{outcome:?} cannot settle Pending key {idem_key}"),
+            });
+        }
+        if evidence.trim().is_empty() || evidence.len() > MAX_RECONCILIATION_EVIDENCE_BYTES {
+            return Err(IdempotencyError::LedgerRecordInvariant {
+                reason: format!(
+                    "reconciliation evidence must hold 1 to {MAX_RECONCILIATION_EVIDENCE_BYTES} bytes"
+                ),
+            });
+        }
+        let reservation = self.acquire_durable_reservation(execution_id, idem_key, now_ms)?;
+        let locked = self.read_durable_ledger_locked(&reservation.execution_lock)?;
+        let record = locked
+            .ledger
+            .records()
+            .iter()
+            .find(|record| record.outcome.is_pending() && &record.idem_key == idem_key)
+            .ok_or_else(|| IdempotencyError::ReconciliationNotPending {
+                key: idem_key.as_str().to_string(),
+                execution_id: execution_id.to_string(),
+            })?;
+        Ok(PendingReconciliation {
+            idem_key: idem_key.clone(),
+            ordinal: record.ordinal,
+            pending_record_hash: record.hash(),
+            outcome,
+            evidence_digest: sha256_domain_digest(
+                b"frankenterm.tx.reconciliation-evidence.v1",
+                &[evidence.as_bytes()],
+            ),
+            reservation,
+        })
+    }
+
+    /// Settle the record with its proof, dispatching nothing, and return the
+    /// receipt now durable in that record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdempotencyError::ReconciliationNotProven`] when the proof is
+    /// for another claim or the record has changed, a binding error when the
+    /// locks belong to another store, or a durable publication error. In every
+    /// case the record stays `Pending`.
+    pub fn reconcile_pending(
+        &mut self,
+        pending: PendingReconciliation,
+        proof: ReconciliationProof,
+        reconciled_by: &str,
+        now_ms: u64,
+    ) -> Result<PendingReconciliationReceipt, IdempotencyError> {
+        self.validate_reservation_binding(&pending.reservation, &pending.idem_key)?;
+        let execution_id = pending.reservation.execution_id.clone();
+        self.validate_execution_lock(&pending.reservation.execution_lock, &execution_id)?;
+        if proof.fingerprint != pending.fingerprint() {
+            return Err(IdempotencyError::ReconciliationNotProven {
+                key: pending.idem_key.as_str().to_string(),
+                reason: "the proof was made for another claim".to_string(),
+            });
+        }
+        self.validate_monotonic_timestamp(now_ms)?;
+        let locked = self.read_durable_ledger_locked(&pending.reservation.execution_lock)?;
+        let mut candidate = locked.ledger;
+        let receipt = PendingReconciliationReceipt {
+            pending_record_hash: pending.pending_record_hash.clone(),
+            reconciled_at_ms: now_ms,
+            reconciled_by: reconciled_by.to_string(),
+            evidence_digest: pending.evidence_digest.clone(),
+            approval_hash: proof.approval_hash,
+        };
+        candidate.reconcile_pending(
+            &pending.idem_key,
+            pending.ordinal,
+            pending.outcome.clone(),
+            receipt.clone(),
+        )?;
+        self.persist_ledger_snapshot(&candidate, Some(&locked.pinned_file))?;
+        self.evict_stale(now_ms.saturating_sub(self.policy.dedup_ttl_ms));
+        self.dedup
+            .record(&pending.idem_key, &execution_id, pending.outcome, now_ms);
+        self.ledgers.insert(execution_id, candidate);
+        Ok(receipt)
+    }
+
     fn validate_reservation_binding(
         &self,
         reservation: &IdempotencyReservation,
@@ -5039,6 +5371,12 @@ impl Default for IdempotencyPolicy {
 pub enum IdempotencyError {
     #[error("duplicate execution: key {key} already recorded")]
     DuplicateExecution { key: String },
+
+    #[error("no Pending record for key {key} in execution {execution_id}")]
+    ReconciliationNotPending { key: String, execution_id: String },
+
+    #[error("reconciliation of key {key} is not proven: {reason}")]
+    ReconciliationNotProven { key: String, reason: String },
 
     #[error("invalid phase transition: {from:?} → {to:?}")]
     InvalidPhaseTransition { from: TxPhase, to: TxPhase },
@@ -6254,6 +6592,7 @@ mod tests {
             risk: StepRisk::Low,
             prev_hash: prev_hash.to_string(),
             agent_id: "a".to_string(),
+            reconciliation: None,
         }
     }
 
@@ -9518,6 +9857,99 @@ mod tests {
     // ── StepExecutionRecord tests ──
 
     #[test]
+    fn a_record_settled_by_no_one_serializes_and_hashes_as_before() {
+        let record = StepExecutionRecord {
+            ordinal: 0,
+            idem_key: make_key("p1", "s1"),
+            execution_id: "exec-1".to_string(),
+            timestamp_ms: 1000,
+            outcome: StepOutcome::Pending,
+            risk: StepRisk::Low,
+            prev_hash: String::new(),
+            agent_id: "a1".to_string(),
+            reconciliation: None,
+        };
+        // A record's hash is over its JSON, so the same JSON is the same hash
+        // for every ledger written before receipts existed.
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(!json.contains("reconciliation"), "{json}");
+        let back: StepExecutionRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.reconciliation, None);
+        assert_eq!(back.hash(), record.hash());
+    }
+
+    #[test]
+    fn a_reconciliation_receipt_is_under_the_hash_chain() {
+        let mut ledger = TxExecutionLedger::new("exec-1", "p1", 7);
+        ledger.transition_phase(TxPhase::Preparing).unwrap();
+        ledger.transition_phase(TxPhase::Committing).unwrap();
+        let key = make_key("p1", "s1");
+        ledger
+            .append(key.clone(), StepOutcome::Pending, StepRisk::Low, "a1", 1000)
+            .unwrap();
+        ledger
+            .append(
+                make_key("p1", "s2"),
+                StepOutcome::Success { result: None },
+                StepRisk::Low,
+                "a1",
+                1500,
+            )
+            .unwrap();
+        let receipt = PendingReconciliationReceipt {
+            pending_record_hash: ledger.records[0].hash(),
+            reconciled_at_ms: 9000,
+            reconciled_by: "operator".to_string(),
+            evidence_digest: "digest".to_string(),
+            approval_hash: "code-hash".to_string(),
+        };
+        let settled = StepOutcome::Success {
+            result: Some("proven".to_string()),
+        };
+
+        for (ordinal, record_hash) in [
+            (1, receipt.pending_record_hash.clone()),
+            (0, "another record".to_string()),
+        ] {
+            let claim = PendingReconciliationReceipt {
+                pending_record_hash: record_hash,
+                ..receipt.clone()
+            };
+            assert!(matches!(
+                ledger.reconcile_pending(&key, ordinal, settled.clone(), claim),
+                Err(IdempotencyError::ReconciliationNotProven { .. })
+            ));
+            assert!(ledger.records[0].outcome.is_pending());
+            assert_eq!(ledger.records[0].reconciliation, None);
+        }
+
+        ledger
+            .reconcile_pending(&key, 0, settled.clone(), receipt.clone())
+            .unwrap();
+        assert_eq!(ledger.records[0].outcome, settled);
+        assert_eq!(ledger.records[0].reconciliation, Some(receipt.clone()));
+        // The next record is older than the reconciliation, so the settled
+        // record has to keep the time of its dispatch.
+        assert_eq!(ledger.records[0].timestamp_ms, 1000);
+        assert!(ledger.verify_chain().chain_intact);
+
+        assert!(matches!(
+            ledger.reconcile_pending(&key, 0, settled, receipt.clone()),
+            Err(IdempotencyError::DuplicateExecution { .. })
+        ));
+
+        let mut forged = ledger.clone();
+        forged.records[0].reconciliation = Some(PendingReconciliationReceipt {
+            reconciled_by: "someone else".to_string(),
+            ..receipt
+        });
+        assert!(!forged.verify_chain().chain_intact);
+        let mut stripped = ledger;
+        stripped.records[0].reconciliation = None;
+        assert!(!stripped.verify_chain().chain_intact);
+    }
+
+    #[test]
     fn record_hash_deterministic() {
         let record = StepExecutionRecord {
             ordinal: 0,
@@ -9528,6 +9960,7 @@ mod tests {
             risk: StepRisk::Low,
             prev_hash: String::new(),
             agent_id: "a1".to_string(),
+            reconciliation: None,
         };
         let h1 = record.hash();
         let h2 = record.hash();
@@ -9546,6 +9979,7 @@ mod tests {
             risk: StepRisk::Low,
             prev_hash: String::new(),
             agent_id: "a1".to_string(),
+            reconciliation: None,
         };
         assert_ne!(make(0).hash(), make(1).hash());
     }
@@ -9568,6 +10002,7 @@ mod tests {
             risk,
             prev_hash: String::new(),
             agent_id: "a1".to_string(),
+            reconciliation: None,
         };
         assert_ne!(make(StepRisk::Low).hash(), make(StepRisk::Critical).hash());
         assert_ne!(make(StepRisk::Low).hash(), make(StepRisk::Medium).hash());
@@ -9585,6 +10020,7 @@ mod tests {
             risk: StepRisk::Low,
             prev_hash: String::new(),
             agent_id: agent.to_string(),
+            reconciliation: None,
         };
         assert_ne!(make("agent-A").hash(), make("agent-B").hash());
         assert_ne!(make("").hash(), make("agent-A").hash());
@@ -9702,6 +10138,7 @@ mod tests {
                 risk: lift(risk_a),
                 prev_hash: String::new(),
                 agent_id: agent_a.clone(),
+                reconciliation: None,
             };
             let b = StepExecutionRecord {
                 ordinal: 0,
@@ -9712,6 +10149,7 @@ mod tests {
                 risk: lift(risk_b),
                 prev_hash: String::new(),
                 agent_id: agent_b.clone(),
+                reconciliation: None,
             };
             // Records are equal iff (risk, agent_id) match. If
             // either differs, the hash MUST differ.
@@ -9743,6 +10181,7 @@ mod tests {
             risk: StepRisk::Critical,
             prev_hash: "abcdef".to_string(),
             agent_id: "agent-x".to_string(),
+            reconciliation: None,
         };
         let json = serde_json::to_string(&record).unwrap();
         let back: StepExecutionRecord = serde_json::from_str(&json).unwrap();

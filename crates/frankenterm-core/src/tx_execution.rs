@@ -28,7 +28,7 @@ use crate::plan::{
 use crate::runtime_async::CompatRuntime;
 use crate::tx_idempotency::{
     DurableKeyLeaseSet, IdempotencyError, IdempotencyKey, IdempotencyPolicy, IdempotencyStore,
-    ResumeRecommendation, StepOutcome, TxExecutionLedger, TxPhase,
+    PendingReconciliation, ResumeRecommendation, StepOutcome, TxExecutionLedger, TxPhase,
 };
 use crate::tx_observability::{
     TxEventKind, TxForensicBundle, TxObservabilityConfig, TxObservabilityEvent,
@@ -3767,6 +3767,108 @@ fn compensation_idempotency_key(
     ))
 }
 
+/// What an operator proved happened to an effect a crash left `Pending`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingEffectResolution {
+    /// The commit effect applied.
+    Success,
+    /// The effect did not apply, or was undone by hand, so it can be dispatched
+    /// again.
+    Failed,
+    /// The undo applied.
+    Compensated,
+}
+
+/// Lock the one `Pending` record this step holds and bind the operator's claim
+/// about it, for [`IdempotencyStore::reconcile_pending`]. Dispatches nothing.
+///
+/// # Errors
+///
+/// Returns [`TxExecutionError::InvalidContract`] for an unknown step, a step
+/// with no such record or more than one, or a claim that cannot settle it;
+/// [`TxExecutionError::InProgress`] while another process owns the key.
+pub fn begin_pending_reconciliation(
+    contract: &MissionTxContract,
+    store: &mut IdempotencyStore,
+    execution_id: Option<&str>,
+    step_id: &str,
+    resolution: PendingEffectResolution,
+    evidence: &str,
+    now_ms: u64,
+) -> Result<PendingReconciliation, TxExecutionError> {
+    let commit_key = commit_idempotency_key(contract, step_id)?;
+    let compensation_key = compensation_idempotency_key(contract, step_id).ok();
+    let mut held = Vec::new();
+    for key in std::iter::once(&commit_key).chain(compensation_key.as_ref()) {
+        for holder in store.executions_pending_on(key) {
+            if execution_id.is_none_or(|wanted| wanted == holder) {
+                held.push((holder, key));
+            }
+        }
+    }
+    let [(holder, key)] = held.as_slice() else {
+        let holders = held
+            .iter()
+            .map(|(holder, _)| holder.as_str())
+            .collect::<Vec<_>>();
+        return Err(TxExecutionError::InvalidContract(format!(
+            "step {step_id} needs exactly one Pending record to reconcile, found {} in [{}]",
+            held.len(),
+            holders.join(", ")
+        )));
+    };
+
+    let evidence_text = crate::redactor::Redactor::new().redact(evidence);
+    let is_undo = *key != &commit_key;
+    let outcome = match resolution {
+        PendingEffectResolution::Success if !is_undo => StepOutcome::Success {
+            result: Some(evidence_text),
+        },
+        PendingEffectResolution::Failed => StepOutcome::Failed {
+            error_code: "reconciled_not_applied".to_string(),
+            error_message: evidence_text,
+            compensated: false,
+        },
+        PendingEffectResolution::Compensated if is_undo => {
+            // Rollback holds an undo to the commit outcome it embeds.
+            let original = store
+                .refresh_durable_outcome_for_key(&commit_key, now_ms)
+                .map_err(|error| TxExecutionError::LedgerWrite(error.to_string()))?
+                .filter(|outcome| matches!(outcome, StepOutcome::Success { .. }))
+                .ok_or_else(|| {
+                    TxExecutionError::InvalidContract(format!(
+                        "step {step_id} has no durable Success for its undo to have undone"
+                    ))
+                })?;
+            StepOutcome::Compensated {
+                original_outcome: Box::new(original),
+                compensation_result: evidence_text,
+            }
+        }
+        PendingEffectResolution::Success => {
+            return Err(TxExecutionError::InvalidContract(format!(
+                "the Pending record of step {step_id} is its undo: it settles as compensated or failed"
+            )));
+        }
+        PendingEffectResolution::Compensated => {
+            return Err(TxExecutionError::InvalidContract(format!(
+                "the Pending record of step {step_id} is its commit: it settles as success or failed, and failed covers an effect undone by hand"
+            )));
+        }
+    };
+    store
+        .acquire_pending_reconciliation(holder, key, outcome, evidence, now_ms)
+        .map_err(|error| match error {
+            IdempotencyError::ReservationInProgress { key } => TxExecutionError::InProgress(
+                format!("another transaction mutation currently owns key {key}"),
+            ),
+            IdempotencyError::LedgerRecordInvariant { reason } => {
+                TxExecutionError::InvalidContract(reason)
+            }
+            other => TxExecutionError::LedgerWrite(other.to_string()),
+        })
+}
+
 fn rollback_proof_idempotency_keys(
     contract: &MissionTxContract,
     commit_report: &TxCommitReport,
@@ -5932,8 +6034,18 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         let leases = store
             .acquire_durable_key_leases(keys, checked_logical_now_ms(now_ms)?)
             .map_err(classify_rollback_proof_lease_error)?;
+        let receipted_commits = contract
+            .receipts
+            .iter()
+            .filter(|receipt| {
+                receipt.get("phase").and_then(serde_json::Value::as_str) == Some("commit")
+                    && receipt.get("outcome").and_then(serde_json::Value::as_str)
+                        == Some("committed")
+            })
+            .filter_map(|receipt| receipt.get("step_id").and_then(serde_json::Value::as_str))
+            .collect::<HashSet<_>>();
         let mut observed_commits = HashMap::new();
-        let mut first_pending = None;
+        let mut first_orphan = None;
         for step in &contract.plan.steps {
             let key = commit_idempotency_key(contract, &step.step_id.0)?;
             let observed = leases
@@ -5946,15 +6058,21 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                 })?
                 .observed_outcome()
                 .cloned();
-            if matches!(observed, Some(StepOutcome::Pending)) && first_pending.is_none() {
-                first_pending = Some(step.step_id.0.clone());
+            let orphaned = matches!(observed, Some(StepOutcome::Pending))
+                || (leases.settled_by_proof(&key)
+                    && !receipted_commits.contains(step.step_id.0.as_str()));
+            if orphaned && first_orphan.is_none() {
+                first_orphan = Some(step.step_id.0.clone());
             }
             observed_commits.insert(step.step_id.0.clone(), observed);
         }
 
-        // This capability is specific to an orphaned Pending action. Ordinary
-        // rollback retains its strict complete-receipt and durable-proof rules.
-        let Some(first_pending) = first_pending else {
+        // This capability is specific to an action a crash orphaned: still
+        // Pending, or settled by proof with no committed receipt in the contract,
+        // whose older receipts cannot speak to a dispatch the crash interrupted.
+        // Ordinary rollback retains its strict complete-receipt and
+        // durable-proof rules.
+        let Some(first_orphan) = first_orphan else {
             let mut commit_report = mission_tx_rollback_commit_report(contract, now_ms)
                 .map_err(TxExecutionError::CompensationPhase)?;
             let outcomes = Self::authoritative_commit_outcomes_with_leases(contract, &leases)?;
@@ -6053,8 +6171,8 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         if outcomes.is_empty() {
             return Err(TxExecutionError::RollbackProof {
                 kind: RollbackProofKind::Conflict,
-                step_id: first_pending,
-                detail: "Pending commit requires reconciliation and the receipt history does not identify a committed effect; no durable successful effect can be compensated".to_string(),
+                step_id: first_orphan,
+                detail: "the receipt history does not identify a committed effect, so no durable successful effect can be compensated: a Pending commit requires reconciliation, and a settled failure left nothing to undo".to_string(),
             });
         }
 
@@ -14881,6 +14999,605 @@ mod tests {
             ));
             assert_eq!(durable_ledger_file_snapshot(dir.path()), ledger_bytes);
         }
+    }
+
+    /// The record's claim, on the given store and at a time after the crash.
+    fn claim_s2(
+        contract: &MissionTxContract,
+        store: &mut IdempotencyStore,
+        resolution: PendingEffectResolution,
+        evidence: &str,
+    ) -> Result<PendingReconciliation, TxExecutionError> {
+        begin_pending_reconciliation(contract, store, None, "s2", resolution, evidence, 7_000)
+    }
+
+    fn on_approval_runtime<F: std::future::Future<Output = ()>>(future: F) {
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("approval test runtime");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(future);
+        }));
+        // asupersync's TLS destructors can panic as the runtime drops.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            crate::runtime_async::clear_runtime_handle,
+        ));
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    /// Issue and consume a real allow-once approval for this claim.
+    fn prove_by_approval(
+        pending: &PendingReconciliation,
+    ) -> crate::tx_idempotency::ReconciliationProof {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("approvals.db");
+        let mut proof = None;
+        on_approval_runtime(async {
+            let storage = crate::storage::StorageHandle::new(database.to_str().unwrap())
+                .await
+                .unwrap();
+            let approvals = crate::approval::ApprovalStore::new(
+                &storage,
+                crate::config::ApprovalConfig::default(),
+                "workspace",
+            );
+            let code = pending
+                .issue_approval(&approvals)
+                .await
+                .unwrap()
+                .allow_once_code;
+            proof = Some(
+                pending
+                    .prove_with_approval(&approvals, &code)
+                    .await
+                    .unwrap(),
+            );
+            storage.shutdown().await.unwrap();
+        });
+        proof.unwrap()
+    }
+
+    /// A crash orphans a record; a rerun refuses it, proof settles it, and the
+    /// rerun after that carries on without repeating the effect.
+    #[test]
+    fn a_proven_success_settles_a_crash_orphan_and_a_rerun_repeats_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let effect_path = directory.path().join("effects.log");
+        let policy = IdempotencyPolicy::default();
+        let (original, store) = orphaned_file_effects(directory.path(), policy.clone());
+        drop(store);
+        let engine = make_pane_engine(FileEffectBackend::handle(
+            &effect_path,
+            "",
+            FileEffectFault::None,
+        ));
+
+        let mut store = IdempotencyStore::open(directory.path(), policy.clone()).unwrap();
+        let mut refused = original.clone();
+        let error = engine
+            .execute_with_store(&mut refused, &mut store, 6_000)
+            .expect_err("a normal run stays fail-closed on the record");
+        assert!(
+            matches!(error, TxExecutionError::DedupConflict { ref step_id, ref outcome }
+            if step_id == "s2" && outcome.contains("Pending")),
+            "{error:?}"
+        );
+
+        let evidence = "later is in effects.log";
+        let pending = claim_s2(
+            &original,
+            &mut store,
+            PendingEffectResolution::Success,
+            evidence,
+        )
+        .unwrap();
+        let execution_id = pending.execution_id().to_string();
+        let proof = prove_by_approval(&pending);
+        let receipt = store
+            .reconcile_pending(pending, proof, "operator", 7_000)
+            .unwrap();
+        assert_eq!(receipt.reconciled_by, "operator");
+        assert_eq!(receipt.reconciled_at_ms, 7_000);
+        drop(store);
+
+        let mut store = IdempotencyStore::open(directory.path(), policy).unwrap();
+        let ledger = store.get_ledger(&execution_id).unwrap();
+        assert!(ledger.verify_chain().chain_intact);
+        let record = ledger
+            .records()
+            .iter()
+            .find(|record| record.idem_key.step_id() == "s2")
+            .unwrap();
+        assert_eq!(record.reconciliation.as_ref(), Some(&receipt));
+        assert_eq!(
+            record.outcome,
+            StepOutcome::Success {
+                result: Some(evidence.to_string())
+            }
+        );
+        assert!(
+            record.timestamp_ms < 7_000,
+            "the record keeps the time of its dispatch"
+        );
+
+        let mut rerun = original.clone();
+        engine
+            .execute_with_store(&mut rerun, &mut store, 8_000)
+            .unwrap();
+        assert_eq!(rerun.lifecycle_state, MissionTxState::Committed);
+        assert_eq!(
+            std::fs::read_to_string(&effect_path).unwrap(),
+            "forward\nlater\n",
+            "nothing is dispatched again"
+        );
+    }
+
+    /// An effect proven not to have applied can be dispatched again, once, and
+    /// like any failure only when the dedup window of its dispatch has passed.
+    #[test]
+    fn a_proven_failure_lets_a_rerun_dispatch_the_effect_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let effect_path = directory.path().join("effects.log");
+        let policy = IdempotencyPolicy {
+            dedup_ttl_ms: 10_000,
+            ..Default::default()
+        };
+        let (original, mut store) = orphaned_file_effects(directory.path(), policy.clone());
+        // The operator finds the effect and takes it back by hand.
+        std::fs::write(&effect_path, "forward\n").unwrap();
+        let pending = claim_s2(
+            &original,
+            &mut store,
+            PendingEffectResolution::Failed,
+            "removed from effects.log by hand",
+        )
+        .unwrap();
+        let proof = prove_by_approval(&pending);
+        store
+            .reconcile_pending(pending, proof, "operator", 7_000)
+            .unwrap();
+        drop(store);
+
+        let mut store = IdempotencyStore::open(directory.path(), policy).unwrap();
+        let engine = make_pane_engine(FileEffectBackend::handle(
+            &effect_path,
+            "",
+            FileEffectFault::None,
+        ));
+        let mut early = original.clone();
+        let error = engine
+            .execute_with_store(&mut early, &mut store, 8_000)
+            .expect_err("still inside the dedup window of the dispatch");
+        assert!(
+            matches!(error, TxExecutionError::DedupConflict { ref step_id, ref outcome }
+            if step_id == "s2" && outcome.contains("Failed")),
+            "{error:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&effect_path).unwrap(),
+            "forward\n",
+            "nothing is dispatched inside the window"
+        );
+
+        let mut rerun = original.clone();
+        engine
+            .execute_with_store(&mut rerun, &mut store, 20_000)
+            .unwrap();
+        assert_eq!(rerun.lifecycle_state, MissionTxState::Committed);
+        assert_eq!(
+            std::fs::read_to_string(&effect_path).unwrap(),
+            "forward\nlater\n"
+        );
+    }
+
+    #[test]
+    fn reconciliation_takes_only_a_claim_about_its_own_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let policy = IdempotencyPolicy::default();
+        let (original, mut store) = orphaned_file_effects(directory.path(), policy);
+        let key = test_commit_key(&original, "s2");
+        let claim = |store: &mut IdempotencyStore,
+                     execution: Option<&str>,
+                     step: &str,
+                     resolution,
+                     evidence: &str| {
+            begin_pending_reconciliation(
+                &original, store, execution, step, resolution, evidence, 7_000,
+            )
+        };
+        let success = PendingEffectResolution::Success;
+        for refused in [
+            // A settled step, and one the plan does not have.
+            claim(&mut store, None, "s1", success, "evidence"),
+            claim(&mut store, None, "s9", success, "evidence"),
+            // Another execution.
+            claim(&mut store, Some("txe-other"), "s2", success, "evidence"),
+            // A commit is not its own undo.
+            claim(
+                &mut store,
+                None,
+                "s2",
+                PendingEffectResolution::Compensated,
+                "evidence",
+            ),
+            // No evidence, and more than a ledger record should hold.
+            claim(&mut store, None, "s2", success, "  "),
+            claim(&mut store, None, "s2", success, &"e".repeat(4097)),
+        ] {
+            assert!(
+                matches!(refused, Err(TxExecutionError::InvalidContract(_))),
+                "{refused:?}"
+            );
+        }
+        assert_eq!(store.executions_pending_on(&key).len(), 1);
+    }
+
+    #[test]
+    fn reconciliation_takes_only_the_proof_of_its_own_claim() {
+        let directory = tempfile::tempdir().unwrap();
+        let policy = IdempotencyPolicy::default();
+        let (original, mut store) = orphaned_file_effects(directory.path(), policy.clone());
+        let key = test_commit_key(&original, "s2");
+        let success = PendingEffectResolution::Success;
+
+        // A proof of other evidence, and of another outcome.
+        let other_evidence = claim_s2(&original, &mut store, success, "other evidence").unwrap();
+        let other_evidence_proof = prove_by_approval(&other_evidence);
+        drop(other_evidence);
+        let other_outcome = claim_s2(
+            &original,
+            &mut store,
+            PendingEffectResolution::Failed,
+            "evidence",
+        )
+        .unwrap();
+        let other_outcome_proof = prove_by_approval(&other_outcome);
+        drop(other_outcome);
+        for forged in [other_evidence_proof, other_outcome_proof] {
+            let pending = claim_s2(&original, &mut store, success, "evidence").unwrap();
+            assert!(matches!(
+                store.reconcile_pending(pending, forged, "operator", 7_000),
+                Err(IdempotencyError::ReconciliationNotProven { .. })
+            ));
+        }
+
+        // A code that was never issued, one issued for another claim, and one
+        // that is spent.
+        on_approval_runtime(async {
+            let database = directory.path().join("approvals.db");
+            let storage = crate::storage::StorageHandle::new(database.to_str().unwrap())
+                .await
+                .unwrap();
+            let approvals = crate::approval::ApprovalStore::new(
+                &storage,
+                crate::config::ApprovalConfig::default(),
+                "workspace",
+            );
+            let other = claim_s2(&original, &mut store, success, "other evidence").unwrap();
+            let other_code = other
+                .issue_approval(&approvals)
+                .await
+                .unwrap()
+                .allow_once_code;
+            drop(other);
+            let pending = claim_s2(&original, &mut store, success, "evidence").unwrap();
+            let code = pending
+                .issue_approval(&approvals)
+                .await
+                .unwrap()
+                .allow_once_code;
+            for wrong in ["NOTACODE", other_code.as_str()] {
+                assert!(matches!(
+                    pending.prove_with_approval(&approvals, wrong).await,
+                    Err(IdempotencyError::ReconciliationNotProven { .. })
+                ));
+            }
+            pending
+                .prove_with_approval(&approvals, &code)
+                .await
+                .unwrap();
+            assert!(matches!(
+                pending.prove_with_approval(&approvals, &code).await,
+                Err(IdempotencyError::ReconciliationNotProven { .. })
+            ));
+            storage.shutdown().await.unwrap();
+        });
+
+        // Locks taken on another store.
+        let other_directory = tempfile::tempdir().unwrap();
+        let mut other_store =
+            IdempotencyStore::open(other_directory.path(), policy.clone()).unwrap();
+        let pending = claim_s2(&original, &mut store, success, "evidence").unwrap();
+        let proof = prove_by_approval(&pending);
+        assert!(matches!(
+            other_store.reconcile_pending(pending, proof, "operator", 7_000),
+            Err(IdempotencyError::ReservationStoreMismatch { .. })
+        ));
+
+        assert_eq!(
+            store.executions_pending_on(&key).len(),
+            1,
+            "every refusal leaves the record Pending"
+        );
+    }
+
+    #[test]
+    fn concurrent_reconciliation_settles_a_record_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let policy = IdempotencyPolicy::default();
+        let (original, mut store) = orphaned_file_effects(directory.path(), policy.clone());
+        let mut contender = IdempotencyStore::open(directory.path(), policy).unwrap();
+        let success = PendingEffectResolution::Success;
+
+        let pending = claim_s2(&original, &mut store, success, "evidence").unwrap();
+        assert!(matches!(
+            claim_s2(&original, &mut contender, success, "evidence"),
+            Err(TxExecutionError::InProgress(_))
+        ));
+        let proof = prove_by_approval(&pending);
+        store
+            .reconcile_pending(pending, proof, "operator", 7_000)
+            .unwrap();
+
+        // Opened before it settled, the contender still holds the record as
+        // Pending, and finds otherwise under the lock.
+        let error = claim_s2(&original, &mut contender, success, "evidence").unwrap_err();
+        assert!(
+            matches!(error, TxExecutionError::LedgerWrite(ref detail)
+            if detail.contains("no Pending record")),
+            "{error:?}"
+        );
+        assert!(matches!(
+            claim_s2(&original, &mut store, success, "evidence"),
+            Err(TxExecutionError::InvalidContract(_))
+        ));
+    }
+
+    /// Success(s1) + Pending(s2): settling s2 lets a rollback undo both, once
+    /// each, and finish, where before it could only undo s1.
+    #[test]
+    fn a_rollback_after_a_proven_success_undoes_both_effects_and_finishes() {
+        let directory = tempfile::tempdir().unwrap();
+        let effect_path = directory.path().join("effects.log");
+        let policy = IdempotencyPolicy::default();
+        let (original, mut store) = orphaned_file_effects(directory.path(), policy.clone());
+        let pending = claim_s2(
+            &original,
+            &mut store,
+            PendingEffectResolution::Success,
+            "later is in effects.log",
+        )
+        .unwrap();
+        let proof = prove_by_approval(&pending);
+        store
+            .reconcile_pending(pending, proof, "operator", 7_000)
+            .unwrap();
+        drop(store);
+
+        let mut store = IdempotencyStore::open(directory.path(), policy).unwrap();
+        let engine = make_pane_engine(FileEffectBackend::handle(
+            &effect_path,
+            "",
+            FileEffectFault::None,
+        ));
+        let mut contract = original.clone();
+        let rollback = engine
+            .rollback_with_store(&mut contract, &mut store, 9_000)
+            .unwrap();
+        assert!(rollback.compensation_report.is_fully_rolled_back());
+        assert!(rollback.compensation_report.unresolved_step_ids.is_empty());
+        assert_eq!(rollback.compensation_report.compensated_count, 2);
+        assert_eq!(contract.lifecycle_state, MissionTxState::RolledBack);
+        assert_eq!(
+            std::fs::read_to_string(&effect_path).unwrap(),
+            "forward\nlater\nundo-later\nundo\n"
+        );
+    }
+
+    /// Success(s1) + Pending(s2), with s2 proven not to have applied: a rollback
+    /// undoes s1 alone and finishes, and s2's undo never runs.
+    #[test]
+    fn a_rollback_after_a_proven_failure_undoes_only_what_applied() {
+        let directory = tempfile::tempdir().unwrap();
+        let effect_path = directory.path().join("effects.log");
+        let policy = IdempotencyPolicy::default();
+        let (original, mut store) = orphaned_file_effects(directory.path(), policy.clone());
+        // The operator finds the effect and takes it back by hand.
+        std::fs::write(&effect_path, "forward\n").unwrap();
+        let pending = claim_s2(
+            &original,
+            &mut store,
+            PendingEffectResolution::Failed,
+            "removed from effects.log by hand",
+        )
+        .unwrap();
+        let proof = prove_by_approval(&pending);
+        store
+            .reconcile_pending(pending, proof, "operator", 7_000)
+            .unwrap();
+        drop(store);
+
+        let mut store = IdempotencyStore::open(directory.path(), policy).unwrap();
+        let engine = make_pane_engine(FileEffectBackend::handle(
+            &effect_path,
+            "",
+            FileEffectFault::None,
+        ));
+        let mut contract = original.clone();
+        let rollback = engine
+            .rollback_with_store(&mut contract, &mut store, 9_000)
+            .unwrap();
+        assert!(rollback.compensation_report.unresolved_step_ids.is_empty());
+        assert_eq!(rollback.compensation_report.compensated_count, 1);
+        assert_eq!(contract.lifecycle_state, MissionTxState::RolledBack);
+        assert_eq!(
+            std::fs::read_to_string(&effect_path).unwrap(),
+            "forward\nundo\n"
+        );
+    }
+
+    /// A step that failed, was dispatched again and crashed: the failed receipt
+    /// the contract still holds says nothing about the dispatch proven to have
+    /// applied, so the rollback undoes it.
+    #[test]
+    fn a_rollback_after_a_proven_success_outranks_an_older_failed_receipt() {
+        let directory = tempfile::tempdir().unwrap();
+        let effect_path = directory.path().join("effects.log");
+        let policy = IdempotencyPolicy::default();
+        let (original, mut store) = orphaned_file_effects(directory.path(), policy.clone());
+        let pending = claim_s2(
+            &original,
+            &mut store,
+            PendingEffectResolution::Success,
+            "later is in effects.log",
+        )
+        .unwrap();
+        let proof = prove_by_approval(&pending);
+        store
+            .reconcile_pending(pending, proof, "operator", 7_000)
+            .unwrap();
+        drop(store);
+
+        let mut store = IdempotencyStore::open(directory.path(), policy).unwrap();
+        let engine = make_pane_engine(FileEffectBackend::handle(
+            &effect_path,
+            "",
+            FileEffectFault::None,
+        ));
+        let mut contract = original.clone();
+        let seq = last_tx_receipt_sequence(&contract) + 1;
+        contract.receipts.push(serde_json::json!({
+            "seq": seq,
+            "phase": "commit",
+            "tx_id": contract.intent.tx_id.0,
+            "plan_id": contract.plan.plan_id.0,
+            "state": MissionTxState::Committing,
+            "step_id": "s2",
+            "outcome": "failed",
+            "reason_code": "commit_step_failed",
+            "error_code": "backend_refused",
+            "decision_path": "commit_phase->failed",
+            "emitted_at_ms": 4_000,
+        }));
+        let rollback = engine
+            .rollback_with_store(&mut contract, &mut store, 9_000)
+            .unwrap();
+        assert!(rollback.compensation_report.is_fully_rolled_back());
+        assert_eq!(rollback.compensation_report.compensated_count, 2);
+        assert_eq!(contract.lifecycle_state, MissionTxState::RolledBack);
+        assert_eq!(
+            std::fs::read_to_string(&effect_path).unwrap(),
+            "forward\nlater\nundo-later\nundo\n"
+        );
+    }
+
+    /// Settling a record is not a reason to believe a contract that leaves out
+    /// a dispatched step's reply: only a settled step can be missing from it.
+    #[test]
+    fn a_rollback_still_refuses_a_contract_missing_an_unsettled_success() {
+        let directory = tempfile::tempdir().unwrap();
+        let effect_path = directory.path().join("effects.log");
+        let policy = IdempotencyPolicy::default();
+        let mut store = IdempotencyStore::open(directory.path(), policy).unwrap();
+        let engine = make_pane_engine(FileEffectBackend::handle(
+            &effect_path,
+            "",
+            FileEffectFault::None,
+        ));
+        let original = file_effect_contract();
+        let mut committed = original.clone();
+        engine
+            .execute_with_store(&mut committed, &mut store, 5_000)
+            .unwrap();
+
+        let mut stale = committed.clone();
+        stale.receipts.retain(|receipt| {
+            receipt.get("phase").and_then(serde_json::Value::as_str) != Some("commit")
+                || receipt.get("step_id").and_then(serde_json::Value::as_str) != Some("s2")
+        });
+        assert!(
+            engine
+                .rollback_with_store(&mut stale, &mut store, 6_000)
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&effect_path).unwrap(),
+            "forward\nlater\n",
+            "nothing is undone"
+        );
+    }
+
+    /// An undo whose reply was lost: proof that it applied ends the rollback
+    /// without repeating it, carrying the commit outcome rollback holds it to.
+    #[test]
+    fn a_proven_undo_ends_a_rollback_without_repeating_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let effect_path = directory.path().join("effects.log");
+        let policy = IdempotencyPolicy::default();
+        let mut store = IdempotencyStore::open(directory.path(), policy.clone()).unwrap();
+        let engine = make_pane_engine(FileEffectBackend::handle(
+            &effect_path,
+            "undo-later",
+            FileEffectFault::LoseReplyAfterEffect,
+        ));
+        let mut contract = file_effect_contract();
+        engine
+            .execute_with_store(&mut contract, &mut store, 5_000)
+            .unwrap();
+        let committed = contract.clone();
+        engine
+            .rollback_with_store(&mut contract, &mut store, 6_000)
+            .expect_err("an unacknowledged undo must remain unresolved");
+        drop(store);
+
+        let mut store = IdempotencyStore::open(directory.path(), policy.clone()).unwrap();
+        assert!(matches!(
+            claim_s2(
+                &committed,
+                &mut store,
+                PendingEffectResolution::Success,
+                "evidence"
+            ),
+            Err(TxExecutionError::InvalidContract(_))
+        ));
+        let pending = claim_s2(
+            &committed,
+            &mut store,
+            PendingEffectResolution::Compensated,
+            "undo-later is in effects.log",
+        )
+        .unwrap();
+        assert!(
+            matches!(pending.outcome(), StepOutcome::Compensated { original_outcome, .. }
+            if matches!(original_outcome.as_ref(), StepOutcome::Success { .. }))
+        );
+        let proof = prove_by_approval(&pending);
+        store
+            .reconcile_pending(pending, proof, "operator", 7_000)
+            .unwrap();
+        drop(store);
+
+        let mut store = IdempotencyStore::open(directory.path(), policy).unwrap();
+        let retry_engine = make_pane_engine(FileEffectBackend::handle(
+            &effect_path,
+            "",
+            FileEffectFault::None,
+        ));
+        let mut retry = committed.clone();
+        let rollback = retry_engine
+            .rollback_with_store(&mut retry, &mut store, 9_000)
+            .unwrap();
+        assert!(rollback.compensation_report.is_fully_rolled_back());
+        assert_eq!(retry.lifecycle_state, MissionTxState::RolledBack);
+        assert_eq!(
+            std::fs::read_to_string(&effect_path).unwrap(),
+            "forward\nlater\nundo-later\nundo\n",
+            "the proven undo is not repeated, and the other undo runs once"
+        );
     }
 
     #[test]
