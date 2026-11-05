@@ -2892,40 +2892,81 @@ mod deferred_scrollback {
                 skip += gaps[next_gap].rows() - 1;
                 next_gap += 1;
             }
-            let oldest = store_oldest + skip;
+            let oldest = store_oldest
+                .checked_add(skip)
+                .ok_or(ScrollbackSpillError::ArithmeticOverflow("stable_row_range"))?;
             let generation = snapshot.generation();
             let fidelity = snapshot.fidelity();
             let stored_bytes = snapshot.stored_bytes();
             let decoded_bytes = snapshot.decoded_bytes();
             let store_rows = snapshot.into_rows();
-            let mut rows = Vec::with_capacity(store_rows.len());
+            let store_newest = StableRowIndex::try_from(store_rows.len())
+                .ok()
+                .and_then(|rows| store_oldest.checked_add(rows))
+                .ok_or(ScrollbackSpillError::ArithmeticOverflow("stable_row_range"))?;
+            // Establish the expanded range without constructing its blank
+            // rows. A single overload marker can stand for millions of rows;
+            // the checkpoint's limit must bound allocation, not just the
+            // result returned after allocating and discarding that history.
+            let mut final_skip = skip;
+            for gap in &gaps[next_gap..] {
+                let marker_row = gap
+                    .start
+                    .checked_sub(final_skip)
+                    .ok_or(ScrollbackSpillError::ArithmeticOverflow("stable_row_range"))?;
+                if marker_row >= store_newest {
+                    break;
+                }
+                if marker_row < store_oldest {
+                    return Err(ScrollbackSpillError::SnapshotRangeMismatch);
+                }
+                final_skip = final_skip
+                    .checked_add(gap.rows() - 1)
+                    .ok_or(ScrollbackSpillError::ArithmeticOverflow("stable_row_range"))?;
+            }
+            if store_newest.checked_add(final_skip) != Some(newest) {
+                return Err(ScrollbackSpillError::SnapshotRangeMismatch);
+            }
+            let expanded_rows = newest
+                .checked_sub(oldest)
+                .and_then(|rows| usize::try_from(rows).ok())
+                .ok_or(ScrollbackSpillError::ArithmeticOverflow("row_count"))?;
+            let over_limit = expanded_rows.saturating_sub(limits.max_rows);
+            if over_limit != 0 && !keep_newest {
+                return Err(ScrollbackSpillError::ResourceLimit {
+                    resource: "rows",
+                    observed: u64::try_from(expanded_rows).unwrap_or(u64::MAX),
+                    maximum: u64::try_from(limits.max_rows).unwrap_or(u64::MAX),
+                });
+            }
+            let retained_rows = expanded_rows - over_limit;
+            let mut to_skip = over_limit;
+            let mut rows = Vec::with_capacity(retained_rows);
             for (offset, line) in store_rows.into_iter().enumerate() {
-                rows.push(line);
+                if to_skip == 0 {
+                    rows.push(line);
+                } else {
+                    to_skip -= 1;
+                }
                 let store_row = store_oldest + offset as StableRowIndex;
                 if let Some(gap) = gaps.get(next_gap) {
                     if gap.start - skip == store_row {
-                        rows.extend((gap.start + 1..gap.end).map(|row| gap.line_at(row)));
+                        let blank_rows = usize::try_from(gap.rows() - 1)
+                            .map_err(|_| ScrollbackSpillError::ArithmeticOverflow("row_count"))?;
+                        let skipped_blanks = to_skip.min(blank_rows);
+                        to_skip -= skipped_blanks;
+                        rows.extend(
+                            std::iter::repeat_with(|| Line::new(0))
+                                .take(blank_rows - skipped_blanks),
+                        );
                         skip += gap.rows() - 1;
                         next_gap += 1;
                     }
                 }
             }
-            if oldest + rows.len() as StableRowIndex != newest {
+            if to_skip != 0 || rows.len() != retained_rows {
                 return Err(ScrollbackSpillError::SnapshotRangeMismatch);
             }
-            // The store's contract is every retained row or a ResourceLimit,
-            // never a truncated snapshot, unless it was asked for the newest.
-            // It checked its own (marker-compact) row count; the expanded
-            // stable rows must pass the same limit.
-            let over_limit = rows.len().saturating_sub(limits.max_rows);
-            if over_limit != 0 && !keep_newest {
-                return Err(ScrollbackSpillError::ResourceLimit {
-                    resource: "rows",
-                    observed: u64::try_from(rows.len()).unwrap_or(u64::MAX),
-                    maximum: u64::try_from(limits.max_rows).unwrap_or(u64::MAX),
-                });
-            }
-            rows.drain(..over_limit);
             ScrollbackSnapshot::from_contiguous_rows(
                 generation,
                 fidelity,
@@ -3825,6 +3866,77 @@ mod deferred_scrollback {
             Arc::strong_count(&hyperlink) <= queued / 2,
             "the release thread frees the shed rows"
         );
+    }
+
+    #[test]
+    fn checkpoint_limits_bound_expansion_of_large_overload_gaps() {
+        use wezterm_term::CellAttributes;
+
+        let (_dir, backing, deferred) = super::tests::deferred_test_sink();
+        let gap = GapSpan {
+            start: 0,
+            end: 1_000_000_000,
+            retention: 1_000_000_010,
+            bytes: 4_096,
+            at_unix_ms: 1,
+        };
+        // An already-shed queue contains a span, not the lost payload. Seed
+        // that frontier directly so this regression never needs to allocate
+        // a billion input rows; the real drain still commits the marker.
+        {
+            let mut state = deferred.state.lock().unwrap();
+            state.pending.push_back(Pending::Gap(gap));
+            state.oldest = Some(gap.start);
+            state.newest_exclusive = Some(gap.end);
+        }
+        deferred.pending_rows.store(1, Ordering::Release);
+        for offset in 0..3 {
+            let line =
+                Line::from_text(&format!("tail {offset}"), &CellAttributes::blank(), 0, None);
+            assert!(deferred.store_scrollback_line(gap.end + offset, &line, gap.retention));
+        }
+        deferred.flush_scrollback().unwrap();
+        assert_eq!(backing.retained_scrollback_rows(), 4);
+        let newest = gap.end + 3;
+        let limits = |max_rows| ScrollbackSnapshotLimits {
+            max_rows,
+            max_stored_bytes: 1 << 20,
+            max_decoded_bytes: 1 << 20,
+            max_physical_bytes: 1 << 20,
+        };
+
+        // The compact store fits exactly, but its expanded range does not.
+        // Refusal must happen before constructing the missing billion rows.
+        assert_eq!(
+            deferred.snapshot_scrollback(newest, limits(4)).unwrap_err(),
+            ScrollbackSpillError::ResourceLimit {
+                resource: "rows",
+                observed: newest as u64,
+                maximum: 4,
+            }
+        );
+        // A newest-only checkpoint can start inside the gap, or past it.
+        // Only blanks within the requested suffix may be materialized.
+        for (max_rows, expected) in [
+            (5, vec!["", "", "tail 0", "tail 1", "tail 2"]),
+            (4, vec!["", "tail 0", "tail 1", "tail 2"]),
+            (2, vec!["tail 1", "tail 2"]),
+        ] {
+            let snapshot = deferred
+                .snapshot_newest_scrollback(newest, limits(max_rows))
+                .unwrap();
+            assert_eq!(
+                snapshot.oldest_stable_row(),
+                Some(newest - max_rows as StableRowIndex)
+            );
+            assert_eq!(snapshot.newest_stable_row_exclusive(), newest);
+            let actual: Vec<_> = snapshot
+                .rows()
+                .iter()
+                .map(|line| line.as_str().trim_end().to_string())
+                .collect();
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]
