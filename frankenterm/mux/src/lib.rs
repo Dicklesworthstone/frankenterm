@@ -2594,6 +2594,11 @@ struct PaneRetirementCompletion {
 const LIVE_PARSER_CHECKPOINT_MAX_TIMEOUT: Duration = Duration::from_secs(30);
 const GUARDIAN_LIVE_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
 const GUARDIAN_LIVE_CHECKPOINT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+/// Where a pane's retries stop doubling. A checkpoint that fails for want of
+/// the guardian's one worker has still spent a parser and a worker thread on
+/// the pane's history: 50 panes of long history all retrying each second never
+/// got through and held 25 cores until the mux was killed.
+const GUARDIAN_LIVE_CHECKPOINT_MAX_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 const GUARDIAN_LIVE_CHECKPOINT_CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Live checkpoints a pane adopts after the one its newest committed recovery
 /// root names, while a root publisher runs: none. Every root capture adopts a
@@ -2661,6 +2666,8 @@ impl GuardianAdoptionLedger {
 #[derive(Clone, Copy, Debug)]
 struct GuardianLiveCheckpointSchedule {
     next_attempt: Instant,
+    /// The next retry's delay.
+    retry_delay: Duration,
 }
 
 impl GuardianLiveCheckpointSchedule {
@@ -2669,6 +2676,7 @@ impl GuardianLiveCheckpointSchedule {
             next_attempt: now
                 .checked_add(GUARDIAN_LIVE_CHECKPOINT_INTERVAL)
                 .unwrap_or(now),
+            retry_delay: GUARDIAN_LIVE_CHECKPOINT_RETRY_INTERVAL,
         }
     }
 
@@ -2678,9 +2686,14 @@ impl GuardianLiveCheckpointSchedule {
 
     fn record_outcome(&mut self, now: Instant, committed: bool) {
         let delay = if committed {
+            self.retry_delay = GUARDIAN_LIVE_CHECKPOINT_RETRY_INTERVAL;
             GUARDIAN_LIVE_CHECKPOINT_INTERVAL
         } else {
-            GUARDIAN_LIVE_CHECKPOINT_RETRY_INTERVAL
+            let delay = self.retry_delay;
+            self.retry_delay = delay
+                .saturating_mul(2)
+                .min(GUARDIAN_LIVE_CHECKPOINT_MAX_RETRY_INTERVAL);
+            delay
         };
         self.next_attempt = now.checked_add(delay).unwrap_or(now);
     }
@@ -25721,6 +25734,32 @@ mod tests {
         schedule.record_outcome(retry, true);
         assert!(!schedule.is_due(retry));
         assert!(schedule.is_due(retry + GUARDIAN_LIVE_CHECKPOINT_INTERVAL));
+    }
+
+    #[test]
+    fn guardian_live_checkpoint_retries_back_off_until_one_commits() {
+        let mut now = Instant::now();
+        let mut schedule = GuardianLiveCheckpointSchedule::new(now);
+        let mut waits = Vec::new();
+        for _ in 0..9 {
+            schedule.record_outcome(now, false);
+            waits.push(schedule.next_attempt - now);
+            now = schedule.next_attempt;
+        }
+        let seconds: Vec<u64> = waits.iter().map(Duration::as_secs).collect();
+        assert_eq!(seconds, [1, 2, 4, 8, 16, 32, 60, 60, 60]);
+
+        schedule.record_outcome(now, true);
+        assert_eq!(
+            schedule.next_attempt - now,
+            GUARDIAN_LIVE_CHECKPOINT_INTERVAL
+        );
+        now = schedule.next_attempt;
+        schedule.record_outcome(now, false);
+        assert_eq!(
+            schedule.next_attempt - now,
+            GUARDIAN_LIVE_CHECKPOINT_RETRY_INTERVAL
+        );
     }
 
     #[test]

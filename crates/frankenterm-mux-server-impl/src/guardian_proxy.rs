@@ -213,6 +213,15 @@ fn reconcile_genesis_birth(
     anyhow::bail!("guardian exact birth reconciliation retry admission exhausted")
 }
 
+/// How long a restore may spend replaying and activating one pane. A restore
+/// takes its panes one after another, each costing seconds when it holds long
+/// history (2.6 s a pane at a 100,000-row retention on a quiet Mac), and the
+/// deadline is checked only between steps, so it cannot catch a hung one: the
+/// guardian transport's I/O timeout does that. All it can stop is a restore
+/// that is slow and still working, and the next start would then do the same
+/// work against the same deadline, leaving the panes out of reach for good.
+const GUARDIAN_PANE_RESTORE_LIMIT: Duration = Duration::from_secs(300);
+
 #[derive(Clone, Copy)]
 struct GuardianRestoreBudget<'a> {
     cx: &'a frankenterm_core::cx::Cx,
@@ -230,6 +239,17 @@ impl GuardianRestoreBudget<'_> {
             ));
         }
         Ok(())
+    }
+
+    /// This budget with [`GUARDIAN_PANE_RESTORE_LIMIT`] from now for the next
+    /// pane, never less than it had. Cancellation still ends the restore.
+    fn for_next_pane(self) -> Self {
+        Self {
+            cx: self.cx,
+            deadline: self
+                .deadline
+                .max(Instant::now() + GUARDIAN_PANE_RESTORE_LIMIT),
+        }
     }
 }
 
@@ -6763,6 +6783,7 @@ impl GuardianProxyStaging {
         budget: GuardianRestoreBudget<'_>,
     ) -> Result<ActivatedGuardianProxy, GuardianProxyError> {
         budget.checkpoint()?;
+        let started = Instant::now();
         let identity = self.identity();
         let expected_size = self.actor.lock().size;
         if self.checkpoint_publisher.is_none() {
@@ -6788,6 +6809,7 @@ impl GuardianProxyStaging {
             self.selected_checkpoint,
         )?;
         budget.checkpoint()?;
+        let replayed = started.elapsed();
         let tail = GuardianReplayTailReader::new(
             replay_transport,
             identity,
@@ -6797,6 +6819,12 @@ impl GuardianProxyStaging {
             limits,
         )?;
         let activated = self.activate_verified_restore(verified.inert_terminal, Box::new(tail))?;
+        log::info!(
+            "restored guardian pane {}: replay {} ms, activation {} ms",
+            identity.pane_id(),
+            replayed.as_millis(),
+            started.elapsed().saturating_sub(replayed).as_millis(),
+        );
         budget.checkpoint()?;
         Ok(activated)
     }
@@ -6926,11 +6954,17 @@ pub fn restore_from_options(
     limits: TerminalCheckpointLimits,
 ) -> anyhow::Result<frankenterm_core::session_restore::PublishedWholeMuxTopology> {
     let cx = frankenterm_core::cx::for_request();
+    let loading = Instant::now();
     let source = crate::recovery_runtime::load_recovery_for_startup(
         options,
         guardian_paths.as_ref().map(|(_, token)| token.clone()),
         &cx,
     )?;
+    log::info!(
+        "verified the recovery root of {} panes in {} ms",
+        source.pane_count(),
+        loading.elapsed().as_millis(),
+    );
     restore_authenticated_topology(
         owner,
         source,
@@ -6944,9 +6978,10 @@ pub fn restore_from_options(
 /// Restore one independently configured guardian's cohort before exposing a
 /// server listener. All metadata and lease plans are admitted before the first
 /// Claim; failed activation/publication retains lease-only rollback custody.
-/// The restore gets `timeout` plus one second per pane
-/// ([`frankenterm_core::snapshot_engine::whole_mux_recovery_budget`]): it
-/// connects, claims and replays the panes one after another.
+/// Connecting and claiming get `timeout` plus one second per pane
+/// ([`frankenterm_core::snapshot_engine::whole_mux_recovery_budget`]); each
+/// pane's replay and activation, and the final publication, then get their own
+/// [`GUARDIAN_PANE_RESTORE_LIMIT`].
 pub fn restore_authenticated_topology(
     owner: Arc<mux::Mux>,
     recovery: frankenterm_core::session_restore::ValidatedWholeMuxRecovery,
@@ -7098,7 +7133,9 @@ pub fn restore_authenticated_topology(
         }
     }
     checkpoint()?;
+    let claimed = started.elapsed();
     let mux = Arc::clone(&owner);
+    let pane_count = staged.len();
     let prepared = PreparedGuardianWholeMuxTopology::prepare_with_budget(
         owner,
         recovery,
@@ -7107,9 +7144,14 @@ pub fn restore_authenticated_topology(
         limits,
         GuardianRestoreBudget { cx, deadline },
     )?;
-    checkpoint()?;
-    let published = prepared.publish_with_budget(Some(GuardianRestoreBudget { cx, deadline }))?;
+    let published = prepared
+        .publish_with_budget(Some(GuardianRestoreBudget { cx, deadline }.for_next_pane()))?;
     mux.note_restored_guardian_panes(restored_panes);
+    log::info!(
+        "restored {pane_count} guardian panes in {} ms, {} ms of it connecting and claiming",
+        started.elapsed().as_millis(),
+        claimed.as_millis(),
+    );
     Ok(published)
 }
 
@@ -7227,7 +7269,7 @@ impl PreparedGuardianWholeMuxTopology {
         staged: Vec<GuardianProxyStaging>,
         ended: Vec<Uuid>,
         limits: TerminalCheckpointLimits,
-        budget: GuardianRestoreBudget<'_>,
+        mut budget: GuardianRestoreBudget<'_>,
     ) -> Result<Self, GuardianProxyError> {
         budget.checkpoint()?;
         let (target_incarnation, by_uuid) =
@@ -7273,6 +7315,7 @@ impl PreparedGuardianWholeMuxTopology {
             ));
         }
         for proxy in staged {
+            budget = budget.for_next_pane();
             budget.checkpoint()?;
             let pane = by_uuid.get(&proxy.identity().pane_id()).ok_or(
                 GuardianProxyError::InvalidConfiguration(
@@ -13407,6 +13450,39 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_restore_budget_gives_each_pane_its_own_time() {
+        let cx = frankenterm_core::cx::Cx::for_testing();
+        let spent = GuardianRestoreBudget {
+            cx: &cx,
+            deadline: Instant::now(),
+        };
+        assert!(matches!(
+            spent.checkpoint(),
+            Err(GuardianProxyError::InvalidConfiguration(
+                "guardian restore deadline expired"
+            ))
+        ));
+
+        let next = spent.for_next_pane();
+        assert!(next.checkpoint().is_ok());
+        assert!(next.deadline > spent.deadline + GUARDIAN_PANE_RESTORE_LIMIT / 2);
+
+        // Time it already has beyond one pane's limit stays.
+        let deadline = Instant::now() + GUARDIAN_PANE_RESTORE_LIMIT * 2;
+        let long = GuardianRestoreBudget { cx: &cx, deadline };
+        assert_eq!(long.for_next_pane().deadline, deadline);
+
+        // More time never outlasts a cancellation.
+        cx.cancel_with(frankenterm_core::outcome::CancelKind::User, None);
+        assert!(matches!(
+            spent.for_next_pane().checkpoint(),
+            Err(GuardianProxyError::InvalidConfiguration(
+                "guardian restore cancelled"
+            ))
+        ));
     }
 
     /// One replay snapshot of a Genesis checkpoint followed by the output

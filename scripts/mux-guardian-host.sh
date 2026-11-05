@@ -24,7 +24,7 @@
 # Re-running install rewrites the units with the current settings and starts
 # whatever is not running; a running unit keeps its settings until it restarts
 # (the mux: `upgrade --force` onto its current family). `upgrade --timeout`
-# (default 90) bounds the new mux's restore, plus one second per guardian pane.
+# (default 90) bounds the new mux's restore, plus five seconds per guardian pane.
 #
 # Invariants:
 #   * The broker owns every pane's child process. It is never restarted by this
@@ -827,13 +827,17 @@ cmd_install() {
   svc_active pty-broker || svc_start pty-broker
   for _ in $(seq 30); do [ -S "$BROKER_SOCK" ] && break; sleep 1; done
   svc_active pty-guardian || svc_start pty-guardian
-  wait_guardian_ready 60 >/dev/null || die "guardian did not become ready; see logs"
+  local probe panes
+  probe=$(wait_guardian_ready 60) || die "guardian did not become ready; see logs"
+  panes=$(echo "$probe" | awk '{print $2}')
+  case $panes in ''|*[!0-9]*) panes=0 ;; esac
   if svc_active mux-server; then
     log "mux already running"
   else
     svc_start mux-server
   fi
-  local deadline=$(( $(date +%s) + 60 )) ids=""
+  # A mux restoring panes with long history takes seconds for each.
+  local deadline=$(( $(date +%s) + 60 + 5 * panes )) ids=""
   while [ "$(date +%s)" -lt "$deadline" ]; do
     ids=$(mux_pane_ids)
     [ -n "$ids" ] && break
@@ -873,12 +877,13 @@ swap_mux() {  # <from dir> <to dir> <timeout> <verb>
   # The restored layout is the last published snapshot: wait for one taken
   # after this point so panes created moments ago are included.
   # A busy guardian can fail a few rounds in a row, so allow several. A mux
-  # capture, and a restore, get one more second per guardian pane (ft-4wrv7),
-  # so the waits for them grow the same way.
+  # capture, and a restore, take seconds a pane when its panes hold long
+  # history (ft-4wrv7), and a capture under way when this starts does not
+  # count, so the waits grow with the panes.
   local mark fresh_within verify_within
   mark=$(date +%s)
-  fresh_within=$(( RECOVERY_INTERVAL * 6 + 60 + 2 * panes ))
-  verify_within=$(( timeout + panes ))
+  fresh_within=$(( RECOVERY_INTERVAL * 6 + 60 + 4 * panes ))
+  verify_within=$(( timeout + 5 * panes ))
   wait_fresh_publication "$mark" "$fresh_within" \
     || die "no fresh recovery snapshot within ${fresh_within}s; refusing (see the mux log)"
   log "fresh recovery snapshot published"

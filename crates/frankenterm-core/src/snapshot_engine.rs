@@ -307,13 +307,42 @@ fn pane_bindings_agree(
 /// and claiming before its first replay. Under a fixed budget, every capture of
 /// a large enough mux overran, threw away the guardian work it had done and
 /// retried, so nothing was published. Model panes are captured in process and
-/// add nothing.
+/// add nothing. A pane holding long history costs more: 1.5 to 2 s a checkpoint
+/// at 100,000 rows of retention on a quiet Mac, which at 40 such panes left
+/// under 10 s of a budget of one second a pane.
 #[cfg(feature = "frankenterm-deps")]
-const GUARDIAN_PANE_RECOVERY_ALLOWANCE: Duration = Duration::from_secs(1);
+const GUARDIAN_PANE_RECOVERY_ALLOWANCE: Duration = Duration::from_secs(3);
 
-/// The total budget of a whole-mux capture or restore: the configured
-/// recovery timeout, plus [`GUARDIAN_PANE_RECOVERY_ALLOWANCE`] for each
-/// guardian pane.
+/// The least a whole-mux capture keeps for each pane still to come, when the
+/// byte ceiling allows that much for them all: well over a pane's hot rows.
+#[cfg(feature = "frankenterm-deps")]
+const MIN_PANE_CHECKPOINT_BYTES: usize = 1024 * 1024;
+
+/// What the next pane's checkpoint may encode to in a whole-mux capture. Over
+/// the mux-wide ceiling a capture fails and every later one fails the same way,
+/// so no root is published again, and a checkpoint at this limit only drops its
+/// oldest rows, which the pane's store still holds. A pane takes what it needs
+/// up to `per_pane` as long as the panes after it keep their reserve.
+#[cfg(feature = "frankenterm-deps")]
+fn next_pane_checkpoint_limit(
+    per_pane: usize,
+    total: usize,
+    used: usize,
+    panes: usize,
+    taken: usize,
+) -> usize {
+    let reserve = MIN_PANE_CHECKPOINT_BYTES.min(total / panes.max(1));
+    let after_this = panes.saturating_sub(taken).saturating_sub(1);
+    total
+        .saturating_sub(used)
+        .saturating_sub(reserve.saturating_mul(after_this))
+        .min(per_pane)
+}
+
+/// The total budget of a whole-mux capture, or of a restore connecting and
+/// claiming its panes: the configured recovery timeout, plus
+/// [`GUARDIAN_PANE_RECOVERY_ALLOWANCE`] for each guardian pane. A restore's
+/// replays have their own limit per pane, in the mux server.
 #[cfg(feature = "frankenterm-deps")]
 pub fn whole_mux_recovery_budget(timeout: Duration, guardian_panes: usize) -> Duration {
     let panes = u32::try_from(guardian_panes).unwrap_or(u32::MAX);
@@ -459,12 +488,10 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
     // encoding ceiling, instead of publication refusing the whole image (a
     // pane showing tens of megabytes of images exceeds it).
     let guardian_limits = mux.guardian_checkpoint_limits();
-    let limits = frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits {
-        max_encoded_bytes: guardian_limits.max_encoded_bytes.min(
-            crate::session_restore::WholeMuxRecoveryLimits::default().max_per_pane_checkpoint_bytes,
-        ),
-        ..guardian_limits
-    };
+    let recovery_limits = crate::session_restore::WholeMuxRecoveryLimits::default();
+    let per_pane_bytes = guardian_limits
+        .max_encoded_bytes
+        .min(recovery_limits.max_per_pane_checkpoint_bytes);
     let mut timing = CaptureTiming {
         started,
         budget,
@@ -475,6 +502,16 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
     for pane in &captured.pane_bindings {
         snapshot_cx_checkpoint(cx)?;
         let pane_started = Instant::now();
+        let limits = frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits {
+            max_encoded_bytes: next_pane_checkpoint_limit(
+                per_pane_bytes,
+                recovery_limits.max_total_checkpoint_bytes,
+                total_bytes,
+                captured.pane_bindings.len(),
+                checkpoints.len(),
+            ),
+            ..guardian_limits
+        };
         // The budget grows with the panes; one pane's parser wait stays within
         // the configured timeout, as before.
         let remaining = deadline
@@ -539,7 +576,7 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
             }
             total_bytes = total_bytes
                 .checked_add(capture.terminal_checkpoint().canonical_payload().len())
-                .filter(|bytes| *bytes <= 256 * 1024 * 1024)
+                .filter(|bytes| *bytes <= recovery_limits.max_total_checkpoint_bytes)
                 .ok_or(WholeMuxCaptureError::CaptureByteLimit)?;
             CapturedPaneCheckpoint::Guardian(Box::new(published))
         } else {
@@ -583,7 +620,7 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
             }
             total_bytes = total_bytes
                 .checked_add(ack.terminal_checkpoint.canonical_payload().len())
-                .filter(|bytes| *bytes <= 256 * 1024 * 1024)
+                .filter(|bytes| *bytes <= recovery_limits.max_total_checkpoint_bytes)
                 .ok_or(WholeMuxCaptureError::CaptureByteLimit)?;
             CapturedPaneCheckpoint::Model(ack)
         };
@@ -14181,19 +14218,62 @@ mod tests {
 
     #[test]
     #[cfg(feature = "frankenterm-deps")]
-    fn recovery_budget_grows_by_one_second_per_guardian_pane() {
+    fn recovery_budget_grows_with_every_guardian_pane() {
         let base = Duration::from_secs(30);
         assert_eq!(whole_mux_recovery_budget(base, 0), base);
-        // 50 guardian panes at about 0.6 s each overran the fixed 30 s.
-        assert_eq!(whole_mux_recovery_budget(base, 50), Duration::from_secs(80));
+        // 40 panes of long history at up to 2 s each overran 70 s.
+        assert_eq!(
+            whole_mux_recovery_budget(base, 40),
+            Duration::from_secs(150)
+        );
         assert_eq!(
             whole_mux_recovery_budget(Duration::from_secs(5), 1024),
-            Duration::from_secs(1029)
+            Duration::from_secs(3077)
         );
         assert_eq!(
             whole_mux_recovery_budget(base, usize::MAX),
-            base + Duration::from_secs(u64::from(u32::MAX))
+            base + Duration::from_secs(3 * u64::from(u32::MAX))
         );
+    }
+
+    #[test]
+    #[cfg(feature = "frankenterm-deps")]
+    fn a_mux_of_long_panes_stays_within_the_capture_byte_ceiling() {
+        const MIB: usize = 1024 * 1024;
+        let (per_pane, total) = (64 * MIB, 256 * MIB);
+        let limit =
+            |used, panes, taken| next_pane_checkpoint_limit(per_pane, total, used, panes, taken);
+
+        // A few panes, or plenty of room left: the ceiling for one pane.
+        assert_eq!(limit(0, 1, 0), 64 * MIB);
+        assert_eq!(limit(0, 40, 0), 64 * MIB);
+        // 50 panes of 5.4 MiB would pass the ceiling at the 48th: the panes
+        // after that are held to what leaves the rest their reserve.
+        let natural = 5 * MIB + 2 * MIB / 5;
+        let mut used = 0;
+        for taken in 0..50 {
+            let allowed = limit(used, 50, taken);
+            assert!(allowed >= MIB, "pane {taken} was offered {allowed}");
+            used += natural.min(allowed);
+        }
+        assert!(used <= total, "{used}");
+        assert!(used > 45 * natural, "{used}");
+
+        // Panes that fill all they are offered, at any size of mux, never pass
+        // the ceiling, and none of them is left without room.
+        for panes in [1, 2, 3, 4, 5, 48, 100, 257, 1024] {
+            let mut used = 0;
+            for taken in 0..panes {
+                let allowed = limit(used, panes, taken);
+                assert!(allowed <= per_pane);
+                assert!(
+                    allowed >= MIB.min(total / panes),
+                    "{panes} panes: pane {taken} was offered {allowed} with {used} used"
+                );
+                used += allowed;
+            }
+            assert!(used <= total, "{panes} panes used {used}");
+        }
     }
 
     #[test]

@@ -552,7 +552,12 @@ proven:
    that rewrapped rows, is replaced, and the pane comes back with only what the
    checkpoint held. A `scrollback_lines` too large for those limits replays at
    the retention that fits, and the activated pane takes the configured one
-   back. A visible row that does not fit still refuses the capture.
+   back. A visible row that does not fit still refuses the capture. All of a
+   mux's checkpoints together stay within 256 MiB: once about 48 long panes
+   have taken theirs, the rest keep about 1 MiB each, so a restored pane leans
+   on its store for the older rows. A restore gives each pane its own five
+   minutes, so a mux with many long panes takes longer to come back but is not
+   refused for it.
 7. `Attach` returns only the exact pane, generation, and next-mutation-sequence
    identity; that reply is not continuity evidence. After claiming the observed
    generation, the mux opens an explicit authenticated `Replay` using the

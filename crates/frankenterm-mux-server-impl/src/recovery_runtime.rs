@@ -58,8 +58,9 @@ pub struct RecoveryOptions {
     /// Local publication age target (seconds; default 120). No replica claim.
     #[arg(long, requires = "recovery_store", value_parser = clap::value_parser!(u64).range(1..=604800))]
     pub recovery_rpo_seconds: Option<u64>,
-    /// Cooperative capture and startup restore deadline (seconds; default 30,
-    /// maximum 30), plus one second per guardian pane.
+    /// Cooperative deadline of a capture, and of a startup restore connecting
+    /// and claiming its panes (seconds; default 30, maximum 30), plus one
+    /// second per guardian pane. Each pane's replay then has its own time.
     #[arg(long, requires = "recovery_store", value_parser = clap::value_parser!(u64).range(1..=30))]
     pub recovery_timeout_seconds: Option<u64>,
 }
@@ -106,6 +107,34 @@ fn capture_was_busy(error: &WholeMuxCaptureError) -> bool {
                     | mux::MuxTopologyCaptureError::ConcurrentMutation { .. }
             )
     )
+}
+
+/// What a failed capture means for the next one: its outcome label, whether
+/// recovery ends for this mux, and whether the next attempt reconciles first.
+fn capture_failure_outcome(error: &WholeMuxCaptureError) -> (&'static str, bool, bool) {
+    match error {
+        error if capture_was_busy(error) => ("capture_busy", false, false),
+        // A pane closed, or an upgrade took it over, under the capture. The
+        // warning names the change; the next period captures the panes that
+        // remain.
+        WholeMuxCaptureError::StaleCapture(_) => ("capture_stale", false, false),
+        // None of these says anything against the store or its keys: a later
+        // capture can succeed, and ending recovery here would leave every pane
+        // of the mux with no root to restart from.
+        WholeMuxCaptureError::CaptureDeadline { .. }
+        | WholeMuxCaptureError::CaptureByteLimit
+        | WholeMuxCaptureError::Topology(_)
+        | WholeMuxCaptureError::Pane { .. }
+        | WholeMuxCaptureError::GuardianPane { .. } => ("capture_rejected", false, false),
+        WholeMuxCaptureError::Context(_) => ("cancelled", false, false),
+        // A store error latched the authority: its root may or may not have
+        // committed. The next attempt reads it back.
+        WholeMuxCaptureError::ReconciliationRequired
+        | WholeMuxCaptureError::Publication(WholeMuxPublicationError::Publication(_)) => {
+            ("publication_requires_reconciliation", false, true)
+        }
+        _ => ("publication_requires_reconciliation", true, false),
+    }
 }
 
 fn parse_identity(value: &str) -> Result<[u8; 32], String> {
@@ -766,39 +795,10 @@ impl PeriodicRecovery {
                         ),
                     }
                 }
-                Err(error) if capture_was_busy(&error) => {
-                    (None, Some("capture_busy"), false, false)
+                Err(error) => {
+                    let (label, terminal, reconcile) = capture_failure_outcome(&error);
+                    (None, Some(label), terminal, reconcile)
                 }
-                // A pane closed, or an upgrade took it over, under the capture.
-                // The warning above names the change; the next period captures
-                // the panes that remain.
-                Err(WholeMuxCaptureError::StaleCapture(_)) => {
-                    (None, Some("capture_stale"), false, false)
-                }
-                Err(
-                    WholeMuxCaptureError::CaptureDeadline { .. }
-                    | WholeMuxCaptureError::Topology(_)
-                    | WholeMuxCaptureError::Pane { .. }
-                    | WholeMuxCaptureError::GuardianPane { .. },
-                ) => (None, Some("capture_rejected"), false, false),
-                Err(WholeMuxCaptureError::Context(_)) => (None, Some("cancelled"), false, false),
-                // A store error latched the authority: its root may or may
-                // not have committed. The next attempt reads it back.
-                Err(
-                    WholeMuxCaptureError::ReconciliationRequired
-                    | WholeMuxCaptureError::Publication(WholeMuxPublicationError::Publication(_)),
-                ) => (
-                    None,
-                    Some("publication_requires_reconciliation"),
-                    false,
-                    true,
-                ),
-                Err(_) => (
-                    None,
-                    Some("publication_requires_reconciliation"),
-                    true,
-                    false,
-                ),
             };
             AttemptResult {
                 state: Some(state),
@@ -819,6 +819,29 @@ mod tests {
     use mux::domain::{Domain, LocalDomain};
     use std::io::Write as _;
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+    #[test]
+    fn a_capture_over_a_limit_does_not_end_recovery() {
+        for error in [
+            WholeMuxCaptureError::CaptureByteLimit,
+            WholeMuxCaptureError::CaptureDeadline {
+                budget_ms: 1,
+                elapsed_ms: 2,
+                taken: 0,
+                panes: 1,
+                slowest_pane: None,
+                slowest_ms: 0,
+            },
+        ] {
+            assert_eq!(
+                capture_failure_outcome(&error),
+                ("capture_rejected", false, false),
+                "{error}"
+            );
+        }
+        // A capture that can never work still ends it.
+        assert!(capture_failure_outcome(&WholeMuxCaptureError::InvalidTimeout).1);
+    }
 
     fn prepared() -> (tempfile::TempDir, RecoveryOptions) {
         // RCH's TMPDIR can sit beneath a group-writable checkout. Resolve the
