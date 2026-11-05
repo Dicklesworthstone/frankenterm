@@ -103,6 +103,11 @@ const GUARDIAN_INPUT_RETRY_MAX_PAUSE: Duration = Duration::from_millis(16);
 const GUARDIAN_INPUT_RETRY_BUDGET: Duration = Duration::from_secs(2);
 const GUARDIAN_CONNECT_ATTEMPTS: usize = 32;
 const GUARDIAN_CONNECT_RETRY_BUDGET: Duration = Duration::from_secs(5);
+/// Admission budget for a standalone recovery lease plan. Startup restoration
+/// instead passes its existing cohort deadline, so a guardian worker holding
+/// the protocol for 8-13 s cannot exhaust a fresh 5 s birth-connect budget on
+/// every restart (ft-b55n7).
+const GUARDIAN_RESTORE_PLAN_LIMIT: Duration = Duration::from_secs(30);
 /// Once a birth has sent its Spawn, a lost reply may hide a real child, and
 /// giving up closes that child and fails the spawn. So its reconciliation is
 /// admitted for this long from the Spawn, not within what is left of the
@@ -5640,7 +5645,32 @@ impl GuardianProxyLeasePlan {
         recovery: &frankenterm_core::session_restore::ValidatedWholeMuxRecovery,
         durable_pane_id: Uuid,
     ) -> Result<Self, GuardianProxyError> {
+        let cx = frankenterm_core::cx::for_request();
+        Self::prepare_from_recovery_with_budget(
+            socket_path,
+            token_path,
+            size,
+            census,
+            recovery,
+            durable_pane_id,
+            GuardianRestoreBudget {
+                cx: &cx,
+                deadline: Instant::now() + GUARDIAN_RESTORE_PLAN_LIMIT,
+            },
+        )
+    }
+
+    fn prepare_from_recovery_with_budget(
+        socket_path: &Path,
+        token_path: &Path,
+        size: PtySize,
+        census: Arc<GuardianCensusCoordinator>,
+        recovery: &frankenterm_core::session_restore::ValidatedWholeMuxRecovery,
+        durable_pane_id: Uuid,
+        budget: GuardianRestoreBudget<'_>,
+    ) -> Result<Self, GuardianProxyError> {
         use frankenterm_core::mux_recovery_image::{CheckpointAuthority, RecoverySpawnCustody};
+        budget.checkpoint()?;
         let pane = recovery
             .image()
             .panes
@@ -5799,11 +5829,14 @@ impl GuardianProxyLeasePlan {
         // An earlier ambiguous attempt may still own the custody admission in
         // retained rollback. Settle that existing authority before reacquiring
         // its inode; otherwise local retries would strand their own guard.
+        budget.checkpoint()?;
         census.retry_retained_lease_cleanup()?;
+        budget.checkpoint()?;
         let admission = Arc::new(custody.admit_recovery().map_err(|_| {
             GuardianProxyError::InvalidConfiguration("recovery custody admission unavailable")
         })?);
-        let mut plan = Self::prepare_with_build(socket_path, token_path, size, census, true)?;
+        let mut plan =
+            Self::prepare_with_build(socket_path, token_path, size, census, Some(budget))?;
         plan.spawn_custody = Some(scope);
         plan.successor_custody = successor;
         plan.selected_checkpoint = Some(selected);
@@ -5821,7 +5854,7 @@ impl GuardianProxyLeasePlan {
         size: PtySize,
         census: Arc<GuardianCensusCoordinator>,
     ) -> Result<Self, GuardianProxyError> {
-        Self::prepare_with_build(socket_path, token_path, size, census, false)
+        Self::prepare_with_build(socket_path, token_path, size, census, None)
     }
 
     fn prepare_with_build(
@@ -5829,24 +5862,28 @@ impl GuardianProxyLeasePlan {
         token_path: &Path,
         size: PtySize,
         census: Arc<GuardianCensusCoordinator>,
-        build_authenticated: bool,
+        build_budget: Option<GuardianRestoreBudget<'_>>,
     ) -> Result<Self, GuardianProxyError> {
+        if let Some(budget) = build_budget {
+            budget.checkpoint()?;
+        }
         validate_pty_size(size)?;
         if let Err(error) = census.retry_retained_lease_cleanup() {
             log::warn!(
                 "retained guardian lease retirement remains pending before a new lease plan: {error}"
             );
         }
-        let client = if build_authenticated {
+        let client = if let Some(budget) = build_budget {
             Self::connect_for_build_authenticated_plan(
                 socket_path,
                 token_path,
                 census.mux_incarnation(),
-            )
+                budget,
+            )?
         } else {
             GuardianClient::connect(socket_path, token_path, census.mux_incarnation())
-        }
-        .map_err(GuardianProxyError::Client)?;
+                .map_err(GuardianProxyError::Client)?
+        };
         if client.guardian_incarnation() != census.guardian_incarnation() {
             return Err(GuardianProxyError::GuardianIncarnationChanged);
         }
@@ -5858,7 +5895,7 @@ impl GuardianProxyLeasePlan {
             client,
             spawn_custody: None,
             successor_custody: None,
-            build_authenticated,
+            build_authenticated: build_budget.is_some(),
             selected_checkpoint: None,
             recovery_claim: None,
         })
@@ -5868,12 +5905,18 @@ impl GuardianProxyLeasePlan {
         socket_path: &Path,
         token_path: &Path,
         mux_incarnation: Uuid,
-    ) -> Result<GuardianClient, GuardianClientError> {
-        let started = Instant::now();
-        let mut attempts = 0;
+        budget: GuardianRestoreBudget<'_>,
+    ) -> Result<GuardianClient, GuardianProxyError> {
+        let mut pause = GUARDIAN_CONNECT_RETRY_DELAY;
         loop {
-            attempts += 1;
-            match GuardianClient::connect_for_genesis(socket_path, token_path, mux_incarnation) {
+            budget.checkpoint()?;
+            // An admitted exchange keeps its transport I/O timeout. Even a
+            // successful Hello must not admit a plan after cancellation or
+            // after the shared deadline has passed while awaiting its reply.
+            let result =
+                GuardianClient::connect_for_genesis(socket_path, token_path, mux_incarnation);
+            budget.checkpoint()?;
+            match result {
                 Err(GuardianClientError::Io(error))
                     if error.kind() == io::ErrorKind::UnexpectedEof =>
                 {
@@ -5881,18 +5924,21 @@ impl GuardianProxyLeasePlan {
                     // while its sole protocol authority belongs to a durable
                     // worker. Retry only this pre-Claim handshake, retaining
                     // the exact endpoint, mux and compiled-build authority.
-                    // No pane effect or Claim intent has been sent here. The
-                    // budget ends this, not a count of 10 ms pauses: 32 of
-                    // those gave up after 0.3 s, and one failed Hello fails
-                    // the whole restore, while a worker holds the protocol
-                    // for seconds at a time.
+                    // No pane effect or Claim intent has been sent here. Use
+                    // the caller's shared restore deadline: a fresh 5 s
+                    // birth-connect budget can expire inside one 8-13 s
+                    // worker hold, failing the whole successor mux.
                     metrics::counter!("mux.guardian_proxy.plan_hello_busy_retry_total")
                         .increment(1);
-                    if !wait_for_genesis_retry(started, GUARDIAN_CONNECT_RETRY_BUDGET, attempts) {
-                        return Err(GuardianClientError::Io(error));
-                    }
+                    thread::sleep(
+                        pause.min(budget.deadline.saturating_duration_since(Instant::now())),
+                    );
+                    budget.checkpoint()?;
+                    pause = pause
+                        .saturating_mul(2)
+                        .min(GUARDIAN_CONNECT_RETRY_MAX_DELAY);
                 }
-                result => return result,
+                result => return result.map_err(GuardianProxyError::Client),
             }
         }
     }
@@ -7102,13 +7148,14 @@ pub fn restore_authenticated_topology(
         )?);
         for (pane, generation, size) in selected {
             checkpoint()?;
-            let plan = GuardianProxyLeasePlan::prepare_from_recovery(
+            let plan = GuardianProxyLeasePlan::prepare_from_recovery_with_budget(
                 socket,
                 token,
                 size,
                 Arc::clone(&census),
                 &recovery,
                 pane,
+                GuardianRestoreBudget { cx, deadline },
             )?;
             plans.push((plan, pane, generation));
         }
@@ -14142,7 +14189,13 @@ mod tests {
         for (case, expected_attempts) in [
             ("busy-then-ready", Some(2)),
             ("busy-past-a-count-of-short-pauses", None),
+            ("busy-past-birth-connect-budget", None),
             ("exhausted", None),
+            ("already-expired", Some(0)),
+            ("cancelled-before-connect", Some(0)),
+            ("cancelled-while-busy", Some(1)),
+            ("cancelled-after-hello", Some(1)),
+            ("deadline-after-hello", Some(1)),
             ("rejected", Some(1)),
             ("wrong-guardian", Some(1)),
         ] {
@@ -14166,6 +14219,13 @@ mod tests {
             let expected_build = GuardianHelloBuildIdentityV1::for_compiled_mux()
                 .unwrap()
                 .encode();
+            let retry_budget = match case {
+                "already-expired" => Duration::ZERO,
+                "exhausted" | "deadline-after-hello" => Duration::from_millis(200),
+                _ => GUARDIAN_RESTORE_PLAN_LIMIT,
+            };
+            let cx = Arc::new(frankenterm_core::cx::Cx::for_testing());
+            let server_cx = Arc::clone(&cx);
             let plan_finished = Arc::new(AtomicBool::new(false));
             let finished = Arc::clone(&plan_finished);
             let server = thread::spawn(move || {
@@ -14209,7 +14269,7 @@ mod tests {
                 census
                     .write_all(&encode_guardian_response(&secret, &response).unwrap())
                     .unwrap();
-                let busy_since = Instant::now();
+                let mut busy_since = None;
                 let mut attempts = 0;
                 while let Some(mut stream) = accept() {
                     attempts += 1;
@@ -14217,12 +14277,24 @@ mod tests {
                     assert_eq!(hello.header().operation, GuardianOperation::Hello);
                     assert_eq!(hello.header().mux_incarnation, owner);
                     assert_eq!(hello.payload(), expected_build.as_slice());
+                    let busy_since = busy_since.get_or_insert_with(Instant::now);
                     let busy = match case {
                         "exhausted" => true,
+                        "cancelled-while-busy" => {
+                            server_cx
+                                .cancel_with(frankenterm_core::outcome::CancelKind::User, None);
+                            true
+                        }
                         "busy-then-ready" => attempts == 1,
                         // Far past 32 pauses of 10 ms, well inside the budget.
                         "busy-past-a-count-of-short-pauses" => {
                             busy_since.elapsed() < Duration::from_millis(1500)
+                        }
+                        // A valid worker hold can outlast the birth-connect
+                        // budget; it must use the restore's remaining time.
+                        "busy-past-birth-connect-budget" => {
+                            busy_since.elapsed()
+                                < GUARDIAN_CONNECT_RETRY_BUDGET + Duration::from_secs(1)
                         }
                         _ => false,
                     };
@@ -14230,6 +14302,12 @@ mod tests {
                         // Exact busy behavior of a build-bearing Hello while
                         // the real guardian's protocol is worker-owned.
                         continue;
+                    }
+                    if case == "deadline-after-hello" {
+                        thread::sleep(retry_budget + Duration::from_millis(50));
+                    }
+                    if case == "cancelled-after-hello" {
+                        server_cx.cancel_with(frankenterm_core::outcome::CancelKind::User, None);
                     }
                     let response = if case == "rejected" {
                         GuardianResponseEnvelope::rejection(
@@ -14265,30 +14343,56 @@ mod tests {
             let census = Arc::new(
                 GuardianCensusCoordinator::connect(&socket, &token, guardian, owner).unwrap(),
             );
+            if case == "cancelled-before-connect" {
+                cx.cancel_with(frankenterm_core::outcome::CancelKind::User, None);
+            }
             let started = Instant::now();
             let result = GuardianProxyLeasePlan::prepare_with_build(
                 &socket,
                 &token,
                 size(24, 80),
                 census,
-                true,
+                Some(GuardianRestoreBudget {
+                    cx: &cx,
+                    deadline: started + retry_budget,
+                }),
             );
             let took = started.elapsed();
             plan_finished.store(true, Ordering::SeqCst);
             match case {
-                "busy-then-ready" | "busy-past-a-count-of-short-pauses" => {
+                "busy-then-ready"
+                | "busy-past-a-count-of-short-pauses"
+                | "busy-past-birth-connect-budget" => {
                     drop(result.expect("pre-Claim Hello recovers"));
+                    if case == "busy-past-birth-connect-budget" {
+                        assert!(took > GUARDIAN_CONNECT_RETRY_BUDGET);
+                    }
                 }
                 "exhausted" => {
                     assert!(matches!(
                         result,
-                        Err(GuardianProxyError::Client(GuardianClientError::Io(ref error)))
-                            if error.kind() == io::ErrorKind::UnexpectedEof
+                        Err(GuardianProxyError::InvalidConfiguration(
+                            "guardian restore deadline expired"
+                        ))
                     ));
                     assert!(
-                        took >= GUARDIAN_CONNECT_RETRY_BUDGET,
-                        "a busy guardian's budget ends the retry, not a count: gave up after {took:?}"
+                        took >= retry_budget,
+                        "the caller's deadline ends the retry: gave up after {took:?}"
                     );
+                }
+                "already-expired" | "deadline-after-hello" => assert!(matches!(
+                    result,
+                    Err(GuardianProxyError::InvalidConfiguration(
+                        "guardian restore deadline expired"
+                    ))
+                )),
+                "cancelled-before-connect" | "cancelled-while-busy" | "cancelled-after-hello" => {
+                    assert!(matches!(
+                        result,
+                        Err(GuardianProxyError::InvalidConfiguration(
+                            "guardian restore cancelled"
+                        ))
+                    ));
                 }
                 "rejected" => assert!(matches!(
                     result,
@@ -14306,8 +14410,7 @@ mod tests {
             match expected_attempts {
                 Some(expected) => assert_eq!(attempts, expected, "{case}"),
                 None => assert!(
-                    attempts > 1
-                        && attempts <= genesis_retry_attempts(GUARDIAN_CONNECT_RETRY_BUDGET),
+                    attempts > 1 && attempts <= genesis_retry_attempts(retry_budget),
                     "{case}: {attempts} Hellos"
                 ),
             }
