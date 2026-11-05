@@ -136,7 +136,8 @@ The contract defaults to `.ft/mission/tx-active.json` in the workspace. Robot
 callers use the same subcommands as `ft robot tx plan|run|rollback|show`.
 
 `ft tx reconcile` settles an effect a crash left unknown, after a person has
-looked at what really happened. The first run prints an allow-once code bound
+looked at what really happened. `ft tx run` and `ft tx rollback` refuse such a
+step, and their hint points here. The first run prints an allow-once code bound
 to that exact claim; running it again with `--approval-code` settles the record
 and writes a receipt under the ledger's hash chain. It has no robot form. Like
 any failed commit, one settled as `failed` can run again an hour after its

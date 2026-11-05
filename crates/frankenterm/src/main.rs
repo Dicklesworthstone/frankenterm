@@ -77383,6 +77383,13 @@ struct MissionCommandError {
 #[derive(Debug)]
 enum TxCommandExecutionError {
     Execution(String),
+    /// A step's record is Pending: its run stopped between dispatching it and
+    /// recording the outcome, so nothing will run or undo it until a person
+    /// settles it with `ft tx reconcile`.
+    PendingEffect {
+        step_id: String,
+        message: String,
+    },
     InProgress(String),
     /// The real runtime could not be resolved, so the command refused to run
     /// through the synthetic executor (ft-n13o4 keeps the cause typed).
@@ -77407,6 +77414,21 @@ enum TxCommandExecutionError {
 impl TxCommandExecutionError {
     fn execution(message: impl Into<String>) -> Self {
         Self::Execution(message.into())
+    }
+
+    /// A run or rollback that failed after persisting its evidence; one that a
+    /// Pending record refused names the step to settle.
+    fn after_evidence(
+        error: &frankenterm_core::tx_execution::TxExecutionError,
+        message: String,
+    ) -> Self {
+        match error.unsettled_pending_step() {
+            Some(step_id) => Self::PendingEffect {
+                step_id: step_id.to_string(),
+                message,
+            },
+            None => Self::Execution(message),
+        }
     }
 
     fn in_progress(message: impl Into<String>) -> Self {
@@ -77466,6 +77488,7 @@ impl TxCommandExecutionError {
     ) -> Option<&frankenterm_core::tx_execution::TxContractStoreError> {
         match self {
             Self::Execution(_)
+            | Self::PendingEffect { .. }
             | Self::InProgress(_)
             | Self::RuntimeUnavailable { .. }
             | Self::RollbackProof { .. } => None,
@@ -77477,7 +77500,7 @@ impl TxCommandExecutionError {
 impl std::fmt::Display for TxCommandExecutionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Execution(message) => f.write_str(message),
+            Self::Execution(message) | Self::PendingEffect { message, .. } => f.write_str(message),
             Self::InProgress(message) => f.write_str(message),
             Self::RuntimeUnavailable { message, .. } => f.write_str(message),
             Self::RollbackProof { message, .. } => f.write_str(message),
@@ -78700,9 +78723,13 @@ fn execute_tx_run_with_executor<E: frankenterm_core::tx_execution::StepExecutor>
             ));
         }
         (Err(execution_err), Ok(())) => {
-            return Err(TxCommandExecutionError::execution(format!(
+            let message = format!(
                 "tx execution failed after persisting available transaction evidence: {execution_err}; inspect tx show before retrying because external effects may have occurred"
-            )));
+            );
+            return Err(TxCommandExecutionError::after_evidence(
+                &execution_err,
+                message,
+            ));
         }
         (Err(execution_err), Err(save_err)) => {
             return Err(TxCommandExecutionError::contract_store(
@@ -78808,9 +78835,13 @@ fn execute_tx_rollback_with_executor<E: frankenterm_core::tx_execution::StepExec
             ));
         }
         (Err(rollback_err), Ok(())) => {
-            return Err(TxCommandExecutionError::execution(format!(
+            let message = format!(
                 "rollback failed after persisting available transaction evidence: {rollback_err}; inspect tx show before retrying because compensation effects may have occurred"
-            )));
+            );
+            return Err(TxCommandExecutionError::after_evidence(
+                &rollback_err,
+                message,
+            ));
         }
         (Err(rollback_err), Err(save_err)) => {
             return Err(TxCommandExecutionError::contract_store(
@@ -79510,7 +79541,7 @@ fn tx_command_error_hint(error: &TxCommandExecutionError) -> Option<String> {
             kind: frankenterm_core::tx_execution::RollbackProofKind::Conflict,
             ..
         } => Some(
-            "Rollback was rejected before compensation dispatch because the receipt history conflicts with ambiguous or contradictory durable state. Do not blindly rerun the commit or rollback: inspect and reconcile the contract receipts with the workspace `.ft/tx_ledgers` records first, because an external effect may already have been dispatched."
+            "Rollback was rejected before compensation dispatch because the receipt history conflicts with ambiguous or contradictory durable state. Do not blindly rerun the commit or rollback: inspect and reconcile the contract receipts with the workspace `.ft/tx_ledgers` records first, because an external effect may already have been dispatched. A step a crash left Pending is settled by a person with `ft tx reconcile --step <step> --outcome success|failed|compensated --evidence <what you saw>`."
                 .to_string(),
         ),
         TxCommandExecutionError::InProgress(_) => {
@@ -79530,13 +79561,18 @@ fn tx_command_error_hint(error: &TxCommandExecutionError) -> Option<String> {
             "Nothing was committed. Start or reconnect the terminal backend (FrankenTerm GUI or mux), check `ft doctor`, then retry; use --dry-run for a preview meanwhile."
                 .to_string(),
         ),
+        TxCommandExecutionError::PendingEffect { step_id, .. } => Some(format!(
+            "Step {step_id} stopped between dispatch and its recorded outcome, so it may or may not have taken effect, and no run or rollback will touch it. Check what it did, then have a person settle it with `ft tx reconcile --step {step_id} --outcome success|failed|compensated --evidence <what you saw>`; it has no robot form."
+        )),
         TxCommandExecutionError::Execution(_) => None,
     }
 }
 
 fn robot_tx_command_error_code(error: &TxCommandExecutionError) -> &'static str {
     match error {
-        TxCommandExecutionError::Execution(_) => "robot.tx_execution_failed",
+        TxCommandExecutionError::Execution(_) | TxCommandExecutionError::PendingEffect { .. } => {
+            "robot.tx_execution_failed"
+        }
         TxCommandExecutionError::InProgress(_) => "robot.tx_in_progress",
         TxCommandExecutionError::RuntimeUnavailable { cause, .. } => cause.robot_error_code(),
         TxCommandExecutionError::RollbackProof {
@@ -79558,7 +79594,7 @@ fn robot_tx_command_error_code(error: &TxCommandExecutionError) -> &'static str 
 
 fn mission_tx_command_error(error: TxCommandExecutionError) -> MissionCommandError {
     let (exit_code, error_code) = match &error {
-        TxCommandExecutionError::Execution(_) => {
+        TxCommandExecutionError::Execution(_) | TxCommandExecutionError::PendingEffect { .. } => {
             (MISSION_EXIT_VALIDATION, "mission.tx.execution_failed")
         }
         TxCommandExecutionError::InProgress(_) => {
@@ -105839,6 +105875,38 @@ mod tests {
             mission_tx_command_error(unknown).error_code,
             "mission.tx.execution_failed"
         );
+    }
+
+    #[test]
+    fn a_step_left_pending_points_at_tx_reconcile_and_keeps_its_codes() {
+        use frankenterm_core::tx_execution::TxExecutionError;
+
+        let pending = TxExecutionError::DedupConflict {
+            step_id: "s1".to_string(),
+            outcome: "Pending".to_string(),
+        };
+        let error = TxCommandExecutionError::after_evidence(&pending, format!("failed: {pending}"));
+        assert_eq!(
+            robot_tx_command_error_code(&error),
+            "robot.tx_execution_failed"
+        );
+        let mission = mission_tx_command_error(error);
+        assert_eq!(mission.error_code, "mission.tx.execution_failed");
+        assert_eq!(mission.exit_code, MISSION_EXIT_VALIDATION);
+        assert!(mission.message.contains("prior outcome Pending"));
+        let hint = mission.hint.expect("a Pending step names its way out");
+        assert!(
+            hint.contains("ft tx reconcile --step s1 --outcome success|failed|compensated"),
+            "{hint}"
+        );
+
+        let failed = TxExecutionError::DedupConflict {
+            step_id: "s1".to_string(),
+            outcome: "Failed".to_string(),
+        };
+        let error = TxCommandExecutionError::after_evidence(&failed, format!("failed: {failed}"));
+        assert!(matches!(error, TxCommandExecutionError::Execution(_)));
+        assert_eq!(mission_tx_command_error(error).hint, None);
     }
 
     fn persisted_robot_tx_contract(

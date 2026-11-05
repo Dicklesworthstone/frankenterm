@@ -7864,6 +7864,23 @@ impl std::fmt::Display for TxExecutionError {
 
 impl std::error::Error for TxExecutionError {}
 
+impl TxExecutionError {
+    /// The step this error refuses because a crash or a lost acknowledgement
+    /// left its effect unknown (its record is Pending). Nothing retries such a
+    /// step; a person settles it with `ft tx reconcile`.
+    #[must_use]
+    pub fn unsettled_pending_step(&self) -> Option<&str> {
+        match self {
+            Self::DedupConflict { step_id, outcome }
+                if outcome == "Pending" || outcome.starts_with("Pending:") =>
+            {
+                Some(step_id)
+            }
+            _ => None,
+        }
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -10429,6 +10446,7 @@ mod tests {
             }
             other => return Err(format!("expected DedupConflict, got: {other}")),
         }
+        assert_eq!(err.unsettled_pending_step(), Some("step-0"));
         assert!(
             dispatched_steps.borrow().is_empty(),
             "no side effects may dispatch when an in-flight marker conflicts"
@@ -10440,6 +10458,46 @@ mod tests {
             "committed"
         ));
         Ok(())
+    }
+
+    #[test]
+    fn only_a_pending_record_names_a_step_to_reconcile() {
+        let conflict = |outcome: &str| TxExecutionError::DedupConflict {
+            step_id: "s1".to_string(),
+            outcome: outcome.to_string(),
+        };
+        assert_eq!(
+            conflict(&format!("{:?}", StepOutcome::Pending)).unsettled_pending_step(),
+            Some("s1")
+        );
+        for indeterminate in [
+            "Pending: commit dispatch outcome is indeterminate (send_timeout)",
+            "Pending: compensation dispatch outcome is indeterminate (send_timeout)",
+        ] {
+            assert_eq!(conflict(indeterminate).unsettled_pending_step(), Some("s1"));
+        }
+        let failed = StepOutcome::Failed {
+            error_code: "tx.commit.refused".to_string(),
+            error_message: "refused".to_string(),
+            compensated: false,
+        };
+        for settled in [
+            format!("{failed:?}"),
+            "compensation candidate lacks authoritative commit Success".to_string(),
+            "durable outcome Some(Pending) conflicts with report outcome Success".to_string(),
+        ] {
+            assert_eq!(
+                conflict(&settled).unsettled_pending_step(),
+                None,
+                "{settled}"
+            );
+        }
+        let proof = TxExecutionError::RollbackProof {
+            kind: RollbackProofKind::Conflict,
+            step_id: "s1".to_string(),
+            detail: "a Pending commit requires reconciliation".to_string(),
+        };
+        assert_eq!(proof.unsettled_pending_step(), None);
     }
 
     #[test]
