@@ -956,11 +956,26 @@ cmd_status() {
     echo "$n: $(svc_active $n && echo "active pid $(svc_pid $n)" || echo inactive)"
   done
   echo "guardian probe:  $(guardian_probe)"
-  echo "pane ids:        [$(mux_pane_ids)]"
+  local ids p age stale_after
+  ids=$(mux_pane_ids)
+  echo "pane ids:        [$ids]"
   echo "pane processes:  [$(broker_children)]"
-  local p
   p=$(newest_publication)
-  if [ "$p" -gt 0 ]; then echo "last snapshot:   $(( $(date +%s) - p ))s ago"; else echo "last snapshot:   none"; fi
+  if [ "$p" -gt 0 ]; then
+    age=$(( $(date +%s) - p ))
+    # The mux starts a capture an interval after the last one ends, whether or
+    # not its panes changed, so an old snapshot means its captures are failing
+    # or it has given up on them, which it reports only in its log. Allow what
+    # an upgrade's wait for a fresh snapshot allows.
+    stale_after=$(( RECOVERY_INTERVAL * 6 + 60 + 4 * $(echo "$ids" | wc -w) ))
+    if [ "$age" -gt "$stale_after" ]; then
+      echo "last snapshot:   ${age}s ago, STALE (expected within ${stale_after}s; see the mux log under $STATE/logs or the service journal)"
+    else
+      echo "last snapshot:   ${age}s ago"
+    fi
+  else
+    echo "last snapshot:   none"
+  fi
 }
 
 cmd_stop_all() {
