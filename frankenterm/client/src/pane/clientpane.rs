@@ -6876,6 +6876,27 @@ mod tests {
         assert_eq!(cached_pane_registration(&pane_authority), None);
     }
 
+    #[test]
+    fn a_restart_grace_counts_the_panes_held_from_its_own_domain() {
+        let scope = MuxTestScope::enter_with_parked_main_thread_scheduler();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let held = test_client_inner(61);
+        let other = test_client_inner(62);
+        assert_eq!(crate::client::domain_pane_count(61), 0);
+        for (local_pane_id, remote_pane_id) in [(611, 1), (612, 2), (613, 3)] {
+            let pane: Arc<dyn Pane> = test_client_pane(&held, local_pane_id, remote_pane_id);
+            mux.add_pane(&pane)
+                .expect("register a pane of the held domain");
+        }
+        let pane: Arc<dyn Pane> = test_client_pane(&other, 621, 1);
+        mux.add_pane(&pane)
+            .expect("register a pane of another domain");
+        assert_eq!(crate::client::domain_pane_count(61), 3);
+        assert_eq!(crate::client::domain_pane_count(62), 1);
+        assert_eq!(crate::client::domain_pane_count(63), 0);
+    }
+
     fn test_client_inner(local_domain_id: DomainId) -> Arc<ClientInner> {
         let unix = UnixDomain {
             name: "client-pane-test".to_string(),

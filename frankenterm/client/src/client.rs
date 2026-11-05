@@ -9718,7 +9718,7 @@ impl Reconnectable {
             // keeps its windows (ft-zy6g7); a mux that comes back without
             // that lineage is refused as a changed session and reattached
             // fresh. Redials never auto-start a mux, and a plain local socket
-            // stops redialing after `PLAIN_LOCAL_MUX_RESTART_GRACE`.
+            // stops redialing after `local_mux_restart_grace`.
             ClientDomainConfig::Unix(_) => true,
             ClientDomainConfig::Tls(_) => true,
             // It *does* make sense to reconnect with an ssh session, but we
@@ -10175,8 +10175,34 @@ fn next_reconnect_backoff(backoff: Duration, max_interval: Duration) -> Duration
 /// enough for a lossless upgrade or a launchd crash restart to bring up the
 /// restored mux, short enough that a mux stopped for good releases its
 /// windows (ft-zy6g7). It is measured from the start of the outage and reset
-/// by any session that stays up `client_reconnect_healthy_session_ms`.
+/// by any session that stays up `client_reconnect_healthy_session_ms`. Each
+/// pane the GUI holds from that mux adds `PLAIN_LOCAL_MUX_RESTART_GRACE_PER_PANE`.
 const PLAIN_LOCAL_MUX_RESTART_GRACE: Duration = Duration::from_secs(120);
+
+/// A restored mux opens its socket only once every pane is back, and long
+/// panes take seconds each: at 100,000 rows of scrollback, 12 panes came back
+/// in 31 s and 24 in 70 s (ft-7qcse). At that rate 50 such panes take about
+/// 155 s, past the fixed grace, which would give up on a mux still restoring.
+const PLAIN_LOCAL_MUX_RESTART_GRACE_PER_PANE: Duration = Duration::from_secs(4);
+
+/// The grace of a plain local socket whose GUI holds `panes` panes from it.
+#[must_use]
+fn local_mux_restart_grace(panes: usize) -> Duration {
+    let panes = u32::try_from(panes).unwrap_or(u32::MAX);
+    PLAIN_LOCAL_MUX_RESTART_GRACE
+        .saturating_add(PLAIN_LOCAL_MUX_RESTART_GRACE_PER_PANE.saturating_mul(panes))
+}
+
+/// How many panes this process holds from `domain_id`: the panes its mux
+/// restores before it answers again.
+pub(crate) fn domain_pane_count(domain_id: DomainId) -> usize {
+    mux::Mux::try_get().map_or(0, |mux| {
+        mux.iter_panes()
+            .iter()
+            .filter(|pane| pane.domain_id() == domain_id)
+            .count()
+    })
+}
 
 /// A plain local unix socket, with no proxy_command between it and its mux:
 /// the kernel hangs it up exactly when that mux exits.
@@ -10213,11 +10239,11 @@ fn reconnect_backoff_bounds(
 #[must_use]
 fn local_mux_restart_grace_exhausted(
     config: &ClientDomainConfig,
+    grace: Duration,
     outage_started: std::time::Instant,
     now: std::time::Instant,
 ) -> bool {
-    is_plain_local_socket(config)
-        && now.saturating_duration_since(outage_started) >= PLAIN_LOCAL_MUX_RESTART_GRACE
+    is_plain_local_socket(config) && now.saturating_duration_since(outage_started) >= grace
 }
 
 /// How long a reconnect, or an automatic domain connect, runs before its
@@ -10375,7 +10401,7 @@ impl Client {
                 // to count as recovered. Bounds the churn above.
                 let mut failed_cycles: u32 = 0;
                 // When the current outage began; it bounds a plain local
-                // socket's redialing to PLAIN_LOCAL_MUX_RESTART_GRACE.
+                // socket's redialing to local_mux_restart_grace.
                 let mut outage_started: Option<std::time::Instant> = None;
                 loop {
                     let session_started = std::time::Instant::now();
@@ -10453,6 +10479,14 @@ impl Client {
                         let new_outage = outage_started.is_none();
                         let outage_start =
                             *outage_started.get_or_insert_with(std::time::Instant::now);
+                        let panes = domain_pane_count(local_domain_id);
+                        let restart_grace = local_mux_restart_grace(panes);
+                        if new_outage && is_plain_local_socket(&reconnectable.config) {
+                            log::info!(
+                                "redialing the local mux of domain {local_domain_id} for up to \
+                                 {restart_grace:?}, as this process holds {panes} of its panes"
+                            );
+                        }
 
                         if let Some(ioerr) = e.root_cause().downcast_ref::<std::io::Error>() {
                             if let std::io::ErrorKind::UnexpectedEof = ioerr.kind() {
@@ -10472,12 +10506,13 @@ impl Client {
 
                         if local_mux_restart_grace_exhausted(
                             &reconnectable.config,
+                            restart_grace,
                             outage_start,
                             std::time::Instant::now(),
                         ) {
                             log::error!(
                                 "giving up on domain {local_domain_id}: its local mux has not \
-                                 stayed up within {PLAIN_LOCAL_MUX_RESTART_GRACE:?} (last error: {e})"
+                                 stayed up within {restart_grace:?} (last error: {e})"
                             );
                             // Never into a window the reattach closed unseen:
                             // dropped with this text, a new one opens to show it.
@@ -10487,7 +10522,7 @@ impl Client {
                                 new_reconnect_ui,
                             )
                             .output_str(&format!(
-                                "Giving up: the local mux has not come back within {PLAIN_LOCAL_MUX_RESTART_GRACE:?}: {e}\n"
+                                "Giving up: the local mux has not come back within {restart_grace:?}: {e}\n"
                             ));
                             break;
                         }
@@ -10689,12 +10724,13 @@ impl Client {
                                     }
                                     if local_mux_restart_grace_exhausted(
                                         &reconnectable.config,
+                                        restart_grace,
                                         outage_start,
                                         std::time::Instant::now(),
                                     ) {
                                         restart_grace_exhausted = true;
                                         ui.output_str(&format!(
-                                            "giving up: the local mux did not come back within {PLAIN_LOCAL_MUX_RESTART_GRACE:?}: {err}\n"
+                                            "giving up: the local mux did not come back within {restart_grace:?}: {err}\n"
                                         ));
                                         break;
                                     }
@@ -10710,7 +10746,7 @@ impl Client {
                             if restart_grace_exhausted {
                                 log::error!(
                                     "giving up on domain {local_domain_id}: its local mux did \
-                                     not come back within {PLAIN_LOCAL_MUX_RESTART_GRACE:?} \
+                                     not come back within {restart_grace:?} \
                                      ({dial_attempts} attempts; last error: {e})"
                                 );
                             } else {
@@ -12085,20 +12121,76 @@ mod tests {
         assert!(!is_plain_local_socket(&proxied));
         assert!(!is_plain_local_socket(&tls));
 
+        let grace = local_mux_restart_grace(0);
+        assert_eq!(grace, PLAIN_LOCAL_MUX_RESTART_GRACE);
         let outage = std::time::Instant::now();
-        let within = outage + PLAIN_LOCAL_MUX_RESTART_GRACE - Duration::from_millis(1);
-        let past = outage + PLAIN_LOCAL_MUX_RESTART_GRACE;
-        assert!(!local_mux_restart_grace_exhausted(&plain, outage, within));
-        assert!(local_mux_restart_grace_exhausted(&plain, outage, past));
+        let within = outage + grace - Duration::from_millis(1);
+        let past = outage + grace;
+        assert!(!local_mux_restart_grace_exhausted(
+            &plain, grace, outage, within
+        ));
+        assert!(local_mux_restart_grace_exhausted(
+            &plain, grace, outage, past
+        ));
         // A clock reading from before the outage never exhausts it.
-        assert!(!local_mux_restart_grace_exhausted(&plain, past, outage));
+        assert!(!local_mux_restart_grace_exhausted(
+            &plain, grace, past, outage
+        ));
         for remote in [&proxied, &tls] {
             assert!(!local_mux_restart_grace_exhausted(
                 remote,
+                grace,
                 outage,
-                past + PLAIN_LOCAL_MUX_RESTART_GRACE
+                past + grace
             ));
         }
+    }
+
+    #[test]
+    fn a_restoring_mux_gets_more_time_for_every_pane_it_brings_back() {
+        assert_eq!(local_mux_restart_grace(0), Duration::from_secs(120));
+        assert_eq!(local_mux_restart_grace(1), Duration::from_secs(124));
+        // Measured at 100,000 rows of scrollback: 31 s for 12 panes, 70 s for
+        // 24 (ft-7qcse), about 3.25 s for each pane past the 12th. Up to 100
+        // panes the grace stays half as long again ahead of that.
+        let measured = |panes: usize| {
+            let past_24 = u64::try_from(panes.saturating_sub(24)).unwrap();
+            Duration::from_secs(70 + past_24 * 13 / 4)
+        };
+        for panes in [12_usize, 24, 40, 50, 100] {
+            let grace = local_mux_restart_grace(panes);
+            assert!(
+                grace >= measured(panes) * 3 / 2,
+                "{} panes: a grace of {:?} leaves too little room",
+                panes,
+                grace
+            );
+        }
+        // The fixed grace alone runs out before 50 such panes are back.
+        assert!(PLAIN_LOCAL_MUX_RESTART_GRACE < measured(50));
+
+        let plain = ClientDomainConfig::Unix(UnixDomain::default());
+        let outage = std::time::Instant::now();
+        let fifty = local_mux_restart_grace(50);
+        let at = outage + Duration::from_secs(200);
+        assert!(local_mux_restart_grace_exhausted(
+            &plain,
+            local_mux_restart_grace(0),
+            outage,
+            at
+        ));
+        assert!(!local_mux_restart_grace_exhausted(
+            &plain, fifty, outage, at
+        ));
+        assert!(local_mux_restart_grace_exhausted(
+            &plain,
+            fifty,
+            outage,
+            outage + fifty
+        ));
+
+        // A count past u32::MAX saturates instead of overflowing.
+        assert!(local_mux_restart_grace(usize::MAX) >= local_mux_restart_grace(1 << 20));
     }
 
     #[test]
