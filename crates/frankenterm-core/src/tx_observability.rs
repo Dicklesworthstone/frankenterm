@@ -19,7 +19,8 @@
 //! the output is identical — suitable for CI artifact comparison and replay linkage.
 
 use crate::tx_idempotency::{
-    ChainVerification, ResumeContext, ResumeRecommendation, StepOutcome, TxExecutionLedger, TxPhase,
+    ChainVerification, RecoveredLinkSource, ResumeContext, ResumeRecommendation, StepOutcome,
+    TxExecutionLedger, TxPhase,
 };
 use crate::tx_plan_compiler::{StepRisk, TxPlan};
 use serde::{Deserialize, Serialize};
@@ -278,6 +279,13 @@ pub fn build_timeline(
             Some(receipt) => format!(
                 "{summary}; reconciled by {} at {}",
                 receipt.reconciled_by, receipt.reconciled_at_ms
+            ),
+            None => summary,
+        };
+        let summary = match &record.recovered_from {
+            Some(source) => format!(
+                "{summary}; recovered, not dispatched: the effect is execution {} ordinal {}, dispatched by {} at {}",
+                source.execution_id, source.ordinal, source.agent_id, source.timestamp_ms
             ),
             None => summary,
         };
@@ -591,6 +599,11 @@ pub struct LedgerRecordSummary {
     pub risk: StepRisk,
     pub agent_id: String,
     pub record_hash: String,
+    /// For a recovered link, the dispatched record it stands for; `risk`,
+    /// `agent_id` and `timestamp_ms` are then the link's own. Left out of
+    /// other records, so their summaries read as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovered_from: Option<RecoveredLinkSource>,
 }
 
 impl LedgerSnapshot {
@@ -608,6 +621,7 @@ impl LedgerSnapshot {
                 risk: r.risk,
                 agent_id: r.agent_id.clone(),
                 record_hash: r.hash(),
+                recovered_from: r.recovered_from.clone(),
             })
             .collect();
 

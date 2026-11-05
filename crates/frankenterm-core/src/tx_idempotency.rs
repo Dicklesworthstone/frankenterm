@@ -401,6 +401,29 @@ pub struct StepExecutionRecord {
     /// hashes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reconciliation: Option<PendingReconciliationReceipt>,
+    /// The record whose effect this one only links, when a later execution
+    /// found the effect already proven and did not dispatch it. Its own
+    /// timestamp, risk and agent are then those of the link. Absent for a
+    /// dispatched effect, so existing records keep their hashes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovered_from: Option<RecoveredLinkSource>,
+}
+
+/// The dispatched record a recovered link stands for, as it stands in its own
+/// ledger. Its chain hash is left out on purpose: settling an earlier `Pending`
+/// record in place re-hashes every record after it, the effect included.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveredLinkSource {
+    /// Execution whose ledger holds the dispatched record.
+    pub execution_id: String,
+    /// The record's ordinal in that ledger.
+    pub ordinal: u64,
+    /// When the effect was recorded.
+    pub timestamp_ms: u64,
+    /// The step's risk when it was dispatched.
+    pub risk: StepRisk,
+    /// The agent that dispatched it.
+    pub agent_id: String,
 }
 
 /// The durable account of settling a crash-orphaned `Pending` record, kept in
@@ -1131,6 +1154,43 @@ impl TxExecutionLedger {
         agent_id: &str,
         timestamp_ms: u64,
     ) -> Result<String, IdempotencyError> {
+        self.append_record(idem_key, outcome, risk, agent_id, timestamp_ms, None)
+    }
+
+    /// Append a link to an effect another execution already proved, naming
+    /// the record that proved it. Returns the link's hash.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::append`].
+    pub(crate) fn append_recovered_link(
+        &mut self,
+        idem_key: IdempotencyKey,
+        outcome: StepOutcome,
+        risk: StepRisk,
+        agent_id: &str,
+        timestamp_ms: u64,
+        source: RecoveredLinkSource,
+    ) -> Result<String, IdempotencyError> {
+        self.append_record(
+            idem_key,
+            outcome,
+            risk,
+            agent_id,
+            timestamp_ms,
+            Some(source),
+        )
+    }
+
+    fn append_record(
+        &mut self,
+        idem_key: IdempotencyKey,
+        outcome: StepOutcome,
+        risk: StepRisk,
+        agent_id: &str,
+        timestamp_ms: u64,
+        recovered_from: Option<RecoveredLinkSource>,
+    ) -> Result<String, IdempotencyError> {
         if self.phase.is_terminal() {
             return Err(IdempotencyError::LedgerSealed { phase: self.phase });
         }
@@ -1176,6 +1236,7 @@ impl TxExecutionLedger {
             prev_hash: self.last_hash.clone(),
             agent_id: agent_id.to_string(),
             reconciliation: None,
+            recovered_from,
         };
 
         let record_hash = record.hash();
@@ -1779,6 +1840,8 @@ struct DurableKeyLockGuard {
 pub(crate) struct DurableKeyLease {
     idem_key: IdempotencyKey,
     observed_outcome: Option<StepOutcome>,
+    /// The dispatched record behind an observed Success or Compensated.
+    observed_source: Option<RecoveredLinkSource>,
     key_lock: Option<DurableKeyLockGuard>,
     proof_barrier: Arc<ProofBarrierGuard>,
 }
@@ -1880,6 +1943,9 @@ pub struct IdempotencyReservation {
     idem_key: String,
     execution_id: String,
     observed_outcome: Option<StepOutcome>,
+    /// The dispatched record behind an observed Success or Compensated, which
+    /// a recovered link records as its source.
+    observed_source: Option<RecoveredLinkSource>,
     pending_recorded: bool,
     // Fields drop in declaration order. Release the execution lock first while
     // the optional key lease and plan barrier are still held, preserving the
@@ -2097,6 +2163,118 @@ struct DurableOutcomeObservation {
     ordinal: u64,
     outcome: StepOutcome,
     settled_by_proof: bool,
+    risk: StepRisk,
+    agent_id: String,
+    recovered_from: Option<RecoveredLinkSource>,
+    /// Set only on the observation [`select_authoritative_durable_outcome`]
+    /// returns for a Success or Compensated: the dispatched record that proved
+    /// it, which a recovered link must name.
+    effect_source: Option<RecoveredLinkSource>,
+}
+
+impl DurableOutcomeObservation {
+    fn of(execution_id: &str, record: &StepExecutionRecord) -> Self {
+        Self {
+            timestamp_ms: record.timestamp_ms,
+            execution_id: execution_id.to_string(),
+            ordinal: record.ordinal,
+            outcome: record.outcome.clone(),
+            settled_by_proof: record.reconciliation.is_some(),
+            risk: record.risk,
+            agent_id: record.agent_id.clone(),
+            recovered_from: record.recovered_from.clone(),
+            effect_source: None,
+        }
+    }
+
+    fn proves_effect(&self) -> bool {
+        matches!(
+            self.outcome,
+            StepOutcome::Success { .. } | StepOutcome::Compensated { .. }
+        )
+    }
+
+    /// The dispatched record whose effect this observation proves: the one it
+    /// links, or itself.
+    fn proven_record(&self) -> RecoveredLinkSource {
+        self.recovered_from
+            .clone()
+            .unwrap_or_else(|| RecoveredLinkSource {
+                execution_id: self.execution_id.clone(),
+                ordinal: self.ordinal,
+                timestamp_ms: self.timestamp_ms,
+                risk: self.risk,
+                agent_id: self.agent_id.clone(),
+            })
+    }
+}
+
+/// The dispatched record behind a key's durable Success or Compensated, once
+/// every recovered link of the key is shown to name it. `observations` must be
+/// sorted oldest first.
+///
+/// A link names one record, which must be present: dispatched and not itself
+/// a link, with the link's outcome and the timestamp, risk and agent the link
+/// carries. The store never deletes a ledger, so a link naming an execution
+/// that is not in the spool is either forged or outlived a ledger someone
+/// removed by hand; it stands only when no dispatched record of the key is
+/// present either, as the only proof left. Every link must name the same
+/// record, and that record is the source; with no link, the oldest dispatched
+/// record is. Records from before links named their source look dispatched.
+fn authoritative_effect_source(
+    idem_key: &IdempotencyKey,
+    observations: &[DurableOutcomeObservation],
+) -> Result<Option<RecoveredLinkSource>, IdempotencyError> {
+    let dispatched_present = observations
+        .iter()
+        .any(|observation| observation.proves_effect() && observation.recovered_from.is_none());
+    let mut linked: Option<&RecoveredLinkSource> = None;
+    for link in observations
+        .iter()
+        .filter(|observation| observation.proves_effect())
+    {
+        let Some(source) = link.recovered_from.as_ref() else {
+            continue;
+        };
+        if let Some(earlier) = linked
+            && earlier != source
+        {
+            return Err(IdempotencyError::LedgerIndexCorrupt {
+                reason: format!(
+                    "recovered links for key {idem_key} name different records: execution {} ordinal {} and execution {} ordinal {}",
+                    earlier.execution_id, earlier.ordinal, source.execution_id, source.ordinal
+                ),
+            });
+        }
+        linked = Some(source);
+        let source_ledger_present = observations
+            .iter()
+            .any(|observation| observation.execution_id == source.execution_id);
+        let named = observations.iter().find(|observation| {
+            observation.execution_id == source.execution_id && observation.ordinal == source.ordinal
+        });
+        let holds_effect = named.is_some_and(|named| {
+            named.recovered_from.is_none()
+                && named.outcome == link.outcome
+                && named.timestamp_ms == source.timestamp_ms
+                && named.risk == source.risk
+                && named.agent_id == source.agent_id
+        });
+        if (source_ledger_present || dispatched_present) && !holds_effect {
+            return Err(IdempotencyError::LedgerIndexCorrupt {
+                reason: format!(
+                    "recovered link for key {idem_key} in execution {} ordinal {} names execution {} ordinal {}, which does not hold that effect",
+                    link.execution_id, link.ordinal, source.execution_id, source.ordinal
+                ),
+            });
+        }
+    }
+    Ok(linked.cloned().or_else(|| {
+        observations
+            .iter()
+            .find(|observation| observation.proves_effect())
+            .map(DurableOutcomeObservation::proven_record)
+    }))
 }
 
 fn select_authoritative_durable_outcome(
@@ -2109,6 +2287,7 @@ fn select_authoritative_durable_outcome(
             .then_with(|| left.execution_id.cmp(&right.execution_id))
             .then_with(|| left.ordinal.cmp(&right.ordinal))
     });
+    let effect_source = authoritative_effect_source(idem_key, &observations)?;
 
     let mut sticky: Option<DurableOutcomeObservation> = None;
     for observation in observations
@@ -2135,7 +2314,14 @@ fn select_authoritative_durable_outcome(
     // retry failure must never downgrade them into permission to dispatch.
     // When no sticky fact exists, the newest failure/skipped observation is
     // the authoritative retry state.
-    Ok(sticky.or_else(|| observations.pop()))
+    Ok(sticky
+        .or_else(|| observations.pop())
+        .map(|mut authoritative| {
+            if authoritative.proves_effect() {
+                authoritative.effect_source = effect_source;
+            }
+            authoritative
+        }))
 }
 
 /// Capability bundle rooted at the caller-declared stable control-plane
@@ -3476,13 +3662,7 @@ impl IdempotencyStore {
                 replay_records
                     .entry(record.idem_key.clone())
                     .or_default()
-                    .push(DurableOutcomeObservation {
-                        timestamp_ms: record.timestamp_ms,
-                        execution_id: execution_id.clone(),
-                        ordinal: record.ordinal,
-                        outcome: record.outcome.clone(),
-                        settled_by_proof: record.reconciliation.is_some(),
-                    });
+                    .push(DurableOutcomeObservation::of(execution_id, record));
             }
         }
         let mut authoritative_records = Vec::with_capacity(replay_records.len());
@@ -3892,10 +4072,14 @@ impl IdempotencyStore {
         // Keep both locks alive during the complete live-spool refresh. Any
         // error drops them in key-then-barrier order; success transfers their
         // ownership into the returned guard.
-        let observed_outcome = self.refresh_durable_outcome_for_key(idem_key, now_ms)?;
+        let observation = self.refresh_durable_observation_for_key(idem_key, now_ms)?;
+        let (observed_outcome, observed_source) = observation.map_or((None, None), |observation| {
+            (Some(observation.outcome), observation.effect_source)
+        });
         Ok(DurableKeyLease {
             idem_key: idem_key.clone(),
             observed_outcome,
+            observed_source,
             key_lock: Some(key_lock),
             proof_barrier,
         })
@@ -3964,9 +4148,14 @@ impl IdempotencyStore {
                 {
                     settled_by_proof.insert(idem_key.clone());
                 }
+                let (observed_outcome, observed_source) = observation
+                    .map_or((None, None), |observation| {
+                        (Some(observation.outcome), observation.effect_source)
+                    });
                 let lease = DurableKeyLease {
                     idem_key: idem_key.clone(),
-                    observed_outcome: observation.map(|observation| observation.outcome),
+                    observed_outcome,
+                    observed_source,
                     key_lock: None,
                     proof_barrier: Arc::clone(&proof_barrier),
                 };
@@ -4017,6 +4206,7 @@ impl IdempotencyStore {
         let DurableKeyLease {
             idem_key,
             observed_outcome,
+            observed_source,
             key_lock,
             proof_barrier,
         } = lease;
@@ -4024,6 +4214,7 @@ impl IdempotencyStore {
             idem_key: idem_key.as_str().to_string(),
             execution_id: execution_id.to_string(),
             observed_outcome,
+            observed_source,
             pending_recorded: false,
             execution_lock,
             key_lock,
@@ -4142,9 +4333,18 @@ impl IdempotencyStore {
         idem_key: &IdempotencyKey,
         now_ms: u64,
     ) -> Result<Option<StepOutcome>, IdempotencyError> {
+        Ok(self
+            .refresh_durable_observation_for_key(idem_key, now_ms)?
+            .map(|observation| observation.outcome))
+    }
+
+    fn refresh_durable_observation_for_key(
+        &mut self,
+        idem_key: &IdempotencyKey,
+        now_ms: u64,
+    ) -> Result<Option<DurableOutcomeObservation>, IdempotencyError> {
         self.refresh_durable_outcomes_for_keys(std::slice::from_ref(idem_key), now_ms)?
             .remove(idem_key)
-            .map(|observation| observation.map(|observation| observation.outcome))
             .ok_or_else(|| IdempotencyError::LedgerRecordInvariant {
                 reason: format!(
                     "bulk durable refresh omitted requested idempotency key {}",
@@ -4272,13 +4472,7 @@ impl IdempotencyStore {
                 for record in ledger.records() {
                     durable_high_water_ms = durable_high_water_ms.max(record.timestamp_ms);
                     if let Some(observations) = matching_records.get_mut(&record.idem_key) {
-                        observations.push(DurableOutcomeObservation {
-                            timestamp_ms: record.timestamp_ms,
-                            execution_id: stem.clone(),
-                            ordinal: record.ordinal,
-                            outcome: record.outcome.clone(),
-                            settled_by_proof: record.reconciliation.is_some(),
-                        });
+                        observations.push(DurableOutcomeObservation::of(&stem, record));
                     }
                 }
             }
@@ -4672,6 +4866,9 @@ impl IdempotencyStore {
     /// durable spool; and appends only when that proof exactly matches
     /// `outcome`. Only Success and Compensated facts are linkable; Pending,
     /// failure, and skipped states cannot certify that a prior effect completed.
+    /// The link names the dispatched record behind that proof, with its own
+    /// execution, ordinal, timestamp, risk and agent, so it never passes for a
+    /// dispatch; `risk`, `agent_id` and `timestamp_ms` describe the link.
     pub fn record_recovered_execution(
         &mut self,
         execution_id: &str,
@@ -4757,15 +4954,25 @@ impl IdempotencyStore {
                 observed: format!("{:?}", reservation.observed_outcome),
             });
         }
+        // The link names the record that proved the effect, as the refresh
+        // under this reservation's locks found it, never one the caller names.
+        let Some(source) = reservation.observed_source.clone() else {
+            return Err(IdempotencyError::LedgerRecordInvariant {
+                reason: format!(
+                    "recovered proof link for key {idem_key} has no dispatched record to name"
+                ),
+            });
+        };
         self.validate_monotonic_timestamp(timestamp_ms)?;
         let locked = self.read_durable_ledger_locked(&reservation.execution_lock)?;
         let mut candidate = locked.ledger;
-        let hash = candidate.append(
+        let hash = candidate.append_recovered_link(
             idem_key.clone(),
             outcome.clone(),
             risk,
             agent_id,
             timestamp_ms,
+            source,
         )?;
         self.persist_ledger_snapshot(&candidate, Some(&locked.pinned_file))?;
         self.evict_stale(timestamp_ms.saturating_sub(self.policy.dedup_ttl_ms));
@@ -6593,6 +6800,7 @@ mod tests {
             prev_hash: prev_hash.to_string(),
             agent_id: "a".to_string(),
             reconciliation: None,
+            recovered_from: None,
         }
     }
 
@@ -8539,6 +8747,298 @@ mod tests {
         );
     }
 
+    /// A durable store whose execution "txe-source" dispatched `key` to
+    /// Success as agent-source at High risk, and whose execution
+    /// "txe-recovery" linked that Success as agent-recovery at Low risk.
+    #[cfg(not(windows))]
+    fn store_with_a_recovered_link(
+        anchor: &Path,
+    ) -> (IdempotencyStore, TxPlan, IdempotencyKey, StepOutcome) {
+        let plan = make_plan(1);
+        let key = IdempotencyKey::new(&plan.plan_id, &plan.steps[0].id, "commit");
+        let success = StepOutcome::Success {
+            result: Some("applied".to_string()),
+        };
+        let mut store = IdempotencyStore::open(anchor, IdempotencyPolicy::default())
+            .expect("open durable store");
+        for execution_id in ["txe-source", "txe-recovery"] {
+            store
+                .create_ledger(execution_id, &plan)
+                .expect("create ledger");
+            store
+                .transition_phase(execution_id, TxPhase::Preparing)
+                .expect("prepare ledger");
+        }
+        let mut reservation = store
+            .acquire_durable_reservation("txe-source", &key, 1_000)
+            .expect("reserve the dispatch");
+        store
+            .record_execution_reserved(
+                &mut reservation,
+                "txe-source",
+                key.clone(),
+                StepOutcome::Pending,
+                StepRisk::High,
+                "agent-source",
+                1_000,
+            )
+            .expect("record the dispatch Pending");
+        store
+            .complete_execution_reserved(
+                reservation,
+                "txe-source",
+                key.clone(),
+                success.clone(),
+                1_001,
+            )
+            .expect("record the dispatch Success");
+        store
+            .record_recovered_execution(
+                "txe-recovery",
+                key.clone(),
+                success.clone(),
+                StepRisk::Low,
+                "agent-recovery",
+                2_000,
+            )
+            .expect("link the proven Success");
+        (store, plan, key, success)
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_recovered_link_names_the_dispatched_record_and_keeps_its_own_attribution() {
+        let anchor = tempfile::tempdir().expect("create durable workspace");
+        let (store, plan, key, success) = store_with_a_recovered_link(anchor.path());
+        let dispatched = store
+            .get_ledger("txe-source")
+            .and_then(|ledger| ledger.get_record(&key))
+            .expect("the dispatched record")
+            .clone();
+        assert_eq!(dispatched.recovered_from, None);
+        let source = RecoveredLinkSource {
+            execution_id: "txe-source".to_string(),
+            ordinal: dispatched.ordinal,
+            timestamp_ms: dispatched.timestamp_ms,
+            risk: StepRisk::High,
+            agent_id: "agent-source".to_string(),
+        };
+        let link = store
+            .get_ledger("txe-recovery")
+            .and_then(|ledger| ledger.get_record(&key))
+            .expect("the link")
+            .clone();
+        assert_eq!(link.recovered_from.as_ref(), Some(&source));
+        assert_eq!(link.agent_id, "agent-recovery");
+        assert_eq!(link.risk, StepRisk::Low);
+        assert_eq!(link.timestamp_ms, 2_000);
+        drop(store);
+
+        // A reopened store accepts the link, and a later link names the
+        // dispatched record too, not the first link.
+        let mut reopened = IdempotencyStore::open(anchor.path(), IdempotencyPolicy::default())
+            .expect("a link that names its dispatched record passes startup");
+        reopened
+            .create_ledger("txe-recovery-2", &plan)
+            .expect("create second recovery ledger");
+        reopened
+            .transition_phase("txe-recovery-2", TxPhase::Preparing)
+            .expect("prepare second recovery ledger");
+        reopened
+            .record_recovered_execution(
+                "txe-recovery-2",
+                key.clone(),
+                success,
+                StepRisk::Low,
+                "agent-recovery-2",
+                3_000,
+            )
+            .expect("link the proven Success again");
+        let second = reopened
+            .get_ledger("txe-recovery-2")
+            .and_then(|ledger| ledger.get_record(&key))
+            .expect("the second link");
+        assert_eq!(second.recovered_from.as_ref(), Some(&source));
+
+        let snapshot = crate::tx_observability::LedgerSnapshot::from_ledger(
+            reopened
+                .get_ledger("txe-recovery-2")
+                .expect("recovery ledger"),
+        );
+        assert_eq!(snapshot.records[0].recovered_from.as_ref(), Some(&source));
+        let timeline = crate::tx_observability::build_timeline(
+            reopened
+                .get_ledger("txe-recovery-2")
+                .expect("recovery ledger"),
+            &[],
+        );
+        assert!(
+            timeline[0]
+                .summary
+                .contains("recovered, not dispatched: the effect is execution txe-source"),
+            "{}",
+            timeline[0].summary
+        );
+    }
+
+    #[test]
+    fn recovered_links_that_name_different_records_fail_closed() {
+        let key = make_key("test-plan", "step-0");
+        let link = |execution_id: &str, source_execution_id: &str| DurableOutcomeObservation {
+            timestamp_ms: 2_000,
+            execution_id: execution_id.to_string(),
+            ordinal: 0,
+            outcome: StepOutcome::Success { result: None },
+            settled_by_proof: false,
+            risk: StepRisk::Low,
+            agent_id: "agent-recovery".to_string(),
+            recovered_from: Some(RecoveredLinkSource {
+                execution_id: source_execution_id.to_string(),
+                ordinal: 0,
+                timestamp_ms: 1_000,
+                risk: StepRisk::High,
+                agent_id: "agent-source".to_string(),
+            }),
+            effect_source: None,
+        };
+        // With no dispatched record left, one link stands alone, and two
+        // links agree or fail.
+        let alone = [link("txe-a", "txe-gone")];
+        assert_eq!(
+            authoritative_effect_source(&key, &alone).expect("a lone link stands"),
+            alone[0].recovered_from
+        );
+        let agreeing = [link("txe-a", "txe-gone"), link("txe-b", "txe-gone")];
+        assert_eq!(
+            authoritative_effect_source(&key, &agreeing).expect("agreeing links stand"),
+            alone[0].recovered_from
+        );
+        let disagreeing = [link("txe-a", "txe-gone"), link("txe-b", "txe-elsewhere")];
+        assert!(matches!(
+            authoritative_effect_source(&key, &disagreeing),
+            Err(IdempotencyError::LedgerIndexCorrupt { .. })
+        ));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_recovered_link_that_misnames_its_record_fails_closed() {
+        let anchor = tempfile::tempdir().expect("create durable workspace");
+        let (store, plan, key, success) = store_with_a_recovered_link(anchor.path());
+        let genuine = store
+            .get_ledger("txe-recovery")
+            .and_then(|ledger| ledger.get_record(&key))
+            .and_then(|link| link.recovered_from.clone())
+            .expect("the genuine link source");
+        drop(store);
+        let spool = anchor.path().join(TX_LEDGER_DIR_NAME);
+        let forge = |source: RecoveredLinkSource| {
+            // A writer that can rewrite the ledger can also re-chain it.
+            let mut forged = TxExecutionLedger::new("txe-recovery", &plan.plan_id, plan.plan_hash);
+            forged
+                .transition_phase(TxPhase::Preparing)
+                .expect("prepare forged ledger");
+            forged
+                .append_recovered_link(
+                    key.clone(),
+                    success.clone(),
+                    StepRisk::Low,
+                    "agent-recovery",
+                    2_000,
+                    source,
+                )
+                .expect("forge the link");
+            assert!(forged.verify_chain().chain_intact);
+            std::fs::write(
+                spool.join("txe-recovery.json"),
+                serde_json::to_vec_pretty(&forged).expect("serialize forged ledger"),
+            )
+            .expect("write forged ledger");
+        };
+
+        let misnamed = [
+            RecoveredLinkSource {
+                agent_id: "agent-someone-else".to_string(),
+                ..genuine.clone()
+            },
+            RecoveredLinkSource {
+                risk: StepRisk::Low,
+                ..genuine.clone()
+            },
+            RecoveredLinkSource {
+                timestamp_ms: genuine.timestamp_ms + 1,
+                ..genuine.clone()
+            },
+            RecoveredLinkSource {
+                ordinal: genuine.ordinal + 1,
+                ..genuine.clone()
+            },
+            // An execution not in the spool, while the dispatched record is.
+            RecoveredLinkSource {
+                execution_id: "txe-gone".to_string(),
+                ..genuine.clone()
+            },
+        ];
+        let mut live = IdempotencyStore::open(anchor.path(), IdempotencyPolicy::default())
+            .expect("the genuine link passes startup");
+        for source in misnamed {
+            forge(source.clone());
+            let error = IdempotencyStore::open(anchor.path(), IdempotencyPolicy::default())
+                .expect_err("a link that misnames its record must not pass startup");
+            assert!(
+                matches!(error, IdempotencyError::LedgerIndexCorrupt { .. }),
+                "{source:?}: {error:?}"
+            );
+            let error = live
+                .acquire_durable_reservation("txe-source", &key, 4_000)
+                .expect_err("a store already open must refuse the key once the link misnames");
+            assert!(
+                matches!(error, IdempotencyError::LedgerIndexCorrupt { .. }),
+                "{source:?}: {error:?}"
+            );
+        }
+        drop(live);
+
+        // Once the dispatched record's ledger is gone too, the link is the
+        // only proof left, so it stands, and the next link names the same
+        // record.
+        let gone = RecoveredLinkSource {
+            execution_id: "txe-gone".to_string(),
+            ..genuine
+        };
+        forge(gone.clone());
+        std::fs::rename(
+            spool.join("txe-source.json"),
+            anchor.path().join("txe-source.json.moved"),
+        )
+        .expect("move the source ledger out of the spool");
+        let mut store = IdempotencyStore::open(anchor.path(), IdempotencyPolicy::default())
+            .expect("a link whose source ledger is gone still stands");
+        store
+            .create_ledger("txe-recovery-2", &plan)
+            .expect("create second recovery ledger");
+        store
+            .transition_phase("txe-recovery-2", TxPhase::Preparing)
+            .expect("prepare second recovery ledger");
+        store
+            .record_recovered_execution(
+                "txe-recovery-2",
+                key.clone(),
+                success,
+                StepRisk::Low,
+                "agent-recovery-2",
+                3_000,
+            )
+            .expect("link the proven Success again");
+        assert_eq!(
+            store
+                .get_ledger("txe-recovery-2")
+                .and_then(|ledger| ledger.get_record(&key))
+                .and_then(|link| link.recovered_from.as_ref()),
+            Some(&gone)
+        );
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn batch_logical_lease_rejects_reopened_store_binding_and_releases_barrier() {
@@ -9868,6 +10368,7 @@ mod tests {
             prev_hash: String::new(),
             agent_id: "a1".to_string(),
             reconciliation: None,
+            recovered_from: None,
         };
         // A record's hash is over its JSON, so the same JSON is the same hash
         // for every ledger written before receipts existed.
@@ -9961,6 +10462,7 @@ mod tests {
             prev_hash: String::new(),
             agent_id: "a1".to_string(),
             reconciliation: None,
+            recovered_from: None,
         };
         let h1 = record.hash();
         let h2 = record.hash();
@@ -9980,6 +10482,7 @@ mod tests {
             prev_hash: String::new(),
             agent_id: "a1".to_string(),
             reconciliation: None,
+            recovered_from: None,
         };
         assert_ne!(make(0).hash(), make(1).hash());
     }
@@ -10003,6 +10506,7 @@ mod tests {
             prev_hash: String::new(),
             agent_id: "a1".to_string(),
             reconciliation: None,
+            recovered_from: None,
         };
         assert_ne!(make(StepRisk::Low).hash(), make(StepRisk::Critical).hash());
         assert_ne!(make(StepRisk::Low).hash(), make(StepRisk::Medium).hash());
@@ -10021,6 +10525,7 @@ mod tests {
             prev_hash: String::new(),
             agent_id: agent.to_string(),
             reconciliation: None,
+            recovered_from: None,
         };
         assert_ne!(make("agent-A").hash(), make("agent-B").hash());
         assert_ne!(make("").hash(), make("agent-A").hash());
@@ -10139,6 +10644,7 @@ mod tests {
                 prev_hash: String::new(),
                 agent_id: agent_a.clone(),
                 reconciliation: None,
+                recovered_from: None,
             };
             let b = StepExecutionRecord {
                 ordinal: 0,
@@ -10150,6 +10656,7 @@ mod tests {
                 prev_hash: String::new(),
                 agent_id: agent_b.clone(),
                 reconciliation: None,
+                recovered_from: None,
             };
             // Records are equal iff (risk, agent_id) match. If
             // either differs, the hash MUST differ.
@@ -10182,6 +10689,7 @@ mod tests {
             prev_hash: "abcdef".to_string(),
             agent_id: "agent-x".to_string(),
             reconciliation: None,
+            recovered_from: None,
         };
         let json = serde_json::to_string(&record).unwrap();
         let back: StepExecutionRecord = serde_json::from_str(&json).unwrap();

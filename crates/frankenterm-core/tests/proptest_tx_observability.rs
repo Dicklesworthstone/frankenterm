@@ -830,6 +830,7 @@ proptest! {
             outcome_kind: "success".to_string(),
             risk, agent_id: aid.clone(),
             record_hash: "h1".to_string(),
+            recovered_from: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let back: LedgerRecordSummary = serde_json::from_str(&json).unwrap();
