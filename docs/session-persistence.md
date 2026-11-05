@@ -545,11 +545,14 @@ proven:
    A checkpoint holds less history than a pane can retain: by default 2 MiB
    cells, 131,072 rows, and 64 MiB of stored cold rows, or about 26,000 full
    80-column rows. A capture and a replay keep the newest rows that fit, and the
-   mux logs one warning per process when rows are left out. A restore then
-   brings back only those rows, and the activated pane's store holds nothing
-   older. A `scrollback_lines` too large for those limits replays at the
-   retention that fits, and the activated pane takes the configured one back. A
-   visible row that does not fit still refuses the capture.
+   mux logs one warning per process when rows are left out. Those rows stay in
+   the pane's store: activation compares the rows the store and the recovered
+   model share, and when they match it appends the model's newer rows and keeps
+   everything older. A store that does not match, as after a clear or a resize
+   that rewrapped rows, is replaced, and the pane comes back with only what the
+   checkpoint held. A `scrollback_lines` too large for those limits replays at
+   the retention that fits, and the activated pane takes the configured one
+   back. A visible row that does not fit still refuses the capture.
 7. `Attach` returns only the exact pane, generation, and next-mutation-sequence
    identity; that reply is not continuity evidence. After claiming the observed
    generation, the mux opens an explicit authenticated `Replay` using the

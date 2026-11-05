@@ -4234,15 +4234,16 @@ fn charge_checkpoint_line(
     Ok(())
 }
 
-/// Say once per process that a checkpoint is leaving history out: a restore
-/// from it brings back only the newest rows, with no other sign of why.
+/// Say once per process that a checkpoint is leaving history out: those rows
+/// then depend on the pane's store, with no other sign of why they could go.
 #[cfg(feature = "use_serde")]
 fn note_history_over_checkpoint_limits(rows: usize) {
     static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         warn!(
             "scrollback is over what a recovery checkpoint holds, here by {rows} rows; a restore \
-             brings back only the newest rows"
+             keeps them from the pane's store if the store still matches, and otherwise brings \
+             back only the newest rows"
         );
     }
 }
@@ -6891,33 +6892,56 @@ impl Screen {
                     ancestor,
                     cleared_since: recovery.cleared_since_checkpoint,
                 });
-            let commit = match ancestry {
-                Some(ancestry) => {
-                    sink.replace_scrollback_prefix_superseding(ancestry, prefix, max_retained_rows)
-                }
-                None => sink.replace_scrollback_prefix(
-                    recovery.expected_generation,
-                    prefix,
-                    max_retained_rows,
-                ),
-            }
-            .map_err(ScrollbackActivationError::Spill)?;
-            let generation_is_valid = match (ancestry, recovery.expected_generation) {
-                (Some(ancestry), _) => ancestry.admits_receipt(commit.generation()),
-                (None, Some(expected)) => {
-                    commit.generation().content_epoch() == expected.content_epoch()
-                        && expected
-                            .revision()
-                            .checked_add(1)
-                            .is_some_and(|revision| commit.generation().revision() == revision)
-                }
-                (None, None) => commit.generation().revision() == 1,
+            // A store that continues into these rows keeps what the checkpoint
+            // left out; anything else is replaced.
+            let extended = match ancestry {
+                Some(ancestry) => sink
+                    .extend_scrollback_to_prefix(ancestry, &prefix, max_retained_rows)
+                    .map_err(ScrollbackActivationError::Spill)?
+                    .map(|commit| (ancestry, commit)),
+                None => None,
             };
-            if !generation_is_valid
-                || commit.oldest_stable_row() != oldest_stable_row
-                || commit.newest_stable_row_exclusive() != newest_stable_row_exclusive
-            {
-                return Err(ScrollbackActivationError::CommitOutcomeIndeterminate);
+            if let Some((ancestry, commit)) = extended {
+                let model_oldest = oldest_stable_row.unwrap_or(newest_stable_row_exclusive);
+                if !ancestry.admits(commit.generation())
+                    || commit
+                        .oldest_stable_row()
+                        .is_none_or(|kept| kept > model_oldest)
+                    || commit.newest_stable_row_exclusive() != newest_stable_row_exclusive
+                {
+                    return Err(ScrollbackActivationError::CommitOutcomeIndeterminate);
+                }
+            } else {
+                let commit = match ancestry {
+                    Some(ancestry) => sink.replace_scrollback_prefix_superseding(
+                        ancestry,
+                        prefix,
+                        max_retained_rows,
+                    ),
+                    None => sink.replace_scrollback_prefix(
+                        recovery.expected_generation,
+                        prefix,
+                        max_retained_rows,
+                    ),
+                }
+                .map_err(ScrollbackActivationError::Spill)?;
+                let generation_is_valid = match (ancestry, recovery.expected_generation) {
+                    (Some(ancestry), _) => ancestry.admits_receipt(commit.generation()),
+                    (None, Some(expected)) => {
+                        commit.generation().content_epoch() == expected.content_epoch()
+                            && expected
+                                .revision()
+                                .checked_add(1)
+                                .is_some_and(|revision| commit.generation().revision() == revision)
+                    }
+                    (None, None) => commit.generation().revision() == 1,
+                };
+                if !generation_is_valid
+                    || commit.oldest_stable_row() != oldest_stable_row
+                    || commit.newest_stable_row_exclusive() != newest_stable_row_exclusive
+                {
+                    return Err(ScrollbackActivationError::CommitOutcomeIndeterminate);
+                }
             }
         }
 
@@ -18007,6 +18031,11 @@ pub(crate) mod tests {
         /// What the last superseding replacement said about clears since its
         /// ancestor.
         pub(crate) last_supersede_cleared: AtomicBool,
+        /// Extend in place a store that continues into a prefix, as a durable
+        /// store does.
+        pub(crate) extends_prefix: AtomicBool,
+        /// Have that extension name a newest row other than the prefix's.
+        pub(crate) extension_misreports_newest: AtomicBool,
     }
 
     impl crate::config::ScrollbackSpillSink for TestColdScrollbackSink {
@@ -18334,6 +18363,51 @@ pub(crate) mod tests {
                 return Err(crate::config::ScrollbackSpillError::SnapshotGenerationMismatch);
             }
             self.replace_scrollback_prefix(Some(current), prefix, max_retained_rows)
+        }
+
+        fn extend_scrollback_to_prefix(
+            &self,
+            _ancestry: crate::config::ScrollbackAncestry,
+            prefix: &crate::config::ScrollbackPrefix<'_>,
+            _max_retained_rows: usize,
+        ) -> Result<
+            Option<crate::config::ScrollbackReplaceCommit>,
+            crate::config::ScrollbackSpillError,
+        > {
+            if !self.extends_prefix.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            let newest = prefix.newest_stable_row_exclusive();
+            let first = prefix.oldest_stable_row().unwrap_or(newest);
+            let mut rows = self.rows.lock().unwrap();
+            let (Some(&oldest), Some(&last)) = (rows.keys().next(), rows.keys().next_back()) else {
+                return Ok(None);
+            };
+            if oldest >= first || last + 1 < first || last + 1 > newest {
+                return Ok(None);
+            }
+            for (stable_row, line) in (first..).zip(prefix.rows()) {
+                match rows.get(&stable_row) {
+                    Some(stored) if stored.as_str() != line.as_str() => return Ok(None),
+                    Some(_) => {}
+                    None => {
+                        rows.insert(stable_row, line.clone());
+                    }
+                }
+            }
+            let reported = if self.extension_misreports_newest.load(Ordering::Relaxed) {
+                newest + 1
+            } else {
+                newest
+            };
+            Ok(Some(crate::config::ScrollbackReplaceCommit::new(
+                crate::config::ScrollbackSnapshotGeneration::new(
+                    [0; 16],
+                    self.revision.load(Ordering::Relaxed),
+                ),
+                Some(oldest),
+                reported,
+            )))
         }
 
         fn clear_scrollback(

@@ -2694,6 +2694,55 @@ mod deferred_scrollback {
             self.replace_prefix_with(Some(ancestry.ancestor), Some(ancestry), prefix, retention)
         }
 
+        fn extend_scrollback_to_prefix(
+            &self,
+            ancestry: ScrollbackAncestry,
+            prefix: &ScrollbackPrefix<'_>,
+            retention: usize,
+        ) -> Result<Option<ScrollbackReplaceCommit>, ScrollbackSpillError> {
+            let _operation = self
+                .operation
+                .lock()
+                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+            let _drain = self
+                .drain_gate
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+            if state.publication_uncertain {
+                return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
+            }
+            if !state.pending.is_empty() {
+                return Ok(None);
+            }
+            let interval_identity = ScrollbackIntervalIdentity::default();
+            let extended = self
+                .backing
+                .extend_scrollback_to_prefix(ancestry, prefix, retention)
+                .inspect_err(|error| {
+                    state.publication_uncertain =
+                        *error == ScrollbackSpillError::CommitOutcomeIndeterminate;
+                })?;
+            let Some(receipt) = extended else {
+                return Ok(None);
+            };
+            *state = State {
+                interval_identity,
+                ..State::empty(
+                    self.backing.retained_scrollback_bytes(),
+                    receipt.oldest_stable_row(),
+                    Some(receipt.newest_stable_row_exclusive()),
+                )
+            };
+            self.pending_rows.store(0, Ordering::Release);
+            drop(state);
+            self.publish_progress();
+            Ok(Some(receipt))
+        }
+
         fn clear_scrollback(&self) -> Result<ScrollbackClearCommit, ScrollbackSpillError> {
             let _operation = self
                 .operation
@@ -17077,6 +17126,56 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
         )
     }
 
+    fn extend_scrollback_to_prefix(
+        &self,
+        ancestry: wezterm_term::config::ScrollbackAncestry,
+        prefix: &wezterm_term::config::ScrollbackPrefix<'_>,
+        max_retained_rows: usize,
+    ) -> Result<
+        Option<wezterm_term::config::ScrollbackReplaceCommit>,
+        wezterm_term::config::ScrollbackSpillError,
+    > {
+        use wezterm_term::config::{ScrollbackReplaceCommit, ScrollbackSpillError};
+
+        let newest = prefix.newest_stable_row_exclusive();
+        let Some(store_newest) = self.store_newest_if_it_continues_into(ancestry, prefix)? else {
+            return Ok(None);
+        };
+        let first = prefix.oldest_stable_row().unwrap_or(newest);
+        let overlap = usize::try_from(store_newest - first)
+            .map_err(|_| ScrollbackSpillError::ArithmeticOverflow("row_count"))?;
+        let rest = prefix.rows().skip(overlap).collect::<Vec<_>>();
+        log::info!(
+            "pane {} store continues into its recovered rows: {overlap} matched, {} to append",
+            self.pane_id,
+            rest.len()
+        );
+        let mut next = store_newest;
+        for window in rest.chunks(LIVE_SCROLLBACK_WINDOW_MAX_ROWS) {
+            let mut window = window;
+            while !window.is_empty() {
+                let stored = self.store_scrollback_rows(next, window, max_retained_rows, None);
+                if stored == 0 {
+                    return Err(self.refusal_cause());
+                }
+                next = wezterm_term::StableRowIndex::try_from(stored)
+                    .ok()
+                    .and_then(|stored| next.checked_add(stored))
+                    .ok_or(ScrollbackSpillError::ArithmeticOverflow("stable_row_range"))?;
+                window = &window[stored..];
+            }
+        }
+        self.flush_scrollback()?;
+        let generation = self
+            .lock_state("extend_scrollback_to_prefix generation")?
+            .snapshot_generation();
+        Ok(Some(ScrollbackReplaceCommit::new(
+            generation,
+            self.oldest_scrollback_row(),
+            newest,
+        )))
+    }
+
     fn clear_scrollback(
         &self,
     ) -> Result<
@@ -17164,6 +17263,100 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
 }
 
 impl LiveScrollbackSpillSink {
+    /// The store's newest row when it can be extended to `prefix`: `ancestry`
+    /// admits it, it holds rows older than `prefix`'s first, it reaches that
+    /// row and does not pass `prefix`, and every row they share is equal.
+    /// Each row is decoded, so a damaged one means `None` as a difference does.
+    fn store_newest_if_it_continues_into(
+        &self,
+        ancestry: wezterm_term::config::ScrollbackAncestry,
+        prefix: &wezterm_term::config::ScrollbackPrefix<'_>,
+    ) -> Result<Option<wezterm_term::StableRowIndex>, wezterm_term::config::ScrollbackSpillError>
+    {
+        use wezterm_term::config::ScrollbackSpillError;
+
+        let _mutation_gate = self.lock_mutation_gate("extend_scrollback_to_prefix")?;
+        let _filesystem_mutation_lease =
+            self.lock_filesystem_mutation("extend_scrollback_to_prefix")?;
+        let mut state = *self.lock_state("extend_scrollback_to_prefix state")?;
+        if state.published.is_some() && !state.transaction_quarantined {
+            if !self.publish_pending_tail("extend") {
+                return Err(ScrollbackSpillError::StorageUnavailable);
+            }
+            state = *self.lock_state("extend_scrollback_to_prefix published state")?;
+        }
+        if state.transaction_quarantined {
+            return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
+        }
+        if ancestry.cleared_since
+            || !state.authenticated_manifest
+            || state.clear_manifest_published
+            || !ancestry.admits(state.snapshot_generation())
+        {
+            return Ok(None);
+        }
+        let (Some(initial), Some(store_newest)) =
+            (state.initial_stable_row, state.newest_stable_row_exclusive)
+        else {
+            return Ok(None);
+        };
+        let ledger_pane_id = self.active_ledger_pane_id();
+        self.verify_current_published_state_before_mutation(&state, ledger_pane_id, false)?;
+        let store = self.lock_store("extend_scrollback_to_prefix store")?;
+        let Some(store_oldest) = store
+            .oldest_seq(ledger_pane_id)
+            .and_then(|seq| wezterm_term::StableRowIndex::try_from(seq).ok())
+            .and_then(|seq| initial.checked_add(seq))
+        else {
+            return Ok(None);
+        };
+        let newest = prefix.newest_stable_row_exclusive();
+        let first = prefix.oldest_stable_row().unwrap_or(newest);
+        if store_oldest >= first || store_newest < first || store_newest > newest {
+            return Ok(None);
+        }
+
+        let shared = usize::try_from(store_newest - first)
+            .map_err(|_| ScrollbackSpillError::ArithmeticOverflow("row_count"))?;
+        let keyring = self.lock_keyring("extend_scrollback_to_prefix decrypt")?;
+        let mut cipher_cache = GuardianScrollbackCipherCache::new(&keyring, &state.row_segments);
+        let (physical_oldest, segment_next) = store_segment_bounds(&store, ledger_pane_id)
+            .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+        let mut segments = LiveScrollbackSegmentReader::default();
+        for (stable_row, line) in (first..).zip(prefix.rows().take(shared)) {
+            let seq = u64::try_from(stable_row - initial)
+                .map_err(|_| ScrollbackSpillError::ArithmeticOverflow("sequence"))?;
+            let Ok(Some(record)) = store.line_at(ledger_pane_id, seq) else {
+                return Ok(None);
+            };
+            let decoded = decode_stored_scrollback_row(
+                &record,
+                &mut segments,
+                &mut |range| store_segment_records(&store, ledger_pane_id, range),
+                physical_oldest,
+                segment_next,
+                &mut cipher_cache,
+                self.durable_pane_id,
+                state.content_epoch,
+                stable_row,
+                seq,
+                LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
+            );
+            let Ok((decoded, _bytes, DecodedScrollbackRecordFidelity::ExactSemantic)) = decoded
+            else {
+                return Ok(None);
+            };
+            match (
+                serialize_cell_semantic_scrollback_line(&decoded),
+                serialize_cell_semantic_scrollback_line(line),
+            ) {
+                (Some(stored), Some(recovered)) if stored == recovered => {}
+                _ => return Ok(None),
+            }
+        }
+        Ok(Some(store_newest))
+    }
+
     /// One snapshot of the store. Over the limits it refuses, unless
     /// `keep_newest`: then it reads back from the newest row until one does
     /// not fit, and the bytes it reports are those of the rows it kept.
@@ -19914,6 +20107,165 @@ mod tests {
         assert_eq!(deferred.retained_scrollback_rows(), 2);
         assert!(deferred.store_scrollback_line(12, &row("live again"), 8));
         assert_eq!(deferred.load_scrollback_line(12), Some(row("live again")));
+    }
+
+    /// A restore whose checkpoint left stored rows out: the store keeps them,
+    /// compares the rows it shares with the recovered model, and writes only
+    /// the newer ones, across more than one write window (ft-ixz5j).
+    #[test]
+    fn a_store_continuing_into_a_recovered_prefix_keeps_its_older_rows() {
+        use wezterm_term::config::{ScrollbackAncestry, ScrollbackPrefix, ScrollbackSpillSink};
+
+        let (dir, backing, deferred) = deferred_test_sink();
+        let attrs = CellAttributes::blank();
+        let row = |index: usize| Line::from_text(&format!("row {index}"), &attrs, 5, None);
+        let added = LIVE_SCROLLBACK_WINDOW_MAX_ROWS + 3;
+        let rows = (0..20 + added).map(row).collect::<Vec<_>>();
+        let retention = rows.len() + 8;
+        for (index, line) in rows[..20].iter().enumerate() {
+            assert!(deferred.store_scrollback_line(10 + index as isize, line, retention));
+        }
+        deferred.flush_scrollback().unwrap();
+        let ancestor = backing
+            .lock_state("extension regression")
+            .unwrap()
+            .snapshot_generation();
+
+        // The model begins at stable row 25 and shares rows 25..30 with the store.
+        let newest = 10 + rows.len() as isize;
+        let prefix = ScrollbackPrefix::from_slices(Some(25), newest, &rows[15..], &[]).unwrap();
+        let receipt = deferred
+            .extend_scrollback_to_prefix(
+                ScrollbackAncestry {
+                    ancestor,
+                    cleared_since: false,
+                },
+                &prefix,
+                retention,
+            )
+            .unwrap()
+            .expect("the store continues into the model");
+        assert_eq!(
+            (
+                receipt.oldest_stable_row(),
+                receipt.newest_stable_row_exclusive()
+            ),
+            (Some(10), newest)
+        );
+        assert_eq!(
+            receipt.generation().content_epoch(),
+            ancestor.content_epoch()
+        );
+        assert!(receipt.generation().revision() > ancestor.revision());
+        assert_eq!(
+            deferred_interval(deferred.as_ref()).rows(),
+            Some(10..newest)
+        );
+        assert_eq!(deferred.retained_scrollback_rows(), rows.len());
+        for index in [0, 14, 15, 19, 20, rows.len() - 1] {
+            assert_eq!(
+                deferred.load_scrollback_line(10 + index as isize),
+                Some(rows[index].clone()),
+                "row {index}"
+            );
+        }
+
+        // The store carries on from there, and all of it survives a reopen.
+        let next = row(rows.len());
+        assert!(deferred.store_scrollback_line(newest, &next, retention));
+        deferred.flush_scrollback().unwrap();
+        drop(deferred);
+        drop(backing);
+        let reopened = LiveScrollbackSpillSink::new(
+            dir.path().to_path_buf(),
+            &config::ScrollbackSpillSinkContext {
+                pane_id: 913,
+                domain_id: 3,
+                durable_pane_id: [0xd3; 16],
+                command_description: "deferred-scrollback-test".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(reopened.oldest_scrollback_row(), Some(10));
+        assert_eq!(reopened.retained_scrollback_rows(), rows.len() + 1);
+        assert_eq!(reopened.load_scrollback_line(10), Some(rows[0].clone()));
+        assert_eq!(reopened.load_scrollback_line(newest), Some(next));
+    }
+
+    /// Anything but a store that continues into the model is left as it was,
+    /// for the replacement that follows.
+    #[test]
+    fn a_store_that_does_not_continue_into_a_prefix_stays_as_it_was() {
+        use wezterm_term::config::{
+            ScrollbackAncestry, ScrollbackPrefix, ScrollbackSnapshotGeneration, ScrollbackSpillSink,
+        };
+
+        let (_dir, backing, deferred) = deferred_test_sink();
+        let attrs = CellAttributes::blank();
+        let row = |index: usize| Line::from_text(&format!("row {index}"), &attrs, 5, None);
+        let rows = (0..30).map(row).collect::<Vec<_>>();
+        for (index, line) in rows[..10].iter().enumerate() {
+            assert!(deferred.store_scrollback_line(10 + index as isize, line, 64));
+        }
+        deferred.flush_scrollback().unwrap();
+        let published = || {
+            backing
+                .lock_state("extension refusal regression")
+                .unwrap()
+                .snapshot_generation()
+        };
+        let ancestor = published();
+        let strict = ScrollbackAncestry {
+            ancestor,
+            cleared_since: false,
+        };
+        let mut differing = rows[5..15].to_vec();
+        differing[1] = row(99);
+
+        let foreign = ScrollbackAncestry {
+            ancestor: ScrollbackSnapshotGeneration::new([0xa5; 16], ancestor.revision()),
+            cleared_since: false,
+        };
+        let ahead = ScrollbackAncestry {
+            ancestor: ScrollbackSnapshotGeneration::new(ancestor.content_epoch(), u64::MAX - 1),
+            cleared_since: false,
+        };
+        let cleared = ScrollbackAncestry {
+            ancestor,
+            cleared_since: true,
+        };
+        let cases: [(&str, ScrollbackAncestry, isize, isize, &[Line]); 7] = [
+            ("a shared row differs", strict, 15, 25, &differing),
+            ("no older rows", strict, 10, 25, &rows[0..15]),
+            ("the store passes the model", strict, 12, 18, &rows[2..8]),
+            ("a gap before the model", strict, 22, 25, &rows[12..15]),
+            ("another epoch", foreign, 15, 25, &rows[5..15]),
+            ("a later generation", ahead, 15, 25, &rows[5..15]),
+            ("a clear since", cleared, 15, 25, &rows[5..15]),
+        ];
+        for (case, ancestry, first, newest, model) in cases {
+            let prefix = ScrollbackPrefix::from_slices(Some(first), newest, model, &[]).unwrap();
+            assert!(
+                deferred
+                    .extend_scrollback_to_prefix(ancestry, &prefix, 64)
+                    .unwrap()
+                    .is_none(),
+                "{case}"
+            );
+            assert_eq!(published(), ancestor, "{case}");
+            assert_eq!(deferred.retained_scrollback_rows(), 10, "{case}");
+            assert_eq!(deferred.load_scrollback_line(10), Some(rows[0].clone()));
+            assert_eq!(deferred.load_scrollback_line(19), Some(rows[9].clone()));
+        }
+
+        // The same store does continue into the rows it really shares.
+        let prefix = ScrollbackPrefix::from_slices(Some(15), 25, &rows[5..15], &[]).unwrap();
+        assert!(
+            deferred
+                .extend_scrollback_to_prefix(strict, &prefix, 64)
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// A restored model that replayed a clear after its checkpoint supersedes

@@ -1407,6 +1407,25 @@ pub trait ScrollbackSpillSink: std::fmt::Debug + Send + Sync {
         self.replace_scrollback_prefix(Some(ancestry.ancestor), prefix, max_retained_rows)
     }
 
+    /// Bring a store holding rows older than `prefix` up to `prefix` in place,
+    /// keeping those rows. A recovery checkpoint's limits can leave out history
+    /// that its store still holds, and a replacement would lose it for good.
+    ///
+    /// This applies when the store holds rows older than `prefix`'s first and
+    /// every store row from that one on is exactly `prefix`'s: the rest of
+    /// `prefix` is appended, and the receipt names the store's oldest row and
+    /// its generation, which [`ScrollbackAncestry::admits`]. Otherwise it
+    /// returns `Ok(None)` with the store unchanged, for the caller to replace
+    /// it. An error can leave some of the rest appended, and a retry resumes.
+    fn extend_scrollback_to_prefix(
+        &self,
+        _ancestry: ScrollbackAncestry,
+        _prefix: &ScrollbackPrefix<'_>,
+        _max_retained_rows: usize,
+    ) -> Result<Option<ScrollbackReplaceCommit>, ScrollbackSpillError> {
+        Ok(None)
+    }
+
     /// Commit a logical clear before returning success.
     ///
     /// Physical reclamation may be retried after this method returns, but

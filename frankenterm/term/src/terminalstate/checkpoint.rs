@@ -8663,8 +8663,8 @@ mod tests {
 
     /// A pane's cold rows can outgrow a checkpoint: the capture keeps the
     /// newest that fit instead of refusing, which stopped whole-mux recovery
-    /// for as long as the pane kept that history. A restore then activates
-    /// with those rows, and the store holds nothing older.
+    /// for as long as the pane kept that history. A restore into a store that
+    /// cannot extend then activates with those rows, and it holds nothing older.
     #[test]
     fn a_capture_over_the_limits_keeps_the_newest_cold_rows_and_restores() {
         use crate::config::ScrollbackSpillSink;
@@ -8777,6 +8777,76 @@ mod tests {
         );
         assert_eq!(sink.retained_scrollback_rows(), kept);
         assert_eq!(activated.screen().phys_to_stable_row_index(0), live_oldest);
+    }
+
+    /// The inert terminal of a capture that left stored rows out, with how many
+    /// rows its store holds and the first of them.
+    fn inert_with_rows_left_out_of_its_checkpoint() -> (
+        crate::InertTerminal,
+        Arc<crate::screen::tests::TestColdScrollbackSink>,
+        usize,
+        StableRowIndex,
+    ) {
+        use crate::config::ScrollbackSpillSink;
+
+        let (mut live, sink) = tiered_terminal_with_cold_rows();
+        for index in 20..60 {
+            live.advance_bytes(format!("r{:02}\r\n", index).as_bytes());
+        }
+        let limits = TerminalCheckpointLimits {
+            max_total_lines: 20,
+            ..TerminalCheckpointLimits::default()
+        };
+        let checkpoint = TerminalCheckpointV3::capture_with_limits(&live, limits).unwrap();
+        let stored = sink.retained_scrollback_rows();
+        assert!((checkpoint.primary_screen.cold_prefix_line_count as usize) < stored);
+        let store_oldest = sink.oldest_scrollback_row().unwrap();
+        let payload = checkpoint.to_canonical_json(limits).unwrap();
+        let mut inert = TerminalCheckpointV3::decode_canonical_json(&payload, limits)
+            .unwrap()
+            .restore_inert(live.get_config())
+            .unwrap();
+        inert.supersede_cold_scrollback_successors();
+        (inert, sink, stored, store_oldest)
+    }
+
+    /// The rows a checkpoint's limits left out are still in the store, and a
+    /// store that continues into the recovered rows keeps them (ft-ixz5j).
+    #[test]
+    fn a_restore_keeps_the_stored_rows_its_checkpoint_left_out() {
+        use crate::config::ScrollbackSpillSink;
+
+        let (inert, sink, stored, store_oldest) = inert_with_rows_left_out_of_its_checkpoint();
+        sink.extends_prefix.store(true, Ordering::Relaxed);
+        let activated = match inert.into_live(Box::new(std::io::sink())) {
+            Ok(activated) => activated,
+            Err(failure) => panic!("the capture must restore: {:?}", failure.error()),
+        };
+        assert_eq!(sink.oldest_scrollback_row(), Some(store_oldest));
+        assert_eq!(sink.retained_scrollback_rows(), stored);
+        assert_eq!(
+            activated.screen().phys_to_stable_row_index(0),
+            store_oldest + stored as StableRowIndex,
+            "the screen begins where the store ends"
+        );
+    }
+
+    #[test]
+    fn a_restore_refuses_a_store_extension_that_misreports_its_rows() {
+        let (inert, sink, _stored, _store_oldest) = inert_with_rows_left_out_of_its_checkpoint();
+        sink.extends_prefix.store(true, Ordering::Relaxed);
+        sink.extension_misreports_newest
+            .store(true, Ordering::Relaxed);
+        let failure = match inert.into_live(Box::new(std::io::sink())) {
+            Ok(_) => panic!("a misreported extension must not activate a terminal"),
+            Err(failure) => failure,
+        };
+        assert_eq!(
+            failure.error(),
+            &crate::InertTerminalError::ScrollbackActivation(
+                crate::config::ScrollbackActivationError::CommitOutcomeIndeterminate,
+            ),
+        );
     }
 
     #[derive(Debug)]
