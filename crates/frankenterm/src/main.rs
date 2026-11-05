@@ -48217,9 +48217,13 @@ async fn run_watcher(
         // ambient cx installed by the runtime driver, falling back
         // to a fresh request-scoped cx. Threads that cx through the
         // entire event-loop + owned child-task chain via
-        // `run_with_shutdown_with_cx`. Shutdown now wakes the idle event wait
+        // `run_subscribed_with_cx`. Shutdown now wakes the idle event wait
         // and bounded-drains every in-flight workflow execution.
-        let event_bus_clone = Arc::clone(&event_bus);
+        // Subscribe synchronously before spawning or starting observation.
+        // The runner retains this bounded subscription throughout recovery;
+        // task scheduling and unfinished workflows must not discard the first
+        // detections from the newly started capture pipeline.
+        let workflow_subscriber = event_bus.subscribe_detections();
         let workflow_shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let task_shutdown_flag = Arc::clone(&workflow_shutdown_flag);
         let workflow_shutdown_notify =
@@ -48230,11 +48234,10 @@ async fn run_watcher(
             let cx = frankenterm_core::cx::Cx::current()
                 .unwrap_or_else(frankenterm_core::cx::for_request);
             workflow_runner
-                .run_with_shutdown_with_cx(
+                .run_subscribed_with_cx(
                     &cx,
-                    &event_bus_clone,
-                    &task_shutdown_flag,
-                    &task_shutdown_notify,
+                    workflow_subscriber,
+                    Some((&task_shutdown_flag, &task_shutdown_notify)),
                 )
                 .await;
             tracing::info!("Workflow runner stopped");
