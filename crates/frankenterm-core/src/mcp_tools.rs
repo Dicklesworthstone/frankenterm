@@ -9533,24 +9533,6 @@ fn mcp_load_submit_profile(
     }
 }
 
-async fn mcp_capture_submit_text(
-    wezterm: &crate::wezterm::WeztermHandle,
-    cx: &crate::cx::Cx,
-    pane_id: u64,
-) -> Option<String> {
-    match wezterm.get_text_with_cx(cx, pane_id, false).await {
-        Ok(text) => Some(text),
-        Err(_error) => {
-            tracing::debug!(
-                pane_id,
-                error_class = "wa_send_submit_text_capture_unavailable",
-                "wa.send verified-submit text capture unavailable"
-            );
-            None
-        }
-    }
-}
-
 async fn mcp_classify_submit_after_send(
     wezterm: &crate::wezterm::WeztermHandle,
     cx: &crate::cx::Cx,
@@ -9559,6 +9541,7 @@ async fn mcp_classify_submit_after_send(
     agent_type: AgentType,
     submit_profile: Option<&crate::patterns::SubmitProfile>,
     before_text: Option<&str>,
+    before_semantic_snapshot: Option<&crate::wezterm::MuxSemanticSnapshot>,
     attempts: u32,
     polls: usize,
 ) -> crate::verified_submit::VerifiedSubmitReport {
@@ -9570,6 +9553,7 @@ async fn mcp_classify_submit_after_send(
         agent_type,
         submit_profile,
         before_text,
+        before_semantic_snapshot,
         attempts,
         polls,
     )
@@ -9974,10 +9958,15 @@ impl ToolHandler for WaSendTool {
             // claim transaction is the final pre-effect owner fence, so the
             // exact-key path pays one FULL-sync transaction rather than a
             // claim followed by a second lease-renewal transaction.
-            let submit_before_text = if submit_profile.is_some() {
-                mcp_capture_submit_text(&wezterm, &wezterm_cx, params.pane_id).await
+            let submit_before = if submit_profile.is_some() {
+                crate::verified_submit::capture_verified_submit_observation(
+                    &wezterm_cx,
+                    &wezterm,
+                    params.pane_id,
+                )
+                .await
             } else {
-                None
+                crate::verified_submit::VerifiedSubmitObservation::default()
             };
             let mut injector =
                 PolicyGatedInjector::with_storage(engine, Arc::clone(&wezterm), storage.clone());
@@ -10030,7 +10019,8 @@ impl ToolHandler for WaSendTool {
                                 command_text: outbound_submit_text,
                                 agent_type: submit_agent_type,
                                 profile: None,
-                                before_text: submit_before_text.as_deref(),
+                                before_text: submit_before.text.as_deref(),
+                                before_semantic_snapshot: submit_before.semantic_snapshot.as_ref(),
                                 after_text: None,
                                 after_semantic_snapshot: None,
                                 attempts: 1,
@@ -10162,7 +10152,8 @@ impl ToolHandler for WaSendTool {
                                         outbound_submit_text,
                                         submit_agent_type,
                                         submit_profile.as_ref(),
-                                        submit_before_text.as_deref(),
+                                        submit_before.text.as_deref(),
+                                        submit_before.semantic_snapshot.as_ref(),
                                         1,
                                         polls,
                                     )

@@ -14391,24 +14391,6 @@ fn load_send_submit_profile(
     }
 }
 
-async fn capture_send_submit_text(
-    wezterm: &frankenterm_core::wezterm::WeztermHandle,
-    cx: &frankenterm_core::cx::Cx,
-    pane_id: u64,
-) -> Option<String> {
-    match wezterm.get_text_with_cx(cx, pane_id, false).await {
-        Ok(text) => Some(text),
-        Err(error) => {
-            tracing::debug!(
-                pane_id,
-                %error,
-                "Verified-submit text capture unavailable"
-            );
-            None
-        }
-    }
-}
-
 async fn classify_send_submit_after_send(
     wezterm: &frankenterm_core::wezterm::WeztermHandle,
     cx: &frankenterm_core::cx::Cx,
@@ -14417,6 +14399,7 @@ async fn classify_send_submit_after_send(
     agent_type: frankenterm_core::patterns::AgentType,
     submit_profile: Option<&frankenterm_core::patterns::SubmitProfile>,
     before_text: Option<&str>,
+    before_semantic_snapshot: Option<&frankenterm_core::wezterm::MuxSemanticSnapshot>,
     attempts: u32,
     polls: usize,
 ) -> frankenterm_core::verified_submit::VerifiedSubmitReport {
@@ -14428,6 +14411,7 @@ async fn classify_send_submit_after_send(
         agent_type,
         submit_profile,
         before_text,
+        before_semantic_snapshot,
         attempts,
         polls,
     )
@@ -52111,14 +52095,16 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     }
                                 };
 
-                                let mut submit_before_text = None;
+                                let mut submit_before =
+                                    frankenterm_core::verified_submit::VerifiedSubmitObservation::default();
                                 let mut send_started_at_ms = None;
                                 let mut injection = match decision {
                                     PolicyDecision::Allow { .. } => {
                                         if use_verified_submit_path {
-                                            submit_before_text =
-                                                capture_send_submit_text(&wezterm, &cx, pane_id)
-                                                    .await;
+                                            submit_before = frankenterm_core::verified_submit::capture_verified_submit_observation(
+                                                &cx, &wezterm, pane_id,
+                                            )
+                                            .await;
                                         }
                                         // ft-xbnl0.2.3 tick 231: cx-first send_text. Reuses
                                         // the `cx` from the get_pane migration above (same scope).
@@ -52302,7 +52288,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                             outbound_submit_text,
                                             submit_agent_type,
                                             submit_profile.as_ref(),
-                                            submit_before_text.as_deref(),
+                                            submit_before.text.as_deref(),
+                                            submit_before.semantic_snapshot.as_ref(),
                                             1,
                                             polls,
                                         )
@@ -62896,12 +62883,15 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     }
                 };
 
-                let mut submit_before_text = None;
+                let mut submit_before =
+                    frankenterm_core::verified_submit::VerifiedSubmitObservation::default();
                 let mut injection = match decision {
                     frankenterm_core::policy::PolicyDecision::Allow { .. } => {
                         if use_verified_submit_path {
-                            submit_before_text =
-                                capture_send_submit_text(&wezterm, &cx, pane_id).await;
+                            submit_before = frankenterm_core::verified_submit::capture_verified_submit_observation(
+                                &cx, &wezterm, pane_id,
+                            )
+                            .await;
                         }
                         let send_result = if use_verified_submit_path {
                             match wezterm
@@ -63067,7 +63057,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             outbound_submit_text,
                             submit_agent_type,
                             submit_profile.as_ref(),
-                            submit_before_text.as_deref(),
+                            submit_before.text.as_deref(),
+                            submit_before.semantic_snapshot.as_ref(),
                             1,
                             polls,
                         )

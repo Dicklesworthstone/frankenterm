@@ -10,6 +10,8 @@ use crate::wezterm::{MuxSemanticSnapshot, MuxSemanticZoneKind};
 
 const CAPTURE_CURSOR_PREFIX: &str = "pane";
 const MAX_CLASSIFIER_CAPTURE_BYTES: usize = 32 * 1024;
+const MAX_CLASSIFIER_CAPTURE_LINES: usize = 200;
+const MAX_CLASSIFIER_SEMANTIC_ZONES: usize = 256;
 const SUBMIT_IDEMPOTENCY_REQUEST_DOMAIN: &[u8] =
     b"frankenterm:verified-submit:semantic-request:v2\0";
 const SUBMIT_IDEMPOTENCY_EFFECT_DOMAIN: &[u8] =
@@ -144,10 +146,67 @@ pub struct VerifiedSubmitInput<'a> {
     pub agent_type: AgentType,
     pub profile: Option<&'a SubmitProfile>,
     pub before_text: Option<&'a str>,
+    pub before_semantic_snapshot: Option<&'a MuxSemanticSnapshot>,
     pub after_text: Option<&'a str>,
     pub after_semantic_snapshot: Option<&'a MuxSemanticSnapshot>,
     pub attempts: u32,
     pub polls: usize,
+}
+
+/// Bounded evidence from one side of a send. Keep the pre-send observation
+/// unchanged throughout polling; a later poll cannot become the baseline for
+/// deciding whether an old input or status marker belongs to this send.
+#[derive(Debug, Default)]
+pub struct VerifiedSubmitObservation {
+    pub text: Option<String>,
+    pub semantic_snapshot: Option<MuxSemanticSnapshot>,
+}
+
+/// Capture bounded live evidence using the caller's exact cancellation scope.
+/// Missing or oversized semantic evidence remains unavailable: truncating it
+/// could turn an old input into an apparently new turn.
+pub async fn capture_verified_submit_observation(
+    cx: &crate::cx::Cx,
+    client: &crate::wezterm::WeztermHandle,
+    pane_id: u64,
+) -> VerifiedSubmitObservation {
+    if cx.checkpoint().is_err() {
+        return VerifiedSubmitObservation::default();
+    }
+    let text = match client
+        .get_text_tail_with_cx(cx, pane_id, false, Some(MAX_CLASSIFIER_CAPTURE_LINES))
+        .await
+    {
+        Ok(capture) => Some(capture_tail(&capture.text).to_string()),
+        Err(error) => {
+            tracing::debug!(pane_id, %error, "verified-submit text capture unavailable");
+            None
+        }
+    };
+    if cx.checkpoint().is_err() {
+        return VerifiedSubmitObservation::default();
+    }
+    let semantic_snapshot = match client.get_semantic_zones_with_cx(cx, pane_id).await {
+        Ok(snapshot) if bounded_semantic_snapshot(&snapshot) => Some(snapshot),
+        Ok(_) => {
+            tracing::debug!(
+                pane_id,
+                "verified-submit semantic capture exceeds evidence bounds"
+            );
+            None
+        }
+        Err(error) => {
+            tracing::debug!(pane_id, %error, "verified-submit semantic capture unavailable");
+            None
+        }
+    };
+    if cx.checkpoint().is_err() {
+        return VerifiedSubmitObservation::default();
+    }
+    VerifiedSubmitObservation {
+        text,
+        semantic_snapshot,
+    }
 }
 
 /// Classification result recorded into a durable submit receipt.
@@ -350,43 +409,43 @@ pub async fn classify_verified_submit_polled(
     agent_type: AgentType,
     profile: Option<&SubmitProfile>,
     before_text: Option<&str>,
+    before_semantic_snapshot: Option<&MuxSemanticSnapshot>,
     attempts: u32,
     polls: usize,
 ) -> VerifiedSubmitReport {
+    if command_text.len() > MAX_CLASSIFIER_CAPTURE_BYTES {
+        return classify_verified_submit(VerifiedSubmitInput {
+            pane_id,
+            command_text,
+            agent_type,
+            profile,
+            before_text,
+            before_semantic_snapshot,
+            after_text: None,
+            after_semantic_snapshot: None,
+            attempts,
+            polls: 0,
+        });
+    }
     let mut captures = 0usize;
     loop {
         captures += 1;
-        let (after_text, after_semantic_snapshot) = if profile.is_some() {
+        let after = if profile.is_some() {
             let delay_ms = if captures == 1 {
                 VERIFY_SUBMIT_FIRST_CAPTURE_MS
             } else {
                 VERIFY_SUBMIT_POLL_MS
             };
-            let _ =
-                crate::runtime_async::sleep_with_cx(cx, std::time::Duration::from_millis(delay_ms))
-                    .await;
-            let after_text = match client.get_text_with_cx(cx, pane_id, false).await {
-                Ok(text) => Some(text),
-                Err(error) => {
-                    tracing::debug!(pane_id, %error, "verified-submit text capture unavailable");
-                    None
-                }
-            };
-            let after_semantic_snapshot = match client.get_semantic_zones_with_cx(cx, pane_id).await
+            if crate::runtime_async::sleep_with_cx(cx, std::time::Duration::from_millis(delay_ms))
+                .await
+                .is_ok()
             {
-                Ok(snapshot) => Some(snapshot),
-                Err(error) => {
-                    tracing::debug!(
-                        pane_id,
-                        %error,
-                        "verified-submit semantic capture unavailable"
-                    );
-                    None
-                }
-            };
-            (after_text, after_semantic_snapshot)
+                capture_verified_submit_observation(cx, client, pane_id).await
+            } else {
+                VerifiedSubmitObservation::default()
+            }
         } else {
-            (None, None)
+            VerifiedSubmitObservation::default()
         };
         let report = classify_verified_submit(VerifiedSubmitInput {
             pane_id,
@@ -394,8 +453,9 @@ pub async fn classify_verified_submit_polled(
             agent_type,
             profile,
             before_text,
-            after_text: after_text.as_deref(),
-            after_semantic_snapshot: after_semantic_snapshot.as_ref(),
+            before_semantic_snapshot,
+            after_text: after.text.as_deref(),
+            after_semantic_snapshot: after.semantic_snapshot.as_ref(),
             attempts,
             polls: polls.saturating_add(captures - 1),
         });
@@ -453,6 +513,18 @@ pub fn classify_verified_submit(input: VerifiedSubmitInput<'_>) -> VerifiedSubmi
         };
     }
 
+    if input.command_text.len() > MAX_CLASSIFIER_CAPTURE_BYTES {
+        return unavailable_with_profile(
+            profile,
+            agent_type,
+            attempts,
+            input.polls,
+            cursor_before,
+            cursor_after,
+            "command_exceeds_evidence_bounds",
+        );
+    }
+
     let Some(after_text) = input.after_text else {
         return unavailable_with_profile(
             profile,
@@ -466,13 +538,36 @@ pub fn classify_verified_submit(input: VerifiedSubmitInput<'_>) -> VerifiedSubmi
     };
 
     let after_tail = capture_tail(after_text).to_ascii_lowercase();
+    let before_tail = input
+        .before_text
+        .map(|text| capture_tail(text).to_ascii_lowercase());
     let command_lower = input.command_text.trim().to_ascii_lowercase();
+    if command_lower.is_empty() {
+        return unavailable_with_profile(
+            profile,
+            agent_type,
+            attempts,
+            input.polls,
+            cursor_before,
+            cursor_after,
+            "insufficient_evidence",
+        );
+    }
+    // A prompt echo can contain any profile marker. Remove complete command
+    // spans from status evidence without joining their surrounding text into
+    // a new marker. Both strings stay within the bounded capture budget.
+    let after_status = after_tail.replace(command_lower.as_str(), "\0");
+    let before_status = before_tail
+        .as_ref()
+        .map(|before| before.replace(command_lower.as_str(), "\0"));
 
-    if let Some(evidence_id) = first_anchor_match(
+    if let Some(evidence_id) = first_fresh_anchor_match(
         profile,
         "crash_to_shell",
         &profile.anchors.crash_to_shell,
-        &after_tail,
+        &command_lower,
+        before_status.as_deref(),
+        &after_status,
     ) {
         return report_with_profile(
             SubmitReceiptState::PaneCrashedToShell,
@@ -485,11 +580,13 @@ pub fn classify_verified_submit(input: VerifiedSubmitInput<'_>) -> VerifiedSubmi
         );
     }
 
-    if let Some(evidence_id) = first_anchor_match(
+    if let Some(evidence_id) = first_fresh_anchor_match(
         profile,
         "queued_behind_operation",
         &profile.anchors.queued_behind_operation,
-        &after_tail,
+        &command_lower,
+        before_status.as_deref(),
+        &after_status,
     ) {
         return report_with_profile(
             SubmitReceiptState::QueuedBehindOperation,
@@ -502,33 +599,108 @@ pub fn classify_verified_submit(input: VerifiedSubmitInput<'_>) -> VerifiedSubmi
         );
     }
 
-    if semantic_has_output_after_matching_input(input.after_semantic_snapshot, &command_lower) {
+    match fresh_semantic_input(
+        input.before_semantic_snapshot,
+        input.after_semantic_snapshot,
+        input.command_text.trim(),
+    ) {
+        Some(FreshSemanticInput::CurrentCommand { has_output }) => {
+            let (state, evidence) = if has_output {
+                (SubmitReceiptState::Submitted, "semantic_output_after_input")
+            } else {
+                (
+                    SubmitReceiptState::StuckInComposer,
+                    "semantic_input_contains_command",
+                )
+            };
+            return report_with_profile(
+                state,
+                profile,
+                attempts,
+                input.polls,
+                cursor_before,
+                cursor_after,
+                vec![format!("submit_profile:{}:{evidence}", profile.id)],
+            );
+        }
+        Some(FreshSemanticInput::OtherCommand) => {
+            return unavailable_with_profile(
+                profile,
+                agent_type,
+                attempts,
+                input.polls,
+                cursor_before,
+                cursor_after,
+                "latest_input_does_not_match",
+            );
+        }
+        Some(FreshSemanticInput::UnprovenCurrentCommand) => {
+            return unavailable_with_profile(
+                profile,
+                agent_type,
+                attempts,
+                input.polls,
+                cursor_before,
+                cursor_after,
+                "semantic_input_not_new",
+            );
+        }
+        None => {}
+    }
+
+    if let Some(evidence_id) = composer_anchor_holds_command(
+        profile,
+        &profile.anchors.composer_nonempty,
+        &after_tail,
+        &command_lower,
+    ) {
+        let new_composer_text = before_tail.as_deref().is_some_and(|before_tail| {
+            composer_anchor_holds_command(
+                profile,
+                &profile.anchors.composer_nonempty,
+                before_tail,
+                &command_lower,
+            )
+            .is_none()
+        });
+        if !new_composer_text {
+            return unavailable_with_profile(
+                profile,
+                agent_type,
+                attempts,
+                input.polls,
+                cursor_before,
+                cursor_after,
+                "composer_input_not_new",
+            );
+        }
         return report_with_profile(
-            SubmitReceiptState::Submitted,
+            SubmitReceiptState::StuckInComposer,
             profile,
             attempts,
             input.polls,
             cursor_before,
             cursor_after,
-            vec![format!(
-                "submit_profile:{}:semantic_output_after_input",
-                profile.id
-            )],
+            vec![evidence_id],
         );
     }
 
-    if let Some(evidence_id) = first_anchor_match(
+    if let Some(evidence_id) = first_fresh_anchor_match(
         profile,
-        "composer_cleared",
-        &profile.anchors.composer_cleared,
-        &after_tail,
+        "working_state",
+        &profile.anchors.working_state,
+        &command_lower,
+        before_status.as_deref(),
+        &after_status,
     )
     .or_else(|| {
-        first_anchor_match(
+        first_fresh_anchor_match(
             profile,
-            "working_state",
-            &profile.anchors.working_state,
-            &after_tail,
+            "composer_cleared",
+            &profile.anchors.composer_cleared,
+            &command_lower,
+            before_status.as_deref(),
+            &after_status,
         )
     }) {
         return report_with_profile(
@@ -539,50 +711,6 @@ pub fn classify_verified_submit(input: VerifiedSubmitInput<'_>) -> VerifiedSubmi
             cursor_before,
             cursor_after,
             vec![evidence_id],
-        );
-    }
-
-    if semantic_latest_input_contains_command(input.after_semantic_snapshot, &command_lower) {
-        return report_with_profile(
-            SubmitReceiptState::StuckInComposer,
-            profile,
-            attempts,
-            input.polls,
-            cursor_before,
-            cursor_after,
-            vec![format!(
-                "submit_profile:{}:semantic_input_contains_command",
-                profile.id
-            )],
-        );
-    }
-
-    if let Some(evidence_id) = composer_anchor_holds_command(
-        profile,
-        &profile.anchors.composer_nonempty,
-        &after_tail,
-        &command_lower,
-    ) {
-        return report_with_profile(
-            SubmitReceiptState::StuckInComposer,
-            profile,
-            attempts,
-            input.polls,
-            cursor_before,
-            cursor_after,
-            vec![evidence_id],
-        );
-    }
-
-    if capture_delta_submitted(input.before_text, input.after_text, &command_lower) {
-        return report_with_profile(
-            SubmitReceiptState::Submitted,
-            profile,
-            attempts,
-            input.polls,
-            cursor_before,
-            cursor_after,
-            vec![format!("submit_profile:{}:capture_delta", profile.id)],
         );
     }
 
@@ -747,18 +875,28 @@ fn unavailable_with_profile(
     }
 }
 
-fn first_anchor_match(
+fn first_fresh_anchor_match(
     profile: &SubmitProfile,
     group: &str,
     anchors: &[String],
+    command_lower: &str,
+    before_tail_lower: Option<&str>,
     after_tail_lower: &str,
 ) -> Option<String> {
+    let before_tail_lower = before_tail_lower?;
     anchors
         .iter()
         .enumerate()
         .find(|(_, anchor)| {
-            let anchor = anchor.trim();
-            !anchor.is_empty() && after_tail_lower.contains(&anchor.to_ascii_lowercase())
+            let anchor = anchor.trim().to_ascii_lowercase();
+            !anchor.is_empty()
+                // Wrapped or clipped prompt echoes do not retain a complete
+                // command span. A marker also present in the command cannot
+                // independently prove status, even if another full echo was
+                // removed. Other fresh markers or semantic evidence can.
+                && !command_lower.contains(&anchor)
+                && !before_tail_lower.contains(&anchor)
+                && after_tail_lower.contains(&anchor)
         })
         .map(|(index, _)| format!("submit_profile:{}:{group}:{index}", profile.id))
 }
@@ -804,92 +942,84 @@ fn capture_tail(text: &str) -> &str {
     text.get(start..).unwrap_or_default()
 }
 
-fn semantic_has_output_after_matching_input(
-    snapshot: Option<&MuxSemanticSnapshot>,
-    command_lower: &str,
-) -> bool {
-    let Some(snapshot) = snapshot else {
-        return false;
-    };
-    if command_lower.is_empty() {
+fn bounded_semantic_snapshot(snapshot: &MuxSemanticSnapshot) -> bool {
+    if snapshot.zones.len() > MAX_CLASSIFIER_SEMANTIC_ZONES {
         return false;
     }
+    let mut remaining = MAX_CLASSIFIER_CAPTURE_BYTES;
+    let mut previous_end = None;
+    for zone in &snapshot.zones {
+        let start = (zone.start_y, zone.start_x);
+        let end = (zone.end_y, zone.end_x);
+        if start > end || previous_end.is_some_and(|previous_end| previous_end > start) {
+            return false;
+        }
+        let Some(next_remaining) = remaining.checked_sub(zone.text.len()) else {
+            return false;
+        };
+        remaining = next_remaining;
+        previous_end = Some(end);
+    }
+    true
+}
 
-    for (index, zone) in snapshot.zones.iter().enumerate().rev() {
-        if zone.semantic_type != MuxSemanticZoneKind::Input {
-            continue;
-        }
-        if !zone.text.to_ascii_lowercase().contains(command_lower) {
-            continue;
-        }
-        let tail_start = index.saturating_add(1);
-        return snapshot
+/// Match only the latest input, and only when the exact pre-send snapshot
+/// proves that turn did not already exist. Preserved prefix zones fence
+/// scrollback loss, coordinate reuse, and reflow; none can manufacture a new
+/// command from a prior matching turn. An in-place composer edit is admissible
+/// only while that Input was the last pre-send zone and did not hold this
+/// command already.
+enum FreshSemanticInput {
+    CurrentCommand { has_output: bool },
+    OtherCommand,
+    UnprovenCurrentCommand,
+}
+
+fn fresh_semantic_input(
+    before: Option<&MuxSemanticSnapshot>,
+    after: Option<&MuxSemanticSnapshot>,
+    command_text: &str,
+) -> Option<FreshSemanticInput> {
+    let after = after?;
+    if command_text.is_empty() || !bounded_semantic_snapshot(after) {
+        return None;
+    }
+    let input_index = after
+        .zones
+        .iter()
+        .rposition(|zone| zone.semantic_type == MuxSemanticZoneKind::Input)?;
+    let input = &after.zones[input_index];
+    let matches_command = input.text.trim() == command_text;
+    // A current matching input is not made fresh by a failed baseline read.
+    // Keep this negative evidence authoritative over generic status markers,
+    // including when the baseline was rejected for size or malformed zones.
+    let Some(before) = before.filter(|snapshot| bounded_semantic_snapshot(snapshot)) else {
+        return matches_command.then_some(FreshSemanticInput::UnprovenCurrentCommand);
+    };
+    let appended_input = input_index >= before.zones.len()
+        && after.zones.starts_with(&before.zones)
+        && before
             .zones
-            .get(tail_start..)
-            .unwrap_or(&[])
-            .iter()
-            .any(|later| {
-                later.semantic_type == MuxSemanticZoneKind::Output && !later.text.trim().is_empty()
-            });
+            .last()
+            .is_none_or(|last| (last.end_y, last.end_x) < (input.start_y, input.start_x));
+    let edited_composer = before.zones.last().is_some_and(|prior| {
+        prior.semantic_type == MuxSemanticZoneKind::Input
+            && input_index == before.zones.len() - 1
+            && after.zones[..input_index] == before.zones[..input_index]
+            && (input.start_y, input.start_x) == (prior.start_y, prior.start_x)
+            && input.text != prior.text
+            && (!matches_command || !prior.text.contains(command_text))
+    });
+    if !appended_input && !edited_composer {
+        return matches_command.then_some(FreshSemanticInput::UnprovenCurrentCommand);
     }
-
-    false
-}
-
-fn semantic_latest_input_contains_command(
-    snapshot: Option<&MuxSemanticSnapshot>,
-    command_lower: &str,
-) -> bool {
-    let Some(snapshot) = snapshot else {
-        return false;
-    };
-    if command_lower.is_empty() {
-        return false;
+    if !matches_command {
+        return Some(FreshSemanticInput::OtherCommand);
     }
-
-    let Some(input_index) = snapshot
-        .zones
-        .iter()
-        .rposition(|zone| zone.semantic_type == MuxSemanticZoneKind::Input)
-    else {
-        return false;
-    };
-
-    let Some(input_zone) = snapshot.zones.get(input_index) else {
-        return false;
-    };
-
-    let tail_start = input_index.saturating_add(1);
-    let has_later_output = snapshot
-        .zones
-        .get(tail_start..)
-        .unwrap_or(&[])
-        .iter()
-        .any(|later| {
-            later.semantic_type == MuxSemanticZoneKind::Output && !later.text.trim().is_empty()
-        });
-    !has_later_output && input_zone.text.to_ascii_lowercase().contains(command_lower)
-}
-
-fn capture_delta_submitted(
-    before_text: Option<&str>,
-    after_text: Option<&str>,
-    command_lower: &str,
-) -> bool {
-    let (Some(before_text), Some(after_text)) = (before_text, after_text) else {
-        return false;
-    };
-    if before_text == after_text {
-        return false;
-    }
-
-    if command_lower.is_empty() {
-        return false;
-    }
-
-    !capture_tail(after_text)
-        .to_ascii_lowercase()
-        .contains(command_lower)
+    let has_output = after.zones[input_index + 1..].iter().any(|later| {
+        later.semantic_type == MuxSemanticZoneKind::Output && !later.text.trim().is_empty()
+    });
+    Some(FreshSemanticInput::CurrentCommand { has_output })
 }
 
 #[cfg(test)]
@@ -924,6 +1054,7 @@ mod tests {
             agent_type: AgentType::Codex,
             profile,
             before_text: Some("Press Enter to send\n"),
+            before_semantic_snapshot: None,
             after_text,
             after_semantic_snapshot: None,
             attempts: 1,
@@ -984,8 +1115,294 @@ mod tests {
     }
 
     #[test]
+    fn stale_status_markers_and_unrelated_output_do_not_satisfy_submit_guarantees() {
+        let profile = profile();
+        for marker in ["Thinking", "Running", "operation in progress"] {
+            let before = format!("{marker}\nPress Enter to send\n");
+            for after in [before.clone(), format!("{before}background heartbeat\n")] {
+                let report = classify_verified_submit(VerifiedSubmitInput {
+                    before_text: Some(&before),
+                    ..input(Some(&profile), Some(&after))
+                });
+                assert_eq!(
+                    report.state,
+                    SubmitReceiptState::VerificationUnavailable,
+                    "stale marker {marker:?} cannot prove this send: {report:?}"
+                );
+                for guarantee in [
+                    SubmitGuaranteeLevel::Submitted,
+                    SubmitGuaranteeLevel::Working,
+                ] {
+                    assert!(!guarantee.is_met_by(report.state, &report.evidence_rule_ids));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn marker_echoes_in_current_composer_never_prove_submission() {
+        let profile = profile();
+        for command in [
+            "print Thinking",
+            "explain Running",
+            "explain operation in progress",
+        ] {
+            let after = format!("Press Enter to send\n{command}\n");
+            let report = classify_verified_submit(VerifiedSubmitInput {
+                command_text: command,
+                ..input(Some(&profile), Some(&after))
+            });
+            assert_eq!(report.state, SubmitReceiptState::StuckInComposer);
+            assert!(
+                !SubmitGuaranteeLevel::Submitted.is_met_by(report.state, &report.evidence_rule_ids)
+            );
+        }
+
+        // A fresh background status cannot override direct evidence that the
+        // new prompt remains in the current composer.
+        let report = classify_verified_submit(input(
+            Some(&profile),
+            Some("Running\nPress Enter to send\nrun tests\n"),
+        ));
+        assert_eq!(report.state, SubmitReceiptState::StuckInComposer);
+
+        let stale_composer = classify_verified_submit(VerifiedSubmitInput {
+            before_text: Some("Press Enter to send\nrun tests\n"),
+            ..input(
+                Some(&profile),
+                Some("Running\nPress Enter to send\nrun tests\n"),
+            )
+        });
+        assert_eq!(
+            stale_composer.state,
+            SubmitReceiptState::VerificationUnavailable
+        );
+    }
+
+    #[test]
+    fn wrapped_echoes_and_oversized_commands_are_not_status_evidence() {
+        let profile = profile();
+        for (command, after) in [
+            (
+                "please print Thinking verbatim",
+                "please print\nThinking verbatim\n",
+            ),
+            (
+                "explain operation in progress",
+                "explain\noperation in progress\n",
+            ),
+        ] {
+            let report = classify_verified_submit(VerifiedSubmitInput {
+                command_text: command,
+                ..input(Some(&profile), Some(after))
+            });
+            assert_eq!(report.state, SubmitReceiptState::VerificationUnavailable);
+        }
+
+        let oversized = format!("{} Thinking", "x".repeat(MAX_CLASSIFIER_CAPTURE_BYTES));
+        let report = classify_verified_submit(VerifiedSubmitInput {
+            command_text: &oversized,
+            ..input(Some(&profile), Some("clipped prompt tail: Thinking\n"))
+        });
+        assert_eq!(report.state, SubmitReceiptState::VerificationUnavailable);
+        assert_eq!(
+            report.evidence_rule_ids,
+            vec!["submit_profile:codex.default:command_exceeds_evidence_bounds"]
+        );
+    }
+
+    #[test]
+    fn independent_fresh_marker_preserves_the_working_guarantee() {
+        let mut profile = profile();
+        profile.anchors.composer_cleared.push("Running".to_string());
+        let report = classify_verified_submit(VerifiedSubmitInput {
+            command_text: "print Thinking",
+            ..input(
+                Some(&profile),
+                Some("print Thinking\nRunning\nPress Enter to send\n"),
+            )
+        });
+        assert_eq!(report.state, SubmitReceiptState::Submitted);
+        assert_eq!(
+            report.evidence_rule_ids,
+            vec!["submit_profile:codex.default:working_state:0"]
+        );
+        assert!(SubmitGuaranteeLevel::Working.is_met_by(report.state, &report.evidence_rule_ids));
+    }
+
+    fn semantic_snapshot(turns: &[(MuxSemanticZoneKind, &str)]) -> MuxSemanticSnapshot {
+        MuxSemanticSnapshot {
+            zones: turns
+                .iter()
+                .enumerate()
+                .map(|(row, (kind, text))| MuxSemanticZone {
+                    start_y: isize::try_from(row).unwrap(),
+                    start_x: 0,
+                    end_y: isize::try_from(row).unwrap(),
+                    end_x: text.len(),
+                    semantic_type: *kind,
+                    text: (*text).to_string(),
+                })
+                .collect(),
+            last_exit_code: None,
+        }
+    }
+
+    #[test]
+    fn semantic_repeated_command_requires_a_new_turn_after_the_exact_baseline() {
+        let profile = profile();
+        let before = semantic_snapshot(&[
+            (MuxSemanticZoneKind::Input, "run tests"),
+            (MuxSemanticZoneKind::Output, "old result"),
+        ]);
+        let stale = classify_verified_submit(VerifiedSubmitInput {
+            before_text: Some("run tests\nold result\n"),
+            before_semantic_snapshot: Some(&before),
+            after_semantic_snapshot: Some(&before),
+            ..input(Some(&profile), Some("run tests\nold result\nRunning\n"))
+        });
+        assert_eq!(stale.state, SubmitReceiptState::VerificationUnavailable);
+
+        let after = semantic_snapshot(&[
+            (MuxSemanticZoneKind::Input, "run tests"),
+            (MuxSemanticZoneKind::Output, "old result"),
+            (MuxSemanticZoneKind::Input, "run tests"),
+            (MuxSemanticZoneKind::Output, "new result"),
+        ]);
+        let fresh = classify_verified_submit(VerifiedSubmitInput {
+            before_text: Some("run tests\nold result\n"),
+            before_semantic_snapshot: Some(&before),
+            after_semantic_snapshot: Some(&after),
+            ..input(Some(&profile), Some("run tests\nnew result\n"))
+        });
+        assert_eq!(fresh.state, SubmitReceiptState::Submitted);
+        assert_eq!(
+            fresh.evidence_rule_ids,
+            vec!["submit_profile:codex.default:semantic_output_after_input"]
+        );
+        assert!(SubmitGuaranteeLevel::Working.is_met_by(fresh.state, &fresh.evidence_rule_ids));
+    }
+
+    #[test]
+    fn semantic_old_matching_turn_cannot_borrow_output_from_a_later_input() {
+        let profile = profile();
+        let before = semantic_snapshot(&[]);
+        let after = semantic_snapshot(&[
+            (MuxSemanticZoneKind::Input, "run tests"),
+            (MuxSemanticZoneKind::Output, "old result"),
+            (MuxSemanticZoneKind::Input, "different command"),
+            (MuxSemanticZoneKind::Output, "Running"),
+        ]);
+        let report = classify_verified_submit(VerifiedSubmitInput {
+            before_semantic_snapshot: Some(&before),
+            after_semantic_snapshot: Some(&after),
+            ..input(
+                Some(&profile),
+                Some("run tests\ndifferent command\nRunning\n"),
+            )
+        });
+        assert_eq!(report.state, SubmitReceiptState::VerificationUnavailable);
+        assert_eq!(
+            report.evidence_rule_ids,
+            vec!["submit_profile:codex.default:latest_input_does_not_match"]
+        );
+    }
+
+    #[test]
+    fn semantic_composer_edit_is_new_but_an_unchanged_prior_command_is_not() {
+        let profile = profile();
+        let before = semantic_snapshot(&[(MuxSemanticZoneKind::Input, "")]);
+        let after = semantic_snapshot(&[(MuxSemanticZoneKind::Input, "run tests")]);
+        let classify = |baseline| {
+            classify_verified_submit(VerifiedSubmitInput {
+                before_semantic_snapshot: Some(baseline),
+                after_semantic_snapshot: Some(&after),
+                ..input(Some(&profile), Some("run tests\n"))
+            })
+        };
+        assert_eq!(classify(&before).state, SubmitReceiptState::StuckInComposer);
+        assert_eq!(
+            classify(&after).state,
+            SubmitReceiptState::VerificationUnavailable
+        );
+    }
+
+    #[test]
+    fn missing_baseline_and_rewritten_or_oversized_semantic_history_fail_closed() {
+        let profile = profile();
+        let without_baseline = classify_verified_submit(VerifiedSubmitInput {
+            before_text: None,
+            ..input(
+                Some(&profile),
+                Some("Thinking\nRunning\noperation in progress\n"),
+            )
+        });
+        assert_eq!(
+            without_baseline.state,
+            SubmitReceiptState::VerificationUnavailable
+        );
+
+        let before = semantic_snapshot(&[
+            (MuxSemanticZoneKind::Input, "old command"),
+            (MuxSemanticZoneKind::Output, "old result"),
+        ]);
+        let rewritten = semantic_snapshot(&[
+            (MuxSemanticZoneKind::Input, "run tests"),
+            (MuxSemanticZoneKind::Output, "new result"),
+        ]);
+        for baseline in [None, Some(&before)] {
+            let report = classify_verified_submit(VerifiedSubmitInput {
+                before_semantic_snapshot: baseline,
+                after_semantic_snapshot: Some(&rewritten),
+                ..input(Some(&profile), Some("run tests\nnew result\n"))
+            });
+            assert_eq!(report.state, SubmitReceiptState::VerificationUnavailable);
+        }
+
+        let empty = semantic_snapshot(&[]);
+        let mut oversized = rewritten;
+        oversized.zones[1].text = "x".repeat(MAX_CLASSIFIER_CAPTURE_BYTES + 1);
+        let report = classify_verified_submit(VerifiedSubmitInput {
+            before_semantic_snapshot: Some(&empty),
+            after_semantic_snapshot: Some(&oversized),
+            ..input(Some(&profile), Some("run tests\nnew result\n"))
+        });
+        assert_eq!(report.state, SubmitReceiptState::VerificationUnavailable);
+    }
+
+    #[test]
+    fn current_semantic_input_with_unusable_baseline_blocks_fresh_working_marker() {
+        let profile = profile();
+        let after = semantic_snapshot(&[(MuxSemanticZoneKind::Input, "run tests")]);
+        let mut oversized = semantic_snapshot(&[(MuxSemanticZoneKind::Output, "")]);
+        oversized.zones[0].text = "x".repeat(MAX_CLASSIFIER_CAPTURE_BYTES + 1);
+        let mut malformed = semantic_snapshot(&[(MuxSemanticZoneKind::Input, "")]);
+        malformed.zones[0].start_y = 1;
+        for before in [None, Some(&oversized), Some(&malformed)] {
+            let report = classify_verified_submit(VerifiedSubmitInput {
+                before_text: Some("ready\n"),
+                before_semantic_snapshot: before,
+                after_semantic_snapshot: Some(&after),
+                ..input(Some(&profile), Some("run tests\nRunning\n"))
+            });
+            assert_eq!(report.state, SubmitReceiptState::VerificationUnavailable);
+            assert_eq!(
+                report.evidence_rule_ids,
+                vec!["submit_profile:codex.default:semantic_input_not_new"]
+            );
+            assert!(
+                !SubmitGuaranteeLevel::Working.is_met_by(report.state, &report.evidence_rule_ids)
+            );
+        }
+    }
+
+    #[test]
     fn semantic_output_after_matching_input_is_submitted_even_if_text_remains_in_transcript() {
         let profile = profile();
+        let before = MuxSemanticSnapshot {
+            zones: Vec::new(),
+            last_exit_code: None,
+        };
         let snapshot = MuxSemanticSnapshot {
             zones: vec![
                 MuxSemanticZone {
@@ -1009,6 +1426,7 @@ mod tests {
         };
 
         let report = classify_verified_submit(VerifiedSubmitInput {
+            before_semantic_snapshot: Some(&before),
             after_semantic_snapshot: Some(&snapshot),
             after_text: Some("run tests\nRunning"),
             ..input(Some(&profile), Some("run tests\nRunning"))
@@ -1024,6 +1442,10 @@ mod tests {
     #[test]
     fn semantic_latest_input_without_output_is_stuck_in_composer() {
         let profile = profile();
+        let before = MuxSemanticSnapshot {
+            zones: Vec::new(),
+            last_exit_code: None,
+        };
         let snapshot = MuxSemanticSnapshot {
             zones: vec![MuxSemanticZone {
                 start_y: 0,
@@ -1037,6 +1459,7 @@ mod tests {
         };
 
         let report = classify_verified_submit(VerifiedSubmitInput {
+            before_semantic_snapshot: Some(&before),
             after_semantic_snapshot: Some(&snapshot),
             after_text: Some("run tests"),
             ..input(Some(&profile), Some("run tests"))
@@ -1050,14 +1473,14 @@ mod tests {
     }
 
     #[test]
-    fn capture_delta_without_command_echo_is_submitted() {
+    fn unrelated_capture_delta_without_command_echo_is_not_submit_evidence() {
         let profile = profile();
         let report = classify_verified_submit(input(Some(&profile), Some("done\n")));
 
-        assert_eq!(report.state, SubmitReceiptState::Submitted);
+        assert_eq!(report.state, SubmitReceiptState::VerificationUnavailable);
         assert_eq!(
             report.evidence_rule_ids,
-            vec!["submit_profile:codex.default:capture_delta"]
+            vec!["submit_profile:codex.default:insufficient_evidence"]
         );
         assert!(report.cursor_before.is_some());
         assert!(report.cursor_after.is_some());
@@ -1072,6 +1495,7 @@ mod tests {
             agent_type: AgentType::Codex,
             profile: Some(&profile),
             before_text: Some("Press Enter to send\n"),
+            before_semantic_snapshot: None,
             after_text: Some("background output changed\n"),
             after_semantic_snapshot: None,
             attempts: 1,
@@ -1111,6 +1535,7 @@ mod tests {
             agent_type: profile.agent_type,
             profile: Some(profile),
             before_text: Some(before),
+            before_semantic_snapshot: None,
             after_text: Some(after),
             after_semantic_snapshot: None,
             attempts: 1,

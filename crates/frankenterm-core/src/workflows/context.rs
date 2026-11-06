@@ -277,10 +277,15 @@ impl WorkflowContext {
         let submit_profile = crate::patterns::PatternEngine::new()
             .submit_profile_for_agent(agent_type)
             .cloned();
-        let before_text = if submit_profile.is_some() {
-            capture_verified_submit_text(cx, injector.client(), pane_id).await
+        let before = if submit_profile.is_some() {
+            crate::verified_submit::capture_verified_submit_observation(
+                cx,
+                injector.client(),
+                pane_id,
+            )
+            .await
         } else {
-            None
+            crate::verified_submit::VerifiedSubmitObservation::default()
         };
         // No verification canary: it is confirmed only through semantic input
         // zones, which agent composers never publish, and its U+2063 marker
@@ -310,7 +315,8 @@ impl WorkflowContext {
                         &outbound_text,
                         agent_type,
                         submit_profile.as_ref(),
-                        before_text.as_deref(),
+                        before.text.as_deref(),
+                        before.semantic_snapshot.as_ref(),
                         1,
                         1,
                     )
@@ -480,24 +486,6 @@ impl WorkflowContext {
 
 // Captures go through the injector's own client: the default handle is a
 // CLI-only client, which cannot read a pane on a vendored-mux deployment.
-async fn capture_verified_submit_text(
-    cx: &crate::cx::Cx,
-    client: &crate::wezterm::WeztermHandle,
-    pane_id: u64,
-) -> Option<String> {
-    match client.get_text_with_cx(cx, pane_id, false).await {
-        Ok(text) => Some(text),
-        Err(error) => {
-            tracing::debug!(
-                pane_id,
-                %error,
-                "workflow verified-submit text capture unavailable"
-            );
-            None
-        }
-    }
-}
-
 async fn persist_verified_submit_receipt(
     cx: &crate::cx::Cx,
     storage: &StorageHandle,
