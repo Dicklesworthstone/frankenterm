@@ -2614,6 +2614,11 @@ const GUARDIAN_LIVE_CHECKPOINT_CAPTURE_TIMEOUT: Duration = Duration::from_secs(5
 const GUARDIAN_LIVE_ADOPTIONS_AFTER_ROOT: usize = 0;
 /// Adoptions a ledger remembers while no committed root names one of them.
 const GUARDIAN_ADOPTION_LEDGER_CAPACITY: usize = 64;
+/// Adoptions after a kept checkpoint up to which a recovery capture may still
+/// name it. The guardian keeps a pane's newest eight catalog members, and an
+/// adoption whose reply was lost never reached the ledger, so stop well short
+/// of eight.
+const GUARDIAN_REUSE_MAX_LATER_ADOPTIONS: usize = 4;
 
 /// The guardian checkpoints one pane registration adopted, as far as keeping
 /// its newest committed recovery root's member needs them.
@@ -2627,6 +2632,12 @@ struct GuardianAdoptionLedger {
     reanchor: Option<(
         crate::guardian_protocol::GuardianCheckpointIdentityDigest,
         u64,
+    )>,
+    /// A checkpoint a recovery capture published but no committed root names,
+    /// and when it was captured, for a later capture to name (ft-upal7).
+    kept_for_reuse: Option<(
+        Instant,
+        crate::guardian_checkpoint::PublishedGuardianCheckpoint,
     )>,
 }
 
@@ -2645,15 +2656,24 @@ impl GuardianAdoptionLedger {
     }
 
     /// A committed root names the member adopted as `effect_id`: from now on
-    /// only what this registration adopted after it counts. A member this
-    /// ledger no longer remembers changes nothing.
+    /// only what this registration adopted after it counts, and no capture
+    /// needs a kept checkpoint. A member this ledger no longer remembers
+    /// changes nothing else.
     fn root_committed(&mut self, effect_id: uuid::Uuid) -> bool {
+        self.kept_for_reuse = None;
         let Some(at) = self.since_root.iter().position(|id| *id == effect_id) else {
             return false;
         };
         self.since_root.drain(..=at);
         self.root_named = true;
         true
+    }
+
+    /// How many adoptions this ledger recorded after `effect_id`, or `None`
+    /// once it no longer remembers that adoption.
+    fn adoptions_after(&self, effect_id: uuid::Uuid) -> Option<usize> {
+        let at = self.since_root.iter().position(|id| *id == effect_id)?;
+        Some(self.since_root.len() - at - 1)
     }
 
     /// Whether a live checkpoint may be adopted, `limit` after the member
@@ -22429,6 +22449,103 @@ impl Mux {
         self.recovery_root_guardian_panes.lock().owned.remove(&pane);
     }
 
+    /// Whether a recovery capture may take this guardian pane's checkpoint at
+    /// the first root's size (ft-upal7): no committed root names a member of
+    /// the pane's current registration, and its history past the hot rows is
+    /// in a durable scrollback store, so a restore keeps the rows a smaller
+    /// checkpoint leaves out.
+    pub fn guardian_pane_awaits_first_root(&self, pane_id: PaneId) -> bool {
+        let current = {
+            let panes = self.panes.read();
+            let Some(registered) = panes.get(&pane_id) else {
+                return false;
+            };
+            (
+                Arc::clone(&registered.pane),
+                Arc::clone(&registered.generation),
+            )
+        };
+        current
+            .0
+            .downcast_ref::<crate::localpane::LocalPane>()
+            .is_some_and(crate::localpane::LocalPane::has_durable_scrollback)
+            && !current.1.guardian_adoptions.lock().root_named
+    }
+
+    /// Keep a guardian checkpoint that a recovery capture published and no
+    /// committed root names, captured at `captured_at`, so that a later
+    /// capture can name it instead of taking the pane's checkpoint again
+    /// (ft-upal7). A capture that ran out of budget used to drop every
+    /// checkpoint it had published and start over from the first pane, so a
+    /// mux whose panes needed more than the budget never committed a root.
+    /// Replaces what the pane kept before; a checkpoint of another
+    /// registration is dropped.
+    pub fn keep_guardian_checkpoint_for_reuse(
+        &self,
+        pane_id: PaneId,
+        published: crate::guardian_checkpoint::PublishedGuardianCheckpoint,
+        captured_at: Instant,
+    ) {
+        let generation = {
+            let panes = self.panes.read();
+            let Some(registered) = panes.get(&pane_id) else {
+                return;
+            };
+            Arc::clone(&registered.generation)
+        };
+        if generation.wire_identity == published.capture().registration_wire_identity() {
+            generation.guardian_adoptions.lock().kept_for_reuse = Some((captured_at, published));
+        }
+    }
+
+    /// When the checkpoint kept for this pane's current registration was
+    /// captured, if one is kept.
+    pub fn guardian_checkpoint_kept_for_reuse(&self, pane_id: PaneId) -> Option<Instant> {
+        let generation = {
+            let panes = self.panes.read();
+            Arc::clone(&panes.get(&pane_id)?.generation)
+        };
+        let ledger = generation.guardian_adoptions.lock();
+        ledger
+            .kept_for_reuse
+            .as_ref()
+            .map(|(captured_at, _)| *captured_at)
+    }
+
+    /// Take back the checkpoint kept for this pane if a recovery root may
+    /// still name it: it belongs to the pane's current registration and
+    /// guardian lease, and few enough adoptions followed it that the guardian,
+    /// which keeps a pane's newest eight members, still holds it. Otherwise
+    /// it is dropped.
+    pub fn take_guardian_checkpoint_for_reuse(
+        &self,
+        pane_id: PaneId,
+    ) -> Option<(
+        Instant,
+        crate::guardian_checkpoint::PublishedGuardianCheckpoint,
+    )> {
+        let generation = {
+            let panes = self.panes.read();
+            Arc::clone(&panes.get(&pane_id)?.generation)
+        };
+        let kept = {
+            let mut ledger = generation.guardian_adoptions.lock();
+            let kept = ledger.kept_for_reuse.take()?;
+            ledger
+                .adoptions_after(kept.1.receipt().effect_id())
+                .is_some_and(|later| later <= GUARDIAN_REUSE_MAX_LATER_ADOPTIONS)
+                .then_some(kept)?
+        };
+        if !self.guardian_checkpoint_is_restorable(pane_id, &kept.1) {
+            return None;
+        }
+        log::info!(
+            "pane {pane_id}: a recovery capture takes back the guardian checkpoint kept {} ms ago",
+            kept.0.elapsed().as_millis()
+        );
+        Some(kept)
+    }
+
     /// A committed recovery root names `published` for `pane_id`. Returns
     /// whether the pane's current registration adopted it.
     pub fn note_guardian_root_committed(
@@ -25833,6 +25950,37 @@ mod tests {
         );
         assert!(!forgetful.root_committed(forgotten));
         assert!(!forgetful.live_adoption_allowed(limit));
+    }
+
+    /// ft-upal7: a capture may name a kept checkpoint only while the ledger
+    /// still counts the adoptions after it, and a root that commits a later
+    /// member takes it out of reach.
+    #[test]
+    fn a_kept_checkpoint_counts_the_adoptions_after_it() {
+        let digest = |byte| {
+            crate::guardian_protocol::GuardianCheckpointIdentityDigest::from_bytes([byte; 32])
+                .expect("checkpoint identity")
+        };
+        let mut ledger = GuardianAdoptionLedger::default();
+        let kept = uuid::Uuid::from_u128(1);
+        assert_eq!(ledger.adoptions_after(kept), None);
+        ledger.record(kept, digest(1), 3);
+        assert_eq!(ledger.adoptions_after(kept), Some(0));
+        let later: Vec<_> = (0..=GUARDIAN_REUSE_MAX_LATER_ADOPTIONS)
+            .map(|n| uuid::Uuid::from_u128(10 + n as u128))
+            .collect();
+        for (n, effect) in later.iter().enumerate() {
+            ledger.record(*effect, digest(2), 3);
+            assert_eq!(ledger.adoptions_after(kept), Some(n + 1));
+        }
+        assert!(ledger.adoptions_after(kept) > Some(GUARDIAN_REUSE_MAX_LATER_ADOPTIONS));
+        assert!(ledger.root_committed(later[0]));
+        assert_eq!(ledger.adoptions_after(kept), None);
+        assert_eq!(
+            ledger.adoptions_after(later[1]),
+            Some(later.len() - 2),
+            "adoptions after the committed member still count"
+        );
     }
 
     #[derive(Debug, Eq, PartialEq)]

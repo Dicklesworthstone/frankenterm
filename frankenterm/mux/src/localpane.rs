@@ -5470,6 +5470,13 @@ impl LocalPane {
         }
     }
 
+    /// Whether the pane's history past its hot rows is in a durable scrollback
+    /// store, which a checkpoint drains to before it is taken and a restore
+    /// keeps the rows from that the checkpoint leaves out.
+    pub(crate) fn has_durable_scrollback(&self) -> bool {
+        self.scrollback_flush_sink.lock().is_some()
+    }
+
     pub(crate) fn stage_legacy_terminal_checkpoint(
         &self,
         _authority: ModelParserCaptureAuthority,

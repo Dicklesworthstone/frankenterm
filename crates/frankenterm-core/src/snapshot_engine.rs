@@ -195,6 +195,90 @@ enum CapturedPaneCheckpoint {
     Guardian(Box<mux::guardian_checkpoint::PublishedGuardianCheckpoint>),
 }
 
+/// The checkpoints one whole-mux capture holds, one slot per pane in
+/// topology order, each with when it was captured. Unless a root committed
+/// naming them, the guardian checkpoints go back to the mux when the capture
+/// ends, for the next capture to name (ft-upal7).
+#[cfg(feature = "frankenterm-deps")]
+struct HeldPaneCheckpoints<'m> {
+    mux: &'m mux::Mux,
+    panes: Vec<mux::pane::PaneId>,
+    slots: Vec<Option<(Instant, CapturedPaneCheckpoint)>>,
+    committed: std::cell::Cell<bool>,
+}
+
+#[cfg(feature = "frankenterm-deps")]
+impl<'m> HeldPaneCheckpoints<'m> {
+    fn new(mux: &'m mux::Mux, bindings: &[mux::MuxCapturedPaneBinding]) -> Self {
+        Self {
+            mux,
+            panes: bindings.iter().map(|pane| pane.pane_id).collect(),
+            slots: bindings.iter().map(|_| None).collect(),
+            committed: std::cell::Cell::new(false),
+        }
+    }
+
+    /// Every pane's checkpoint, in topology order.
+    fn checkpoints(&self) -> Vec<&CapturedPaneCheckpoint> {
+        self.slots
+            .iter()
+            .flatten()
+            .map(|(_, checkpoint)| checkpoint)
+            .collect()
+    }
+}
+
+#[cfg(feature = "frankenterm-deps")]
+impl Drop for HeldPaneCheckpoints<'_> {
+    fn drop(&mut self) {
+        if self.committed.get() {
+            return;
+        }
+        for (pane_id, slot) in self.panes.iter().zip(&mut self.slots) {
+            if let Some((captured_at, CapturedPaneCheckpoint::Guardian(published))) = slot.take() {
+                self.mux
+                    .keep_guardian_checkpoint_for_reuse(*pane_id, *published, captured_at);
+            }
+        }
+    }
+}
+
+/// The order a whole-mux capture takes its panes in, from when each pane's
+/// kept guardian checkpoint was captured (ft-upal7): every pane without one
+/// first, in topology order, then the panes with one, the oldest first. A
+/// capture short of budget names the kept checkpoints of the panes it has not
+/// reached, so the budget refreshes the stalest of them.
+#[cfg(feature = "frankenterm-deps")]
+fn pane_capture_order(kept: &[Option<Instant>]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..kept.len()).collect();
+    order.sort_by_key(|&index| (kept[index].is_some(), kept[index]));
+    order
+}
+
+/// The guardian checkpoint the mux kept for `pane`, if this capture may name
+/// it: the pane's own registration, within the pane's byte limit here. One
+/// over the limit stays kept.
+#[cfg(feature = "frankenterm-deps")]
+fn take_kept_guardian_checkpoint(
+    mux: &mux::Mux,
+    pane: &mux::MuxCapturedPaneBinding,
+    max_encoded_bytes: usize,
+) -> Option<(
+    Instant,
+    mux::guardian_checkpoint::PublishedGuardianCheckpoint,
+)> {
+    let (captured_at, published) = mux.take_guardian_checkpoint_for_reuse(pane.pane_id)?;
+    let capture = published.capture();
+    if capture.registration_wire_identity() == pane.registration_wire_identity
+        && capture.durable_pane_id().to_string() == pane.pane_uuid
+        && capture.terminal_checkpoint().canonical_payload().len() <= max_encoded_bytes
+    {
+        return Some((captured_at, published));
+    }
+    mux.keep_guardian_checkpoint_for_reuse(pane.pane_id, published, captured_at);
+    None
+}
+
 /// The first part of a topology recheck that differs from the capture, if any.
 #[cfg(feature = "frankenterm-deps")]
 fn topology_change(
@@ -318,6 +402,17 @@ const GUARDIAN_PANE_RECOVERY_ALLOWANCE: Duration = Duration::from_secs(3);
 #[cfg(feature = "frankenterm-deps")]
 const MIN_PANE_CHECKPOINT_BYTES: usize = 1024 * 1024;
 
+/// What a guardian pane's checkpoint may encode to while no committed root
+/// names the pane and its older rows are in a durable store (ft-upal7). Until
+/// a mux commits its first root, a crash strands every guardian pane. That
+/// root needs a checkpoint of each, one after another through the guardian's
+/// one worker, and a guardian round trip for every 256 KiB of it: 50 panes of
+/// 40,000 flooded rows reached a first root 124 s after the mux was ready.
+/// The store keeps the older rows and a restore keeps them from it. A capture
+/// over this size is taken again at the pane's full limit.
+#[cfg(feature = "frankenterm-deps")]
+const FIRST_ROOT_PANE_CHECKPOINT_BYTES: usize = MIN_PANE_CHECKPOINT_BYTES;
+
 /// What the next pane's checkpoint may encode to in a whole-mux capture. Over
 /// the mux-wide ceiling a capture fails and every later one fails the same way,
 /// so no root is published again, and a checkpoint at this limit only drops its
@@ -370,6 +465,17 @@ impl CaptureTiming {
         }
     }
 
+    /// The budget a fresh guardian checkpoint must have left before a capture
+    /// starts one instead of naming the pane's kept checkpoint: twice the
+    /// slowest pane so far, and at least twice a pane's allowance.
+    fn reuse_reserve(&self) -> Duration {
+        self.slowest
+            .map_or(GUARDIAN_PANE_RECOVERY_ALLOWANCE, |(_, took)| {
+                took.max(GUARDIAN_PANE_RECOVERY_ALLOWANCE)
+            })
+            .saturating_mul(2)
+    }
+
     /// [`WholeMuxCaptureError::CaptureDeadline`] with the timing, which the
     /// mux logs as the capture's failure.
     fn deadline(&self) -> WholeMuxCaptureError {
@@ -384,12 +490,118 @@ impl CaptureTiming {
     }
 }
 
+/// A new guardian checkpoint of `pane` for a whole-mux capture, within the
+/// capture's deadline. While the pane awaits its first root it is taken at
+/// [`FIRST_ROOT_PANE_CHECKPOINT_BYTES`], and again at `limits` if that capture
+/// fails (a screen of large images exceeds it). An error comes with whether a
+/// checkpoint the pane kept may stand in for this one: the pane was busy, its
+/// parser could not reach a recovery ground in time, the capture ran out of
+/// budget, or the capture failed with the pane still consistent.
+#[cfg(feature = "frankenterm-deps")]
+fn capture_fresh_guardian_checkpoint(
+    cx: &crate::cx::Cx,
+    mux: &mux::Mux,
+    pane: &mux::MuxCapturedPaneBinding,
+    limits: frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits,
+    deadline: Instant,
+    capture_timeout: Duration,
+    timing: &CaptureTiming,
+) -> Result<mux::guardian_checkpoint::PublishedGuardianCheckpoint, (WholeMuxCaptureError, bool)> {
+    use mux::LiveParserCheckpointError as Live;
+    let mut attempt_limits = limits;
+    if limits.max_encoded_bytes > FIRST_ROOT_PANE_CHECKPOINT_BYTES
+        && mux.guardian_pane_awaits_first_root(pane.pane_id)
+    {
+        attempt_limits.max_encoded_bytes = FIRST_ROOT_PANE_CHECKPOINT_BYTES;
+    }
+    loop {
+        // The budget grows with the panes; one pane's parser wait stays within
+        // the configured timeout, as before.
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .ok_or_else(|| (timing.deadline(), true))?
+            .min(capture_timeout);
+        let mut cancellation = None;
+        let mut capture_deadline_reached = false;
+        let result =
+            mux.capture_pane_guardian_checkpoint(pane.pane_id, attempt_limits, remaining, || {
+                match snapshot_cx_checkpoint(cx) {
+                    Ok(()) => {
+                        capture_deadline_reached = Instant::now() >= deadline;
+                        capture_deadline_reached
+                    }
+                    Err(error) => {
+                        cancellation = Some(error);
+                        true
+                    }
+                }
+            });
+        if let Some(error) = cancellation {
+            return Err((WholeMuxCaptureError::Context(error), false));
+        }
+        // A checkpoint that completed is held even past the deadline: the
+        // guardian already adopted it, and the next capture can name it.
+        let source = match result {
+            Ok(published) => return Ok(published),
+            Err(source) => source,
+        };
+        if capture_deadline_reached {
+            return Err((timing.deadline(), true));
+        }
+        snapshot_cx_checkpoint(cx)
+            .map_err(|error| (WholeMuxCaptureError::Context(error), false))?;
+        let live = source.downcast_ref::<Live>().cloned();
+        if attempt_limits.max_encoded_bytes < limits.max_encoded_bytes
+            && live == Some(Live::CaptureAndBind)
+        {
+            attempt_limits = limits;
+            continue;
+        }
+        return Err(match live {
+            Some(Live::StaleRegistration) => (
+                WholeMuxCaptureError::StaleCapture(
+                    "guardian pane registration changed during its checkpoint",
+                ),
+                false,
+            ),
+            Some(Live::CheckpointBusy | Live::GuardianDeliveryBusy) => {
+                (WholeMuxCaptureError::Busy, true)
+            }
+            Some(
+                Live::Timeout
+                | Live::CaptureAndBind
+                | Live::SynchronizedOutputHold
+                | Live::ParserNotRecoveryGround
+                | Live::DeliveryWriteInFlight,
+            ) => (
+                WholeMuxCaptureError::GuardianPane {
+                    pane_id: pane.pane_id,
+                    source: source.into(),
+                },
+                true,
+            ),
+            _ => (
+                WholeMuxCaptureError::GuardianPane {
+                    pane_id: pane.pane_id,
+                    source: source.into(),
+                },
+                false,
+            ),
+        });
+    }
+}
+
 /// Capture actual mux/parser state and publish an encrypted offline recovery image.
 ///
 /// Run on an owned blocking worker, never a mux or readiness thread. There is
 /// one attempt, at most 1,024 panes, a total deadline checked between phases
-/// ([`whole_mux_recovery_budget`]: `capture_timeout` plus one second per
-/// guardian pane), and at most 100ms for each parser ACK channel wait.
+/// ([`whole_mux_recovery_budget`]: `capture_timeout` plus
+/// [`GUARDIAN_PANE_RECOVERY_ALLOWANCE`] per guardian pane), and at most 100ms
+/// for each parser ACK channel wait. A guardian checkpoint this capture
+/// publishes but no root it commits names stays with the mux, and a later
+/// capture names it for a pane it is short of budget for, or whose new
+/// checkpoint fails while the pane stays restorable (ft-upal7).
 /// Registry locks, staging, guardian publication round trips, and cold-history
 /// filesystem calls are not preemptible by that wait bound.
 /// Supports both legacy model-only panes and authenticated guardian-owned panes.
@@ -480,7 +692,6 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
     let deadline = started
         .checked_add(budget)
         .ok_or(WholeMuxCaptureError::InvalidTimeout)?;
-    let mut checkpoints = Vec::with_capacity(captured.pane_bindings.len());
     let mut total_bytes = 0usize;
     // Version 4 lines, graphics and protection when the mux's guardian admits
     // them. A pane's checkpoint must also fit the recovery image's per-pane
@@ -499,7 +710,20 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
         taken: 0,
         slowest: None,
     };
-    for pane in &captured.pane_bindings {
+    // When each guardian pane's kept checkpoint, from a capture that ended
+    // without a root, was captured (ft-upal7).
+    let kept: Vec<Option<Instant>> = captured
+        .pane_bindings
+        .iter()
+        .map(|pane| {
+            pane.spawn_custody
+                .as_ref()
+                .and_then(|_| mux.guardian_checkpoint_kept_for_reuse(pane.pane_id))
+        })
+        .collect();
+    let mut held = HeldPaneCheckpoints::new(mux, &captured.pane_bindings);
+    for index in pane_capture_order(&kept) {
+        let pane = &captured.pane_bindings[index];
         snapshot_cx_checkpoint(cx)?;
         let pane_started = Instant::now();
         let limits = frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits {
@@ -508,64 +732,43 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
                 recovery_limits.max_total_checkpoint_bytes,
                 total_bytes,
                 captured.pane_bindings.len(),
-                checkpoints.len(),
+                timing.taken,
             ),
             ..guardian_limits
         };
-        // The budget grows with the panes; one pane's parser wait stays within
-        // the configured timeout, as before.
-        let remaining = deadline
-            .checked_duration_since(pane_started)
-            .filter(|duration| !duration.is_zero())
-            .ok_or_else(|| timing.deadline())?
-            .min(capture_timeout);
-        let mut cancellation = None;
-        let mut capture_deadline_reached = false;
-        let checkpoint = if pane.spawn_custody.is_some() {
-            let result =
-                mux.capture_pane_guardian_checkpoint(pane.pane_id, limits, remaining, || {
-                    match snapshot_cx_checkpoint(cx) {
-                        Ok(()) => {
-                            capture_deadline_reached = Instant::now() >= deadline;
-                            capture_deadline_reached
-                        }
-                        Err(error) => {
-                            cancellation = Some(error);
-                            true
-                        }
+        let (captured_at, checkpoint, payload_bytes) = if pane.spawn_custody.is_some() {
+            // A guardian pane needs no common cut with the rest of the mux, so
+            // a capture short of budget names the pane's kept checkpoint
+            // instead of taking a new one, and so does a capture whose new
+            // checkpoint of the pane failed while the pane stayed restorable.
+            let short = deadline.saturating_duration_since(pane_started) < timing.reuse_reserve();
+            let reused = if kept[index].is_some() && short {
+                take_kept_guardian_checkpoint(mux, pane, limits.max_encoded_bytes)
+            } else {
+                None
+            };
+            let (captured_at, published) = match reused {
+                Some(kept) => kept,
+                None => match capture_fresh_guardian_checkpoint(
+                    cx,
+                    mux,
+                    pane,
+                    limits,
+                    deadline,
+                    capture_timeout,
+                    &timing,
+                ) {
+                    Ok(published) => (pane_started, published),
+                    Err((error, kept_may_stand_in)) => {
+                        let stand_in = if kept_may_stand_in && kept[index].is_some() {
+                            take_kept_guardian_checkpoint(mux, pane, limits.max_encoded_bytes)
+                        } else {
+                            None
+                        };
+                        stand_in.ok_or(error)?
                     }
-                });
-            if let Some(error) = cancellation {
-                return Err(WholeMuxCaptureError::Context(error));
-            }
-            if capture_deadline_reached {
-                return Err(timing.deadline());
-            }
-            snapshot_cx_checkpoint(cx)?;
-            let published = result.map_err(|source| {
-                if let Some(live_err) = source.downcast_ref::<mux::LiveParserCheckpointError>() {
-                    match live_err {
-                        mux::LiveParserCheckpointError::StaleRegistration => {
-                            WholeMuxCaptureError::StaleCapture(
-                                "guardian pane registration changed during its checkpoint",
-                            )
-                        }
-                        mux::LiveParserCheckpointError::CheckpointBusy
-                        | mux::LiveParserCheckpointError::GuardianDeliveryBusy => {
-                            WholeMuxCaptureError::Busy
-                        }
-                        _ => WholeMuxCaptureError::GuardianPane {
-                            pane_id: pane.pane_id,
-                            source: source.into(),
-                        },
-                    }
-                } else {
-                    WholeMuxCaptureError::GuardianPane {
-                        pane_id: pane.pane_id,
-                        source: source.into(),
-                    }
-                }
-            })?;
+                },
+            };
             let capture = published.capture();
             if capture.registration_wire_identity() != pane.registration_wire_identity
                 || capture.durable_pane_id().to_string() != pane.pane_uuid
@@ -574,12 +777,22 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
                     "guardian checkpoint names another registration",
                 ));
             }
-            total_bytes = total_bytes
-                .checked_add(capture.terminal_checkpoint().canonical_payload().len())
-                .filter(|bytes| *bytes <= recovery_limits.max_total_checkpoint_bytes)
-                .ok_or(WholeMuxCaptureError::CaptureByteLimit)?;
-            CapturedPaneCheckpoint::Guardian(Box::new(published))
+            let payload_bytes = capture.terminal_checkpoint().canonical_payload().len();
+            (
+                captured_at,
+                CapturedPaneCheckpoint::Guardian(Box::new(published)),
+                payload_bytes,
+            )
         } else {
+            // The budget grows with the panes; one pane's parser wait stays
+            // within the configured timeout, as before.
+            let remaining = deadline
+                .checked_duration_since(pane_started)
+                .filter(|duration| !duration.is_zero())
+                .ok_or_else(|| timing.deadline())?
+                .min(capture_timeout);
+            let mut cancellation = None;
+            let mut capture_deadline_reached = false;
             let result = mux.capture_pane_model_checkpoint(pane.pane_id, limits, remaining, || {
                 match snapshot_cx_checkpoint(cx) {
                     Ok(()) => {
@@ -618,15 +831,23 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
                     "model checkpoint names another registration",
                 ));
             }
-            total_bytes = total_bytes
-                .checked_add(ack.terminal_checkpoint.canonical_payload().len())
-                .filter(|bytes| *bytes <= recovery_limits.max_total_checkpoint_bytes)
-                .ok_or(WholeMuxCaptureError::CaptureByteLimit)?;
-            CapturedPaneCheckpoint::Model(ack)
+            let payload_bytes = ack.terminal_checkpoint.canonical_payload().len();
+            (
+                pane_started,
+                CapturedPaneCheckpoint::Model(ack),
+                payload_bytes,
+            )
         };
-        checkpoints.push(checkpoint);
+        // Held before the byte check, so a guardian checkpoint over the
+        // ceiling still goes back to the mux.
+        held.slots[index] = Some((captured_at, checkpoint));
+        total_bytes = total_bytes
+            .checked_add(payload_bytes)
+            .filter(|bytes| *bytes <= recovery_limits.max_total_checkpoint_bytes)
+            .ok_or(WholeMuxCaptureError::CaptureByteLimit)?;
         timing.pane_taken(pane.pane_id, pane_started.elapsed());
     }
+    let checkpoints = held.checkpoints();
     after_capture();
     snapshot_cx_checkpoint(cx)?;
     if Instant::now() >= deadline {
@@ -717,12 +938,14 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
     match result {
         Ok(receipt) => {
             attempt.settle();
-            // Live checkpoints now count from the members this root names.
+            // Live checkpoints now count from the members this root names, and
+            // no pane keeps a checkpoint for reuse.
             for (pane, checkpoint) in captured.pane_bindings.iter().zip(&checkpoints) {
                 if let CapturedPaneCheckpoint::Guardian(published) = checkpoint {
                     mux.note_guardian_root_committed(pane.pane_id, published);
                 }
             }
+            held.committed.set(true);
             mux.note_recovery_root_guardian_panes(named_guardian_panes(), true);
             Ok(receipt)
         }
@@ -14430,6 +14653,44 @@ mod tests {
             whole_mux_recovery_budget(base, usize::MAX),
             base + Duration::from_secs(3 * u64::from(u32::MAX))
         );
+    }
+
+    /// ft-upal7: a capture takes the panes it holds nothing for first, in
+    /// topology order, then refreshes kept checkpoints oldest first, so what
+    /// it names for want of budget is the newest it has.
+    #[test]
+    #[cfg(feature = "frankenterm-deps")]
+    fn a_capture_takes_panes_without_a_kept_checkpoint_first_then_the_oldest_kept() {
+        let newer = Instant::now();
+        let older = newer
+            .checked_sub(Duration::from_secs(20))
+            .expect("an instant 20 s back");
+        assert_eq!(
+            pane_capture_order(&[Some(newer), None, Some(older), None, None]),
+            [1, 3, 4, 2, 0]
+        );
+        assert_eq!(pane_capture_order(&[None, None]), [0, 1]);
+        assert!(pane_capture_order(&[]).is_empty());
+    }
+
+    /// ft-upal7: a fresh guardian checkpoint starts only with twice the
+    /// slowest pane's time left, and never less than two allowances.
+    #[test]
+    #[cfg(feature = "frankenterm-deps")]
+    fn a_capture_keeps_twice_its_slowest_pane_before_a_fresh_checkpoint() {
+        let mut timing = CaptureTiming {
+            started: Instant::now(),
+            budget: Duration::from_secs(60),
+            panes: 3,
+            taken: 0,
+            slowest: None,
+        };
+        let floor = GUARDIAN_PANE_RECOVERY_ALLOWANCE * 2;
+        assert_eq!(timing.reuse_reserve(), floor);
+        timing.pane_taken(0, Duration::from_millis(500));
+        assert_eq!(timing.reuse_reserve(), floor);
+        timing.pane_taken(1, Duration::from_secs(10));
+        assert_eq!(timing.reuse_reserve(), Duration::from_secs(20));
     }
 
     #[test]

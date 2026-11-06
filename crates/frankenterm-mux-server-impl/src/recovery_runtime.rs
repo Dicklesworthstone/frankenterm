@@ -59,8 +59,8 @@ pub struct RecoveryOptions {
     #[arg(long, requires = "recovery_store", value_parser = clap::value_parser!(u64).range(1..=604800))]
     pub recovery_rpo_seconds: Option<u64>,
     /// Cooperative deadline of a capture, and of a startup restore connecting
-    /// and claiming its panes (seconds; default 30, maximum 30), plus one
-    /// second per guardian pane. Each pane's replay then has its own time.
+    /// and claiming its panes (seconds; default 30, maximum 30), plus three
+    /// seconds per guardian pane. Each pane's replay then has its own time.
     #[arg(long, requires = "recovery_store", value_parser = clap::value_parser!(u64).range(1..=30))]
     pub recovery_timeout_seconds: Option<u64>,
 }
