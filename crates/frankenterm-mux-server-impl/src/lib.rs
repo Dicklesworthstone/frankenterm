@@ -3142,14 +3142,16 @@ mod deferred_scrollback {
                     .and_then(|index| usize::try_from(index).ok())
                     .and_then(|index| rows.get(index).copied())
             };
-            // Before reading the whole store: the newest rows must match.
+            // Before reading the store: the newest rows must match.
             let last = self.backing.load_scrollback_line(store_newest - 1)?;
             if !same_semantic_row(&last, prefix_row(newest - 1)?) {
                 return None;
             }
             let mut gaps = VecDeque::new();
             let mut end = store_newest;
-            while end > store_oldest {
+            // Once the offset is spent no older row can be a marker, which
+            // must stand in for at least two rows, so the walk stops there.
+            while end > store_oldest && skip > 0 {
                 let start = end.saturating_sub(READ_BATCH).max(store_oldest);
                 // A store read returns at most 32 rows, fewer past its
                 // decoded-byte budget.
