@@ -1,0 +1,36 @@
+[2026-11-06T18:40:41Z INFO  frankenterm_mux_server] frankenterm-mux-server-ready unix_domains=1 tls_servers=0
+[2026-11-06T18:44:06Z WARN  frankenterm_mux_server_impl::recovery_runtime] mux periodic recovery capture failed: model capture exhausted its total time budget of 180000 ms after 181437 ms with 23 of 50 pane checkpoints taken (slowest: pane Some(3) in 12093 ms)
+[2026-11-06T18:47:11Z INFO  mux] pane 0: a recovery capture takes back the guardian checkpoint kept 366309 ms ago
+[2026-11-06T18:47:11Z INFO  mux] pane 1: a recovery capture takes back the guardian checkpoint kept 365836 ms ago
+[2026-11-06T18:47:11Z INFO  mux] pane 2: a recovery capture takes back the guardian checkpoint kept 361537 ms ago
+[2026-11-06T18:47:11Z INFO  mux] pane 3: a recovery capture takes back the guardian checkpoint kept 353458 ms ago
+[2026-11-06T18:47:11Z INFO  mux] pane 4: a recovery capture takes back the guardian checkpoint kept 341365 ms ago
+[2026-11-06T18:47:11Z INFO  mux] pane 5: a recovery capture takes back the guardian checkpoint kept 333269 ms ago
+[2026-11-06T18:47:11Z INFO  mux] pane 6: a recovery capture takes back the guardian checkpoint kept 321391 ms ago
+[2026-11-06T18:47:11Z INFO  mux] pane 7: a recovery capture takes back the guardian checkpoint kept 313381 ms ago
+[2026-11-06T18:47:11Z INFO  mux] pane 8: a recovery capture takes back the guardian checkpoint kept 301338 ms ago
+[2026-11-06T18:47:11Z INFO  mux] pane 9: a recovery capture takes back the guardian checkpoint kept 297154 ms ago
+[2026-11-06T18:47:11Z INFO  mux] pane 10: a recovery capture takes back the guardian checkpoint kept 293155 ms ago
+[2026-11-06T18:47:11Z INFO  mux] pane 11: a recovery capture takes back the guardian checkpoint kept 285286 ms ago
+[2026-11-06T18:47:11Z INFO  mux] pane 12: a recovery capture takes back the guardian checkpoint kept 277247 ms ago
+[2026-11-06T18:47:11Z INFO  mux] pane 13: a recovery capture takes back the guardian checkpoint kept 269220 ms ago
+[2026-11-06T18:47:11Z INFO  mux] pane 14: a recovery capture takes back the guardian checkpoint kept 261123 ms ago
+[2026-11-06T18:47:11Z INFO  mux] pane 15: a recovery capture takes back the guardian checkpoint kept 256992 ms ago
+[2026-11-06T18:47:11Z INFO  mux] pane 16: a recovery capture takes back the guardian checkpoint kept 245137 ms ago
+[2026-11-06T18:47:11Z INFO  mux] pane 17: a recovery capture takes back the guardian checkpoint kept 233087 ms ago
+[2026-11-06T18:47:11Z INFO  mux] pane 18: a recovery capture takes back the guardian checkpoint kept 224975 ms ago
+[2026-11-06T18:47:11Z INFO  mux] pane 19: a recovery capture takes back the guardian checkpoint kept 216924 ms ago
+[2026-11-06T18:47:11Z INFO  mux] pane 20: a recovery capture takes back the guardian checkpoint kept 208984 ms ago
+[2026-11-06T18:47:11Z INFO  mux] pane 21: a recovery capture takes back the guardian checkpoint kept 200945 ms ago
+[2026-11-06T18:47:11Z INFO  mux] pane 22: a recovery capture takes back the guardian checkpoint kept 192969 ms ago
+[2026-11-06T18:47:11Z WARN  frankenterm_mux_server_impl::recovery_runtime] mux periodic recovery capture failed: model capture exhausted its total time budget of 180000 ms after 182404 ms with 50 of 50 pane checkpoints taken (slowest: pane Some(40) in 11916 ms)
+[2026-11-06T18:50:07Z INFO  mux] pane 45: a recovery capture takes back the guardian checkpoint kept 212861 ms ago
+[2026-11-06T18:50:07Z INFO  mux] pane 46: a recovery capture takes back the guardian checkpoint kept 204816 ms ago
+[2026-11-06T18:50:07Z INFO  mux] pane 47: a recovery capture takes back the guardian checkpoint kept 196781 ms ago
+[2026-11-06T18:50:07Z INFO  mux] pane 48: a recovery capture takes back the guardian checkpoint kept 188736 ms ago
+[2026-11-06T18:50:07Z INFO  mux] pane 49: a recovery capture takes back the guardian checkpoint kept 180602 ms ago
+[2026-11-06T18:50:11Z INFO  frankenterm_mux_server_impl::recovery_runtime] mux periodic recovery published local generation=1 in 177856 ms (1275 ms of it verifying the newest root); replica durability unproven
+[2026-11-06 13:50:12] restoring 50 guardian pane(s) with /private/tmp/ftrt-98105/h/.local/lib/frankenterm-guardian-e2e/families/0.15.21-b005fca
+[2026-11-06T18:50:49Z INFO  frankenterm_mux_server_impl::guardian_proxy] restored 50 guardian panes in 35469 ms, 3255 ms of it connecting and claiming
+[2026-11-06T18:50:49Z INFO  frankenterm_mux_server] frankenterm-mux-server-ready unix_domains=1 tls_servers=0
+[2026-11-06T18:51:19Z INFO  frankenterm_mux_server_impl::recovery_runtime] mux periodic recovery published local generation=2 in 29969 ms (1216 ms of it verifying the newest root); replica durability unproven
