@@ -103,6 +103,8 @@ const GUARDIAN_INPUT_RETRY_MAX_PAUSE: Duration = Duration::from_millis(16);
 const GUARDIAN_INPUT_RETRY_BUDGET: Duration = Duration::from_secs(2);
 const GUARDIAN_CONNECT_ATTEMPTS: usize = 32;
 const GUARDIAN_CONNECT_RETRY_BUDGET: Duration = Duration::from_secs(5);
+const GUARDIAN_CLAIM_RETRY_BUDGET: Duration = Duration::from_secs(5);
+const GUARDIAN_RECOVERY_CLAIM_RETRY_BUDGET: Duration = Duration::from_secs(10);
 /// Admission budget for a standalone recovery lease plan. Startup restoration
 /// instead passes its existing cohort deadline, so a guardian worker holding
 /// the protocol for 8-13 s cannot exhaust a fresh 5 s birth-connect budget on
@@ -144,6 +146,20 @@ fn wait_for_genesis_retry(started: Instant, budget: Duration, attempts: usize) -
         .min(GUARDIAN_CONNECT_RETRY_MAX_DELAY)
         .min(remaining);
     thread::sleep(delay);
+    started.elapsed() < budget
+}
+
+/// Pace an exact Claim retry within its original admission budget. A separate
+/// attempt cap would exhaust 32 fast failures in about 310 ms, before a busy
+/// guardian can release its protocol authority. Recovery shares `started`
+/// across the entire persisted intent chain; advancing a generation must not
+/// renew the budget. An admitted exchange keeps its transport I/O timeout.
+fn wait_for_claim_retry(started: Instant, budget: Duration) -> bool {
+    let remaining = budget.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return false;
+    }
+    thread::sleep(GUARDIAN_CONNECT_RETRY_DELAY.min(remaining));
     started.elapsed() < budget
 }
 
@@ -5971,7 +5987,7 @@ impl GuardianProxyLeasePlan {
 
     /// Claim one currently unowned pane and immediately install rollback
     /// authority before opening any secondary replay or checkpoint channel.
-    /// Transport failures retry the exact request under a finite attempt and
+    /// Transport failures retry the exact request under a finite
     /// retry-admission budget. Exhaustion retains unresolved Claim authority
     /// in the coordinator for later recovery and retirement.
     pub fn claim(
@@ -6052,7 +6068,6 @@ impl GuardianProxyLeasePlan {
             recovery_admission: None,
         });
         let started = Instant::now();
-        let mut attempts = 0_u32;
         let mut ambiguous = false;
         let mut client = Some(client);
         let claimed_lease = loop {
@@ -6070,7 +6085,6 @@ impl GuardianProxyLeasePlan {
             match result {
                 Ok(lease) => break lease,
                 Err(error) => {
-                    attempts += 1;
                     let retryable = matches!(
                         &error,
                         GuardianProxyError::Client(GuardianClientError::Io(_))
@@ -6079,11 +6093,8 @@ impl GuardianProxyLeasePlan {
                     // authenticated rejection establishes a definite outcome
                     // before any earlier ambiguous attempt.
                     ambiguous |= !definitive_rejection;
-                    if retryable && attempts < 32 && started.elapsed() < Duration::from_secs(5) {
-                        std::thread::sleep(Duration::from_millis(10));
-                        if started.elapsed() < Duration::from_secs(5) {
-                            continue;
-                        }
+                    if retryable && wait_for_claim_retry(started, GUARDIAN_CLAIM_RETRY_BUDGET) {
+                        continue;
                     }
                     // A Claim may have applied before any transport failure.
                     // Preserve the original request even if a later reconnect
@@ -6162,7 +6173,7 @@ impl GuardianProxyLeasePlan {
         // Bound retained-chain work as well as retry admission. Individual
         // socket exchanges retain their existing five-second I/O deadline.
         for _ in 0..16 {
-            if started.elapsed() >= Duration::from_secs(10) {
+            if started.elapsed() >= GUARDIAN_RECOVERY_CLAIM_RETRY_BUDGET {
                 return Err(rejected());
             }
             let intent = recovery
@@ -6215,10 +6226,8 @@ impl GuardianProxyLeasePlan {
                 } else {
                     None
                 };
-            let mut attempts = 0;
             let mut ambiguous = false;
             let resolution = loop {
-                attempts += 1;
                 let result = (|| {
                     recovery.admission.validate().map_err(|_| rejected())?;
                     let result = if let Some(context) = predecessor {
@@ -6273,22 +6282,23 @@ impl GuardianProxyLeasePlan {
                 match result {
                     Ok(resolution) => break resolution,
                     Err(error)
-                        if attempts < 32
-                            && started.elapsed() < Duration::from_secs(10)
-                            && matches!(
-                                &error,
-                                GuardianProxyError::Client(
-                                    GuardianClientError::Io(_)
-                                        | GuardianClientError::Rejected(
-                                            GuardianRejectionCode::InvalidRequest
-                                        )
-                                )
-                            ) =>
+                        if matches!(
+                            &error,
+                            GuardianProxyError::Client(
+                                GuardianClientError::Io(_)
+                                    | GuardianClientError::Rejected(
+                                        GuardianRejectionCode::InvalidRequest
+                                    )
+                            )
+                        ) && wait_for_claim_retry(
+                            started,
+                            GUARDIAN_RECOVERY_CLAIM_RETRY_BUDGET,
+                        ) =>
                     {
                         // Exact persisted IDs cover reply loss. A definite busy
                         // rejection may also precede observation of the final
                         // old-owner EOF; no new operation is minted on retry.
-                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
                     }
                     Err(error) => {
                         if ambiguous
@@ -6374,11 +6384,10 @@ impl GuardianProxyLeasePlan {
                     break entry;
                 }
                 if entry.mux_incarnation != Some(intent.target_mux_incarnation)
-                    || started.elapsed() >= Duration::from_secs(10)
+                    || !wait_for_claim_retry(started, GUARDIAN_RECOVERY_CLAIM_RETRY_BUDGET)
                 {
                     return Err(rejected());
                 }
-                std::thread::sleep(Duration::from_millis(10));
             };
             // A higher generation is traversable only if its child intent
             // already exists. A fresh operation needs live unclaimed evidence;
@@ -14153,6 +14162,7 @@ mod tests {
 
     #[derive(Clone, Copy)]
     enum ClaimReplyFault {
+        RecoverAfterManyLostReplies,
         ExhaustThenRecover,
         RejectFirst,
         ReplaceAfterLostReply,
@@ -14667,6 +14677,29 @@ mod tests {
             stream.read_exact(&mut frame[4..]).expect("frame body");
             frame
         }
+        fn accept(listener: &UnixListener, deadline: Instant) -> UnixStream {
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "bounded fixture accept");
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("fixture accept: {error}"),
+                }
+            };
+            // macOS accepted sockets inherit the listener's O_NONBLOCK.
+            stream
+                .set_nonblocking(false)
+                .expect("blocking fixture stream");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read bound");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("write bound");
+            stream
+        }
         let directory = tempfile::Builder::new()
             .prefix("ft-claim-retry-")
             .permissions(std::fs::Permissions::from_mode(0o700))
@@ -14688,6 +14721,8 @@ mod tests {
         let request_id = Uuid::new_v4();
         let effect_id = Uuid::new_v4();
         let observed_generation = 0;
+        let claim_finished = Arc::new(AtomicBool::new(false));
+        let server_claim_finished = Arc::clone(&claim_finished);
         let server = thread::spawn(move || {
             let secret = GuardianSecret::from_bytes(token_bytes).expect("fixture secret");
             let mut protocol = GuardianProtocolState::new(lease_identity.guardian_incarnation())
@@ -14718,37 +14753,15 @@ mod tests {
             protocol
                 .apply_effect_transactionally(&request, |_| GuardianEffectOutcome::<()>::Applied)
                 .expect("install protocol-only unclaimed pane");
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + Duration::from_secs(20);
             let mut applied_claims = 0;
-            let attempts = match fault {
-                ClaimReplyFault::ExhaustThenRecover => 33,
-                ClaimReplyFault::RejectFirst | ClaimReplyFault::WrongClaimReply => 1,
-                ClaimReplyFault::ReplaceAfterLostReply => 2,
-            };
-            for attempt in 0..attempts {
-                let mut stream = loop {
-                    match listener.accept() {
-                        Ok((stream, _)) => break stream,
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                            assert!(Instant::now() < deadline, "bounded fixture accept");
-                            thread::sleep(Duration::from_millis(1));
-                        }
-                        Err(error) => panic!("fixture accept: {error}"),
-                    }
-                };
-                // macOS accepted sockets inherit the listener's O_NONBLOCK.
-                stream
-                    .set_nonblocking(false)
-                    .expect("blocking fixture stream");
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .expect("read bound");
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(2)))
-                    .expect("write bound");
+            let mut attempts = 0;
+            loop {
+                let mut stream = accept(&listener, deadline);
+                attempts += 1;
                 let hello = decode_guardian_request(&secret, &receive(&mut stream)).expect("Hello");
                 let replaced =
-                    matches!(fault, ClaimReplyFault::ReplaceAfterLostReply) && attempt == 1;
+                    matches!(fault, ClaimReplyFault::ReplaceAfterLostReply) && attempts == 2;
                 let reply = if replaced {
                     GuardianReply::Hello {
                         guardian_incarnation: Uuid::new_v4(),
@@ -14817,8 +14830,16 @@ mod tests {
                         .expect("send wrong reply after actual Claim");
                     break;
                 }
-                if attempt < 32 {
+                let finished = server_claim_finished.load(Ordering::SeqCst);
+                if !finished
+                    && (matches!(fault, ClaimReplyFault::ExhaustThenRecover)
+                        || (matches!(fault, ClaimReplyFault::RecoverAfterManyLostReplies)
+                            && attempts <= 40)
+                        || matches!(fault, ClaimReplyFault::ReplaceAfterLostReply))
+                {
                     // The real ledger applied Claim, but no response reaches the client.
+                    // Exhaustion lasts until the caller's deadline, rather than
+                    // assuming that a fixed number of lost replies ends retries.
                     continue;
                 }
                 let response =
@@ -14850,6 +14871,34 @@ mod tests {
                 stream
                     .write_all(&encode_guardian_response(&secret, &response).expect("Attach frame"))
                     .expect("send Attach");
+                let mut observation_channels = Vec::new();
+                if matches!(fault, ClaimReplyFault::RecoverAfterManyLostReplies) && !finished {
+                    assert!(attempts > 32, "recover past the former retry count");
+                    // Successful staging opens independent replay and checkpoint
+                    // channels after authenticating the claimed mutation lease.
+                    for _ in 0..2 {
+                        let mut observation = accept(&listener, deadline);
+                        let hello = decode_guardian_request(&secret, &receive(&mut observation))
+                            .expect("staging channel Hello");
+                        assert_eq!(hello.header().operation, GuardianOperation::Hello);
+                        assert_eq!(
+                            hello.header().mux_incarnation,
+                            lease_identity.mux_incarnation()
+                        );
+                        let reply = protocol
+                            .apply_observation(&hello)
+                            .expect("canonical staging channel Hello");
+                        let response = GuardianResponseEnvelope::reply(&hello, &reply)
+                            .expect("staging channel Hello reply");
+                        observation
+                            .write_all(
+                                &encode_guardian_response(&secret, &response)
+                                    .expect("staging channel Hello frame"),
+                            )
+                            .expect("send staging channel Hello");
+                        observation_channels.push(observation);
+                    }
+                }
                 let retire =
                     decode_guardian_request(&secret, &receive(&mut stream)).expect("Retire");
                 assert_eq!(retire.header().operation, GuardianOperation::RetireLease);
@@ -14868,6 +14917,7 @@ mod tests {
                 stream
                     .write_all(&encode_guardian_response(&secret, &response).expect("Retire frame"))
                     .expect("send Retire");
+                break;
             }
             assert_eq!(
                 applied_claims,
@@ -14881,12 +14931,46 @@ mod tests {
         let plan =
             GuardianProxyLeasePlan::prepare(&socket, &token, size(24, 80), Arc::clone(&census))
                 .expect("authenticated plan");
+        let started = Instant::now();
         let outcome = plan.claim(
             lease_identity.pane_id(),
             observed_generation,
             request_id,
             effect_id,
         );
+        let elapsed = started.elapsed();
+        claim_finished.store(true, Ordering::SeqCst);
+        if matches!(fault, ClaimReplyFault::RecoverAfterManyLostReplies) {
+            match outcome {
+                Ok(staging) => {
+                    assert_eq!(
+                        staging.identity(),
+                        identity_for(lease_identity.pane_id(), observed_generation + 1)
+                    );
+                    assert_eq!(census.retained_lease_cleanup_count(), 1);
+                    assert!(
+                        census.state.lock().retirement_slots[&lease_identity.pane_id()]
+                            .authority
+                            .lock()
+                            .is_none(),
+                        "successful staging holds only its armed rollback reservation"
+                    );
+                    drop(staging);
+                    assert_eq!(census.retained_lease_cleanup_count(), 0);
+                    server.join().expect("join successful claim fixture");
+                }
+                Err(error) => {
+                    // Settle the genuinely applied Claim even when running this
+                    // regression against the old count-bound retry loop.
+                    census
+                        .retry_retained_lease_cleanup()
+                        .expect("settle failed claim regression");
+                    server.join().expect("join failed claim fixture");
+                    panic!("Claim stopped before its retry budget: {error:?}");
+                }
+            }
+            return;
+        }
         if matches!(fault, ClaimReplyFault::RejectFirst) {
             assert!(outcome.is_err());
             assert_eq!(
@@ -14898,6 +14982,7 @@ mod tests {
             return;
         }
         match fault {
+            ClaimReplyFault::RecoverAfterManyLostReplies => unreachable!(),
             ClaimReplyFault::ExhaustThenRecover => assert!(matches!(
                 outcome,
                 Err(GuardianProxyError::Client(GuardianClientError::Io(_)))
@@ -14937,6 +15022,17 @@ mod tests {
             assert_eq!(census.retained_lease_cleanup_count(), 0);
         }
         server.join().expect("join canonical protocol fixture");
+        if matches!(fault, ClaimReplyFault::ExhaustThenRecover) {
+            assert!(
+                elapsed >= GUARDIAN_CLAIM_RETRY_BUDGET,
+                "Claim retries stopped after {elapsed:?}, before their admission budget"
+            );
+        }
+    }
+
+    #[test]
+    fn claim_retries_more_than_32_lost_replies_without_repeating_effect() {
+        exercise_authenticated_claim_fault(ClaimReplyFault::RecoverAfterManyLostReplies);
     }
 
     #[test]
