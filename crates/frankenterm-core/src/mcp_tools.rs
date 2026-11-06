@@ -10057,182 +10057,206 @@ impl ToolHandler for WaSendTool {
                 InjectionResult::Error { .. } => {}
             }
 
-            let mut submit = None;
-            let mut wait_for_data = None;
-            let mut verification_error = None;
-            if injection.is_allowed() {
-                if let (Some(pattern), Some(matcher)) =
-                    (params.wait_for.as_ref(), wait_matcher.as_ref())
-                {
-                    let options = WaitOptions {
-                        tail_lines: 200,
-                        escapes: false,
-                        ..WaitOptions::default()
-                    };
-                    let source = WeztermHandleSource::new(Arc::clone(&wezterm));
-                    let waiter = PaneWaiter::new(&source).with_options(options);
-                    let timeout = std::time::Duration::from_secs(params.timeout_secs);
-                    match waiter.wait_for(params.pane_id, matcher, timeout).await {
-                        Ok(WaitResult::Matched { elapsed_ms, polls }) => {
-                            let pattern_out =
-                                redacted_wait_for.as_deref().unwrap_or(pattern).to_string();
-                            wait_for_data = Some(McpWaitForData {
-                                pane_id: params.pane_id,
-                                pattern: pattern_out,
-                                matched: true,
-                                elapsed_ms,
-                                polls,
-                                is_regex: params.wait_for_regex,
-                            });
-                        }
-                        Ok(WaitResult::TimedOut {
-                            elapsed_ms, polls, ..
-                        }) => {
-                            let pattern_out =
-                                redacted_wait_for.as_deref().unwrap_or(pattern).to_string();
-                            wait_for_data = Some(McpWaitForData {
-                                pane_id: params.pane_id,
-                                pattern: pattern_out.clone(),
-                                matched: false,
-                                elapsed_ms,
-                                polls,
-                                is_regex: params.wait_for_regex,
-                            });
-                            verification_error =
-                                Some(format!("Timeout waiting for pattern '{pattern_out}'"));
-                        }
-                        Ok(WaitResult::Cancelled { reason: _, polls }) => {
-                            let pattern_out =
-                                redacted_wait_for.as_deref().unwrap_or(pattern).to_string();
-                            wait_for_data = Some(McpWaitForData {
-                                pane_id: params.pane_id,
-                                pattern: pattern_out,
-                                matched: false,
-                                elapsed_ms: 0,
-                                polls,
-                                is_regex: params.wait_for_regex,
-                            });
-                            verification_error = Some("Wait cancelled".to_string());
-                        }
-                        Err(_error) => {
-                            verification_error = Some("Wait-for failed".to_string());
-                        }
-                    }
-                }
-            }
-
-            if let Some(guarantee_level) = submit_guarantee_level {
-                let submit_verification =
-                    if injection.is_allowed() && guarantee_level.requires_submit_profile() {
-                        let polls = wait_for_data
-                            .as_ref()
-                            .map_or(0, |data| data.polls)
-                            .saturating_add(usize::from(submit_profile.is_some()));
-                        Some(
-                            mcp_classify_submit_after_send(
-                                &wezterm,
-                                &wezterm_cx,
-                                params.pane_id,
-                                outbound_submit_text,
-                                submit_agent_type,
-                                submit_profile.as_ref(),
-                                submit_before_text.as_deref(),
-                                1,
-                                polls,
+            let receipt_future = async {
+                let mut submit = None;
+                let mut verification_error = None;
+                if let Some(guarantee_level) = submit_guarantee_level {
+                    let submit_verification =
+                        if injection.is_allowed() && guarantee_level.requires_submit_profile() {
+                            let polls = usize::from(submit_profile.is_some());
+                            Some(
+                                mcp_classify_submit_after_send(
+                                    &wezterm,
+                                    &wezterm_cx,
+                                    params.pane_id,
+                                    outbound_submit_text,
+                                    submit_agent_type,
+                                    submit_profile.as_ref(),
+                                    submit_before_text.as_deref(),
+                                    1,
+                                    polls,
+                                )
+                                .await,
                             )
-                            .await,
-                        )
-                    } else {
-                        None
-                    };
-                let mut receipt = crate::verified_submit::build_submit_receipt_with_guarantee(
-                    params.pane_id,
-                    &params.text,
-                    &injection,
-                    submit_verification.as_ref(),
-                    elapsed_ms(start),
-                    guarantee_level,
-                );
-                if let Some(binding) = submit_idempotency_binding.as_ref() {
-                    // Echo the bounded caller nonce. The derived internal
-                    // claim key and request fingerprint remain store-private.
-                    receipt.idempotency_key = binding.caller_key().to_string();
-                }
-                crate::verified_submit::record_submit_receipt(params.pane_id, &receipt);
-                // The exact receipt is now fully constructed. Persist it
-                // before best-effort audit attachment or any unrelated await.
-                // Always attempt completion for Allowed, even when the prior
-                // pending transition reported an error: the transaction may
-                // have committed despite an ambiguous return, and this
-                // owner-token CAS is the safe reconciliation attempt.
-                let submit_idempotency_completion_error = if matches!(
-                    &injection,
-                    InjectionResult::Allowed { .. }
-                ) {
-                    if let (Some(binding), Some(token)) =
-                        (submit_idempotency_binding.as_ref(), submit_idempotency_claim)
-                    {
-                        mcp_submit_idempotency_complete(ft_dir, binding, token, &receipt)
-                            .await
-                            .err()
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                if let Some(error) = submit_idempotency_completion_error {
-                    tracing::warn!(
-                        error_class = error.error_class(),
-                        injection_allowed = injection.is_allowed(),
-                        "wa.send could not confirm its durable idempotency receipt completion"
+                        } else {
+                            None
+                        };
+                    let mut receipt = crate::verified_submit::build_submit_receipt_with_guarantee(
+                        params.pane_id,
+                        &params.text,
+                        &injection,
+                        submit_verification.as_ref(),
+                        elapsed_ms(start),
+                        guarantee_level,
                     );
-                }
-                if let Some(error) =
-                    crate::verified_submit::submit_guarantee_failure_message(&receipt)
-                {
-                    verification_error = Some(match verification_error.take() {
-                        Some(existing) => format!("{existing}; {error}"),
-                        None => error,
-                    });
-                }
-                attach_mcp_submit_receipt_to_audit(&storage, &wezterm_cx, &injection, &receipt)
-                    .await;
-                if matches!(&injection, InjectionResult::Error { .. }) {
-                    verification_error = Some(match verification_error.take() {
-                        Some(existing) => format!(
-                            "{existing}; send outcome is indeterminate; automatic retries disabled"
-                        ),
-                        None => "Send outcome is indeterminate; automatic retries disabled"
-                            .to_string(),
-                    });
-                }
-                if submit_idempotency_transition_error.is_some() {
-                    let transition_message = if matches!(
+                    if let Some(binding) = submit_idempotency_binding.as_ref() {
+                        // Echo the bounded caller nonce. The derived internal
+                        // claim key and request fingerprint remain store-private.
+                        receipt.idempotency_key = binding.caller_key().to_string();
+                    }
+                    crate::verified_submit::record_submit_receipt(params.pane_id, &receipt);
+                    // The exact receipt is now fully constructed. Persist it
+                    // before best-effort audit attachment or any unrelated await.
+                    // Always attempt completion for Allowed, even when the prior
+                    // pending transition reported an error: the transaction may
+                    // have committed despite an ambiguous return, and this
+                    // owner-token CAS is the safe reconciliation attempt.
+                    let submit_idempotency_completion_error = if matches!(
                         &injection,
                         InjectionResult::Allowed { .. }
-                    ) && submit_idempotency_completion_error.is_none()
-                    {
-                        "Submit idempotency pending transition reported a failure, but exact receipt completion recovered durable authority"
+                    ) {
+                        if let (Some(binding), Some(token)) =
+                            (submit_idempotency_binding.as_ref(), submit_idempotency_claim)
+                        {
+                            mcp_submit_idempotency_complete(ft_dir, binding, token, &receipt)
+                                .await
+                                .err()
+                        } else {
+                            None
+                        }
                     } else {
-                        "Submit idempotency pending transition failed; automatic retries disabled"
+                        None
                     };
-                    verification_error = Some(match verification_error.take() {
-                        Some(existing) => format!("{existing}; {transition_message}"),
-                        None => transition_message.to_string(),
-                    });
+                    if let Some(error) = submit_idempotency_completion_error {
+                        tracing::warn!(
+                            error_class = error.error_class(),
+                            injection_allowed = injection.is_allowed(),
+                            "wa.send could not confirm its durable idempotency receipt completion"
+                        );
+                    }
+                    if let Some(error) =
+                        crate::verified_submit::submit_guarantee_failure_message(&receipt)
+                    {
+                        verification_error = Some(error);
+                    }
+                    attach_mcp_submit_receipt_to_audit(&storage, &wezterm_cx, &injection, &receipt)
+                        .await;
+                    if matches!(&injection, InjectionResult::Error { .. }) {
+                        verification_error = Some(match verification_error.take() {
+                            Some(existing) => format!(
+                                "{existing}; send outcome is indeterminate; automatic retries disabled"
+                            ),
+                            None => "Send outcome is indeterminate; automatic retries disabled"
+                                .to_string(),
+                        });
+                    }
+                    if submit_idempotency_transition_error.is_some() {
+                        let transition_message = if matches!(
+                            &injection,
+                            InjectionResult::Allowed { .. }
+                        ) && submit_idempotency_completion_error.is_none()
+                        {
+                            "Submit idempotency pending transition reported a failure, but exact receipt completion recovered durable authority"
+                        } else {
+                            "Submit idempotency pending transition failed; automatic retries disabled"
+                        };
+                        verification_error = Some(match verification_error.take() {
+                            Some(existing) => format!("{existing}; {transition_message}"),
+                            None => transition_message.to_string(),
+                        });
+                    }
+                    if submit_idempotency_completion_error.is_some() {
+                        verification_error = Some(match verification_error.take() {
+                            Some(existing) => format!(
+                                "{existing}; submit idempotency receipt completion failed; automatic retries disabled"
+                            ),
+                            None => "Submit idempotency receipt completion failed; automatic retries disabled"
+                                .to_string(),
+                        });
+                    }
+                    submit = Some(receipt);
                 }
-                if submit_idempotency_completion_error.is_some() {
-                    verification_error = Some(match verification_error.take() {
-                        Some(existing) => format!(
-                            "{existing}; submit idempotency receipt completion failed; automatic retries disabled"
-                        ),
-                        None => "Submit idempotency receipt completion failed; automatic retries disabled"
-                            .to_string(),
-                    });
+                (submit, verification_error)
+            };
+
+            let wait_future = async {
+                let mut wait_for_data = None;
+                let mut wait_error = None;
+                if injection.is_allowed() {
+                    if let (Some(pattern), Some(matcher)) =
+                        (params.wait_for.as_ref(), wait_matcher.as_ref())
+                    {
+                        let options = WaitOptions {
+                            tail_lines: 200,
+                            escapes: false,
+                            ..WaitOptions::default()
+                        };
+                        let source = WeztermHandleSource::new(Arc::clone(&wezterm));
+                        let waiter = PaneWaiter::new(&source).with_options(options);
+                        let timeout = std::time::Duration::from_secs(params.timeout_secs);
+                        wait_error = match waiter
+                            .wait_for_with_cx(&wezterm_cx, params.pane_id, matcher, timeout)
+                            .await
+                        {
+                            Ok(WaitResult::Matched { elapsed_ms, polls }) => {
+                                let pattern_out =
+                                    redacted_wait_for.as_deref().unwrap_or(pattern).to_string();
+                                wait_for_data = Some(McpWaitForData {
+                                    pane_id: params.pane_id,
+                                    pattern: pattern_out,
+                                    matched: true,
+                                    elapsed_ms,
+                                    polls,
+                                    is_regex: params.wait_for_regex,
+                                });
+                                None
+                            }
+                            Ok(WaitResult::TimedOut {
+                                elapsed_ms, polls, ..
+                            }) => {
+                                let pattern_out =
+                                    redacted_wait_for.as_deref().unwrap_or(pattern).to_string();
+                                wait_for_data = Some(McpWaitForData {
+                                    pane_id: params.pane_id,
+                                    pattern: pattern_out.clone(),
+                                    matched: false,
+                                    elapsed_ms,
+                                    polls,
+                                    is_regex: params.wait_for_regex,
+                                });
+                                Some(format!("Timeout waiting for pattern '{pattern_out}'"))
+                            }
+                            Ok(WaitResult::Cancelled { reason: _, polls }) => {
+                                let pattern_out =
+                                    redacted_wait_for.as_deref().unwrap_or(pattern).to_string();
+                                wait_for_data = Some(McpWaitForData {
+                                    pane_id: params.pane_id,
+                                    pattern: pattern_out,
+                                    matched: false,
+                                    elapsed_ms: 0,
+                                    polls,
+                                    is_regex: params.wait_for_regex,
+                                });
+                                Some("Wait cancelled".to_string())
+                            }
+                            Err(_error) => Some("Wait-for failed".to_string()),
+                        };
+                    }
                 }
-                submit = Some(receipt);
-            }
+                (wait_for_data, wait_error)
+            };
+
+            // Both observations must start promptly: either a submit indicator
+            // or the caller's wait pattern can disappear during the other's
+            // polling budget. Keep both futures in this request task, while
+            // persisting the receipt as soon as its own observation completes.
+            // Write-only and unavailable-profile receipts need no observation;
+            // complete those before starting any optional, cancellable wait.
+            let ((submit, submit_error), (wait_for_data, wait_error)) =
+                if injection.is_allowed() && submit_profile.is_some() {
+                    crate::runtime_async::join!(receipt_future, wait_future)
+                } else {
+                    let receipt_result = receipt_future.await;
+                    let wait_result = wait_future.await;
+                    (receipt_result, wait_result)
+                };
+            let verification_error = match (submit_error, wait_error) {
+                (Some(submit_error), Some(wait_error)) => {
+                    Some(format!("{submit_error}; {wait_error}"))
+                }
+                (Some(error), None) | (None, Some(error)) => Some(error),
+                (None, None) => None,
+            };
 
             Ok(McpSendData {
                 pane_id: params.pane_id,
@@ -14798,17 +14822,19 @@ mod tests {
         )
     }
 
-    /// Backend decorator used to prove that `wa.send` passes the MCP request
-    /// Cx through the policy injector to the pane-write seam. The simulated
-    /// transport cancellation occurs at dispatch, where effect application is
-    /// ambiguous and durable replay must therefore fail closed as `InDoubt`.
-    struct CancelOnSendWezterm {
+    type SubmitReadHook = Box<dyn Fn(&crate::cx::Cx, &mut crate::Result<String>) + Send + Sync>;
+
+    /// Backend decorator that cancels the request at dispatch, or runs a read
+    /// hook that can supply observations and inspect durable authority. Hooks
+    /// also see pre-send reads; the mock's command echo distinguishes them.
+    struct CancelDuringSubmitWezterm {
         inner: Arc<crate::wezterm::MockWezterm>,
         cx_cancellation_observed: Arc<std::sync::atomic::AtomicBool>,
         fail_dispatch_after_cancel: bool,
+        read_hook: Option<SubmitReadHook>,
     }
 
-    impl crate::wezterm::MuxInterface for CancelOnSendWezterm {
+    impl crate::wezterm::MuxInterface for CancelDuringSubmitWezterm {
         fn list_panes(&self) -> crate::wezterm::WeztermFuture<'_, Vec<crate::wezterm::PaneInfo>> {
             crate::wezterm::MuxInterface::list_panes(self.inner.as_ref())
         }
@@ -14826,6 +14852,27 @@ mod tests {
             escapes: bool,
         ) -> crate::wezterm::WeztermFuture<'_, String> {
             crate::wezterm::MuxInterface::get_text(self.inner.as_ref(), pane_id, escapes)
+        }
+
+        fn get_text_with_cx<'a>(
+            &'a self,
+            cx: &'a crate::cx::Cx,
+            pane_id: u64,
+            escapes: bool,
+        ) -> crate::wezterm::WeztermFuture<'a, String> {
+            Box::pin(async move {
+                let mut result =
+                    crate::wezterm::MuxInterface::get_text(self.inner.as_ref(), pane_id, escapes)
+                        .await;
+                if let Some(hook) = self.read_hook.as_ref() {
+                    hook(cx, &mut result);
+                    self.cx_cancellation_observed.store(
+                        cx.checkpoint().is_err(),
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                }
+                result
+            })
         }
 
         fn send_text(&self, _pane_id: u64, _text: &str) -> crate::wezterm::WeztermFuture<'_, ()> {
@@ -14846,13 +14893,16 @@ mod tests {
             let inner = Arc::clone(&self.inner);
             let text = text.to_string();
             let fail_dispatch_after_cancel = self.fail_dispatch_after_cancel;
+            let cancel_at_dispatch = self.read_hook.is_none();
             Box::pin(async move {
-                cx.set_cancel_requested(true);
-                observed.store(
-                    cx.checkpoint().is_err(),
-                    std::sync::atomic::Ordering::SeqCst,
-                );
-                if fail_dispatch_after_cancel {
+                if cancel_at_dispatch {
+                    cx.set_cancel_requested(true);
+                    observed.store(
+                        cx.checkpoint().is_err(),
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                }
+                if cancel_at_dispatch && fail_dispatch_after_cancel {
                     Err(crate::Error::Cancelled(
                         "test cancellation at pane-write dispatch".to_string(),
                     ))
@@ -22185,10 +22235,11 @@ mod tests {
             let inner = Arc::new(crate::wezterm::MockWezterm::new());
             inner.add_default_pane(pane_id).await;
             let cancellation_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let backend = Arc::new(CancelOnSendWezterm {
+            let backend = Arc::new(CancelDuringSubmitWezterm {
                 inner: Arc::clone(&inner),
                 cx_cancellation_observed: Arc::clone(&cancellation_observed),
                 fail_dispatch_after_cancel: true,
+                read_hook: None,
             });
             let _pane_state = set_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
             let tool = WaSendTool::with_wezterm_handle(
@@ -22261,10 +22312,11 @@ mod tests {
             let inner = Arc::new(crate::wezterm::MockWezterm::new());
             inner.add_default_pane(pane_id).await;
             let cancellation_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let backend = Arc::new(CancelOnSendWezterm {
+            let backend = Arc::new(CancelDuringSubmitWezterm {
                 inner: Arc::clone(&inner),
                 cx_cancellation_observed: Arc::clone(&cancellation_observed),
                 fail_dispatch_after_cancel: false,
+                read_hook: None,
             });
             let _pane_state = set_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
             let tool = WaSendTool::with_wezterm_handle(
@@ -22317,6 +22369,318 @@ mod tests {
                 .expect("mock pane should remain present")
                 .content;
             assert_eq!(pane_text.matches(text).count(), 1);
+        });
+    }
+
+    #[test]
+    fn wa_send_completes_write_receipt_before_cancelled_output_wait_and_replays_it() {
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let (_dir, db) = temp_db_path();
+            let pane_id = 4_215;
+            let text = "echo receipt-before-wait";
+            let caller_key = "receipt-before-cancelled-wait";
+            let wait_pattern = "output-that-never-arrives";
+            let mut cfg = Config::default();
+            cfg.safety.require_prompt_active = false;
+            cfg.safety.rate_limit_per_pane = 100;
+            cfg.safety.rate_limit_global = 100;
+            let cfg = Arc::new(cfg);
+
+            let binding = crate::verified_submit::idempotency_binding(
+                crate::verified_submit::SubmitIdempotencyRequest {
+                    pane_id,
+                    text,
+                    caller_key,
+                    guarantee_level: crate::robot_types::SubmitGuaranteeLevel::Write,
+                    wait_for: Some(wait_pattern),
+                    wait_for_regex: false,
+                    timeout_secs: 600,
+                },
+            );
+            let ft_dir = db.parent().expect("test database parent").to_path_buf();
+            let receipt_at_wait = Arc::new(std::sync::Mutex::new(None));
+            let observed_receipt = Arc::clone(&receipt_at_wait);
+            let wait_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed_reads = Arc::clone(&wait_reads);
+            let cancellation_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let inner = Arc::new(crate::wezterm::MockWezterm::new());
+            inner.add_default_pane(pane_id).await;
+            let backend = Arc::new(CancelDuringSubmitWezterm {
+                inner: Arc::clone(&inner),
+                cx_cancellation_observed: Arc::clone(&cancellation_observed),
+                fail_dispatch_after_cancel: false,
+                read_hook: Some(Box::new(move |cx, _result| {
+                    observed_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let stored = crate::submit_idempotency_store::lookup(&ft_dir, &binding)
+                        .expect("lookup receipt at the first optional wait read");
+                    let receipt = match stored {
+                        Some(crate::submit_idempotency_store::StoredSubmitState::Completed(
+                            receipt,
+                        )) => receipt,
+                        other => panic!(
+                            "write receipt must already be durable before waiting: {other:?}"
+                        ),
+                    };
+                    *observed_receipt.lock().expect("record observed receipt") = Some(receipt);
+                    cx.set_cancel_requested(true);
+                })),
+            });
+            let _pane_state = set_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
+            let tool = WaSendTool::with_wezterm_handle(
+                Arc::clone(&cfg),
+                Arc::clone(&db),
+                backend as crate::wezterm::WeztermHandle,
+            );
+            let request = serde_json::json!({
+                "pane_id": pane_id,
+                "text": text,
+                "idempotency_key": caller_key,
+                "wait_for": wait_pattern,
+                "timeout_secs": 600
+            });
+            let context = McpContext::new(crate::mcp_framework::FrameworkCx::for_testing(), 1);
+
+            let first = parse_json_content(
+                tool.call(&context, request.clone())
+                    .expect("send with a cancelled optional output wait"),
+            );
+            assert_eq!(first["ok"], true, "first envelope: {first:?}");
+            assert_eq!(first["data"]["injection"]["status"], "allowed");
+            assert_eq!(first["data"]["wait_for"]["matched"], false);
+            assert_eq!(first["data"]["wait_for"]["polls"], 1);
+            assert_eq!(first["data"]["verification_error"], "Wait cancelled");
+            assert!(
+                context.cx().checkpoint().is_err()
+                    && cancellation_observed.load(std::sync::atomic::Ordering::SeqCst),
+                "the optional wait must use the exact MCP request cancellation context"
+            );
+            let stored_receipt = receipt_at_wait
+                .lock()
+                .expect("read observed receipt")
+                .clone()
+                .expect("the optional wait must observe a completed receipt");
+            assert_eq!(
+                serde_json::to_value(&stored_receipt).expect("serialize observed receipt"),
+                first["data"]["submit"],
+                "cancelling the output wait must not alter the already-completed receipt"
+            );
+            assert_eq!(first["data"]["submit"]["guarantee_level"], "write");
+            assert_eq!(first["data"]["submit"]["guarantee_met"], true);
+
+            let replay = parse_json_content(
+                tool.call(&test_mcp_context(), request)
+                    .expect("replay after the optional wait was cancelled"),
+            );
+            assert_eq!(replay["ok"], true, "replay envelope: {replay:?}");
+            assert_eq!(
+                replay["data"]["injection"]["decision"]["rule_id"],
+                "submit_idempotency.duplicate_noop"
+            );
+            assert_eq!(replay["data"]["submit"], first["data"]["submit"]);
+            assert_eq!(
+                wait_reads.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "completed replay must not repeat the abandoned wait"
+            );
+            let pane_text = inner
+                .pane_state(pane_id)
+                .await
+                .expect("mock pane should remain present")
+                .content;
+            assert_eq!(pane_text.matches(text).count(), 1, "replay must not resend");
+        });
+    }
+
+    #[test]
+    fn wa_send_observes_transient_wait_pattern_while_submit_profile_is_pending() {
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let (_dir, db) = temp_db_path();
+            let pane_id = 4_216;
+            let text = "inspect the workspace";
+            let caller_key = "concurrent-submit-and-wait";
+            let wait_pattern = "transient-ready-marker";
+            let mut cfg = Config::default();
+            cfg.safety.require_prompt_active = false;
+            cfg.safety.rate_limit_per_pane = 100;
+            cfg.safety.rate_limit_global = 100;
+            let cfg = Arc::new(cfg);
+
+            let binding = Arc::new(crate::verified_submit::idempotency_binding(
+                crate::verified_submit::SubmitIdempotencyRequest {
+                    pane_id,
+                    text,
+                    caller_key,
+                    guarantee_level: crate::robot_types::SubmitGuaranteeLevel::Submitted,
+                    wait_for: Some(wait_pattern),
+                    wait_for_regex: false,
+                    timeout_secs: 1,
+                },
+            ));
+            let observed_binding = Arc::clone(&binding);
+            let ft_dir = db.parent().expect("test database parent").to_path_buf();
+            let observed_store_dir = ft_dir.clone();
+            let post_send_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed_reads = Arc::clone(&post_send_reads);
+            let inner = Arc::new(crate::wezterm::MockWezterm::new());
+            inner.add_default_pane(pane_id).await;
+            inner
+                .inject(
+                    pane_id,
+                    crate::wezterm::MockEvent::SetTitle("Claude Code".to_string()),
+                )
+                .await
+                .expect("set the mock pane's agent title");
+            let backend = Arc::new(CancelDuringSubmitWezterm {
+                inner: Arc::clone(&inner),
+                cx_cancellation_observed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                fail_dispatch_after_cancel: false,
+                read_hook: Some(Box::new(move |_cx, result| {
+                    // Profile preparation captures the empty pane before the
+                    // send. Script only reads after the mock echoes our effect.
+                    if !result.as_ref().is_ok_and(|output| output.contains(text)) {
+                        return;
+                    }
+                    let read = observed_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if read == 0 {
+                        assert_eq!(
+                            crate::submit_idempotency_store::lookup(
+                                &observed_store_dir,
+                                &observed_binding,
+                            )
+                            .expect("lookup receipt during the immediate wait read"),
+                            Some(
+                                crate::submit_idempotency_store::StoredSubmitState::EffectAppliedReceiptPending
+                            ),
+                            "the wait must sample while profile observation is still pending"
+                        );
+                        // This marker is available only to the first reader.
+                        // A waiter delayed until after profile classification
+                        // misses it and cannot satisfy the requested pattern.
+                        *result = Ok(wait_pattern.to_string());
+                    } else {
+                        *result = Ok("Thinking".to_string());
+                    }
+                })),
+            });
+            let _pane_state = set_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
+            let tool = WaSendTool::with_wezterm_handle(
+                Arc::clone(&cfg),
+                Arc::clone(&db),
+                backend as crate::wezterm::WeztermHandle,
+            );
+
+            let envelope = parse_json_content(
+                tool.call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "pane_id": pane_id,
+                        "text": text,
+                        "submit_level": "submitted",
+                        "idempotency_key": caller_key,
+                        "wait_for": wait_pattern,
+                        "timeout_secs": 1
+                    }),
+                )
+                .expect("concurrent submit-profile and output observation"),
+            );
+            assert_eq!(envelope["ok"], true, "envelope: {envelope:?}");
+            assert_eq!(envelope["data"]["wait_for"]["matched"], true);
+            assert_eq!(envelope["data"]["wait_for"]["polls"], 1);
+            assert_eq!(envelope["data"]["submit"]["profile_id"], "claude_code.default");
+            assert_eq!(envelope["data"]["submit"]["state"], "submitted");
+            assert_eq!(envelope["data"]["submit"]["guarantee_met"], true);
+            assert_eq!(envelope["data"]["submit"]["polls"], 1);
+            assert!(envelope["data"]["verification_error"].is_null());
+            assert_eq!(post_send_reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+            let stored_receipt = match crate::submit_idempotency_store::lookup(&ft_dir, &binding)
+                .expect("lookup completed concurrently observed receipt")
+            {
+                Some(crate::submit_idempotency_store::StoredSubmitState::Completed(receipt)) => {
+                    receipt
+                }
+                other => panic!("profile observation must complete its durable receipt: {other:?}"),
+            };
+            assert_eq!(
+                serde_json::to_value(stored_receipt).expect("serialize stored receipt"),
+                envelope["data"]["submit"]
+            );
+        });
+    }
+
+    #[test]
+    fn wa_send_preserves_submit_and_wait_failures_from_concurrent_observation() {
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let (_dir, db) = temp_db_path();
+            let pane_id = 4_217;
+            let text = "inspect the failing session";
+            let mut cfg = Config::default();
+            cfg.safety.require_prompt_active = false;
+            cfg.safety.rate_limit_per_pane = 100;
+            cfg.safety.rate_limit_global = 100;
+            let cfg = Arc::new(cfg);
+            let inner = Arc::new(crate::wezterm::MockWezterm::new());
+            inner.add_default_pane(pane_id).await;
+            inner
+                .inject(
+                    pane_id,
+                    crate::wezterm::MockEvent::SetTitle("Claude Code".to_string()),
+                )
+                .await
+                .expect("set the mock pane's agent title");
+            let post_send_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed_reads = Arc::clone(&post_send_reads);
+            let backend = Arc::new(CancelDuringSubmitWezterm {
+                inner,
+                cx_cancellation_observed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                fail_dispatch_after_cancel: false,
+                read_hook: Some(Box::new(move |_cx, result| {
+                    if !result.as_ref().is_ok_and(|output| output.contains(text)) {
+                        return;
+                    }
+                    if observed_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        *result = Err(crate::Error::Wezterm(
+                            crate::error::WeztermError::CommandFailed(
+                                "test optional wait read failed".to_string(),
+                            ),
+                        ));
+                    } else {
+                        *result = Ok("Session ended".to_string());
+                    }
+                })),
+            });
+            let _pane_state = set_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
+            let tool = WaSendTool::with_wezterm_handle(
+                Arc::clone(&cfg),
+                Arc::clone(&db),
+                backend as crate::wezterm::WeztermHandle,
+            );
+
+            let envelope = parse_json_content(
+                tool.call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "pane_id": pane_id,
+                        "text": text,
+                        "submit_level": "submitted",
+                        "idempotency_key": "concurrent-observation-failures",
+                        "wait_for": "unavailable-marker",
+                        "timeout_secs": 1
+                    }),
+                )
+                .expect("concurrent observation failures"),
+            );
+            assert_eq!(envelope["ok"], true, "envelope: {envelope:?}");
+            assert_eq!(envelope["data"]["injection"]["status"], "allowed");
+            assert_eq!(envelope["data"]["submit"]["state"], "pane_crashed_to_shell");
+            assert_eq!(envelope["data"]["submit"]["guarantee_met"], false);
+            assert_eq!(
+                envelope["data"]["verification_error"],
+                "submit guarantee 'submitted' not met: state=pane_crashed_to_shell; Wait-for failed"
+            );
+            assert_eq!(post_send_reads.load(std::sync::atomic::Ordering::SeqCst), 2);
         });
     }
 
