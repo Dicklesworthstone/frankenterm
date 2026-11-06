@@ -5535,54 +5535,35 @@ impl SnapshotEngine {
 
         let now_ms = epoch_ms();
 
-        // 2. Load auxiliary persisted observations without blocking an async
-        // worker on SQLite.
+        // 2. Load both auxiliary datasets under one SQLite read transaction.
+        // One blocking worker owns the connection and the caller's Cx so
+        // cancellation cannot publish half a projection or leave a long
+        // ranking query running without a cooperative progress check.
         #[cfg(test)]
         self.auxiliary_projection_read_attempts
             .fetch_add(1, Ordering::Relaxed);
         let pane_ids: Vec<u64> = panes.iter().map(|p| p.pane_id).collect();
-        let detection_pane_ids = pane_ids.clone();
-        let db_path_for_detections = Arc::clone(&self.db_path);
+        let db_path_for_auxiliary = Arc::clone(&self.db_path);
+        let auxiliary_cx = cx.clone();
         let detection_max_age_ms =
             u64::try_from(STATE_DETECTION_MAX_AGE.as_millis()).unwrap_or(u64::MAX);
         let cutoff_ms: i64 =
             i64::try_from(now_ms.saturating_sub(detection_max_age_ms)).unwrap_or(i64::MAX);
 
-        let detections_by_pane = match crate::runtime_async::spawn_blocking_with_cx(cx, move || {
-            load_latest_detections_by_pane_sync(
-                db_path_for_detections.as_str(),
-                &detection_pane_ids,
+        let SnapshotAuxiliaryProjection {
+            detections_by_pane,
+            scrollback_refs,
+        } = crate::runtime_async::spawn_blocking_with_cx(cx, move || {
+            load_snapshot_auxiliary_sync(
+                &auxiliary_cx,
+                db_path_for_auxiliary.as_str(),
+                &pane_ids,
                 cutoff_ms,
+                include_scrollback,
             )
         })
         .await
-        .map_err(classify_snapshot_pure_blocking_failure)?
-        {
-            Ok(detections) => detections,
-            Err(_) => {
-                tracing::warn!(
-                    error_class = "detection_projection_database",
-                    "best-effort snapshot detection projection failed; continuing without detections"
-                );
-                HashMap::new()
-            }
-        };
-
-        let scrollback_refs = if include_scrollback {
-            let db_path_for_scrollback = Arc::clone(&self.db_path);
-            let scrollback_pane_ids = pane_ids.clone();
-            crate::runtime_async::spawn_blocking_with_cx(cx, move || {
-                load_latest_scrollback_refs_sync(
-                    db_path_for_scrollback.as_str(),
-                    &scrollback_pane_ids,
-                )
-            })
-            .await
-            .map_err(classify_snapshot_pure_blocking_failure)?
-            .map_err(SnapshotError::Database)?
-        } else {
-            std::collections::HashMap::new()
-        };
+        .map_err(classify_snapshot_pure_blocking_failure)??;
 
         // 3. Copy only the bounded fields consumed by topology, pane-state, and
         // agent correlation. In particular, do not clone arbitrary backend
@@ -7464,26 +7445,181 @@ const SNAPSHOT_SQLITE_IN_LIST_CHUNK: usize = 900;
 const SNAPSHOT_DETECTION_RULE_ID_BYTES: usize = 1024;
 const SNAPSHOT_DETECTION_EXTRACTED_BYTES: usize = 16 * 1024;
 
+#[derive(Debug, Default)]
+struct SnapshotAuxiliaryProjection {
+    detections_by_pane: HashMap<u64, Detection>,
+    scrollback_refs: HashMap<u64, ScrollbackRef>,
+}
+
+/// Observation points allow deterministic writer/cancellation interleavings
+/// in tests without changing the connection, SQL, or transaction boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotAuxiliaryReadStep {
+    DetectionRow,
+    DetectionChunk,
+    DetectionsComplete,
+    ScrollbackRow,
+    ScrollbackChunk,
+    Complete,
+}
+
+fn admit_snapshot_auxiliary_pane_ids(
+    cx: &crate::cx::Cx,
+    pane_ids: &[u64],
+) -> std::result::Result<Vec<i64>, SnapshotError> {
+    snapshot_cx_checkpoint(cx)?;
+    if pane_ids.len() > MAX_TOPOLOGY_PANES {
+        return Err(SnapshotError::Topology(
+            TopologySnapshotError::ResourceLimit {
+                resource: "panes",
+                count: pane_ids.len(),
+                limit: MAX_TOPOLOGY_PANES,
+            },
+        ));
+    }
+    let mut admitted = Vec::with_capacity(pane_ids.len());
+    for &pane_id in pane_ids {
+        snapshot_cx_checkpoint(cx)?;
+        admitted.push(i64::try_from(pane_id).map_err(|_| {
+            SnapshotError::Database("pane_id exceeds sqlite integer range".to_string())
+        })?);
+    }
+    admitted.sort_unstable();
+    admitted.dedup();
+    snapshot_cx_checkpoint(cx)?;
+    Ok(admitted)
+}
+
+fn snapshot_auxiliary_database_error(cx: &crate::cx::Cx, error: rusqlite::Error) -> SnapshotError {
+    // The progress handler interrupts SQLite when the caller stops. Preserve
+    // that typed stop instead of turning it into a best-effort missing result
+    // or a generic database failure.
+    snapshot_cx_checkpoint(cx)
+        .err()
+        .unwrap_or_else(|| SnapshotError::Database(error.to_string()))
+}
+
+fn load_snapshot_auxiliary_sync(
+    cx: &crate::cx::Cx,
+    db_path: &str,
+    pane_ids: &[u64],
+    cutoff_ms: i64,
+    include_scrollback: bool,
+) -> std::result::Result<SnapshotAuxiliaryProjection, SnapshotError> {
+    // Reject oversized or unrepresentable input before opening the database,
+    // even when the optional events table is absent.
+    let pane_ids = admit_snapshot_auxiliary_pane_ids(cx, pane_ids)?;
+    if pane_ids.is_empty() {
+        return Ok(SnapshotAuxiliaryProjection::default());
+    }
+    let conn = open_snapshot_query_conn(db_path)
+        .map_err(|error| snapshot_auxiliary_database_error(cx, error))?;
+    load_snapshot_auxiliary_on_conn(cx, conn, &pane_ids, cutoff_ms, include_scrollback, |_| {})
+}
+
+fn load_snapshot_auxiliary_on_conn(
+    cx: &crate::cx::Cx,
+    mut conn: Connection,
+    pane_ids: &[i64],
+    cutoff_ms: i64,
+    include_scrollback: bool,
+    mut observe: impl FnMut(SnapshotAuxiliaryReadStep),
+) -> std::result::Result<SnapshotAuxiliaryProjection, SnapshotError> {
+    snapshot_cx_checkpoint(cx)?;
+    if pane_ids.is_empty() {
+        return Ok(SnapshotAuxiliaryProjection::default());
+    }
+    let progress_cx = cx.clone();
+    conn.progress_handler(
+        1_000,
+        Some(move || snapshot_cx_checkpoint(&progress_cx).is_err()),
+    )
+    .map_err(|error| snapshot_auxiliary_database_error(cx, error))?;
+    let variable_limit = conn
+        .limit(rusqlite::limits::Limit::SQLITE_LIMIT_VARIABLE_NUMBER)
+        .map_err(|error| snapshot_auxiliary_database_error(cx, error))?;
+    // Reserve the detection cutoff bind even for scrollback chunks. Freeze
+    // this size once for the transaction, below both the live limit and the
+    // finite SQL/allocation cap.
+    let chunk_size = usize::try_from(variable_limit)
+        .ok()
+        .and_then(|limit| limit.checked_sub(1))
+        .filter(|limit| *limit > 0)
+        .map(|limit| limit.min(SNAPSHOT_SQLITE_IN_LIST_CHUNK))
+        .ok_or_else(|| {
+            SnapshotError::Database(
+                "snapshot auxiliary reads require at least two SQLite variables".to_string(),
+            )
+        })?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+        .map_err(|error| snapshot_auxiliary_database_error(cx, error))?;
+    // BEGIN is deferred. Pin the read generation explicitly, including when
+    // `events` does not exist and its prepare would otherwise be the first
+    // read. Every later chunk and both datasets share this snapshot.
+    tx.query_row("SELECT 1 FROM main.sqlite_schema LIMIT 1", [], |_| Ok(()))
+        .optional()
+        .map_err(|error| snapshot_auxiliary_database_error(cx, error))?;
+    snapshot_cx_checkpoint(cx)?;
+    let detections_by_pane = load_snapshot_detections_in_transaction(
+        cx,
+        &tx,
+        pane_ids,
+        cutoff_ms,
+        chunk_size,
+        &mut observe,
+    )?;
+    observe(SnapshotAuxiliaryReadStep::DetectionsComplete);
+    snapshot_cx_checkpoint(cx)?;
+    let scrollback_refs = if include_scrollback {
+        load_snapshot_scrollback_in_transaction(cx, &tx, pane_ids, chunk_size, &mut observe)?
+    } else {
+        HashMap::new()
+    };
+    observe(SnapshotAuxiliaryReadStep::Complete);
+    snapshot_cx_checkpoint(cx)?;
+    tx.commit()
+        .map_err(|error| snapshot_auxiliary_database_error(cx, error))?;
+    snapshot_cx_checkpoint(cx)?;
+    Ok(SnapshotAuxiliaryProjection {
+        detections_by_pane,
+        scrollback_refs,
+    })
+}
+
 /// Load the most recent bounded, supported-agent detection per pane from
 /// storage. Mux-level and unknown-provider events are intentionally outside
 /// snapshot agent-correlation authority.
 ///
 /// This is best-effort: if the `events` table does not exist (e.g., tests using a
 /// minimal schema), it returns an empty map.
+#[cfg(test)]
 fn load_latest_detections_by_pane_sync(
     db_path: &str,
     pane_ids: &[u64],
     cutoff_ms: i64,
-) -> std::result::Result<std::collections::HashMap<u64, Detection>, rusqlite::Error> {
-    use std::collections::HashMap;
+) -> std::result::Result<HashMap<u64, Detection>, SnapshotError> {
+    load_snapshot_auxiliary_sync(
+        &crate::cx::Cx::for_testing(),
+        db_path,
+        pane_ids,
+        cutoff_ms,
+        false,
+    )
+    .map(|projection| projection.detections_by_pane)
+}
 
-    if pane_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let conn = open_snapshot_query_conn(db_path)?;
+fn load_snapshot_detections_in_transaction(
+    cx: &crate::cx::Cx,
+    conn: &Connection,
+    pane_ids: &[i64],
+    cutoff_ms: i64,
+    chunk_size: usize,
+    observe: &mut impl FnMut(SnapshotAuxiliaryReadStep),
+) -> std::result::Result<HashMap<u64, Detection>, SnapshotError> {
     let mut out: HashMap<u64, Detection> = HashMap::with_capacity(pane_ids.len());
-    for pane_chunk in pane_ids.chunks(SNAPSHOT_SQLITE_IN_LIST_CHUNK) {
+    for pane_chunk in pane_ids.chunks(chunk_size) {
+        snapshot_cx_checkpoint(cx)?;
         let placeholders = std::iter::repeat_n("?", pane_chunk.len())
             .collect::<Vec<_>>()
             .join(",");
@@ -7518,21 +7654,40 @@ fn load_latest_detections_by_pane_sync(
         );
         let mut stmt = match conn.prepare(&sql) {
             Ok(stmt) => stmt,
-            Err(err) if is_missing_events_table(&err) => return Ok(HashMap::new()),
-            Err(err) => return Err(err),
+            Err(err) if is_missing_events_table(&err) => {
+                snapshot_cx_checkpoint(cx)?;
+                return Ok(HashMap::new());
+            }
+            Err(err) => return Err(snapshot_auxiliary_database_error(cx, err)),
         };
         let mut params = Vec::with_capacity(pane_chunk.len().saturating_add(1));
-        for &pane_id in pane_chunk {
-            params.push(u64_to_sqlite_integer(pane_id)?);
-        }
+        params.extend_from_slice(pane_chunk);
         params.push(cutoff_ms);
 
-        let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
-        while let Some(row) = rows.next()? {
-            let pane_id = sqlite_integer_to_u64(0, row.get(0)?)?;
-            let rule_id: String = row.get(1)?;
-            let agent_type: String = row.get(2)?;
-            let extracted: Option<String> = row.get(3)?;
+        let mut rows = stmt
+            .query(rusqlite::params_from_iter(params))
+            .map_err(|error| snapshot_auxiliary_database_error(cx, error))?;
+        loop {
+            snapshot_cx_checkpoint(cx)?;
+            let Some(row) = rows
+                .next()
+                .map_err(|error| snapshot_auxiliary_database_error(cx, error))?
+            else {
+                break;
+            };
+            let pane_id = row
+                .get(0)
+                .and_then(|value| sqlite_integer_to_u64(0, value))
+                .map_err(|error| snapshot_auxiliary_database_error(cx, error))?;
+            let rule_id: String = row
+                .get(1)
+                .map_err(|error| snapshot_auxiliary_database_error(cx, error))?;
+            let agent_type: String = row
+                .get(2)
+                .map_err(|error| snapshot_auxiliary_database_error(cx, error))?;
+            let extracted: Option<String> = row
+                .get(3)
+                .map_err(|error| snapshot_auxiliary_database_error(cx, error))?;
             let detection = Detection {
                 rule_id,
                 agent_type: agent_type_from_db(&agent_type),
@@ -7547,7 +7702,11 @@ fn load_latest_detections_by_pane_sync(
                 span: (0, 0),
             };
             out.insert(pane_id, detection);
+            observe(SnapshotAuxiliaryReadStep::DetectionRow);
+            snapshot_cx_checkpoint(cx)?;
         }
+        observe(SnapshotAuxiliaryReadStep::DetectionChunk);
+        snapshot_cx_checkpoint(cx)?;
     }
 
     Ok(out)
@@ -7558,19 +7717,29 @@ fn load_latest_detections_by_pane_sync(
 /// Schema v39 maintains these rows transactionally at append/retention time.
 /// This query must remain independent of `output_segments` history depth; a
 /// `MIN`/`MAX`/`COUNT` regression here reintroduces long-session snapshot lag.
+#[cfg(test)]
 fn load_latest_scrollback_refs_sync(
     db_path: &str,
     pane_ids: &[u64],
-) -> std::result::Result<std::collections::HashMap<u64, ScrollbackRef>, String> {
-    use std::collections::HashMap;
+) -> std::result::Result<HashMap<u64, ScrollbackRef>, String> {
+    load_snapshot_auxiliary_sync(&crate::cx::Cx::for_testing(), db_path, pane_ids, 0, true)
+        .map(|projection| projection.scrollback_refs)
+        .map_err(|error| match error {
+            SnapshotError::Database(detail) => detail,
+            other => other.to_string(),
+        })
+}
 
-    if pane_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let conn = open_snapshot_query_conn(db_path).map_err(|error| error.to_string())?;
+fn load_snapshot_scrollback_in_transaction(
+    cx: &crate::cx::Cx,
+    conn: &Connection,
+    pane_ids: &[i64],
+    chunk_size: usize,
+    observe: &mut impl FnMut(SnapshotAuxiliaryReadStep),
+) -> std::result::Result<HashMap<u64, ScrollbackRef>, SnapshotError> {
     let mut refs = HashMap::with_capacity(pane_ids.len());
-    for pane_chunk in pane_ids.chunks(SNAPSHOT_SQLITE_IN_LIST_CHUNK) {
+    for pane_chunk in pane_ids.chunks(chunk_size) {
+        snapshot_cx_checkpoint(cx)?;
         let placeholders = std::iter::repeat_n("?", pane_chunk.len())
             .collect::<Vec<_>>()
             .join(",");
@@ -7580,32 +7749,45 @@ fn load_latest_scrollback_refs_sync(
              FROM pane_scrollback_summary
              WHERE pane_id IN ({placeholders})"
         );
-        let mut params = Vec::with_capacity(pane_chunk.len());
-        for &pane_id in pane_chunk {
-            params.push(
-                i64::try_from(pane_id)
-                    .map_err(|_| format!("pane_id {pane_id} exceeds sqlite integer range"))?,
-            );
-        }
-        let mut stmt = conn.prepare(&sql).map_err(|error| error.to_string())?;
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|error| snapshot_auxiliary_database_error(cx, error))?;
         let mut rows = stmt
-            .query(rusqlite::params_from_iter(params))
-            .map_err(|error| error.to_string())?;
-        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
-            let pane_id_raw: i64 = row.get(0).map_err(|error| error.to_string())?;
-            let pane_id =
-                sqlite_integer_to_u64(0, pane_id_raw).map_err(|error| error.to_string())?;
-            let retained_segment_count: i64 = row.get(1).map_err(|error| error.to_string())?;
-            let first_seq: Option<i64> = row.get(2).map_err(|error| error.to_string())?;
-            let last_seq: Option<i64> = row.get(3).map_err(|error| error.to_string())?;
-            let first_capture_at: Option<i64> = row.get(4).map_err(|error| error.to_string())?;
-            let last_capture_at: Option<i64> = row.get(5).map_err(|error| error.to_string())?;
+            .query(rusqlite::params_from_iter(pane_chunk.iter()))
+            .map_err(|error| snapshot_auxiliary_database_error(cx, error))?;
+        loop {
+            snapshot_cx_checkpoint(cx)?;
+            let Some(row) = rows
+                .next()
+                .map_err(|error| snapshot_auxiliary_database_error(cx, error))?
+            else {
+                break;
+            };
+            let pane_id = row
+                .get(0)
+                .and_then(|value| sqlite_integer_to_u64(0, value))
+                .map_err(|error| snapshot_auxiliary_database_error(cx, error))?;
+            let retained_segment_count: i64 = row
+                .get(1)
+                .map_err(|error| snapshot_auxiliary_database_error(cx, error))?;
+            let first_seq: Option<i64> = row
+                .get(2)
+                .map_err(|error| snapshot_auxiliary_database_error(cx, error))?;
+            let last_seq: Option<i64> = row
+                .get(3)
+                .map_err(|error| snapshot_auxiliary_database_error(cx, error))?;
+            let first_capture_at: Option<i64> = row
+                .get(4)
+                .map_err(|error| snapshot_auxiliary_database_error(cx, error))?;
+            let last_capture_at: Option<i64> = row
+                .get(5)
+                .map_err(|error| snapshot_auxiliary_database_error(cx, error))?;
 
             if retained_segment_count < 0 {
-                return Err(format!(
+                return Err(SnapshotError::Database(format!(
                     "invalid scrollback summary for pane_id={pane_id}: \
                      negative retained segment count {retained_segment_count}"
-                ));
+                )));
             }
             if retained_segment_count == 0 {
                 if first_seq.is_some()
@@ -7613,28 +7795,34 @@ fn load_latest_scrollback_refs_sync(
                     || first_capture_at.is_some()
                     || last_capture_at.is_some()
                 {
-                    return Err(format!(
+                    return Err(SnapshotError::Database(format!(
                         "invalid empty scrollback summary for pane_id={pane_id}: non-null bounds"
-                    ));
+                    )));
                 }
+                observe(SnapshotAuxiliaryReadStep::ScrollbackRow);
+                snapshot_cx_checkpoint(cx)?;
                 continue;
             }
 
             let first_seq = first_seq.ok_or_else(|| {
-                format!("invalid scrollback summary for pane_id={pane_id}: missing first_seq")
+                SnapshotError::Database(format!(
+                    "invalid scrollback summary for pane_id={pane_id}: missing first_seq"
+                ))
             })?;
             let output_segments_seq = last_seq.ok_or_else(|| {
-                format!("invalid scrollback summary for pane_id={pane_id}: missing last_seq")
+                SnapshotError::Database(format!(
+                    "invalid scrollback summary for pane_id={pane_id}: missing last_seq"
+                ))
             })?;
             let first_capture_at = first_capture_at.ok_or_else(|| {
-                format!(
+                SnapshotError::Database(format!(
                     "invalid scrollback summary for pane_id={pane_id}: missing first_captured_at"
-                )
+                ))
             })?;
             let Some(last_capture_at) = last_capture_at else {
-                return Err(format!(
+                return Err(SnapshotError::Database(format!(
                     "invalid scrollback summary for pane_id={pane_id}: missing last_captured_at"
-                ));
+                )));
             };
             if first_seq < 0
                 || output_segments_seq < 0
@@ -7643,13 +7831,13 @@ fn load_latest_scrollback_refs_sync(
                 || last_capture_at < 0
                 || first_capture_at > last_capture_at
             {
-                return Err(format!(
+                return Err(SnapshotError::Database(format!(
                     "invalid scrollback summary for pane_id={pane_id}: \
                      first_seq={first_seq}, last_seq={output_segments_seq}, \
                      retained_segment_count={retained_segment_count}, \
                      first_capture_at={first_capture_at}, \
                      last_capture_at={last_capture_at}"
-                ));
+                )));
             }
 
             refs.insert(
@@ -7657,19 +7845,27 @@ fn load_latest_scrollback_refs_sync(
                 ScrollbackRef {
                     output_segments_seq,
                     retained_segment_count: u64::try_from(retained_segment_count)
-                        .map_err(|error| error.to_string())?,
+                        .map_err(|error| SnapshotError::Database(error.to_string()))?,
                     last_capture_at: u64::try_from(last_capture_at)
-                        .map_err(|error| error.to_string())?,
+                        .map_err(|error| SnapshotError::Database(error.to_string()))?,
                 },
             );
+            observe(SnapshotAuxiliaryReadStep::ScrollbackRow);
+            snapshot_cx_checkpoint(cx)?;
         }
+        observe(SnapshotAuxiliaryReadStep::ScrollbackChunk);
+        snapshot_cx_checkpoint(cx)?;
     }
 
     Ok(refs)
 }
 
 fn is_missing_events_table(err: &rusqlite::Error) -> bool {
-    err.to_string().contains("no such table: events")
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(_, Some(message))
+            if message == "no such table: events"
+    )
 }
 
 fn agent_type_from_db(agent_type: &str) -> AgentType {
@@ -15379,13 +15575,13 @@ mod tests {
         assert_eq!(checkpoint_count(db_path.as_str()), 1);
     }
 
-    #[test]
-    fn auxiliary_snapshot_queries_chunk_large_pane_sets() {
+    fn setup_auxiliary_projection_db(pane_count: usize) -> (tempfile::NamedTempFile, Connection) {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let db_path = tmp.path().to_str().unwrap();
         let mut conn = Connection::open(db_path).unwrap();
         conn.execute_batch(
-            "CREATE TABLE events (
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE events (
                  id INTEGER PRIMARY KEY,
                  pane_id INTEGER NOT NULL,
                  rule_id TEXT NOT NULL,
@@ -15393,8 +15589,9 @@ mod tests {
                  extracted TEXT,
                  detected_at INTEGER NOT NULL
              );
+             CREATE INDEX events_pane_latest ON events(pane_id, detected_at DESC, id DESC);
              CREATE TABLE pane_scrollback_summary (
-                 pane_id INTEGER NOT NULL,
+                 pane_id INTEGER PRIMARY KEY,
                  retained_segment_count INTEGER NOT NULL,
                  first_seq INTEGER,
                  last_seq INTEGER,
@@ -15403,7 +15600,6 @@ mod tests {
              );",
         )
         .unwrap();
-        let pane_count = SNAPSHOT_SQLITE_IN_LIST_CHUNK + 17;
         let tx = conn.transaction().unwrap();
         for pane_id in 0..pane_count {
             let pane_id = i64::try_from(pane_id).unwrap();
@@ -15424,8 +15620,15 @@ mod tests {
             .unwrap();
         }
         tx.commit().unwrap();
-        drop(conn);
+        (tmp, conn)
+    }
 
+    #[test]
+    fn auxiliary_snapshot_queries_chunk_large_pane_sets() {
+        let pane_count = SNAPSHOT_SQLITE_IN_LIST_CHUNK + 17;
+        let (tmp, conn) = setup_auxiliary_projection_db(pane_count);
+        drop(conn);
+        let db_path = tmp.path().to_str().unwrap();
         let pane_ids: Vec<u64> = (0..u64::try_from(pane_count).unwrap()).collect();
         let detections = load_latest_detections_by_pane_sync(db_path, &pane_ids, 0).unwrap();
         let scrollback = load_latest_scrollback_refs_sync(db_path, &pane_ids).unwrap();
@@ -15441,6 +15644,354 @@ mod tests {
                 .values()
                 .all(|reference| reference.retained_segment_count == 1)
         );
+    }
+
+    #[test]
+    fn auxiliary_snapshot_keeps_one_generation_across_chunks_and_datasets() {
+        for write_at in [
+            SnapshotAuxiliaryReadStep::DetectionChunk,
+            SnapshotAuxiliaryReadStep::DetectionsComplete,
+        ] {
+            let (tmp, mut writer) = setup_auxiliary_projection_db(3);
+            let db_path = tmp.path().to_str().unwrap();
+            let cx = crate::cx::Cx::for_testing();
+            let pane_ids = admit_snapshot_auxiliary_pane_ids(&cx, &[0, 1, 2]).unwrap();
+            let reader = open_snapshot_query_conn(db_path).unwrap();
+            reader
+                .set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_VARIABLE_NUMBER, 3)
+                .unwrap();
+            let mut wrote = false;
+            let before = load_snapshot_auxiliary_on_conn(
+                &cx,
+                reader,
+                &pane_ids,
+                0,
+                true,
+                |step| {
+                    if step == write_at && !wrote {
+                        // Commit both datasets while the first read is still
+                        // alive. With a three-bind limit, pane 2 belongs to a
+                        // later detection chunk and must still see old rows.
+                        let tx = writer.transaction().unwrap();
+                        assert_eq!(
+                            tx.execute(
+                                "UPDATE events SET rule_id = 'codex-after', detected_at = 20",
+                                [],
+                            )
+                            .unwrap(),
+                            3
+                        );
+                        assert_eq!(
+                            tx.execute(
+                                "UPDATE pane_scrollback_summary
+                                 SET retained_segment_count = 2, last_seq = 1, last_captured_at = 20",
+                                [],
+                            )
+                            .unwrap(),
+                            3
+                        );
+                        tx.commit().unwrap();
+                        wrote = true;
+                    }
+                },
+            )
+            .unwrap();
+            assert!(wrote);
+            assert_eq!(before.detections_by_pane.len(), 3);
+            assert_eq!(before.scrollback_refs.len(), 3);
+            assert!(
+                before
+                    .detections_by_pane
+                    .values()
+                    .all(|detection| detection.rule_id == "codex-working")
+            );
+            assert!(before.scrollback_refs.values().all(|reference| {
+                reference.output_segments_seq == 0
+                    && reference.retained_segment_count == 1
+                    && reference.last_capture_at == 10
+            }));
+
+            let after = load_snapshot_auxiliary_sync(&cx, db_path, &[0, 1, 2], 0, true).unwrap();
+            assert!(
+                after
+                    .detections_by_pane
+                    .values()
+                    .all(|detection| detection.rule_id == "codex-after")
+            );
+            assert!(after.scrollback_refs.values().all(|reference| {
+                reference.output_segments_seq == 1
+                    && reference.retained_segment_count == 2
+                    && reference.last_capture_at == 20
+            }));
+        }
+    }
+
+    #[test]
+    fn auxiliary_snapshot_respects_live_bind_limits_at_session_boundaries() {
+        let (tmp, _writer) = setup_auxiliary_projection_db(MAX_TOPOLOGY_PANES);
+        let db_path = tmp.path().to_str().unwrap();
+        for (pane_count, variable_limit) in [
+            (0, 1),
+            (1, 2),
+            (200, 32),
+            (SNAPSHOT_SQLITE_IN_LIST_CHUNK, 901),
+            (SNAPSHOT_SQLITE_IN_LIST_CHUNK + 1, 901),
+            (MAX_TOPOLOGY_PANES, 999),
+        ] {
+            let cx = crate::cx::Cx::for_testing();
+            let raw_ids: Vec<u64> = (0..u64::try_from(pane_count).unwrap()).collect();
+            let pane_ids = admit_snapshot_auxiliary_pane_ids(&cx, &raw_ids).unwrap();
+            let reader = open_snapshot_query_conn(db_path).unwrap();
+            reader
+                .set_limit(
+                    rusqlite::limits::Limit::SQLITE_LIMIT_VARIABLE_NUMBER,
+                    variable_limit,
+                )
+                .unwrap();
+            let mut detection_chunks = 0;
+            let mut scrollback_chunks = 0;
+            let projection = load_snapshot_auxiliary_on_conn(
+                &cx,
+                reader,
+                &pane_ids,
+                0,
+                true,
+                |step| match step {
+                    SnapshotAuxiliaryReadStep::DetectionChunk => detection_chunks += 1,
+                    SnapshotAuxiliaryReadStep::ScrollbackChunk => scrollback_chunks += 1,
+                    _ => {}
+                },
+            )
+            .unwrap();
+            assert_eq!(projection.detections_by_pane.len(), pane_count);
+            assert_eq!(projection.scrollback_refs.len(), pane_count);
+            let expected_chunks = if pane_count == 0 {
+                0
+            } else {
+                pane_count.div_ceil(
+                    usize::try_from(variable_limit - 1)
+                        .unwrap()
+                        .min(SNAPSHOT_SQLITE_IN_LIST_CHUNK),
+                )
+            };
+            assert_eq!(detection_chunks, expected_chunks);
+            assert_eq!(scrollback_chunks, expected_chunks);
+        }
+    }
+
+    #[test]
+    fn auxiliary_snapshot_deduplicates_before_selecting_chunks() {
+        let (tmp, _writer) = setup_auxiliary_projection_db(8);
+        let cx = crate::cx::Cx::for_testing();
+        let pane_ids = admit_snapshot_auxiliary_pane_ids(&cx, &[7, 3, 7, 1, 3, 7]).unwrap();
+        let reader = open_snapshot_query_conn(tmp.path().to_str().unwrap()).unwrap();
+        reader
+            .set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_VARIABLE_NUMBER, 3)
+            .unwrap();
+        let mut detection_chunks = 0;
+        let mut scrollback_chunks = 0;
+        let projection =
+            load_snapshot_auxiliary_on_conn(&cx, reader, &pane_ids, 0, true, |step| match step {
+                SnapshotAuxiliaryReadStep::DetectionChunk => detection_chunks += 1,
+                SnapshotAuxiliaryReadStep::ScrollbackChunk => scrollback_chunks += 1,
+                _ => {}
+            })
+            .unwrap();
+        assert_eq!(projection.detections_by_pane.len(), 3);
+        assert_eq!(projection.scrollback_refs.len(), 3);
+        for pane_id in [1, 3, 7] {
+            assert!(projection.detections_by_pane.contains_key(&pane_id));
+            assert!(projection.scrollback_refs.contains_key(&pane_id));
+        }
+        assert_eq!(
+            detection_chunks, 2,
+            "duplicate IDs must not consume queries"
+        );
+        assert_eq!(scrollback_chunks, 2);
+    }
+
+    #[test]
+    fn auxiliary_snapshot_admits_ids_before_open_and_rejects_unusable_bind_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing_path = tmp.path().join("must-not-open.db");
+        let db_path = missing_path.to_str().unwrap();
+        let cx = crate::cx::Cx::for_testing();
+        let empty = load_snapshot_auxiliary_sync(&cx, db_path, &[], 0, true).unwrap();
+        assert!(empty.detections_by_pane.is_empty());
+        assert!(empty.scrollback_refs.is_empty());
+        assert!(matches!(
+            load_snapshot_auxiliary_sync(&cx, db_path, &[u64::MAX], 0, false),
+            Err(SnapshotError::Database(detail)) if detail.contains("exceeds sqlite integer range")
+        ));
+        assert!(matches!(
+            load_snapshot_auxiliary_sync(
+                &cx,
+                db_path,
+                &vec![0; MAX_TOPOLOGY_PANES + 1],
+                0,
+                false,
+            ),
+            Err(SnapshotError::Topology(TopologySnapshotError::ResourceLimit {
+                resource: "panes",
+                count,
+                limit: MAX_TOPOLOGY_PANES,
+            })) if count == MAX_TOPOLOGY_PANES + 1
+        ));
+        assert!(!missing_path.exists());
+
+        let reader = Connection::open_in_memory().unwrap();
+        reader
+            .set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_VARIABLE_NUMBER, 1)
+            .unwrap();
+        let pane_ids = admit_snapshot_auxiliary_pane_ids(&cx, &[0]).unwrap();
+        assert!(matches!(
+            load_snapshot_auxiliary_on_conn(&cx, reader, &pane_ids, 0, true, |_| {}),
+            Err(SnapshotError::Database(detail)) if detail.contains("at least two SQLite variables")
+        ));
+    }
+
+    #[test]
+    fn auxiliary_snapshot_cancellation_discards_rows_chunks_and_completed_phases() {
+        for cancel_at in [
+            SnapshotAuxiliaryReadStep::DetectionRow,
+            SnapshotAuxiliaryReadStep::DetectionChunk,
+            SnapshotAuxiliaryReadStep::DetectionsComplete,
+            SnapshotAuxiliaryReadStep::ScrollbackRow,
+            SnapshotAuxiliaryReadStep::ScrollbackChunk,
+            SnapshotAuxiliaryReadStep::Complete,
+        ] {
+            let (tmp, writer) = setup_auxiliary_projection_db(3);
+            let cx = crate::cx::Cx::for_testing();
+            let pane_ids = admit_snapshot_auxiliary_pane_ids(&cx, &[0, 1, 2]).unwrap();
+            let reader = open_snapshot_query_conn(tmp.path().to_str().unwrap()).unwrap();
+            reader
+                .set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_VARIABLE_NUMBER, 3)
+                .unwrap();
+            let mut stopped = false;
+            let result = load_snapshot_auxiliary_on_conn(&cx, reader, &pane_ids, 0, true, |step| {
+                if step == cancel_at {
+                    cx.cancel_with(CancelKind::User, Some("cancel auxiliary snapshot read"));
+                    stopped = true;
+                }
+            });
+            assert!(
+                stopped,
+                "the {cancel_at:?} cancellation point must be reached"
+            );
+            assert!(
+                matches!(result, Err(SnapshotError::Cancelled)),
+                "{cancel_at:?} must discard the whole projection: {result:?}"
+            );
+            let (busy, _, _): (i64, i64, i64) = writer
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .unwrap();
+            assert_eq!(busy, 0, "cancelled reads must release the WAL snapshot");
+        }
+    }
+
+    #[test]
+    fn auxiliary_snapshot_progress_handler_interrupts_ranking_before_first_row() {
+        let (tmp, writer) = setup_auxiliary_projection_db(1);
+        writer
+            .execute_batch(
+                "ALTER TABLE events RENAME TO event_history;
+                 WITH RECURSIVE more(n) AS (
+                     VALUES (1) UNION ALL SELECT n + 1 FROM more WHERE n < 2000
+                 )
+                 INSERT INTO event_history
+                     (pane_id, rule_id, agent_type, extracted, detected_at)
+                 SELECT 0, 'codex-working', 'codex', '{}', 10 FROM more;
+                 CREATE VIEW events AS
+                 SELECT id, pane_id, rule_id, agent_type, extracted,
+                        cancel_snapshot_read() AS detected_at
+                 FROM event_history;",
+            )
+            .unwrap();
+        let cx = crate::cx::Cx::for_testing();
+        let pane_ids = admit_snapshot_auxiliary_pane_ids(&cx, &[0]).unwrap();
+        let reader = open_snapshot_query_conn(tmp.path().to_str().unwrap()).unwrap();
+        let visited = Arc::new(AtomicU64::new(0));
+        let visited_by_sql = Arc::clone(&visited);
+        let cancelled_by_sql = cx.clone();
+        reader
+            .create_scalar_function(
+                "cancel_snapshot_read",
+                0,
+                rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+                move |_| {
+                    if visited_by_sql.fetch_add(1, Ordering::Relaxed) == 0 {
+                        cancelled_by_sql.cancel_with(
+                            CancelKind::User,
+                            Some("cancel while SQLite ranks detection history"),
+                        );
+                    }
+                    Ok(10_i64)
+                },
+            )
+            .unwrap();
+        let mut returned_row = false;
+        let result = load_snapshot_auxiliary_on_conn(&cx, reader, &pane_ids, 0, true, |step| {
+            if step == SnapshotAuxiliaryReadStep::DetectionRow {
+                returned_row = true;
+            }
+        });
+        assert!(matches!(result, Err(SnapshotError::Cancelled)));
+        assert!(!returned_row);
+        let visited = visited.load(Ordering::Relaxed);
+        assert!(visited > 0);
+        assert!(
+            visited < 2001,
+            "the progress handler must stop ranking before scanning all history: {visited}"
+        );
+    }
+
+    #[test]
+    fn auxiliary_snapshot_only_absent_events_are_optional() {
+        let (tmp, writer) = setup_auxiliary_projection_db(1);
+        writer
+            .execute_batch("ALTER TABLE events RENAME TO archived_events;")
+            .unwrap();
+        let db_path = tmp.path().to_str().unwrap();
+        let cx = crate::cx::Cx::for_testing();
+        let projection = load_snapshot_auxiliary_sync(&cx, db_path, &[0], 0, true).unwrap();
+        assert!(projection.detections_by_pane.is_empty());
+        assert_eq!(projection.scrollback_refs.len(), 1);
+
+        writer
+            .execute_batch("CREATE VIEW events AS SELECT * FROM events_missing_dependency;")
+            .unwrap();
+        assert!(matches!(
+            load_snapshot_auxiliary_sync(&cx, db_path, &[0], 0, true),
+            Err(SnapshotError::Database(_))
+        ));
+    }
+
+    #[test]
+    fn capture_rejects_malformed_event_projection_without_publishing_checkpoint() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            Connection::open(db_path.as_str())
+                .unwrap()
+                .execute_batch("CREATE TABLE events (pane_id INTEGER NOT NULL);")
+                .unwrap();
+            let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+            let result = engine
+                .capture(&[make_test_pane(1, 24, 80)], SnapshotTrigger::Manual)
+                .await;
+            assert!(matches!(result, Err(SnapshotError::Database(_))));
+            assert_eq!(checkpoint_count(db_path.as_str()), 0);
+            assert_eq!(
+                Connection::open(db_path.as_str())
+                    .unwrap()
+                    .query_row("SELECT COUNT(*) FROM mux_sessions", [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0,
+                "failed enrichment must not publish an empty first session"
+            );
+        });
     }
 
     #[test]
