@@ -2144,7 +2144,51 @@ pub fn complete(
     token: ClaimToken,
     receipt: &SubmitReceipt,
 ) -> Result<(), SubmitIdempotencyError> {
-    complete_with_clock(ft_dir, binding, token, receipt, now_unix_ms)
+    complete_with_clock(
+        ft_dir,
+        binding,
+        token,
+        receipt,
+        CompletionMode::PendingOnly,
+        now_unix_ms,
+    )
+}
+
+/// Atomically record a confirmed injection effect and its final receipt.
+///
+/// Callers must already know that injection succeeded and that no further
+/// observation is required to determine the receipt. A live active owner may
+/// complete directly, avoiding a receipt-pending crash window. An already
+/// pending claim may also complete with its original token. This operation
+/// never grants permission to inject or retry an ambiguous effect.
+///
+/// Repeating the identical completion is idempotent, including after losing
+/// the commit response. Expired active owners are fenced to `in_doubt`, and
+/// stale tokens or conflicting receipts cannot replace completed authority.
+///
+/// # Errors
+/// Returns a finite [`SubmitIdempotencyError`] when the claim is absent,
+/// malformed, not transitionable, too large, or cannot be committed.
+pub fn complete_after_effect(
+    ft_dir: &Path,
+    binding: &SubmitIdempotencyBinding,
+    token: ClaimToken,
+    receipt: &SubmitReceipt,
+) -> Result<(), SubmitIdempotencyError> {
+    complete_with_clock(
+        ft_dir,
+        binding,
+        token,
+        receipt,
+        CompletionMode::EffectConfirmed,
+        now_unix_ms,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum CompletionMode {
+    PendingOnly,
+    EffectConfirmed,
 }
 
 #[cfg(test)]
@@ -2155,7 +2199,14 @@ fn complete_at(
     receipt: &SubmitReceipt,
     completed_at: i64,
 ) -> Result<(), SubmitIdempotencyError> {
-    complete_with_clock(ft_dir, binding, token, receipt, move || completed_at)
+    complete_with_clock(
+        ft_dir,
+        binding,
+        token,
+        receipt,
+        CompletionMode::PendingOnly,
+        move || completed_at,
+    )
 }
 
 fn complete_with_clock<F>(
@@ -2163,6 +2214,7 @@ fn complete_with_clock<F>(
     binding: &SubmitIdempotencyBinding,
     token: ClaimToken,
     receipt: &SubmitReceipt,
+    mode: CompletionMode,
     mut clock: F,
 ) -> Result<(), SubmitIdempotencyError>
 where
@@ -2195,24 +2247,46 @@ where
         map_sqlite(tx.commit(), SubmitIdempotencyError::TransitionFailed)?;
         return Ok(());
     }
-    if header.state != STATE_EFFECT_APPLIED_RECEIPT_PENDING {
-        return Err(SubmitIdempotencyError::InvalidTransition);
+    match header.state {
+        STATE_EFFECT_APPLIED_RECEIPT_PENDING => {}
+        STATE_ACTIVE_OWNER if matches!(mode, CompletionMode::EffectConfirmed) => {
+            let lease_expires = header
+                .lease_expires_unix_ms
+                .ok_or(SubmitIdempotencyError::RecordCorrupt)?;
+            let maximum_credible_expiry = completed_at
+                .checked_add(MAX_OWNER_LEASE_FUTURE_MS)
+                .unwrap_or(i64::MAX);
+            if lease_expires <= completed_at || lease_expires > maximum_credible_expiry {
+                expire_active_owner_locked(
+                    &tx,
+                    binding,
+                    header,
+                    completed_at,
+                    SubmitIdempotencyError::TransitionFailed,
+                )?;
+                map_sqlite(tx.commit(), SubmitIdempotencyError::TransitionFailed)?;
+                return Err(SubmitIdempotencyError::InvalidTransition);
+            }
+        }
+        _ => return Err(SubmitIdempotencyError::InvalidTransition),
     }
     let persisted_update = completed_at.max(header.updated_unix_ms);
     let changed = map_sqlite(
         tx.execute(
             "UPDATE verified_submit_idempotency \
-             SET state = ?2, retryable_reason = NULL, receipt_json = ?3, updated_unix_ms = ?4 \
+             SET state = ?2, retryable_reason = NULL, receipt_json = ?3, \
+                 lease_expires_unix_ms = NULL, updated_unix_ms = ?4 \
              WHERE idempotency_key COLLATE BINARY = ?1 COLLATE BINARY AND state = ?5 \
-               AND generation = ?6 AND owner_nonce = ?7",
+               AND generation = ?6 AND owner_nonce = ?7 AND lease_expires_unix_ms IS ?8",
             params![
                 binding.key(),
                 STATE_COMPLETED,
                 receipt_json,
                 persisted_update,
-                STATE_EFFECT_APPLIED_RECEIPT_PENDING,
+                header.state,
                 token.generation,
                 &token.owner_nonce[..],
+                header.lease_expires_unix_ms,
             ],
         ),
         SubmitIdempotencyError::TransitionFailed,
@@ -3143,6 +3217,289 @@ mod tests {
             lookup(dir.path(), &binding),
             Ok(Some(StoredSubmitState::Completed(original)))
         );
+    }
+
+    #[test]
+    fn confirmed_effect_receipt_survives_reopen_and_lost_completion_response() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binding = binding(7, "direct-completion-reopen");
+        let original = receipt(&binding, SubmitReceiptState::Submitted);
+        let token = claim_token(dir.path(), &binding);
+
+        assert_eq!(
+            complete(dir.path(), &binding, token, &original),
+            Err(SubmitIdempotencyError::InvalidTransition),
+            "ordinary completion still requires a prior effect-pending fence"
+        );
+        complete_after_effect(dir.path(), &binding, token, &original)
+            .expect("commit the effect and its final receipt together");
+
+        // Every store operation opens a fresh connection. A restarted caller
+        // can replay the receipt without the original owner's token, while an
+        // owner that lost the commit response may repeat the exact completion.
+        assert_eq!(
+            claim(dir.path(), &binding),
+            Ok(ClaimOutcome::Completed(original.clone()))
+        );
+        complete_after_effect(dir.path(), &binding, token, &original)
+            .expect("lost completion response is safe to retry");
+        complete_with_clock(
+            dir.path(),
+            &binding,
+            token,
+            &original,
+            CompletionMode::EffectConfirmed,
+            || now_unix_ms() + OWNER_LEASE_DURATION_MS,
+        )
+        .expect("committed receipt replay does not depend on the former owner lease");
+        complete(dir.path(), &binding, token, &original)
+            .expect("existing completion accepts the same completed receipt");
+        assert_eq!(
+            mark_effect_applied_receipt_pending(dir.path(), &binding, token),
+            Err(SubmitIdempotencyError::InvalidTransition),
+            "a fallback fence cannot downgrade a completed receipt"
+        );
+
+        let mut conflicting = original.clone();
+        conflicting.elapsed_ms += 1;
+        assert_eq!(
+            complete_after_effect(dir.path(), &binding, token, &conflicting),
+            Err(SubmitIdempotencyError::InvalidTransition)
+        );
+        assert_eq!(
+            complete(dir.path(), &binding, token, &conflicting),
+            Err(SubmitIdempotencyError::InvalidTransition)
+        );
+        assert_eq!(
+            lookup(dir.path(), &binding),
+            Ok(Some(StoredSubmitState::Completed(original)))
+        );
+    }
+
+    #[test]
+    fn confirmed_effect_completion_accepts_pending_but_never_reopens_uncertain_effects() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pending = binding(7, "direct-completion-pending");
+        let pending_token = claim_token(dir.path(), &pending);
+        let original = receipt(&pending, SubmitReceiptState::VerificationUnavailable);
+        mark_effect_applied_receipt_pending(dir.path(), &pending, pending_token)
+            .expect("persist a legacy pending fence");
+        complete_after_effect(dir.path(), &pending, pending_token, &original)
+            .expect("complete the pending receipt with its original token");
+        assert_eq!(
+            claim(dir.path(), &pending),
+            Ok(ClaimOutcome::Completed(original))
+        );
+
+        let uncertain = binding(7, "direct-completion-uncertain");
+        let uncertain_token = claim_token(dir.path(), &uncertain);
+        mark_in_doubt(dir.path(), &uncertain, uncertain_token).expect("ambiguous send");
+        assert_eq!(
+            complete_after_effect(
+                dir.path(),
+                &uncertain,
+                uncertain_token,
+                &receipt(&uncertain, SubmitReceiptState::Submitted),
+            ),
+            Err(SubmitIdempotencyError::InvalidTransition)
+        );
+        assert_eq!(claim(dir.path(), &uncertain), Ok(ClaimOutcome::InDoubt));
+
+        let retryable = binding(7, "direct-completion-retryable");
+        let retryable_token = claim_token(dir.path(), &retryable);
+        mark_retryable(
+            dir.path(),
+            &retryable,
+            retryable_token,
+            RetryableReason::PolicyDenied,
+        )
+        .expect("proven pre-effect denial");
+        assert_eq!(
+            complete_after_effect(
+                dir.path(),
+                &retryable,
+                retryable_token,
+                &receipt(&retryable, SubmitReceiptState::Submitted),
+            ),
+            Err(SubmitIdempotencyError::InvalidTransition)
+        );
+        assert_eq!(
+            lookup(dir.path(), &retryable),
+            Ok(Some(StoredSubmitState::Retryable(
+                RetryableReason::PolicyDenied,
+            )))
+        );
+    }
+
+    #[test]
+    fn confirmed_effect_completion_rejects_stale_generation_and_nonce() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binding = binding(7, "direct-completion-stale");
+        let first_token = claim_token(dir.path(), &binding);
+        mark_retryable(
+            dir.path(),
+            &binding,
+            first_token,
+            RetryableReason::PolicyDenied,
+        )
+        .expect("release first generation before any effect");
+        let current_token = claim_token(dir.path(), &binding);
+        let original = receipt(&binding, SubmitReceiptState::Submitted);
+        let mut wrong_nonce = current_token;
+        wrong_nonce.owner_nonce[0] ^= 1;
+        let wrong_generation = ClaimToken {
+            generation: first_token.generation,
+            ..current_token
+        };
+
+        for stale in [first_token, wrong_nonce, wrong_generation] {
+            assert_eq!(
+                complete_after_effect(dir.path(), &binding, stale, &original),
+                Err(SubmitIdempotencyError::InvalidTransition)
+            );
+            assert_eq!(
+                lookup(dir.path(), &binding),
+                Ok(Some(StoredSubmitState::ActiveOwner))
+            );
+        }
+        complete_after_effect(dir.path(), &binding, current_token, &original)
+            .expect("current owner completes");
+        assert_eq!(
+            complete_after_effect(dir.path(), &binding, wrong_nonce, &original),
+            Err(SubmitIdempotencyError::InvalidTransition),
+            "even an identical receipt cannot bypass completed-row ownership"
+        );
+        assert_eq!(
+            claim(dir.path(), &binding),
+            Ok(ClaimOutcome::Completed(original))
+        );
+    }
+
+    #[test]
+    fn confirmed_effect_completion_fences_expiry_and_large_clock_rollback() {
+        let claimed_at = 200_000;
+        for (suffix, completed_at) in [
+            ("expired", claimed_at + OWNER_LEASE_DURATION_MS),
+            ("clock-rollback", claimed_at - OWNER_LEASE_DURATION_MS - 1),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let binding = binding(7, suffix);
+            let token = match claim_with_nonce_limits_and_time(
+                dir.path(),
+                &binding,
+                [3; OWNER_NONCE_BYTES],
+                PRODUCTION_LIMITS,
+                claimed_at,
+            )
+            .expect("claim")
+            {
+                ClaimOutcome::Claimed(token) => token,
+                other => panic!("expected owner, got {other:?}"),
+            };
+            let original = receipt(&binding, SubmitReceiptState::Submitted);
+            assert_eq!(
+                complete_with_clock(
+                    dir.path(),
+                    &binding,
+                    token,
+                    &original,
+                    CompletionMode::EffectConfirmed,
+                    || completed_at,
+                ),
+                Err(SubmitIdempotencyError::InvalidTransition)
+            );
+            assert_eq!(
+                lookup_at(dir.path(), &binding, completed_at),
+                Ok(Some(StoredSubmitState::InDoubt))
+            );
+            assert_eq!(
+                persisted_updated_at(dir.path(), &binding),
+                claimed_at.max(completed_at)
+            );
+            assert_eq!(
+                complete_with_clock(
+                    dir.path(),
+                    &binding,
+                    token,
+                    &original,
+                    CompletionMode::EffectConfirmed,
+                    || claimed_at + 1,
+                ),
+                Err(SubmitIdempotencyError::InvalidTransition),
+                "a later credible clock cannot revive fenced authority"
+            );
+        }
+    }
+
+    #[test]
+    fn confirmed_effect_completion_preserves_timestamp_through_small_clock_rollback() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binding = binding(7, "direct-completion-monotonic");
+        let token = match claim_with_nonce_limits_and_time(
+            dir.path(),
+            &binding,
+            [4; OWNER_NONCE_BYTES],
+            PRODUCTION_LIMITS,
+            200_000,
+        )
+        .expect("claim")
+        {
+            ClaimOutcome::Claimed(token) => token,
+            other => panic!("expected owner, got {other:?}"),
+        };
+        let original = receipt(&binding, SubmitReceiptState::Submitted);
+        complete_with_clock(
+            dir.path(),
+            &binding,
+            token,
+            &original,
+            CompletionMode::EffectConfirmed,
+            || 199_999,
+        )
+        .expect("a still-credible lease may complete after a small rollback");
+        assert_eq!(persisted_updated_at(dir.path(), &binding), 200_000);
+        assert_eq!(
+            lookup_at(dir.path(), &binding, 200_001),
+            Ok(Some(StoredSubmitState::Completed(original)))
+        );
+    }
+
+    #[test]
+    fn confirmed_effect_completion_validates_receipts_before_changing_authority() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binding = binding(7, "direct-completion-invalid-receipt");
+        let token = claim_token(dir.path(), &binding);
+        let original = receipt(&binding, SubmitReceiptState::Submitted);
+        let mut unbound = original.clone();
+        unbound.idempotency_key = "another-caller-key".to_string();
+        let mut oversized = original.clone();
+        oversized.cursor_after = Some("x".repeat(MAX_RECEIPT_CURSOR_BYTES + 1));
+        let mut inconsistent = original.clone();
+        inconsistent.guarantee_met = !inconsistent.guarantee_met;
+        for (invalid, expected) in [
+            (unbound, SubmitIdempotencyError::ReceiptInvalid),
+            (oversized, SubmitIdempotencyError::ReceiptOversize),
+            (inconsistent, SubmitIdempotencyError::ReceiptInvalid),
+            (
+                receipt(&binding, SubmitReceiptState::PolicyDenied),
+                SubmitIdempotencyError::ReceiptInvalid,
+            ),
+            (
+                receipt(&binding, SubmitReceiptState::SendFailed),
+                SubmitIdempotencyError::ReceiptInvalid,
+            ),
+        ] {
+            assert_eq!(
+                complete_after_effect(dir.path(), &binding, token, &invalid),
+                Err(expected)
+            );
+            assert_eq!(
+                lookup(dir.path(), &binding),
+                Ok(Some(StoredSubmitState::ActiveOwner))
+            );
+        }
+        complete_after_effect(dir.path(), &binding, token, &original)
+            .expect("rejected receipts leave the original owner able to complete");
     }
 
     #[test]

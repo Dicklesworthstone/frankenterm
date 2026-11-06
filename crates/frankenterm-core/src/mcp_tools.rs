@@ -9288,6 +9288,46 @@ async fn mcp_submit_idempotency_complete(
     .await
 }
 
+async fn mcp_submit_idempotency_complete_after_effect(
+    ft_dir: &Path,
+    binding: &crate::verified_submit::SubmitIdempotencyBinding,
+    token: crate::submit_idempotency_store::ClaimToken,
+    receipt: &crate::robot_types::SubmitReceipt,
+) -> Result<(), crate::submit_idempotency_store::SubmitIdempotencyError> {
+    let ft_dir = ft_dir.to_path_buf();
+    let binding = binding.clone();
+    let receipt = receipt.clone();
+    mcp_submit_idempotency_spawn_blocking(
+        crate::submit_idempotency_store::SubmitIdempotencyError::TransitionFailed,
+        move || {
+            let completion = mcp_submit_idempotency_retry_post_effect(|| {
+                crate::submit_idempotency_store::complete_after_effect(
+                    &ft_dir, &binding, token, &receipt,
+                )
+            });
+            if completion.is_err() {
+                // Keep the known-applied effect fenced even if its receipt is
+                // invalid or completion exhausts its retries. This fallback
+                // lives in the same blocking job so caller loss cannot skip
+                // it. An ambiguous completion may already have committed;
+                // the owner-token transition never downgrades Completed.
+                if let Err(error) = mcp_submit_idempotency_retry_post_effect(|| {
+                    crate::submit_idempotency_store::mark_effect_applied_receipt_pending(
+                        &ft_dir, &binding, token,
+                    )
+                }) {
+                    tracing::warn!(
+                        error_class = error.error_class(),
+                        "wa.send could not confirm the fallback fence after receipt completion failed"
+                    );
+                }
+            }
+            completion
+        },
+    )
+    .await
+}
+
 async fn mcp_submit_idempotency_reconcile(
     ft_dir: &Path,
     binding: &crate::verified_submit::SubmitIdempotencyBinding,
@@ -9977,39 +10017,83 @@ impl ToolHandler for WaSendTool {
                 )
                 .await;
 
-            // Persist the injector outcome immediately, before wait-for,
-            // approval enrichment, audit attachment, classification, or
-            // response construction. Every outcome has a distinct durable
-            // state: Allowed means the effect happened but its receipt is
-            // pending; backend Error is ambiguous; policy terminals are
-            // proven pre-effect and safely reclaimable.
-            let mut submit_idempotency_transition_error = None;
+            // A write or unavailable-profile receipt is already determined by
+            // the injector outcome. Build it without yielding so the first
+            // post-effect transaction can durably complete that exact receipt,
+            // rather than leaving a pending row for another transaction.
+            let immediate_submit_receipt = if injection.is_allowed() && submit_profile.is_none() {
+                submit_guarantee_level.map(|guarantee_level| {
+                    let verification = guarantee_level.requires_submit_profile().then(|| {
+                        crate::verified_submit::classify_verified_submit(
+                            crate::verified_submit::VerifiedSubmitInput {
+                                pane_id: params.pane_id,
+                                command_text: outbound_submit_text,
+                                agent_type: submit_agent_type,
+                                profile: None,
+                                before_text: submit_before_text.as_deref(),
+                                after_text: None,
+                                after_semantic_snapshot: None,
+                                attempts: 1,
+                                polls: 0,
+                            },
+                        )
+                    });
+                    let mut receipt = crate::verified_submit::build_submit_receipt_with_guarantee(
+                        params.pane_id,
+                        &params.text,
+                        &injection,
+                        verification.as_ref(),
+                        elapsed_ms(start),
+                        guarantee_level,
+                    );
+                    if let Some(binding) = submit_idempotency_binding.as_ref() {
+                        receipt.idempotency_key = binding.caller_key().to_string();
+                    }
+                    receipt
+                })
+            } else {
+                None
+            };
+
+            // Persist the injector outcome before any observation, approval
+            // enrichment, or audit attachment. Known-profile sends still need
+            // a pending fence; backend Error is ambiguous; policy terminals
+            // are proven pre-effect and safely reclaimable.
+            let mut submit_idempotency_post_effect_error = None;
+            let mut immediate_receipt_completed = false;
             if let (Some(binding), Some(token)) =
                 (submit_idempotency_binding.as_ref(), submit_idempotency_claim)
             {
-                let transition = match &injection {
-                    InjectionResult::Allowed { .. } => {
-                        McpSubmitIdempotencyTransition::EffectAppliedReceiptPending
-                    }
-                    InjectionResult::Denied { .. } => McpSubmitIdempotencyTransition::Retryable(
-                        crate::submit_idempotency_store::RetryableReason::PolicyDenied,
-                    ),
-                    InjectionResult::RequiresApproval { .. } => {
-                        McpSubmitIdempotencyTransition::Retryable(
-                            crate::submit_idempotency_store::RetryableReason::ApprovalRequired,
-                        )
-                    }
-                    InjectionResult::Error { .. } => McpSubmitIdempotencyTransition::InDoubt,
+                let transition = if let Some(receipt) = immediate_submit_receipt.as_ref() {
+                    let completion =
+                        mcp_submit_idempotency_complete_after_effect(ft_dir, binding, token, receipt)
+                            .await;
+                    immediate_receipt_completed = completion.is_ok();
+                    completion
+                } else {
+                    let transition = match &injection {
+                        InjectionResult::Allowed { .. } => {
+                            McpSubmitIdempotencyTransition::EffectAppliedReceiptPending
+                        }
+                        InjectionResult::Denied { .. } => McpSubmitIdempotencyTransition::Retryable(
+                            crate::submit_idempotency_store::RetryableReason::PolicyDenied,
+                        ),
+                        InjectionResult::RequiresApproval { .. } => {
+                            McpSubmitIdempotencyTransition::Retryable(
+                                crate::submit_idempotency_store::RetryableReason::ApprovalRequired,
+                            )
+                        }
+                        InjectionResult::Error { .. } => McpSubmitIdempotencyTransition::InDoubt,
+                    };
+                    mcp_submit_idempotency_transition(ft_dir, binding, token, transition).await
                 };
-                let transition =
-                    mcp_submit_idempotency_transition(ft_dir, binding, token, transition).await;
                 if let Err(error) = transition {
                     tracing::warn!(
                         error_class = error.error_class(),
                         injection_allowed = injection.is_allowed(),
                         "wa.send could not persist its immediate post-inject idempotency state"
                     );
-                    submit_idempotency_transition_error = Some(error);
+                    submit_idempotency_post_effect_error = Some(error);
                 }
             }
 
@@ -10057,60 +10141,76 @@ impl ToolHandler for WaSendTool {
                 InjectionResult::Error { .. } => {}
             }
 
+            let has_immediate_receipt = immediate_submit_receipt.is_some();
             let receipt_future = async {
                 let mut submit = None;
                 let mut verification_error = None;
                 if let Some(guarantee_level) = submit_guarantee_level {
-                    let submit_verification =
-                        if injection.is_allowed() && guarantee_level.requires_submit_profile() {
-                            let polls = usize::from(submit_profile.is_some());
-                            Some(
-                                mcp_classify_submit_after_send(
-                                    &wezterm,
-                                    &wezterm_cx,
-                                    params.pane_id,
-                                    outbound_submit_text,
-                                    submit_agent_type,
-                                    submit_profile.as_ref(),
-                                    submit_before_text.as_deref(),
-                                    1,
-                                    polls,
+                    let receipt = if let Some(receipt) = immediate_submit_receipt {
+                        // Preserve every byte, including elapsed time, through
+                        // ambiguous completion retries and the final response.
+                        receipt
+                    } else {
+                        let submit_verification =
+                            if injection.is_allowed() && guarantee_level.requires_submit_profile() {
+                                let polls = usize::from(submit_profile.is_some());
+                                Some(
+                                    mcp_classify_submit_after_send(
+                                        &wezterm,
+                                        &wezterm_cx,
+                                        params.pane_id,
+                                        outbound_submit_text,
+                                        submit_agent_type,
+                                        submit_profile.as_ref(),
+                                        submit_before_text.as_deref(),
+                                        1,
+                                        polls,
+                                    )
+                                    .await,
                                 )
-                                .await,
-                            )
-                        } else {
-                            None
-                        };
-                    let mut receipt = crate::verified_submit::build_submit_receipt_with_guarantee(
-                        params.pane_id,
-                        &params.text,
-                        &injection,
-                        submit_verification.as_ref(),
-                        elapsed_ms(start),
-                        guarantee_level,
-                    );
-                    if let Some(binding) = submit_idempotency_binding.as_ref() {
-                        // Echo the bounded caller nonce. The derived internal
-                        // claim key and request fingerprint remain store-private.
-                        receipt.idempotency_key = binding.caller_key().to_string();
-                    }
+                            } else {
+                                None
+                            };
+                        let mut receipt = crate::verified_submit::build_submit_receipt_with_guarantee(
+                            params.pane_id,
+                            &params.text,
+                            &injection,
+                            submit_verification.as_ref(),
+                            elapsed_ms(start),
+                            guarantee_level,
+                        );
+                        if let Some(binding) = submit_idempotency_binding.as_ref() {
+                            // Echo the bounded caller nonce. The derived internal
+                            // claim key and request fingerprint remain store-private.
+                            receipt.idempotency_key = binding.caller_key().to_string();
+                        }
+                        receipt
+                    };
                     crate::verified_submit::record_submit_receipt(params.pane_id, &receipt);
                     // The exact receipt is now fully constructed. Persist it
                     // before best-effort audit attachment or any unrelated await.
-                    // Always attempt completion for Allowed, even when the prior
-                    // pending transition reported an error: the transaction may
-                    // have committed despite an ambiguous return, and this
-                    // owner-token CAS is the safe reconciliation attempt.
+                    // A confirmed immediate completion needs no second write.
+                    // Otherwise retry even after an earlier persistence error:
+                    // an owner-token CAS reconciles an ambiguous commit safely.
                     let submit_idempotency_completion_error = if matches!(
                         &injection,
                         InjectionResult::Allowed { .. }
-                    ) {
+                    ) && !immediate_receipt_completed
+                    {
                         if let (Some(binding), Some(token)) =
                             (submit_idempotency_binding.as_ref(), submit_idempotency_claim)
                         {
-                            mcp_submit_idempotency_complete(ft_dir, binding, token, &receipt)
+                            if has_immediate_receipt {
+                                mcp_submit_idempotency_complete_after_effect(
+                                    ft_dir, binding, token, &receipt,
+                                )
                                 .await
                                 .err()
+                            } else {
+                                mcp_submit_idempotency_complete(ft_dir, binding, token, &receipt)
+                                    .await
+                                    .err()
+                            }
                         } else {
                             None
                         }
@@ -10140,15 +10240,15 @@ impl ToolHandler for WaSendTool {
                                 .to_string(),
                         });
                     }
-                    if submit_idempotency_transition_error.is_some() {
+                    if submit_idempotency_post_effect_error.is_some() {
                         let transition_message = if matches!(
                             &injection,
                             InjectionResult::Allowed { .. }
                         ) && submit_idempotency_completion_error.is_none()
                         {
-                            "Submit idempotency pending transition reported a failure, but exact receipt completion recovered durable authority"
+                            "Submit idempotency post-effect persistence reported a failure, but exact receipt completion recovered durable authority"
                         } else {
-                            "Submit idempotency pending transition failed; automatic retries disabled"
+                            "Submit idempotency post-effect persistence failed; automatic retries disabled"
                         };
                         verification_error = Some(match verification_error.take() {
                             Some(existing) => format!("{existing}; {transition_message}"),
@@ -14820,6 +14920,26 @@ mod tests {
                 timeout_secs: 30,
             },
         )
+    }
+
+    fn test_write_submit_receipt(
+        binding: &crate::verified_submit::SubmitIdempotencyBinding,
+    ) -> crate::robot_types::SubmitReceipt {
+        crate::robot_types::SubmitReceipt {
+            state: crate::robot_types::SubmitReceiptState::Submitted,
+            guarantee_level: crate::robot_types::SubmitGuaranteeLevel::Write,
+            guarantee_met: true,
+            agent_type: None,
+            profile_id: None,
+            profile_version: None,
+            attempts: 1,
+            evidence_rule_ids: vec!["policy.default_allow".to_string()],
+            elapsed_ms: 17,
+            polls: 0,
+            cursor_before: None,
+            cursor_after: None,
+            idempotency_key: binding.caller_key().to_string(),
+        }
     }
 
     type SubmitReadHook = Box<dyn Fn(&crate::cx::Cx, &mut crate::Result<String>) + Send + Sync>;
@@ -21550,6 +21670,166 @@ mod tests {
     }
 
     #[test]
+    fn submit_idempotency_first_post_effect_completion_survives_queued_request_drop() {
+        use crate::submit_idempotency_store::{ClaimOutcome, StoredSubmitState};
+        use std::future::Future as _;
+        use std::sync::mpsc;
+        use std::task::Poll;
+        use std::time::Duration;
+
+        let (_dir, db) = temp_db_path();
+        let ft_dir = db.parent().expect("test database parent");
+        let binding =
+            test_submit_idempotency_binding(4_218, "echo queued receipt", "queued-receipt");
+        let token = match crate::submit_idempotency_store::claim(ft_dir, &binding)
+            .expect("claim before applying the send")
+        {
+            ClaimOutcome::Claimed(token) => token,
+            other => panic!("expected a fresh claim: {other:?}"),
+        };
+        let receipt = test_write_submit_receipt(&binding);
+        let runtime = CompatRuntimeBuilder::current_thread()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let pool = crate::runtime_async::current_runtime_handle()
+                .and_then(|handle| handle.blocking_handle())
+                .expect("test runtime must expose its one-thread blocking pool");
+            let (blocker_entered_tx, blocker_entered_rx) = mpsc::sync_channel(1);
+            let (release_blocker_tx, release_blocker_rx) = mpsc::sync_channel(1);
+            let blocker = pool.spawn(move || {
+                blocker_entered_tx
+                    .send(())
+                    .expect("announce occupied blocking worker");
+                release_blocker_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("release occupied blocking worker");
+            });
+            blocker_entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("blocking worker did not enter its gate");
+
+            // This is the first persistence operation after an Allowed send:
+            // no separate pending transaction has run or may be required.
+            let mut caller = Box::pin(super::mcp_submit_idempotency_complete_after_effect(
+                ft_dir, &binding, token, &receipt,
+            ));
+            let first_poll = std::future::poll_fn(|cx| Poll::Ready(caller.as_mut().poll(cx))).await;
+            assert!(matches!(first_poll, Poll::Pending));
+            for _ in 0..1_000 {
+                if pool.pending_count() == 1 {
+                    break;
+                }
+                crate::runtime_async::task::yield_now().await;
+            }
+            assert_eq!(
+                pool.pending_count(),
+                1,
+                "receipt persistence must be queued"
+            );
+            drop(caller);
+            assert_eq!(
+                crate::submit_idempotency_store::lookup(ft_dir, &binding)
+                    .expect("lookup before releasing the first post-effect transaction"),
+                Some(StoredSubmitState::ActiveOwner)
+            );
+
+            release_blocker_tx
+                .send(())
+                .expect("release occupied blocking worker");
+            assert!(blocker.wait_timeout(Duration::from_secs(5)));
+            let stored_receipt = crate::runtime_async::timeout(Duration::from_secs(5), async {
+                loop {
+                    match crate::submit_idempotency_store::lookup(ft_dir, &binding) {
+                        Ok(Some(StoredSubmitState::Completed(stored))) => break stored,
+                        Ok(Some(StoredSubmitState::ActiveOwner)) => {}
+                        Err(error) if error.is_retryable() => {}
+                        other => panic!(
+                            "first post-effect persistence must complete directly: {other:?}"
+                        ),
+                    }
+                    crate::runtime_async::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("detached receipt persistence must finish after the caller is dropped");
+            assert_eq!(
+                stored_receipt, receipt,
+                "losing the request must leave the exact receipt, not a stranded pending key"
+            );
+            assert_eq!(
+                crate::submit_idempotency_store::claim(ft_dir, &binding)
+                    .expect("replay after losing the completion response"),
+                ClaimOutcome::Completed(receipt.clone()),
+                "replay must return the exact receipt without granting a second send"
+            );
+        });
+    }
+
+    #[test]
+    fn submit_idempotency_immediate_receipt_failure_fences_without_downgrading_completion() {
+        use crate::submit_idempotency_store::{
+            ClaimOutcome, StoredSubmitState, SubmitIdempotencyError,
+        };
+
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let (_dir, db) = temp_db_path();
+            let ft_dir = db.parent().expect("test database parent");
+            let binding =
+                test_submit_idempotency_binding(4_219, "echo fenced receipt", "fenced-receipt");
+            let token = match crate::submit_idempotency_store::claim(ft_dir, &binding)
+                .expect("claim before applying the send")
+            {
+                ClaimOutcome::Claimed(token) => token,
+                other => panic!("expected a fresh claim: {other:?}"),
+            };
+            let receipt = test_write_submit_receipt(&binding);
+            let mut invalid_receipt = receipt.clone();
+            invalid_receipt.guarantee_met = false;
+            assert_eq!(
+                super::mcp_submit_idempotency_complete_after_effect(
+                    ft_dir,
+                    &binding,
+                    token,
+                    &invalid_receipt,
+                )
+                .await,
+                Err(SubmitIdempotencyError::ReceiptInvalid)
+            );
+            assert_eq!(
+                crate::submit_idempotency_store::lookup(ft_dir, &binding)
+                    .expect("lookup fallback fence"),
+                Some(StoredSubmitState::EffectAppliedReceiptPending),
+                "receipt failure must still fence the known-applied effect"
+            );
+
+            super::mcp_submit_idempotency_complete_after_effect(ft_dir, &binding, token, &receipt)
+                .await
+                .expect("complete the fallback-fenced receipt");
+            let mut conflicting_receipt = receipt.clone();
+            conflicting_receipt.elapsed_ms += 1;
+            assert_eq!(
+                super::mcp_submit_idempotency_complete_after_effect(
+                    ft_dir,
+                    &binding,
+                    token,
+                    &conflicting_receipt,
+                )
+                .await,
+                Err(SubmitIdempotencyError::InvalidTransition)
+            );
+            assert_eq!(
+                crate::submit_idempotency_store::lookup(ft_dir, &binding)
+                    .expect("lookup after a rejected conflicting completion"),
+                Some(StoredSubmitState::Completed(receipt)),
+                "a failed completion's fallback must never downgrade Completed"
+            );
+        });
+    }
+
+    #[test]
     fn wa_send_dry_run_does_not_consume_rate_limit_budget() {
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         runtime.block_on(async {
@@ -22706,23 +22986,42 @@ mod tests {
                 Arc::clone(&mock) as crate::wezterm::WeztermHandle,
             );
 
+            let request = serde_json::json!({
+                "pane_id": pane_id,
+                "text": text,
+                "submit_level": "submitted",
+                "idempotency_key": caller_key
+            });
             let envelope = parse_json_content(
-                tool.call(
-                    &test_mcp_context(),
-                    serde_json::json!({
-                        "pane_id": pane_id,
-                        "text": text,
-                        "submit_level": "submitted",
-                        "idempotency_key": caller_key
-                    }),
-                )
-                .expect("unsupported-profile submit"),
+                tool.call(&test_mcp_context(), request.clone())
+                    .expect("unsupported-profile submit"),
             );
             assert_eq!(envelope["ok"], true, "envelope: {envelope:?}");
             assert_eq!(envelope["data"]["injection"]["status"], "allowed");
             assert_eq!(
                 envelope["data"]["submit"]["state"],
                 "verification_unavailable"
+            );
+            assert_eq!(envelope["data"]["submit"]["guarantee_met"], false);
+            assert_eq!(envelope["data"]["submit"]["polls"], 0);
+            assert!(envelope["data"]["submit"]["profile_id"].is_null());
+            assert_eq!(
+                envelope["data"]["verification_error"],
+                "submit guarantee 'submitted' not met: state=verification_unavailable"
+            );
+            let replay = parse_json_content(
+                tool.call(&test_mcp_context(), request)
+                    .expect("replay the no-observation receipt"),
+            );
+            assert_eq!(replay["ok"], true, "replay envelope: {replay:?}");
+            assert_eq!(
+                replay["data"]["injection"]["decision"]["rule_id"],
+                "submit_idempotency.duplicate_noop"
+            );
+            assert_eq!(replay["data"]["submit"], envelope["data"]["submit"]);
+            assert_eq!(
+                replay["data"]["verification_error"],
+                envelope["data"]["verification_error"]
             );
             let content = mock
                 .pane_state(pane_id)
@@ -22731,7 +23030,7 @@ mod tests {
                 .content;
             assert_eq!(
                 content, text,
-                "unsupported profile must receive exact caller text"
+                "unsupported profile must receive exact caller text once, including after replay"
             );
         });
     }
