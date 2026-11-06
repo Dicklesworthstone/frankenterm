@@ -1520,10 +1520,19 @@ impl PaneFile {
         let mut record = Vec::new();
         let mut total_bytes = 0u64;
         let mut trailing_partial = false;
+        // A torn append can leave its record's newline on disk with part of
+        // the record unwritten, which reads as NUL bytes: a sector of it
+        // landed and an earlier one did not. As the final record it is
+        // excluded like an unterminated tail; followed by another record, or
+        // malformed without a NUL, it is corruption (ft-yccm0.2.1.7).
+        let mut torn_record = None;
         loop {
             let bytes_read = (&mut reader).take(129).read_until(b'\n', &mut record)?;
             if bytes_read == 0 {
                 break;
+            }
+            if let Some(error) = torn_record.take() {
+                return Err(error);
             }
             total_bytes = total_bytes
                 .checked_add(
@@ -1542,25 +1551,36 @@ impl PaneFile {
                 ));
             }
             if record.ends_with(b"\n") {
-                let value = record
+                let parsed = record
                     .strip_prefix(PANE_BASE_SEQ_JOURNAL_PREFIX.as_bytes())
                     .and_then(|bytes| bytes.strip_suffix(b"\n"))
                     .ok_or_else(|| {
                         MmapStoreError::InvalidPaneLogHeader(
                             "malformed base sequence journal record".to_string(),
                         )
-                    })?;
-                let value = std::str::from_utf8(value)
-                    .map_err(|error| MmapStoreError::InvalidPaneLogHeader(error.to_string()))?;
-                let value = value
-                    .parse::<u64>()
-                    .map_err(|error| MmapStoreError::InvalidPaneLogHeader(error.to_string()))?;
-                if latest.is_some_and(|previous| value < previous) {
-                    return Err(MmapStoreError::InvalidPaneLogHeader(
-                        "base sequence journal is not monotonic".to_string(),
-                    ));
+                    })
+                    .and_then(|value| {
+                        std::str::from_utf8(value).map_err(|error| {
+                            MmapStoreError::InvalidPaneLogHeader(error.to_string())
+                        })
+                    })
+                    .and_then(|value| {
+                        value.parse::<u64>().map_err(|error| {
+                            MmapStoreError::InvalidPaneLogHeader(error.to_string())
+                        })
+                    });
+                match parsed {
+                    Ok(value) => {
+                        if latest.is_some_and(|previous| value < previous) {
+                            return Err(MmapStoreError::InvalidPaneLogHeader(
+                                "base sequence journal is not monotonic".to_string(),
+                            ));
+                        }
+                        latest = Some(value);
+                    }
+                    Err(error) if record.contains(&0) => torn_record = Some(error),
+                    Err(error) => return Err(error),
                 }
-                latest = Some(value);
             } else {
                 trailing_partial = true;
             }
@@ -1569,7 +1589,7 @@ impl PaneFile {
         Ok(PaneSequenceJournalState {
             latest,
             bytes: total_bytes,
-            trailing_partial,
+            trailing_partial: trailing_partial || torn_record.is_some(),
         })
     }
 
@@ -7127,6 +7147,45 @@ mod tests {
             PaneFile::open(dir.path(), 3),
             Err(MmapStoreError::InvalidPaneLogHeader(_))
         ));
+    }
+
+    #[test]
+    fn pane_file_sequence_journal_excludes_a_zero_filled_final_record_only() {
+        // A torn append that kept its newline: part of the record never
+        // reached disk and reads as NUL bytes (ft-yccm0.2.1.7).
+        let dir = temp_dir();
+        for (pane, journal) in [
+            (1, b"FTSEQ1:1\nFTSEQ1:\0\0\n".as_slice()),
+            (2, b"FTSEQ1:1\n\0\0\0\0\0\0\0\0\n".as_slice()),
+            (3, b"FTSEQ1:1\nFTSEQ1\0\0\0\0\0\n".as_slice()),
+        ] {
+            std::fs::write(
+                dir.path().join(format!("{pane}.log")),
+                b"line-0\nline-1\nline-2\n",
+            )
+            .unwrap();
+            std::fs::write(dir.path().join(format!("{pane}.seq")), journal).unwrap();
+            let opened = PaneFile::open(dir.path(), pane).unwrap();
+            assert_eq!(opened.base_seq, 1, "pane {pane}");
+            assert_eq!(opened.line_at(1).unwrap().as_deref(), Some("line-1"));
+            assert!(opened.base_seq_journal_needs_checkpoint, "pane {pane}");
+        }
+        // Only the final record can be torn: one followed by another record
+        // is corruption.
+        std::fs::write(dir.path().join("4.log"), b"line-0\nline-1\n").unwrap();
+        std::fs::write(dir.path().join("4.seq"), b"FTSEQ1:\0\nFTSEQ1:1\n").unwrap();
+        assert!(matches!(
+            PaneFile::open(dir.path(), 4),
+            Err(MmapStoreError::InvalidPaneLogHeader(_))
+        ));
+        // The checkpoint the next prune writes drops the torn record.
+        let mut reopened = PaneFile::open(dir.path(), 1).unwrap();
+        reopened.prune_before(2).unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("1.seq")).unwrap(),
+            b"FTSEQ1:2\n"
+        );
+        assert_eq!(PaneFile::open(dir.path(), 1).unwrap().oldest_seq(), Some(2));
     }
 
     #[cfg(unix)]

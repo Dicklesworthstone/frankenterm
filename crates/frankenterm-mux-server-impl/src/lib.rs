@@ -8905,8 +8905,9 @@ impl LiveScrollbackSpillSink {
     /// stage may name. A complete adjacent digest-only WAL stage is the
     /// interrupted publication: it is finished, replacing the consumed active
     /// WAL as that transaction would have. Any other complete WAL stage
-    /// leaves the rows alone. Otherwise nothing names them: a durable commit
-    /// window tail (ft-yccm0.2.1.2) or a batch interrupted before its WAL.
+    /// leaves the rows alone. Otherwise nothing names them (an incomplete
+    /// stage never named anything): a durable commit window tail
+    /// (ft-yccm0.2.1.2) or a batch interrupted before its WAL.
     /// Once the retained prefix is proven to be exactly the manifest's, the
     /// rows that open at their exact locations are adopted in order, through
     /// the cumulative WAL their publication would have written, and the rows
@@ -9002,18 +9003,18 @@ impl LiveScrollbackSpillSink {
         // up to the first that does not; rows from there on (a torn,
         // reordered or foreign suffix) are cut. The adopted tail gets the WAL
         // its publication would have written, and recovery rolls it forward.
-        let (adopted, may_hold_gap_marker) = if incomplete_stage {
-            (Vec::new(), false)
-        } else {
-            Self::adoptable_ledger_tail(
-                manifest,
-                ledger_pane_id,
-                store,
-                &*keyring,
-                durable_pane_id,
-                observed_next,
-            )?
-        };
+        // An incomplete stage is a WAL write a crash cut short (the tail's
+        // own publication, a batch's, or this adoption's): it named nothing,
+        // so the windows' durable rows are adopted all the same and the
+        // adoption's WAL replaces it (ft-yccm0.2.1.7).
+        let (adopted, may_hold_gap_marker) = Self::adoptable_ledger_tail(
+            manifest,
+            ledger_pane_id,
+            store,
+            &*keyring,
+            durable_pane_id,
+            observed_next,
+        )?;
         let adopted_rows = u64::try_from(adopted.len())?;
         let adopted_next = manifest
             .next_seq
@@ -9023,6 +9024,8 @@ impl LiveScrollbackSpillSink {
             store
                 .truncate_after(ledger_pane_id, adopted_next)
                 .context("cut scrollback rows past the adoptable tail")?;
+            #[cfg(test)]
+            scrollback_crash_points::reach("recovery_tail_cut");
             log::warn!(
                 "cut {} scrollback rows past the published manifest that do not open at their location (adopted {adopted_rows} before them)",
                 observed_next - adopted_next
@@ -9049,7 +9052,7 @@ impl LiveScrollbackSpillSink {
             keyring,
             durable_pane_id,
         )?;
-        Self::write_new_append_wal_stage(stage_path, &wal)?;
+        Self::write_new_append_wal_stage(stage_path, &wal, incomplete_stage)?;
         Self::promote_append_wal_stage(stage_path, active_path, &wal)?;
         log::warn!("adopted {adopted_rows} durable scrollback rows past the published manifest");
         Ok(LedgerTailSettlement::PromotedStage)
@@ -9201,11 +9204,13 @@ impl LiveScrollbackSpillSink {
         )
     }
 
-    /// Write a fresh, private, synchronized append WAL stage, refusing to
-    /// replace any existing stage file.
+    /// Write a fresh, private, synchronized append WAL stage. An existing
+    /// stage file is replaced only when the caller proved it a recoverably
+    /// incomplete write (`replace_incomplete`), and refused otherwise.
     fn write_new_append_wal_stage(
         stage_path: &std::path::Path,
         wal: &LiveScrollbackAppendWalV1,
+        replace_incomplete: bool,
     ) -> anyhow::Result<()> {
         let mut bytes = serde_json::to_vec_pretty(wal)?;
         bytes.push(b'\n');
@@ -9213,20 +9218,99 @@ impl LiveScrollbackSpillSink {
             u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES,
             "append WAL serialization exceeds its byte ceiling"
         );
+        if replace_incomplete {
+            Self::write_append_wal_stage(stage_path, &bytes)?;
+        } else {
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true).write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+
+                options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+            }
+            let mut file = options
+                .open(stage_path)
+                .with_context(|| format!("create append WAL stage {}", stage_path.display()))?;
+            file.write_all(&bytes)?;
+            frankenterm_core::storage::mmap_store::ordered_durability_sync(&file)?;
+        }
+        Self::verify_append_wal_readback(stage_path, &bytes)
+    }
+
+    /// Write `bytes` to the deterministic append WAL stage and sync them: a
+    /// new private file, or, in place, the incomplete stage a crash left.
+    /// Only that exact private, single-link inode is rewritten, pinned
+    /// before the truncation; the caller has proven any existing stage a
+    /// recoverably incomplete write.
+    fn write_append_wal_stage(stage_path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+        let stage_exists = std::fs::symlink_metadata(stage_path).is_ok();
         let mut options = std::fs::OpenOptions::new();
-        options.read(true).write(true).create_new(true);
+        options.read(true).write(true);
+        let expected_stage_metadata = if stage_exists {
+            Some(std::fs::symlink_metadata(stage_path)?)
+        } else {
+            None
+        };
+        if !stage_exists {
+            options.create_new(true);
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
 
             options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
-        let mut file = options
-            .open(stage_path)
-            .with_context(|| format!("create append WAL stage {}", stage_path.display()))?;
-        file.write_all(&bytes)?;
+        let mut file = options.open(stage_path).with_context(|| {
+            format!(
+                "open deterministic append WAL stage {}",
+                stage_path.display()
+            )
+        })?;
+        anyhow::ensure!(
+            file.metadata()?.is_file(),
+            "opened append WAL stage is not a regular file"
+        );
+        if let Some(expected) = expected_stage_metadata {
+            let _observed = file.metadata()?;
+            #[cfg(unix)]
+            let observed = _observed;
+            anyhow::ensure!(
+                expected.file_type().is_file()
+                    && expected.len() <= LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES,
+                "incomplete append WAL stage is not a bounded regular file"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+                let parent = stage_path
+                    .parent()
+                    .ok_or_else(|| anyhow::anyhow!("append WAL stage has no parent"))?;
+                let parent_metadata = std::fs::symlink_metadata(parent)?;
+                anyhow::ensure!(
+                    unix_mode_is_private(expected.permissions().mode())
+                        && expected.nlink() == 1
+                        && expected.uid() == parent_metadata.uid()
+                        && observed.dev() == expected.dev()
+                        && observed.ino() == expected.ino(),
+                    "incomplete append WAL stage changed identity before rewrite"
+                );
+                let path_metadata = std::fs::symlink_metadata(stage_path)?;
+                anyhow::ensure!(
+                    path_metadata.file_type().is_file()
+                        && path_metadata.dev() == observed.dev()
+                        && path_metadata.ino() == observed.ino(),
+                    "incomplete append WAL stage changed path before rewrite"
+                );
+            }
+            // Do not truncate during path resolution: only the exact
+            // private, single-link inode pinned above may be rewritten.
+            file.set_len(0)?;
+        }
+        file.write_all(bytes)?;
         frankenterm_core::storage::mmap_store::ordered_durability_sync(&file)?;
-        Self::verify_append_wal_readback(stage_path, &bytes)
+        Ok(())
     }
 
     /// Publish a complete, authenticated WAL stage as the active WAL: sync
@@ -9237,12 +9321,16 @@ impl LiveScrollbackSpillSink {
         staged: &LiveScrollbackAppendWalV1,
     ) -> anyhow::Result<()> {
         Self::sync_private_scrollback_stage(stage_path, LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES)?;
+        #[cfg(test)]
+        scrollback_crash_points::reach("recovery_wal_staged");
         if let Err(rename_error) = std::fs::rename(stage_path, active_path) {
             anyhow::ensure!(
                 Self::read_append_wal(active_path)?.as_ref() == Some(staged),
                 "publish the interrupted append WAL stage: {rename_error}"
             );
         }
+        #[cfg(test)]
+        scrollback_crash_points::reach("recovery_wal_renamed");
         #[cfg(not(windows))]
         std::fs::File::open(
             active_path
@@ -9372,6 +9460,8 @@ impl LiveScrollbackSpillSink {
                     appended == observed_next,
                     "batch WAL recovery wrote the wrong sequence"
                 );
+                #[cfg(test)]
+                scrollback_crash_points::reach("recovery_rows_appended");
             }
         } else {
             match observed_next.cmp(&wal.appended_sequence) {
@@ -9389,6 +9479,8 @@ impl LiveScrollbackSpillSink {
                         appended == wal.appended_sequence,
                         "append WAL recovery wrote the wrong sequence"
                     );
+                    #[cfg(test)]
+                    scrollback_crash_points::reach("recovery_rows_appended");
                 }
                 std::cmp::Ordering::Greater => {
                     anyhow::ensure!(
@@ -9419,6 +9511,8 @@ impl LiveScrollbackSpillSink {
             store
                 .prune_before(wal.ledger_pane_id, wal.target_oldest_sequence)
                 .context("recover append WAL retention cut")?;
+            #[cfg(test)]
+            scrollback_crash_points::reach("recovery_pruned");
         }
         // A crash may already have published the retention cut while leaving
         // physical compaction unfinished. Complete bounded maintenance even
@@ -9431,6 +9525,8 @@ impl LiveScrollbackSpillSink {
                 Some(LIVE_SCROLLBACK_REPLACEMENT_MAX_COMMITTED_BYTES),
             )
             .context("compact recovered append WAL target within manifest bound")?;
+        #[cfg(test)]
+        scrollback_crash_points::reach("recovery_compacted");
         Self::verify_append_wal_target_store(wal, store)?;
         let verified_ledger = if wal.is_incremental() {
             Some(Self::verify_incremental_append_wal_target_chain_cold(
@@ -10094,69 +10190,7 @@ impl LiveScrollbackSpillSink {
                     LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES,
                 )?;
             } else {
-                let stage_exists = std::fs::symlink_metadata(&stage_path).is_ok();
-                let mut options = std::fs::OpenOptions::new();
-                options.read(true).write(true);
-                let expected_stage_metadata = if stage_exists {
-                    Some(std::fs::symlink_metadata(&stage_path)?)
-                } else {
-                    None
-                };
-                if !stage_exists {
-                    options.create_new(true);
-                }
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt as _;
-
-                    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-                }
-                let mut file = options.open(&stage_path).with_context(|| {
-                    format!(
-                        "open deterministic append WAL stage {}",
-                        stage_path.display()
-                    )
-                })?;
-                anyhow::ensure!(
-                    file.metadata()?.is_file(),
-                    "opened append WAL stage is not a regular file"
-                );
-                if let Some(expected) = expected_stage_metadata {
-                    let _observed = file.metadata()?;
-                    #[cfg(unix)]
-                    let observed = _observed;
-                    anyhow::ensure!(
-                        expected.file_type().is_file()
-                            && expected.len() <= LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES,
-                        "incomplete append WAL stage is not a bounded regular file"
-                    );
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-
-                        let parent_metadata = std::fs::symlink_metadata(parent)?;
-                        anyhow::ensure!(
-                            unix_mode_is_private(expected.permissions().mode())
-                                && expected.nlink() == 1
-                                && expected.uid() == parent_metadata.uid()
-                                && observed.dev() == expected.dev()
-                                && observed.ino() == expected.ino(),
-                            "incomplete append WAL stage changed identity before rewrite"
-                        );
-                        let path_metadata = std::fs::symlink_metadata(&stage_path)?;
-                        anyhow::ensure!(
-                            path_metadata.file_type().is_file()
-                                && path_metadata.dev() == observed.dev()
-                                && path_metadata.ino() == observed.ino(),
-                            "incomplete append WAL stage changed path before rewrite"
-                        );
-                    }
-                    // Do not truncate during path resolution: only the exact
-                    // private, single-link inode pinned above may be rewritten.
-                    file.set_len(0)?;
-                }
-                file.write_all(&bytes)?;
-                frankenterm_core::storage::mmap_store::ordered_durability_sync(&file)?;
+                Self::write_append_wal_stage(&stage_path, &bytes)?;
             }
             #[cfg(test)]
             if LIVE_SCROLLBACK_WAL_READBACK_FAULT.with(|fault| fault.get() == 1) {
@@ -10760,6 +10794,48 @@ impl LiveScrollbackSpillSink {
         Self::open(base_dir, context, std::time::Duration::ZERO)
     }
 
+    /// Whether `staged` is a lineage's first-row prepare and nothing else:
+    /// authentic, this pane's and this ledger's, over a ledger that is still
+    /// empty, and the exact successor of where the lineage starts: its first
+    /// revision on a fresh pane, or the revision after `published`, a clear.
+    fn is_first_row_prepare(
+        staged: &LiveScrollbackManifestV1,
+        published: Option<&LiveScrollbackManifestV1>,
+        durable_pane_id: &str,
+        stage_path: &std::path::Path,
+        ledger_pane_id: u64,
+        store: &frankenterm_core::storage::mmap_store::MmapScrollbackStore,
+        keyring: &guardian_output_keys::GuardianOutputKeyring,
+    ) -> bool {
+        let succeeds_the_start = || -> anyhow::Result<bool> {
+            let Some((epoch, revision)) = live_scrollback_manifest_generation(staged)? else {
+                return Ok(false);
+            };
+            let start = match published {
+                None => (epoch, 0),
+                Some(cleared) => match live_scrollback_manifest_generation(cleared)? {
+                    Some(start) if cleared.publication_state == "cleared" && start.0 == epoch => {
+                        start
+                    }
+                    _ => return Ok(false),
+                },
+            };
+            Ok(start.1.checked_add(1) == Some(revision)
+                && live_scrollback_manifest_predecessor(staged)?
+                    == Some(wezterm_term::config::ScrollbackSnapshotGeneration::new(
+                        start.0, start.1,
+                    )))
+        };
+        staged.publication_state == "prepared"
+            && staged.retained_rows == 0
+            && validate_live_scrollback_manifest_identity(staged, durable_pane_id, stage_path)
+                .is_ok()
+            && matches!(Self::authenticate_manifest(staged, keyring), Ok(true))
+            && Self::manifest_ledger_pane_id(staged).is_ok_and(|ledger| ledger == ledger_pane_id)
+            && succeeds_the_start().unwrap_or(false)
+            && Self::verify_logical_ledger_digest_from_store(staged, ledger_pane_id, store).is_ok()
+    }
+
     /// A sink whose commit windows publish the manifest at most once per
     /// `manifest_publish_interval` (ft-yccm0.2.1.2).
     fn open(
@@ -11075,6 +11151,8 @@ impl LiveScrollbackSpillSink {
                                 manifest_path.display()
                             )
                         })?;
+                        #[cfg(test)]
+                        scrollback_crash_points::reach("recovery_manifest_renamed");
                         #[cfg(not(windows))]
                         std::fs::File::open(manifest_path.parent().ok_or_else(|| {
                             anyhow::anyhow!("scrollback manifest path has no parent")
@@ -11102,6 +11180,59 @@ impl LiveScrollbackSpillSink {
                             &store,
                         )
                         .context("reverify recovered complete scrollback ledger")?;
+                        persisted_manifest = Some(recovered);
+                    }
+                } else if persisted_manifest
+                    .as_ref()
+                    .is_none_or(|published| published.publication_state == "cleared")
+                {
+                    // A first-row prepare (a fresh lineage's, or the first
+                    // after a clear) that a crash left staged: its row is
+                    // appended only after the rename. This process's own
+                    // prepare would not match the stage (a fresh pane mints a
+                    // new content epoch; a first gap marker's totals differ),
+                    // so every row would refuse. Finish the rename instead;
+                    // the lineage then opens as one whose first row never
+                    // landed (ft-yccm0.2.1.7).
+                    let fresh_prepare = {
+                        let keyring_guard = keyring
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("guardian output keyring is poisoned"))?;
+                        Self::is_first_row_prepare(
+                            &staged_manifest,
+                            persisted_manifest.as_ref(),
+                            &durable_pane_id,
+                            &stage_path,
+                            ledger_pane_id,
+                            &store,
+                            &keyring_guard,
+                        )
+                    };
+                    if fresh_prepare {
+                        Self::sync_private_scrollback_stage(
+                            &stage_path,
+                            LIVE_SCROLLBACK_MANIFEST_MAX_BYTES,
+                        )?;
+                        std::fs::rename(&stage_path, &manifest_path).with_context(|| {
+                            format!(
+                                "publish a fresh lineage's staged first-row prepare {}",
+                                manifest_path.display()
+                            )
+                        })?;
+                        #[cfg(test)]
+                        scrollback_crash_points::reach("recovery_manifest_renamed");
+                        #[cfg(not(windows))]
+                        std::fs::File::open(manifest_path.parent().ok_or_else(|| {
+                            anyhow::anyhow!("scrollback manifest path has no parent")
+                        })?)?
+                        .sync_all()?;
+                        let recovered = Self::read_manifest(&manifest_path)?.ok_or_else(|| {
+                            anyhow::anyhow!("recovered first-row prepare disappeared")
+                        })?;
+                        anyhow::ensure!(
+                            recovered == staged_manifest,
+                            "recovered first-row prepare changed during publication"
+                        );
                         persisted_manifest = Some(recovered);
                     }
                 }
@@ -11258,6 +11389,8 @@ impl LiveScrollbackSpillSink {
                         );
                     }
                 }
+                #[cfg(test)]
+                scrollback_crash_points::reach("recovery_wal_renamed");
                 #[cfg(not(windows))]
                 std::fs::File::open(
                     append_wal_path
@@ -11330,6 +11463,8 @@ impl LiveScrollbackSpillSink {
                                     manifest_path.display()
                                 )
                             })?;
+                            #[cfg(test)]
+                            scrollback_crash_points::reach("recovery_cleared");
                         } else {
                             anyhow::ensure!(
                                 store.line_count(ledger_pane_id) == 0
@@ -11351,6 +11486,47 @@ impl LiveScrollbackSpillSink {
                         // republish them under a stronger label.
                         (state, None)
                     } else {
+                        // A first row's prepared manifest authorizes only the
+                        // row after it, which reaches the ledger unsynced, so
+                        // a crash can leave that row torn or zero-filled. It
+                        // was never acknowledged: a row there that does not
+                        // open at its location is cut, as a torn tail past a
+                        // complete manifest is (ft-yccm0.2.1.7).
+                        if authenticated_manifest
+                            && manifest.publication_state == "prepared"
+                            && store.next_seq(ledger_pane_id)? > manifest.next_seq
+                        {
+                            let opens = match manifest.initial_stable_row {
+                                Some(initial) => {
+                                    let row_segments = Self::manifest_row_segments(&manifest)?;
+                                    let keyring_guard = keyring.lock().map_err(|_| {
+                                        anyhow::anyhow!("guardian output keyring is poisoned")
+                                    })?;
+                                    Self::validate_persisted_records(
+                                        &store,
+                                        ledger_pane_id,
+                                        &keyring_guard,
+                                        context.durable_pane_id,
+                                        state_content_epoch,
+                                        initial,
+                                        &row_segments,
+                                        true,
+                                    )
+                                    .is_ok()
+                                }
+                                None => false,
+                            };
+                            if !opens {
+                                store
+                                    .truncate_after(ledger_pane_id, manifest.next_seq)
+                                    .context("cut a prepared first row that does not open")?;
+                                #[cfg(test)]
+                                scrollback_crash_points::reach("recovery_tail_cut");
+                                log::warn!(
+                                    "cut a prepared first scrollback row that does not open at its location"
+                                );
+                            }
+                        }
                         let actual_retained_rows = u64::try_from(store.line_count(ledger_pane_id))
                             .map_err(|_| anyhow::anyhow!("scrollback row count exceeds u64"))?;
                         let actual_oldest_seq = store.oldest_seq(ledger_pane_id);
@@ -11531,35 +11707,68 @@ impl LiveScrollbackSpillSink {
                                 )
                             })?;
                         }
+                        // A first row's prepared manifest promises only that
+                        // row. When the row never reached the ledger, the
+                        // lineage still holds nothing, which a cleared
+                        // manifest says (a prepared one serves no snapshot):
+                        // it is republished cleared at its generation, and
+                        // its next row prepares again from wherever it lands.
+                        // Held to the prepared stable rows, every later row
+                        // would refuse (ft-yccm0.2.1.7).
+                        let unrealized_first_row = authenticated_manifest
+                            && manifest.publication_state == "prepared"
+                            && actual_retained_rows == 0
+                            && actual_next_seq == manifest.next_seq;
                         let repair_complete_manifest =
                             authenticated_manifest && content_repair_required;
+                        let repair_publication = if unrealized_first_row {
+                            Some("cleared")
+                        } else {
+                            repair_complete_manifest.then_some("complete")
+                        };
                         (
                             LiveScrollbackSpillState {
-                                initial_stable_row,
-                                newest_stable_row_exclusive: if authenticated_manifest {
+                                initial_stable_row: initial_stable_row
+                                    .filter(|_| !unrealized_first_row),
+                                newest_stable_row_exclusive: if unrealized_first_row {
+                                    None
+                                } else if authenticated_manifest {
                                     manifest.newest_stable_row_exclusive
                                 } else {
                                     actual_newest_stable_row_exclusive
                                 },
-                                max_retained_rows: usize::try_from(manifest.max_retained_rows)
-                                    .map_err(|_| {
+                                // A canonical cleared manifest retains nothing.
+                                max_retained_rows: if unrealized_first_row {
+                                    0
+                                } else {
+                                    usize::try_from(manifest.max_retained_rows).map_err(|_| {
                                         anyhow::anyhow!(
                                             "scrollback retention exceeds platform usize"
                                         )
-                                    })?,
+                                    })?
+                                },
                                 content_epoch: state_content_epoch,
                                 revision: state_revision,
                                 authenticated_manifest,
                                 predecessor_generation: repaired_predecessor,
-                                clear_manifest_published: false,
+                                clear_manifest_published: unrealized_first_row,
                                 clear_pending_physical_reclamation: false,
                                 transaction_quarantined: false,
                                 verified_ledger: None,
                                 row_segments,
-                                durability_gaps: manifest.durability_gaps,
+                                // The prepared totals count a first gap
+                                // marker that never landed; the lineage
+                                // holds no marker. Unknown stays unknown.
+                                durability_gaps: if unrealized_first_row {
+                                    manifest
+                                        .durability_gaps
+                                        .map(|_| LiveScrollbackDurabilityGaps::default())
+                                } else {
+                                    manifest.durability_gaps
+                                },
                                 published: None,
                             },
-                            repair_complete_manifest.then_some("complete"),
+                            repair_publication,
                         )
                     }
                 }
@@ -23719,80 +23928,165 @@ mod tests {
             .position(|(names, _)| names.contains(&name))
     }
 
-    /// The durable states a crash can leave between two consecutive images:
-    /// each unit that changed is at its earlier or its later image, and a
-    /// grown append-only file or a newly written stage may also stop half way
-    /// or one byte short. Files outside every unit (keys, locks) take their
-    /// later image.
-    fn crash_states_between(
+    /// The units with a file that differs between two images, in order.
+    fn changed_crash_units(
         earlier: &scrollback_crash_points::Image,
         later: &scrollback_crash_points::Image,
-    ) -> Vec<scrollback_crash_points::Image> {
+    ) -> Vec<usize> {
         let paths: std::collections::BTreeSet<_> = earlier.keys().chain(later.keys()).collect();
-        let changed: Vec<usize> = (0..CRASH_UNITS.len())
+        (0..CRASH_UNITS.len())
             .filter(|&unit| {
                 paths
                     .iter()
                     .filter(|path| crash_unit(path) == Some(unit))
                     .any(|path| earlier.get(*path) != later.get(*path))
             })
-            .collect();
-        let mut states = Vec::new();
-        for mask in 0..(1_u32 << changed.len()) {
-            let takes_later = |unit: Option<usize>| {
-                unit.is_none_or(|unit| {
-                    changed
-                        .iter()
-                        .position(|&changed| changed == unit)
-                        .is_some_and(|bit| mask & (1 << bit) != 0)
-                })
-            };
-            let state: scrollback_crash_points::Image = paths
+            .collect()
+    }
+
+    /// The state in which the `changed` units named by `mask` hold their later
+    /// image and the others their earlier one. Files outside every unit
+    /// (keys, locks) take their later image.
+    fn crash_state_with_mask(
+        earlier: &scrollback_crash_points::Image,
+        later: &scrollback_crash_points::Image,
+        changed: &[usize],
+        mask: u64,
+    ) -> scrollback_crash_points::Image {
+        earlier
+            .keys()
+            .chain(later.keys())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .filter_map(|path| {
+                let source = if unit_takes_later(crash_unit(path), changed, mask) {
+                    later
+                } else {
+                    earlier
+                };
+                source.get(path).map(|bytes| (path.clone(), bytes.clone()))
+            })
+            .collect()
+    }
+
+    fn unit_takes_later(unit: Option<usize>, changed: &[usize], mask: u64) -> bool {
+        unit.is_none_or(|unit| {
+            changed
                 .iter()
-                .filter_map(|path| {
-                    let source = if takes_later(crash_unit(path)) {
-                        later
-                    } else {
-                        earlier
-                    };
-                    source
-                        .get(*path)
-                        .map(|bytes| ((*path).clone(), bytes.clone()))
-                })
-                .collect();
-            for path in &paths {
-                let Some(unit) = crash_unit(path) else {
-                    continue;
-                };
-                let (Some(grown), before) = (later.get(*path), earlier.get(*path)) else {
-                    continue;
-                };
-                // A new stage is written then synced, so it can tear too.
-                let new_stage = before.is_none()
-                    && path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name.contains("installing"));
-                let before = before.map_or(&[][..], Vec::as_slice);
-                if !takes_later(Some(unit))
-                    || !(CRASH_UNITS[unit].1 || new_stage)
-                    || grown.len() <= before.len() + 1
-                    || !grown.starts_with(before)
-                {
+                .position(|&changed| changed == unit)
+                .is_some_and(|bit| mask & (1 << bit) != 0)
+        })
+    }
+
+    /// How much of `path` was already there and the bytes it holds now, when
+    /// what it gained between the images can reach disk only in part: a grown
+    /// append-only file, or a new stage, which is written and then synced.
+    fn torn_growth<'a>(
+        path: &std::path::Path,
+        earlier: &scrollback_crash_points::Image,
+        later: &'a scrollback_crash_points::Image,
+    ) -> Option<(usize, &'a [u8])> {
+        let unit = crash_unit(path)?;
+        let grown = later.get(path)?.as_slice();
+        let before = earlier.get(path);
+        let new_stage = before.is_none()
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains("installing"));
+        let before = before.map_or(&[][..], Vec::as_slice);
+        ((CRASH_UNITS[unit].1 || new_stage)
+            && grown.len() > before.len() + 1
+            && grown.starts_with(before))
+        .then_some((before.len(), grown))
+    }
+
+    /// The durable states a crash can leave between two consecutive images:
+    /// each unit that changed is at its earlier or its later image, and a
+    /// grown append-only file or a newly written stage may also stop half way
+    /// or one byte short.
+    fn crash_states_between(
+        earlier: &scrollback_crash_points::Image,
+        later: &scrollback_crash_points::Image,
+    ) -> Vec<scrollback_crash_points::Image> {
+        let changed = changed_crash_units(earlier, later);
+        let mut states = Vec::new();
+        for mask in 0..(1_u64 << changed.len()) {
+            let state = crash_state_with_mask(earlier, later, &changed, mask);
+            for path in later.keys() {
+                if !unit_takes_later(crash_unit(path), &changed, mask) {
                     continue;
                 }
-                for cut in [
-                    before.len() + (grown.len() - before.len()) / 2,
-                    grown.len() - 1,
-                ] {
+                let Some((kept, grown)) = torn_growth(path, earlier, later) else {
+                    continue;
+                };
+                for cut in [kept + (grown.len() - kept) / 2, grown.len() - 1] {
                     let mut torn = state.clone();
-                    torn.insert((*path).clone(), grown[..cut].to_vec());
+                    torn.insert(path.clone(), grown[..cut].to_vec());
                     states.push(torn);
                 }
             }
             states.push(state);
         }
         states
+    }
+
+    /// SplitMix64: every choice a crash schedule makes, from its printed seed.
+    struct ScheduleRandom(u64);
+
+    impl ScheduleRandom {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mixed = (self.0 ^ (self.0 >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            let mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            mixed ^ (mixed >> 31)
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            usize::try_from(self.next() % u64::try_from(bound).unwrap()).unwrap()
+        }
+    }
+
+    /// One state a crash can leave between two consecutive images, drawn at
+    /// random, and what was drawn: any subset of the changed units holds its
+    /// later image, and what a file gained may stop at any byte or have a
+    /// hole, since a file's size can reach disk ahead of its data. This is
+    /// unsynced writes reordering, within a file and across files.
+    fn random_crash_state(
+        earlier: &scrollback_crash_points::Image,
+        later: &scrollback_crash_points::Image,
+        random: &mut ScheduleRandom,
+    ) -> (scrollback_crash_points::Image, String) {
+        let changed = changed_crash_units(earlier, later);
+        let mask = random.next();
+        let mut state = crash_state_with_mask(earlier, later, &changed, mask);
+        let mut drawn = format!("units {changed:?} mask {:b}", mask & 0xf);
+        for path in later.keys() {
+            if !unit_takes_later(crash_unit(path), &changed, mask) {
+                continue;
+            }
+            let Some((kept, grown)) = torn_growth(path, earlier, later) else {
+                continue;
+            };
+            let gained = grown.len() - kept;
+            match random.below(3) {
+                0 => {
+                    let cut = kept + 1 + random.below(gained - 1);
+                    state.insert(path.clone(), grown[..cut].to_vec());
+                    drawn += &format!(", {} cut at {cut}", path.display());
+                }
+                1 => {
+                    let start = kept + random.below(gained);
+                    let end = start + 1 + random.below(grown.len() - start);
+                    let mut holed = grown.to_vec();
+                    holed[start..end].fill(0);
+                    state.insert(path.clone(), holed);
+                    drawn += &format!(", {} hole {start}..{end}", path.display());
+                }
+                _ => {}
+            }
+        }
+        (state, drawn)
     }
 
     /// A fresh store holding exactly `image`, with the live store's
@@ -23846,8 +24140,8 @@ mod tests {
     /// images. Each must reopen to exactly the rows before the transaction
     /// followed by an in-order prefix of the batch: none of it, the part of
     /// it already durable that opens at its location (adopted, ft-yccm0.2.1.2)
-    /// or all of it. Never a reordered, duplicated or missing row. Returns
-    /// the number of states checked.
+    /// or all of it. Never a reordered, duplicated or missing row, and the
+    /// reopened sink takes the next row. Returns the number of states checked.
     fn every_crash_state_of_a_batch_recovers_exactly(
         pre: &[Line],
         batch: &[Line],
@@ -23864,58 +24158,13 @@ mod tests {
         );
         let mut images = scrollback_crash_points::take();
         images.push(("end", scrollback_crash_points::image(dir.path())));
-        let retained = |rows: &[Line]| -> Vec<(isize, Line)> {
-            let first = rows.len().saturating_sub(retention);
-            rows.iter()
-                .enumerate()
-                .skip(first)
-                .map(|(row, line)| (row as isize, line.clone()))
-                .collect()
-        };
-        let prefixes: Vec<Vec<(isize, Line)>> = (0..=batch.len())
-            .map(|adopted| {
-                retained(
-                    &pre.iter()
-                        .chain(&batch[..adopted])
-                        .cloned()
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .collect();
+        let rows: Vec<Line> = pre.iter().chain(batch).cloned().collect();
         let mut states = 0;
         for pair in images.windows(2) {
             let case = format!("{} -> {}", pair[0].0, pair[1].0);
             for state in crash_states_between(&pair[0].1, &pair[1].1) {
                 states += 1;
-                let restored = materialize_store_image(dir.path(), &state);
-                let reopened = LiveScrollbackSpillSink::new(
-                    restored.path().to_path_buf(),
-                    &deferred_test_context(),
-                )
-                .unwrap_or_else(|error| panic!("{case}: crash state refused: {error:#}"));
-                let holds = |expected: &[(isize, Line)]| {
-                    reopened.retained_scrollback_rows() == expected.len()
-                        && expected.iter().all(|(row, line)| {
-                            reopened
-                                .load_scrollback_line(*row)
-                                .is_some_and(|mut actual| {
-                                    let mut line = line.clone();
-                                    actual.cells_mut();
-                                    line.cells_mut();
-                                    actual == line
-                                })
-                        })
-                };
-                assert!(
-                    prefixes.iter().any(|expected| holds(expected)),
-                    "{case}: recovered no in-order prefix of the rows before and the batch"
-                );
-                assert!(
-                    reopened
-                        .load_scrollback_line((pre.len() + batch.len()) as isize)
-                        .is_none(),
-                    "{case}"
-                );
+                check_crash_state(dir.path(), &state, pre.len(), &rows, retention, &case);
             }
         }
         states
@@ -23947,6 +24196,486 @@ mod tests {
         );
         states += every_crash_state_of_a_batch_recovers_exactly(&[row("old")], &[row("new")], 1);
         assert!(states >= 40, "only {states} crash states were exercised");
+    }
+
+    /// What a random history does next.
+    #[derive(Clone, Copy, Debug)]
+    enum CrashScheduleStep {
+        /// Offer `rows` rows of `width` cells: a commit window, the path every
+        /// pane takes, once a batch has established the tail.
+        Rows { rows: usize, width: usize },
+        /// An overload gap marker, in its own single-batch transaction.
+        GapMarker,
+        /// Publish the durable tail: WAL, prune, compact, manifest.
+        Flush,
+    }
+
+    /// Steps in a history, and random crash states drawn at each step.
+    const CRASH_SCHEDULE_STEPS: usize = 5;
+    const CRASH_STATES_PER_STEP: usize = 2;
+    /// The crash points after which the rows a step has appended must
+    /// survive any crash: a window's sync, the rename that makes a WAL roll
+    /// forward, and a first row's complete publication.
+    const CRASH_DURABLE_STEPS: [&str; 3] = ["window_rows_synced", "wal_renamed", "committed"];
+
+    fn reopen_crashed_store(base: &std::path::Path) -> anyhow::Result<LiveScrollbackSpillSink> {
+        LiveScrollbackSpillSink::open(
+            base.to_path_buf(),
+            &deferred_test_context(),
+            std::time::Duration::from_secs(3600),
+        )
+    }
+
+    /// The consecutive image pairs that differ, by first index: a crash inside
+    /// one can leave something neither image holds.
+    fn changed_crash_intervals(
+        images: &[(&'static str, scrollback_crash_points::Image)],
+    ) -> Vec<usize> {
+        (0..images.len().saturating_sub(1))
+            .filter(|&interval| images[interval].1 != images[interval + 1].1)
+            .collect()
+    }
+
+    /// Holds a reopened store to what a crash may leave of `rows`: exactly
+    /// the retained part of an in-order prefix that ends at `floor` or later,
+    /// with nothing past it. Returns where the prefix ends.
+    fn assert_recovered_prefix(
+        sink: &LiveScrollbackSpillSink,
+        floor: usize,
+        rows: &[Line],
+        retention: usize,
+        case: &str,
+    ) -> usize {
+        let oldest = sink
+            .oldest_scrollback_row()
+            .map_or(0, |row| usize::try_from(row).unwrap());
+        let newest = oldest + sink.retained_scrollback_rows();
+        assert!(
+            (floor..=rows.len()).contains(&newest),
+            "{case}: recovered rows {oldest}..{newest}, expected a prefix ending in {floor}..={}",
+            rows.len()
+        );
+        assert_eq!(
+            oldest,
+            newest.saturating_sub(retention),
+            "{case}: recovered rows {oldest}..{newest} at retention {retention}"
+        );
+        for (row, expected) in rows.iter().enumerate().take(newest).skip(oldest) {
+            let mut actual = sink
+                .load_scrollback_line(row as isize)
+                .unwrap_or_else(|| panic!("{case}: row {row} of {oldest}..{newest} is missing"));
+            let mut expected = expected.clone();
+            actual.cells_mut();
+            expected.cells_mut();
+            assert_eq!(actual, expected, "{case}: row {row} of {oldest}..{newest}");
+        }
+        assert!(
+            sink.load_scrollback_line(newest as isize).is_none(),
+            "{case}: a row past {newest}"
+        );
+        newest
+    }
+
+    /// Reopens one crash state, holds it to the oracle, and checks the
+    /// recovered sink serves a snapshot of what it holds (a guardian
+    /// checkpoint reads one), still takes a row, and reopens again with it.
+    fn check_crash_state(
+        live: &std::path::Path,
+        state: &scrollback_crash_points::Image,
+        floor: usize,
+        rows: &[Line],
+        retention: usize,
+        case: &str,
+    ) {
+        let restored = materialize_store_image(live, state);
+        let reopened = reopen_crashed_store(restored.path())
+            .unwrap_or_else(|error| panic!("{case}: crash state refused: {error:#}"));
+        let newest = assert_recovered_prefix(&reopened, floor, rows, retention, case);
+        let limits = wezterm_term::config::ScrollbackSnapshotLimits {
+            max_rows: 1 << 16,
+            max_stored_bytes: 1 << 26,
+            max_decoded_bytes: 1 << 26,
+            max_physical_bytes: 1 << 26,
+        };
+        let snapshot = reopened
+            .snapshot_scrollback(newest as isize, limits)
+            .unwrap_or_else(|error| {
+                panic!("{case}: the recovered sink serves no snapshot: {error:?}")
+            });
+        assert_eq!(
+            snapshot.rows().len(),
+            reopened.retained_scrollback_rows(),
+            "{case}: the snapshot of the recovered rows"
+        );
+        let next = Line::from_text("after the crash", &CellAttributes::blank(), 2, None);
+        assert_eq!(
+            reopened.store_scrollback_lines(
+                newest as isize,
+                std::slice::from_ref(&next),
+                retention
+            ),
+            1,
+            "{case}: the recovered sink refused a row at {newest}"
+        );
+        assert_rows_read_back_from(&reopened, newest as isize, &[&next]);
+        // What recovery published must itself open, the next restart's state.
+        drop(reopened);
+        let again = reopen_crashed_store(restored.path()).unwrap_or_else(|error| {
+            panic!("{case}: the recovered store does not reopen: {error:#}")
+        });
+        assert_rows_read_back_from(&again, newest as isize, &[&next]);
+    }
+
+    /// ft-yccm0.2.1.7 AC2: runs one random history on a windowed sink, the
+    /// shape every pane has, imaging the store at each crash point. At every
+    /// step it draws random crash states and holds each to the oracle: rows
+    /// committed before the step survive, so do a step's own rows once a
+    /// durable point after them has passed, and only an in-order prefix
+    /// comes back. Some steps then really crash: the history carries on from
+    /// the recovered store, and a crash inside that recovery must recover the
+    /// same rows. Returns the crash states checked.
+    fn run_crash_schedule(steps: &[CrashScheduleStep], retention: usize, seed: u64) -> usize {
+        let mut random = ScheduleRandom(seed);
+        let mut live = tempfile::tempdir().unwrap();
+        let mut sink = windowed_test_sink(live.path());
+        let mut rows: Vec<Line> = Vec::new();
+        let mut checked = 0;
+        for (index, step) in steps.iter().enumerate() {
+            let before = rows.len();
+            let stable = before as isize;
+            let offered: Vec<Line> = match *step {
+                CrashScheduleStep::Rows { rows: count, width } => (0..count)
+                    .map(|_| {
+                        let text: String =
+                            std::iter::repeat_with(|| format!("{:x}", random.next()))
+                                .flat_map(|hex| hex.chars().collect::<Vec<_>>())
+                                .take(width)
+                                .collect();
+                        Line::from_text(&text, &CellAttributes::blank(), 2, None)
+                    })
+                    .collect(),
+                CrashScheduleStep::GapMarker => vec![Line::from_text(
+                    &format!(
+                        "[durability gap: 3 rows ({stable}..{}), 30 bytes, reason=overload, at_unix_ms=1]",
+                        stable + 3
+                    ),
+                    &CellAttributes::blank(),
+                    1,
+                    None,
+                )],
+                CrashScheduleStep::Flush => Vec::new(),
+            };
+            scrollback_crash_points::record(live.path());
+            let acknowledged = match *step {
+                CrashScheduleStep::Rows { .. } => {
+                    sink.store_scrollback_lines(stable, &offered, retention)
+                }
+                CrashScheduleStep::GapMarker => usize::from(sink.store_scrollback_gap_marker(
+                    stable,
+                    &offered[0],
+                    retention,
+                    3,
+                    30,
+                )),
+                CrashScheduleStep::Flush => {
+                    sink.flush_scrollback().unwrap();
+                    0
+                }
+            };
+            let mut images = scrollback_crash_points::take();
+            images.push(("end", scrollback_crash_points::image(live.path())));
+            assert!(
+                acknowledged > 0 || offered.is_empty(),
+                "step {index} {step:?} committed nothing"
+            );
+            rows.extend_from_slice(&offered[..acknowledged]);
+            // The step's own rows land at its last `rows_appended` (a window
+            // appends and syncs them at once) and are durable from the next
+            // durable point. One before them publishes the rows before them.
+            let own_rows_from = images
+                .iter()
+                .rposition(|(point, _)| *point == "rows_appended")
+                .unwrap_or(0);
+            let durable_from = (own_rows_from..images.len())
+                .find(|&index| CRASH_DURABLE_STEPS.contains(&images[index].0))
+                .unwrap_or(usize::MAX);
+            let intervals = changed_crash_intervals(&images);
+            if intervals.is_empty() {
+                continue;
+            }
+            let mut last = None;
+            for _ in 0..CRASH_STATES_PER_STEP {
+                let interval = intervals[random.below(intervals.len())];
+                let (state, drawn) =
+                    random_crash_state(&images[interval].1, &images[interval + 1].1, &mut random);
+                let floor = if interval >= durable_from {
+                    rows.len()
+                } else {
+                    before
+                };
+                let case = format!(
+                    "step {index} {step:?}, {} -> {}, {drawn}",
+                    images[interval].0,
+                    images[interval + 1].0
+                );
+                check_crash_state(live.path(), &state, floor, &rows, retention, &case);
+                checked += 1;
+                last = Some((state, floor, case));
+            }
+            let Some((state, floor, case)) = last.filter(|_| random.below(4) == 0) else {
+                continue;
+            };
+            let restored = materialize_store_image(live.path(), &state);
+            scrollback_crash_points::record(restored.path());
+            let reopened = reopen_crashed_store(restored.path())
+                .unwrap_or_else(|error| panic!("{case}: crash state refused: {error:#}"));
+            let mut recovery = scrollback_crash_points::take();
+            recovery.push(("end", scrollback_crash_points::image(restored.path())));
+            let newest = assert_recovered_prefix(&reopened, floor, &rows, retention, &case);
+            rows.truncate(newest);
+            for interval in changed_crash_intervals(&recovery) {
+                let (state, drawn) = random_crash_state(
+                    &recovery[interval].1,
+                    &recovery[interval + 1].1,
+                    &mut random,
+                );
+                let case = format!(
+                    "{case}, recovering, {} -> {}, {drawn}",
+                    recovery[interval].0,
+                    recovery[interval + 1].0
+                );
+                check_crash_state(restored.path(), &state, newest, &rows, retention, &case);
+                checked += 1;
+            }
+            sink = reopened;
+            live = restored;
+        }
+        checked
+    }
+
+    /// ft-yccm0.2.1.7: a fresh lineage's first row reaches the ledger after
+    /// its prepared manifest and before any sync, so a crash can leave the
+    /// row's bytes zero-filled: its tail (the file's size reached disk
+    /// first), which reads as a torn line, or the sectors before its last,
+    /// which kept its newline, so the ledger holds a complete row that does
+    /// not open. The row was never acknowledged: reopen cuts it rather than
+    /// refusing the store, and the sink takes rows again.
+    #[test]
+    fn a_zero_filled_first_row_under_its_prepared_manifest_is_cut() {
+        for unwritten in ["its tail", "the sectors before its last"] {
+            let dir = tempfile::tempdir().unwrap();
+            let sink = windowed_test_sink(dir.path());
+            // Random text, so its sealed record spans several sectors.
+            let mut random = ScheduleRandom(7);
+            let text: String = std::iter::repeat_with(|| format!("{:x}", random.next()))
+                .flat_map(|hex| hex.chars().collect::<Vec<_>>())
+                .take(2_000)
+                .collect();
+            let first = Line::from_text(&text, &CellAttributes::blank(), 2, None);
+            scrollback_crash_points::record(dir.path());
+            assert_eq!(
+                sink.store_scrollback_lines(0, std::slice::from_ref(&first), 16),
+                1
+            );
+            let images = scrollback_crash_points::take();
+            let image_at = |point: &str| {
+                images
+                    .iter()
+                    .position(|(name, _)| *name == point)
+                    .unwrap_or_else(|| panic!("no {point} image"))
+            };
+            let (prepared, appended) = (
+                &images[image_at("manifest_renamed")].1,
+                &images[image_at("rows_appended")].1,
+            );
+            let log = appended
+                .keys()
+                .find(|path| path.ends_with("0.log"))
+                .expect("the first row's ledger")
+                .clone();
+            let (kept, grown) =
+                torn_growth(&log, prepared, appended).expect("the first row grows the ledger");
+            let last_sector = (grown.len() - 1) / 512 * 512;
+            assert!(last_sector > kept, "the first row spans sectors");
+            let mut zeroed = grown.to_vec();
+            if unwritten == "its tail" {
+                zeroed[kept + (grown.len() - kept) / 2..].fill(0);
+            } else {
+                zeroed[kept..last_sector].fill(0);
+            }
+            let mut state = appended.clone();
+            state.insert(log, zeroed);
+            check_crash_state(
+                dir.path(),
+                &state,
+                0,
+                std::slice::from_ref(&first),
+                16,
+                &format!("a first row zero-filled in {unwritten}"),
+            );
+        }
+    }
+
+    /// ft-yccm0.2.1.7: a crash while a tail publication writes its WAL stage
+    /// leaves the stage torn. The windows' rows were durable before the
+    /// publication began, and the torn stage never named anything: reopen
+    /// adopts every window row instead of cutting the tail.
+    #[test]
+    fn a_torn_tail_publication_wal_stage_keeps_every_window_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = windowed_test_sink(dir.path());
+        let rows: Vec<Line> = (0..6)
+            .map(|row| Line::from_text(&format!("row {row}"), &CellAttributes::blank(), 2, None))
+            .collect();
+        // The first batch starts the lineage; each later row is a window.
+        for (row, line) in rows.iter().enumerate() {
+            assert_eq!(
+                sink.store_scrollback_lines(row as isize, std::slice::from_ref(line), 16),
+                1
+            );
+        }
+        scrollback_crash_points::record(dir.path());
+        sink.flush_scrollback().unwrap();
+        let images = scrollback_crash_points::take();
+        let staged = images
+            .iter()
+            .position(|(point, _)| *point == "wal_staged")
+            .expect("the tail publication stages its WAL");
+        let (before, after) = (&images[staged - 1].1, &images[staged].1);
+        let wal_stage = after
+            .keys()
+            .find(|path| path.ends_with(LIVE_SCROLLBACK_APPEND_WAL_STAGE_NAME))
+            .expect("the tail's WAL stage")
+            .clone();
+        let (kept, grown) = torn_growth(&wal_stage, before, after).expect("the stage grows");
+        let mut state = before.clone();
+        state.insert(wal_stage, grown[..kept + (grown.len() - kept) / 2].to_vec());
+        check_crash_state(
+            dir.path(),
+            &state,
+            rows.len(),
+            &rows,
+            16,
+            "a torn tail WAL stage",
+        );
+    }
+
+    /// ft-yccm0.2.1.7: a lineage's first row comes on a fresh pane, after a
+    /// flush, or after a clear, and an overload can make it a gap marker. A
+    /// crash before it lands recovers an empty lineage that takes rows and
+    /// lists no gap it does not hold.
+    #[test]
+    fn a_first_row_that_never_landed_recovers_an_empty_lineage() {
+        for (before, gap) in [
+            ("", true),
+            (" after a flush", true),
+            (" after a flush", false),
+            (" after a clear", false),
+            (" after a clear", true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let sink = windowed_test_sink(dir.path());
+            let first = Line::from_text(
+                "[durability gap: 3 rows (0..3), 30 bytes, reason=overload, at_unix_ms=1]",
+                &CellAttributes::blank(),
+                1,
+                None,
+            );
+            if before == " after a flush" {
+                sink.flush_scrollback().unwrap();
+            }
+            if before == " after a clear" {
+                // A cleared lineage has no stable-row origin: its next first
+                // row may land anywhere, row 0 included.
+                let cleared = Line::from_text("cleared", &CellAttributes::blank(), 2, None);
+                assert_eq!(
+                    sink.store_scrollback_lines(0, std::slice::from_ref(&cleared), 16),
+                    1
+                );
+                sink.clear_scrollback().unwrap();
+            }
+            scrollback_crash_points::record(dir.path());
+            if gap {
+                assert!(sink.store_scrollback_gap_marker(0, &first, 16, 3, 30));
+            } else {
+                assert_eq!(
+                    sink.store_scrollback_lines(0, std::slice::from_ref(&first), 16),
+                    1
+                );
+            }
+            let images = scrollback_crash_points::take();
+            for point in ["manifest_staged", "manifest_renamed"] {
+                let state = &images
+                    .iter()
+                    .find(|(name, _)| *name == point)
+                    .unwrap_or_else(|| panic!("no {point} image"))
+                    .1;
+                let case = format!(
+                    "a first {} at {point}{before}",
+                    if gap { "gap marker" } else { "row" }
+                );
+                check_crash_state(
+                    dir.path(),
+                    state,
+                    0,
+                    std::slice::from_ref(&first),
+                    16,
+                    &case,
+                );
+                let restored = materialize_store_image(dir.path(), state);
+                let reopened = reopen_crashed_store(restored.path()).unwrap();
+                assert_eq!(
+                    published_manifest(&reopened).durability_gaps,
+                    Some(LiveScrollbackDurabilityGaps::default()),
+                    "{case}: lists a gap marker it does not hold"
+                );
+            }
+        }
+    }
+
+    /// ft-yccm0.2.1.7 AC2: random crash schedules. The proof lane sets
+    /// FT_CRASH_SCHEDULE_HISTORIES to reach 10k crash states; `--nocapture`
+    /// prints the count. A failure prints the history, its seed, the crash
+    /// point and what was drawn, and the rows expected and recovered.
+    #[test]
+    fn random_crash_schedules_recover_an_exact_committed_prefix() {
+        use proptest::strategy::Strategy as _;
+
+        let histories: u32 = std::env::var("FT_CRASH_SCHEDULE_HISTORIES")
+            .map_or(16, |histories| histories.parse().unwrap());
+        let step = proptest::prop_oneof![
+            4 => (1_usize..6, proptest::sample::select(vec![1_usize, 16, 80, 2_000]))
+                .prop_map(|(rows, width)| CrashScheduleStep::Rows { rows, width }),
+            1 => proptest::strategy::Just(CrashScheduleStep::GapMarker),
+            1 => proptest::strategy::Just(CrashScheduleStep::Flush),
+        ];
+        let schedule = (
+            proptest::collection::vec(step, CRASH_SCHEDULE_STEPS),
+            proptest::sample::select(vec![1_usize, 2, 3, 4, 16, 4096]),
+            proptest::num::u64::ANY,
+        );
+        let checked = std::sync::atomic::AtomicUsize::new(0);
+        let mut runner = proptest::test_runner::TestRunner::new(proptest::test_runner::Config {
+            cases: histories,
+            failure_persistence: None,
+            max_shrink_iters: 64,
+            ..proptest::test_runner::Config::default()
+        });
+        runner
+            .run(&schedule, |(steps, retention, seed)| {
+                checked.fetch_add(
+                    run_crash_schedule(&steps, retention, seed),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                Ok(())
+            })
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        let checked = checked.into_inner();
+        eprintln!("crash schedules: {histories} histories, {checked} crash states");
+        assert!(
+            checked >= histories as usize,
+            "only {checked} crash states in {histories} histories"
+        );
     }
 
     /// Rows past the manifest that no WAL names, here a batch interrupted
