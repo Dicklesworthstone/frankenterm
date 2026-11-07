@@ -14181,7 +14181,8 @@ fn checkpoint_catalog_read_published_candidate(
 /// [`checkpoint_catalog_read_published_candidate`] of a member pinned under
 /// an earlier directory lock hold (a replay snapshot's): the file is opened
 /// and stamped now, so a summary stands in only for a file unchanged since
-/// an authenticated read of it.
+/// an authenticated read of it. A read from the file of a candidate whose
+/// checksum is authenticated is remembered as a scan's is.
 fn checkpoint_catalog_reread_published_candidate(
     inner: &GuardianCheckpointStageStoreInner,
     path: &Path,
@@ -14198,17 +14199,39 @@ fn checkpoint_catalog_reread_published_candidate(
     if !file_identity.matches(&metadata) {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
-    checkpoint_catalog_read_published_candidate(
-        inner,
-        path,
-        file_identity,
-        CheckpointCatalogFileStamp::capture(&metadata),
-    )
+    let stamp = CheckpointCatalogFileStamp::capture(&metadata);
+    let (candidate, source) =
+        checkpoint_catalog_read_published_candidate(inner, path, file_identity, stamp)?;
+    // Pins come from a remembered census (`checkpoint_catalog_replay_census`)
+    // whose scan ran as the newest member was published, before its file
+    // settled, so that scan remembered no summary, and nothing scans the
+    // scope again until it changes. Every page then read and hashed the
+    // whole candidate twice (the selected member and the settled head), and
+    // every open read it once more for its descriptor: a fifth of a 50-pane
+    // guardian's checkpoint worker once each checkpoint held 5 MiB, two
+    // thirds of it pages (ft-upal7). These bytes decoded to a checksum, over
+    // the header and every record, that a read has authenticated: all a
+    // summary is trusted for. The checksum does not cover the adoption
+    // evidence a summary also keeps, so every reader that uses it
+    // authenticates it (a scan, a replay open, a pin check, an Ack check), as
+    // for a scan's.
+    if source == CheckpointCatalogCandidateSource::File
+        && inner
+            .catalog_memo
+            .validated
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&candidate.checksum)
+    {
+        checkpoint_catalog_remember_candidate(inner, stamp, &candidate);
+    }
+    Ok((candidate, source))
 }
 
 /// Remember the summary of a published candidate read from the file that
-/// `stamp` describes, whose records the caller has just authenticated, once
-/// that file has settled (see `CheckpointCatalogFileStamp`).
+/// `stamp` describes, whose records the caller has authenticated (or whose
+/// checksum the memo holds as authenticated), once that file has settled
+/// (see `CheckpointCatalogFileStamp`).
 fn checkpoint_catalog_remember_candidate(
     inner: &GuardianCheckpointStageStoreInner,
     stamp: CheckpointCatalogFileStamp,
@@ -19519,6 +19542,102 @@ mod tests {
             rescanned.map(|scan| scan.published.len())
         );
         assert_eq!(reads() - rewritten, 1);
+        Ok(())
+    }
+
+    /// A replay pin listed before its member settled, as a remembered
+    /// census's are, is read from the file by the first page after the
+    /// member settles and from that read's summary by every later page.
+    #[test]
+    fn a_pinned_member_is_summarized_by_the_first_page_after_it_settles()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-catalog-pin-summary-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let guardian = Uuid::from_u128(0xae200);
+        let mux = Uuid::from_u128(0xae201);
+        let pane = Uuid::from_u128(0xae202);
+        let journal = pipeline.prepare_pane(guardian, pane)?;
+        let mut state = checkpoint_catalog_claimed_protocol_state(guardian, mux, pane)?;
+        // Nothing settles until the test says so.
+        *store.inner.catalog_summary_settle.lock().unwrap() = Duration::from_secs(3600);
+        checkpoint_catalog_stage_and_publish(
+            &pipeline, &store, &journal, &mut state, guardian, mux, pane, 1, 1, 0xae_2000, b"pin;",
+            b"pin;",
+        )?;
+        let (begin, completion) = checkpoint_catalog_newest_begin(&store, pane)?;
+        store.apply_ack_from_committed_catalog(
+            GuardianCheckpointStageRequestV1::ack(
+                begin.scope(),
+                begin.upload_id(),
+                begin.descriptor(),
+                begin.chunk_bytes(),
+                completion,
+            )?,
+            mux,
+        )?;
+        let reads = || {
+            store
+                .inner
+                .catalog_candidate_reads
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        let pin = store.with_exclusive_directory(|inner| {
+            let scan =
+                checkpoint_catalog_scan(inner, CheckpointCatalogScope::Pane { pane_id: pane })?;
+            let member = &scan.published[0];
+            Ok(GuardianReplayCatalogPin {
+                genesis_origin: None,
+                selected: member.clone(),
+                settled_head_identity: member.metadata.identity,
+                settled_head_candidate_checksum: member.candidate_checksum,
+                settled_head_candidate_path: member.candidate_path.clone(),
+                settled_head_candidate_file_identity: member.candidate_file_identity,
+                settled_head_marker_path: member.marker_path.clone(),
+                settled_head_marker_file_identity: member.marker_file_identity,
+            })
+        })?;
+        let take_page = || {
+            store.with_exclusive_directory(|inner| {
+                let (checked, source) = guardian_replay_validate_catalog_pin(inner, &pin)?;
+                let full = guardian_replay_selected_records(inner, &pin, checked, source)?;
+                Ok((source, full.records.len()))
+            })
+        };
+
+        let unsettled = reads();
+        for _ in 0..2 {
+            let (source, records) = take_page()?;
+            assert_eq!(source, CheckpointCatalogCandidateSource::File);
+            assert!(records > 2, "{records} records");
+        }
+        assert_eq!(
+            reads() - unsettled,
+            4,
+            "an unsettled pin reads its selected member and its head every page"
+        );
+
+        *store.inner.catalog_summary_settle.lock().unwrap() = Duration::ZERO;
+        let settled = reads();
+        assert_eq!(take_page()?.0, CheckpointCatalogCandidateSource::File);
+        for _ in 0..3 {
+            let (source, records) = take_page()?;
+            assert_eq!(
+                source,
+                CheckpointCatalogCandidateSource::Summary,
+                "a pin re-read after its member settled comes from that read's summary"
+            );
+            assert!(records > 2, "a checkpoint page still gets every record");
+        }
+        // A checkpoint page still reads the member's records from its file
+        // (`guardian_replay_selected_records`); the pin check no longer does.
+        assert_eq!(
+            reads() - settled,
+            1,
+            "a pin check reads its member once after the member settles"
+        );
         Ok(())
     }
 
