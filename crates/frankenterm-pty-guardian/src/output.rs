@@ -568,7 +568,10 @@ struct GuardianCheckpointStageStoreInner {
     custody_sync_failure: std::sync::atomic::AtomicU8,
     #[cfg(test)]
     custody_publication_cut: std::sync::atomic::AtomicU8,
-    /// Published candidate files read in full.
+    /// Published candidate files read in full by
+    /// `checkpoint_catalog_read_published_candidate` (scans, replay opens, pin
+    /// checks and Ack checks); other full reads, such as a checkpoint page's,
+    /// are not counted.
     #[cfg(test)]
     catalog_candidate_reads: std::sync::atomic::AtomicUsize,
     /// Catalog candidates' payloads decoded and validated.
@@ -14209,12 +14212,13 @@ fn checkpoint_catalog_reread_published_candidate(
     // whole candidate twice (the selected member and the settled head), and
     // every open read it once more for its descriptor: a fifth of a 50-pane
     // guardian's checkpoint worker once each checkpoint held 5 MiB, two
-    // thirds of it pages (ft-upal7). These bytes decoded to a checksum, over
-    // the header and every record, that a read has authenticated: all a
-    // summary is trusted for. The checksum does not cover the adoption
-    // evidence a summary also keeps, so every reader that uses it
-    // authenticates it (a scan, a replay open, a pin check, an Ack check), as
-    // for a scan's.
+    // thirds of it pages (ft-upal7). The bytes read decoded to a checksum,
+    // over the header and every record, that the memo holds because an
+    // earlier check of those records authenticated them: all a summary is
+    // trusted for. That checksum does not cover the adoption evidence a
+    // summary also keeps, so every reader that uses the evidence
+    // authenticates it itself (a scan, a replay open, a pin check, an Ack
+    // check), as it does for a scan's summary.
     if source == CheckpointCatalogCandidateSource::File
         && inner
             .catalog_memo
@@ -19631,8 +19635,10 @@ mod tests {
             );
             assert!(records > 2, "a checkpoint page still gets every record");
         }
-        // A checkpoint page still reads the member's records from its file
-        // (`guardian_replay_selected_records`); the pin check no longer does.
+        // `reads` counts only `checkpoint_catalog_read_published_candidate`,
+        // so it leaves out a checkpoint page's own read of the member's
+        // records (`guardian_replay_selected_records`) and counts the pin
+        // checks alone.
         assert_eq!(
             reads() - settled,
             1,

@@ -37,7 +37,7 @@ Base and fixed release-perf guardians with the same release-interactive mux serv
 fc1aa61b8's change); base, fix, fix, base. The fixed guardian is gate 5130b7bdf; the landed
 change (2faddbeb8) has the same code and differs only in comments and in its new test.
 
-| run | Replay ops | Replay time | per op | worker busy | gen 1 | gen 2 |
+| run | Replay ops | Replay time | per op | worker busy | gen 1 capture | gen 2 capture |
 |---|---|---|---|---|---|---|
 | base 1 | 10,268 | 81.1 s | 7.9 ms | 169.6 s | 33.7 s | 104.4 s |
 | fix 1 | 12,626 | 36.5 s | 2.9 ms | 130.5 s | 38.5 s | 104.7 s |
