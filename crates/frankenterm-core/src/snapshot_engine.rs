@@ -5730,6 +5730,15 @@ impl SnapshotEngine {
                 },
             ));
         }
+        // A pane ID SQLite cannot hold is the caller's input, not a storage
+        // fault: refuse it before any auxiliary database read, as preparation
+        // would, so the capture fails retry-safe without opening the database.
+        if let Some(pane) = panes
+            .iter()
+            .find(|pane| i64::try_from(pane.pane_id).is_err())
+        {
+            return Err(SnapshotPreparationError::PaneIdRange(pane.pane_id).into());
+        }
 
         let mut options = options;
         let include_scrollback = options.include_scrollback;
@@ -21358,6 +21367,13 @@ mod tests {
                 .expect_err("an unrepresentable pane ID must abort the first capture");
             assert!(matches!(&error, SnapshotError::Serialization(message)
                 if message.contains("exceeds SQLite integer range")));
+            assert_eq!(
+                engine
+                    .auxiliary_projection_read_attempts
+                    .load(Ordering::Relaxed),
+                0,
+                "an unrepresentable pane ID must fail before the auxiliary read phase"
+            );
             assert!(!error.requires_reconciliation());
             assert!(
                 !engine
