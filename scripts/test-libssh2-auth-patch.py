@@ -18,6 +18,85 @@ import subprocess
 import tempfile
 
 
+def verify_sftp_bounds(prepared: Path, work: Path, compiler: list[str]) -> None:
+    """Compile the actual upstream response parser with ASan/UBSan."""
+    misc = (prepared / "src/misc.c").read_text()
+    helpers = []
+    for name in ("_libssh2_check_length", "_libssh2_get_byte",
+                 "_libssh2_get_u32", "_libssh2_get_string"):
+        start = misc.index("int " + name + "(")
+        end = misc.index("\n}", start) + 2
+        helpers.append(misc[start:end])
+    sftp = (prepared / "src/sftp.c").read_text()
+    start = sftp.index("    buf.data = data;", sftp.index("sftp_symlink("))
+    end = sftp.index("    return retcode;\n}", start)
+    parser = sftp[start:end] + "    return retcode;\n}"
+    harness = r'''
+#include <assert.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+struct string_buf { unsigned char *data, *dataptr; size_t len; };
+#define _libssh2_ntohu32(p) (((uint32_t)(p)[0]<<24)|((uint32_t)(p)[1]<<16)|((uint32_t)(p)[2]<<8)|(p)[3])
+#define LIBSSH2_FREE(session, data) free(data)
+#define _libssh2_error(session, code, message) (code)
+#define LIBSSH2_ERROR_SFTP_PROTOCOL (-31)
+#define LIBSSH2_ERROR_BUFFER_TOO_SMALL (-38)
+#define LIBSSH2_ERROR_NONE 0
+#define LIBSSH2_FX_OK 0
+#define SSH_FXP_STATUS 101
+'''
+    harness += "\n".join(helpers)
+    harness += r'''
+static int parse(unsigned char *data, size_t data_len, char *target, size_t target_len) {
+    struct string_buf buf;
+    unsigned char packet_type, *lk_target;
+    size_t lk_len;
+    uint32_t tmp_u32;
+    int retcode;
+    struct { int last_errno; } state = {0}, *sftp = &state;
+'''
+    harness += parser
+    harness += r'''
+int main(void) {
+    const unsigned char good[] = {104,0,0,0,1,0,0,0,1,0,0,0,3,'a','b','c'};
+    unsigned cases = 0;
+    for(size_t n = 0; n < sizeof(good); ++n) {
+        unsigned char *packet = malloc(n ? n : 1);
+        memcpy(packet, good, n);
+        char out[8]; memset(out, 'X', sizeof(out));
+        assert(parse(packet, n, out, sizeof(out)) == LIBSSH2_ERROR_SFTP_PROTOCOL);
+        for(size_t i = 0; i < sizeof(out); ++i) assert(out[i] == 'X');
+        ++cases;
+    }
+    for(size_t capacity = 0; capacity <= 4; ++capacity) {
+        unsigned char *packet = malloc(sizeof(good)); memcpy(packet, good, sizeof(good));
+        char out[8]; memset(out, 'X', sizeof(out));
+        int rc = parse(packet, sizeof(good), out, capacity);
+        assert(rc == (capacity > 3 ? 3 : LIBSSH2_ERROR_BUFFER_TOO_SMALL));
+        if(capacity > 3) assert(strcmp(out, "abc") == 0);
+        else for(size_t i = 0; i < sizeof(out); ++i) assert(out[i] == 'X');
+        ++cases;
+    }
+    unsigned char *packet = malloc(sizeof(good)); memcpy(packet, good, sizeof(good));
+    memset(packet + 9, 255, 4);
+    char out[8]; memset(out, 'X', sizeof(out));
+    assert(parse(packet, sizeof(good), out, sizeof(out)) == LIBSSH2_ERROR_SFTP_PROTOCOL);
+    for(size_t i = 0; i < sizeof(out); ++i) assert(out[i] == 'X');
+    printf("Actual SFTP response parser: %u cases passed with sanitizers\n", cases + 1);
+    return 0;
+}
+'''
+    source = work / "sftp-bounds.c"
+    source.write_text(harness)
+    executable = work / "sftp-bounds"
+    subprocess.run(compiler + ["-std=c99", "-Wall", "-Wextra", "-Werror",  # ubs:ignore — explicit operator-selected compiler argv, never a shell command
+                              "-fsanitize=address,undefined", str(source),
+                              "-o", str(executable)], check=True, timeout=60)
+    subprocess.run([str(executable)], check=True, timeout=30)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("upstream_source", type=Path)
@@ -28,7 +107,7 @@ def main() -> None:
     prepared = subprocess.run(
         ["bash", str(scripts / "prepare-libssh2-auth-source.sh"),
          str(args.upstream_source.resolve(strict=True)), str(work / "sources")],
-        check=True, text=True, stdout=subprocess.PIPE,
+        check=True, text=True, stdout=subprocess.PIPE, timeout=60,
     )
     source = (Path(prepared.stdout.strip()) / "src/userauth.c").read_text()
     first = "size_t plain_method(char *method, size_t method_len)"
@@ -52,13 +131,14 @@ def main() -> None:
     if not compiler:
         raise RuntimeError("a C compiler is required")
     executable = work / "key-sign-algorithms"
-    subprocess.run(
+    subprocess.run(  # ubs:ignore — explicit operator-selected compiler argv, never a shell command
         compiler + ["-std=c99", "-Wall", "-Wextra", "-Werror", "-pedantic",
                     "-I", str(work), str(scripts / "fixtures/libssh2-key-sign-algorithms.c"),
                     "-o", str(executable)],
-        check=True,
+        check=True, timeout=60,
     )
-    subprocess.run([str(executable)], check=True)
+    subprocess.run([str(executable)], check=True, timeout=30)
+    verify_sftp_bounds(Path(prepared.stdout.strip()), work, compiler)
     print(f"Diagnostic artifacts retained at {work}")
 
 

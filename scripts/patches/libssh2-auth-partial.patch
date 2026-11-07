@@ -355,16 +355,3 @@ diff --git a/src/sftp.c b/src/sftp.c
                  }
  
                  if(rc32 != chunk->len) {
-@@ -3921,6 +3937,11 @@
--    /* this reads a u32 and stores it into a signed 32bit value */
-+    /* Validate the complete peer string before copying any filename bytes. */
-     link_len = _libssh2_ntohu32(data + 9);
-+    if(link_len > data_len - 13) {
-+        LIBSSH2_FREE(session, data);
-+        return _libssh2_error(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
-+                              "SFTP READLINK/REALPATH packet too short");
-+    }
-     if(link_len < target_len) {
-         memcpy(target, data + 13, link_len);
-         target[link_len] = 0;
-         retcode = (int)link_len;
