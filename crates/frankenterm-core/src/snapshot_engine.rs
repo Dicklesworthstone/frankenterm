@@ -413,6 +413,35 @@ const MIN_PANE_CHECKPOINT_BYTES: usize = 1024 * 1024;
 #[cfg(feature = "frankenterm-deps")]
 const FIRST_ROOT_PANE_CHECKPOINT_BYTES: usize = MIN_PANE_CHECKPOINT_BYTES;
 
+/// The limits of the first attempt at a pane's checkpoint, `limits` unless
+/// the pane awaits its first root. Then the checkpoint encodes to at most
+/// [`FIRST_ROOT_PANE_CHECKPOINT_BYTES`] (or the pane's own smaller share of
+/// the capture), read from at most that much of the pane's durable store.
+/// Reading the whole store to keep the newest 7,000 rows took more than half
+/// of a first root's capture (ft-upal7). For those flooded rows a store row
+/// took about the bytes its encoding did (127 and 135), so the checkpoint
+/// kept as many rows; where rows take more bytes in the store than encoded,
+/// the checkpoint keeps fewer, and the store still holds every older row.
+/// The store is read newest first, back from the resident rows, so the
+/// checkpoint still continues it.
+#[cfg(feature = "frankenterm-deps")]
+fn first_attempt_limits(
+    limits: frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits,
+    awaits_first_root: bool,
+) -> frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits {
+    if !awaits_first_root {
+        return limits;
+    }
+    let mut first_root = limits;
+    first_root.max_encoded_bytes = limits
+        .max_encoded_bytes
+        .min(FIRST_ROOT_PANE_CHECKPOINT_BYTES);
+    first_root.max_cold_scrollback_bytes = limits
+        .max_cold_scrollback_bytes
+        .min(first_root.max_encoded_bytes);
+    first_root
+}
+
 /// What the next pane's checkpoint may encode to in a whole-mux capture. Over
 /// the mux-wide ceiling a capture fails and every later one fails the same way,
 /// so no root is published again, and a checkpoint at this limit only drops its
@@ -491,9 +520,9 @@ impl CaptureTiming {
 }
 
 /// A new guardian checkpoint of `pane` for a whole-mux capture, within the
-/// capture's deadline. While the pane awaits its first root it is taken at
-/// [`FIRST_ROOT_PANE_CHECKPOINT_BYTES`], and again at `limits` if that capture
-/// fails (a screen of large images exceeds it). An error comes with whether a
+/// capture's deadline. It is taken at [`first_attempt_limits`], and again at
+/// `limits` if that capture fails at a smaller encoding than `limits` allows
+/// (a screen of large images exceeds it). An error comes with whether a
 /// checkpoint the pane kept may stand in for this one: the pane was busy, its
 /// parser could not reach a recovery ground in time, the capture ran out of
 /// budget, or the capture failed with the pane still consistent.
@@ -508,12 +537,8 @@ fn capture_fresh_guardian_checkpoint(
     timing: &CaptureTiming,
 ) -> Result<mux::guardian_checkpoint::PublishedGuardianCheckpoint, (WholeMuxCaptureError, bool)> {
     use mux::LiveParserCheckpointError as Live;
-    let mut attempt_limits = limits;
-    if limits.max_encoded_bytes > FIRST_ROOT_PANE_CHECKPOINT_BYTES
-        && mux.guardian_pane_awaits_first_root(pane.pane_id)
-    {
-        attempt_limits.max_encoded_bytes = FIRST_ROOT_PANE_CHECKPOINT_BYTES;
-    }
+    let mut attempt_limits =
+        first_attempt_limits(limits, mux.guardian_pane_awaits_first_root(pane.pane_id));
     loop {
         // The budget grows with the panes; one pane's parser wait stays within
         // the configured timeout, as before.
@@ -14661,6 +14686,57 @@ mod tests {
         assert_eq!(
             whole_mux_recovery_budget(base, usize::MAX),
             base + Duration::from_secs(3 * u64::from(u32::MAX))
+        );
+    }
+
+    /// ft-upal7: a first-root capture encodes at most its checkpoint size
+    /// and reads at most what it may encode from the pane's store, a pane's
+    /// smaller share of the capture included, and keeps the pane's own
+    /// limits otherwise, a smaller one included. Any other capture keeps
+    /// the pane's limits.
+    #[test]
+    #[cfg(feature = "frankenterm-deps")]
+    fn a_first_root_attempt_reads_and_encodes_at_most_its_checkpoint_size() {
+        use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits;
+        let limits = TerminalCheckpointLimits::default();
+        assert!(limits.max_encoded_bytes > FIRST_ROOT_PANE_CHECKPOINT_BYTES);
+        assert!(limits.max_cold_scrollback_bytes > FIRST_ROOT_PANE_CHECKPOINT_BYTES);
+        assert_eq!(first_attempt_limits(limits, false), limits);
+        let first_root = first_attempt_limits(limits, true);
+        assert_eq!(
+            first_root.max_encoded_bytes,
+            FIRST_ROOT_PANE_CHECKPOINT_BYTES
+        );
+        assert_eq!(
+            first_root.max_cold_scrollback_bytes, FIRST_ROOT_PANE_CHECKPOINT_BYTES,
+            "a first root reads no more of the store than it can keep"
+        );
+        let mut rest = first_root;
+        rest.max_encoded_bytes = limits.max_encoded_bytes;
+        rest.max_cold_scrollback_bytes = limits.max_cold_scrollback_bytes;
+        assert_eq!(rest, limits);
+
+        let mut small = limits;
+        small.max_cold_scrollback_bytes = 4096;
+        assert_eq!(
+            first_attempt_limits(small, true).max_cold_scrollback_bytes,
+            4096
+        );
+
+        // The mux-wide ceiling can leave a pane less than the first-root
+        // size (`next_pane_checkpoint_limit`): past 256 panes, or once the
+        // panes before it took more than that each.
+        let mut squeezed = limits;
+        squeezed.max_encoded_bytes = FIRST_ROOT_PANE_CHECKPOINT_BYTES / 2;
+        let first_root = first_attempt_limits(squeezed, true);
+        assert_eq!(
+            first_root.max_encoded_bytes,
+            FIRST_ROOT_PANE_CHECKPOINT_BYTES / 2
+        );
+        assert_eq!(
+            first_root.max_cold_scrollback_bytes,
+            FIRST_ROOT_PANE_CHECKPOINT_BYTES / 2,
+            "a squeezed first root reads no more of the store than it may encode"
         );
     }
 
