@@ -649,6 +649,10 @@ fn default_color_map() -> HashMap<u16, RgbColor> {
 /// stops reading its input must not stall the parser or the GUI while they
 /// hold the terminal lock (ft-yccm0.2.2.5). Completion is observable only
 /// through [`TerminalState::writer_barrier`].
+///
+/// The thread resends what the child's writer refused for now (see
+/// [`write_error_is_transient`]) and stops only on any other error, which
+/// says the child's input is gone.
 enum ThreadedWriter {
     Live {
         sender: Sender<WriterMessage>,
@@ -815,6 +819,87 @@ enum WriterMessage {
     Barrier(Sender<std::io::Result<()>>),
 }
 
+/// The first pause before the writer thread resends input its writer refused
+/// for now; it doubles up to [`WRITER_RESEND_MAX_PAUSE`].
+const WRITER_RESEND_FIRST_PAUSE: std::time::Duration = std::time::Duration::from_millis(5);
+const WRITER_RESEND_MAX_PAUSE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Whether a write error says that the child's input is still there and took
+/// no byte of this call, so the same bytes must be sent again later.
+///
+/// A guardian-backed pane's writer answers so while its guardian is busy or
+/// slower than the client's socket timeout (EAGAIN, so `WouldBlock`, on macOS
+/// and Linux) and while its last input is still settling. It keeps that input
+/// pending by identity and settles it exactly once when the same bytes come
+/// again; any other bytes are refused until then. Before this, one such error
+/// ended the writer thread with the input unsent, and the pane took no input
+/// and no recovery capture again (ft-jrhpr). A blocking PTY never returns
+/// either kind. An error that proves the bytes will never be taken, such as a
+/// guardian's `InputKnownNotApplied`, is not one of these.
+fn write_error_is_transient(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
+/// Writes every byte of `bytes` in order. A transient refusal resends the
+/// unwritten tail unchanged after a pause, for as long as `abandoned` says
+/// someone still holds the terminal. Any other error, or a refusal after the
+/// terminal is gone, ends the write with that error. `refusing` carries the
+/// thread's state across calls, so a stall logs once when it starts and once
+/// when it ends.
+fn write_all_resending(
+    writer: &mut dyn std::io::Write,
+    mut bytes: &[u8],
+    abandoned: &dyn Fn() -> bool,
+    refusing: &mut Option<std::time::Instant>,
+) -> std::io::Result<()> {
+    let mut pause = WRITER_RESEND_FIRST_PAUSE;
+    while !bytes.is_empty() {
+        match writer.write(bytes) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "terminal writer took no byte",
+                ))
+            }
+            Ok(written) => match bytes.get(written..) {
+                Some(rest) => {
+                    bytes = rest;
+                    pause = WRITER_RESEND_FIRST_PAUSE;
+                }
+                None => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "terminal writer claimed more bytes than it was given",
+                    ))
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) if write_error_is_transient(err.kind()) && !abandoned() => {
+                if refusing.is_none() {
+                    log::warn!(
+                        "terminal writer: the child's input refused {} bytes for now; resending them until it takes them: {err:#}",
+                        bytes.len()
+                    );
+                    *refusing = Some(std::time::Instant::now());
+                }
+                std::thread::sleep(pause);
+                pause = pause.saturating_mul(2).min(WRITER_RESEND_MAX_PAUSE);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    if let Some(since) = refusing.take() {
+        log::info!(
+            "terminal writer: the child's input took the resent bytes after {:?}",
+            since.elapsed()
+        );
+    }
+    Ok(())
+}
+
 impl ThreadedWriter {
     fn new(writer: Box<dyn std::io::Write + Send>) -> Self {
         match Self::try_new(writer) {
@@ -840,25 +925,43 @@ impl ThreadedWriter {
         std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
+                // The terminal's `Live` writer holds the only other reference,
+                // so a count of one means nobody can wait for these bytes.
+                let abandoned = || Arc::strong_count(&thread_counters) == 1;
+                let mut refusing = None;
                 while let Ok(msg) = receiver.recv() {
                     match msg {
                         WriterMessage::Data { bytes, class } => {
-                            let result = writer.write_all(&bytes);
+                            let result = write_all_resending(
+                                &mut *writer,
+                                &bytes,
+                                &abandoned,
+                                &mut refusing,
+                            );
                             thread_counters
                                 .pending(class)
                                 .fetch_sub(bytes.len(), Ordering::Relaxed);
-                            if result.is_err() {
+                            if let Err(err) = result {
+                                if !abandoned() {
+                                    log::warn!(
+                                        "terminal writer stopped; later input to this terminal is refused: {err:#}"
+                                    );
+                                }
                                 break;
                             }
                         }
-                        WriterMessage::Flush => {
-                            if writer.flush().is_err() {
-                                break;
-                            }
-                        }
+                        // A transient flush error leaves no byte unsent, so
+                        // the thread goes on.
+                        WriterMessage::Flush => match writer.flush() {
+                            Err(err) if !write_error_is_transient(err.kind()) => break,
+                            Ok(()) | Err(_) => {}
+                        },
                         WriterMessage::Barrier(ack) => {
                             let result = writer.flush();
-                            let should_break = result.is_err();
+                            let should_break = matches!(
+                                &result,
+                                Err(err) if !write_error_is_transient(err.kind())
+                            );
                             let _ = ack.send(result);
                             if should_break {
                                 break;
@@ -866,9 +969,10 @@ impl ThreadedWriter {
                         }
                     }
                 }
-                // The child's input is gone. Discard what is still queued so
-                // the backlog counters stay truthful; pending barriers see a
-                // disconnect and report BrokenPipe.
+                // The child's input is gone, or nobody holds the terminal.
+                // Discard what is still queued so the backlog counters stay
+                // truthful; pending barriers see a disconnect and report
+                // BrokenPipe.
                 for msg in receiver.try_iter() {
                     if let WriterMessage::Data { bytes, class } = msg {
                         thread_counters
@@ -4956,6 +5060,212 @@ mod tests {
         drain_writer(&mut terminal);
         drop(terminal);
         assert_eq!(read.join().unwrap().len(), STALLING_PASTE_BYTES);
+    }
+
+    /// What a [`ScriptedChildInput`] does on one `write` call.
+    #[derive(Clone, Copy, Debug)]
+    enum ChildInputStep {
+        /// Takes at most this many bytes.
+        Take(usize),
+        /// Takes nothing and fails with this kind.
+        Refuse(std::io::ErrorKind),
+    }
+
+    /// A child's input that answers its writes from `writes`, one call at a
+    /// time, and then with `then`, and fails its flushes with `flushes` before
+    /// it succeeds. It records every byte it took and its calls, and says when
+    /// the writer thread drops it.
+    struct ScriptedChildInput {
+        writes: std::collections::VecDeque<ChildInputStep>,
+        flushes: std::collections::VecDeque<std::io::ErrorKind>,
+        then: ChildInputStep,
+        child: ScriptedChild,
+    }
+
+    #[derive(Clone, Default)]
+    struct ScriptedChild {
+        taken: Arc<std::sync::Mutex<Vec<u8>>>,
+        write_calls: Arc<AtomicUsize>,
+        flush_calls: Arc<AtomicUsize>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl std::io::Write for ScriptedChildInput {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.child.write_calls.fetch_add(1, Ordering::SeqCst);
+            match self.writes.pop_front().unwrap_or(self.then) {
+                ChildInputStep::Take(limit) => {
+                    let took = buf.len().min(limit);
+                    self.child
+                        .taken
+                        .lock()
+                        .unwrap()
+                        .extend_from_slice(&buf[..took]);
+                    Ok(took)
+                }
+                ChildInputStep::Refuse(kind) => Err(std::io::Error::new(kind, "scripted refusal")),
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.child.flush_calls.fetch_add(1, Ordering::SeqCst);
+            match self.flushes.pop_front() {
+                Some(kind) => Err(std::io::Error::new(kind, "scripted flush refusal")),
+                None => Ok(()),
+            }
+        }
+    }
+
+    impl Drop for ScriptedChildInput {
+        fn drop(&mut self) {
+            self.child.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn terminal_with_scripted_child(
+        writes: &[ChildInputStep],
+        flushes: &[std::io::ErrorKind],
+        then: ChildInputStep,
+    ) -> (TerminalState, ScriptedChild) {
+        let child = ScriptedChild::default();
+        let input = ScriptedChildInput {
+            writes: writes.iter().copied().collect(),
+            flushes: flushes.iter().copied().collect(),
+            then,
+            child: child.clone(),
+        };
+        let config: Arc<dyn TerminalConfiguration> = Arc::new(TestTermConfig {
+            kitty_budget: 1024,
+            unicode_version: UnicodeVersion::new(14),
+            scorecard_enabled: false,
+            checksum_rectangular_area: false,
+        });
+        let terminal = TerminalState::new(
+            TerminalSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 640,
+                pixel_height: 384,
+                dpi: 96,
+            },
+            config,
+            "test-program",
+            "1.0",
+            Box::new(input),
+        );
+        (terminal, child)
+    }
+
+    fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !condition() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting until {}",
+                what
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// A guardian-backed pane's writer refuses input with WouldBlock or
+    /// TimedOut while its guardian is busy or stalled, and settles it exactly
+    /// once when the same bytes come again (ft-jrhpr).
+    #[test]
+    fn the_writer_thread_resends_what_its_child_refused_for_now() {
+        use std::io::ErrorKind::{Interrupted, TimedOut, WouldBlock};
+        let (mut terminal, child) = terminal_with_scripted_child(
+            &[
+                ChildInputStep::Refuse(WouldBlock),
+                ChildInputStep::Take(3),
+                ChildInputStep::Refuse(TimedOut),
+                ChildInputStep::Refuse(Interrupted),
+                ChildInputStep::Refuse(WouldBlock),
+                ChildInputStep::Take(4),
+                ChildInputStep::Refuse(WouldBlock),
+            ],
+            &[],
+            ChildInputStep::Take(usize::MAX),
+        );
+        terminal.send_paste("hello world").unwrap();
+        terminal.send_paste("again").unwrap();
+        drain_writer(&mut terminal);
+        assert_eq!(child.taken.lock().unwrap().as_slice(), b"hello worldagain");
+        assert_eq!(terminal.writer_backlog(), WriterBacklog::default());
+        assert!(
+            child.write_calls.load(Ordering::SeqCst) >= 8,
+            "every scripted refusal was answered by a resend"
+        );
+        assert!(!child.dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_write_error_that_is_not_transient_still_stops_the_writer() {
+        let (mut terminal, child) = terminal_with_scripted_child(
+            &[ChildInputStep::Refuse(std::io::ErrorKind::BrokenPipe)],
+            &[],
+            ChildInputStep::Take(usize::MAX),
+        );
+        terminal.send_paste("lost").unwrap();
+        let err = terminal
+            .writer_barrier()
+            .wait(std::time::Duration::from_secs(10))
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe, "{err}");
+        wait_until("the writer thread drops the child's input", || {
+            child.dropped.load(Ordering::SeqCst)
+        });
+        assert_eq!(child.write_calls.load(Ordering::SeqCst), 1);
+        assert!(child.taken.lock().unwrap().is_empty());
+        assert_eq!(terminal.writer_backlog(), WriterBacklog::default());
+        wait_until("later input is refused", || {
+            terminal.send_paste("later").is_err()
+        });
+    }
+
+    #[test]
+    fn the_writer_thread_stops_resending_once_its_terminal_is_gone() {
+        let (mut terminal, child) = terminal_with_scripted_child(
+            &[],
+            &[],
+            ChildInputStep::Refuse(std::io::ErrorKind::WouldBlock),
+        );
+        terminal.send_paste("never taken").unwrap();
+        wait_until("the writer thread resends", || {
+            child.write_calls.load(Ordering::SeqCst) >= 3
+        });
+        drop(terminal);
+        wait_until("the writer thread drops the child's input", || {
+            child.dropped.load(Ordering::SeqCst)
+        });
+        assert!(child.taken.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_transient_flush_error_leaves_the_writer_running() {
+        use std::io::ErrorKind::{TimedOut, WouldBlock};
+        let (mut terminal, child) = terminal_with_scripted_child(
+            &[],
+            &[WouldBlock, TimedOut],
+            ChildInputStep::Take(usize::MAX),
+        );
+        terminal.send_paste("a").unwrap();
+        // The refused flushes are send_paste's own or a barrier's; a barrier
+        // reports the refusal it met, and the writer goes on.
+        for _ in 0..3 {
+            if let Err(err) = terminal
+                .writer_barrier()
+                .wait(std::time::Duration::from_secs(10))
+            {
+                assert!(matches!(err.kind(), WouldBlock | TimedOut), "{}", err);
+            }
+        }
+        drain_writer(&mut terminal);
+        terminal.send_paste("b").unwrap();
+        drain_writer(&mut terminal);
+        assert_eq!(child.taken.lock().unwrap().as_slice(), b"ab");
+        assert!(child.flush_calls.load(Ordering::SeqCst) >= 4);
+        assert!(!child.dropped.load(Ordering::SeqCst));
     }
 
     #[test]
