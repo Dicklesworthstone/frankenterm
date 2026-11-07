@@ -4434,6 +4434,7 @@ impl GuardianRuntime {
                                         BrokerControlClientError::SpawnQuarantined => "spawn-quarantined",
                                         BrokerControlClientError::SpawnPtyAvailable => "spawn-pty-available",
                                         BrokerControlClientError::ConnectionPoisoned => "connection-poisoned",
+                                        BrokerControlClientError::InputRefused => "input-refused",
                                     };
                                     eprintln!("GENESIS_OPEN_INITIAL_FAILED class={label}");
                                 }

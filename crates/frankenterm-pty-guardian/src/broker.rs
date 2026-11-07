@@ -224,6 +224,12 @@ const BROKER_CONTROL_REQUEST_PAYLOAD_OFFSET: usize = 208;
 const BROKER_CONTROL_RESPONSE_FIXED_BYTES: usize = 228;
 const BROKER_CONTROL_RESPONSE_PAYLOAD_OFFSET: usize = 196;
 const BROKER_CONTROL_HELLO_PAYLOAD_BYTES: usize = 48;
+/// A Write's Applied reply carries no payload when every byte went, or this
+/// many bytes, a big-endian u32 count of the leading bytes that went, when
+/// the PTY took only a prefix (ft-twwf2). A guardian that predates the count
+/// rejects such a reply as malformed, which costs it what a Quarantined reply
+/// did before.
+const BROKER_WRITE_PREFIX_PAYLOAD_BYTES: usize = 4;
 const BROKER_CONTROL_CENSUS_REQUEST_BYTES: usize = 30;
 const BROKER_CONTROL_CENSUS_PAGE_MAGIC: [u8; 4] = *b"FTBC";
 const BROKER_CONTROL_CENSUS_PAGE_VERSION: u16 = 1;
@@ -240,6 +246,15 @@ const BROKER_CONTROL_ACCEPT_QUANTUM: usize = 32;
 const BROKER_CONTROL_MAX_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const BROKER_CONTROL_AUTHENTICATION_DEADLINE: Duration = Duration::from_secs(5);
 const BROKER_CONTROL_CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long an input resends a Write the broker could not start (a full PTY
+/// input queue, or a drain holding the reader) before it gives up with no
+/// byte written (ft-twwf2). A reading program empties the queue within
+/// milliseconds, but a drain lasts as long as its journal's fsync. The
+/// resends hold the mux's broker session, and with it every one of its panes,
+/// and the mux's main thread waits for the reply, so a program that does not
+/// read holds them for this long. It matches the mux's own input retry budget
+/// and leaves the reply well inside the mux's 5 s read timeout.
+const BROKER_INPUT_NOT_READY_WAIT: Duration = Duration::from_secs(2);
 const BROKER_CONTROL_CENSUS_COLLECTION_TIMEOUT: Duration = Duration::from_secs(5);
 // The least time an exchange of a repeated request gets for its own I/O,
 // however near its caller's deadline (`repeated_exchange_budget`), and the
@@ -1860,8 +1875,17 @@ impl BrokerControlResponseHeaderV1 {
                     && self.output_sequence_end == 0
                     && ((successful && payload_bytes == 16) || (unsuccessful && payload_bytes == 0))
             }
-            BrokerControlOperationV1::Write
-            | BrokerControlOperationV1::Resize
+            BrokerControlOperationV1::Write => {
+                pane_scoped
+                    && self.lease_generation > 0
+                    && ((empty_effect && (successful || unsuccessful))
+                        || (self.status == BrokerControlResponseStatusV1::Applied
+                            && self.child_identity.is_none()
+                            && self.output_sequence_start == 0
+                            && self.output_sequence_end == 0
+                            && payload_bytes == BROKER_WRITE_PREFIX_PAYLOAD_BYTES))
+            }
+            BrokerControlOperationV1::Resize
             | BrokerControlOperationV1::SignalTerminate
             | BrokerControlOperationV1::AcknowledgeOutput
             | BrokerControlOperationV1::RetirePane => {
@@ -2395,6 +2419,8 @@ pub enum BrokerControlClientError {
     SpawnPtyAvailable,
     #[error("broker client connection is poisoned after an ambiguous exchange")]
     ConnectionPoisoned,
+    #[error("broker refused the input before writing any byte")]
+    InputRefused,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6020,6 +6046,7 @@ impl BrokerControlServiceV1 {
     ) -> Result<BrokerControlResponseV1, ()> {
         let mut header =
             self.response_header(request.header, BrokerControlResponseStatusV1::Rejected);
+        let mut prefix: Option<[u8; BROKER_WRITE_PREFIX_PAYLOAD_BYTES]> = None;
         // A drain holds the pane's reader on the output worker, and the write
         // checks the master's flags through it (ft-q1lol). Take back a
         // finished drain first.
@@ -6040,23 +6067,49 @@ impl BrokerControlServiceV1 {
                     .admit_proxy_write(&attachment, request.payload())
                 {
                     // The guardian's input WAL owns intent/disposition. This
-                    // route performs one attempt. It is Retryable only when
-                    // the drain still holds the reader, before any byte moves.
+                    // route performs one attempt and answers exactly what it
+                    // moved (ft-twwf2): Applied for every byte, Applied with
+                    // the count for a prefix, Retryable for none yet (a full
+                    // input queue, or a drain still holding the reader),
+                    // Rejected for none at all, and Quarantined only when it
+                    // cannot know.
                     header.status = match live
                         .adoption
                         .pane
                         .execute_proxy_write(permit, request.payload())
                     {
                         Ok(_) => BrokerControlResponseStatusV1::Applied,
+                        Err(BrokerError::ProxyWritePartial { written }) => {
+                            match u32::try_from(written) {
+                                Ok(written) => {
+                                    prefix = Some(written.to_be_bytes());
+                                    BrokerControlResponseStatusV1::Applied
+                                }
+                                Err(_) => BrokerControlResponseStatusV1::Quarantined,
+                            }
+                        }
                         Err(BrokerError::ProxyWouldBlock) if draining => {
                             BrokerControlResponseStatusV1::Retryable
                         }
+                        Err(BrokerError::ProxyWriteNotReady) => {
+                            BrokerControlResponseStatusV1::Retryable
+                        }
+                        // Each of these stops the write before its first byte.
+                        Err(
+                            BrokerError::StaleProxyLease
+                            | BrokerError::InvalidProxyOperation
+                            | BrokerError::ProxyPayloadMismatch
+                            | BrokerError::ProxyWouldBlock
+                            | BrokerError::FinalTerminalEofAlreadySent
+                            | BrokerError::ProxyWriteFailed,
+                        ) => BrokerControlResponseStatusV1::Rejected,
                         Err(_) => BrokerControlResponseStatusV1::Quarantined,
                     };
                 }
             }
         }
-        BrokerControlResponseV1::new(header, &[]).map_err(|_| ())
+        BrokerControlResponseV1::new(header, prefix.as_ref().map_or(&[][..], |count| &count[..]))
+            .map_err(|_| ())
     }
 
     fn dispatch_resize(
@@ -8075,13 +8128,12 @@ impl Write for BrokerPaneInputWriterV1 {
             ));
         }
         self.attempted = true;
+        // A short count is the exact prefix the PTY took (ft-twwf2), which the
+        // input WAL records as such; the mux sends the rest as new input.
         self.session
             .client
             .write_input_once(&self.handle, bytes, self.deadline)
-            .map_err(|_| {
-                std::io::Error::other("broker input result unavailable or indeterminate")
-            })?;
-        Ok(bytes.len())
+            .map_err(|_| std::io::Error::other("broker input result unavailable or indeterminate"))
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -9091,12 +9143,17 @@ impl BrokerControlClientV1 {
         }
     }
 
+    /// Write `bytes` once and return how many leading bytes the PTY took: all
+    /// of them, or the exact prefix a full input queue let through
+    /// (ft-twwf2). An error took no byte, except one that poisons the
+    /// connection (a failed exchange, a malformed count, or any reply but
+    /// Applied, Retryable and Rejected), whose outcome is unknown.
     fn write_input_once(
         &mut self,
         handle: &BrokerPaneOutputHandleV1,
         bytes: &[u8],
         deadline: Instant,
-    ) -> Result<(), BrokerControlClientError> {
+    ) -> Result<usize, BrokerControlClientError> {
         if handle.broker_incarnation != self.broker_incarnation
             || handle.connection_id != self.connection_id
         {
@@ -9123,25 +9180,38 @@ impl BrokerControlClientV1 {
         )
         .map_err(|_| BrokerControlClientError::Protocol)?;
         let budget = repeated_exchange_budget(deadline);
+        // This session carries every pane of its mux, and the guardian's
+        // protocol waits for this input, so a program that is not reading
+        // holds them for at most `BROKER_INPUT_NOT_READY_WAIT`.
+        let resend_until = deadline.min(Instant::now() + BROKER_INPUT_NOT_READY_WAIT);
         loop {
-            match self
-                .exchange_with_deadline(&request, Some(Instant::now() + budget))?
-                .header
-                .status
-            {
-                BrokerControlResponseStatusV1::Applied => return Ok(()),
-                // The broker wrote nothing: an output drain held the pane's
-                // reader. The same request may go again; none starts once the
-                // pause would reach the deadline.
+            let response = self.exchange_with_deadline(&request, Some(Instant::now() + budget))?;
+            match response.header.status {
+                BrokerControlResponseStatusV1::Applied => {
+                    let Some(written) = applied_write_count(response.payload(), bytes.len()) else {
+                        self.poisoned = true;
+                        return Err(BrokerControlClientError::Protocol);
+                    };
+                    return Ok(written);
+                }
+                // The broker wrote nothing: the PTY's input queue is full
+                // until its program reads, or an output drain held the pane's
+                // reader. The same request may go again; none starts once
+                // the pause would pass `resend_until`.
                 BrokerControlResponseStatusV1::Retryable => {
                     let pause = Duration::from_millis(1);
-                    if Instant::now() + pause >= deadline {
+                    if Instant::now() + pause >= resend_until {
                         return Err(BrokerControlClientError::Io(std::io::Error::new(
                             std::io::ErrorKind::TimedOut,
                             "broker input deadline",
                         )));
                     }
                     thread::sleep(pause);
+                }
+                // A clean refusal moved no byte and left the exchange
+                // complete, so the session goes on for the mux's other panes.
+                BrokerControlResponseStatusV1::Rejected => {
+                    return Err(BrokerControlClientError::InputRefused);
                 }
                 // No other status permits retransmission of raw input. The
                 // outer canonical WAL records the failed/ambiguous attempt and
@@ -10835,6 +10905,18 @@ fn read_broker_control_frame_with(
     frame[..prefix.len()].copy_from_slice(&prefix);
     read_exact(stream, &mut frame[prefix.len()..])?;
     Ok(frame)
+}
+
+/// How many leading bytes a Write's Applied reply says went (ft-twwf2): all
+/// `sent` for an empty payload, otherwise its big-endian count, which must be
+/// at least one and fewer than were sent. Anything else is malformed.
+fn applied_write_count(payload: &[u8], sent: usize) -> Option<usize> {
+    if payload.is_empty() {
+        return Some(sent);
+    }
+    let count: [u8; BROKER_WRITE_PREFIX_PAYLOAD_BYTES] = payload.try_into().ok()?;
+    let written = usize::try_from(u32::from_be_bytes(count)).ok()?;
+    (written > 0 && written < sent).then_some(written)
 }
 
 /// The I/O bound for each exchange of a request that repeats until
@@ -20963,9 +21045,16 @@ impl BrokerAdoptedPaneV1 {
 
     /// Revalidate and execute one admitted write immediately before effect.
     ///
-    /// A low-level partial-write failure is classified indeterminate. The
-    /// guardian caller must hold its canonical durable input permit; neither
-    /// this method nor the transport may replay bytes after an ambiguous cut.
+    /// The master is non-blocking, so the PTY takes what its input queue has
+    /// room for (1,022 bytes on macOS) and every count it returns is exact. A
+    /// write that stops early therefore reports exactly what moved
+    /// (ft-twwf2): [`BrokerError::ProxyWritePartial`] for a prefix,
+    /// [`BrokerError::ProxyWriteNotReady`] when a full queue took nothing yet,
+    /// and [`BrokerError::ProxyWriteFailed`] when the write failed before any
+    /// byte. Only an impossible count or a failed flush after the bytes went
+    /// is indeterminate. The guardian caller must hold its canonical durable
+    /// input permit; neither this method nor the transport may replay bytes
+    /// after an ambiguous cut.
     pub fn execute_proxy_write(
         &mut self,
         permit: BrokerProxyOperationPermitV1,
@@ -21000,27 +21089,47 @@ impl BrokerAdoptedPaneV1 {
             .as_mut()
             .ok_or(BrokerError::FinalTerminalEofAlreadySent)?;
         let mut written = 0;
+        // Whether the write stopped only because the queue was full, or kept
+        // being interrupted, so that a later resend of what is left may go.
+        let mut may_resend = true;
         // Both progress and Interrupted consume the fixed syscall budget.
-        // A partial tail is never resent by this operation on failure.
+        // A partial tail is never resent by this operation.
         for _ in 0..128 {
             match writer.write(&bytes[written..]) {
-                Ok(0) => return Err(BrokerError::ProxyEffectIndeterminate),
+                Ok(0) => {
+                    may_resend = false;
+                    break;
+                }
                 Ok(count) if count <= bytes.len() - written => {
                     written += count;
                     if written == bytes.len() {
                         break;
                     }
                 }
+                Ok(_) => return Err(BrokerError::ProxyEffectIndeterminate),
                 Err(error) if error.kind() == ErrorKind::Interrupted => {}
-                Ok(_) | Err(_) => return Err(BrokerError::ProxyEffectIndeterminate),
+                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                Err(_) => {
+                    may_resend = false;
+                    break;
+                }
             }
         }
-        if written != bytes.len() {
-            return Err(BrokerError::ProxyEffectIndeterminate);
+        // A write call that fails moves no byte, so `written` is exactly what
+        // the PTY took.
+        if written == 0 {
+            return Err(if may_resend {
+                BrokerError::ProxyWriteNotReady
+            } else {
+                BrokerError::ProxyWriteFailed
+            });
         }
         writer
             .flush()
             .map_err(|_| BrokerError::ProxyEffectIndeterminate)?;
+        if written < bytes.len() {
+            return Err(BrokerError::ProxyWritePartial { written });
+        }
         Ok(BrokerProxyEffectReceiptV1 {
             operation_id: permit.operation_id,
             lease_generation: permit.attachment.lease_generation,
@@ -21784,6 +21893,17 @@ pub enum BrokerError {
     ProxyPayloadMismatch,
     #[error("broker proxy effect may be partially applied")]
     ProxyEffectIndeterminate,
+    /// The PTY took exactly the first `written` bytes of a proxy write, at
+    /// least one and fewer than all, before the write stopped (ft-twwf2).
+    #[error("broker proxy write applied only its first {written} bytes")]
+    ProxyWritePartial { written: usize },
+    /// The PTY's input queue took no byte of a proxy write yet, so the same
+    /// write may go again once its program reads (ft-twwf2).
+    #[error("broker proxy write found the PTY input queue full")]
+    ProxyWriteNotReady,
+    /// A proxy write failed before the PTY took any byte of it (ft-twwf2).
+    #[error("broker proxy write failed before any byte")]
+    ProxyWriteFailed,
     #[error("broker proxy read has no bytes ready")]
     ProxyWouldBlock,
     #[error("broker PTY output is terminal and every retained byte was acknowledged")]
@@ -28763,6 +28883,78 @@ mod tests {
             "one input adapter must never replay raw bytes"
         );
         let (returned_session, output_handle) = input_writer.into_parts();
+        // ft-twwf2: the input path reports exactly what the PTY took, resends
+        // while a full queue takes nothing, and keeps the mux's session
+        // usable after any clean reply. A scripted master stands in for the
+        // PTY so each outcome is exact.
+        let script = |steps: &'static [PtyWriteStep]| {
+            let (writer, pty_input) = scripted_pty_writer(steps);
+            let real = service.inspect(move |service| {
+                let pane = &mut service.live_spawns.get_mut(&pane_id).unwrap().adoption.pane;
+                pane.proxy_writer.replace(writer)
+            });
+            (real, pty_input)
+        };
+        let soon = || Instant::now() + Duration::from_secs(5);
+        let (real_writer, pty_input) = script(&[PtyWriteStep::Take(2), PtyWriteStep::Full]);
+        let mut input_writer =
+            BrokerPaneInputWriterV1::new(returned_session, output_handle, soon());
+        assert_eq!(
+            input_writer.write(b"abcdef").unwrap(),
+            2,
+            "a full queue after a prefix is a short write of exactly that prefix"
+        );
+        assert_eq!(pty_input.lock().unwrap().as_slice(), b"ab");
+        let (mut returned_session, output_handle) = input_writer.into_parts();
+        let client = &mut returned_session.client;
+        let (_, pty_input) = script(&[
+            PtyWriteStep::Full,
+            PtyWriteStep::Full,
+            PtyWriteStep::Take(6),
+        ]);
+        assert_eq!(
+            client
+                .write_input_once(&output_handle, b"cdef", soon())
+                .unwrap(),
+            4,
+            "a full queue that took nothing is resent until the program reads"
+        );
+        assert_eq!(pty_input.lock().unwrap().as_slice(), b"cdef");
+        let (_, pty_input) = script(&[PtyWriteStep::Full]);
+        assert!(matches!(
+            client.write_input_once(
+                &output_handle,
+                b"gh",
+                Instant::now() + Duration::from_millis(30)
+            ),
+            Err(BrokerControlClientError::Io(error)) if error.kind() == ErrorKind::TimedOut
+        ));
+        assert!(pty_input.lock().unwrap().is_empty());
+        assert!(!client.poisoned, "a queue that stayed full moved no byte");
+        let (_, pty_input) = script(&[PtyWriteStep::Fail]);
+        assert!(matches!(
+            client.write_input_once(&output_handle, b"ij", soon()),
+            Err(BrokerControlClientError::InputRefused)
+        ));
+        assert!(pty_input.lock().unwrap().is_empty());
+        assert!(
+            !client.poisoned,
+            "a clean refusal leaves the session usable"
+        );
+        let (_, pty_input) = script(&[PtyWriteStep::Take(2)]);
+        assert_eq!(
+            client
+                .write_input_once(&output_handle, b"kl", soon())
+                .unwrap(),
+            2,
+            "the same session writes again after a refusal"
+        );
+        assert_eq!(pty_input.lock().unwrap().as_slice(), b"kl");
+        let real_writer = real_writer.expect("the pane kept its writer");
+        let _scripted = service.inspect(move |service| {
+            let pane = &mut service.live_spawns.get_mut(&pane_id).unwrap().adoption.pane;
+            pane.proxy_writer.replace(real_writer)
+        });
         drop(io_worker);
         let mut io_worker =
             BrokerPaneIoWorkerV1::start(returned_session, Arc::clone(&custody_waker))
@@ -33279,6 +33471,275 @@ mod tests {
             pane.pump_ready_output(),
             Ok(BrokerOutputPumpOutcomeV1::TerminalDrained(_))
         ));
+    }
+
+    /// One answer of a [`ScriptedPtyWriter`] (ft-twwf2).
+    #[derive(Clone, Copy, Debug)]
+    enum PtyWriteStep {
+        /// Take up to this many bytes.
+        Take(usize),
+        /// A full input queue: `WouldBlock`.
+        Full,
+        Interrupted,
+        /// A write error other than the two above.
+        Fail,
+    }
+
+    /// A PTY master writer that answers each `write` from its script, the last
+    /// step repeating once the script runs out, and keeps what it took.
+    struct ScriptedPtyWriter {
+        steps: VecDeque<PtyWriteStep>,
+        last: PtyWriteStep,
+        taken: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl Write for ScriptedPtyWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            match self.steps.pop_front().unwrap_or(self.last) {
+                PtyWriteStep::Take(count) => {
+                    let count = count.min(bytes.len());
+                    self.taken
+                        .lock()
+                        .unwrap()
+                        .extend_from_slice(&bytes[..count]);
+                    Ok(count)
+                }
+                PtyWriteStep::Full => Err(std::io::Error::from(ErrorKind::WouldBlock)),
+                PtyWriteStep::Interrupted => Err(std::io::Error::from(ErrorKind::Interrupted)),
+                PtyWriteStep::Fail => Err(std::io::Error::from_raw_os_error(libc::EIO)),
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn scripted_pty_writer(
+        steps: &[PtyWriteStep],
+    ) -> (Box<dyn Write + Send>, Arc<std::sync::Mutex<Vec<u8>>>) {
+        let taken = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = ScriptedPtyWriter {
+            steps: steps.iter().copied().collect(),
+            last: *steps.last().expect("a script has a step"),
+            taken: Arc::clone(&taken),
+        };
+        (Box::new(writer), taken)
+    }
+
+    #[test]
+    fn a_proxy_write_reports_exactly_what_the_pty_took() {
+        use PtyWriteStep::{Fail, Full, Interrupted, Take};
+        /// The script, the input, what the write returns, and how many
+        /// bytes the PTY took.
+        type Case = (
+            &'static [PtyWriteStep],
+            &'static [u8],
+            Result<(), BrokerError>,
+            usize,
+        );
+        const LONG: &[u8] = &[b'x'; 200];
+        let temp = tempfile::tempdir().expect("test directory");
+        let sentinel = temp.path().join("unused");
+        let auth = authority(id(7_411), id(7_412), id(7_413), id(7_414), 0x41, 0x42);
+        let payload = command_payload("IFS= read -r ignored", &sentinel);
+        let binding = binding_for(&payload, &auth);
+        let (prepared, control) =
+            prepare_for_test(payload, binding, &auth, BrokerResourceLimitsV1::default())
+                .expect("prepare a pane");
+        let BrokerAdoptionV1 {
+            mut pane,
+            attachment,
+        } = commit_for_test(prepared, control, binding).expect("commit a pane");
+        let six = b"abcdef".as_slice();
+        let cases: [Case; 12] = [
+            (&[Take(6)], six, Ok(()), 6),
+            (&[Take(2), Take(6)], six, Ok(()), 6),
+            (&[Interrupted, Take(6)], six, Ok(()), 6),
+            // The queue fills after a prefix, or the write fails after one:
+            // either way exactly the prefix went.
+            (
+                &[Take(2), Full],
+                six,
+                Err(BrokerError::ProxyWritePartial { written: 2 }),
+                2,
+            ),
+            (
+                &[Take(2), Fail],
+                six,
+                Err(BrokerError::ProxyWritePartial { written: 2 }),
+                2,
+            ),
+            (
+                &[Take(2), Take(0)],
+                six,
+                Err(BrokerError::ProxyWritePartial { written: 2 }),
+                2,
+            ),
+            // The syscall budget ends a write that keeps taking one byte.
+            (
+                &[Take(1)],
+                LONG,
+                Err(BrokerError::ProxyWritePartial { written: 128 }),
+                128,
+            ),
+            // Nothing went: a full queue may take the same write later.
+            (&[Full], six, Err(BrokerError::ProxyWriteNotReady), 0),
+            (&[Interrupted], six, Err(BrokerError::ProxyWriteNotReady), 0),
+            (
+                &[Interrupted, Full],
+                six,
+                Err(BrokerError::ProxyWriteNotReady),
+                0,
+            ),
+            // Nothing went and nothing will.
+            (&[Fail], six, Err(BrokerError::ProxyWriteFailed), 0),
+            (&[Take(0)], six, Err(BrokerError::ProxyWriteFailed), 0),
+        ];
+        for (steps, bytes, expected, taken_bytes) in cases {
+            let (writer, taken) = scripted_pty_writer(steps);
+            pane.proxy_writer = Some(writer);
+            let permit = pane
+                .admit_proxy_write(&attachment, bytes)
+                .expect("admit a write");
+            assert_eq!(
+                pane.execute_proxy_write(permit, bytes).map(|_| ()),
+                expected,
+                "{steps:?}"
+            );
+            assert_eq!(*taken.lock().unwrap(), bytes[..taken_bytes], "{steps:?}");
+        }
+    }
+
+    #[test]
+    fn a_full_pty_input_queue_takes_a_prefix_and_then_nothing() {
+        let temp = tempfile::tempdir().expect("test directory");
+        let sentinel = temp.path().join("unused");
+        let auth = authority(id(7_421), id(7_422), id(7_423), id(7_424), 0x41, 0x42);
+        // A program that never reads its raw-mode terminal, so its input
+        // queue fills: 1,022 bytes on macOS, the line buffer and then the
+        // tty buffer's 64 KiB on Linux.
+        let payload = command_payload("stty raw -echo; printf ready; exec sleep 60", &sentinel);
+        let binding = binding_for(&payload, &auth);
+        let (prepared, control) =
+            prepare_for_test(payload, binding, &auth, BrokerResourceLimitsV1::default())
+                .expect("prepare a pane");
+        let BrokerAdoptionV1 {
+            mut pane,
+            attachment,
+        } = commit_for_test(prepared, control, binding).expect("commit a pane");
+        read_until(&mut pane, &attachment, b"ready");
+        let chunk = vec![b'a'; 16 * 1024];
+        let mut accepted = 0;
+        let mut filled = false;
+        for _ in 0..64 {
+            let permit = pane
+                .admit_proxy_write(&attachment, &chunk)
+                .expect("admit a write");
+            match pane.execute_proxy_write(permit, &chunk) {
+                Ok(_) => accepted += chunk.len(),
+                Err(BrokerError::ProxyWritePartial { written }) => {
+                    assert!(written > 0 && written < chunk.len(), "{written}");
+                    accepted += written;
+                    filled = true;
+                    break;
+                }
+                Err(BrokerError::ProxyWriteNotReady) => {
+                    filled = true;
+                    break;
+                }
+                Err(error) => panic!("a write to a full queue failed: {error}"),
+            }
+        }
+        assert!(
+            filled,
+            "the input queue took {accepted} bytes and never filled"
+        );
+        assert!(accepted > 0);
+        let permit = pane
+            .admit_proxy_write(&attachment, b"z")
+            .expect("admit a write");
+        assert_eq!(
+            pane.execute_proxy_write(permit, b"z").map(|_| ()),
+            Err(BrokerError::ProxyWriteNotReady),
+            "a full queue takes nothing more"
+        );
+    }
+
+    #[test]
+    fn an_applied_write_reply_counts_every_byte_or_an_exact_prefix() {
+        assert_eq!(applied_write_count(&[], 6), Some(6));
+        assert_eq!(applied_write_count(&1_u32.to_be_bytes(), 6), Some(1));
+        assert_eq!(applied_write_count(&5_u32.to_be_bytes(), 6), Some(5));
+        for count in [0_u32, 6, 7, u32::MAX] {
+            assert_eq!(
+                applied_write_count(&count.to_be_bytes(), 6),
+                None,
+                "{count}"
+            );
+        }
+        assert_eq!(applied_write_count(&[0, 2], 6), None);
+        assert_eq!(applied_write_count(&[0, 0, 0, 0, 2], 6), None);
+
+        let header = |operation, status| BrokerControlResponseHeaderV1 {
+            operation,
+            status,
+            request_id: id(7_431),
+            broker_incarnation: id(7_432),
+            guardian_incarnation: id(7_433),
+            connection_id: id(7_434),
+            durable_pane_id: id(7_435),
+            lease_generation: 1,
+            operation_id: id(7_436),
+            child_identity: None,
+            output_sequence_start: 0,
+            output_sequence_end: 0,
+        };
+        let count = 2_u32.to_be_bytes();
+        let write = BrokerControlOperationV1::Write;
+        assert!(
+            BrokerControlResponseV1::new(
+                header(write, BrokerControlResponseStatusV1::Applied),
+                &count
+            )
+            .is_ok()
+        );
+        assert!(
+            BrokerControlResponseV1::new(
+                header(write, BrokerControlResponseStatusV1::Applied),
+                &[]
+            )
+            .is_ok()
+        );
+        assert!(
+            BrokerControlResponseV1::new(
+                header(write, BrokerControlResponseStatusV1::Applied),
+                &[0, 0, 2]
+            )
+            .is_err()
+        );
+        for status in [
+            BrokerControlResponseStatusV1::Recovered,
+            BrokerControlResponseStatusV1::Rejected,
+            BrokerControlResponseStatusV1::Retryable,
+            BrokerControlResponseStatusV1::Quarantined,
+        ] {
+            assert!(BrokerControlResponseV1::new(header(write, status), &[]).is_ok());
+            assert!(
+                BrokerControlResponseV1::new(header(write, status), &count).is_err(),
+                "only an Applied Write carries a count: {status:?}"
+            );
+        }
+        assert!(
+            BrokerControlResponseV1::new(
+                header(
+                    BrokerControlOperationV1::Resize,
+                    BrokerControlResponseStatusV1::Applied
+                ),
+                &count
+            )
+            .is_err()
+        );
     }
 
     #[test]
