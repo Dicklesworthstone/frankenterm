@@ -106,7 +106,10 @@
 /// Bumped 47 -> 48 to persist authoritative workflow retry and total-deadline
 /// budgets. Legacy executions deliberately receive no inferred budget: resume
 /// must fail closed instead of refunding attempts or extending a deadline.
-pub const SCHEMA_VERSION: i32 = 48;
+/// Bumped 48 -> 49 to seek the latest eligible agent detection per pane
+/// without ranking retained event history during each checkpoint. The partial
+/// index excludes rows that cannot contribute to snapshot agent correlation.
+pub const SCHEMA_VERSION: i32 = 49;
 
 /// [ft-ih4tm] Idempotent re-creation of the three `output_segments` FTS
 /// triggers. Called when a database is opened with
@@ -501,6 +504,14 @@ CREATE INDEX IF NOT EXISTS idx_events_triage_state
     ON events(triage_state) WHERE triage_state IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_events_segment_id
     ON events(segment_id) WHERE segment_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_events_snapshot_agent_latest
+    ON events(pane_id, detected_at DESC, id DESC)
+    WHERE typeof(pane_id) = 'integer'
+      AND typeof(detected_at) = 'integer'
+      AND typeof(rule_id) = 'text'
+      AND length(CAST(rule_id AS BLOB)) BETWEEN 1 AND 1024
+      AND typeof(agent_type) = 'text'
+      AND agent_type IN ('codex', 'claude_code', 'gemini');
 
 -- Durable, exact evidence for event-retention holes.  A missing row in
 -- `events` is not by itself proof of retention: cursor streams can skip IDs

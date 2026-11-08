@@ -7866,6 +7866,43 @@ fn load_latest_detections_by_pane_sync(
     .map(|projection| projection.detections_by_pane)
 }
 
+/// Seek one eligible event per requested pane instead of ranking every event
+/// in the correlation window. Keep the eligibility predicate identical to
+/// `idx_events_snapshot_agent_latest`: invalid or unsupported newer events
+/// must not turn the seek back into a scan of the pane's history.
+fn snapshot_detection_query(pane_count: usize) -> String {
+    let pane_values = std::iter::repeat_n("(?)", pane_count)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "WITH requested(pane_id) AS (VALUES {pane_values})
+         SELECT event.pane_id,
+                event.rule_id,
+                event.agent_type,
+                CASE
+                    WHEN event.extracted IS NULL THEN NULL
+                    WHEN typeof(event.extracted) = 'text'
+                     AND length(CAST(event.extracted AS BLOB)) <= {SNAPSHOT_DETECTION_EXTRACTED_BYTES}
+                    THEN event.extracted
+                END AS bounded_extracted
+         FROM requested
+         JOIN events AS event ON event.id = (
+             SELECT latest.id
+             FROM events AS latest
+             WHERE latest.pane_id = requested.pane_id
+               AND typeof(latest.pane_id) = 'integer'
+               AND typeof(latest.detected_at) = 'integer'
+               AND latest.detected_at >= ?
+               AND typeof(latest.rule_id) = 'text'
+               AND length(CAST(latest.rule_id AS BLOB)) BETWEEN 1 AND {SNAPSHOT_DETECTION_RULE_ID_BYTES}
+               AND typeof(latest.agent_type) = 'text'
+               AND latest.agent_type IN ('codex', 'claude_code', 'gemini')
+             ORDER BY latest.detected_at DESC, latest.id DESC
+             LIMIT 1
+         )"
+    )
+}
+
 fn load_snapshot_detections_in_transaction(
     cx: &crate::cx::Cx,
     conn: &Connection,
@@ -7877,38 +7914,7 @@ fn load_snapshot_detections_in_transaction(
     let mut out: HashMap<u64, Detection> = HashMap::with_capacity(pane_ids.len());
     for pane_chunk in pane_ids.chunks(chunk_size) {
         snapshot_cx_checkpoint(cx)?;
-        let placeholders = std::iter::repeat_n("?", pane_chunk.len())
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "WITH ranked AS (
-                 SELECT pane_id,
-                        rule_id,
-                        agent_type,
-                        CASE
-                            WHEN extracted IS NULL THEN NULL
-                            WHEN typeof(extracted) = 'text'
-                             AND length(CAST(extracted AS BLOB)) <= {SNAPSHOT_DETECTION_EXTRACTED_BYTES}
-                            THEN extracted
-                        END AS bounded_extracted,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY pane_id
-                            ORDER BY detected_at DESC, id DESC
-                        ) AS rn
-                 FROM events
-                 WHERE pane_id IN ({placeholders})
-                   AND typeof(pane_id) = 'integer'
-                   AND typeof(detected_at) = 'integer'
-                   AND detected_at >= ?
-                   AND typeof(rule_id) = 'text'
-                   AND length(CAST(rule_id AS BLOB)) BETWEEN 1 AND {SNAPSHOT_DETECTION_RULE_ID_BYTES}
-                   AND typeof(agent_type) = 'text'
-                   AND agent_type IN ('codex', 'claude_code', 'gemini')
-             )
-             SELECT pane_id, rule_id, agent_type, bounded_extracted
-             FROM ranked
-             WHERE rn = 1"
-        );
+        let sql = snapshot_detection_query(pane_chunk.len());
         let mut stmt = match conn.prepare(&sql) {
             Ok(stmt) => stmt,
             Err(err) if is_missing_events_table(&err) => {
@@ -15925,42 +15931,31 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let db_path = tmp.path().to_str().unwrap();
         let mut conn = Connection::open(db_path).unwrap();
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             CREATE TABLE events (
-                 id INTEGER PRIMARY KEY,
-                 pane_id INTEGER NOT NULL,
-                 rule_id TEXT NOT NULL,
-                 agent_type TEXT NOT NULL,
-                 extracted TEXT,
-                 detected_at INTEGER NOT NULL
-             );
-             CREATE INDEX events_pane_latest ON events(pane_id, detected_at DESC, id DESC);
-             CREATE TABLE pane_scrollback_summary (
-                 pane_id INTEGER PRIMARY KEY,
-                 retained_segment_count INTEGER NOT NULL,
-                 first_seq INTEGER,
-                 last_seq INTEGER,
-                 first_captured_at INTEGER,
-                 last_captured_at INTEGER
-             );",
-        )
-        .unwrap();
+        // Use the production indexes, not a fixture-only latest-event index
+        // that can conceal a full-history scan in the actual database.
+        conn.execute_batch(crate::storage::SCHEMA_SQL).unwrap();
         let tx = conn.transaction().unwrap();
         for pane_id in 0..pane_count {
             let pane_id = i64::try_from(pane_id).unwrap();
             tx.execute(
-                "INSERT INTO events
-                 (pane_id, rule_id, agent_type, extracted, detected_at)
-                 VALUES (?1, 'codex-working', 'codex', '{}', 10)",
+                "INSERT INTO panes (pane_id, first_seen_at, last_seen_at)
+                 VALUES (?1, 10, 10)",
                 [pane_id],
             )
             .unwrap();
             tx.execute(
-                "INSERT INTO pane_scrollback_summary (
-                     pane_id, retained_segment_count, first_seq, last_seq,
-                     first_captured_at, last_captured_at
-                 ) VALUES (?1, 1, 0, 0, 10, 10)",
+                "INSERT INTO events
+                 (id, pane_id, rule_id, agent_type, event_type, severity,
+                  confidence, extracted, detected_at)
+                 VALUES (?1 + 1, ?1, 'codex-working', 'codex', 'session.start',
+                         'info', 1.0, '{}', 10)",
+                [pane_id],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO output_segments
+                 (pane_id, seq, content, content_len, captured_at)
+                 VALUES (?1, 0, 'captured', 8, 10)",
                 [pane_id],
             )
             .unwrap();
@@ -15989,6 +15984,140 @@ mod tests {
             scrollback
                 .values()
                 .all(|reference| reference.retained_segment_count == 1)
+        );
+    }
+
+    #[test]
+    fn auxiliary_snapshot_seeks_latest_eligible_event_with_timestamp_ties() {
+        let (tmp, writer) = setup_auxiliary_projection_db(4);
+        writer
+            .execute_batch(
+                "INSERT INTO events
+                     (id, pane_id, rule_id, agent_type, event_type, severity,
+                      confidence, extracted, detected_at)
+                 VALUES
+                     (5, 0, 'codex-at-cutoff', 'codex', 'session.start', 'info',
+                      1.0, '{\"session_id\":\"older-id\"}', 20),
+                     (6, 0, 'gemini-tie-winner', 'gemini', 'session.start', 'info',
+                      1.0, '{\"session_id\":\"winner\"}', 20),
+                     (7, 0, 'claude-later-id', 'claude_code', 'session.start', 'info',
+                      1.0, '{}', 19),
+                     (8, 0, 'mux-newer', 'wezterm', 'mux.error', 'info',
+                      1.0, '{}', 30),
+                     (9, 0, '', 'codex', 'session.start', 'info',
+                      1.0, '{}', 40),
+                     (10, 0, CAST('not-text' AS BLOB), 'codex', 'session.start', 'info',
+                      1.0, '{}', 50),
+                     (11, 0, 'codex-invalid-clock', 'codex', 'session.start', 'info',
+                      1.0, '{}', 'not-a-timestamp'),
+                     (12, 2, 'claude-at-cutoff', 'claude_code', 'session.start', 'info',
+                      1.0, CAST('{}' AS BLOB), 20);",
+            )
+            .unwrap();
+        writer
+            .execute(
+                "INSERT INTO events
+                     (id, pane_id, rule_id, agent_type, event_type, severity,
+                      confidence, extracted, detected_at)
+                 VALUES (13, 0, ?1, 'codex', 'session.start', 'info', 1.0, '{}', 60)",
+                ["r".repeat(SNAPSHOT_DETECTION_RULE_ID_BYTES + 1)],
+            )
+            .unwrap();
+
+        let detections =
+            load_latest_detections_by_pane_sync(tmp.path().to_str().unwrap(), &[3, 2, 1, 0], 20)
+                .unwrap();
+        assert_eq!(detections.len(), 2);
+        assert_eq!(detections[&0].rule_id, "gemini-tie-winner");
+        assert_eq!(detections[&0].extracted["session_id"], "winner");
+        assert_eq!(detections[&2].rule_id, "claude-at-cutoff");
+        assert_eq!(detections[&2].extracted, Value::Null);
+        assert!(!detections.contains_key(&1));
+        assert!(!detections.contains_key(&3));
+    }
+
+    #[test]
+    fn auxiliary_snapshot_latest_event_work_does_not_grow_with_history() {
+        let (_tmp, conn) = setup_auxiliary_projection_db(2);
+        let sql = snapshot_detection_query(2);
+        let plan = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map([0_i64, 1, 0], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            plan.contains("idx_events_snapshot_agent_latest"),
+            "production schema must provide the eligible latest-event seek: {plan}"
+        );
+        assert!(
+            !plan.contains("TEMP B-TREE")
+                && !plan.contains("SCAN latest")
+                && !plan.contains("SCAN event"),
+            "snapshot lookups must not sort or scan retained event history: {plan}"
+        );
+
+        // Count actual SQLite VM work, not elapsed time on a shared worker.
+        // The old window query visits all of these rows even with the index.
+        let measure = || {
+            let steps = Arc::new(AtomicU64::new(0));
+            let observed_steps = Arc::clone(&steps);
+            conn.progress_handler(
+                1,
+                Some(move || {
+                    observed_steps.fetch_add(1, Ordering::Relaxed);
+                    false
+                }),
+            )
+            .unwrap();
+            let result = load_snapshot_detections_in_transaction(
+                &crate::cx::Cx::for_testing(),
+                &conn,
+                &[0, 1],
+                0,
+                SNAPSHOT_SQLITE_IN_LIST_CHUNK,
+                &mut |_| {},
+            )
+            .unwrap();
+            conn.progress_handler(0, None::<fn() -> bool>).unwrap();
+            assert_eq!(result.len(), 2);
+            assert!(
+                result
+                    .values()
+                    .all(|detection| detection.rule_id == "codex-working")
+            );
+            steps.load(Ordering::Relaxed)
+        };
+        let shallow_steps = measure();
+        conn.execute_batch(
+            "WITH RECURSIVE history(n) AS (
+                 VALUES (1) UNION ALL SELECT n + 1 FROM history WHERE n < 4000
+             )
+             INSERT INTO events
+                 (id, pane_id, rule_id, agent_type, event_type, severity,
+                  confidence, extracted, detected_at)
+             SELECT 2 + pane_id * 4000 + n, pane_id, 'codex-working', 'codex',
+                    'session.start', 'info', 1.0, '{}', n
+             FROM panes CROSS JOIN history ORDER BY pane_id, n;
+             WITH RECURSIVE ignored(n) AS (
+                 VALUES (1) UNION ALL SELECT n + 1 FROM ignored WHERE n < 4000
+             )
+             INSERT INTO events
+                 (id, pane_id, rule_id, agent_type, event_type, severity,
+                  confidence, extracted, detected_at)
+             SELECT 8002 + pane_id * 4000 + n, pane_id, '', 'codex',
+                    'session.start', 'info', 1.0, '{}', 4000 + n
+             FROM panes CROSS JOIN ignored ORDER BY pane_id, n;",
+        )
+        .unwrap();
+        let deep_steps = measure();
+        assert!(shallow_steps > 0);
+        assert!(
+            deep_steps <= shallow_steps.saturating_add(100),
+            "latest-event work must be independent of valid history and invalid newer rows: \
+             shallow={shallow_steps}, deep={deep_steps}"
         );
     }
 
@@ -16238,7 +16367,7 @@ mod tests {
     }
 
     #[test]
-    fn auxiliary_snapshot_progress_handler_interrupts_ranking_before_first_row() {
+    fn auxiliary_snapshot_progress_handler_interrupts_scan_before_first_row() {
         let (tmp, writer) = setup_auxiliary_projection_db(1);
         writer
             .execute_batch(
@@ -16247,8 +16376,10 @@ mod tests {
                      VALUES (1) UNION ALL SELECT n + 1 FROM more WHERE n < 2000
                  )
                  INSERT INTO event_history
-                     (pane_id, rule_id, agent_type, extracted, detected_at)
-                 SELECT 0, 'codex-working', 'codex', '{}', 10 FROM more;
+                     (id, pane_id, rule_id, agent_type, event_type, severity,
+                      confidence, extracted, detected_at)
+                 SELECT n + 1, 0, 'codex-working', 'codex', 'session.start',
+                        'info', 1.0, '{}', 10 FROM more;
                  CREATE VIEW events AS
                  SELECT id, pane_id, rule_id, agent_type, extracted,
                         cancel_snapshot_read() AS detected_at
@@ -16270,7 +16401,7 @@ mod tests {
                     if visited_by_sql.fetch_add(1, Ordering::Relaxed) == 0 {
                         cancelled_by_sql.cancel_with(
                             CancelKind::User,
-                            Some("cancel while SQLite ranks detection history"),
+                            Some("cancel while SQLite scans detection history"),
                         );
                     }
                     Ok(10_i64)
@@ -16289,7 +16420,7 @@ mod tests {
         assert!(visited > 0);
         assert!(
             visited < 2001,
-            "the progress handler must stop ranking before scanning all history: {visited}"
+            "the progress handler must stop before scanning all history: {visited}"
         );
     }
 

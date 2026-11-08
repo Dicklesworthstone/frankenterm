@@ -2249,6 +2249,23 @@ pub(crate) static MIGRATIONS: &[Migration] = &[
         // Downgrade would erase admitted attempts and permit their replay.
         down_sql: None,
     },
+    Migration {
+        version: 49,
+        description: "Bound latest snapshot agent-detection queries with a partial index",
+        up_sql: "
+        DROP INDEX IF EXISTS idx_events_snapshot_agent_latest;
+        CREATE INDEX idx_events_snapshot_agent_latest
+            ON events(pane_id, detected_at DESC, id DESC)
+            WHERE typeof(pane_id) = 'integer'
+              AND typeof(detected_at) = 'integer'
+              AND typeof(rule_id) = 'text'
+              AND length(CAST(rule_id AS BLOB)) BETWEEN 1 AND 1024
+              AND typeof(agent_type) = 'text'
+              AND agent_type IN ('codex', 'claude_code', 'gemini');
+        ",
+        // This changes only query acceleration, not persisted event authority.
+        down_sql: Some("DROP INDEX IF EXISTS idx_events_snapshot_agent_latest;"),
+    },
 ];
 
 // =============================================================================
@@ -6927,6 +6944,105 @@ pub fn migrate_database_to_version(db_path: &Path, target_version: i32) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_agent_index_v49_upgrade_is_atomic_reversible_and_preserves_events() {
+        const INDEX: &str = "idx_events_snapshot_agent_latest";
+        let conn = Connection::open_in_memory().expect("open snapshot index fixture");
+        initialize_schema(&conn).expect("initialize canonical schema");
+        let fresh_ddl = load_schema_object_sql(&conn, "index", INDEX)
+            .expect("read fresh index")
+            .expect("fresh snapshot index exists");
+        conn.execute_batch(
+            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed)
+                 VALUES (7, 'local', 1, 1, 1);
+             INSERT INTO events
+                 (id, pane_id, rule_id, agent_type, event_type, severity,
+                  confidence, extracted, detected_at)
+                 VALUES (11, 7, 'codex.working', 'codex', 'working', 'info',
+                         1.0, '{\"session_id\":\"retained\"}', 100),
+                        (12, 7, 'mux.notice', 'wezterm', 'notice', 'info',
+                         1.0, '{}', 200);",
+        )
+        .expect("seed eligible and excluded event evidence");
+
+        let down = build_migration_plan(49, 48).expect("snapshot index is reversible");
+        apply_migration_plan(&conn, &down).expect("restore v48 index shape");
+        ensure_ft_meta(&conn, 48).expect("stamp v48 metadata");
+        assert_eq!(get_user_version(&conn).unwrap(), 48);
+        assert!(
+            load_schema_object_sql(&conn, "index", INDEX)
+                .unwrap()
+                .is_none()
+        );
+
+        // A failed migration must restore even a pre-release same-name index,
+        // together with its original version. Reopening can then repair it.
+        conn.execute_batch(
+            "CREATE INDEX idx_events_snapshot_agent_latest ON events(id);
+             CREATE TRIGGER reject_snapshot_index_migration
+                 BEFORE INSERT ON schema_version WHEN new.version = 49 BEGIN
+                     SELECT RAISE(ABORT, 'fixture rejects snapshot index receipt');
+                 END;",
+        )
+        .expect("seed wrong index and failing migration receipt");
+        let prior_ddl = load_schema_object_sql(&conn, "index", INDEX).unwrap();
+        assert!(initialize_schema(&conn).is_err());
+        assert_eq!(get_user_version(&conn).unwrap(), 48);
+        assert_eq!(
+            load_schema_object_sql(&conn, "index", INDEX).unwrap(),
+            prior_ddl
+        );
+        assert!(conn.is_autocommit(), "failed migration releases its lock");
+
+        conn.execute_batch("DROP TRIGGER reject_snapshot_index_migration")
+            .expect("release fixture migration failure");
+        initialize_schema(&conn).expect("upgrade v48 snapshot index");
+        initialize_schema(&conn).expect("reopen upgraded database");
+        assert_eq!(get_user_version(&conn).unwrap(), SCHEMA_VERSION);
+        let upgraded_ddl = load_schema_object_sql(&conn, "index", INDEX)
+            .unwrap()
+            .expect("upgraded snapshot index exists");
+        assert_eq!(
+            compact_schema_sql(&upgraded_ddl),
+            compact_schema_sql(&fresh_ddl)
+        );
+
+        for phase in ["upgraded", "downgraded"] {
+            if phase == "downgraded" {
+                apply_migration_plan(&conn, &down).expect("remove only query acceleration");
+                assert_eq!(get_user_version(&conn).unwrap(), 48);
+                assert!(
+                    load_schema_object_sql(&conn, "index", INDEX)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            let events: Vec<(i64, String, String, i64)> = conn
+                .prepare("SELECT id, rule_id, extracted, detected_at FROM events ORDER BY id")
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap();
+            assert_eq!(
+                events,
+                vec![
+                    (
+                        11,
+                        "codex.working".to_string(),
+                        r#"{"session_id":"retained"}"#.to_string(),
+                        100,
+                    ),
+                    (12, "mux.notice".to_string(), "{}".to_string(), 200),
+                ],
+                "{phase} migration preserves all event evidence"
+            );
+            ensure_no_foreign_key_violations(&conn, phase).unwrap();
+        }
+    }
 
     #[test]
     fn workflow_budget_migration_is_atomic_and_does_not_refund_legacy_executions() {
