@@ -91,6 +91,46 @@ const MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES: usize = 4 * 1024;
 const PANE_USER_VARS_SNAPSHOT_ESTIMATED_BYTES: usize =
     2 * codec::MAX_PANE_USER_VARS_RESPONSE_DECOMPRESSED_BYTES;
 const RELIABLE_INPUT_RETRY_AFTER_NS: u64 = 1_000_000;
+/// How long a client waits before it resends a reliable pane write that the
+/// pane's writer refused for now. A guardian pane can refuse for seconds
+/// while its program does not read (ft-vc66w), and each resend runs on the
+/// mux main thread, so it is not the 1 ms retry of a scheduling refusal.
+const RELIABLE_PANE_WRITE_REFUSED_RETRY_AFTER_NS: u64 = 100_000_000;
+
+/// What a client is told about a reliable pane write whose single writer call
+/// took no byte and answered `WouldBlock` or `TimedOut`, so that it resends the
+/// identical request.
+///
+/// Only a guardian answer proves that the bytes wrote nothing: the guardian
+/// knew they were not applied, the lease was holding new input back, or the
+/// lease still waits for a different input that is pending. Any other such
+/// refusal, such as a guardian transport timeout or an input the guardian
+/// accepted but has not made durable, may still take effect. The lease settles
+/// it exactly once when the same bytes come again, so the client resends them
+/// to this mux, but it must not send them to a mux that has replaced this one.
+fn refused_pane_write_retry(error: &std::io::Error) -> ReliablePaneWriteRetryV1 {
+    use crate::guardian_proxy::GuardianProxyError;
+    let retry_after_ns = RELIABLE_PANE_WRITE_REFUSED_RETRY_AFTER_NS;
+    let wrote_nothing = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<GuardianProxyError>())
+        .is_some_and(|refusal| {
+            matches!(
+                refusal,
+                GuardianProxyError::InputKnownNotApplied
+                    | GuardianProxyError::InputNotReady
+                    | GuardianProxyError::PendingInputPayloadRequired
+            )
+        });
+    if wrote_nothing {
+        ReliablePaneWriteRetryV1::DefinitelyNotApplied { retry_after_ns }
+    } else {
+        ReliablePaneWriteRetryV1::Input(ReliableKeyEventRetryV1::DuplicatePending {
+            retry_after_ns,
+        })
+    }
+}
+
 const PRODUCTION_TRACE_SHARDS: u16 = 64;
 const PRODUCTION_TRACE_TOTAL_SLOTS: u32 = 16_384;
 const PRODUCTION_TRACE_BYTE_CEILING: u64 = 32 * 1024 * 1024;
@@ -8783,7 +8823,15 @@ impl SessionHandler {
                         catch(
                             move || {
                                 pane_authority.try_with_pane(|pane| {
-                                    pane.write_all(&data)?;
+                                    // The pane's own input queue, not its raw
+                                    // writer: a raw write here held this main
+                                    // thread while the program did not read,
+                                    // could overtake a paste still being sent,
+                                    // and dropped the bytes when a guardian
+                                    // refused them for now, which left the
+                                    // guardian lease refusing all other input
+                                    // and every recovery capture (ft-jrhpr).
+                                    pane.send_user_input(&data)?;
                                     input_activity.mark();
                                     push_pane_changes_after_committed_input(
                                         pane, sender, per_pane, "write",
@@ -9362,6 +9410,34 @@ impl SessionHandler {
                                         data.len()
                                     );
                                     ReliablePaneWriteOutcomeV1::Indeterminate
+                                }
+                                // The writer took nothing for now. A guardian
+                                // pane's lease keeps an input it could not
+                                // settle pending by identity and refuses other
+                                // input until the same bytes come again, then
+                                // settles them exactly once; it also holds
+                                // input back while the program does not read.
+                                // A tmux pane's writer refuses while its queue
+                                // is full. So the client resends the identical
+                                // request, ahead of its later input, instead of
+                                // dropping it (ft-jrhpr). The ledger records
+                                // this call as having applied nothing, which
+                                // lets that identical request run again; the
+                                // lease settles input it may still apply.
+                                Ok(Err(error))
+                                    if matches!(
+                                        error.kind(),
+                                        std::io::ErrorKind::WouldBlock
+                                            | std::io::ErrorKind::TimedOut
+                                    ) =>
+                                {
+                                    if permit.commit_definitely_not_applied() {
+                                        ReliablePaneWriteOutcomeV1::Retry(
+                                            refused_pane_write_retry(&error),
+                                        )
+                                    } else {
+                                        ReliablePaneWriteOutcomeV1::Indeterminate
+                                    }
                                 }
                                 Ok(Err(error)) => {
                                     log::warn!(
@@ -14680,6 +14756,161 @@ mod tests {
     }
 
     #[test]
+    fn reliable_pane_write_that_the_writer_refuses_for_now_is_resent_not_dropped() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let _mux_guard = ScopedMux::install(&mux);
+        let pane = Arc::new(FakePane::new_with_id(7_124, None));
+        let pane_for_mux: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&pane_for_mux)
+            .expect("register refusing pane-write pane");
+        let registration = mux
+            .capture_pane_registration(&pane_for_mux)
+            .expect("capture refusing pane-write authority");
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux)).unwrap();
+        handler.process_one(DecodedPdu {
+            serial: 1,
+            pdu: Pdu::SetClientId(SetClientId {
+                client_id: test_client_id("reliable-pane-refused-for-now", 41_124),
+                is_proxy: false,
+            }),
+        });
+        take_response(&captured);
+        let request = ReliablePaneWriteV1 {
+            pane_id: pane.pane_id(),
+            pane_registration: Some(ReliablePaneRegistrationIdentityV1::from_bytes(
+                registration.wire_identity(),
+            )),
+            input_serial: InputSerial::from_millis_since_epoch(160),
+            data: b"held-back".to_vec(),
+        };
+
+        // A writer that takes nothing and answers WouldBlock or TimedOut is
+        // asked for the identical request again, never dropped. Only a
+        // guardian's proof that the bytes wrote nothing lets the client send
+        // them to a replacement mux; any other refusal may still take effect.
+        let refusals = [
+            (2, FakePaneWriteBehavior::GuardianKnownNotApplied, true),
+            (3, FakePaneWriteBehavior::GuardianDurabilityPending, false),
+            (
+                4,
+                FakePaneWriteBehavior::RefuseForNow(std::io::ErrorKind::WouldBlock),
+                false,
+            ),
+            (
+                5,
+                FakePaneWriteBehavior::RefuseForNow(std::io::ErrorKind::TimedOut),
+                false,
+            ),
+        ];
+        for (serial, behavior, wrote_nothing) in refusals {
+            pane.set_writer_behavior(behavior);
+            handler.process_one(DecodedPdu {
+                serial,
+                pdu: Pdu::ReliablePaneWriteV1(request.clone()),
+            });
+            tick_until_response(&executor, &captured, 1);
+            let response = take_response(&captured);
+            assert_eq!(response.serial, serial);
+            let Pdu::ReliablePaneWriteV1Response(ReliablePaneWriteV1Response {
+                outcome: ReliablePaneWriteOutcomeV1::Retry(retry),
+                ..
+            }) = response.pdu
+            else {
+                panic!(
+                    "{behavior:?} must ask for the same request again, got {:?}",
+                    response.pdu
+                );
+            };
+            let expected = if wrote_nothing {
+                ReliablePaneWriteRetryV1::DefinitelyNotApplied {
+                    retry_after_ns: RELIABLE_PANE_WRITE_REFUSED_RETRY_AFTER_NS,
+                }
+            } else {
+                ReliablePaneWriteRetryV1::Input(ReliableKeyEventRetryV1::DuplicatePending {
+                    retry_after_ns: RELIABLE_PANE_WRITE_REFUSED_RETRY_AFTER_NS,
+                })
+            };
+            assert_eq!(retry, expected, "{behavior:?}");
+        }
+        assert_eq!(pane.writer_calls(), 4);
+        assert_eq!(pane.written_bytes(), Vec::<u8>::new());
+
+        pane.set_writer_behavior(FakePaneWriteBehavior::ApplyAll);
+        handler.process_one(DecodedPdu {
+            serial: 6,
+            pdu: Pdu::ReliablePaneWriteV1(request),
+        });
+        tick_until_response(&executor, &captured, 1);
+        drain_simple_executor(&executor);
+        assert!(captured.lock().unwrap().iter().any(|response| {
+            response.serial == 6
+                && matches!(
+                    &response.pdu,
+                    Pdu::ReliablePaneWriteV1Response(ReliablePaneWriteV1Response {
+                        outcome: ReliablePaneWriteOutcomeV1::AppliedPrefix { bytes: 9 },
+                        ..
+                    })
+                )
+        }));
+        assert_eq!(pane.writer_calls(), 5);
+        assert_eq!(pane.written_bytes(), b"held-back");
+    }
+
+    #[test]
+    fn write_to_pane_queues_on_the_panes_own_input_path() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let executor = SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let _mux_guard = ScopedMux::install(&mux);
+        let pane = Arc::new(FakePane::new_with_id(7_125, None));
+        let pane_for_mux: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&pane_for_mux)
+            .expect("register write-to-pane pane");
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux)).unwrap();
+        handler.process_one(DecodedPdu {
+            serial: 1,
+            pdu: Pdu::SetClientId(SetClientId {
+                client_id: test_client_id("write-to-pane-input-path", 41_125),
+                is_proxy: false,
+            }),
+        });
+        take_response(&captured);
+
+        handler.process_one(DecodedPdu {
+            serial: 2,
+            pdu: Pdu::WriteToPane(WriteToPane {
+                pane_id: pane.pane_id(),
+                data: b"queued-input".to_vec(),
+            }),
+        });
+        tick_until_response(&executor, &captured, 1);
+        drain_simple_executor(&executor);
+        let response = {
+            let mut responses = captured.lock().unwrap_or_else(|err| err.into_inner());
+            let index = responses
+                .iter()
+                .position(|response| response.serial == 2)
+                .expect("the pane write must produce a correlated response");
+            responses.remove(index)
+        };
+        assert_eq!(response.pdu, Pdu::UnitResponse(UnitResponse {}));
+        assert_eq!(pane.user_input(), b"queued-input");
+        assert_eq!(
+            pane.writer_calls(),
+            0,
+            "the request must not write the pane's raw writer on the main thread"
+        );
+    }
+
+    #[test]
     fn server_trace_dispatch_retirement_records_no_pair_or_key_side_effect() {
         let _lock = crate::GLOBAL_STATE_TEST_LOCK
             .lock()
@@ -14841,6 +15072,15 @@ mod tests {
         ApplyPrefix(usize),
         Zero,
         Error,
+        /// Takes nothing and fails with a bare error of this kind, as a
+        /// guardian transport timeout or a full tmux command queue does.
+        RefuseForNow(std::io::ErrorKind),
+        /// Takes nothing and fails as a guardian lease does once the guardian
+        /// proved the input wrote nothing.
+        GuardianKnownNotApplied,
+        /// Takes nothing and fails as a guardian lease does while the guardian
+        /// has accepted the input but not made it durable.
+        GuardianDurabilityPending,
         Panic,
     }
 
@@ -14860,6 +15100,19 @@ mod tests {
                 FakePaneWriteBehavior::Zero => 0,
                 FakePaneWriteBehavior::Error => {
                     return Err(std::io::Error::other("injected pane-writer rejection"));
+                }
+                FakePaneWriteBehavior::RefuseForNow(kind) => {
+                    return Err(std::io::Error::new(kind, "injected pane-writer refusal"));
+                }
+                FakePaneWriteBehavior::GuardianKnownNotApplied => {
+                    return Err(
+                        crate::guardian_proxy::GuardianProxyError::InputKnownNotApplied.into(),
+                    );
+                }
+                FakePaneWriteBehavior::GuardianDurabilityPending => {
+                    return Err(
+                        crate::guardian_proxy::GuardianProxyError::InputDurabilityPending.into(),
+                    );
                 }
                 FakePaneWriteBehavior::Panic => panic!("injected pane-writer panic"),
             };
@@ -14892,6 +15145,8 @@ mod tests {
         coherent_surface: AtomicBool,
         cursor_line_start_override: Option<StableRowIndex>,
         writer_sink: ParkingMutex<FakePaneWriter>,
+        /// What `send_user_input` queued, apart from the raw writer.
+        user_input: ParkingMutex<Vec<u8>>,
         mux_registration: Arc<mux::PaneRegistrationSlot>,
     }
 
@@ -14915,6 +15170,7 @@ mod tests {
                 coherent_surface: AtomicBool::new(false),
                 cursor_line_start_override: None,
                 writer_sink: ParkingMutex::new(FakePaneWriter::default()),
+                user_input: ParkingMutex::new(Vec::new()),
                 mux_registration: Arc::new(mux::PaneRegistrationSlot::default()),
                 changed_lines: Mutex::new(RangeSet::new()),
                 changed_since_seqnos: Mutex::new(Vec::new()),
@@ -15013,6 +15269,10 @@ mod tests {
 
         fn written_bytes(&self) -> Vec<u8> {
             self.writer_sink.lock().applied.clone()
+        }
+
+        fn user_input(&self) -> Vec<u8> {
+            self.user_input.lock().clone()
         }
     }
 
@@ -15177,6 +15437,11 @@ mod tests {
 
         fn send_paste(&self, _text: &str) -> anyhow::Result<()> {
             self.paste_count.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn send_user_input(&self, bytes: &[u8]) -> anyhow::Result<()> {
+            self.user_input.lock().extend_from_slice(bytes);
             Ok(())
         }
 

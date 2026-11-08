@@ -5891,6 +5891,16 @@ impl Pane for ClientPane {
         })
     }
 
+    /// Hands the bytes to this pane's reliable input FIFO, which owns them
+    /// from then on: it settles them in order or records a failure that the
+    /// next write reports. Unlike the default, it does not flush: on the mux
+    /// main thread, which runs the FIFO, a flush can only answer that the bytes
+    /// are still pending, and on another thread it waits for the remote mux.
+    fn send_user_input(&self, bytes: &[u8]) -> anyhow::Result<()> {
+        std::io::Write::write_all(&mut *self.writer.lock(), bytes)?;
+        Ok(())
+    }
+
     fn set_zoomed(&self, zoomed: bool) {
         let render = self.renderable.lock();
         let mut inner = render.inner.borrow_mut();
@@ -10215,6 +10225,29 @@ mod tests {
             accepted.len()
         );
         assert_eq!(inner.reliable_input_queue.state.lock().pending.len(), 1);
+        assert_eq!(pane.writer.lock().delivery.sticky_failure(), None);
+        inner.reliable_input_queue.retire("test_complete");
+    }
+
+    #[test]
+    fn user_input_on_the_mux_thread_is_queued_without_waiting_for_delivery() {
+        let scope = MuxTestScope::enter_with_parked_main_thread_scheduler();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(17);
+        let pane = test_client_pane(&inner, 160, 146);
+        let pane_for_mux: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&pane_for_mux)
+            .expect("register user-input pane");
+        inner.reliable_input_queue.state.lock().worker_running = true;
+
+        // The FIFO now owns the bytes and runs on this thread, so they are
+        // still pending; that is not a failure to send them.
+        pane_for_mux
+            .send_user_input(b"composed")
+            .expect("queued user input is sent");
+        assert_eq!(inner.reliable_input_queue.state.lock().pending.len(), 1);
+        assert_eq!(pane.writer.lock().delivery.pending_chunks(), 1);
         assert_eq!(pane.writer.lock().delivery.sticky_failure(), None);
         inner.reliable_input_queue.retire("test_complete");
     }

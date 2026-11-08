@@ -4667,6 +4667,14 @@ mod pane_registration_handle {
             writer.flush()
         }
 
+        /// Queue `data` as input on the pane's own input path, in order with
+        /// its keys and pastes; see [`crate::pane::Pane::send_user_input`]. A local pane
+        /// hands it to its terminal's writer thread, so the caller never waits
+        /// for a program that is not reading.
+        pub fn send_user_input(&self, data: &[u8]) -> anyhow::Result<()> {
+            self.pane.send_user_input(data)
+        }
+
         #[must_use]
         pub fn owner_is_main_thread(&self) -> bool {
             self.owner.is_main_thread()
