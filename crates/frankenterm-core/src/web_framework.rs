@@ -17,7 +17,7 @@ pub(crate) use fastapi::core::{
     BoxFuture, ControlFlow, Cx, Middleware, OpenApiConfig, StartupOutcome,
 };
 #[allow(unused_imports)]
-pub(crate) use fastapi::http::{ParseLimits, PreBodyValidator, QueryString};
+pub(crate) use fastapi::http::{ParseLimits, PreBodyValidator, QueryString, percent_decode};
 #[allow(unused_imports)]
 pub(crate) use fastapi::prelude::{App, Method, Request, RequestContext, Response, StatusCode};
 #[allow(unused_imports)]

@@ -337,6 +337,57 @@ mod web_tests {
         fetch_raw(addr, request.as_bytes()).await
     }
 
+    /// An invalid pane selection must be rejected before either data access
+    /// or SSE subscription. No backend is attached, so 400 rather than 503
+    /// also proves that validation owns the admission decision.
+    #[test]
+    fn web_pane_filters_fail_closed_before_data_or_stream_admission() {
+        run_async_test(async {
+            let server = start_web_server(WebServerConfig::default().with_port(0))
+                .await
+                .expect("start web server");
+            let addr = server.bound_addr();
+            let mut observations = Vec::new();
+            for endpoint in ["/events", "/search", "/stream/events", "/stream/deltas"] {
+                for query in [
+                    "pane_id=not-a-pane",
+                    "pane_id=-1",
+                    "pane_id=18446744073709551616",
+                    "pane_id=7&pane_id=8",
+                    "pane_id=7&pane%5Fid=7",
+                    "%70ane_id=%37&pane_id=%37",
+                ] {
+                    let path = format!("{endpoint}?q=needle&{query}");
+                    observations.push((
+                        path.clone(),
+                        "invalid_pane_id",
+                        fetch_path(addr, &path).await,
+                    ));
+                }
+                let path = format!("{endpoint}?{}pane_id=7", "x=1&".repeat(256));
+                observations.push((
+                    path.clone(),
+                    "too_many_query_parameters",
+                    fetch_path(addr, &path).await,
+                ));
+            }
+            let health = fetch_health(addr).await;
+            server.shutdown().await.expect("shutdown web server");
+
+            for (path, code, response) in observations {
+                let response = response.expect("invalid query must receive a finite response");
+                assert_eq!(extract_status(&response), 400, "{path}");
+                assert!(!response.contains("text/event-stream"), "{path}");
+                let body: serde_json::Value =
+                    serde_json::from_str(extract_body(&response)).expect("JSON rejection");
+                assert_eq!(body["ok"], false, "{path}");
+                assert_eq!(body["error_code"], code, "{path}");
+                assert!(body.get("data").is_none(), "{path}");
+            }
+            assert_eq!(extract_status(&health.unwrap()), 200);
+        });
+    }
+
     /// `ft web --ui-dir` serves exactly the manifest's verified files under
     /// `/ui/`, beside an unchanged API; nothing else on disk is reachable.
     #[test]

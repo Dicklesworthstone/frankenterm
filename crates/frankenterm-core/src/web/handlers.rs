@@ -5,7 +5,7 @@
 
 use super::error::{json_err, json_ok};
 use super::extractors::{
-    parse_bool, parse_i64, parse_limit, parse_u64, redact_json_value, request_runtime_limits,
+    parse_bool, parse_i64, parse_limit, parse_pane_filter, redact_json_value, request_runtime_limits,
     require_storage,
 };
 use super::middleware::AppState;
@@ -200,9 +200,13 @@ pub(super) fn handle_events(
     let qs = QueryString::parse(&qs_raw);
     let runtime_limits = request_runtime_limits(req);
 
+    let pane_id = match parse_pane_filter(&qs) {
+        Ok(pane_id) => pane_id,
+        Err(response) => return Box::pin(async move { response }),
+    };
     let query = EventQuery {
         limit: Some(parse_limit(&qs, runtime_limits)),
-        pane_id: parse_u64(&qs, "pane_id"),
+        pane_id,
         rule_id: qs.get("rule_id").map(String::from),
         event_type: qs.get("event_type").map(String::from),
         triage_state: qs.get("triage_state").map(String::from),
@@ -300,10 +304,14 @@ pub(super) fn handle_search(
     let qs = QueryString::parse(&qs_raw);
     let runtime_limits = request_runtime_limits(req);
 
+    let pane_id = match parse_pane_filter(&qs) {
+        Ok(pane_id) => pane_id,
+        Err(response) => return Box::pin(async move { response }),
+    };
     let query_str = qs.get("q").map(String::from);
     let options = SearchOptions {
         limit: Some(parse_limit(&qs, runtime_limits)),
-        pane_id: parse_u64(&qs, "pane_id"),
+        pane_id,
         zone_type: None,
         since: parse_i64(&qs, "since"),
         until: parse_i64(&qs, "until"),
@@ -940,7 +948,7 @@ mod tests {
 
             let req = make_request(
                 "/events",
-                Some("pane_id=not-a-number&since=oops&until=nah&unhandled=yes"),
+                Some("pane_id=8&since=oops&until=nah&unhandled=yes"),
                 Some(storage.clone()),
             );
             let response = handle_events(&req).await;
@@ -962,6 +970,69 @@ mod tests {
                 "urgent"
             );
 
+            storage.shutdown().await.expect("shutdown storage");
+        });
+    }
+
+    #[test]
+    fn event_and_search_reads_keep_exact_pane_scope() {
+        run_async_test(async {
+            let (_dir, storage) = temp_storage().await;
+            for pane_id in [7, 8] {
+                storage
+                    .upsert_pane(sample_pane(pane_id))
+                    .await
+                    .expect("upsert pane");
+                storage
+                    .record_event(sample_event(pane_id))
+                    .await
+                    .expect("record event");
+                storage
+                    .append_segment(pane_id, "needle in both panes", None)
+                    .await
+                    .expect("append segment");
+            }
+
+            for (scope, expected) in [
+                ("", vec![7, 8]),
+                ("&pane_id=7", vec![7]),
+                ("&%70ane_id=%37", vec![7]),
+                ("&pane%5Fid=%38", vec![8]),
+            ] {
+                let query = format!("q=needle{scope}");
+                let events_req = make_request("/events", Some(&query), Some(storage.clone()));
+                let search_req = make_request("/search", Some(&query), Some(storage.clone()));
+                for (response, key) in [
+                    (handle_events(&events_req).await, "events"),
+                    (handle_search(&search_req).await, "results"),
+                ] {
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let json = response_json(response);
+                    let mut panes: Vec<u64> = json["data"][key]
+                        .as_array()
+                        .expect("result array")
+                        .iter()
+                        .map(|row| row["pane_id"].as_u64().expect("pane id"))
+                        .collect();
+                    panes.sort_unstable();
+                    assert_eq!(panes, expected, "{key}: {scope:?}");
+                }
+            }
+
+            for query in ["pane_id=oops", "pane_id=7&pane_id=8"] {
+                let query = format!("q=needle&{query}");
+                let events_req = make_request("/events", Some(&query), Some(storage.clone()));
+                let search_req = make_request("/search", Some(&query), Some(storage.clone()));
+                for response in [
+                    handle_events(&events_req).await,
+                    handle_search(&search_req).await,
+                ] {
+                    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                    let json = response_json(response);
+                    assert_eq!(json["error_code"], "invalid_pane_id");
+                    assert!(json.get("data").is_none());
+                }
+            }
             storage.shutdown().await.expect("shutdown storage");
         });
     }

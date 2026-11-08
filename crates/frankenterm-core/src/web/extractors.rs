@@ -10,6 +10,7 @@ use super::{QueryString, Request, Response, StatusCode, WebRuntimeLimits, resolv
 use crate::events::EventBus;
 use crate::policy::Redactor;
 use crate::storage::StorageHandle;
+use crate::web_framework::percent_decode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -162,6 +163,57 @@ pub(super) fn parse_limit(qs: &QueryString<'_>, limits: WebRuntimeLimits) -> usi
 /// Parse a `u64` query parameter by key.
 pub(super) fn parse_u64(qs: &QueryString<'_>, key: &str) -> Option<u64> {
     qs.get(key).and_then(|v: &str| v.parse::<u64>().ok())
+}
+
+/// Parse an optional pane scope without turning malformed input into an
+/// unfiltered read. The framework silently ignores query pairs after 256;
+/// reject that truncation before looking for a scope or duplicate instead.
+pub(super) fn parse_pane_filter(qs: &QueryString<'_>) -> std::result::Result<Option<u64>, Response> {
+    const MAX_QUERY_PARAMS: usize = 256;
+    if qs
+        .raw()
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .take(MAX_QUERY_PARAMS + 1)
+        .count()
+        > MAX_QUERY_PARAMS
+    {
+        return Err(json_err(
+            StatusCode::BAD_REQUEST,
+            "too_many_query_parameters",
+            "At most 256 query parameters are supported",
+        ));
+    }
+
+    let invalid = || {
+        json_err(
+            StatusCode::BAD_REQUEST,
+            "invalid_pane_id",
+            "pane_id must occur once and contain an unsigned 64-bit decimal integer",
+        )
+    };
+    let mut pane_id = None;
+    for (key, value) in qs.pairs() {
+        // Seven ASCII bytes need at most 21 bytes of percent encoding.
+        // Decode keys too, so encoded aliases cannot conceal a duplicate.
+        if key.len() > 21 || percent_decode(key) != "pane_id" {
+            continue;
+        }
+        // A u64 has at most 20 digits (60 bytes if all are percent-encoded).
+        // Bound decoding before allocating and reject signs/whitespace.
+        if pane_id.is_some() || value.len() > 60 {
+            return Err(invalid());
+        }
+        let value = percent_decode(value);
+        if value.is_empty()
+            || value.len() > 20
+            || !value.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(invalid());
+        }
+        pane_id = Some(value.parse::<u64>().map_err(|_| invalid())?);
+    }
+    Ok(pane_id)
 }
 
 /// Parse an `i64` query parameter by key.
@@ -400,7 +452,9 @@ fn redact_json_value_with_depth(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_bool, parse_i64, parse_limit, parse_u64, redact_json_value};
+    use super::{
+        parse_bool, parse_i64, parse_limit, parse_pane_filter, parse_u64, redact_json_value,
+    };
     use crate::policy::Redactor;
     use crate::web_framework::QueryString;
 
@@ -484,6 +538,78 @@ mod tests {
     fn parse_u64_invalid() {
         let qs = QueryString::parse("pane=-1");
         assert_eq!(parse_u64(&qs, "pane"), None);
+    }
+
+    #[test]
+    fn pane_filter_preserves_absence_zero_and_full_width_identity() {
+        for (query, expected) in [
+            ("", None),
+            ("q=needle&limit=5", None),
+            ("pane_id=0", Some(0)),
+            ("pane_id=42", Some(42)),
+            ("pane_id=00042", Some(42)),
+            ("pane_id=18446744073709551615", Some(u64::MAX)),
+            ("pane%5Fid=%34%32", Some(42)),
+            ("%70ane_id=%30", Some(0)),
+        ] {
+            let parsed = parse_pane_filter(&QueryString::parse(query));
+            assert_eq!(parsed.ok(), Some(expected), "query {query:?}");
+        }
+    }
+
+    #[test]
+    fn pane_filter_rejects_invalid_or_ambiguous_scope() {
+        for query in [
+            "pane_id",
+            "pane_id=",
+            "pane_id=no-such-pane",
+            "pane_id=-1",
+            "pane_id=+1",
+            "pane_id=%2B1",
+            "pane_id=%201",
+            "pane_id=1%20",
+            "pane_id=1.0",
+            "pane_id=0x10",
+            "pane_id=1e2",
+            "pane_id=18446744073709551616",
+            "pane_id=000000000000000000000",
+            "pane_id=7&pane_id=8",
+            "pane_id=0&pane_id=0",
+            "pane_id=7&pane%5Fid=8",
+            "pane%5Fid=7&pane_id=7",
+            "%70ane_id=%37&pane_id=7",
+            "pane_id=%37&pane_id=%37",
+            "pane_id=%FF",
+        ] {
+            let response = parse_pane_filter(&QueryString::parse(query))
+                .expect_err("invalid scope must fail closed");
+            assert_eq!(
+                response.status(),
+                crate::web_framework::StatusCode::BAD_REQUEST,
+                "query {query:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pane_filter_never_ignores_a_scope_after_query_truncation() {
+        let at_limit = format!("{}pane_id=7", "x=1&".repeat(255));
+        assert_eq!(
+            parse_pane_filter(&QueryString::parse(&at_limit)).ok(),
+            Some(Some(7))
+        );
+        for query in [
+            format!("{}pane_id=7", "x=1&".repeat(256)),
+            format!("pane_id=7&{}pane_id=8", "x=1&".repeat(255)),
+            "x=1&".repeat(257),
+        ] {
+            let response = parse_pane_filter(&QueryString::parse(&query))
+                .expect_err("truncated query must fail closed");
+            assert_eq!(
+                response.status(),
+                crate::web_framework::StatusCode::BAD_REQUEST
+            );
+        }
     }
 
     // ── parse_i64 ────────────────────────────────────────────────────

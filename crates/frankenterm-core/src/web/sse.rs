@@ -1,7 +1,9 @@
 //! Server-Sent Events endpoint surface for Wave 4B migration.
 
 use super::error::json_err;
-use super::extractors::{parse_u64, redact_json_value, request_runtime_limits, require_event_bus};
+use super::extractors::{
+    parse_pane_filter, parse_u64, redact_json_value, request_runtime_limits, require_event_bus,
+};
 use super::{
     STREAM_CHANNEL_BUFFER, STREAM_MAX_CONSECUTIVE_DROPS, STREAM_SCHEMA_VERSION, WebRuntimeLimits,
 };
@@ -714,7 +716,10 @@ pub(super) fn handle_stream_events(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
     let qs_raw = req.query().unwrap_or("").to_string();
     let qs = QueryString::parse(&qs_raw);
-    let pane_filter = parse_u64(&qs, "pane_id");
+    let pane_filter = match parse_pane_filter(&qs) {
+        Ok(pane_id) => pane_id,
+        Err(response) => return Box::pin(async move { response }),
+    };
     let runtime_limits = request_runtime_limits(req);
     let max_hz = parse_stream_max_hz(&qs, runtime_limits);
     let channel = match parse_event_stream_channel(&qs) {

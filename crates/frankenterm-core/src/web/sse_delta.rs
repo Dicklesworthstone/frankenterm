@@ -4,7 +4,9 @@
 //! frames never overwrite the client's last received segment cursor.
 
 use super::super::error::json_err;
-use super::super::extractors::{request_runtime_limits, require_storage_and_event_bus};
+use super::super::extractors::{
+    parse_pane_filter, request_runtime_limits, require_storage_and_event_bus,
+};
 use super::super::{STREAM_CHANNEL_BUFFER, WebRuntimeLimits};
 use super::{
     SseByteStream, SseEvent, SseResponse, advance_stream_sequence, epoch_ms_now, frame_to_sse,
@@ -262,21 +264,9 @@ pub fn handle_stream_deltas(
 ) -> std::pin::Pin<Box<dyn Future<Output = Response> + Send>> {
     let qs_raw = req.query().unwrap_or("").to_string();
     let qs = QueryString::parse(&qs_raw);
-    // Invalid filter text must not broaden a pane-scoped stream to all panes.
-    let pane_filter = match qs.get("pane_id") {
-        None => None,
-        Some(value) => match decimal_u64(value) {
-            Some(pane) => Some(pane),
-            None => {
-                return Box::pin(async {
-                    json_err(
-                        StatusCode::BAD_REQUEST,
-                        "invalid_pane_id",
-                        "pane_id must be a nonnegative integer",
-                    )
-                });
-            }
-        },
+    let pane_filter = match parse_pane_filter(&qs) {
+        Ok(pane_id) => pane_id,
+        Err(response) => return Box::pin(async move { response }),
     };
     let resume_after = match parse_delta_resume(
         req.headers().get("last-event-id"),
