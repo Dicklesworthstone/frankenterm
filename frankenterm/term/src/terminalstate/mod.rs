@@ -833,9 +833,12 @@ const WRITER_RESEND_MAX_PAUSE: std::time::Duration = std::time::Duration::from_s
 /// pending by identity and settles it exactly once when the same bytes come
 /// again; any other bytes are refused until then. Before this, one such error
 /// ended the writer thread with the input unsent, and the pane took no input
-/// and no recovery capture again (ft-jrhpr). A blocking PTY never returns
-/// either kind. An error that proves the bytes will never be taken, such as a
-/// guardian's `InputKnownNotApplied`, is not one of these.
+/// and no recovery capture again (ft-jrhpr). It answers `WouldBlock` as well
+/// when its guardian proved that an input wrote nothing because the program
+/// did not read it in time, and while it then holds new input back; the same
+/// bytes go again later as new input (ft-vc66w). A tmux pane's writer answers
+/// `WouldBlock` while its command queue is full, having queued nothing. A
+/// blocking PTY never returns either kind.
 fn write_error_is_transient(kind: std::io::ErrorKind) -> bool {
     matches!(
         kind,

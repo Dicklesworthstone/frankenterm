@@ -101,6 +101,17 @@ const GUARDIAN_RETIREMENT_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(5);
 const GUARDIAN_INPUT_RETRY_FIRST_PAUSE: Duration = Duration::from_millis(1);
 const GUARDIAN_INPUT_RETRY_MAX_PAUSE: Duration = Duration::from_millis(16);
 const GUARDIAN_INPUT_RETRY_BUDGET: Duration = Duration::from_secs(2);
+/// After the guardian proves that an input wrote nothing, usually because the
+/// pane's program has not read its input for the guardian's resend window
+/// (2 s), the lease refuses new input itself, with no guardian call, for this
+/// long. The pause doubles up to the largest with each such input and ends
+/// when an input applies (ft-vc66w). Callers resend what was refused, so this
+/// paces their resends: each guardian attempt against a program that does not
+/// read holds the guardian's broker session, and with it every pane of this
+/// mux, for that window, so a hung program costs the other panes about one
+/// window in every largest pause, not two seconds in three.
+const GUARDIAN_INPUT_NOT_READY_FIRST_PAUSE: Duration = Duration::from_secs(1);
+const GUARDIAN_INPUT_NOT_READY_MAX_PAUSE: Duration = Duration::from_secs(32);
 const GUARDIAN_CONNECT_ATTEMPTS: usize = 32;
 const GUARDIAN_CONNECT_RETRY_BUDGET: Duration = Duration::from_secs(5);
 const GUARDIAN_CLAIM_RETRY_BUDGET: Duration = Duration::from_secs(5);
@@ -1110,6 +1121,10 @@ pub enum GuardianProxyError {
     InputDurabilityPending,
     #[error("guardian proved that the pending input wrote zero bytes")]
     InputKnownNotApplied,
+    #[error(
+        "guardian pane's program is not reading its input; new input is held back until a later attempt"
+    )]
+    InputNotReady,
     #[error("guardian cannot prove the disposition of the pending input")]
     InputDispositionUnavailable,
     #[error("the pending input can only be retried with its exact original bytes")]
@@ -1155,7 +1170,12 @@ impl From<GuardianProxyError> for io::Error {
             | GuardianProxyError::GuardianIncarnationChanged => {
                 Self::new(io::ErrorKind::BrokenPipe, error)
             }
+            // An input known to have written nothing, or held back while the
+            // program does not read, can go again unchanged: the terminal's
+            // writer thread resends it (ft-vc66w).
             GuardianProxyError::InputDurabilityPending
+            | GuardianProxyError::InputKnownNotApplied
+            | GuardianProxyError::InputNotReady
             | GuardianProxyError::PendingInputPayloadRequired
             | GuardianProxyError::ReplaySnapshotExpired
             | GuardianProxyError::ReplayEndsInsideSequence
@@ -1301,6 +1321,10 @@ enum GuardianMutationTransportError {
 trait GuardianMutationTransport: Send {
     fn input_retry_budget(&self) -> Duration {
         GUARDIAN_INPUT_RETRY_BUDGET
+    }
+
+    fn input_not_ready_first_pause(&self) -> Duration {
+        GUARDIAN_INPUT_NOT_READY_FIRST_PAUSE
     }
 
     fn input(
@@ -3264,8 +3288,20 @@ pub struct GuardianPaneLeaseActor {
     /// Whether this lease saw its child exit. The guardian then keeps the pane
     /// and its journal for whatever this mux still reads, until it closes it.
     exited_unclosed: bool,
+    /// Set while the pane's program is not reading its input (ft-vc66w).
+    input_not_ready: Option<InputNotReady>,
     #[cfg(test)]
     fail_next_input_copy: bool,
+}
+
+/// The lease's hold on new input after the guardian proved that an input
+/// wrote nothing; see [`GUARDIAN_INPUT_NOT_READY_FIRST_PAUSE`].
+#[derive(Clone, Copy, Debug)]
+struct InputNotReady {
+    /// No new input goes to the guardian before this.
+    retry_at: Instant,
+    /// The pause that set `retry_at`; the next one is twice as long.
+    pause: Duration,
 }
 
 impl fmt::Debug for GuardianPaneLeaseActor {
@@ -3299,6 +3335,7 @@ impl GuardianPaneLeaseActor {
             transport,
             _recovery_admission: None,
             exited_unclosed: false,
+            input_not_ready: None,
             #[cfg(test)]
             fail_next_input_copy: false,
         }
@@ -3789,7 +3826,45 @@ impl GuardianPaneLeaseActor {
         completion: RecoveredPendingMutation,
     ) -> Result<RecoveredPendingMutation, GuardianProxyError> {
         self.complete_sequence(pending.sequence)?;
+        match completion {
+            RecoveredPendingMutation::InputKnownNotApplied => self.hold_input_back(),
+            RecoveredPendingMutation::InputApplied { applied_bytes, .. } if applied_bytes > 0 => {
+                self.input_not_ready = None;
+            }
+            RecoveredPendingMutation::InputApplied { .. }
+            | RecoveredPendingMutation::Generic
+            | RecoveredPendingMutation::Checkpoint(_) => {}
+        }
         Ok(completion)
+    }
+
+    /// Start or lengthen the hold on new input after an input wrote nothing.
+    fn hold_input_back(&mut self) {
+        let pause = self.input_not_ready.map_or_else(
+            || self.transport.input_not_ready_first_pause(),
+            |held| {
+                held.pause
+                    .saturating_mul(2)
+                    .min(GUARDIAN_INPUT_NOT_READY_MAX_PAUSE)
+            },
+        );
+        self.input_not_ready = Some(InputNotReady {
+            retry_at: Instant::now() + pause,
+            pause,
+        });
+    }
+
+    /// Refuse new input while the hold from [`Self::hold_input_back`] lasts.
+    /// The lease must be attached, so a fenced or closed lease still says so.
+    fn ensure_input_ready(&self) -> Result<(), GuardianProxyError> {
+        self.ensure_attached()?;
+        match self.input_not_ready {
+            Some(held) if Instant::now() < held.retry_at => {
+                metrics::counter!("mux.guardian_proxy.input_not_ready_total").increment(1);
+                Err(GuardianProxyError::InputNotReady)
+            }
+            Some(_) | None => Ok(()),
+        }
     }
 
     fn retry_generic(
@@ -3942,6 +4017,7 @@ impl GuardianPaneLeaseActor {
                 | None => {}
             }
         }
+        self.ensure_input_ready()?;
         self.begin_input(payload)?;
         match self.settle_new_input(payload)? {
             RecoveredPendingMutation::InputApplied { applied_bytes, .. } => {
@@ -8807,6 +8883,8 @@ mod tests {
         calls: Vec<FakeCall>,
         // Zero by default: most tests script each attempt as its own call.
         input_retry_budget: Duration,
+        // Zero by default: an input after one that wrote nothing goes at once.
+        input_not_ready_first_pause: Duration,
     }
 
     #[derive(Clone)]
@@ -11970,6 +12048,10 @@ mod tests {
             self.state.lock().input_retry_budget
         }
 
+        fn input_not_ready_first_pause(&self) -> Duration {
+            self.state.lock().input_not_ready_first_pause
+        }
+
         fn input(
             &mut self,
             pane_id: Uuid,
@@ -12316,6 +12398,7 @@ mod tests {
             directives: directives.into_iter().collect(),
             calls: Vec::new(),
             input_retry_budget: Duration::ZERO,
+            input_not_ready_first_pause: Duration::ZERO,
         }));
         let staging = GuardianProxyStaging::with_transports(
             identity(),
@@ -16317,6 +16400,88 @@ mod tests {
         assert_eq!(second.0, 52);
         assert_ne!(first.1, second.1);
         assert_ne!(first.2, second.2);
+    }
+
+    /// A program that does not read makes the guardian answer
+    /// InputKnownNotApplied after its resend window. The terminal's writer
+    /// resends such input; the lease answers those resends itself until a
+    /// doubling pause ends, so they do not hold the guardian (ft-vc66w).
+    #[test]
+    fn input_that_wrote_nothing_holds_new_input_back_for_a_doubling_pause() {
+        let input_calls = |state: &Arc<Mutex<FakeState>>| input_call_count(&state.lock());
+        let end_hold = |actor: &SharedGuardianPaneLeaseActor| {
+            let mut actor = actor.lock();
+            let held = actor.input_not_ready.as_mut().expect("input is held back");
+            held.retry_at = Instant::now();
+            held.pause
+        };
+        let (staging, state) = fake_staging(
+            [
+                FakeDirective::Reject(GuardianRejectionCode::InputKnownNotApplied),
+                FakeDirective::Reject(GuardianRejectionCode::InputKnownNotApplied),
+                FakeDirective::Reject(GuardianRejectionCode::InputKnownNotApplied),
+                FakeDirective::Auto,
+                FakeDirective::Auto,
+            ],
+            61,
+        );
+        state.lock().input_not_ready_first_pause = Duration::from_secs(10);
+        let actor = staging.shared_actor();
+
+        let refused = actor.lock().write_input(b"paste").unwrap_err();
+        assert!(matches!(refused, GuardianProxyError::InputKnownNotApplied));
+        assert_eq!(io::Error::from(refused).kind(), io::ErrorKind::WouldBlock);
+        for bytes in [&b"paste"[..], b"other"] {
+            let held = actor.lock().write_input(bytes).unwrap_err();
+            assert!(matches!(held, GuardianProxyError::InputNotReady), "{held}");
+            assert_eq!(io::Error::from(held).kind(), io::ErrorKind::WouldBlock);
+        }
+        assert_eq!(
+            input_calls(&state),
+            1,
+            "a held input never reaches the guardian"
+        );
+        assert_eq!(actor.lock().next_sequence(), 62);
+
+        // Each input that writes nothing doubles the pause, up to the largest.
+        assert_eq!(end_hold(&actor), Duration::from_secs(10));
+        assert!(matches!(
+            actor.lock().write_input(b"paste"),
+            Err(GuardianProxyError::InputKnownNotApplied)
+        ));
+        assert_eq!(end_hold(&actor), Duration::from_secs(20));
+        assert!(matches!(
+            actor.lock().write_input(b"paste"),
+            Err(GuardianProxyError::InputKnownNotApplied)
+        ));
+        assert_eq!(end_hold(&actor), GUARDIAN_INPUT_NOT_READY_MAX_PAUSE);
+        assert_eq!(input_calls(&state), 3);
+
+        // An input that applies ends the hold, so the next one goes at once.
+        assert_eq!(actor.lock().write_input(b"paste").expect("applied"), 5);
+        assert!(actor.lock().input_not_ready.is_none());
+        assert_eq!(actor.lock().write_input(b"after").expect("applied"), 5);
+        assert_eq!(input_calls(&state), 5);
+        assert_eq!(actor.lock().next_sequence(), 66);
+    }
+
+    #[test]
+    fn a_held_input_still_reports_a_lease_that_is_no_longer_attached() {
+        let (staging, state) = fake_staging(
+            [FakeDirective::Reject(
+                GuardianRejectionCode::InputKnownNotApplied,
+            )],
+            71,
+        );
+        state.lock().input_not_ready_first_pause = Duration::from_secs(10);
+        let actor = staging.shared_actor();
+        assert!(actor.lock().write_input(b"paste").is_err());
+        actor.lock().disposition = GuardianLeaseDisposition::Fenced;
+        assert!(matches!(
+            actor.lock().write_input(b"paste"),
+            Err(GuardianProxyError::LeaseFenced)
+        ));
+        assert_eq!(input_call_count(&state.lock()), 1);
     }
 
     #[test]
