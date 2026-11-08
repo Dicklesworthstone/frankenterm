@@ -8744,8 +8744,7 @@ fn checkpoint_stage_upload_acknowledged(
     Ok(inspection.seal_present && inspection.ack_present && !inspection.expiry_present)
 }
 
-/// Unlink one stage record file and forget its durability, so the bounded
-/// durable-record cache tracks only files that still exist.
+/// Unlink one stage record file and forget its durability in this store.
 fn checkpoint_stage_unlink(
     inner: &GuardianCheckpointStageStoreInner,
     entry: &CheckpointStageCensusEntry,
@@ -9040,10 +9039,10 @@ fn checkpoint_write_created_record(
 }
 
 /// What [`checkpoint_read_record`] does for a record's durability, without
-/// reading it: a record this store incarnation has not synced (one found on
-/// disk after a restart, or whose creator lost its reply between the data and
-/// the directory sync) is synced once before it can count toward a Ready or
-/// Progress reply.
+/// reading it: a record this store does not remember syncing (one found on
+/// disk after a restart, evicted from the cache, or whose creator lost its
+/// reply between the data and directory sync) is synced before it can count
+/// toward a Ready or Progress reply.
 fn checkpoint_ensure_record_durable(
     inner: &GuardianCheckpointStageStoreInner,
     entry: &CheckpointStageCensusEntry,
@@ -9093,7 +9092,11 @@ fn checkpoint_remember_durable_record(
         return Ok(());
     }
     if durable_records.len() >= inner.policy.max_stage_files {
-        return Err(GuardianCheckpointStageStoreError::Capacity);
+        // Another store can reclaim files without invalidating this store's
+        // remembered identities. This cache only avoids repeated syncs; the
+        // on-disk census owns capacity admission. Forgetting it must cause
+        // re-synchronization, never refuse an already durable record.
+        durable_records.clear();
     }
     durable_records
         .try_reserve_exact(1)
@@ -9182,8 +9185,8 @@ fn checkpoint_read_record(
     if !durability_known {
         // An O_EXCL creator can lose its reply after the data sync but before
         // the directory sync, or a cooperating process can encounter a prior
-        // sync error. Re-synchronize each identity once per store incarnation
-        // before it can produce Ready/Progress/Sealed. The bounded cache avoids
+        // sync error. Re-synchronize identities the store no longer remembers
+        // before they can produce Ready/Progress/Sealed. The bounded cache avoids
         // turning an ordered 1,024-chunk upload into quadratic fsync traffic.
         file.sync_all().map_err(|error| {
             GuardianCheckpointStageStoreError::io("checkpoint-record-retry-sync", error)
@@ -24485,6 +24488,165 @@ mod tests {
                 next_index: total_chunks,
                 committed_bytes: u64::try_from(payload.len())?,
             }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_stage_keeps_progressing_after_another_store_reclaims_cached_records()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-checkpoint-cache-reclaim-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let retiring_store = pipeline.checkpoint_stage_store();
+        let mut store = GuardianDurableSpawnCustodyV1::open_existing_store(
+            &directory.join("guardian.token"),
+        )?;
+        // The stores have independent caches over the same directory. A
+        // one-chunk upload reserves four files; exercise the cache bound
+        // without creating thousands of durable records.
+        const MAX_FILES: usize = 4;
+        Arc::get_mut(&mut store.inner)
+            .expect("test store is uniquely owned")
+            .policy
+            .max_stage_files = MAX_FILES;
+        let remembered = || {
+            store
+                .inner
+                .durable_records
+                .lock()
+                .expect("checkpoint durability cache")
+                .len()
+        };
+        let payload = b"durable";
+        let chunk_bytes = u32::try_from(payload.len())?;
+        let pane_id = Uuid::from_u128(0x5c00);
+        let mut retired_files = Vec::new();
+        for (index, with_chunk) in [true, false].into_iter().enumerate() {
+            let spawn_effect_id = Uuid::from_u128(0x5c10 + u128::try_from(index)?);
+            let upload_id = Uuid::from_u128(0x5c20 + u128::try_from(index)?);
+            let begin = checkpoint_test_genesis_request(
+                GuardianCheckpointStageKindV1::Begin,
+                spawn_effect_id,
+                upload_id,
+                payload,
+                chunk_bytes,
+                None,
+            )?;
+            store.apply_begin(&begin)?;
+            if with_chunk {
+                store.apply_chunk(checkpoint_test_genesis_request(
+                    GuardianCheckpointStageKindV1::Chunk,
+                    spawn_effect_id,
+                    upload_id,
+                    payload,
+                    chunk_bytes,
+                    Some((0, payload)),
+                )?)?;
+            }
+            // Keep deleted inodes allocated so this fixture cannot pass by
+            // accidentally reusing one of the stale cached identities.
+            retired_files.extend(retiring_store.with_exclusive_directory(|inner| {
+                let census = checkpoint_stage_census(inner)?;
+                census
+                    .entries
+                    .iter()
+                    .map(|entry| {
+                        open_private_file_at(
+                            &inner.directory,
+                            &inner.directory_path,
+                            &entry.path,
+                            false,
+                        )
+                        .map_err(GuardianCheckpointStageStoreError::from)
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })?);
+            assert_eq!(
+                retiring_store.delete_retired_pane_files(pane_id, spawn_effect_id)?,
+                1 + usize::from(with_chunk)
+            );
+        }
+        assert_eq!(retired_files.len(), MAX_FILES - 1);
+        assert_eq!(remembered(), MAX_FILES - 1);
+        assert!(checkpoint_stage_upload_keys(&store)?.is_empty());
+
+        let spawn_effect_id = Uuid::from_u128(0x5c30);
+        let upload_id = Uuid::from_u128(0x5c31);
+        let request = |kind, chunk: Option<(u32, &[u8])>| {
+            checkpoint_test_genesis_request(
+                kind,
+                spawn_effect_id,
+                upload_id,
+                payload,
+                chunk_bytes,
+                chunk,
+            )
+        };
+        assert_eq!(
+            store.apply_begin(&request(GuardianCheckpointStageKindV1::Begin, None)?)?,
+            GuardianCheckpointStageReplyV1::Ready {
+                upload_id,
+                next_index: 0,
+                committed_bytes: 0,
+            }
+        );
+        assert_eq!(remembered(), MAX_FILES);
+        let progress = GuardianCheckpointStageReplyV1::Progress {
+            upload_id,
+            next_index: 1,
+            committed_bytes: u64::try_from(payload.len())?,
+        };
+        // The new chunk used to fail with Capacity after syncing: the cache
+        // was full even though only two records remained on disk.
+        assert_eq!(
+            store.apply_chunk(request(GuardianCheckpointStageKindV1::Chunk, Some((0, payload)))?)?,
+            progress
+        );
+        // Query re-synchronizes the forgotten candidate and authenticates
+        // every record. Exact chunk retries still return their own progress.
+        assert_eq!(
+            store.apply_query(request(GuardianCheckpointStageKindV1::Query, None)?)?,
+            progress
+        );
+        assert_eq!(
+            store.apply_chunk(request(GuardianCheckpointStageKindV1::Chunk, Some((0, payload)))?)?,
+            progress
+        );
+        assert!(remembered() <= MAX_FILES);
+        assert!(matches!(
+            store.apply_begin(&checkpoint_test_genesis_request(
+                GuardianCheckpointStageKindV1::Begin,
+                Uuid::from_u128(0x5c40),
+                Uuid::from_u128(0x5c41),
+                payload,
+                chunk_bytes,
+                None,
+            )?),
+            Err(GuardianCheckpointStageStoreError::Capacity)
+        ));
+
+        // Eviction changes no authentication rule: a same-inode, same-size
+        // corrupt chunk must be quarantined even with its identity cached.
+        let chunk_path = store.with_exclusive_directory(|inner| {
+            checkpoint_stage_census(inner)?
+                .entries
+                .into_iter()
+                .find(|entry| matches!(entry.role, CheckpointStageFileRole::Chunk { .. }))
+                .map(|entry| entry.path)
+                .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)
+        })?;
+        let metadata = std::fs::metadata(&chunk_path)?;
+        let identity = FileIdentity::capture(&metadata, Some(metadata.len()));
+        let mut bytes = std::fs::read(&chunk_path)?;
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x5a;
+        std::fs::write(&chunk_path, bytes)?;
+        assert!(identity.matches(&std::fs::metadata(&chunk_path)?));
+        assert_eq!(
+            store.apply_query(request(GuardianCheckpointStageKindV1::Query, None)?)?,
+            GuardianCheckpointStageReplyV1::Quarantined { upload_id }
         );
         Ok(())
     }
