@@ -109,9 +109,22 @@ const RELIABLE_PANE_WRITE_REFUSED_RETRY_AFTER_NS: u64 = 100_000_000;
 /// it exactly once when the same bytes come again, so the client resends them
 /// to this mux, but it must not send them to a mux that has replaced this one.
 fn refused_pane_write_retry(error: &std::io::Error) -> ReliablePaneWriteRetryV1 {
-    use crate::guardian_proxy::GuardianProxyError;
     let retry_after_ns = RELIABLE_PANE_WRITE_REFUSED_RETRY_AFTER_NS;
-    let wrote_nothing = error
+    if guardian_refusal_wrote_nothing(error) {
+        ReliablePaneWriteRetryV1::DefinitelyNotApplied { retry_after_ns }
+    } else {
+        ReliablePaneWriteRetryV1::Input(ReliableKeyEventRetryV1::DuplicatePending {
+            retry_after_ns,
+        })
+    }
+}
+
+/// Whether a guardian pane's lease refused a write with proof that it wrote
+/// nothing; see [`refused_pane_write_retry`].
+#[cfg(unix)]
+fn guardian_refusal_wrote_nothing(error: &std::io::Error) -> bool {
+    use crate::guardian_proxy::GuardianProxyError;
+    error
         .get_ref()
         .and_then(|inner| inner.downcast_ref::<GuardianProxyError>())
         .is_some_and(|refusal| {
@@ -121,14 +134,34 @@ fn refused_pane_write_retry(error: &std::io::Error) -> ReliablePaneWriteRetryV1 
                     | GuardianProxyError::InputNotReady
                     | GuardianProxyError::PendingInputPayloadRequired
             )
-        });
-    if wrote_nothing {
-        ReliablePaneWriteRetryV1::DefinitelyNotApplied { retry_after_ns }
-    } else {
-        ReliablePaneWriteRetryV1::Input(ReliableKeyEventRetryV1::DuplicatePending {
-            retry_after_ns,
         })
+}
+
+/// Guardian panes exist only on unix.
+#[cfg(not(unix))]
+fn guardian_refusal_wrote_nothing(_error: &std::io::Error) -> bool {
+    false
+}
+
+/// Runs the single writer call of `client`'s reliable pane-write request
+/// `input_serial`. The client sends a request this call refused for now
+/// again as it was, before its later input, so a guardian pane's lease may
+/// wait for that resend (ft-jrhpr).
+fn reliable_pane_write_once(
+    pane: &CurrentPane<'_>,
+    data: &[u8],
+    client: Option<&Arc<ClientId>>,
+    input_serial: u64,
+) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    if let Some(client) = client {
+        let request =
+            crate::guardian_proxy::PaneWriteRequest::new(Arc::clone(client), input_serial);
+        return crate::guardian_proxy::resending_pane_write(request, || pane.write_once(data));
     }
+    #[cfg(not(unix))]
+    let _ = (client, input_serial);
+    pane.write_once(data)
 }
 
 const PRODUCTION_TRACE_SHARDS: u16 = 64;
@@ -9582,6 +9615,8 @@ impl SessionHandler {
                 let sender = self.to_write_tx.clone();
                 let per_pane = self.per_pane_for_registration(&registration);
                 let input_activity = self.pane_input_activity(pane_id);
+                // The client admitted above, which resends this request as is.
+                let resending_client = self.client_id.clone();
                 #[cfg(test)]
                 let force_begin_side_effect_failure =
                     self.reliable_input_test_fault == ReliableInputTestFault::BeginSideEffectFalse;
@@ -9623,7 +9658,14 @@ impl SessionHandler {
                             let callback = pane_operation.with_current_pane(|pane| {
                                 catch_recoverable(
                                     RecoverablePanicSite::MuxPaneCallback,
-                                    AssertUnwindSafe(|| pane.write_once(&data)),
+                                    AssertUnwindSafe(|| {
+                                        reliable_pane_write_once(
+                                            pane,
+                                            &data,
+                                            resending_client.as_ref(),
+                                            input_serial.get(),
+                                        )
+                                    }),
                                 )
                             });
                             match callback {
@@ -15004,6 +15046,8 @@ mod tests {
         assert_eq!(pane.written_bytes(), b"saturated");
     }
 
+    /// Its guardian refusals exist only on unix.
+    #[cfg(unix)]
     #[test]
     fn reliable_pane_write_that_the_writer_refuses_for_now_is_resent_not_dropped() {
         let _lock = crate::GLOBAL_STATE_TEST_LOCK
@@ -15087,6 +15131,15 @@ mod tests {
             assert_eq!(retry, expected, "{behavior:?}");
         }
         assert_eq!(pane.writer_calls(), 4);
+        // Each call ran as the write of this client's request, which it
+        // resends as is, so a guardian pane's lease waits for that resend
+        // (ft-jrhpr), and only during the call.
+        let resent = crate::guardian_proxy::PaneWriteRequest::new(
+            Arc::new(test_client_id("reliable-pane-refused-for-now", 41_124)),
+            160,
+        );
+        assert_eq!(pane.pane_write_requests(), vec![Some(resent); 4]);
+        assert!(crate::guardian_proxy::current_pane_write_request().is_none());
         assert_eq!(pane.written_bytes(), Vec::<u8>::new());
 
         pane.set_writer_behavior(FakePaneWriteBehavior::ApplyAll);
@@ -15326,9 +15379,11 @@ mod tests {
         RefuseForNow(std::io::ErrorKind),
         /// Takes nothing and fails as a guardian lease does once the guardian
         /// proved the input wrote nothing.
+        #[cfg(unix)]
         GuardianKnownNotApplied,
         /// Takes nothing and fails as a guardian lease does while the guardian
         /// has accepted the input but not made it durable.
+        #[cfg(unix)]
         GuardianDurabilityPending,
         Panic,
     }
@@ -15337,12 +15392,19 @@ mod tests {
     struct FakePaneWriter {
         behavior: FakePaneWriteBehavior,
         calls: usize,
+        /// The reliable pane-write request each call ran inside, if any; see
+        /// `guardian_proxy::resending_pane_write`.
+        #[cfg(unix)]
+        requests: Vec<Option<crate::guardian_proxy::PaneWriteRequest>>,
         applied: Vec<u8>,
     }
 
     impl std::io::Write for FakePaneWriter {
         fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
             self.calls = self.calls.saturating_add(1);
+            #[cfg(unix)]
+            self.requests
+                .push(crate::guardian_proxy::current_pane_write_request());
             let applied = match self.behavior {
                 FakePaneWriteBehavior::ApplyAll => data.len(),
                 FakePaneWriteBehavior::ApplyPrefix(maximum) => data.len().min(maximum),
@@ -15353,11 +15415,13 @@ mod tests {
                 FakePaneWriteBehavior::RefuseForNow(kind) => {
                     return Err(std::io::Error::new(kind, "injected pane-writer refusal"));
                 }
+                #[cfg(unix)]
                 FakePaneWriteBehavior::GuardianKnownNotApplied => {
                     return Err(
                         crate::guardian_proxy::GuardianProxyError::InputKnownNotApplied.into(),
                     );
                 }
+                #[cfg(unix)]
                 FakePaneWriteBehavior::GuardianDurabilityPending => {
                     return Err(
                         crate::guardian_proxy::GuardianProxyError::InputDurabilityPending.into(),
@@ -15514,6 +15578,11 @@ mod tests {
 
         fn writer_calls(&self) -> usize {
             self.writer_sink.lock().calls
+        }
+
+        #[cfg(unix)]
+        fn pane_write_requests(&self) -> Vec<Option<crate::guardian_proxy::PaneWriteRequest>> {
+            self.writer_sink.lock().requests.clone()
         }
 
         fn written_bytes(&self) -> Vec<u8> {

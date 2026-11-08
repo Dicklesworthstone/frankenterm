@@ -13,6 +13,7 @@ use anyhow::Context as _;
 use frankenterm_pty_guardian::{
     GuardianClaimedPaneLease, GuardianClient, GuardianClientError, GuardianDurableSpawnCustodyV1,
 };
+use mux::client::ClientId;
 use mux::domain::{
     Domain, DomainId, DomainState, GuardianPanePublicationReceipt, LocalDomain, UnpublishedPane,
 };
@@ -39,6 +40,7 @@ use mux::pane::{
 use parking_lot::Mutex;
 use portable_pty::{Child, ChildKiller, ExitStatus, MasterPty, PtySize};
 use sha2::{Digest as _, Sha256};
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -1221,9 +1223,89 @@ enum GuardianInputWriter {
     /// The terminal's writer thread: keys, pastes and query replies. It
     /// resends the bytes the lease refused for now before anything else.
     Terminal,
-    /// The pane's own writer: reliable pane writes from clients, and other
-    /// direct writes.
+    /// The pane's own writer: reliable pane writes from clients, which resend
+    /// a request the lease refused for now as it was (see
+    /// [`resending_pane_write`]), and other direct writes, such as tmux
+    /// control-mode commands, which give up on them.
     Pane,
+}
+
+impl GuardianInputWriter {
+    /// Who sends the input now going through this writer again, if the lease
+    /// refuses it for now and anyone does.
+    fn resender(self) -> Option<InputResender> {
+        match self {
+            Self::Terminal => Some(InputResender::TerminalWriter),
+            Self::Pane => current_pane_write_request().map(InputResender::Request),
+        }
+    }
+}
+
+/// One reliable pane-write request, the same in each of its client's resends:
+/// the client and that client's input serial.
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct PaneWriteRequest {
+    client: Arc<ClientId>,
+    input_serial: u64,
+}
+
+impl PaneWriteRequest {
+    pub(crate) fn new(client: Arc<ClientId>, input_serial: u64) -> Self {
+        Self {
+            client,
+            input_serial,
+        }
+    }
+}
+
+impl fmt::Debug for PaneWriteRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PaneWriteRequest")
+            .field("client", &self.client.id)
+            .field("input_serial", &self.input_serial)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Who sends an input the lease refused for now again.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum InputResender {
+    /// The terminal's writer thread, before any other input of its own.
+    TerminalWriter,
+    /// The client of this reliable pane-write request, as it was.
+    Request(PaneWriteRequest),
+}
+
+thread_local! {
+    /// The reliable pane-write request whose write runs on this thread, if
+    /// any; see [`resending_pane_write`].
+    static PANE_WRITE_REQUEST: RefCell<Option<PaneWriteRequest>> = const { RefCell::new(None) };
+}
+
+/// Runs `write`, the single writer call of a reliable pane-write `request`.
+/// Its client sends the same request again, before its later input, when a
+/// guardian pane refuses it for now (`WouldBlock` or `TimedOut`). A guardian
+/// pane's own writer counts on a resend only inside this call, and only of
+/// the same request: its other callers give up on such a refusal, and a
+/// client's next request is new input (ft-jrhpr). The terminal's writer
+/// thread always resends, so its writes need no such call.
+pub(crate) fn resending_pane_write<T>(request: PaneWriteRequest, write: impl FnOnce() -> T) -> T {
+    /// Puts the earlier request back, also when `write` panics.
+    struct Restore(Option<PaneWriteRequest>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PANE_WRITE_REQUEST.with(|current| *current.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(PANE_WRITE_REQUEST.with(|current| current.replace(Some(request))));
+    write()
+}
+
+/// The reliable pane-write request whose write runs on this thread inside
+/// [`resending_pane_write`], if any.
+pub(crate) fn current_pane_write_request() -> Option<PaneWriteRequest> {
+    PANE_WRITE_REQUEST.with(|current| current.borrow().clone())
 }
 
 #[derive(Clone)]
@@ -1237,9 +1319,9 @@ struct PendingInput {
     submitted: bool,
     /// The writer that sent this input.
     writer: GuardianInputWriter,
-    /// Whether that writer was refused for now (`WouldBlock` or `TimedOut`)
-    /// on these bytes, so that it will send them again.
-    resend_expected: bool,
+    /// Who sends these bytes again, once that writer was refused them for now
+    /// (`WouldBlock` or `TimedOut`).
+    resender: Option<InputResender>,
 }
 
 impl fmt::Debug for PendingInput {
@@ -1253,7 +1335,7 @@ impl fmt::Debug for PendingInput {
             .field("recovery_query_request_id", &self.recovery_query_request_id)
             .field("submitted", &self.submitted)
             .field("writer", &self.writer)
-            .field("resend_expected", &self.resend_expected)
+            .field("resender", &self.resender)
             .finish_non_exhaustive()
     }
 }
@@ -1267,13 +1349,17 @@ impl PendingInput {
 
 /// A pending input that another operation (a resize, a capture, a flush or a
 /// different input) found applied and settled, after its writer was refused
-/// for now and before the writer sent it again. The terminal's writer thread
-/// and the reliable pane-write lane each resend such bytes before their next
-/// input, so that writer's next input is answered from here if it is these
-/// bytes, and they are not written twice. Any other input from that writer
-/// ends the wait.
-#[derive(Clone, Copy, Debug)]
+/// for now and before it was sent again. Only an input that someone resends
+/// leaves one: one from the terminal's writer thread, which resends before
+/// its next input, or a reliable pane-write request (see
+/// [`resending_pane_write`]), which its client sends again as it was. That
+/// resend is answered from here, so the bytes are not written twice. Any
+/// other input from the terminal's writer ends the wait; a pane write ends
+/// only the wait of its own request.
+#[derive(Clone, Debug)]
 struct SettledBeforeResend {
+    /// Who sends it again.
+    resender: InputResender,
     input_bytes: u32,
     payload_sha256: [u8; 32],
     /// More than zero: an input that applied no byte goes again as new input.
@@ -3339,7 +3425,8 @@ pub struct GuardianPaneLeaseActor {
     /// The terminal writer's input that another operation settled before the
     /// writer resent it; see [`SettledBeforeResend`].
     terminal_settled_before_resend: Option<SettledBeforeResend>,
-    /// The same for the pane's own writer.
+    /// The same for the pane's own writer: the last reliable pane-write
+    /// request that another operation settled before its client resent it.
     pane_settled_before_resend: Option<SettledBeforeResend>,
     #[cfg(test)]
     fail_next_input_copy: bool,
@@ -3602,7 +3689,7 @@ impl GuardianPaneLeaseActor {
             recovery_query_request_id: None,
             submitted: false,
             writer,
-            resend_expected: false,
+            resender: None,
         }));
         Ok(())
     }
@@ -4033,23 +4120,30 @@ impl GuardianPaneLeaseActor {
         // loop. A terminal census may still reconcile an operation that was
         // already submitted; it may never authorize a new mutation.
         self.ensure_pending_recovery_permitted()?;
-        // Without its bytes, this call is not the input's resend. A writer
-        // that was refused for now will still resend it, and must not write
-        // it again (ft-jrhpr).
+        // Without its bytes, this call is not the input's resend. Whoever
+        // sends it again must not have it written twice (ft-jrhpr).
         let unresent_input = match (&self.pending, input_payload) {
-            (Some(PendingMutation::Input(pending)), None) if pending.resend_expected => {
-                Some((pending.writer, pending.input_bytes, pending.payload_sha256))
+            (Some(PendingMutation::Input(pending)), None) => {
+                pending.resender.clone().map(|resender| {
+                    (
+                        pending.writer,
+                        resender,
+                        pending.input_bytes,
+                        pending.payload_sha256,
+                    )
+                })
             }
             _ => None,
         };
         let recovered = self.retry_pending(input_payload)?;
         if let (
-            Some((writer, input_bytes, payload_sha256)),
+            Some((writer, resender, input_bytes, payload_sha256)),
             RecoveredPendingMutation::InputApplied { applied_bytes, .. },
         ) = (unresent_input, &recovered)
             && *applied_bytes > 0
         {
             *self.settled_before_resend(writer) = Some(SettledBeforeResend {
+                resender,
                 input_bytes,
                 payload_sha256,
                 applied_bytes: *applied_bytes,
@@ -4068,36 +4162,67 @@ impl GuardianPaneLeaseActor {
         }
     }
 
-    /// Note that `writer` was refused `payload` for now and will send it again,
-    /// if it is that writer's pending input; see [`SettledBeforeResend`].
-    fn expect_resend(&mut self, writer: GuardianInputWriter, payload: &[u8]) {
+    /// The record of `writer`'s settled input, taken when this input from
+    /// `resender` may be its resend; see [`SettledBeforeResend`]. The
+    /// terminal's writer resends before anything else, so any input of its
+    /// own ends the wait. A pane write ends only the wait of its own request,
+    /// so other clients' input and a client's later requests leave it.
+    fn take_settled_before_resend(
+        &mut self,
+        writer: GuardianInputWriter,
+        resender: Option<&InputResender>,
+    ) -> Option<SettledBeforeResend> {
+        let settled = self.settled_before_resend(writer);
+        match writer {
+            GuardianInputWriter::Terminal => settled.take(),
+            GuardianInputWriter::Pane => {
+                settled.take_if(|settled| Some(&settled.resender) == resender)
+            }
+        }
+    }
+
+    /// Note that `resender` sends `payload` again, which `writer` was refused
+    /// for now, if it is that writer's pending input; see
+    /// [`SettledBeforeResend`].
+    fn expect_resend(
+        &mut self,
+        writer: GuardianInputWriter,
+        resender: InputResender,
+        payload: &[u8],
+    ) {
         let payload = guardian_input_payload(payload);
         if let Some(PendingMutation::Input(pending)) = self.pending.as_mut()
             && pending.writer == writer
             && pending.matches_payload(payload)
         {
-            pending.resend_expected = true;
+            pending.resender = Some(resender);
         }
     }
 
     #[cfg(test)]
     fn write_input(&mut self, payload: &[u8]) -> Result<usize, GuardianProxyError> {
-        self.write_input_from(GuardianInputWriter::Terminal, payload)
+        self.write_input_from(
+            GuardianInputWriter::Terminal,
+            Some(&InputResender::TerminalWriter),
+            payload,
+        )
     }
 
+    /// Writes `payload` from `writer`, sent by `resender` if it is someone
+    /// who sends it again when the lease refuses it for now.
     fn write_input_from(
         &mut self,
         writer: GuardianInputWriter,
+        resender: Option<&InputResender>,
         payload: &[u8],
     ) -> Result<usize, GuardianProxyError> {
         if payload.is_empty() {
             return Ok(0);
         }
         let payload = guardian_input_payload(payload);
-        // This writer's first input since another operation settled its last
-        // one is that input's resend if the bytes match; anything else means
-        // the resend is not coming.
-        if let Some(settled) = self.settled_before_resend(writer).take()
+        // The resend of an input another operation settled since gets its
+        // result instead of being written again.
+        if let Some(settled) = self.take_settled_before_resend(writer, resender)
             && settled.matches_payload(payload)
         {
             return usize::try_from(settled.applied_bytes)
@@ -7790,18 +7915,22 @@ impl fmt::Debug for GuardianProxyWriter {
 
 impl Write for GuardianProxyWriter {
     fn write(&mut self, payload: &[u8]) -> io::Result<usize> {
+        let resender = self.writer.resender();
         let mut actor = self.actor.lock();
-        let error = match actor.write_input_from(self.writer, payload) {
+        let error = match actor.write_input_from(self.writer, resender.as_ref(), payload) {
             Ok(written) => return Ok(written),
             Err(error) => io::Error::from(error),
         };
-        // The terminal's writer thread and the reliable pane-write lane send
-        // the same bytes again after either kind (ft-jrhpr).
-        if matches!(
-            error.kind(),
-            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-        ) {
-            actor.expect_resend(self.writer, payload);
+        // The terminal's writer thread and a reliable pane write's client
+        // send the same bytes again after either kind (ft-jrhpr); the pane's
+        // other writers give up.
+        if let Some(resender) = resender
+            && matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            )
+        {
+            actor.expect_resend(self.writer, resender, payload);
         }
         Err(error)
     }
@@ -16691,13 +16820,17 @@ mod tests {
         let actor = staging.shared_actor();
         let mut terminal = proxy_writer(&actor, GuardianInputWriter::Terminal);
         let mut pane = proxy_writer(&actor, GuardianInputWriter::Pane);
-        assert!(pane.write(b"keys").is_err());
+        let keys = PaneWriteRequest::new(Arc::new(ClientId::new()), 1);
+        assert!(resending_pane_write(keys.clone(), || pane.write(b"keys")).is_err());
         // The terminal's input settles the pane's, then goes itself.
         assert_eq!(terminal.write(b"reply").unwrap(), 5);
         // The same bytes from the other writer are that writer's new input.
         assert_eq!(terminal.write(b"keys").unwrap(), 4);
         assert_eq!(input_call_count(&state.lock()), 3);
-        assert_eq!(pane.write(b"keys").unwrap(), 4);
+        assert_eq!(
+            resending_pane_write(keys, || pane.write(b"keys")).unwrap(),
+            4
+        );
         assert_eq!(
             input_call_count(&state.lock()),
             3,
@@ -16741,7 +16874,8 @@ mod tests {
     }
 
     /// A writer refused for good (here a reset connection) does not send the
-    /// bytes again, so a later input of the same bytes is new input.
+    /// bytes again, so a later input of the same bytes, even of the same
+    /// request, is new input.
     #[test]
     fn a_settled_input_whose_writer_was_not_refused_for_now_answers_nothing() {
         let (staging, state) = fake_staging(
@@ -16755,15 +16889,111 @@ mod tests {
         );
         let actor = staging.shared_actor();
         let mut pane = proxy_writer(&actor, GuardianInputWriter::Pane);
-        let reset = pane.write(b"keys").unwrap_err();
+        let keys = PaneWriteRequest::new(Arc::new(ClientId::new()), 1);
+        let reset = resending_pane_write(keys.clone(), || pane.write(b"keys")).unwrap_err();
         assert_eq!(reset.kind(), io::ErrorKind::ConnectionReset);
         actor
             .lock()
             .resize(size(30, 90))
             .expect("the resize finds the input applied, then applies");
-        assert_eq!(pane.write(b"keys").expect("new input applies"), 4);
+        assert_eq!(
+            resending_pane_write(keys, || pane.write(b"keys")).expect("new input applies"),
+            4
+        );
         assert_eq!(input_call_count(&state.lock()), 2);
         assert_eq!(actor.lock().next_sequence(), 54);
+    }
+
+    /// A write to the pane's own writer outside [`resending_pane_write`],
+    /// such as a tmux control-mode command, gives up when it is refused for
+    /// now. If another operation then finds it applied, the same bytes again
+    /// are new input, not an answered resend.
+    #[test]
+    fn a_pane_write_whose_caller_gives_up_on_a_refusal_answers_nothing() {
+        let (staging, state) = fake_staging(
+            [
+                FakeDirective::Auto,
+                REFUSED_FOR_NOW,
+                FakeDirective::Query(InputEffectState::DurableFull),
+                FakeDirective::Auto,
+                FakeDirective::Auto,
+            ],
+            61,
+        );
+        let actor = staging.shared_actor();
+        let mut pane = proxy_writer(&actor, GuardianInputWriter::Pane);
+        let lane = PaneWriteRequest::new(Arc::new(ClientId::new()), 1);
+        assert_eq!(
+            resending_pane_write(lane, || pane.write(b"lane")).unwrap(),
+            4
+        );
+        assert!(
+            current_pane_write_request().is_none(),
+            "the scope ends with its call"
+        );
+        let refused = pane.write(b"list-windows\n").unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::WouldBlock);
+        actor
+            .lock()
+            .resize(size(30, 90))
+            .expect("the resize finds the input applied, then applies");
+        assert_eq!(
+            pane.write(b"list-windows\n").expect("new input applies"),
+            13
+        );
+        assert_eq!(
+            input_call_count(&state.lock()),
+            3,
+            "the new input is written"
+        );
+        assert_eq!(actor.lock().next_sequence(), 65);
+    }
+
+    /// A client resends a reliable pane-write request refused for now as it
+    /// was, before its later requests. If another operation settled it
+    /// meanwhile, only that request's resend is answered: another client's
+    /// input, or a later request of the same bytes (such as one from a client
+    /// that gave up on the refusal), is new input and leaves the wait as is.
+    #[test]
+    fn a_settled_pane_write_answers_only_the_resend_of_its_own_request() {
+        let (staging, state) = fake_staging(
+            [
+                REFUSED_FOR_NOW,
+                FakeDirective::Query(InputEffectState::DurableFull),
+                FakeDirective::Auto,
+                FakeDirective::Auto,
+            ],
+            71,
+        );
+        let actor = staging.shared_actor();
+        let mut pane = proxy_writer(&actor, GuardianInputWriter::Pane);
+        let client = Arc::new(ClientId::new());
+        let first = PaneWriteRequest::new(Arc::clone(&client), 1);
+        assert!(resending_pane_write(first.clone(), || pane.write(b"keys")).is_err());
+        // Another client's input, of the same serial, settles the first
+        // request, then goes itself.
+        let other = PaneWriteRequest::new(Arc::new(ClientId::new()), 1);
+        assert_eq!(
+            resending_pane_write(other, || pane.write(b"other")).unwrap(),
+            5
+        );
+        // The first client's next request, of the same bytes, is new input.
+        let next = PaneWriteRequest::new(client, 2);
+        assert_eq!(
+            resending_pane_write(next, || pane.write(b"keys")).unwrap(),
+            4
+        );
+        assert_eq!(input_call_count(&state.lock()), 3);
+        assert_eq!(
+            resending_pane_write(first, || pane.write(b"keys")).unwrap(),
+            4
+        );
+        assert_eq!(
+            input_call_count(&state.lock()),
+            3,
+            "the first request's resend is answered"
+        );
+        assert_eq!(actor.lock().next_sequence(), 74);
     }
 
     #[test]
