@@ -76,7 +76,7 @@ const PANE_ALERT_BACKLOG_FAILURE: &str =
 const TOPOLOGY_FENCE_MAX_EVENTS: usize = 4096;
 const TOPOLOGY_FENCE_MAX_RETAINED_BYTES: usize = 4 * 1024 * 1024;
 /// Accounted topology values retain their original 4 MiB connection ceiling;
-/// complete snapshots have a separate ceiling shared by PDU82, PDU87 and PDU116.
+/// complete snapshots have a separate ceiling shared by PDU82, PDU87, PDU116 and PDU122.
 /// Their aggregate
 /// permits one maximum snapshot to coexist with the separately bounded
 /// successor queue, while each class remains unable to borrow the other's
@@ -1578,7 +1578,10 @@ fn queue_response_pdu_with_emission_authority(
     delivery_class: PduDeliveryClass,
     emission_authority: ServerEmissionAuthority,
 ) -> anyhow::Result<()> {
-    if matches!(&pdu, Pdu::GetPaneUserVarsV1Response(_)) {
+    if matches!(
+        &pdu,
+        Pdu::GetPaneUserVarsV1Response(_) | Pdu::ListPanesWithDomainsV1Response(_)
+    ) {
         return queue_user_vars_snapshot_response(
             item_tx,
             terminal,
@@ -1607,13 +1610,13 @@ fn queue_response_pdu_with_emission_authority(
 
 fn user_vars_snapshot_frame_capacity(plan: &codec::PduOutboundPlan) -> anyhow::Result<usize> {
     // Auto may retain a compressed Vec with spare compressBound capacity.
-    // PDU116 has a one-byte identifier; length and serial are at most ten
+    // PDU116 and PDU122 have one-byte identifiers; length and serial are at most ten
     // bytes each. Reserve its backing allocation, not just the wire length.
     plan.maximum_compression_output_bytes()
         .max(plan.maximum_encoded_payload_bytes())
         .checked_add(21)
         .map(|capacity| capacity.max(plan.maximum_frame_bytes()))
-        .context("counting bounded pane user-variable frame storage")
+        .context("counting bounded pane metadata frame storage")
 }
 
 fn user_vars_snapshot_codec_peak_bytes(
@@ -1627,14 +1630,15 @@ fn user_vars_snapshot_codec_peak_bytes(
         .checked_mul(2)
         .and_then(|bytes| bytes.checked_add(plan.logical_payload_bytes()))
         .map(|bytes| bytes.max(plan.codec_peak_bytes()))
-        .context("counting pane user-variable codec peak storage")
+        .context("counting pane metadata codec peak storage")
 }
 
 fn user_vars_snapshot_codec_rejection(
     outcome: promise::spawn::MainThreadReservationOutcome,
+    request_ident: u64,
 ) -> codec::ErrorResponse {
     use promise::spawn::MainThreadReservationOutcome as Outcome;
-    let ident = <codec::GetPaneUserVarsV1 as codec::PduWireIdent>::IDENT;
+    let ident = request_ident;
     let (label, error) = match outcome {
         Outcome::Reserved(_) => unreachable!("an admitted codec stage must retain its reservation"),
         Outcome::RetryableFull(_) => (
@@ -1659,8 +1663,12 @@ fn user_vars_snapshot_codec_rejection(
             codec::ErrorResponse::backend_failure(ident),
         ),
     };
-    metrics::counter!("mux.dispatch.user_vars_snapshot.codec_admission", "outcome" => label)
-        .increment(1);
+    let metric = if ident == <codec::ListPanesWithDomainsV1 as codec::PduWireIdent>::IDENT {
+        "mux.dispatch.pane_domains_snapshot.codec_admission"
+    } else {
+        "mux.dispatch.user_vars_snapshot.codec_admission"
+    };
+    metrics::counter!(metric, "outcome" => label).increment(1);
     error
 }
 
@@ -1691,6 +1699,12 @@ fn queue_user_vars_snapshot_response(
     serial: u64,
     emission_authority: ServerEmissionAuthority,
 ) -> anyhow::Result<()> {
+    let request_ident = match &pdu {
+        Pdu::ListPanesWithDomainsV1Response(_) => {
+            <codec::ListPanesWithDomainsV1 as codec::PduWireIdent>::IDENT
+        }
+        _ => <codec::GetPaneUserVarsV1 as codec::PduWireIdent>::IDENT,
+    };
     let authority = EncodedPduAuthority::capture(&pdu, serial, emission_authority);
     authority.validate(terminal)?;
     let prepared = pdu
@@ -1700,7 +1714,7 @@ fn queue_user_vars_snapshot_response(
             None,
             codec::CompressionMode::Auto,
         )
-        .context("planning bounded pane user-variable response")?;
+        .context("planning bounded pane metadata response")?;
     let frame_capacity = user_vars_snapshot_frame_capacity(prepared.plan())?;
     let codec_peak_bytes = user_vars_snapshot_codec_peak_bytes(prepared.plan(), frame_capacity)?;
     let reservation = {
@@ -1716,8 +1730,14 @@ fn queue_user_vars_snapshot_response(
                 // pressure must not turn that ordinary concurrency into a
                 // failed attachment; the client can request a fresh cut later.
                 drop(admission);
-                metrics::counter!("mux.dispatch.user_vars_snapshot.retryable_pressure")
-                    .increment(1);
+                let metric = if request_ident
+                    == <codec::ListPanesWithDomainsV1 as codec::PduWireIdent>::IDENT
+                {
+                    "mux.dispatch.pane_domains_snapshot.retryable_pressure"
+                } else {
+                    "mux.dispatch.user_vars_snapshot.retryable_pressure"
+                };
+                metrics::counter!(metric).increment(1);
                 None
             }
             Err(limit) => {
@@ -1734,9 +1754,7 @@ fn queue_user_vars_snapshot_response(
             terminal,
             budget,
             serial,
-            codec::ErrorResponse::quota_exceeded(
-                <codec::GetPaneUserVarsV1 as codec::PduWireIdent>::IDENT,
-            ),
+            codec::ErrorResponse::quota_exceeded(request_ident),
         );
     };
     // Fund codec intermediates independently of the retained frame tranche.
@@ -1748,7 +1766,7 @@ fn queue_user_vars_snapshot_response(
     ) {
         promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
         outcome => {
-            let error = user_vars_snapshot_codec_rejection(outcome);
+            let error = user_vars_snapshot_codec_rejection(outcome, request_ident);
             drop(prepared);
             drop(reservation);
             return queue_user_vars_snapshot_rejection(item_tx, terminal, budget, serial, error);
@@ -1759,11 +1777,11 @@ fn queue_user_vars_snapshot_response(
     // a stalled socket, and no second payload-sized frame copy is needed.
     let bytes = prepared
         .encode_frame(serial)
-        .context("encoding admitted pane user-variable response")?;
+        .context("encoding admitted pane metadata response")?;
     drop(codec_reservation);
     anyhow::ensure!(
         bytes.capacity() <= frame_capacity,
-        "pane user-variable frame exceeded its admitted allocation bound"
+        "pane metadata frame exceeded its admitted allocation bound"
     );
     reweight_accounted_batch(
         terminal,
@@ -3293,7 +3311,8 @@ impl TopologyStreamCoordinator {
             Pdu::ListPanesOrderedV1Response(response) => self
                 .validate_and_complete_ordered_fence_response(serial, response)
                 .inspect_err(|_| self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE)),
-            Pdu::GetPaneUserVarsV1Response(response) => {
+            metadata @ (Pdu::GetPaneUserVarsV1Response(_)
+            | Pdu::ListPanesWithDomainsV1Response(_)) => {
                 {
                     let state = self.state.lock();
                     if matches!(
@@ -3310,7 +3329,7 @@ impl TopologyStreamCoordinator {
                     &self.item_tx,
                     &self.terminal,
                     &self.outbound_budget,
-                    Pdu::GetPaneUserVarsV1Response(response),
+                    metadata,
                     serial,
                     delivery_class,
                 )

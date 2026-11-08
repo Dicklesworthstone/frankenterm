@@ -1405,6 +1405,7 @@ fn observe_ordered_panes_bounded(
     workspace: &str,
     census_ledger: &mut PaneSnapshotCensusLedger,
     metadata_ledger: &mut PaneSnapshotMetadataLedger,
+    domain_snapshot: Option<&crate::PaneDomainSnapshot>,
 ) -> anyhow::Result<OrderedPaneObservation> {
     if tree_leaf_count > panes.len() {
         anyhow::bail!(
@@ -1453,6 +1454,12 @@ fn observe_ordered_panes_bounded(
         };
         let pane_id =
             observe_snapshot_pane_callback(tab_id, &pane, census_ledger, |pane| pane.pane_id())?;
+        if let Some(snapshot) = domain_snapshot {
+            anyhow::ensure!(
+                snapshot.matches_pane(pane_id, &pane),
+                "pane {pane_id} metadata source differs from its frozen registration"
+            );
+        }
         let tree_entry = if pane_index < tree_leaf_count {
             // Admit each owned UTF-8 result immediately. No subsequent getter
             // runs after a field or cumulative budget rejection.
@@ -5871,6 +5878,36 @@ impl Tab {
         ledger: &mut PaneSnapshotCensusLedger,
         metadata_ledger: &mut PaneSnapshotMetadataLedger,
     ) -> anyhow::Result<PaneArenaAppendReceipt> {
+        self.append_codec_pane_arena_in_window_with_domain_snapshot(
+            window_id,
+            workspace,
+            arena,
+            max_depth,
+            max_total_nodes,
+            max_census_work,
+            max_tree_leaves,
+            ledger,
+            metadata_ledger,
+            None,
+        )
+    }
+
+    /// Bind every observed source allocation to a previously frozen mux
+    /// registration when collecting an authoritative domain-policy listing.
+    /// Other snapshot families retain the original wrapper and its work budget.
+    pub fn append_codec_pane_arena_in_window_with_domain_snapshot(
+        &self,
+        window_id: WindowId,
+        workspace: &str,
+        arena: &mut Vec<PaneArenaNode>,
+        max_depth: usize,
+        max_total_nodes: usize,
+        max_census_work: usize,
+        max_tree_leaves: usize,
+        ledger: &mut PaneSnapshotCensusLedger,
+        metadata_ledger: &mut PaneSnapshotMetadataLedger,
+        domain_snapshot: Option<&crate::PaneDomainSnapshot>,
+    ) -> anyhow::Result<PaneArenaAppendReceipt> {
         const SNAPSHOT_ATTEMPTS: usize = 3;
         let work_before = ledger.attempt_stats();
         let arena_start = arena.len();
@@ -5908,6 +5945,7 @@ impl Tab {
                 workspace,
                 ledger,
                 metadata_ledger,
+                domain_snapshot,
             );
 
             let captured = {

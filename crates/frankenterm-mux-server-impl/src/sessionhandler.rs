@@ -2599,6 +2599,7 @@ impl MuxRequestErrorContext {
             Pdu::Ping(_)
                 | Pdu::ListPanes(_)
                 | Pdu::ListPanesCoherent(_)
+                | Pdu::ListPanesWithDomainsV1(_)
                 | Pdu::ListPanesOrderedV1(_)
                 | Pdu::ListPanesTabStacks(_)
                 | Pdu::GetClientList(_)
@@ -6210,7 +6211,15 @@ fn budgeted_floating_pane_snapshot_entry(
     positioned: mux::tab::PositionedFloatingPane,
     census_ledger: &mut mux::tab::PaneSnapshotCensusLedger,
     metadata_ledger: &mut mux::tab::PaneSnapshotMetadataLedger,
+    domain_snapshot: Option<&mux::PaneDomainSnapshot>,
 ) -> anyhow::Result<codec::FloatingPaneSnapshotEntry> {
+    if let Some(snapshot) = domain_snapshot {
+        anyhow::ensure!(
+            snapshot.matches_pane(positioned.pane_id, &positioned.pane),
+            "floating pane {} metadata source differs from its frozen registration",
+            positioned.pane_id
+        );
+    }
     census_ledger.preflight_pane_callbacks(6)?;
     metadata_ledger.preflight_required_string(
         mux::tab::PaneSnapshotMetadataField::PaneWorkspace,
@@ -6337,6 +6346,26 @@ fn append_floating_pane_snapshot(
     ledger: &mut mux::tab::PaneSnapshotCensusLedger,
     metadata_ledger: &mut mux::tab::PaneSnapshotMetadataLedger,
 ) -> anyhow::Result<()> {
+    append_floating_pane_snapshot_with_domains(
+        output,
+        window_id,
+        tab,
+        workspace,
+        ledger,
+        metadata_ledger,
+        None,
+    )
+}
+
+fn append_floating_pane_snapshot_with_domains(
+    output: &mut Vec<codec::FloatingPaneSnapshotEntry>,
+    window_id: mux::window::WindowId,
+    tab: &mux::tab::Tab,
+    workspace: &str,
+    ledger: &mut mux::tab::PaneSnapshotCensusLedger,
+    metadata_ledger: &mut mux::tab::PaneSnapshotMetadataLedger,
+    domain_snapshot: Option<&mux::PaneDomainSnapshot>,
+) -> anyhow::Result<()> {
     let remaining = codec::MAX_FLOATING_PANES_PER_SNAPSHOT.saturating_sub(output.len());
     let positioned = tab.snapshot_floating_panes_with_census_ledger(remaining, ledger)?;
     let next_len = output
@@ -6361,6 +6390,7 @@ fn append_floating_pane_snapshot(
             positioned,
             ledger,
             metadata_ledger,
+            domain_snapshot,
         )?;
         entries.push(entry);
     }
@@ -6407,6 +6437,29 @@ async fn collect_list_panes_snapshot_with_stage_observer_and_census(
     cooperator: &mut PaneSnapshotCooperator,
     cardinality_limits: PaneSnapshotCardinalityLimits,
     cardinality: &mut PaneSnapshotCardinalityStats,
+) -> anyhow::Result<ListPanesResponse> {
+    collect_list_panes_snapshot_with_domain_snapshot(
+        mux,
+        observer,
+        ledger,
+        metadata_ledger,
+        cooperator,
+        cardinality_limits,
+        cardinality,
+        None,
+    )
+    .await
+}
+
+async fn collect_list_panes_snapshot_with_domain_snapshot(
+    mux: &Mux,
+    observer: &mut impl FnMut(ListPanesSnapshotStage),
+    ledger: &mut mux::tab::PaneSnapshotCensusLedger,
+    metadata_ledger: &mut mux::tab::PaneSnapshotMetadataLedger,
+    cooperator: &mut PaneSnapshotCooperator,
+    cardinality_limits: PaneSnapshotCardinalityLimits,
+    cardinality: &mut PaneSnapshotCardinalityStats,
+    domain_snapshot: Option<&mux::PaneDomainSnapshot>,
 ) -> anyhow::Result<ListPanesResponse> {
     let mut metadata_attempt = PaneSnapshotMetadataAttempt::new(metadata_ledger);
     let metadata_ledger = &mut *metadata_attempt;
@@ -6517,7 +6570,7 @@ async fn collect_list_panes_snapshot_with_stage_observer_and_census(
                     cardinality_limits.pane_leaves,
                 )?;
                 let mut arena = Vec::new();
-                let receipt = tab.append_codec_pane_arena_in_window_with_ledgers(
+                let receipt = tab.append_codec_pane_arena_in_window_with_domain_snapshot(
                     window_id,
                     &workspace,
                     &mut arena,
@@ -6527,6 +6580,7 @@ async fn collect_list_panes_snapshot_with_stage_observer_and_census(
                     max_tree_leaves,
                     ledger,
                     metadata_ledger,
+                    domain_snapshot,
                 )?;
                 debug_assert!(receipt.work.total().is_some());
                 captured_nodes = captured_nodes
@@ -6540,13 +6594,14 @@ async fn collect_list_panes_snapshot_with_stage_observer_and_census(
                 pane_arena_tree_into_legacy(receipt.tree, arena)?
             };
             tabs.push(tree);
-            append_floating_pane_snapshot(
+            append_floating_pane_snapshot_with_domains(
                 &mut floating_panes,
                 window_id,
                 tab.as_ref(),
                 &workspace,
                 ledger,
                 metadata_ledger,
+                domain_snapshot,
             )?;
             observer(ListPanesSnapshotStage::TabTreeCaptured);
             tab_titles.push(tab_title);
@@ -6730,6 +6785,171 @@ async fn collect_coherent_list_panes_snapshot_with_stage_observer(
         last_revision: last_revision
             .expect("a contended snapshot records its last observed revision"),
     })
+}
+
+async fn collect_list_panes_with_domains(
+    mux: &Mux,
+    observer: &mut impl FnMut(ListPanesSnapshotStage),
+) -> anyhow::Result<codec::ListPanesWithDomainsV1Response> {
+    use codec::ListPanesWithDomainsOutcomeV1;
+
+    let mut first_revision = None;
+    let mut last_revision = None;
+    let mut ledger = new_pane_snapshot_census_ledger()?;
+    let mut metadata_ledger = new_pane_snapshot_metadata_ledger()?;
+    let mut cooperator = PaneSnapshotCooperator::new("pdu122");
+    let mut cardinality = PaneSnapshotCardinalityStats::default();
+    let exhausted = || codec::ListPanesWithDomainsV1Response {
+        outcome: ListPanesWithDomainsOutcomeV1::RevisionExhausted,
+    };
+
+    for attempt in 1..=COHERENT_SNAPSHOT_ATTEMPTS {
+        ledger.begin_attempt();
+        metadata_ledger.begin_attempt();
+        let authority = match mux.capture_pane_domain_snapshot(
+            codec::MAX_PANES_WITH_DOMAINS_V1,
+            codec::MAX_PANE_DOMAIN_NAME_BYTES,
+        ) {
+            Ok(authority) => authority,
+            Err(error) if error.is::<mux::TopologyRevisionExhausted>() => return Ok(exhausted()),
+            Err(error) => return Err(error),
+        };
+        let before = authority.topology_authority();
+        if before.1.get() == u64::MAX {
+            return Ok(exhausted());
+        }
+        let panes = collect_list_panes_snapshot_with_domain_snapshot(
+            mux,
+            observer,
+            &mut ledger,
+            &mut metadata_ledger,
+            &mut cooperator,
+            PaneSnapshotCardinalityLimits::PRODUCTION,
+            &mut cardinality,
+            Some(&authority),
+        )
+        .await;
+        record_pane_snapshot_cardinality_metrics("pdu122", cardinality, &panes, attempt > 1);
+        record_pane_snapshot_census_metrics("pdu122", &ledger, attempt > 1);
+        record_pane_snapshot_metadata_metrics("pdu122", &mut metadata_ledger);
+
+        // The authority helper samples topology while the pane and domain
+        // registration serializers still protect this final validation. A
+        // separate later domain lookup could otherwise name a successor.
+        let after = match mux.validate_pane_domain_snapshot(&authority) {
+            Ok(after) => after,
+            Err(_) => return Ok(exhausted()),
+        };
+        if let Some(after) = after {
+            if after.1.get() == u64::MAX {
+                return Ok(exhausted());
+            }
+            anyhow::ensure!(
+                after.0 == before.0,
+                "mux session changed while collecting pane-domain snapshot"
+            );
+            if after == before {
+                // Callback failures are authoritative only after the same
+                // registrations survived collection. Changed sources retry.
+                let panes = flatten_snapshot_panes_with_domains(panes?, &authority)?;
+                let response = codec::ListPanesWithDomainsV1Response {
+                    outcome: ListPanesWithDomainsOutcomeV1::Snapshot {
+                        session_incarnation: after.0,
+                        snapshot_revision: after.1,
+                        panes,
+                    },
+                };
+                response.validate()?;
+                return Ok(response);
+            }
+        }
+
+        let observed_revision = match mux.topology_snapshot_authority() {
+            Ok((_, revision)) if revision.get() != u64::MAX => revision,
+            _ => return Ok(exhausted()),
+        };
+        first_revision.get_or_insert(before.1);
+        last_revision = Some(observed_revision);
+        drop(panes);
+        metadata_ledger.release_attempt_to(Default::default())?;
+        record_pane_snapshot_metadata_retry_release("pdu122", &mut metadata_ledger);
+    }
+
+    Ok(codec::ListPanesWithDomainsV1Response {
+        outcome: ListPanesWithDomainsOutcomeV1::Contended {
+            attempts: COHERENT_SNAPSHOT_ATTEMPTS,
+            first_revision: first_revision.expect("contended snapshot records its first revision"),
+            last_revision: last_revision.expect("contended snapshot records its last revision"),
+        },
+    })
+}
+
+fn flatten_snapshot_panes_with_domains(
+    snapshot: ListPanesResponse,
+    authority: &mux::PaneDomainSnapshot,
+) -> anyhow::Result<Vec<codec::PaneWithDomainV1>> {
+    snapshot.validate_floating_panes()?;
+    let ListPanesResponse {
+        tabs,
+        floating_panes,
+        ..
+    } = snapshot;
+    let mut panes = Vec::new();
+    let mut pending = Vec::new();
+    pending
+        .try_reserve_exact(codec::MAX_ORDERED_PANE_TREE_DEPTH + 1)
+        .context("reserving pane-domain snapshot traversal")?;
+    let mut append = |pane: mux::tab::PaneEntry| -> anyhow::Result<()> {
+        anyhow::ensure!(
+            panes.len() < codec::MAX_PANES_WITH_DOMAINS_V1,
+            "pane-domain snapshot exceeds its pane-count budget"
+        );
+        let entry = authority
+            .entry(pane.pane_id)
+            .context("listed pane has no frozen domain registration")?;
+        let domain = match entry.domain_name() {
+            Some(name) => codec::PaneDomainOutcomeV1::Named {
+                domain_id: entry.domain_id(),
+                domain_name: name.to_string(),
+            },
+            None => codec::PaneDomainOutcomeV1::Unnamed {
+                domain_id: entry.domain_id(),
+            },
+        };
+        panes
+            .try_reserve(1)
+            .context("reserving bounded pane-domain snapshot entries")?;
+        panes.push(codec::PaneWithDomainV1 {
+            pane,
+            pane_registration: ReliablePaneRegistrationIdentityV1::from_bytes(
+                entry.registration_identity(),
+            ),
+            domain,
+        });
+        Ok(())
+    };
+    for tree in tabs {
+        pending.push(tree);
+        while let Some(node) = pending.pop() {
+            match node {
+                mux::tab::PaneNode::Empty => {}
+                mux::tab::PaneNode::Leaf(pane) => append(pane)?,
+                mux::tab::PaneNode::Split { left, right, .. } => {
+                    anyhow::ensure!(
+                        pending.len() < codec::MAX_ORDERED_PANE_TREE_DEPTH,
+                        "pane-domain snapshot traversal exceeds its depth budget"
+                    );
+                    pending.push(*right);
+                    pending.push(*left);
+                }
+            }
+        }
+    }
+    for floating in floating_panes {
+        append(floating.pane)?;
+    }
+    panes.sort_unstable_by_key(|entry| entry.pane.pane_id);
+    Ok(panes)
 }
 
 /// One callback-free window capture used to derive both halves of PDU87.
@@ -8677,6 +8897,34 @@ impl SessionHandler {
                         }
                         .await;
                         record_pane_snapshot_collection_wall("pdu82", started_at, response.is_ok());
+                        send_response(response);
+                    },
+                    send_response,
+                );
+            }
+            Pdu::ListPanesWithDomainsV1(_) => {
+                let queued_at = Instant::now();
+                schedule_main_thread_snapshot_rpc(
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+                    |send_response| async move {
+                        record_pane_snapshot_queue_delay("pdu122", queued_at);
+                        let started_at = Instant::now();
+                        let response = async {
+                            let mux = session_mux(&authority)?;
+                            Ok(Pdu::ListPanesWithDomainsV1Response(
+                                collect_list_panes_with_domains(
+                                    &mux,
+                                    &mut ignore_list_panes_snapshot_stage,
+                                )
+                                .await?,
+                            ))
+                        }
+                        .await;
+                        record_pane_snapshot_collection_wall(
+                            "pdu122",
+                            started_at,
+                            response.is_ok(),
+                        );
                         send_response(response);
                     },
                     send_response,
@@ -11257,6 +11505,7 @@ impl SessionHandler {
             unexpected @ (Pdu::Pong { .. }
             | Pdu::ListPanesResponse { .. }
             | Pdu::ListPanesCoherentResponse { .. }
+            | Pdu::ListPanesWithDomainsV1Response { .. }
             | Pdu::ListPanesTabStacksResponse { .. }
             | Pdu::ListPanesOrderedV1Response { .. }
             | Pdu::GetPaneUserVarsV1Response { .. }
@@ -18410,6 +18659,127 @@ mod tests {
             render_callback_calls.load(Ordering::Relaxed),
             0,
             "health sampling must not enter the render-delta callback graph"
+        );
+    }
+
+    #[test]
+    fn pane_domain_listing_carries_one_authority_for_tiled_and_floating_panes() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = SimpleExecutor::new();
+        let domain: Arc<dyn Domain> = Arc::new(SpawnRoutingTestDomain::new(
+            0,
+            "private-production",
+            None,
+            Arc::new(AtomicUsize::new(0)),
+        ));
+        let mux = Arc::new(Mux::new(Some(domain)));
+        let _guard = ScopedMux::install(&mux);
+        let tiled: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(7_201, None));
+        let floating: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(7_202, None));
+        let tab = register_snapshot_tab(&mux, Arc::clone(&tiled));
+        attach_snapshot_tab_to_new_window(&mux, &tab);
+        mux.add_pane(&floating).unwrap();
+        tab.add_floating_pane(
+            Arc::clone(&floating),
+            mux::tab::FloatingPaneRect {
+                left: 1,
+                top: 1,
+                width: 20,
+                height: 5,
+            },
+        )
+        .unwrap();
+        let (sender, captured) = capturing_sender();
+        let mut handler =
+            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux))).unwrap();
+
+        for serial in [501, 502] {
+            handler.process_one(DecodedPdu {
+                serial,
+                pdu: Pdu::ListPanesWithDomainsV1(codec::ListPanesWithDomainsV1 {}),
+            });
+            tick_until_response(&executor, &captured, 1);
+            let Pdu::ListPanesWithDomainsV1Response(response) = take_response(&captured).pdu else {
+                panic!("expected authoritative pane-domain listing");
+            };
+            response.validate().unwrap();
+            let codec::ListPanesWithDomainsOutcomeV1::Snapshot {
+                session_incarnation,
+                snapshot_revision,
+                panes,
+            } = response.outcome
+            else {
+                panic!("stable mux must produce a coherent pane-domain snapshot");
+            };
+            assert_eq!(
+                (session_incarnation, snapshot_revision),
+                mux.topology_snapshot_authority().unwrap()
+            );
+            assert_eq!(panes.len(), 2);
+            for (entry, source) in panes.iter().zip([&tiled, &floating]) {
+                assert_eq!(entry.pane.pane_id, source.pane_id());
+                assert_eq!(
+                    entry.pane_registration.as_bytes(),
+                    mux.capture_pane_registration(source).unwrap().wire_identity()
+                );
+                assert_eq!(
+                    entry.domain,
+                    codec::PaneDomainOutcomeV1::Named {
+                        domain_id: 0,
+                        domain_name: "private-production".to_string(),
+                    }
+                );
+                assert_eq!(
+                    entry.pane.working_dir.as_ref().unwrap().as_str(),
+                    "file:///tmp/tiered-pane",
+                    "shared local-looking cwd cannot substitute for owning domain"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pane_domain_listing_retries_a_replaced_registration_before_returning_metadata() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(&mux);
+        let first: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(7_203, None));
+        let tab = register_snapshot_tab(&mux, Arc::clone(&first));
+        attach_snapshot_tab_to_new_window(&mux, &tab);
+        let predecessor = mux.capture_pane_registration(&first).unwrap().wire_identity();
+        let mut replacements = 0;
+        let mut completed_attempts = 0;
+        let response = block_on(collect_list_panes_with_domains(&mux, &mut |stage| {
+            if stage != ListPanesSnapshotStage::TitlesCaptured {
+                return;
+            }
+            completed_attempts += 1;
+            if replacements == 0 {
+                replacements += 1;
+                mux.remove_pane(7_203);
+                let successor = Arc::new(FakePane::new_with_id(7_203, None));
+                successor.state.lock().unwrap().title = "replacement-source".to_string();
+                let successor: Arc<dyn Pane> = successor;
+                let successor_tab = register_snapshot_tab(&mux, successor);
+                attach_snapshot_tab_to_new_window(&mux, &successor_tab);
+            }
+        }))
+        .unwrap();
+        let codec::ListPanesWithDomainsOutcomeV1::Snapshot { panes, .. } = response.outcome else {
+            panic!("one replacement must settle on a fresh bounded attempt");
+        };
+        assert_eq!(completed_attempts, 2);
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].pane.title, "replacement-source");
+        assert_ne!(panes[0].pane_registration.as_bytes(), predecessor);
+        assert_eq!(
+            panes[0].domain,
+            codec::PaneDomainOutcomeV1::Unnamed { domain_id: 0 },
+            "an unregistered domain remains explicitly unavailable"
         );
     }
 

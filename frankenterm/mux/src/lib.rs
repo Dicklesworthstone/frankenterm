@@ -7365,6 +7365,58 @@ impl Drop for LivePaneRegistration {
     }
 }
 
+/// Callback-free domain metadata bound to one exact pane registration.
+/// The private domain witness distinguishes a same-ID, same-name successor
+/// registration from the one that supplied this observation.
+pub struct PaneDomainSnapshotEntry {
+    registration: PaneRegistrationHandle,
+    domain_id: DomainId,
+    domain_registration: Option<Weak<LiveDomainRegistration>>,
+    domain_name: Option<String>,
+}
+
+impl PaneDomainSnapshotEntry {
+    pub fn registration_identity(&self) -> [u8; 16] {
+        self.registration.wire_identity()
+    }
+
+    pub fn domain_id(&self) -> DomainId {
+        self.domain_id
+    }
+
+    pub fn domain_name(&self) -> Option<&str> {
+        self.domain_name.as_deref()
+    }
+}
+
+/// Bounded registration witnesses captured before pane metadata callbacks.
+/// No mux lock or operation lease survives this value's construction. The
+/// producer must call [`Mux::validate_pane_domain_snapshot`] after collection
+/// and require the returned topology authority to equal `topology_authority`.
+pub struct PaneDomainSnapshot {
+    owner_identity: Arc<()>,
+    topology_authority: (MuxSessionIncarnation, TopologyRevision),
+    entries: HashMap<PaneId, PaneDomainSnapshotEntry>,
+}
+
+impl PaneDomainSnapshot {
+    pub fn topology_authority(&self) -> (MuxSessionIncarnation, TopologyRevision) {
+        self.topology_authority
+    }
+
+    pub fn entry(&self, pane_id: PaneId) -> Option<&PaneDomainSnapshotEntry> {
+        self.entries.get(&pane_id)
+    }
+
+    /// Bind a metadata callback's exact source allocation to this frozen
+    /// registration. A numeric ID reported by another pane is insufficient.
+    pub fn matches_pane(&self, pane_id: PaneId, pane: &Arc<dyn Pane>) -> bool {
+        self.entries
+            .get(&pane_id)
+            .is_some_and(|entry| entry.registration.is_same_pane(pane))
+    }
+}
+
 struct PanePreparationClaim<'a> {
     registration: &'a Mutex<()>,
     claims: &'a Mutex<HashMap<PaneId, PanePreparation>>,
@@ -17759,6 +17811,118 @@ impl Mux {
             .read()
             .get(&pane_id)
             .map(|registered| PaneRegistrationHandle::new(&registered.pane, &registered.generation))
+    }
+
+    /// Freeze exact pane/domain registrations before a bounded listing reads
+    /// mutable pane metadata. Domain names come from registered immutable
+    /// records, never external `Pane` or `Domain` callbacks under mux locks.
+    pub fn capture_pane_domain_snapshot(
+        &self,
+        max_panes: usize,
+        max_domain_name_bytes: usize,
+    ) -> Result<PaneDomainSnapshot, Error> {
+        let _domains = self.domain_registration.lock();
+        let _panes = self.pane_registration.lock();
+        let panes = self.panes.read();
+        anyhow::ensure!(
+            panes.len() <= max_panes,
+            "pane-domain snapshot has {} registrations; maximum is {max_panes}",
+            panes.len()
+        );
+        let mut entries = HashMap::new();
+        entries
+            .try_reserve(panes.len())
+            .context("reserving bounded pane-domain registration snapshot")?;
+        for (&pane_id, registered) in panes.iter() {
+            anyhow::ensure!(
+                registered.generation.operation_state.load(Ordering::Acquire)
+                    & PANE_REGISTRATION_RETIRED
+                    == 0,
+                "pane-domain snapshot encountered a retired pane registration"
+            );
+            let domain = self
+                .domain_registrations
+                .read()
+                .get(&registered.domain_id)
+                .cloned();
+            let domain = domain.filter(|domain| {
+                domain.domain_id == registered.domain_id
+                    && self.domain_registration_is_current_locked(domain)
+            });
+            let domain_name = domain.as_ref().and_then(|domain| {
+                (domain.domain_name.len() <= max_domain_name_bytes
+                    && !domain.domain_name.trim().is_empty())
+                .then(|| domain.domain_name.clone())
+            });
+            entries.insert(
+                pane_id,
+                PaneDomainSnapshotEntry {
+                    registration: PaneRegistrationHandle::new(
+                        &registered.pane,
+                        &registered.generation,
+                    ),
+                    domain_id: registered.domain_id,
+                    domain_registration: domain.as_ref().map(Arc::downgrade),
+                    domain_name,
+                },
+            );
+        }
+        let topology_authority = self.topology.lock().snapshot()?;
+        Ok(PaneDomainSnapshot {
+            owner_identity: Arc::clone(&self.domain_owner_identity),
+            topology_authority,
+            entries,
+        })
+    }
+
+    /// Validate all frozen registrations and sample topology in one final cut.
+    ///
+    /// The lock order matches registration publication: domain serializer,
+    /// pane serializer, then topology authority. Same-ID pane replacement,
+    /// domain retirement/re-registration, and foreign mux witnesses fail
+    /// closed even if no topology notification described the domain change.
+    pub fn validate_pane_domain_snapshot(
+        &self,
+        snapshot: &PaneDomainSnapshot,
+    ) -> Result<Option<(MuxSessionIncarnation, TopologyRevision)>, TopologyRevisionExhausted> {
+        if !Arc::ptr_eq(&snapshot.owner_identity, &self.domain_owner_identity) {
+            return Ok(None);
+        }
+        let _domains = self.domain_registration.lock();
+        let _panes = self.pane_registration.lock();
+        let panes = self.panes.read();
+        if panes.len() != snapshot.entries.len() {
+            return Ok(None);
+        }
+        for (&pane_id, expected) in &snapshot.entries {
+            let Some(current) = panes.get(&pane_id) else {
+                return Ok(None);
+            };
+            if current.domain_id != expected.domain_id
+                || !expected.registration.matches_live_registration(current)
+                || current.generation.operation_state.load(Ordering::Acquire)
+                    & PANE_REGISTRATION_RETIRED
+                    != 0
+            {
+                return Ok(None);
+            }
+            let domain = self
+                .domain_registrations
+                .read()
+                .get(&current.domain_id)
+                .cloned();
+            let domain = domain.filter(|domain| {
+                domain.domain_id == current.domain_id
+                    && self.domain_registration_is_current_locked(domain)
+            });
+            match (&expected.domain_registration, domain.as_ref()) {
+                (None, None) => {}
+                (Some(expected), Some(current))
+                    if Weak::ptr_eq(expected, &Arc::downgrade(current)) => {}
+                _ => return Ok(None),
+            }
+        }
+        self.topology.lock().snapshot().map(Some)
     }
 
     /// Admit one complete operation against the exact current registration.
@@ -30639,6 +30803,73 @@ mod tests {
             ),
             ReliableInputClaimOutcome::DuplicateApplied(ReliableInputAppliedEffect::KeyEvent)
         ));
+    }
+
+    #[test]
+    fn pane_domain_snapshot_binds_exact_panes_owner_and_capacity() {
+        let _global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let domain = register_guarded_mutation_test_domain(&mux);
+        let (first, _first_kills) = KillCountingPane::new(305, test_size());
+        mux.add_pane(&first).expect("register snapshot pane");
+        let snapshot = mux.capture_pane_domain_snapshot(1, 64).unwrap();
+        let entry = snapshot.entry(305).unwrap();
+        assert_eq!(entry.domain_id(), domain.domain_id());
+        assert_eq!(entry.domain_name(), Some(domain.domain_name()));
+        assert!(snapshot.matches_pane(305, &first));
+        assert_eq!(
+            mux.validate_pane_domain_snapshot(&snapshot).unwrap(),
+            Some(snapshot.topology_authority())
+        );
+        assert!(mux.capture_pane_domain_snapshot(0, 64).is_err());
+        let foreign_mux = Mux::new(None);
+        assert_eq!(foreign_mux.validate_pane_domain_snapshot(&snapshot).unwrap(), None);
+
+        let (successor, _successor_kills) = KillCountingPane::new(305, test_size());
+        assert!(!snapshot.matches_pane(305, &successor));
+        mux.remove_pane(305);
+        mux.add_pane(&successor).expect("register same-ID successor");
+        assert_eq!(mux.validate_pane_domain_snapshot(&snapshot).unwrap(), None);
+        let replacement = mux.capture_pane_domain_snapshot(1, 64).unwrap();
+        assert_ne!(
+            entry.registration_identity(),
+            replacement.entry(305).unwrap().registration_identity()
+        );
+    }
+
+    #[test]
+    fn pane_domain_snapshot_detects_same_name_domain_generation_without_topology_change() {
+        let _global_guard = global_test_lock();
+        let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::new(None));
+        let mux = Arc::new(Mux::new(Some(Arc::clone(&domain))));
+        let (pane, _kills) = KillCountingPane::new(306, test_size());
+        mux.add_pane(&pane).expect("register domain witness pane");
+        let snapshot = mux.capture_pane_domain_snapshot(1, 64).unwrap();
+        let before = mux.topology_snapshot_authority().unwrap();
+        let replacement = LiveDomainRegistration::new(
+            domain.domain_id(),
+            domain.domain_name().to_string(),
+            Arc::clone(&domain),
+        );
+        // Keep every live domain projection valid, while replacing only the
+        // exact registration generation. Numeric IDs, names and even the
+        // external Arc are deliberately identical, and topology did not move.
+        {
+            let _domains = mux.domain_registration.lock();
+            mux.domain_registrations
+                .write()
+                .insert(domain.domain_id(), Arc::clone(&replacement));
+            mux.domain_registrations_by_name
+                .write()
+                .insert(domain.domain_name().to_string(), Arc::clone(&replacement));
+            *mux.default_domain_registration.write() = Some(Arc::clone(&replacement));
+        }
+        assert_eq!(mux.topology_snapshot_authority().unwrap(), before);
+        assert_eq!(mux.validate_pane_domain_snapshot(&snapshot).unwrap(), None);
+        let current = mux.capture_pane_domain_snapshot(1, 64).unwrap();
+        assert_eq!(mux.validate_pane_domain_snapshot(&current).unwrap(), Some(before));
+        replacement.generation.retire();
+        assert_eq!(mux.validate_pane_domain_snapshot(&current).unwrap(), None);
     }
 
     #[test]

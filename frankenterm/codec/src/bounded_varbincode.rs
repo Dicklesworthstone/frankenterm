@@ -35,6 +35,8 @@ pub(crate) const TIERED_SCROLLBACK_BATCH_ENTRIES_V1_NEWTYPE: &str =
     "frankenterm.codec.TieredScrollbackBatchEntriesV1";
 pub(crate) const PANE_USER_VARS_V1_NEWTYPE: &str = "frankenterm.codec.PaneUserVarsV1";
 pub(crate) const PANE_USER_VAR_TEXT_V1_NEWTYPE: &str = "frankenterm.codec.PaneUserVarTextV1";
+pub(crate) const PANES_WITH_DOMAINS_V1_NEWTYPE: &str = "frankenterm.codec.PanesWithDomainsV1";
+pub(crate) const SNAPSHOT_PANE_DOMAIN_V1_NEWTYPE: &str = "frankenterm.codec.SnapshotPaneDomainV1";
 pub(crate) const IMAGE_WIRE_BYTES_V1_NEWTYPE: &str = termwiz::image::IMAGE_WIRE_BYTES_V1_NEWTYPE;
 pub(crate) const EXACT_RENDER_ROW_UTF8_V1_MAX_BYTES: usize = 1_000_000;
 pub(crate) const EXACT_RENDER_METADATA_UTF8_V1_MAX_BYTES: usize = 65_536;
@@ -168,6 +170,12 @@ impl ContainerAdmission {
         preallocation_maximum: super::MAX_PANE_USER_VARS,
     };
 
+    const PANES_WITH_DOMAINS: Self = Self {
+        label: "pane-domain snapshot entries",
+        maximum: super::MAX_PANES_WITH_DOMAINS_V1,
+        preallocation_maximum: super::MAX_PANES_WITH_DOMAINS_V1,
+    };
+
     const fn restricted_by(self, requested: Self) -> Self {
         if requested.maximum <= self.maximum {
             requested
@@ -206,6 +214,11 @@ impl ByteBufferAdmission {
     const PANE_USER_VAR_TEXT: Self = Self {
         label: "pane user variable text bytes",
         maximum: super::MAX_PANE_USER_VAR_TEXT_BYTES,
+    };
+
+    const SNAPSHOT_PANE_DOMAIN: Self = Self {
+        label: "snapshot pane domain name bytes",
+        maximum: super::MAX_PANE_DOMAIN_NAME_BYTES,
     };
 
     const fn restricted_by(self, requested: Self) -> Self {
@@ -525,6 +538,8 @@ impl<'de, 'a, 'b, R: Read> serde::Deserializer<'de> for &'a mut Deserializer<'b,
             Some(ByteBufferAdmission::IMAGE_WIRE_BYTES)
         } else if name == PANE_USER_VAR_TEXT_V1_NEWTYPE {
             Some(ByteBufferAdmission::PANE_USER_VAR_TEXT)
+        } else if name == SNAPSHOT_PANE_DOMAIN_V1_NEWTYPE {
+            Some(ByteBufferAdmission::SNAPSHOT_PANE_DOMAIN)
         } else {
             None
         };
@@ -552,6 +567,8 @@ impl<'de, 'a, 'b, R: Read> serde::Deserializer<'de> for &'a mut Deserializer<'b,
             Some(ContainerAdmission::TIERED_SCROLLBACK_BATCH_ENTRIES)
         } else if name == PANE_USER_VARS_V1_NEWTYPE {
             Some(ContainerAdmission::PANE_USER_VARS)
+        } else if name == PANES_WITH_DOMAINS_V1_NEWTYPE {
+            Some(ContainerAdmission::PANES_WITH_DOMAINS)
         } else {
             None
         };

@@ -3569,6 +3569,18 @@ macro_rules! pdu_encoded_body_limit {
             max_zstd_encoded_bytes: MAX_TIERED_SCROLLBACK_STATUS_RESPONSE_ZSTD_ENCODED_BYTES,
         }
     };
+    (ListPanesWithDomainsV1, none) => {
+        PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: MAX_LIST_PANES_WITH_DOMAINS_REQUEST_DECOMPRESSED_BYTES,
+            max_zstd_encoded_bytes: MAX_LIST_PANES_WITH_DOMAINS_REQUEST_ZSTD_ENCODED_BYTES,
+        }
+    };
+    (ListPanesWithDomainsV1Response, none) => {
+        PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: MAX_LIST_PANES_WITH_DOMAINS_RESPONSE_DECOMPRESSED_BYTES,
+            max_zstd_encoded_bytes: MAX_LIST_PANES_WITH_DOMAINS_RESPONSE_ZSTD_ENCODED_BYTES,
+        }
+    };
     (GetPaneUserVarsV1, none) => {
         PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
             max_decompressed_bytes: MAX_PANE_USER_VARS_REQUEST_DECOMPRESSED_BYTES,
@@ -4360,7 +4372,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 72;
+pub const CODEC_VERSION: usize = 73;
 
 /// Lowest codec version this build can decode wire frames from.
 ///
@@ -4968,6 +4980,12 @@ pdu! {
     ResizePaneConditionalV1Response: 120, 72, server_reply, none,
         interactive_state, interactive_state, interactive
         => deserialize_resize_pane_conditional_v1_response;
+    ListPanesWithDomainsV1: 121, 73, client_request, none,
+        query, query, normal
+        => deserialize_list_panes_with_domains_v1;
+    ListPanesWithDomainsV1Response: 122, 73, server_reply, none,
+        bulk_data, bulk_data, bulk
+        => deserialize_list_panes_with_domains_v1_response;
 }
 
 impl Pdu {
@@ -4988,6 +5006,7 @@ impl Pdu {
             Self::EvictPaneWarmScrollbackV1Response(value) => value.validate()?,
             Self::GetPaneDomainsV1(value) => value.validate()?,
             Self::GetPaneDomainsV1Response(value) => value.validate()?,
+            Self::ListPanesWithDomainsV1Response(value) => value.validate()?,
             Self::GetPaneUserVarsV1Response(value) => value.validate()?,
             Self::GetPaneIdentityV1Response(value) => value.validate()?,
             Self::ResizePaneConditionalV1(value) => value.validate()?,
@@ -15220,6 +15239,245 @@ fn deserialize_get_pane_domains_v1_response(
     Ok(response)
 }
 
+pub const LIST_PANES_WITH_DOMAINS_V1_MIN_CODEC_VERSION: usize = 73;
+pub const MAX_PANES_WITH_DOMAINS_V1: usize =
+    MAX_ORDERED_PANE_LEAVES_PER_SNAPSHOT + MAX_FLOATING_PANES_PER_SNAPSHOT;
+pub const MAX_LIST_PANES_WITH_DOMAINS_REQUEST_DECOMPRESSED_BYTES: usize = 16;
+pub const MAX_LIST_PANES_WITH_DOMAINS_REQUEST_ZSTD_ENCODED_BYTES: usize = 128;
+pub const MAX_LIST_PANES_WITH_DOMAINS_RESPONSE_DECOMPRESSED_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_LIST_PANES_WITH_DOMAINS_RESPONSE_ZSTD_ENCODED_BYTES: usize =
+    MAX_LIST_PANES_WITH_DOMAINS_RESPONSE_DECOMPRESSED_BYTES
+        + (MAX_LIST_PANES_WITH_DOMAINS_RESPONSE_DECOMPRESSED_BYTES >> 8);
+const MAX_LIST_PANES_WITH_DOMAINS_METADATA_BYTES: usize = 8 * 1024 * 1024;
+
+/// Read pane metadata and its registered domain in one coherent observation.
+///
+/// This request neither installs nor changes a connection's topology stream.
+/// Codec 73 is the explicit capability boundary; older listings and a separate
+/// [`GetPaneDomainsV1`] reply never substitute for this snapshot's authority.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ListPanesWithDomainsV1 {}
+
+/// One exact pane registration observed in the owning mux session.
+///
+/// `Unnamed` explicitly withholds name-based policy authority. `Missing` is
+/// invalid here: a pane cannot simultaneously belong to a successful snapshot
+/// and be absent from the registration cut that produced it.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct PaneWithDomainV1 {
+    pub pane: mux::tab::PaneEntry,
+    pub pane_registration: ReliablePaneRegistrationIdentityV1,
+    #[serde(
+        serialize_with = "serialize_snapshot_pane_domain",
+        deserialize_with = "deserialize_snapshot_pane_domain"
+    )]
+    pub domain: PaneDomainOutcomeV1,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub enum ListPanesWithDomainsOutcomeV1 {
+    Snapshot {
+        session_incarnation: MuxSessionIncarnation,
+        snapshot_revision: TopologyRevision,
+        /// All listed tiled and floating panes, in strictly increasing pane-ID
+        /// order. Exact registrations and domain registrations are revalidated
+        /// together at the snapshot's final mux-owned cut.
+        #[serde(
+            serialize_with = "serialize_panes_with_domains",
+            deserialize_with = "deserialize_panes_with_domains"
+        )]
+        panes: Vec<PaneWithDomainV1>,
+    },
+    Contended {
+        attempts: u8,
+        first_revision: TopologyRevision,
+        last_revision: TopologyRevision,
+    },
+    RevisionExhausted,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ListPanesWithDomainsV1Response {
+    pub outcome: ListPanesWithDomainsOutcomeV1,
+}
+
+impl ListPanesWithDomainsV1Response {
+    pub fn validate(&self) -> Result<(), Error> {
+        let ListPanesWithDomainsOutcomeV1::Snapshot {
+            session_incarnation,
+            snapshot_revision,
+            panes,
+        } = &self.outcome
+        else {
+            if let ListPanesWithDomainsOutcomeV1::Contended {
+                attempts,
+                first_revision,
+                last_revision,
+            } = &self.outcome
+            {
+                anyhow::ensure!((1..=3).contains(attempts), "invalid pane-domain snapshot attempts");
+                anyhow::ensure!(
+                    first_revision <= last_revision && last_revision.get() != u64::MAX,
+                    "invalid pane-domain snapshot contention revisions"
+                );
+            }
+            return Ok(());
+        };
+        anyhow::ensure!(
+            session_incarnation.as_bytes() != [0; 16],
+            "pane-domain snapshot uses a reserved mux session incarnation"
+        );
+        anyhow::ensure!(
+            snapshot_revision.get() != u64::MAX,
+            "pane-domain snapshot uses an exhausted topology revision"
+        );
+        anyhow::ensure!(
+            panes.len() <= MAX_PANES_WITH_DOMAINS_V1,
+            "pane-domain snapshot exceeds its pane limit"
+        );
+        let mut previous_pane_id = None;
+        let mut metadata_bytes = 0usize;
+        for entry in panes {
+            let pane = &entry.pane;
+            anyhow::ensure!(
+                previous_pane_id.is_none_or(|previous| previous < pane.pane_id),
+                "pane-domain snapshot IDs are duplicated or out of order"
+            );
+            previous_pane_id = Some(pane.pane_id);
+            anyhow::ensure!(
+                !entry.pane_registration.is_reserved(),
+                "pane-domain snapshot uses a reserved pane registration"
+            );
+            for (value, maximum) in [
+                (pane.title.as_str(), 64 * 1024),
+                (
+                    pane.working_dir.as_ref().map_or("", |url| url.as_str()),
+                    256 * 1024,
+                ),
+                (pane.workspace.as_str(), 16 * 1024),
+                (pane.tty_name.as_deref().unwrap_or(""), 16 * 1024),
+            ] {
+                anyhow::ensure!(value.len() <= maximum, "pane-domain snapshot metadata is too long");
+                metadata_bytes = metadata_bytes
+                    .checked_add(value.len())
+                    .context("counting pane-domain snapshot metadata")?;
+            }
+            match &entry.domain {
+                PaneDomainOutcomeV1::Named { domain_name, .. } => {
+                    anyhow::ensure!(
+                        !domain_name.trim().is_empty()
+                            && domain_name.len() <= MAX_PANE_DOMAIN_NAME_BYTES,
+                        "pane-domain snapshot has an invalid domain name"
+                    );
+                    metadata_bytes = metadata_bytes
+                        .checked_add(domain_name.len())
+                        .context("counting pane-domain snapshot names")?;
+                }
+                PaneDomainOutcomeV1::Unnamed { .. } => {}
+                PaneDomainOutcomeV1::Missing => {
+                    bail!("pane-domain snapshot contains a missing pane registration");
+                }
+            }
+            anyhow::ensure!(
+                metadata_bytes <= MAX_LIST_PANES_WITH_DOMAINS_METADATA_BYTES,
+                "pane-domain snapshot exceeds its metadata budget"
+            );
+        }
+        Ok(())
+    }
+}
+
+fn serialize_panes_with_domains<S>(
+    entries: &[PaneWithDomainV1],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serialize_bounded_newtype_vec::<S, _, MAX_PANES_WITH_DOMAINS_V1>(
+        entries,
+        serializer,
+        "pane-domain snapshot entries",
+        bounded_varbincode::PANES_WITH_DOMAINS_V1_NEWTYPE,
+    )
+}
+
+fn deserialize_panes_with_domains<'de, D>(
+    deserializer: D,
+) -> Result<Vec<PaneWithDomainV1>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_newtype_vec::<D, _, MAX_PANES_WITH_DOMAINS_V1>(
+        deserializer,
+        "pane-domain snapshot entries",
+        bounded_varbincode::PANES_WITH_DOMAINS_V1_NEWTYPE,
+    )
+}
+
+fn serialize_snapshot_pane_domain<S>(
+    domain: &PaneDomainOutcomeV1,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_newtype_struct(bounded_varbincode::SNAPSHOT_PANE_DOMAIN_V1_NEWTYPE, domain)
+}
+
+fn deserialize_snapshot_pane_domain<'de, D>(
+    deserializer: D,
+) -> Result<PaneDomainOutcomeV1, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct DomainVisitor;
+    impl<'de> serde::de::Visitor<'de> for DomainVisitor {
+        type Value = PaneDomainOutcomeV1;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a bounded snapshot pane domain")
+        }
+
+        fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            PaneDomainOutcomeV1::deserialize(deserializer)
+        }
+    }
+    deserializer.deserialize_newtype_struct(
+        bounded_varbincode::SNAPSHOT_PANE_DOMAIN_V1_NEWTYPE,
+        DomainVisitor,
+    )
+}
+
+fn deserialize_list_panes_with_domains_v1(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<ListPanesWithDomainsV1, Error> {
+    deserialize_exact_payload_with_limit(
+        data,
+        is_compressed,
+        "ListPanesWithDomainsV1",
+        MAX_LIST_PANES_WITH_DOMAINS_REQUEST_DECOMPRESSED_BYTES,
+    )
+}
+
+fn deserialize_list_panes_with_domains_v1_response(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<ListPanesWithDomainsV1Response, Error> {
+    let response: ListPanesWithDomainsV1Response = deserialize_exact_payload_with_limit(
+        data,
+        is_compressed,
+        "ListPanesWithDomainsV1Response",
+        MAX_LIST_PANES_WITH_DOMAINS_RESPONSE_DECOMPRESSED_BYTES,
+    )?;
+    response.validate()?;
+    Ok(response)
+}
+
 pub const GET_PANE_USER_VARS_V1_MIN_CODEC_VERSION: usize = 70;
 pub const MAX_PANE_USER_VARS: usize = 16_384;
 pub const MAX_PANE_USER_VARS_REQUEST_DECOMPRESSED_BYTES: usize = 16;
@@ -23065,7 +23323,7 @@ mod test {
 
     #[test]
     fn codec_v65_additive_line_layout_preserves_the_v61_compatibility_floor() {
-        assert_eq!(CODEC_VERSION, 72);
+        assert_eq!(CODEC_VERSION, 73);
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 61);
         assert_eq!(ORDERED_WINDOW_V1_MIN_CODEC_VERSION, 54);
         assert!(!codec_version_supports_ordered_window_v1(50));
@@ -24957,7 +25215,7 @@ mod test {
 
     #[test]
     fn codec_version_is_current() {
-        assert_eq!(CODEC_VERSION, 72);
+        assert_eq!(CODEC_VERSION, 73);
     }
 
     #[test]
@@ -25554,6 +25812,203 @@ mod test {
             let mut frame = Vec::new();
             encode_raw(spec.ident, 23, &vec![0; plain + 1], false, &mut frame).unwrap();
             assert!(Pdu::decode(frame.as_slice()).is_err());
+        }
+    }
+
+    #[test]
+    fn pane_domain_snapshot_round_trips_exact_authority_at_codec_73() {
+        let named = PaneWithDomainV1 {
+            pane: sample_pane_entry(0),
+            pane_registration: ReliablePaneRegistrationIdentityV1::from_bytes([7; 16]),
+            domain: PaneDomainOutcomeV1::Named {
+                domain_id: 3,
+                domain_name: "private-production".to_string(),
+            },
+        };
+        let unnamed = PaneWithDomainV1 {
+            pane: sample_pane_entry(1),
+            pane_registration: ReliablePaneRegistrationIdentityV1::from_bytes([8; 16]),
+            domain: PaneDomainOutcomeV1::Unnamed { domain_id: 4 },
+        };
+        let mut pdus = vec![Pdu::ListPanesWithDomainsV1(ListPanesWithDomainsV1 {})];
+        for panes in [Vec::new(), vec![named, unnamed]] {
+            pdus.push(Pdu::ListPanesWithDomainsV1Response(
+                ListPanesWithDomainsV1Response {
+                    outcome: ListPanesWithDomainsOutcomeV1::Snapshot {
+                        session_incarnation: MuxSessionIncarnation::from_bytes([9; 16]),
+                        snapshot_revision: TopologyRevision::new(17),
+                        panes,
+                    },
+                },
+            ));
+        }
+        for outcome in [
+            ListPanesWithDomainsOutcomeV1::Contended {
+                attempts: 3,
+                first_revision: TopologyRevision::new(17),
+                last_revision: TopologyRevision::new(17),
+            },
+            ListPanesWithDomainsOutcomeV1::RevisionExhausted,
+        ] {
+            pdus.push(Pdu::ListPanesWithDomainsV1Response(
+                ListPanesWithDomainsV1Response { outcome },
+            ));
+        }
+        for pdu in pdus {
+            for mode in [CompressionMode::Never, CompressionMode::Always] {
+                let frame = pdu.encode_frame_with_mode(401, mode).unwrap();
+                assert_eq!(Pdu::decode(frame.as_slice()).unwrap().pdu, pdu);
+            }
+            assert_eq!(pdu.minimum_codec_version(), Some(73));
+        }
+        assert_eq!(ListPanesWithDomainsV1::IDENT, 121);
+        assert_eq!(ListPanesWithDomainsV1Response::IDENT, 122);
+        assert_eq!(LIST_PANES_WITH_DOMAINS_V1_MIN_CODEC_VERSION, 73);
+        assert_eq!(
+            check_compat(CODEC_VERSION, CODEC_VERSION_MIN_SUPPORTED, 72, 61),
+            Ok(CompatDecision::Compatible { agreed: 72 })
+        );
+        assert!(!ListPanesWithDomainsV1Response::WIRE_SPEC
+            .authorizes(PduProducer::Server, PduWireRole::Unilateral));
+    }
+
+    #[test]
+    fn pane_domain_snapshot_rejects_missing_ambiguous_and_reserved_authority() {
+        let valid = PaneWithDomainV1 {
+            pane: sample_pane_entry(0),
+            pane_registration: ReliablePaneRegistrationIdentityV1::from_bytes([7; 16]),
+            domain: PaneDomainOutcomeV1::Named {
+                domain_id: 3,
+                domain_name: "private-production".to_string(),
+            },
+        };
+        let response = |panes, session_incarnation, snapshot_revision| {
+            ListPanesWithDomainsV1Response {
+                outcome: ListPanesWithDomainsOutcomeV1::Snapshot {
+                    session_incarnation,
+                    snapshot_revision,
+                    panes,
+                },
+            }
+        };
+        let session = MuxSessionIncarnation::from_bytes([9; 16]);
+        let revision = TopologyRevision::new(17);
+        for invalid_domain in [
+            PaneDomainOutcomeV1::Missing,
+            PaneDomainOutcomeV1::Named {
+                domain_id: 3,
+                domain_name: " \t".to_string(),
+            },
+            PaneDomainOutcomeV1::Named {
+                domain_id: 3,
+                domain_name: "x".repeat(MAX_PANE_DOMAIN_NAME_BYTES + 1),
+            },
+        ] {
+            let mut invalid = valid.clone();
+            invalid.domain = invalid_domain;
+            assert!(response(vec![invalid], session, revision).validate().is_err());
+        }
+        assert!(response(vec![valid.clone(), valid.clone()], session, revision)
+            .validate()
+            .is_err());
+        let mut earlier = valid.clone();
+        earlier.pane.pane_id = 0;
+        assert!(response(vec![valid.clone(), earlier], session, revision)
+            .validate()
+            .is_err());
+        assert!(response(
+            vec![valid.clone()],
+            MuxSessionIncarnation::from_bytes([0; 16]),
+            revision,
+        )
+        .validate()
+        .is_err());
+        assert!(response(vec![valid.clone()], session, TopologyRevision::new(u64::MAX))
+            .validate()
+            .is_err());
+        let mut reserved = valid;
+        reserved.pane_registration = ReliablePaneRegistrationIdentityV1::from_bytes([0; 16]);
+        assert!(response(vec![reserved], session, revision).validate().is_err());
+    }
+
+    #[test]
+    fn pane_domain_snapshot_rejects_hostile_lengths_before_entry_or_name_allocation() {
+        let count_payload = varbincode::serialize(&(
+            0u32,
+            MuxSessionIncarnation::from_bytes([9; 16]),
+            TopologyRevision::INITIAL,
+            MAX_PANES_WITH_DOMAINS_V1 + 1,
+        ))
+        .unwrap();
+        let name_payload = varbincode::serialize(&(
+            0u32,
+            MuxSessionIncarnation::from_bytes([9; 16]),
+            TopologyRevision::INITIAL,
+            1usize,
+            sample_pane_entry(0),
+            ReliablePaneRegistrationIdentityV1::from_bytes([7; 16]),
+            0u32,
+            3usize,
+            MAX_PANE_DOMAIN_NAME_BYTES + 1,
+        ))
+        .unwrap();
+        for (payload, expected) in [
+            (count_payload, "pane-domain snapshot entries length 32769"),
+            (name_payload, "snapshot pane domain name bytes length 65"),
+        ] {
+            for compressed in [false, true] {
+                let body = if compressed {
+                    zstd::encode_all(payload.as_slice(), 0).unwrap()
+                } else {
+                    payload.clone()
+                };
+                let mut frame = Vec::new();
+                encode_raw(ListPanesWithDomainsV1Response::IDENT, 402, &body, compressed, &mut frame)
+                    .unwrap();
+                let error = Pdu::decode(frame.as_slice()).unwrap_err();
+                assert!(format!("{error:#}").contains(expected), "{error:#}");
+            }
+        }
+    }
+
+    #[test]
+    fn pane_domain_snapshot_exact_payload_and_frame_caps_fail_closed() {
+        for (ident, payload, plain_cap, compressed_cap) in [
+            (
+                ListPanesWithDomainsV1::IDENT,
+                varbincode::serialize(&ListPanesWithDomainsV1 {}).unwrap(),
+                MAX_LIST_PANES_WITH_DOMAINS_REQUEST_DECOMPRESSED_BYTES,
+                MAX_LIST_PANES_WITH_DOMAINS_REQUEST_ZSTD_ENCODED_BYTES,
+            ),
+            (
+                ListPanesWithDomainsV1Response::IDENT,
+                varbincode::serialize(&ListPanesWithDomainsV1Response {
+                    outcome: ListPanesWithDomainsOutcomeV1::RevisionExhausted,
+                })
+                .unwrap(),
+                MAX_LIST_PANES_WITH_DOMAINS_RESPONSE_DECOMPRESSED_BYTES,
+                MAX_LIST_PANES_WITH_DOMAINS_RESPONSE_ZSTD_ENCODED_BYTES,
+            ),
+        ] {
+            let mut trailing = payload;
+            trailing.push(0);
+            for compressed in [false, true] {
+                let body = if compressed {
+                    zstd::encode_all(trailing.as_slice(), 0).unwrap()
+                } else {
+                    trailing.clone()
+                };
+                let mut frame = Vec::new();
+                encode_raw(ident, 403, &body, compressed, &mut frame).unwrap();
+                assert!(format!("{:#}", Pdu::decode(frame.as_slice()).unwrap_err())
+                    .contains("trailing"));
+                let cap = if compressed { compressed_cap } else { plain_cap };
+                let header = declared_pdu_frame_header(ident, 403, cap + 1, compressed);
+                assert!(decode_raw(header.as_slice())
+                    .unwrap_err()
+                    .downcast_ref::<PduEncodedBodyLimitExceeded>()
+                    .is_some());
+            }
         }
     }
 
@@ -26163,7 +26618,7 @@ mod test {
     fn pdu_wire_registry_covers_every_assigned_id_and_only_the_historical_gaps() {
         const GAPS: &[u64] = &[5, 6, 7, 15, 16, 17, 18, 19, 21];
 
-        for ident in 0..=120 {
+        for ident in 0..=122 {
             let spec = Pdu::wire_spec_for_ident(ident);
             assert_eq!(
                 spec.is_none(),
@@ -26177,9 +26632,9 @@ mod test {
             }
         }
 
-        assert!(Pdu::wire_spec_for_ident(121).is_none());
+        assert!(Pdu::wire_spec_for_ident(123).is_none());
         assert!(Pdu::wire_spec_for_ident(u64::MAX).is_none());
-        assert_eq!(Pdu::all_wire_specs().len(), 121 - GAPS.len());
+        assert_eq!(Pdu::all_wire_specs().len(), 123 - GAPS.len());
     }
 
     #[test]
@@ -26227,6 +26682,7 @@ mod test {
                 115..=116 => 70,
                 117..=118 => 71,
                 119..=120 => 72,
+                121..=122 => 73,
                 ident => panic!("unexpected assigned PDU ID {}", ident),
             };
             assert_eq!(
@@ -26262,11 +26718,11 @@ mod test {
             1, 3, 9, 11, 12, 13, 14, 22, 24, 26, 28, 31, 33, 34, 35, 36, 38, 40, 41, 43, 45, 46,
             48, 50, 51, 56, 57, 58, 59, 60, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75,
             77, 80, 81, 85, 86, 88, 91, 93, 95, 96, 98, 99, 100, 102, 104, 106, 108, 110, 112, 114,
-            115, 117, 119,
+            115, 117, 119, 121,
         ];
         const SERVER_REPLIES: &[u64] = &[
             0, 2, 4, 8, 10, 23, 25, 27, 29, 30, 32, 42, 47, 49, 52, 61, 76, 78, 82, 87, 89, 92, 94,
-            97, 101, 103, 105, 107, 109, 111, 113, 116, 118, 120,
+            97, 101, 103, 105, 107, 109, 111, 113, 116, 118, 120, 122,
         ];
         const SERVER_UNILATERALS: &[u64] = &[
             20, 25, 37, 38, 39, 44, 53, 54, 55, 56, 57, 58, 79, 83, 84, 90,
@@ -26393,8 +26849,9 @@ mod test {
                 | 104..=109
                 | 112
                 | 117
-                | 118 => Class::Query,
-                23 | 32 | 42 | 47 | 78 | 94 | 103 | 113 => Class::BulkData,
+                | 118
+                | 121 => Class::Query,
+                23 | 32 | 42 | 47 | 78 | 94 | 103 | 113 | 122 => Class::BulkData,
                 ident => panic!("PDU {} is missing from the semantic-class census", ident),
             };
             let expected_cap = match spec.ident {
@@ -26434,8 +26891,10 @@ mod test {
                 | 112
                 | 115
                 | 117
-                | 118 => Cap::Query,
-                4 | 13 | 20 | 23 | 32 | 42 | 47 | 76 | 78 | 82 | 87 | 94 | 99 | 103 | 113 | 116 => {
+                | 118
+                | 121 => Cap::Query,
+                4 | 13 | 20 | 23 | 32 | 42 | 47 | 76 | 78 | 82 | 87 | 94 | 99 | 103 | 113 | 116
+                | 122 => {
                     Cap::BulkData
                 }
                 ident => panic!("PDU {} is missing from the admission-cap census", ident),
@@ -26480,8 +26939,9 @@ mod test {
                 | 114
                 | 115
                 | 117
-                | 118 => Qos::Normal,
-                4 | 23 | 32 | 42 | 47 | 76 | 78 | 82 | 87 | 94 | 103 | 113 | 116 => Qos::Bulk,
+                | 118
+                | 121 => Qos::Normal,
+                4 | 23 | 32 | 42 | 47 | 76 | 78 | 82 | 87 | 94 | 103 | 113 | 116 | 122 => Qos::Bulk,
                 ident => panic!("PDU {} is missing from the queue-QoS census", ident),
             };
 
@@ -27435,7 +27895,7 @@ mod test {
     #[test]
     fn check_compat_current_build_keeps_v61_floor_after_additive_v65() {
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 61);
-        assert_eq!(CODEC_VERSION, 72);
+        assert_eq!(CODEC_VERSION, 73);
         assert!(check_compat(62, 61, 60, 58).is_err());
         assert_eq!(
             check_compat(62, 61, 61, 61),
