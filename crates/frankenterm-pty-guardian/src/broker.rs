@@ -2264,8 +2264,10 @@ fn read_broker_be_u64(bytes: &[u8]) -> u64 {
     u64::from_be_bytes(value)
 }
 
-/// Production-disabled configuration for the separately spawned broker
-/// process. The ordinary guardian service never selects this path yet.
+/// Configuration for the separately spawned broker process, which owns the
+/// PTY and child of each pane spawned through it. The guardian connects to it
+/// when started with `--broker-socket-path`, as `scripts/mux-guardian-host.sh`
+/// always does.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrokerControlServiceConfigV1 {
     socket_path: PathBuf,
@@ -8047,7 +8049,11 @@ fn evict_one_inactive_hello_receipt(
 pub use crate::output::GuardianDurableSpawnCustodyV1;
 pub use crate::output::GuardianDurableSuccessorCustodyV1;
 
-/// Blocking guardian-side client for the production-disabled broker process.
+/// Blocking guardian-side client for the broker process. The guardian runtime
+/// keeps one for each mux incarnation, shared by all of its panes. An exchange
+/// whose outcome it cannot tell (a cut or timeout mid-exchange, or an
+/// unexpected reply) poisons the client, and it then refuses every later
+/// exchange without sending it.
 pub struct BrokerControlClientV1 {
     stream: BlockingUnixStream,
     control_authenticator: GuardianBrokerControlAuthenticatorV1,
