@@ -6373,8 +6373,8 @@ impl GuardianProxyLeasePlan {
                     {
                         // Exact persisted IDs cover reply loss. A definite busy
                         // rejection may also precede observation of the final
-                        // old-owner EOF; no new operation is minted on retry.
-                        continue;
+                        // old-owner EOF; the loop tries again, and no new
+                        // operation is minted on retry.
                     }
                     Err(error) => {
                         if ambiguous
