@@ -95,9 +95,10 @@ const GUARDIAN_RETIREMENT_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(5);
 /// A guardian can close an Input without recording it while it restarts, or
 /// after waiting too long for its protocol. One built before that wait closes
 /// an Input whenever a job holds the protocol, and guardians outlive mux
-/// upgrades. `write_input` repeats the exact input within the budget, doubling
-/// its pause from the first to the largest. It runs on the mux main thread, so
-/// these pauses hold that thread, for at most the budget per lost input.
+/// upgrades. `write_input_from` repeats the exact input within the budget,
+/// doubling its pause from the first to the largest. A reliable pane write
+/// runs it on the mux main thread, so these pauses can hold that thread, for
+/// at most the budget per lost input.
 const GUARDIAN_INPUT_RETRY_FIRST_PAUSE: Duration = Duration::from_millis(1);
 const GUARDIAN_INPUT_RETRY_MAX_PAUSE: Duration = Duration::from_millis(16);
 const GUARDIAN_INPUT_RETRY_BUDGET: Duration = Duration::from_secs(2);
@@ -1214,6 +1215,17 @@ enum GenericMutation {
     Retire,
 }
 
+/// Which of a guardian pane's two writers an input came through.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GuardianInputWriter {
+    /// The terminal's writer thread: keys, pastes and query replies. It
+    /// resends the bytes the lease refused for now before anything else.
+    Terminal,
+    /// The pane's own writer: reliable pane writes from clients, and other
+    /// direct writes.
+    Pane,
+}
+
 #[derive(Clone)]
 struct PendingInput {
     sequence: u64,
@@ -1223,6 +1235,11 @@ struct PendingInput {
     payload_sha256: [u8; 32],
     recovery_query_request_id: Option<Uuid>,
     submitted: bool,
+    /// The writer that sent this input.
+    writer: GuardianInputWriter,
+    /// Whether that writer was refused for now (`WouldBlock` or `TimedOut`)
+    /// on these bytes, so that it will send them again.
+    resend_expected: bool,
 }
 
 impl fmt::Debug for PendingInput {
@@ -1235,6 +1252,8 @@ impl fmt::Debug for PendingInput {
             .field("input_bytes", &self.input_bytes)
             .field("recovery_query_request_id", &self.recovery_query_request_id)
             .field("submitted", &self.submitted)
+            .field("writer", &self.writer)
+            .field("resend_expected", &self.resend_expected)
             .finish_non_exhaustive()
     }
 }
@@ -1244,6 +1263,33 @@ impl PendingInput {
         u32::try_from(payload.len()) == Ok(self.input_bytes)
             && <[u8; 32]>::from(Sha256::digest(payload)) == self.payload_sha256
     }
+}
+
+/// A pending input that another operation (a resize, a capture, a flush or a
+/// different input) found applied and settled, after its writer was refused
+/// for now and before the writer sent it again. The terminal's writer thread
+/// and the reliable pane-write lane each resend such bytes before their next
+/// input, so that writer's next input is answered from here if it is these
+/// bytes, and they are not written twice. Any other input from that writer
+/// ends the wait.
+#[derive(Clone, Copy, Debug)]
+struct SettledBeforeResend {
+    input_bytes: u32,
+    payload_sha256: [u8; 32],
+    /// More than zero: an input that applied no byte goes again as new input.
+    applied_bytes: u32,
+}
+
+impl SettledBeforeResend {
+    fn matches_payload(&self, payload: &[u8]) -> bool {
+        u32::try_from(payload.len()) == Ok(self.input_bytes)
+            && <[u8; 32]>::from(Sha256::digest(payload)) == self.payload_sha256
+    }
+}
+
+/// The part of a pane write that one guardian Input carries.
+fn guardian_input_payload(payload: &[u8]) -> &[u8] {
+    &payload[..payload.len().min(GUARDIAN_MAX_INPUT_BYTES)]
 }
 
 #[derive(Clone, Debug)]
@@ -3276,7 +3322,7 @@ fn classify_child_census_entry(
 /// lease sequence for a fresh-connection retry.  Pending input retains only
 /// its length and SHA-256 commitment; plaintext is supplied again by the
 /// caller only after `QueryInputEffect` proves that resending is safe, which
-/// `write_input` does itself for a bounded time, while it holds the bytes.
+/// `write_input_from` does itself for a bounded time, while it holds the bytes.
 pub struct GuardianPaneLeaseActor {
     identity: GuardianPaneLeaseIdentity,
     next_sequence: u64,
@@ -3290,6 +3336,11 @@ pub struct GuardianPaneLeaseActor {
     exited_unclosed: bool,
     /// Set while the pane's program is not reading its input (ft-vc66w).
     input_not_ready: Option<InputNotReady>,
+    /// The terminal writer's input that another operation settled before the
+    /// writer resent it; see [`SettledBeforeResend`].
+    terminal_settled_before_resend: Option<SettledBeforeResend>,
+    /// The same for the pane's own writer.
+    pane_settled_before_resend: Option<SettledBeforeResend>,
     #[cfg(test)]
     fail_next_input_copy: bool,
 }
@@ -3336,6 +3387,8 @@ impl GuardianPaneLeaseActor {
             _recovery_admission: None,
             exited_unclosed: false,
             input_not_ready: None,
+            terminal_settled_before_resend: None,
+            pane_settled_before_resend: None,
             #[cfg(test)]
             fail_next_input_copy: false,
         }
@@ -3528,7 +3581,11 @@ impl GuardianPaneLeaseActor {
         Ok(owned)
     }
 
-    fn begin_input(&mut self, payload: &[u8]) -> Result<(), GuardianProxyError> {
+    fn begin_input(
+        &mut self,
+        writer: GuardianInputWriter,
+        payload: &[u8],
+    ) -> Result<(), GuardianProxyError> {
         self.ensure_attached()?;
         if self.pending.is_some() {
             return Err(GuardianProxyError::UnexpectedMutationReply);
@@ -3544,6 +3601,8 @@ impl GuardianPaneLeaseActor {
             payload_sha256: Sha256::digest(payload).into(),
             recovery_query_request_id: None,
             submitted: false,
+            writer,
+            resend_expected: false,
         }));
         Ok(())
     }
@@ -3974,14 +4033,76 @@ impl GuardianPaneLeaseActor {
         // loop. A terminal census may still reconcile an operation that was
         // already submitted; it may never authorize a new mutation.
         self.ensure_pending_recovery_permitted()?;
-        self.retry_pending(input_payload).map(Some)
+        // Without its bytes, this call is not the input's resend. A writer
+        // that was refused for now will still resend it, and must not write
+        // it again (ft-jrhpr).
+        let unresent_input = match (&self.pending, input_payload) {
+            (Some(PendingMutation::Input(pending)), None) if pending.resend_expected => {
+                Some((pending.writer, pending.input_bytes, pending.payload_sha256))
+            }
+            _ => None,
+        };
+        let recovered = self.retry_pending(input_payload)?;
+        if let (
+            Some((writer, input_bytes, payload_sha256)),
+            RecoveredPendingMutation::InputApplied { applied_bytes, .. },
+        ) = (unresent_input, &recovered)
+            && *applied_bytes > 0
+        {
+            *self.settled_before_resend(writer) = Some(SettledBeforeResend {
+                input_bytes,
+                payload_sha256,
+                applied_bytes: *applied_bytes,
+            });
+        }
+        Ok(Some(recovered))
     }
 
+    fn settled_before_resend(
+        &mut self,
+        writer: GuardianInputWriter,
+    ) -> &mut Option<SettledBeforeResend> {
+        match writer {
+            GuardianInputWriter::Terminal => &mut self.terminal_settled_before_resend,
+            GuardianInputWriter::Pane => &mut self.pane_settled_before_resend,
+        }
+    }
+
+    /// Note that `writer` was refused `payload` for now and will send it again,
+    /// if it is that writer's pending input; see [`SettledBeforeResend`].
+    fn expect_resend(&mut self, writer: GuardianInputWriter, payload: &[u8]) {
+        let payload = guardian_input_payload(payload);
+        if let Some(PendingMutation::Input(pending)) = self.pending.as_mut()
+            && pending.writer == writer
+            && pending.matches_payload(payload)
+        {
+            pending.resend_expected = true;
+        }
+    }
+
+    #[cfg(test)]
     fn write_input(&mut self, payload: &[u8]) -> Result<usize, GuardianProxyError> {
+        self.write_input_from(GuardianInputWriter::Terminal, payload)
+    }
+
+    fn write_input_from(
+        &mut self,
+        writer: GuardianInputWriter,
+        payload: &[u8],
+    ) -> Result<usize, GuardianProxyError> {
         if payload.is_empty() {
             return Ok(0);
         }
-        let payload = &payload[..payload.len().min(GUARDIAN_MAX_INPUT_BYTES)];
+        let payload = guardian_input_payload(payload);
+        // This writer's first input since another operation settled its last
+        // one is that input's resend if the bytes match; anything else means
+        // the resend is not coming.
+        if let Some(settled) = self.settled_before_resend(writer).take()
+            && settled.matches_payload(payload)
+        {
+            return usize::try_from(settled.applied_bytes)
+                .map_err(|_| GuardianProxyError::UnexpectedMutationReply);
+        }
         if self.pending.is_some() {
             let same_input = self
                 .pending
@@ -4018,7 +4139,7 @@ impl GuardianPaneLeaseActor {
             }
         }
         self.ensure_input_ready()?;
-        self.begin_input(payload)?;
+        self.begin_input(writer, payload)?;
         match self.settle_new_input(payload)? {
             RecoveredPendingMutation::InputApplied { applied_bytes, .. } => {
                 usize::try_from(applied_bytes)
@@ -6968,6 +7089,7 @@ impl GuardianProxyStaging {
         let identity = self.identity();
         let terminal_writer = GuardianProxyWriter {
             actor: Arc::clone(&self.actor),
+            writer: GuardianInputWriter::Terminal,
         };
         let (terminal, restored_prefix) = inert_terminal
             .activate(Box::new(terminal_writer.clone()))
@@ -6989,6 +7111,7 @@ impl GuardianProxyStaging {
             }),
             writer: Box::new(GuardianProxyWriter {
                 actor: Arc::clone(&actor),
+                writer: GuardianInputWriter::Pane,
             }),
             lease_control: Arc::new(GuardianProxyLeaseControl {
                 actor,
@@ -7009,6 +7132,7 @@ impl GuardianProxyStaging {
     ) -> TestActivatedGuardianProxy {
         let terminal_writer = GuardianProxyWriter {
             actor: Arc::clone(&self.actor),
+            writer: GuardianInputWriter::Terminal,
         };
         let terminal = inert_terminal
             .into_live(Box::new(terminal_writer.clone()))
@@ -7034,6 +7158,7 @@ impl GuardianProxyStaging {
             }),
             writer: Box::new(GuardianProxyWriter {
                 actor: Arc::clone(&actor),
+                writer: GuardianInputWriter::Pane,
             }),
             lease_control: Arc::new(GuardianProxyLeaseControl {
                 actor,
@@ -7648,6 +7773,9 @@ type TestActivatedGuardianProxy = ActivatedGuardianProxy;
 /// publish all proxy facets atomically.
 pub struct GuardianProxyWriter {
     actor: SharedGuardianPaneLeaseActor,
+    /// Which of the pane's writers this is; the lease answers each one's
+    /// resends apart.
+    writer: GuardianInputWriter,
 }
 
 impl fmt::Debug for GuardianProxyWriter {
@@ -7655,16 +7783,27 @@ impl fmt::Debug for GuardianProxyWriter {
         formatter
             .debug_struct("GuardianProxyWriter")
             .field("identity", &self.actor.lock().identity())
+            .field("writer", &self.writer)
             .finish_non_exhaustive()
     }
 }
 
 impl Write for GuardianProxyWriter {
     fn write(&mut self, payload: &[u8]) -> io::Result<usize> {
-        self.actor
-            .lock()
-            .write_input(payload)
-            .map_err(io::Error::from)
+        let mut actor = self.actor.lock();
+        let error = match actor.write_input_from(self.writer, payload) {
+            Ok(written) => return Ok(written),
+            Err(error) => io::Error::from(error),
+        };
+        // The terminal's writer thread and the reliable pane-write lane send
+        // the same bytes again after either kind (ft-jrhpr).
+        if matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ) {
+            actor.expect_resend(self.writer, payload);
+        }
+        Err(error)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -16482,6 +16621,149 @@ mod tests {
             Err(GuardianProxyError::LeaseFenced)
         ));
         assert_eq!(input_call_count(&state.lock()), 1);
+    }
+
+    fn proxy_writer(
+        actor: &SharedGuardianPaneLeaseActor,
+        writer: GuardianInputWriter,
+    ) -> GuardianProxyWriter {
+        GuardianProxyWriter {
+            actor: Arc::clone(actor),
+            writer,
+        }
+    }
+
+    /// The guardian accepted the input but has not made it durable, so the
+    /// lease keeps it pending and its writer is refused for now.
+    const REFUSED_FOR_NOW: FakeDirective =
+        FakeDirective::Reject(GuardianRejectionCode::InputDurabilityPending);
+
+    /// An input refused for now stays pending, and its writer resends it. A
+    /// resize, a capture, a flush or a different input that finds it applied
+    /// settles it first. The writer's resend is then answered, not written a
+    /// second time (ft-jrhpr).
+    #[test]
+    fn an_input_another_operation_settled_is_not_written_again_by_its_resend() {
+        let (staging, state) = fake_staging(
+            [
+                REFUSED_FOR_NOW,
+                FakeDirective::Query(InputEffectState::DurableFull),
+                FakeDirective::Auto,
+                FakeDirective::Auto,
+            ],
+            91,
+        );
+        let actor = staging.shared_actor();
+        let mut terminal = proxy_writer(&actor, GuardianInputWriter::Terminal);
+        let refused = terminal.write(b"typed").unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::WouldBlock);
+        actor
+            .lock()
+            .resize(size(30, 90))
+            .expect("the resize finds the input applied, then applies");
+        assert_eq!(terminal.write(b"typed").expect("the resend is answered"), 5);
+        assert_eq!(input_call_count(&state.lock()), 1, "written once");
+
+        // The answer is used up, so the same bytes again are new input.
+        assert_eq!(terminal.write(b"typed").expect("new input applies"), 5);
+        assert_eq!(input_call_count(&state.lock()), 2);
+        assert_eq!(actor.lock().next_sequence(), 94);
+    }
+
+    /// Each writer resends only its own input, so a settled input answers only
+    /// its own writer's resend, and that writer's next different input ends
+    /// the wait for it.
+    #[test]
+    fn a_settled_input_answers_only_the_next_input_of_its_own_writer() {
+        let (staging, state) = fake_staging(
+            [
+                REFUSED_FOR_NOW,
+                FakeDirective::Query(InputEffectState::DurableFull),
+                FakeDirective::Auto,
+                FakeDirective::Auto,
+                REFUSED_FOR_NOW,
+                FakeDirective::Query(InputEffectState::DurableFull),
+                FakeDirective::Auto,
+                FakeDirective::Auto,
+            ],
+            95,
+        );
+        let actor = staging.shared_actor();
+        let mut terminal = proxy_writer(&actor, GuardianInputWriter::Terminal);
+        let mut pane = proxy_writer(&actor, GuardianInputWriter::Pane);
+        assert!(pane.write(b"keys").is_err());
+        // The terminal's input settles the pane's, then goes itself.
+        assert_eq!(terminal.write(b"reply").unwrap(), 5);
+        // The same bytes from the other writer are that writer's new input.
+        assert_eq!(terminal.write(b"keys").unwrap(), 4);
+        assert_eq!(input_call_count(&state.lock()), 3);
+        assert_eq!(pane.write(b"keys").unwrap(), 4);
+        assert_eq!(
+            input_call_count(&state.lock()),
+            3,
+            "the pane writer's resend is answered"
+        );
+
+        assert!(terminal.write(b"abc").is_err());
+        terminal.flush().expect("the flush finds the input applied");
+        // A different input from that writer: its resend is not coming.
+        assert_eq!(terminal.write(b"xyz").unwrap(), 3);
+        assert_eq!(terminal.write(b"abc").unwrap(), 3);
+        assert_eq!(input_call_count(&state.lock()), 6);
+        assert_eq!(actor.lock().next_sequence(), 101);
+    }
+
+    #[test]
+    fn the_resend_of_a_settled_partly_applied_input_gets_its_applied_prefix() {
+        let (staging, state) = fake_staging(
+            [
+                REFUSED_FOR_NOW,
+                FakeDirective::Query(InputEffectState::DurablePrefix { applied_bytes: 3 }),
+                FakeDirective::Auto,
+            ],
+            56,
+        );
+        let actor = staging.shared_actor();
+        let mut terminal = proxy_writer(&actor, GuardianInputWriter::Terminal);
+        assert!(terminal.write(b"abcdef").is_err());
+        assert!(matches!(
+            actor.lock().flush_pending(),
+            Err(GuardianProxyError::PreviousInputPartiallyApplied {
+                applied_bytes: 3,
+                input_bytes: 6,
+            })
+        ));
+        // The writer then sends the tail as new input.
+        assert_eq!(terminal.write(b"abcdef").unwrap(), 3);
+        assert_eq!(terminal.write(b"def").unwrap(), 3);
+        assert_eq!(input_call_count(&state.lock()), 2);
+        assert_eq!(actor.lock().next_sequence(), 58);
+    }
+
+    /// A writer refused for good (here a reset connection) does not send the
+    /// bytes again, so a later input of the same bytes is new input.
+    #[test]
+    fn a_settled_input_whose_writer_was_not_refused_for_now_answers_nothing() {
+        let (staging, state) = fake_staging(
+            [
+                FakeDirective::Io,
+                FakeDirective::Query(InputEffectState::DurableFull),
+                FakeDirective::Auto,
+                FakeDirective::Auto,
+            ],
+            51,
+        );
+        let actor = staging.shared_actor();
+        let mut pane = proxy_writer(&actor, GuardianInputWriter::Pane);
+        let reset = pane.write(b"keys").unwrap_err();
+        assert_eq!(reset.kind(), io::ErrorKind::ConnectionReset);
+        actor
+            .lock()
+            .resize(size(30, 90))
+            .expect("the resize finds the input applied, then applies");
+        assert_eq!(pane.write(b"keys").expect("new input applies"), 4);
+        assert_eq!(input_call_count(&state.lock()), 2);
+        assert_eq!(actor.lock().next_sequence(), 54);
     }
 
     #[test]

@@ -6561,9 +6561,13 @@ fn tmux_dispatch_send_keys(
         .ok_or_else(|| format!("pane not found: %{pane_id}"))?;
     registration
         .try_with_current(|current| {
+            // The pane's own input queue, as for its keys and pastes: a raw
+            // write here held this thread while the program did not read, could
+            // overtake a paste still being sent, and lost the keys when a
+            // guardian refused them for now (ft-jrhpr).
             current
-                .write_all_and_flush(&payload)
-                .map_err(|err| format!("send-keys write failed or flush failed: {err}"))?;
+                .send_user_input(&payload)
+                .map_err(|err| format!("send-keys failed: {err:#}"))?;
             Ok(Vec::new())
         })
         .ok_or_else(|| format!("pane registration is no longer current: %{pane_id}"))?
@@ -7608,6 +7612,8 @@ mod tests {
         pane_id: usize,
         lines: ParkingMutex<Vec<Line>>,
         writes: ParkingMutex<Vec<u8>>,
+        /// What `send_user_input` queued, apart from the raw writer.
+        user_input: ParkingMutex<Vec<u8>>,
         dimensions: RenderableDimensions,
         mux_registration: Arc<mux::PaneRegistrationSlot>,
     }
@@ -7624,6 +7630,7 @@ mod tests {
                         .collect(),
                 ),
                 writes: ParkingMutex::new(Vec::new()),
+                user_input: ParkingMutex::new(Vec::new()),
                 mux_registration: Arc::new(mux::PaneRegistrationSlot::default()),
                 dimensions: RenderableDimensions {
                     cols: 80,
@@ -7641,6 +7648,10 @@ mod tests {
 
         fn written_bytes(&self) -> Vec<u8> {
             self.writes.lock().clone()
+        }
+
+        fn user_input(&self) -> Vec<u8> {
+            self.user_input.lock().clone()
         }
     }
 
@@ -7722,6 +7733,11 @@ mod tests {
                 let writer: &mut dyn std::io::Write = writes;
                 writer
             })
+        }
+
+        fn send_user_input(&self, bytes: &[u8]) -> anyhow::Result<()> {
+            self.user_input.lock().extend_from_slice(bytes);
+            Ok(())
         }
 
         fn resize(&self, _size: TerminalSize) -> anyhow::Result<()> {
@@ -9866,7 +9882,11 @@ mod tests {
 
         assert!(response.outcome.is_ok());
         assert_eq!(response.output.len(), 0);
-        assert_eq!(pane.written_bytes(), b"echo hi\r\x03");
+        assert_eq!(pane.user_input(), b"echo hi\r\x03");
+        assert!(
+            pane.written_bytes().is_empty(),
+            "send-keys must queue on the pane's own input path, not write its raw writer"
+        );
     }
 
     #[test]
@@ -9887,9 +9907,9 @@ mod tests {
         let response = tmux_control_response_at(&origin, 14, 12, "send-keys -t %43 origin Enter\n");
 
         assert!(response.outcome.is_ok());
-        assert_eq!(origin_pane.written_bytes(), b"origin\r");
+        assert_eq!(origin_pane.user_input(), b"origin\r");
         assert!(
-            replacement_pane.written_bytes().is_empty(),
+            replacement_pane.user_input().is_empty() && replacement_pane.written_bytes().is_empty(),
             "a live tmux-control connection must never redirect through a replacement singleton"
         );
     }
