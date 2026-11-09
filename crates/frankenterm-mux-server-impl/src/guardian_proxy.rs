@@ -1130,8 +1130,6 @@ pub enum GuardianProxyError {
     InputNotReady,
     #[error("guardian cannot prove the disposition of the pending input")]
     InputDispositionUnavailable,
-    #[error("the pending input can only be retried with its exact original bytes")]
-    PendingInputPayloadRequired,
     #[error(
         "a prior guardian input was durably partial: applied {applied_bytes} of {input_bytes} bytes"
     )]
@@ -1179,7 +1177,6 @@ impl From<GuardianProxyError> for io::Error {
             GuardianProxyError::InputDurabilityPending
             | GuardianProxyError::InputKnownNotApplied
             | GuardianProxyError::InputNotReady
-            | GuardianProxyError::PendingInputPayloadRequired
             | GuardianProxyError::ReplaySnapshotExpired
             | GuardianProxyError::ReplayEndsInsideSequence
             | GuardianProxyError::ReplayCompacted => Self::new(io::ErrorKind::WouldBlock, error),
@@ -1315,6 +1312,13 @@ struct PendingInput {
     effect_id: Uuid,
     input_bytes: u32,
     payload_sha256: [u8; 32],
+    /// The bytes themselves, until the input settles. After an exact
+    /// `NotSeen` the lease sends them again under this identity on its own,
+    /// so the input settles even when its writer never sends it again, and
+    /// it never holds up the pane's other input, its captures or its
+    /// retirement (ft-gpxow). They stay in this process: no log, journal or
+    /// `Debug` output shows them.
+    payload: Arc<Vec<u8>>,
     recovery_query_request_id: Option<Uuid>,
     submitted: bool,
     /// The writer that sent this input.
@@ -1342,14 +1346,13 @@ impl fmt::Debug for PendingInput {
 
 impl PendingInput {
     fn matches_payload(&self, payload: &[u8]) -> bool {
-        u32::try_from(payload.len()) == Ok(self.input_bytes)
-            && <[u8; 32]>::from(Sha256::digest(payload)) == self.payload_sha256
+        self.payload.as_slice() == payload
     }
 }
 
 /// A pending input that another operation (a resize, a capture, a flush or a
-/// different input) found applied and settled, after its writer was refused
-/// for now and before it was sent again. Only an input that someone resends
+/// different input) settled, finding it applied or sending it again itself,
+/// after its writer was refused for now and before that writer sent it again. Only an input that someone resends
 /// leaves one: one from the terminal's writer thread, which resends before
 /// its next input, or a reliable pane-write request (see
 /// [`resending_pane_write`]), which its client sends again as it was. That
@@ -2991,7 +2994,7 @@ impl GuardianCheckpointPublisher {
                     if let Some(RecoveredPendingMutation::InputApplied {
                         applied_bytes,
                         input_bytes,
-                    }) = actor.reconcile_before_new_operation(None)?
+                    }) = actor.reconcile_before_new_operation(false)?
                     {
                         if applied_bytes != input_bytes {
                             return Err(GuardianProxyError::PreviousInputPartiallyApplied {
@@ -3405,10 +3408,9 @@ fn classify_child_census_entry(
 /// The actor is always shared through [`SharedGuardianPaneLeaseActor`].  A
 /// mutation is installed in `pending` before any fallible transport call.  An
 /// I/O failure therefore preserves the exact request UUID, effect UUID, and
-/// lease sequence for a fresh-connection retry.  Pending input retains only
-/// its length and SHA-256 commitment; plaintext is supplied again by the
-/// caller only after `QueryInputEffect` proves that resending is safe, which
-/// `write_input_from` does itself for a bounded time, while it holds the bytes.
+/// lease sequence for a fresh-connection retry.  Pending input also keeps its
+/// bytes until it settles, and the lease sends them again under the same
+/// identity only after `QueryInputEffect` proves that resending is safe.
 pub struct GuardianPaneLeaseActor {
     identity: GuardianPaneLeaseIdentity,
     next_sequence: u64,
@@ -3680,12 +3682,15 @@ impl GuardianPaneLeaseActor {
         let input_bytes = u32::try_from(payload.len()).map_err(|_| {
             GuardianProxyError::InvalidConfiguration("guardian input exceeds protocol bounds")
         })?;
+        let payload_sha256 = Sha256::digest(payload).into();
+        let payload = Arc::new(self.copy_input(payload)?);
         self.pending = Some(PendingMutation::Input(PendingInput {
             sequence: self.next_sequence,
             request_id: Uuid::new_v4(),
             effect_id: Uuid::new_v4(),
             input_bytes,
-            payload_sha256: Sha256::digest(payload).into(),
+            payload_sha256,
+            payload,
             recovery_query_request_id: None,
             submitted: false,
             writer,
@@ -3725,12 +3730,9 @@ impl GuardianPaneLeaseActor {
         Ok(())
     }
 
-    fn retry_pending(
-        &mut self,
-        input_payload: Option<&[u8]>,
-    ) -> Result<RecoveredPendingMutation, GuardianProxyError> {
+    fn retry_pending(&mut self) -> Result<RecoveredPendingMutation, GuardianProxyError> {
         match self.pending.clone() {
-            Some(PendingMutation::Input(pending)) => self.retry_input(pending, input_payload),
+            Some(PendingMutation::Input(pending)) => self.retry_input(pending),
             Some(PendingMutation::Generic(pending)) => self.retry_generic(pending),
             Some(PendingMutation::Checkpoint(pending)) => self.retry_checkpoint(pending),
             None => Err(GuardianProxyError::UnexpectedMutationReply),
@@ -3784,14 +3786,9 @@ impl GuardianPaneLeaseActor {
     fn retry_input(
         &mut self,
         pending: PendingInput,
-        input_payload: Option<&[u8]>,
     ) -> Result<RecoveredPendingMutation, GuardianProxyError> {
         if !pending.submitted {
-            let payload = input_payload.ok_or(GuardianProxyError::PendingInputPayloadRequired)?;
-            if !pending.matches_payload(payload) {
-                return Err(GuardianProxyError::PendingInputPayloadRequired);
-            }
-            return self.send_pending_input(pending, payload);
+            return self.send_pending_input(pending);
         }
 
         let query_request_id = match self.pending.as_mut() {
@@ -3824,14 +3821,7 @@ impl GuardianPaneLeaseActor {
             )
             .map_err(|error| self.transport_failure(error))?;
         match state {
-            InputEffectState::NotSeen => {
-                let payload =
-                    input_payload.ok_or(GuardianProxyError::PendingInputPayloadRequired)?;
-                if !pending.matches_payload(payload) {
-                    return Err(GuardianProxyError::PendingInputPayloadRequired);
-                }
-                self.send_pending_input(pending, payload)
-            }
+            InputEffectState::NotSeen => self.send_pending_input(pending),
             InputEffectState::AcceptedNotDurable => Err(GuardianProxyError::InputDurabilityPending),
             InputEffectState::DurableFull => {
                 let input_bytes = pending.input_bytes;
@@ -3866,15 +3856,11 @@ impl GuardianPaneLeaseActor {
     fn send_pending_input(
         &mut self,
         pending: PendingInput,
-        payload: &[u8],
     ) -> Result<RecoveredPendingMutation, GuardianProxyError> {
-        if !pending.matches_payload(payload) {
-            return Err(GuardianProxyError::PendingInputPayloadRequired);
-        }
         // Allocation failure proves that no transport call was possible. Keep
-        // `submitted=false` so the caller can retry with the exact bytes
-        // directly rather than performing an unnecessary effect query.
-        let payload = self.copy_input(payload)?;
+        // `submitted=false` so the next attempt sends the bytes directly
+        // rather than performing an unnecessary effect query.
+        let payload = self.copy_input(&pending.payload)?;
         match self.pending.as_mut() {
             Some(PendingMutation::Input(current)) if current.sequence == pending.sequence => {
                 current.submitted = true;
@@ -4108,9 +4094,13 @@ impl GuardianPaneLeaseActor {
         }
     }
 
+    /// Settle the pending mutation, if any, before a new operation. A pending
+    /// input that the guardian never saw is sent again here, with its own
+    /// bytes and identity, so it lands before whatever comes next. `resend`
+    /// says whether this call is that input coming again from its writer.
     fn reconcile_before_new_operation(
         &mut self,
-        input_payload: Option<&[u8]>,
+        resend: bool,
     ) -> Result<Option<RecoveredPendingMutation>, GuardianProxyError> {
         if self.pending.is_none() {
             return Ok(None);
@@ -4120,10 +4110,10 @@ impl GuardianPaneLeaseActor {
         // loop. A terminal census may still reconcile an operation that was
         // already submitted; it may never authorize a new mutation.
         self.ensure_pending_recovery_permitted()?;
-        // Without its bytes, this call is not the input's resend. Whoever
+        // Another operation settling the input is not its resend. Whoever
         // sends it again must not have it written twice (ft-jrhpr).
-        let unresent_input = match (&self.pending, input_payload) {
-            (Some(PendingMutation::Input(pending)), None) => {
+        let unresent_input = match &self.pending {
+            Some(PendingMutation::Input(pending)) if !resend => {
                 pending.resender.clone().map(|resender| {
                     (
                         pending.writer,
@@ -4133,9 +4123,9 @@ impl GuardianPaneLeaseActor {
                     )
                 })
             }
-            _ => None,
+            Some(_) | None => None,
         };
-        let recovered = self.retry_pending(input_payload)?;
+        let recovered = self.retry_pending()?;
         if let (
             Some((writer, resender, input_bytes, payload_sha256)),
             RecoveredPendingMutation::InputApplied { applied_bytes, .. },
@@ -4233,7 +4223,7 @@ impl GuardianPaneLeaseActor {
                 .pending
                 .as_ref()
                 .is_some_and(|pending| pending.matches_input(payload));
-            let recovered = self.reconcile_before_new_operation(same_input.then_some(payload))?;
+            let recovered = self.reconcile_before_new_operation(same_input)?;
             match recovered {
                 Some(RecoveredPendingMutation::InputApplied {
                     applied_bytes,
@@ -4265,7 +4255,7 @@ impl GuardianPaneLeaseActor {
         }
         self.ensure_input_ready()?;
         self.begin_input(writer, payload)?;
-        match self.settle_new_input(payload)? {
+        match self.settle_new_input()? {
             RecoveredPendingMutation::InputApplied { applied_bytes, .. } => {
                 usize::try_from(applied_bytes)
                     .map_err(|_| GuardianProxyError::UnexpectedMutationReply)
@@ -4280,20 +4270,17 @@ impl GuardianPaneLeaseActor {
         }
     }
 
-    /// Settle the input `begin_input` installed while this call still holds
-    /// its plaintext. `pending` keeps only a commitment, so an input abandoned
-    /// here as `NotSeen` can be resent by nothing else, and it then refuses
-    /// this lease's captures, its retirement and every different input. Each
-    /// pass goes through `retry_pending`, so a resend still follows an exact
-    /// `NotSeen`, and an input that took effect is never written twice.
-    fn settle_new_input(
-        &mut self,
-        payload: &[u8],
-    ) -> Result<RecoveredPendingMutation, GuardianProxyError> {
+    /// Settle the input `begin_input` installed, retrying for a bounded time,
+    /// so its writer usually learns the outcome within this call. An input
+    /// still pending afterwards settles at the next operation on this lease,
+    /// which sends its bytes again after an exact `NotSeen`. Each pass goes
+    /// through `retry_pending`, so a resend still follows an exact `NotSeen`,
+    /// and an input that took effect is never written twice.
+    fn settle_new_input(&mut self) -> Result<RecoveredPendingMutation, GuardianProxyError> {
         let deadline = Instant::now() + self.transport.input_retry_budget();
         let mut pause = GUARDIAN_INPUT_RETRY_FIRST_PAUSE;
         loop {
-            match self.retry_pending(Some(payload)) {
+            match self.retry_pending() {
                 Err(error)
                     if error.input_can_still_settle()
                         && self.pending.is_some()
@@ -4310,7 +4297,7 @@ impl GuardianPaneLeaseActor {
 
     fn flush_pending(&mut self) -> Result<(), GuardianProxyError> {
         self.ensure_pending_recovery_permitted()?;
-        let Some(recovered) = self.reconcile_before_new_operation(None)? else {
+        let Some(recovered) = self.reconcile_before_new_operation(false)? else {
             return Ok(());
         };
         match recovered {
@@ -4347,7 +4334,7 @@ impl GuardianPaneLeaseActor {
                 .pending
                 .as_ref()
                 .is_some_and(|pending| pending.matches_generic(kind));
-            let recovered = self.reconcile_before_new_operation(None)?;
+            let recovered = self.reconcile_before_new_operation(false)?;
             match recovered {
                 Some(RecoveredPendingMutation::Generic) if same_mutation => return Ok(()),
                 Some(RecoveredPendingMutation::InputApplied {
@@ -4378,7 +4365,7 @@ impl GuardianPaneLeaseActor {
             return Ok(());
         }
         self.begin_generic(kind)?;
-        match self.retry_pending(None)? {
+        match self.retry_pending()? {
             RecoveredPendingMutation::Generic => Ok(()),
             RecoveredPendingMutation::Checkpoint(_)
             | RecoveredPendingMutation::InputApplied { .. }
@@ -4398,7 +4385,7 @@ impl GuardianPaneLeaseActor {
                 .pending
                 .as_ref()
                 .is_some_and(|pending| pending.matches_checkpoint(intent));
-            let recovered = self.reconcile_before_new_operation(None)?;
+            let recovered = self.reconcile_before_new_operation(false)?;
             match recovered {
                 Some(RecoveredPendingMutation::Checkpoint(receipt)) if same_checkpoint => {
                     return Ok(receipt);
@@ -4422,7 +4409,7 @@ impl GuardianPaneLeaseActor {
             }
         }
         self.begin_checkpoint(intent)?;
-        match self.retry_pending(None)? {
+        match self.retry_pending()? {
             RecoveredPendingMutation::Checkpoint(receipt) => Ok(receipt),
             RecoveredPendingMutation::Generic
             | RecoveredPendingMutation::InputApplied { .. }
@@ -16612,8 +16599,32 @@ mod tests {
         }
     }
 
+    /// The `Input` calls the fake guardian saw, in order.
+    fn sent_inputs(state: &FakeState) -> Vec<FakeCall> {
+        state
+            .calls
+            .iter()
+            .filter(|call| matches!(call, FakeCall::Input { .. }))
+            .cloned()
+            .collect()
+    }
+
+    fn input_call_digest(call: &FakeCall) -> (u64, [u8; 32]) {
+        let FakeCall::Input {
+            sequence,
+            payload_sha256,
+            ..
+        } = call
+        else {
+            panic!("an input call");
+        };
+        (*sequence, *payload_sha256)
+    }
+
     #[test]
-    fn not_seen_pending_input_rejects_different_bytes_without_a_second_input() {
+    fn a_not_seen_input_goes_again_with_its_own_bytes_before_different_input() {
+        // The writer of "original" never sends it again (ft-gpxow): the lease
+        // sends it itself, under its own identity, before "different".
         let (staging, state) = fake_staging(
             [
                 FakeDirective::Io,
@@ -16623,19 +16634,68 @@ mod tests {
         );
         let actor = staging.shared_actor();
         assert!(actor.lock().write_input(b"original").is_err());
-        assert!(matches!(
-            actor.lock().write_input(b"different"),
-            Err(GuardianProxyError::PendingInputPayloadRequired)
-        ));
-        let state = state.lock();
         assert_eq!(
-            state
-                .calls
-                .iter()
-                .filter(|call| matches!(call, FakeCall::Input { .. }))
-                .count(),
-            1
+            actor.lock().write_input(b"different").unwrap(),
+            b"different".len()
         );
+        assert_eq!(actor.lock().next_sequence(), 43);
+        let inputs = sent_inputs(&state.lock());
+        assert_eq!(inputs.len(), 3);
+        assert_eq!(inputs[0], inputs[1], "the same request, sent again");
+        assert_eq!(
+            input_call_digest(&inputs[0]),
+            (41, Sha256::digest(b"original").into())
+        );
+        assert_eq!(
+            input_call_digest(&inputs[2]),
+            (42, Sha256::digest(b"different").into())
+        );
+    }
+
+    #[test]
+    fn a_not_seen_input_whose_writer_gave_up_settles_before_a_resize_and_a_retirement() {
+        // Before ft-gpxow's follow-up, both refused for good: the lease kept
+        // only the input's commitment and could not send it again.
+        let (staging, state) = fake_staging(
+            [
+                FakeDirective::Io,
+                FakeDirective::Query(InputEffectState::NotSeen),
+                FakeDirective::Auto,
+                FakeDirective::Auto,
+                FakeDirective::Io,
+                FakeDirective::Query(InputEffectState::NotSeen),
+            ],
+            51,
+        );
+        let actor = staging.shared_actor();
+        assert!(actor.lock().write_input(b"typed").is_err());
+        actor.lock().resize(size(30, 90)).unwrap();
+        assert!(actor.lock().write_input(b"again").is_err());
+        actor.lock().retire(identity()).unwrap();
+        assert_eq!(actor.lock().disposition, GuardianLeaseDisposition::Retired);
+        let state = state.lock();
+        let inputs = sent_inputs(&state);
+        assert_eq!(
+            inputs.iter().map(input_call_digest).collect::<Vec<_>>(),
+            [
+                (51, Sha256::digest(b"typed").into()),
+                (51, Sha256::digest(b"typed").into()),
+                (53, Sha256::digest(b"again").into()),
+                (53, Sha256::digest(b"again").into()),
+            ]
+        );
+        assert_eq!((&inputs[0], &inputs[2]), (&inputs[1], &inputs[3]));
+        let order: Vec<_> = state
+            .calls
+            .iter()
+            .filter_map(|call| match call {
+                FakeCall::Input { sequence, .. }
+                | FakeCall::Resize { sequence, .. }
+                | FakeCall::Retire { sequence, .. } => Some(*sequence),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, [51, 51, 52, 53, 53, 54]);
     }
 
     #[test]
@@ -16797,6 +16857,39 @@ mod tests {
         assert_eq!(terminal.write(b"typed").expect("new input applies"), 5);
         assert_eq!(input_call_count(&state.lock()), 2);
         assert_eq!(actor.lock().next_sequence(), 94);
+    }
+
+    /// The same when the guardian never saw the input: the other operation
+    /// sends it again itself (ft-gpxow), and the writer's resend is answered
+    /// from that, not written a third time.
+    #[test]
+    fn an_input_another_operation_sent_again_is_not_written_again_by_its_resend() {
+        let (staging, state) = fake_staging(
+            [
+                REFUSED_FOR_NOW,
+                FakeDirective::Query(InputEffectState::NotSeen),
+                FakeDirective::Auto,
+                FakeDirective::Auto,
+            ],
+            95,
+        );
+        let actor = staging.shared_actor();
+        let mut terminal = proxy_writer(&actor, GuardianInputWriter::Terminal);
+        let refused = terminal.write(b"typed").unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::WouldBlock);
+        actor
+            .lock()
+            .resize(size(30, 90))
+            .expect("the resize sends the input again, then applies");
+        assert_eq!(terminal.write(b"typed").expect("the resend is answered"), 5);
+        assert_eq!(actor.lock().next_sequence(), 97);
+        let inputs = sent_inputs(&state.lock());
+        assert_eq!(
+            inputs.len(),
+            2,
+            "NotSeen allowed one more send, and only one"
+        );
+        assert_eq!(inputs[0], inputs[1], "under the input's own identity");
     }
 
     /// Each writer resends only its own input, so a settled input answers only

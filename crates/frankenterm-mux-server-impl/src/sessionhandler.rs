@@ -101,13 +101,16 @@ const RELIABLE_PANE_WRITE_REFUSED_RETRY_AFTER_NS: u64 = 100_000_000;
 /// took no byte and answered `WouldBlock` or `TimedOut`, so that it resends the
 /// identical request.
 ///
-/// Only a guardian answer proves that the bytes wrote nothing: the guardian
-/// knew they were not applied, the lease was holding new input back, or the
-/// lease still waits for a different input that is pending. Any other such
-/// refusal, such as a guardian transport timeout or an input the guardian
-/// accepted but has not made durable, may still take effect. The lease settles
-/// it exactly once when the same bytes come again, so the client resends them
-/// to this mux, but it must not send them to a mux that has replaced this one.
+/// Only the lease's own hold on new input proves that the bytes went nowhere:
+/// it refuses them before any guardian call. Any other such refusal may
+/// still take effect: a guardian transport timeout, an input the guardian
+/// accepted but has not made durable, and even the guardian's own
+/// `InputKnownNotApplied`, which a broker-mode guardian also reports for a
+/// write whose outcome it lost with its broker connection (ft-q1lol item 2).
+/// The lease settles such an input exactly once, by itself if the resend is
+/// late, and answers the resend of the same request from that. So the client
+/// resends it to this mux, but it must not send it to a mux that has replaced
+/// this one: there it could reach the program twice.
 fn refused_pane_write_retry(error: &std::io::Error) -> ReliablePaneWriteRetryV1 {
     let retry_after_ns = RELIABLE_PANE_WRITE_REFUSED_RETRY_AFTER_NS;
     if guardian_refusal_wrote_nothing(error) {
@@ -127,14 +130,7 @@ fn guardian_refusal_wrote_nothing(error: &std::io::Error) -> bool {
     error
         .get_ref()
         .and_then(|inner| inner.downcast_ref::<GuardianProxyError>())
-        .is_some_and(|refusal| {
-            matches!(
-                refusal,
-                GuardianProxyError::InputKnownNotApplied
-                    | GuardianProxyError::InputNotReady
-                    | GuardianProxyError::PendingInputPayloadRequired
-            )
-        })
+        .is_some_and(|refusal| matches!(refusal, GuardianProxyError::InputNotReady))
 }
 
 /// Guardian panes exist only on unix.
@@ -9703,10 +9699,11 @@ impl SessionHandler {
                                 }
                                 // The writer took nothing for now. A guardian
                                 // pane's lease keeps an input it could not
-                                // settle pending by identity and refuses other
-                                // input until the same bytes come again, then
-                                // settles them exactly once; it also holds
-                                // input back while the program does not read.
+                                // settle pending, bytes and all, and settles it
+                                // exactly once before anything later, sending
+                                // it again itself if the resend is late; it
+                                // also holds input back while the program does
+                                // not read.
                                 // A tmux pane's writer refuses while its queue
                                 // is full. So the client resends the identical
                                 // request, ahead of its later input, instead of
@@ -15083,19 +15080,22 @@ mod tests {
         };
 
         // A writer that takes nothing and answers WouldBlock or TimedOut is
-        // asked for the identical request again, never dropped. Only a
-        // guardian's proof that the bytes wrote nothing lets the client send
-        // them to a replacement mux; any other refusal may still take effect.
+        // asked for the identical request again, never dropped. Only the
+        // lease's hold on new input proves that the bytes went nowhere and
+        // lets the client send them to a replacement mux; any other refusal,
+        // the guardian's InputKnownNotApplied included (ft-q1lol item 2), may
+        // still take effect.
         let refusals = [
-            (2, FakePaneWriteBehavior::GuardianKnownNotApplied, true),
-            (3, FakePaneWriteBehavior::GuardianDurabilityPending, false),
+            (2, FakePaneWriteBehavior::GuardianInputNotReady, true),
+            (3, FakePaneWriteBehavior::GuardianKnownNotApplied, false),
+            (4, FakePaneWriteBehavior::GuardianDurabilityPending, false),
             (
-                4,
+                5,
                 FakePaneWriteBehavior::RefuseForNow(std::io::ErrorKind::WouldBlock),
                 false,
             ),
             (
-                5,
+                6,
                 FakePaneWriteBehavior::RefuseForNow(std::io::ErrorKind::TimedOut),
                 false,
             ),
@@ -15130,7 +15130,7 @@ mod tests {
             };
             assert_eq!(retry, expected, "{behavior:?}");
         }
-        assert_eq!(pane.writer_calls(), 4);
+        assert_eq!(pane.writer_calls(), 5);
         // Each call ran as the write of this client's request, which it
         // resends as is, so a guardian pane's lease waits for that resend
         // (ft-jrhpr), and only during the call.
@@ -15138,19 +15138,19 @@ mod tests {
             Arc::new(test_client_id("reliable-pane-refused-for-now", 41_124)),
             160,
         );
-        assert_eq!(pane.pane_write_requests(), vec![Some(resent); 4]);
+        assert_eq!(pane.pane_write_requests(), vec![Some(resent); 5]);
         assert!(crate::guardian_proxy::current_pane_write_request().is_none());
         assert_eq!(pane.written_bytes(), Vec::<u8>::new());
 
         pane.set_writer_behavior(FakePaneWriteBehavior::ApplyAll);
         handler.process_one(DecodedPdu {
-            serial: 6,
+            serial: 7,
             pdu: Pdu::ReliablePaneWriteV1(request),
         });
         tick_until_response(&executor, &captured, 1);
         drain_simple_executor(&executor);
         assert!(captured.lock().unwrap().iter().any(|response| {
-            response.serial == 6
+            response.serial == 7
                 && matches!(
                     &response.pdu,
                     Pdu::ReliablePaneWriteV1Response(ReliablePaneWriteV1Response {
@@ -15159,7 +15159,7 @@ mod tests {
                     })
                 )
         }));
-        assert_eq!(pane.writer_calls(), 5);
+        assert_eq!(pane.writer_calls(), 6);
         assert_eq!(pane.written_bytes(), b"held-back");
     }
 
@@ -15377,8 +15377,12 @@ mod tests {
         /// Takes nothing and fails with a bare error of this kind, as a
         /// guardian transport timeout or a full tmux command queue does.
         RefuseForNow(std::io::ErrorKind),
+        /// Takes nothing and fails as a guardian lease does while it holds
+        /// new input back, before any guardian call.
+        #[cfg(unix)]
+        GuardianInputNotReady,
         /// Takes nothing and fails as a guardian lease does once the guardian
-        /// proved the input wrote nothing.
+        /// answered that the input wrote nothing.
         #[cfg(unix)]
         GuardianKnownNotApplied,
         /// Takes nothing and fails as a guardian lease does while the guardian
@@ -15414,6 +15418,10 @@ mod tests {
                 }
                 FakePaneWriteBehavior::RefuseForNow(kind) => {
                     return Err(std::io::Error::new(kind, "injected pane-writer refusal"));
+                }
+                #[cfg(unix)]
+                FakePaneWriteBehavior::GuardianInputNotReady => {
+                    return Err(crate::guardian_proxy::GuardianProxyError::InputNotReady.into());
                 }
                 #[cfg(unix)]
                 FakePaneWriteBehavior::GuardianKnownNotApplied => {
@@ -18791,7 +18799,9 @@ mod tests {
                 assert_eq!(entry.pane.pane_id, source.pane_id());
                 assert_eq!(
                     entry.pane_registration.as_bytes(),
-                    mux.capture_pane_registration(source).unwrap().wire_identity()
+                    mux.capture_pane_registration(source)
+                        .unwrap()
+                        .wire_identity()
                 );
                 assert_eq!(
                     entry.domain,
@@ -18819,7 +18829,10 @@ mod tests {
         let first: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(7_203, None));
         let tab = register_snapshot_tab(&mux, Arc::clone(&first));
         attach_snapshot_tab_to_new_window(&mux, &tab);
-        let predecessor = mux.capture_pane_registration(&first).unwrap().wire_identity();
+        let predecessor = mux
+            .capture_pane_registration(&first)
+            .unwrap()
+            .wire_identity();
         let mut replacements = 0;
         let mut completed_attempts = 0;
         let response = block_on(collect_list_panes_with_domains(&mux, &mut |stage| {
