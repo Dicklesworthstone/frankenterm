@@ -2804,10 +2804,11 @@ impl GuardianClient {
 
     /// Whether the guardian accepts `hello`. The mux keeps this answer for its
     /// whole life. A close without a reply is no answer: it is how a guardian
-    /// meets a build-bearing Hello while a job holds its protocol authority,
-    /// and a flooded pane keeps such jobs running. So that one is asked again
-    /// until `PROBE_BUSY_BUDGET` ends; a refusal, or any other failure, is a
-    /// no at once.
+    /// predating Hello authorities met a build-bearing Hello while a job held
+    /// its protocol authority, and a flooded pane keeps such jobs running. A
+    /// guardian stays on the build it was installed with, so muxes still meet
+    /// those. So that one is asked again until `PROBE_BUSY_BUDGET` ends; a
+    /// refusal, or any other failure, is a no at once.
     fn admits_hello(socket_path: &Path, token_path: &Path, hello: Vec<u8>) -> bool {
         let mux_incarnation = Uuid::new_v4();
         let started = Instant::now();
@@ -6829,10 +6830,96 @@ mod tests {
         client.join().unwrap();
     }
 
-    /// A guardian out with a job closes a probe's Hello without a reply, which
-    /// says nothing about what it admits: the probe asks again until the job
-    /// is back, and only a job outlasting its budget reads as no. A refusal is
-    /// a no at once.
+    /// A Hello needs only the guardian's incarnation, so the guardian answers
+    /// it while a job holds the protocol authority. A build-bearing Hello,
+    /// with which a birth, a restore plan or a feature probe connects, binds
+    /// its connection to the sealed build; one from an unsealed build is
+    /// refused, as with the authority home. Neither is closed: a closed one
+    /// made births and restores give up on a busy guardian.
+    #[test]
+    fn a_build_bearing_hello_is_answered_while_a_job_holds_the_protocol_authority() {
+        fn hello(
+            service: &mut GuardianService,
+            socket: &Path,
+            token: &Path,
+            payload: Vec<u8>,
+        ) -> Result<GuardianClient, GuardianClientError> {
+            let (socket, token) = (socket.to_path_buf(), token.to_path_buf());
+            let client = std::thread::spawn(move || {
+                GuardianClient::connect_with_hello(&socket, &token, Uuid::new_v4(), payload)
+            });
+            let deadline = Instant::now() + CLIENT_IO_TIMEOUT * 2;
+            while !client.is_finished() {
+                assert!(Instant::now() < deadline, "the Hello was never answered");
+                service.poll_once().unwrap();
+            }
+            client.join().unwrap()
+        }
+
+        let directory = tempfile::Builder::new()
+            .prefix("ft-guardian-hello-busy-")
+            .tempdir_in(crate::canonical_test_temp_root())
+            .unwrap()
+            .keep();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let token = directory.join("token");
+        let socket = directory.join("guardian.sock");
+        provision_guardian_token(&token).unwrap();
+        let config = GuardianServiceConfig::new(
+            socket.clone(),
+            token.clone(),
+            8,
+            1,
+            65_536,
+            65_536,
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        let mut service = GuardianService::bind(config).unwrap();
+        let guardian = service.runtime.incarnation();
+        // A sealed build's Hello, whether or not this test build is sealed.
+        let mut sealed = GuardianHelloBuildIdentityV1::for_compiled_mux()
+            .unwrap()
+            .encode();
+        sealed[4] = 1;
+        sealed[8..].fill(0x5a);
+        let mut unsealed = sealed;
+        unsealed[4] = 0;
+        unsealed[8..].fill(0);
+
+        let held = service.runtime.take_protocol_for_test().unwrap();
+        let client = hello(&mut service, &socket, &token, sealed.to_vec())
+            .expect("a build-bearing Hello is answered while a job holds the authority");
+        assert_eq!(client.guardian_incarnation(), guardian);
+        assert_eq!(
+            service
+                .connections
+                .values()
+                .filter(|connection| connection.genesis_authority.is_some())
+                .count(),
+            1,
+            "its connection holds Genesis authority"
+        );
+        let refused = hello(&mut service, &socket, &token, unsealed.to_vec());
+        assert!(
+            matches!(refused, Err(GuardianClientError::Rejected(_))),
+            "an unsealed build is refused, not closed: {:?}",
+            refused.err()
+        );
+        let plain = hello(&mut service, &socket, &token, Vec::new())
+            .expect("a plain Hello is answered too");
+        assert_eq!(plain.guardian_incarnation(), guardian);
+        service.runtime.restore_protocol_for_test(held);
+    }
+
+    /// A guardian predating Hello authorities closed a probe's Hello without
+    /// a reply while a job held its protocol authority, which says nothing
+    /// about what it admits. Probes still meet such guardians: a guardian
+    /// stays on the build it was installed with. So the probe asks again
+    /// until the job is back, and only a job outlasting its budget reads as
+    /// no. A refusal is a no at once. A relay stands in for that guardian: it
+    /// closes every connection while `busy`, as such a guardian did, and
+    /// passes the others to a guardian of this build.
     #[test]
     fn a_probe_waits_out_the_job_holding_the_protocol_authority() {
         fn answer_of(
@@ -6849,16 +6936,58 @@ mod tests {
             }
         }
 
+        fn relay(
+            listener: &std::os::unix::net::UnixListener,
+            guardian: &Path,
+            busy: &AtomicBool,
+            stop: &AtomicBool,
+        ) {
+            listener.set_nonblocking(true).unwrap();
+            while !stop.load(Ordering::Acquire) {
+                let client = match listener.accept() {
+                    Ok((client, _)) => client,
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(error) => panic!("relay accept failed: {error}"),
+                };
+                client.set_nonblocking(false).unwrap();
+                if busy.load(Ordering::Acquire) {
+                    // Take the whole request before closing, as the guardian
+                    // did: a close before the client's write could fail that
+                    // write instead of its read.
+                    client
+                        .set_read_timeout(Some(Duration::from_millis(100)))
+                        .unwrap();
+                    let _ = (&client).read_to_end(&mut Vec::new());
+                    continue;
+                }
+                let upstream = std::os::unix::net::UnixStream::connect(guardian).unwrap();
+                let mut to_guardian = (client.try_clone().unwrap(), upstream.try_clone().unwrap());
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut to_guardian.0, &mut to_guardian.1);
+                    let _ = to_guardian.1.shutdown(std::net::Shutdown::Write);
+                });
+                let mut to_client = (upstream, client);
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut to_client.0, &mut to_client.1);
+                    let _ = to_client.1.shutdown(std::net::Shutdown::Write);
+                });
+            }
+        }
+
         let directory = tempfile::Builder::new()
             .prefix("ft-guardian-probe-busy-")
             .tempdir_in(crate::canonical_test_temp_root())
             .unwrap();
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let token = directory.path().join("token");
-        let socket = directory.path().join("guardian.sock");
+        let guardian_socket = directory.path().join("guardian.sock");
+        let socket = directory.path().join("older-guardian.sock");
         provision_guardian_token(&token).unwrap();
         let config = GuardianServiceConfig::new(
-            socket.clone(),
+            guardian_socket.clone(),
             token.clone(),
             8,
             1,
@@ -6868,6 +6997,14 @@ mod tests {
         )
         .unwrap();
         let mut service = GuardianService::bind(config).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let busy = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let relay = {
+            let (busy, stop) = (Arc::clone(&busy), Arc::clone(&stop));
+            std::thread::spawn(move || relay(&listener, &guardian_socket, &busy, &stop))
+        };
         let probe = || {
             let (socket, token) = (socket.clone(), token.clone());
             let (answer_tx, answer_rx) = std::sync::mpsc::sync_channel(1);
@@ -6890,7 +7027,7 @@ mod tests {
         );
 
         // Out for several closes, back within the budget: the same answer.
-        let held = service.runtime.take_protocol_for_test().unwrap();
+        busy.store(true, Ordering::Release);
         let (worker, answer) = probe();
         let back_at = Instant::now() + PROBE_BUSY_PAUSE * 10;
         while Instant::now() < back_at {
@@ -6900,18 +7037,19 @@ mod tests {
                 "a close without a reply is no answer"
             );
         }
-        service.runtime.restore_protocol_for_test(held);
+        busy.store(false, Ordering::Release);
         assert_eq!(answer_of(&mut service, &answer), settled);
         worker.join().unwrap();
 
         // Out past the budget: a no, in about that long.
-        let held = service.runtime.take_protocol_for_test().unwrap();
+        busy.store(true, Ordering::Release);
         let started = Instant::now();
         let (worker, answer) = probe();
         assert!(!answer_of(&mut service, &answer));
         worker.join().unwrap();
         assert!(started.elapsed() >= PROBE_BUSY_BUDGET);
-        service.runtime.restore_protocol_for_test(held);
+        stop.store(true, Ordering::Release);
+        relay.join().unwrap();
     }
 
     /// An Input that meets the authority out with a job is answered once the

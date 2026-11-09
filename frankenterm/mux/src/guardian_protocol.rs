@@ -1316,8 +1316,10 @@ impl GuardianHelloBuildIdentityV1 {
 /// bound by an authenticated `Hello` request accepted for this guardian.
 ///
 /// Private fields prevent a raw UUID or decoded Spawn payload from becoming
-/// connection authority.  The only production constructor is the protocol
-/// state method that consumes an authenticated `Hello` envelope.
+/// connection authority.  The only production constructor is
+/// [`GuardianHelloAuthorityV1::authenticate_mux_connection_for_genesis`],
+/// which consumes an authenticated `Hello` envelope; only a protocol state
+/// makes that authority.
 pub struct GuardianAuthenticatedMuxConnectionAuthorityV1 {
     guardian_incarnation: Uuid,
     mux_incarnation: Uuid,
@@ -1348,6 +1350,73 @@ impl std::fmt::Debug for GuardianAuthenticatedMuxConnectionAuthorityV1 {
             .field("hello_request_id", &self.hello_request_id)
             .field("mux_build_identity", &"[REDACTED]")
             .finish_non_exhaustive()
+    }
+}
+
+/// What a guardian needs to answer `Hello`: its incarnation, which never
+/// changes. A guardian runtime keeps this beside its protocol state and
+/// answers every `Hello` with it, build-bearing ones included, so a mux can
+/// connect while a worker holds that state for a checkpoint job. A guardian
+/// that closed such a `Hello` instead failed births, restores and feature
+/// probes whenever its worker was busy.
+///
+/// Only [`GuardianProtocolState::hello_authority`] makes one, so its
+/// incarnation is always a protocol state's own.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuardianHelloAuthorityV1 {
+    guardian_incarnation: Uuid,
+}
+
+impl GuardianHelloAuthorityV1 {
+    #[must_use]
+    pub const fn guardian_incarnation(&self) -> Uuid {
+        self.guardian_incarnation
+    }
+
+    /// Answer one authenticated `Hello` exactly as the protocol state's
+    /// `apply_observation` does.
+    pub fn reply(
+        &self,
+        hello: &AuthenticatedGuardianRequest,
+    ) -> Result<GuardianReply, GuardianProtocolError> {
+        validate_request_envelope(hello)?;
+        if hello.header.operation != GuardianOperation::Hello {
+            return Err(GuardianProtocolError::InvalidOperationScope {
+                operation: hello.header.operation,
+            });
+        }
+        Ok(GuardianReply::Hello {
+            guardian_incarnation: self.guardian_incarnation,
+        })
+    }
+
+    /// Bind one authenticated, build-bearing `Hello` to this guardian.
+    ///
+    /// The mux incarnation and build identity are decoded exclusively from
+    /// the authenticated request. Legacy empty `Hello` and explicit unsealed
+    /// development identities remain valid for ordinary discovery but fail
+    /// closed here.
+    pub fn authenticate_mux_connection_for_genesis(
+        &self,
+        hello: &AuthenticatedGuardianRequest,
+    ) -> Result<GuardianAuthenticatedMuxConnectionAuthorityV1, GuardianProtocolError> {
+        validate_request_envelope(hello)?;
+        if hello.header.operation != GuardianOperation::Hello {
+            return Err(GuardianProtocolError::InvalidOperationScope {
+                operation: hello.header.operation,
+            });
+        }
+        if hello.payload().is_empty() {
+            return Err(GuardianProtocolError::GenesisAuthorityUnavailable);
+        }
+        let mux_build_identity =
+            GuardianHelloBuildIdentityV1::decode(hello.payload())?.require_sealed()?;
+        Ok(GuardianAuthenticatedMuxConnectionAuthorityV1 {
+            guardian_incarnation: self.guardian_incarnation,
+            mux_incarnation: hello.header.mux_incarnation,
+            hello_request_id: hello.header.request_id,
+            mux_build_identity,
+        })
     }
 }
 
@@ -8796,6 +8865,15 @@ impl GuardianProtocolState {
         self.incarnation
     }
 
+    /// What answers `Hello` for this state, kept by a runtime so that it
+    /// can answer while a worker holds the state itself.
+    #[must_use]
+    pub const fn hello_authority(&self) -> GuardianHelloAuthorityV1 {
+        GuardianHelloAuthorityV1 {
+            guardian_incarnation: self.incarnation,
+        }
+    }
+
     /// Install one authenticated Spawn fence recovered from durable broker
     /// state before the service accepts traffic.
     ///
@@ -8955,33 +9033,14 @@ impl GuardianProtocolState {
         Ok(GuardianDurableSpawnFenceInstallV1::Installed)
     }
 
-    /// Bind one authenticated, build-bearing `Hello` to this guardian state.
-    ///
-    /// The mux incarnation and build identity are decoded exclusively from
-    /// the authenticated request. Legacy empty `Hello` and explicit unsealed
-    /// development identities remain valid for ordinary discovery but fail
-    /// closed here.
+    /// Bind one authenticated, build-bearing `Hello` to this guardian state,
+    /// as [`GuardianHelloAuthorityV1::authenticate_mux_connection_for_genesis`].
     pub fn authenticate_mux_connection_for_genesis(
         &self,
         hello: &AuthenticatedGuardianRequest,
     ) -> Result<GuardianAuthenticatedMuxConnectionAuthorityV1, GuardianProtocolError> {
-        validate_request_envelope(hello)?;
-        if hello.header.operation != GuardianOperation::Hello {
-            return Err(GuardianProtocolError::InvalidOperationScope {
-                operation: hello.header.operation,
-            });
-        }
-        if hello.payload().is_empty() {
-            return Err(GuardianProtocolError::GenesisAuthorityUnavailable);
-        }
-        let mux_build_identity =
-            GuardianHelloBuildIdentityV1::decode(hello.payload())?.require_sealed()?;
-        Ok(GuardianAuthenticatedMuxConnectionAuthorityV1 {
-            guardian_incarnation: self.incarnation,
-            mux_incarnation: hello.header.mux_incarnation,
-            hello_request_id: hello.header.request_id,
-            mux_build_identity,
-        })
+        self.hello_authority()
+            .authenticate_mux_connection_for_genesis(hello)
     }
 
     /// Derive the running guardian's Genesis authority from this compilation.
@@ -13294,6 +13353,94 @@ mod tests {
         let debug = format!("{authority:?}");
         assert!(!debug.contains(&"51".repeat(32)));
         assert!(debug.contains("[REDACTED]"));
+    }
+
+    /// A guardian runtime answers every `Hello` from its state's Hello
+    /// authority, so that it can answer while a worker holds the state: the
+    /// authority must answer exactly as the state does.
+    #[test]
+    fn a_hello_authority_answers_hello_exactly_as_its_state_does() {
+        let mut state = GuardianProtocolState::new(id(1)).unwrap();
+        let hello_authority = state.hello_authority();
+        assert_eq!(hello_authority.guardian_incarnation(), id(1));
+        let sealed_payload = GuardianHelloBuildIdentityV1::from_build_identity_for_test(
+            AtomicBuildIdentity::Sealed(sealed_build_identity(0x51)),
+        )
+        .encode();
+        let unsealed_payload = GuardianHelloBuildIdentityV1::from_build_identity_for_test(
+            AtomicBuildIdentity::UnsealedDevelopment,
+        )
+        .encode();
+        let hellos: [(u8, &[u8]); 3] = [(80, b""), (81, &sealed_payload), (82, &unsealed_payload)];
+        for (request_byte, payload) in hellos {
+            let hello = authenticate(&request(
+                GuardianOperation::Hello,
+                Uuid::nil(),
+                id(2),
+                id(request_byte),
+                None,
+                0,
+                0,
+                None,
+                payload,
+            ));
+            assert_eq!(
+                hello_authority.reply(&hello),
+                state.apply_observation(&hello),
+                "Hello {request_byte}"
+            );
+            assert_eq!(
+                hello_authority.reply(&hello),
+                Ok(GuardianReply::Hello {
+                    guardian_incarnation: id(1),
+                })
+            );
+        }
+
+        let sealed_hello = authenticate(&request(
+            GuardianOperation::Hello,
+            Uuid::nil(),
+            id(2),
+            id(84),
+            None,
+            0,
+            0,
+            None,
+            &sealed_payload,
+        ));
+        let authority = hello_authority
+            .authenticate_mux_connection_for_genesis(&sealed_hello)
+            .unwrap();
+        assert_eq!(authority.guardian_incarnation, id(1));
+        assert_eq!(authority.mux_incarnation, id(2));
+        assert_eq!(authority.hello_request_id, id(84));
+        assert_eq!(authority.mux_build_identity, sealed_build_identity(0x51));
+
+        // Only a Hello: anything else is the protocol state's to answer.
+        let census_page =
+            GuardianCensusPageRequest::new(Uuid::nil(), 0, 1, GUARDIAN_MIN_CENSUS_PAGE_BYTES)
+                .unwrap();
+        let census = authenticate(&request(
+            GuardianOperation::Census,
+            id(1),
+            id(2),
+            id(85),
+            None,
+            0,
+            0,
+            None,
+            &census_page.encode(),
+        ));
+        let not_hello = Err(GuardianProtocolError::InvalidOperationScope {
+            operation: GuardianOperation::Census,
+        });
+        assert_eq!(hello_authority.reply(&census), not_hello);
+        assert!(matches!(
+            hello_authority.authenticate_mux_connection_for_genesis(&census),
+            Err(GuardianProtocolError::InvalidOperationScope {
+                operation: GuardianOperation::Census,
+            })
+        ));
     }
 
     #[test]

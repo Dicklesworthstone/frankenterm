@@ -28,8 +28,8 @@ use mux::guardian_protocol::{
     GuardianCheckpointStageRequestV1, GuardianDurableSpawnFenceInstallV1,
     GuardianDurableSpawnFenceV1, GuardianEffectOutcome, GuardianEffectTransactionError,
     GuardianGenesisActivationContinuationV1, GuardianGenesisMuxAuthorityV1,
-    GuardianMuxLeaseRetirement, GuardianOperation, GuardianPaneState, GuardianProtocolError,
-    GuardianProtocolState, GuardianRejectionCode, GuardianReplayRequestV1,
+    GuardianHelloAuthorityV1, GuardianMuxLeaseRetirement, GuardianOperation, GuardianPaneState,
+    GuardianProtocolError, GuardianProtocolState, GuardianRejectionCode, GuardianReplayRequestV1,
     GuardianReplaySelectorV1, GuardianReply, GuardianResizePayload, GuardianResponseEnvelope,
     GuardianSignal, GuardianSpawnPayload, InputEffectState,
 };
@@ -1845,6 +1845,8 @@ fn input_reply_execution(
 /// One process-local owner of native PTYs, child handles, and fencing state.
 pub struct GuardianRuntime {
     incarnation: Uuid,
+    /// Answers Hello while a worker holds `protocol`.
+    hello: GuardianHelloAuthorityV1,
     protocol: Option<GuardianProtocolState>,
     registry: Registry,
     config: GuardianRuntimeConfig,
@@ -1968,9 +1970,11 @@ impl GuardianRuntime {
         let input_pipeline = GuardianInputPipeline::new(Arc::clone(&completion_waker))?;
         let checkpoint_pipeline =
             GuardianCheckpointPipeline::new(checkpoint_store, Arc::clone(&completion_waker))?;
+        let protocol = GuardianProtocolState::new(incarnation)?;
         Ok(Self {
             incarnation,
-            protocol: Some(GuardianProtocolState::new(incarnation)?),
+            hello: protocol.hello_authority(),
+            protocol: Some(protocol),
             registry,
             config,
             panes: HashMap::new(),
@@ -2137,23 +2141,20 @@ impl GuardianRuntime {
             self.checkpoint_settlement_retry_at
                 .remove(&request.header().mux_incarnation);
         }
-        // Hello is the one protocol-independent observation: the immutable
-        // incarnation is cached specifically so a mux can authenticate while
-        // the sole mutable protocol authority is worker-owned. Every other
-        // operation closes without a response as an explicit retryable busy
-        // fence; no caller is told that an operation failed terminally while
-        // its preflight cannot be evaluated.
+        // Hello is the one protocol-independent observation: its Hello
+        // authority holds the immutable incarnation, so a mux can connect,
+        // and authenticate its build for Genesis, while the sole mutable
+        // protocol authority is worker-owned. A build-bearing Hello closed
+        // here used to fail births, restores and feature probes whenever a
+        // checkpoint job ran. Every other operation closes without a response
+        // as an explicit retryable busy fence; no caller is told that an
+        // operation failed terminally while its preflight cannot be evaluated.
         if self.protocol.is_none() {
-            if request.header().operation == GuardianOperation::Hello
-                && request.payload().is_empty()
-            {
-                return GuardianResponseEnvelope::reply(
-                    request,
-                    &GuardianReply::Hello {
-                        guardian_incarnation: self.incarnation,
-                    },
-                )
-                .ok();
+            if request.header().operation == GuardianOperation::Hello {
+                return match self.hello_reply(request) {
+                    Ok(reply) => GuardianResponseEnvelope::reply(request, &reply).ok(),
+                    Err(code) => Some(GuardianResponseEnvelope::rejection(request, code)),
+                };
             }
             return None;
         }
@@ -2200,16 +2201,7 @@ impl GuardianRuntime {
                 return None;
             }
             GuardianOperation::GuardedStop => Err(GuardianRejectionCode::InvalidRequest),
-            GuardianOperation::Hello => {
-                if request.payload().is_empty() {
-                    self.apply_observation(request)
-                } else {
-                    match self.authenticate_genesis_connection(request) {
-                        Ok(_) => self.apply_observation(request),
-                        Err(error) => Err(GuardianRejectionCode::from_protocol_error(&error)),
-                    }
-                }
-            }
+            GuardianOperation::Hello => self.hello_reply(request),
             GuardianOperation::Census | GuardianOperation::QueryInputEffect => {
                 self.apply_observation(request)
             }
@@ -2530,14 +2522,30 @@ impl GuardianRuntime {
             .saturating_add(1);
     }
 
+    /// Bind a build-bearing Hello's connection to its sealed build. This needs
+    /// only the Hello authority, so it succeeds while a job holds the
+    /// protocol authority.
     pub(crate) fn authenticate_genesis_connection(
         &self,
         request: &AuthenticatedGuardianRequest,
     ) -> Result<GuardianAuthenticatedMuxConnectionAuthorityV1, GuardianProtocolError> {
-        self.protocol
-            .as_ref()
-            .ok_or(GuardianProtocolError::GenesisAuthorityUnavailable)?
-            .authenticate_mux_connection_for_genesis(request)
+        self.hello.authenticate_mux_connection_for_genesis(request)
+    }
+
+    /// Answer a Hello exactly as the protocol state would, from the Hello
+    /// authority alone: a build-bearing Hello must also authenticate a
+    /// sealed build for Genesis.
+    fn hello_reply(
+        &self,
+        request: &AuthenticatedGuardianRequest,
+    ) -> Result<GuardianReply, GuardianRejectionCode> {
+        if !request.payload().is_empty() {
+            self.authenticate_genesis_connection(request)
+                .map_err(|error| GuardianRejectionCode::from_protocol_error(&error))?;
+        }
+        self.hello
+            .reply(request)
+            .map_err(|error| GuardianRejectionCode::from_protocol_error(&error))
     }
 
     pub(crate) fn is_broker_control_request(&self, request: &AuthenticatedGuardianRequest) -> bool {
