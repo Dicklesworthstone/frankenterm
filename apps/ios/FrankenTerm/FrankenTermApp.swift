@@ -2950,7 +2950,7 @@ struct MobileWorkspaceRoot: View {
                 .toolbar {
                     ToolbarItem(placement: .topBarLeading) {
                         Button { showIncludedMac = true } label: {
-                            Label(includedMacURL == nil ? "App Information" : "Included Mac App",
+                            Label(includedMacURL == nil ? "App Information" : "Mac Exporter",
                                   systemImage: includedMacURL == nil ? "info.circle" : "desktopcomputer")
                         }
                     }
@@ -2979,13 +2979,19 @@ struct MobileWorkspaceRoot: View {
             NavigationStack {
                 Form {
                     if let url = includedMacURL {
-                        Section("FrankenTerm for Mac is included") {
-                            Text("Your iOS purchase includes the full Mac app at no extra charge. No separate purchase or subscription is required.")
-                            Text("Send this link to your Mac, download FrankenTerm, then open it to install.")
+                        Section("Get the Mac Exporter") {
+                            Text("FrankenTermExport is the small Mac utility for transferring your machines and workspaces to this app. No additional purchase or subscription is required.")
+                            Text("Requires an Apple Silicon Mac with macOS 14 or later.")
                             ShareLink(item: url) {
                                 Label("Send Download Link to My Mac", systemImage: "square.and.arrow.up")
                             }
-                            Link("Open Mac Download", destination: url)
+                            Link("Download Mac Exporter", destination: url)
+                        }
+                        Section("Set Up on Your Mac") {
+                            Text("1. Open the download link on your Mac and unzip the downloaded file.")
+                            Text("2. Open FrankenTermExport.app. You can move it to Applications to keep it handy.")
+                            Text("3. Choose the machines and contents to transfer. If your machines are not listed, use Other Sources to import an SSH config or open a workspace.")
+                            Text("4. Start the transfer on your Mac. On this iPhone or iPad, choose Scan My Mac and scan the displayed codes. Review the imported contents before saving.")
                         }
                     }
                     Section("Support and Privacy") {
@@ -2997,7 +3003,7 @@ struct MobileWorkspaceRoot: View {
                         }
                     }
                 }
-                .navigationTitle(includedMacURL == nil ? "App Information" : "Included Mac App")
+                .navigationTitle(includedMacURL == nil ? "App Information" : "Mac Exporter")
                 .toolbar {
                     ToolbarItem(placement: .confirmationAction) {
                         Button("Done") { showIncludedMac = false }
