@@ -504,6 +504,9 @@ enum MuxConnectionTrackingError {
     MembershipMismatch,
     ActiveMembershipAtReplay,
     PendingRetirementMismatch,
+    /// Too many disconnected muxes already wait for retirement: this one is
+    /// not tracked, so its panes stay with it. The tracker stays healthy.
+    RetirementCapacityExhausted,
     Poisoned,
 }
 
@@ -661,9 +664,11 @@ impl MuxConnectionTracker {
             self.poisoned = true;
             return Err(MuxConnectionTrackingError::PendingRetirementMismatch);
         }
+        // Past the bound this one mux goes unretired and its panes stay with
+        // it. Poisoning the tracker here instead closed every later
+        // connection, so no mux could reach any pane again.
         if self.pending_retirements.len() >= self.max_connections {
-            self.poisoned = true;
-            return Err(MuxConnectionTrackingError::CapacityExhausted);
+            return Err(MuxConnectionTrackingError::RetirementCapacityExhausted);
         }
         self.pending_retirements
             .push(PendingMuxRetirementObservation {
@@ -2261,7 +2266,15 @@ impl GuardianService {
             .mux_connections
             .observe_disconnect(identity, connection.mux_incarnation);
         self.free_connection_tokens.push(token.0);
-        if observed.is_err() {
+        if let Err(error) = observed {
+            if error == MuxConnectionTrackingError::RetirementCapacityExhausted {
+                log::warn!(
+                    "guardian cannot retire mux {} after its last connection closed: {} \
+                     disconnected muxes already wait for retirement; its panes stay with it",
+                    connection.mux_incarnation.unwrap_or_default(),
+                    self.mux_connections.pending_retirements.len()
+                );
+            }
             self.transport_failures = self.transport_failures.saturating_add(1);
         }
     }
@@ -5994,6 +6007,69 @@ mod tests {
         );
         assert!(!failed);
         assert!(tracker.pending_retirements.is_empty());
+        assert!(!tracker.poisoned);
+    }
+
+    #[test]
+    fn a_full_retirement_list_refuses_one_more_mux_and_stays_healthy() {
+        let waiting_mux = Uuid::from_u128(241);
+        let refused_mux = Uuid::from_u128(242);
+        let identity = |token| ConnectionIdentity {
+            token: Token(token),
+            generation: 1,
+        };
+        // One connection, so one pending retirement fills the list.
+        let mut tracker = MuxConnectionTracker::new(1).unwrap();
+        tracker.observe_accept(identity(1)).unwrap();
+        tracker
+            .observe_authenticated_hello(identity(1), waiting_mux)
+            .unwrap();
+        tracker
+            .observe_disconnect(identity(1), Some(waiting_mux))
+            .unwrap();
+        tracker.observe_accept(identity(2)).unwrap();
+        tracker
+            .observe_authenticated_hello(identity(2), refused_mux)
+            .unwrap();
+
+        assert_eq!(
+            tracker.observe_disconnect(identity(2), Some(refused_mux)),
+            Err(MuxConnectionTrackingError::RetirementCapacityExhausted)
+        );
+        assert!(!tracker.poisoned);
+        assert!(tracker.live_connections.is_empty());
+        assert_eq!(tracker.pending_retirements.len(), 1);
+        assert_eq!(tracker.pending_retirements[0].mux_incarnation, waiting_mux);
+
+        // The refused mux can still reach its panes, and the waiting mux still
+        // retires.
+        tracker.observe_accept(identity(3)).unwrap();
+        tracker
+            .observe_authenticated_hello(identity(3), refused_mux)
+            .unwrap();
+        let settled = GuardianMuxLeaseRetirement {
+            retired_panes: 1,
+            pending_input_panes: 0,
+            indeterminate_checkpoint_panes: 0,
+        };
+        let mut replayed = Vec::new();
+        let failed = tracker.replay_retirements(
+            |retirement| {
+                replayed.push(retirement.mux_incarnation);
+                Ok::<_, ()>(Some(settled))
+            },
+            |retirement, _| panic!("{} is not blocked", retirement.mux_incarnation),
+        );
+        assert!(!failed);
+        assert_eq!(replayed, [waiting_mux]);
+        assert!(tracker.pending_retirements.is_empty());
+
+        // With room again, its next disconnect is tracked.
+        tracker
+            .observe_disconnect(identity(3), Some(refused_mux))
+            .unwrap();
+        assert_eq!(tracker.pending_retirements.len(), 1);
+        assert_eq!(tracker.pending_retirements[0].mux_incarnation, refused_mux);
         assert!(!tracker.poisoned);
     }
 
