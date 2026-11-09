@@ -15,13 +15,13 @@ use mux::guardian_protocol::{
     GUARDIAN_MAX_PANES, GuardianAuthenticatedMuxConnectionAuthorityV1, GuardianCensusEntry,
     GuardianCensusPageRequest, GuardianCheckpointIntent, GuardianCheckpointReceipt,
     GuardianCheckpointScopeV1, GuardianCheckpointStageReplyV1, GuardianCheckpointStageRequestV1,
-    GuardianHelloBuildIdentityV1, GuardianInputEffectQuery, GuardianOperation,
-    GuardianProtocolError, GuardianRejectionCode, GuardianReplayAckReceiptV1, GuardianReplayAckV1,
-    GuardianReplayPageDelivery, GuardianReplayRequestV1, GuardianReply, GuardianRequestEnvelope,
-    GuardianRequestHeader, GuardianResizePayload, GuardianResponseEnvelope, GuardianResponseStatus,
-    GuardianSecret, GuardianSignal, GuardianSpawnPayload, GuardianWireFrame, InputEffectState,
-    decode_guardian_request, decode_guardian_response, encode_guardian_request,
-    encode_guardian_response,
+    GuardianHelloBuildIdentityV1, GuardianInputEffectQuery, GuardianMuxLeaseRetirement,
+    GuardianOperation, GuardianProtocolError, GuardianRejectionCode, GuardianReplayAckReceiptV1,
+    GuardianReplayAckV1, GuardianReplayPageDelivery, GuardianReplayRequestV1, GuardianReply,
+    GuardianRequestEnvelope, GuardianRequestHeader, GuardianResizePayload,
+    GuardianResponseEnvelope, GuardianResponseStatus, GuardianSecret, GuardianSignal,
+    GuardianSpawnPayload, GuardianWireFrame, InputEffectState, decode_guardian_request,
+    decode_guardian_response, encode_guardian_request, encode_guardian_response,
 };
 use nix::unistd::geteuid;
 use portable_pty::{CommandBuilder, PtySize};
@@ -697,11 +697,22 @@ impl MuxConnectionTracker {
         })
     }
 
+    #[cfg(test)]
     fn next_replayable_retirement(
         &mut self,
     ) -> Result<Option<PendingMuxRetirementObservation>, MuxConnectionTrackingError> {
+        self.replayable_retirement_at(0)
+    }
+
+    /// The pending retirement at `index` (oldest first) if it can be replayed
+    /// now. An unresolved unauthenticated candidate accepted before its
+    /// cutoff stops the scan there: every later retirement's cutoff is later.
+    fn replayable_retirement_at(
+        &mut self,
+        index: usize,
+    ) -> Result<Option<PendingMuxRetirementObservation>, MuxConnectionTrackingError> {
         self.require_healthy()?;
-        let Some(retirement) = self.pending_retirements.first().copied() else {
+        let Some(retirement) = self.pending_retirements.get(index).copied() else {
             return Ok(None);
         };
         if self.has_authenticated_membership(retirement.mux_incarnation) {
@@ -729,6 +740,42 @@ impl MuxConnectionTracker {
         };
         self.pending_retirements.remove(position);
         Ok(())
+    }
+
+    /// Replay every pending retirement through `retire`, oldest first, and
+    /// complete each one it fully retires. One that cannot complete yet (a
+    /// pane still waiting on an input or a checkpoint) goes to `blocked` and
+    /// stays pending, and the scan goes on: the retirements after it are other
+    /// muxes', and theirs may complete. Returns whether the tracker or
+    /// `retire` failed.
+    fn replay_retirements<E>(
+        &mut self,
+        mut retire: impl FnMut(
+            PendingMuxRetirementObservation,
+        ) -> Result<Option<GuardianMuxLeaseRetirement>, E>,
+        mut blocked: impl FnMut(PendingMuxRetirementObservation, GuardianMuxLeaseRetirement),
+    ) -> bool {
+        let mut index = 0;
+        loop {
+            let retirement = match self.replayable_retirement_at(index) {
+                Ok(Some(retirement)) => retirement,
+                Ok(None) => return false,
+                Err(_) => return true,
+            };
+            let result = match retire(retirement) {
+                Ok(Some(result)) => result,
+                Ok(None) => return false,
+                Err(_) => return true,
+            };
+            if result.pending_input_panes != 0 || result.indeterminate_checkpoint_panes != 0 {
+                blocked(retirement, result);
+                index += 1;
+                continue;
+            }
+            if self.complete_retirement(retirement).is_err() {
+                return true;
+            }
+        }
     }
 }
 
@@ -1031,8 +1078,8 @@ pub struct GuardianService {
     transport_failures: u64,
     /// When a connection refused for want of a slot was last logged.
     capacity_refusal_logged_at: Option<Instant>,
-    /// The last disconnected mux logged as unable to retire.
-    blocked_retirement_logged: Option<Uuid>,
+    /// The disconnected muxes, still pending, logged as unable to retire.
+    blocked_retirements_logged: Vec<Uuid>,
     lifecycle: GuardianLifecycle,
     output_completion_token: Token,
     next_connection_generation: u64,
@@ -1157,7 +1204,7 @@ impl GuardianService {
             poll_interval: config.poll_interval,
             transport_failures: 0,
             capacity_refusal_logged_at: None,
-            blocked_retirement_logged: None,
+            blocked_retirements_logged: Vec::new(),
             lifecycle: GuardianLifecycle::Running,
             output_completion_token,
             next_connection_generation: 1,
@@ -2222,47 +2269,31 @@ impl GuardianService {
     /// Replay only a readiness-loop-owned final-disconnect observation whose
     /// exact mux membership is still empty at the last possible moment.
     fn replay_deferred_mux_retirements(&mut self) {
-        loop {
-            let retirement = match self.mux_connections.next_replayable_retirement() {
-                Ok(Some(retirement)) => retirement,
-                Ok(None) => return,
-                Err(_) => {
-                    self.transport_failures = self.transport_failures.saturating_add(1);
-                    return;
-                }
-            };
-            let result = match self
-                .runtime
-                .retire_disconnected_mux(retirement.mux_incarnation)
-            {
-                Ok(Some(result)) => result,
-                Ok(None) => return,
-                Err(_) => {
-                    self.transport_failures = self.transport_failures.saturating_add(1);
-                    return;
-                }
-            };
-            if result.pending_input_panes != 0 || result.indeterminate_checkpoint_panes != 0 {
-                if self.blocked_retirement_logged != Some(retirement.mux_incarnation) {
-                    self.blocked_retirement_logged = Some(retirement.mux_incarnation);
+        let runtime = &mut self.runtime;
+        let logged = &mut self.blocked_retirements_logged;
+        let failed = self.mux_connections.replay_retirements(
+            |retirement| runtime.retire_disconnected_mux(retirement.mux_incarnation),
+            |retirement, result| {
+                if !logged.contains(&retirement.mux_incarnation) {
+                    logged.push(retirement.mux_incarnation);
                     log::warn!(
-                        "guardian cannot retire disconnected mux {}: {} pane(s) hold an unsettled input, {} an indeterminate checkpoint",
+                        "guardian cannot retire disconnected mux {} yet: {} pane(s) hold an unsettled input, {} an indeterminate checkpoint",
                         retirement.mux_incarnation,
                         result.pending_input_panes,
                         result.indeterminate_checkpoint_panes,
                     );
                 }
-                return;
-            }
-            if self
-                .mux_connections
-                .complete_retirement(retirement)
-                .is_err()
-            {
-                self.transport_failures = self.transport_failures.saturating_add(1);
-                return;
-            }
+            },
+        );
+        if failed {
+            self.transport_failures = self.transport_failures.saturating_add(1);
         }
+        let pending = &self.mux_connections.pending_retirements;
+        self.blocked_retirements_logged.retain(|mux_incarnation| {
+            pending
+                .iter()
+                .any(|retirement| retirement.mux_incarnation == *mux_incarnation)
+        });
     }
 
     fn expire_unauthenticated_connections(&mut self) {
@@ -5899,6 +5930,73 @@ mod tests {
     }
 
     #[test]
+    fn a_blocked_retirement_holds_up_none_queued_after_it() {
+        let blocked_mux = Uuid::from_u128(231);
+        let later_mux = Uuid::from_u128(232);
+        let mut tracker = MuxConnectionTracker::new(4).unwrap();
+        for (token, mux_incarnation) in [(1, blocked_mux), (2, later_mux)] {
+            let identity = ConnectionIdentity {
+                token: Token(token),
+                generation: 1,
+            };
+            tracker.observe_accept(identity).unwrap();
+            tracker
+                .observe_authenticated_hello(identity, mux_incarnation)
+                .unwrap();
+            tracker
+                .observe_disconnect(identity, Some(mux_incarnation))
+                .unwrap();
+        }
+        let blocked_retirement = tracker.pending_retirements[0];
+        assert_eq!(blocked_retirement.mux_incarnation, blocked_mux);
+        let settled = GuardianMuxLeaseRetirement {
+            retired_panes: 1,
+            pending_input_panes: 0,
+            indeterminate_checkpoint_panes: 0,
+        };
+        let unsettled = GuardianMuxLeaseRetirement {
+            retired_panes: 0,
+            pending_input_panes: 0,
+            indeterminate_checkpoint_panes: 1,
+        };
+
+        let mut replayed = Vec::new();
+        let mut blocked = Vec::new();
+        let failed = tracker.replay_retirements(
+            |retirement| {
+                replayed.push(retirement.mux_incarnation);
+                Ok::<_, ()>(Some(if retirement.mux_incarnation == blocked_mux {
+                    unsettled
+                } else {
+                    settled
+                }))
+            },
+            |retirement, result| blocked.push((retirement.mux_incarnation, result)),
+        );
+        assert!(!failed);
+        assert_eq!(
+            replayed,
+            [blocked_mux, later_mux],
+            "the later mux's retirement is replayed past the blocked one"
+        );
+        assert_eq!(blocked, [(blocked_mux, unsettled)]);
+        assert_eq!(
+            tracker.pending_retirements,
+            [blocked_retirement],
+            "the later mux retired; the blocked one is still pending"
+        );
+
+        // Once its pane settles, the blocked one completes as well.
+        let failed = tracker.replay_retirements(
+            |_| Ok::<_, ()>(Some(settled)),
+            |retirement, _| panic!("{} no longer blocks", retirement.mux_incarnation),
+        );
+        assert!(!failed);
+        assert!(tracker.pending_retirements.is_empty());
+        assert!(!tracker.poisoned);
+    }
+
+    #[test]
     fn guardian_service_source_wires_exact_lifecycle_tracker_at_every_boundary() {
         let source = include_str!("transport.rs");
         let service_source = source
@@ -5973,7 +6071,8 @@ mod tests {
             1
         );
         assert!(!finish_connection_source.contains("replay_deferred_mux_retirements"));
-        assert!(service_source.contains(".next_replayable_retirement()"));
+        assert!(service_source.contains(".replayable_retirement_at(index)"));
+        assert!(service_source.contains(".replay_retirements("));
         assert!(service_source.contains(".retire_disconnected_mux(retirement.mux_incarnation)"));
         assert!(!service_source.contains("active_mux_connections"));
         assert!(!service_source.contains("observe_connected_mux"));

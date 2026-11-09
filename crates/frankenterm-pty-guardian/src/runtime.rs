@@ -1854,9 +1854,11 @@ pub struct GuardianRuntime {
     starting_broker_panes: HashMap<Uuid, StartingBrokerPane>,
     settled_broker_panes: HashMap<Uuid, SettledBrokerPane>,
     rotation_admission_owner: Option<Uuid>,
-    /// No disconnected mux's indeterminate checkpoint is settled from the
-    /// catalog before this, after a read of it failed.
-    checkpoint_settlement_retry_at: Option<Instant>,
+    /// A disconnected mux whose indeterminate checkpoints could not all be
+    /// settled from the catalog reads it again no sooner than this. Per mux,
+    /// so one whose read keeps failing never holds up another's: each
+    /// retirement replay settles its own mux first.
+    checkpoint_settlement_retry_at: HashMap<Uuid, Instant>,
     completion_waker: Arc<Waker>,
     // This slot is reachable only if the pane map violates the invariant that
     // a worker-owned pane cannot retire while the sole protocol authority is
@@ -1977,7 +1979,7 @@ impl GuardianRuntime {
             starting_broker_panes: HashMap::new(),
             settled_broker_panes: HashMap::new(),
             rotation_admission_owner: None,
-            checkpoint_settlement_retry_at: None,
+            checkpoint_settlement_retry_at: HashMap::new(),
             completion_waker,
             orphaned_input_authority: None,
             pending_child_exits,
@@ -2120,6 +2122,8 @@ impl GuardianRuntime {
                 connection.retired_outer_owner = false;
                 connection.fully_retired_outer_owner = false;
             }
+            self.checkpoint_settlement_retry_at
+                .remove(&request.header().mux_incarnation);
         }
         // Hello is the one protocol-independent observation: the immutable
         // incarnation is cached specifically so a mux can authenticate while
@@ -4031,7 +4035,8 @@ impl GuardianRuntime {
     fn settle_disconnected_mux_checkpoints(&mut self, mux_incarnation: Uuid) {
         if self
             .checkpoint_settlement_retry_at
-            .is_some_and(|retry_at| Instant::now() < retry_at)
+            .get(&mux_incarnation)
+            .is_some_and(|retry_at| Instant::now() < *retry_at)
         {
             return;
         }
@@ -4066,8 +4071,15 @@ impl GuardianRuntime {
                 true
             }
         };
-        self.checkpoint_settlement_retry_at =
-            retry.then(|| Instant::now() + CHECKPOINT_SETTLEMENT_RETRY);
+        if !retry {
+            self.checkpoint_settlement_retry_at.remove(&mux_incarnation);
+        } else if self.checkpoint_settlement_retry_at.try_reserve(1).is_ok() {
+            // Without room for the pause it reads again on the next replay.
+            self.checkpoint_settlement_retry_at.insert(
+                mux_incarnation,
+                Instant::now() + CHECKPOINT_SETTLEMENT_RETRY,
+            );
+        }
     }
 
     /// Whether a successor may take the panes `mux_incarnation` left
@@ -7273,7 +7285,9 @@ mod tests {
             .broker_connections
             .insert(mux, broker_connection(false));
         // A read of the catalog just failed: this retirement cannot settle it.
-        runtime.checkpoint_settlement_retry_at = Some(Instant::now() + Duration::from_secs(60));
+        runtime
+            .checkpoint_settlement_retry_at
+            .insert(mux, Instant::now() + Duration::from_secs(60));
         assert_eq!(
             runtime
                 .retire_disconnected_mux(mux)
@@ -7291,8 +7305,16 @@ mod tests {
         );
         assert!(!runtime.broker_connections[&mux].fully_retired_outer_owner);
 
-        // The pause over, the next replay of the retirement settles the last.
-        runtime.checkpoint_settlement_retry_at = None;
+        // The pause over, the next replay of the retirement settles the last,
+        // while another disconnected mux's reads are still paused: that pause
+        // is its own.
+        let other_mux = Uuid::from_u128(9);
+        runtime
+            .checkpoint_settlement_retry_at
+            .insert(other_mux, Instant::now() + Duration::from_secs(60));
+        runtime
+            .checkpoint_settlement_retry_at
+            .insert(mux, Instant::now());
         assert_eq!(
             runtime
                 .retire_disconnected_mux(mux)
@@ -7305,7 +7327,12 @@ mod tests {
             }
         );
         assert!(runtime.broker_connections[&mux].fully_retired_outer_owner);
-        assert_eq!(runtime.checkpoint_settlement_retry_at, None);
+        assert!(!runtime.checkpoint_settlement_retry_at.contains_key(&mux));
+        assert!(
+            runtime
+                .checkpoint_settlement_retry_at
+                .contains_key(&other_mux)
+        );
     }
 
     #[test]
