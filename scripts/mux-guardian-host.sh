@@ -861,27 +861,37 @@ cmd_install() {
   provision_state
   write_default_mux_toml
 
-  # An existing, unguarded mux (the pre-guardian unit) owns its panes directly:
-  # replacing it ends them. That is the one-time cost of moving to the guardian.
-  local legacy_active=0
-  if [ -z "$INSTANCE" ]; then
-    case "$MANAGER" in
-      systemd)
-        if systemctl --user is-active --quiet frankenterm-mux-server.service && \
-           ! systemctl --user cat frankenterm-mux-server.service 2>/dev/null | grep -q 'run-mux'; then
-          legacy_active=1
-        fi ;;
-      launchd)
-        if launchctl print "$(launchd_target com.frankenterm.mux-server)" >/dev/null 2>&1 && \
-           ! grep -q run-mux "$HOME/Library/LaunchAgents/com.frankenterm.mux-server.plist" 2>/dev/null; then
-          legacy_active=1
-        fi ;;
-    esac
-  fi
+  # An existing, unguarded mux (the pre-guardian unit, under the label this
+  # install's mux takes) owns its panes directly: replacing it ends them. That
+  # is the one-time cost of moving to the guardian. Every mux unit this script
+  # writes runs run-mux, so a loaded one without it is that unit.
+  local legacy_active=0 legacy_def=""
+  case "$MANAGER" in
+    systemd)
+      legacy_def=$HOME/.config/systemd/user/$(unit mux-server)
+      if systemctl --user is-active --quiet "$(unit mux-server)" && \
+         ! systemctl --user cat "$(unit mux-server)" 2>/dev/null | grep -q 'run-mux'; then
+        legacy_active=1
+      fi ;;
+    launchd)
+      legacy_def=$HOME/Library/LaunchAgents/$(unit mux-server).plist
+      if launchctl print "$(launchd_target "$(unit mux-server)")" >/dev/null 2>&1 && \
+         ! grep -q run-mux "$legacy_def" 2>/dev/null; then
+        legacy_active=1
+      fi ;;
+  esac
   if [ "$legacy_active" = 1 ] && [ "$accept_loss" != 1 ]; then
     die "an unguarded mux is running; converting it ends its panes. Re-run with --accept-pane-loss (a session dump is taken first)"
   fi
   if [ "$legacy_active" = 1 ]; then
+    # The install writes its own unit at that path. Keep the old one (its
+    # environment, limits and logs are the operator's), before anything stops.
+    if [ -e "$legacy_def" ]; then
+      local kept
+      kept=$STATE/$(basename "$legacy_def").pre-guardian.$(date +%s)
+      cp -p "$legacy_def" "$kept" || die "cannot keep a copy of $legacy_def; nothing was changed"
+      log "kept the unguarded mux unit as $kept"
+    fi
     local dump
     dump=$STATE/pre-guardian-dump-$(date +%Y%m%dT%H%M%S).json
     if (cd "$STATE" && "$dest/ft" session dump --allow-partial --output "$dump" >/dev/null 2>&1); then
@@ -889,14 +899,9 @@ cmd_install() {
     else
       log "session dump of the legacy mux failed; continuing (panes end either way)"
     fi
-    # The legacy unit has the label this install's mux takes (no instance).
     # Wait for its process to exit: launchd refuses to load the label again
     # before that, and the new mux must not start beside it.
     svc_stop mux-server || true
-    if [ "$MANAGER" = systemd ]; then
-      local old=$HOME/.config/systemd/user/frankenterm-mux-server.service
-      [ -e "$old" ] && cp -p "$old" "$STATE/frankenterm-mux-server.service.pre-guardian.$(date +%s)"
-    fi
   fi
 
   write_services
