@@ -11302,7 +11302,10 @@ impl BrokerVerifiedKernelChildV1 {
         let process_id = child
             .process_id()
             .ok_or(BrokerChildIncarnationError::InvalidIdentity)?;
-        let start_token = match LocalProcessInfo::observe_process_start_time(process_id) {
+        // The child's own read: a child that has already exited (a command
+        // that finishes at once) is a zombie until this owner reaps it, and
+        // keeps its start time and pid until then.
+        let start_token = match LocalProcessInfo::observe_child_process_start_time(process_id) {
             ProcessStartTimeObservation::Running(token) if token != 0 => token,
             ProcessStartTimeObservation::Absent => {
                 return Err(BrokerChildIncarnationError::ChildNotRunning);
@@ -11321,11 +11324,11 @@ impl BrokerVerifiedKernelChildV1 {
                     site: "post-start-token-child-status",
                     source,
                 })?;
-        // A child that exited after try_wait looked no longer reads as
-        // running, but its pid cannot be reused before this owner reaps it:
-        // reap it as if try_wait had seen it exit.
+        // Read the start time again. A zombie keeps its own, so a child that
+        // exited meanwhile still reads the same; another reading while
+        // try_wait still sees no exit means the pid no longer names it.
         if terminal_status.is_none()
-            && LocalProcessInfo::observe_process_start_time(process_id)
+            && LocalProcessInfo::observe_child_process_start_time(process_id)
                 != ProcessStartTimeObservation::Running(start_token)
             && child
                 .try_wait()
@@ -31827,6 +31830,45 @@ mod tests {
         child.wait().expect("reap pidfd test child");
         assert!(matches!(
             BrokerVerifiedKernelChildV1::verify_spawned_child(&mut *child, id(891)),
+            Err(BrokerChildIncarnationError::ChildNotRunning)
+        ));
+        drop(pair.master);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_child_that_exited_before_it_is_checked_is_still_verified() {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("open PTY");
+        let mut child = pair
+            .slave
+            .spawn_command(portable_pty::CommandBuilder::new("/usr/bin/true"))
+            .expect("spawn a child that exits at once");
+        drop(pair.slave);
+        let process_id = child.process_id().expect("child pid");
+        // Exited and not yet reaped, the child is a zombie, which
+        // proc_pidinfo no longer reports: what a busy broker meets when the
+        // command finishes before it looks.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while LocalProcessInfo::observe_process_start_time(process_id)
+            != ProcessStartTimeObservation::Absent
+        {
+            assert!(Instant::now() < deadline, "the child never exited");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let verified = BrokerVerifiedKernelChildV1::verify_spawned_child(&mut *child, id(892))
+            .expect("a child that already exited is still verified");
+        assert_eq!(verified.identity().process_id(), process_id);
+        assert_ne!(verified.identity().kernel_start_identity_digest(), [0; 32]);
+        assert!(child.wait().expect("reap the child").success());
+        assert!(matches!(
+            BrokerVerifiedKernelChildV1::verify_spawned_child(&mut *child, id(893)),
             Err(BrokerChildIncarnationError::ChildNotRunning)
         ));
         drop(pair.master);

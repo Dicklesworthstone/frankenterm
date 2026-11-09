@@ -23,6 +23,46 @@ fn process_start_token(seconds: u64, microseconds: u64) -> Option<u64> {
     seconds.checked_mul(1_000_000)?.checked_add(microseconds)
 }
 
+/// `sizeof(struct kinfo_proc)` on 64-bit Darwin (the same for arm64 and
+/// x86_64), which libc does not declare for Apple targets; then the offsets
+/// in it of `kp_proc.p_starttime` (a timeval: i64 seconds, i32 microseconds)
+/// and of `kp_proc.p_pid` (i32).
+const KINFO_PROC_BYTES: usize = 648;
+const KINFO_PROC_START_SECONDS: usize = 0;
+const KINFO_PROC_START_MICROSECONDS: usize = 8;
+const KINFO_PROC_PID: usize = 40;
+
+/// Decode the start token of `pid` from one `KERN_PROC_PID` record: a
+/// record of another size or for another pid is unknown, and no record
+/// (the pid is free) is absent.
+fn kinfo_proc_start_time(pid: libc::c_int, record: &[u8]) -> ProcessStartTimeObservation {
+    if record.is_empty() {
+        return ProcessStartTimeObservation::Absent;
+    }
+    if record.len() != KINFO_PROC_BYTES {
+        return ProcessStartTimeObservation::Unknown;
+    }
+    kinfo_proc_start_token(pid, record).map_or(
+        ProcessStartTimeObservation::Unknown,
+        ProcessStartTimeObservation::Running,
+    )
+}
+
+fn kinfo_proc_start_token(pid: libc::c_int, record: &[u8]) -> Option<u64> {
+    let field = |offset: usize, bytes: usize| record.get(offset..offset.checked_add(bytes)?);
+    let record_pid = i32::from_ne_bytes(field(KINFO_PROC_PID, 4)?.try_into().ok()?);
+    if record_pid != pid {
+        return None;
+    }
+    let seconds = i64::from_ne_bytes(field(KINFO_PROC_START_SECONDS, 8)?.try_into().ok()?);
+    let microseconds =
+        i32::from_ne_bytes(field(KINFO_PROC_START_MICROSECONDS, 4)?.try_into().ok()?);
+    process_start_token(
+        u64::try_from(seconds).ok()?,
+        u64::try_from(microseconds).ok()?,
+    )
+}
+
 impl LocalProcessInfo {
     /// Read one process-incarnation token without enumerating the process tree.
     pub fn process_start_time(pid: u32) -> Option<u64> {
@@ -65,6 +105,46 @@ impl LocalProcessInfo {
         } else {
             ProcessStartTimeObservation::Unknown
         }
+    }
+
+    /// [`Self::observe_process_start_time`] for the caller's own child, which
+    /// may have exited and not yet been reaped. `proc_pidinfo` reports such a
+    /// zombie as absent, while the kernel's process table still holds it with
+    /// the start time it had while running, and its pid cannot be reused
+    /// until the caller reaps it. So a zombie reads as running here, as it
+    /// does on Linux, and only a reaped pid reads as absent.
+    pub fn observe_child_process_start_time(pid: u32) -> ProcessStartTimeObservation {
+        match Self::observe_process_start_time(pid) {
+            ProcessStartTimeObservation::Absent => {}
+            observation => return observation,
+        }
+        let Ok(pid) = libc::c_int::try_from(pid) else {
+            return ProcessStartTimeObservation::Unknown;
+        };
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+        let mut record = [0_u8; KINFO_PROC_BYTES];
+        let mut size = record.len();
+        // SAFETY: `mib` names a four-level MIB, and the kernel writes at most
+        // `size` bytes into `record`, then stores the length written in
+        // `size`; no new value is passed.
+        let result = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as libc::c_uint,
+                record.as_mut_ptr().cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if result != 0 {
+            return ProcessStartTimeObservation::Unknown;
+        }
+        record
+            .get(..size)
+            .map_or(ProcessStartTimeObservation::Unknown, |record| {
+                kinfo_proc_start_time(pid, record)
+            })
     }
 
     /// Read the kernel-generated UUID that is stable for one boot session.
@@ -366,7 +446,88 @@ fn parse_exe_and_argv_sysctl(buf: Vec<u8>) -> Option<(PathBuf, Vec<String>)> {
 mod tests {
     use std::path::Path;
 
-    use super::{parse_exe_and_argv_sysctl, process_start_token};
+    use super::{
+        kinfo_proc_start_time, parse_exe_and_argv_sysctl, process_start_token, LocalProcessInfo,
+        ProcessStartTimeObservation, KINFO_PROC_BYTES, KINFO_PROC_PID,
+        KINFO_PROC_START_MICROSECONDS, KINFO_PROC_START_SECONDS,
+    };
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn an_exited_unreaped_child_keeps_its_start_time_until_it_is_reaped() {
+        let mut child = std::process::Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn cat");
+        let pid = child.id();
+        let running = LocalProcessInfo::observe_process_start_time(pid);
+        assert!(
+            matches!(running, ProcessStartTimeObservation::Running(_)),
+            "{running:?}"
+        );
+        assert_eq!(
+            LocalProcessInfo::observe_child_process_start_time(pid),
+            running
+        );
+
+        // At end of input cat exits, and stays a zombie until it is reaped.
+        drop(child.stdin.take());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while LocalProcessInfo::observe_process_start_time(pid) == running {
+            assert!(Instant::now() < deadline, "cat never exited");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            LocalProcessInfo::observe_process_start_time(pid),
+            ProcessStartTimeObservation::Absent,
+            "proc_pidinfo reports a zombie as absent"
+        );
+        assert_eq!(
+            LocalProcessInfo::observe_child_process_start_time(pid),
+            running,
+            "the unreaped child keeps the start time it had while running"
+        );
+
+        assert!(child.wait().expect("reap cat").success());
+        assert_eq!(
+            LocalProcessInfo::observe_child_process_start_time(pid),
+            ProcessStartTimeObservation::Absent
+        );
+    }
+
+    #[test]
+    fn a_process_table_record_decodes_only_at_its_exact_size_and_pid() {
+        let pid: libc::c_int = 4321;
+        let mut record = vec![0_u8; KINFO_PROC_BYTES];
+        record[KINFO_PROC_START_SECONDS..KINFO_PROC_START_SECONDS + 8]
+            .copy_from_slice(&1_700_000_000_i64.to_ne_bytes());
+        record[KINFO_PROC_START_MICROSECONDS..KINFO_PROC_START_MICROSECONDS + 4]
+            .copy_from_slice(&654_321_i32.to_ne_bytes());
+        record[KINFO_PROC_PID..KINFO_PROC_PID + 4].copy_from_slice(&pid.to_ne_bytes());
+        assert_eq!(
+            kinfo_proc_start_time(pid, &record),
+            ProcessStartTimeObservation::Running(1_700_000_000_654_321)
+        );
+        assert_eq!(
+            kinfo_proc_start_time(pid + 1, &record),
+            ProcessStartTimeObservation::Unknown
+        );
+        assert_eq!(
+            kinfo_proc_start_time(pid, &record[..KINFO_PROC_BYTES - 1]),
+            ProcessStartTimeObservation::Unknown
+        );
+        assert_eq!(
+            kinfo_proc_start_time(pid, &[]),
+            ProcessStartTimeObservation::Absent
+        );
+        record[KINFO_PROC_START_MICROSECONDS..KINFO_PROC_START_MICROSECONDS + 4]
+            .copy_from_slice(&(-1_i32).to_ne_bytes());
+        assert_eq!(
+            kinfo_proc_start_time(pid, &record),
+            ProcessStartTimeObservation::Unknown
+        );
+    }
 
     #[test]
     fn process_start_token_uses_microseconds_and_rejects_invalid_inputs() {
