@@ -1142,6 +1142,17 @@ fn execute_checkpoint_job(
                             StoreError::CatalogFull | StoreError::CheckpointAlreadyCataloged => {
                                 Failure::Refused(error)
                             }
+                            // No sealed upload of it could be selected (a mux
+                            // adopting what it never sealed, or a repeat of
+                            // an acknowledged one), or reading the stage
+                            // failed: selection only reads, so nothing was
+                            // written either.
+                            StoreError::AdoptionUploadNotSelected(_) => {
+                                log::warn!(
+                                    "guardian refused a checkpoint adoption; nothing was written: {error:?}"
+                                );
+                                Failure::Refused(error)
+                            }
                             error => {
                                 // The mux sees only an indeterminate outcome,
                                 // and quarantines the lease: this names it.
@@ -1591,6 +1602,7 @@ fn replay_store_error_response(
         GuardianCheckpointStageStoreError::Capacity
         | GuardianCheckpointStageStoreError::CatalogFull
         | GuardianCheckpointStageStoreError::CheckpointAlreadyCataloged
+        | GuardianCheckpointStageStoreError::AdoptionUploadNotSelected(_)
         | GuardianCheckpointStageStoreError::Allocation
         | GuardianCheckpointStageStoreError::NameLimit => GuardianRejectionCode::CapacityExhausted,
         GuardianCheckpointStageStoreError::SpawnCustody(_)
@@ -6927,6 +6939,17 @@ mod tests {
         output: &[u8],
         identity_base: u128,
     ) -> GuardianCheckpointIntent {
+        seal_runtime_checkpoint_upload_with_ack(runtime, pane_id, output, identity_base).0
+    }
+
+    /// As [`seal_runtime_checkpoint_upload`], with the Ack the mux sends
+    /// once the upload is adopted.
+    fn seal_runtime_checkpoint_upload_with_ack(
+        runtime: &mut GuardianRuntime,
+        pane_id: Uuid,
+        output: &[u8],
+        identity_base: u128,
+    ) -> (GuardianCheckpointIntent, GuardianCheckpointStageRequestV1) {
         let generation = 1;
         let journal = runtime
             .panes
@@ -7008,13 +7031,41 @@ mod tests {
             generation,
             seal,
         );
-        assert_eq!(
-            submit_checkpoint_worker_request(runtime, seal, 69)
-                .header()
-                .status,
-            GuardianResponseStatus::Success
+        let sealed = submit_checkpoint_worker_request(runtime, seal, 69);
+        assert_eq!(sealed.header().status, GuardianResponseStatus::Success);
+        let completion_id = match GuardianReply::decode_for_operation(
+            GuardianOperation::CheckpointStage,
+            sealed.payload(),
+        )
+        .expect("decode the Seal reply")
+        {
+            GuardianReply::CheckpointStage(
+                mux::guardian_protocol::GuardianCheckpointStageReplyV1::Sealed {
+                    completion_id,
+                    ..
+                },
+            ) => completion_id,
+            other => panic!("expected a sealed upload, got {other:?}"),
+        };
+        let shape = record_checkpoint_stage_request(
+            GuardianCheckpointStageKindV1::Query,
+            pane_id,
+            generation,
+            upload_id,
+            &terminal,
+            receipt,
+            chunk_bytes,
+            None,
         );
-        intent
+        let ack = GuardianCheckpointStageRequestV1::ack(
+            shape.scope(),
+            upload_id,
+            shape.descriptor(),
+            chunk_bytes,
+            completion_id,
+        )
+        .expect("exact sealed Ack request");
+        (intent, ack)
     }
 
     fn runtime_catalog_file_names(directory: &std::path::Path) -> Vec<String> {
@@ -7126,6 +7177,73 @@ mod tests {
         );
         assert_eq!(
             response_rejection_code(&adopt(0xe020, 2), &repeated),
+            GuardianRejectionCode::CapacityExhausted
+        );
+        assert_eq!(runtime_catalog_file_names(&directory), catalog);
+        assert!(
+            matches!(
+                runtime
+                    .protocol
+                    .as_ref()
+                    .expect("runtime holds protocol between jobs")
+                    .pane_state(pane_id),
+                Some(GuardianPaneState::LiveClaimed {
+                    next_sequence: 2,
+                    pending_input_effect: None,
+                    ..
+                })
+            ),
+            "the refusal took no sequence and left the lease claimed"
+        );
+    }
+
+    #[test]
+    fn a_repeat_of_an_acknowledged_checkpoint_is_refused_and_takes_no_sequence() {
+        let (directory, _poll, mut runtime, pane_id) =
+            claimed_runtime_with_writer(Box::new(Vec::<u8>::new()));
+        let (intent, ack) = seal_runtime_checkpoint_upload_with_ack(
+            &mut runtime,
+            pane_id,
+            b"acknowledged-adoption",
+            0xe400,
+        );
+        let adopt = |request_id: u128, sequence| {
+            authenticated_checkpoint_adoption_request(
+                Uuid::from_u128(request_id),
+                Uuid::from_u128(request_id + 1),
+                pane_id,
+                1,
+                sequence,
+                intent,
+            )
+        };
+        assert_eq!(
+            submit_checkpoint_worker_request(&mut runtime, adopt(0xe410, 1), 80)
+                .header()
+                .status,
+            GuardianResponseStatus::Success
+        );
+        let ack =
+            authenticated_record_checkpoint_stage_request(Uuid::from_u128(0xe420), pane_id, 1, ack);
+        assert_eq!(
+            submit_checkpoint_worker_request(&mut runtime, ack, 81)
+                .header()
+                .status,
+            GuardianResponseStatus::Success
+        );
+        let catalog = runtime_catalog_file_names(&directory);
+
+        // The pane's newest checkpoint adopted again under another effect:
+        // its one upload is acknowledged, so no sealed upload is left to
+        // select, and the selection wrote nothing.
+        let repeated = submit_checkpoint_worker_request(&mut runtime, adopt(0xe430, 2), 82);
+        assert_ne!(
+            repeated.header().status,
+            GuardianResponseStatus::Indeterminate,
+            "an indeterminate outcome would quarantine the lease and close the pane"
+        );
+        assert_eq!(
+            response_rejection_code(&adopt(0xe430, 2), &repeated),
             GuardianRejectionCode::CapacityExhausted
         );
         assert_eq!(runtime_catalog_file_names(&directory), catalog);

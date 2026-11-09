@@ -356,6 +356,12 @@ pub enum GuardianCheckpointStageStoreError {
     /// never publish, and wrote nothing.
     #[error("guardian checkpoint catalog already holds this checkpoint under another adoption")]
     CheckpointAlreadyCataloged,
+    /// A Checkpoint adoption could not select the sealed upload it names: an
+    /// upload of it is unsealed, incomplete, acknowledged or expired, two are
+    /// sealed, none exists, or reading the stage failed. Selection only
+    /// reads, so the adoption wrote nothing.
+    #[error("guardian checkpoint adoption could not select the sealed upload it names")]
+    AdoptionUploadNotSelected(#[source] Box<GuardianCheckpointStageStoreError>),
     #[error("guardian checkpoint staging allocation failed")]
     Allocation,
     #[error("guardian checkpoint staging filesystem does not expose a safe name bound")]
@@ -4936,61 +4942,16 @@ impl GuardianCheckpointStageStore {
         let checkpoint_identity = seed.checkpoint_identity_digest();
         let boundary_identity = seed.output_boundary_identity_digest();
         self.with_exclusive_directory(|inner| {
-            let census = checkpoint_stage_census(inner)?;
-            let expected_scope = CheckpointStagePathScope::Pane {
+            let request = checkpoint_catalog_select_adopted_upload(
+                inner,
                 pane_id,
                 generation,
-            };
-            let mut selected = None;
-            for entry in census.entries.iter().filter(|entry| {
-                entry.key.scope == expected_scope
-                    && entry.role == CheckpointStageFileRole::Candidate
-            }) {
-                let (_, plaintext) = checkpoint_open_record(
-                    inner,
-                    entry,
-                    u32::try_from(CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES)
-                        .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?,
-                )?;
-                let begin = GuardianCheckpointStageRequestV1::decode(&plaintext)?;
-                if begin.kind() != GuardianCheckpointStageKindV1::Begin {
-                    return Err(GuardianCheckpointStageStoreError::Poisoned);
-                }
-                let shape = CheckpointStageRequestShape::from_request(&begin)?;
-                if shape.key() != entry.key {
-                    return Err(GuardianCheckpointStageStoreError::Poisoned);
-                }
-                if shape.descriptor.checkpoint_id().into_bytes() != checkpoint_identity
-                    || shape.descriptor.boundary_id().into_bytes() != boundary_identity
-                {
-                    continue;
-                }
-                let inspection = checkpoint_inspect_upload(
-                    inner,
-                    &census,
-                    &shape,
-                    CheckpointStageSealInspection::IgnoreForHistoricalChunkRetry,
-                )?
-                .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
-                if !inspection.seal_present
-                    || inspection.ack_present
-                    || inspection.expiry_present
-                    || inspection.next_index != shape.total_chunks
-                    || inspection.committed_bytes != shape.total_bytes
-                {
-                    return Err(GuardianCheckpointStageStoreError::OutOfOrder);
-                }
-                if selected.is_some() {
-                    return Err(GuardianCheckpointStageStoreError::Conflict);
-                }
-                selected = Some(GuardianCheckpointStageRequestV1::seal(
-                    shape.scope,
-                    shape.upload_id,
-                    shape.descriptor,
-                    shape.chunk_bytes,
-                )?);
-            }
-            let request = selected.ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
+                checkpoint_identity,
+                boundary_identity,
+            )
+            .map_err(|error| {
+                GuardianCheckpointStageStoreError::AdoptionUploadNotSelected(Box::new(error))
+            })?;
             checkpoint_catalog_publish_sealed_stage(inner, &request, seed).map(|_| ())
         })
     }
@@ -16199,6 +16160,72 @@ fn checkpoint_catalog_reclaim_oldest_pane_members(
         })?;
     }
     Ok(reclaimed)
+}
+
+/// The one sealed, unacknowledged upload of this checkpoint and boundary at
+/// this capture generation, which a Checkpoint adoption publishes. Reads
+/// only: the census, each candidate's Begin and each upload's inspection.
+fn checkpoint_catalog_select_adopted_upload(
+    inner: &GuardianCheckpointStageStoreInner,
+    pane_id: Uuid,
+    generation: u64,
+    checkpoint_identity: [u8; 32],
+    boundary_identity: [u8; 32],
+) -> Result<GuardianCheckpointStageRequestV1, GuardianCheckpointStageStoreError> {
+    let census = checkpoint_stage_census(inner)?;
+    let expected_scope = CheckpointStagePathScope::Pane {
+        pane_id,
+        generation,
+    };
+    let mut selected = None;
+    for entry in census.entries.iter().filter(|entry| {
+        entry.key.scope == expected_scope && entry.role == CheckpointStageFileRole::Candidate
+    }) {
+        let (_, plaintext) = checkpoint_open_record(
+            inner,
+            entry,
+            u32::try_from(CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES)
+                .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?,
+        )?;
+        let begin = GuardianCheckpointStageRequestV1::decode(&plaintext)?;
+        if begin.kind() != GuardianCheckpointStageKindV1::Begin {
+            return Err(GuardianCheckpointStageStoreError::Poisoned);
+        }
+        let shape = CheckpointStageRequestShape::from_request(&begin)?;
+        if shape.key() != entry.key {
+            return Err(GuardianCheckpointStageStoreError::Poisoned);
+        }
+        if shape.descriptor.checkpoint_id().into_bytes() != checkpoint_identity
+            || shape.descriptor.boundary_id().into_bytes() != boundary_identity
+        {
+            continue;
+        }
+        let inspection = checkpoint_inspect_upload(
+            inner,
+            &census,
+            &shape,
+            CheckpointStageSealInspection::IgnoreForHistoricalChunkRetry,
+        )?
+        .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+        if !inspection.seal_present
+            || inspection.ack_present
+            || inspection.expiry_present
+            || inspection.next_index != shape.total_chunks
+            || inspection.committed_bytes != shape.total_bytes
+        {
+            return Err(GuardianCheckpointStageStoreError::OutOfOrder);
+        }
+        if selected.is_some() {
+            return Err(GuardianCheckpointStageStoreError::Conflict);
+        }
+        selected = Some(GuardianCheckpointStageRequestV1::seal(
+            shape.scope,
+            shape.upload_id,
+            shape.descriptor,
+            shape.chunk_bytes,
+        )?);
+    }
+    selected.ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)
 }
 
 fn checkpoint_catalog_publish_sealed_stage(
