@@ -5,16 +5,50 @@ import os
 from pathlib import Path
 import plistlib
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import zipfile
+import unicodedata
 
 
 def verify_archive_layout(archive):
     """Archive Utility must extract one real app, never a misleading .app folder."""
     with zipfile.ZipFile(archive) as zipped:
-        names = set(zipped.namelist())
+        entries = zipped.infolist()
+        seen = set()
+        files = set()
+        for entry in entries:
+            name = entry.filename
+            parts = name.rstrip("/").split("/")
+            if any(part in ("", ".", "..") for part in parts) or "\\" in name:
+                raise ValueError(f"Unsafe archive path: {name}")
+            # Finder commonly extracts onto case-insensitive, normalization-
+            # insensitive APFS. Reject collisions before extraction loses data.
+            canonical = unicodedata.normalize("NFD", name.rstrip("/")).casefold()
+            if canonical in seen:
+                raise ValueError(f"Duplicate archive path: {name}")
+            seen.add(canonical)
+            mode = entry.external_attr >> 16
+            expected_type = stat.S_IFDIR if entry.is_dir() else stat.S_IFREG
+            if stat.S_IFMT(mode) != expected_type:
+                raise ValueError(f"Unsupported archive entry type: {name}")
+            if not entry.is_dir():
+                files.add(canonical)
+            if parts[0] == "__MACOSX":
+                if entry.is_dir():
+                    if len(parts) > 1 and parts[1] != "FrankenTermExport.app":
+                        raise ValueError(f"Unrelated resource metadata: {name}")
+                elif not (parts[-1].startswith("._") and
+                          (parts[1:] == ["._FrankenTermExport.app"] or
+                           (len(parts) > 2 and parts[1] == "FrankenTermExport.app"))):
+                    raise ValueError(f"Unrelated resource metadata: {name}")
+        for name in seen:
+            parts = name.split("/")
+            if any("/".join(parts[:i]) in files for i in range(1, len(parts))):
+                raise ValueError(f"Archive file is also used as a directory: {name}")
+        names = {entry.filename for entry in entries}
         payload = {name for name in names if not name.startswith("__MACOSX/")}
         if not payload or any(
             not name.startswith("FrankenTermExport.app/") for name in payload
@@ -24,6 +58,31 @@ def verify_archive_layout(archive):
                          "Contents/MacOS/frankenterm-machines"):
             if "FrankenTermExport.app/" + required not in payload:
                 raise ValueError(f"Buyer ZIP is missing {required}")
+            entry = zipped.getinfo("FrankenTermExport.app/" + required)
+            if entry.file_size == 0:
+                raise ValueError(f"Buyer ZIP has empty {required}")
+            if required.startswith("Contents/MacOS/") and not (entry.external_attr >> 16) & stat.S_IXUSR:
+                raise ValueError(f"Buyer ZIP has non-executable {required}")
+        info = plistlib.loads(zipped.read("FrankenTermExport.app/Contents/Info.plist"))
+        if not isinstance(info, dict) or any(info.get(key) != value for key, value in {
+            "CFBundleIdentifier": "org.frankenterm.offline-export",
+            "CFBundleExecutable": "FrankenTermExport",
+            "CFBundlePackageType": "APPL",
+        }.items()):
+            raise ValueError("Buyer ZIP has incorrect app identity or executable metadata")
+        corrupt = zipped.testzip()
+        if corrupt is not None:
+            raise ValueError(f"Buyer ZIP has corrupt contents: {corrupt}")
+
+
+def write_export_archive(export, archive):
+    """Keep the actual production archiving command covered by integration tests."""
+    if export.name != "FrankenTermExport.app" or export.is_symlink() or not export.is_dir():
+        raise ValueError("Expected an existing standalone Export app directory")
+    if archive.exists() or archive.is_symlink():
+        raise ValueError("Refusing to replace an existing archive")
+    run("ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", export, archive)
+    verify_archive_layout(archive)
 
 
 def run(*args):
@@ -119,8 +178,7 @@ def main():
     staged = work / archive.name
     # The full desktop app is distributed separately. Multiple top-level items
     # in an .app.zip cause Finder to create a non-launchable .app wrapper.
-    run("ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", export, staged)
-    verify_archive_layout(staged)
+    write_export_archive(export, staged)
     unpacked = work / "unpacked"
     run("ditto", "-x", "-k", staged, unpacked)
     verify_app(unpacked / export.name, "org.frankenterm.offline-export", team)
