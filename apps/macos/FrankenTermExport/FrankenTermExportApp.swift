@@ -1889,10 +1889,21 @@ private struct MacExportView: View {
                                 ProgressView("Loading this Mac's machines…").frame(maxWidth: .infinity)
                             }
                         } else if !model.hasRecordingRecovery {
-                            ContentUnavailableView("No machines loaded", systemImage: "rectangle.3.group",
-                                description: Text("This Mac's FrankenTerm machines load automatically. Use Other Sources to open a workspace or SSH config instead."))
+                            ContentUnavailableView {
+                                Label("Choose What to Send", systemImage: "rectangle.3.group")
+                            } description: {
+                                Text("Import your SSH config or open a FrankenTerm workspace. You can review the machines and keys before preparing a transfer.")
+                            } actions: {
+                                HStack {
+                                    Button("Import SSH Config…") { model.chooseSSHConfiguration() }
+                                        .buttonStyle(.borderedProminent)
+                                    Button("Open Workspace…") { model.chooseWorkspace() }
+                                }.disabled(enrollment.busy)
+                            }
                         }
-                        enrollmentCard.disabled(model.busy || model.sourceSheet != nil || model.requestingCameraAccess)
+                        DisclosureGroup("Advanced: Phone Key Access") {
+                            enrollmentCard
+                        }.disabled(model.busy || model.sourceSheet != nil || model.requestingCameraAccess)
                     }.padding(28)
                 }
             }
