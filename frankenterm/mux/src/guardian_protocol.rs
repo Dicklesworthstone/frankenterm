@@ -7871,6 +7871,18 @@ pub struct GuardianMuxLeaseRetirement {
     pub indeterminate_checkpoint_panes: usize,
 }
 
+/// Result of settling a disconnected mux's indeterminate checkpoint
+/// adoptions from the guardian's catalog.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GuardianDisconnectedCheckpointSettlement {
+    /// The catalog holds the member: the adoption committed.
+    pub committed: usize,
+    /// The catalog lacks the member: the adoption was never published.
+    pub not_published: usize,
+    /// The catalog could not be read; the pane stays fenced.
+    pub unsettled: usize,
+}
+
 impl GuardianPaneState {
     #[must_use]
     pub const fn generation(&self) -> u64 {
@@ -9630,6 +9642,81 @@ impl GuardianProtocolState {
         Ok(result)
     }
 
+    /// Settle each indeterminate checkpoint adoption that holds a live pane
+    /// of one disconnected mux, so its lease can retire.
+    ///
+    /// The caller has the proof [`Self::retire_disconnected_mux_leases`]
+    /// needs. That mux can never resend the adoption, so nothing else would
+    /// settle it, and the pane would stay the mux's for as long as the
+    /// guardian runs. `catalog_holds` reports whether the guardian's catalog
+    /// holds the member the adoption names. A publication is durable once its
+    /// commit marker is written, and the attempt that left the outcome
+    /// indeterminate has returned, so the answer is final: held, the adoption
+    /// committed; not held, it was never published, and its sequence is
+    /// given back. An error or panic leaves that pane fenced, as before.
+    pub fn settle_disconnected_mux_checkpoints<E>(
+        &mut self,
+        mux_incarnation: Uuid,
+        mut catalog_holds: impl FnMut(GuardianCheckpointCatalogAdoptionPermitV1) -> Result<bool, E>,
+    ) -> Result<GuardianDisconnectedCheckpointSettlement, GuardianProtocolError> {
+        require_nonzero(mux_incarnation, "mux incarnation")?;
+        let mut identities = Vec::new();
+        for (pane_id, effect_id) in &self.indeterminate_checkpoints_by_pane {
+            let Some(GuardianPaneState::LiveClaimed {
+                mux_incarnation: owner,
+                pending_input_effect: None,
+                ..
+            }) = self.panes.get(pane_id)
+            else {
+                continue;
+            };
+            if *owner != mux_incarnation {
+                continue;
+            }
+            let identity = match self.effects.get(effect_id).map(|stored| &stored.state) {
+                Some(StoredEffectState::Checkpoint {
+                    disposition: GuardianCheckpointDisposition::OutcomeIndeterminate,
+                    identity,
+                }) if identity.pane_id == *pane_id && identity.effect_id == *effect_id => *identity,
+                _ => {
+                    return Err(GuardianProtocolError::StateInvariantViolation(
+                        "checkpoint-settlement-barrier-effect",
+                    ));
+                }
+            };
+            identities
+                .try_reserve(1)
+                .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
+            identities.push(identity);
+        }
+        let mut result = GuardianDisconnectedCheckpointSettlement::default();
+        for identity in identities {
+            let permit = GuardianCheckpointCatalogAdoptionPermitV1 { identity };
+            match catch_recoverable(
+                RecoverablePanicSite::MuxPaneCallback,
+                AssertUnwindSafe(|| catalog_holds(permit)),
+            ) {
+                Ok(Ok(true)) => {
+                    self.mark_checkpoint_committed(identity)?;
+                    result.committed += 1;
+                }
+                Ok(Ok(false)) => {
+                    self.mark_checkpoint_definitely_not_published(identity)?;
+                    result.not_published += 1;
+                }
+                Ok(Err(error)) => {
+                    let _ = catch_recoverable(
+                        RecoverablePanicSite::MuxPaneCallback,
+                        AssertUnwindSafe(|| drop(error)),
+                    );
+                    result.unsettled += 1;
+                }
+                Err(_) => result.unsettled += 1,
+            }
+        }
+        Ok(result)
+    }
+
     pub fn mark_exited(
         &mut self,
         pane_id: Uuid,
@@ -10453,7 +10540,6 @@ impl GuardianProtocolState {
     /// proved that the exact artifact was definitely not published. The
     /// consumed sequence is rolled back only while the exact original claimed
     /// lease remains otherwise untouched; terminal panes stay terminal.
-    #[allow(dead_code)]
     fn mark_checkpoint_definitely_not_published(
         &mut self,
         identity: GuardianCheckpointEffectIdentity,
@@ -16649,6 +16735,204 @@ mod tests {
         );
         assert_eq!(
             state.retire_disconnected_mux_leases(Uuid::nil()),
+            Err(GuardianProtocolError::ZeroIdentity("mux incarnation"))
+        );
+    }
+
+    #[test]
+    fn a_disconnected_muxs_indeterminate_checkpoints_settle_from_the_catalog_and_retire() {
+        let guardian = id(1);
+        let old_mux = id(2);
+        let successor_mux = id(3);
+        let held_pane = id(50);
+        let unpublished_pane = id(51);
+        let unreadable_pane = id(52);
+        let other_mux_pane = id(53);
+        let mut state = GuardianProtocolState::new(guardian).unwrap();
+        let spawn = |pane, request_byte, effect_byte| {
+            let payload = spawn_payload("checkpoint-settlement-fixture");
+            request(
+                GuardianOperation::Spawn,
+                guardian,
+                old_mux,
+                id(request_byte),
+                Some(pane),
+                0,
+                0,
+                Some(id(effect_byte)),
+                &payload,
+            )
+        };
+        for (pane, mux, request_byte) in [
+            (held_pane, old_mux, 60),
+            (unpublished_pane, old_mux, 62),
+            (unreadable_pane, old_mux, 64),
+            (other_mux_pane, successor_mux, 66),
+        ] {
+            apply_request(&mut state, &spawn(pane, request_byte, request_byte + 1)).unwrap();
+            apply_request(
+                &mut state,
+                &claim_request(guardian, mux, pane, 0, request_byte + 10, request_byte + 11),
+            )
+            .unwrap();
+        }
+        // Each publication fails once its effect is admitted: indeterminate.
+        let adoptions = [
+            checkpoint_request(guardian, old_mux, held_pane, 1, 1, 80, 81, 0x41, 0x52),
+            checkpoint_request(
+                guardian,
+                old_mux,
+                unpublished_pane,
+                1,
+                1,
+                82,
+                83,
+                0x42,
+                0x53,
+            ),
+            checkpoint_request(guardian, old_mux, unreadable_pane, 1, 1, 84, 85, 0x43, 0x54),
+            checkpoint_request(
+                guardian,
+                successor_mux,
+                other_mux_pane,
+                1,
+                1,
+                86,
+                87,
+                0x44,
+                0x55,
+            ),
+        ];
+        for adoption in &adoptions {
+            let receipt = state
+                .apply_checkpoint_transactionally(&authenticate(adoption), |_| {
+                    Err("catalog-unavailable")
+                })
+                .unwrap();
+            assert_eq!(
+                receipt.disposition(),
+                GuardianCheckpointDisposition::OutcomeIndeterminate
+            );
+        }
+        assert_eq!(
+            state.retire_disconnected_mux_leases(old_mux).unwrap(),
+            GuardianMuxLeaseRetirement {
+                retired_panes: 0,
+                pending_input_panes: 0,
+                indeterminate_checkpoint_panes: 3,
+            }
+        );
+
+        let mut asked = Vec::new();
+        let settled = state
+            .settle_disconnected_mux_checkpoints(old_mux, |permit| {
+                asked.push(permit.pane_id());
+                if permit.pane_id() == held_pane {
+                    Ok(true)
+                } else if permit.pane_id() == unpublished_pane {
+                    Ok(false)
+                } else {
+                    Err("catalog-unreadable")
+                }
+            })
+            .unwrap();
+        asked.sort_unstable();
+        let mut expected = vec![held_pane, unpublished_pane, unreadable_pane];
+        expected.sort_unstable();
+        assert_eq!(
+            asked, expected,
+            "only the disconnected mux's panes are read"
+        );
+        assert_eq!(
+            settled,
+            GuardianDisconnectedCheckpointSettlement {
+                committed: 1,
+                not_published: 1,
+                unsettled: 1,
+            }
+        );
+        // Held: the adoption's exact replay finds it committed.
+        assert_eq!(
+            state
+                .apply_checkpoint_transactionally(&authenticate(&adoptions[0]), |_| {
+                    Err("a committed adoption is never published again")
+                })
+                .unwrap()
+                .disposition(),
+            GuardianCheckpointDisposition::Committed
+        );
+        // Never published: the sequence it took is given back.
+        assert!(matches!(
+            state.pane_state(unpublished_pane),
+            Some(GuardianPaneState::LiveClaimed {
+                next_sequence: 1,
+                ..
+            })
+        ));
+        assert_eq!(
+            state.retire_disconnected_mux_leases(old_mux).unwrap(),
+            GuardianMuxLeaseRetirement {
+                retired_panes: 2,
+                pending_input_panes: 0,
+                indeterminate_checkpoint_panes: 1,
+            }
+        );
+        for (pane, request_byte) in [(held_pane, 90), (unpublished_pane, 92)] {
+            apply_request(
+                &mut state,
+                &claim_request(
+                    guardian,
+                    successor_mux,
+                    pane,
+                    1,
+                    request_byte,
+                    request_byte + 1,
+                ),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            apply_request(
+                &mut state,
+                &claim_request(guardian, successor_mux, unreadable_pane, 1, 94, 95),
+            ),
+            Err(GuardianProtocolError::CheckpointOutcomeIndeterminate)
+        );
+
+        // A later read settles the last one; the panes now another mux's are
+        // not the disconnected mux's to settle.
+        let settled = state
+            .settle_disconnected_mux_checkpoints(old_mux, |permit| {
+                assert_eq!(permit.pane_id(), unreadable_pane);
+                Ok::<bool, &str>(false)
+            })
+            .unwrap();
+        assert_eq!(
+            settled,
+            GuardianDisconnectedCheckpointSettlement {
+                not_published: 1,
+                ..GuardianDisconnectedCheckpointSettlement::default()
+            }
+        );
+        assert_eq!(
+            state.retire_disconnected_mux_leases(old_mux).unwrap(),
+            GuardianMuxLeaseRetirement {
+                retired_panes: 1,
+                ..GuardianMuxLeaseRetirement::default()
+            }
+        );
+        apply_request(
+            &mut state,
+            &claim_request(guardian, successor_mux, unreadable_pane, 1, 96, 97),
+        )
+        .unwrap();
+        assert!(matches!(
+            state.pane_state(other_mux_pane),
+            Some(GuardianPaneState::LiveClaimed { mux_incarnation, next_sequence: 2, .. })
+                if *mux_incarnation == successor_mux
+        ));
+        assert_eq!(
+            state.settle_disconnected_mux_checkpoints(Uuid::nil(), |_| Ok::<bool, &str>(true)),
             Err(GuardianProtocolError::ZeroIdentity("mux incarnation"))
         );
     }

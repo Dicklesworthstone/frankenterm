@@ -351,6 +351,11 @@ pub enum GuardianCheckpointStageStoreError {
     /// may find room.
     #[error("guardian checkpoint catalog has no room for another pane member")]
     CatalogFull,
+    /// The pane's catalog already holds this checkpoint at this capture
+    /// generation, adopted by another Checkpoint effect: this adoption can
+    /// never publish, and wrote nothing.
+    #[error("guardian checkpoint catalog already holds this checkpoint under another adoption")]
+    CheckpointAlreadyCataloged,
     #[error("guardian checkpoint staging allocation failed")]
     Allocation,
     #[error("guardian checkpoint staging filesystem does not expose a safe name bound")]
@@ -4987,6 +4992,32 @@ impl GuardianCheckpointStageStore {
             }
             let request = selected.ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
             checkpoint_catalog_publish_sealed_stage(inner, &request, seed).map(|_| ())
+        })
+    }
+
+    /// Whether the pane's catalog holds the member one Checkpoint adoption
+    /// published: a committed member (its marker written) under that exact
+    /// adoption. Reads only; a candidate left without its marker is not a
+    /// member.
+    pub(crate) fn checkpoint_catalog_holds_adoption(
+        &self,
+        permit: GuardianCheckpointCatalogAdoptionPermitV1,
+    ) -> Result<bool, GuardianCheckpointStageStoreError> {
+        let seed = permit.into_evidence_seed();
+        self.with_exclusive_directory(|inner| {
+            let catalog = checkpoint_catalog_scan(
+                inner,
+                CheckpointCatalogScope::Pane {
+                    pane_id: seed.pane_id(),
+                },
+            )?;
+            Ok(catalog.published.iter().any(|member| {
+                member.metadata.checkpoint_id == seed.checkpoint_identity_digest()
+                    && member.metadata.boundary_id == seed.output_boundary_identity_digest()
+                    && member.metadata.adoption_mux_incarnation == seed.mux_incarnation()
+                    && member.metadata.adoption_effect_id == seed.effect_id()
+                    && member.metadata.adoption_sequence == seed.sequence()
+            }))
         })
     }
 
@@ -16228,6 +16259,17 @@ fn checkpoint_catalog_publish_sealed_stage(
             )?;
             return Ok(existing.clone());
         }
+        // A pane's catalog holds one member per checkpoint and capture
+        // generation. Another effect's member means this adoption can never
+        // publish; nothing is written yet.
+        if (
+            existing.metadata.adoption_mux_incarnation,
+            existing.metadata.adoption_effect_id,
+            existing.metadata.adoption_sequence,
+        ) != (seed.mux_incarnation(), seed.effect_id(), seed.sequence())
+        {
+            return Err(GuardianCheckpointStageStoreError::CheckpointAlreadyCataloged);
+        }
         return Err(GuardianCheckpointStageStoreError::Conflict);
     }
     // The member this publication makes. Reclaiming the oldest members below
@@ -18481,6 +18523,150 @@ mod tests {
     fn unchanged_successor_checkpoint_reopens_both_authenticated_adoptions()
     -> Result<(), Box<dyn std::error::Error>> {
         exercise_successor_checkpoint_reopen(true)
+    }
+
+    #[test]
+    fn a_checkpoint_cataloged_under_another_adoption_is_refused_and_nothing_is_written()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-catalog-repeat-refused-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let context = spawn_custody_context();
+        let scope = context.scope();
+        let (guardian, mux, pane) = (
+            scope.guardian_incarnation,
+            scope.mux_incarnation,
+            scope.pane_id,
+        );
+        drop(store.persist_spawn_custody(&context, &Zeroizing::new([0x94; 32]))?);
+        let journal = pipeline.prepare_pane(guardian, pane)?;
+        let mut state = checkpoint_catalog_claimed_protocol_state(guardian, mux, pane)?;
+        let receipt = durable_commit(&pipeline, pane, &journal, b"cataloged")?;
+        let terminal = checkpoint_catalog_test_terminal(b"cataloged");
+        let (checkpoint_id, _) = checkpoint_catalog_stage_and_publish_checkpoint(
+            &store, &journal, &mut state, guardian, mux, pane, 1, 1, 0xae100, receipt, &terminal,
+        )?;
+        let catalog = || {
+            store.with_exclusive_directory(|inner| {
+                let scan =
+                    checkpoint_catalog_scan(inner, CheckpointCatalogScope::Pane { pane_id: pane })?;
+                Ok((
+                    scan.published
+                        .iter()
+                        .map(|member| {
+                            (
+                                member.metadata.checkpoint_id,
+                                member.metadata.upload_id,
+                                member.metadata.adoption_effect_id,
+                                member.candidate_checksum,
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    scan.unpublished_candidates.len(),
+                    scan.staged_files.len(),
+                    scan.relevant_files,
+                ))
+            })
+        };
+        let before = catalog()?;
+        assert_eq!(before.0.len(), 1, "one published member");
+
+        // The same checkpoint at the same capture generation, sealed under
+        // another upload.
+        let upload = Uuid::from_u128(0xae200);
+        let chunk_bytes = 1_024_u32;
+        let begin = checkpoint_catalog_test_record_stage_request(
+            GuardianCheckpointStageKindV1::Begin,
+            pane,
+            1,
+            upload,
+            &terminal,
+            receipt,
+            chunk_bytes,
+            None,
+        )?;
+        assert_eq!(begin.checkpoint_id().into_bytes(), checkpoint_id);
+        let intent = GuardianCheckpointIntent::new(begin.checkpoint_id(), begin.boundary_id());
+        store.apply_begin(&begin)?;
+        for (index, bytes) in terminal
+            .canonical_payload()
+            .chunks(usize::try_from(chunk_bytes)?)
+            .enumerate()
+        {
+            store.apply_chunk(checkpoint_catalog_test_record_stage_request(
+                GuardianCheckpointStageKindV1::Chunk,
+                pane,
+                1,
+                upload,
+                &terminal,
+                receipt,
+                chunk_bytes,
+                Some((u32::try_from(index)?, bytes)),
+            )?)?;
+        }
+        let seal = || {
+            checkpoint_catalog_test_record_stage_request(
+                GuardianCheckpointStageKindV1::Seal,
+                pane,
+                1,
+                upload,
+                &terminal,
+                receipt,
+                chunk_bytes,
+                None,
+            )
+        };
+        let authenticated_seal = checkpoint_catalog_authenticate_request(
+            GuardianOperation::CheckpointStage,
+            guardian,
+            mux,
+            Uuid::from_u128(0xae201),
+            Some(pane),
+            1,
+            0,
+            None,
+            seal()?.into_zeroizing_payload()?,
+        )?;
+        let seal_permit = state.preflight_checkpoint_seal(&authenticated_seal)?;
+        store.apply_runtime_seal(seal_permit, &journal)?;
+        let staged = catalog()?;
+
+        let mut adoption_payload = Zeroizing::new(Vec::new());
+        adoption_payload.extend_from_slice(&intent.encode());
+        let adoption = checkpoint_catalog_authenticate_request(
+            GuardianOperation::Checkpoint,
+            guardian,
+            mux,
+            Uuid::from_u128(0xae202),
+            Some(pane),
+            1,
+            2,
+            Some(Uuid::from_u128(0xae203)),
+            adoption_payload,
+        )?;
+        let seal = seal()?;
+        let mut refusal = None;
+        let outcome = state.apply_checkpoint_transactionally_or_refuse(&adoption, |permit| {
+            let error = match store.publish_sealed_catalog_member(&seal, permit) {
+                Ok(()) => return Ok(()),
+                Err(error) => error,
+            };
+            refusal = Some(format!("{error:?}"));
+            Err(mux::guardian_protocol::GuardianCheckpointPublicationFailure::Refused(error))
+        });
+        assert_eq!(refusal.as_deref(), Some("CheckpointAlreadyCataloged"));
+        assert!(
+            matches!(outcome, Err(GuardianProtocolError::CapacityExhausted)),
+            "a refused adoption installs nothing: the mux sees a retryable refusal"
+        );
+        assert_eq!(catalog()?, staged, "the refusal wrote nothing");
+        assert_eq!(
+            staged.0, before.0,
+            "the catalog still holds only the first member"
+        );
+        Ok(())
     }
 
     fn exercise_successor_checkpoint_reopen(

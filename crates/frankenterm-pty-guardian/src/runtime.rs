@@ -313,6 +313,10 @@ const BROKER_READ_IDLE_AFTER: Duration = Duration::from_secs(1);
 /// How long a pane waits to read a record again after its commit found the
 /// disk full.
 const OUTPUT_STORAGE_FULL_RETRY: Duration = Duration::from_millis(250);
+/// How long a disconnected mux's retirement waits to read the checkpoint
+/// catalog again after it could not settle an indeterminate adoption: the
+/// transport replays a blocked retirement every loop turn.
+const CHECKPOINT_SETTLEMENT_RETRY: Duration = Duration::from_secs(5);
 /// A pane that delivered output this recently is streaming: a Read that
 /// finds none is most likely waiting on a drain the broker has in flight.
 const BROKER_READ_STREAMING_WINDOW: Duration = Duration::from_millis(20);
@@ -433,6 +437,11 @@ struct RuntimeBrokerConnection {
     /// The last command was a released pane's retirement: a read goes next.
     retired_last: bool,
     failed: bool,
+    /// This mux's final disconnect was seen and its settled leases retired:
+    /// a successor may claim any pane of it that is unclaimed. A pane still
+    /// waiting on an input or a checkpoint stays its own until it settles.
+    retired_outer_owner: bool,
+    /// As `retired_outer_owner`, with every lease of it retired.
     fully_retired_outer_owner: bool,
 }
 
@@ -1125,10 +1134,14 @@ fn execute_checkpoint_job(
                         use mux::guardian_protocol::GuardianCheckpointPublicationFailure as Failure;
                         match error {
                             // No room in the pane's catalog yet (a restore's
-                            // replay pins its oldest members): nothing was
-                            // written, so the request is refused, not left
-                            // indeterminate, which would quarantine the lease.
-                            StoreError::CatalogFull => Failure::Refused(error),
+                            // replay pins its oldest members), or the catalog
+                            // holds this checkpoint under another adoption:
+                            // nothing was written, so the request is refused,
+                            // not left indeterminate, which would quarantine
+                            // the lease.
+                            StoreError::CatalogFull | StoreError::CheckpointAlreadyCataloged => {
+                                Failure::Refused(error)
+                            }
                             error => {
                                 // The mux sees only an indeterminate outcome,
                                 // and quarantines the lease: this names it.
@@ -1577,6 +1590,7 @@ fn replay_store_error_response(
         }
         GuardianCheckpointStageStoreError::Capacity
         | GuardianCheckpointStageStoreError::CatalogFull
+        | GuardianCheckpointStageStoreError::CheckpointAlreadyCataloged
         | GuardianCheckpointStageStoreError::Allocation
         | GuardianCheckpointStageStoreError::NameLimit => GuardianRejectionCode::CapacityExhausted,
         GuardianCheckpointStageStoreError::SpawnCustody(_)
@@ -1840,6 +1854,9 @@ pub struct GuardianRuntime {
     starting_broker_panes: HashMap<Uuid, StartingBrokerPane>,
     settled_broker_panes: HashMap<Uuid, SettledBrokerPane>,
     rotation_admission_owner: Option<Uuid>,
+    /// No disconnected mux's indeterminate checkpoint is settled from the
+    /// catalog before this, after a read of it failed.
+    checkpoint_settlement_retry_at: Option<Instant>,
     completion_waker: Arc<Waker>,
     // This slot is reachable only if the pane map violates the invariant that
     // a worker-owned pane cannot retire while the sole protocol authority is
@@ -1895,7 +1912,8 @@ impl GuardianRuntime {
                         connection.active_pane == Some(id),
                         connection.last_pane == Some(id),
                         connection.failed,
-                        connection.fully_retired_outer_owner,
+                        u8::from(connection.retired_outer_owner)
+                            + u8::from(connection.fully_retired_outer_owner),
                     ));
                 }
             }
@@ -1959,6 +1977,7 @@ impl GuardianRuntime {
             starting_broker_panes: HashMap::new(),
             settled_broker_panes: HashMap::new(),
             rotation_admission_owner: None,
+            checkpoint_settlement_retry_at: None,
             completion_waker,
             orphaned_input_authority: None,
             pending_child_exits,
@@ -2098,6 +2117,7 @@ impl GuardianRuntime {
                 .broker_connections
                 .get_mut(&request.header().mux_incarnation)
             {
+                connection.retired_outer_owner = false;
                 connection.fully_retired_outer_owner = false;
             }
         }
@@ -2606,10 +2626,7 @@ impl GuardianRuntime {
                     return GuardianCheckpointSubmission::CloseRetryably;
                 };
                 let old_mux = self.starting_broker_panes[&pane_id].mux_incarnation;
-                let retired = self
-                    .broker_connections
-                    .get(&old_mux)
-                    .is_some_and(|connection| connection.fully_retired_outer_owner);
+                let retired = self.retired_outer_owner(old_mux);
                 let successor = request.header().mux_incarnation;
                 if old_mux != successor {
                     let refusal = if !retired {
@@ -2915,6 +2932,7 @@ impl GuardianRuntime {
                     last_pane: None,
                     retired_last: false,
                     failed: false,
+                    retired_outer_owner: false,
                     fully_retired_outer_owner: false,
                 });
         let Some(mut protocol) = self.protocol.take() else {
@@ -3708,6 +3726,7 @@ impl GuardianRuntime {
                                             last_pane: None,
                                             retired_last: false,
                                             failed,
+                                            retired_outer_owner: false,
                                             fully_retired_outer_owner: false,
                                         },
                                     );
@@ -3970,11 +3989,17 @@ impl GuardianRuntime {
                 "guardian external effects are quarantined after an indeterminate outcome",
             ));
         }
+        self.settle_disconnected_mux_checkpoints(mux_incarnation);
         let result = self
             .protocol
             .as_mut()
             .map(|protocol| protocol.retire_disconnected_mux_leases(mux_incarnation))
             .transpose()?;
+        if result.is_some() {
+            if let Some(connection) = self.broker_connections.get_mut(&mux_incarnation) {
+                connection.retired_outer_owner = true;
+            }
+        }
         if result.as_ref().is_some_and(|retirement| {
             retirement.pending_input_panes == 0 && retirement.indeterminate_checkpoint_panes == 0
         }) {
@@ -3996,6 +4021,63 @@ impl GuardianRuntime {
             }
         }
         Ok(result)
+    }
+
+    /// A disconnected mux can never resend a checkpoint adoption it was told
+    /// is indeterminate, so its pane would stay the mux's for as long as the
+    /// guardian runs. The member is in this guardian's catalog or it is not:
+    /// settle each from there. Runs only while the runtime holds the
+    /// protocol, so no checkpoint job holds the store.
+    fn settle_disconnected_mux_checkpoints(&mut self, mux_incarnation: Uuid) {
+        if self
+            .checkpoint_settlement_retry_at
+            .is_some_and(|retry_at| Instant::now() < retry_at)
+        {
+            return;
+        }
+        let Some(protocol) = self.protocol.as_mut() else {
+            return;
+        };
+        let store = self.output_pipeline.checkpoint_stage_store();
+        let settled = protocol.settle_disconnected_mux_checkpoints(mux_incarnation, |permit| {
+            let held = store.checkpoint_catalog_holds_adoption(permit);
+            if let Err(error) = &held {
+                log::warn!(
+                    "guardian could not read the checkpoint catalog to settle an indeterminate adoption of disconnected mux {mux_incarnation}: {error:?}"
+                );
+            }
+            held
+        });
+        let retry = match settled {
+            Ok(settled) => {
+                if settled.committed != 0 || settled.not_published != 0 {
+                    log::info!(
+                        "guardian settled the indeterminate checkpoint adoptions of disconnected mux {mux_incarnation}: {} committed, {} never published",
+                        settled.committed,
+                        settled.not_published,
+                    );
+                }
+                settled.unsettled != 0
+            }
+            Err(error) => {
+                log::warn!(
+                    "guardian could not settle the indeterminate checkpoint adoptions of disconnected mux {mux_incarnation}: {error:?}"
+                );
+                true
+            }
+        };
+        self.checkpoint_settlement_retry_at =
+            retry.then(|| Instant::now() + CHECKPOINT_SETTLEMENT_RETRY);
+    }
+
+    /// Whether a successor may take the panes `mux_incarnation` left
+    /// unclaimed: its final disconnect was seen and its settled leases
+    /// retired. Per pane: the rotation itself takes only an unclaimed pane,
+    /// so one pane that has not settled keeps no other from the successor.
+    fn retired_outer_owner(&self, mux_incarnation: Uuid) -> bool {
+        self.broker_connections
+            .get(&mux_incarnation)
+            .is_some_and(|connection| connection.retired_outer_owner)
     }
 
     /// Drop the connections of retired muxes that no pane needs. Every mux
@@ -5544,6 +5626,13 @@ mod tests {
     fn runtime_with_output_record_limits(
         record_limits: Option<(u64, usize)>,
     ) -> (std::path::PathBuf, Poll, GuardianRuntime) {
+        runtime_with_limits(record_limits, 1)
+    }
+
+    fn runtime_with_limits(
+        record_limits: Option<(u64, usize)>,
+        max_panes: usize,
+    ) -> (std::path::PathBuf, Poll, GuardianRuntime) {
         let canonical_temp = crate::canonical_test_temp_root();
         let directory = tempfile::Builder::new()
             .prefix("ft-guardian-runtime-input-rejection-")
@@ -5560,7 +5649,7 @@ mod tests {
             Some((max_records, max_segments)) => {
                 GuardianOutputPipeline::open_with_record_limits_for_test(
                     &directory.join("guardian.token"),
-                    1,
+                    max_panes,
                     Arc::clone(&completion_waker),
                     max_records,
                     max_segments,
@@ -5568,13 +5657,14 @@ mod tests {
             }
             None => GuardianOutputPipeline::open(
                 &directory.join("guardian.token"),
-                1,
+                max_panes,
                 Arc::clone(&completion_waker),
             ),
         }
         .expect("create runtime output pipeline");
-        let config = GuardianRuntimeConfig::new(1, OUTPUT_RECORD_BYTES, OUTPUT_RECORD_BYTES, 2)
-            .expect("valid runtime test limits");
+        let config =
+            GuardianRuntimeConfig::new(max_panes, OUTPUT_RECORD_BYTES, OUTPUT_RECORD_BYTES, 2)
+                .expect("valid runtime test limits");
         let runtime = GuardianRuntime::new(
             poll.registry()
                 .try_clone()
@@ -6246,7 +6336,16 @@ mod tests {
     fn claimed_runtime_with_writer(
         writer: Box<dyn Write + Send>,
     ) -> (std::path::PathBuf, Poll, GuardianRuntime, Uuid) {
-        let (directory, poll, mut runtime) = runtime_for_input_rejection();
+        claimed_runtime_with_capacity(writer, 1)
+    }
+
+    /// As [`claimed_runtime_with_writer`], in a runtime with room for
+    /// `max_panes` panes.
+    fn claimed_runtime_with_capacity(
+        writer: Box<dyn Write + Send>,
+        max_panes: usize,
+    ) -> (std::path::PathBuf, Poll, GuardianRuntime, Uuid) {
+        let (directory, poll, mut runtime) = runtime_with_limits(None, max_panes);
         let pane_id = Uuid::from_u128(31);
         let spawn = successful_spawn_request(Uuid::from_u128(32), pane_id, Uuid::from_u128(33));
         assert_eq!(
@@ -6805,6 +6904,408 @@ mod tests {
         let rejected =
             submit_checkpoint_worker_request(&mut runtime, make_ack(Uuid::from_u128(0xd013)), 52);
         assert_ne!(rejected.header().status, GuardianResponseStatus::Success);
+    }
+
+    /// Stages and seals one record-backed upload of `output`, the pane's
+    /// first, at lease generation 1 through the checkpoint worker, and
+    /// returns the intent its Checkpoint adoption names.
+    fn seal_runtime_checkpoint_upload(
+        runtime: &mut GuardianRuntime,
+        pane_id: Uuid,
+        output: &[u8],
+        identity_base: u128,
+    ) -> GuardianCheckpointIntent {
+        let generation = 1;
+        let journal = runtime
+            .panes
+            .get(&pane_id)
+            .expect("claimed runtime pane exists")
+            .output
+            .journal
+            .clone();
+        let receipt = durable_runtime_output(runtime, pane_id, &journal, output);
+        let terminal = runtime_terminal_checkpoint_with(output);
+        let upload_id = Uuid::from_u128(identity_base);
+        let chunk_bytes = 1_024_u32;
+        let begin = record_checkpoint_stage_request(
+            GuardianCheckpointStageKindV1::Begin,
+            pane_id,
+            generation,
+            upload_id,
+            &terminal,
+            receipt,
+            chunk_bytes,
+            None,
+        );
+        let intent = GuardianCheckpointIntent::new(begin.checkpoint_id(), begin.boundary_id());
+        let begin = authenticated_record_checkpoint_stage_request(
+            Uuid::from_u128(identity_base + 1),
+            pane_id,
+            generation,
+            begin,
+        );
+        assert_eq!(
+            submit_checkpoint_worker_request(runtime, begin, 70)
+                .header()
+                .status,
+            GuardianResponseStatus::Success
+        );
+        for (index, bytes) in terminal
+            .canonical_payload()
+            .chunks(usize::try_from(chunk_bytes).expect("chunk size fits usize"))
+            .enumerate()
+        {
+            let chunk = record_checkpoint_stage_request(
+                GuardianCheckpointStageKindV1::Chunk,
+                pane_id,
+                generation,
+                upload_id,
+                &terminal,
+                receipt,
+                chunk_bytes,
+                Some((u32::try_from(index).expect("chunk index fits u32"), bytes)),
+            );
+            let chunk = authenticated_record_checkpoint_stage_request(
+                Uuid::from_u128(
+                    identity_base + 0x100 + u128::try_from(index).expect("chunk index fits u128"),
+                ),
+                pane_id,
+                generation,
+                chunk,
+            );
+            assert_eq!(
+                submit_checkpoint_worker_request(runtime, chunk, 71 + index)
+                    .header()
+                    .status,
+                GuardianResponseStatus::Success
+            );
+        }
+        let seal = record_checkpoint_stage_request(
+            GuardianCheckpointStageKindV1::Seal,
+            pane_id,
+            generation,
+            upload_id,
+            &terminal,
+            receipt,
+            chunk_bytes,
+            None,
+        );
+        let seal = authenticated_record_checkpoint_stage_request(
+            Uuid::from_u128(identity_base + 2),
+            pane_id,
+            generation,
+            seal,
+        );
+        assert_eq!(
+            submit_checkpoint_worker_request(runtime, seal, 69)
+                .header()
+                .status,
+            GuardianResponseStatus::Success
+        );
+        intent
+    }
+
+    fn runtime_catalog_file_names(directory: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(directory.join("guardian-output-v3"))
+            .expect("read runtime catalog directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("checkpoint-catalog-"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn response_rejection_code(
+        request: &AuthenticatedGuardianRequest,
+        response: &GuardianResponseEnvelope,
+    ) -> GuardianRejectionCode {
+        let secret = GuardianSecret::from_bytes([0x5a; 32]).expect("test secret is strong");
+        decode_guardian_response(
+            &secret,
+            &encode_guardian_response(&secret, response).expect("response encodes"),
+        )
+        .expect("response authenticates")
+        .correlate(request.header())
+        .expect("response correlates")
+        .rejection_code()
+        .expect("the response is a rejection")
+    }
+
+    fn successor_claim_request(request_id: Uuid, pane_id: Uuid) -> AuthenticatedGuardianRequest {
+        let request = GuardianRequestEnvelope::new(
+            GuardianRequestHeader::new(
+                GuardianOperation::Claim,
+                Uuid::from_u128(1),
+                Uuid::from_u128(3),
+                request_id,
+                Some(pane_id),
+                1,
+                0,
+                Some(Uuid::from_u128(request_id.as_u128() + 1)),
+                &[],
+            ),
+            Vec::new(),
+        );
+        let secret = GuardianSecret::from_bytes([0x5a; 32]).expect("test secret is strong");
+        let frame = encode_guardian_request(&secret, &request).expect("test request encodes");
+        decode_guardian_request(&secret, &frame).expect("test request authenticates")
+    }
+
+    /// Spawns and claims (as mux 2) one more pane of a claimed runtime.
+    fn claim_another_runtime_pane(runtime: &mut GuardianRuntime, pane_id: Uuid, base: u128) {
+        let spawn =
+            successful_spawn_request(Uuid::from_u128(base), pane_id, Uuid::from_u128(base + 1));
+        assert_eq!(
+            runtime
+                .dispatch(&spawn)
+                .expect("spawn response")
+                .header()
+                .status,
+            GuardianResponseStatus::Success
+        );
+        let claim = authenticated_claim_request(
+            Uuid::from_u128(base + 2),
+            pane_id,
+            Uuid::from_u128(base + 3),
+        );
+        assert_eq!(
+            runtime
+                .dispatch(&claim)
+                .expect("claim response")
+                .header()
+                .status,
+            GuardianResponseStatus::Success
+        );
+    }
+
+    #[test]
+    fn a_repeated_checkpoint_adoption_is_refused_and_leaves_its_lease_and_catalog_alone() {
+        let (directory, _poll, mut runtime, pane_id) =
+            claimed_runtime_with_writer(Box::new(Vec::<u8>::new()));
+        let intent =
+            seal_runtime_checkpoint_upload(&mut runtime, pane_id, b"repeated-adoption", 0xe000);
+        let adopt = |request_id: u128, sequence| {
+            authenticated_checkpoint_adoption_request(
+                Uuid::from_u128(request_id),
+                Uuid::from_u128(request_id + 1),
+                pane_id,
+                1,
+                sequence,
+                intent,
+            )
+        };
+        assert_eq!(
+            submit_checkpoint_worker_request(&mut runtime, adopt(0xe010, 1), 80)
+                .header()
+                .status,
+            GuardianResponseStatus::Success
+        );
+        let catalog = runtime_catalog_file_names(&directory);
+        assert_eq!(catalog.len(), 2, "one member: a candidate and its marker");
+
+        // The checkpoint adopted again under another effect, as a publisher
+        // repeating an earlier publication does.
+        let repeated = submit_checkpoint_worker_request(&mut runtime, adopt(0xe020, 2), 81);
+        assert_ne!(
+            repeated.header().status,
+            GuardianResponseStatus::Indeterminate,
+            "the repeat wrote nothing: an indeterminate outcome would quarantine the lease"
+        );
+        assert_eq!(
+            response_rejection_code(&adopt(0xe020, 2), &repeated),
+            GuardianRejectionCode::CapacityExhausted
+        );
+        assert_eq!(runtime_catalog_file_names(&directory), catalog);
+        assert!(
+            matches!(
+                runtime
+                    .protocol
+                    .as_ref()
+                    .expect("runtime holds protocol between jobs")
+                    .pane_state(pane_id),
+                Some(GuardianPaneState::LiveClaimed {
+                    next_sequence: 2,
+                    pending_input_effect: None,
+                    ..
+                })
+            ),
+            "the refusal took no sequence and left the lease claimed"
+        );
+    }
+
+    #[test]
+    fn a_killed_muxs_indeterminate_checkpoints_settle_so_a_successor_claims_all_its_panes() {
+        let (_directory, _poll, mut runtime, held_pane) =
+            claimed_runtime_with_capacity(Box::new(Vec::<u8>::new()), 3);
+        let failed_pane = Uuid::from_u128(41);
+        let plain_pane = Uuid::from_u128(51);
+        claim_another_runtime_pane(&mut runtime, failed_pane, 0x4100);
+        claim_another_runtime_pane(&mut runtime, plain_pane, 0x5100);
+        let held_intent =
+            seal_runtime_checkpoint_upload(&mut runtime, held_pane, b"held-member", 0xf000);
+        let failed_intent =
+            seal_runtime_checkpoint_upload(&mut runtime, failed_pane, b"never-published", 0xf100);
+        let held = authenticated_checkpoint_adoption_request(
+            Uuid::from_u128(0xf010),
+            Uuid::from_u128(0xf011),
+            held_pane,
+            1,
+            1,
+            held_intent,
+        );
+        let failed = authenticated_checkpoint_adoption_request(
+            Uuid::from_u128(0xf110),
+            Uuid::from_u128(0xf111),
+            failed_pane,
+            1,
+            1,
+            failed_intent,
+        );
+        let store = runtime.output_pipeline.checkpoint_stage_store();
+        let protocol = runtime
+            .protocol
+            .as_mut()
+            .expect("runtime holds protocol between jobs");
+        // The member becomes durable, then the reply is cut.
+        let held_receipt = protocol
+            .apply_checkpoint_transactionally(&held, |permit| {
+                store
+                    .publish_checkpoint_catalog_adoption(permit)
+                    .expect("the member becomes durable");
+                Err::<(), &str>("simulated-reply-cut-after-durable-marker")
+            })
+            .expect("a typed indeterminate receipt");
+        // The CatalogFull-style failure: nothing written, the mux told the
+        // outcome is indeterminate.
+        let failed_receipt = protocol
+            .apply_checkpoint_transactionally(&failed, |_permit| {
+                Err::<(), &str>("injected-catalog-failure")
+            })
+            .expect("a typed indeterminate receipt");
+        for receipt in [held_receipt, failed_receipt] {
+            assert_eq!(
+                receipt.disposition(),
+                GuardianCheckpointDisposition::OutcomeIndeterminate
+            );
+        }
+
+        // The mux is killed: its final disconnect settles both from the
+        // catalog and retires every lease.
+        assert_eq!(
+            runtime
+                .retire_disconnected_mux(Uuid::from_u128(2))
+                .expect("retirement applies")
+                .expect("runtime holds protocol between jobs"),
+            GuardianMuxLeaseRetirement {
+                retired_panes: 3,
+                pending_input_panes: 0,
+                indeterminate_checkpoint_panes: 0,
+            }
+        );
+        let protocol = runtime
+            .protocol
+            .as_mut()
+            .expect("runtime holds protocol between jobs");
+        assert_eq!(
+            protocol
+                .apply_checkpoint_transactionally(&held, |_permit| {
+                    Err::<(), &str>("a committed adoption is never published again")
+                })
+                .expect("the exact replay of a committed adoption")
+                .disposition(),
+            GuardianCheckpointDisposition::Committed,
+            "the catalog held its member: committed"
+        );
+        assert!(
+            protocol
+                .apply_checkpoint_transactionally(&failed, |_permit| Ok::<(), &str>(()))
+                .is_err(),
+            "never published: its receipt is gone and its lease retired"
+        );
+        for (index, pane_id) in [held_pane, failed_pane, plain_pane].into_iter().enumerate() {
+            let claim = successor_claim_request(
+                Uuid::from_u128(0xf200 + 2 * u128::try_from(index).expect("index fits u128")),
+                pane_id,
+            );
+            assert_eq!(
+                runtime
+                    .dispatch(&claim)
+                    .expect("claim response")
+                    .header()
+                    .status,
+                GuardianResponseStatus::Success,
+                "the successor claims pane {pane_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_retired_muxs_settled_panes_are_claimable_while_one_waits_to_settle() {
+        let (_directory, _poll, mut runtime, waiting_pane) =
+            claimed_runtime_with_capacity(Box::new(Vec::<u8>::new()), 2);
+        let settled_pane = Uuid::from_u128(41);
+        claim_another_runtime_pane(&mut runtime, settled_pane, 0x4100);
+        let intent =
+            seal_runtime_checkpoint_upload(&mut runtime, waiting_pane, b"waits-to-settle", 0xf300);
+        let adoption = authenticated_checkpoint_adoption_request(
+            Uuid::from_u128(0xf310),
+            Uuid::from_u128(0xf311),
+            waiting_pane,
+            1,
+            1,
+            intent,
+        );
+        assert_eq!(
+            runtime
+                .protocol
+                .as_mut()
+                .expect("runtime holds protocol between jobs")
+                .apply_checkpoint_transactionally(&adoption, |_permit| {
+                    Err::<(), &str>("injected-catalog-failure")
+                })
+                .expect("a typed indeterminate receipt")
+                .disposition(),
+            GuardianCheckpointDisposition::OutcomeIndeterminate
+        );
+        let mux = Uuid::from_u128(2);
+        runtime
+            .broker_connections
+            .insert(mux, broker_connection(false));
+        // A read of the catalog just failed: this retirement cannot settle it.
+        runtime.checkpoint_settlement_retry_at = Some(Instant::now() + Duration::from_secs(60));
+        assert_eq!(
+            runtime
+                .retire_disconnected_mux(mux)
+                .expect("retirement applies")
+                .expect("runtime holds protocol between jobs"),
+            GuardianMuxLeaseRetirement {
+                retired_panes: 1,
+                pending_input_panes: 0,
+                indeterminate_checkpoint_panes: 1,
+            }
+        );
+        assert!(
+            runtime.retired_outer_owner(mux),
+            "one pane waiting to settle keeps no other from a successor"
+        );
+        assert!(!runtime.broker_connections[&mux].fully_retired_outer_owner);
+
+        // The pause over, the next replay of the retirement settles the last.
+        runtime.checkpoint_settlement_retry_at = None;
+        assert_eq!(
+            runtime
+                .retire_disconnected_mux(mux)
+                .expect("retirement applies")
+                .expect("runtime holds protocol between jobs"),
+            GuardianMuxLeaseRetirement {
+                retired_panes: 1,
+                pending_input_panes: 0,
+                indeterminate_checkpoint_panes: 0,
+            }
+        );
+        assert!(runtime.broker_connections[&mux].fully_retired_outer_owner);
+        assert_eq!(runtime.checkpoint_settlement_retry_at, None);
     }
 
     #[test]
@@ -7801,6 +8302,7 @@ mod tests {
             last_pane: None,
             retired_last: false,
             failed: false,
+            retired_outer_owner: fully_retired_outer_owner,
             fully_retired_outer_owner,
         }
     }
