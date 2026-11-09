@@ -1370,6 +1370,9 @@ pub struct PaneState {
     pending_selection_start: Option<crate::selection::PendingSelectionStart>,
     pending_native_selection: Option<crate::selection::PendingNativeSelection>,
     suppress_selection_link: bool,
+    /// The press under way made this pane the active one: its release only
+    /// focuses, and moves no cursor (`cursor_click_to_move`).
+    click_focused_pane: bool,
     /// If is_some(), rather than display the actual tab
     /// contents, we're overlaying a little internal application
     /// tab.  We'll also route input to it.
@@ -9859,7 +9862,11 @@ impl TermWindow {
                 } else if !suppress_link
                     && (!had_selection || self.selection_authority_is_current(pane))
                 {
-                    self.do_open_link_at_mouse_cursor(pane);
+                    if self.current_highlight.is_some() {
+                        self.do_open_link_at_mouse_cursor(pane);
+                    } else if !had_selection {
+                        self.move_cursor_to_click(pane);
+                    }
                 }
             }
             CompleteSelection(dest) => {

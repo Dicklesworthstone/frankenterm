@@ -1274,6 +1274,20 @@ pub struct Config {
     #[dynamic(default)]
     pub pane_focus_follows_mouse: bool,
 
+    /// A click in a shell's command line moves its cursor there, by the
+    /// arrow keys it takes, as if typed. Needs shell integration (OSC 133)
+    /// to mark the command line; a click anywhere else does what it did.
+    #[dynamic(default = "default_true")]
+    pub cursor_click_to_move: bool,
+
+    /// Also move the cursor for a click in its own row when no shell
+    /// integration marks a command line there, as in an agent's or an
+    /// editor's input box that shows the cursor. Off by default: a program
+    /// that reads the arrow keys as anything but cursor motion would see
+    /// them.
+    #[dynamic(default)]
+    pub cursor_click_to_move_on_cursor_row: bool,
+
     #[dynamic(default = "default_true")]
     pub unzoom_on_switch_pane: bool,
 

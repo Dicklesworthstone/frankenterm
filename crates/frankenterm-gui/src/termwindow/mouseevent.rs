@@ -771,6 +771,71 @@ impl super::TermWindow {
         }
     }
 
+    /// `cursor_click_to_move`: a plain click in the cursor's command line,
+    /// one that made no selection and opened no link, moves the cursor there
+    /// by the arrow keys it takes, as if typed (see `click_to_move`). A click
+    /// that only focused the pane, one with a modifier, and one in a program
+    /// that reads the mouse or shows its alternate screen move nothing.
+    pub(super) fn move_cursor_to_click(&mut self, pane: &Arc<dyn Pane>) {
+        use frankenterm_gui::click_to_move::{ClickToMove, cursor_move_for_click};
+        let rules = ClickToMove {
+            shell_integration: self.config.cursor_click_to_move,
+            cursor_row: self.config.cursor_click_to_move_on_cursor_row,
+        };
+        if !(rules.shell_integration || rules.cursor_row)
+            || !self
+                .current_mouse_event
+                .as_ref()
+                .is_some_and(|event| event.modifiers == ::window::Modifiers::NONE)
+            // An overlay (copy mode, search) reads arrow keys as its own.
+            || !self
+                .get_active_pane_no_overlay()
+                .is_some_and(|active| active.pane_id() == pane.pane_id())
+            || !self.pane_input_ready(pane)
+            || mouse_grabbed(&**pane)
+            || alt_screen_active(&**pane)
+        {
+            return;
+        }
+        let Some((click, click_row)) = self.pane_state(pane.pane_id()).and_then(|state| {
+            if state.click_focused_pane {
+                None
+            } else {
+                state.mouse_terminal_coords
+            }
+        }) else {
+            return;
+        };
+        let cursor = published_facts(&**pane)
+            .map_or_else(|| pane.get_cursor_position(), |facts| facts.cursor);
+        if cursor.visibility != termwiz::surface::CursorVisibility::Visible {
+            return;
+        }
+        let zones = if rules.shell_integration {
+            pane.get_semantic_zones().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let Some(motion) = cursor_move_for_click(
+            rules,
+            &zones,
+            |rows| pane.get_lines(rows),
+            (cursor.y, cursor.x),
+            (click_row, click.column),
+        ) else {
+            return;
+        };
+        log::trace!("click moves the cursor: {motion:?}");
+        for _ in 0..motion.presses {
+            if let Err(error) = pane.key_down(motion.key, wezterm_term::KeyModifiers::NONE) {
+                log::warn!("click-to-move stopped after a refused key: {error:#}");
+                return;
+            }
+            pane.key_up(motion.key, wezterm_term::KeyModifiers::NONE)
+                .ok();
+        }
+    }
+
     fn mouse_event_terminal(
         &mut self,
         mut pane: Arc<dyn Pane>,
@@ -932,6 +997,9 @@ impl super::TermWindow {
                 return;
             };
             pane_state.mouse_selection_frame = mouse_selection_frame;
+            if matches!(&event.kind, WMEK::Press(_)) {
+                pane_state.click_focused_pane = is_click_to_focus_pane;
+            }
             if let Some(pending) = pane_state.pending_selection_start.as_mut() {
                 if let Some((frame, stable_row)) = mouse_selection_frame.zip(stable_row) {
                     pending.retain_endpoint(
