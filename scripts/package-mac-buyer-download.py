@@ -1,4 +1,4 @@
-"""Build the matching Export app and pack both notarized apps for iOS buyers."""
+"""Build and package the standalone notarized Export utility for iOS buyers."""
 
 import argparse
 import os
@@ -8,10 +8,27 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
+
+
+def verify_archive_layout(archive):
+    """Archive Utility must extract one real app, never a misleading .app folder."""
+    with zipfile.ZipFile(archive) as zipped:
+        names = set(zipped.namelist())
+        payload = {name for name in names if not name.startswith("__MACOSX/")}
+        if not payload or any(
+            not name.startswith("FrankenTermExport.app/") for name in payload
+        ):
+            raise ValueError("Buyer ZIP must contain only the standalone Export app")
+        for required in ("Contents/Info.plist", "Contents/MacOS/FrankenTermExport",
+                         "Contents/MacOS/frankenterm-machines"):
+            if "FrankenTermExport.app/" + required not in payload:
+                raise ValueError(f"Buyer ZIP is missing {required}")
 
 
 def run(*args):
-    subprocess.run(args, check=True)
+    # ubs:ignore python.taint.command -- fixed tool names, argv operands, no shell evaluation.
+    subprocess.run(args, check=True, timeout=7200, shell=False)
 
 
 def verify_app(app, bundle_id, team):
@@ -33,7 +50,7 @@ def build_export(source, work, helper):
     project = apple / "FrankenTerm.xcodeproj"
     project.mkdir(parents=True)
     doc = plistlib.loads(subprocess.check_output(
-        ["plutil", "-convert", "xml1", "-o", "-", original / "project.pbxproj"]))
+        ["plutil", "-convert", "xml1", "-o", "-", original / "project.pbxproj"], timeout=60))
     objects = doc["objects"]
     root = objects[doc["rootObject"]]
     targets = [t for t in root["targets"] if objects[t]["name"] == "FrankenTermExport"]
@@ -64,7 +81,7 @@ def build_export(source, work, helper):
         "ARCHS=arm64", "CODE_SIGN_IDENTITY=-", "CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO", "build")
     app = work / "DerivedData/Build/Products/Release/FrankenTermExport.app"
     entitlements = plistlib.loads(subprocess.check_output(
-        ["codesign", "--display", "--entitlements", "-", "--xml", app]))
+        ["codesign", "--display", "--entitlements", "-", "--xml", app], timeout=60))
     with (companion / "FrankenTermExport.entitlements").open("rb") as f:
         if entitlements != plistlib.load(f) or entitlements.get("com.apple.security.get-task-allow"):
             raise ValueError("Export must retain its declared capabilities without debugger access")
@@ -99,19 +116,14 @@ def main():
     work = Path(tempfile.mkdtemp(prefix="ft-buyer-", dir=archive.parent))
     export = build_export(source, work, helper)
     run(sys.executable, source / "scripts/sign-macos-bundle.py", export, identity, "--notarize")
-    payload = work / "download"
-    payload.mkdir()
-    for app in (desktop, export):
-        run("ditto", app, payload / app.name)
-    shutil.copy2(manifest, payload / manifest.name)
     staged = work / archive.name
-    run("ditto", "-c", "-k", "--sequesterRsrc", payload, staged)
+    # The full desktop app is distributed separately. Multiple top-level items
+    # in an .app.zip cause Finder to create a non-launchable .app wrapper.
+    run("ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", export, staged)
+    verify_archive_layout(staged)
     unpacked = work / "unpacked"
     run("ditto", "-x", "-k", staged, unpacked)
-    verify_app(unpacked / desktop.name, "com.dicklesworthstone.frankenterm", team)
     verify_app(unpacked / export.name, "org.frankenterm.offline-export", team)
-    run("bash", unpacked / desktop.name / "Contents/Resources/verify-components.sh",
-        "verify", "--root", unpacked / desktop.name, "--manifest", unpacked / manifest.name)
     # Expose the completed archive atomically without replacing previous bytes.
     os.link(staged, archive)
     print(f"Verified buyer ZIP: {archive}")
