@@ -33678,40 +33678,48 @@ mod tests {
         } = commit_for_test(prepared, control, binding).expect("commit a pane");
         read_until(&mut pane, &attachment, b"ready");
         let chunk = vec![b'a'; 16 * 1024];
-        let mut accepted = 0;
-        let mut filled = false;
-        for _ in 0..64 {
+        // Writes until the queue takes only a prefix of a write, or none of
+        // it, and returns how many bytes went.
+        let fill = |pane: &mut BrokerAdoptedPaneV1| {
+            let mut accepted = 0;
+            for _ in 0..64 {
+                let permit = pane
+                    .admit_proxy_write(&attachment, &chunk)
+                    .expect("admit a write");
+                match pane.execute_proxy_write(permit, &chunk) {
+                    Ok(_) => accepted += chunk.len(),
+                    Err(BrokerError::ProxyWritePartial { written }) => {
+                        assert!(written > 0 && written < chunk.len(), "{written}");
+                        return accepted + written;
+                    }
+                    Err(BrokerError::ProxyWriteNotReady) => return accepted,
+                    Err(error) => panic!("a write to a full queue failed: {error}"),
+                }
+            }
+            panic!("the input queue took {accepted} bytes and never filled");
+        };
+        assert!(fill(&mut pane) > 0);
+        // Linux moves bytes from the tty buffer into the line discipline on
+        // its own (flush_to_ldisc), so a queue that just reported full can
+        // have room again while nothing reads, and the byte goes. Then fill
+        // it again: once the line discipline is full too, nothing moves and
+        // the byte is refused (ft-1198a).
+        let mut refills = 0;
+        loop {
             let permit = pane
-                .admit_proxy_write(&attachment, &chunk)
+                .admit_proxy_write(&attachment, b"z")
                 .expect("admit a write");
-            match pane.execute_proxy_write(permit, &chunk) {
-                Ok(_) => accepted += chunk.len(),
-                Err(BrokerError::ProxyWritePartial { written }) => {
-                    assert!(written > 0 && written < chunk.len(), "{written}");
-                    accepted += written;
-                    filled = true;
-                    break;
+            match pane.execute_proxy_write(permit, b"z").map(|_| ()) {
+                Err(BrokerError::ProxyWriteNotReady) => break,
+                Ok(()) if refills < 8 => {
+                    refills += 1;
+                    fill(&mut pane);
                 }
-                Err(BrokerError::ProxyWriteNotReady) => {
-                    filled = true;
-                    break;
+                other => {
+                    panic!("a full queue takes nothing more, after {refills} refills: {other:?}")
                 }
-                Err(error) => panic!("a write to a full queue failed: {error}"),
             }
         }
-        assert!(
-            filled,
-            "the input queue took {accepted} bytes and never filled"
-        );
-        assert!(accepted > 0);
-        let permit = pane
-            .admit_proxy_write(&attachment, b"z")
-            .expect("admit a write");
-        assert_eq!(
-            pane.execute_proxy_write(permit, b"z").map(|_| ()),
-            Err(BrokerError::ProxyWriteNotReady),
-            "a full queue takes nothing more"
-        );
     }
 
     #[test]
