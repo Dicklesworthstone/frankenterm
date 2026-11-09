@@ -17,7 +17,9 @@
 # Pass criteria (all must hold):
 #   1. install: the broker, guardian and mux run in user/<uid> and not in
 #      gui/<uid>; their plists lint, say Background and carry the installer's
-#      FT_GRID_ENGINE, and the mux runs with it; the login loader is Aqua.
+#      FT_GRID_ENGINE and LANG, and the mux runs with both; a pane's program
+#      has the installer's LANG (launchd's user/<uid> sets no locale); the
+#      login loader is Aqua.
 #   2. re-running install while the units run rewrites the plists (a new
 #      FTG_RECOVERY_INTERVAL) and restarts nothing; a forced same-family
 #      upgrade then restarts the mux on the rewritten definition, with the
@@ -40,7 +42,7 @@ TOOL=${2:-$(cd "$(dirname "$0")/../.." && pwd)/scripts/mux-guardian-host.sh}
 S=/private/tmp/ftld-$$
 mkdir -m 700 "$S" || { echo "FAIL: sandbox $S exists"; exit 1; }
 export HOME=$S/h XDG_CONFIG_HOME=$S/h/.config XDG_DATA_HOME=$S/h/.local/share XDG_RUNTIME_DIR=$S/r
-export TMPDIR=$S/h/tmp FTG_INSTANCE=ld FTG_RECOVERY_INTERVAL=5 FT_GRID_ENGINE=page
+export TMPDIR=$S/h/tmp FTG_INSTANCE=ld FTG_RECOVERY_INTERVAL=5 FT_GRID_ENGINE=page LANG=en_US.UTF-8
 mkdir -p "$HOME" "$XDG_RUNTIME_DIR" "$TMPDIR"
 chmod 700 "$HOME" "$XDG_RUNTIME_DIR" "$TMPDIR"
 unset WEZTERM_UNIX_SOCKET WEZTERM_PANE FRANKENTERM_UNIX_SOCKET FT_WORKSPACE RUST_LOG
@@ -50,6 +52,11 @@ LA=$HOME/Library/LaunchAgents
 STATE=$HOME/.local/state/frankenterm-guardian-ld
 UNITS="pty-broker pty-guardian mux-server"
 echo "sandbox: $S"
+# The panes' program records the locale it starts with, then waits: ps
+# shows no environment for the processes the broker starts.
+printf '#!/bin/sh\nprintf "LANG=%%s\\n" "${LANG-}" >> %s/pane-locale.txt\nexec /bin/sleep 100000\n' "$S" > "$S/pane.sh"
+chmod 755 "$S/pane.sh"
+export FTG_SHELL=$S/pane.sh
 
 FAILS=0
 pass() { echo "PASS: $*"; }
@@ -94,6 +101,8 @@ for n in $UNITS; do
     pass "$n plist is Background"; else fail "$n plist is not Background"; fi
   if [ "$(plutil -extract EnvironmentVariables.FT_GRID_ENGINE raw "$p" 2>/dev/null)" = page ]; then
     pass "$n plist carries FT_GRID_ENGINE=page"; else fail "$n plist lacks FT_GRID_ENGINE"; fi
+  if [ "$(plutil -extract EnvironmentVariables.LANG raw "$p" 2>/dev/null)" = en_US.UTF-8 ]; then
+    pass "$n plist carries LANG=en_US.UTF-8"; else fail "$n plist lacks LANG"; fi
 done
 lp=$LA/$(label login-loader).plist
 if plutil -lint "$lp" >/dev/null && [ "$(plutil -extract LimitLoadToSessionType raw "$lp")" = Aqua ]; then
@@ -105,6 +114,12 @@ ids=$(pane_ids)
 if [ -n "$ids" ]; then pass "mux reports panes [$ids]"; else fail "mux reports no panes"; fi
 broker_pid=$(pid_in user pty-broker)
 guardian_pid=$(pid_in user pty-guardian)
+if env_of "$mux_pid" LANG=en_US.UTF-8; then
+  pass "mux runs with LANG=en_US.UTF-8"; else fail "mux env lacks LANG=en_US.UTF-8"; fi
+for _ in $(seq 20); do [ -s "$S/pane-locale.txt" ] && break; sleep 0.5; done
+if [ "$(head -1 "$S/pane-locale.txt" 2>/dev/null)" = LANG=en_US.UTF-8 ]; then
+  pass "the pane's program runs with LANG=en_US.UTF-8"
+else fail "the pane's program runs with $(head -1 "$S/pane-locale.txt" 2>/dev/null || echo 'no record')"; fi
 
 echo "== 2. re-install with a new setting, then a forced same-family upgrade"
 export FTG_RECOVERY_INTERVAL=6

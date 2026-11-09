@@ -427,8 +427,10 @@ service_env() {  # NAME=value pairs, each ending in NUL: what a service needs to
   # instance's mux would write into the default instance's store, and
   # FT_GRID_ENGINE picks the mux's grid engine (a GUI login's `launchctl
   # setenv` reaches only gui/<uid>, never the user/<uid> the units run in).
+  # Panes inherit the mux's locale, and launchd's user/<uid> sets none, so
+  # without these every shell would start in the C locale.
   local name
-  for name in XDG_DATA_HOME FT_GRID_ENGINE; do
+  for name in XDG_DATA_HOME FT_GRID_ENGINE LANG LC_ALL LC_CTYPE; do
     if [ -n "${!name:-}" ]; then printf '%s\0' "$name=${!name}"; fi
   done
 }
