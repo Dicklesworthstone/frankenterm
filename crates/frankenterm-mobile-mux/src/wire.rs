@@ -25,8 +25,9 @@ pub const LEGACY_VERSIONS: RangeInclusive<usize> = 46..=47;
 /// the rolling-upgrade window `codec::CODEC_VERSION_MIN_SUPPORTED..=
 /// CODEC_VERSION`. Additive reliable writes (v64) and pane identity (v71)
 /// are gated by the negotiated version; neither silently falls back to a
-/// numeric-pane legacy write on a current connection.
-pub const CURRENT_VERSIONS: RangeInclusive<usize> = 61..=72;
+/// numeric-pane legacy write on a current connection. v73 only adds the
+/// pane-and-domain listing, which the phone never sends.
+pub const CURRENT_VERSIONS: RangeInclusive<usize> = 61..=73;
 
 /// Which of the two layouts a server speaks. They differ, for this client,
 /// in SendPaste (an input serial follows the text) and ErrorResponse (a
@@ -260,6 +261,25 @@ impl ReliableKeyRetry {
         validate_retry_delay(delay)?;
         Ok(Some(delay))
     }
+
+    /// The delay before this client sends the identical request again, when
+    /// the mux answered DuplicatePending: that request may already have
+    /// reached the pane, but the mux answers its identical resend from its
+    /// input ledger, so it takes effect at most once. Only on the connection
+    /// it was admitted on, which a session never outlives.
+    pub fn duplicate_pending_delay_ns(self) -> Result<Option<u64>, crate::Error> {
+        match self {
+            Self::DuplicatePending { retry_after_ns } => {
+                validate_retry_delay(retry_after_ns)?;
+                Ok(Some(retry_after_ns))
+            }
+            Self::SchedulerFull(_)
+            | Self::SchedulerRetired(_)
+            | Self::SchedulerUnavailable { .. }
+            | Self::ClientRegistrationTransition { .. }
+            | Self::PaneAuthorityRequired { .. } => Ok(None),
+        }
+    }
 }
 
 fn validate_retry_delay(delay_ns: u64) -> Result<(), crate::Error> {
@@ -310,6 +330,14 @@ impl ReliableWriteRetry {
                 validate_retry_delay(retry_after_ns)?;
                 Ok(Some(retry_after_ns))
             }
+        }
+    }
+
+    /// See [`ReliableKeyRetry::duplicate_pending_delay_ns`].
+    pub fn duplicate_pending_delay_ns(self) -> Result<Option<u64>, crate::Error> {
+        match self {
+            Self::Input(retry) => retry.duplicate_pending_delay_ns(),
+            Self::DefinitelyNotApplied { .. } => Ok(None),
         }
     }
 }

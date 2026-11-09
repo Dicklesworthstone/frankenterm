@@ -948,11 +948,6 @@ fn missing_or_ambiguous_receipts_never_gain_retry_authority_from_a_clock() {
     for outcome in [
         ReliablePaneWriteOutcomeV1::Indeterminate,
         ReliablePaneWriteOutcomeV1::Retry(codec::ReliablePaneWriteRetryV1::Input(
-            codec::ReliableKeyEventRetryV1::DuplicatePending {
-                retry_after_ns: 1_000_000,
-            },
-        )),
-        ReliablePaneWriteOutcomeV1::Retry(codec::ReliablePaneWriteRetryV1::Input(
             codec::ReliableKeyEventRetryV1::PaneAuthorityRequired {
                 pane_registration: codec::ReliablePaneRegistrationIdentityV1::from_bytes(
                     [0x55; 16],
@@ -978,6 +973,137 @@ fn missing_or_ambiguous_receipts_never_gain_retry_authority_from_a_clock() {
     assert!(harness.session.take_outgoing().is_empty());
     assert!(!harness.session.advance_time(INPUT_DEADLINE_NS));
     assert_stopped(&mut harness.session, pane);
+}
+
+fn duplicate_pending_write(retry_after_ns: u64) -> ReliablePaneWriteOutcomeV1 {
+    ReliablePaneWriteOutcomeV1::Retry(codec::ReliablePaneWriteRetryV1::Input(
+        codec::ReliableKeyEventRetryV1::DuplicatePending { retry_after_ns },
+    ))
+}
+
+#[test]
+fn a_duplicate_pending_write_goes_again_as_the_same_request_before_later_input() {
+    // A guardian pane's mux answers DuplicatePending while its guardian has
+    // not answered the write yet. The mux answers the identical request from
+    // its input ledger, so the phone sends it again instead of ending the
+    // session, past the no-effect retry budget, never faster than 100 ms.
+    let mut harness = timed_current();
+    let pane = harness.server.pane_id;
+    harness.session.write(pane, b"abc");
+    let (mut rpc, pdu) = take_one(&mut harness.session);
+    let Pdu::ReliablePaneWriteV1(original) = pdu else {
+        panic!("reliable write")
+    };
+    harness.session.paste(pane, "later");
+    let mut now = 0;
+    for _ in 0..=MAX_INPUT_RETRIES {
+        write_reply(
+            &mut harness.session,
+            rpc,
+            &original,
+            duplicate_pending_write(1),
+        );
+        assert!(harness.session.is_ready());
+        now += 100_000_000;
+        assert_eq!(harness.session.next_input_wake_ns(), Some(now));
+        assert!(harness.session.advance_time(now - 1));
+        assert!(harness.session.take_outgoing().is_empty());
+        assert!(harness.session.advance_time(now));
+        let (next_rpc, pdu) = take_one(&mut harness.session);
+        let Pdu::ReliablePaneWriteV1(resent) = pdu else {
+            panic!("the same write, before the paste")
+        };
+        assert_ne!(next_rpc, rpc);
+        assert_eq!(resent, original, "only the transport RPC serial changes");
+        rpc = next_rpc;
+    }
+    write_reply(
+        &mut harness.session,
+        rpc,
+        &original,
+        ReliablePaneWriteOutcomeV1::DuplicateAppliedPrefix { bytes: 3 },
+    );
+    let (paste_rpc, pdu) = take_one(&mut harness.session);
+    assert!(matches!(pdu, Pdu::SendPaste(_)));
+    reply(&mut harness.session, 10, paste_rpc, &codec::UnitResponse {});
+    assert!(!harness.session.unanswered_input(pane));
+    assert_eq!(harness.session.next_input_wake_ns(), None);
+}
+
+#[test]
+fn duplicate_pending_resends_end_at_the_inputs_admission_deadline() {
+    let mut harness = timed_current();
+    let pane = harness.server.pane_id;
+    harness.session.write(pane, b"abc");
+    let (mut rpc, pdu) = take_one(&mut harness.session);
+    let Pdu::ReliablePaneWriteV1(original) = pdu else {
+        panic!("reliable write")
+    };
+    for now in [1_000_000_000, 2_000_000_000, 3_000_000_000, 4_000_000_000] {
+        write_reply(
+            &mut harness.session,
+            rpc,
+            &original,
+            duplicate_pending_write(1_000_000_000),
+        );
+        assert_eq!(harness.session.next_input_wake_ns(), Some(now));
+        assert!(harness.session.advance_time(now));
+        let (next_rpc, pdu) = take_one(&mut harness.session);
+        assert!(matches!(pdu, Pdu::ReliablePaneWriteV1(resent) if resent == original));
+        rpc = next_rpc;
+    }
+    // Another pause would end at the deadline, so the session ends instead.
+    write_reply(
+        &mut harness.session,
+        rpc,
+        &original,
+        duplicate_pending_write(1_000_000_000),
+    );
+    assert_stopped(&mut harness.session, pane);
+}
+
+#[test]
+fn a_duplicate_pending_key_goes_again_as_the_same_request() {
+    let mut harness = timed_current();
+    let pane = harness.server.pane_id;
+    harness.session.write(pane, b"\x1b[A");
+    let (rpc, pdu) = take_one(&mut harness.session);
+    let Pdu::ReliableKeyEventV1(original) = pdu else {
+        panic!("reliable key")
+    };
+    reply(
+        &mut harness.session,
+        97,
+        rpc,
+        &ReliableKeyEventV1Response {
+            pane_id: pane,
+            input_serial: original.input_serial,
+            outcome: ReliableKeyEventOutcomeV1::Retry(
+                codec::ReliableKeyEventRetryV1::DuplicatePending {
+                    retry_after_ns: 1_000_000,
+                },
+            ),
+        },
+    );
+    assert_eq!(harness.session.next_input_wake_ns(), Some(100_000_000));
+    assert!(harness.session.advance_time(100_000_000));
+    let (retry_rpc, pdu) = take_one(&mut harness.session);
+    let Pdu::ReliableKeyEventV1(retry) = pdu else {
+        panic!("same key")
+    };
+    assert_eq!(retry, original);
+    reply(
+        &mut harness.session,
+        97,
+        retry_rpc,
+        &ReliableKeyEventV1Response {
+            pane_id: pane,
+            input_serial: retry.input_serial,
+            outcome: ReliableKeyEventOutcomeV1::DuplicateApplied,
+        },
+    );
+    assert!(harness.session.is_ready());
+    assert!(!harness.session.unanswered_input(pane));
 }
 
 #[test]

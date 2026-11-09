@@ -576,6 +576,15 @@ fn retry_authority_validation_agrees_with_the_canonical_codec() {
                 "valid syntax alone is not no-effect retry authority"
             );
         }
+        // Only a valid DuplicatePending lets the identical request go again.
+        let resend = mobile.duplicate_pending_delay_ns();
+        match retry {
+            Retry::DuplicatePending { retry_after_ns } => assert_eq!(
+                resend.ok(),
+                reply.validate().is_ok().then_some(Some(retry_after_ns))
+            ),
+            _ => assert!(matches!(resend, Ok(None))),
+        }
     }
 }
 

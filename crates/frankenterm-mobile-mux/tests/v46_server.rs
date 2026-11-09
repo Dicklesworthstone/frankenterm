@@ -443,7 +443,7 @@ fn a_refused_history_fetch_leaves_history_out_and_the_pane_carries_on() {
 fn a_server_on_another_protocol_is_refused() {
     // Between v0.13 and the current window, and past it with an oldest
     // accepted version past this app's newest.
-    for version in [48, 73] {
+    for version in [48, 74] {
         let mut harness = Harness::new(4, 20);
         harness.server.codec_vers = version;
         harness.server.min_supported = version;
@@ -455,7 +455,7 @@ fn a_server_on_another_protocol_is_refused() {
         });
         let reason = reason.expect("a failure");
         assert!(
-            reason.contains(&version.to_string()) && reason.contains("46") && reason.contains("72"),
+            reason.contains(&version.to_string()) && reason.contains("46") && reason.contains("73"),
             "{reason}"
         );
         assert_eq!(harness.server.requests, ["GetCodecVersion"]);
@@ -483,7 +483,7 @@ fn a_newer_server_that_still_accepts_this_apps_protocol_is_spoken_to() {
 
 #[test]
 fn the_current_window_keeps_earlier_servers_and_accepts_its_new_upper_bound() {
-    for version in [61, 70, 71, 72] {
+    for version in [61, 70, 71, 72, 73] {
         let mut harness = Harness::new(4, 20);
         harness.server.codec_vers = version;
         harness.attach();

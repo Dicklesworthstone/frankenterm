@@ -309,6 +309,20 @@ struct OrderedInput {
     retries: u8,
 }
 
+/// Why the mux let the front input go again as the identical request.
+#[derive(Clone, Copy, Debug)]
+enum InputRetry {
+    /// The mux proved that the attempt had no effect. Counted against
+    /// [`MAX_INPUT_RETRIES`].
+    NoEffect { delay_ns: u64 },
+    /// The attempt may already have reached the pane (DuplicatePending, such
+    /// as a guardian pane's write that its guardian has not answered yet).
+    /// The mux answers the identical request from its input ledger, so it
+    /// takes effect at most once, and this session never sends input on
+    /// another connection. Bounded by the input's deadline only.
+    DuplicatePending { delay_ns: u64 },
+}
+
 /// The pane id that opens PDUs 25, 30 and 37.
 #[derive(Deserialize)]
 struct PanePrefix {
@@ -1472,7 +1486,7 @@ impl Session {
         self.drive_input();
     }
 
-    fn schedule_input_retry(&mut self, peer_delay_ns: u64) -> Result<(), crate::Error> {
+    fn schedule_input_retry(&mut self, retry: InputRetry) -> Result<(), crate::Error> {
         let Some(now) = self.monotonic_ns else {
             self.fail(
                 "timed mux input retry requires an owner clock; input was not replayed".to_owned(),
@@ -1486,18 +1500,29 @@ impl Session {
             self.fail("mux input had no clock at admission; input was not replayed".to_owned());
             return Ok(());
         };
-        if input.retries >= MAX_INPUT_RETRIES {
-            self.fail(
-                "mux input retry budget exhausted; unconfirmed input was not replayed".to_owned(),
-            );
-            return Ok(());
-        }
-        // Amplify short prompts to avoid a busy loop; never shorten a valid
-        // authoritative delay. Retry count and deadline survive partial writes.
-        let base = peer_delay_ns.max(MIN_INPUT_RETRY_DELAY_NS);
-        let delay = base
-            .saturating_mul(1u64 << input.retries)
-            .min(MAX_INPUT_RETRY_BACKOFF_NS.max(base));
+        let delay = match retry {
+            InputRetry::NoEffect { delay_ns } => {
+                if input.retries >= MAX_INPUT_RETRIES {
+                    self.fail(
+                        "mux input retry budget exhausted; unconfirmed input was not replayed"
+                            .to_owned(),
+                    );
+                    return Ok(());
+                }
+                // Amplify short prompts to avoid a busy loop; never shorten a
+                // valid authoritative delay. Retry count and deadline survive
+                // partial writes.
+                let base = delay_ns.max(MIN_INPUT_RETRY_DELAY_NS);
+                let delay = base
+                    .saturating_mul(1u64 << input.retries)
+                    .min(MAX_INPUT_RETRY_BACKOFF_NS.max(base));
+                input.retries += 1;
+                delay
+            }
+            // The mux paces these itself, and the deadline bounds them; never
+            // ask again sooner than the longest no-effect backoff.
+            InputRetry::DuplicatePending { delay_ns } => delay_ns.max(MAX_INPUT_RETRY_BACKOFF_NS),
+        };
         let Some(due) = now.checked_add(delay).filter(|due| *due < deadline) else {
             self.fail(
                 "mux input retry would exceed its original deadline; input was not replayed"
@@ -1505,7 +1530,6 @@ impl Session {
             );
             return Ok(());
         };
-        input.retries += 1;
         input.retry_at_ns = Some(due);
         input.in_flight = false;
         Ok(())
@@ -1529,8 +1553,11 @@ impl Session {
                 self.finish_input();
             }
             wire::ReliableKeyOutcome::Retry(retry) => {
-                if let Some(delay) = retry.no_effect_delay_ns()? {
-                    return self.schedule_input_retry(delay);
+                if let Some(delay_ns) = retry.no_effect_delay_ns()? {
+                    return self.schedule_input_retry(InputRetry::NoEffect { delay_ns });
+                }
+                if let Some(delay_ns) = retry.duplicate_pending_delay_ns()? {
+                    return self.schedule_input_retry(InputRetry::DuplicatePending { delay_ns });
                 }
                 self.fail(
                     "the mux did not authorize a no-effect key retry; input was not replayed"
@@ -1583,8 +1610,11 @@ impl Session {
                 }
             }
             wire::ReliableWriteOutcome::Retry(retry) => {
-                if let Some(delay) = retry.no_effect_delay_ns()? {
-                    return self.schedule_input_retry(delay);
+                if let Some(delay_ns) = retry.no_effect_delay_ns()? {
+                    return self.schedule_input_retry(InputRetry::NoEffect { delay_ns });
+                }
+                if let Some(delay_ns) = retry.duplicate_pending_delay_ns()? {
+                    return self.schedule_input_retry(InputRetry::DuplicatePending { delay_ns });
                 }
                 self.fail(
                     "the mux did not authorize a no-effect byte retry; input was not replayed"
