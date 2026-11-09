@@ -97,6 +97,16 @@ class GuardianHostStartup(unittest.TestCase):
     def add_root(self):
         (self.store / "roots/slot_a.root").write_text("committed root")
 
+    def give_mux_adoption(self):
+        # The launcher looks for the flag's name in the mux binary itself.
+        self.write_executable(
+            self.base / "mux-current/frankenterm-mux-server",
+            "#!/usr/bin/env python3\n# knows --recovery-adopt\n"
+            "import json, os, pathlib, sys\n"
+            "pathlib.Path(os.environ['FTG_TEST_MUX_ARGS']).write_text("
+            "json.dumps(sys.argv[1:]))\n",
+        )
+
     def launch(self):
         return subprocess.run(
             ["bash", str(SCRIPT), "run-mux"],
@@ -118,19 +128,42 @@ class GuardianHostStartup(unittest.TestCase):
         self.assertEqual(list(self.recovery.glob("store.retired-*")), [])
 
     def test_live_guardian_without_committed_root_never_starts_fresh(self):
+        # This mux predates adoption, so it is refused as before.
         self.env["FTG_TEST_PANES"] = "12"
         result = self.launch()
         self.assert_refused_without_mutation(result)
         self.assertIn("no committed recovery snapshot", result.stderr)
+        self.assertIn("cannot adopt", result.stderr)
+
+    def test_live_guardian_without_committed_root_is_adopted(self):
+        self.env["FTG_TEST_PANES"] = "12"
+        self.give_mux_adoption()
+        result = self.launch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = json.loads(self.args_path.read_text())
+        self.assertIn("--recovery-adopt", args)
+        self.assertNotIn("--recovery-restore", args)
+        self.assertFalse(self.prepared_path.exists(), "adoption keeps the recovery store")
+        self.assertEqual(
+            (self.store / "retained-object").read_text(),
+            "uncommitted recovery object",
+        )
+        self.assertEqual(list(self.recovery.glob("store.retired-*")), [])
 
     def test_live_guardian_restores_from_committed_root(self):
         self.env["FTG_TEST_PANES"] = "12"
         self.add_root()
-        result = self.launch()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("--recovery-restore", json.loads(self.args_path.read_text()))
-        self.assertFalse(self.prepared_path.exists())
-        self.assertTrue((self.store / "roots/slot_a.root").exists())
+        for adopts in (False, True):
+            with self.subTest(mux_can_adopt=adopts):
+                if adopts:
+                    self.give_mux_adoption()
+                result = self.launch()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                args = json.loads(self.args_path.read_text())
+                self.assertIn("--recovery-restore", args)
+                self.assertNotIn("--recovery-adopt", args)
+                self.assertFalse(self.prepared_path.exists())
+                self.assertTrue((self.store / "roots/slot_a.root").exists())
 
     def test_empty_guardian_with_broker_children_never_starts_fresh(self):
         self.env.update(FTG_TEST_CHILDREN="101\n102", FTG_TEST_CENSUS_STATUS="0")

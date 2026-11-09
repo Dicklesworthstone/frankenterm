@@ -2845,10 +2845,54 @@ impl AcknowledgedGuardianCheckpointPublication {
     }
 }
 
+/// The acknowledged publications before its newest that a publisher still
+/// names for a capture that repeats one (ft-upal7). With no output between
+/// them a pane's captures can differ and come back: a first root's capture
+/// keeps fewer rows of history than the next one, and a resize there and back
+/// returns to the first. A repeat may only name its earlier member, since the
+/// guardian adopts each checkpoint identity once, and the guardian keeps a
+/// pane's newest eight members, so a root naming one of these keeps most of
+/// the margin a root naming the newest has for failed captures after it.
+const GUARDIAN_CHECKPOINT_EARLIER_RECEIPTS: usize = 2;
+
 struct GuardianCheckpointPublisherState {
     transport: Box<dyn GuardianCheckpointStageTransport>,
     pending: Option<PendingGuardianCheckpointPublication>,
     last_acknowledged: Option<AcknowledgedGuardianCheckpointPublication>,
+    /// The receipts of the acknowledged publications before
+    /// `last_acknowledged`, oldest first, at most
+    /// [`GUARDIAN_CHECKPOINT_EARLIER_RECEIPTS`].
+    earlier_acknowledged: VecDeque<GuardianCheckpointReceipt>,
+}
+
+impl GuardianCheckpointPublisherState {
+    /// `acknowledged` is now the newest publication; the one it follows joins
+    /// the earlier ones.
+    fn acknowledge(&mut self, acknowledged: &AcknowledgedGuardianCheckpointPublication) {
+        if let Some(previous) = self.last_acknowledged.replace(*acknowledged) {
+            if self.earlier_acknowledged.len() == GUARDIAN_CHECKPOINT_EARLIER_RECEIPTS {
+                self.earlier_acknowledged.pop_front();
+            }
+            self.earlier_acknowledged.push_back(previous.receipt);
+        }
+    }
+
+    /// The acknowledged receipt of a publication of `intent`: the newest's
+    /// when it is the newest, otherwise the newest earlier one's.
+    fn acknowledged_receipt(
+        &self,
+        newest: &AcknowledgedGuardianCheckpointPublication,
+        intent: GuardianCheckpointIntent,
+    ) -> Option<GuardianCheckpointReceipt> {
+        if newest.receipt.intent() == intent {
+            return Some(newest.receipt);
+        }
+        self.earlier_acknowledged
+            .iter()
+            .rev()
+            .find(|receipt| receipt.intent() == intent)
+            .copied()
+    }
 }
 
 /// Serialized mux-side checkpoint publisher for one exact guardian lease.
@@ -2903,6 +2947,7 @@ impl GuardianCheckpointPublisher {
                 transport,
                 pending: None,
                 last_acknowledged: None,
+                earlier_acknowledged: VecDeque::new(),
             }),
         }
     }
@@ -2957,37 +3002,35 @@ impl GuardianCheckpointPublisher {
         let mut state = self.state.lock();
         if state.pending.is_some() {
             let GuardianCheckpointPublisherState {
-                transport,
-                pending,
-                last_acknowledged,
+                transport, pending, ..
             } = &mut *state;
             let existing = pending
                 .as_mut()
                 .ok_or(GuardianProxyError::CheckpointStageInvariant)?;
             let receipt = Self::drive_pending(&self.actor, transport.as_mut(), existing)?;
-            *last_acknowledged = Some(AcknowledgedGuardianCheckpointPublication::from_pending(
-                existing, receipt,
-            )?);
+            let acknowledged =
+                AcknowledgedGuardianCheckpointPublication::from_pending(existing, receipt)?;
             *pending = None;
+            state.acknowledge(&acknowledged);
         }
         // Checkpoint identities describe content, not capture attempts. A
         // quiescent pane can be sampled repeatedly at the same durable output
         // boundary. Starting another upload would try to adopt that immutable
         // catalog identity under a different effect and correctly be rejected.
         // Rebind the fresh affine parser capture only to a receipt whose Ack
-        // this exact publisher has already completed for its unchanged lease.
+        // this exact publisher has already completed for its unchanged lease:
+        // the newest, or an earlier one this capture repeats. The guardian
+        // took that repeat for an outcome it could not settle and quarantined
+        // the lease, and its pane closed (ft-upal7).
         if let Some(acknowledged) = state.last_acknowledged {
             let descriptor = GuardianCheckpointDescriptorV1::from_live_capture(
                 &capture,
                 self.identity.generation(),
             )
             .map_err(GuardianProxyError::ReplayProtocol)?;
-            if acknowledged.receipt.intent()
-                == GuardianCheckpointIntent::new(
-                    descriptor.checkpoint_id(),
-                    descriptor.boundary_id(),
-                )
-            {
+            let intent =
+                GuardianCheckpointIntent::new(descriptor.checkpoint_id(), descriptor.boundary_id());
+            if let Some(receipt) = state.acknowledged_receipt(&acknowledged, intent) {
                 let mut actor = self.actor.lock();
                 actor.ensure_identity(self.identity)?;
                 if actor.pending.is_some() {
@@ -3008,9 +3051,12 @@ impl GuardianCheckpointPublisher {
                 // A local Attached flag alone cannot detect an externally
                 // fenced lease or damaged durable Ack. Revalidate through the
                 // authenticated Stage query without creating another upload.
+                // The stage keeps only the newest acknowledged upload to query
+                // (an earlier member keeps its own proof of its Ack), and its
+                // Ack vouches for the lease.
                 acknowledged.confirm_ack(state.transport.as_mut())?;
                 return capture
-                    .bind_published(acknowledged.receipt, self.identity)
+                    .bind_published(receipt, self.identity)
                     .map_err(|_| GuardianProxyError::CheckpointStageInvariant);
             }
         }
@@ -3018,9 +3064,7 @@ impl GuardianCheckpointPublisher {
             PendingGuardianCheckpointPublication::from_live_capture(self.identity, capture)?;
         state.pending = Some(pending);
         let GuardianCheckpointPublisherState {
-            transport,
-            pending,
-            last_acknowledged,
+            transport, pending, ..
         } = &mut *state;
         let current = pending
             .as_mut()
@@ -3035,7 +3079,7 @@ impl GuardianCheckpointPublisher {
             .capture
             .bind_published(receipt, self.identity)
             .map_err(|_| GuardianProxyError::CheckpointStageInvariant)?;
-        *last_acknowledged = Some(acknowledged);
+        state.acknowledge(&acknowledged);
         Ok(published)
     }
 }
@@ -4757,6 +4801,76 @@ struct VerifiedGuardianReplayRestore {
     checkpoint_id: GuardianCheckpointIdentityDigest,
     capture_generation: u64,
     boundary: GuardianReplayBoundary,
+    /// The restored model's size: its checkpoint's rows and columns.
+    size: PtySize,
+}
+
+/// The size a restore's replay accepts its checkpoint at.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GuardianReplayGeometry {
+    /// The size a recovery root or a birth names. A checkpoint of any other
+    /// size refuses.
+    Exact(PtySize),
+    /// The size of whichever checkpoint the guardian selects, for a pane no
+    /// recovery root names (ft-upal7): nothing else records it.
+    FromCheckpoint,
+}
+
+impl GuardianReplayGeometry {
+    /// The size the checkpoint `descriptor` describes must have. Its pixel
+    /// size, which only the checkpoint itself holds, is settled by
+    /// [`Self::for_checkpoint`].
+    fn for_descriptor(
+        self,
+        descriptor: GuardianCheckpointDescriptorV1,
+    ) -> Result<PtySize, GuardianProxyError> {
+        match self {
+            Self::Exact(size) => Ok(size),
+            Self::FromCheckpoint => {
+                let size = PtySize {
+                    rows: checkpoint_dimension(u64::from(descriptor.rows()))?,
+                    cols: checkpoint_dimension(u64::from(descriptor.cols()))?,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                };
+                validate_pty_size(size)?;
+                Ok(size)
+            }
+        }
+    }
+
+    /// `size`, from [`Self::for_descriptor`], with the pixel size of the
+    /// complete `checkpoint` it describes when that is what counts.
+    fn for_checkpoint(
+        self,
+        size: PtySize,
+        checkpoint: &[u8],
+        limits: TerminalCheckpointLimits,
+    ) -> Result<PtySize, GuardianProxyError> {
+        match self {
+            Self::Exact(_) => Ok(size),
+            Self::FromCheckpoint => {
+                // Only read here: restoring the model validates it in full.
+                let model = wezterm_term::terminalstate::checkpoint::TerminalCheckpointV3::decode_canonical_json(
+                    checkpoint, limits,
+                )
+                .map_err(|_| {
+                    GuardianProxyError::ReplayInvariant("checkpoint payload does not decode")
+                })?;
+                Ok(PtySize {
+                    pixel_width: checkpoint_dimension(model.pixel_width())?,
+                    pixel_height: checkpoint_dimension(model.pixel_height())?,
+                    ..size
+                })
+            }
+        }
+    }
+}
+
+fn checkpoint_dimension(value: u64) -> Result<u16, GuardianProxyError> {
+    u16::try_from(value).map_err(|_| {
+        GuardianProxyError::ReplayInvariant("checkpoint geometry is larger than any PTY")
+    })
 }
 
 impl fmt::Debug for VerifiedGuardianReplayRestore {
@@ -4859,10 +4973,29 @@ fn replay_page_ack_plan(
     }
 }
 
+#[cfg(test)]
 fn consume_one_guardian_replay_snapshot(
     transport: &mut dyn GuardianReplayTransport,
     identity: GuardianPaneLeaseIdentity,
     expected_size: PtySize,
+    config: Arc<dyn TerminalConfiguration>,
+    limits: TerminalCheckpointLimits,
+    selected: Option<SelectedRecoveryCheckpoint>,
+) -> Result<VerifiedGuardianReplayRestore, GuardianProxyError> {
+    consume_one_guardian_replay_snapshot_at(
+        transport,
+        identity,
+        GuardianReplayGeometry::Exact(expected_size),
+        config,
+        limits,
+        selected,
+    )
+}
+
+fn consume_one_guardian_replay_snapshot_at(
+    transport: &mut dyn GuardianReplayTransport,
+    identity: GuardianPaneLeaseIdentity,
+    geometry: GuardianReplayGeometry,
     config: Arc<dyn TerminalConfiguration>,
     limits: TerminalCheckpointLimits,
     selected: Option<SelectedRecoveryCheckpoint>,
@@ -4893,6 +5026,7 @@ fn consume_one_guardian_replay_snapshot(
     let mut descriptor = None;
     let mut inert_terminal = None;
     let mut boundary = None;
+    let mut size = None;
 
     for _ in 0..GUARDIAN_RESTORE_MAX_PAGES {
         let request_id = Uuid::new_v4();
@@ -4918,6 +5052,7 @@ fn consume_one_guardian_replay_snapshot(
                 if let Some(selected) = selected {
                     selected.validate_descriptor(observed_descriptor)?;
                 }
+                let expected_size = geometry.for_descriptor(observed_descriptor)?;
                 validate_checkpoint_descriptor_for_proxy(
                     observed_descriptor,
                     page_identity,
@@ -4962,6 +5097,8 @@ fn consume_one_guardian_replay_snapshot(
                 })?;
 
                 if u64::try_from(checkpoint.len()) == Ok(observed_descriptor.total_bytes()) {
+                    let expected_size =
+                        geometry.for_checkpoint(expected_size, checkpoint.as_slice(), limits)?;
                     let restored = restore_inert_checkpoint(
                         identity.pane_id(),
                         observed_descriptor,
@@ -4973,6 +5110,7 @@ fn consume_one_guardian_replay_snapshot(
                     checkpoint.zeroize_and_clear();
                     inert_terminal = Some(restored);
                     boundary = Some(base);
+                    size = Some(expected_size);
                 }
             }
             GuardianReplayPageBodyDelivery::OutputRecords(records) => {
@@ -5094,6 +5232,9 @@ fn consume_one_guardian_replay_snapshot(
                     checkpoint_id,
                     capture_generation: expected_descriptor.capture_generation(),
                     boundary: current,
+                    size: size.ok_or(GuardianProxyError::ReplayInvariant(
+                        "verified terminal has no checkpoint geometry",
+                    ))?,
                 });
             }
             GuardianReplayPageBodyDelivery::Gap { .. } => {
@@ -5148,6 +5289,7 @@ fn consume_one_guardian_replay_snapshot(
     Err(GuardianProxyError::ReplayCapacity)
 }
 
+#[cfg(test)]
 fn consume_guardian_replay_for_restore(
     transport: &mut dyn GuardianReplayTransport,
     identity: GuardianPaneLeaseIdentity,
@@ -5156,14 +5298,32 @@ fn consume_guardian_replay_for_restore(
     limits: TerminalCheckpointLimits,
     selected: Option<SelectedRecoveryCheckpoint>,
 ) -> Result<VerifiedGuardianReplayRestore, GuardianProxyError> {
+    consume_guardian_replay_for_restore_at(
+        transport,
+        identity,
+        GuardianReplayGeometry::Exact(expected_size),
+        config,
+        limits,
+        selected,
+    )
+}
+
+fn consume_guardian_replay_for_restore_at(
+    transport: &mut dyn GuardianReplayTransport,
+    identity: GuardianPaneLeaseIdentity,
+    geometry: GuardianReplayGeometry,
+    config: Arc<dyn TerminalConfiguration>,
+    limits: TerminalCheckpointLimits,
+    selected: Option<SelectedRecoveryCheckpoint>,
+) -> Result<VerifiedGuardianReplayRestore, GuardianProxyError> {
     let mut expired = 0;
     let mut waited = Duration::ZERO;
     let mut wait = GUARDIAN_RESTORE_SEQUENCE_FIRST_WAIT;
     loop {
-        match consume_one_guardian_replay_snapshot(
+        match consume_one_guardian_replay_snapshot_at(
             transport,
             identity,
-            expected_size,
+            geometry,
             Arc::clone(&config),
             limits,
             selected,
@@ -7141,15 +7301,44 @@ impl GuardianProxyStaging {
     }
 
     fn restore_and_activate_with_budget(
-        mut self,
+        self,
         config: Arc<dyn TerminalConfiguration>,
         limits: TerminalCheckpointLimits,
         budget: GuardianRestoreBudget<'_>,
     ) -> Result<ActivatedGuardianProxy, GuardianProxyError> {
+        self.restore_and_activate_at(config, limits, budget, false)
+            .map(|(activated, _)| activated)
+    }
+
+    /// [`Self::restore_and_activate`] for a pane no recovery root names
+    /// (ft-upal7). Nothing records its size, so the model, and the lease,
+    /// take the size of the checkpoint the guardian selects, which this
+    /// returns.
+    fn restore_and_activate_adopted(
+        self,
+        config: Arc<dyn TerminalConfiguration>,
+        limits: TerminalCheckpointLimits,
+        budget: GuardianRestoreBudget<'_>,
+    ) -> Result<(ActivatedGuardianProxy, PtySize), GuardianProxyError> {
+        self.restore_and_activate_at(config, limits, budget, true)
+    }
+
+    fn restore_and_activate_at(
+        mut self,
+        config: Arc<dyn TerminalConfiguration>,
+        limits: TerminalCheckpointLimits,
+        budget: GuardianRestoreBudget<'_>,
+        adopted: bool,
+    ) -> Result<(ActivatedGuardianProxy, PtySize), GuardianProxyError> {
         budget.checkpoint()?;
         let started = Instant::now();
         let identity = self.identity();
         let expected_size = self.actor.lock().size;
+        let geometry = if adopted {
+            GuardianReplayGeometry::FromCheckpoint
+        } else {
+            GuardianReplayGeometry::Exact(expected_size)
+        };
         if self.checkpoint_publisher.is_none() {
             return Err(GuardianProxyError::InvalidConfiguration(
                 "guardian staging has no checkpoint publisher bound to its claimed lease",
@@ -7161,18 +7350,20 @@ impl GuardianProxyStaging {
                 .ok_or(GuardianProxyError::InvalidConfiguration(
                     "guardian staging has no replay transport bound to its claimed lease",
                 ))?;
-        let verified = consume_guardian_replay_for_restore(
+        let verified = consume_guardian_replay_for_restore_at(
             &mut BudgetedGuardianReplayTransport {
                 inner: replay_transport.as_mut(),
                 budget,
             },
             identity,
-            expected_size,
+            geometry,
             config,
             limits,
             self.selected_checkpoint,
         )?;
         budget.checkpoint()?;
+        let size = verified.size;
+        self.actor.lock().size = size;
         let replayed = started.elapsed();
         let tail = GuardianReplayTailReader::new(
             replay_transport,
@@ -7190,7 +7381,7 @@ impl GuardianProxyStaging {
             started.elapsed().saturating_sub(replayed).as_millis(),
         );
         budget.checkpoint()?;
-        Ok(activated)
+        Ok((activated, size))
     }
 
     fn activate_verified_restore(
@@ -7515,13 +7706,278 @@ pub fn restore_authenticated_topology(
     )?;
     let published = prepared
         .publish_with_budget(Some(GuardianRestoreBudget { cx, deadline }.for_next_pane()))?;
+    let named: std::collections::HashSet<Uuid> = restored_panes.iter().copied().collect();
     mux.note_restored_guardian_panes(restored_panes);
     log::info!(
         "restored {pane_count} guardian panes in {} ms, {} ms of it connecting and claiming",
         started.elapsed().as_millis(),
         claimed.as_millis(),
     );
+    // Panes the root's mux spawned after that root are still running under
+    // the guardian; the root is restored either way.
+    if let Some((socket, token)) = guardian_paths.as_ref()
+        && let Err(error) = adopt_unnamed_guardian_panes(&mux, socket, token, &named, limits, cx)
+    {
+        log::warn!("guardian panes this recovery root does not name stay unadopted: {error:#}");
+    }
     Ok(published)
+}
+
+/// What adoption makes of a guardian pane that no recovery root names
+/// (ft-upal7), from its census entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnnamedGuardianPane {
+    /// A live child its mux claimed and then left, with nothing unsettled:
+    /// this mux claims it as that mux's successor.
+    Adopt,
+    /// A mux still holds it, or its last mux left an input or a checkpoint
+    /// unsettled, so no successor may claim it yet.
+    Held,
+    /// Its mux ended before it ever claimed it, so no one has seen it.
+    NeverClaimed,
+    /// A mux took it over from its first one before: only a recovery root
+    /// names the successor custody a claim of it needs.
+    TakenOver,
+    /// It ended, or its guardian quarantined it.
+    Ended,
+}
+
+impl UnnamedGuardianPane {
+    fn of(entry: &GuardianCensusEntry) -> Self {
+        match entry.status {
+            GuardianCensusPaneStatus::LiveUnclaimed
+                if entry.pending_input_effect.is_some()
+                    || entry.indeterminate_checkpoint_effect.is_some() =>
+            {
+                Self::Held
+            }
+            GuardianCensusPaneStatus::LiveUnclaimed => match entry.generation {
+                0 => Self::NeverClaimed,
+                1 => Self::Adopt,
+                _ => Self::TakenOver,
+            },
+            GuardianCensusPaneStatus::LiveClaimed => Self::Held,
+            GuardianCensusPaneStatus::ExitedUnclaimed
+            | GuardianCensusPaneStatus::ClosedTerminal
+            | GuardianCensusPaneStatus::Quarantined => Self::Ended,
+        }
+    }
+}
+
+/// Adopt the live guardian panes that no recovery root names, as tabs of one
+/// new window, before this mux accepts clients (ft-upal7). A mux that ends
+/// before its first root commits, or after it spawned panes its newest root
+/// predates, leaves their programs running with no root to restore them
+/// from; they ran on unseen, and a host with no root refused to start a mux
+/// at all. Each pane's model is its newest checkpoint and the output its
+/// guardian journaled after it (all of it, from the pane's birth, when it
+/// has none), at that checkpoint's size. A pane that fails stays running
+/// unclaimed, as before, and costs no other pane. Ended panes no root names
+/// join this mux's own, so the guardian releases them once its roots settle.
+/// `named` holds the panes a restored root names. Returns how many were
+/// adopted.
+fn adopt_unnamed_guardian_panes(
+    owner: &Arc<mux::Mux>,
+    socket: &Path,
+    token: &Path,
+    named: &std::collections::HashSet<Uuid>,
+    limits: TerminalCheckpointLimits,
+    cx: &frankenterm_core::cx::Cx,
+) -> anyhow::Result<usize> {
+    let started = Instant::now();
+    let domain_id = owner
+        .iter_domains()
+        .iter()
+        .find_map(|domain| {
+            domain
+                .downcast_ref::<GuardianDomain>()
+                .filter(|domain| domain.socket_path == socket && domain.token_path == token)
+                .map(|domain| domain.domain_id())
+        })
+        .context("adopting guardian panes needs this guardian's domain")?;
+    let (session, _) = owner.topology_snapshot_authority()?;
+    let target = Uuid::from_bytes(session.as_bytes());
+    let mut client = GuardianClient::connect(socket, token, target)
+        .context("connect to the guardian to adopt the panes no recovery root names")?;
+    // A mux that ended a moment ago holds its panes until its guardian sees
+    // its connections close: wait for that, briefly, rather than leave them.
+    let entries = loop {
+        let entries = client
+            .census_snapshot()
+            .context("guardian census before adopting the panes no recovery root names")?;
+        let released = entries.iter().all(|entry| {
+            named.contains(&entry.pane_id)
+                || entry.status != GuardianCensusPaneStatus::LiveClaimed
+                || entry.mux_incarnation == Some(target)
+        });
+        if released || !wait_for_claim_retry(started, GUARDIAN_RECOVERY_CLAIM_RETRY_BUDGET) {
+            break entries;
+        }
+    };
+    let guardian = client.guardian_incarnation();
+    drop(client);
+    let mut adopt = Vec::new();
+    let mut ended = Vec::new();
+    let mut left = Vec::new();
+    for entry in entries
+        .iter()
+        .filter(|entry| !named.contains(&entry.pane_id))
+    {
+        match UnnamedGuardianPane::of(entry) {
+            UnnamedGuardianPane::Adopt => adopt.push(entry.pane_id),
+            UnnamedGuardianPane::Ended => ended.push(entry.pane_id),
+            other => left.push((entry.pane_id, other)),
+        }
+    }
+    for (pane, why) in &left {
+        log::warn!("guardian pane {pane} that no recovery root names stays unadopted: {why:?}");
+    }
+    owner.note_restored_guardian_panes(ended);
+    if adopt.is_empty() {
+        return Ok(0);
+    }
+    let census = Arc::new(GuardianCensusCoordinator::connect(
+        socket, token, guardian, target,
+    )?);
+    let mut window = None;
+    let mut adopted = Vec::new();
+    for pane in adopt {
+        cx.checkpoint()
+            .map_err(|_| anyhow::anyhow!("guardian pane adoption cancelled"))?;
+        let budget = GuardianRestoreBudget {
+            cx,
+            deadline: Instant::now() + GUARDIAN_PANE_RESTORE_LIMIT,
+        };
+        let (local, size) = match adopt_unnamed_guardian_pane(
+            socket, token, &census, pane, domain_id, limits, budget,
+        ) {
+            Ok(adopted) => adopted,
+            Err(error) => {
+                log::warn!(
+                    "guardian pane {pane} that no recovery root names stays unadopted: {error:#}"
+                );
+                continue;
+            }
+        };
+        // Until it is registered, abandoning the pane retires only its
+        // lease: its program keeps running, unclaimed, as before.
+        let unpublished = match UnpublishedPane::from_guardian_proxy(local) {
+            Ok(unpublished) => unpublished,
+            Err(error) => {
+                log::warn!("adopted guardian pane {pane} cannot be published: {error:#}");
+                continue;
+            }
+        };
+        let tab_size = wezterm_term::TerminalSize {
+            rows: usize::from(size.rows),
+            cols: usize::from(size.cols),
+            pixel_width: usize::from(size.pixel_width),
+            pixel_height: usize::from(size.pixel_height),
+            dpi: 0,
+        };
+        let tab = match unpublished.publish_in_new_tab(owner, &tab_size) {
+            Ok((tab, _pane)) => tab,
+            Err(error) => {
+                log::warn!("adopted guardian pane {pane} cannot be registered: {error:#}");
+                continue;
+            }
+        };
+        adopted.push(pane);
+        let window = window.get_or_insert_with(|| owner.new_empty_window(None, None));
+        if let Err(error) = owner.add_tab_to_window(&tab, **window) {
+            log::error!("adopted guardian pane {pane} has no window: {error:#}");
+        }
+    }
+    let count = adopted.len();
+    owner.note_restored_guardian_panes(adopted);
+    log::info!(
+        "adopted {count} guardian panes that no recovery root names in {} ms",
+        started.elapsed().as_millis()
+    );
+    Ok(count)
+}
+
+/// [`adopt_unnamed_guardian_panes`] for a mux that starts with no recovery
+/// root to restore: no root names any of its guardian's panes.
+pub fn adopt_without_recovery_root(
+    owner: &Arc<mux::Mux>,
+    socket: &Path,
+    token: &Path,
+    limits: TerminalCheckpointLimits,
+) -> anyhow::Result<usize> {
+    let cx = frankenterm_core::cx::for_request();
+    adopt_unnamed_guardian_panes(
+        owner,
+        socket,
+        token,
+        &std::collections::HashSet::new(),
+        limits,
+        &cx,
+    )
+}
+
+/// Claim `pane` as the successor of the mux that spawned it, and restore its
+/// model from its guardian's replay, at its checkpoint's size, which this
+/// returns with the unpublished pane.
+fn adopt_unnamed_guardian_pane(
+    socket: &Path,
+    token: &Path,
+    census: &Arc<GuardianCensusCoordinator>,
+    pane: Uuid,
+    domain_id: DomainId,
+    limits: TerminalCheckpointLimits,
+    budget: GuardianRestoreBudget<'_>,
+) -> anyhow::Result<(LocalPane, PtySize)> {
+    let custody = GuardianDurableSpawnCustodyV1::open_existing_for_adoption(
+        token,
+        census.guardian_incarnation(),
+        pane,
+    )
+    .context("authenticate the pane's spawn custody")?;
+    // The lease takes its checkpoint's size once its replay shows it; until
+    // then nothing uses this one.
+    let placeholder = PtySize {
+        rows: 24,
+        cols: 80,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    // The custody names the mux that spawned the pane, not this one, so the
+    // plan's client must carry this mux's build, as a restore's does. The
+    // guardian closes a build-bearing Hello while a worker holds its protocol,
+    // which the panes adopted before this one keep it doing with their
+    // checkpoints: a plan without a budget to retry in lost three of ten.
+    let staging = GuardianProxyLeasePlan::prepare_with_build(
+        socket,
+        token,
+        placeholder,
+        Arc::clone(census),
+        Some(budget),
+    )
+    .context("authenticate this mux's build to the guardian")?
+    .with_spawn_custody(custody)
+    .context("bind the pane's spawn custody")?
+    .claim(pane, 1, Uuid::new_v4(), Uuid::new_v4())
+    .context("claim the pane as its mux's successor")?;
+    let pane_id = mux::pane::alloc_pane_id()?;
+    let description = "guardian-owned command".to_string();
+    let config: Arc<dyn TerminalConfiguration + Send + Sync> = Arc::new(
+        config::TermConfig::new_for_pane(pane_id, domain_id, *pane.as_bytes(), description.clone()),
+    );
+    let (activated, size) = staging
+        .restore_and_activate_adopted(config, limits, budget)
+        .context("restore the pane from its guardian's replay")?;
+    // The program sized itself for the PTY its last mux left, which may not
+    // be its checkpoint's size; this redraws it for the model.
+    if let Err(error) = activated.pty.resize(size) {
+        log::warn!(
+            "adopted guardian pane {pane} keeps its PTY's earlier size until its next resize: {error:#}"
+        );
+    }
+    Ok((
+        activated.into_local_pane(pane_id, domain_id, description),
+        size,
+    ))
 }
 
 impl PreparedGuardianWholeMuxTopology {
@@ -9492,16 +9948,28 @@ mod tests {
         pane_id: mux::pane::PaneId,
         executor: &promise::spawn::SimpleExecutor,
     ) -> mux::guardian_checkpoint::PublishedGuardianCheckpoint {
+        capture_real_guardian_checkpoint_at(
+            mux,
+            pane_id,
+            executor,
+            TerminalCheckpointLimits::default(),
+        )
+    }
+
+    fn capture_real_guardian_checkpoint_at(
+        mux: &Arc<Mux>,
+        pane_id: mux::pane::PaneId,
+        executor: &promise::spawn::SimpleExecutor,
+        limits: TerminalCheckpointLimits,
+    ) -> mux::guardian_checkpoint::PublishedGuardianCheckpoint {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let capture_mux = Arc::clone(mux);
         let capture_thread = thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 let operation = capture_mux.capture_pane_operation(pane_id).unwrap();
-                let result = operation.capture_current_guardian_checkpoint(
-                    TerminalCheckpointLimits::default(),
-                    Duration::from_secs(5),
-                );
+                let result =
+                    operation.capture_current_guardian_checkpoint(limits, Duration::from_secs(5));
                 if matches!(
                     result
                         .as_ref()
@@ -9875,6 +10343,32 @@ mod tests {
         );
         assert!(mux.guardian_checkpoint_is_current(pane_id, &repeated));
         drop(repeated);
+        // With no output between them, captures can differ (here by line
+        // encoding; a first root's keeps fewer rows of history) and come
+        // back. The return names the publication it repeats and uploads
+        // nothing: the guardian adopts each checkpoint identity once, and took
+        // a second upload of it for an unsettled outcome, quarantining the
+        // lease (ft-upal7).
+        let compact = TerminalCheckpointLimits {
+            line_encoding:
+                wezterm_term::terminalstate::checkpoint::TerminalCheckpointLineEncoding::Runs,
+            ..TerminalCheckpointLimits::default()
+        };
+        let other = capture_real_guardian_checkpoint_at(mux, pane_id, executor, compact);
+        assert_eq!(
+            other.capture().output_sequence(),
+            published.capture().output_sequence()
+        );
+        assert_ne!(other.receipt(), published.receipt());
+        drop(other);
+        let returned = capture_real_guardian_checkpoint(mux, pane_id, executor);
+        assert_eq!(
+            returned.receipt(),
+            published.receipt(),
+            "a capture that repeats an earlier publication must name it"
+        );
+        assert!(mux.guardian_checkpoint_is_current(pane_id, &returned));
+        drop(returned);
         let captured = mux.capture_topology_coherent(Default::default()).unwrap();
         assert_eq!(captured.pane_bindings.len(), 1);
         assert_eq!(captured.pane_bindings[0].spawn_custody, Some(provenance));
@@ -14226,6 +14720,84 @@ mod tests {
                 .iter()
                 .all(|(_, ack)| ack.through_sequence() == 0)
         );
+    }
+
+    #[test]
+    fn an_adopted_pane_takes_its_checkpoints_size_where_a_restore_refuses_another() {
+        // Nothing records the size of a pane no recovery root names, so its
+        // replay takes the checkpoint's, pixels included (ft-upal7).
+        let replay = |geometry| {
+            let (descriptor, checkpoint) = genesis_checkpoint_fixture();
+            let mut transport = FakeReplayTransport {
+                state: Arc::new(Mutex::new(FakeReplayState {
+                    pages: checkpoint_and_complete_pages(descriptor, checkpoint),
+                    replay_io_failures: 0,
+                    ack_io_failures: 0,
+                    requests: Vec::new(),
+                    acks: Vec::new(),
+                })),
+            };
+            consume_guardian_replay_for_restore_at(
+                &mut transport,
+                identity(),
+                geometry,
+                test_terminal_config(),
+                TerminalCheckpointLimits::default(),
+                None,
+            )
+        };
+        let adopted = replay(GuardianReplayGeometry::FromCheckpoint)
+            .expect("an adoption replays its checkpoint at the checkpoint's size");
+        assert_eq!(adopted.size, size(24, 80));
+        adopted.inert_terminal.checkpoint().unwrap();
+        let restored = replay(GuardianReplayGeometry::Exact(size(24, 80)))
+            .expect("a restore at the checkpoint's own size");
+        assert_eq!(restored.size, size(24, 80));
+        // A root or a birth names its own size: another one still refuses.
+        assert!(matches!(
+            replay(GuardianReplayGeometry::Exact(size(30, 100))),
+            Err(GuardianProxyError::ReplayInvariant(
+                "checkpoint geometry does not match the claimed topology manifest"
+            ))
+        ));
+    }
+
+    #[test]
+    fn adoption_takes_only_live_panes_a_mux_claimed_and_left_settled() {
+        use GuardianCensusPaneStatus::{
+            ClosedTerminal, ExitedUnclaimed, LiveClaimed, LiveUnclaimed, Quarantined,
+        };
+        let of = |status, generation, pending_input: bool, indeterminate_checkpoint: bool| {
+            UnnamedGuardianPane::of(&GuardianCensusEntry {
+                pane_id: id(0x900),
+                status,
+                generation,
+                mux_incarnation: None,
+                next_sequence: None,
+                pending_input_effect: pending_input.then(|| id(0x901)),
+                indeterminate_checkpoint_effect: indeterminate_checkpoint.then(|| id(0x902)),
+                exit_status: None,
+                quarantine_reason: None,
+            })
+        };
+        assert_eq!(
+            of(LiveUnclaimed, 1, false, false),
+            UnnamedGuardianPane::Adopt
+        );
+        assert_eq!(
+            of(LiveUnclaimed, 0, false, false),
+            UnnamedGuardianPane::NeverClaimed
+        );
+        assert_eq!(
+            of(LiveUnclaimed, 2, false, false),
+            UnnamedGuardianPane::TakenOver
+        );
+        assert_eq!(of(LiveUnclaimed, 1, true, false), UnnamedGuardianPane::Held);
+        assert_eq!(of(LiveUnclaimed, 1, false, true), UnnamedGuardianPane::Held);
+        assert_eq!(of(LiveClaimed, 1, false, false), UnnamedGuardianPane::Held);
+        for status in [ExitedUnclaimed, ClosedTerminal, Quarantined] {
+            assert_eq!(of(status, 1, false, false), UnnamedGuardianPane::Ended);
+        }
     }
 
     #[test]

@@ -144,6 +144,16 @@ struct Opt {
     #[arg(long, requires = "recovery_store", conflicts_with_all = ["cwd", "prog"])]
     recovery_restore: bool,
 
+    /// With no recovery root to restore, adopt the guardian's live panes
+    /// before accepting clients; never spawn a replacement shell. For a mux
+    /// that ended before its first recovery root committed.
+    #[arg(
+        long,
+        requires = "recovery_store",
+        conflicts_with_all = ["cwd", "prog", "recovery_restore"]
+    )]
+    recovery_adopt: bool,
+
     /// Skip loading wezterm.lua
     #[arg(long, short = 'n')]
     skip_config: bool,
@@ -459,14 +469,34 @@ fn run(generation_lifetime: &mut Option<GenerationLifetimeLease>) -> anyhow::Res
                 mux.set_guardian_compact_checkpoints(compact_checkpoints);
                 mux.set_guardian_graphics_checkpoints(graphics_checkpoints);
                 mux.set_guardian_protection_checkpoints(protection_checkpoints);
+                if opts.recovery_adopt {
+                    frankenterm_mux_server_impl::install_scrollback_spill_sink_factory();
+                }
                 let domain: Arc<dyn Domain> = Arc::new(
                     frankenterm_mux_server_impl::guardian_proxy::GuardianDomain::new(
-                        &mux, socket, token,
+                        &mux,
+                        socket.clone(),
+                        token.clone(),
                     )?,
                 );
                 mux.add_domain(&domain)?;
                 mux.set_default_domain(&domain)?;
+                if opts.recovery_adopt {
+                    // A failure leaves the mux unstarted, so its host tries
+                    // again, rather than one that ignores live panes.
+                    let limits =
+                        wezterm_term::terminalstate::checkpoint::TerminalCheckpointLimits {
+                            line_encoding: mux.guardian_checkpoint_limits().line_encoding,
+                            ..Default::default()
+                        };
+                    frankenterm_mux_server_impl::guardian_proxy::adopt_without_recovery_root(
+                        &mux, &socket, &token, limits,
+                    )?;
+                }
                 mux
+            }
+            _ if opts.recovery_adopt => {
+                anyhow::bail!("adopting guardian panes requires a configured guardian")
             }
             _ => {
                 let domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("local")?);
@@ -511,6 +541,7 @@ fn run(generation_lifetime: &mut Option<GenerationLifetimeLease>) -> anyhow::Res
 
     let startup_complete = Arc::new(AtomicBool::new(opts.recovery_restore));
     if !opts.recovery_restore {
+        let adopted = opts.recovery_adopt;
         let activity = Activity::new_for_mux(&mux);
         let startup_reservation = match promise::spawn::try_reserve_main_thread(
             promise::spawn::MainThreadServiceClass::Topology,
@@ -524,7 +555,7 @@ fn run(generation_lifetime: &mut Option<GenerationLifetimeLease>) -> anyhow::Res
         let startup_ready = Arc::clone(&startup_complete);
         startup_reservation
             .spawn_local(async move {
-                if let Err(err) = async_run(cmd).await {
+                if let Err(err) = async_run(cmd, adopted).await {
                     terminate_with_error(err);
                 }
                 startup_ready.store(true, Ordering::Release);
@@ -854,11 +885,18 @@ async fn reconcile_mux_domain_config_until_converged(generation: u64) {
     }
 }
 
-async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
+/// `adopted`: this mux adopted the guardian panes of one that ended before
+/// its first recovery root. No root holds its domains, so they come from the
+/// configuration, as at any start; but its panes still run, so no startup
+/// hook and no first shell runs again.
+async fn async_run(cmd: Option<CommandBuilder>, adopted: bool) -> anyhow::Result<()> {
     let mux = Mux::try_get().context("mux singleton is not available")?;
     let config = config::configuration();
 
     update_mux_domains_for_server(&config)?;
+    if adopted {
+        return Ok(());
+    }
     let domain = mux.default_domain()?;
 
     {
@@ -984,6 +1022,9 @@ fn daemonized_child_args(opts: &Opt) -> Vec<OsString> {
     args.extend(opts.recovery.child_args());
     if opts.recovery_restore {
         args.push(OsString::from("--recovery-restore"));
+    }
+    if opts.recovery_adopt {
+        args.push(OsString::from("--recovery-adopt"));
     }
     if opts.skip_config {
         args.push(OsString::from("-n"));
@@ -1112,6 +1153,7 @@ mod tests {
         Opt {
             recovery: Default::default(),
             recovery_restore: false,
+            recovery_adopt: false,
             skip_config: false,
             config_file: None,
             config_override: Vec::new(),
@@ -1149,6 +1191,44 @@ mod tests {
         assert_eq!(child.guardian_socket_path, opts.guardian_socket_path);
         assert_eq!(child.guardian_token_path, opts.guardian_token_path);
         for extra in [vec!["--cwd", "/private"], vec!["--", "sh"]] {
+            assert!(
+                Opt::try_parse_from(
+                    std::iter::once(OsString::from("mux"))
+                        .chain(args.clone())
+                        .chain(extra.into_iter().map(OsString::from))
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_adopt_requires_a_store_forwards_and_excludes_restore_and_a_new_program() {
+        assert!(Opt::try_parse_from(["mux", "--recovery-adopt"]).is_err());
+        let mut opts = make_opt();
+        opts.recovery_adopt = true;
+        opts.recovery.recovery_store = Some(PathBuf::from("/private/recovery"));
+        opts.recovery.recovery_enrollment = Some(PathBuf::from("/private/enrollment"));
+        opts.recovery.recovery_kek = Some(PathBuf::from("/private/key"));
+        opts.recovery.recovery_namespace = Some([1; 32]);
+        opts.recovery.recovery_policy = Some([2; 32]);
+        opts.recovery.recovery_root_id = Some([3; 32]);
+        opts.recovery.recovery_session = Some("retained-session".into());
+        opts.guardian_socket_path = Some(PathBuf::from("/private/guardian.sock"));
+        opts.guardian_token_path = Some(PathBuf::from("/private/guardian.token"));
+        let args = daemonized_child_args(&opts);
+        let child = Opt::try_parse_from(std::iter::once(OsString::from("mux")).chain(args.clone()))
+            .unwrap();
+        assert!(child.recovery_adopt);
+        assert!(!child.recovery_restore);
+        assert_eq!(child.recovery.child_args(), opts.recovery.child_args());
+        assert_eq!(child.guardian_socket_path, opts.guardian_socket_path);
+        for extra in [
+            vec!["--cwd", "/private"],
+            vec!["--recovery-restore"],
+            vec!["--", "sh"],
+        ] {
             assert!(
                 Opt::try_parse_from(
                     std::iter::once(OsString::from("mux"))

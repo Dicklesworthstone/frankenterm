@@ -349,12 +349,20 @@ run_mux() {
   recovery_args=$(mux_args) || die "cannot load the mux recovery configuration"
   while IFS= read -r a; do args+=("$a"); done <<< "$recovery_args"
   if [ "$panes" -gt 0 ]; then
-    # A crash before the first root commits leaves real children in guardian
-    # custody. Fresh startup would run hooks again and duplicate those panes.
-    snapshot_published \
-      || die "guardian holds $panes live pane(s), but no committed recovery snapshot exists; refusing a fresh mux start"
-    log "restoring $panes guardian pane(s) with $(readlink "$BASE/mux-current")"
-    args+=(--recovery-restore)
+    # The guardian's children outlived their mux. Fresh startup would run
+    # hooks again and duplicate those panes: bring back the mux instead.
+    if snapshot_published; then
+      log "restoring $panes guardian pane(s) with $(readlink "$BASE/mux-current")"
+      args+=(--recovery-restore)
+    else
+      # The mux ended before its first recovery root committed, so no root
+      # names them: the mux adopts them as they are (ft-upal7). A mux too old
+      # to adopt (its binary has no such flag) gets the earlier refusal.
+      grep -a -q -F recovery-adopt "$BASE/mux-current/frankenterm-mux-server" \
+        || die "guardian holds $panes live pane(s), but no committed recovery snapshot exists and $(readlink "$BASE/mux-current") cannot adopt them; refusing a fresh mux start"
+      log "adopting $panes guardian pane(s) that no recovery snapshot names with $(readlink "$BASE/mux-current")"
+      args+=(--recovery-adopt)
+    fi
   else
     # A guardian may not yet know about children that survived in its broker.
     # Neither that state nor a failed census establishes a safe fresh start.

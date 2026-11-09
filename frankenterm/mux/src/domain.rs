@@ -438,6 +438,22 @@ impl UnpublishedPane {
         Ok(self.into_pane())
     }
 
+    /// Publish as the only pane of a new tab of `size`, registering the pane
+    /// and the tab in one cut. Rollback stays armed until that commits, so a
+    /// refused registration leaves a restored guardian pane's program
+    /// running, as abandoning it would. The caller places the tab in a
+    /// window.
+    pub fn publish_in_new_tab(
+        self,
+        mux: &Arc<Mux>,
+        size: &TerminalSize,
+    ) -> anyhow::Result<(Arc<Tab>, Arc<dyn Pane>)> {
+        let tab = Arc::new(Tab::new(size));
+        tab.assign_pane(self.pane());
+        mux.add_tab_and_active_pane(&tab)?;
+        Ok((tab, self.into_pane()))
+    }
+
     pub(crate) fn pane(&self) -> &Arc<dyn Pane> {
         self.pane
             .as_ref()

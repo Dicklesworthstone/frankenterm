@@ -996,6 +996,49 @@ impl GuardianDurableSpawnCustodyV1 {
         Ok(Self { store, context })
     }
 
+    /// Recover provenance for a live pane that no recovery root names, from
+    /// the pane alone: one its mux spawned and claimed, then ended before any
+    /// committed root named it (ft-upal7). The pane's one authenticated Spawn
+    /// record supplies everything else. No record, or more than one, refuses:
+    /// provenance is never guessed.
+    pub fn open_existing_for_adoption(
+        token_path: &Path,
+        guardian_incarnation: Uuid,
+        pane_id: Uuid,
+    ) -> Result<Self, GuardianCheckpointStageStoreError> {
+        let store = Self::open_existing_store(token_path)?;
+        let prefix = format!("spawn-custody-v1-{pane_id}-");
+        let context = store.with_exclusive_directory(|inner| {
+            let mut found = None;
+            for name in read_directory_names(&inner.directory)? {
+                let Some(effect) = name
+                    .to_str()
+                    .and_then(|name| name.strip_prefix(prefix.as_str()))
+                    .and_then(|rest| rest.strip_suffix(".bin"))
+                else {
+                    continue;
+                };
+                let effect_id = Uuid::parse_str(effect)
+                    .map_err(|_| GuardianCheckpointStageStoreError::Conflict)?;
+                let bytes = read_synced_custody_bytes::<GUARDIAN_SPAWN_CUSTODY_BYTES>(
+                    inner,
+                    &inner.directory_path.join(&name),
+                )?;
+                let (context, secret) = inner.cipher.open_spawn_custody_record(&bytes)?;
+                drop(secret);
+                if context.guardian_incarnation != guardian_incarnation
+                    || context.pane_id != pane_id
+                    || context.effect_id != effect_id
+                    || found.replace(context).is_some()
+                {
+                    return Err(GuardianCheckpointStageStoreError::Conflict);
+                }
+            }
+            found.ok_or(GuardianCheckpointStageStoreError::Conflict)
+        })?;
+        Ok(Self { store, context })
+    }
+
     /// Nonsecret lookup provenance, never sufficient to claim a lease alone.
     pub const fn scope(&self) -> GuardianSpawnCustodyScopeV1 {
         self.context.scope()
@@ -17126,6 +17169,75 @@ mod tests {
     }
 
     #[test]
+    fn adoption_finds_a_panes_one_spawn_custody_from_the_pane_alone()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (directory, poll, pipeline) =
+            pipeline_with_policy("ft-adopt-custody-", OutputSegmentPolicy::production())?;
+        let store = pipeline.checkpoint_stage_store();
+        let context = spawn_custody_context();
+        let other = GuardianSpawnCustodyContextV1 {
+            pane_id: Uuid::from_u128(50),
+            effect_id: Uuid::from_u128(51),
+            ..context
+        };
+        drop(store.persist_spawn_custody(&context, &[0x93; 32])?);
+        drop(store.persist_spawn_custody(&other, &[0x94; 32])?);
+        let token = directory.join("guardian.token");
+        let adopt = |guardian, pane| {
+            GuardianDurableSpawnCustodyV1::open_existing_for_adoption(&token, guardian, pane)
+        };
+        assert_eq!(
+            adopt(context.guardian_incarnation, context.pane_id)?.scope(),
+            context.scope()
+        );
+        assert_eq!(
+            adopt(other.guardian_incarnation, other.pane_id)?.scope(),
+            other.scope()
+        );
+        // Another guardian's pane, and a pane with no record, refuse.
+        for (guardian, pane) in [
+            (Uuid::new_v4(), context.pane_id),
+            (context.guardian_incarnation, Uuid::new_v4()),
+        ] {
+            assert!(matches!(
+                adopt(guardian, pane),
+                Err(GuardianCheckpointStageStoreError::Conflict)
+            ));
+        }
+        // A record filed under another effect than its own refuses.
+        std::fs::rename(
+            spawn_custody_path(&store.inner, &other),
+            spawn_custody_path(
+                &store.inner,
+                &GuardianSpawnCustodyContextV1 {
+                    effect_id: Uuid::from_u128(53),
+                    ..other
+                },
+            ),
+        )?;
+        assert!(matches!(
+            adopt(other.guardian_incarnation, other.pane_id),
+            Err(GuardianCheckpointStageStoreError::Conflict)
+        ));
+        // Two records for one pane: its provenance is never guessed.
+        drop(store.persist_spawn_custody(
+            &GuardianSpawnCustodyContextV1 {
+                effect_id: Uuid::from_u128(52),
+                ..context
+            },
+            &[0x95; 32],
+        )?);
+        assert!(matches!(
+            adopt(context.guardian_incarnation, context.pane_id),
+            Err(GuardianCheckpointStageStoreError::Conflict)
+        ));
+        drop(store);
+        drop(pipeline);
+        drop(poll);
+        Ok(())
+    }
+
+    #[test]
     fn spawn_custody_survives_fresh_store_and_rejects_tamper_and_wrong_authority()
     -> Result<(), Box<dyn std::error::Error>> {
         let policy = OutputSegmentPolicy::production();
@@ -24500,9 +24612,8 @@ mod tests {
             OutputSegmentPolicy::production(),
         )?;
         let retiring_store = pipeline.checkpoint_stage_store();
-        let mut store = GuardianDurableSpawnCustodyV1::open_existing_store(
-            &directory.join("guardian.token"),
-        )?;
+        let mut store =
+            GuardianDurableSpawnCustodyV1::open_existing_store(&directory.join("guardian.token"))?;
         // The stores have independent caches over the same directory. A
         // one-chunk upload reserves four files; exercise the cache bound
         // without creating thousands of durable records.
@@ -24601,7 +24712,10 @@ mod tests {
         // The new chunk used to fail with Capacity after syncing: the cache
         // was full even though only two records remained on disk.
         assert_eq!(
-            store.apply_chunk(request(GuardianCheckpointStageKindV1::Chunk, Some((0, payload)))?)?,
+            store.apply_chunk(request(
+                GuardianCheckpointStageKindV1::Chunk,
+                Some((0, payload))
+            )?)?,
             progress
         );
         // Query re-synchronizes the forgotten candidate and authenticates
@@ -24611,7 +24725,10 @@ mod tests {
             progress
         );
         assert_eq!(
-            store.apply_chunk(request(GuardianCheckpointStageKindV1::Chunk, Some((0, payload)))?)?,
+            store.apply_chunk(request(
+                GuardianCheckpointStageKindV1::Chunk,
+                Some((0, payload))
+            )?)?,
             progress
         );
         assert!(remembered() <= MAX_FILES);
