@@ -109,7 +109,10 @@
 /// Bumped 48 -> 49 to seek the latest eligible agent detection per pane
 /// without ranking retained event history during each checkpoint. The partial
 /// index excludes rows that cannot contribute to snapshot agent correlation.
-pub const SCHEMA_VERSION: i32 = 49;
+/// Bumped 49 -> 50 to reserve durable fleet execution before side effects and
+/// bind completed results to immutable caller intent across inventory changes.
+/// Legacy receipts deliberately receive no inferred request binding.
+pub const SCHEMA_VERSION: i32 = 50;
 
 /// [ft-ih4tm] Idempotent re-creation of the three `output_segments` FTS
 /// triggers. Called when a database is opened with

@@ -2266,6 +2266,15 @@ pub(crate) static MIGRATIONS: &[Migration] = &[
         // This changes only query acceleration, not persisted event authority.
         down_sql: Some("DROP INDEX IF EXISTS idx_events_snapshot_agent_latest;"),
     },
+    Migration {
+        version: 50,
+        description: "Reserve fleet mutation execution and bind durable request results",
+        up_sql: super::fleet_mutation_receipts_sql::FLEET_MUTATION_CLAIMS_SCHEMA_SQL,
+        // Historical receipts cannot prove their caller's immutable intent.
+        // Never backfill claims from them, or erase unresolved execution
+        // ownership on downgrade and thereby authorize duplicate effects.
+        down_sql: None,
+    },
 ];
 
 // =============================================================================
@@ -2346,6 +2355,7 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
         validate_session_owner_lifecycle_schema(conn)?;
         validate_session_retained_size_schema(conn)?;
         validate_session_recovery_usability_schema(conn)?;
+        validate_fleet_mutation_claims_schema(conn)?;
         check_ft_version_compatibility(conn)?;
         // The overwhelmingly common reopen path is read-only and must not
         // acquire SQLite's singleton writer lock. If the optimistic probe
@@ -2403,6 +2413,27 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
     run_owned_migration_transaction(conn, "schema metadata", |transaction| {
         ensure_ft_meta(transaction, SCHEMA_VERSION)
     })
+}
+
+/// Losing execution claims cannot be repaired by creating an empty table:
+/// doing so would silently grant already-admitted requests another execution.
+fn validate_fleet_mutation_claims_schema(conn: &Connection) -> Result<()> {
+    let actual =
+        load_schema_object_sql(conn, "table", "fleet_mutation_claims")?.ok_or_else(|| {
+            StorageError::Corruption {
+                details: "schema v50 is missing fleet_mutation_claims execution authority"
+                    .to_string(),
+            }
+        })?;
+    let expected = super::fleet_mutation_receipts_sql::FLEET_MUTATION_CLAIMS_SCHEMA_SQL;
+    if compact_schema_sql(&actual) != compact_schema_sql(expected) {
+        return Err(StorageError::Corruption {
+            details: "schema v50 fleet_mutation_claims has non-canonical execution authority"
+                .to_string(),
+        }
+        .into());
+    }
+    Ok(())
 }
 
 pub(crate) fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
@@ -3630,7 +3661,7 @@ fn require_exact_table_column_count(
     .into())
 }
 
-fn compact_schema_sql(sql: &str) -> String {
+pub(crate) fn compact_schema_sql(sql: &str) -> String {
     #[derive(Clone, Copy)]
     enum Quote {
         Single,
@@ -6448,6 +6479,9 @@ fn apply_migration_mutation(
                 validate_session_recovery_usability_schema(conn)?;
                 ensure_no_foreign_key_violations(conn, "migration v44")?;
             }
+            if migration.version == 50 {
+                validate_fleet_mutation_claims_schema(conn)?;
+            }
             set_user_version(conn, migration.version)?;
             record_migration(conn, migration.version, migration.description)?;
             Ok(())
@@ -6944,6 +6978,138 @@ pub fn migrate_database_to_version(db_path: &Path, target_version: i32) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fleet_claim_v50_upgrade_is_atomic_and_preserves_legacy_and_unresolved_authority() {
+        let conn = Connection::open_in_memory().expect("open fleet migration fixture");
+        initialize_schema(&conn).expect("initialize fresh schema");
+        validate_fleet_mutation_claims_schema(&conn).expect("fresh claims authority");
+        let fresh_ddl = load_schema_object_sql(&conn, "table", "fleet_mutation_claims")
+            .unwrap()
+            .unwrap();
+        conn.execute_batch(
+            "DROP TABLE fleet_mutation_claims;
+             DELETE FROM schema_version WHERE version >= 50;
+             PRAGMA user_version = 49;
+             INSERT INTO fleet_mutation_receipts
+                 (idempotency_key, payload_fingerprint, action, plan_id,
+                  dry_run, receipt_json, recorded_at_ms)
+                 VALUES ('legacy', 'fingerprint', 'scale', 'original',
+                         0, '{\"historical\":true}', 1);
+             CREATE TRIGGER reject_fleet_claim_migration
+                 BEFORE INSERT ON schema_version WHEN new.version = 50 BEGIN
+                     SELECT RAISE(ABORT, 'fixture rejects fleet claim migration');
+                 END;",
+        )
+        .expect("prepare populated v49 fixture");
+        ensure_ft_meta(&conn, 49).unwrap();
+        assert!(initialize_schema(&conn).is_err());
+        assert_eq!(get_user_version(&conn).unwrap(), 49);
+        assert!(!table_exists(&conn, "fleet_mutation_claims").unwrap());
+        assert!(conn.is_autocommit());
+        conn.execute_batch("DROP TRIGGER reject_fleet_claim_migration;")
+            .expect("release injected failure");
+
+        initialize_schema(&conn).expect("upgrade existing database");
+        assert_eq!(get_user_version(&conn).unwrap(), 50);
+        let upgraded_ddl = load_schema_object_sql(&conn, "table", "fleet_mutation_claims")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            compact_schema_sql(&fresh_ddl),
+            compact_schema_sql(&upgraded_ddl)
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM fleet_mutation_claims", [], |row| row
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0,
+            "legacy receipts cannot be assigned invented request bindings",
+        );
+        let legacy: (String, String, String) = conn
+            .query_row(
+                "SELECT payload_fingerprint, plan_id, receipt_json
+                 FROM fleet_mutation_receipts WHERE idempotency_key = 'legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            legacy,
+            (
+                "fingerprint".into(),
+                "original".into(),
+                "{\"historical\":true}".into()
+            )
+        );
+
+        let nonce = "b".repeat(64);
+        conn.execute(
+            "INSERT INTO fleet_mutation_claims
+                 (idempotency_key, request_sha256, action, payload_fingerprint,
+                  plan_id, owner_nonce, state, response_data_json, created_at_ms, updated_at_ms)
+             VALUES ('interrupted', ?1, 'scale', 'fingerprint', 'owned-plan',
+                     ?2, 'claimed', NULL, 10, 10)",
+            params!["a".repeat(64), nonce],
+        )
+        .expect("retain unresolved execution claim");
+        initialize_schema(&conn).expect("reopen without changing claim authority");
+        let stored: (String, String, i64) = conn
+            .query_row(
+                "SELECT owner_nonce, state, created_at_ms FROM fleet_mutation_claims
+                 WHERE idempotency_key = 'interrupted'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, (nonce, "claimed".into(), 10));
+        assert!(
+            build_migration_plan(50, 49).is_err(),
+            "rollback must not erase execution ownership"
+        );
+    }
+
+    #[test]
+    fn fleet_claim_schema_loss_and_drift_refuse_reopen_or_upgrade() {
+        for version in [49, 50] {
+            let conn = Connection::open_in_memory().unwrap();
+            initialize_schema(&conn).unwrap();
+            conn.execute_batch("DROP TABLE fleet_mutation_claims;")
+                .unwrap();
+            if version == 50 {
+                let error = initialize_schema(&conn)
+                    .expect_err("lost execution authority must not be recreated");
+                assert!(error.to_string().contains("fleet_mutation_claims"));
+                assert!(!table_exists(&conn, "fleet_mutation_claims").unwrap());
+            } else {
+                conn.execute("DELETE FROM schema_version WHERE version >= 50", [])
+                    .unwrap();
+                set_user_version(&conn, 49).unwrap();
+                ensure_ft_meta(&conn, 49).unwrap();
+            }
+            conn.execute_batch(
+                "CREATE TABLE fleet_mutation_claims (idempotency_key TEXT);
+                 INSERT INTO fleet_mutation_claims VALUES ('retained');",
+            )
+            .unwrap();
+            let error = initialize_schema(&conn)
+                .expect_err("drifted execution authority must not be adopted");
+            assert!(error.to_string().contains("fleet_mutation_claims"));
+            assert_eq!(get_user_version(&conn).unwrap(), version);
+            assert_eq!(
+                conn.query_row(
+                    "SELECT idempotency_key FROM fleet_mutation_claims",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+                "retained",
+            );
+            assert!(conn.is_autocommit());
+        }
+    }
 
     #[test]
     fn snapshot_agent_index_v49_upgrade_is_atomic_reversible_and_preserves_events() {

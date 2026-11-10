@@ -19,8 +19,251 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::robot_idempotency::MutationKey;
+
+const MAX_FLEET_REQUEST_KEY_BYTES: usize = 512;
+const MAX_FLEET_REQUEST_ACTION_BYTES: usize = 64;
+const MAX_FLEET_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_FLEET_REQUEST_NODES: usize = 65_536;
+const MAX_FLEET_REQUEST_DEPTH: usize = 64;
+
+/// Immutable caller intent for durable fleet execution.
+///
+/// An explicit scale/rebalance request must keep this identity when the live
+/// inventory changes. The inventory-derived plan is a separate binding owned
+/// by the winning execution claim. Only the key, action, and SHA-256 digest
+/// survive construction; request parameters are not retained here.
+#[derive(Clone, PartialEq, Eq)]
+pub struct FleetMutationRequestBinding {
+    idempotency_key: String,
+    action: String,
+    request_sha256: String,
+}
+
+impl std::fmt::Debug for FleetMutationRequestBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FleetMutationRequestBinding")
+            .field("action", &self.action)
+            .field("request_sha256", &self.request_sha256)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Finite construction errors that never include request parameters or keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum FleetMutationRequestBindingError {
+    #[error("fleet mutation idempotency key is empty, invalid, or exceeds 512 bytes")]
+    InvalidKey,
+    #[error("fleet mutation action must be 1-64 lowercase ASCII letters, digits, or underscores")]
+    InvalidAction,
+    #[error("fleet mutation request exceeds the bounded canonical representation")]
+    RequestTooLarge,
+    #[error("fleet mutation request cannot be encoded")]
+    InvalidEncoding,
+}
+
+impl FleetMutationRequestBinding {
+    /// Bind a caller key to an action and canonical request parameters.
+    ///
+    /// Callers normalize provider/strategy aliases before construction. Object
+    /// key order is ignored; array order, JSON types, and exact string bytes
+    /// remain significant. The digest includes an explicit format version and
+    /// length framing, so delimiter-like parameters cannot alias one another.
+    pub fn new(
+        key: &str,
+        action: &str,
+        canonical_request: &serde_json::Value,
+    ) -> Result<Self, FleetMutationRequestBindingError> {
+        if !valid_fleet_request_key(key) {
+            return Err(FleetMutationRequestBindingError::InvalidKey);
+        }
+        if !valid_fleet_request_action(action) {
+            return Err(FleetMutationRequestBindingError::InvalidAction);
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(b"ft.fleet-mutation-request.v1\0");
+        let mut budget = FleetRequestHashBudget {
+            bytes: MAX_FLEET_REQUEST_BYTES,
+            nodes: MAX_FLEET_REQUEST_NODES,
+        };
+        budget.field(&mut hasher, action.as_bytes())?;
+        hash_fleet_request_value(&mut hasher, canonical_request, &mut budget, 0)?;
+        Ok(Self {
+            idempotency_key: key.to_string(),
+            action: action.to_string(),
+            request_sha256: format!("{:x}", hasher.finalize()),
+        })
+    }
+
+    /// Bind a generated key to its complete plan when no caller key was given.
+    ///
+    /// Explicit caller requests use [`Self::new`] instead, so retrying them
+    /// does not depend on recreating a previous inventory-derived plan.
+    pub fn for_plan(
+        action: &str,
+        plan: &FleetMutationPlan,
+    ) -> Result<Self, FleetMutationRequestBindingError> {
+        // Refuse oversized plans while encoding, before cloning their strings
+        // into a second JSON tree. The subsequent canonical hash enforces the
+        // independent depth/node/framing budget as for explicit requests.
+        let mut encoded = BoundedFleetRequestBuffer::default();
+        serde_json::to_writer(&mut encoded, plan).map_err(|_| {
+            if encoded.exceeded {
+                FleetMutationRequestBindingError::RequestTooLarge
+            } else {
+                FleetMutationRequestBindingError::InvalidEncoding
+            }
+        })?;
+        let request = serde_json::from_slice(&encoded.bytes)
+            .map_err(|_| FleetMutationRequestBindingError::InvalidEncoding)?;
+        Self::new(plan.idempotency_key.as_str(), action, &request)
+    }
+
+    #[must_use]
+    pub fn idempotency_key(&self) -> &str {
+        &self.idempotency_key
+    }
+
+    #[must_use]
+    pub fn action(&self) -> &str {
+        &self.action
+    }
+
+    #[must_use]
+    pub fn request_sha256(&self) -> &str {
+        &self.request_sha256
+    }
+
+    /// Validate the bounded authority representation before a store operation.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        valid_fleet_request_key(&self.idempotency_key)
+            && valid_fleet_request_action(&self.action)
+            && self.request_sha256.len() == 64
+            && self
+                .request_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+}
+
+fn valid_fleet_request_key(key: &str) -> bool {
+    !key.trim().is_empty()
+        && key.len() <= MAX_FLEET_REQUEST_KEY_BYTES
+        && !key.as_bytes().contains(&0)
+}
+
+fn valid_fleet_request_action(action: &str) -> bool {
+    !action.is_empty()
+        && action.len() <= MAX_FLEET_REQUEST_ACTION_BYTES
+        && action
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+#[derive(Default)]
+struct BoundedFleetRequestBuffer {
+    bytes: Vec<u8>,
+    exceeded: bool,
+}
+
+impl std::io::Write for BoundedFleetRequestBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.bytes.len().saturating_add(bytes.len()) > MAX_FLEET_REQUEST_BYTES {
+            self.exceeded = true;
+            return Err(std::io::Error::other(
+                "fleet request encoding exceeds its bound",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+struct FleetRequestHashBudget {
+    bytes: usize,
+    nodes: usize,
+}
+
+impl FleetRequestHashBudget {
+    fn field(
+        &mut self,
+        hasher: &mut Sha256,
+        bytes: &[u8],
+    ) -> Result<(), FleetMutationRequestBindingError> {
+        self.bytes = self
+            .bytes
+            .checked_sub(bytes.len().saturating_add(8))
+            .ok_or(FleetMutationRequestBindingError::RequestTooLarge)?;
+        let length = u64::try_from(bytes.len())
+            .map_err(|_| FleetMutationRequestBindingError::RequestTooLarge)?;
+        hasher.update(length.to_be_bytes());
+        hasher.update(bytes);
+        Ok(())
+    }
+}
+
+fn hash_fleet_request_value(
+    hasher: &mut Sha256,
+    value: &serde_json::Value,
+    budget: &mut FleetRequestHashBudget,
+    depth: usize,
+) -> Result<(), FleetMutationRequestBindingError> {
+    if depth > MAX_FLEET_REQUEST_DEPTH {
+        return Err(FleetMutationRequestBindingError::RequestTooLarge);
+    }
+    budget.nodes = budget
+        .nodes
+        .checked_sub(1)
+        .ok_or(FleetMutationRequestBindingError::RequestTooLarge)?;
+    budget.bytes = budget
+        .bytes
+        .checked_sub(1)
+        .ok_or(FleetMutationRequestBindingError::RequestTooLarge)?;
+    match value {
+        serde_json::Value::Null => hasher.update(b"n"),
+        serde_json::Value::Bool(value) => hasher.update(if *value { b"t" } else { b"f" }),
+        serde_json::Value::Number(value) => {
+            hasher.update(b"d");
+            budget.field(hasher, value.to_string().as_bytes())?;
+        }
+        serde_json::Value::String(value) => {
+            hasher.update(b"s");
+            budget.field(hasher, value.as_bytes())?;
+        }
+        serde_json::Value::Array(values) => {
+            if values.len() > budget.nodes {
+                return Err(FleetMutationRequestBindingError::RequestTooLarge);
+            }
+            hasher.update(b"a");
+            budget.field(hasher, values.len().to_string().as_bytes())?;
+            for value in values {
+                hash_fleet_request_value(hasher, value, budget, depth + 1)?;
+            }
+        }
+        serde_json::Value::Object(values) => {
+            if values.len() > budget.nodes {
+                return Err(FleetMutationRequestBindingError::RequestTooLarge);
+            }
+            hasher.update(b"o");
+            budget.field(hasher, values.len().to_string().as_bytes())?;
+            let mut entries: Vec<_> = values.iter().collect();
+            entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            for (key, value) in entries {
+                budget.field(hasher, key.as_bytes())?;
+                hash_fleet_request_value(hasher, value, budget, depth + 1)?;
+            }
+        }
+    }
+    Ok(())
+}
 
 /// One daemon-side fleet/profile mutation action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -284,6 +527,30 @@ pub struct FleetMutationReceipt {
 }
 
 impl FleetMutationReceipt {
+    /// Record an admitted request that needs no mutations at its planning point.
+    ///
+    /// Persisting this result binds an explicit caller key even when inventory
+    /// already meets its target. A later retry cannot turn that same request
+    /// into a new mutation after inventory changes.
+    pub fn no_op(plan: &FleetMutationPlan) -> Result<Self, FleetMutationPlanError> {
+        if plan.plan_id.trim().is_empty() {
+            return Err(FleetMutationPlanError::EmptyPlanId);
+        }
+        if !plan.steps.is_empty() {
+            return Err(FleetMutationPlanError::NonEmptyNoOp);
+        }
+        Ok(receipt_with_counts(
+            plan,
+            if plan.dry_run {
+                FleetMutationReceiptStatus::DryRun
+            } else {
+                FleetMutationReceiptStatus::Succeeded
+            },
+            false,
+            Vec::new(),
+        ))
+    }
+
     #[must_use]
     pub fn replay(mut self) -> Self {
         self.idempotent_replay = true;
@@ -320,6 +587,7 @@ impl FleetMutationReceipt {
 pub enum FleetMutationPlanError {
     EmptyPlanId,
     EmptyPlan,
+    NonEmptyNoOp,
     EmptyStepId {
         step_index: usize,
     },
@@ -340,6 +608,9 @@ impl std::fmt::Display for FleetMutationPlanError {
         match self {
             Self::EmptyPlanId => f.write_str("fleet mutation plan_id must not be empty"),
             Self::EmptyPlan => f.write_str("fleet mutation plan must contain at least one step"),
+            Self::NonEmptyNoOp => {
+                f.write_str("fleet mutation no-op receipt must not contain mutation steps")
+            }
             Self::EmptyStepId { step_index } => {
                 write!(
                     f,
@@ -894,6 +1165,173 @@ mod tests {
             policy: FleetMutationPolicyDecision::Allow,
             compensation,
         }
+    }
+
+    #[test]
+    fn request_binding_canonicalizes_objects_and_hides_request_material() {
+        let left: serde_json::Value =
+            serde_json::from_str(r#"{"program":"codex","options":{"force":false,"count":3}}"#)
+                .unwrap();
+        let right: serde_json::Value =
+            serde_json::from_str(r#"{"options":{"count":3,"force":false},"program":"codex"}"#)
+                .unwrap();
+        let first =
+            FleetMutationRequestBinding::new("private-request-key", "scale", &left).unwrap();
+        let reordered =
+            FleetMutationRequestBinding::new("private-request-key", "scale", &right).unwrap();
+        assert_eq!(first, reordered);
+        assert!(first.is_valid());
+        let debug = format!("{first:?}");
+        assert!(!debug.contains("private-request-key"));
+        assert!(!debug.contains("codex"));
+
+        let different_key =
+            FleetMutationRequestBinding::new(" other-key ", "scale", &left).unwrap();
+        assert_eq!(different_key.idempotency_key(), " other-key ");
+        assert_eq!(first.request_sha256(), different_key.request_sha256());
+        assert_ne!(first, different_key);
+        let other_action =
+            FleetMutationRequestBinding::new("private-request-key", "rebalance", &left).unwrap();
+        assert_ne!(first.request_sha256(), other_action.request_sha256());
+    }
+
+    #[test]
+    fn request_binding_keeps_types_array_order_and_field_boundaries_distinct() {
+        let requests = [
+            serde_json::json!(null),
+            serde_json::json!(false),
+            serde_json::json!(0),
+            serde_json::json!("0"),
+            serde_json::json!(["a", "b"]),
+            serde_json::json!(["b", "a"]),
+            serde_json::json!(["a:b", "c"]),
+            serde_json::json!(["a", "b:c"]),
+            serde_json::json!({"a:b": "c"}),
+            serde_json::json!({"a": "b:c"}),
+            serde_json::json!({"a": {"b": "c"}}),
+        ];
+        let hashes: BTreeSet<String> = requests
+            .iter()
+            .map(|request| {
+                FleetMutationRequestBinding::new("same-key", "scale", request)
+                    .unwrap()
+                    .request_sha256()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(hashes.len(), requests.len());
+    }
+
+    #[test]
+    fn request_binding_enforces_key_action_depth_node_and_byte_limits() {
+        use FleetMutationRequestBindingError::{InvalidAction, InvalidKey, RequestTooLarge};
+        let request = serde_json::json!({"target_count": 3});
+        for key in [
+            "".to_string(),
+            " \n".to_string(),
+            "nul\0key".to_string(),
+            "k".repeat(513),
+        ] {
+            assert_eq!(
+                FleetMutationRequestBinding::new(&key, "scale", &request),
+                Err(InvalidKey)
+            );
+        }
+        for action in ["", "Scale", "scale-up", "é", &"a".repeat(65)] {
+            assert_eq!(
+                FleetMutationRequestBinding::new("key", action, &request),
+                Err(InvalidAction)
+            );
+        }
+        let huge = serde_json::Value::String("x".repeat(MAX_FLEET_REQUEST_BYTES));
+        assert_eq!(
+            FleetMutationRequestBinding::new("key", "scale", &huge),
+            Err(RequestTooLarge)
+        );
+        let wide = serde_json::Value::Array(vec![serde_json::Value::Null; MAX_FLEET_REQUEST_NODES]);
+        assert_eq!(
+            FleetMutationRequestBinding::new("key", "scale", &wide),
+            Err(RequestTooLarge)
+        );
+        let mut deep = serde_json::Value::Null;
+        for _ in 0..MAX_FLEET_REQUEST_DEPTH {
+            deep = serde_json::Value::Array(vec![deep]);
+        }
+        assert!(FleetMutationRequestBinding::new("key", "scale", &deep).is_ok());
+        deep = serde_json::Value::Array(vec![deep]);
+        assert_eq!(
+            FleetMutationRequestBinding::new("key", "scale", &deep),
+            Err(RequestTooLarge)
+        );
+    }
+
+    #[test]
+    fn generated_binding_tracks_the_plan_and_refuses_oversized_encoding() {
+        let original = FleetMutationPlan::with_client_key(
+            "scale-down",
+            false,
+            vec![stop_step("stop", 7)],
+            "caller-key",
+        );
+        let changed = FleetMutationPlan::with_client_key(
+            "scale-down",
+            false,
+            vec![stop_step("stop", 8)],
+            "caller-key",
+        );
+        assert_ne!(
+            FleetMutationRequestBinding::for_plan("scale", &original).unwrap(),
+            FleetMutationRequestBinding::for_plan("scale", &changed).unwrap(),
+        );
+        let mut oversized = original;
+        if let FleetMutationAction::StopAgent { reason, .. } = &mut oversized.steps[0].action {
+            *reason = "x".repeat(MAX_FLEET_REQUEST_BYTES);
+        }
+        assert_eq!(
+            FleetMutationRequestBinding::for_plan("scale", &oversized),
+            Err(FleetMutationRequestBindingError::RequestTooLarge),
+        );
+    }
+
+    #[test]
+    fn no_op_receipt_binds_only_an_empty_valid_plan() {
+        for dry_run in [false, true] {
+            let plan =
+                FleetMutationPlan::with_client_key("at-target", dry_run, Vec::new(), "caller-key");
+            let receipt = FleetMutationReceipt::no_op(&plan).unwrap();
+            assert_eq!(receipt.idempotency_key, plan.idempotency_key);
+            assert_eq!(receipt.payload_fingerprint, plan.payload_fingerprint);
+            assert_eq!(receipt.dry_run, dry_run);
+            assert_eq!(
+                receipt.status,
+                if dry_run {
+                    FleetMutationReceiptStatus::DryRun
+                } else {
+                    FleetMutationReceiptStatus::Succeeded
+                }
+            );
+            assert_eq!(
+                (
+                    receipt.completed_count,
+                    receipt.failed_count,
+                    receipt.compensated_count,
+                    receipt.skipped_count
+                ),
+                (0, 0, 0, 0)
+            );
+            assert!(receipt.steps.is_empty());
+            assert!(!receipt.idempotent_replay);
+        }
+        let nonempty = FleetMutationPlan::new("must-execute", false, vec![spawn_step("one")]);
+        assert_eq!(
+            FleetMutationReceipt::no_op(&nonempty),
+            Err(FleetMutationPlanError::NonEmptyNoOp)
+        );
+        let invalid = FleetMutationPlan::new(" ", false, Vec::new());
+        assert_eq!(
+            FleetMutationReceipt::no_op(&invalid),
+            Err(FleetMutationPlanError::EmptyPlanId)
+        );
     }
 
     #[test]
