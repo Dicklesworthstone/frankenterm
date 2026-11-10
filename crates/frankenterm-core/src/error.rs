@@ -1476,6 +1476,14 @@ pub enum WorkflowTriggerRejection {
     MissingEvent,
     #[error("the stored event belongs to a different pane")]
     PaneMismatch,
+    #[error("the stored event does not belong to the current observed pane incarnation")]
+    SourceIdentityMismatch,
+    #[error("the workflow detection does not match a valid stored event")]
+    InvalidDetection,
+    #[error("the stored detection is outside the bounded workflow recovery window")]
+    StaleDetection,
+    #[error("the stored event cursor belongs to a retired retention epoch")]
+    EventEpochMismatch,
     #[error("the stored event has already been handled")]
     AlreadyHandled,
     #[error("the stored event already belongs to execution {execution_id}")]

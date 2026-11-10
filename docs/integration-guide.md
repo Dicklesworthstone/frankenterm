@@ -170,6 +170,41 @@ fallback.
 | `robot workflow status <id> --detail` | `WorkflowStatusDetailData` | Step-by-step log for a single execution |
 | `robot workflow abort` | `WorkflowAbortData` | Abort confirmation |
 
+#### Automatic detection recovery
+
+`ft watch` subscribes to detections and captures a durable event boundary before
+starting observation. A notification for a persisted detection wakes the workflow
+runner; the stored event is authoritative. Periodic, ordered, bounded pages recover
+missed publications and revisit temporary admission failures, including a busy
+pane, the concurrency limit, or a rate limit. A blocked detection does not prevent
+other panes from being considered.
+
+Recovery can create a new workflow only when all of these conditions hold:
+
+- The event is after the current watcher's startup boundary and remains within
+  that session's retention epoch, with complete retention continuity.
+- The source pane is currently observed, its UUID matches, and the stored event's
+  identity hash binds that pane incarnation to the authoritative detection
+  payload. A reused numeric pane ID is insufficient.
+- The payload is valid and `detected_at` is positive, no later than the current
+  time, and at most five minutes old when admission is attempted.
+
+Expired, unbound, pruned, cross-epoch, and pre-boundary historical detections do not
+start new workflows. Expired events remain unhandled; advancing the recovery scan
+does not mark them as successfully processed. Storage failures and rejected or
+unverifiable recovery are visible in watcher logs. Continuity failures do not
+silently rebase the scan onto newer history. Use `ft robot events` and
+`ft robot workflow status --all` to distinguish retained detections from admitted
+executions.
+
+These checks bind durable workflow admission to its source; they do not provide an
+atomic guarantee spanning admission through every eventual terminal effect.
+Recovery also does not revalidate that the original trigger condition still holds
+on the current terminal screen. A cross-restart outbox for detections that never
+reached admission is not implemented: restarting the watcher establishes a new
+boundary. The existing resume path for previously admitted, incomplete workflow
+executions is unchanged.
+
 ### Rules & pattern tooling
 
 | Command | Type | Description |

@@ -39143,7 +39143,10 @@ mod watch_events_tests {
             assert_eq!(action, IpcRelayAction::DurableWakeup);
             assert_eq!(cursor, Some(7));
             assert_eq!(last_event_emit, None);
-            assert_eq!(last_emit, before, "private baseline must emit no public row");
+            assert_eq!(
+                last_emit, before,
+                "private baseline must emit no public row"
+            );
 
             for (key, value) in [
                 ("cursor", serde_json::json!(-1)),
@@ -39176,8 +39179,7 @@ mod watch_events_tests {
                 "reason": "fresh_tail_baseline",
             });
             for mut record in [ipc_persisted_event(1), checkpoint] {
-                record["cursor_epoch"] =
-                    serde_json::json!("fedcba9876543210fedcba9876543210");
+                record["cursor_epoch"] = serde_json::json!("fedcba9876543210fedcba9876543210");
                 let action = relay_ipc_event_line(
                     &cx,
                     &stdout,
@@ -48380,7 +48382,9 @@ async fn run_watcher(
         // The runner retains this bounded subscription throughout recovery;
         // task scheduling and unfinished workflows must not discard the first
         // detections from the newly started capture pipeline.
-        let workflow_subscriber = event_bus.subscribe_detections();
+        let workflow_subscriber = workflow_runner
+            .subscribe_with_cx(&frankenterm_core::cx::for_request(), &event_bus)
+            .await?;
         let workflow_shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let task_shutdown_flag = Arc::clone(&workflow_shutdown_flag);
         let workflow_shutdown_notify =

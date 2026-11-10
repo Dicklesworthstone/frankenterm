@@ -13,6 +13,185 @@ use tracing::{debug, warn};
 
 const WORKFLOW_INDEPENDENT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const WORKFLOW_RUNNER_CHILD_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const WORKFLOW_DETECTION_REPLAY_PAGE_SIZE: usize = 64;
+const WORKFLOW_DETECTION_REPLAY_INTERVAL: Duration = Duration::from_millis(250);
+
+/// A detection subscription prepared before the observation runtime starts.
+///
+/// The optional replay boundary belongs to this watcher session. It does not
+/// authorize historical events from a previous watcher or configuration.
+pub struct WorkflowEventSubscription {
+    subscriber: crate::events::EventSubscriber,
+    replay: Option<WorkflowDetectionReplay>,
+}
+
+struct RecoveredWorkflowSource {
+    pane_uuid: String,
+    event_epoch: String,
+    detected_at: i64,
+}
+
+struct WorkflowDetectionReplay {
+    cursor: crate::event_stream::DurableStreamCursor,
+    sweep_until: Option<i64>,
+    retry_after: Option<i64>,
+    rows: std::collections::VecDeque<crate::storage::StoredEvent>,
+    page_through: Option<i64>,
+    next_poll: Instant,
+}
+
+impl WorkflowDetectionReplay {
+    fn new(baseline: crate::storage::EventRetentionSnapshot) -> Self {
+        Self {
+            cursor: crate::event_stream::DurableStreamCursor {
+                after_id: baseline.max_event_id,
+                epoch: baseline.cursor_epoch,
+            },
+            sweep_until: None,
+            retry_after: None,
+            rows: std::collections::VecDeque::new(),
+            page_through: None,
+            next_poll: Instant::now(),
+        }
+    }
+
+    fn retry(&mut self, event_id: i64) {
+        let after_id = event_id.saturating_sub(1);
+        self.retry_after = Some(self.retry_after.map_or(after_id, |old| old.min(after_id)));
+    }
+
+    fn wake(&mut self, event_id: Option<i64>) {
+        if event_id.is_none_or(|id| id > self.cursor.after_id) {
+            self.next_poll = Instant::now();
+        }
+    }
+
+    /// Read one bounded page per turn. Freeze a sweep's upper watermark so
+    /// continuous insertion cannot starve a temporarily blocked earlier pane.
+    async fn next_stored_with_cx(
+        &mut self,
+        cx: &crate::cx::Cx,
+        storage: &crate::storage::StorageHandle,
+    ) -> Result<Option<crate::storage::StoredEvent>, crate::event_stream::DurableStreamError> {
+        use crate::event_stream::DurableStreamError;
+
+        cx.checkpoint().map_err(|_| DurableStreamError::Cancelled)?;
+        if let Some(row) = self.rows.pop_front() {
+            return Ok(Some(row));
+        }
+        if let Some(through_id) = self.page_through.take() {
+            self.cursor.after_id = through_id;
+            if self.sweep_until == Some(through_id) {
+                self.cursor.after_id = self.retry_after.take().unwrap_or(through_id);
+                self.sweep_until = None;
+                self.next_poll = Instant::now() + WORKFLOW_DETECTION_REPLAY_INTERVAL;
+            } else {
+                // Give shutdown, completed children, and live-only signals a
+                // turn between pages even when the durable backlog is large.
+                crate::runtime_async::task::yield_now().await;
+            }
+            return Ok(None);
+        }
+        if Instant::now() < self.next_poll {
+            return Ok(None);
+        }
+
+        let page = storage
+            .get_events_stream_page_with_cx(
+                cx,
+                crate::storage::EventStreamQuery {
+                    after_id: Some(self.cursor.after_id),
+                    limit: Some(WORKFLOW_DETECTION_REPLAY_PAGE_SIZE),
+                    unhandled_only: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(DurableStreamError::Storage)?;
+        let upper = self.sweep_until.unwrap_or(page.retention.max_event_id);
+        let mut previous = self.cursor.after_id;
+        if page.events.len() > WORKFLOW_DETECTION_REPLAY_PAGE_SIZE
+            || upper < self.cursor.after_id
+            || page.retention.max_event_id < upper
+            || !page.events.iter().all(|event| {
+                let ordered = event.id > previous && event.id <= page.retention.max_event_id;
+                previous = event.id;
+                ordered
+            })
+        {
+            return Err(DurableStreamError::InvalidPage);
+        }
+        let reaches_upper = page.events.len() < WORKFLOW_DETECTION_REPLAY_PAGE_SIZE
+            || page.events.last().is_some_and(|event| event.id >= upper);
+        let through_id = if reaches_upper {
+            upper
+        } else {
+            page.events.last().map_or(upper, |event| event.id)
+        };
+        let retention = storage
+            .check_event_retention_in_epoch_with_cx(
+                cx,
+                self.cursor.after_id,
+                through_id,
+                &self.cursor.epoch,
+            )
+            .await
+            .map_err(DurableStreamError::Storage)?;
+        if page.retention.cursor_epoch != self.cursor.epoch
+            || retention.snapshot.cursor_epoch != self.cursor.epoch
+            || !matches!(
+                retention.status,
+                crate::storage::EventRetentionStatus::CompleteNoPruning
+            )
+        {
+            return Err(DurableStreamError::CursorExpired(Box::new(retention)));
+        }
+        if retention.checked_through_id != through_id
+            || retention.snapshot.max_event_id < page.retention.max_event_id
+            || retention.snapshot.generation < page.retention.generation
+        {
+            return Err(DurableStreamError::InvalidPage);
+        }
+        tracing::debug!(
+            after_id = self.cursor.after_id,
+            through_id,
+            sweep_until = upper,
+            rows = page.events.len(),
+            "Reconciled workflow detection page"
+        );
+        self.sweep_until = Some(upper);
+        self.page_through = Some(through_id);
+        self.rows = page
+            .events
+            .into_iter()
+            .take_while(|event| event.id <= upper)
+            .collect();
+        self.next_poll = Instant::now();
+        Ok(self.rows.pop_front())
+    }
+}
+
+/// Action admission has stricter decoding than display-only event streams.
+fn workflow_detection_from_stored(
+    stored: &crate::storage::StoredEvent,
+) -> Option<crate::patterns::Detection> {
+    if stored.id <= 0 || !stored.confidence.is_finite() || !(0.0..=1.0).contains(&stored.confidence)
+    {
+        return None;
+    }
+    Some(crate::patterns::Detection {
+        rule_id: stored.rule_id.clone(),
+        agent_type: serde_json::from_value(serde_json::Value::String(stored.agent_type.clone()))
+            .ok()?,
+        event_type: stored.event_type.clone(),
+        severity: serde_json::from_value(serde_json::Value::String(stored.severity.clone()))
+            .ok()?,
+        confidence: stored.confidence,
+        extracted: stored.extracted.clone().unwrap_or(serde_json::Value::Null),
+        matched_text: stored.matched_text.clone().unwrap_or_default(),
+        span: (0, 0),
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkflowRunnerChildDrainOutcome {
@@ -805,6 +984,8 @@ pub struct WorkflowRunner {
     lock_manager: Arc<PaneWorkflowLockManager>,
     /// Storage handle for persistence
     storage: Arc<crate::storage::StorageHandle>,
+    /// Live incarnation authority for automatic durable detection recovery.
+    source_registry: Option<Arc<crate::runtime_async::RwLock<crate::ingest::PaneRegistry>>>,
     /// Policy-gated injector for terminal input
     injector: CxPolicyInjector,
     /// Optional replay capture adapter for decision provenance.
@@ -845,6 +1026,7 @@ impl WorkflowRunner {
             lock_manager,
             injector: injector.with_capability_source(Arc::clone(&storage), None),
             storage,
+            source_registry: None,
             replay_capture: None,
             external_signals: None,
             config,
@@ -867,6 +1049,7 @@ impl WorkflowRunner {
         mut self,
         registry: Arc<crate::runtime_async::RwLock<crate::ingest::PaneRegistry>>,
     ) -> Self {
+        self.source_registry = Some(Arc::clone(&registry));
         self.injector = self.injector.with_capability_source(
             Arc::clone(&self.storage),
             Some(crate::pane_capability_resolution::WatcherCapabilitySource::Registry(registry)),
@@ -882,6 +1065,7 @@ impl WorkflowRunner {
         registry: Arc<crate::runtime_async::RwLock<crate::ingest::PaneRegistry>>,
         mux: crate::wezterm::WeztermHandle,
     ) -> Self {
+        self.source_registry = Some(Arc::clone(&registry));
         self.injector = self.injector.with_capability_source(
             Arc::clone(&self.storage),
             Some(
@@ -1008,6 +1192,18 @@ impl WorkflowRunner {
         pane_id: u64,
         detection: &crate::patterns::Detection,
         event_id: Option<i64>,
+    ) -> WorkflowStartResult {
+        self.handle_detection_for_source_with_cx(cx, pane_id, detection, event_id, None)
+            .await
+    }
+
+    async fn handle_detection_for_source_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        detection: &crate::patterns::Detection,
+        event_id: Option<i64>,
+        source: Option<&RecoveredWorkflowSource>,
     ) -> WorkflowStartResult {
         if cx.is_cancel_requested() {
             return WorkflowStartResult::Error {
@@ -1145,6 +1341,8 @@ impl WorkflowRunner {
             "matched_text": detection.matched_text,
             "span": { "start": detection.span.0, "end": detection.span.1 },
             "source_pane_id": source_pane_id,
+            "source_pane_uuid": source.map(|source| source.pane_uuid.as_str()),
+            "source_event_epoch": source.map(|source| source.event_epoch.as_str()),
             "detection": {
                 "rule_id": detection.rule_id,
                 "matched_text": detection.matched_text,
@@ -1152,7 +1350,51 @@ impl WorkflowRunner {
             }
         });
 
-        match self
+        // Discovery publishes the live registry before its durable pane
+        // upsert. Keep this short read guard through the admission transaction
+        // so that neither authority can silently validate a predecessor while
+        // the other already describes its replacement. No workflow code or
+        // nested capability lookup runs while this guard is held.
+        let source_guard = if let Some(source) = source {
+            let Some(event_id) = event_id else {
+                return WorkflowStartResult::Error {
+                    error: "recovered workflow source has no durable event".to_string(),
+                };
+            };
+            let Some(registry) = &self.source_registry else {
+                return WorkflowStartResult::TriggerRejected {
+                    event_id,
+                    reason: crate::error::WorkflowTriggerRejection::SourceIdentityMismatch,
+                };
+            };
+            let registry = match registry.read_with_cx(cx).await {
+                Ok(registry) => registry,
+                Err(error) => {
+                    return WorkflowStartResult::Error {
+                        error: format!("workflow source identity unavailable: {error}"),
+                    };
+                }
+            };
+            if !registry
+                .get_entry(pane_id)
+                .is_some_and(|pane| pane.should_observe() && pane.pane_uuid == source.pane_uuid)
+            {
+                return WorkflowStartResult::TriggerRejected {
+                    event_id,
+                    reason: crate::error::WorkflowTriggerRejection::SourceIdentityMismatch,
+                };
+            }
+            if !crate::storage::workflow_trigger_recovery_is_fresh(source.detected_at, now_ms()) {
+                return WorkflowStartResult::TriggerRejected {
+                    event_id,
+                    reason: crate::error::WorkflowTriggerRejection::StaleDetection,
+                };
+            }
+            Some(registry)
+        } else {
+            None
+        };
+        let started = self
             .engine
             .start_with_id_cx(
                 cx,
@@ -1165,8 +1407,9 @@ impl WorkflowRunner {
                     context: Some(context),
                 },
             )
-            .await
-        {
+            .await;
+        drop(source_guard);
+        match started {
             Ok(execution) => {
                 if let Err(error) = self
                     .initialize_execution_budget_with_cx(cx, &execution_id, execution.started_at)
@@ -1209,6 +1452,33 @@ impl WorkflowRunner {
                 }
             }
         }
+    }
+
+    async fn replay_source_uuid_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        stored: &crate::storage::StoredEvent,
+        detection: &crate::patterns::Detection,
+    ) -> crate::Result<Option<String>> {
+        let Some(registry) = &self.source_registry else {
+            return Ok(None);
+        };
+        let registry = registry.read_with_cx(cx).await.map_err(|error| {
+            workflow_runner_cancelled("workflow.replay_source", error.to_string())
+        })?;
+        let Some(pane) = registry.get_entry(stored.pane_id) else {
+            return Ok(None);
+        };
+        if !pane.should_observe() || pane.pane_uuid.trim().is_empty() {
+            return Ok(None);
+        }
+        let expected =
+            crate::events::event_identity_key(detection, stored.pane_id, Some(&pane.pane_uuid));
+        let bound = stored.dedupe_key.as_deref().is_some_and(|key| {
+            key.strip_prefix(&expected)
+                .is_some_and(|suffix| suffix.starts_with(':') && suffix.len() > 1)
+        });
+        Ok(bound.then(|| pane.pane_uuid.clone()))
     }
 
     /// Manually start and run a workflow to completion (ft-cli44).
@@ -3276,8 +3546,13 @@ impl WorkflowRunner {
     ///
     /// Legacy [`run`](Self::run) preserved unchanged.
     pub async fn run_with_cx(&self, cx: &crate::cx::Cx, event_bus: &crate::events::EventBus) {
-        let subscriber = event_bus.subscribe_detections();
-        self.run_subscribed_with_cx(cx, subscriber, None).await;
+        match self.subscribe_with_cx(cx, event_bus).await {
+            Ok(subscription) => self.run_subscribed_with_cx(cx, subscription, None).await,
+            Err(error) => tracing::error!(
+                error = %error,
+                "Workflow detection subscription could not establish its storage boundary"
+            ),
+        }
     }
 
     /// Run the event loop with an explicit cooperative shutdown channel.
@@ -3294,9 +3569,46 @@ impl WorkflowRunner {
         shutdown_flag: &std::sync::atomic::AtomicBool,
         shutdown_notify: &crate::runtime_async::notify::Notify,
     ) {
+        match self.subscribe_with_cx(cx, event_bus).await {
+            Ok(subscription) => {
+                self.run_subscribed_with_cx(
+                    cx,
+                    subscription,
+                    Some((shutdown_flag, shutdown_notify)),
+                )
+                .await;
+            }
+            Err(error) => tracing::error!(
+                error = %error,
+                "Workflow detection subscription could not establish its storage boundary"
+            ),
+        }
+    }
+
+    /// Subscribe and capture this session's durable event boundary.
+    ///
+    /// The watcher calls this before spawning its workflow task or starting
+    /// observation. A live registry enables ordered recovery of newly stored
+    /// detections; without incarnation authority the subscription remains
+    /// live-only. Earlier events are never newly authorized by startup.
+    pub async fn subscribe_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        event_bus: &crate::events::EventBus,
+    ) -> crate::Result<WorkflowEventSubscription> {
+        cx.checkpoint()
+            .map_err(|error| workflow_runner_cancelled("workflow.subscribe", error.to_string()))?;
         let subscriber = event_bus.subscribe_detections();
-        self.run_subscribed_with_cx(cx, subscriber, Some((shutdown_flag, shutdown_notify)))
-            .await;
+        let replay = if self.source_registry.is_some() {
+            Some(WorkflowDetectionReplay::new(
+                self.storage
+                    .get_event_retention_snapshot_with_cx(cx)
+                    .await?,
+            ))
+        } else {
+            None
+        };
+        Ok(WorkflowEventSubscription { subscriber, replay })
     }
 
     /// Recover unfinished workflows and run with an already-owned detection
@@ -3304,20 +3616,26 @@ impl WorkflowRunner {
     /// spawning the runner or starting observation: subscribing inside an
     /// asynchronous task leaves a window where initial detections are lost.
     ///
-    /// The same subscription buffers detections while recovery awaits stored
-    /// workflows. Its capacity and lag reporting remain those of the event
-    /// bus; this does not replay events from storage after a process crash.
+    /// With live incarnation authority, persisted notifications only wake an
+    /// ordered storage scan. Periodic scans recover missed publications and
+    /// bounded sweeps revisit temporary admission failures without blocking
+    /// other panes. Newly recovered admissions expire five minutes after
+    /// detection; they do not replay pre-boundary history after a crash.
     /// When supplied, the shutdown flag and notification must be the pair
     /// owned by the surrounding [`crate::watchdog::WatchdogHandle`].
     pub async fn run_subscribed_with_cx(
         &self,
         cx: &crate::cx::Cx,
-        mut subscriber: crate::events::EventSubscriber,
+        subscription: WorkflowEventSubscription,
         shutdown: Option<(
             &std::sync::atomic::AtomicBool,
             &crate::runtime_async::notify::Notify,
         )>,
     ) {
+        let WorkflowEventSubscription {
+            mut subscriber,
+            mut replay,
+        } = subscription;
         if shutdown.is_some_and(|(flag, _)| flag.load(Ordering::SeqCst)) {
             tracing::info!(
                 explicit_cx = true,
@@ -3384,14 +3702,124 @@ impl WorkflowRunner {
                 break;
             }
 
-            let next_event = match wait_for_workflow_runner_activity(
-                cx,
-                &mut subscriber,
-                &mut child_tasks,
-                shutdown,
-            )
-            .await
-            {
+            let recovered = if let Some(replay) = &mut replay {
+                match replay.next_stored_with_cx(cx, &self.storage).await {
+                    Ok(row) => row,
+                    Err(crate::event_stream::DurableStreamError::Storage(error)) => {
+                        tracing::warn!(
+                            error = %error,
+                            after_id = replay.cursor.after_id,
+                            "Workflow detection replay storage unavailable; retaining cursor"
+                        );
+                        replay.next_poll = Instant::now() + WORKFLOW_DETECTION_REPLAY_INTERVAL;
+                        None
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            error = %error,
+                            after_id = replay.cursor.after_id,
+                            "Workflow detection continuity unavailable; stopping without rebasing"
+                        );
+                        break;
+                    }
+                }
+            } else {
+                None
+            };
+            let mut recovered_source = None;
+            let wake = if let Some(stored) = recovered {
+                if !crate::storage::workflow_trigger_recovery_is_fresh(stored.detected_at, now_ms())
+                {
+                    tracing::warn!(
+                        event_id = stored.id,
+                        pane_id = stored.pane_id,
+                        reason = "stale_detection",
+                        "Refused recovered workflow detection"
+                    );
+                    continue;
+                }
+                let Some(detection) = workflow_detection_from_stored(&stored) else {
+                    tracing::warn!(
+                        event_id = stored.id,
+                        pane_id = stored.pane_id,
+                        reason = "invalid_detection",
+                        "Refused recovered workflow detection"
+                    );
+                    continue;
+                };
+                let pane_uuid = match self
+                    .replay_source_uuid_with_cx(cx, &stored, &detection)
+                    .await
+                {
+                    Ok(Some(uuid)) => uuid,
+                    Ok(None) => {
+                        tracing::warn!(
+                            event_id = stored.id,
+                            pane_id = stored.pane_id,
+                            reason = "source_identity_mismatch",
+                            "Refused recovered workflow detection"
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            event_id = stored.id,
+                            error = %error,
+                            "Workflow source identity unavailable; retaining detection for retry"
+                        );
+                        if let Some(replay) = &mut replay {
+                            replay.retry(stored.id);
+                        }
+                        continue;
+                    }
+                };
+                let Some(replay) = &replay else {
+                    // A stored row without its subscription epoch cannot
+                    // authorize an action, even if the row looks valid.
+                    break;
+                };
+                recovered_source = Some(RecoveredWorkflowSource {
+                    pane_uuid: pane_uuid.clone(),
+                    event_epoch: replay.cursor.epoch.clone(),
+                    detected_at: stored.detected_at,
+                });
+                WorkflowRunnerWake::Event(Box::new(Ok(crate::events::Event::PatternDetected {
+                    pane_id: stored.pane_id,
+                    pane_uuid: Some(pane_uuid),
+                    detection,
+                    event_id: Some(stored.id),
+                })))
+            } else if let Some(replay) = &mut replay {
+                // A fixed deadline wins even under an uninterrupted stream of
+                // live notifications. Probe the bus between storage pages so
+                // lag and closure remain visible during a long catch-up.
+                if Instant::now() >= replay.next_poll {
+                    match subscriber.try_recv() {
+                        Some(event) => WorkflowRunnerWake::Event(Box::new(event)),
+                        None => continue,
+                    }
+                } else {
+                    match crate::runtime_async::timeout_with_cx(
+                        cx,
+                        replay.next_poll.saturating_duration_since(Instant::now()),
+                        wait_for_workflow_runner_activity(
+                            cx,
+                            &mut subscriber,
+                            &mut child_tasks,
+                            shutdown,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(wake) => wake,
+                        Err(_) => continue,
+                    }
+                }
+            } else {
+                wait_for_workflow_runner_activity(cx, &mut subscriber, &mut child_tasks, shutdown)
+                    .await
+            };
+            let next_event = match wake {
                 WorkflowRunnerWake::Shutdown => {
                     tracing::info!(
                         explicit_cx = true,
@@ -3427,9 +3855,37 @@ impl WorkflowRunner {
                         event_id,
                     } = event
                     {
+                        if recovered_source.is_none()
+                            && let Some(replay) = &mut replay
+                            && let Some(event_id) = event_id
+                        {
+                            // No notification can replace the stored payload,
+                            // jump the ordered cursor, or replay old history.
+                            replay.wake(Some(event_id));
+                            continue;
+                        }
                         let result = self
-                            .handle_detection_with_cx(cx, pane_id, &detection, event_id)
+                            .handle_detection_for_source_with_cx(
+                                cx,
+                                pane_id,
+                                &detection,
+                                event_id,
+                                recovered_source.as_ref(),
+                            )
                             .await;
+
+                        if recovered_source.is_some()
+                            && matches!(
+                                &result,
+                                WorkflowStartResult::PaneLocked { .. }
+                                    | WorkflowStartResult::ConcurrencyLimitReached { .. }
+                                    | WorkflowStartResult::PaneRateLimited { .. }
+                                    | WorkflowStartResult::Error { .. }
+                            )
+                            && let (Some(replay), Some(event_id)) = (&mut replay, event_id)
+                        {
+                            replay.retry(event_id);
+                        }
 
                         match result {
                             WorkflowStartResult::Started {
@@ -3451,6 +3907,7 @@ impl WorkflowRunner {
                                         engine,
                                         lock_manager,
                                         storage,
+                                        source_registry: self.source_registry.clone(),
                                         injector: self.injector.clone(),
                                         config,
                                         replay_capture: self.replay_capture.clone(),
@@ -3621,10 +4078,14 @@ impl WorkflowRunner {
                     }
                 }
                 Err(crate::events::RecvError::Lagged { missed_count }) => {
+                    if let Some(replay) = &mut replay {
+                        replay.wake(None);
+                    }
                     tracing::warn!(
                         skipped = missed_count,
                         explicit_cx = true,
-                        "Workflow runner lagged, skipped events (cx)"
+                        storage_replay = replay.is_some(),
+                        "Workflow notification gap; reconciling eligible stored detections"
                     );
                 }
                 Err(crate::events::RecvError::Cancelled) => {
@@ -6123,6 +6584,509 @@ mod tests {
         });
     }
 
+    async fn durable_ingress_registry(
+        storage: &StorageHandle,
+        pane_ids: &[u64],
+    ) -> Arc<crate::runtime_async::RwLock<crate::ingest::PaneRegistry>> {
+        let mut registry = crate::ingest::PaneRegistry::new();
+        let panes = pane_ids
+            .iter()
+            .map(|pane_id| {
+                serde_json::from_value::<crate::wezterm::PaneInfo>(serde_json::json!({
+                    "pane_id": pane_id,
+                    "tab_id": 1,
+                    "window_id": 1,
+                    "domain_name": "local",
+                    "title": "codex"
+                }))
+                .unwrap()
+            })
+            .collect();
+        registry.update(panes);
+        for pane_id in pane_ids {
+            seed_test_pane(storage, *pane_id, now_ms()).await;
+            assert!(registry.adopt_uuid(*pane_id, format!("pane-{pane_id}")));
+            assert!(registry.get_entry(*pane_id).unwrap().should_observe());
+        }
+        Arc::new(crate::runtime_async::RwLock::new(registry))
+    }
+
+    fn durable_ingress_detection() -> crate::patterns::Detection {
+        crate::patterns::Detection {
+            rule_id: "startup_ingress.trigger".to_string(),
+            ..unlimited_gate_detection()
+        }
+    }
+
+    async fn persist_durable_ingress_detection(storage: &StorageHandle, pane_id: u64) -> i64 {
+        persist_durable_ingress_detection_at(storage, pane_id, now_ms()).await
+    }
+
+    async fn persist_durable_ingress_detection_at(
+        storage: &StorageHandle,
+        pane_id: u64,
+        detected_at: i64,
+    ) -> i64 {
+        let detection = durable_ingress_detection();
+        let identity = crate::events::event_identity_key(
+            &detection,
+            pane_id,
+            Some(&format!("pane-{pane_id}")),
+        );
+        storage
+            .record_event(crate::storage::StoredEvent {
+                id: 0,
+                pane_id,
+                rule_id: detection.rule_id,
+                agent_type: detection.agent_type.to_string(),
+                event_type: detection.event_type,
+                severity: format!("{:?}", detection.severity).to_lowercase(),
+                confidence: detection.confidence,
+                extracted: Some(detection.extracted),
+                matched_text: Some(detection.matched_text),
+                segment_id: None,
+                detected_at,
+                dedupe_key: Some(format!("{identity}:{}", detected_at / 300_000)),
+                handled_at: None,
+                handled_by_workflow_id: None,
+                handled_status: None,
+            })
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn workflow_runner_recovers_lost_publications_and_ignores_forged_wake_payloads() {
+        run_async_test(async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("durable_ingress_lost_wake.db");
+            let (storage, runner, locks) = unlimited_gate_runner(path.to_str().unwrap()).await;
+            let registry = durable_ingress_registry(&storage, &[78, 79, 80, 999]).await;
+            let runner = runner.with_watcher_registry(registry);
+            let probe = Arc::new(StartupIngressProbeWorkflow::new());
+            runner.register_workflow(probe.clone());
+            let cx = crate::cx::for_testing();
+            let event_bus = crate::events::EventBus::new(1);
+            let subscription = runner.subscribe_with_cx(&cx, &event_bus).await.unwrap();
+            let first_id = persist_durable_ingress_detection(&storage, 78).await;
+            let second_id = persist_durable_ingress_detection(&storage, 79).await;
+
+            // Overflow the live channel with duplicate, out-of-order hints whose
+            // pane and detection payload disagree with the durable event IDs.
+            for event_id in [second_id, first_id, second_id] {
+                assert_eq!(
+                    event_bus.publish(crate::events::Event::PatternDetected {
+                        pane_id: 999,
+                        pane_uuid: Some("pane-999".to_string()),
+                        detection: crate::patterns::Detection {
+                            rule_id: "forged.unregistered.rule".to_string(),
+                            ..durable_ingress_detection()
+                        },
+                        event_id: Some(event_id),
+                    }),
+                    1
+                );
+            }
+            let runner_task = crate::runtime_async::task::spawn(async move {
+                runner.run_subscribed_with_cx(&cx, subscription, None).await;
+            });
+            wait_for_startup_executions(&storage, &probe, &[78, 79]).await;
+
+            // The runner is already active. This committed detection has no bus
+            // publication at all, so only periodic storage recovery can find it.
+            let third_id = persist_durable_ingress_detection(&storage, 80).await;
+            wait_for_startup_executions(&storage, &probe, &[78, 79, 80]).await;
+            assert_eq!(event_bus.metrics().snapshot().events_published, 3);
+            drop(event_bus);
+            let observer_cx = crate::cx::for_testing();
+            crate::runtime_async::timeout_with_cx(
+                &observer_cx,
+                Duration::from_secs(1),
+                runner_task,
+            )
+            .await
+            .expect("closed event bus must stop durable ingress")
+            .expect("durable ingress task must settle");
+            assert_eq!(probe.executions.lock().unwrap().len(), 3);
+            assert_eq!(locks.active_count(), 0);
+            let rows = storage
+                .get_events(crate::storage::EventQuery::default())
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 3);
+            for event_id in [first_id, second_id, third_id] {
+                let row = rows.iter().find(|row| row.id == event_id).unwrap();
+                assert!(row.handled_at.is_some());
+                let owner = storage
+                    .get_workflow(row.handled_by_workflow_id.as_deref().unwrap())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(owner.trigger_event_id, Some(event_id));
+                assert_eq!(owner.pane_id, row.pane_id);
+                assert_eq!(owner.status, "completed");
+            }
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn workflow_runner_retries_busy_pane_without_starving_other_panes() {
+        run_async_test(async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("durable_ingress_busy_pane.db");
+            let (storage, runner, locks) = unlimited_gate_runner(path.to_str().unwrap()).await;
+            let registry = durable_ingress_registry(&storage, &[78, 79]).await;
+            let runner = runner.with_watcher_registry(registry);
+            let probe = Arc::new(StartupIngressProbeWorkflow::new());
+            runner.register_workflow(probe.clone());
+            let cx = crate::cx::for_testing();
+            let event_bus = crate::events::EventBus::new(1);
+            let subscription = runner.subscribe_with_cx(&cx, &event_bus).await.unwrap();
+            let held = pre_hold_pane_lock(&locks, 78);
+            let blocked_id = persist_durable_ingress_detection(&storage, 78).await;
+            persist_durable_ingress_detection(&storage, 79).await;
+            let runner_task = crate::runtime_async::task::spawn(async move {
+                runner.run_subscribed_with_cx(&cx, subscription, None).await;
+            });
+
+            // An earlier busy event must not hold the durable scan at its ID.
+            wait_for_startup_executions(&storage, &probe, &[79]).await;
+            assert!(locks.is_locked(78).is_some());
+            let rows = storage
+                .get_events(crate::storage::EventQuery::default())
+                .await
+                .unwrap();
+            let blocked = rows.iter().find(|row| row.id == blocked_id).unwrap();
+            assert!(blocked.handled_at.is_none());
+            assert!(blocked.handled_by_workflow_id.is_none());
+
+            // No further bus event is sent. Releasing admission capacity is enough
+            // for a later bounded sweep to retry the original durable detection.
+            drop(held);
+            wait_for_startup_executions(&storage, &probe, &[78, 79]).await;
+            assert_eq!(event_bus.metrics().snapshot().events_published, 0);
+            drop(event_bus);
+            let observer_cx = crate::cx::for_testing();
+            crate::runtime_async::timeout_with_cx(
+                &observer_cx,
+                Duration::from_secs(1),
+                runner_task,
+            )
+            .await
+            .expect("closed event bus must stop durable ingress")
+            .expect("durable ingress task must settle");
+            assert_eq!(probe.executions.lock().unwrap().len(), 2);
+            assert_eq!(locks.active_count(), 0);
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn workflow_runner_does_not_authorize_pre_subscription_detections() {
+        run_async_test(async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("durable_ingress_historical.db");
+            let (storage, runner, locks) = unlimited_gate_runner(path.to_str().unwrap()).await;
+            let registry = durable_ingress_registry(&storage, &[78, 79]).await;
+            let runner = runner.with_watcher_registry(registry);
+            let probe = Arc::new(StartupIngressProbeWorkflow::new());
+            runner.register_workflow(probe.clone());
+            let historical_id = persist_durable_ingress_detection(&storage, 78).await;
+            let cx = crate::cx::for_testing();
+            let event_bus = crate::events::EventBus::new(8);
+            let subscription = runner.subscribe_with_cx(&cx, &event_bus).await.unwrap();
+            let fresh_id = persist_durable_ingress_detection(&storage, 79).await;
+            assert_eq!(
+                event_bus.publish(crate::events::Event::PatternDetected {
+                    pane_id: 78,
+                    pane_uuid: Some("pane-78".to_string()),
+                    detection: durable_ingress_detection(),
+                    event_id: Some(historical_id),
+                }),
+                1
+            );
+            let runner_task = crate::runtime_async::task::spawn(async move {
+                runner.run_subscribed_with_cx(&cx, subscription, None).await;
+            });
+            wait_for_startup_executions(&storage, &probe, &[79]).await;
+            drop(event_bus);
+            let observer_cx = crate::cx::for_testing();
+            crate::runtime_async::timeout_with_cx(
+                &observer_cx,
+                Duration::from_secs(1),
+                runner_task,
+            )
+            .await
+            .expect("closed event bus must stop durable ingress")
+            .expect("durable ingress task must settle");
+            assert_eq!(probe.executions.lock().unwrap().len(), 1);
+            assert_eq!(locks.active_count(), 0);
+            let rows = storage
+                .get_events(crate::storage::EventQuery::default())
+                .await
+                .unwrap();
+            let historical = rows.iter().find(|row| row.id == historical_id).unwrap();
+            assert!(historical.handled_at.is_none());
+            assert!(historical.handled_by_workflow_id.is_none());
+            assert!(
+                rows.iter()
+                    .find(|row| row.id == fresh_id)
+                    .unwrap()
+                    .handled_at
+                    .is_some()
+            );
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn workflow_runner_skips_expired_and_future_detections_without_blocking_fresh_work() {
+        run_async_test(async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("durable_ingress_freshness.db");
+            let (storage, runner, locks) = unlimited_gate_runner(path.to_str().unwrap()).await;
+            let registry = durable_ingress_registry(&storage, &[78, 79, 80, 81]).await;
+            let runner = runner.with_watcher_registry(registry);
+            let probe = Arc::new(StartupIngressProbeWorkflow::new());
+            runner.register_workflow(probe.clone());
+            let cx = crate::cx::for_testing();
+            let event_bus = crate::events::EventBus::new(1);
+            let subscription = runner.subscribe_with_cx(&cx, &event_bus).await.unwrap();
+            let now = now_ms();
+            let expired_id = persist_durable_ingress_detection_at(
+                &storage,
+                78,
+                now - crate::storage::WORKFLOW_TRIGGER_RECOVERY_MAX_AGE_MS - 1,
+            )
+            .await;
+            let future_id = persist_durable_ingress_detection_at(&storage, 79, now + 60_000).await;
+            let invalid_id = persist_durable_ingress_detection_at(&storage, 80, 0).await;
+            persist_durable_ingress_detection(&storage, 81).await;
+            let runner_task = crate::runtime_async::task::spawn(async move {
+                runner.run_subscribed_with_cx(&cx, subscription, None).await;
+            });
+
+            // The final healthy row fences traversal of all earlier rejected
+            // rows, without relying on an arbitrary sleep to prove refusal.
+            wait_for_startup_executions(&storage, &probe, &[81]).await;
+            drop(event_bus);
+            crate::runtime_async::timeout_with_cx(
+                &crate::cx::for_testing(),
+                Duration::from_secs(1),
+                runner_task,
+            )
+            .await
+            .expect("closed event bus must stop durable ingress")
+            .expect("durable ingress task must settle");
+            assert_eq!(probe.executions.lock().unwrap().len(), 1);
+            assert_eq!(locks.active_count(), 0);
+            let rows = storage
+                .get_events(crate::storage::EventQuery::default())
+                .await
+                .unwrap();
+            for event_id in [expired_id, future_id, invalid_id] {
+                let row = rows.iter().find(|row| row.id == event_id).unwrap();
+                assert!(row.handled_at.is_none());
+                assert!(row.handled_by_workflow_id.is_none());
+            }
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn workflow_runner_rejects_unbound_and_retired_pane_incarnations() {
+        run_async_test(async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("durable_ingress_incarnations.db");
+            let (storage, runner, locks) = unlimited_gate_runner(path.to_str().unwrap()).await;
+            let registry = durable_ingress_registry(&storage, &[78, 79, 80, 81, 82]).await;
+            let runner = runner.with_watcher_registry(Arc::clone(&registry));
+            let probe = Arc::new(StartupIngressProbeWorkflow::new());
+            runner.register_workflow(probe.clone());
+            let cx = crate::cx::for_testing();
+            let event_bus = crate::events::EventBus::new(1);
+            let subscription = runner.subscribe_with_cx(&cx, &event_bus).await.unwrap();
+            let changed_storage_id = persist_durable_ingress_detection(&storage, 78).await;
+            let unbound_id =
+                persist_test_detection(&storage, 79, &durable_ingress_detection()).await;
+            let unobserved_id = persist_durable_ingress_detection(&storage, 80).await;
+            let changed_registry_id = persist_durable_ingress_detection(&storage, 81).await;
+            let healthy_id = persist_durable_ingress_detection(&storage, 82).await;
+
+            // Keep the live registry unchanged for pane 78: the storage-side
+            // incarnation check must independently reject stale authority.
+            let mut changed = storage.get_pane(78).await.unwrap().unwrap();
+            changed.pane_uuid = Some("replacement-pane-78".to_string());
+            storage.upsert_pane(changed).await.unwrap();
+            let mut unobserved = storage.get_pane(80).await.unwrap().unwrap();
+            unobserved.observed = false;
+            unobserved.ignore_reason = Some("operator excluded pane".to_string());
+            storage.upsert_pane(unobserved).await.unwrap();
+            assert!(
+                registry
+                    .write()
+                    .await
+                    .adopt_uuid(81, "replacement-pane-81".to_string())
+            );
+
+            let runner_task = crate::runtime_async::task::spawn(async move {
+                runner.run_subscribed_with_cx(&cx, subscription, None).await;
+            });
+            // A valid later row proves the scan traversed all four rejected rows.
+            wait_for_startup_executions(&storage, &probe, &[82]).await;
+            drop(event_bus);
+            let observer_cx = crate::cx::for_testing();
+            crate::runtime_async::timeout_with_cx(
+                &observer_cx,
+                Duration::from_secs(1),
+                runner_task,
+            )
+            .await
+            .expect("closed event bus must stop durable ingress")
+            .expect("durable ingress task must settle");
+            assert_eq!(probe.executions.lock().unwrap().len(), 1);
+            assert_eq!(locks.active_count(), 0);
+            let rows = storage
+                .get_events(crate::storage::EventQuery::default())
+                .await
+                .unwrap();
+            for event_id in [
+                changed_storage_id,
+                unbound_id,
+                unobserved_id,
+                changed_registry_id,
+            ] {
+                let row = rows.iter().find(|row| row.id == event_id).unwrap();
+                assert!(
+                    row.handled_at.is_none(),
+                    "event {event_id} must stay unhandled"
+                );
+                assert!(
+                    row.handled_by_workflow_id.is_none(),
+                    "event {event_id} must not acquire a workflow owner"
+                );
+            }
+            assert!(
+                rows.iter()
+                    .find(|row| row.id == healthy_id)
+                    .unwrap()
+                    .handled_at
+                    .is_some()
+            );
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn workflow_runner_rechecks_live_incarnation_after_resolving_recovery_source() {
+        run_async_test(async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory
+                .path()
+                .join("durable_ingress_replaced_before_admission.db");
+            let (storage, runner, locks) = unlimited_gate_runner(path.to_str().unwrap()).await;
+            let registry = durable_ingress_registry(&storage, &[78]).await;
+            let runner = runner.with_watcher_registry(Arc::clone(&registry));
+            let probe = Arc::new(StartupIngressProbeWorkflow::new());
+            runner.register_workflow(probe.clone());
+            let cx = crate::cx::for_testing();
+            let event_id = persist_durable_ingress_detection(&storage, 78).await;
+            let events = storage
+                .get_events(crate::storage::EventQuery::default())
+                .await
+                .unwrap();
+            let stored = events.iter().find(|event| event.id == event_id).unwrap();
+            let detection = workflow_detection_from_stored(stored).unwrap();
+            let resolved_uuid = runner
+                .replay_source_uuid_with_cx(&cx, stored, &detection)
+                .await
+                .unwrap()
+                .expect("the original live incarnation authorizes source resolution");
+            assert_eq!(resolved_uuid, "pane-78");
+            let epoch = storage
+                .get_event_retention_snapshot_with_cx(&cx)
+                .await
+                .unwrap()
+                .cursor_epoch;
+            let recovered_source = RecoveredWorkflowSource {
+                pane_uuid: resolved_uuid,
+                event_epoch: epoch,
+                detected_at: stored.detected_at,
+            };
+
+            // Discovery publishes the replacement before its asynchronous pane
+            // upsert. The unchanged database row alone would still admit the old
+            // event; admission must recheck the actual live registry as well.
+            assert!(
+                registry
+                    .write_with_cx(&cx)
+                    .await
+                    .unwrap()
+                    .adopt_uuid(78, "replacement-pane-78".to_string())
+            );
+            assert_eq!(
+                storage.get_pane(78).await.unwrap().unwrap().pane_uuid,
+                Some("pane-78".to_string())
+            );
+            assert!(matches!(
+                runner
+                    .handle_detection_for_source_with_cx(
+                        &cx,
+                        78,
+                        &detection,
+                        Some(event_id),
+                        Some(&recovered_source),
+                    )
+                    .await,
+                WorkflowStartResult::TriggerRejected {
+                    event_id: rejected_id,
+                    reason: crate::error::WorkflowTriggerRejection::SourceIdentityMismatch,
+                } if rejected_id == event_id
+            ));
+
+            assert_eq!(locks.active_count(), 0);
+            assert!(probe.executions.lock().unwrap().is_empty());
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            for table in ["workflow_executions", "workflow_execution_budgets"] {
+                let count: i64 = connection
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(count, 0, "rejected source must not write {table}");
+            }
+            drop(connection);
+            assert!(
+                storage
+                    .get_audit_actions(crate::storage::AuditQuery::default())
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let events = storage
+                .get_events(crate::storage::EventQuery::default())
+                .await
+                .unwrap();
+            let stored = events.iter().find(|event| event.id == event_id).unwrap();
+            assert!(stored.handled_at.is_none());
+            assert!(stored.handled_by_workflow_id.is_none());
+
+            // An early rejection must drop the admission read guard too.
+            let mut registry_guard = crate::runtime_async::timeout_with_cx(
+                &cx,
+                Duration::from_secs(1),
+                registry.write_with_cx(&cx),
+            )
+            .await
+            .expect("source rejection must release the live registry read guard")
+            .unwrap();
+            assert!(registry_guard.adopt_uuid(78, "pane-78".to_string()));
+            drop(registry_guard);
+            storage.shutdown().await.unwrap();
+        });
+    }
+
     async fn seed_startup_recovery(runner: &WorkflowRunner) {
         let cx = crate::cx::for_testing();
         seed_test_pane(&runner.storage, 77, now_ms()).await;
@@ -6212,7 +7176,10 @@ mod tests {
 
         let event_bus = Arc::new(crate::events::EventBus::new(8));
         let subscriber = if matches!(entry, StartupRunnerEntry::Subscribed) {
-            let subscriber = event_bus.subscribe_detections();
+            let subscriber = runner
+                .subscribe_with_cx(&crate::cx::for_testing(), &event_bus)
+                .await
+                .unwrap();
             assert_eq!(event_bus.publish(startup_ingress_event(78)), 1);
             Some(subscriber)
         } else {
@@ -6330,7 +7297,10 @@ mod tests {
                 runner.register_workflow(probe.clone());
                 seed_startup_recovery(&runner).await;
                 let event_bus = crate::events::EventBus::new(8);
-                let subscriber = event_bus.subscribe_detections();
+                let subscriber = runner
+                    .subscribe_with_cx(&crate::cx::for_testing(), &event_bus)
+                    .await
+                    .unwrap();
                 assert_eq!(event_bus.publish(startup_ingress_event(78)), 1);
                 let shutdown_flag = std::sync::atomic::AtomicBool::new(!cancelled);
                 let shutdown_notify = crate::runtime_async::notify::Notify::new();
@@ -6381,7 +7351,10 @@ mod tests {
             let probe = Arc::new(StartupIngressProbeWorkflow::new());
             runner.register_workflow(probe.clone());
             let event_bus = crate::events::EventBus::new(1);
-            let subscriber = event_bus.subscribe_detections();
+            let subscriber = runner
+                .subscribe_with_cx(&crate::cx::for_testing(), &event_bus)
+                .await
+                .unwrap();
             for pane_id in 78..=80 {
                 seed_test_pane(&storage, pane_id, now_ms()).await;
                 assert_eq!(event_bus.publish(startup_ingress_event(pane_id)), 1);

@@ -22737,6 +22737,149 @@ fn abort_workflow_backend(
     )
 }
 
+/// Recovered detections can wait briefly for admission pressure, but must not
+/// become an unbounded queue of old terminal actions.
+pub(crate) const WORKFLOW_TRIGGER_RECOVERY_MAX_AGE_MS: i64 = 5 * 60 * 1_000;
+
+/// Require a positive timestamp within the inclusive recovery window.
+#[must_use]
+pub(crate) fn workflow_trigger_recovery_is_fresh(detected_at: i64, now: i64) -> bool {
+    detected_at > 0
+        && now
+            .checked_sub(detected_at)
+            .is_some_and(|age| (0..=WORKFLOW_TRIGGER_RECOVERY_MAX_AGE_MS).contains(&age))
+}
+
+/// Validate recovered detection authority inside the workflow admission
+/// transaction. A source UUID supplied by the watcher is an expected identity,
+/// not permission to act on whichever pane now has the same numeric ID.
+fn validate_workflow_trigger_source_backend(
+    backend: &dyn StorageBackend,
+    workflow: &WorkflowRecord,
+    event_id: i64,
+    source_pane_uuid: &str,
+) -> Result<()> {
+    use crate::error::{WorkflowError, WorkflowTriggerRejection};
+
+    let rejected =
+        |reason| crate::Error::Workflow(WorkflowError::TriggerRejected { event_id, reason });
+    if source_pane_uuid.trim().is_empty() {
+        return Err(rejected(WorkflowTriggerRejection::SourceIdentityMismatch));
+    }
+    let pane = backend
+        .query_row_cells(
+            "SELECT pane_uuid, observed FROM panes WHERE pane_id = ?1",
+            &[ToSqlValue::Integer(u64_to_i64(
+                workflow.pane_id,
+                "pane_id",
+            )?)],
+        )
+        .map_err(|error| storage_backend_error("Read workflow source identity", error))?
+        .ok_or_else(|| rejected(WorkflowTriggerRejection::SourceIdentityMismatch))?;
+    let pane = CellRowReader::new(&pane);
+    let current_uuid = pane
+        .optional_string(0)
+        .map_err(|_| rejected(WorkflowTriggerRejection::SourceIdentityMismatch))?;
+    let observed = pane
+        .bool(1)
+        .map_err(|_| rejected(WorkflowTriggerRejection::SourceIdentityMismatch))?;
+    if !observed || current_uuid.as_deref() != Some(source_pane_uuid) {
+        return Err(rejected(WorkflowTriggerRejection::SourceIdentityMismatch));
+    }
+
+    // Read the raw cells here: the general display/query decoder deliberately
+    // tolerates malformed extracted JSON, which cannot authorize an action.
+    let event = backend
+        .query_row_cells(
+            "SELECT rule_id, agent_type, event_type, severity, confidence,
+                    extracted, matched_text, dedupe_key, detected_at FROM events WHERE id = ?1",
+            &[ToSqlValue::Integer(event_id)],
+        )
+        .map_err(|error| storage_backend_error("Read workflow source detection", error))?
+        .ok_or_else(|| rejected(WorkflowTriggerRejection::MissingEvent))?;
+    let event = CellRowReader::new(&event);
+    let invalid_detection = |_| rejected(WorkflowTriggerRejection::InvalidDetection);
+    let rule_id = event.string(0).map_err(invalid_detection)?;
+    let agent_label = event.string(1).map_err(invalid_detection)?;
+    let event_type = event.string(2).map_err(invalid_detection)?;
+    let severity_label = event.string(3).map_err(invalid_detection)?;
+    let confidence = event.f64(4).map_err(invalid_detection)?;
+    let extracted = event.optional_string(5).map_err(invalid_detection)?;
+    let extracted = extracted
+        .as_deref()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .transpose()
+        .map_err(|_| rejected(WorkflowTriggerRejection::InvalidDetection))?
+        .unwrap_or(serde_json::Value::Null);
+    let matched_text = event
+        .optional_string(6)
+        .map_err(invalid_detection)?
+        .unwrap_or_default();
+    let dedupe_key = event.optional_string(7).map_err(invalid_detection)?;
+    let detected_at = event.i64(8).map_err(invalid_detection)?;
+    if !workflow_trigger_recovery_is_fresh(detected_at, now_ms()) {
+        return Err(rejected(WorkflowTriggerRejection::StaleDetection));
+    }
+    let agent_type = serde_json::from_value(serde_json::Value::String(agent_label.clone()))
+        .map_err(|_| rejected(WorkflowTriggerRejection::InvalidDetection))?;
+    let severity = serde_json::from_value(serde_json::Value::String(severity_label.clone()))
+        .map_err(|_| rejected(WorkflowTriggerRejection::InvalidDetection))?;
+    if rule_id.trim().is_empty()
+        || event_type.trim().is_empty()
+        || !confidence.is_finite()
+        || !(0.0..=1.0).contains(&confidence)
+    {
+        return Err(rejected(WorkflowTriggerRejection::InvalidDetection));
+    }
+    let detection = crate::patterns::Detection {
+        rule_id,
+        agent_type,
+        event_type,
+        severity,
+        confidence,
+        extracted,
+        matched_text,
+        span: (0, 0),
+    };
+    let identity = event_identity_key(&detection, workflow.pane_id, Some(source_pane_uuid));
+    if dedupe_key
+        .as_deref()
+        .and_then(|key| key.strip_prefix(&identity))
+        .and_then(|suffix| suffix.strip_prefix(':'))
+        .is_none_or(str::is_empty)
+    {
+        return Err(rejected(WorkflowTriggerRejection::SourceIdentityMismatch));
+    }
+
+    let context = workflow
+        .context
+        .as_ref()
+        .ok_or_else(|| rejected(WorkflowTriggerRejection::InvalidDetection))?;
+    let expected = serde_json::json!({
+        "rule_id": detection.rule_id,
+        "agent_type": agent_label,
+        "event_type": detection.event_type,
+        "severity": severity_label,
+        "confidence": confidence,
+        "extracted": detection.extracted,
+        "matched_text": detection.matched_text,
+        "source_pane_id": workflow.pane_id,
+        "detection": {
+            "rule_id": detection.rule_id,
+            "matched_text": detection.matched_text,
+            "severity": format!("{:?}", detection.severity),
+        },
+    });
+    if !expected.as_object().is_some_and(|fields| {
+        fields
+            .iter()
+            .all(|(field, value)| context.get(field) == Some(value))
+    }) {
+        return Err(rejected(WorkflowTriggerRejection::InvalidDetection));
+    }
+    Ok(())
+}
+
 fn create_workflow_backend(backend: &dyn StorageBackend, workflow: &WorkflowRecord) -> Result<()> {
     run_writer_transaction(
         backend,
@@ -22794,6 +22937,40 @@ fn create_workflow_backend(backend: &dyn StorageBackend, workflow: &WorkflowReco
                     .is_some()
                 {
                     return Err(rejected(WorkflowTriggerRejection::AlreadyHandled).into());
+                }
+                if let Some(source_epoch) = workflow
+                    .context
+                    .as_ref()
+                    .and_then(|context| context.get("source_event_epoch"))
+                    .filter(|value| !value.is_null())
+                {
+                    let source_epoch = source_epoch
+                        .as_str()
+                        .ok_or_else(|| rejected(WorkflowTriggerRejection::InvalidDetection))?;
+                    validate_event_retention_cursor_epoch(source_epoch, "workflow event epoch")
+                        .map_err(|_| rejected(WorkflowTriggerRejection::InvalidDetection))?;
+                    // The replay page and its continuity proof were read
+                    // before admission. Retention can rotate their epoch in
+                    // between, so compare again under this writer lock.
+                    if event_retention_snapshot_backend(backend)?.cursor_epoch != source_epoch {
+                        return Err(rejected(WorkflowTriggerRejection::EventEpochMismatch).into());
+                    }
+                }
+                if let Some(source_uuid) = workflow
+                    .context
+                    .as_ref()
+                    .and_then(|context| context.get("source_pane_uuid"))
+                    .filter(|value| !value.is_null())
+                {
+                    let source_uuid = source_uuid.as_str().ok_or_else(|| {
+                        rejected(WorkflowTriggerRejection::SourceIdentityMismatch)
+                    })?;
+                    validate_workflow_trigger_source_backend(
+                        backend,
+                        workflow,
+                        event_id,
+                        source_uuid,
+                    )?;
                 }
             }
 
@@ -37166,6 +37343,317 @@ fn workflow_budget_cursor_failure_rolls_back_admission_and_terminal_owner_refuse
     assert_eq!(query_workflow_backend(&backend, "budget-rollback").unwrap().unwrap().current_step, 0);
     assert!(!compare_exchange_workflow_budget_backend(&backend, "budget-terminal", 0, &admitted).unwrap());
     assert_eq!(query_workflow_budget_backend(&backend, "budget-terminal").unwrap(), Some(budget));
+}
+
+fn source_bound_workflow_fixture() -> (RusqliteBackend, WorkflowRecord) {
+    let backend = memory_backend();
+    seed_pane_backend(&backend, 1, 1_000);
+    backend.execute("UPDATE panes SET pane_uuid = 'source-pane' WHERE pane_id = 1").unwrap();
+    let detected_at = now_ms();
+    let detection = crate::patterns::Detection {
+        rule_id: "codex.compaction.complete".to_string(),
+        agent_type: crate::patterns::AgentType::Codex,
+        event_type: "compaction.complete".to_string(),
+        severity: crate::patterns::Severity::Info,
+        confidence: 1.0,
+        extracted: serde_json::json!({"session_id": "source-session"}),
+        matched_text: "Compaction complete".to_string(),
+        span: (0, 19),
+    };
+    let event_id = record_event_backend(&backend, &StoredEvent {
+        id: 0,
+        pane_id: 1,
+        rule_id: detection.rule_id.clone(),
+        agent_type: "codex".to_string(),
+        event_type: detection.event_type.clone(),
+        severity: "info".to_string(),
+        confidence: detection.confidence,
+        extracted: Some(detection.extracted.clone()),
+        matched_text: Some(detection.matched_text.clone()),
+        segment_id: None,
+        detected_at,
+        dedupe_key: Some(format!("{}:0", event_identity_key(&detection, 1, Some("source-pane")))),
+        handled_at: None,
+        handled_by_workflow_id: None,
+        handled_status: None,
+    }).unwrap().event_id();
+    let source_event_epoch = event_retention_snapshot_backend(&backend).unwrap().cursor_epoch;
+    let workflow = WorkflowRecord {
+        id: "source-bound-trigger".to_string(),
+        workflow_name: "source-bound-probe".to_string(),
+        pane_id: 1,
+        trigger_event_id: Some(event_id),
+        current_step: 0,
+        status: "running".to_string(),
+        wait_condition: None,
+        context: Some(serde_json::json!({
+            "rule_id": detection.rule_id,
+            "agent_type": "codex",
+            "event_type": detection.event_type,
+            "severity": "info",
+            "confidence": detection.confidence,
+            "extracted": detection.extracted,
+            "matched_text": detection.matched_text,
+            "span": {"start": 0, "end": 0},
+            "source_pane_id": 1,
+            "source_pane_uuid": "source-pane",
+            "source_event_epoch": source_event_epoch,
+            "detection": {
+                "rule_id": detection.rule_id,
+                "matched_text": detection.matched_text,
+                "severity": "Info",
+            },
+        })),
+        result: None,
+        error: None,
+        started_at: detected_at,
+        updated_at: detected_at,
+        completed_at: None,
+    };
+    (backend, workflow)
+}
+
+fn assert_source_bound_trigger_rejected(
+    backend: &dyn StorageBackend,
+    workflow: &WorkflowRecord,
+    expected: crate::error::WorkflowTriggerRejection,
+) {
+    let event_id = workflow.trigger_event_id.unwrap();
+    let before = backend.query_row_cells(
+        "SELECT handled_at, handled_by_workflow_id, handled_status FROM events WHERE id = ?1",
+        &[ToSqlValue::Integer(event_id)],
+    ).unwrap();
+    match create_workflow_backend(backend, workflow) {
+        Err(crate::Error::Workflow(crate::error::WorkflowError::TriggerRejected {
+            event_id: rejected_id,
+            reason,
+        })) => {
+            assert_eq!(rejected_id, event_id);
+            assert_eq!(reason, expected);
+            assert!(!reason.to_string().contains("private-synthetic-content"));
+        }
+        result => panic!("expected a source-bound trigger rejection, got {result:?}"),
+    }
+    assert!(query_workflow_backend(backend, &workflow.id).unwrap().is_none());
+    assert!(query_workflow_budget_backend(backend, &workflow.id).unwrap().is_none());
+    assert_eq!(count_table_where(backend, "workflow_executions", "1=1", &[]).unwrap(), 0);
+    assert_eq!(count_table_where(backend, "workflow_execution_budgets", "1=1", &[]).unwrap(), 0);
+    assert_eq!(backend.query_row_cells(
+        "SELECT handled_at, handled_by_workflow_id, handled_status FROM events WHERE id = ?1",
+        &[ToSqlValue::Integer(event_id)],
+    ).unwrap(), before, "rejection must not consume the stored event");
+}
+
+#[test]
+fn workflow_source_bound_trigger_admits_matching_authority_once() {
+    let (backend, workflow) = source_bound_workflow_fixture();
+    create_workflow_backend(&backend, &workflow).unwrap();
+    let retained = query_workflow_backend(&backend, &workflow.id).unwrap().unwrap();
+    assert_eq!(retained.context, workflow.context);
+    assert_eq!(retained.trigger_event_id, workflow.trigger_event_id);
+    assert_eq!(query_events_stream_backend(&backend, &EventStreamQuery {
+        unhandled_only: true,
+        ..Default::default()
+    }).unwrap().len(), 1, "admission is not a completed effect");
+    let mut duplicate = workflow;
+    duplicate.id = "source-bound-duplicate".to_string();
+    assert!(matches!(create_workflow_backend(&backend, &duplicate),
+        Err(crate::Error::Workflow(crate::error::WorkflowError::TriggerRejected {
+            reason: crate::error::WorkflowTriggerRejection::AlreadyClaimed { .. },
+            ..
+        }))));
+    assert!(query_workflow_backend(&backend, &duplicate.id).unwrap().is_none());
+}
+
+#[test]
+fn workflow_source_bound_trigger_rejects_changed_or_unobserved_incarnations() {
+    use crate::error::WorkflowTriggerRejection::SourceIdentityMismatch;
+
+    for (current_uuid, expected_uuid, observed) in [
+        (Some("successor-pane"), "source-pane", true),
+        // Supplying the successor's actual UUID cannot authorize its predecessor's event.
+        (Some("successor-pane"), "successor-pane", true),
+        (None, "source-pane", true),
+        (Some("source-pane"), "source-pane", false),
+    ] {
+        let (backend, mut workflow) = source_bound_workflow_fixture();
+        let mut pane = query_pane_backend(&backend, 1).unwrap().unwrap();
+        pane.pane_uuid = current_uuid.map(str::to_string);
+        pane.observed = observed;
+        // first_seen_at is retained across upserts and cannot fence incarnation reuse.
+        pane.first_seen_at = 2_000;
+        upsert_pane_backend(&backend, &pane).unwrap();
+        if current_uuid.is_none() {
+            backend.execute("UPDATE panes SET pane_uuid = NULL WHERE pane_id = 1").unwrap();
+        }
+        assert_eq!(query_pane_backend(&backend, 1).unwrap().unwrap().first_seen_at, 1_000);
+        workflow.context.as_mut().unwrap()["source_pane_uuid"] = serde_json::json!(expected_uuid);
+        assert_source_bound_trigger_rejected(&backend, &workflow, SourceIdentityMismatch);
+    }
+}
+
+#[test]
+fn workflow_source_bound_trigger_rejects_invalid_source_uuid_without_fallback() {
+    for invalid in [serde_json::json!(""), serde_json::json!(" \t"), serde_json::json!(7),
+        serde_json::json!(false), serde_json::json!([]), serde_json::json!({"uuid": "source-pane"})] {
+        let (backend, mut workflow) = source_bound_workflow_fixture();
+        workflow.context.as_mut().unwrap()["source_pane_uuid"] = invalid;
+        assert_source_bound_trigger_rejected(&backend, &workflow,
+            crate::error::WorkflowTriggerRejection::SourceIdentityMismatch);
+    }
+}
+
+#[test]
+fn workflow_source_bound_trigger_rejects_changed_detection_projection() {
+    for (field, replacement) in [
+        ("rule_id", serde_json::json!("codex.other")),
+        ("agent_type", serde_json::json!("claude_code")),
+        ("event_type", serde_json::json!("other.complete")),
+        ("severity", serde_json::json!("critical")),
+        ("confidence", serde_json::json!(0.25)),
+        ("extracted", serde_json::json!({"session_id": "other-session"})),
+        ("matched_text", serde_json::json!("private-synthetic-content")),
+        ("source_pane_id", serde_json::json!(2)),
+        ("detection", serde_json::json!({"rule_id": "codex.other"})),
+    ] {
+        let (backend, mut workflow) = source_bound_workflow_fixture();
+        workflow.context.as_mut().unwrap()[field] = replacement;
+        assert_source_bound_trigger_rejected(&backend, &workflow,
+            crate::error::WorkflowTriggerRejection::InvalidDetection);
+    }
+}
+
+#[test]
+fn workflow_source_bound_trigger_rejects_invalid_or_rebound_stored_rows() {
+    use crate::error::WorkflowTriggerRejection::{InvalidDetection, SourceIdentityMismatch};
+
+    for (sql, expected) in [
+        ("UPDATE events SET agent_type = 'private-synthetic-content'", InvalidDetection),
+        ("UPDATE events SET severity = 'private-synthetic-content'", InvalidDetection),
+        ("UPDATE events SET rule_id = ''", InvalidDetection),
+        ("UPDATE events SET event_type = ''", InvalidDetection),
+        ("UPDATE events SET confidence = -1.0", InvalidDetection),
+        ("UPDATE events SET confidence = 2.0", InvalidDetection),
+        ("UPDATE events SET confidence = 1e999", InvalidDetection),
+        ("UPDATE events SET extracted = '{private-synthetic-content'", InvalidDetection),
+        ("UPDATE events SET matched_text = 'private-synthetic-content'", InvalidDetection),
+        ("UPDATE events SET rule_id = 'codex.other'", SourceIdentityMismatch),
+        ("UPDATE events SET extracted = '{}'", SourceIdentityMismatch),
+        ("UPDATE events SET dedupe_key = NULL", SourceIdentityMismatch),
+        ("UPDATE events SET dedupe_key = 'evt:unbound'", SourceIdentityMismatch),
+        ("UPDATE events SET dedupe_key = substr(dedupe_key, 1, length(dedupe_key) - 2)", SourceIdentityMismatch),
+    ] {
+        let (backend, workflow) = source_bound_workflow_fixture();
+        backend.execute(sql).unwrap();
+        assert_source_bound_trigger_rejected(&backend, &workflow, expected);
+    }
+}
+
+#[test]
+fn workflow_source_bound_trigger_rejects_expired_or_invalid_detection_times() {
+    let now = now_ms();
+    for detected_at in [
+        now - WORKFLOW_TRIGGER_RECOVERY_MAX_AGE_MS - 1_000,
+        now + 60_000,
+        0,
+        -1,
+        i64::MIN,
+        i64::MAX,
+    ] {
+        let (backend, workflow) = source_bound_workflow_fixture();
+        execute_typed(&backend, "UPDATE events SET detected_at = ?1 WHERE id = ?2", &[
+            ToSqlValue::Integer(detected_at),
+            ToSqlValue::Integer(workflow.trigger_event_id.unwrap()),
+        ]).unwrap();
+        assert_source_bound_trigger_rejected(&backend, &workflow,
+            crate::error::WorkflowTriggerRejection::StaleDetection);
+    }
+}
+
+#[test]
+fn workflow_trigger_recovery_freshness_has_closed_bounds() {
+    let now = WORKFLOW_TRIGGER_RECOVERY_MAX_AGE_MS + 10;
+    assert!(workflow_trigger_recovery_is_fresh(now, now));
+    assert!(workflow_trigger_recovery_is_fresh(10, now));
+    assert!(!workflow_trigger_recovery_is_fresh(9, now));
+    assert!(!workflow_trigger_recovery_is_fresh(now + 1, now));
+    assert!(!workflow_trigger_recovery_is_fresh(0, 0));
+    assert!(!workflow_trigger_recovery_is_fresh(i64::MIN, i64::MAX));
+    assert!(!workflow_trigger_recovery_is_fresh(i64::MAX, i64::MIN));
+}
+
+#[test]
+fn workflow_source_binding_is_explicit_for_existing_callers() {
+    for null_instead_of_missing in [false, true] {
+        let (backend, mut workflow) = source_bound_workflow_fixture();
+        let context = workflow.context.as_mut().unwrap().as_object_mut().unwrap();
+        if null_instead_of_missing {
+            context.insert("source_pane_uuid".to_string(), serde_json::Value::Null);
+        } else {
+            context.remove("source_pane_uuid");
+        }
+        backend.execute("UPDATE panes SET pane_uuid = 'different-pane' WHERE pane_id = 1").unwrap();
+        create_workflow_backend(&backend, &workflow).unwrap();
+        assert!(query_workflow_backend(&backend, &workflow.id).unwrap().is_some());
+    }
+}
+
+fn rotate_source_bound_event_epoch(backend: &dyn StorageBackend) {
+    let retired_id = seed_retention_event_backend(backend, 1, "info", "retired", 500, None);
+    assert_eq!(delete_event_retention_batch_backend(
+        backend,
+        "SELECT id FROM events WHERE id = ?",
+        &[ToSqlValue::Integer(retired_id)],
+        1,
+        "workflow source epoch rotation fixture",
+        0,
+    ).unwrap(), 1);
+}
+
+#[test]
+fn workflow_source_bound_trigger_rejects_rotated_event_epoch_without_writes() {
+    let (backend, workflow) = source_bound_workflow_fixture();
+    let original_epoch = event_retention_snapshot_backend(&backend).unwrap().cursor_epoch;
+    rotate_source_bound_event_epoch(&backend);
+    assert_ne!(event_retention_snapshot_backend(&backend).unwrap().cursor_epoch, original_epoch);
+    assert!(backend.query_row_cells(
+        "SELECT id FROM events WHERE id = ?1",
+        &[ToSqlValue::Integer(workflow.trigger_event_id.unwrap())],
+    ).unwrap().is_some(), "rotation must leave the workflow's trigger present");
+    assert_source_bound_trigger_rejected(&backend, &workflow,
+        crate::error::WorkflowTriggerRejection::EventEpochMismatch);
+}
+
+#[test]
+fn workflow_source_bound_trigger_rejects_malformed_event_epoch_without_fallback() {
+    for invalid in [serde_json::json!(""), serde_json::json!("private-synthetic-content"),
+        serde_json::json!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        serde_json::json!("0000000000000000000000000000000g"),
+        serde_json::json!(7), serde_json::json!(false), serde_json::json!([])] {
+        let (backend, mut workflow) = source_bound_workflow_fixture();
+        workflow.context.as_mut().unwrap()["source_event_epoch"] = invalid;
+        // An explicitly supplied epoch remains authoritative even for a
+        // legacy caller without the optional pane-incarnation fence.
+        workflow.context.as_mut().unwrap()["source_pane_uuid"] = serde_json::Value::Null;
+        assert_source_bound_trigger_rejected(&backend, &workflow,
+            crate::error::WorkflowTriggerRejection::InvalidDetection);
+    }
+}
+
+#[test]
+fn workflow_event_epoch_binding_is_explicit_for_existing_callers() {
+    for null_instead_of_missing in [false, true] {
+        let (backend, mut workflow) = source_bound_workflow_fixture();
+        rotate_source_bound_event_epoch(&backend);
+        let context = workflow.context.as_mut().unwrap().as_object_mut().unwrap();
+        if null_instead_of_missing {
+            context.insert("source_event_epoch".to_string(), serde_json::Value::Null);
+        } else {
+            context.remove("source_event_epoch");
+        }
+        create_workflow_backend(&backend, &workflow).unwrap();
+        assert!(query_workflow_backend(&backend, &workflow.id).unwrap().is_some());
+    }
 }
 
 #[test]
