@@ -1,10 +1,10 @@
 //! Streaming event subscriptions, filters, cursors, and wait primitives.
 //!
-//! This module currently provides live `EventBus` subscriptions plus reusable
-//! filter and wait-condition types that are shared with storage-backed event
-//! query surfaces elsewhere in the crate. `FilteredEventStream` itself is a
-//! live-bus stream; cursor metadata is tracked for callers, but historical
-//! replay is handled by `storage.rs` rather than this type.
+//! `DurableFilteredEventStream` drains ordered storage pages with explicit
+//! acknowledgements, epoch-aware retention checks, and bus wakeups. The older
+//! `FilteredEventStream` remains a live-bus stream for callers that need only
+//! best-effort signals. Filter and wait-condition types are shared with the
+//! storage-backed query surfaces elsewhere in the crate.
 //!
 //! # Example
 //!
@@ -24,14 +24,298 @@
 //! let condition = WaitCondition::rule_id("codex.usage.reached");
 //! ```
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 use crate::events::{Event, EventBus, EventSubscriber};
 use crate::patterns::Detection;
+
+/// Resume identity for a storage-authoritative event subscription.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DurableStreamCursor {
+    pub after_id: i64,
+    pub epoch: String,
+}
+
+/// Storage rows and best-effort signals have different delivery authority.
+#[derive(Debug)]
+pub enum DurableStreamItem {
+    Stored(Box<crate::storage::StoredEvent>),
+    Live(Box<Event>),
+    Gap { missed_count: u64 },
+    Checkpoint(DurableStreamCursor),
+    Idle,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum DurableStreamError {
+    #[error("event storage read failed")]
+    Storage(#[source] crate::Error),
+    #[error("event cursor history is unavailable")]
+    CursorExpired(Box<crate::storage::EventRetentionCheck>),
+    #[error("event delivery must be acknowledged before reading another row")]
+    PendingAcknowledgement,
+    #[error("event acknowledgment does not match the pending row")]
+    InvalidAcknowledgement,
+    #[error("event storage returned an invalid ordered page")]
+    InvalidPage,
+    #[error("event subscription cancelled")]
+    Cancelled,
+}
+
+const DURABLE_EVENT_PAGE_SIZE: usize = 64;
+const DURABLE_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Ordered durable delivery with one outstanding acknowledgement.
+///
+/// Subscribe before reading storage. Persisted bus messages only request a
+/// drain; their payload and ordering never advance the durable cursor. A
+/// fixed polling deadline also finds rows whose publisher died after commit.
+/// The caller acknowledges a row only after a successful output flush, or
+/// after deliberately filtering it. Dropping the stream before that boundary
+/// leaves its previous cursor safe to replay.
+pub struct DurableFilteredEventStream {
+    storage: Arc<crate::storage::StorageHandle>,
+    subscriber: EventSubscriber,
+    cursor: Option<DurableStreamCursor>,
+    rows: VecDeque<crate::storage::StoredEvent>,
+    pending_id: Option<i64>,
+    needs_drain: bool,
+    bus_closed: bool,
+    baseline_pending: bool,
+    probe_bus_before_page: bool,
+    next_poll: Instant,
+}
+
+impl DurableFilteredEventStream {
+    #[must_use]
+    pub fn new(
+        bus: &EventBus,
+        storage: Arc<crate::storage::StorageHandle>,
+        cursor: Option<DurableStreamCursor>,
+    ) -> Self {
+        Self {
+            storage,
+            subscriber: bus.subscribe(),
+            cursor,
+            rows: VecDeque::new(),
+            pending_id: None,
+            needs_drain: true,
+            bus_closed: false,
+            baseline_pending: false,
+            probe_bus_before_page: false,
+            next_poll: Instant::now(),
+        }
+    }
+
+    #[must_use]
+    pub fn cursor(&self) -> Option<&DurableStreamCursor> {
+        self.cursor.as_ref()
+    }
+
+    /// Commit exactly the delivered or deliberately filtered row.
+    pub fn acknowledge(&mut self, event_id: i64) -> Result<(), DurableStreamError> {
+        if self.pending_id != Some(event_id) {
+            return Err(DurableStreamError::InvalidAcknowledgement);
+        }
+        let Some(cursor) = self.cursor.as_mut() else {
+            return Err(DurableStreamError::InvalidAcknowledgement);
+        };
+        cursor.after_id = event_id;
+        self.pending_id = None;
+        Ok(())
+    }
+
+    async fn drain_page_cx(&mut self, cx: &crate::cx::Cx) -> Result<(), DurableStreamError> {
+        if self.cursor.is_none() {
+            // Subscribe first, then capture one atomic tail/epoch baseline.
+            // Later commits are found even if their notification is lost.
+            let tail = self
+                .storage
+                .get_event_retention_snapshot_with_cx(cx)
+                .await
+                .map_err(DurableStreamError::Storage)?;
+            self.cursor = Some(DurableStreamCursor {
+                after_id: tail.max_event_id,
+                epoch: tail.cursor_epoch,
+            });
+            self.baseline_pending = true;
+            return Ok(());
+        }
+        let cursor = self.cursor.as_ref().expect("initialized above");
+        let page = self
+            .storage
+            .get_events_stream_page_with_cx(
+                cx,
+                crate::storage::EventStreamQuery {
+                    after_id: Some(cursor.after_id),
+                    limit: Some(DURABLE_EVENT_PAGE_SIZE),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(DurableStreamError::Storage)?;
+        let through_id = page
+            .events
+            .last()
+            .map_or(page.retention.max_event_id, |event| event.id);
+        if !durable_page_is_ordered(cursor, &page) {
+            return Err(DurableStreamError::InvalidPage);
+        }
+        let retention = self
+            .storage
+            .check_event_retention_in_epoch_with_cx(
+                cx,
+                cursor.after_id,
+                through_id.max(cursor.after_id),
+                &cursor.epoch,
+            )
+            .await
+            .map_err(DurableStreamError::Storage)?;
+        if page.retention.cursor_epoch != cursor.epoch
+            || retention.snapshot.cursor_epoch != cursor.epoch
+            || !matches!(
+                &retention.status,
+                crate::storage::EventRetentionStatus::CompleteNoPruning
+            )
+        {
+            return Err(DurableStreamError::CursorExpired(Box::new(retention)));
+        }
+        if page.retention.max_event_id < cursor.after_id
+            || retention.checked_through_id != through_id
+            || retention.snapshot.max_event_id < page.retention.max_event_id
+            || retention.snapshot.generation < page.retention.generation
+        {
+            return Err(DurableStreamError::InvalidPage);
+        }
+        tracing::trace!(
+            after_id = cursor.after_id,
+            through_id,
+            rows = page.events.len(),
+            "drained durable IPC event page"
+        );
+        self.next_poll = Instant::now() + DURABLE_EVENT_POLL_INTERVAL;
+        self.needs_drain = !page.events.is_empty();
+        self.probe_bus_before_page = self.needs_drain;
+        // An empty unfiltered page proves that any allocator gaps up to this
+        // high-water mark contain no row requiring delivery.
+        if page.events.is_empty() {
+            self.cursor.as_mut().expect("initialized above").after_id = through_id;
+        }
+        self.rows = page.events.into();
+        Ok(())
+    }
+
+    /// A bus notification is a wake hint or an explicitly best-effort signal.
+    fn bus_item(&mut self, event: Event) -> DurableStreamItem {
+        match event {
+            Event::PatternDetected {
+                event_id: Some(id),
+                ..
+            } => {
+                self.needs_drain |= self.cursor.as_ref().is_none_or(|cursor| id > cursor.after_id);
+                // Stale notifications need no query. Yield so queued wakeups
+                // cannot monopolize the caller's heartbeat deadline.
+                DurableStreamItem::Idle
+            }
+            event => DurableStreamItem::Live(Box::new(event)),
+        }
+    }
+
+    /// Read one item, with a bounded idle wake for the caller's heartbeat.
+    ///
+    /// Heartbeat timing never cancels a storage read. The absolute storage
+    /// polling deadline is not postponed by unrelated live signal traffic.
+    pub async fn next_item_cx(
+        &mut self,
+        cx: &crate::cx::Cx,
+        idle_budget: Duration,
+    ) -> Result<Option<DurableStreamItem>, DurableStreamError> {
+        if self.pending_id.is_some() {
+            return Err(DurableStreamError::PendingAcknowledgement);
+        }
+        loop {
+            cx.checkpoint().map_err(|_| DurableStreamError::Cancelled)?;
+            if let Some(event) = self.rows.pop_front() {
+                self.pending_id = Some(event.id);
+                return Ok(Some(DurableStreamItem::Stored(Box::new(event))));
+            }
+            // Probe at most once per completed page. A durable backlog cannot
+            // hide bus loss/closure forever, and a bus flood cannot postpone
+            // the next storage page indefinitely.
+            if std::mem::take(&mut self.probe_bus_before_page) && !self.bus_closed {
+                match self.subscriber.try_recv() {
+                    Some(Ok(event)) => return Ok(Some(self.bus_item(event))),
+                    Some(Err(crate::events::RecvError::Lagged { missed_count })) => {
+                        self.needs_drain = true;
+                        return Ok(Some(DurableStreamItem::Gap { missed_count }));
+                    }
+                    Some(Err(crate::events::RecvError::Closed)) => {
+                        self.bus_closed = true;
+                        self.needs_drain = true;
+                    }
+                    Some(Err(crate::events::RecvError::Cancelled)) => {
+                        return Err(DurableStreamError::Cancelled);
+                    }
+                    None => {}
+                }
+            }
+            if self.needs_drain || Instant::now() >= self.next_poll {
+                self.drain_page_cx(cx).await?;
+                if std::mem::take(&mut self.baseline_pending) {
+                    return Ok(Some(DurableStreamItem::Checkpoint(
+                        self.cursor.as_ref().expect("initialized baseline").clone(),
+                    )));
+                }
+                if !self.rows.is_empty() {
+                    continue;
+                }
+            }
+            if self.bus_closed {
+                return Ok(None);
+            }
+            let wait = self
+                .next_poll
+                .saturating_duration_since(Instant::now())
+                .min(idle_budget.max(Duration::from_millis(1)));
+            match crate::runtime_async::timeout_with_cx(cx, wait, self.subscriber.recv_cx(cx)).await {
+                Ok(Ok(event)) => return Ok(Some(self.bus_item(event))),
+                Ok(Err(crate::events::RecvError::Lagged { missed_count })) => {
+                    self.needs_drain = true;
+                    return Ok(Some(DurableStreamItem::Gap { missed_count }));
+                }
+                Ok(Err(crate::events::RecvError::Closed)) => {
+                    self.bus_closed = true;
+                    self.needs_drain = true;
+                }
+                Ok(Err(crate::events::RecvError::Cancelled)) => {
+                    return Err(DurableStreamError::Cancelled);
+                }
+                Err(_) => {
+                    cx.checkpoint().map_err(|_| DurableStreamError::Cancelled)?;
+                    return Ok(Some(DurableStreamItem::Idle));
+                }
+            }
+        }
+    }
+}
+
+fn durable_page_is_ordered(cursor: &DurableStreamCursor, page: &crate::storage::EventStreamPage) -> bool {
+    if page.events.len() > DURABLE_EVENT_PAGE_SIZE {
+        return false;
+    }
+    let mut preceding_id = cursor.after_id;
+    page.events.iter().all(|event| {
+        let valid = event.id > preceding_id && event.id <= page.retention.max_event_id;
+        preceding_id = event.id;
+        valid
+    })
+}
 
 // =============================================================================
 // Stream Cursor
@@ -1186,6 +1470,363 @@ mod tests {
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
         }
+    }
+
+    // --- Storage-authoritative event stream regressions ---
+
+    fn durable_test_event(sequence: i64) -> crate::storage::StoredEvent {
+        crate::storage::StoredEvent {
+            id: 0,
+            pane_id: 7,
+            rule_id: format!("codex.stored.{sequence}"),
+            agent_type: "codex".to_string(),
+            event_type: "usage.reached".to_string(),
+            severity: "warning".to_string(),
+            confidence: 0.9,
+            extracted: Some(serde_json::json!({"source": "storage", "sequence": sequence})),
+            matched_text: Some(format!("stored payload {sequence}")),
+            segment_id: None,
+            detected_at: 1_700_000_000_000 + sequence,
+            dedupe_key: None,
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        }
+    }
+
+    async fn durable_storage_fixture() -> (
+        tempfile::TempDir,
+        Arc<crate::storage::StorageHandle>,
+        DurableStreamCursor,
+    ) {
+        let directory = tempfile::tempdir().expect("event stream fixture directory");
+        let storage = Arc::new(
+            crate::storage::StorageHandle::new(
+                &directory.path().join("events.db").to_string_lossy(),
+            )
+            .await
+            .expect("open event stream fixture"),
+        );
+        storage
+            .upsert_pane(crate::storage::PaneRecord {
+                pane_id: 7,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 1_700_000_000_000,
+                last_seen_at: 1_700_000_000_000,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            })
+            .await
+            .expect("fixture pane");
+        let snapshot = storage
+            .get_event_retention_snapshot()
+            .await
+            .expect("fixture epoch");
+        let cursor = DurableStreamCursor {
+            after_id: snapshot.max_event_id,
+            epoch: snapshot.cursor_epoch,
+        };
+        (directory, storage, cursor)
+    }
+
+    async fn next_durable_row(
+        stream: &mut DurableFilteredEventStream,
+        cx: &crate::cx::Cx,
+    ) -> crate::storage::StoredEvent {
+        match stream
+            .next_item_cx(cx, Duration::from_millis(10))
+            .await
+            .expect("read durable stream")
+        {
+            Some(DurableStreamItem::Stored(event)) => *event,
+            other => panic!("expected an ordered stored row, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn durable_stream_orders_storage_and_replays_before_acknowledgement() {
+        run_async_test(async {
+            let (_directory, storage, start) = durable_storage_fixture().await;
+            let cx = crate::cx::Cx::current().expect("runtime context");
+            let bus = EventBus::new(16);
+            let mut stream =
+                DurableFilteredEventStream::new(&bus, Arc::clone(&storage), Some(start.clone()));
+            let first = storage.record_event(durable_test_event(1)).await.unwrap();
+            let second = storage.record_event(durable_test_event(2)).await.unwrap();
+            // Notification ordering and payload deliberately contradict storage.
+            bus.publish(make_pattern_event(99, "wrong.second", Some(second)));
+            bus.publish(make_pattern_event(99, "wrong.first", Some(first)));
+            let row = next_durable_row(&mut stream, &cx).await;
+            assert_eq!(row.id, first);
+            assert_eq!(row.pane_id, 7);
+            assert_eq!(row.rule_id, "codex.stored.1");
+            assert_eq!(row.detected_at, 1_700_000_000_001);
+            assert_eq!(row.matched_text.as_deref(), Some("stored payload 1"));
+            assert_eq!(stream.cursor(), Some(&start));
+            assert!(matches!(
+                stream.acknowledge(second),
+                Err(DurableStreamError::InvalidAcknowledgement)
+            ));
+            assert!(matches!(
+                stream.next_item_cx(&cx, Duration::from_millis(1)).await,
+                Err(DurableStreamError::PendingAcknowledgement)
+            ));
+
+            // A failed/partial output flush drops the stream without an ack.
+            // Reconnect with the last flushed cursor and the same row replays.
+            drop(stream);
+            let mut resumed =
+                DurableFilteredEventStream::new(&bus, Arc::clone(&storage), Some(start));
+            assert_eq!(next_durable_row(&mut resumed, &cx).await.id, first);
+            resumed.acknowledge(first).unwrap();
+            assert_eq!(resumed.cursor().unwrap().after_id, first);
+            assert_eq!(next_durable_row(&mut resumed, &cx).await.id, second);
+            resumed.acknowledge(second).unwrap();
+            assert_eq!(resumed.cursor().unwrap().after_id, second);
+            assert!(matches!(
+                resumed.acknowledge(first),
+                Err(DurableStreamError::InvalidAcknowledgement)
+            ));
+            drop(resumed);
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn durable_stream_pages_without_publication_and_reports_lag_between_pages() {
+        run_async_test(async {
+            let (_directory, storage, start) = durable_storage_fixture().await;
+            let cx = crate::cx::Cx::current().expect("runtime context");
+            let bus = EventBus::new(1);
+            let mut stream =
+                DurableFilteredEventStream::new(&bus, Arc::clone(&storage), Some(start));
+            let mut ids = Vec::new();
+            for sequence in 1..=DURABLE_EVENT_PAGE_SIZE + 3 {
+                ids.push(
+                    storage
+                        .record_event(durable_test_event(sequence as i64))
+                        .await
+                        .unwrap(),
+                );
+            }
+            // None of these stored rows has a PatternDetected notification.
+            // Overflow independent live signals while the durable backlog runs.
+            for pane_id in 0..4 {
+                bus.publish(Event::PaneDisappeared { pane_id });
+            }
+            for expected in &ids[..DURABLE_EVENT_PAGE_SIZE] {
+                let row = next_durable_row(&mut stream, &cx).await;
+                assert_eq!(row.id, *expected);
+                assert!(stream.rows.len() < DURABLE_EVENT_PAGE_SIZE);
+                stream.acknowledge(row.id).unwrap();
+            }
+            assert!(matches!(
+                stream.next_item_cx(&cx, Duration::from_millis(1)).await.unwrap(),
+                Some(DurableStreamItem::Gap { missed_count }) if missed_count > 0
+            ));
+            for expected in &ids[DURABLE_EVENT_PAGE_SIZE..] {
+                let row = next_durable_row(&mut stream, &cx).await;
+                assert_eq!(row.id, *expected);
+                stream.acknowledge(row.id).unwrap();
+            }
+            assert_eq!(stream.cursor().unwrap().after_id, *ids.last().unwrap());
+            // Lifecycle delivery also gets a turn while storage is backlogged.
+            assert!(matches!(
+                stream.next_item_cx(&cx, Duration::from_millis(1)).await.unwrap(),
+                Some(DurableStreamItem::Live(event))
+                    if matches!(*event, Event::PaneDisappeared { pane_id: 3 })
+            ));
+            drop(stream);
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn durable_stream_stale_wakeups_do_not_reset_poll_deadline() {
+        run_async_test(async {
+            let (_directory, storage, start) = durable_storage_fixture().await;
+            let cx = crate::cx::Cx::current().expect("runtime context");
+            let bus = EventBus::new(16);
+            let mut stream =
+                DurableFilteredEventStream::new(&bus, Arc::clone(&storage), Some(start.clone()));
+            stream.drain_page_cx(&cx).await.unwrap();
+            let deadline = stream.next_poll;
+            bus.publish(make_pattern_event(7, "stale", Some(start.after_id)));
+            assert!(matches!(
+                stream.next_item_cx(&cx, Duration::from_millis(1)).await.unwrap(),
+                Some(DurableStreamItem::Idle)
+            ));
+            assert!(!stream.needs_drain, "stale IDs must not trigger another query");
+            assert_eq!(stream.next_poll, deadline);
+
+            let id = storage.record_event(durable_test_event(1)).await.unwrap();
+            // Deterministically reach the absolute poll boundary. Even queued
+            // unrelated live traffic must not postpone this silent commit.
+            stream.next_poll = Instant::now();
+            for pane_id in 0..8 {
+                bus.publish(Event::PaneDisappeared { pane_id });
+            }
+            assert_eq!(next_durable_row(&mut stream, &cx).await.id, id);
+            stream.acknowledge(id).unwrap();
+            drop(stream);
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn durable_stream_fresh_baseline_precedes_later_silent_commits() {
+        run_async_test(async {
+            let (_directory, storage, start) = durable_storage_fixture().await;
+            let old_id = storage.record_event(durable_test_event(1)).await.unwrap();
+            let cx = crate::cx::Cx::current().expect("runtime context");
+            let bus = EventBus::new(4);
+            let mut stream = DurableFilteredEventStream::new(&bus, Arc::clone(&storage), None);
+            assert_eq!(bus.subscriber_count(), 1, "subscribe before capturing the tail");
+            let baseline = match stream
+                .next_item_cx(&cx, Duration::from_millis(1))
+                .await
+                .unwrap()
+            {
+                Some(DurableStreamItem::Checkpoint(cursor)) => cursor,
+                other => panic!("fresh clients need an explicit baseline first: {other:?}"),
+            };
+            assert_eq!(baseline.after_id, old_id);
+            assert_eq!(baseline.epoch, start.epoch);
+            let new_id = storage.record_event(durable_test_event(2)).await.unwrap();
+            assert_eq!(next_durable_row(&mut stream, &cx).await.id, new_id);
+            assert_eq!(stream.cursor(), Some(&baseline));
+            stream.acknowledge(new_id).unwrap();
+            drop(stream);
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn durable_stream_rejects_wrong_epoch_ahead_cursor_and_pruned_history() {
+        run_async_test(async {
+            let (_directory, storage, start) = durable_storage_fixture().await;
+            let cx = crate::cx::Cx::current().expect("runtime context");
+            let bus = EventBus::new(4);
+            let id = storage.record_event(durable_test_event(1)).await.unwrap();
+            let mut wrong_epoch = start.clone();
+            wrong_epoch.epoch = if start.epoch == "00000000000000000000000000000000" {
+                "11111111111111111111111111111111"
+            } else {
+                "00000000000000000000000000000000"
+            }
+            .to_string();
+            let mut stream = DurableFilteredEventStream::new(
+                &bus,
+                Arc::clone(&storage),
+                Some(wrong_epoch.clone()),
+            );
+            assert!(matches!(
+                stream.next_item_cx(&cx, Duration::from_millis(1)).await,
+                Err(DurableStreamError::CursorExpired(check))
+                    if matches!(check.status, crate::storage::EventRetentionStatus::CursorEpochMismatch)
+            ));
+            assert_eq!(stream.cursor(), Some(&wrong_epoch));
+            drop(stream);
+
+            let ahead = DurableStreamCursor {
+                after_id: id + 1,
+                epoch: start.epoch.clone(),
+            };
+            let mut stream =
+                DurableFilteredEventStream::new(&bus, Arc::clone(&storage), Some(ahead.clone()));
+            assert!(matches!(
+                stream.next_item_cx(&cx, Duration::from_millis(1)).await,
+                Err(DurableStreamError::CursorExpired(check))
+                    if matches!(check.status, crate::storage::EventRetentionStatus::CursorAheadOfHighWater { .. })
+            ));
+            assert_eq!(stream.cursor(), Some(&ahead));
+            drop(stream);
+
+            assert_eq!(
+                storage
+                    .delete_events_by_retention_rule(i64::MAX, None, &[], 10)
+                    .await
+                    .unwrap(),
+                1
+            );
+            let mut stream =
+                DurableFilteredEventStream::new(&bus, Arc::clone(&storage), Some(start.clone()));
+            assert!(matches!(
+                stream.next_item_cx(&cx, Duration::from_millis(1)).await,
+                Err(DurableStreamError::CursorExpired(check))
+                    if matches!(check.status, crate::storage::EventRetentionStatus::Pruned { .. })
+            ));
+            assert_eq!(stream.cursor(), Some(&start));
+            assert!(stream.pending_id.is_none());
+            assert!(stream.rows.is_empty());
+            drop(stream);
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn durable_stream_cancelled_read_preserves_resume_state() {
+        run_async_test(async {
+            let (_directory, storage, start) = durable_storage_fixture().await;
+            let bus = EventBus::new(4);
+            let mut stream =
+                DurableFilteredEventStream::new(&bus, Arc::clone(&storage), Some(start.clone()));
+            storage.record_event(durable_test_event(1)).await.unwrap();
+            let cancelled = crate::cx::for_testing();
+            cancelled.cancel_with(crate::outcome::CancelKind::User, Some("stream test"));
+            assert!(matches!(
+                stream.next_item_cx(&cancelled, Duration::from_millis(1)).await,
+                Err(DurableStreamError::Cancelled)
+            ));
+            assert_eq!(stream.cursor(), Some(&start));
+            assert!(stream.pending_id.is_none());
+            assert!(stream.rows.is_empty());
+            let cx = crate::cx::Cx::current().expect("runtime context");
+            let row = next_durable_row(&mut stream, &cx).await;
+            stream.acknowledge(row.id).unwrap();
+            drop(stream);
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn durable_page_validation_rejects_unordered_duplicate_and_oversized_rows() {
+        let cursor = DurableStreamCursor {
+            after_id: 0,
+            epoch: "0123456789abcdef0123456789abcdef".to_string(),
+        };
+        let mut page = crate::storage::EventStreamPage {
+            events: Vec::new(),
+            retention: crate::storage::EventRetentionSnapshot {
+                cursor_epoch: cursor.epoch.clone(),
+                legacy_history_complete: true,
+                generation: 0,
+                evidence_from_event_id: 1,
+                max_event_id: 100,
+                deleted_event_count: 0,
+                last_deleted_at: None,
+            },
+        };
+        let row = |id| {
+            let mut event = durable_test_event(id);
+            event.id = id;
+            event
+        };
+        page.events = vec![row(1), row(2)];
+        assert!(durable_page_is_ordered(&cursor, &page));
+        for ids in [vec![2, 1], vec![1, 1], vec![0, 1], vec![1, 101]] {
+            page.events = ids.into_iter().map(row).collect();
+            assert!(!durable_page_is_ordered(&cursor, &page));
+        }
+        page.events = (1..=65).map(row).collect();
+        assert!(!durable_page_is_ordered(&cursor, &page));
     }
 
     // --- StreamCursor tests ---
