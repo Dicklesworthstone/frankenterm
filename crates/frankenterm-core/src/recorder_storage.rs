@@ -797,9 +797,12 @@ impl Default for AppendLogStorageConfig {
 /// Once the active log reaches `roll_at_bytes` it is sealed into a numbered
 /// segment file beside it and a fresh active log starts; ordinals continue.
 /// After each roll the oldest sealed segments are deleted while the recorder's
-/// append-log files exceed `max_total_bytes`. Rolling and deletion only happen
-/// while no consumer checkpoint is registered: path-based readers resume by
-/// byte offset within the active file, so a checkpointed consumer pins the log.
+/// append-log files exceed `max_total_bytes`. The newest sealed segment is
+/// retained even when it alone exceeds the budget: its name is the recovery
+/// authority for the active log's segment and ordinal base. Rolling and deletion
+/// only happen while no consumer checkpoint is registered: path-based readers
+/// resume by byte offset within the active file, so a checkpointed consumer pins
+/// the log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppendLogRetention {
     pub roll_at_bytes: u64,
@@ -1249,6 +1252,14 @@ struct AppendLogInner {
     writer: std::io::BufWriter<RecorderLeaseFile>,
     writer_failed: bool,
     repair_boundary: Option<AppendRepairBoundary>,
+    // Keep rollover bound to the same directory opened and synced at startup.
+    data_directory: CapDir,
+    data_directory_sync: File,
+    data_name: PathBuf,
+    // A rename was attempted. Before more writes or checkpoint acknowledgements,
+    // verify the writer's active name and durably settle the directory and state.
+    // Partial-write repair must never clear an uncertain namespace transition.
+    roll_pending: bool,
     // Field order keeps state authority alive through the writer's final flush.
     state_file: AppendLogStateFile,
     segment_id: u64,
@@ -1551,9 +1562,22 @@ impl AppendLogRecorderStorage {
             }
             None => Vec::new(),
         };
-        let (recovered_segment_id, segment_base_ordinal) = sealed.last().map_or((0, 0), |last| {
-            (last.segment_id.saturating_add(1), last.end_ordinal)
-        });
+        let (recovered_segment_id, segment_base_ordinal) = match sealed.last() {
+            Some(last) => (
+                last.segment_id.checked_add(1).ok_or_else(|| {
+                    RecorderStorageError::InvalidRequest {
+                        message: "recorder segment identity exhausted".to_string(),
+                    }
+                })?,
+                last.end_ordinal,
+            ),
+            None => (0, 0),
+        };
+        let recovered_next_ordinal = segment_base_ordinal
+            .checked_add(scan.valid_records)
+            .ok_or_else(|| RecorderStorageError::InvalidRequest {
+                message: "recorder ordinal exhausted".to_string(),
+            })?;
         let sealed_latest = match (sealed.last(), scan.valid_records) {
             (Some(last), 0) if last.end_ordinal > last.first_ordinal => {
                 let mut read = recorder_open_options();
@@ -1577,7 +1601,7 @@ impl AppendLogRecorderStorage {
         } else {
             persisted.segment_id == recovered_segment_id
                 && persisted.next_offset == scan.valid_len
-                && persisted.next_ordinal == segment_base_ordinal.saturating_add(scan.valid_records)
+                && persisted.next_ordinal == recovered_next_ordinal
         };
 
         let next_offset = if state_matches_scan {
@@ -1589,7 +1613,7 @@ impl AppendLogRecorderStorage {
         let next_ordinal = if state_matches_scan {
             persisted.next_ordinal
         } else {
-            segment_base_ordinal.saturating_add(scan.valid_records)
+            recovered_next_ordinal
         };
 
         let segment_id = if state_matches_scan {
@@ -1615,6 +1639,10 @@ impl AppendLogRecorderStorage {
             writer: std::io::BufWriter::new(file),
             writer_failed: false,
             repair_boundary: None,
+            data_directory: data_dir,
+            data_directory_sync: data_dir_sync,
+            data_name,
+            roll_pending: false,
             state_file,
             segment_id,
             segment_base_ordinal,
@@ -1654,13 +1682,15 @@ impl AppendLogRecorderStorage {
 
     /// Seal the active log once it reaches the roll size, then delete the
     /// oldest sealed segments beyond the byte budget. Called with the inner
-    /// lock held after a committed append; failures leave appending intact.
+    /// lock held after a committed append. Namespace changes must settle before
+    /// subsequent appends; a maintenance error never invalidates that prior batch.
     #[cfg(unix)]
     fn roll_and_prune(
         &self,
         inner: &mut AppendLogInner,
         retention: AppendLogRetention,
     ) -> std::result::Result<(), RecorderStorageError> {
+        Self::settle_pending_roll(inner)?;
         if inner.writer_failed
             || inner.repair_boundary.is_some()
             || !inner.checkpoints.is_empty()
@@ -1671,7 +1701,12 @@ impl AppendLogRecorderStorage {
         let Some(log_name) = inner.log_name.clone() else {
             return Ok(());
         };
-        let (directory, _) = recorder_parent(&self.config.data_path)?;
+        let next_segment_id = inner.segment_id.checked_add(1).ok_or_else(|| {
+            RecorderStorageError::InvalidRequest {
+                message: "recorder segment identity exhausted".to_string(),
+            }
+        })?;
+        Self::check_active_writer_identity(inner)?;
         Self::flush_writer(inner)?;
         inner.writer.get_ref().sync_data()?;
 
@@ -1679,6 +1714,7 @@ impl AppendLogRecorderStorage {
         let rolling = rolling_file_name(&log_name);
         let mut options = recorder_open_options();
         options.create_new(true).read(true).append(true);
+        let directory = &inner.data_directory;
         let mut next = RecorderLeaseFile::new(directory.open_with(&rolling, &options)?.into_std());
         if let Err(error) = next.acquire().and_then(|()| next.file.sync_all()) {
             drop(next);
@@ -1692,46 +1728,87 @@ impl AppendLogRecorderStorage {
             inner.segment_base_ordinal,
             inner.next_ordinal,
         );
-        if let Err(error) = directory.rename(&log_name, &directory, &sealed_name) {
+        // Even an error return can leave a rename applied. Keep this obligation
+        // until exact inode/name checks and directory durability establish which
+        // file the writer owns; generic buffered-write repair is insufficient.
+        inner.roll_pending = true;
+        if let Err(error) = directory.rename(&log_name, directory, &sealed_name) {
             drop(next);
             let _ = directory.remove_file(&rolling);
             return Err(error.into());
         }
-        if let Err(error) = directory.rename(&rolling, &directory, &log_name) {
-            // Put the sealed log back so the writer and the name agree again.
-            if directory
-                .rename(&sealed_name, &directory, &log_name)
-                .is_err()
+        if let Err(error) = directory.rename(&rolling, directory, &log_name) {
+            // Roll back only a demonstrably uninstalled successor. Never rename
+            // over an active name whose replacement may already have succeeded.
+            let active_absent = directory
+                .symlink_metadata(&log_name)
+                .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound);
+            if active_absent
+                && recorder_named_file_matches(directory, &rolling, &next.file)?
+                && recorder_named_file_matches(
+                    directory,
+                    &sealed_name,
+                    &inner.writer.get_ref().file,
+                )?
             {
-                inner.writer_failed = true;
+                let _ = directory.rename(&sealed_name, directory, &log_name);
             }
             drop(next);
             let _ = directory.remove_file(&rolling);
             return Err(error.into());
         }
-        sync_directory_file(&open_directory_sync(&directory)?)?;
 
-        // The sealed inode's lease is released when its writer drops here.
+        // Both names changed: install the new descriptor and counters BEFORE
+        // any fallible sync/publication. Otherwise an error sends the next batch
+        // into the sealed inode, past its frozen ordinal range.
         inner.sealed_latest = Self::latest_offset(inner);
         inner.writer = std::io::BufWriter::new(next);
-        inner.segment_id = inner.segment_id.saturating_add(1);
+        inner.segment_id = next_segment_id;
         inner.segment_base_ordinal = inner.next_ordinal;
         inner.next_offset = 0;
         inner.latest_record_start = None;
-        Self::persist_state(inner)?;
+        Self::settle_pending_roll(inner)?;
 
-        let mut sealed = list_sealed_segments(&directory, &log_name)?;
-        let mut total: u64 = sealed.iter().map(|segment| segment.bytes).sum();
+        let directory = &inner.data_directory;
+        let sealed = list_sealed_segments(directory, &log_name)?;
+        // u128 keeps accounting exact even if a directory census contains file
+        // lengths whose sum exceeds the u64 configuration domain.
+        let mut total: u128 = sealed.iter().map(|segment| u128::from(segment.bytes)).sum();
         let mut removed = false;
-        while total > retention.max_total_bytes && !sealed.is_empty() {
-            let oldest = sealed.remove(0);
+        for oldest in sealed.iter().take(sealed.len().saturating_sub(1)) {
+            if total <= u128::from(retention.max_total_bytes) {
+                break;
+            }
             directory.remove_file(&oldest.file_name)?;
-            total = total.saturating_sub(oldest.bytes);
+            total -= u128::from(oldest.bytes);
             removed = true;
         }
         if removed {
-            sync_directory_file(&open_directory_sync(&directory)?)?;
+            sync_directory_file(&inner.data_directory_sync)?;
         }
+        Ok(())
+    }
+
+    fn check_active_writer_identity(inner: &AppendLogInner) -> Result<(), RecorderStorageError> {
+        inner.state_file.check_lock()?;
+        if !recorder_named_file_matches(
+            &inner.data_directory,
+            &inner.data_name,
+            &inner.writer.get_ref().file,
+        )? {
+            return Err(RecorderStorageError::AppendLogNeedsRecovery);
+        }
+        Ok(())
+    }
+
+    fn settle_pending_roll(inner: &mut AppendLogInner) -> Result<(), RecorderStorageError> {
+        if !inner.roll_pending {
+            return Ok(());
+        }
+        Self::check_active_writer_identity(inner)?;
+        sync_directory_file(&inner.data_directory_sync)?;
+        Self::persist_state(inner)?;
+        inner.roll_pending = false;
         Ok(())
     }
 
@@ -1812,11 +1889,12 @@ impl AppendLogRecorderStorage {
     }
 
     fn repair_writer(inner: &mut AppendLogInner) -> Result<(), RecorderStorageError> {
+        Self::settle_pending_roll(inner)?;
         if !inner.writer_failed {
             return Ok(());
         }
         let repaired = (|| -> Result<(), RecorderStorageError> {
-            inner.state_file.check_lock()?;
+            Self::check_active_writer_identity(inner)?;
             // BufWriter retains the unwritten remainder after flush errors.
             // Settle it before truncation so acknowledged, buffered records
             // before the failed batch are preserved. Never discard its buffer.
@@ -2150,6 +2228,7 @@ impl AppendLogRecorderStorage {
         }
 
         let result = (|| -> std::result::Result<CheckpointCommitOutcome, RecorderStorageError> {
+            Self::settle_pending_roll(&mut inner)?;
             Self::ensure_writer_healthy(&inner)?;
             validate_checkpoint_state(&checkpoint)?;
             let key = checkpoint.consumer.0.clone();
@@ -3913,6 +3992,22 @@ fn open_directory_sync(directory: &CapDir) -> std::io::Result<File> {
     }
 }
 
+fn recorder_named_file_matches(
+    directory: &CapDir,
+    name: impl AsRef<Path>,
+    file: &File,
+) -> Result<bool, RecorderStorageError> {
+    let named = match directory.symlink_metadata(name) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let held = CapMetadata::from_file(file)?;
+    Ok(named.is_file()
+        && held.is_file()
+        && recorder_file_identity(&named)? == recorder_file_identity(&held)?)
+}
+
 #[cfg(test)]
 mod directory_sync_test_hook {
     use super::{CapMetadata, File, RecorderStorageError, recorder_file_identity};
@@ -5436,6 +5531,307 @@ recorder_backend = "frankensqlite"
                 response.first_offset.segment_id,
                 sealed.last().unwrap().segment_id + 1
             );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn roll_publication_failures_keep_new_writer_and_recover_exact_ordinals() {
+        run_async_test(async {
+            for fail_directory_sync in [true, false] {
+                let dir = tempdir().unwrap();
+                let config = test_config(dir.path());
+                let storage = AppendLogRecorderStorage::open(config.clone()).unwrap();
+                let first = append_one(&storage, 0).await;
+                let before = std::fs::read(&config.data_path).unwrap();
+                {
+                    let mut inner = storage.inner.lock().await;
+                    if fail_directory_sync {
+                        directory_sync_test_hook::start(Some(0));
+                    } else {
+                        inner
+                            .state_file
+                            .fail_after_rename
+                            .store(true, Ordering::SeqCst);
+                    }
+                    let result = storage.roll_and_prune(
+                        &mut inner,
+                        AppendLogRetention {
+                            roll_at_bytes: 1,
+                            max_total_bytes: u64::MAX,
+                        },
+                    );
+                    if fail_directory_sync {
+                        assert_eq!(directory_sync_test_hook::take().len(), 1);
+                    }
+                    assert!(result.is_err());
+                    assert!(inner.roll_pending);
+                    assert_eq!(inner.segment_id, first.last_offset.segment_id + 1);
+                    assert_eq!(inner.next_offset, 0);
+
+                    // Another failed sync must not clear the obligation, even
+                    // though the writer itself has no partial data to repair.
+                    directory_sync_test_hook::start(Some(0));
+                    let repair = AppendLogRecorderStorage::repair_writer(&mut inner);
+                    assert_eq!(directory_sync_test_hook::take().len(), 1);
+                    assert!(repair.is_err());
+                    assert!(inner.roll_pending);
+                }
+                let sealed = storage.sealed_segments().unwrap();
+                assert_eq!(sealed.len(), 1);
+                let sealed_path = dir.path().join(&sealed[0].file_name);
+                assert_eq!(std::fs::read(&sealed_path).unwrap(), before);
+                assert_eq!(std::fs::metadata(&config.data_path).unwrap().len(), 0);
+
+                // Exercise the actual blocking-worker append path, not just the
+                // rotation helper. It must settle the previous namespace first.
+                let second = append_one(&storage, 1).await;
+                assert_eq!(
+                    second.first_offset.segment_id,
+                    first.last_offset.segment_id + 1
+                );
+                assert_eq!(second.first_offset.byte_offset, 0);
+                assert_eq!(second.first_offset.ordinal, 1);
+                assert!(!storage.inner.lock().await.roll_pending);
+                assert_eq!(std::fs::read(&sealed_path).unwrap(), before);
+                storage.flush(FlushMode::Durable).await.unwrap();
+                drop(storage);
+
+                let reopened = AppendLogRecorderStorage::open(config).unwrap();
+                assert_eq!(
+                    reopened.health().await.latest_offset,
+                    Some(second.last_offset)
+                );
+                assert_eq!(append_one(&reopened, 2).await.first_offset.ordinal, 2);
+                assert_eq!(std::fs::read(sealed_path).unwrap(), before);
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uncertain_roll_namespace_cannot_be_cleared_by_data_writer_repair() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let config = test_config(dir.path());
+            let storage = AppendLogRecorderStorage::open(config.clone()).unwrap();
+            let first = append_one(&storage, 0).await;
+            let before = std::fs::read(&config.data_path).unwrap();
+            let sealed_name = sealed_segment_file_name("events.log", 0, 0, 1);
+            {
+                let mut inner = storage.inner.lock().await;
+                // The first rename happened, installing the successor failed,
+                // and rollback failed too. The old descriptor still has exactly
+                // next_offset bytes, so data-only repair would wrongly succeed.
+                inner
+                    .data_directory
+                    .rename(&inner.data_name, &inner.data_directory, &sealed_name)
+                    .unwrap();
+                inner.roll_pending = true;
+                inner.writer_failed = true;
+                assert!(matches!(
+                    AppendLogRecorderStorage::repair_writer(&mut inner),
+                    Err(RecorderStorageError::AppendLogNeedsRecovery)
+                ));
+                assert!(inner.roll_pending);
+                assert!(inner.writer_failed);
+            }
+            // A newly visible active name must not be mistaken for our writer.
+            std::fs::write(&config.data_path, b"").unwrap();
+            let retry = storage
+                .append_batch(AppendRequest {
+                    batch_id: "after-uncertain-namespace".to_string(),
+                    events: vec![sample_event(
+                        "not-written",
+                        3,
+                        1,
+                        "must not reach sealed inode",
+                    )],
+                    required_durability: DurabilityLevel::Fsync,
+                    producer_ts_ms: 1,
+                })
+                .await;
+            assert!(matches!(
+                retry,
+                Err(RecorderStorageError::AppendLogNeedsRecovery)
+            ));
+            assert!(matches!(
+                storage.flush(FlushMode::Durable).await,
+                Err(RecorderStorageError::AppendLogNeedsRecovery)
+            ));
+            assert!(matches!(
+                storage
+                    .commit_checkpoint(RecorderCheckpoint {
+                        consumer: CheckpointConsumerId("reader".to_string()),
+                        upto_offset: first.last_offset,
+                        schema_version: "v1".to_string(),
+                        committed_at_ms: 1,
+                    })
+                    .await,
+                Err(RecorderStorageError::AppendLogNeedsRecovery)
+            ));
+            assert_eq!(
+                std::fs::read(dir.path().join(&sealed_name)).unwrap(),
+                before
+            );
+            assert_eq!(std::fs::metadata(&config.data_path).unwrap().len(), 0);
+            drop(storage);
+            let reopened = AppendLogRecorderStorage::open(config).unwrap();
+            let second = append_one(&reopened, 1).await;
+            assert_eq!(second.first_offset.ordinal, 1);
+            assert_eq!(second.first_offset.segment_id, 1);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_roll_settles_before_cached_receipts_flushes_and_checkpoints() {
+        run_async_test(async {
+            for operation in 0..3 {
+                let dir = tempdir().unwrap();
+                let config = test_config(dir.path());
+                let storage = AppendLogRecorderStorage::open(config.clone()).unwrap();
+                let first = append_one(&storage, 0).await;
+                {
+                    let mut inner = storage.inner.lock().await;
+                    directory_sync_test_hook::start(Some(0));
+                    let result = storage.roll_and_prune(
+                        &mut inner,
+                        AppendLogRetention {
+                            roll_at_bytes: 1,
+                            max_total_bytes: u64::MAX,
+                        },
+                    );
+                    assert_eq!(directory_sync_test_hook::take().len(), 1);
+                    assert!(result.is_err());
+                    assert!(inner.roll_pending);
+                }
+                match operation {
+                    0 => {
+                        let replay = append_one(&storage, 0).await;
+                        assert!(replay.was_idempotent_replay);
+                        assert_eq!(replay.last_offset, first.last_offset);
+                    }
+                    1 => {
+                        assert_eq!(
+                            storage
+                                .flush(FlushMode::Durable)
+                                .await
+                                .unwrap()
+                                .latest_offset,
+                            Some(first.last_offset),
+                        );
+                    }
+                    _ => {
+                        storage
+                            .commit_checkpoint(RecorderCheckpoint {
+                                consumer: CheckpointConsumerId("settled-reader".to_string()),
+                                upto_offset: first.last_offset,
+                                schema_version: "v1".to_string(),
+                                committed_at_ms: 1,
+                            })
+                            .await
+                            .unwrap();
+                    }
+                }
+                assert!(!storage.inner.lock().await.roll_pending);
+                assert_eq!(storage.sealed_segments().unwrap().len(), 1);
+                assert_eq!(std::fs::metadata(&config.data_path).unwrap().len(), 0);
+                drop(storage);
+                let reopened = AppendLogRecorderStorage::open(config).unwrap();
+                assert_eq!(append_one(&reopened, 1).await.first_offset.ordinal, 1);
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tiny_retention_budget_preserves_the_recovery_anchor_across_reopen() {
+        run_async_test(async {
+            for budget in [0, 1] {
+                let dir = tempdir().unwrap();
+                let config = test_config(dir.path());
+                let retention = AppendLogRetention {
+                    roll_at_bytes: 1,
+                    max_total_bytes: budget,
+                };
+                for ordinal in 0..4 {
+                    let storage = AppendLogRecorderStorage::open(config.clone())
+                        .unwrap()
+                        .with_retention(retention);
+                    let receipt = append_one(&storage, ordinal).await;
+                    assert_eq!(receipt.first_offset.ordinal, ordinal);
+                    assert_eq!(receipt.first_offset.segment_id, ordinal);
+                    let sealed = storage.sealed_segments().unwrap();
+                    assert_eq!(sealed.len(), 1, "the newest recovery anchor must remain");
+                    assert_eq!(sealed[0].segment_id, ordinal);
+                    assert_eq!(sealed[0].end_ordinal, ordinal + 1);
+                    assert_eq!(
+                        storage.health().await.latest_offset,
+                        Some(receipt.last_offset)
+                    );
+                }
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exhausted_segment_identity_refuses_roll_before_namespace_mutation() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let config = test_config(dir.path());
+            let storage = AppendLogRecorderStorage::open(config.clone()).unwrap();
+            append_one(&storage, 0).await;
+            let before = std::fs::read(&config.data_path).unwrap();
+            {
+                let mut inner = storage.inner.lock().await;
+                inner.segment_id = u64::MAX;
+                assert!(matches!(
+                    storage.roll_and_prune(
+                        &mut inner,
+                        AppendLogRetention {
+                            roll_at_bytes: 1,
+                            max_total_bytes: u64::MAX,
+                        }
+                    ),
+                    Err(RecorderStorageError::InvalidRequest { .. })
+                ));
+                assert!(!inner.roll_pending);
+            }
+            assert_eq!(std::fs::read(&config.data_path).unwrap(), before);
+            assert!(storage.sealed_segments().unwrap().is_empty());
+            assert!(!dir.path().join("events.log.rolling").exists());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reopen_refuses_exhausted_segment_and_ordinal_authority() {
+        run_async_test(async {
+            for exhaust_segment in [true, false] {
+                let dir = tempdir().unwrap();
+                let config = test_config(dir.path());
+                let storage = AppendLogRecorderStorage::open(config.clone()).unwrap();
+                append_one(&storage, 0).await;
+                drop(storage);
+                let before = std::fs::read(&config.data_path).unwrap();
+                let (segment, first, end) = if exhaust_segment {
+                    (u64::MAX, 0, 1)
+                } else {
+                    (0, u64::MAX - 1, u64::MAX)
+                };
+                let sealed =
+                    dir.path()
+                        .join(sealed_segment_file_name("events.log", segment, first, end));
+                std::fs::write(&sealed, &before).unwrap();
+                assert!(matches!(
+                    AppendLogRecorderStorage::open(config.clone()),
+                    Err(RecorderStorageError::InvalidRequest { .. })
+                ));
+                assert_eq!(std::fs::read(&config.data_path).unwrap(), before);
+                assert_eq!(std::fs::read(sealed).unwrap(), before);
+            }
         });
     }
 
