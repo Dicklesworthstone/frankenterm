@@ -94,6 +94,40 @@ pub type MuxHandle = Arc<dyn MuxInterface>;
 /// [`MuxHandle`].
 pub type WeztermHandle = MuxHandle;
 
+/// Native identity of one registered pane in one mux session.
+///
+/// Numeric pane IDs can be reused after a pane closes or a mux restarts. A
+/// durable operation must compare all three components before attributing
+/// new observations to the pane on which it originally acted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MuxPaneIdentity {
+    pub session_incarnation: [u8; 16],
+    pub durable_pane_id: [u8; 16],
+    pub pane_registration: [u8; 16],
+}
+
+impl MuxPaneIdentity {
+    /// Whether every component carries an authoritative, non-nil identity.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.session_incarnation != [0; 16]
+            && self.durable_pane_id != [0; 16]
+            && self.pane_registration != [0; 16]
+    }
+}
+
+#[cfg(all(feature = "vendored", unix))]
+impl From<codec::PaneIdentityV1> for MuxPaneIdentity {
+    fn from(identity: codec::PaneIdentityV1) -> Self {
+        Self {
+            session_incarnation: identity.session_incarnation.as_bytes(),
+            durable_pane_id: identity.durable_pane_id,
+            pane_registration: identity.pane_registration.as_bytes(),
+        }
+    }
+}
+
 /// Semantic type for a contiguous OSC 133 terminal zone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -245,6 +279,20 @@ pub trait MuxInterface: Send + Sync {
     ) -> WeztermFuture<'a, PaneInfo> {
         self.get_pane(pane_id)
     }
+
+    /// Read the mux-issued identity of this exact pane registration.
+    ///
+    /// Backends without native identity support return `None`. Callers must
+    /// not replace a missing identity with a numeric pane ID, host name, or
+    /// locally generated UUID when recovering a durable operation.
+    fn pane_native_identity_with_cx<'a>(
+        &'a self,
+        _cx: &'a crate::cx::Cx,
+        _pane_id: u64,
+    ) -> WeztermFuture<'a, Option<MuxPaneIdentity>> {
+        Box::pin(async { Ok(None) })
+    }
+
     /// Get text content from a pane.
     fn get_text(&self, pane_id: u64, escapes: bool) -> WeztermFuture<'_, String>;
 
@@ -4526,6 +4574,19 @@ impl WeztermInterface for WeztermClient {
         Box::pin(async move { WeztermClient::get_pane_with_cx(self, cx, pane_id).await })
     }
 
+    #[cfg(all(feature = "vendored", unix))]
+    fn pane_native_identity_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, Option<MuxPaneIdentity>> {
+        Box::pin(async move {
+            WeztermClient::pane_native_identity_with_cx(self, cx, pane_id)
+                .await
+                .map(|identity| identity.map(MuxPaneIdentity::from))
+        })
+    }
+
     fn get_text(&self, pane_id: u64, escapes: bool) -> WeztermFuture<'_, String> {
         Box::pin(async move { WeztermClient::get_text(self, pane_id, escapes).await })
     }
@@ -5004,6 +5065,14 @@ impl WeztermInterface for Arc<dyn WeztermInterface> {
         pane_id: u64,
     ) -> WeztermFuture<'a, PaneInfo> {
         self.as_ref().get_pane_with_cx(cx, pane_id)
+    }
+
+    fn pane_native_identity_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, Option<MuxPaneIdentity>> {
+        self.as_ref().pane_native_identity_with_cx(cx, pane_id)
     }
 
     fn get_text_with_cx<'a>(
@@ -5956,6 +6025,120 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::sync::Arc;
+
+    #[test]
+    fn native_pane_identity_roundtrips_without_accepting_ambiguous_fields() {
+        let identity = MuxPaneIdentity {
+            session_incarnation: [0x11; 16],
+            durable_pane_id: [0x22; 16],
+            pane_registration: [0x33; 16],
+        };
+        let wire = serde_json::to_value(identity).unwrap();
+        assert_eq!(
+            serde_json::from_value::<MuxPaneIdentity>(wire.clone()).unwrap(),
+            identity
+        );
+        assert!(identity.is_valid());
+
+        let mut unknown = wire.clone();
+        unknown["host_identity"] = serde_json::json!("not-a-mux-issued-identity");
+        assert!(serde_json::from_value::<MuxPaneIdentity>(unknown).is_err());
+
+        for field in [
+            "session_incarnation",
+            "durable_pane_id",
+            "pane_registration",
+        ] {
+            let mut missing = wire.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<MuxPaneIdentity>(missing).is_err());
+
+            let mut truncated = wire.clone();
+            truncated[field] = serde_json::json!([1, 2, 3]);
+            assert!(serde_json::from_value::<MuxPaneIdentity>(truncated).is_err());
+
+            let mut nil = wire.clone();
+            nil[field] = serde_json::to_value([0u8; 16]).unwrap();
+            let decoded = serde_json::from_value::<MuxPaneIdentity>(nil).unwrap();
+            assert!(!decoded.is_valid(), "{field} must not be nil");
+        }
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn native_pane_identity_preserves_every_mux_issued_component() {
+        let native = codec::PaneIdentityV1 {
+            session_incarnation: mux::MuxSessionIncarnation::from_bytes([0x14; 16]),
+            durable_pane_id: [0x25; 16],
+            pane_registration: codec::ReliablePaneRegistrationIdentityV1::from_bytes([0x36; 16]),
+        };
+        assert_eq!(
+            MuxPaneIdentity::from(native),
+            MuxPaneIdentity {
+                session_incarnation: [0x14; 16],
+                durable_pane_id: [0x25; 16],
+                pane_registration: [0x36; 16],
+            }
+        );
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn native_pane_identity_trait_reaches_the_real_mux_client() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let client = isolated_cli_client();
+            assert!(client.mux_pool.is_none());
+            let error = MuxInterface::pane_native_identity_with_cx(&client, &cx, 7)
+                .await
+                .expect_err("a native client must not silently use the unsupported default");
+            assert!(matches!(
+                error,
+                crate::Error::Wezterm(WeztermError::CommandFailed(ref detail))
+                    if detail == "native pane identity requires a direct mux connection"
+            ));
+        });
+    }
+
+    #[test]
+    fn native_pane_identity_and_cancellation_forward_through_arc_and_unified() {
+        run_async_test(async {
+            let mock = Arc::new(MockWezterm::new());
+            mock.add_default_pane(7).await;
+            let identity = MuxPaneIdentity {
+                session_incarnation: [0x11; 16],
+                durable_pane_id: [0x22; 16],
+                pane_registration: [0x33; 16],
+            };
+            mock.set_pane_native_identity(7, Some(identity))
+                .await
+                .unwrap();
+            let handle: MuxHandle = mock;
+            let unified = UnifiedClient::from_handle(
+                handle.clone(),
+                BackendSelection {
+                    kind: BackendKind::Cli,
+                    reason: "native identity forwarding fixture".to_string(),
+                    compatibility: None,
+                },
+            );
+            let cx = crate::cx::for_testing();
+            for backend in [&handle as &dyn MuxInterface, &unified as &dyn MuxInterface] {
+                assert_eq!(
+                    backend.pane_native_identity_with_cx(&cx, 7).await.unwrap(),
+                    Some(identity)
+                );
+            }
+
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("identity read cancelled"),
+            );
+            for backend in [&handle as &dyn MuxInterface, &unified as &dyn MuxInterface] {
+                assert!(backend.pane_native_identity_with_cx(&cx, 7).await.is_err());
+            }
+        });
+    }
 
     #[cfg(all(feature = "vendored", unix))]
     #[test]
@@ -11356,6 +11539,14 @@ impl WeztermInterface for UnifiedClient {
         self.inner.get_pane_with_cx(cx, pane_id)
     }
 
+    fn pane_native_identity_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, Option<MuxPaneIdentity>> {
+        self.inner.pane_native_identity_with_cx(cx, pane_id)
+    }
+
     fn get_text_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -11550,6 +11741,8 @@ impl WeztermInterface for UnifiedClient {
 /// WezTerm instance.
 pub struct MockWezterm {
     panes: crate::runtime_async::RwLock<std::collections::HashMap<u64, MockPane>>,
+    native_identities:
+        crate::runtime_async::RwLock<std::collections::HashMap<u64, MuxPaneIdentity>>,
     next_pane_id: std::sync::atomic::AtomicU64,
     next_window_id: std::sync::atomic::AtomicU64,
     next_tab_id: std::sync::atomic::AtomicU64,
@@ -11712,6 +11905,7 @@ impl MockWezterm {
     pub fn new() -> Self {
         Self {
             panes: crate::runtime_async::RwLock::new(std::collections::HashMap::new()),
+            native_identities: crate::runtime_async::RwLock::new(std::collections::HashMap::new()),
             next_pane_id: std::sync::atomic::AtomicU64::new(0),
             next_window_id: std::sync::atomic::AtomicU64::new(0),
             next_tab_id: std::sync::atomic::AtomicU64::new(0),
@@ -11799,6 +11993,44 @@ impl MockWezterm {
             self.tiered_scrollback_bulk_calls.load(Ordering::Relaxed),
             self.tiered_scrollback_legacy_calls.load(Ordering::Relaxed),
         )
+    }
+
+    /// Configure the native identity exposed for an existing mock pane.
+    ///
+    /// Panes have no native identity until one is supplied. Removing a pane
+    /// clears its identity so a reused numeric ID cannot inherit it.
+    pub async fn set_pane_native_identity(
+        &self,
+        pane_id: u64,
+        identity: Option<MuxPaneIdentity>,
+    ) -> Result<()> {
+        if identity.is_some_and(|identity| !identity.is_valid()) {
+            return Err(WeztermError::CommandFailed(
+                "native pane identity contains a nil component".to_string(),
+            )
+            .into());
+        }
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        let panes = self
+            .panes
+            .read_with_cx(&cx)
+            .await
+            .map_err(|error| mock_lock_error(&cx, "mock set pane identity", error))?;
+        if !panes.contains_key(&pane_id) {
+            return Err(WeztermError::PaneNotFound(pane_id).into());
+        }
+        let mut identities = self
+            .native_identities
+            .write_with_cx(&cx)
+            .await
+            .map_err(|error| mock_lock_error(&cx, "mock set pane identity", error))?;
+        mock_checkpoint(&cx, "mock set pane identity")?;
+        if let Some(identity) = identity {
+            identities.insert(pane_id, identity);
+        } else {
+            identities.remove(&pane_id);
+        }
+        Ok(())
     }
 
     /// Add a pre-configured pane.
@@ -12290,9 +12522,11 @@ impl WeztermInterface for MockWezterm {
     fn kill_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
         Box::pin(async move {
             let mut panes = self.panes.write().await;
+            let mut identities = self.native_identities.write().await;
             if panes.remove(&pane_id).is_none() {
                 return Err(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id)));
             }
+            identities.remove(&pane_id);
             Ok(())
         })
     }
@@ -12337,6 +12571,30 @@ impl WeztermInterface for MockWezterm {
                 .get(&pane_id)
                 .map(MockPane::to_pane_info)
                 .ok_or(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id)))
+        })
+    }
+
+    fn pane_native_identity_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, Option<MuxPaneIdentity>> {
+        Box::pin(async move {
+            let panes = self
+                .panes
+                .read_with_cx(cx)
+                .await
+                .map_err(|error| mock_lock_error(cx, "mock pane identity", error))?;
+            if !panes.contains_key(&pane_id) {
+                return Err(WeztermError::PaneNotFound(pane_id).into());
+            }
+            let identities = self
+                .native_identities
+                .read_with_cx(cx)
+                .await
+                .map_err(|error| mock_lock_error(cx, "mock pane identity", error))?;
+            mock_checkpoint(cx, "mock pane identity")?;
+            Ok(identities.get(&pane_id).copied())
         })
     }
 
@@ -12593,10 +12851,16 @@ impl WeztermInterface for MockWezterm {
                 .write_with_cx(cx)
                 .await
                 .map_err(|error| mock_lock_error(cx, "mock kill pane", error))?;
+            let mut identities = self
+                .native_identities
+                .write_with_cx(cx)
+                .await
+                .map_err(|error| mock_lock_error(cx, "mock kill pane", error))?;
             mock_checkpoint(cx, "mock kill pane")?;
             if panes.remove(&pane_id).is_none() {
                 return Err(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id)));
             }
+            identities.remove(&pane_id);
             Ok(())
         })
     }
@@ -12936,6 +13200,78 @@ mod mock_tests {
 
             let panes = mock.list_panes().await.unwrap();
             assert_eq!(panes.len(), 2);
+        });
+    }
+
+    #[test]
+    fn mock_native_identity_is_optional_validated_and_cleared_before_pane_id_reuse() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let identity = MuxPaneIdentity {
+                session_incarnation: [0x11; 16],
+                durable_pane_id: [0x22; 16],
+                pane_registration: [0x33; 16],
+            };
+            for use_cx in [false, true] {
+                let mock = MockWezterm::new();
+                assert!(
+                    mock.set_pane_native_identity(7, Some(identity))
+                        .await
+                        .is_err()
+                );
+                mock.add_default_pane(7).await;
+                assert_eq!(
+                    mock.pane_native_identity_with_cx(&cx, 7).await.unwrap(),
+                    None
+                );
+
+                mock.set_pane_native_identity(7, Some(identity))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    mock.pane_native_identity_with_cx(&cx, 7).await.unwrap(),
+                    Some(identity)
+                );
+                assert!(
+                    mock.set_pane_native_identity(
+                        7,
+                        Some(MuxPaneIdentity {
+                            pane_registration: [0; 16],
+                            ..identity
+                        })
+                    )
+                    .await
+                    .is_err()
+                );
+                assert_eq!(
+                    mock.pane_native_identity_with_cx(&cx, 7).await.unwrap(),
+                    Some(identity),
+                    "invalid replacement must leave the current identity intact"
+                );
+
+                mock.set_pane_native_identity(7, None).await.unwrap();
+                assert_eq!(
+                    mock.pane_native_identity_with_cx(&cx, 7).await.unwrap(),
+                    None
+                );
+                mock.set_pane_native_identity(7, Some(identity))
+                    .await
+                    .unwrap();
+                if use_cx {
+                    mock.kill_pane_with_cx(&cx, 7).await.unwrap();
+                } else {
+                    mock.kill_pane(7).await.unwrap();
+                }
+                assert!(matches!(
+                    mock.pane_native_identity_with_cx(&cx, 7).await,
+                    Err(crate::Error::Wezterm(WeztermError::PaneNotFound(7)))
+                ));
+                mock.add_default_pane(7).await;
+                assert_eq!(
+                    mock.pane_native_identity_with_cx(&cx, 7).await.unwrap(),
+                    None
+                );
+            }
         });
     }
 

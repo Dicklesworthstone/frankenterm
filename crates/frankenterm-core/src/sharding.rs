@@ -23,9 +23,9 @@ use crate::error::{MuxObjectKind, MuxRejectionCode, StorageError, WeztermError};
 use crate::patterns::AgentType;
 use crate::watchdog::HealthStatus;
 use crate::wezterm::{
-    MoveDirection, MuxPaneText, MuxSemanticSnapshot, PaneInfo, PaneTieredScrollbackBatchEntry,
-    PaneTieredScrollbackSummary, SpawnTarget, SplitDirection, WeztermFuture, WeztermHandle,
-    WeztermInterface,
+    MoveDirection, MuxPaneIdentity, MuxPaneText, MuxSemanticSnapshot, PaneInfo,
+    PaneTieredScrollbackBatchEntry, PaneTieredScrollbackSummary, SpawnTarget, SplitDirection,
+    WeztermFuture, WeztermHandle, WeztermInterface,
 };
 
 // =============================================================================
@@ -2546,6 +2546,24 @@ impl WeztermInterface for ShardedWeztermClient {
                 Value::from(route.local_pane_id),
             );
             Ok(pane)
+        })
+    }
+
+    fn pane_native_identity_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, Option<MuxPaneIdentity>> {
+        Box::pin(async move {
+            let route = self.route_for_global_pane_id_with_cx(cx, pane_id)?;
+            let backend = self.backend_for_id(route.shard_id)?;
+            backend
+                .handle
+                .pane_native_identity_with_cx(cx, route.local_pane_id)
+                .await
+                .map_err(|err| {
+                    Self::backend_error(route.shard_id, "pane_native_identity", Some(pane_id), err)
+                })
         })
     }
 
@@ -5899,6 +5917,73 @@ mod tests {
                 .unwrap();
             let (shard, _local) = decode_sharded_pane_id(new_pane);
             assert_eq!(shard, ShardId(0));
+        });
+    }
+
+    #[test]
+    fn native_identity_routes_same_local_pane_id_to_its_owning_shard() {
+        run_async_test(async {
+            let first = Arc::new(MockWezterm::new());
+            let second = Arc::new(MockWezterm::new());
+            first.add_default_pane(7).await;
+            second.add_default_pane(7).await;
+            let first_identity = MuxPaneIdentity {
+                session_incarnation: [0x11; 16],
+                durable_pane_id: [0x22; 16],
+                pane_registration: [0x33; 16],
+            };
+            let second_identity = MuxPaneIdentity {
+                session_incarnation: [0x44; 16],
+                durable_pane_id: [0x55; 16],
+                pane_registration: [0x66; 16],
+            };
+            first
+                .set_pane_native_identity(7, Some(first_identity))
+                .await
+                .unwrap();
+            second
+                .set_pane_native_identity(7, Some(second_identity))
+                .await
+                .unwrap();
+            let client = ShardedWeztermClient::new(
+                vec![
+                    ShardBackend::new(ShardId(3), first as WeztermHandle),
+                    ShardBackend::new(ShardId(5), second.clone() as WeztermHandle),
+                ],
+                AssignmentStrategy::RoundRobin,
+            )
+            .unwrap();
+            let cx = crate::cx::for_testing();
+            for (shard, identity) in [(ShardId(3), first_identity), (ShardId(5), second_identity)] {
+                let pane_id = try_encode_sharded_pane_id(shard, 7).unwrap();
+                assert_eq!(
+                    client
+                        .pane_native_identity_with_cx(&cx, pane_id)
+                        .await
+                        .unwrap(),
+                    Some(identity)
+                );
+            }
+
+            let second_pane_id = try_encode_sharded_pane_id(ShardId(5), 7).unwrap();
+            second.set_pane_native_identity(7, None).await.unwrap();
+            assert_eq!(
+                client
+                    .pane_native_identity_with_cx(&cx, second_pane_id)
+                    .await
+                    .unwrap(),
+                None
+            );
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("shard identity read cancelled"),
+            );
+            assert!(
+                client
+                    .pane_native_identity_with_cx(&cx, second_pane_id)
+                    .await
+                    .is_err()
+            );
         });
     }
 
