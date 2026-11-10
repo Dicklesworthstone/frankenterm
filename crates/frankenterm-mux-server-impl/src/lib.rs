@@ -657,9 +657,33 @@ mod deferred_scrollback {
             }
         }
 
-        /// Start a writer thread. Without one (spawn failure), sinks fall
-        /// back to draining inline on the requesting thread.
+        /// Start a writer thread. If startup fails, asynchronous handoffs
+        /// report degraded durability while the bounded sink queues retain
+        /// their pending history. They never drain on the parser thread.
         pub(super) fn spawn() -> Arc<Self> {
+            Self::spawn_with(|worker| {
+                std::thread::Builder::new()
+                    .name(DURABILITY_THREAD_NAME.to_string())
+                    .spawn(move || {
+                        // Durability need not finish promptly; keep it off the
+                        // performance cores that parse output (ft-yccm0.3.1.3),
+                        // and on Linux below the input and parse threads.
+                        if let Err(error) =
+                            procinfo::set_current_thread_qos_for_life(procinfo::ThreadQos::Utility)
+                        {
+                            log::warn!(
+                                "{DURABILITY_THREAD_NAME} thread keeps its default QoS class: {error}"
+                            );
+                        }
+                        worker.run();
+                    })
+                    .map(|_| ())
+            })
+        }
+
+        /// Keep startup failure injectable without creating a thread or
+        /// exhausting the process's operating-system resources in tests.
+        fn spawn_with(start: impl FnOnce(Arc<WriterShared>) -> std::io::Result<()>) -> Arc<Self> {
             let shared = Arc::new(WriterShared {
                 queue: Mutex::new(WriterQueue::default()),
                 wake: Condvar::new(),
@@ -681,25 +705,10 @@ mod deferred_scrollback {
             shared
                 .idle_ms
                 .store(duration_ms(policy.idle), Ordering::Release);
-            let worker = Arc::clone(&shared);
-            match std::thread::Builder::new()
-                .name(DURABILITY_THREAD_NAME.to_string())
-                .spawn(move || {
-                    // Durability need not finish promptly; keep it off the
-                    // performance cores that parse output (ft-yccm0.3.1.3),
-                    // and on Linux below the input and parse threads.
-                    if let Err(error) =
-                        procinfo::set_current_thread_qos_for_life(procinfo::ThreadQos::Utility)
-                    {
-                        log::warn!(
-                            "{DURABILITY_THREAD_NAME} thread keeps its default QoS class: {error}"
-                        );
-                    }
-                    worker.run();
-                }) {
-                Ok(_) => shared.running.store(true, Ordering::Release),
+            match start(Arc::clone(&shared)) {
+                Ok(()) => shared.running.store(true, Ordering::Release),
                 Err(error) => log::error!(
-                    "failed to start the {DURABILITY_THREAD_NAME} thread; scrollback durability runs inline on parser threads: {error}"
+                    "failed to start the {DURABILITY_THREAD_NAME} thread; pending scrollback remains in bounded memory and asynchronous durability handoffs report failure: {error}"
                 ),
             }
             Arc::new(Self { shared })
@@ -1516,6 +1525,7 @@ mod deferred_scrollback {
         }
 
         fn record_writer_failure(&self, error: ScrollbackSpillError, panicked: bool) {
+            let retrying = self.writer.shared.running.load(Ordering::Acquire);
             let mut health = self.lock_health();
             let first = health.failure.is_none();
             health.failure = Some(error);
@@ -1525,22 +1535,30 @@ mod deferred_scrollback {
             let delay = RETRY_BACKOFF_MIN
                 .saturating_mul(1 << doublings)
                 .min(RETRY_BACKOFF_MAX);
-            let retry_at = Instant::now() + delay;
-            health.retry_not_before = Some(retry_at);
+            health.retry_not_before = retrying.then(|| Instant::now() + delay);
             drop(health);
             // Surfaced by `ft doctor --json` through the resource snapshot.
-            DurabilityLedger::global().record_failure(
-                &self.pane_label,
-                &error.to_string(),
-                panicked,
-            );
+            // An unavailable background worker cannot promise a timed retry.
+            let diagnostic = if retrying {
+                error.to_string()
+            } else {
+                format!(
+                    "{error}; background durability writer unavailable; explicit flush or restart required"
+                )
+            };
+            DurabilityLedger::global().record_failure(&self.pane_label, &diagnostic, panicked);
             if panicked {
                 metrics::counter!("mux.scrollback.durability_writer_panics").increment(1);
             }
             metrics::counter!("mux.scrollback.durability_writer_failures").increment(1);
             if first {
+                let recovery = if retrying {
+                    "rows stay in memory and the writer retries"
+                } else {
+                    "pending history stays in bounded memory; explicit flush or restart is required"
+                };
                 log::error!(
-                    "scrollback durability for pane {} is degraded{}: {error}; rows stay in memory and the writer retries",
+                    "scrollback durability for pane {} is degraded{}: {error}; {recovery}",
                     self.pane_label,
                     if panicked {
                         " by a contained writer panic"
@@ -1548,18 +1566,25 @@ mod deferred_scrollback {
                         ""
                     }
                 );
-            } else {
+            } else if retrying {
                 log::debug!(
                     target: "mux::scrollback_durability",
                     "pane={} writer retry failed: {error} retry_in_ms={}",
                     self.pane_label,
                     delay.as_millis()
                 );
+            } else {
+                log::debug!(
+                    target: "mux::scrollback_durability",
+                    "pane={} background durability writer unavailable: {error}; no background retry is scheduled",
+                    self.pane_label
+                );
             }
         }
 
         /// O(1): queue this sink for the writer unless it is already queued.
-        /// Without a writer thread, the caller drains inline instead.
+        /// Without a writer thread, preserve the pending history and report
+        /// degraded durability. Parser handoffs never perform storage IO.
         fn schedule(&self) {
             if self.scheduled.swap(true, Ordering::AcqRel) {
                 return;
@@ -1570,8 +1595,10 @@ mod deferred_scrollback {
                 .is_some_and(|this| self.writer.enqueue(this));
             if !enqueued {
                 self.scheduled.store(false, Ordering::Release);
-                // Records its own outcome; the caller reads the failure state.
-                let _ = self.flush_scrollback();
+                // Explicit flush_scrollback remains a synchronous recovery
+                // operation. Calling it here would stall the parser whenever
+                // operating-system thread creation fails.
+                self.record_writer_failure(ScrollbackSpillError::StorageUnavailable, false);
             }
         }
 
@@ -3904,6 +3931,185 @@ mod deferred_scrollback {
         fn clear_scrollback(&self) -> Result<ScrollbackClearCommit, ScrollbackSpillError> {
             Err(ScrollbackSpillError::StorageUnavailable)
         }
+    }
+
+    #[test]
+    fn durability_writer_start_failure_preserves_rows_without_inline_io() {
+        let writer = DurabilityWriter::spawn_with(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "injected durability writer startup failure",
+            ))
+        });
+        let store = Arc::new(GatedStore::default());
+        let pane = [0xd7; 16];
+        let pane_label = uuid::Uuid::from_bytes(pane).to_string();
+        let sink =
+            DeferredScrollbackSpillSink::with_writer(store.clone(), pane, Arc::clone(&writer))
+                .unwrap();
+
+        // Keep the store open: the old inline fallback fails these assertions
+        // promptly instead of leaving the test blocked inside a closed gate.
+        for row in 0..8 {
+            assert!(sink.store_scrollback_line(row, &GatedStore::line(row), 256));
+            assert_eq!(
+                sink.request_scrollback_flush(),
+                Err(ScrollbackSpillError::StorageUnavailable)
+            );
+        }
+        assert_eq!(
+            sink.request_scrollback_commit(),
+            Err(ScrollbackSpillError::StorageUnavailable)
+        );
+        assert_eq!(store.gate.lock().unwrap().entered_calls, 0);
+        assert!(store.rows().is_empty());
+        assert!(store.published_frontiers().is_empty());
+        assert_eq!(
+            sink.durability_failure(),
+            Some(ScrollbackSpillError::StorageUnavailable)
+        );
+        assert_eq!(sink.retry_not_before(), None);
+        assert!(!sink.scheduled.load(Ordering::Acquire));
+        assert!(!writer.shared.running.load(Ordering::Acquire));
+        let degraded = DurabilityLedger::global().snapshot();
+        assert!(
+            degraded
+                .degraded_panes
+                .get(&pane_label)
+                .is_some_and(|reason| reason.contains("background durability writer unavailable")),
+            "the exported diagnostic must not promise a nonexistent background retry"
+        );
+        for row in 0..8 {
+            assert_eq!(
+                sink.load_scrollback_line(row)
+                    .map(|line| line.as_str().trim_end().to_string()),
+                Some(GatedStore::text(row)),
+                "admitted row {row} remains readable while the worker is unavailable"
+            );
+        }
+
+        // A deliberate synchronous operation still owns its normal captured
+        // frontier, writes the rows exactly once, and publishes that frontier.
+        sink.flush_scrollback().unwrap();
+        let expected: Vec<_> = (0..8).map(|row| (row, GatedStore::text(row))).collect();
+        assert_eq!(store.rows(), expected);
+        assert_eq!(store.published_frontiers().last(), Some(&8));
+        assert_eq!(writer.queued_bytes(), 0);
+        assert_eq!(sink.durability_failure(), None);
+        assert!(
+            !DurabilityLedger::global()
+                .snapshot()
+                .degraded_panes
+                .contains_key(&pane_label)
+        );
+
+        // Successful explicit persistence does not invent a running worker
+        // or turn subsequent parser handoffs back into inline storage IO.
+        let calls = store.gate.lock().unwrap().entered_calls;
+        let publications = store.published_frontiers();
+        assert!(sink.store_scrollback_line(8, &GatedStore::line(8), 256));
+        assert_eq!(
+            sink.request_scrollback_commit(),
+            Err(ScrollbackSpillError::StorageUnavailable)
+        );
+        assert_eq!(store.gate.lock().unwrap().entered_calls, calls);
+        assert_eq!(store.rows(), expected);
+        assert_eq!(store.published_frontiers(), publications);
+        assert_eq!(
+            sink.load_scrollback_line(8)
+                .map(|line| line.as_str().trim_end().to_string()),
+            Some(GatedStore::text(8))
+        );
+        assert_eq!(sink.retry_not_before(), None);
+
+        sink.flush_scrollback().unwrap();
+        let expected: Vec<_> = (0..9).map(|row| (row, GatedStore::text(row))).collect();
+        assert_eq!(store.rows(), expected);
+        assert_eq!(store.published_frontiers().last(), Some(&9));
+        assert_eq!(writer.queued_bytes(), 0);
+        assert_eq!(sink.durability_failure(), None);
+        assert!(!writer.shared.running.load(Ordering::Acquire));
+        assert!(
+            !DurabilityLedger::global()
+                .snapshot()
+                .degraded_panes
+                .contains_key(&pane_label)
+        );
+    }
+
+    #[test]
+    fn durability_writer_start_failure_keeps_overload_bounded_and_reports_abandonment() {
+        let writer = DurabilityWriter::spawn_with(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "injected durability writer startup failure",
+            ))
+        });
+        let store = Arc::new(GatedStore::default());
+        let pane = [0xd8; 16];
+        let pane_label = uuid::Uuid::from_bytes(pane).to_string();
+        let sink =
+            DeferredScrollbackSpillSink::with_writer(store.clone(), pane, Arc::clone(&writer))
+                .unwrap();
+        let largest_row = (0..128)
+            .map(|row| DeferredScrollbackSpillSink::row_charge(&GatedStore::line(row)).unwrap())
+            .max()
+            .unwrap();
+        writer.set_queue_budget(largest_row * 4);
+        let budget = writer.queue_budget();
+
+        // Admission continues through explicit overload gaps even when no
+        // background thread can ever drain this writer's pending queues.
+        for row in 0..128 {
+            assert!(sink.store_scrollback_line(row, &GatedStore::line(row), 256));
+            assert_eq!(
+                sink.request_scrollback_flush(),
+                Err(ScrollbackSpillError::StorageUnavailable)
+            );
+            assert!(
+                writer.queued_bytes() <= budget,
+                "row {row} exceeded the unavailable writer's queue budget"
+            );
+        }
+        assert_eq!(store.gate.lock().unwrap().entered_calls, 0);
+        assert!(store.rows().is_empty());
+        assert!(store.published_frontiers().is_empty());
+        assert_eq!(sink.retained_scrollback_rows(), 128);
+        let gaps = sink.queued_gaps();
+        assert!(!gaps.is_empty(), "overload must retain explicit gap spans");
+        assert_eq!(gaps[0].start, 0);
+        assert!(
+            sink.load_scrollback_line(gaps[0].start)
+                .is_some_and(|line| line.as_str().starts_with(GAP_MARKER_PREFIX)),
+            "the missing durable prefix remains visible as a gap"
+        );
+        assert_eq!(
+            sink.load_scrollback_line(127)
+                .map(|line| line.as_str().trim_end().to_string()),
+            Some(GatedStore::text(127)),
+            "the newest admitted row remains readable"
+        );
+        assert!(
+            DurabilityLedger::global()
+                .snapshot()
+                .degraded_panes
+                .contains_key(&pane_label)
+        );
+
+        let retained = Arc::downgrade(&sink);
+        let abandoned_before = DurabilityLedger::global().snapshot().rows_abandoned_total;
+        drop(sink);
+        assert!(retained.upgrade().is_none());
+        assert_eq!(writer.queued_bytes(), 0);
+        assert_eq!(store.gate.lock().unwrap().entered_calls, 0);
+        assert!(store.rows().is_empty());
+        assert!(store.published_frontiers().is_empty());
+        let after = DurabilityLedger::global().snapshot();
+        assert!(
+            after.rows_abandoned_total >= abandoned_before.saturating_add(128),
+            "closing the pane must account for queued rows and every row represented by a gap"
+        );
+        assert!(!after.degraded_panes.contains_key(&pane_label));
     }
 
     #[test]
