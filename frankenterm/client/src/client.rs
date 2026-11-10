@@ -1345,10 +1345,12 @@ impl RpcProtocolAuthority {
         // selection coordinator's capture/resolve/release pairs, and the
         // user-variable hydration request/reply (115-116, codec 70), whose
         // coordinator is the ordered `UserVarDeliveryQueue`, and the bounded
-        // correlated pane identity query (117-118, codec 71) are active.
+        // correlated pane identity query (117-118, codec 71), and the joined
+        // pane census (121-122) plus exact-pane input coordinator (123-124)
+        // are active.
         matches!(
             spec.ident,
-            0..=4 | 8..=14 | 20 | 22..=78 | 81..=83 | 96..=109 | 115..=118
+            0..=4 | 8..=14 | 20 | 22..=78 | 81..=83 | 96..=109 | 115..=118 | 121..=124
         )
     }
 
@@ -14928,6 +14930,7 @@ mod tests {
         expected.extend(81..=83);
         expected.extend(96..=109);
         expected.extend(115..=118);
+        expected.extend(121..=124);
 
         let actual = Pdu::all_wire_specs()
             .iter()
