@@ -108,7 +108,17 @@ except Exception:
     pass
 ' "http://127.0.0.1:$PORT/stream/deltas?pane_id=$PANE&max_hz=2" "$OUT/$MODE.deltas-2hz.arrivals" &
     PIDS+=("$!")
-    sleep 2
+    # The ready checkpoint defines the fresh subscription boundary. Wait for
+    # that receipt rather than assuming the connection completed during a nap.
+    local subscribe_deadline=$((SECONDS + 10))
+    while (( SECONDS < subscribe_deadline )); do
+        grep -q '"kind":"ready"' "$OUT/$MODE.sse.txt" 2> /dev/null \
+            && grep -q '"kind":"ready"' "$OUT/$MODE.sse-other-pane.txt" 2> /dev/null && break
+        sleep 0.1
+    done
+    grep -q '"kind":"ready"' "$OUT/$MODE.sse.txt" \
+        && grep -q '"kind":"ready"' "$OUT/$MODE.sse-other-pane.txt"
+    check "$MODE/both subscriptions establish a checkpoint before the trigger" $? "subscription not ready"
     ft send --no-paste "$PANE" 'printf "\033]2;codex\007"' > "$OUT/$MODE.send1.log" 2>&1
     sleep 1
     ft send --no-paste "$PANE" "echo \"You've reached your usage limit. try again at 3:00 PM.\"" > "$OUT/$MODE.send2.log" 2>&1
@@ -125,24 +135,59 @@ except Exception:
     ARRIVED=$(now)
     sleep "${DELTA_SETTLE_SECS:-2}"
 
-    # Resume (ft-emlzp): the detection frame's SSE id is its persisted event id.
-    # A client reconnecting with Last-Event-ID one below it gets it replayed;
-    # one reconnecting at it gets nothing replayed.
-    local EVENT_ID
-    EVENT_ID=$(python3 - "$OUT/$MODE.sse.txt" << 'PY'
-import sys
-lines = open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines()
-for i, line in enumerate(lines):
-    if line.startswith("data: ") and "codex.usage.reached" in line:
-        ids = [l[4:].strip() for l in lines[max(0, i - 3):i] if l.startswith("id: ")]
-        print(ids[-1] if ids else "")
+    # Resume from actual received checkpoints, including the initial ready
+    # frame. A plain event ID cannot identify a database epoch or pane scope.
+    local INITIAL_CURSOR EVENT_CURSOR EVENT_ID CURSOR_FIELDS
+    CURSOR_FIELDS=$(python3 - "$OUT/$MODE.sse.txt" << 'PY'
+import json, re, sys
+initial = None
+for block in open(sys.argv[1], encoding="utf-8", errors="replace").read().split("\n\n"):
+    fields = dict(line.split(": ", 1) for line in block.splitlines() if ": " in line)
+    if "data" not in fields:
+        continue
+    frame = json.loads(fields["data"])
+    cursor = fields.get("id", "")
+    if frame.get("kind") == "ready":
+        assert re.fullmatch(r"event-v1:[0-9a-f]{32}:all:[0-9]+", cursor), cursor
+        assert frame["data"]["cursor"] == cursor
+        initial = cursor
+    event = frame.get("data", {}).get("event", {})
+    if event.get("detection", {}).get("rule_id") == "codex.usage.reached":
+        assert initial is not None, "detection arrived without a ready checkpoint"
+        assert re.fullmatch(r"event-v1:[0-9a-f]{32}:all:[0-9]+", cursor), cursor
+        assert cursor.rsplit(":", 1)[0] == initial.rsplit(":", 1)[0]
+        event_id = event["event_id"]
+        assert int(cursor.rsplit(":", 1)[1]) == event_id
+        assert int(initial.rsplit(":", 1)[1]) < event_id
+        print(initial, cursor, event_id, sep="\t")
         break
+else:
+    raise SystemExit("missing ready checkpoint or expected detection")
 PY
 )
-    curl -sN --max-time 4 -H "Last-Event-ID: $((${EVENT_ID:-1} - 1))" \
+    local cursor_status=$?
+    check "$MODE/ready and detection carry epoch-bound ordered cursors" "$cursor_status" "invalid stream cursor"
+    IFS=$'\t' read -r INITIAL_CURSOR EVENT_CURSOR EVENT_ID <<< "$CURSOR_FIELDS"
+    # Invalid fixture output must remain a failing request, not silently turn
+    # into a fresh subscription through an empty Last-Event-ID header.
+    INITIAL_CURSOR=${INITIAL_CURSOR:-invalid}
+    EVENT_CURSOR=${EVENT_CURSOR:-invalid}
+    EVENT_ID=${EVENT_ID:-0}
+    curl -sN --max-time 4 -H "Last-Event-ID: $INITIAL_CURSOR" \
         "http://127.0.0.1:$PORT/stream/events?channel=detections" > "$OUT/$MODE.resume-before.txt" 2> /dev/null
-    curl -sN --max-time 4 -H "Last-Event-ID: ${EVENT_ID:-0}" \
+    curl -sN --max-time 4 -H "Last-Event-ID: $EVENT_CURSOR" \
         "http://127.0.0.1:$PORT/stream/events?channel=detections" > "$OUT/$MODE.resume-at.txt" 2> /dev/null
+    local wrong_scope_status legacy_status
+    wrong_scope_status=$(curl -s --max-time 4 -o "$OUT/$MODE.resume-wrong-scope.json" -w '%{http_code}' \
+        -H "Last-Event-ID: $EVENT_CURSOR" \
+        "http://127.0.0.1:$PORT/stream/events?channel=detections&pane_id=$PANE")
+    legacy_status=$(curl -s --max-time 4 -o "$OUT/$MODE.resume-legacy.json" -w '%{http_code}' \
+        -H "Last-Event-ID: $EVENT_ID" \
+        "http://127.0.0.1:$PORT/stream/events?channel=detections")
+    [[ "$wrong_scope_status" == 400 ]]
+    check "$MODE/a cursor cannot change pane scope" $? "$wrong_scope_status"
+    [[ "$legacy_status" == 400 ]]
+    check "$MODE/an ambiguous numeric cursor is refused" $? "$legacy_status"
 
     if [[ -n "$WEB_PID" ]]; then
         # Slow client: subscribes to the busiest stream and never reads, while
@@ -204,8 +249,8 @@ PY
     copies=$(grep -c "codex.usage.reached" "$OUT/$MODE.sse.txt")
     [[ "$copies" == 1 ]]
     check "$MODE/the detection is delivered exactly once" $? "$copies copies"
-    [[ -n "$EVENT_ID" ]] && grep -q "^id: $EVENT_ID\$" "$OUT/$MODE.sse.txt"
-    check "$MODE/the detection frame's SSE id is its persisted event id" $? "id '${EVENT_ID}'"
+    [[ "$EVENT_CURSOR" != invalid ]] && grep -Fxq "id: $EVENT_CURSOR" "$OUT/$MODE.sse.txt"
+    check "$MODE/the detection frame preserves its exact resume token" $? "missing detection cursor"
     # Replayed frames' persisted ids, per resume point. Later detections (ids
     # above the codex one) may legitimately be replayed too.
     replayed_ids() {
@@ -220,14 +265,29 @@ PY
     replayed_ids "$OUT/$MODE.resume-before.txt" > "$OUT/$MODE.resume-before.ids"
     replayed_ids "$OUT/$MODE.resume-at.txt" > "$OUT/$MODE.resume-at.ids"
     [[ "$(grep -c "^$EVENT_ID codex.usage.reached\$" "$OUT/$MODE.resume-before.ids")" == 1 ]]
-    check "$MODE/Last-Event-ID just before it replays the detection once" $? \
+    check "$MODE/the initial checkpoint replays the detection once" $? \
         "$(tr '\n' ' ' < "$OUT/$MODE.resume-before.ids")"
     python3 -c 'import sys;ids=[int(l.split()[0]) for l in open(sys.argv[1]) if l.strip()];sys.exit(0 if all(i > int(sys.argv[2]) for i in ids) else 1)' \
         "$OUT/$MODE.resume-at.ids" "${EVENT_ID:-0}" && grep -q '"kind":"ready"' "$OUT/$MODE.resume-at.txt"
     check "$MODE/Last-Event-ID at it replays nothing at or before it" $? \
         "$(tr '\n' ' ' < "$OUT/$MODE.resume-at.ids")"
-    ! grep -q '^id: ' <(grep -B2 '"kind":"ready"' "$OUT/$MODE.resume-at.txt")
-    check "$MODE/non-event frames carry no SSE id" $? "$(head -c 200 "$OUT/$MODE.resume-at.txt")"
+    python3 - "$OUT/$MODE.resume-at.txt" "$EVENT_CURSOR" <<'PY'
+import json, sys
+ready = 0
+for block in open(sys.argv[1], encoding="utf-8", errors="replace").read().split("\n\n"):
+    fields = dict(line.split(": ", 1) for line in block.splitlines() if ": " in line)
+    if "data" not in fields:
+        continue
+    frame = json.loads(fields["data"])
+    if frame.get("kind") == "ready":
+        assert fields.get("id") == sys.argv[2]
+        assert frame["data"]["cursor"] == sys.argv[2]
+        ready += 1
+    elif frame.get("data", {}).get("event", {}).get("event_id") is None:
+        assert "id" not in fields, "a live signal or diagnostic overwrote the cursor"
+assert ready == 1, "resume must acknowledge exactly one accepted checkpoint"
+PY
+    check "$MODE/only checkpoints and persisted events carry SSE ids" $? "invalid cursor authority"
 }
 
 for mode in ${WEB_STREAM_MODES:-standalone inprocess}; do

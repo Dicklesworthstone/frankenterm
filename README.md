@@ -905,7 +905,7 @@ curl -N "http://127.0.0.1:8000/stream/events?channel=detections&pane_id=7&max_hz
 curl -N "http://127.0.0.1:8000/stream/deltas?pane_id=7&max_hz=50"
 ```
 
-- `/stream/events` streams live `EventBus` traffic as `text/event-stream`. A standalone `ft web` runs no capture pipeline, so it tails detections a watcher persists to the same database (every 250 ms; `FT_WEB_STORAGE_TAIL=0` turns the tail off). `ft watch --web [--web-port N]` serves the same API from inside the watcher on its live bus, so events arrive at publish time. A client that falls behind receives a `lag` frame with the missed count instead of a silent gap.
+- `/stream/events` delivers persisted detections in database ID order as `text/event-stream`. Fresh subscriptions start at an atomic database checkpoint; reconnects resume from the last received checkpoint or detection cursor. EventBus notifications wake storage reads promptly, and periodic reads recover detections whose notifications were lost. Lifecycle and diagnostic signals remain best-effort live events; bus overflow produces an explicit `lag` frame.
 - `/stream/deltas` streams redacted pane output deltas and gap markers from storage.
 - `max_hz` bounds fan-out rate; `pane_id` narrows to one pane; `channel` accepts `all`, `deltas`, `detections`, or `signals`.
 
@@ -1100,7 +1100,16 @@ curl -N "http://127.0.0.1:8000/stream/deltas?pane_id=3&max_hz=50"
 
 Streaming query parameters: `pane_id` filters to one pane; `max_hz` caps delivery rate for backpressure control; `/stream/events` also accepts `channel=all|deltas|detections|signals`. Streaming responses use schema `ft.stream.v1`, send keepalive comments when idle, emit `lag` frames when a slow client misses events, and redact secret material before emission.
 
-`/stream/events` has two event sources. Standalone `ft web` tails detections that a watcher persists to the same database (250 ms poll; `FT_WEB_STORAGE_TAIL=0` disables it). `ft watch --web [--web-port N]` runs the API inside the watcher and streams its live event bus directly, with no polling delay.
+`/stream/events` reads persisted detections from the database in ascending ID order. Standalone `ft web` also tails the watcher's database every 250 ms to publish prompt wakeups; `ft watch --web [--web-port N]` receives wakeups directly from its watcher. Periodic storage reads repair missing wakeups in either mode, including when `FT_WEB_STORAGE_TAIL=0` disables the standalone tail. The `all` and `detections` channels require event storage. The `signals` and `deltas` channels carry best-effort live bus traffic without durable resume cursors; `/stream/deltas` is the separate storage-backed output endpoint.
+
+The first `ready` frame establishes an accepted durable checkpoint and includes its cursor in both `data.cursor` and the SSE `id` field. Each persisted detection then carries its own cursor. Browser `EventSource` reconnects send the most recently received value as `Last-Event-ID`; other clients can supply that exact value in the header or the `cursor` query parameter:
+
+```bash
+curl -N -H "Last-Event-ID: $CURSOR" \
+  "http://127.0.0.1:8000/stream/events?channel=detections&pane_id=7"
+```
+
+Treat these values as opaque tokens. Their versioned form is `event-v1:<epoch>:all:<id>` or `event-v1:<epoch>:pane:<pane_id>:<id>`, where the epoch binds the cursor to the database's retention history. Keep the same pane filter when resuming. Numeric legacy IDs and `since_id` bootstrap requests are rejected; begin a fresh subscription without a cursor to deliberately start at the current tail. A nonempty `Last-Event-ID` takes precedence over a URL cursor. Invalid tokens fail before streaming, and an expired cursor, changed database epoch, or unprovable retention interval produces an explicit discontinuity instead of silently resetting the position. Lifecycle, lag, and error frames do not overwrite the durable checkpoint. Delivery is at least once across reconnects; clients should deduplicate by cursor when necessary.
 
 #### Browser fleet viewer (preview)
 
@@ -1115,7 +1124,7 @@ The build script fetches the renderer's last source revision from the frankentui
 
 The server is still loopback-only and unauthenticated, so the viewer is for the local machine (or a tunnel you control). Authenticated tailnet access, terminal attach and DSR packaging are the open milestones of `ft-browser-frankenterm-7z4il`.
 
-`ft web` runs no capture pipeline of its own. `/stream/events` is fed by a storage tail: the server follows newly persisted `events` rows written by the watcher (another process) and republishes them on its in-process bus, so a detection reaches SSE clients within one poll interval (250 ms) after `ft watch` stores it. The tail starts after the newest existing row, so a restart never replays history. Embedders that publish to the same bus in-process can disable it with `WebServerConfig::with_storage_event_tail(false)`.
+`ft web` runs no capture pipeline of its own. Its storage tail follows newly persisted `events` rows written by the watcher and republishes wakeups on its in-process bus. Subscriptions always obtain detection content and ordering from storage, so a delayed or reordered wakeup cannot skip an earlier row. The tail starts after existing history; explicit subscription cursors control replay. Embedders that publish to the same bus in-process can disable the extra wakeup tail with `WebServerConfig::with_storage_event_tail(false)`.
 
 ### Session persistence
 
@@ -4106,7 +4115,7 @@ GET /health
 GET /panes
 GET /events
 GET /search?q=…
-GET /stream/events       (channel=all|deltas|detections|signals, pane_id, max_hz)
+GET /stream/events       (channel=all|deltas|detections|signals, pane_id, max_hz, cursor)
 GET /stream/deltas       (pane_id, max_hz)
 ```
 

@@ -937,12 +937,15 @@ mod web_tests {
         use base64::Engine as _;
 
         run_async_test(async {
+            let (storage, _tmp) = create_test_storage_with_pane(72).await.unwrap();
             let event_bus = Arc::new(EventBus::new(8));
             let server = timeout(
                 Duration::from_secs(5),
                 start_web_server(
                     WebServerConfig::default()
                         .with_port(0)
+                        .with_storage(storage.clone())
+                        .with_storage_event_tail(false)
                         .with_event_bus(Arc::clone(&event_bus)),
                 ),
             )
@@ -1038,6 +1041,7 @@ mod web_tests {
                 while event_bus.subscriber_count() != 0 {
                     sleep(Duration::from_millis(10)).await;
                 }
+                storage.shutdown().await?;
                 Ok::<_, anyhow::Error>(())
             })
             .await;
@@ -2135,13 +2139,255 @@ mod web_tests {
         });
     }
 
+    fn durable_stream_fixture(text: &str, detected_at: i64) -> StoredEvent {
+        StoredEvent {
+            id: 0,
+            pane_id: 7,
+            rule_id: "test.durable.stream".to_owned(),
+            agent_type: "codex".to_owned(),
+            event_type: "durable_stream_test".to_owned(),
+            severity: "info".to_owned(),
+            confidence: 1.0,
+            extracted: None,
+            matched_text: Some(text.to_owned()),
+            segment_id: None,
+            detected_at,
+            dedupe_key: None,
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        }
+    }
+
+    fn durable_stream_ids(raw: &str) -> Vec<i64> {
+        raw.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|frame| frame["kind"] == "event" && frame["data"]["delivery"] == "durable")
+            .map(|frame| frame["data"]["event"]["event_id"].as_i64().unwrap())
+            .collect()
+    }
+
+    async fn read_event_stream_until(
+        stream: &mut TcpStream,
+        response: &mut Vec<u8>,
+        kind: &str,
+        count: usize,
+    ) -> anyhow::Result<String> {
+        loop {
+            let raw = String::from_utf8_lossy(response);
+            if stream_frame_kind_count(&raw, kind) >= count {
+                return Ok(raw.into_owned());
+            }
+            let mut chunk = [0_u8; 2048];
+            let read_count = read(stream, &mut chunk).await?;
+            anyhow::ensure!(read_count != 0, "stream ended before {kind}");
+            anyhow::ensure!(response.len() + read_count <= 256 * 1024, "stream byte budget");
+            response.extend_from_slice(&chunk[..read_count]);
+        }
+    }
+
+    #[test]
+    fn stream_events_uses_storage_for_fresh_ordered_recoverable_delivery() {
+        use anyhow::{Context, ensure};
+
+        run_async_test(async {
+            let (storage, _tmp) = create_test_storage_with_pane(7).await.unwrap();
+            let old_id = storage
+                .record_event(durable_stream_fixture("old_baseline_row", 1))
+                .await
+                .unwrap();
+            let event_bus = Arc::new(EventBus::new(64));
+            let limits = WebRuntimeLimits {
+                stream_keepalive_secs: 1,
+                stream_max_max_hz: 1000,
+                ..frankenterm_core::web::resolve_runtime_limits(None)
+            };
+            let server = start_web_server(
+                WebServerConfig::default()
+                    .with_port(0)
+                    .with_storage(storage.clone())
+                    .with_event_bus(Arc::clone(&event_bus))
+                    .with_storage_event_tail(false)
+                    .with_runtime_limits(limits),
+            )
+            .await
+            .unwrap();
+            let addr = server.bound_addr();
+            let scenario = timeout(Duration::from_secs(12), async {
+                let mut stream = TcpStream::connect(addr).await?;
+                stream.write_all(b"GET /stream/events?channel=all&pane_id=7&max_hz=1000 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await?;
+                let mut response = Vec::new();
+                let ready_raw = read_event_stream_until(&mut stream, &mut response, "ready", 1).await?;
+                ensure!(extract_status(&ready_raw) == 200, "fresh stream must start");
+                let ready = ready_raw.lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .find(|frame| frame["kind"] == "ready")
+                    .context("ready frame")?;
+                let baseline = ready["data"]["cursor"].as_str().context("ready durable cursor")?;
+                ensure!(baseline.starts_with("event-v1:"), "versioned checkpoint");
+                ensure!(baseline.ends_with(&format!(":pane:7:{old_id}")), "fresh high-water boundary");
+                ensure!(ready_raw.lines().any(|line| line == format!("id: {baseline}")), "ready sets Last-Event-ID");
+                let baseline = baseline.to_owned();
+
+                let first = storage.record_event(durable_stream_fixture("stored_first", 10)).await?;
+                let second = storage.record_event(durable_stream_fixture("stored_second", 11)).await?;
+                // Reversed notifications carry deliberately wrong content.
+                // Only the durable rows may determine order and payload.
+                for event_id in [second, first] {
+                    event_bus.publish(Event::PatternDetected {
+                        pane_id: 7,
+                        pane_uuid: None,
+                        event_id: Some(event_id),
+                        detection: Detection {
+                            rule_id: "forged_bus_payload".to_owned(),
+                            agent_type: AgentType::Codex,
+                            event_type: "forged_bus_payload".to_owned(),
+                            severity: Severity::Info,
+                            confidence: 1.0,
+                            extracted: serde_json::Value::Null,
+                            matched_text: "forged_bus_payload".to_owned(),
+                            span: (0, 0),
+                        },
+                    });
+                }
+                let raw = read_event_stream_until(&mut stream, &mut response, "event", 2).await?;
+                ensure!(durable_stream_ids(&raw) == [first, second], "fresh durable ordering");
+                ensure!(raw.contains("stored_first") && raw.contains("stored_second"), "storage payloads");
+                ensure!(!raw.contains("old_baseline_row") && !raw.contains("forged_bus_payload"), "baseline and notification payloads excluded");
+                let first_token = raw.lines().filter_map(|line| line.strip_prefix("id: "))
+                    .find(|token| token.ends_with(&format!(":pane:7:{first}")))
+                    .context("first event cursor")?.to_owned();
+
+                // A committed row with no notification must be discovered
+                // even while unrelated pane traffic prevents bus idleness.
+                let third = storage.record_event(durable_stream_fixture("stored_without_wakeup", 12)).await?;
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while durable_stream_ids(&String::from_utf8_lossy(&response)).len() < 3 {
+                    ensure!(Instant::now() < deadline, "periodic catchup starved by bus traffic");
+                    event_bus.publish(Event::SegmentCaptured {
+                        pane_id: 999,
+                        seq: 0,
+                        content_len: 0,
+                    });
+                    let mut chunk = [0_u8; 2048];
+                    match timeout(Duration::from_millis(20), read(&mut stream, &mut chunk)).await {
+                        Ok(Ok(count)) => {
+                            ensure!(count != 0, "durable stream closed during catchup");
+                            ensure!(response.len() + count <= 256 * 1024, "stream byte budget");
+                            response.extend_from_slice(&chunk[..count]);
+                        }
+                        Ok(Err(error)) => return Err(error.into()),
+                        Err(_) => {}
+                    }
+                }
+                let raw = String::from_utf8(response)?;
+                ensure!(durable_stream_ids(&raw) == [first, second, third], "lost wakeup repaired once");
+                let third_token = raw.lines().filter_map(|line| line.strip_prefix("id: "))
+                    .find(|token| token.ends_with(&format!(":pane:7:{third}")))
+                    .context("third event cursor")?.to_owned();
+                drop(stream);
+
+                // The ready checkpoint alone suffices if a client disconnects
+                // before it receives its first persisted detection.
+                let request = format!("GET /stream/events?channel=detections&pane_id=7&cursor={baseline}&max_hz=1000 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+                let replay = fetch_stream_until_kind_count(addr, request.as_bytes(), Duration::from_secs(3), "event", 3).await?;
+                ensure!(durable_stream_ids(&replay) == [first, second, third], "ready checkpoint reconnect");
+
+                let request = format!("GET /stream/events?channel=detections&pane_id=7&cursor={third_token}&max_hz=1000 HTTP/1.1\r\nHost: localhost\r\nLast-Event-ID: {first_token}\r\nConnection: close\r\n\r\n");
+                let replay = fetch_stream_until_kind_count(addr, request.as_bytes(), Duration::from_secs(3), "event", 2).await?;
+                ensure!(durable_stream_ids(&replay) == [second, third], "header overrides URL without duplicates");
+
+                // Prune an unseen row between the resume boundary and the
+                // retained suffix. The stream must stop before that suffix.
+                let deleted = storage.delete_events_before(12, 256).await?;
+                ensure!(deleted >= 2, "retention fixture deletes the unseen second row");
+                let request = format!("GET /stream/events?channel=detections&pane_id=7&cursor={first_token}&max_hz=1000 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+                let gap = fetch_stream_until_kind_count(addr, request.as_bytes(), Duration::from_secs(3), "cursor_discontinuity", 1).await?;
+                ensure!(gap.contains("retention_pruned") && gap.contains("\"terminal\":true"), "explicit terminal retention gap");
+                ensure!(durable_stream_ids(&gap).is_empty(), "retained suffix must not conceal the gap");
+                let ids: Vec<_> = gap.lines().filter_map(|line| line.strip_prefix("id: ")).collect();
+                ensure!(ids == [first_token.as_str()], "gap must preserve the ready checkpoint");
+
+                let epoch = baseline.split(':').nth(1).context("cursor epoch")?;
+                let different_epoch = if epoch == "0".repeat(32) { "1".repeat(32) } else { "0".repeat(32) };
+                let request = format!("GET /stream/events?channel=detections&pane_id=7&cursor=event-v1:{different_epoch}:pane:7:{third}&max_hz=1000 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+                let reset = fetch_stream_until_kind_count(addr, request.as_bytes(), Duration::from_secs(3), "cursor_discontinuity", 1).await?;
+                ensure!(reset.contains("cursor_epoch_mismatch"), "database epoch cannot be adopted on reconnect");
+                ensure!(!reset.lines().any(|line| line.starts_with("id: ")), "rejected epoch must not install a checkpoint");
+                Ok::<_, anyhow::Error>(())
+            })
+            .await;
+            let teardown = timeout(Duration::from_secs(5), async {
+                server.shutdown().await?;
+                storage.shutdown().await?;
+                Ok::<_, anyhow::Error>(())
+            })
+            .await;
+            teardown.expect("durable stream teardown deadline").expect("durable stream teardown");
+            scenario.expect("durable stream scenario deadline").expect("durable stream assertions");
+            assert_eq!(event_bus.subscriber_count(), 0);
+        });
+    }
+
+    #[test]
+    fn stream_events_rejects_ambiguous_cursors_and_requires_durable_storage() {
+        run_async_test(async {
+            let event_bus = Arc::new(EventBus::new(8));
+            let server = start_web_server(
+                WebServerConfig::default()
+                    .with_port(0)
+                    .with_event_bus(event_bus),
+            )
+            .await
+            .unwrap();
+            let addr = server.bound_addr();
+            let token = "event-v1:0123456789abcdef0123456789abcdef:all:0";
+            let requests = [
+                ("channel=all".to_owned(), "", 503, "event_replay_unavailable"),
+                ("channel=detections".to_owned(), "", 503, "event_replay_unavailable"),
+                ("channel=detections&since_id=0".to_owned(), "", 400, "invalid_event_cursor"),
+                ("channel=detections".to_owned(), "Last-Event-ID: 0\r\n", 400, "invalid_event_cursor"),
+                (format!("channel=signals&cursor={token}"), "", 400, "event_cursor_channel_mismatch"),
+                (format!("channel=detections&pane_id=7&cursor={token}"), "", 400, "event_cursor_scope_mismatch"),
+            ];
+            let mut responses = Vec::new();
+            for (query, header, status, code) in requests {
+                let request = format!("GET /stream/events?{query} HTTP/1.1\r\nHost: localhost\r\n{header}Connection: close\r\n\r\n");
+                responses.push((fetch_raw(addr, request.as_bytes()).await, status, code));
+            }
+            let signal = fetch_stream_until_kind_count(
+                addr,
+                b"GET /stream/events?channel=signals HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                Duration::from_secs(2),
+                "ready",
+                1,
+            )
+            .await;
+            server.shutdown().await.unwrap();
+            for (response, status, code) in responses {
+                let response = response.unwrap();
+                assert_eq!(extract_status(&response), status, "{response}");
+                assert!(response.contains(code), "{response}");
+            }
+            let signal = signal.unwrap();
+            assert_eq!(extract_status(&signal), 200, "{signal}");
+            assert_eq!(stream_frame_kind_count(&signal, "ready"), 1);
+            assert!(!signal.lines().any(|line| line.starts_with("id: ")));
+        });
+    }
+
     #[test]
     fn stream_events_reports_lag_and_releases_subscriber() {
         run_async_test(async {
+            let (storage, _tmp) = create_test_storage_with_pane(11).await.unwrap();
             let event_bus = Arc::new(EventBus::new(2));
             let server = start_web_server(
                 WebServerConfig::default()
                     .with_port(0)
+                    .with_storage(storage.clone())
+                    .with_storage_event_tail(false)
                     .with_event_bus(Arc::clone(&event_bus)),
             )
             .await
@@ -2181,6 +2427,7 @@ mod web_tests {
             let response = fetch_task.await.unwrap().unwrap();
             server.shutdown().await.unwrap();
 
+            storage.shutdown().await.unwrap();
             assert!(
                 response.contains("event: lag") || response.contains("\"kind\":\"lag\""),
                 "expected lag event in stream output: {response}"
