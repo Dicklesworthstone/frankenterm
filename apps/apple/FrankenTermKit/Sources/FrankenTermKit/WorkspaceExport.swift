@@ -221,6 +221,7 @@ public struct WorkspaceExportSelection: Sendable {
             required.remove(WorkspaceDocument.hostAlgorithmPolicyCapability)
             required.remove(WorkspaceDocument.transportAlgorithmPolicyCapability)
             required.remove(WorkspaceDocument.hostRevocationCapability)
+            required.remove(WorkspaceDocument.publicKeyAlgorithmPolicyCapability)
             var reasons: [String] = []
             let lacksSessionPolicy = destinations.contains(route.id)
                 && ((route.mode == "direct_ssh" && route.sessionCreation == nil)

@@ -229,3 +229,138 @@ final class WorkspacePublicKeyAlgorithmPolicyTests: XCTestCase {
         }
     }
 }
+
+extension WorkspacePublicKeyAlgorithmPolicyTests {
+    func testSigningPolicyRemainsUsableAndEnforcedAfterQRExportAndInstall() async throws {
+        let fixture = try XCTUnwrap(RSAFixtures.load().keys.first)
+        let key = try PrivateKeyRecord.fromPEM(Data(fixture.clearPEM.utf8), credentialID: "key", using: crypto)
+        let source = try document(["rsa-sha2-256"], key: key)
+        let selection = try WorkspaceExportSelection(workspace: source, groupIDs: ["group"])
+        let fingerprint = try SSHPublicIdentity(blob: key.publicBlob).fingerprint
+        let decisions: [String: WorkspaceExportSelection.IdentityDecision] = [fingerprint: .includePrivateKey]
+        let review = try selection.review(decisions: decisions, loadedFingerprints: [fingerprint])
+        XCTAssertTrue(review.canPrepare)
+        XCTAssertEqual(review.blockedRouteIDs, [])
+
+        let archive = try selection.archive(decisions: decisions, keys: [key],
+            bundleID: "signing-policy-qr-export", using: crypto)
+        let sealed = try FTAG.seal(archive, using: crypto)
+        let sender = try OpticalSender(envelope: sealed.envelope, using: crypto)
+        let first = try OpticalFrame(text: sender.frame(page: 0, sequence: 1, using: crypto))
+        var receiver = OpticalReceiver(selecting: first)
+        for page in (0..<sender.identity.pageCount).reversed() {
+            for sequence in (1...(try sender.sourcePartCount(page: page))).reversed() {
+                try receiver.receive(OpticalFrame(text: sender.frame(page: page,
+                    sequence: UInt32(sequence), using: crypto)), using: crypto)
+            }
+        }
+        let envelope = try receiver.envelope(using: crypto)
+        XCTAssertEqual(envelope, sealed.envelope)
+        let restored = try FTAG.open(envelope, code: sealed.code, using: crypto)
+        let route = try XCTUnwrap(restored.workspace.routes.first { $0.id == "route" })
+        XCTAssertEqual(route.publicKeyAlgorithmPolicy.acceptedAlgorithms, ["rsa-sha2-256"])
+        XCTAssertTrue(route.requiredCapabilities.contains(WorkspaceDocument.publicKeyAlgorithmPolicyCapability))
+        XCTAssertFalse(restored.portability.contains { $0.disposition == 1 })
+
+        let store = WorkspaceStore(persistence: StoreTestPersistence(), vault: StoreTestVault())
+        let digest = crypto.sha256(envelope)
+        let preview = try await store.previewImport(restored, envelopeDigest: digest, support: profile())
+        XCTAssertTrue(try XCTUnwrap(preview.routes.first { $0.routeID == "route" }).isLocallyReady)
+        let saved = try await store.install(restored, envelopeDigest: digest, expectedRevision: nil,
+            sourceAndContentsConfirmed: true).workspace
+        XCTAssertTrue(saved.connectLater)
+        let ready = try await store.routeReadiness(workspaceID: saved.id, support: profile())
+        XCTAssertTrue(try XCTUnwrap(ready.first { $0.routeID == "route" }).isLocallyReady)
+        let unsupported = try await store.routeReadiness(workspaceID: saved.id, support: profile(capabilities: []))
+        XCTAssertTrue(try XCTUnwrap(unsupported.first { $0.routeID == "route" }).issues.contains(.unsupportedRequirement))
+
+        let signer = PublicKeyPolicySigner(container: key.container)
+        let broker = SSHAuthenticationBroker(store: store, signer: signer, support: profile())
+        await broker.resume()
+        let pin = try XCTUnwrap(restored.workspace.hostTrust[0].pins.first)
+        do {
+            _ = try await broker.prepare(workspaceID: saved.id, expectedRevision: saved.revision,
+                routeID: "route", credentialID: "key", presentedHostKey: pin, transportID: UUID(),
+                sessionIdentifier: Data(0..<32), publicBlob: key.publicBlob, signatureAlgorithm: "rsa-sha2-512")
+            XCTFail("An exported policy must reject a forbidden hash before signing")
+        } catch { XCTAssertEqual(error as? SSHAuthenticationError, .denied) }
+        let before = await signer.signatureCount
+        XCTAssertEqual(before, 0)
+        let request = try await broker.prepare(workspaceID: saved.id, expectedRevision: saved.revision,
+            routeID: "route", credentialID: "key", presentedHostKey: pin, transportID: UUID(),
+            sessionIdentifier: Data(0..<32), publicBlob: key.publicBlob, signatureAlgorithm: "rsa-sha2-256")
+        let signed = try await broker.confirm(requestID: request.id)
+        XCTAssertEqual(signed.algorithm, "rsa-sha2-256")
+        let after = await signer.signatureCount
+        XCTAssertEqual(after, 1)
+    }
+
+    func testExportedEmptyUnknownAndMismatchedSigningPoliciesKeepReceiverEnforcement() async throws {
+        let (key, _) = try sampleKey(using: crypto)
+        let policies: [[String]] = [[], ["unknown-key@example.invalid"], ["rsa-sha2-256"]]
+        for algorithms in policies {
+            for permitsPassword in [false, true] {
+                let source = try document(algorithms) { workspace in
+                    var routes = workspace["routes"] as! [[String: Any]]
+                    routes[0]["authentication_methods"] = permitsPassword ? ["publickey", "password"] : ["publickey"]
+                    workspace["routes"] = routes
+                }
+                let selection = try WorkspaceExportSelection(workspace: source, groupIDs: ["group"])
+                let archive = try selection.archive(including: [key], using: crypto)
+                let sealed = try FTAG.seal(archive, using: crypto)
+                let restored = try FTAG.open(sealed.envelope, code: sealed.code, using: crypto)
+                XCTAssertEqual(restored.workspace.routes[0].publicKeyAlgorithmPolicy.acceptedAlgorithms, algorithms)
+                XCTAssertTrue(restored.workspace.routes[0].requiredCapabilities.contains(
+                    WorkspaceDocument.publicKeyAlgorithmPolicyCapability))
+                XCTAssertFalse(restored.portability.contains { $0.disposition == 1 })
+                let store = WorkspaceStore(persistence: StoreTestPersistence(), vault: StoreTestVault())
+                let saved = try await store.install(restored, envelopeDigest: crypto.sha256(sealed.envelope),
+                    expectedRevision: nil, sourceAndContentsConfirmed: true).workspace
+                let ready = try await store.routeReadiness(workspaceID: saved.id, support: profile())
+                let route = try XCTUnwrap(ready.first { $0.routeID == "route" })
+                XCTAssertEqual(route.isLocallyReady, permitsPassword)
+                XCTAssertEqual(route.usableCredentialIDs, [])
+                if !permitsPassword { XCTAssertTrue(route.issues.contains(.credentialAlgorithmUnavailable)) }
+                let unsupported = try await store.routeReadiness(workspaceID: saved.id, support: profile(capabilities: []))
+                XCTAssertTrue(try XCTUnwrap(unsupported.first { $0.routeID == "route" }).issues.contains(.unsupportedRequirement))
+            }
+        }
+    }
+
+    func testExportedJumpSigningPolicyDoesNotEraseUnknownRequirementsOrSourceBlockers() async throws {
+        let (key, _) = try sampleKey(using: crypto)
+        for blocker in ["none", "unknown-capability", "source-finding"] {
+            let source = try document(["ssh-ed25519"]) { workspace in
+                var routes = workspace["routes"] as! [[String: Any]]
+                var hop = routes[0]
+                hop["id"] = "jump"
+                if blocker == "unknown-capability" {
+                    hop["required_capabilities"] = ["future.required_transit_policy"]
+                }
+                routes[0]["jump_routes"] = ["jump"]
+                routes.append(hop)
+                workspace["routes"] = routes
+            }
+            let findings: [AirGapArchive.Portability] = blocker == "source-finding"
+                ? [.init(entityID: "jump", setting: "source.required_policy", disposition: 1,
+                         reason: "A required source policy has not been resolved.")]
+                : []
+            let selection = try WorkspaceExportSelection(workspace: source, groupIDs: ["group"], findings: findings)
+            let archive = try selection.archive(including: [key], using: crypto)
+            let sealed = try FTAG.seal(archive, using: crypto)
+            let restored = try FTAG.open(sealed.envelope, code: sealed.code, using: crypto)
+            XCTAssertEqual(Set(restored.workspace.routes.map(\.id)), ["route", "jump"])
+            for route in restored.workspace.routes {
+                XCTAssertEqual(route.publicKeyAlgorithmPolicy.acceptedAlgorithms, ["ssh-ed25519"])
+                XCTAssertTrue(route.requiredCapabilities.contains(WorkspaceDocument.publicKeyAlgorithmPolicyCapability))
+            }
+            XCTAssertEqual(restored.portability.contains { $0.disposition == 1 }, blocker != "none")
+            let store = WorkspaceStore(persistence: StoreTestPersistence(), vault: StoreTestVault())
+            let saved = try await store.install(restored, envelopeDigest: crypto.sha256(sealed.envelope),
+                expectedRevision: nil, sourceAndContentsConfirmed: true).workspace
+            let ready = try await store.routeReadiness(workspaceID: saved.id, support: profile())
+            XCTAssertEqual(try XCTUnwrap(ready.first { $0.routeID == "route" }).isLocallyReady, blocker == "none")
+            XCTAssertEqual(try XCTUnwrap(ready.first { $0.routeID == "jump" }).isLocallyReady, blocker == "none")
+        }
+    }
+}
