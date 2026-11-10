@@ -157,6 +157,11 @@ public enum TerminalMuxEvent: Equatable, Sendable {
     /// keeping the connection available for viewing and supported input.
     /// This is not an uncertain outcome and never authorizes a resend.
     case inputRejected(paneID: Int, reason: String)
+    /// A receipt for an explicitly requested shell. Numeric identifiers are
+    /// descriptive; they do not authorize selecting, resizing or typing in it.
+    case shellCreated(request: UInt64, paneID: Int, tabID: Int, windowID: Int)
+    /// An uncertain result may have created a shell. Never resend it.
+    case shellCreationFailed(request: UInt64, reason: String, uncertain: Bool)
     /// The session is over; the channel must close.
     case failed(String)
 }
@@ -401,6 +406,10 @@ public protocol TerminalMuxClient: AnyObject, Sendable {
     /// receive loop or replay bytes itself. A thrown failure stops egress.
     func pollInputTimer() throws -> Duration?
     func refreshPanes() throws
+    /// One new persistent shell in the server's default domain and a new
+    /// window. The reviewed server incarnation must still match. This never
+    /// selects the resulting pane, runs a supplied command or retries a spawn.
+    func createShell(workspace: String, rows: Int, columns: Int, expectedIncarnation: Data) throws -> UInt64
     /// Passive v71 identity preflight, bounded to eight distinct outstanding
     /// requests. A `paneIdentity` or `paneGone` event settles it; older peers
     /// answer with nil identity locally. It grants no control lease or input.
@@ -440,6 +449,9 @@ public protocol TerminalMuxClient: AnyObject, Sendable {
 }
 
 extension TerminalMuxClient {
+    public func createShell(workspace: String, rows: Int, columns: Int, expectedIncarnation: Data) throws -> UInt64 {
+        throw TerminalMuxShellCreationError.unavailable
+    }
     /// Protocol adapters with no internal input timers need no extra wake.
     public func pollInputTimer() throws -> Duration? { nil }
     /// A client without a mouse ignores clicks.
@@ -465,6 +477,21 @@ public enum TerminalMuxAccessMode: String, Equatable, Sendable {
     case interactive
     public var permitsInput: Bool { self != .viewOnly }
     public var controlsSize: Bool { self == .interactive }
+    /// Creation is a separate, explicitly reviewed topology action. Input-only
+    /// and observer connections cannot gain it from keyboard permission.
+    public var permitsShellCreation: Bool { self == .interactive }
+}
+
+public enum TerminalMuxShellCreationError: Error, Equatable, Sendable, LocalizedError {
+    case unavailable, stale, busy, invalid
+    public var errorDescription: String? {
+        switch self {
+        case .unavailable: return "New persistent shells require a current mux connection with interactive permission."
+        case .stale: return "This connection or review changed. Review the new shell again."
+        case .busy: return "A shell creation is already awaiting its result."
+        case .invalid: return "Choose a workspace of 1–256 UTF-8 bytes without control characters and a supported terminal size."
+        }
+    }
 }
 
 public enum TerminalMuxError: Error, Equatable, Sendable, LocalizedError {
@@ -520,6 +547,39 @@ public final class TerminalMuxControl: @unchecked Sendable {
         public var error: String?
         public let firstRow: Int64, rowCount: Int
     }
+    /// Captured for the confirmation sheet. It belongs to one live control
+    /// and server run; an identical-looking replacement connection cannot use it.
+    public struct ShellCreationPlan: Identifiable, Equatable, Sendable {
+        public let id: UUID
+        fileprivate let owner: UUID
+        public let incarnation: Data
+        public let workspace: String
+        public let rows: Int, columns: Int
+    }
+    public struct ShellCreation: Equatable, Sendable {
+        public enum Outcome: Equatable, Sendable {
+            case queued, awaitingReply
+            case created(pane: Int, tab: Int, window: Int)
+            case failed(reason: String, uncertain: Bool)
+        }
+        public let plan: ShellCreationPlan
+        public fileprivate(set) var request: UInt64?
+        public fileprivate(set) var outcome: Outcome
+        public var pending: Bool {
+            switch outcome { case .queued, .awaitingReply: return true; default: return false }
+        }
+        public var message: String {
+            switch outcome {
+            case .queued: return "Preparing the new persistent shell…"
+            case .awaitingReply: return "Waiting for the server to confirm the new shell…"
+            case .created(let pane, _, _): return "Created pane \(pane). Select it in the pane list to view it."
+            case .failed(let reason, let uncertain):
+                return uncertain
+                    ? "A shell may have been created. Check the pane list before creating another. \(reason)"
+                    : "The shell was not created. \(reason)"
+            }
+        }
+    }
     public struct State: Equatable, Sendable {
         /// Callbacks cross executors outside the lock. Consumers compare this
         /// witness with current.revision before applying a delayed snapshot.
@@ -555,6 +615,9 @@ public final class TerminalMuxControl: @unchecked Sendable {
         /// A captured request expired before the transport could apply it. The
         /// original presenter can stop waiting without selecting a substitute.
         public var rejectedNavigation: TerminalMuxInputRouting.NavigationPlan?
+        /// Present only after the authenticated mux handshake and initial list.
+        public var shellCreationIncarnation: Data?
+        public var shellCreation: ShellCreation?
     }
     private let lock = NSLock()
     private var state = State()
@@ -569,6 +632,9 @@ public final class TerminalMuxControl: @unchecked Sendable {
     private var leftScreen: [Int: ContinuousClock.Instant] = [:]
     private let settle: Duration
     private var queriesEnded = false
+    private let shellCreationOwner = UUID()
+    private var shellCreationReview: UUID?
+    private var pendingShellCreation: ShellCreationPlan?
 
     public static let maximumSearchPanes = 128
     public static let maximumSearchMatches = 512
@@ -590,6 +656,59 @@ public final class TerminalMuxControl: @unchecked Sendable {
     /// Presentation can narrow, never expand, the connection's permissions.
     public var controlsSize: Bool { accessMode.controlsSize && lock.withLock { state.sizeControlEnabled } }
 
+    public var canCreateShell: Bool { lock.withLock { canCreateShellLocked } }
+
+    private var canCreateShellLocked: Bool {
+        !queriesEnded && accessMode.permitsShellCreation && state.visible && state.sizeControlEnabled
+            && state.shellCreationIncarnation != nil && state.shellCreation?.pending != true
+    }
+
+    public func prepareShellCreation(workspace: String, rows: Int = 24, columns: Int = 80) throws -> ShellCreationPlan {
+        try lock.withLock {
+            guard state.shellCreation?.pending != true else { throw TerminalMuxShellCreationError.busy }
+            guard canCreateShellLocked, let incarnation = state.shellCreationIncarnation else {
+                throw TerminalMuxShellCreationError.unavailable
+            }
+            guard (1...256).contains(workspace.utf8.count),
+                  !workspace.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
+                  (1...512).contains(rows), (1...512).contains(columns),
+                  rows <= TerminalSessionGeometry.maximumShownCells / columns else {
+                throw TerminalMuxShellCreationError.invalid
+            }
+            let plan = ShellCreationPlan(id: UUID(), owner: shellCreationOwner, incarnation: incarnation,
+                                         workspace: workspace, rows: rows, columns: columns)
+            shellCreationReview = plan.id
+            return plan
+        }
+    }
+
+    public func cancelShellCreationReview(_ plan: ShellCreationPlan) {
+        lock.withLock { if shellCreationReview == plan.id { shellCreationReview = nil } }
+    }
+
+    public func requestShellCreation(_ plan: ShellCreationPlan) throws {
+        let (notify, snapshot, wake) = try lock.withLock {
+            guard canCreateShellLocked, plan.owner == shellCreationOwner,
+                  shellCreationReview == plan.id, state.shellCreationIncarnation == plan.incarnation else {
+                throw TerminalMuxShellCreationError.stale
+            }
+            shellCreationReview = nil
+            state.shellCreation = ShellCreation(plan: plan, request: nil, outcome: .queued)
+            pendingShellCreation = plan; state.revision = UUID()
+            return (observer, state, waker)
+        }
+        notify?(snapshot); wake?()
+    }
+
+    /// Under the control lock. Once focus leaves, returning cannot revive an
+    /// unconsumed creation request or a confirmation sheet from the old visit.
+    private func cancelUnsentShellCreation() {
+        shellCreationReview = nil
+        guard pendingShellCreation != nil else { return }
+        pendingShellCreation = nil
+        state.shellCreation?.outcome = .failed(reason: "The connection is no longer active.", uncertain: false)
+    }
+
     /// Releasing local size control restores an outstanding override while
     /// keeping the pane subscribed. This changes neither input permission nor
     /// the exact selected pane, and grants no server-side exclusive lease.
@@ -597,6 +716,7 @@ public final class TerminalMuxControl: @unchecked Sendable {
         let (wake, notify, snapshot) = lock.withLock { () -> ((@Sendable () -> Void)?, (@Sendable (State) -> Void)?, State) in
             guard !queriesEnded, state.sizeControlEnabled != enabled else { return (nil, nil, state) }
             state.sizeControlEnabled = enabled; state.revision = UUID()
+            if !enabled { cancelUnsentShellCreation() }
             return (waker, observer, state)
         }
         notify?(snapshot); wake?()
@@ -707,6 +827,7 @@ public final class TerminalMuxControl: @unchecked Sendable {
         let (wake, notify, snapshot, read) = lock.withLock { () -> ((@Sendable () -> Void)?, (@Sendable (State) -> Void)?, State, (@Sendable (Bool) -> Void)?) in
             guard state.visible != visible else { return (nil, nil, state, nil) }
             if !visible {
+                cancelUnsentShellCreation()
                 inputRouting.discardPointers()
                 if let requested { state.rejectedNavigation = requested; self.requested = nil }
             }
@@ -823,6 +944,81 @@ public final class TerminalMuxControl: @unchecked Sendable {
     }
 
     // MARK: transport side
+
+    /// Only the authenticated channel owner publishes this after its first
+    /// coherent inventory. Legacy peers remain useful for viewing.
+    public func enableShellCreation(incarnation: Data?) {
+        update { state in
+            guard !queriesEnded, let incarnation, TerminalMuxPhoneSizes.isRun(incarnation),
+                  state.shellCreationIncarnation == nil else { return false }
+            state.shellCreationIncarnation = incarnation
+            return true
+        }
+    }
+
+    public var hasPendingShellCreation: Bool { lock.withLock { pendingShellCreation != nil } }
+
+    /// Called once, after foreground authorization, with no suspension before
+    /// native admission. A hidden/retired request never transfers to a new owner.
+    public func takeShellCreation() -> ShellCreationPlan? {
+        let (plan, notify, snapshot) = lock.withLock { () -> (ShellCreationPlan?, (@Sendable (State) -> Void)?, State) in
+            guard let plan = pendingShellCreation else { return (nil, nil, state) }
+            pendingShellCreation = nil
+            guard !queriesEnded, state.visible, state.sizeControlEnabled, accessMode.permitsShellCreation,
+                  state.shellCreationIncarnation == plan.incarnation else {
+                state.shellCreation?.outcome = .failed(reason: "The connection is no longer active.", uncertain: false)
+                state.revision = UUID(); return (nil, observer, state)
+            }
+            // A concurrent close cannot label an operation claimed by native
+            // admission as definitely unsent before its serial is returned.
+            state.shellCreation?.outcome = .awaitingReply
+            state.revision = UUID()
+            return (plan, nil, state)
+        }
+        notify?(snapshot)
+        return plan
+    }
+
+    public func shellCreationAdmitted(_ id: UUID, request: UInt64) {
+        update { state in
+            guard request > 0, state.shellCreation?.plan.id == id, state.shellCreation?.request == nil else { return false }
+            state.shellCreation?.request = request
+            state.shellCreation?.outcome = queriesEnded
+                ? .failed(reason: "The connection closed before confirmation.", uncertain: true) : .awaitingReply
+            return true
+        }
+    }
+
+    public func shellCreationRejected(_ id: UUID, reason: String) {
+        update { state in
+            guard state.shellCreation?.plan.id == id, state.shellCreation?.request == nil else { return false }
+            state.shellCreation?.outcome = .failed(reason: Self.boundedError(reason), uncertain: false)
+            return true
+        }
+    }
+
+    @discardableResult
+    public func finishShellCreation(request: UInt64, outcome: ShellCreation.Outcome) -> Bool {
+        var matched = false
+        update { state in
+            guard request > 0, let creation = state.shellCreation, creation.request == request else { return false }
+            switch creation.outcome {
+            case .awaitingReply, .failed(_, true): break
+            default: return false
+            }
+            switch outcome {
+            case .created(let pane, let tab, let window):
+                guard pane >= 0, tab >= 0, window >= 0 else { return false }
+                state.shellCreation?.outcome = outcome
+            case .failed(let reason, let uncertain):
+                state.shellCreation?.outcome = .failed(reason: Self.boundedError(reason), uncertain: uncertain)
+            default: return false
+            }
+            matched = true
+            return true
+        }
+        return matched
+    }
 
     /// The attached session is ending for `reason`; the screen shows it.
     public func recordFailure(_ reason: String) {
@@ -946,6 +1142,11 @@ public final class TerminalMuxControl: @unchecked Sendable {
     public func endQueries() {
         let (notify, snapshot) = lock.withLock {
             queriesEnded = true
+            shellCreationReview = nil; pendingShellCreation = nil; state.shellCreationIncarnation = nil
+            if let creation = state.shellCreation, creation.pending {
+                let uncertain = creation.outcome == .awaitingReply
+                state.shellCreation?.outcome = .failed(reason: "The connection closed before confirmation.", uncertain: uncertain)
+            }
             if let requested { state.rejectedNavigation = requested; self.requested = nil }
             inputRouting.discardPointers()
             pendingSearch = nil; pendingContext = nil

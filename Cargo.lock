@@ -4680,6 +4680,7 @@ name = "frankenterm-mobile-mux"
 version = "0.15.21"
 dependencies = [
  "codec",
+ "config",
  "frankenterm-term",
  "leb128",
  "mux",

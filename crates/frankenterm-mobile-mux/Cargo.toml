@@ -26,5 +26,6 @@ zstd.workspace = true
 [dev-dependencies]
 # The desktop's own codec is the reference every frame here is checked against.
 codec = { workspace = true, features = ["async-asupersync"] }
+config.workspace = true
 frankenterm-term = { workspace = true, features = ["use_serde"] }
 mux.workspace = true

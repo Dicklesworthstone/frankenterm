@@ -912,7 +912,9 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 _ = try await pumpMux(timeout: .seconds(5), driver: driver)
                 try await validateForeground()
             }
-            guard !state.panes.isEmpty else { throw TerminalMuxError.noPanes }
+            // An empty mux is a useful live connection: its inventory can
+            // change, and an explicit reviewed action can create its first shell.
+            control.enableShellCreation(incarnation: state.incarnation)
             // Inspect only the remembered selection (or the first selected
             // pane), not the entire fleet. No show, resize or input precedes
             // this bounded, passive check on the new authenticated channel.
@@ -1028,6 +1030,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                     throw TerminalMuxError.failed("The mux server identity changed. Reconnect before using its panes.")
                 }
                 state.incarnation = incarnation
+                if state.listed { state.control.enableShellCreation(incarnation: incarnation) }
             case .paneIdentity(let pane, let identity):
                 state.identityQueries.remove(pane)
                 guard state.panes.contains(where: { $0.paneId == pane }) else { continue }
@@ -1038,6 +1041,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                         throw TerminalMuxError.failed("The pane identity changed. Select it again on a new connection.")
                     }
                     state.incarnation = identity.incarnation
+                    if state.listed { state.control.enableShellCreation(incarnation: identity.incarnation) }
                     state.identities[pane] = identity
                 } else {
                     guard state.identities[pane] == nil else {
@@ -1059,6 +1063,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 state.identityQueries.formIntersection(present)
                 state.sizeRecovery.formIntersection(present)
                 state.panes = panes; state.listed = true
+                state.control.enableShellCreation(incarnation: state.incarnation)
                 if let shown = state.shown {
                     // The record follows a pane the desktop moved; one that left clears it.
                     let listed = panes.first { $0.paneId == shown }
@@ -1159,6 +1164,16 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 // Nothing reached the wire. Keep viewing and supported input
                 // alive; do not mark uncertainty or queue a resend.
                 state.control.recordNotice(reason)
+            case .shellCreated(let request, let pane, let tab, let window):
+                if state.control.finishShellCreation(request: request, outcome: .created(pane: pane, tab: tab, window: window)) {
+                    // A numeric spawn receipt cannot prove a later pane's live
+                    // registration. Refresh the picker; selection remains explicit.
+                    state.nextListing = .now
+                }
+            case .shellCreationFailed(let request, let reason, let uncertain):
+                if state.control.finishShellCreation(request: request, outcome: .failed(reason: reason, uncertain: uncertain)) {
+                    state.nextListing = .now
+                }
             case .failed(let reason):
                 // Once attached, a failure still ends this connection (and may
                 // be reconnected), but its reason reaches the screen.
@@ -1297,6 +1312,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
 
     private func serviceMux(driver: NativeSSHDriver) async throws -> TerminalSessionUpdate {
         try reconcileMux()
+        try await dispatchMuxShellCreation()
         try await dispatchMuxPointer(driver: driver)
         try await flushMux(driver: driver)
         guard !closed else { throw NativeSSHError.closed }
@@ -1321,6 +1337,24 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         try reconcileMux()
         try await flushMux(driver: driver)
         return nextMuxUpdate() ?? TerminalSessionUpdate(output: Data())
+    }
+
+    /// Topology mutation uses its own reviewed request, never the current
+    /// keyboard destination. Authorization is rechecked before consuming it;
+    /// no suspension separates that cut from native admission.
+    private func dispatchMuxShellCreation() async throws {
+        guard let state = mux, state.control.hasPendingShellCreation else { return }
+        try await validateForeground()
+        guard mux === state, !closed, let plan = state.control.takeShellCreation() else { return }
+        do {
+            let request = try state.client.createShell(workspace: plan.workspace, rows: plan.rows,
+                columns: plan.columns, expectedIncarnation: plan.incarnation)
+            state.control.shellCreationAdmitted(plan.id, request: request)
+        } catch {
+            // The native API throws only before admission. Sent operations
+            // settle through their correlated events, including unknown effects.
+            state.control.shellCreationRejected(plan.id, reason: error.localizedDescription)
+        }
     }
 
     func writeSome(_ bytes: Data) async throws -> TerminalTransportWrite {
@@ -1507,6 +1541,7 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
         muxControl?.inputRouting.retire()
         muxControl?.setWaker(nil)
         mux?.queries.retire()
+        muxControl?.endQueries()
         mux?.output.retire()
         closed = true; inputSignal.finish()
         let session = self.session, lease = networkLease
@@ -1552,6 +1587,10 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                     state.rememberPhoneSize(pane: pane, desktop: desktop, rows: rows, columns: columns)
                 case .inputRejected(_, let reason):
                     state.control.recordNotice(reason)
+                case .shellCreated(let request, let pane, let tab, let window):
+                    state.control.finishShellCreation(request: request, outcome: .created(pane: pane, tab: tab, window: window))
+                case .shellCreationFailed(let request, let reason, let uncertain):
+                    state.control.finishShellCreation(request: request, outcome: .failed(reason: reason, uncertain: uncertain))
                 case .failed: failed = true
                 default: break
                 }

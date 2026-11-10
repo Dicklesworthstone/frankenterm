@@ -47,6 +47,9 @@ public final class NativeMuxClient: TerminalMuxClient, @unchecked Sendable {
         case UInt32(FT_TERMINAL_STALE): throw TerminalModelError.stale
         case UInt32(FT_TERMINAL_CLOSED): throw TerminalModelError.closed
         case UInt32(FT_TERMINAL_CAPACITY): throw TerminalModelError.capacity
+        case UInt32(FT_TERMINAL_BUSY): throw TerminalModelError.busy
+        case UInt32(FT_TERMINAL_UNSUPPORTED): throw TerminalModelError.unsupported
+        case UInt32(FT_TERMINAL_SEQUENCE_EXHAUSTED): throw TerminalModelError.exhausted
         case UInt32(FT_TERMINAL_PANIC): throw TerminalModelError.poisoned
         default: throw TerminalModelError.invalid
         }
@@ -122,6 +125,12 @@ public final class NativeMuxClient: TerminalMuxClient, @unchecked Sendable {
                 guard length == 0 else { throw TerminalModelError.invalid }
                 return nil
             }
+            if kind == UInt32(FT_MUX_EVENT_SHELL_CREATED), length > 256 {
+                throw TerminalModelError.capacity
+            }
+            if kind == UInt32(FT_MUX_EVENT_SHELL_CREATION_FAILED), length > 4096 {
+                throw TerminalModelError.capacity
+            }
             var payload = Data(count: Int(length))
             if length > 0 {
                 var written: UInt32 = 0
@@ -163,6 +172,24 @@ public final class NativeMuxClient: TerminalMuxClient, @unchecked Sendable {
                     throw TerminalModelError.invalid
                 }
                 return .inputRejected(paneID: paneID, reason: reason)
+            case UInt32(FT_MUX_EVENT_SHELL_CREATED):
+                guard rows == 0, cols == 0 else { throw TerminalModelError.invalid }
+                let decoder = JSONDecoder()
+                decoder.keyDecodingStrategy = .convertFromSnakeCase
+                let receipt = try decoder.decode(ShellCreatedReceipt.self, from: payload)
+                guard receipt.request != 0, receipt.tabId >= 0, receipt.windowId >= 0 else {
+                    throw TerminalModelError.invalid
+                }
+                return .shellCreated(request: receipt.request, paneID: paneID,
+                                     tabID: receipt.tabId, windowID: receipt.windowId)
+            case UInt32(FT_MUX_EVENT_SHELL_CREATION_FAILED):
+                guard pane == 0, rows == 0, cols == 0 else { throw TerminalModelError.invalid }
+                let receipt = try JSONDecoder().decode(ShellCreationFailure.self, from: payload)
+                guard receipt.request != 0, !receipt.reason.isEmpty, receipt.reason.utf8.count <= 512 else {
+                    throw TerminalModelError.invalid
+                }
+                return .shellCreationFailed(request: receipt.request, reason: receipt.reason,
+                                            uncertain: receipt.uncertain)
             case UInt32(FT_MUX_EVENT_FAILED): return .failed(String(decoding: payload, as: UTF8.self))
             case UInt32(FT_MUX_EVENT_SEARCH_RESULTS):
                 let decoder = JSONDecoder()
@@ -193,6 +220,46 @@ public final class NativeMuxClient: TerminalMuxClient, @unchecked Sendable {
     }
 
     public func refreshPanes() throws { try call { ft_mux_v1_refresh_panes($0) } }
+
+    private struct ShellCreatedReceipt: Decodable {
+        let request: UInt64
+        let tabId: Int
+        let windowId: Int
+    }
+
+    private struct ShellCreationFailure: Decodable {
+        let request: UInt64
+        let reason: String
+        let uncertain: Bool
+    }
+
+    /// Creates only the reviewed default-domain shell. The Rust RPC serial
+    /// owns settlement; neither this call nor its receipt selects a pane.
+    public func createShell(workspace: String, rows: Int, columns: Int,
+                            expectedIncarnation: Data) throws -> UInt64 {
+        guard !workspace.isEmpty, workspace.utf8.count <= 256,
+              !workspace.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
+              (1...512).contains(rows), (1...512).contains(columns),
+              rows * columns <= TerminalSessionGeometry.maximumShownCells,
+              expectedIncarnation.count == 16, expectedIncarnation.contains(where: { $0 != 0 }) else {
+            throw TerminalModelError.invalid
+        }
+        let bytes = Data(workspace.utf8)
+        var request: UInt64 = 0
+        try bytes.withUnsafeBytes { workspaceBuffer in
+            try expectedIncarnation.withUnsafeBytes { incarnationBuffer in
+                try timedCall {
+                    ft_mux_v1_create_shell($0, workspaceBuffer.bindMemory(to: UInt8.self).baseAddress,
+                                          UInt32(bytes.count), UInt32(rows), UInt32(columns),
+                                          incarnationBuffer.bindMemory(to: UInt8.self).baseAddress,
+                                          UInt32(expectedIncarnation.count), &request)
+                }
+            }
+        }
+        // Success at this audited boundary guarantees a nonzero RPC serial.
+        // Nothing after admission may throw and be mistaken for a refusal.
+        return request
+    }
     public func inspectPaneIdentity(pane: Int) throws {
         guard let pane = UInt64(exactly: pane) else { throw TerminalModelError.invalid }
         try timedCall { ft_mux_v1_inspect_pane_identity($0, pane) }

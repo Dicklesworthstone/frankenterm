@@ -26,6 +26,128 @@ private func queryResults(_ count: Int, request: UInt64 = 1, text: String = "a m
 private let queryNeedle = TerminalMuxControl.SearchQuery(text: "needle", caseSensitive: false, regex: false)
 
 final class TerminalMuxControlTests: XCTestCase {
+    func testEmptyMuxCreatesOneReviewedShellWithoutSelectingOrGrantingInput() throws {
+        let control = TerminalMuxControl(), run = Data(repeating: 0x31, count: 16)
+        control.publish(panes: [], shown: nil); control.setVisible(true)
+        XCTAssertFalse(control.canCreateShell, "the authenticated server run must be known")
+        control.enableShellCreation(incarnation: run)
+        let plan = try control.prepareShellCreation(workspace: "default")
+        XCTAssertEqual(plan.rows, 24); XCTAssertEqual(plan.columns, 80)
+        try control.requestShellCreation(plan)
+        XCTAssertFalse(control.canCreateShell)
+        XCTAssertThrowsError(try control.requestShellCreation(plan), "a confirmation is single-use")
+        XCTAssertEqual(control.takeShellCreation(), plan)
+        XCTAssertNil(control.takeShellCreation(), "the transport consumes the request once")
+        control.shellCreationAdmitted(plan.id, request: 51)
+        XCTAssertFalse(control.finishShellCreation(request: 50, outcome: .created(pane: 9, tab: 7, window: 4)))
+        XCTAssertTrue(control.finishShellCreation(request: 51, outcome: .created(pane: 9, tab: 7, window: 4)))
+        XCTAssertEqual(control.current.shellCreation?.outcome, .created(pane: 9, tab: 7, window: 4))
+        control.publish(panes: [queryPane(9)], shown: nil)
+        XCTAssertNil(control.current.shown)
+        XCTAssertNil(control.inputRouting.current.destination)
+        XCTAssertFalse(control.inputRouting.current.ready)
+        XCTAssertTrue(control.canCreateShell)
+        XCTAssertFalse(control.finishShellCreation(request: 51, outcome: .failed(reason: "late duplicate", uncertain: true)))
+    }
+
+    func testShellReviewIsBoundToConnectionAndInvalidatedByLostFocus() throws {
+        let run = Data(repeating: 0x31, count: 16)
+        let first = TerminalMuxControl(), replacement = TerminalMuxControl()
+        for control in [first, replacement] {
+            control.setVisible(true); control.enableShellCreation(incarnation: run)
+        }
+        let plan = try first.prepareShellCreation(workspace: "work")
+        XCTAssertThrowsError(try replacement.requestShellCreation(plan), "the same server run is not the same connection")
+        first.setSizeControlEnabled(false)
+        first.setSizeControlEnabled(true)
+        XCTAssertThrowsError(try first.requestShellCreation(plan), "returning focus cannot revive a review")
+        let next = try first.prepareShellCreation(workspace: "work")
+        first.setVisible(false); first.setVisible(true)
+        XCTAssertThrowsError(try first.requestShellCreation(next))
+        let queued = try first.prepareShellCreation(workspace: "work")
+        try first.requestShellCreation(queued)
+        first.setVisible(false); first.setVisible(true)
+        XCTAssertNil(first.takeShellCreation(), "returning cannot revive an unsent request")
+        XCTAssertEqual(first.current.shellCreation?.outcome,
+                       .failed(reason: "The connection is no longer active.", uncertain: false))
+    }
+
+    func testShellCreationPermissionIsSeparateFromInputAndValidatesBounds() throws {
+        for mode in [TerminalMuxAccessMode.viewOnly, .inputOnly] {
+            let control = TerminalMuxControl(accessMode: mode)
+            control.setVisible(true); control.enableShellCreation(incarnation: Data(repeating: 1, count: 16))
+            XCTAssertFalse(mode.permitsShellCreation)
+            XCTAssertThrowsError(try control.prepareShellCreation(workspace: "default"))
+        }
+        let control = TerminalMuxControl()
+        control.setVisible(true)
+        for run in [Data(), Data(repeating: 0, count: 16), Data(repeating: 1, count: 15)] {
+            control.enableShellCreation(incarnation: run)
+            XCTAssertFalse(control.canCreateShell)
+        }
+        control.enableShellCreation(incarnation: Data(repeating: 1, count: 16))
+        for workspace in ["", "bad\nworkspace", "bad\u{0}workspace", String(repeating: "界", count: 86)] {
+            XCTAssertThrowsError(try control.prepareShellCreation(workspace: workspace))
+        }
+        for (rows, columns) in [(0, 80), (24, 0), (513, 1), (1, 513), (512, 65)] {
+            XCTAssertThrowsError(try control.prepareShellCreation(workspace: "default", rows: rows, columns: columns))
+        }
+        XCTAssertNoThrow(try control.prepareShellCreation(workspace: "开发", rows: 512, columns: 64))
+    }
+
+    func testClosingMarksOnlyClaimedShellCreationUncertainAndNeverRequeues() throws {
+        for claimed in [false, true] {
+            let control = TerminalMuxControl()
+            control.setVisible(true); control.enableShellCreation(incarnation: Data(repeating: 1, count: 16))
+            let plan = try control.prepareShellCreation(workspace: "default")
+            try control.requestShellCreation(plan)
+            if claimed { XCTAssertEqual(control.takeShellCreation(), plan) }
+            control.endQueries()
+            XCTAssertNil(control.takeShellCreation())
+            XCTAssertFalse(control.canCreateShell)
+            XCTAssertEqual(control.current.shellCreation?.outcome,
+                .failed(reason: "The connection closed before confirmation.", uncertain: claimed))
+            if claimed {
+                control.shellCreationAdmitted(plan.id, request: 31)
+                XCTAssertEqual(control.current.shellCreation?.outcome,
+                    .failed(reason: "The connection closed before confirmation.", uncertain: true),
+                    "late serial publication cannot revive a closed operation")
+                XCTAssertTrue(control.finishShellCreation(request: 31, outcome: .created(pane: 9, tab: 7, window: 4)),
+                              "a correlated receipt drained during close can settle the unknown outcome")
+            }
+        }
+    }
+
+    func testNativeAdmissionRefusalCanSettleCloseUncertaintyWithoutRetry() throws {
+        let control = TerminalMuxControl()
+        control.setVisible(true); control.enableShellCreation(incarnation: Data(repeating: 1, count: 16))
+        let plan = try control.prepareShellCreation(workspace: "default")
+        try control.requestShellCreation(plan)
+        _ = control.takeShellCreation()
+        control.endQueries()
+        control.shellCreationRejected(plan.id, reason: "unsupported peer")
+        XCTAssertEqual(control.current.shellCreation?.outcome, .failed(reason: "unsupported peer", uncertain: false))
+        XCTAssertNil(control.takeShellCreation())
+    }
+
+    func testShellCompletionKeepsExistingPaneVisitAndSharedSizePermission() throws {
+        let control = TerminalMuxControl(), routing = control.inputRouting
+        try routing.replaceInventory([1])
+        let destination = try routing.select(pane: 1)
+        routing.didApplyOutput(destination)
+        control.publish(panes: [queryPane(1)], shown: 1); control.setVisible(true)
+        control.enableShellCreation(incarnation: Data(repeating: 1, count: 16))
+        let plan = try control.prepareShellCreation(workspace: "work")
+        try control.requestShellCreation(plan)
+        _ = control.takeShellCreation(); control.shellCreationAdmitted(plan.id, request: 71)
+        XCTAssertTrue(control.finishShellCreation(request: 71, outcome: .failed(reason: "busy", uncertain: false)))
+        XCTAssertEqual(control.current.shown, 1)
+        XCTAssertEqual(routing.current.destination, destination)
+        XCTAssertTrue(routing.current.ready)
+        XCTAssertTrue(control.controlsSize)
+        XCTAssertNil(control.takeShellCreation(), "a refusal never schedules a retry")
+    }
+
     func testVisibleCompanionCanRelinquishSizeWithoutChangingInputOrSelection() throws {
         for mode in [TerminalMuxAccessMode.viewOnly, .inputOnly, .interactive] {
             let control = TerminalMuxControl(accessMode: mode), routing = control.inputRouting

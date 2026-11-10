@@ -801,6 +801,91 @@ final class TerminalSessionController {
         return target.restricted(to: selected)
     }
 
+    struct PersistentShellReview: Identifiable {
+        var id: UUID { plan.id }
+        let controllerID: UUID, connectionID: UUID
+        let control: TerminalMuxControl
+        let plan: TerminalMuxControl.ShellCreationPlan
+        let machineName: String, user: String, host: String
+        let port: UInt16
+        let route: TerminalSessionRoute
+    }
+    private var persistentShellReviewID: UUID?
+    /// Bounded presentation only, carried across connection replacement. It
+    /// contains neither a request to replay nor authority for a later pane.
+    private(set) var persistentShellNotice: String?
+    private var persistentShellDestination: String?
+
+    private static func boundedShellNotice(_ value: String, bytes: Int = 1024) -> String {
+        String(decoding: value.utf8.prefix(bytes), as: UTF8.self)
+    }
+
+    private func rememberPersistentShellOutcome(_ state: TerminalMuxControl.State) {
+        guard let creation = state.shellCreation else { return }
+        let destination = persistentShellDestination ?? Self.boundedShellNotice(target.machineName, bytes: 384)
+        persistentShellNotice = Self.boundedShellNotice("Shell request on \(destination): \(creation.message)")
+    }
+
+    private var permitsPersistentShellReview: Bool {
+        !stopped && phase == .live && attachedToMux && hasFocusedPresentation
+            && focus?.permitsTerminalCreation == true && !overviewBlocking && !paneNavigationBusy
+            && !localInputNeedsDecision && clipboard?.blocksKeyboardActivation != true
+            && historyInspection == nil && !historyReturning && !muxSearchPresented
+    }
+
+    var canCreatePersistentShell: Bool {
+        permitsPersistentShellReview && persistentShellReviewID == nil && muxControl?.canCreateShell == true
+    }
+
+    func preparePersistentShell() throws -> PersistentShellReview {
+        guard canCreatePersistentShell, let connection, let control = connection.muxControl else {
+            throw TerminalMuxShellCreationError.unavailable
+        }
+        // Workspace metadata is only a reviewed destination label. No pane,
+        // working directory, command or numeric domain is inherited.
+        let state = control.current
+        let workspace = state.panes.first(where: { $0.paneId == state.shown })?.workspace ?? "default"
+        let plan = try control.prepareShellCreation(workspace: workspace)
+        persistentShellReviewID = plan.id
+        control.inputRouting.discardPointers()
+        pointerFocusActivation?.cancel(); viewAttachment?.cancel()
+        terminal?.input.retire(); keyboard?.suspend()
+        return PersistentShellReview(controllerID: id, connectionID: connection.id, control: control, plan: plan,
+            machineName: target.machineName, user: connection.user, host: connection.host, port: connection.port, route: route)
+    }
+
+    func canConfirmPersistentShell(_ review: PersistentShellReview) -> Bool {
+        permitsPersistentShellReview && persistentShellReviewID == review.id && review.controllerID == id
+            && connection?.id == review.connectionID && connection?.muxControl === review.control
+            && review.control.canCreateShell
+            && review.control.current.shellCreationIncarnation == review.plan.incarnation
+    }
+
+    func createPersistentShell(_ review: PersistentShellReview) throws {
+        guard canConfirmPersistentShell(review) else { throw TerminalMuxShellCreationError.stale }
+        let destination = Self.boundedShellNotice(
+            "\(review.machineName) · \(review.user)@\(review.host):\(review.port)", bytes: 384)
+        try review.control.requestShellCreation(review.plan)
+        persistentShellDestination = destination
+        rememberPersistentShellOutcome(review.control.current)
+    }
+
+    func endPersistentShellReview(_ review: PersistentShellReview, resumingView: Bool = true) {
+        review.control.cancelShellCreationReview(review.plan)
+        guard persistentShellReviewID == review.id else { return }
+        persistentShellReviewID = nil
+        guard resumingView, !stopped, phase == .live, hasFocusedPresentation else { return }
+        showView()
+        let source = pump?.source
+        Task { [weak self] in
+            guard let self, self.hasFocusedPresentation, self.persistentShellReviewID == nil,
+                  self.pump?.source == source else { return }
+            await self.focus?.activateKeyboard(showKeyboard: false, source: source)
+        }
+    }
+
+    func reportPersistentShellProblem(_ error: Error) { interactionProblem = error.localizedDescription }
+
     func makeRemoteFiles(scene: WorkspaceTerminalScene) throws -> TerminalRemoteFilesController {
         guard let target = remoteFilesTarget else { throw WorkspaceSSHConnectionError.stale }
         return TerminalRemoteFilesController(target: target, source: self, scene: scene, connections: connections)
@@ -941,6 +1026,7 @@ final class TerminalSessionController {
          reconnectingFrom previous: TerminalSessionController? = nil,
          retryingAfterPasswordHop retried: TerminalSessionController? = nil,
          inputDelivery: TerminalInputDelivery = .init(),
+         persistentShellNotice: String? = nil,
          muxAccessMode: TerminalMuxAccessMode = .interactive, requiresExistingMux: Bool = false,
          terminalSessionID: UUID? = nil) {
         self.target = target; self.connections = connections; self.focus = focus
@@ -948,6 +1034,7 @@ final class TerminalSessionController {
         requestedFont = target.font
         self.muxAccessMode = muxAccessMode; self.requiresExistingMux = requiresExistingMux
         self.inputDelivery = inputDelivery
+        self.persistentShellNotice = persistentShellNotice.map { Self.boundedShellNotice($0) }
         unansweredInput = TerminalUnansweredInput(workspace: target.workspaceID.uuidString, machine: target.machineID,
             terminalSessionID: terminalSessionID)
         shellOnly = terminalSessionID != nil
@@ -1001,6 +1088,7 @@ final class TerminalSessionController {
 
     var clipboardIsPresenting: Bool {
         clipboard?.isPresenting == true || historyInspection != nil || historyReturning || muxSearchPresented
+            || persistentShellReviewID != nil
     }
     var localInputNeedsDecision: Bool { localInputRecovery != nil || resolvingLocalInput }
     /// A local command editor blocks input. Its explicit Review transition is
@@ -1008,6 +1096,7 @@ final class TerminalSessionController {
     /// existing native paste review can bind to a fresh focus generation.
     var keyboardActivationBlocked: Bool {
         clipboard?.blocksKeyboardActivation == true || historyInspection != nil || historyReturning || muxSearchPresented
+            || persistentShellReviewID != nil
     }
 
     /// The fleet picker owns the text responder while open. Its machine/pane
@@ -1448,6 +1537,7 @@ final class TerminalSessionController {
             [weak self, weak control] state, routing in
             guard let self, let control, !self.stopped, self.connection?.muxControl === control else { return }
             self.muxState = state
+            self.rememberPersistentShellOutcome(state)
             self.terminal?.remoteMouseGrabbed = state.mouseGrabbed && control.accessMode.permitsInput
             if let notice = state.notice, self.noticedMux !== control {
                 self.noticedMux = control
@@ -1677,7 +1767,7 @@ final class TerminalSessionController {
             catch let failure as TerminalMuxError {
                 guard !requiresExistingMux else { throw failure }
                 // No mux answered, it speaks a protocol this app does not (a
-                // newer desktop's), or it has no panes: the machine gets a
+                // newer desktop's): the machine gets a
                 // shell of its own on one of its direct SSH routes instead, as
                 // before there was a mux. That shell opens only under the
                 // direct route's own creation policy (shouldOpenTerminal); an
@@ -2386,6 +2476,11 @@ final class TerminalSessionController {
 
     private func pumpEnded(_ end: Result<TerminalSessionEnd, Error>) async {
         guard !stopped else { return }
+        if let control = connection?.muxControl {
+            control.endQueries()
+            muxState = control.current
+            rememberPersistentShellOutcome(control.current)
+        }
         if phase == .live {
             // This phone ended it, and viewing again would end the same way:
             // not a drop to reconnect automatically.
@@ -2534,6 +2629,13 @@ final class TerminalSessionController {
             // or retaining an otherwise settled coordinator source.
             do { try await connections.manager.close(connectionID: connection.id); self.connection = nil }
             catch { failure = failure ?? error }
+            if let control = connection.muxControl {
+                // Close may drain a final correlated creation receipt after
+                // observation retired. Carry that final fact to any reconnect.
+                control.endQueries()
+                muxState = control.current
+                rememberPersistentShellOutcome(control.current)
+            }
             // Closing settles a mux pane's input: its server confirmed it or not.
             if dropped || preserveUnansweredOnStop,
                connection.muxControl?.current.inputUnconfirmed == true, !inputDelivery.unanswered {

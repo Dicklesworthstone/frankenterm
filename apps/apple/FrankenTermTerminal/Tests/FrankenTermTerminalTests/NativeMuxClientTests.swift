@@ -88,6 +88,176 @@ final class NativeMuxClientTests: XCTestCase {
         return client
     }
 
+    private func emptyCurrentClient(clock: MuxTestClock) throws -> NativeMuxClient {
+        let client = try NativeMuxClient(monotonicNanoseconds: { clock.read() })
+        _ = try request(client, ident: 26, serial: 1)
+        try client.receive(frame(ident: 27, serial: 1, body: leb(71) + text("current")))
+        _ = try request(client, ident: 40, serial: 2)
+        try client.receive(frame(ident: 10, serial: 2, body: []))
+        _ = try request(client, ident: 81, serial: 3)
+        let run = [UInt8](repeating: 0x1c, count: 16)
+        let stream = [UInt8](repeating: 0x5a, count: 16)
+        try client.receive(frame(ident: 82, serial: 3,
+                                 body: [1] + stream + [0] + run + [0, 0, 0, 0, 0]))
+        XCTAssertEqual(try events(client), [
+            .ready(serverVersion: "current"), .incarnation(Data(run)), .panes([])
+        ])
+        XCTAssertTrue(try client.outgoing(limit: 4096).isEmpty)
+        return client
+    }
+
+    func testAnEmptyMuxCanCreateTheReviewedDefaultShellWithoutSelectingIt() throws {
+        let client = try emptyCurrentClient(clock: MuxTestClock())
+        let run = Data(repeating: 0x1c, count: 16)
+        let operation = try client.createShell(workspace: "default", rows: 24, columns: 80,
+                                                expectedIncarnation: run)
+        XCTAssertEqual(operation, 4)
+        // DefaultDomain, no window/command/directory; rows, cols, pixels, DPI;
+        // then the explicit workspace. No inferred pane/domain authority.
+        XCTAssertEqual(try request(client, ident: 36, serial: 4),
+                       [0, 0, 0, 0, 24, 80, 0, 0, 0] + text("default"))
+        XCTAssertEqual(try client.pollInputTimer(), Duration.seconds(15),
+                       "an empty inventory still has a finite creation wake")
+        XCTAssertEqual(try events(client), [])
+        try client.receive(frame(ident: 8, serial: operation, body: [9, 17, 23, 24, 80, 0, 0, 0]))
+        XCTAssertEqual(try events(client), [
+            .shellCreated(request: operation, paneID: 17, tabID: 9, windowID: 23)
+        ])
+        XCTAssertNil(try client.pollInputTimer())
+        XCTAssertTrue(try client.outgoing(limit: 4096).isEmpty,
+                      "the receipt does not select, inspect, size, or type into its numeric pane")
+    }
+
+    func testShellAdmissionRefusalsConsumeNoOperationAndDuplicateCreationStaysBounded() throws {
+        let client = try emptyCurrentClient(clock: MuxTestClock())
+        let run = Data(repeating: 0x1c, count: 16)
+        let invalid: [(String, Int, Int, Data)] = [
+            ("", 24, 80, run),
+            ("bad\nworkspace", 24, 80, run),
+            (String(repeating: "é", count: 129), 24, 80, run),
+            ("default", 0, 80, run),
+            ("default", 24, 513, run),
+            ("default", 256, 129, run),
+            ("default", 24, 80, Data(repeating: 0x1c, count: 15)),
+            ("default", 24, 80, Data(repeating: 0, count: 16))
+        ]
+        for (workspace, rows, columns, incarnation) in invalid {
+            XCTAssertThrowsError(try client.createShell(workspace: workspace, rows: rows,
+                columns: columns, expectedIncarnation: incarnation)) {
+                XCTAssertEqual($0 as? TerminalModelError, .invalid)
+            }
+        }
+        XCTAssertThrowsError(try client.createShell(workspace: "default", rows: 24, columns: 80,
+            expectedIncarnation: Data(repeating: 0x55, count: 16))) {
+            XCTAssertEqual($0 as? TerminalModelError, .stale)
+        }
+        XCTAssertEqual(try events(client), [])
+        XCTAssertTrue(try client.outgoing(limit: 4096).isEmpty)
+        XCTAssertNil(try client.pollInputTimer())
+
+        let first = try client.createShell(workspace: "default", rows: 24, columns: 80,
+                                           expectedIncarnation: run)
+        XCTAssertEqual(first, 4, "pre-admission refusals consumed no RPC serial")
+        XCTAssertThrowsError(try client.createShell(workspace: "duplicate", rows: 24, columns: 80,
+            expectedIncarnation: run)) { XCTAssertEqual($0 as? TerminalModelError, .busy) }
+        _ = try request(client, ident: 36, serial: 4)
+        try client.receive(frame(ident: 8, serial: first, body: [9, 17, 23, 24, 80, 0, 0, 0]))
+        XCTAssertThrowsError(try client.createShell(workspace: "unread result", rows: 24, columns: 80,
+            expectedIncarnation: run)) { XCTAssertEqual($0 as? TerminalModelError, .busy) }
+        XCTAssertTrue(try client.outgoing(limit: 4096).isEmpty)
+        XCTAssertEqual(try events(client).count, 1)
+        XCTAssertEqual(try client.createShell(workspace: "next explicit action", rows: 24, columns: 80,
+            expectedIncarnation: run), 5)
+        _ = try request(client, ident: 36, serial: 5)
+    }
+
+    func testShellRejectionAuthorityIsTypedAndNeverCausesAnAutomaticRetry() throws {
+        for uncertain in [false, true] {
+            let client = try emptyCurrentClient(clock: MuxTestClock())
+            let operation = try client.createShell(workspace: "default", rows: 24, columns: 80,
+                expectedIncarnation: Data(repeating: 0x1c, count: 16))
+            _ = try request(client, ident: 36, serial: 4)
+            // Known DomainNotFound/NOT_APPLIED/NEVER vs IndeterminateMutation.
+            let authority: [UInt8] = uncertain ? [1, 36, 11, 0, 2, 3] : [1, 36, 4, 0, 1, 1]
+            try client.receive(frame(ident: 0, serial: operation, body: authority))
+            let settled = try events(client)
+            guard settled.count == 1,
+                  case let .shellCreationFailed(request, reason, actualUncertainty) = settled[0] else {
+                return XCTFail("missing correlated shell creation failure: \(settled)")
+            }
+            XCTAssertEqual(request, operation)
+            XCTAssertEqual(actualUncertainty, uncertain)
+            XCTAssertFalse(reason.isEmpty)
+            XCTAssertLessThanOrEqual(reason.utf8.count, 512)
+            XCTAssertTrue(try client.outgoing(limit: 4096).isEmpty)
+            XCTAssertNil(try client.pollInputTimer())
+            try client.refreshPanes()
+            XCTAssertEqual(try request(client, ident: 3, serial: 5), [],
+                           "a rejected creation keeps inventory viewing available")
+        }
+    }
+
+    func testLostOrMalformedShellReceiptSurvivesTeardownBeforeSessionFailure() throws {
+        for fault in ["deadline", "closed", "malformed"] {
+            let clock = MuxTestClock(), client = try emptyCurrentClient(clock: clock)
+            let operation = try client.createShell(workspace: "default", rows: 24, columns: 80,
+                expectedIncarnation: Data(repeating: 0x1c, count: 16))
+            _ = try request(client, ident: 36, serial: 4)
+            // Wrong-RPC output cannot settle or extend the original operation.
+            try client.receive(frame(ident: 8, serial: 99, body: [9, 17, 23, 24, 80, 0, 0, 0]))
+            XCTAssertEqual(try events(client), [])
+            XCTAssertEqual(try client.pollInputTimer(), Duration.seconds(15))
+            switch fault {
+            case "deadline":
+                clock.set(15_000_000_000)
+                XCTAssertThrowsError(try client.pollInputTimer()) {
+                    XCTAssertEqual($0 as? TerminalModelError, .closed)
+                }
+            case "closed":
+                try client.channelClosed()
+            default:
+                try client.receive(frame(ident: 8, serial: operation,
+                                         body: [9, 17, 23, 24, 80, 0, 0, 0, 0]))
+            }
+            let settled = try events(client)
+            guard settled.count == 2,
+                  case let .shellCreationFailed(request, reason, uncertain) = settled[0],
+                  case .failed = settled[1] else {
+                return XCTFail("creation result must precede teardown: \(settled)")
+            }
+            XCTAssertEqual(request, operation)
+            XCTAssertTrue(uncertain)
+            XCTAssertFalse(reason.isEmpty)
+            XCTAssertLessThanOrEqual(reason.utf8.count, 512)
+            XCTAssertTrue(try client.outgoing(limit: 4096).isEmpty)
+            XCTAssertThrowsError(try client.receive(frame(ident: 8, serial: operation,
+                                                          body: [9, 17, 23, 24, 80, 0, 0, 0]))) {
+                XCTAssertEqual($0 as? TerminalModelError, .closed)
+            }
+            XCTAssertEqual(try events(client), [], "late receipts cannot revive or replay creation")
+        }
+    }
+
+    func testShellCreationDoesNotRetargetOrAcknowledgeTheSelectedPanesInput() throws {
+        let client = try currentClient(clock: MuxTestClock())
+        let operation = try client.createShell(workspace: "default", rows: 24, columns: 80,
+            expectedIncarnation: Data(repeating: 0x1c, count: 16))
+        XCTAssertEqual(operation, 7)
+        _ = try request(client, ident: 36, serial: 7)
+        try client.write(pane: 7, bytes: Data("ok".utf8))
+        _ = try request(client, ident: 100, serial: 8)
+        try client.receive(frame(ident: 8, serial: operation, body: [9, 17, 23, 24, 80, 0, 0, 0]))
+        XCTAssertEqual(try events(client), [
+            .shellCreated(request: operation, paneID: 17, tabID: 9, windowID: 23)
+        ])
+        XCTAssertTrue(try client.unansweredInput(pane: 7))
+        XCTAssertFalse(try client.unansweredInput(pane: 17))
+        XCTAssertTrue(try client.outgoing(limit: 4096).isEmpty)
+        try client.receive(frame(ident: 101, serial: 8, body: [7, 1, 0, 2]))
+        XCTAssertFalse(try client.unansweredInput(pane: 7))
+        XCTAssertNil(try client.pollInputTimer())
+    }
+
     func testInitialResetIsPreparatoryUntilTheCompletePaneOutputArrives() throws {
         let client = try currentClient(clock: MuxTestClock(), consumeEvents: false)
         let output = try events(client).filter {

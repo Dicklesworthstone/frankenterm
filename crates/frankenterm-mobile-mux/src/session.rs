@@ -149,6 +149,21 @@ pub enum Event {
         pane_id: usize,
         reason: String,
     },
+    /// The matching PDU8 acknowledged creation, not attachment or control.
+    /// Its numeric IDs grant no authority to select a replacement pane.
+    ShellCreated {
+        request: u64,
+        pane_id: usize,
+        tab_id: usize,
+        window_id: usize,
+    },
+    /// A finite result for an admitted creation. Unknown outcomes never
+    /// authorize replay; inspect the current inventory before another action.
+    ShellCreationFailed {
+        request: u64,
+        reason: String,
+        uncertain: bool,
+    },
     /// The session is over; close the channel.
     Failed {
         reason: String,
@@ -158,6 +173,7 @@ pub enum Event {
 #[derive(Debug)]
 enum Request {
     Version,
+    CreateShell,
     RegisterClient {
         server_version: String,
     },
@@ -241,6 +257,8 @@ enum Request {
 pub const MAX_WHEEL_STEPS: u32 = 64;
 /// Reliable input retains one admission budget across retries and suffixes.
 pub const INPUT_DEADLINE_NS: u64 = 5_000_000_000;
+/// Shell creation has one admission deadline and no automatic retry path.
+pub const SHELL_CREATION_DEADLINE_NS: u64 = 15_000_000_000;
 /// Passive reconnect checks have their own bounded lane and never consume
 /// an input serial or subscribe to a pane's output.
 pub const MAX_IDENTITY_QUERIES: usize = 8;
@@ -381,6 +399,31 @@ struct RenderRetry {
     refusals: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ShellCreationError {
+    #[error("the mux connection is not ready")]
+    NotReady,
+    #[error("shell creation requires a current mux connection")]
+    Unsupported,
+    #[error("the reviewed mux incarnation is not current")]
+    Stale,
+    #[error("another shell creation result is still pending")]
+    Busy,
+    #[error("invalid shell workspace or geometry")]
+    Invalid,
+    #[error("shell creation requires a valid owner clock")]
+    ClockUnavailable,
+    #[error("the mux request serial space is exhausted")]
+    SerialExhausted,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingShellCreation {
+    request: u64,
+    incarnation: [u8; 16],
+    deadline_ns: u64,
+}
+
 #[derive(Debug, Default)]
 pub struct Session {
     next_serial: u64,
@@ -428,6 +471,9 @@ pub struct Session {
     /// Payloads are released on failure, but their uncertain disposition is
     /// retained for the existing Swift journal/close path.
     interrupted_input: HashSet<usize>,
+    /// Remains owned even after the RPC map removes a malformed receipt, so
+    /// failure cleanup can emit an uncertain creation result before Failed.
+    pending_shell_creation: Option<PendingShellCreation>,
 }
 
 impl Session {
@@ -464,6 +510,13 @@ impl Session {
             return false;
         }
         self.monotonic_ns = Some(now_ns);
+        if self
+            .pending_shell_creation
+            .is_some_and(|pending| now_ns >= pending.deadline_ns)
+        {
+            self.fail("shell creation was not confirmed before its deadline; it was not retried".to_owned());
+            return false;
+        }
         let expired: Vec<_> = self
             .requests
             .iter()
@@ -571,7 +624,69 @@ impl Session {
                     .filter_map(|sizing| sizing.restore_observation)
                     .map(|observation| observation.deadline_ns.min(observation.next_read_ns)),
             )
+            .chain(self.pending_shell_creation.map(|pending| pending.deadline_ns))
             .min()
+    }
+
+    /// Deliberately creates one persistent default-domain shell in a new
+    /// window. This never selects, shows, resizes, or sends input to a pane.
+    /// Every error is pre-admission: no serial or request bytes are consumed.
+    pub fn create_shell(
+        &mut self,
+        workspace: &str,
+        rows: usize,
+        cols: usize,
+        expected_incarnation: [u8; 16],
+    ) -> Result<u64, ShellCreationError> {
+        if !self.is_ready() {
+            return Err(ShellCreationError::NotReady);
+        }
+        if self.dialect != Dialect::Current || self.codec_version < 61 {
+            return Err(ShellCreationError::Unsupported);
+        }
+        if expected_incarnation == [0; 16]
+            || self.incarnation != Some(expected_incarnation)
+        {
+            return Err(ShellCreationError::Stale);
+        }
+        if self.pending_shell_creation.is_some()
+            || self.events.iter().any(|event| {
+                matches!(event, Event::ShellCreated { .. } | Event::ShellCreationFailed { .. })
+            })
+        {
+            return Err(ShellCreationError::Busy);
+        }
+        if workspace.is_empty()
+            || workspace.len() > wire::MAX_SHELL_WORKSPACE_BYTES
+            || workspace.chars().any(char::is_control)
+            || !(1..=512).contains(&rows)
+            || !(1..=512).contains(&cols)
+            || rows.checked_mul(cols).is_none_or(|cells| cells > wire::MAX_SHELL_CELLS)
+        {
+            return Err(ShellCreationError::Invalid);
+        }
+        let deadline_ns = self
+            .monotonic_ns
+            .and_then(|now| now.checked_add(SHELL_CREATION_DEADLINE_NS))
+            .ok_or(ShellCreationError::ClockUnavailable)?;
+        let request = self.next_serial.checked_add(1).ok_or(ShellCreationError::SerialExhausted)?;
+        let spawn = wire::SpawnDefaultShell::new(
+            workspace,
+            TerminalSize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+                dpi: 0,
+            },
+        );
+        self.send(ident::SPAWN_V2, &spawn, Request::CreateShell);
+        self.pending_shell_creation = Some(PendingShellCreation {
+            request,
+            incarnation: expected_incarnation,
+            deadline_ns,
+        });
+        Ok(request)
     }
 
     pub fn panes(&self) -> &[PaneInfo] {
@@ -1858,6 +1973,7 @@ impl Session {
     fn fail(&mut self, reason: String) {
         if !self.failed {
             self.failed = true;
+            self.finish_shell_creation_failure(true);
             self.interrupted_input
                 .extend(self.ordered_input.iter().map(|input| input.pane_id));
             self.interrupted_input.extend(self.input.pending_panes());
@@ -1867,6 +1983,52 @@ impl Session {
             self.outgoing.clear();
             self.input.clear();
             self.events.push_back(Event::Failed { reason });
+        }
+    }
+
+    fn finish_shell_creation_failure(&mut self, uncertain: bool) {
+        if let Some(pending) = self.pending_shell_creation.take() {
+            self.requests.remove(&pending.request);
+            self.events.push_back(Event::ShellCreationFailed {
+                request: pending.request,
+                reason: if uncertain {
+                    "Shell creation could not be confirmed. A shell may have been created; inspect the pane list before trying again."
+                } else {
+                    "The mux refused shell creation and confirmed that no shell was created. The request was not retried."
+                }.to_owned(),
+                uncertain,
+            });
+        }
+    }
+
+    fn settle_shell_creation(&mut self, frame: &Frame) -> Result<(), crate::Error> {
+        let Some(pending) = self.pending_shell_creation else {
+            return Err(crate::Error::Schema);
+        };
+        if frame.serial != pending.request || self.incarnation != Some(pending.incarnation) {
+            return Err(crate::Error::Frame("shell creation receipt lost its original mux authority"));
+        }
+        if frame.oversized {
+            return Err(crate::Error::Frame("a shell creation receipt is too large"));
+        }
+        match frame.ident {
+            ident::SPAWN_RESPONSE => {
+                let response = wire::decode_spawn_response(&frame.body)?;
+                self.pending_shell_creation = None;
+                self.events.push_back(Event::ShellCreated {
+                    request: pending.request,
+                    pane_id: response.pane_id,
+                    tab_id: response.tab_id,
+                    window_id: response.window_id,
+                });
+                Ok(())
+            }
+            ident::ERROR_RESPONSE => {
+                let definitely_not_applied = wire::shell_creation_definitely_not_applied(&frame.body)?;
+                self.finish_shell_creation_failure(!definitely_not_applied);
+                Ok(())
+            }
+            _ => Err(crate::Error::Frame("shell creation received an unexpected reply")),
         }
     }
 
@@ -1989,6 +2151,9 @@ impl Session {
             // Their numeric pane IDs no longer identify the displayed visit.
             // An unmatched receipt also cannot settle any current operation.
             return Ok(());
+        }
+        if matches!(&request, Some(Request::CreateShell)) {
+            return self.settle_shell_creation(&frame);
         }
         if frame.oversized {
             // Only a search can draw a reply this large; fail just that one.
@@ -2390,7 +2555,8 @@ impl Session {
         }
         if matches!(
             frame.ident,
-            ident::RELIABLE_KEY_EVENT_RESPONSE
+            ident::SPAWN_RESPONSE
+                | ident::RELIABLE_KEY_EVENT_RESPONSE
                 | ident::RELIABLE_PANE_WRITE_RESPONSE
                 | ident::SEND_PANE_INPUT_CONDITIONAL_RESPONSE
                 | ident::GET_PANE_IDENTITY_RESPONSE
@@ -2832,7 +2998,8 @@ impl Session {
                     }
                     Some(Request::Input { .. } | Request::Action) | None => {}
                     Some(
-                        Request::PaneIdentity { .. }
+                        Request::CreateShell
+                        | Request::PaneIdentity { .. }
                         | Request::InspectPaneIdentity { .. }
                         | Request::RenderMetadata { .. }
                         | Request::PaneAuthority { .. }
@@ -3314,6 +3481,72 @@ fn pane_infos(list: &PaneList) -> Vec<PaneInfo> {
         }));
     }
     infos
+}
+
+#[cfg(test)]
+mod shell_creation_tests {
+    use super::*;
+
+    fn ready() -> Session {
+        Session {
+            ready: true,
+            dialect: Dialect::Current,
+            codec_version: 74,
+            incarnation: Some([0x1c; 16]),
+            monotonic_ns: Some(0),
+            ..Session::default()
+        }
+    }
+
+    #[test]
+    fn creation_cannot_wrap_its_rpc_serial_or_admission_deadline() {
+        let mut session = ready();
+        session.next_serial = u64::MAX;
+        assert_eq!(
+            session.create_shell("default", 24, 80, [0x1c; 16]),
+            Err(ShellCreationError::SerialExhausted)
+        );
+        assert!(session.is_ready());
+        assert!(session.take_outgoing().is_empty());
+        assert!(session.next_event().is_none());
+        assert!(session.pending_shell_creation.is_none());
+
+        let mut session = ready();
+        session.monotonic_ns = Some(u64::MAX - SHELL_CREATION_DEADLINE_NS + 1);
+        assert_eq!(
+            session.create_shell("default", 24, 80, [0x1c; 16]),
+            Err(ShellCreationError::ClockUnavailable)
+        );
+        assert_eq!(session.next_serial, 0);
+        assert!(session.take_outgoing().is_empty());
+        assert!(session.pending_shell_creation.is_none());
+    }
+
+    #[test]
+    fn a_creation_receipt_cannot_inherit_a_changed_mux_incarnation() {
+        let mut session = ready();
+        let request = session.create_shell("default", 24, 80, [0x1c; 16]).unwrap();
+        session.take_outgoing();
+        session.incarnation = Some([0x55; 16]);
+        session.receive(&frame::encode(
+            ident::SPAWN_RESPONSE,
+            request,
+            &wire::encode(&codec::SpawnResponse {
+                tab_id: 2,
+                pane_id: 7,
+                window_id: 3,
+                size: frankenterm_term::TerminalSize {
+                    rows: 24, cols: 80, pixel_width: 0, pixel_height: 0, dpi: 0,
+                },
+            }),
+        ));
+        assert!(matches!(session.next_event(),
+            Some(Event::ShellCreationFailed { request: got, uncertain: true, .. })
+            if got == request));
+        assert!(matches!(session.next_event(), Some(Event::Failed { .. })));
+        assert!(session.next_event().is_none());
+        assert!(session.take_outgoing().is_empty());
+    }
 }
 
 #[cfg(test)]

@@ -1451,6 +1451,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
             reconnectingFrom: preservingSuccessfulCandidate ? continuity : nil,
             retryingAfterPasswordHop: preservingSuccessfulCandidate ? nil : continuity,
             inputDelivery: previous?.inputDelivery ?? .init(),
+            persistentShellNotice: previous?.persistentShellNotice,
             muxAccessMode: muxAccessSelections[machineID] ?? continuity?.muxAccessMode ?? initialMuxAccessMode,
             requiresExistingMux: existingMuxRequired.contains(machineID) || continuity?.requiresExistingMux == true)
         controller.onChange = { [weak self, weak controller] in
@@ -2178,6 +2179,12 @@ struct WorkspaceTerminalScreen: View {
     @State private var muxSearch: TerminalSessionController?
     @State private var useTerminalReview: TerminalSessionController?
     @State private var hostKeyReview: TerminalSessionController?
+    private struct PersistentShellReview: Identifiable {
+        var id: UUID { request.id }
+        let session: TerminalSessionController
+        let request: TerminalSessionController.PersistentShellReview
+    }
+    @State private var persistentShellReview: PersistentShellReview?
     private struct EarlierTerminalsReview: Identifiable {
         let id = UUID()
         let machineID: String, machineName: String
@@ -2203,13 +2210,26 @@ struct WorkspaceTerminalScreen: View {
             if let machine, !scene.earlierTerminals(machine.id).isEmpty || scene.terminalHistoryFailure != nil {
                 earlierTerminalBar(machine).environment(\.colorScheme, chrome)
             }
-            if let session = scene.selectedSession, session.phase == .live, let mux = session.muxState, !mux.panes.isEmpty {
+            if let session = scene.selectedSession, session.phase == .live, let mux = session.muxState {
                 muxAccessBar(session).environment(\.colorScheme, chrome)
-                PaneStrip(session: session, state: mux,
-                          accent: Color(ftHex: machine.flatMap { scene.themes[$0.id]?.accent } ?? "#3B82F6"),
-                          onKeyboard: { Task { await scene.activateKeyboard() } })
-                    .environment(\.colorScheme, chrome)
-                    .transition(.move(edge: .top).combined(with: .opacity))
+                if !mux.panes.isEmpty {
+                    PaneStrip(session: session, state: mux,
+                              accent: Color(ftHex: machine.flatMap { scene.themes[$0.id]?.accent } ?? "#3B82F6"),
+                              onKeyboard: { Task { await scene.activateKeyboard() } })
+                        .environment(\.colorScheme, chrome)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
+            }
+            if let notice = scene.selectedSession?.persistentShellNotice {
+                HStack(spacing: 10) {
+                    if scene.selectedSession?.muxState?.shellCreation?.pending == true { ProgressView() }
+                    else { Image(systemName: "terminal") }
+                    Text(notice).font(.caption).frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .padding(.horizontal, 14).padding(.vertical, 8).background(.regularMaterial)
+                .environment(\.colorScheme, chrome)
+                .accessibilityElement(children: .combine)
+                .accessibilityIdentifier("terminal.mux.creation.result")
             }
             if scene.splitExpanded {
                 HStack(spacing: 1) {
@@ -2293,6 +2313,10 @@ struct WorkspaceTerminalScreen: View {
             TerminalHostKeyMismatchScreen(scene: scene, session: session)
         }
         .sheet(item: $earlierTerminalsReview) { review in earlierTerminalReview(review) }
+        .sheet(item: Binding(get: { persistentShellReview }, set: { review in
+            if let review { persistentShellReview = review }
+            else { dismissPersistentShellReview() }
+        })) { review in persistentShellConfirmation(review) }
         .confirmationDialog("How should this phone use the shared terminal?",
             isPresented: Binding(get: { useTerminalReview != nil }, set: { if !$0 { useTerminalReview = nil } }),
             titleVisibility: .visible, presenting: useTerminalReview) { session in
@@ -2316,7 +2340,7 @@ struct WorkspaceTerminalScreen: View {
                 }
                 Button("Cancel", role: .cancel) { useTerminalReview = nil }
             } message: { session in
-                Text("Reconnect to \(session.target.machineName) with the selected permissions. Type at Shared Size keeps the pane's current dimensions. Type and Fit to Phone changes them for every client. Other connected clients can still type and resize it.")
+                Text("Reconnect to \(session.target.machineName) with the selected permissions. Type at Shared Size keeps the pane's current dimensions. Type and Fit to Phone changes them for every client and permits separately reviewed new persistent shells. Other connected clients can still type and resize it.")
             }
         .sheet(isPresented: Binding(get: { scene.overviewPresented }, set: { visible in
             if !visible { scene.dismissOverview() }
@@ -2345,6 +2369,7 @@ struct WorkspaceTerminalScreen: View {
             historyInspection?.retire(); historyInspection = nil; retainedOutput = nil
             hostKeyReview = nil
             earlierTerminalsReview = nil
+            dismissPersistentShellReview(resumingView: false)
             scene.disappear()
             if !scene.closed { onShowing?(nil) }
         }
@@ -2354,9 +2379,65 @@ struct WorkspaceTerminalScreen: View {
                 historyInspection?.retire(); historyInspection = nil; retainedOutput = nil
                 hostKeyReview = nil
                 earlierTerminalsReview = nil
+                dismissPersistentShellReview(resumingView: false)
             }
         }
-        .onChange(of: scene.selectedSession?.id) { _, _ in hostKeyReview = nil; earlierTerminalsReview = nil }
+        .onChange(of: scene.selectedSession?.id) { _, _ in
+            hostKeyReview = nil; earlierTerminalsReview = nil
+            dismissPersistentShellReview(resumingView: false)
+        }
+    }
+
+    private func dismissPersistentShellReview(resumingView: Bool = true) {
+        // A review can be cancelled before SwiftUI ever mounts its sheet.
+        // Retire the captured controller now; onDisappear is only a backstop.
+        guard let review = persistentShellReview else { return }
+        persistentShellReview = nil
+        review.session.endPersistentShellReview(review.request, resumingView: resumingView)
+    }
+
+    private func beginPersistentShell(_ session: TerminalSessionController) {
+        do { persistentShellReview = .init(session: session, request: try session.preparePersistentShell()) }
+        catch { session.reportPersistentShellProblem(error) }
+    }
+
+    private func persistentShellConfirmation(_ review: PersistentShellReview) -> some View {
+        NavigationStack {
+            Form {
+                Section("Connected machine") {
+                    Text(verbatim: review.request.machineName).font(.headline)
+                    Text(verbatim: "\(review.request.user)@\(review.request.host):\(review.request.port)")
+                        .font(.system(.body, design: .monospaced)).textSelection(.enabled)
+                    Text(verbatim: Self.via(review.request.route)).font(.caption)
+                }
+                Section("New persistent shell") {
+                    LabeledContent("Domain", value: "Server's default domain")
+                    LabeledContent("Workspace", value: review.request.plan.workspace)
+                    LabeledContent("Initial size", value: "\(review.request.plan.columns) columns × \(review.request.plan.rows) rows")
+                    Text("Creates a new window and tab using the default domain's configured shell and working directory. That domain may be local or remote. The shell remains in the mux when this phone disconnects.")
+                    Text("After confirmation, select the new pane from the pane list. This phone keeps its current pane selected.")
+                }
+                if let previous = review.session.persistentShellNotice {
+                    Section("Previous request") { Text(previous) }
+                }
+            }
+            .navigationTitle("New Persistent Shell").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismissPersistentShellReview() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Create Shell") {
+                        do { try review.session.createPersistentShell(review.request) }
+                        catch { review.session.reportPersistentShellProblem(error) }
+                        dismissPersistentShellReview()
+                    }
+                    .disabled(scene.selectedSession !== review.session || !review.session.canConfirmPersistentShell(review.request))
+                    .accessibilityIdentifier("terminal.mux.creation.confirm")
+                }
+            }
+        }
+        .onDisappear { review.session.endPersistentShellReview(review.request) }
     }
 
     private func directTerminalStrip(_ machine: SceneMachine) -> some View {
@@ -2480,6 +2561,12 @@ struct WorkspaceTerminalScreen: View {
                     .disabled(session.isViewingOnly || session.clipboardIsPresenting || session.localInputNeedsDecision)
             }
             Menu {
+                if let session = scene.selectedSession, session.phase == .live, session.attachedToMux {
+                    Button("New Persistent Shell", systemImage: "plus.rectangle") { beginPersistentShell(session) }
+                        .disabled(!session.canCreatePersistentShell)
+                        .accessibilityIdentifier("terminal.mux.creation.new")
+                    Divider()
+                }
                 if let session = scene.selectedSession, !session.attachedToMux,
                    scene.additionalSessions[session.target.machineID]?.isEmpty == false
                     || session.additionalTerminalTarget != nil {
@@ -2727,9 +2814,22 @@ struct WorkspaceTerminalScreen: View {
                 readyCard(machine, session: session, accent: accent)
             case .live:
                 if session.terminal == nil {
-                    if let mux = session.muxState, mux.shown == nil, !mux.panes.isEmpty {
-                        sceneCard(symbol: "rectangle.split.2x1", title: "Select a Pane",
-                                  message: mux.notice ?? "Choose a pane above to continue on this machine.", accent: accent) {}
+                    if let mux = session.muxState, mux.shown == nil {
+                        if mux.panes.isEmpty {
+                            sceneCard(symbol: "terminal", title: "No Persistent Shells",
+                                      message: "Connected to this machine's mux. Create its first shell, or wait for a pane opened by another client.", accent: accent) {
+                                Button("New Persistent Shell") { beginPersistentShell(session) }
+                                    .buttonStyle(.borderedProminent).disabled(!session.canCreatePersistentShell)
+                                    .accessibilityIdentifier("terminal.mux.creation.empty")
+                                if !session.muxAccessMode.permitsShellCreation {
+                                    Text("Choose Type and Fit to Phone in the access menu to enable shell creation.")
+                                        .font(.caption)
+                                }
+                            }
+                        } else {
+                            sceneCard(symbol: "rectangle.split.2x1", title: "Select a Pane",
+                                      message: mux.notice ?? "Choose a pane above to continue on this machine.", accent: accent) {}
+                        }
                     } else { ProgressView().controlSize(.large).tint(accent) }
                 }
             case let .couldNotConnect(help):

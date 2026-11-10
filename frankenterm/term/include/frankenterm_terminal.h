@@ -275,6 +275,15 @@ uint32_t ft_terminal_v1_frame_release(uint64_t frame);
 #define FT_MUX_EVENT_PREPARING_OUTPUT 16u
 #define FT_MUX_EVENT_PALETTE 17u
 #define FT_MUX_EVENT_INPUT_REJECTED 18u
+/* SHELL_CREATED: pane_id is the returned pane; rows/cols are zero; payload
+ * JSON {request, tab_id, window_id} (at most 256 bytes). This acknowledges
+ * creation, not attachment, identity continuity, input or size authority.
+ * SHELL_CREATION_FAILED: pane_id/rows/cols are zero; payload JSON
+ * {request, reason, uncertain} (at most 4096 bytes; nonempty reason at most
+ * 512 UTF-8 bytes). An uncertain outcome never authorizes replay. A pending
+ * creation's failure event precedes FAILED when the connection ends. */
+#define FT_MUX_EVENT_SHELL_CREATED 19u
+#define FT_MUX_EVENT_SHELL_CREATION_FAILED 20u
 #define FT_MUX_SEARCH_CASE_SENSITIVE 1u
 #define FT_MUX_SEARCH_REGEX 2u
 #define FT_MUX_MAX_RECEIVE_BYTES 1048576u
@@ -313,6 +322,21 @@ uint32_t ft_mux_v1_refresh_panes(uint64_t session);
  * sample that clock before calling (otherwise admission returns CAPACITY).
  * a late reply is inert. PANE_GONE may answer instead when the pane closes. */
 uint32_t ft_mux_v1_inspect_pane_identity(uint64_t session, uint64_t pane_id);
+/* Create one persistent default shell in a new mux window. The caller must
+ * first sample ft_mux_v1_tick. Current dialect only, with the exact known
+ * nonzero 16-byte server incarnation. Workspace is nonempty UTF-8, at most
+ * 256 bytes, without control characters. Grid is 1..512 each, at most 32768
+ * cells. No command, directory, numeric domain or existing window is used.
+ * One creation/result may be outstanding; BUSY admits no additional request.
+ * Every non-OK status leaves *request=0 and sends no creation. OK returns the
+ * nonzero RPC serial; SHELL_CREATED or SHELL_CREATION_FAILED settles it.
+ * The deadline is 15 seconds from admission; no retry, fallback, automatic
+ * selection, resize or input occurs. Closing after admission may leave a
+ * remote shell alive even when no acknowledgement arrived. */
+uint32_t ft_mux_v1_create_shell(uint64_t session, const uint8_t *workspace,
+                              uint32_t workspace_length, uint32_t rows, uint32_t cols,
+                              const uint8_t *expected_incarnation, uint32_t incarnation_length,
+                              uint64_t *request);
 /* Draws the pane from scratch (clearing its terminal), then every change. */
 uint32_t ft_mux_v1_show(uint64_t session, uint64_t pane_id);
 /* Stops drawing the pane. */

@@ -63,6 +63,7 @@ pub mod ident {
     pub const ERROR_RESPONSE: u64 = 0;
     pub const LIST_PANES: u64 = 3;
     pub const LIST_PANES_RESPONSE: u64 = 4;
+    pub const SPAWN_RESPONSE: u64 = 8;
     pub const WRITE_TO_PANE: u64 = 9;
     pub const UNIT_RESPONSE: u64 = 10;
     pub const SEND_KEY_DOWN: u64 = 11;
@@ -81,6 +82,7 @@ pub mod ident {
     pub const LIVENESS_RESPONSE: u64 = 30;
     pub const SEARCH_SCROLLBACK: u64 = 31;
     pub const SEARCH_SCROLLBACK_RESPONSE: u64 = 32;
+    pub const SPAWN_V2: u64 = 36;
     pub const PANE_REMOVED: u64 = 37;
     pub const SET_PALETTE: u64 = 38;
     pub const SET_CLIENT_ID: u64 = 40;
@@ -137,6 +139,100 @@ pub struct CodecWindow {
 
 #[derive(Serialize)]
 pub struct ListPanes {}
+
+pub const MAX_SHELL_WORKSPACE_BYTES: usize = 256;
+/// Match the native phone's maximumShownCells, not its larger parser limit.
+pub const MAX_SHELL_CELLS: usize = 32_768;
+pub const MAX_SPAWN_RESPONSE_BYTES: usize = 128;
+
+/// The only domain this operation can request: the mux's configured default.
+/// Its variant index is zero in config::keyassignment::SpawnTabDomain.
+#[derive(Serialize)]
+enum SpawnShellDomain {
+    DefaultDomain,
+}
+
+/// The existing PDU36 layout, restricted to a fresh default shell in a new
+/// window. None has the same wire form regardless of its unused inner type;
+/// no command, directory, existing window or numeric domain can be supplied.
+#[derive(Serialize)]
+pub struct SpawnDefaultShell<'a> {
+    domain: SpawnShellDomain,
+    window_id: Option<usize>,
+    command: Option<()>,
+    command_dir: Option<&'a str>,
+    size: TerminalSize,
+    workspace: &'a str,
+}
+
+impl<'a> SpawnDefaultShell<'a> {
+    pub fn new(workspace: &'a str, size: TerminalSize) -> Self {
+        Self {
+            domain: SpawnShellDomain::DefaultDomain,
+            window_id: None,
+            command: None,
+            command_dir: None,
+            size,
+            workspace,
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnResponse {
+    pub tab_id: usize,
+    pub pane_id: usize,
+    pub window_id: usize,
+    pub size: TerminalSize,
+}
+
+pub fn decode_spawn_response(body: &[u8]) -> Result<SpawnResponse, crate::Error> {
+    if body.len() > MAX_SPAWN_RESPONSE_BYTES {
+        return Err(crate::Error::Frame("a shell creation receipt is too large"));
+    }
+    let response: SpawnResponse = decode_input_receipt(body)?;
+    if response.size.rows == 0 || response.size.cols == 0 {
+        return Err(crate::Error::Frame("a shell creation receipt has an empty grid"));
+    }
+    if response.pane_id > isize::MAX as usize
+        || response.tab_id > isize::MAX as usize
+        || response.window_id > isize::MAX as usize
+    {
+        return Err(crate::Error::Frame("a shell creation receipt exceeds native ID bounds"));
+    }
+    Ok(response)
+}
+
+/// Only known, internally consistent v1 authority for this exact request can
+/// prove no shell was created. Retry advice never makes creation replayable.
+pub fn shell_creation_definitely_not_applied(body: &[u8]) -> Result<bool, crate::Error> {
+    if body.len() > MAX_SPAWN_RESPONSE_BYTES {
+        return Err(crate::Error::Frame("a shell creation rejection is too large"));
+    }
+    let response: ErrorResponse = decode_input_receipt(body)?;
+    if response.request_ident != ident::SPAWN_V2 {
+        return Err(crate::Error::Frame("a shell creation rejection names another request"));
+    }
+    if response.schema_version != 1
+        || !matches!(response.code, 1..=12)
+        || response.effect != ErrorResponse::NOT_APPLIED
+    {
+        return Ok(false);
+    }
+    // Mirrors codec::ErrorResponse::validate's closed object/effect/retry
+    // combinations. Unknown future authority remains an uncertain outcome.
+    let object_valid = match response.code {
+        1..=3 => response.object.is_some_and(|object| u16::from(object.kind) == response.code),
+        4 => response.object.is_none_or(|object| object.kind == 4),
+        11 => false, // INDETERMINATE_MUTATION can never prove no effect.
+        _ => response.object.is_none(),
+    };
+    let retry_valid = match response.code {
+        8..=10 | 12 => response.retry == ErrorResponse::SAFE_AFTER_BACKOFF,
+        _ => response.retry == 1, // MuxErrorRetry::NEVER
+    };
+    Ok(object_valid && retry_valid)
+}
 
 #[derive(Serialize)]
 pub struct GetPaneRenderChanges {
