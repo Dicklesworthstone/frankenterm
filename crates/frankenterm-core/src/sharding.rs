@@ -5923,6 +5923,7 @@ mod tests {
     #[test]
     fn native_identity_routes_same_local_pane_id_to_its_owning_shard() {
         run_async_test(async {
+            let cx = crate::cx::for_testing();
             let first = Arc::new(MockWezterm::new());
             let second = Arc::new(MockWezterm::new());
             first.add_default_pane(7).await;
@@ -5938,11 +5939,11 @@ mod tests {
                 pane_registration: [0x66; 16],
             };
             first
-                .set_pane_native_identity(7, Some(first_identity))
+                .set_pane_native_identity_with_cx(&cx, 7, Some(first_identity))
                 .await
                 .unwrap();
             second
-                .set_pane_native_identity(7, Some(second_identity))
+                .set_pane_native_identity_with_cx(&cx, 7, Some(second_identity))
                 .await
                 .unwrap();
             let client = ShardedWeztermClient::new(
@@ -5953,7 +5954,6 @@ mod tests {
                 AssignmentStrategy::RoundRobin,
             )
             .unwrap();
-            let cx = crate::cx::for_testing();
             for (shard, identity) in [(ShardId(3), first_identity), (ShardId(5), second_identity)] {
                 let pane_id = try_encode_sharded_pane_id(shard, 7).unwrap();
                 assert_eq!(
@@ -5966,7 +5966,10 @@ mod tests {
             }
 
             let second_pane_id = try_encode_sharded_pane_id(ShardId(5), 7).unwrap();
-            second.set_pane_native_identity(7, None).await.unwrap();
+            second
+                .set_pane_native_identity_with_cx(&cx, 7, None)
+                .await
+                .unwrap();
             assert_eq!(
                 client
                     .pane_native_identity_with_cx(&cx, second_pane_id)

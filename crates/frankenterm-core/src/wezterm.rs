@@ -6103,6 +6103,7 @@ mod tests {
     #[test]
     fn native_pane_identity_and_cancellation_forward_through_arc_and_unified() {
         run_async_test(async {
+            let cx = crate::cx::for_testing();
             let mock = Arc::new(MockWezterm::new());
             mock.add_default_pane(7).await;
             let identity = MuxPaneIdentity {
@@ -6110,7 +6111,7 @@ mod tests {
                 durable_pane_id: [0x22; 16],
                 pane_registration: [0x33; 16],
             };
-            mock.set_pane_native_identity(7, Some(identity))
+            mock.set_pane_native_identity_with_cx(&cx, 7, Some(identity))
                 .await
                 .unwrap();
             let handle: MuxHandle = mock;
@@ -6122,7 +6123,6 @@ mod tests {
                     compatibility: None,
                 },
             );
-            let cx = crate::cx::for_testing();
             for backend in [&handle as &dyn MuxInterface, &unified as &dyn MuxInterface] {
                 assert_eq!(
                     backend.pane_native_identity_with_cx(&cx, 7).await.unwrap(),
@@ -11998,9 +11998,11 @@ impl MockWezterm {
     /// Configure the native identity exposed for an existing mock pane.
     ///
     /// Panes have no native identity until one is supplied. Removing a pane
-    /// clears its identity so a reused numeric ID cannot inherit it.
-    pub async fn set_pane_native_identity(
+    /// clears its identity so a reused numeric ID cannot inherit it. Both
+    /// lock acquisitions and the mutation checkpoint use the caller's Cx.
+    pub async fn set_pane_native_identity_with_cx(
         &self,
+        cx: &crate::cx::Cx,
         pane_id: u64,
         identity: Option<MuxPaneIdentity>,
     ) -> Result<()> {
@@ -12010,21 +12012,20 @@ impl MockWezterm {
             )
             .into());
         }
-        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         let panes = self
             .panes
-            .read_with_cx(&cx)
+            .read_with_cx(cx)
             .await
-            .map_err(|error| mock_lock_error(&cx, "mock set pane identity", error))?;
+            .map_err(|error| mock_lock_error(cx, "mock set pane identity", error))?;
         if !panes.contains_key(&pane_id) {
             return Err(WeztermError::PaneNotFound(pane_id).into());
         }
         let mut identities = self
             .native_identities
-            .write_with_cx(&cx)
+            .write_with_cx(cx)
             .await
-            .map_err(|error| mock_lock_error(&cx, "mock set pane identity", error))?;
-        mock_checkpoint(&cx, "mock set pane identity")?;
+            .map_err(|error| mock_lock_error(cx, "mock set pane identity", error))?;
+        mock_checkpoint(cx, "mock set pane identity")?;
         if let Some(identity) = identity {
             identities.insert(pane_id, identity);
         } else {
@@ -13215,7 +13216,7 @@ mod mock_tests {
             for use_cx in [false, true] {
                 let mock = MockWezterm::new();
                 assert!(
-                    mock.set_pane_native_identity(7, Some(identity))
+                    mock.set_pane_native_identity_with_cx(&cx, 7, Some(identity))
                         .await
                         .is_err()
                 );
@@ -13225,7 +13226,7 @@ mod mock_tests {
                     None
                 );
 
-                mock.set_pane_native_identity(7, Some(identity))
+                mock.set_pane_native_identity_with_cx(&cx, 7, Some(identity))
                     .await
                     .unwrap();
                 assert_eq!(
@@ -13233,7 +13234,8 @@ mod mock_tests {
                     Some(identity)
                 );
                 assert!(
-                    mock.set_pane_native_identity(
+                    mock.set_pane_native_identity_with_cx(
+                        &cx,
                         7,
                         Some(MuxPaneIdentity {
                             pane_registration: [0; 16],
@@ -13249,12 +13251,14 @@ mod mock_tests {
                     "invalid replacement must leave the current identity intact"
                 );
 
-                mock.set_pane_native_identity(7, None).await.unwrap();
+                mock.set_pane_native_identity_with_cx(&cx, 7, None)
+                    .await
+                    .unwrap();
                 assert_eq!(
                     mock.pane_native_identity_with_cx(&cx, 7).await.unwrap(),
                     None
                 );
-                mock.set_pane_native_identity(7, Some(identity))
+                mock.set_pane_native_identity_with_cx(&cx, 7, Some(identity))
                     .await
                     .unwrap();
                 if use_cx {
@@ -13272,6 +13276,39 @@ mod mock_tests {
                     None
                 );
             }
+        });
+    }
+
+    #[test]
+    fn mock_native_identity_mutation_honors_explicit_cancellation() {
+        run_async_test(async {
+            let mock = MockWezterm::new();
+            mock.add_default_pane(7).await;
+            let cx = crate::cx::for_testing();
+            let identity = MuxPaneIdentity {
+                session_incarnation: [0x11; 16],
+                durable_pane_id: [0x22; 16],
+                pane_registration: [0x33; 16],
+            };
+            mock.set_pane_native_identity_with_cx(&cx, 7, Some(identity))
+                .await
+                .unwrap();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("identity mutation cancelled"),
+            );
+            assert!(
+                mock.set_pane_native_identity_with_cx(&cx, 7, None)
+                    .await
+                    .is_err()
+            );
+            let live_cx = crate::cx::for_testing();
+            assert_eq!(
+                mock.pane_native_identity_with_cx(&live_cx, 7)
+                    .await
+                    .unwrap(),
+                Some(identity)
+            );
         });
     }
 

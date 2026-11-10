@@ -89,8 +89,8 @@ use crate::rehearsal_score::{
     REHEARSAL_SCORE_SURFACE_CONTRACT_ID, RehearsalScoreSurface, RehearsalScoreSurfaceReport,
 };
 use crate::robot_types::{
-    SubmitGuaranteeLevel, WorkflowActionPlan, WorkflowStatusDetailData, WorkflowStatusListData,
-    WorkflowStepLog,
+    SubmitGuaranteeLevel, SubmitReceiptState, WorkflowActionPlan, WorkflowStatusDetailData,
+    WorkflowStatusListData, WorkflowStepLog,
 };
 use crate::runtime_async::{CompatRuntime, RuntimeBuilder as CompatRuntimeBuilder};
 use crate::storage::{
@@ -9230,6 +9230,282 @@ async fn mcp_submit_idempotency_claim(
     .await
 }
 
+// The live classifier has a roughly five-second polling budget. Retain a
+// bounded recovery window as well, so a replacement request can finish an
+// interrupted observation after the original observer's lease expires. The
+// store keeps this original absolute deadline across every takeover.
+const MCP_SUBMIT_OBSERVATION_RECOVERY_WINDOW_MS: i64 = 60_000;
+
+async fn mcp_submit_idempotency_mark_observation(
+    ft_dir: &Path,
+    binding: &crate::verified_submit::SubmitIdempotencyBinding,
+    token: crate::submit_idempotency_store::ClaimToken,
+    continuation: &crate::submit_idempotency_store::SubmitObservationContinuation,
+) -> Result<(), crate::submit_idempotency_store::SubmitIdempotencyError> {
+    let ft_dir = ft_dir.to_path_buf();
+    let binding = binding.clone();
+    let continuation = continuation.clone();
+    mcp_submit_idempotency_spawn_blocking(
+        crate::submit_idempotency_store::SubmitIdempotencyError::TransitionFailed,
+        move || {
+            let result = mcp_submit_idempotency_retry_post_effect(|| {
+                crate::submit_idempotency_store::mark_effect_applied_with_observation(
+                    &ft_dir,
+                    &binding,
+                    token,
+                    &continuation,
+                )
+            });
+            if result.is_err() {
+                // Observation durability is additional recovery authority. A
+                // failure must still retain the original no-resend fence.
+                if let Err(error) = mcp_submit_idempotency_retry_post_effect(|| {
+                    crate::submit_idempotency_store::mark_effect_applied_receipt_pending(
+                        &ft_dir, &binding, token,
+                    )
+                }) {
+                    tracing::warn!(
+                        error_class = error.error_class(),
+                        "wa.send could not confirm the fallback observation fence"
+                    );
+                }
+            }
+            result
+        },
+    )
+    .await
+}
+
+async fn mcp_submit_idempotency_claim_observation(
+    ft_dir: &Path,
+    binding: &crate::verified_submit::SubmitIdempotencyBinding,
+) -> Result<
+    crate::submit_idempotency_store::ObservationClaimOutcome,
+    crate::submit_idempotency_store::SubmitIdempotencyError,
+> {
+    let ft_dir = ft_dir.to_path_buf();
+    let binding = binding.clone();
+    mcp_submit_idempotency_spawn_blocking(
+        crate::submit_idempotency_store::SubmitIdempotencyError::ClaimFailed,
+        move || crate::submit_idempotency_store::claim_observation(&ft_dir, &binding),
+    )
+    .await
+}
+
+async fn mcp_submit_idempotency_end_observation(
+    ft_dir: &Path,
+    binding: &crate::verified_submit::SubmitIdempotencyBinding,
+    token: crate::submit_idempotency_store::ClaimToken,
+    release: bool,
+) -> Result<(), crate::submit_idempotency_store::SubmitIdempotencyError> {
+    let ft_dir = ft_dir.to_path_buf();
+    let binding = binding.clone();
+    mcp_submit_idempotency_spawn_blocking(
+        crate::submit_idempotency_store::SubmitIdempotencyError::TransitionFailed,
+        move || {
+            mcp_submit_idempotency_retry_post_effect(|| {
+                if release {
+                    crate::submit_idempotency_store::release_observation(&ft_dir, &binding, token)
+                } else {
+                    crate::submit_idempotency_store::mark_observation_in_doubt(
+                        &ft_dir, &binding, token,
+                    )
+                }
+            })
+        },
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn mcp_observe_bound_submit(
+    wezterm: &crate::wezterm::WeztermHandle,
+    cx: &crate::cx::Cx,
+    binding: &crate::verified_submit::SubmitIdempotencyBinding,
+    continuation: &crate::submit_idempotency_store::SubmitObservationContinuation,
+    agent_type: AgentType,
+    profile: Option<&crate::patterns::SubmitProfile>,
+) -> Option<crate::verified_submit::VerifiedSubmitReport> {
+    if cx.checkpoint().is_err() {
+        return None;
+    }
+    let identity_before = wezterm
+        .pane_native_identity_with_cx(cx, binding.pane_id())
+        .await
+        .ok()
+        .flatten();
+    if identity_before != Some(continuation.pane_identity) {
+        return None;
+    }
+    let report = crate::verified_submit::classify_verified_submit_polled_from_baseline(
+        cx,
+        wezterm,
+        binding.pane_id(),
+        binding.outbound_text(),
+        agent_type,
+        profile,
+        &continuation.baseline,
+        1,
+        1,
+    )
+    .await;
+    let identity_after = wezterm
+        .pane_native_identity_with_cx(cx, binding.pane_id())
+        .await
+        .ok()
+        .flatten();
+    (identity_after == identity_before && cx.checkpoint().is_ok()).then_some(report)
+}
+
+async fn record_mcp_submit_observation_audit(
+    storage: &StorageHandle,
+    cx: &crate::cx::Cx,
+    binding: &crate::verified_submit::SubmitIdempotencyBinding,
+    outcome: &'static str,
+) {
+    let record = crate::storage::AuditActionRecord {
+        id: 0,
+        ts: mcp_now_ms_i64(),
+        actor_kind: "mcp".to_string(),
+        actor_id: None,
+        correlation_id: Some(binding.caller_key().to_string()),
+        pane_id: Some(binding.pane_id()),
+        domain: None,
+        action_kind: "submit_observation".to_string(),
+        policy_decision: "allow".to_string(),
+        decision_reason: Some(outcome.to_string()),
+        rule_id: Some("submit_idempotency.observation_recovery".to_string()),
+        input_summary: Some("observation only; no input sent".to_string()),
+        verification_summary: None,
+        decision_context: None,
+        result: outcome.to_string(),
+    };
+    if storage
+        .record_audit_action_with_cx(cx, record)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            error_class = "submit_observation_audit_unavailable",
+            "wa.send could not audit observation recovery"
+        );
+    }
+}
+
+/// Recover only receipt observation for an already-applied effect. There is
+/// deliberately no injector in this function. Both reads around observation
+/// must identify the original live pane registration; a recycled numeric ID
+/// or a restored pane cannot supply evidence for the old send.
+#[allow(clippy::too_many_arguments)]
+async fn mcp_recover_pending_submit(
+    ft_dir: &Path,
+    binding: &crate::verified_submit::SubmitIdempotencyBinding,
+    wezterm: &crate::wezterm::WeztermHandle,
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    agent_type: AgentType,
+    profile: Option<&crate::patterns::SubmitProfile>,
+) -> crate::Result<McpSendData> {
+    use crate::submit_idempotency_store::ObservationClaimOutcome;
+
+    if cx.checkpoint().is_err() {
+        return Ok(mcp_effect_pending_submit_replay(binding.pane_id()));
+    }
+    let (token, continuation, remaining_ms) =
+        match mcp_submit_idempotency_claim_observation(ft_dir, binding)
+            .await
+            .map_err(mcp_submit_idempotency_storage_error)?
+        {
+            ObservationClaimOutcome::Claimed {
+                token,
+                continuation,
+                remaining_ms,
+            } => (token, continuation, remaining_ms),
+            ObservationClaimOutcome::Completed(receipt) => {
+                return Ok(mcp_completed_submit_replay(binding.pane_id(), &receipt));
+            }
+            ObservationClaimOutcome::InFlight | ObservationClaimOutcome::Unavailable => {
+                return Ok(mcp_effect_pending_submit_replay(binding.pane_id()));
+            }
+            ObservationClaimOutcome::InDoubt | ObservationClaimOutcome::Expired => {
+                record_mcp_submit_observation_audit(storage, cx, binding, "in_doubt").await;
+                return Ok(mcp_indeterminate_submit_replay(binding.pane_id()));
+            }
+        };
+
+    tracing::debug!(
+        phase = "observation_recovery_begin",
+        "wa.send request progress"
+    );
+    let observation = crate::runtime_async::timeout_with_cx(
+        cx,
+        std::time::Duration::from_millis(remaining_ms),
+        mcp_observe_bound_submit(wezterm, cx, binding, &continuation, agent_type, profile),
+    )
+    .await;
+
+    // A cancelled observer relinquishes its lease, not its original budget.
+    // Unqueryable/expired evidence retains the known-applied effect in doubt;
+    // even operator abandonment must never reopen such a key for a resend.
+    if cx.checkpoint().is_err() {
+        mcp_submit_idempotency_end_observation(ft_dir, binding, token, true)
+            .await
+            .map_err(mcp_submit_idempotency_storage_error)?;
+        return Ok(mcp_effect_pending_submit_replay(binding.pane_id()));
+    }
+    let report = match observation {
+        Ok(Some(report)) if report.state != SubmitReceiptState::VerificationUnavailable => report,
+        _ => {
+            mcp_submit_idempotency_end_observation(ft_dir, binding, token, false)
+                .await
+                .map_err(mcp_submit_idempotency_storage_error)?;
+            record_mcp_submit_observation_audit(storage, cx, binding, "in_doubt").await;
+            tracing::debug!(
+                phase = "observation_recovery_in_doubt",
+                "wa.send request progress"
+            );
+            return Ok(mcp_indeterminate_submit_replay(binding.pane_id()));
+        }
+    };
+
+    let injection = InjectionResult::Allowed {
+        decision: PolicyDecision::allow_with_rule("submit_idempotency.observation_recovered"),
+        summary: "original submit receipt recovered; no input was sent".to_string(),
+        pane_id: binding.pane_id(),
+        action: ActionKind::SendText,
+        audit_action_id: continuation.audit_action_id,
+    };
+    let elapsed = mcp_now_ms_i64().saturating_sub(continuation.started_unix_ms);
+    let mut receipt = crate::verified_submit::build_submit_receipt_with_guarantee(
+        binding.pane_id(),
+        binding.outbound_text(),
+        &injection,
+        Some(&report),
+        u64::try_from(elapsed).unwrap_or_default(),
+        binding.guarantee_level(),
+    );
+    receipt.idempotency_key = binding.caller_key().to_string();
+    mcp_submit_idempotency_complete(ft_dir, binding, token, &receipt)
+        .await
+        .map_err(mcp_submit_idempotency_storage_error)?;
+    crate::verified_submit::record_submit_receipt(binding.pane_id(), &receipt);
+    attach_mcp_submit_receipt_to_audit(storage, cx, &injection, &receipt).await;
+    record_mcp_submit_observation_audit(storage, cx, binding, "completed").await;
+    tracing::debug!(
+        phase = "observation_recovery_complete",
+        "wa.send request progress"
+    );
+    Ok(McpSendData {
+        pane_id: binding.pane_id(),
+        injection,
+        wait_for: None,
+        verification_error: crate::verified_submit::submit_guarantee_failure_message(&receipt),
+        submit: Some(receipt),
+        output_omissions: None,
+        dry_run: false,
+    })
+}
+
 #[derive(Debug, Clone, Copy)]
 enum McpSubmitIdempotencyTransition {
     EffectAppliedReceiptPending,
@@ -9458,10 +9734,10 @@ fn mcp_in_flight_submit_replay(pane_id: u64) -> McpSendData {
 fn mcp_effect_pending_submit_replay(pane_id: u64) -> McpSendData {
     mcp_blocked_submit_replay(
         pane_id,
-        "A prior send applied its pane effect but receipt finalization is pending; automatic replay is disabled",
+        "A prior send applied its pane effect but receipt finalization is pending; resending is disabled",
         "submit_idempotency.effect_applied_receipt_pending_noop",
         "effect-applied duplicate submit replay suppressed",
-        "Prior send effect was applied but its receipt is pending; automatic resend refused (settle it with reconcile)",
+        "Prior send effect was applied but its receipt is pending; retry the same request to resume eligible observation after its owner releases or expires, or use reconcile=settle; no input will be resent",
     )
 }
 
@@ -9471,7 +9747,7 @@ fn mcp_indeterminate_submit_replay(pane_id: u64) -> McpSendData {
         "A prior send with this idempotency key has an indeterminate outcome; automatic replay is disabled",
         "submit_idempotency.in_doubt_noop",
         "indeterminate duplicate submit replay suppressed",
-        "Prior send outcome is indeterminate; automatic resend refused (settle or abandon it with reconcile)",
+        "Prior send outcome is indeterminate; automatic resend refused; use reconcile=settle, or reconcile=abandon only if the effect is not known to have applied",
     )
 }
 
@@ -9958,6 +10234,18 @@ impl ToolHandler for WaSendTool {
             // claim transaction is the final pre-effect owner fence, so the
             // exact-key path pays one FULL-sync transaction rather than a
             // claim followed by a second lease-renewal transaction.
+            let submit_native_identity = if submit_idempotency_binding.is_some()
+                && submit_profile.is_some()
+            {
+                wezterm
+                    .pane_native_identity_with_cx(&wezterm_cx, params.pane_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .filter(crate::wezterm::MuxPaneIdentity::is_valid)
+            } else {
+                None
+            };
             let submit_before = if submit_profile.is_some() {
                 crate::verified_submit::capture_verified_submit_observation(
                     &wezterm_cx,
@@ -9967,6 +10255,43 @@ impl ToolHandler for WaSendTool {
                 .await
             } else {
                 crate::verified_submit::VerifiedSubmitObservation::default()
+            };
+            let mut submit_observation = if let Some(pane_identity) = submit_native_identity {
+                let after_baseline = wezterm
+                    .pane_native_identity_with_cx(&wezterm_cx, params.pane_id)
+                    .await
+                    .ok()
+                    .flatten();
+                if after_baseline != Some(pane_identity) {
+                    return Ok(mcp_blocked_submit_replay(
+                        params.pane_id,
+                        "The live pane changed while preparing verified-submit evidence",
+                        "submit_idempotency.pane_identity_changed",
+                        "verified submit refused before dispatch",
+                        "Pane identity changed before dispatch; no input was sent",
+                    ));
+                }
+                crate::verified_submit::prepare_verified_submit_baseline(
+                    params.pane_id,
+                    outbound_submit_text,
+                    submit_agent_type,
+                    submit_profile.as_ref(),
+                    submit_before.text.as_deref(),
+                    submit_before.semantic_snapshot.as_ref(),
+                )
+                .map(|baseline| {
+                    let started_unix_ms = mcp_now_ms_i64();
+                    crate::submit_idempotency_store::SubmitObservationContinuation {
+                        baseline,
+                        pane_identity,
+                        started_unix_ms,
+                        deadline_unix_ms: started_unix_ms
+                            .saturating_add(MCP_SUBMIT_OBSERVATION_RECOVERY_WINDOW_MS),
+                        audit_action_id: None,
+                    }
+                })
+            } else {
+                None
             };
             let mut injector =
                 PolicyGatedInjector::with_storage(engine, Arc::clone(&wezterm), storage.clone());
@@ -9986,7 +10311,16 @@ impl ToolHandler for WaSendTool {
                         return Ok(mcp_in_flight_submit_replay(params.pane_id));
                     }
                     crate::submit_idempotency_store::ClaimOutcome::EffectAppliedReceiptPending => {
-                        return Ok(mcp_effect_pending_submit_replay(params.pane_id));
+                        return mcp_recover_pending_submit(
+                            ft_dir,
+                            binding,
+                            &wezterm,
+                            &wezterm_cx,
+                            &storage,
+                            submit_agent_type,
+                            submit_profile.as_ref(),
+                        )
+                        .await;
                     }
                     crate::submit_idempotency_store::ClaimOutcome::InDoubt => {
                         return Ok(mcp_indeterminate_submit_replay(params.pane_id));
@@ -10005,6 +10339,9 @@ impl ToolHandler for WaSendTool {
                     None,
                 )
                 .await;
+            if let Some(continuation) = submit_observation.as_mut() {
+                continuation.audit_action_id = injection.audit_action_id();
+            }
 
             // A write or unavailable-profile receipt is already determined by
             // the injector outcome. Build it without yielding so the first
@@ -10060,6 +10397,11 @@ impl ToolHandler for WaSendTool {
                             .await;
                     immediate_receipt_completed = completion.is_ok();
                     completion
+                } else if let Some(continuation) =
+                    submit_observation.as_ref().filter(|_| injection.is_allowed())
+                {
+                    mcp_submit_idempotency_mark_observation(ft_dir, binding, token, continuation)
+                        .await
                 } else {
                     let transition = match &injection {
                         InjectionResult::Allowed { .. } => {
@@ -10144,21 +10486,74 @@ impl ToolHandler for WaSendTool {
                         let submit_verification =
                             if injection.is_allowed() && guarantee_level.requires_submit_profile() {
                                 let polls = usize::from(submit_profile.is_some());
-                                Some(
-                                    mcp_classify_submit_after_send(
-                                        &wezterm,
-                                        &wezterm_cx,
-                                        params.pane_id,
-                                        outbound_submit_text,
-                                        submit_agent_type,
-                                        submit_profile.as_ref(),
-                                        submit_before.text.as_deref(),
-                                        submit_before.semantic_snapshot.as_ref(),
-                                        1,
-                                        polls,
+                                if let (Some(continuation), Some(binding), Some(token)) = (
+                                    submit_observation.as_ref(),
+                                    submit_idempotency_binding.as_ref(),
+                                    submit_idempotency_claim,
+                                ) {
+                                    let remaining_ms = u64::try_from(
+                                        continuation.deadline_unix_ms.saturating_sub(mcp_now_ms_i64()),
                                     )
-                                    .await,
-                                )
+                                    .unwrap_or_default()
+                                    .min(
+                                        u64::try_from(
+                                            crate::submit_idempotency_store::OBSERVATION_OWNER_LEASE_DURATION_MS,
+                                        )
+                                        .unwrap_or_default(),
+                                    );
+                                    let observation = crate::runtime_async::timeout_with_cx(
+                                        &wezterm_cx,
+                                        std::time::Duration::from_millis(remaining_ms),
+                                        mcp_observe_bound_submit(
+                                            &wezterm,
+                                            &wezterm_cx,
+                                            binding,
+                                            continuation,
+                                            submit_agent_type,
+                                            submit_profile.as_ref(),
+                                        ),
+                                    )
+                                    .await;
+                                    if let Ok(Some(report)) = observation {
+                                        Some(report)
+                                    } else {
+                                        let cancelled = wezterm_cx.checkpoint().is_err();
+                                        if let Err(error) = mcp_submit_idempotency_end_observation(
+                                            ft_dir, binding, token, cancelled,
+                                        )
+                                        .await
+                                        {
+                                            tracing::warn!(
+                                                error_class = error.error_class(),
+                                                "wa.send could not settle interrupted observation"
+                                            );
+                                        }
+                                        return (
+                                            None,
+                                            Some(if cancelled {
+                                                "Receipt observation was cancelled; retry the same request to resume without resending".to_string()
+                                            } else {
+                                                "Receipt observation lost the original pane or exceeded its deadline; the applied send remains in doubt and cannot be resent".to_string()
+                                            }),
+                                        );
+                                    }
+                                } else {
+                                    Some(
+                                        mcp_classify_submit_after_send(
+                                            &wezterm,
+                                            &wezterm_cx,
+                                            params.pane_id,
+                                            outbound_submit_text,
+                                            submit_agent_type,
+                                            submit_profile.as_ref(),
+                                            submit_before.text.as_deref(),
+                                            submit_before.semantic_snapshot.as_ref(),
+                                            1,
+                                            polls,
+                                        )
+                                        .await,
+                                    )
+                                }
                             } else {
                                 None
                             };
@@ -10177,7 +10572,6 @@ impl ToolHandler for WaSendTool {
                         }
                         receipt
                     };
-                    crate::verified_submit::record_submit_receipt(params.pane_id, &receipt);
                     // The exact receipt is now fully constructed. Persist it
                     // before best-effort audit attachment or any unrelated await.
                     // A confirmed immediate completion needs no second write.
@@ -10214,7 +10608,17 @@ impl ToolHandler for WaSendTool {
                             injection_allowed = injection.is_allowed(),
                             "wa.send could not confirm its durable idempotency receipt completion"
                         );
+                        if submit_observation.is_some() {
+                            // A replacement observer can own this row now.
+                            // Never return, count, or attach the stale owner's
+                            // local verdict after its completion CAS failed.
+                            return (
+                                None,
+                                Some("Receipt completion lost durable authority; retry the same request to read or recover the authoritative receipt without resending".to_string()),
+                            );
+                        }
                     }
+                    crate::verified_submit::record_submit_receipt(params.pane_id, &receipt);
                     if let Some(error) =
                         crate::verified_submit::submit_guarantee_failure_message(&receipt)
                     {
@@ -14708,30 +15112,32 @@ mod tests {
     #[cfg(unix)]
     use super::set_cass_test_binary_override;
     use super::{
-        ActionKind, ActorKind, CASS_TIMEOUT_SECS_MAX, CASS_TIMEOUT_SECS_MIN, CompatRuntime,
-        CompatRuntimeBuilder, Config, Content, DemoScenarioManifest, MAX_MCP_ACCOUNT_SERVICE_BYTES,
-        MAX_MCP_CASS_AGENT_FILTER_BYTES, MAX_MCP_CASS_QUERY_BYTES, MAX_MCP_RULES_AGENT_TYPE_BYTES,
-        MAX_MCP_RULES_TEST_TEXT_BYTES, MAX_MCP_SEARCH_QUERY_BYTES,
+        ActionKind, ActorKind, AgentType, CASS_TIMEOUT_SECS_MAX, CASS_TIMEOUT_SECS_MIN,
+        CompatRuntime, CompatRuntimeBuilder, Config, Content, DemoScenarioManifest,
+        MAX_MCP_ACCOUNT_SERVICE_BYTES, MAX_MCP_CASS_AGENT_FILTER_BYTES, MAX_MCP_CASS_QUERY_BYTES,
+        MAX_MCP_RULES_AGENT_TYPE_BYTES, MAX_MCP_RULES_TEST_TEXT_BYTES, MAX_MCP_SEARCH_QUERY_BYTES,
         MAX_MCP_STATE_AGENT_FILTER_BYTES, MAX_MCP_SUBMIT_IDEMPOTENCY_KEY_BYTES,
         MAX_MCP_WAIT_PATTERN_BYTES, MAX_MCP_WAIT_TIMEOUT_SECS, MAX_SEND_TEXT_BYTES,
         MCP_REHEARSAL_MANIFEST_MAX_BYTES, MCP_STATE_FIELD_INPUT_MAX_BYTES,
-        MCP_STATE_FIELD_MAX_BYTES, MCP_STATE_FIELD_OVERSIZE, McpContext, PaneCapabilities,
-        PaneFilterConfig, PolicySurface, RecoverablePanicSite, StorageHandle, Tool, ToolHandler,
-        WaAccountsRefreshTool, WaAccountsTool, WaAttentionTool, WaAwaitEventTool, WaCassSearchTool,
-        WaCassStatusTool, WaCassViewTool, WaDomTool, WaEventsAnnotateTool, WaEventsLabelTool,
-        WaEventsTool, WaEventsTriageTool, WaGetTextTool, WaMissionAbortTool, WaMissionExplainTool,
-        WaMissionObjectivePlanTool, WaMissionPauseTool, WaMissionResumeTool, WaMissionStateTool,
-        WaOperatingEnvelopeTool, WaRehearsalScoreTool, WaReleaseTool, WaReservationsTool,
-        WaReserveTool, WaRulesListTool, WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool,
-        WaSteerPlanTool, WaTxPlanTool, WaTxRollbackTool, WaTxRunTool, WaTxShowTool, WaWaitForTool,
-        WaWorkflowRunTool, WaWorkflowStatusTool, accounts_refresh_policy_input,
-        audit_mcp_policy_denial_async, authorize_mcp_policy_call, build_mcp_shared_rate_limiter,
-        build_policy_engine_with_shared_rate_limiter, catch_recoverable, intent_hash_hex,
-        mcp_event_mutation_decision_context, mcp_get_text_policy_input,
-        mcp_load_mission_tx_contract_from_path, mcp_now_ms_i64, mcp_release_pane_policy_input,
-        mcp_reserve_pane_policy_input, mcp_search_output_policy_input, mcp_send_text_policy_input,
-        mcp_workflow_run_policy_input, merge_distributed_remote_mcp_states,
-        read_mcp_rehearsal_manifest, redact_mcp_output_secrets, redact_mcp_pane_state_fields,
+        MCP_STATE_FIELD_MAX_BYTES, MCP_STATE_FIELD_OVERSIZE,
+        MCP_SUBMIT_OBSERVATION_RECOVERY_WINDOW_MS, McpContext, PaneCapabilities, PaneFilterConfig,
+        PolicySurface, RecoverablePanicSite, StorageHandle, SubmitGuaranteeLevel, Tool,
+        ToolHandler, WaAccountsRefreshTool, WaAccountsTool, WaAttentionTool, WaAwaitEventTool,
+        WaCassSearchTool, WaCassStatusTool, WaCassViewTool, WaDomTool, WaEventsAnnotateTool,
+        WaEventsLabelTool, WaEventsTool, WaEventsTriageTool, WaGetTextTool, WaMissionAbortTool,
+        WaMissionExplainTool, WaMissionObjectivePlanTool, WaMissionPauseTool, WaMissionResumeTool,
+        WaMissionStateTool, WaOperatingEnvelopeTool, WaRehearsalScoreTool, WaReleaseTool,
+        WaReservationsTool, WaReserveTool, WaRulesListTool, WaRulesTestTool, WaSearchTool,
+        WaSendTool, WaStateTool, WaSteerPlanTool, WaTxPlanTool, WaTxRollbackTool, WaTxRunTool,
+        WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool,
+        accounts_refresh_policy_input, audit_mcp_policy_denial_async, authorize_mcp_policy_call,
+        build_mcp_shared_rate_limiter, build_policy_engine_with_shared_rate_limiter,
+        catch_recoverable, intent_hash_hex, mcp_event_mutation_decision_context,
+        mcp_get_text_policy_input, mcp_load_mission_tx_contract_from_path, mcp_load_submit_profile,
+        mcp_now_ms_i64, mcp_release_pane_policy_input, mcp_reserve_pane_policy_input,
+        mcp_search_output_policy_input, mcp_send_text_policy_input, mcp_workflow_run_policy_input,
+        merge_distributed_remote_mcp_states, read_mcp_rehearsal_manifest,
+        redact_mcp_output_secrets, redact_mcp_pane_state_fields,
         redact_mcp_pane_text_with_escape_contract, redact_mcp_wait_pattern_for_output,
         resolve_mcp_rehearsal_manifest_path, serialize_mcp_audit_decision_context,
         tx_run_test_wezterm_override_slot, tx_run_wezterm_handle, validate_cass_timeout_secs,
@@ -14955,6 +15361,18 @@ mod tests {
             pane_id: u64,
         ) -> crate::wezterm::WeztermFuture<'_, crate::wezterm::PaneInfo> {
             crate::wezterm::MuxInterface::get_pane(self.inner.as_ref(), pane_id)
+        }
+
+        fn pane_native_identity_with_cx<'a>(
+            &'a self,
+            cx: &'a crate::cx::Cx,
+            pane_id: u64,
+        ) -> crate::wezterm::WeztermFuture<'a, Option<crate::wezterm::MuxPaneIdentity>> {
+            crate::wezterm::MuxInterface::pane_native_identity_with_cx(
+                self.inner.as_ref(),
+                cx,
+                pane_id,
+            )
         }
 
         fn get_text(
@@ -22414,6 +22832,415 @@ mod tests {
                     .as_deref()
                     .is_some_and(|summary| !summary.contains(text))
             }));
+        });
+    }
+
+    #[test]
+    fn wa_send_recovers_persisted_observation_and_replays_exact_receipt_without_resending() {
+        use crate::submit_idempotency_store::{self as store, ClaimOutcome};
+        use crate::wezterm::{MuxInterface, MuxPaneIdentity};
+
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let (_dir, db) = temp_db_path();
+            let ft_dir = db.parent().unwrap();
+            let pane_id = 4_601;
+            let text = "inspect the recovery fixture";
+            let caller_key = "recover-original-observation";
+            let mut cfg = Config::default();
+            cfg.safety.require_prompt_active = false;
+            cfg.safety.rate_limit_per_pane = 100;
+            cfg.safety.rate_limit_global = 100;
+            let cfg = Arc::new(cfg);
+            let profile = mcp_load_submit_profile(&cfg, AgentType::Codex).unwrap();
+            let identity = MuxPaneIdentity {
+                session_incarnation: [0x11; 16],
+                durable_pane_id: [0x22; 16],
+                pane_registration: [0x33; 16],
+            };
+            let binding = crate::verified_submit::idempotency_binding(
+                crate::verified_submit::SubmitIdempotencyRequest {
+                    pane_id,
+                    text,
+                    caller_key,
+                    guarantee_level: SubmitGuaranteeLevel::Submitted,
+                    wait_for: None,
+                    wait_for_regex: false,
+                    timeout_secs: 30,
+                },
+            );
+            let baseline = crate::verified_submit::prepare_verified_submit_baseline(
+                pane_id,
+                text,
+                AgentType::Codex,
+                Some(&profile),
+                Some(""),
+                None,
+            )
+            .unwrap();
+            let token = match store::claim(ft_dir, &binding).unwrap() {
+                ClaimOutcome::Claimed(token) => token,
+                other => panic!("fresh claim required: {other:?}"),
+            };
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            mock.add_default_pane(pane_id).await;
+            mock.set_pane_native_identity_with_cx(
+                &crate::cx::for_testing(),
+                pane_id,
+                Some(identity),
+            )
+            .await
+            .unwrap();
+            mock.inject(
+                pane_id,
+                crate::wezterm::MockEvent::SetTitle("Codex".to_string()),
+            )
+            .await
+            .unwrap();
+            mock.send_text(pane_id, text).await.unwrap();
+            mock.inject_output(
+                pane_id,
+                &format!("\n{}", profile.anchors.working_state.first().unwrap()),
+            )
+            .await
+            .unwrap();
+            let started_unix_ms = mcp_now_ms_i64();
+            store::mark_effect_applied_with_observation(
+                ft_dir,
+                &binding,
+                token,
+                &store::SubmitObservationContinuation {
+                    baseline,
+                    pane_identity: identity,
+                    audit_action_id: None,
+                    started_unix_ms,
+                    deadline_unix_ms: started_unix_ms + MCP_SUBMIT_OBSERVATION_RECOVERY_WINDOW_MS,
+                },
+            )
+            .unwrap();
+            // Every store operation reopens SQLite. Releasing the observation
+            // models a cancelled request; lease-expiry takeover and crash
+            // boundaries are exercised independently by the store tests.
+            store::release_observation(ft_dir, &binding, token).unwrap();
+
+            let _pane_state = set_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
+            let request = serde_json::json!({
+                "pane_id": pane_id,
+                "text": text,
+                "verify_submit": true,
+                "idempotency_key": caller_key,
+            });
+            let make_tool = || {
+                WaSendTool::with_wezterm_handle(
+                    Arc::clone(&cfg),
+                    Arc::clone(&db),
+                    Arc::clone(&mock) as crate::wezterm::WeztermHandle,
+                )
+            };
+            let recovered = parse_json_content(
+                make_tool()
+                    .call(&test_mcp_context(), request.clone())
+                    .unwrap(),
+            );
+            assert_eq!(recovered["ok"], true, "{recovered:?}");
+            assert_eq!(recovered["data"]["submit"]["state"], "submitted");
+            assert_eq!(recovered["data"]["submit"]["guarantee_met"], true);
+            assert_eq!(
+                recovered["data"]["injection"]["decision"]["rule_id"],
+                "submit_idempotency.observation_recovered"
+            );
+            let replayed =
+                parse_json_content(make_tool().call(&test_mcp_context(), request).unwrap());
+            assert_eq!(replayed["data"]["submit"], recovered["data"]["submit"]);
+            assert_eq!(
+                replayed["data"]["injection"]["decision"]["rule_id"],
+                "submit_idempotency.duplicate_noop"
+            );
+            assert_eq!(
+                mock.pane_state(pane_id)
+                    .await
+                    .unwrap()
+                    .content
+                    .matches(text)
+                    .count(),
+                1,
+                "recovery and receipt replay must both perform zero additional sends"
+            );
+            let storage = StorageHandle::new(&db.to_string_lossy()).await.unwrap();
+            let audit = storage
+                .get_audit_actions(crate::storage::AuditQuery {
+                    action_kind: Some("submit_observation".to_string()),
+                    ..crate::storage::AuditQuery::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(audit.len(), 1);
+            assert_eq!(audit[0].result, "completed");
+            assert_eq!(audit[0].correlation_id.as_deref(), Some(caller_key));
+            assert!(!audit[0].input_summary.as_deref().unwrap().contains(text));
+        });
+    }
+
+    #[test]
+    fn wa_send_recovery_refuses_replaced_or_unavailable_native_identity() {
+        use crate::submit_idempotency_store::{self as store, ClaimOutcome};
+        use crate::wezterm::MuxPaneIdentity;
+
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            for (index, unavailable) in [false, true].into_iter().enumerate() {
+                let (_dir, db) = temp_db_path();
+                let ft_dir = db.parent().unwrap();
+                let pane_id = 4_602 + u64::try_from(index).unwrap();
+                let text = "inspect the replaced pane fixture";
+                let caller_key = "do-not-recover-from-replacement";
+                let mut cfg = Config::default();
+                cfg.safety.require_prompt_active = false;
+                cfg.safety.rate_limit_per_pane = 100;
+                cfg.safety.rate_limit_global = 100;
+                let cfg = Arc::new(cfg);
+                let profile = mcp_load_submit_profile(&cfg, AgentType::Codex).unwrap();
+                let identity = MuxPaneIdentity {
+                    session_incarnation: [0x11; 16],
+                    durable_pane_id: [0x22; 16],
+                    pane_registration: [0x33; 16],
+                };
+                let binding = crate::verified_submit::idempotency_binding(
+                    crate::verified_submit::SubmitIdempotencyRequest {
+                        pane_id,
+                        text,
+                        caller_key,
+                        guarantee_level: SubmitGuaranteeLevel::Submitted,
+                        wait_for: None,
+                        wait_for_regex: false,
+                        timeout_secs: 30,
+                    },
+                );
+                let baseline = crate::verified_submit::prepare_verified_submit_baseline(
+                    pane_id,
+                    text,
+                    AgentType::Codex,
+                    Some(&profile),
+                    Some(""),
+                    None,
+                )
+                .unwrap();
+                let token = match store::claim(ft_dir, &binding).unwrap() {
+                    ClaimOutcome::Claimed(token) => token,
+                    other => panic!("fresh claim required: {other:?}"),
+                };
+                let started_unix_ms = mcp_now_ms_i64();
+                store::mark_effect_applied_with_observation(
+                    ft_dir,
+                    &binding,
+                    token,
+                    &store::SubmitObservationContinuation {
+                        baseline,
+                        pane_identity: identity,
+                        audit_action_id: None,
+                        started_unix_ms,
+                        deadline_unix_ms: started_unix_ms
+                            + MCP_SUBMIT_OBSERVATION_RECOVERY_WINDOW_MS,
+                    },
+                )
+                .unwrap();
+                store::release_observation(ft_dir, &binding, token).unwrap();
+                let mock = Arc::new(crate::wezterm::MockWezterm::new());
+                mock.add_default_pane(pane_id).await;
+                mock.inject(
+                    pane_id,
+                    crate::wezterm::MockEvent::SetTitle("Codex".to_string()),
+                )
+                .await
+                .unwrap();
+                if !unavailable {
+                    mock.set_pane_native_identity_with_cx(
+                        &crate::cx::for_testing(),
+                        pane_id,
+                        Some(MuxPaneIdentity {
+                            pane_registration: [0x44; 16],
+                            ..identity
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                }
+                // Plausible success output from a different pane must never
+                // settle the original effect's receipt.
+                mock.inject_output(pane_id, profile.anchors.working_state.first().unwrap())
+                    .await
+                    .unwrap();
+                let _pane_state = set_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
+                let tool = WaSendTool::with_wezterm_handle(
+                    cfg,
+                    Arc::clone(&db),
+                    Arc::clone(&mock) as crate::wezterm::WeztermHandle,
+                );
+                let outcome = parse_json_content(
+                    tool.call(
+                        &test_mcp_context(),
+                        serde_json::json!({
+                            "pane_id": pane_id, "text": text, "verify_submit": true,
+                            "idempotency_key": caller_key,
+                        }),
+                    )
+                    .unwrap(),
+                );
+                assert_eq!(outcome["ok"], true, "{outcome:?}");
+                assert_eq!(outcome["data"]["submit"], serde_json::Value::Null);
+                assert_eq!(
+                    outcome["data"]["injection"]["decision"]["rule_id"],
+                    "submit_idempotency.in_doubt_noop"
+                );
+                assert_eq!(
+                    store::lookup(ft_dir, &binding).unwrap(),
+                    Some(store::StoredSubmitState::InDoubt)
+                );
+                assert_eq!(
+                    store::reconcile(ft_dir, &binding, store::SubmitReconciliation::Abandon),
+                    Err(store::SubmitIdempotencyError::InvalidTransition)
+                );
+                assert!(
+                    !mock
+                        .pane_state(pane_id)
+                        .await
+                        .unwrap()
+                        .content
+                        .contains(text)
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn wa_send_losing_observation_authority_does_not_publish_a_stale_success() {
+        use crate::submit_idempotency_store::{self as store, ObservationClaimOutcome};
+        use crate::wezterm::MuxPaneIdentity;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let (_dir, db) = temp_db_path();
+            let pane_id = 4_604;
+            let text = "inspect the stale observer fixture";
+            let caller_key = "settled-during-original-observation";
+            let mut cfg = Config::default();
+            cfg.safety.require_prompt_active = false;
+            cfg.safety.rate_limit_per_pane = 100;
+            cfg.safety.rate_limit_global = 100;
+            let cfg = Arc::new(cfg);
+            let profile = mcp_load_submit_profile(&cfg, AgentType::Codex).unwrap();
+            let working_anchor = profile.anchors.working_state.first().unwrap().clone();
+            let binding = crate::verified_submit::idempotency_binding(
+                crate::verified_submit::SubmitIdempotencyRequest {
+                    pane_id,
+                    text,
+                    caller_key,
+                    guarantee_level: SubmitGuaranteeLevel::Submitted,
+                    wait_for: None,
+                    wait_for_regex: false,
+                    timeout_secs: 30,
+                },
+            );
+            let inner = Arc::new(crate::wezterm::MockWezterm::new());
+            inner.add_default_pane(pane_id).await;
+            inner
+                .set_pane_native_identity_with_cx(
+                    &crate::cx::for_testing(),
+                    pane_id,
+                    Some(MuxPaneIdentity {
+                        session_incarnation: [0x11; 16],
+                        durable_pane_id: [0x22; 16],
+                        pane_registration: [0x33; 16],
+                    }),
+                )
+                .await
+                .unwrap();
+            inner
+                .inject(
+                    pane_id,
+                    crate::wezterm::MockEvent::SetTitle("Codex".to_string()),
+                )
+                .await
+                .unwrap();
+
+            let settled = Arc::new(AtomicBool::new(false));
+            let settled_in_hook = Arc::clone(&settled);
+            let binding_in_hook = binding.clone();
+            let ft_dir = db.parent().unwrap().to_path_buf();
+            let backend = Arc::new(CancelDuringSubmitWezterm {
+                inner: Arc::clone(&inner),
+                cx_cancellation_observed: Arc::new(AtomicBool::new(false)),
+                fail_dispatch_after_cancel: false,
+                read_hook: Some(Box::new(move |_cx, result| {
+                    if !result.as_ref().is_ok_and(|output| output.contains(text)) {
+                        return;
+                    }
+                    if !settled_in_hook.swap(true, Ordering::SeqCst) {
+                        // The production handler must have durably recorded
+                        // the applied effect before its first observation.
+                        assert_eq!(
+                            store::claim_observation(&ft_dir, &binding_in_hook).unwrap(),
+                            ObservationClaimOutcome::InFlight
+                        );
+                        assert!(matches!(
+                            store::reconcile(
+                                &ft_dir,
+                                &binding_in_hook,
+                                store::SubmitReconciliation::Settle,
+                            )
+                            .unwrap(),
+                            store::ReconcileOutcome::Settled(_)
+                        ));
+                    }
+                    // The stale observer can still see plausible success.
+                    // Its rejected completion must prevent that local verdict
+                    // from escaping into the response or replacing settlement.
+                    *result = Ok(format!("{text}\n{working_anchor}"));
+                })),
+            });
+            let _pane_state = set_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
+            let tool = WaSendTool::with_wezterm_handle(
+                cfg,
+                Arc::clone(&db),
+                backend as crate::wezterm::WeztermHandle,
+            );
+            let request = serde_json::json!({
+                "pane_id": pane_id, "text": text, "verify_submit": true,
+                "idempotency_key": caller_key,
+            });
+            let original =
+                parse_json_content(tool.call(&test_mcp_context(), request.clone()).unwrap());
+            assert!(settled.load(Ordering::SeqCst));
+            assert_eq!(original["ok"], true, "{original:?}");
+            assert_eq!(original["data"]["submit"], serde_json::Value::Null);
+            assert!(
+                original["data"]["verification_error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("lost durable authority"))
+            );
+
+            let replayed = parse_json_content(tool.call(&test_mcp_context(), request).unwrap());
+            assert_eq!(
+                replayed["data"]["submit"]["state"],
+                "verification_unavailable"
+            );
+            assert_eq!(replayed["data"]["submit"]["guarantee_met"], false);
+            assert_eq!(
+                replayed["data"]["submit"]["evidence_rule_ids"],
+                serde_json::json!(["submit_idempotency.operator_reconciled"])
+            );
+            assert_eq!(
+                inner
+                    .pane_state(pane_id)
+                    .await
+                    .unwrap()
+                    .content
+                    .matches(text)
+                    .count(),
+                1,
+                "neither stale completion nor settled replay may resend"
+            );
         });
     }
 
