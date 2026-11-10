@@ -3,7 +3,7 @@
 //!
 //! `ft robot watch-events --follow` unifies two sources behind one `events.id`
 //! cursor: a DB cursor over persisted detections, and a live unix-IPC EventBus
-//! transport. The server-side record BUILDERS (`subscribe_event_record`,
+//! transport. The server-side record BUILDERS (`subscribe_stored_event_record`,
 //! `watch_lag_gap_record`, `watch_heartbeat_record`) are already covered by
 //! behavioral unit tests in `ipc.rs`. What those isolated tests do NOT pin is
 //! the FLOW wiring — that the live path (`stream_subscribe_events`) actually
@@ -31,13 +31,13 @@ fn watch_events_unification_contract() -> serde_json::Value {
     serde_json::json!([
         {
             "invariant": "unify_on_events_id",
-            "detail": "live IPC record carries the same events.id cursor as the DB-cursor path; no cursor-less emission",
+            "detail": "persisted IPC records carry the stored events.id and epoch; lifecycle signals remain cursorless",
             "pinned": contains_all(
                 &ipc,
                 &[
-                    "let cursor = (*event_id)?;",
-                    "\"cursor\": cursor,",
-                    "\"id\": cursor,",
+                    "\"cursor\": event.id,",
+                    "\"id\": event.id,",
+                    "\"cursor_epoch\": epoch,",
                 ],
             ),
         },
@@ -59,11 +59,17 @@ fn watch_events_unification_contract() -> serde_json::Value {
             ),
         },
         {
-            "invariant": "shared_filtered_event_stream",
-            "detail": "stream_subscribe_events drives the shared FilteredEventStream cursor/gap engine",
+            "invariant": "storage_authoritative_event_stream",
+            "detail": "stream_subscribe_events drains durable storage and acknowledges only flushed or filtered rows",
             "pinned": contains_all(
                 &ipc,
-                &["FilteredEventStream::new", "StreamItem::Gap"],
+                &[
+                    "DurableFilteredEventStream::new",
+                    "DurableStreamItem::Stored",
+                    "DurableStreamItem::Gap",
+                    "stream.acknowledge(event_id)",
+                    "subscribe_stored_event_record",
+                ],
             ),
         },
         {
@@ -82,7 +88,7 @@ fn watch_events_unification_matches_golden() {
     let expected = serde_json::json!([
         {
             "invariant": "unify_on_events_id",
-            "detail": "live IPC record carries the same events.id cursor as the DB-cursor path; no cursor-less emission",
+            "detail": "persisted IPC records carry the stored events.id and epoch; lifecycle signals remain cursorless",
             "pinned": true,
         },
         {
@@ -96,8 +102,8 @@ fn watch_events_unification_matches_golden() {
             "pinned": true,
         },
         {
-            "invariant": "shared_filtered_event_stream",
-            "detail": "stream_subscribe_events drives the shared FilteredEventStream cursor/gap engine",
+            "invariant": "storage_authoritative_event_stream",
+            "detail": "stream_subscribe_events drains durable storage and acknowledges only flushed or filtered rows",
             "pinned": true,
         },
         {
@@ -113,17 +119,19 @@ fn watch_events_unification_matches_golden() {
 }
 
 /// ft-7h5da.4.1: the live IPC record and the DB-cursor record both key on
-/// `events.id` — the live `subscribe_event_record` sets BOTH `cursor` and `id`
-/// from the persisted `event_id` (and skips events that have no id).
+/// `events.id` — `subscribe_stored_event_record` sets BOTH `cursor` and `id`
+/// from the authoritative stored row and attaches its retention epoch.
 #[test]
 fn live_record_unifies_cursor_and_id_on_events_id() {
     let ipc = core_src("ipc.rs");
     assert!(
-        ipc.contains("let cursor = (*event_id)?;"),
+        ipc.contains("subscribe_stored_event_record"),
         "live path must derive the cursor from the persisted events.id (ft-7h5da.4.1)"
     );
     assert!(
-        ipc.contains("\"cursor\": cursor,") && ipc.contains("\"id\": cursor,"),
+        ipc.contains("\"cursor\": event.id,")
+            && ipc.contains("\"id\": event.id,")
+            && ipc.contains("\"cursor_epoch\": epoch,"),
         "live record's cursor and id must both be the events.id (ft-7h5da.4.1)"
     );
 }

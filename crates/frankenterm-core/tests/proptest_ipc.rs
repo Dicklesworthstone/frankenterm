@@ -60,6 +60,8 @@ fn arb_ipc_request() -> impl Strategy<Value = IpcRequest> {
         )
             .prop_map(|(pane, severity, rule_id, heartbeat_interval_ms)| {
                 IpcRequest::SubscribeEvents {
+                    version: frankenterm_core::ipc::IPC_EVENT_STREAM_VERSION,
+                    cursor: None,
                     pane,
                     severity,
                     rule_id,

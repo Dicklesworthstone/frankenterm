@@ -297,11 +297,20 @@ fn accepted_idle_partial_and_subscribed_clients_stop_without_rpc_settlement_grac
             .unwrap();
             let event_bus = Arc::new(EventBus::new(16));
             let server_bus = Arc::clone(&event_bus);
+            let storage = Arc::new(
+                frankenterm_core::storage::StorageHandle::new(
+                    &directory.path().join("events.db").to_string_lossy(),
+                )
+                .await
+                .unwrap(),
+            );
+            let handler_context = frankenterm_core::ipc::IpcHandlerContext::new(server_bus)
+                .with_event_storage(Arc::clone(&storage));
             let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
             let run_cx = cx.clone();
             let server_task = task::spawn(async move {
                 server
-                    .run_with_cx(&run_cx, server_bus, shutdown_rx)
+                    .run_with_handler_context_with_cx(&run_cx, handler_context, shutdown_rx)
                     .with_subscriber(
                         tracing_subscriber::fmt()
                             .with_max_level(tracing::Level::DEBUG)
@@ -316,6 +325,8 @@ fn accepted_idle_partial_and_subscribed_clients_stop_without_rpc_settlement_grac
                 "partial" => client.write_all(br#"{"type":"ping""#).await.unwrap(),
                 "subscription" => {
                     let mut request = serde_json::to_vec(&IpcRequest::SubscribeEvents {
+                        version: frankenterm_core::ipc::IPC_EVENT_STREAM_VERSION,
+                        cursor: None,
                         pane: None,
                         severity: None,
                         rule_id: None,
@@ -386,6 +397,157 @@ fn accepted_idle_partial_and_subscribed_clients_stop_without_rpc_settlement_grac
                 0,
                 "subscription must be dropped"
             );
+            storage.shutdown().await.unwrap();
         }
+    });
+}
+
+fn subscription_fixture_event(sequence: i64) -> frankenterm_core::storage::StoredEvent {
+    frankenterm_core::storage::StoredEvent {
+        id: 0,
+        pane_id: 7,
+        rule_id: "codex.durable".to_string(),
+        agent_type: "codex".to_string(),
+        event_type: "usage.reached".to_string(),
+        severity: "warning".to_string(),
+        confidence: 0.9,
+        extracted: Some(serde_json::json!({"sequence": sequence})),
+        matched_text: Some(format!("stored-{sequence}")),
+        segment_id: None,
+        detected_at: 1_700_000_000_000 + sequence,
+        dedupe_key: None,
+        handled_at: None,
+        handled_by_workflow_id: None,
+        handled_status: None,
+    }
+}
+
+async fn read_subscription_record(
+    cx: &frankenterm_core::cx::Cx,
+    stream: &mut frankenterm_core::ipc::IpcEventStream,
+) -> serde_json::Value {
+    let line = frankenterm_core::runtime_async::timeout_with_cx(
+        cx,
+        Duration::from_secs(2),
+        stream.next_line_with_cx(cx),
+    )
+    .await
+    .expect("subscription must make bounded progress")
+    .expect("read subscription line")
+    .expect("subscription must stay open");
+    serde_json::from_str(&line).expect("subscription JSON")
+}
+
+#[test]
+fn durable_subscription_replays_and_polls_silent_commits_over_real_socket() {
+    use frankenterm_core::event_stream::DurableStreamCursor;
+    use frankenterm_core::ipc::{IpcClient, IpcHandlerContext};
+    use frankenterm_core::storage::{PaneRecord, StorageHandle};
+
+    run_async_test(async {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.sock");
+        let cx = runtime_ipc_cx();
+        let storage = Arc::new(
+            StorageHandle::new(&directory.path().join("events.db").to_string_lossy())
+                .await
+                .unwrap(),
+        );
+        storage
+            .upsert_pane(PaneRecord {
+                pane_id: 7,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 1_700_000_000_000,
+                last_seen_at: 1_700_000_000_000,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            })
+            .await
+            .unwrap();
+        let epoch = storage.get_event_retention_snapshot().await.unwrap().cursor_epoch;
+        let first = storage.record_event(subscription_fixture_event(1)).await.unwrap();
+        let second = storage.record_event(subscription_fixture_event(2)).await.unwrap();
+        // No EventBus publication accompanies any stored row in this test.
+        let bus = Arc::new(EventBus::new(4));
+        let context = IpcHandlerContext::new(bus).with_event_storage(Arc::clone(&storage));
+        let server = IpcServer::bind_with_cx(&cx, &path).await.unwrap();
+        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
+        let run_cx = cx.clone();
+        let server_task = task::spawn(async move {
+            server
+                .run_with_handler_context_with_cx(&run_cx, context, shutdown_rx)
+                .await;
+        });
+        let client = IpcClient::new(&path);
+        let mut stream = client
+            .subscribe_events_from_cursor_with_cx(
+                &cx,
+                Some(DurableStreamCursor { after_id: 0, epoch: epoch.clone() }),
+                Some(7),
+                Some("warning".to_string()),
+                Some("codex.*".to_string()),
+                0,
+            )
+            .await
+            .unwrap();
+        let row = read_subscription_record(&cx, &mut stream).await;
+        assert_eq!(row["cursor"], first);
+        assert_eq!(row["id"], first);
+        assert_eq!(row["cursor_epoch"], epoch);
+        assert_eq!(row["detected_at"], 1_700_000_000_001_i64);
+        assert_eq!(row["matched_text"], "stored-1");
+        drop(stream);
+
+        // Resume from the caller's last consumed record even if the old socket
+        // had already accepted later bytes before the client disconnected.
+        let mut resumed = client
+            .subscribe_events_from_cursor_with_cx(
+                &cx,
+                Some(DurableStreamCursor { after_id: first, epoch: epoch.clone() }),
+                None,
+                None,
+                None,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_subscription_record(&cx, &mut resumed).await["id"], second);
+        let third = storage.record_event(subscription_fixture_event(3)).await.unwrap();
+        assert_eq!(read_subscription_record(&cx, &mut resumed).await["id"], third);
+
+        // The compatibility API deliberately starts at the current tail and
+        // publishes its exact epoch/baseline before a later silent commit.
+        let mut fresh = client
+            .subscribe_events_with_cx(&cx, None, None, None, 0)
+            .await
+            .unwrap();
+        let checkpoint = read_subscription_record(&cx, &mut fresh).await;
+        assert_eq!(checkpoint["type"], "cursor_checkpoint");
+        assert_eq!(checkpoint["cursor"], third);
+        assert_eq!(checkpoint["cursor_epoch"], epoch);
+        assert_eq!(checkpoint["reason"], "fresh_tail_baseline");
+        let fourth = storage.record_event(subscription_fixture_event(4)).await.unwrap();
+        assert_eq!(read_subscription_record(&cx, &mut fresh).await["id"], fourth);
+        drop(fresh);
+        drop(resumed);
+
+        frankenterm_core::runtime_async::mpsc_send(&shutdown_tx, ()).await.unwrap();
+        frankenterm_core::runtime_async::timeout_with_cx(
+            &cx,
+            Duration::from_secs(2),
+            server_task,
+        )
+        .await
+        .expect("subscription shutdown deadline")
+        .expect("server task settles");
+        assert!(!path.exists());
+        storage.shutdown().await.unwrap();
     });
 }

@@ -35,6 +35,8 @@ pub const IPC_SOCKET_NAME: &str = "ipc.sock";
 /// Maximum message size in bytes (128KB).
 /// Overridable via `[tuning.ipc] max_message_size` in ft.toml.
 pub const MAX_MESSAGE_SIZE: usize = crate::tuning_config::IpcTuning::DEFAULT_MAX_MESSAGE_SIZE;
+/// Storage-authoritative, epoch-aware NDJSON event subscription protocol.
+pub const IPC_EVENT_STREAM_VERSION: u32 = 2;
 /// One-response RPC execution budget, measured from authenticated admission.
 pub const IPC_RPC_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(all(any(unix, windows), test))]
@@ -746,11 +748,11 @@ pub enum IpcRequest {
     },
     /// Subscribe to a live NDJSON stream of watch events over IPC. Unlike every
     /// other request, this does NOT return a single `IpcResponse` — the server
-    /// keeps the connection open and fans selected `EventBus` records to the
-    /// socket as one already-redacted NDJSON record per line.
+    /// keeps the connection open and drains selected stored rows in ascending
+    /// ID order as redacted NDJSON. EventBus notifications only wake that drain.
     ///
-    /// Persisted detection records carry `cursor = <storage event id>` (the
-    /// same monotonic key the DB-cursor fallback tails), so a follower can
+    /// Persisted detection records carry `cursor = <storage event id>` and
+    /// `cursor_epoch` (the history identity used by DB fallback), so a follower can
     /// dedupe across transports and resume on the DB path if the watcher dies
     /// mid-stream. Non-persisted live signal records carry `cursor = null`;
     /// they are live notifications, not DB-resumable history. Idle heartbeats
@@ -758,6 +760,10 @@ pub enum IpcRequest {
     /// is the low-latency transport for `ft robot watch-events --follow`; the
     /// CLI falls back to storage-cursor tailing when the watcher is down.
     SubscribeEvents {
+        /// Required wire version; unsupported versions fail closed.
+        version: u32,
+        /// Resume after this durable ID in its storage epoch; None starts at the tail.
+        cursor: Option<crate::event_stream::DurableStreamCursor>,
         /// Restrict to a single pane (server-side filter).
         pane: Option<u64>,
         /// Severity filter (case-insensitive exact, e.g. "warning").
@@ -1240,6 +1246,8 @@ impl IpcAuthError {
 pub struct IpcHandlerContext {
     /// Event bus for publishing events
     pub event_bus: Arc<EventBus>,
+    /// Durable event source for ordered, resumable subscriptions.
+    pub event_storage: Option<Arc<crate::storage::StorageHandle>>,
     /// Pane registry for pane state queries (optional for backward compatibility)
     pub registry: Option<Arc<RwLock<PaneRegistry>>>,
     /// Optional IPC auth configuration
@@ -1268,6 +1276,7 @@ impl IpcHandlerContext {
             watcher_control_handler: None,
             search_config: None,
             semantic_source: None,
+            event_storage: None,
             connection_shutdown: crate::runtime_async::process::CommandCancellation::new(),
         }
     }
@@ -1283,6 +1292,7 @@ impl IpcHandlerContext {
             watcher_control_handler: None,
             search_config: None,
             semantic_source: None,
+            event_storage: None,
             connection_shutdown: crate::runtime_async::process::CommandCancellation::new(),
         }
     }
@@ -1302,6 +1312,7 @@ impl IpcHandlerContext {
             watcher_control_handler: None,
             search_config: None,
             semantic_source: None,
+            event_storage: None,
             connection_shutdown: crate::runtime_async::process::CommandCancellation::new(),
         }
     }
@@ -1355,8 +1366,16 @@ impl IpcHandlerContext {
             watcher_control_handler,
             search_config,
             semantic_source: None,
+            event_storage: None,
             connection_shutdown: crate::runtime_async::process::CommandCancellation::new(),
         }
+    }
+
+    /// Enable versioned durable event subscriptions against the watcher store.
+    #[must_use]
+    pub fn with_event_storage(mut self, storage: Arc<crate::storage::StorageHandle>) -> Self {
+        self.event_storage = Some(storage);
+        self
     }
 
     /// Answer `pane_state` with live prompt evidence read from this mux.
@@ -2423,15 +2442,32 @@ async fn handle_client_with_context_with_cx(
 
     // ft-7h5da.4.1: SubscribeEvents is a streaming request. Intercept it
     // before the single-response dispatch and keep the connection open,
-    // fanning EventBus detections to the socket as NDJSON until the
-    // consumer disconnects or the watcher cx is cancelled.
+    // draining stored detections and forwarding best-effort lifecycle signals
+    // until the consumer disconnects or the watcher cx is cancelled.
     if let IpcRequest::SubscribeEvents {
+        version,
+        cursor,
         pane,
         severity,
         rule_id,
         heartbeat_interval_ms,
     } = &envelope.request
     {
+        if let Err(response) = validate_subscribe_events(
+            *version,
+            cursor.as_ref(),
+            ctx.event_storage.is_some(),
+        ) {
+            let encoded = serialize_ipc_response_bounded(response, limits.max_message_size)?;
+            return write_ipc_line_with_deadline(
+                &cx,
+                &mut writer,
+                limits.io_timeout(),
+                limits.max_message_size,
+                &encoded,
+            )
+            .await;
+        }
         // A subscription owns no child process. Close it promptly on server
         // shutdown even while it is waiting for an event or a blocked write.
         return match futures::future::select(
@@ -2440,6 +2476,7 @@ async fn handle_client_with_context_with_cx(
                 &cx,
                 &mut writer,
                 &ctx,
+                cursor.clone(),
                 *pane,
                 severity.clone(),
                 rule_id.clone(),
@@ -2761,19 +2798,93 @@ fn subscribe_event_record(
     }
 }
 
-/// ft-7h5da.4.1/ft-0q7a2: stream selected `EventBus` records to a subscribed
-/// client as NDJSON, one already-redacted record per line. Persisted detections
-/// carry `cursor = <storage event id>`; live-only signal records carry
-/// `cursor = null`. Idle heartbeats keep the stream live and surface a closed
-/// or non-reading consumer (the next write fails or reaches its finite I/O
-/// deadline). Returns `Ok(())` when the consumer
-/// disconnects (broken pipe) or the watcher cx is cancelled — a cancelled cx
-/// ends the stream within at most one heartbeat interval.
+/// Validate admission before taking a subscription or reading storage.
+#[cfg(unix)]
+fn validate_subscribe_events(
+    version: u32,
+    cursor: Option<&crate::event_stream::DurableStreamCursor>,
+    storage_available: bool,
+) -> Result<(), IpcResponse> {
+    if version != IPC_EVENT_STREAM_VERSION || !storage_available {
+        return Err(IpcResponse::error_with_code(
+            "ipc.subscribe_events.unavailable",
+            "Storage-authoritative event subscriptions require protocol version 2 and event storage",
+            None,
+        ));
+    }
+    if cursor.is_some_and(|cursor| {
+        cursor.after_id < 0
+            || cursor.epoch.len() != 32
+            || !cursor
+                .epoch
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    }) {
+        return Err(IpcResponse::error_with_code(
+            "ipc.subscribe_events.invalid_cursor",
+            "Event resume cursor requires a nonnegative ID and a canonical storage epoch",
+            None,
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn subscribe_stored_event_record(
+    event: &crate::storage::StoredEvent,
+    epoch: &str,
+    pane: Option<u64>,
+    severity: Option<&str>,
+    rule_glob: Option<&str>,
+) -> Option<serde_json::Value> {
+    if pane.is_some_and(|want| event.pane_id != want)
+        || severity.is_some_and(|want| !event.severity.eq_ignore_ascii_case(want))
+        || rule_glob.is_some_and(|glob| !crate::events::rule_glob_matches(glob, &event.rule_id))
+    {
+        return None;
+    }
+    let redactor = crate::policy::Redactor::new();
+    let mut extracted = event.extracted.clone().unwrap_or(serde_json::Value::Null);
+    let mut pending = vec![&mut extracted];
+    while let Some(value) = pending.pop() {
+        match value {
+            serde_json::Value::String(text) => *text = redactor.redact(text),
+            serde_json::Value::Array(values) => pending.extend(values.iter_mut()),
+            serde_json::Value::Object(values) => pending.extend(values.values_mut()),
+            _ => {}
+        }
+    }
+    Some(serde_json::json!({
+        "type": "event",
+        "cursor": event.id,
+        "cursor_epoch": epoch,
+        "id": event.id,
+        "pane_id": event.pane_id,
+        "rule_id": event.rule_id,
+        "agent_type": event.agent_type,
+        "event_type": event.event_type,
+        "severity": event.severity,
+        "confidence": event.confidence,
+        "detected_at": event.detected_at,
+        "matched_text": event.matched_text.as_deref().map(|text| redactor.redact(text)),
+        "extracted": extracted,
+        "handled": event.handled_at.is_some(),
+        "handled_status": event.handled_status.as_deref().map(|text| redactor.redact(text)),
+    }))
+}
+
+/// Stream ordered durable rows and best-effort lifecycle signals as NDJSON.
+///
+/// Version 2 binds resume IDs to a storage epoch. A fresh client receives the
+/// captured tail checkpoint before later rows. Persisted payloads come only
+/// from storage, and their cursor advances only after a successful flush or
+/// deliberate filtering. Heartbeats and writes keep their finite deadlines.
 #[cfg(unix)]
 async fn stream_subscribe_events<W>(
     cx: &crate::cx::Cx,
     writer: &mut W,
     ctx: &IpcHandlerContext,
+    cursor: Option<crate::event_stream::DurableStreamCursor>,
     pane: Option<u64>,
     severity: Option<String>,
     rule_glob: Option<String>,
@@ -2784,71 +2895,100 @@ async fn stream_subscribe_events<W>(
 where
     W: socket_transport::AsyncWrite + Unpin,
 {
-    use crate::event_stream::{EventStreamFilter, FilteredEventStream, StreamCursor, StreamItem};
+    use crate::event_stream::{DurableFilteredEventStream, DurableStreamError, DurableStreamItem};
 
-    // ft-ubuw2: drive the live subscription through the (now gap-aware)
-    // FilteredEventStream so that abstraction is the shared recv + cursor +
-    // gap engine rather than dead code. An accept-all filter is used because
-    // per-request pane/severity/rule_glob filtering and NDJSON record shaping
-    // stay in subscribe_event_record below; FilteredEventStream surfaces a
-    // bounded-broadcast overflow as an explicit StreamItem::Gap (never a silent
-    // drop), which we render with the same watch_lag_gap_record as before.
-    let mut stream = FilteredEventStream::new(
-        &ctx.event_bus,
-        EventStreamFilter::default(),
-        StreamCursor::from_beginning(),
-        1,
-    );
+    let storage = ctx.event_storage.as_ref().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotConnected, "event storage unavailable")
+    })?;
+    let mut stream = DurableFilteredEventStream::new(&ctx.event_bus, Arc::clone(storage), cursor);
     let heartbeat = Duration::from_millis(heartbeat_interval_ms.max(1));
+    let mut last_emit = Instant::now();
 
     loop {
         if cx.checkpoint().is_err() {
             return Ok(());
         }
 
-        let record = if heartbeat_interval_ms > 0 {
-            match crate::runtime_async::timeout_with_cx(cx, heartbeat, stream.next_item_cx(cx))
+        // Filtered traffic must not postpone heartbeat deadlines. At this
+        // boundary every prior durable row is flushed or deliberately skipped.
+        if heartbeat_interval_ms > 0 && last_emit.elapsed() >= heartbeat {
+            let heartbeat_record = watch_heartbeat_record(now_ms_i64());
+            let encoded = serialize_ipc_json_bounded(&heartbeat_record, max_message_size)?;
+            if write_ipc_line_with_deadline(cx, writer, io_timeout, max_message_size, &encoded)
                 .await
+                .is_err()
             {
-                // Idle heartbeat tick (or cx-cancel surfaced as a timeout
-                // error). Re-check cancellation before emitting so a cancelled
-                // watcher doesn't loop forever writing heartbeats.
-                Err(_) => {
-                    if cx.checkpoint().is_err() {
-                        return Ok(());
-                    }
-                    watch_heartbeat_record(now_ms_i64())
-                }
-                Ok(Some(StreamItem::Event(event))) => match subscribe_event_record(
-                    &event,
-                    pane,
-                    severity.as_deref(),
-                    rule_glob.as_deref(),
-                ) {
-                    Some(record) => record,
-                    None => continue,
-                },
-                // Fell behind the bounded broadcast buffer: emit an explicit
-                // gap record (ft-7h5da.4.2, no-silent-gaps) so the follower
-                // re-baselines the missed (but still persisted) events via the
-                // DB cursor — at-least-once, never a silent drop.
-                Ok(Some(StreamItem::Gap { missed_count })) => watch_lag_gap_record(missed_count),
-                // Channel closed or cx cancelled.
-                Ok(None) => return Ok(()),
+                return Ok(());
             }
+            last_emit = Instant::now();
+        }
+
+        let idle_budget = if heartbeat_interval_ms > 0 {
+            heartbeat.saturating_sub(last_emit.elapsed())
         } else {
-            match stream.next_item_cx(cx).await {
-                Some(StreamItem::Event(event)) => match subscribe_event_record(
+            Duration::from_millis(250)
+        };
+        let mut acknowledge = None;
+        let mut terminal = false;
+        let record = match stream.next_item_cx(cx, idle_budget).await {
+            Ok(Some(DurableStreamItem::Stored(event))) => {
+                acknowledge = Some(event.id);
+                let epoch = &stream.cursor().expect("stored row has a cursor").epoch;
+                match subscribe_stored_event_record(
                     &event,
+                    epoch,
                     pane,
                     severity.as_deref(),
                     rule_glob.as_deref(),
                 ) {
                     Some(record) => record,
-                    None => continue,
-                },
-                Some(StreamItem::Gap { missed_count }) => watch_lag_gap_record(missed_count),
-                None => return Ok(()),
+                    None => {
+                        stream.acknowledge(event.id).map_err(std::io::Error::other)?;
+                        continue;
+                    }
+                }
+            }
+            Ok(Some(DurableStreamItem::Live(event))) => match subscribe_event_record(
+                &event,
+                pane,
+                severity.as_deref(),
+                rule_glob.as_deref(),
+            ) {
+                Some(record) => record,
+                None => continue,
+            },
+            Ok(Some(DurableStreamItem::Gap { missed_count })) => watch_lag_gap_record(missed_count),
+            Ok(Some(DurableStreamItem::Checkpoint(cursor))) => serde_json::json!({
+                "type": "cursor_checkpoint",
+                "cursor": cursor.after_id,
+                "cursor_epoch": cursor.epoch,
+                "reason": "fresh_tail_baseline",
+            }),
+            Ok(Some(DurableStreamItem::Idle)) => {
+                if heartbeat_interval_ms == 0 || last_emit.elapsed() < heartbeat {
+                    continue;
+                }
+                watch_heartbeat_record(now_ms_i64())
+            }
+            Ok(None) | Err(DurableStreamError::Cancelled) => return Ok(()),
+            Err(error) => {
+                terminal = true;
+                let code = if matches!(error, DurableStreamError::CursorExpired(_)) {
+                    "ipc.event_stream.cursor_expired"
+                } else {
+                    "ipc.event_stream.storage_unavailable"
+                };
+                tracing::warn!(
+                    code,
+                    "durable IPC event stream stopped before cursor advancement"
+                );
+                serde_json::json!({
+                    "type": "error",
+                    "code": code,
+                    "terminal": true,
+                    "cursor": stream.cursor().map(|cursor| cursor.after_id),
+                    "cursor_epoch": stream.cursor().map(|cursor| cursor.epoch.as_str()),
+                })
             }
         };
 
@@ -2857,6 +2997,13 @@ where
             .await
             .is_err()
         {
+            return Ok(());
+        }
+        if let Some(event_id) = acknowledge {
+            stream.acknowledge(event_id).map_err(std::io::Error::other)?;
+        }
+        last_emit = Instant::now();
+        if terminal {
             return Ok(());
         }
     }
@@ -3927,8 +4074,8 @@ impl IpcEventStream {
 impl IpcClient {
     /// ft-7h5da.4.1: open a live NDJSON event subscription over IPC. Connects
     /// to the watcher socket, sends a `SubscribeEvents` request, and returns a
-    /// stream of NDJSON lines the watcher pushes as it detects events (each
-    /// carrying `cursor = <storage event id>`). This is the low-latency
+    /// stream beginning with a fresh-tail cursor checkpoint, followed by
+    /// ordered durable rows and best-effort lifecycle signals. This is the low-latency
     /// transport for `ft robot watch-events --follow`; when the watcher is down
     /// (socket missing / connect fails) the caller transparently falls back to
     /// storage-cursor tailing.
@@ -3940,6 +4087,31 @@ impl IpcClient {
     pub async fn subscribe_events_with_cx(
         &self,
         cx: &crate::cx::Cx,
+        pane: Option<u64>,
+        severity: Option<String>,
+        rule_id: Option<String>,
+        heartbeat_interval_ms: u64,
+    ) -> Result<IpcEventStream, UserVarError> {
+        self.subscribe_events_from_cursor_with_cx(
+            cx,
+            None,
+            pane,
+            severity,
+            rule_id,
+            heartbeat_interval_ms,
+        )
+        .await
+    }
+
+    /// Resume the ordered stream after an ID bound to its storage epoch.
+    ///
+    /// A fresh subscription first emits a cursor_checkpoint baseline. Stored
+    /// rows are emitted in ID order; bus notifications are only wake hints.
+    /// An unavailable history terminates with an explicit cursor-expired error.
+    pub async fn subscribe_events_from_cursor_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        cursor: Option<crate::event_stream::DurableStreamCursor>,
         pane: Option<u64>,
         severity: Option<String>,
         rule_id: Option<String>,
@@ -3984,6 +4156,8 @@ impl IpcClient {
             token: self.auth_token.clone(),
             request_id: None,
             request: IpcRequest::SubscribeEvents {
+                version: IPC_EVENT_STREAM_VERSION,
+                cursor,
                 pane,
                 severity,
                 rule_id,
@@ -4261,6 +4435,8 @@ mod tests {
     fn subscribe_events_required_scope_is_read() {
         // ft-7h5da.4.1: a live event subscription is a read-only surface.
         let req = IpcRequest::SubscribeEvents {
+            version: IPC_EVENT_STREAM_VERSION,
+            cursor: None,
             pane: Some(3),
             severity: Some("warning".into()),
             rule_id: Some("codex.*".into()),
@@ -4284,6 +4460,105 @@ mod tests {
             extracted: serde_json::json!({"k": "v"}),
             matched_text: matched.into(),
             span: (0, matched.len()),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_subscription_admission_rejects_unversioned_or_invalid_resume() {
+        use crate::event_stream::DurableStreamCursor;
+
+        let cursor = DurableStreamCursor {
+            after_id: 0,
+            epoch: "0123456789abcdef0123456789abcdef".to_string(),
+        };
+        assert!(validate_subscribe_events(IPC_EVENT_STREAM_VERSION, Some(&cursor), true).is_ok());
+        assert!(validate_subscribe_events(IPC_EVENT_STREAM_VERSION, None, true).is_ok());
+        for (version, available) in [(1, true), (IPC_EVENT_STREAM_VERSION, false)] {
+            let error = validate_subscribe_events(version, Some(&cursor), available).unwrap_err();
+            assert_eq!(
+                error.error_code.as_deref(),
+                Some("ipc.subscribe_events.unavailable")
+            );
+        }
+        for invalid in [
+            DurableStreamCursor {
+                after_id: -1,
+                ..cursor.clone()
+            },
+            DurableStreamCursor {
+                epoch: "short".to_string(),
+                ..cursor.clone()
+            },
+            DurableStreamCursor {
+                epoch: cursor.epoch.to_uppercase(),
+                ..cursor.clone()
+            },
+        ] {
+            let error =
+                validate_subscribe_events(IPC_EVENT_STREAM_VERSION, Some(&invalid), true).unwrap_err();
+            assert_eq!(
+                error.error_code.as_deref(),
+                Some("ipc.subscribe_events.invalid_cursor")
+            );
+        }
+        assert!(serde_json::from_value::<DurableStreamCursor>(serde_json::json!({
+            "after_id": 0,
+            "epoch": cursor.epoch,
+            "unknown": true,
+        }))
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stored_subscription_preserves_history_filters_and_redacts_nested_strings() {
+        let secret = "ghp_0123456789012345678901234567890123456789"; // ubs:ignore - synthetic redaction fixture, not a live credential.
+        let epoch = "0123456789abcdef0123456789abcdef";
+        let event = crate::storage::StoredEvent {
+            id: 42,
+            pane_id: 7,
+            rule_id: "codex.usage.reached".to_string(),
+            agent_type: "codex".to_string(),
+            event_type: "usage.reached".to_string(),
+            severity: "warning".to_string(),
+            confidence: 0.9,
+            extracted: Some(serde_json::json!({
+                "nested": [{"secret": secret, "count": 3}],
+                "ordinary": "keep this",
+            })),
+            matched_text: Some(format!("stored {secret}")),
+            segment_id: None,
+            detected_at: 1_700_000_000_123,
+            dedupe_key: None,
+            handled_at: Some(1_700_000_000_456),
+            handled_by_workflow_id: Some("workflow-1".to_string()),
+            handled_status: Some(format!("completed {secret}")),
+        };
+        let record = subscribe_stored_event_record(
+            &event,
+            epoch,
+            Some(7),
+            Some("WARNING"),
+            Some("codex.*"),
+        )
+        .expect("matching stored record");
+        assert_eq!(record["cursor"], 42);
+        assert_eq!(record["id"], 42);
+        assert_eq!(record["cursor_epoch"], epoch);
+        assert_eq!(record["detected_at"], 1_700_000_000_123_i64);
+        assert_eq!(record["handled"], true);
+        assert_eq!(record["extracted"]["nested"][0]["count"], 3);
+        assert_eq!(record["extracted"]["ordinary"], "keep this");
+        assert!(!serde_json::to_string(&record).unwrap().contains(secret));
+        assert!(event.matched_text.as_deref().unwrap().contains(secret));
+        assert_eq!(record.as_object().unwrap().len(), 15);
+        for (pane, severity, rule) in [
+            (Some(8), Some("warning"), Some("codex.*")),
+            (Some(7), Some("critical"), Some("codex.*")),
+            (Some(7), Some("warning"), Some("claude.*")),
+        ] {
+            assert!(subscribe_stored_event_record(&event, epoch, pane, severity, rule).is_none());
         }
     }
 

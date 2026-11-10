@@ -35479,6 +35479,7 @@ enum IpcRelayRecordType {
     Event,
     Heartbeat,
     Gap,
+    Checkpoint,
 }
 
 #[cfg(unix)]
@@ -35766,7 +35767,12 @@ fn ipc_event_cursor(value: &serde_json::Value) -> Result<Option<i64>, IpcRelayPr
         "handled",
         "handled_status",
     ];
-    if !json_object_has_exact_keys(value, &EVENT_KEYS) {
+    let durable_shape = value.as_object().is_some_and(|object| {
+        object.len() == EVENT_KEYS.len() + 1
+            && EVENT_KEYS.iter().all(|key| object.contains_key(*key))
+            && object.contains_key("cursor_epoch")
+    });
+    if !json_object_has_exact_keys(value, &EVENT_KEYS) && !durable_shape {
         return Err(IpcRelayProtocolFault::InvalidRecordShape);
     }
 
@@ -35783,10 +35789,11 @@ fn ipc_event_cursor(value: &serde_json::Value) -> Result<Option<i64>, IpcRelayPr
             .get("detected_at")
             .and_then(serde_json::Value::as_i64)
             .is_some_and(|timestamp| timestamp >= 0)
-        && value.get("handled").and_then(serde_json::Value::as_bool) == Some(false)
         && value
-            .get("handled_status")
-            .is_some_and(serde_json::Value::is_null)
+            .get("handled")
+            .and_then(serde_json::Value::as_bool)
+            .is_some()
+        && json_is_null_or_string(value.get("handled_status"))
         && json_is_null_or_string(value.get("matched_text"));
     if !common_shape_is_valid {
         return Err(IpcRelayProtocolFault::InvalidRecordShape);
@@ -35846,10 +35853,21 @@ fn ipc_event_cursor(value: &serde_json::Value) -> Result<Option<i64>, IpcRelayPr
         _ => false,
     };
 
+    let live_shape_is_valid = live_shape_is_valid
+        && !durable_shape
+        && value.get("handled").and_then(serde_json::Value::as_bool) == Some(false)
+        && value
+            .get("handled_status")
+            .is_some_and(serde_json::Value::is_null);
+
     // Live lifecycle records are identified by their cursorless/null-metadata
     // shape, not by globally reserving their event_type strings. User rule
     // packs may legally persist detections with either lifecycle-like name.
     let persisted_shape_is_valid = event_type.is_some_and(|event_type| !event_type.is_empty())
+        && value
+            .get("cursor_epoch")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(event_cursor_epoch_is_canonical)
         && pane_id_is_valid
         && value
             .get("rule_id")
@@ -35895,6 +35913,39 @@ fn json_object_has_exact_keys(value: &serde_json::Value, expected: &[&str]) -> b
 #[cfg(unix)]
 fn json_is_null_or_string(value: Option<&serde_json::Value>) -> bool {
     value.is_some_and(|value| value.is_null() || value.is_string())
+}
+
+/// Bind durable IPC records to the follower history before numeric deduplication.
+#[cfg(unix)]
+fn validate_ipc_cursor_epoch(
+    value: &serde_json::Value,
+    current_cursor_epoch: Option<&str>,
+) -> Result<(), IpcRelayProtocolFault> {
+    let epoch = value
+        .get("cursor_epoch")
+        .and_then(serde_json::Value::as_str)
+        .filter(|epoch| event_cursor_epoch_is_canonical(epoch))
+        .ok_or(IpcRelayProtocolFault::InvalidEventCursor)?;
+    if current_cursor_epoch.is_some_and(|expected| expected != epoch) {
+        return Err(IpcRelayProtocolFault::InvalidEventCursor);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_ipc_checkpoint_record(value: &serde_json::Value) -> Result<(), IpcRelayProtocolFault> {
+    const CHECKPOINT_KEYS: [&str; 4] = ["type", "cursor", "cursor_epoch", "reason"];
+    let valid = json_object_has_exact_keys(value, &CHECKPOINT_KEYS)
+        && value.get("type").and_then(serde_json::Value::as_str) == Some("cursor_checkpoint")
+        && value.get("reason").and_then(serde_json::Value::as_str) == Some("fresh_tail_baseline")
+        && value
+            .get("cursor")
+            .and_then(serde_json::Value::as_i64)
+            .is_some_and(|cursor| cursor >= 0);
+    if !valid {
+        return Err(IpcRelayProtocolFault::InvalidRecordShape);
+    }
+    validate_ipc_cursor_epoch(value, None)
 }
 
 #[cfg(unix)]
@@ -35968,6 +36019,7 @@ fn ipc_relay_record_type(
         Some("event") => Ok(IpcRelayRecordType::Event),
         Some("heartbeat") => Ok(IpcRelayRecordType::Heartbeat),
         Some("gap") => Ok(IpcRelayRecordType::Gap),
+        Some("cursor_checkpoint") => Ok(IpcRelayRecordType::Checkpoint),
         Some(_) | None => Err(IpcRelayProtocolFault::UnknownRecordType),
     }
 }
@@ -36008,14 +36060,18 @@ async fn relay_ipc_event_line(
                 Ok(cursor) => cursor,
                 Err(fault) => return Ok(IpcRelayAction::ProtocolFault(fault)),
             };
+            if cursor.is_some() {
+                if let Err(fault) = validate_ipc_cursor_epoch(&value, current_cursor_epoch) {
+                    return Ok(IpcRelayAction::ProtocolFault(fault));
+                }
+            }
             if ipc_event_is_duplicate(cursor, current_cursor) {
                 return Ok(IpcRelayAction::Skipped); // already emitted via DB drain
             }
             if cursor.is_some() {
-                // EventBus publication can be out of SQLite-id order, and a
-                // dedupe conflict can pair a current detection payload with an
-                // older stored id. The in-memory record is therefore only a
-                // wakeup; the outer DB drain fetches the exact StoredEvent.
+                // The server drains storage too, but this follower owns its
+                // claims, filters, and output boundary. Keep its independent
+                // ordered StoredEvent drain authoritative.
                 return Ok(IpcRelayAction::DurableWakeup);
             }
             // Cursorless lifecycle signals are emitted directly and still
@@ -36105,6 +36161,16 @@ async fn relay_ipc_event_line(
             note_watch_output_emitted(last_emit);
             Ok(IpcRelayAction::Resync)
         }
+        IpcRelayRecordType::Checkpoint => {
+            if let Err(fault) = validate_ipc_checkpoint_record(&value)
+                .and_then(|()| validate_ipc_cursor_epoch(&value, current_cursor_epoch))
+            {
+                return Ok(IpcRelayAction::ProtocolFault(fault));
+            }
+            // A server's fresh-tail baseline is useful to direct clients, but
+            // cannot skip rows or advance this follower's independent cursor.
+            Ok(IpcRelayAction::DurableWakeup)
+        }
     }
 }
 
@@ -36142,6 +36208,7 @@ mod watch_events_tests {
         serde_json::json!({
             "type": "event",
             "cursor": id,
+            "cursor_epoch": TEST_CURSOR_EPOCH,
             "id": id,
             "pane_id": 7,
             "rule_id": "codex.usage",
@@ -38928,7 +38995,7 @@ mod watch_events_tests {
         let mut extra_field = ipc_persisted_event(9);
         extra_field["future_field"] = serde_json::json!(true);
         let mut handled = ipc_persisted_event(9);
-        handled["handled"] = serde_json::json!(true);
+        handled["handled"] = serde_json::json!("true");
         let mut invalid_severity = ipc_persisted_event(9);
         invalid_severity["severity"] = serde_json::json!("future-severity");
         let mut malformed_live = ipc_live_event("pane_discovered");
@@ -38953,6 +39020,16 @@ mod watch_events_tests {
     #[test]
     fn ipc_relay_protocol_accepts_persisted_and_declared_live_only_cursors() {
         assert_eq!(ipc_event_cursor(&ipc_persisted_event(1)), Ok(Some(1)));
+        let mut handled_event = ipc_persisted_event(4);
+        handled_event["handled"] = serde_json::json!(true);
+        handled_event["handled_status"] = serde_json::json!("completed");
+        assert_eq!(ipc_event_cursor(&handled_event), Ok(Some(4)));
+        let mut handled_live = ipc_live_event("pane_disappeared");
+        handled_live["handled"] = serde_json::json!(true);
+        assert_eq!(
+            ipc_event_cursor(&handled_live),
+            Err(IpcRelayProtocolFault::InvalidRecordShape)
+        );
         let mut error_event = ipc_persisted_event(3);
         error_event["severity"] = serde_json::json!("error");
         assert_eq!(
@@ -39028,6 +39105,102 @@ mod watch_events_tests {
             }
             assert_eq!(cursor, event_ids.last().copied());
             storage.shutdown().await.expect("shutdown wakeup fixture");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ipc_relay_checkpoint_wakes_storage_without_advancing_follower_cursor() {
+        run_watch_claim_async(async {
+            let cx = frankenterm_core::cx::for_testing();
+            let stdout = std::io::stdout();
+            let cursor = Some(7);
+            let mut last_event_emit = None;
+            let mut last_emit = std::time::Instant::now();
+            let before = last_emit;
+            let checkpoint = serde_json::json!({
+                "type": "cursor_checkpoint",
+                "cursor": 999,
+                "cursor_epoch": TEST_CURSOR_EPOCH,
+                "reason": "fresh_tail_baseline",
+            });
+            assert_eq!(validate_ipc_checkpoint_record(&checkpoint), Ok(()));
+            let action = relay_ipc_event_line(
+                &cx,
+                &stdout,
+                &checkpoint.to_string(),
+                cursor,
+                Some(TEST_CURSOR_EPOCH),
+                Some(TEST_CURSOR_SCOPE),
+                None,
+                &mut last_event_emit,
+                0,
+                std::time::Duration::ZERO,
+                &mut last_emit,
+            )
+            .await
+            .unwrap();
+            assert_eq!(action, IpcRelayAction::DurableWakeup);
+            assert_eq!(cursor, Some(7));
+            assert_eq!(last_event_emit, None);
+            assert_eq!(last_emit, before, "private baseline must emit no public row");
+
+            for (key, value) in [
+                ("cursor", serde_json::json!(-1)),
+                ("reason", serde_json::json!("unknown")),
+                ("extra", serde_json::json!(true)),
+            ] {
+                let mut invalid = checkpoint.clone();
+                invalid[key] = value;
+                assert_eq!(
+                    validate_ipc_checkpoint_record(&invalid),
+                    Err(IpcRelayProtocolFault::InvalidRecordShape)
+                );
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ipc_relay_rejects_wrong_history_before_numeric_duplicate_checks() {
+        run_watch_claim_async(async {
+            let cx = frankenterm_core::cx::for_testing();
+            let stdout = std::io::stdout();
+            let mut last_event_emit = None;
+            let mut last_emit = std::time::Instant::now();
+            let before = last_emit;
+            let checkpoint = serde_json::json!({
+                "type": "cursor_checkpoint",
+                "cursor": 1,
+                "cursor_epoch": TEST_CURSOR_EPOCH,
+                "reason": "fresh_tail_baseline",
+            });
+            for mut record in [ipc_persisted_event(1), checkpoint] {
+                record["cursor_epoch"] =
+                    serde_json::json!("fedcba9876543210fedcba9876543210");
+                let action = relay_ipc_event_line(
+                    &cx,
+                    &stdout,
+                    &record.to_string(),
+                    Some(42),
+                    Some(TEST_CURSOR_EPOCH),
+                    Some(TEST_CURSOR_SCOPE),
+                    None,
+                    &mut last_event_emit,
+                    0,
+                    std::time::Duration::ZERO,
+                    &mut last_emit,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    action,
+                    IpcRelayAction::ProtocolFault(IpcRelayProtocolFault::InvalidEventCursor),
+                    "another history's lower ID must never count as an emitted duplicate"
+                );
+            }
+            assert_eq!(last_event_emit, None);
+            assert_eq!(last_emit, before);
         });
     }
 
@@ -48463,7 +48636,8 @@ async fn run_watcher(
                             watcher_control_handler,
                             Some(search_config),
                         )
-                        .with_semantic_source(wezterm_handle.clone());
+                        .with_semantic_source(wezterm_handle.clone())
+                        .with_event_storage(Arc::clone(&shared_storage));
                     let ipc_task = frankenterm_core::runtime_async::task::spawn(async move {
                         server
                             .run_with_handler_context_with_cx(
@@ -55780,8 +55954,16 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                             &layout.ipc_socket_path,
                                         );
                                         match client
-                                            .subscribe_events_with_cx(
+                                            .subscribe_events_from_cursor_with_cx(
                                                 &cx,
+                                                current_cursor.zip(current_cursor_epoch.clone()).map(
+                                                    |(after_id, epoch)| {
+                                                        frankenterm_core::event_stream::DurableStreamCursor {
+                                                            after_id,
+                                                            epoch,
+                                                        }
+                                                    },
+                                                ),
                                                 pane,
                                                 severity.clone(),
                                                 rule_id.clone(),
