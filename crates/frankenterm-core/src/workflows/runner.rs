@@ -533,6 +533,11 @@ pub enum WorkflowStartResult {
         /// The rule_id from the detection
         rule_id: String,
     },
+    /// The durable event cannot authorize a fresh automatic execution.
+    TriggerRejected {
+        event_id: i64,
+        reason: crate::error::WorkflowTriggerRejection,
+    },
     /// The pane is already locked by another workflow
     PaneLocked {
         /// The pane that is locked
@@ -1193,8 +1198,14 @@ impl WorkflowRunner {
             Err(e) => {
                 // lock_guard drops here → release(pane_id, &execution_id).
                 drop(lock_guard);
-                WorkflowStartResult::Error {
-                    error: e.to_string(),
+                match e {
+                    crate::Error::Workflow(crate::error::WorkflowError::TriggerRejected {
+                        event_id,
+                        reason,
+                    }) => WorkflowStartResult::TriggerRejected { event_id, reason },
+                    error => WorkflowStartResult::Error {
+                        error: error.to_string(),
+                    },
                 }
             }
         }
@@ -3539,6 +3550,14 @@ impl WorkflowRunner {
                                     rule_id,
                                     explicit_cx = true,
                                     "No workflow handles detection (cx)"
+                                );
+                            }
+                            WorkflowStartResult::TriggerRejected { event_id, reason } => {
+                                tracing::debug!(
+                                    event_id,
+                                    reason = %reason,
+                                    explicit_cx = true,
+                                    "Stored detection did not authorize a new workflow (cx)"
                                 );
                             }
                             WorkflowStartResult::PaneLocked {
@@ -5914,6 +5933,194 @@ mod tests {
             },
             event_id: None,
         }
+    }
+
+    async fn persist_test_detection(
+        storage: &StorageHandle,
+        pane_id: u64,
+        detection: &crate::patterns::Detection,
+    ) -> i64 {
+        storage
+            .record_event(crate::storage::StoredEvent {
+                id: 0,
+                pane_id,
+                rule_id: detection.rule_id.clone(),
+                agent_type: detection.agent_type.to_string(),
+                event_type: detection.event_type.clone(),
+                severity: format!("{:?}", detection.severity).to_lowercase(),
+                confidence: detection.confidence,
+                extracted: Some(detection.extracted.clone()),
+                matched_text: Some(detection.matched_text.clone()),
+                segment_id: None,
+                detected_at: now_ms(),
+                dedupe_key: None,
+                handled_at: None,
+                handled_by_workflow_id: None,
+                handled_status: None,
+            })
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn persisted_trigger_replay_after_restart_does_not_repeat_completed_workflow() {
+        run_async_test(async {
+            let directory = tempfile::tempdir().unwrap();
+            let db_path = directory.path().join("trigger-replay.db");
+            let path = db_path.to_str().unwrap();
+            let (storage, runner, locks) = unlimited_gate_runner(path).await;
+            let probe = Arc::new(StartupIngressProbeWorkflow::new());
+            runner.register_workflow(probe.clone());
+            seed_test_pane(&storage, 78, now_ms()).await;
+            let detection = crate::patterns::Detection {
+                rule_id: "startup_ingress.trigger".to_string(),
+                ..unlimited_gate_detection()
+            };
+            let event_id = persist_test_detection(&storage, 78, &detection).await;
+            let cx = crate::cx::for_testing();
+            let first = runner
+                .handle_detection_with_cx(&cx, 78, &detection, Some(event_id))
+                .await;
+            let execution_id = first
+                .execution_id()
+                .expect("first trigger starts")
+                .to_string();
+            assert!(matches!(
+                runner
+                    .run_workflow_with_cx(&cx, 78, probe.clone(), &execution_id, 0)
+                    .await,
+                WorkflowExecutionResult::Completed { .. }
+            ));
+            assert_eq!(probe.executions.lock().unwrap().len(), 1);
+            assert_eq!(locks.active_count(), 0);
+            let original = storage.get_workflow(&execution_id).await.unwrap().unwrap();
+            let budget = storage
+                .get_workflow_budget_with_cx(&cx, &execution_id)
+                .await
+                .unwrap();
+            let events = storage
+                .get_events(crate::storage::EventQuery::default())
+                .await
+                .unwrap();
+            assert_eq!(events.len(), 1);
+            assert!(events[0].handled_at.is_some());
+            storage.shutdown().await.unwrap();
+            drop(runner);
+            drop(storage);
+
+            let (reopened, runner, locks) = unlimited_gate_runner(path).await;
+            runner.register_workflow(probe.clone());
+            let replay = runner
+                .handle_detection_with_cx(&cx, 78, &detection, Some(event_id))
+                .await;
+            assert!(matches!(
+                replay,
+                WorkflowStartResult::TriggerRejected {
+                    event_id: rejected_id,
+                    reason: crate::error::WorkflowTriggerRejection::AlreadyClaimed {
+                        execution_id: original_id,
+                    },
+                } if rejected_id == event_id && original_id == execution_id
+            ));
+            assert_eq!(probe.executions.lock().unwrap().len(), 1);
+            assert_eq!(
+                locks.active_count(),
+                0,
+                "rejected admission releases its pane lock"
+            );
+            assert_eq!(
+                serde_json::to_value(reopened.get_workflow(&execution_id).await.unwrap().unwrap())
+                    .unwrap(),
+                serde_json::to_value(original).unwrap(),
+            );
+            assert_eq!(
+                reopened
+                    .get_workflow_budget_with_cx(&cx, &execution_id)
+                    .await
+                    .unwrap(),
+                budget,
+            );
+            assert_eq!(
+                serde_json::to_value(
+                    reopened
+                        .get_events(crate::storage::EventQuery::default())
+                        .await
+                        .unwrap()
+                )
+                .unwrap(),
+                serde_json::to_value(events).unwrap(),
+                "replay cannot overwrite the original handling receipt",
+            );
+            reopened.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn persisted_trigger_competing_writers_admit_one_execution_without_handling_early() {
+        run_async_test(async {
+            let directory = tempfile::tempdir().unwrap();
+            let db_path = directory.path().join("trigger-race.db");
+            let path = db_path.to_str().unwrap();
+            let (left_storage, left, left_locks) = unlimited_gate_runner(path).await;
+            let (right_storage, right, right_locks) = unlimited_gate_runner(path).await;
+            let probe = Arc::new(StartupIngressProbeWorkflow::new());
+            left.register_workflow(probe.clone());
+            right.register_workflow(probe.clone());
+            seed_test_pane(&left_storage, 78, now_ms()).await;
+            let detection = crate::patterns::Detection {
+                rule_id: "startup_ingress.trigger".to_string(),
+                ..unlimited_gate_detection()
+            };
+            let event_id = persist_test_detection(&left_storage, 78, &detection).await;
+            let left_cx = crate::cx::for_testing();
+            let right_cx = crate::cx::for_testing();
+            let (left_result, right_result) = futures::join!(
+                left.handle_detection_with_cx(&left_cx, 78, &detection, Some(event_id)),
+                right.handle_detection_with_cx(&right_cx, 78, &detection, Some(event_id)),
+            );
+            let (winner, rejection, winner_runner) = if left_result.is_started() {
+                (&left_result, &right_result, &left)
+            } else {
+                (&right_result, &left_result, &right)
+            };
+            let execution_id = winner.execution_id().expect("one writer must win");
+            assert!(
+                matches!(
+                    rejection,
+                    WorkflowStartResult::TriggerRejected {
+                        event_id: rejected_id,
+                        reason: crate::error::WorkflowTriggerRejection::AlreadyClaimed {
+                            execution_id: original_id,
+                        },
+                    } if *rejected_id == event_id && original_id == execution_id
+                ),
+                "expected one typed duplicate, got {rejection:?}"
+            );
+            assert_eq!(left_locks.active_count() + right_locks.active_count(), 1);
+            let pending = left_storage.find_incomplete_workflows().await.unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].id, execution_id);
+            let unhandled = left_storage
+                .get_events(crate::storage::EventQuery {
+                    unhandled_only: true,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(unhandled.len(), 1, "admission is not an effect receipt");
+            assert_eq!(unhandled[0].id, event_id);
+
+            assert!(matches!(
+                winner_runner
+                    .run_workflow_with_cx(&left_cx, 78, probe.clone(), execution_id, 0)
+                    .await,
+                WorkflowExecutionResult::Completed { .. }
+            ));
+            assert_eq!(probe.executions.lock().unwrap().len(), 1);
+            assert_eq!(left_locks.active_count() + right_locks.active_count(), 0);
+            left_storage.shutdown().await.unwrap();
+            right_storage.shutdown().await.unwrap();
+        });
     }
 
     async fn seed_startup_recovery(runner: &WorkflowRunner) {

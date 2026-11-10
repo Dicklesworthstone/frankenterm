@@ -505,7 +505,9 @@ impl Error {
                     NetworkErrorKind::Permanent
                 }
             }
-            Self::Policy(_) => NetworkErrorKind::Degraded,
+            Self::Policy(_) | Self::Workflow(WorkflowError::TriggerRejected { .. }) => {
+                NetworkErrorKind::Degraded
+            }
             Self::Storage(
                 StorageError::ReservationConflict { .. }
                 | StorageError::LeaseOwnershipConflict { .. },
@@ -1463,6 +1465,23 @@ impl PatternError {
     }
 }
 
+/// A persisted detection did not authorize a new automatic workflow.
+///
+/// These are logical admission outcomes, not database failures. No workflow
+/// record, budget, or event-handled marker is written for a rejected trigger.
+#[derive(Error, Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "code", rename_all = "snake_case")]
+pub enum WorkflowTriggerRejection {
+    #[error("the stored event does not exist")]
+    MissingEvent,
+    #[error("the stored event belongs to a different pane")]
+    PaneMismatch,
+    #[error("the stored event has already been handled")]
+    AlreadyHandled,
+    #[error("the stored event already belongs to execution {execution_id}")]
+    AlreadyClaimed { execution_id: String },
+}
+
 /// Workflow-specific errors
 #[derive(Error, Debug)]
 pub enum WorkflowError {
@@ -1477,6 +1496,12 @@ pub enum WorkflowError {
 
     #[error("Pane locked by another workflow")]
     PaneLocked,
+
+    #[error("Workflow trigger {event_id} rejected: {reason}")]
+    TriggerRejected {
+        event_id: i64,
+        reason: WorkflowTriggerRejection,
+    },
 }
 
 impl WorkflowError {
@@ -1501,6 +1526,13 @@ impl WorkflowError {
                     .command("Status", "ft status")
                     .alternative("Avoid running multiple workflows on the same pane.")
             }
+            Self::TriggerRejected { .. } => Remediation::new(
+                "This persisted event does not authorize another workflow execution.",
+            )
+            .command("Inspect events", "ft robot events")
+            .alternative(
+                "Inspect the original event and workflow; replaying its notification cannot restart it.",
+            ),
         }
     }
 }

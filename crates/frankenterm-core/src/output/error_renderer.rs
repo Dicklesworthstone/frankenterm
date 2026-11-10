@@ -96,7 +96,7 @@ impl ErrorRenderer {
             Error::Workflow(e) => match e {
                 WorkflowError::NotFound(_) => "FT-5001",
                 WorkflowError::Aborted(_) => "FT-5010",
-                WorkflowError::GuardFailed(_) => "FT-5020",
+                WorkflowError::GuardFailed(_) | WorkflowError::TriggerRejected { .. } => "FT-5020",
                 WorkflowError::PaneLocked => "FT-5030",
             },
             Error::Config(e) => match e {

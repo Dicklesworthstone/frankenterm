@@ -240,6 +240,16 @@ impl MissionDispatcher {
                     dispatch_ms,
                 }
             }
+            WorkflowStartResult::TriggerRejected { event_id, reason } => DispatchResult {
+                assignment_id: assignment_id.to_string(),
+                target_agent: target_agent.to_string(),
+                accepted: false,
+                execution_id: None,
+                reason: Some(format!(
+                    "stored workflow trigger {event_id} rejected: {reason}"
+                )),
+                dispatch_ms,
+            },
             WorkflowStartResult::PaneLocked {
                 pane_id,
                 held_by_workflow,

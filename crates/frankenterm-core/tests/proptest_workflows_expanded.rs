@@ -148,6 +148,23 @@ fn arb_workflow_start_result() -> impl Strategy<Value = WorkflowStartResult> {
             }
         }),
         arb_step_id().prop_map(|rule_id| WorkflowStartResult::NoMatchingWorkflow { rule_id }),
+        (
+            1_i64..i64::MAX,
+            prop_oneof![
+                Just(frankenterm_core::error::WorkflowTriggerRejection::MissingEvent),
+                Just(frankenterm_core::error::WorkflowTriggerRejection::PaneMismatch),
+                Just(frankenterm_core::error::WorkflowTriggerRejection::AlreadyHandled),
+                arb_step_id().prop_map(|execution_id| {
+                    frankenterm_core::error::WorkflowTriggerRejection::AlreadyClaimed {
+                        execution_id,
+                    }
+                }),
+            ],
+        )
+            .prop_map(|(event_id, reason)| WorkflowStartResult::TriggerRejected {
+                event_id,
+                reason
+            }),
         (any::<u64>(), arb_short_text(), arb_step_id()).prop_map(
             |(pane_id, held_by_workflow, held_by_execution)| WorkflowStartResult::PaneLocked {
                 pane_id,
@@ -530,6 +547,9 @@ proptest! {
             WorkflowStartResult::Started { .. } => prop_assert_eq!(ty, "started"),
             WorkflowStartResult::NoMatchingWorkflow { .. } => {
                 prop_assert_eq!(ty, "no_matching_workflow");
+            }
+            WorkflowStartResult::TriggerRejected { .. } => {
+                prop_assert_eq!(ty, "trigger_rejected");
             }
             WorkflowStartResult::PaneLocked { .. } => prop_assert_eq!(ty, "pane_locked"),
             WorkflowStartResult::ConcurrencyLimitReached { .. } => {

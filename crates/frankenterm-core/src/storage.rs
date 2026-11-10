@@ -7740,6 +7740,8 @@ impl StorageHandle {
 
     /// Create an execution identity exactly once. Unlike progress upserts, a
     /// duplicate start must not overwrite a running or terminal execution.
+    /// A persisted trigger may admit only one automatic workflow, even when a
+    /// replay supplies a different execution ID or workflow selection.
     pub async fn create_workflow_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -22741,6 +22743,60 @@ fn create_workflow_backend(backend: &dyn StorageBackend, workflow: &WorkflowReco
         WriterTransactionBeginMode::Immediate,
         "create workflow execution",
         || {
+            if let Some(event_id) = workflow.trigger_event_id {
+                use crate::error::{WorkflowError, WorkflowTriggerRejection};
+
+                let rejected = |reason| WorkflowError::TriggerRejected { event_id, reason };
+                if event_id <= 0 {
+                    return Err(rejected(WorkflowTriggerRejection::MissingEvent).into());
+                }
+                let event = backend
+                    .query_row_typed(
+                        "SELECT pane_id, handled_at FROM events WHERE id = ?1",
+                        &[ToSqlValue::Integer(event_id)],
+                    )
+                    .map_err(|error| storage_backend_error("Read workflow trigger", error))?
+                    .ok_or_else(|| rejected(WorkflowTriggerRejection::MissingEvent))?;
+                let event = RowReader::new(&event);
+                let source_pane = event
+                    .i64(0)
+                    .map_err(|error| storage_backend_error("Workflow trigger pane", error))?;
+                if source_pane != u64_to_i64(workflow.pane_id, "pane_id")? {
+                    return Err(rejected(WorkflowTriggerRejection::PaneMismatch).into());
+                }
+
+                // The runner selects the first matching enabled workflow. A
+                // stored event therefore owns one execution, independently of
+                // random execution IDs or configuration changes on replay.
+                // Keep the check and insertion under the same writer lock;
+                // another process must not admit a second owner between them.
+                let owner = backend
+                    .query_row_typed(
+                        "SELECT id FROM workflow_executions
+                         WHERE trigger_event_id = ?1 LIMIT 1",
+                        &[ToSqlValue::Integer(event_id)],
+                    )
+                    .map_err(|error| storage_backend_error("Read workflow trigger owner", error))?;
+                if let Some(owner) = owner {
+                    let execution_id = RowReader::new(&owner)
+                        .string(0)
+                        .map_err(|error| storage_backend_error("Workflow trigger owner", error))?;
+                    return Err(rejected(WorkflowTriggerRejection::AlreadyClaimed {
+                        execution_id,
+                    })
+                    .into());
+                }
+                if event
+                    .optional_i64(1)
+                    .map_err(|error| {
+                        storage_backend_error("Workflow trigger handled state", error)
+                    })?
+                    .is_some()
+                {
+                    return Err(rejected(WorkflowTriggerRejection::AlreadyHandled).into());
+                }
+            }
+
             let existing = backend
                 .query_row_typed(
                     "SELECT id FROM workflow_executions WHERE id = ?1",
@@ -36303,6 +36359,18 @@ fn event_retention_protects_leases_and_detaches_workflow_provenance() {
         "workflow row survives with a NULL trigger link"
     );
     assert_eq!(count_events_backend(&backend).unwrap(), 1, "leased event survives");
+    let mut replay = query_workflow_backend(&backend, "workflow-1").unwrap().unwrap();
+    replay.id = "replay-after-retention".to_string();
+    replay.trigger_event_id = Some(workflow_id);
+    replay.status = "running".to_string();
+    assert!(matches!(
+        create_workflow_backend(&backend, &replay),
+        Err(crate::Error::Workflow(crate::error::WorkflowError::TriggerRejected {
+            event_id,
+            reason: crate::error::WorkflowTriggerRejection::MissingEvent,
+        })) if event_id == workflow_id
+    ), "detaching the historical trigger must not allow its old notification to start fresh work");
+    assert!(query_workflow_backend(&backend, &replay.id).unwrap().is_none());
     assert!(release_event_delivery_backend(&backend, leased_id, "owner").unwrap());
     assert_eq!(delete_events_before_backend(&backend, 100, 10).unwrap(), 1);
 }
@@ -36959,6 +37027,119 @@ fn workflow_start_duplicate_identity_preserves_existing_progress_and_terminal_ev
         assert_eq!(retained.started_at, 1_000);
         assert_eq!(retained.updated_at, 2_000);
     }
+}
+
+#[test]
+fn workflow_trigger_admits_one_owner_across_execution_ids_and_terminal_states() {
+    use crate::error::{WorkflowError, WorkflowTriggerRejection};
+
+    let backend = memory_backend();
+    seed_pane_backend(&backend, 1, 1_000);
+    for (index, status) in ["running", "waiting", "completed", "failed", "aborted"].into_iter().enumerate() {
+        let event_id = seed_retention_event_backend(&backend, 1, "warning", "trigger", 1_000 + i64::try_from(index).unwrap(), None);
+        let owner = WorkflowRecord {
+            id: format!("trigger-owner-{status}"),
+            workflow_name: "original".to_string(),
+            pane_id: 1,
+            trigger_event_id: Some(event_id),
+            current_step: 0,
+            status: "running".to_string(),
+            wait_condition: None,
+            context: Some(serde_json::json!({"original": true})),
+            result: None,
+            error: None,
+            started_at: 1_000,
+            updated_at: 1_000,
+            completed_at: None,
+        };
+        create_workflow_backend(&backend, &owner).unwrap();
+        let budget = WorkflowExecutionBudget::new(1_000, 1_000, 10_000, 2, 2.0).unwrap();
+        create_workflow_budget_backend(&backend, &owner.id, &budget).unwrap();
+        let mut original = owner;
+        original.current_step = 4;
+        original.status = status.to_string();
+        original.updated_at = 2_000;
+        upsert_workflow_backend(&backend, &original).unwrap();
+
+        let mut replay = original.clone();
+        replay.id = format!("different-execution-{status}");
+        replay.workflow_name = "new-config-first-match".to_string();
+        replay.current_step = 0;
+        replay.status = "running".to_string();
+        replay.started_at = 3_000;
+        replay.updated_at = 3_000;
+        assert!(matches!(
+            create_workflow_backend(&backend, &replay),
+            Err(crate::Error::Workflow(WorkflowError::TriggerRejected {
+                event_id: rejected_id,
+                reason: WorkflowTriggerRejection::AlreadyClaimed { execution_id },
+            })) if rejected_id == event_id && execution_id == original.id
+        ));
+        assert!(query_workflow_backend(&backend, &replay.id).unwrap().is_none());
+        assert!(query_workflow_budget_backend(&backend, &replay.id).unwrap().is_none());
+        assert_eq!(
+            serde_json::to_value(query_workflow_backend(&backend, &original.id).unwrap().unwrap()).unwrap(),
+            serde_json::to_value(&original).unwrap(),
+        );
+        assert_eq!(query_workflow_budget_backend(&backend, &original.id).unwrap(), Some(budget));
+        let row = backend.query_row_typed(
+            "SELECT handled_at FROM events WHERE id = ?1",
+            &[ToSqlValue::Integer(event_id)],
+        ).unwrap().unwrap();
+        assert!(RowReader::new(&row).optional_i64(0).unwrap().is_none(),
+            "duplicate admission must not mark the original trigger handled");
+    }
+}
+
+#[test]
+fn workflow_trigger_rejects_missing_foreign_and_handled_events_without_creating_execution() {
+    use crate::error::{WorkflowError, WorkflowTriggerRejection};
+
+    let backend = memory_backend();
+    seed_pane_backend(&backend, 1, 1_000);
+    seed_pane_backend(&backend, 2, 1_000);
+    let foreign = seed_retention_event_backend(&backend, 2, "warning", "foreign", 1_000, None);
+    let handled = seed_retention_event_backend(&backend, 1, "warning", "handled", 1_000, None);
+    mark_event_handled_backend(&backend, handled, None, "operator_handled").unwrap();
+    let template = WorkflowRecord {
+        id: "invalid-trigger".to_string(),
+        workflow_name: "probe".to_string(),
+        pane_id: 1,
+        trigger_event_id: None,
+        current_step: 0,
+        status: "running".to_string(),
+        wait_condition: None,
+        context: None,
+        result: None,
+        error: None,
+        started_at: 1_000,
+        updated_at: 1_000,
+        completed_at: None,
+    };
+    for (event_id, expected) in [
+        (-1, WorkflowTriggerRejection::MissingEvent),
+        (0, WorkflowTriggerRejection::MissingEvent),
+        (i64::MAX, WorkflowTriggerRejection::MissingEvent),
+        (foreign, WorkflowTriggerRejection::PaneMismatch),
+        (handled, WorkflowTriggerRejection::AlreadyHandled),
+    ] {
+        let mut workflow = template.clone();
+        workflow.trigger_event_id = Some(event_id);
+        match create_workflow_backend(&backend, &workflow) {
+            Err(crate::Error::Workflow(WorkflowError::TriggerRejected { event_id: rejected_id, reason })) => {
+                assert_eq!(rejected_id, event_id);
+                assert_eq!(reason, expected);
+            }
+            result => panic!("expected a typed trigger rejection, got {result:?}"),
+        }
+        assert!(query_workflow_backend(&backend, &workflow.id).unwrap().is_none());
+    }
+    // Manual workflows have no persisted trigger and remain independently
+    // invokable; deduplication is not a global workflow-name or pane lock.
+    create_workflow_backend(&backend, &template).unwrap();
+    let mut second_manual = template;
+    second_manual.id = "second-manual".to_string();
+    create_workflow_backend(&backend, &second_manual).unwrap();
 }
 
 #[test]
