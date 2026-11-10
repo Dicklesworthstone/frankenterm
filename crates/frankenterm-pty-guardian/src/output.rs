@@ -1,13 +1,15 @@
 //! Durable PTY-output and input-WAL ownership for the standalone guardian.
 //!
 //! The steady-state PTY-output path hands one bounded, zeroizing plaintext
-//! allocation to this fixed worker pool and receives only a content-free append
+//! allocation to this fixed worker pool and receives a content-free append
 //! receipt after the encrypted journal record and its filesystem identity have
-//! been synchronized and rechecked. Spawn preparation still performs bounded
-//! filesystem publication before the child is admitted. There is deliberately
-//! no plaintext getter or mux-delivery API here. The live-input worker owns the
-//! per-pane encrypted WAL through the transaction wrappers below; the sole Mio
-//! readiness loop never calls synchronous journal or PTY-write operations.
+//! been synchronized and rechecked. A direct PTY append that definitively wrote
+//! nothing for lack of space returns that same allocation for a bounded retry.
+//! Spawn preparation still performs bounded filesystem publication before the
+//! child is admitted. There is deliberately no plaintext getter or mux-delivery
+//! API here. The live-input worker owns the per-pane encrypted WAL through the
+//! transaction wrappers below; the sole Mio readiness loop never calls
+//! synchronous journal or PTY-write operations.
 
 use crate::transport::provision_guardian_token_in_pinned_parent;
 use hmac::{Hmac, KeyInit as _, Mac as _};
@@ -3723,6 +3725,19 @@ impl GuardianPaneOutputJournal {
             .unwrap()
             .path
             .clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn simulate_storage_full_appends_for_test(&self, count: u32) {
+        self.authority.lock().unwrap().storage_full_appends = count;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recovered_bytes_for_test(&self) -> Result<Vec<u8>, GuardianOutputError> {
+        let authority = self.authority.lock().map_err(|_| {
+            GuardianOutputError::FilesystemAuthority("guardian output authority was poisoned")
+        })?;
+        recover_all_segment_bytes(&authority)
     }
 
     pub(crate) fn receipt_is_current(&self, receipt: GuardianOutputAppendReceipt) -> bool {
@@ -10312,6 +10327,11 @@ pub struct GuardianOutputCompletion {
     pub(crate) payload_bytes: usize,
     pub(crate) result: Result<GuardianOutputAppendReceipt, GuardianOutputCommitFailure>,
     pub(crate) broker_ack: Option<GuardianDurableBrokerOutputAckV1>,
+    /// The same bounded allocation drained from a direct PTY, returned only
+    /// after a definitively uncommitted `StorageFull`. Broker records remain
+    /// unacknowledged at their source and never need a second retained copy.
+    /// No completion exposes plaintext after success or an ambiguous failure.
+    pub(crate) retry_payload: Option<Zeroizing<Vec<u8>>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -10975,10 +10995,22 @@ fn output_worker(
             },
             Err(_) => Err(OutputCommitError::JournalLockPoisoned),
         };
-        job.payload.zeroize();
-        drop(job.payload);
+        let mut retry_payload = if job.broker_delivery.is_none()
+            && result
+                .as_ref()
+                .is_err_and(OutputCommitError::is_storage_full)
+        {
+            Some(job.payload)
+        } else {
+            job.payload.zeroize();
+            drop(job.payload);
+            None
+        };
         if !queue.complete_one() {
             result = Err(OutputCommitError::QueueInvariant);
+            if let Some(mut payload) = retry_payload.take() {
+                payload.zeroize();
+            }
         }
         let broker_ack = match (&result, job.broker_delivery) {
             (Ok(receipt), Some(token)) if job.journal.receipt_is_current(*receipt) => {
@@ -11001,6 +11033,7 @@ fn output_worker(
                 }
             }),
             broker_ack,
+            retry_payload,
         };
         if completions.send(completion).is_err() {
             return;
@@ -26711,7 +26744,12 @@ mod tests {
                 zeroizing_test_bytes(b"must-not-commit"),
             )
             .map_err(|_| "output submission was unexpectedly rejected")?;
-        assert!(completion(&pipeline)?.result.is_err());
+        let completion = completion(&pipeline)?;
+        assert_eq!(
+            completion.result.err(),
+            Some(GuardianOutputCommitFailure::Failed)
+        );
+        assert!(completion.retry_payload.is_none());
         let authority = journal
             .authority
             .lock()
@@ -26951,21 +26989,32 @@ mod tests {
         let pipeline = GuardianOutputPipeline::open(&token_path, 1, waker)?;
         let pane_id = Uuid::new_v4();
         let journal = pipeline.prepare_pane(Uuid::new_v4(), pane_id)?;
-        journal
-            .authority
-            .lock()
-            .map_err(|_| "journal authority was poisoned")?
-            .storage_full_appends = 1;
+        journal.simulate_storage_full_appends_for_test(1);
 
+        let mut payload = Some(zeroizing_test_bytes(b"retried"));
         for expected_records in [0, 1] {
             pipeline
-                .try_submit(pane_id, journal.clone(), zeroizing_test_bytes(b"retried"))
+                .try_submit(
+                    pane_id,
+                    journal.clone(),
+                    payload.take().ok_or("missing retained output")?,
+                )
                 .map_err(|_| "output submission was unexpectedly rejected")?;
-            let result = completion(&pipeline)?.result;
+            let completed = completion(&pipeline)?;
             if expected_records == 0 {
-                assert_eq!(result.err(), Some(GuardianOutputCommitFailure::StorageFull));
+                assert_eq!(
+                    completed.result.err(),
+                    Some(GuardianOutputCommitFailure::StorageFull)
+                );
+                payload = completed.retry_payload;
+                assert_eq!(
+                    payload.as_deref().map(Vec::as_slice),
+                    Some(b"retried".as_slice())
+                );
+                assert!(completed.broker_ack.is_none());
             } else {
-                assert_eq!(result.map_err(|_| "retry failed")?.sequence(), 1);
+                assert_eq!(completed.result.map_err(|_| "retry failed")?.sequence(), 1);
+                assert!(completed.retry_payload.is_none());
             }
             let authority = journal
                 .authority

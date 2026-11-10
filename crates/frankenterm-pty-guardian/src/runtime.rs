@@ -141,7 +141,7 @@ pub struct GuardianRuntimeCounters {
     pub broker_control_failures: u64,
     pub pty_read_failures: u64,
     pub output_commit_failures: u64,
-    /// Broker records whose commit found the disk full, to be read again.
+    /// Records whose commit found the disk full, retained or read again.
     pub output_storage_full_retries: u64,
     pub output_deregister_failures: u64,
     pub output_rearm_failures: u64,
@@ -154,6 +154,9 @@ pub struct GuardianRuntimeCounters {
 struct RuntimePaneOutput {
     journal: GuardianPaneOutputJournal,
     pending_plaintext: Option<Zeroizing<Vec<u8>>>,
+    /// A direct PTY's drained record remains charged to the output budget
+    /// while storage is full. No new read can overtake this retained record.
+    storage_retry_at: Option<Instant>,
     in_flight_bytes: usize,
     expected_sequence: Option<u64>,
     durable_plaintext_bytes: u64,
@@ -173,6 +176,7 @@ impl RuntimePaneOutput {
             max_append_bytes: journal.initial_append_bytes(),
             journal,
             pending_plaintext: None,
+            storage_retry_at: None,
             in_flight_bytes: 0,
             waiting_for_slot: false,
             waiting_for_capacity: false,
@@ -2071,15 +2075,21 @@ impl GuardianRuntime {
         self.pty_tokens.contains_key(&token)
     }
 
-    /// When the first broker pane whose last Read found no output may read
-    /// again; the service loop must wake by then. Only times after `now`: a
-    /// pane already due but not read waits on a busy connection or journal,
-    /// whose completion wakes the loop, and a past time would spin it.
+    /// When a broker pane may read again, or a direct PTY may retry its retained
+    /// record after storage pressure; the service loop must wake by then.
+    /// Only times after `now`: a pane already due waits on a busy connection
+    /// or journal, whose completion wakes the loop, and a past time would spin it.
     #[must_use]
     pub fn next_broker_read_retry(&self, now: Instant) -> Option<Instant> {
         self.starting_broker_panes
             .values()
             .filter_map(|pane| pane.read_retry_at)
+            .chain(
+                self.panes
+                    .values()
+                    .filter(|pane| !pane.output.failed)
+                    .filter_map(|pane| pane.output.storage_retry_at),
+            )
             .filter(|at| *at > now)
             .min()
     }
@@ -4243,9 +4253,10 @@ impl GuardianRuntime {
         self.resume_output_flow();
     }
 
-    /// Apply every content-free worker completion. The worker explicitly
-    /// zeroizes and drops the plaintext allocation before publishing one of
-    /// these completions, so reader rearming cannot precede plaintext disposal.
+    /// Apply worker completions. Successful and ambiguous-failure completions
+    /// carry no plaintext. A direct PTY's definitively uncommitted `StorageFull`
+    /// returns its same allocation, still charged to the output budget, until
+    /// the retained record commits and the reader can be rearmed.
     pub fn handle_output_completions(&mut self) {
         self.poll_broker_output();
         loop {
@@ -4258,7 +4269,8 @@ impl GuardianRuntime {
                             continue;
                         };
                         let valid = output.in_flight_bytes == completion.payload_bytes
-                            && pane.pending_ack.is_none();
+                            && pane.pending_ack.is_none()
+                            && completion.retry_payload.is_none();
                         let remaining = self
                             .buffered_output_bytes
                             .checked_sub(completion.payload_bytes);
@@ -4323,7 +4335,10 @@ impl GuardianRuntime {
                             self.counters.protocol_transition_failures.saturating_add(1);
                         continue;
                     };
-                    if pane.output.in_flight_bytes != completion.payload_bytes {
+                    if pane.output.in_flight_bytes != completion.payload_bytes
+                        || pane.output.pending_plaintext.is_some()
+                        || completion.broker_ack.is_some()
+                    {
                         pane.output.failed = true;
                         pane.output.waiting_for_slot = false;
                         self.counters.output_commit_failures =
@@ -4340,10 +4355,22 @@ impl GuardianRuntime {
                             self.counters.output_commit_failures.saturating_add(1);
                         continue;
                     };
-                    self.buffered_output_bytes = remaining_buffered_bytes;
                     pane.output.in_flight_bytes = 0;
-                    match completion.result {
-                        Ok(receipt)
+                    match (completion.result, completion.retry_payload) {
+                        (Err(GuardianOutputCommitFailure::StorageFull), Some(payload))
+                            if !pane.output.failed && payload.len() == completion.payload_bytes =>
+                        {
+                            pane.output.pending_plaintext = Some(payload);
+                            pane.output.storage_retry_at =
+                                Some(Instant::now() + OUTPUT_STORAGE_FULL_RETRY);
+                            pane.output.waiting_for_slot = true;
+                            self.counters.output_storage_full_retries =
+                                self.counters.output_storage_full_retries.saturating_add(1);
+                            // The same allocation remains owned, so neither
+                            // pane nor aggregate admission gains headroom.
+                            continue;
+                        }
+                        (Ok(receipt), None)
                             if pane.output.journal.receipt_is_current(receipt)
                                 && Some(receipt.sequence()) == pane.output.expected_sequence
                                 && usize::try_from(receipt.payload_bytes()).ok()
@@ -4378,13 +4405,15 @@ impl GuardianRuntime {
                                     self.counters.output_segment_exhaustions.saturating_add(1);
                             }
                         }
-                        Ok(_) | Err(_) => {
+                        _ => {
                             pane.output.failed = true;
                             pane.output.waiting_for_slot = false;
                             self.counters.output_commit_failures =
                                 self.counters.output_commit_failures.saturating_add(1);
                         }
                     }
+                    self.buffered_output_bytes = remaining_buffered_bytes;
+                    pane.output.storage_retry_at = None;
                 }
                 GuardianOutputCompletionState::Empty => break,
                 GuardianOutputCompletionState::Disconnected => {
@@ -4890,6 +4919,7 @@ impl GuardianRuntime {
         // Submit previously read plaintext before rearming any new producer.
         // Hash-map order is irrelevant to correctness: each pane has at most
         // one pending/in-flight record and its own journal sequence authority.
+        let now = Instant::now();
         for (pane_id, pane) in panes.iter_mut() {
             if output_pipeline.available_slots() == 0 {
                 break;
@@ -4897,7 +4927,9 @@ impl GuardianRuntime {
             // A deregistration failure is sticky, but bytes read before that
             // failure still must reach durable storage. Such a pane may drain
             // its one existing pending record; it can never be rearmed.
-            if pane.output.in_flight_bytes != 0 {
+            if pane.output.in_flight_bytes != 0
+                || pane.output.storage_retry_at.is_some_and(|at| at > now)
+            {
                 continue;
             }
             let Some(payload) = pane.output.pending_plaintext.take() else {
@@ -4907,6 +4939,7 @@ impl GuardianRuntime {
             match output_pipeline.try_submit(*pane_id, pane.output.journal.clone(), payload) {
                 Ok(()) => {
                     pane.output.in_flight_bytes = payload_bytes;
+                    pane.output.storage_retry_at = None;
                     pane.output.waiting_for_slot = false;
                 }
                 Err(GuardianOutputSubmitError::Saturated(payload)) => {
@@ -4925,6 +4958,7 @@ impl GuardianRuntime {
                             counters.protocol_transition_failures.saturating_add(1);
                     }
                     pane.output.failed = true;
+                    pane.output.storage_retry_at = None;
                     pane.output.waiting_for_slot = false;
                     counters.output_commit_failures =
                         counters.output_commit_failures.saturating_add(1);
@@ -8344,6 +8378,195 @@ mod tests {
 
         assert!(GuardianRuntimeConfig::new(2, 128, 257, 10).is_err());
         assert!(GuardianRuntimeConfig::new(2, usize::MAX, 1, 10).is_err());
+    }
+
+    fn direct_output_fixture(
+        runtime: &mut GuardianRuntime,
+        pane_id: Uuid,
+    ) -> (
+        std::os::unix::net::UnixStream,
+        Token,
+        GuardianPaneOutputJournal,
+    ) {
+        let spawn = successful_spawn_request(Uuid::new_v4(), pane_id, Uuid::new_v4());
+        assert_eq!(
+            runtime
+                .dispatch(&spawn)
+                .expect("spawn response")
+                .header()
+                .status,
+            GuardianResponseStatus::Success
+        );
+        let (reader, producer) = std::os::unix::net::UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let pane = runtime.panes.get_mut(&pane_id).unwrap();
+        deregister_reader(&runtime.registry, pane, &mut runtime.counters);
+        pane.reader = Box::new(reader);
+        assert!(register_reader(&runtime.registry, pane));
+        (producer, pane.token, pane.output.journal.clone())
+    }
+
+    fn drive_output_completions_until(
+        runtime: &mut GuardianRuntime,
+        done: impl Fn(&GuardianRuntime) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !done(runtime) {
+            runtime.handle_output_completions();
+            assert!(Instant::now() < deadline, "output completion timed out");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn direct_output_survives_storage_pressure_without_losing_final_bytes_or_blocking_a_peer() {
+        let (_directory, _poll, mut runtime) = runtime_with_limits(None, 2);
+        let pane_id = Uuid::from_u128(31);
+        let peer_id = Uuid::from_u128(41);
+        let (mut producer, token, journal) = direct_output_fixture(&mut runtime, pane_id);
+        let (mut peer_producer, peer_token, peer_journal) =
+            direct_output_fixture(&mut runtime, peer_id);
+        journal.simulate_storage_full_appends_for_test(2);
+
+        producer.write_all(b"first").unwrap();
+        runtime.handle_pty_ready(token);
+        drive_output_completions_until(&mut runtime, |runtime| {
+            let output = &runtime.panes[&pane_id].output;
+            output.pending_plaintext.is_some() || output.failed
+        });
+        let pane = &runtime.panes[&pane_id];
+        assert!(!pane.output.failed);
+        assert!(!pane.reader_registered);
+        assert!(!pane.output.is_quiescent());
+        assert_eq!(pane.output.expected_sequence, Some(1));
+        assert_eq!(pane.output.in_flight_bytes, 0);
+        assert_eq!(runtime.buffered_output_bytes, b"first".len());
+        assert_eq!(runtime.counters().output_storage_full_retries, 1);
+        assert!(journal.recovered_bytes_for_test().unwrap().is_empty());
+
+        // Hold the clock boundary while a second pane progresses: neither
+        // stale readiness nor a free worker slot may retry early or drain the
+        // first pane's final bytes into another allocation.
+        let retry_at = Instant::now() + Duration::from_secs(60);
+        runtime
+            .panes
+            .get_mut(&pane_id)
+            .unwrap()
+            .output
+            .storage_retry_at = Some(retry_at);
+        assert_eq!(
+            runtime.next_broker_read_retry(Instant::now()),
+            Some(retry_at)
+        );
+        assert_eq!(runtime.next_broker_read_retry(retry_at), None);
+        producer.write_all(b"-final").unwrap();
+        drop(producer);
+        for _ in 0..3 {
+            runtime.handle_pty_ready(token);
+            runtime.handle_output_completions();
+        }
+        let pane = &runtime.panes[&pane_id];
+        assert!(!pane.pty_eof_observed);
+        assert!(!pane.reader_registered);
+        assert_eq!(
+            pane.output.pending_plaintext.as_deref().map(Vec::as_slice),
+            Some(b"first".as_slice())
+        );
+        assert_eq!(runtime.buffered_output_bytes, b"first".len());
+        assert_eq!(runtime.counters().output_storage_full_retries, 1);
+
+        peer_producer.write_all(b"peer").unwrap();
+        runtime.handle_pty_ready(peer_token);
+        drive_output_completions_until(&mut runtime, |runtime| {
+            let output = &runtime.panes[&peer_id].output;
+            output.expected_sequence == Some(2) || output.failed
+        });
+        assert!(!runtime.panes[&peer_id].output.failed);
+        assert_eq!(peer_journal.recovered_bytes_for_test().unwrap(), b"peer");
+        assert_eq!(runtime.buffered_output_bytes, b"first".len());
+        assert_eq!(runtime.counters().output_storage_full_retries, 1);
+
+        // The same record encounters another full disk, without freeing its
+        // byte charge or advancing its sequence. Then space returns with no
+        // producer left to send another readiness notification.
+        runtime
+            .panes
+            .get_mut(&pane_id)
+            .unwrap()
+            .output
+            .storage_retry_at = Some(Instant::now());
+        drive_output_completions_until(&mut runtime, |runtime| {
+            runtime.counters().output_storage_full_retries == 2
+                || runtime.panes[&pane_id].output.failed
+        });
+        assert!(!runtime.panes[&pane_id].output.failed);
+        assert_eq!(runtime.buffered_output_bytes, b"first".len());
+        assert_eq!(runtime.panes[&pane_id].output.expected_sequence, Some(1));
+        assert!(journal.recovered_bytes_for_test().unwrap().is_empty());
+        runtime
+            .panes
+            .get_mut(&pane_id)
+            .unwrap()
+            .output
+            .storage_retry_at = Some(Instant::now());
+        drive_output_completions_until(&mut runtime, |runtime| {
+            let output = &runtime.panes[&pane_id].output;
+            output.expected_sequence == Some(2) || output.failed
+        });
+        assert!(!runtime.panes[&pane_id].output.failed);
+        assert!(runtime.panes[&pane_id].reader_registered);
+        assert_eq!(journal.recovered_bytes_for_test().unwrap(), b"first");
+        assert_eq!(runtime.buffered_output_bytes, 0);
+
+        runtime.handle_pty_ready(token);
+        drive_output_completions_until(&mut runtime, |runtime| {
+            let output = &runtime.panes[&pane_id].output;
+            output.expected_sequence == Some(3) || output.failed
+        });
+        runtime.handle_pty_ready(token);
+        let pane = &runtime.panes[&pane_id];
+        assert!(!pane.output.failed);
+        assert!(pane.pty_eof_observed);
+        assert!(pane.output.is_quiescent());
+        assert!(pane.output.storage_retry_at.is_none());
+        assert_eq!(journal.recovered_bytes_for_test().unwrap(), b"first-final");
+        assert_eq!(pane.output.durable_plaintext_bytes, 11);
+        assert_eq!(runtime.buffered_output_bytes, 0);
+        assert_eq!(runtime.counters().pty_records_durably_committed, 3);
+        assert_eq!(runtime.counters().output_commit_failures, 0);
+        assert_eq!(runtime.counters().output_storage_full_retries, 2);
+    }
+
+    #[test]
+    fn direct_output_authority_failure_never_becomes_a_storage_retry() {
+        let (directory, _poll, mut runtime) = runtime_with_output_record_limits(None);
+        let pane_id = Uuid::from_u128(31);
+        let (mut producer, token, journal) = direct_output_fixture(&mut runtime, pane_id);
+        std::fs::hard_link(
+            journal.current_segment_path_for_test(),
+            directory.join("changed-output-authority"),
+        )
+        .unwrap();
+
+        producer.write_all(b"uncommitted").unwrap();
+        runtime.handle_pty_ready(token);
+        drive_output_completions_until(&mut runtime, |runtime| {
+            runtime.panes[&pane_id].output.failed
+        });
+        producer.write_all(b"never-read").unwrap();
+        runtime.handle_pty_ready(token);
+        runtime.handle_output_completions();
+        runtime.refresh_output_capacity_after_checkpoint(pane_id);
+        let pane = &runtime.panes[&pane_id];
+        assert!(pane.output.failed);
+        assert!(!pane.reader_registered);
+        assert!(pane.output.pending_plaintext.is_none());
+        assert!(pane.output.storage_retry_at.is_none());
+        assert_eq!(pane.output.expected_sequence, Some(1));
+        assert_eq!(runtime.buffered_output_bytes, 0);
+        assert_eq!(runtime.counters().pty_records_durably_committed, 0);
+        assert_eq!(runtime.counters().output_commit_failures, 1);
+        assert_eq!(runtime.counters().output_storage_full_retries, 0);
     }
 
     #[test]
