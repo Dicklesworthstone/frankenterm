@@ -168,11 +168,11 @@ final class FixedQRCodeTests: XCTestCase {
     private struct DecoderCase { let name: String, text: String, pixelSide: Int }
 
     private func maximumProfileFrame() -> String {
-        // Conservative public-frame bound, including a 256-byte nominal part.
-        // Current FTAG padding produces <=255-byte parts, tested separately.
+        // A 32,765-byte final page has a 32,768-byte CBOR message and
+        // 256-byte nominal parts, attaining the conservative public bound.
         let part = URPart(sequence: UInt32.max, count: 128, messageLength: 32768,
                           checksum: UInt32.max, payload: Data(repeating: 255, count: 256))
-        return "FTQR1/" + String(repeating: "F", count: 32) + "/4194304/127-128/"
+        return "FTQR1/" + String(repeating: "F", count: 32) + "/4194301/127-128/"
             + String(repeating: "F", count: 64) + "/" + String(repeating: "F", count: 64)
             + "/UR:BYTES/4294967295-128/" + Bytewords.encode(part.encoded())
     }

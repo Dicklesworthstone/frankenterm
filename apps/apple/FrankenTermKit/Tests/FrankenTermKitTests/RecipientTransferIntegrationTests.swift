@@ -234,22 +234,17 @@ final class RecipientTransferIntegrationTests: XCTestCase {
         let sender = try OpticalSender(envelope: envelope, using: crypto)
         let first = try sender.frame(page: 0, sequence: 1, using: crypto)
         let prefix = first.split(separator: "/", maxSplits: 6).prefix(6).joined(separator: "/") + "/"
-        state = try await restore.observe(prefix + "UR:BYTES/AAAA", generation: state.generation)
         let rejectedGeneration = state.generation
         do {
-            _ = try await restore.selectCandidate(generation: rejectedGeneration, digest: sender.identity.envelopeDigest)
-            XCTFail("selected a malformed recipient response")
+            _ = try await restore.observe(prefix + "UR:BYTES/AAAA", generation: rejectedGeneration)
+            XCTFail("offered a malformed recipient response for selection")
         } catch { XCTAssertEqual(error as? FTError, .malformed("bytewords.extent")) }
         state = await restore.status()
         XCTAssertEqual(state.phase, .idle); XCTAssertNil(state.identity)
-        XCTAssertNotEqual(state.generation, rejectedGeneration)
-        XCTAssertEqual(state.recipientRequest, request, "Only the bad source is discarded, not the phone's private request.")
+        XCTAssertEqual(state.generation, rejectedGeneration)
+        XCTAssertEqual(state.recipientRequest, request, "An unreadable observation must not discard the phone's private request.")
         XCTAssertEqual(state.receivedParts, 0); XCTAssertNil(state.review)
         XCTAssertNil(persistence.bytes(.catalog)); XCTAssertEqual(vault.creates, 0)
-        do {
-            _ = try await restore.observe(first, generation: rejectedGeneration)
-            XCTFail("a queued response entered the retired selection generation")
-        } catch { XCTAssertEqual(error as? FTError, .stale) }
         state = try await restore.observe(first, generation: state.generation)
         state = try await restore.selectCandidate(generation: state.generation, digest: sender.identity.envelopeDigest)
         for sequence in 2...(try sender.sourcePartCount(page: 0)) {

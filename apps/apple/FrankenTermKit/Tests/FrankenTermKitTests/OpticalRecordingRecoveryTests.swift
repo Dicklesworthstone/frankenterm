@@ -79,6 +79,46 @@ final class OpticalRecordingRecoveryTests: XCTestCase {
         XCTAssertEqual(try recovery.envelope(using: crypto), bytes)
     }
 
+    func testCorruptInnerURFramesDoNotSelectASourceOrDiscardPartialRecording() async throws {
+        func corruptChecksum(_ text: String) -> String {
+            // Replace one valid Bytewords pair in the CRC, keeping the wrapper
+            // and alphabet intact while guaranteeing an incorrect checksum.
+            String(text.dropLast(2)) + (text.hasSuffix("AE") ? "AD" : "AE")
+        }
+        let bytes = try envelope(size: 40_000)
+        let sender = try OpticalSender(envelope: bytes, using: crypto)
+        let foreign = try OpticalSender(envelope: envelope(marker: 51), using: crypto)
+        let corruptForeign = corruptChecksum(try foreign.frame(page: 0, sequence: 1, using: crypto))
+        var recovery = OpticalRecordingRecovery()
+        let recording = try recovery.beginRecording()
+        try recovery.observe([corruptForeign], recording: recording, using: crypto)
+        XCTAssertNil(recovery.progress.identity)
+        XCTAssertEqual(recovery.progress.receivedParts, 0)
+        for sequence in 1...(try sender.sourcePartCount(page: 1)) {
+            try recovery.observe([
+                corruptForeign, sender.frame(page: 1, sequence: UInt32(sequence), using: crypto)
+            ], recording: recording, using: crypto)
+        }
+        for sequence in 1...7 {
+            try recovery.observe([sender.frame(page: 0, sequence: UInt32(sequence), using: crypto)],
+                                 recording: recording, using: crypto)
+        }
+        let before = recovery.progress
+        XCTAssertEqual(before.identity, sender.identity)
+        XCTAssertEqual(before.verifiedPages, 1)
+        XCTAssertEqual(before.receivedParts, try sender.sourcePartCount(page: 1) + 7)
+        let corrupt = corruptChecksum(try sender.frame(page: 0, sequence: 8, using: crypto))
+        try recovery.observe([corrupt, corruptForeign], recording: recording, using: crypto)
+        XCTAssertEqual(recovery.progress, before)
+        for sequence in 8...(try sender.sourcePartCount(page: 0)) {
+            try recovery.observe([sender.frame(page: 0, sequence: UInt32(sequence), using: crypto)],
+                                 recording: recording, using: crypto)
+        }
+        XCTAssertTrue(recovery.progress.isComplete)
+        recovery.endRecording(recording)
+        XCTAssertEqual(try recovery.envelope(using: crypto), bytes)
+    }
+
     func testSameFrameCompetingSourcesRejectBeforeSelectingEitherTransfer() async throws {
         let a = try OpticalSender(envelope: envelope(marker: 51), using: crypto)
         let b = try OpticalSender(envelope: envelope(marker: 52), using: crypto)

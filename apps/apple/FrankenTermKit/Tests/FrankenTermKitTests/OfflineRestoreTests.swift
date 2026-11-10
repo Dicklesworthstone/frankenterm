@@ -270,38 +270,35 @@ final class OfflineRestoreTests: XCTestCase {
         let part = try URPart(cbor: Bytewords.decode(ur[2]))
         let shortPart = URPart(sequence: part.sequence, count: part.count, messageLength: part.messageLength,
                                checksum: part.checksum, payload: Data(part.payload.dropLast()))
+        let noncanonicalPart = Data([0x85, 0x18, 0x01]) + Data(part.encoded().dropFirst(2))
         let malformed: [(String, FTError)] = [
             ("UR:BYTES/AAAA", .malformed("bytewords.extent")),
             ("UR:BYTES/2-\(part.count)/\(ur[2])", .malformed("ur.sequence_or_length")),
             ("UR:BYTES/1-\(part.count)/" + Bytewords.encode(shortPart.encoded()), .malformed("ur.fragment_geometry")),
-            ("UR:BYTES/" + Bytewords.encode(CBORWriter.bytes(Data([1]))), .checksum)
+            ("UR:BYTES/1-\(part.count)/" + Bytewords.encode(noncanonicalPart), .malformed("cbor.noncanonical")),
+            ("UR:BYTES/1-\(part.count)/" + Bytewords.encode(part.encoded() + Data([0])), .malformed("cbor.trailing")),
+            ("UR:BYTES/" + Bytewords.encode(CBORWriter.bytes(Data([1]))), .malformed("ur.single_extent"))
         ]
         for (invalid, expected) in malformed {
             let persistence = StoreTestPersistence(), vault = StoreTestVault(), network = WorkspaceNetworkActivity()
             let store = WorkspaceStore(persistence: persistence, vault: vault)
             let restore = OfflineRestore(using: crypto, store: store, networkActivity: network)
             var state = await restore.status()
-            state = try await restore.observe(prefix + invalid, generation: state.generation)
-            XCTAssertEqual(state.phase, .candidate)
             let rejectedGeneration = state.generation
             do {
-                _ = try await restore.selectCandidate(generation: rejectedGeneration, digest: sender.identity.envelopeDigest)
-                XCTFail("selected a malformed first symbol")
+                _ = try await restore.observe(prefix + invalid, generation: rejectedGeneration)
+                XCTFail("offered a malformed first symbol for selection")
             } catch { XCTAssertEqual(error as? FTError, expected) }
 
             state = await restore.status()
             XCTAssertEqual(state.phase, .idle, "The camera must be able to offer the next healthy frame.")
             XCTAssertNil(state.identity); XCTAssertNil(state.source); XCTAssertNil(state.encryptionMode)
-            XCTAssertNotEqual(state.generation, rejectedGeneration)
+            XCTAssertEqual(state.generation, rejectedGeneration, "Rejected observations must not retire healthy queued frames.")
             XCTAssertEqual(state.receivedParts, 0); XCTAssertEqual(state.verifiedBytes, 0)
             XCTAssertNil(state.review); XCTAssertNil(state.receipt)
             XCTAssertNil(persistence.bytes(.catalog)); XCTAssertEqual(vault.creates, 0)
             XCTAssertEqual(network.accounting().offlineRestores, 1)
             XCTAssertThrowsError(try network.beginConnection(), "A bad symbol cannot release offline exclusion.")
-            do {
-                _ = try await restore.observe(first, generation: rejectedGeneration)
-                XCTFail("a queued callback reselected the rejected source")
-            } catch { XCTAssertEqual(error as? FTError, .stale) }
 
             // The very next healthy observation works without Start Over,
             // including when it belongs to the same envelope as the bad part.

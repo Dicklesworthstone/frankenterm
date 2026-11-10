@@ -133,6 +133,56 @@ final class OpticalRecordingTests: XCTestCase {
         XCTAssertNil(state.receipt); XCTAssertNil(state.review)
     }
 
+    func testCorruptRecordingFramesPreserveProgressAndCameraCanFinishExactCiphertext() async throws {
+        func corruptChecksum(_ text: String) -> String {
+            String(text.dropLast(2)) + (text.hasSuffix("AE") ? "AD" : "AE")
+        }
+        let (restore, store, vault, network) = environment(), exported = try export()
+        let source = try OpticalSender(envelope: exported.envelope, using: crypto)
+        let foreign = try sender(transfer: 8)
+        let corruptForeign = corruptChecksum(try foreign.frame(page: 0, sequence: 1, using: crypto))
+        try await restore.enterOfflineMode()
+        var state = await restore.status()
+        state = try await restore.observeRecordingFrame([corruptForeign], generation: state.generation)
+        XCTAssertEqual(state.phase, .idle); XCTAssertNil(state.identity)
+        state = try await restore.observeRecordingFrame([
+            corruptForeign, source.frame(page: 0, sequence: 1, using: crypto)
+        ], generation: state.generation)
+        XCTAssertEqual(state.phase, .collecting); XCTAssertEqual(state.identity, source.identity)
+        for sequence in 2...7 {
+            state = try await restore.observeRecordingFrame([
+                source.frame(page: 0, sequence: UInt32(sequence), using: crypto)
+            ], generation: state.generation)
+        }
+        let before = state
+        let corrupt = corruptChecksum(try source.frame(page: 0, sequence: 8, using: crypto))
+        state = try await restore.observeRecordingFrame([corrupt, corruptForeign], generation: before.generation)
+        XCTAssertEqual(state.generation, before.generation)
+        XCTAssertEqual(state.phase, before.phase); XCTAssertEqual(state.identity, before.identity)
+        XCTAssertEqual(state.receivedParts, before.receivedParts)
+        XCTAssertEqual(state.verifiedPages, before.verifiedPages)
+        XCTAssertEqual(state.verifiedBytes, before.verifiedBytes)
+        for page in 0..<source.identity.pageCount {
+            for sequence in 1...(try source.sourcePartCount(page: page)) {
+                if page == 0 && sequence < 8 { continue }
+                state = try await restore.observe(source.frame(page: page, sequence: UInt32(sequence), using: crypto),
+                                                  generation: before.generation)
+            }
+        }
+        XCTAssertEqual(state.phase, .locked); XCTAssertEqual(state.identity, source.identity)
+        XCTAssertEqual(state.verifiedBytes, exported.envelope.count)
+        XCTAssertNil(state.review); XCTAssertNil(state.receipt)
+        let saved = try await restore.scanCheckpoint(generation: state.generation)
+        let checkpoint = try XCTUnwrap(saved)
+        let recovered = try OpticalReceiver(resuming: checkpoint, using: crypto)
+        XCTAssertEqual(try recovered.envelope(using: crypto), exported.envelope)
+        XCTAssertEqual(vault.creates, 0)
+        let workspaces = try await store.load()
+        XCTAssertTrue(workspaces.isEmpty)
+        XCTAssertThrowsError(try network.beginConnection())
+        XCTAssertEqual(network.accounting().connections, 0)
+    }
+
     func testRecordingNeverConsumesCodeOrInstallsEvenAfterCiphertextCompletionAndUnlock() async throws {
         let (restore, store, vault, network) = environment(), exported = try export()
         let source = try OpticalSender(envelope: exported.envelope, using: crypto)

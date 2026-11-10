@@ -288,6 +288,13 @@ public struct OpticalFrame: Sendable {
             return (CBORWriter.head(2, UInt64(length)).count + length + 255) / 256
         }
     }
+    /// Only syntactically valid, checksum-checked UR data can name a source.
+    /// Page hashes and the complete envelope are still checked by the receiver.
+    enum Payload: Sendable {
+        case single(Data)
+        case multipart(URPart)
+    }
+    let payload: Payload
     public let identity: Identity, pageIndex: Int, pageDigest: Data
     let ur: String
     public var expectedPageLength: Int { min(FTLimit.page, identity.envelopeLength - pageIndex * FTLimit.page) }
@@ -309,6 +316,27 @@ public struct OpticalFrame: Sendable {
         pageIndex = index; pageDigest = try hex(fields[5], length: 64)
         guard fields[6].hasPrefix("UR:BYTES/"), fields[6].utf8.allSatisfy({ !(97...122).contains($0) }) else { throw FTError.malformed("qr.ur") }
         ur = String(fields[6])
+        let parts = fields[6].split(separator: "/", omittingEmptySubsequences: false)
+        let expectedLength = min(FTLimit.page, length - index * FTLimit.page)
+        if parts.count == 2 {
+            let single = try Bytewords.decode(parts[1])
+            guard single.count <= 256 else { throw FTError.malformed("ur.single_extent") }
+            var reader = CBORReader(single)
+            let page = try reader.bytes(cap: FTLimit.page)
+            try reader.finish()
+            guard page.count == expectedLength else { throw FTError.malformed("ur.single_extent") }
+            payload = .single(single)
+        } else if parts.count == 3 {
+            let part = try URPart(cbor: Bytewords.decode(parts[2]))
+            let sequence = parts[1].split(separator: "-", omittingEmptySubsequences: false)
+            guard sequence.count == 2,
+                  try Self.decimal(sequence[0], maximum: Int(UInt32.max)) == part.sequence,
+                  try Self.decimal(sequence[1], maximum: 129) == part.count,
+                  part.messageLength == expectedLength + CBORWriter.head(2, UInt64(expectedLength)).count else {
+                throw FTError.malformed("ur.sequence_or_length")
+            }
+            payload = .multipart(part)
+        } else { throw FTError.malformed("ur.path") }
     }
     static func decimal(_ value: Substring, maximum: Int) throws -> Int {
         guard !value.isEmpty, value.utf8.count <= 10, (value == "0" || value.first != "0"),
@@ -517,23 +545,16 @@ public struct OpticalReceiver: Sendable {
         guard frame.identity == identity else { throw FTError.stale }
         if let previous = expectedDigests[frame.pageIndex], previous != frame.pageDigest { throw FTError.malformed("qr.changed_page_digest") }
         if verified[frame.pageIndex] != nil { return }
-        let parts = frame.ur.split(separator: "/", omittingEmptySubsequences: false)
         let message: Data?
-        if parts.count == 2 {
-            let single = try Bytewords.decode(parts[1])
-            guard single.count <= 256 else { throw FTError.malformed("ur.single_extent") }
+        switch frame.payload {
+        case .single(let single):
             message = single
-        } else if parts.count == 3 {
-            let part = try URPart(cbor: Bytewords.decode(parts[2]))
-            let sequence = parts[1].split(separator: "-", omittingEmptySubsequences: false)
-            guard sequence.count == 2, try OpticalFrame.decimal(sequence[0], maximum: Int(UInt32.max)) == part.sequence,
-                  try OpticalFrame.decimal(sequence[1], maximum: 129) == part.count,
-                  part.messageLength == frame.expectedPageLength + CBORWriter.head(2, UInt64(frame.expectedPageLength)).count else { throw FTError.malformed("ur.sequence_or_length") }
+        case .multipart(let part):
             var decoder = decoders[frame.pageIndex] ?? URPageDecoder(part: part)
             do { message = try decoder.receive(part, using: crypto) }
             catch { resetIncompletePage(frame.pageIndex); throw error }
             decoders[frame.pageIndex] = decoder
-        } else { throw FTError.malformed("ur.path") }
+        }
         expectedDigests[frame.pageIndex] = frame.pageDigest
         guard let message else { return }
         do {
