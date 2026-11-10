@@ -16,6 +16,7 @@ pub(crate) const ORDERED_WINDOW_SECTION_V1_NEWTYPE: &str =
     "frankenterm.codec.OrderedWindowSectionV1";
 pub(crate) const ORDERED_PANE_TREE_DESCRIPTORS_V1_NEWTYPE: &str =
     "frankenterm.codec.OrderedPaneTreeDescriptorsV1";
+pub(crate) const NATIVE_PANE_TREES_NEWTYPE: &str = "frankenterm.codec.NativePaneTrees";
 pub(crate) const ORDERED_PANE_NODES_V1_NEWTYPE: &str = "frankenterm.codec.OrderedPaneNodesV1";
 pub(crate) const ORDERED_PANE_WINDOW_TITLES_V1_NEWTYPE: &str =
     "frankenterm.codec.OrderedPaneWindowTitlesV1";
@@ -102,6 +103,12 @@ impl ContainerAdmission {
         label: "ordered pane tree descriptors",
         maximum: ORDERED_PANE_TREE_DESCRIPTORS_V1_MAX_ITEMS,
         preallocation_maximum: ORDERED_PANE_TREE_DESCRIPTORS_V1_MAX_ITEMS,
+    };
+
+    const NATIVE_PANE_TREES: Self = Self {
+        label: "native pane trees",
+        maximum: super::MAX_ORDERED_TABS_PER_SNAPSHOT,
+        preallocation_maximum: super::MAX_ORDERED_TABS_PER_SNAPSHOT,
     };
 
     const ORDERED_PANE_NODES: Self = Self {
@@ -545,6 +552,8 @@ impl<'de, 'a, 'b, R: Read> serde::Deserializer<'de> for &'a mut Deserializer<'b,
         };
         let requested_container = if name == ORDERED_PANE_TREE_DESCRIPTORS_V1_NEWTYPE {
             Some(ContainerAdmission::ORDERED_PANE_TREE_DESCRIPTORS)
+        } else if name == NATIVE_PANE_TREES_NEWTYPE {
+            Some(ContainerAdmission::NATIVE_PANE_TREES)
         } else if name == ORDERED_PANE_NODES_V1_NEWTYPE {
             Some(ContainerAdmission::ORDERED_PANE_NODES)
         } else if name == ORDERED_PANE_WINDOW_TITLES_V1_NEWTYPE {

@@ -13469,8 +13469,370 @@ fn validate_floating_pane_snapshot(
     Ok(())
 }
 
+/// Resource refusal for the recursive pane trees carried by native PDU4 and
+/// PDU82. These bounds match the existing legacy-v46 decoder and ordered-pane
+/// snapshot limits; they do not change the representation of an admitted tree.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum PaneTreeBoundsError {
+    #[error("pane snapshot has {count} tab trees; maximum is {max}")]
+    TooManyTrees { count: usize, max: usize },
+    #[error("pane tree {tree_index} has {count} {resource}; maximum is {max}")]
+    TreeLimit {
+        tree_index: usize,
+        resource: &'static str,
+        count: usize,
+        max: usize,
+    },
+    #[error("pane snapshot has {count} {resource}; maximum is {max}")]
+    SnapshotLimit {
+        resource: &'static str,
+        count: usize,
+        max: usize,
+    },
+    #[error("pane-tree allocation failed within admitted bounds")]
+    Allocation,
+}
+
+#[derive(Debug, Default)]
+struct NativePaneTreeBudget {
+    tree_nodes: usize,
+    tree_leaves: usize,
+    total_nodes: usize,
+    total_leaves: usize,
+}
+
+impl NativePaneTreeBudget {
+    fn begin_tree(&mut self) {
+        self.tree_nodes = 0;
+        self.tree_leaves = 0;
+    }
+
+    fn admit_node(&mut self, tree_index: usize, depth: usize) -> Result<(), PaneTreeBoundsError> {
+        if tree_index >= MAX_ORDERED_TABS_PER_SNAPSHOT {
+            return Err(PaneTreeBoundsError::TooManyTrees {
+                count: tree_index.saturating_add(1),
+                max: MAX_ORDERED_TABS_PER_SNAPSHOT,
+            });
+        }
+        Self::admit_depth(tree_index, depth)?;
+        let tree_nodes = self.tree_nodes.saturating_add(1);
+        if tree_nodes > MAX_ORDERED_PANE_NODES_PER_TREE {
+            return Err(PaneTreeBoundsError::TreeLimit {
+                tree_index,
+                resource: "nodes",
+                count: tree_nodes,
+                max: MAX_ORDERED_PANE_NODES_PER_TREE,
+            });
+        }
+        let total_nodes = self.total_nodes.saturating_add(1);
+        if total_nodes > MAX_ORDERED_PANE_NODES_PER_SNAPSHOT {
+            return Err(PaneTreeBoundsError::SnapshotLimit {
+                resource: "nodes",
+                count: total_nodes,
+                max: MAX_ORDERED_PANE_NODES_PER_SNAPSHOT,
+            });
+        }
+        self.tree_nodes = tree_nodes;
+        self.total_nodes = total_nodes;
+        Ok(())
+    }
+
+    fn admit_depth(tree_index: usize, depth: usize) -> Result<(), PaneTreeBoundsError> {
+        if depth > MAX_ORDERED_PANE_TREE_DEPTH {
+            return Err(PaneTreeBoundsError::TreeLimit {
+                tree_index,
+                resource: "levels",
+                count: depth,
+                max: MAX_ORDERED_PANE_TREE_DEPTH,
+            });
+        }
+        Ok(())
+    }
+
+    fn admit_leaf(&mut self, tree_index: usize) -> Result<(), PaneTreeBoundsError> {
+        let tree_leaves = self.tree_leaves.saturating_add(1);
+        if tree_leaves > MAX_ORDERED_PANE_LEAVES_PER_TREE {
+            return Err(PaneTreeBoundsError::TreeLimit {
+                tree_index,
+                resource: "leaves",
+                count: tree_leaves,
+                max: MAX_ORDERED_PANE_LEAVES_PER_TREE,
+            });
+        }
+        let total_leaves = self.total_leaves.saturating_add(1);
+        if total_leaves > MAX_ORDERED_PANE_LEAVES_PER_SNAPSHOT {
+            return Err(PaneTreeBoundsError::SnapshotLimit {
+                resource: "leaves",
+                count: total_leaves,
+                max: MAX_ORDERED_PANE_LEAVES_PER_SNAPSHOT,
+            });
+        }
+        self.tree_leaves = tree_leaves;
+        self.total_leaves = total_leaves;
+        Ok(())
+    }
+}
+
+/// Borrow the producer's trees without cloning or recursing. A depth-first
+/// stack holds at most one pending sibling per admitted level, even for a
+/// broad tree. Refusal leaves ownership (and destruction) with the producer.
+fn validate_native_pane_trees(
+    trees: &[PaneNode],
+) -> Result<NativePaneTreeBudget, PaneTreeBoundsError> {
+    if trees.len() > MAX_ORDERED_TABS_PER_SNAPSHOT {
+        return Err(PaneTreeBoundsError::TooManyTrees {
+            count: trees.len(),
+            max: MAX_ORDERED_TABS_PER_SNAPSHOT,
+        });
+    }
+    let mut budget = NativePaneTreeBudget::default();
+    let mut pending = Vec::new();
+    pending
+        .try_reserve_exact(MAX_ORDERED_PANE_TREE_DEPTH)
+        .map_err(|_| PaneTreeBoundsError::Allocation)?;
+    for (tree_index, tree) in trees.iter().enumerate() {
+        budget.begin_tree();
+        pending.push((tree, 1_usize));
+        while let Some((node, depth)) = pending.pop() {
+            budget.admit_node(tree_index, depth)?;
+            match node {
+                PaneNode::Empty => {}
+                PaneNode::Leaf(_) => budget.admit_leaf(tree_index)?,
+                PaneNode::Split { left, right, .. } => {
+                    let child_depth = depth.saturating_add(1);
+                    NativePaneTreeBudget::admit_depth(tree_index, child_depth)?;
+                    pending.push((right.as_ref(), child_depth));
+                    pending.push((left.as_ref(), child_depth));
+                }
+            }
+        }
+    }
+    Ok(budget)
+}
+
+fn serialize_native_pane_trees<S>(trees: &[PaneNode], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    // This runs before serde reaches any recursive PaneNode::serialize,
+    // including counting/prepared encoders and non-varbincode consumers.
+    validate_native_pane_trees(trees).map_err(serde::ser::Error::custom)?;
+    serializer.serialize_newtype_struct(bounded_varbincode::NATIVE_PANE_TREES_NEWTYPE, trees)
+}
+
+#[derive(Deserialize)]
+#[serde(variant_identifier)]
+enum NativePaneNodeVariant {
+    Empty,
+    Split,
+    Leaf,
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum NativePaneSplitField {
+    Left,
+    Right,
+    Node,
+}
+
+/// Carry one aggregate budget across every tree and both split children.
+/// Admission precedes the variant body, so a rejected child never creates a
+/// Box or leaf payload and every partially built value is safely droppable at
+/// the same bounded depth as a complete admitted tree.
+struct NativePaneNodeSeed<'a> {
+    tree_index: usize,
+    depth: usize,
+    budget: &'a mut NativePaneTreeBudget,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for NativePaneNodeSeed<'_> {
+    type Value = PaneNode;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        self.budget
+            .admit_node(self.tree_index, self.depth)
+            .map_err(serde::de::Error::custom)?;
+        deserializer.deserialize_enum("PaneNode", &["Empty", "Split", "Leaf"], self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for NativePaneNodeSeed<'_> {
+    type Value = PaneNode;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a bounded pane tree")
+    }
+
+    fn visit_enum<A>(self, data: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::EnumAccess<'de>,
+    {
+        use serde::de::VariantAccess as _;
+        let (variant, body) = data.variant::<NativePaneNodeVariant>()?;
+        match variant {
+            NativePaneNodeVariant::Empty => {
+                body.unit_variant()?;
+                Ok(PaneNode::Empty)
+            }
+            NativePaneNodeVariant::Leaf => {
+                self.budget
+                    .admit_leaf(self.tree_index)
+                    .map_err(serde::de::Error::custom)?;
+                body.newtype_variant().map(PaneNode::Leaf)
+            }
+            NativePaneNodeVariant::Split => {
+                NativePaneTreeBudget::admit_depth(self.tree_index, self.depth.saturating_add(1))
+                    .map_err(serde::de::Error::custom)?;
+                body.struct_variant(&["left", "right", "node"], self)
+            }
+        }
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        let child_depth = self.depth.saturating_add(1);
+        let left = sequence
+            .next_element_seed(NativePaneNodeSeed {
+                tree_index: self.tree_index,
+                depth: child_depth,
+                budget: &mut *self.budget,
+            })?
+            .ok_or_else(|| serde::de::Error::missing_field("left"))?;
+        let right = sequence
+            .next_element_seed(NativePaneNodeSeed {
+                tree_index: self.tree_index,
+                depth: child_depth,
+                budget: &mut *self.budget,
+            })?
+            .ok_or_else(|| serde::de::Error::missing_field("right"))?;
+        let node = sequence
+            .next_element()?
+            .ok_or_else(|| serde::de::Error::missing_field("node"))?;
+        Ok(PaneNode::Split {
+            left: Box::new(left),
+            right: Box::new(right),
+            node,
+        })
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut left = None;
+        let mut right = None;
+        let mut node = None;
+        while let Some(field) = map.next_key::<NativePaneSplitField>()? {
+            match field {
+                NativePaneSplitField::Left => {
+                    if left.is_some() {
+                        return Err(serde::de::Error::duplicate_field("left"));
+                    }
+                    left = Some(map.next_value_seed(NativePaneNodeSeed {
+                        tree_index: self.tree_index,
+                        depth: self.depth.saturating_add(1),
+                        budget: &mut *self.budget,
+                    })?);
+                }
+                NativePaneSplitField::Right => {
+                    if right.is_some() {
+                        return Err(serde::de::Error::duplicate_field("right"));
+                    }
+                    right = Some(map.next_value_seed(NativePaneNodeSeed {
+                        tree_index: self.tree_index,
+                        depth: self.depth.saturating_add(1),
+                        budget: &mut *self.budget,
+                    })?);
+                }
+                NativePaneSplitField::Node => {
+                    if node.is_some() {
+                        return Err(serde::de::Error::duplicate_field("node"));
+                    }
+                    node = Some(map.next_value()?);
+                }
+            }
+        }
+        Ok(PaneNode::Split {
+            left: Box::new(left.ok_or_else(|| serde::de::Error::missing_field("left"))?),
+            right: Box::new(right.ok_or_else(|| serde::de::Error::missing_field("right"))?),
+            node: node.ok_or_else(|| serde::de::Error::missing_field("node"))?,
+        })
+    }
+}
+
+struct NativePaneTreesVisitor;
+
+impl<'de> serde::de::Visitor<'de> for NativePaneTreesVisitor {
+    type Value = Vec<PaneNode>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a bounded pane-tree collection")
+    }
+
+    fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(self)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        let hinted = sequence.size_hint().unwrap_or(0);
+        if hinted > MAX_ORDERED_TABS_PER_SNAPSHOT {
+            return Err(serde::de::Error::custom(PaneTreeBoundsError::TooManyTrees {
+                count: hinted,
+                max: MAX_ORDERED_TABS_PER_SNAPSHOT,
+            }));
+        }
+        let mut trees = Vec::new();
+        trees
+            .try_reserve_exact(hinted)
+            .map_err(|_| serde::de::Error::custom(PaneTreeBoundsError::Allocation))?;
+        let mut budget = NativePaneTreeBudget::default();
+        loop {
+            budget.begin_tree();
+            let Some(tree) = sequence.next_element_seed(NativePaneNodeSeed {
+                tree_index: trees.len(),
+                depth: 1,
+                budget: &mut budget,
+            })? else {
+                return Ok(trees);
+            };
+            trees
+                .try_reserve(1)
+                .map_err(|_| serde::de::Error::custom(PaneTreeBoundsError::Allocation))?;
+            trees.push(tree);
+        }
+    }
+}
+
+fn deserialize_native_pane_trees<'de, D>(deserializer: D) -> Result<Vec<PaneNode>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // The marker rejects a hostile raw length before a container visitor can
+    // allocate. It adds no bytes to varbincode (or JSON) representations.
+    deserializer.deserialize_newtype_struct(
+        bounded_varbincode::NATIVE_PANE_TREES_NEWTYPE,
+        NativePaneTreesVisitor,
+    )
+}
+
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct ListPanesResponse {
+    #[serde(
+        serialize_with = "serialize_native_pane_trees",
+        deserialize_with = "deserialize_native_pane_trees"
+    )]
     pub tabs: Vec<PaneNode>,
     pub tab_titles: Vec<String>,
     pub window_titles: HashMap<WindowId, String>,
@@ -18514,6 +18876,351 @@ mod test {
             level = next;
         }
         level.pop().expect("positive slot count produces one root")
+    }
+
+    fn frozen_native_pane_payload(panes: &ListPanesResponse) -> Vec<u8> {
+        // The original native struct field order, without any guarded field
+        // serializer. Vec<PaneNode> still uses the original derived node wire.
+        serialize_uncompressed(&(
+            &panes.tabs,
+            &panes.tab_titles,
+            &panes.window_titles,
+            &panes.floating_panes,
+        ))
+        .expect("serialize original native pane fields")
+    }
+
+    fn native_pane_test_pdu(ident: u64, panes: ListPanesResponse) -> Pdu {
+        match ident {
+            4 => Pdu::ListPanesResponse(panes),
+            82 => Pdu::ListPanesCoherentResponse(ListPanesCoherentResponse {
+                negotiated: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+                stream_id: TopologyStreamId::from_bytes([0x71; 16]),
+                outcome: ListPanesCoherentOutcome::Snapshot(CoherentPaneSnapshot {
+                    session_incarnation: MuxSessionIncarnation::from_bytes([0x72; 16]),
+                    snapshot_revision: TopologyRevision::new(73),
+                    panes,
+                }),
+            }),
+            _ => panic!("unsupported native topology fixture identifier"),
+        }
+    }
+
+    fn frozen_native_pane_frame(
+        ident: u64,
+        pane_payload: &[u8],
+        mode: CompressionMode,
+    ) -> Vec<u8> {
+        let mut payload = match ident {
+            4 => Vec::new(),
+            82 => serialize_uncompressed(&(
+                TopologyCapabilities::FENCED_SNAPSHOT_V1,
+                TopologyStreamId::from_bytes([0x71; 16]),
+                0_u32, // ListPanesCoherentOutcome::Snapshot
+                MuxSessionIncarnation::from_bytes([0x72; 16]),
+                TopologyRevision::new(73),
+            ))
+            .expect("serialize original coherent snapshot prefix"),
+            _ => panic!("unsupported native topology fixture identifier"),
+        };
+        payload.extend_from_slice(pane_payload);
+        let payload = finish_serialized_payload(payload, mode).expect("compress fixture payload");
+        encode_raw_as_vec(ident, 74, &payload.data, payload.is_compressed)
+            .expect("frame original native payload")
+    }
+
+    #[test]
+    fn native_pane_wire_bytes_and_framed_roundtrips_are_unchanged() {
+        let panes = ListPanesResponse {
+            tabs: vec![
+                PaneNode::Empty,
+                PaneNode::Split {
+                    left: Box::new(PaneNode::Leaf(sample_pane_entry(0))),
+                    right: Box::new(PaneNode::Split {
+                        left: Box::new(PaneNode::Empty),
+                        right: Box::new(PaneNode::Leaf(sample_pane_entry(1))),
+                        node: sample_split(),
+                    }),
+                    node: sample_split(),
+                },
+            ],
+            tab_titles: vec!["empty".to_string(), "native-tab-é".to_string()],
+            window_titles: HashMap::from([(1, "native-window-é".to_string())]),
+            floating_panes: Vec::new(),
+        };
+        let original_payload = frozen_native_pane_payload(&panes);
+        assert_eq!(
+            serialize_uncompressed(&panes).expect("serialize guarded native panes"),
+            original_payload,
+        );
+        for ident in [4, 82] {
+            let pdu = native_pane_test_pdu(ident, panes.clone());
+            for mode in [CompressionMode::Never, CompressionMode::Always] {
+                let original_frame = frozen_native_pane_frame(ident, &original_payload, mode);
+                assert_eq!(
+                    pdu.encode_frame_with_mode(74, mode).expect("encode native frame"),
+                    original_frame,
+                    "native PDU {ident} under {mode:?} changed its admitted wire bytes",
+                );
+                let decoded = Pdu::decode(original_frame.as_slice()).expect("decode native frame");
+                assert_eq!(decoded.serial, 74);
+                assert_eq!(decoded.pdu, pdu);
+            }
+        }
+    }
+
+    fn native_pane_snapshot_at_aggregate_limits() -> ListPanesResponse {
+        ListPanesResponse {
+            tabs: [4096, 4096, 4096, 2049, 2049]
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(index, slots)| {
+                    pane_tree_with_slots(slots, usize::from(index >= 3), index * 4096)
+                })
+                .collect(),
+            ..empty_pane_list()
+        }
+    }
+
+    #[test]
+    fn native_pane_tree_admission_counts_each_node_once() {
+        for leaves in [1, 20, 200, MAX_ORDERED_PANE_LEAVES_PER_TREE] {
+            let panes = ListPanesResponse {
+                tabs: vec![pane_tree_with_slots(leaves, 0, 0)],
+                ..empty_pane_list()
+            };
+            let budget = validate_native_pane_trees(&panes.tabs).expect("admit bounded pane tree");
+            assert_eq!(budget.total_nodes, 2 * leaves - 1);
+            assert_eq!(budget.total_leaves, leaves);
+            let original = frozen_native_pane_payload(&panes);
+            assert_eq!(
+                serialize_uncompressed(&panes).expect("encode bounded pane tree"),
+                original,
+            );
+            assert_eq!(
+                deserialize_list_panes_response(&original, false).expect("decode bounded pane tree"),
+                panes,
+            );
+        }
+    }
+
+    #[test]
+    fn native_pane_tree_admission_accepts_exact_depth_root_and_aggregate_limits() {
+        let aggregate = native_pane_snapshot_at_aggregate_limits();
+        let budget =
+            validate_native_pane_trees(&aggregate.tabs).expect("admit exact aggregate limits");
+        assert_eq!(budget.total_nodes, MAX_ORDERED_PANE_NODES_PER_SNAPSHOT);
+        assert_eq!(budget.total_leaves, MAX_ORDERED_PANE_LEAVES_PER_SNAPSHOT);
+        for panes in [
+            ListPanesResponse {
+                tabs: vec![left_deep_pane_tree(MAX_ORDERED_PANE_TREE_DEPTH)],
+                ..empty_pane_list()
+            },
+            ListPanesResponse {
+                tabs: vec![PaneNode::Empty; MAX_ORDERED_TABS_PER_SNAPSHOT],
+                ..empty_pane_list()
+            },
+            aggregate,
+        ] {
+            let original = frozen_native_pane_payload(&panes);
+            assert_eq!(
+                serialize_uncompressed(&panes).expect("encode exact native limits"),
+                original,
+            );
+            assert_eq!(
+                deserialize_list_panes_response(&original, false)
+                    .expect("decode exact native limits"),
+                panes,
+            );
+        }
+    }
+
+    #[test]
+    fn native_pane_tree_admission_rejects_per_tree_and_aggregate_overflow() {
+        let tree_nodes = ListPanesResponse {
+            tabs: vec![PaneNode::Split {
+                left: Box::new(broad_pane_tree(MAX_ORDERED_PANE_LEAVES_PER_TREE)),
+                right: Box::new(PaneNode::Empty),
+                node: sample_split(),
+            }],
+            ..empty_pane_list()
+        };
+        let mut aggregate_nodes = native_pane_snapshot_at_aggregate_limits();
+        aggregate_nodes.tabs.push(PaneNode::Empty);
+        let mut aggregate_leaves = ListPanesResponse {
+            tabs: (0..4)
+                .map(|index| pane_tree_with_slots(MAX_ORDERED_PANE_LEAVES_PER_TREE, 0, index * 4096))
+                .collect(),
+            ..empty_pane_list()
+        };
+        aggregate_leaves
+            .tabs
+            .push(PaneNode::Leaf(sample_pane_entry(16_384)));
+
+        for (panes, expected_count, expected_maximum) in [
+            (
+                tree_nodes,
+                MAX_ORDERED_PANE_NODES_PER_TREE + 1,
+                MAX_ORDERED_PANE_NODES_PER_TREE,
+            ),
+            (
+                aggregate_nodes,
+                MAX_ORDERED_PANE_NODES_PER_SNAPSHOT + 1,
+                MAX_ORDERED_PANE_NODES_PER_SNAPSHOT,
+            ),
+            (
+                aggregate_leaves,
+                MAX_ORDERED_PANE_LEAVES_PER_SNAPSHOT + 1,
+                MAX_ORDERED_PANE_LEAVES_PER_SNAPSHOT,
+            ),
+        ] {
+            let error =
+                validate_native_pane_trees(&panes.tabs).expect_err("reject native tree overflow");
+            assert!(matches!(
+                &error,
+                PaneTreeBoundsError::TreeLimit { count, max, .. }
+                    | PaneTreeBoundsError::SnapshotLimit { count, max, .. }
+                    if *count == expected_count && *max == expected_maximum
+            ));
+            let expected = error.to_string();
+            let encode_error =
+                serialize_uncompressed(&panes).expect_err("reject producer tree overflow");
+            assert!(format!("{encode_error:#}").contains(&expected));
+            let original = frozen_native_pane_payload(&panes);
+            for ident in [4, 82] {
+                for mode in [CompressionMode::Never, CompressionMode::Always] {
+                    let frame = frozen_native_pane_frame(ident, &original, mode);
+                    let error =
+                        Pdu::decode(frame.as_slice()).expect_err("reject native frame overflow");
+                    assert!(format!("{error:#}").contains(&expected), "{error:#}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_pane_tree_marker_does_not_limit_following_metadata_sequences() {
+        let panes = ListPanesResponse {
+            tab_titles: vec![String::new(); MAX_ORDERED_TABS_PER_SNAPSHOT + 1],
+            ..empty_pane_list()
+        };
+        let original = frozen_native_pane_payload(&panes);
+        assert_eq!(
+            deserialize_list_panes_response(&original, false).expect("consume only the tree marker"),
+            panes,
+        );
+    }
+
+    #[test]
+    fn native_pane_malformed_frames_refuse_before_children_and_preserve_next_frame() {
+        let depth_error =
+            validate_native_pane_trees(&[left_deep_pane_tree(MAX_ORDERED_PANE_TREE_DEPTH + 1)])
+                .expect_err("reject excessive producer depth")
+                .to_string();
+        let mut split_only_prefix = serialize_uncompressed(&1_usize).expect("encode root count");
+        let split_tag = serialize_uncompressed(&1_u32).expect("encode original Split tag");
+        for _ in 0..MAX_ORDERED_PANE_TREE_DEPTH {
+            split_only_prefix.extend_from_slice(&split_tag);
+        }
+        // There are no child fields or geometries after the final Split tag.
+        // A depth refusal, rather than EOF, proves admission precedes descent.
+        let excessive_roots = MAX_ORDERED_TABS_PER_SNAPSHOT + 1;
+        let root_only_prefix = serialize_uncompressed(&excessive_roots).expect("encode root prefix");
+        let root_error = format!(
+            "native pane trees length {excessive_roots} exceeds maximum {}",
+            MAX_ORDERED_TABS_PER_SNAPSHOT,
+        );
+        let mut trailing_payload = frozen_native_pane_payload(&empty_pane_list());
+        trailing_payload.push(0);
+        let next_pdu = Pdu::Ping(Ping {});
+        let next_frame = next_pdu
+            .encode_frame_with_mode(75, CompressionMode::Never)
+            .expect("encode next outer frame");
+
+        for (pane_payload, expected) in [
+            (split_only_prefix, depth_error),
+            (root_only_prefix, root_error),
+            (
+                trailing_payload,
+                "payload has trailing schema bytes".to_string(),
+            ),
+        ] {
+            for ident in [4, 82] {
+                for mode in [CompressionMode::Never, CompressionMode::Always] {
+                    let rejected_frame = frozen_native_pane_frame(ident, &pane_payload, mode);
+                    let mut concatenated = rejected_frame.clone();
+                    concatenated.extend_from_slice(&next_frame);
+
+                    let mut reader = Cursor::new(concatenated.clone());
+                    let error = Pdu::decode(&mut reader).expect_err("reject native frame");
+                    assert!(format!("{error:#}").contains(&expected), "{error:#}");
+                    assert_eq!(reader.position() as usize, rejected_frame.len());
+                    let next = Pdu::decode(&mut reader).expect("decode next sync frame");
+                    assert_eq!(next.serial, 75);
+                    assert_eq!(next.pdu, next_pdu);
+
+                    let (error, next) = runtime::block_on(async {
+                        let mut reader = runtime::Cursor::new(concatenated.clone());
+                        let error = Pdu::decode_async(&mut reader, None)
+                            .await
+                            .expect_err("reject native async frame");
+                        let next = Pdu::decode_async(&mut reader, None)
+                            .await
+                            .expect("decode next async frame");
+                        (error, next)
+                    });
+                    assert!(format!("{error:#}").contains(&expected), "{error:#}");
+                    assert_eq!(next.serial, 75);
+                    assert_eq!(next.pdu, next_pdu);
+
+                    let mut buffered = StreamingPduBuffer::from(concatenated.clone());
+                    let error =
+                        Pdu::stream_decode(&mut buffered).expect_err("reject buffered frame");
+                    assert!(format!("{error:#}").contains(&expected), "{error:#}");
+                    assert_eq!(buffered.as_slice(), concatenated.as_slice());
+                    buffered
+                        .consume_prefix(rejected_frame.len())
+                        .expect("explicitly discard only the rejected frame");
+                    assert_eq!(buffered.as_slice(), next_frame.as_slice());
+                    let next = Pdu::stream_decode(&mut buffered)
+                        .expect("decode next buffered frame")
+                        .expect("next frame is complete");
+                    assert_eq!(next.serial, 75);
+                    assert_eq!(next.pdu, next_pdu);
+                    assert!(buffered.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_pane_json_maps_roundtrip_and_reject_ambiguous_fields() {
+        let panes = ListPanesResponse {
+            tabs: vec![PaneNode::Split {
+                left: Box::new(PaneNode::Empty),
+                right: Box::new(PaneNode::Leaf(sample_pane_entry(0))),
+                node: sample_split(),
+            }],
+            ..empty_pane_list()
+        };
+        let json = serde_json::to_value(&panes).expect("serialize native JSON map");
+        assert_eq!(
+            serde_json::from_value::<ListPanesResponse>(json).expect("decode native JSON map"),
+            panes,
+        );
+        let encoded = serde_json::to_string(&panes).expect("serialize native JSON fields");
+        let duplicated = encoded.replacen("\"left\":", "\"left\":\"Empty\",\"left\":", 1);
+        let error = serde_json::from_str::<ListPanesResponse>(&duplicated)
+            .expect_err("duplicate Split fields must be rejected");
+        assert!(error.to_string().contains("duplicate field"), "{error}");
+
+        // Reject the unknown key before trying to deserialize its value. This
+        // also prevents an ignored arbitrary object from evading tree bounds.
+        let error =
+            serde_json::from_str::<ListPanesResponse>(r#"{"tabs":[{"Split":{"unexpected":"#)
+                .expect_err("unknown Split fields must fail closed before their body");
+        assert!(error.to_string().contains("unknown field"), "{error}");
     }
 
     fn sample_flat_wire() -> OrderedPanesFlatWireOwned {
