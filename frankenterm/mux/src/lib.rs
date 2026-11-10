@@ -4419,6 +4419,7 @@ struct PaneRegistrationGeneration {
     reader_dead: Arc<AtomicBool>,
     live_parser_checkpoint: Arc<LiveParserCheckpointControl>,
     guardian_adoptions: Mutex<GuardianAdoptionLedger>,
+    guardian_checkpoint_publication: AtomicBool,
     retirement_tracker: Weak<PaneRetirementTracker>,
     owner: Weak<Mux>,
     cleanup: Mutex<PaneRetirementCleanupState>,
@@ -4437,6 +4438,23 @@ fn pane_registration_is_quiescent(state: usize) -> bool {
     state & PANE_REGISTRATION_RETIRED != 0 && state & PANE_REGISTRATION_OPERATION_MASK == 0
 }
 
+/// Orders capture and publication together, including a live reader and a
+/// concurrent recovery-root capture. Serializing only inside the Stage
+/// publisher lets a newer capture publish before an older worker starts.
+/// Unlike a mutex guard, this owned permit can travel with the affine parser
+/// acknowledgement without retaining a lock or blocking output delivery.
+struct GuardianCheckpointPublicationLease {
+    generation: Arc<PaneRegistrationGeneration>,
+}
+
+impl Drop for GuardianCheckpointPublicationLease {
+    fn drop(&mut self) {
+        self.generation
+            .guardian_checkpoint_publication
+            .store(false, Ordering::Release);
+    }
+}
+
 impl PaneRegistrationGeneration {
     fn new(
         pane_id: PaneId,
@@ -4451,12 +4469,24 @@ impl PaneRegistrationGeneration {
             reader_dead: Arc::new(AtomicBool::new(false)),
             live_parser_checkpoint: Arc::new(LiveParserCheckpointControl::new(wire_identity)),
             guardian_adoptions: Mutex::new(GuardianAdoptionLedger::default()),
+            guardian_checkpoint_publication: AtomicBool::new(false),
             retirement_tracker: Arc::downgrade(retirement_tracker),
             owner,
             cleanup: Mutex::new(PaneRetirementCleanupState::Unattached),
             cleanup_complete: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             parse_path_bytes: Default::default(),
+        })
+    }
+
+    fn try_acquire_guardian_checkpoint_publication(
+        self: &Arc<Self>,
+    ) -> Result<GuardianCheckpointPublicationLease, LiveParserCheckpointError> {
+        self.guardian_checkpoint_publication
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| LiveParserCheckpointError::CheckpointBusy)?;
+        Ok(GuardianCheckpointPublicationLease {
+            generation: Arc::clone(self),
         })
     }
 
@@ -6011,6 +6041,9 @@ mod pane_registration_handle {
             limits: TerminalCheckpointLimits,
             timeout: Duration,
         ) -> anyhow::Result<crate::guardian_checkpoint::PublishedGuardianCheckpoint> {
+            let _publication = self
+                .generation
+                .try_acquire_guardian_checkpoint_publication()?;
             let capture = self
                 .capture_live_parser_checkpoint(segment, output, limits, timeout)
                 .map_err(anyhow::Error::new)?;
@@ -6020,7 +6053,7 @@ mod pane_registration_handle {
         /// Every adoption, live or for a recovery root, enters this
         /// registration's ledger: the live replay re-anchors at the newest,
         /// and live adoptions count against the newest committed root.
-        fn publish_and_record_guardian_checkpoint(
+        pub(super) fn publish_and_record_guardian_checkpoint(
             &self,
             capture: LiveParserCheckpointAck,
         ) -> anyhow::Result<crate::guardian_checkpoint::PublishedGuardianCheckpoint> {
@@ -6051,29 +6084,13 @@ mod pane_registration_handle {
             timeout: Duration,
             cancelled: impl FnMut() -> bool,
         ) -> anyhow::Result<crate::guardian_checkpoint::PublishedGuardianCheckpoint> {
-            let source = {
-                let state = self.generation.live_parser_checkpoint.state.lock();
-                if state.dead
-                    || state.poison.is_some()
-                    || !state.attached
-                    || state.authorized_delivery.is_some()
-                    || state.delivery_call_in_flight
-                    || state.socket_write_in_flight
-                    || state.delivered_bytes != state.parsed_bytes
-                {
-                    return Err(LiveParserCheckpointError::GuardianDeliveryBusy.into());
-                }
-                let cursor = state
-                    .guardian_cursor
-                    .ok_or(LiveParserCheckpointError::GuardianDeliveryStartedLate)?;
-                cursor.source
-            };
+            let _publication = self
+                .generation
+                .try_acquire_guardian_checkpoint_publication()?;
             let started = Instant::now();
-            let capture = self
-                .capture_live_parser_checkpoint_source_cancelling(
-                    source, limits, timeout, cancelled,
-                )
-                .map_err(anyhow::Error::new)?;
+            let capture = self.capture_current_guardian_parser_checkpoint_cancelling(
+                limits, timeout, cancelled,
+            )?;
             let captured = started.elapsed();
             let payload_bytes = capture.terminal_checkpoint().canonical_payload().len();
             let published = self.publish_and_record_guardian_checkpoint(capture);
@@ -6091,6 +6108,38 @@ mod pane_registration_handle {
                 );
             }
             published
+        }
+
+        /// Capture the current exact prefix without yet submitting its Stage
+        /// upload. The live reader retains this operation guard until the
+        /// owned publication worker finishes; only publication may move off
+        /// the reader, never admission of the parser's output fence.
+        pub(super) fn capture_current_guardian_parser_checkpoint_cancelling(
+            &self,
+            limits: TerminalCheckpointLimits,
+            timeout: Duration,
+            cancelled: impl FnMut() -> bool,
+        ) -> Result<LiveParserCheckpointAck, LiveParserCheckpointError> {
+            let source = {
+                let state = self.generation.live_parser_checkpoint.state.lock();
+                if state.dead
+                    || state.poison.is_some()
+                    || !state.attached
+                    || state.authorized_delivery.is_some()
+                    || state.delivery_call_in_flight
+                    || state.socket_write_in_flight
+                    || state.delivered_bytes != state.parsed_bytes
+                {
+                    return Err(LiveParserCheckpointError::GuardianDeliveryBusy);
+                }
+                let cursor = state
+                    .guardian_cursor
+                    .ok_or(LiveParserCheckpointError::GuardianDeliveryStartedLate)?;
+                cursor.source
+            };
+            self.capture_live_parser_checkpoint_source_cancelling(
+                source, limits, timeout, cancelled,
+            )
         }
 
         pub fn same_registration(&self, other: &Self) -> bool {
@@ -13537,12 +13586,28 @@ fn schedule_pane_reader_eof(
     }
 }
 
-fn publish_guardian_live_checkpoint(
+/// One exact parser capture, together with the registration and domain leases
+/// that must remain owned until Stage publication and its durable Ack finish.
+struct PreparedGuardianLiveCheckpoint {
+    operation: PaneOperationGuard,
+    capture: LiveParserCheckpointAck,
+    _publication: GuardianCheckpointPublicationLease,
+}
+
+impl PreparedGuardianLiveCheckpoint {
+    fn publish(self) -> anyhow::Result<()> {
+        self.operation
+            .publish_and_record_guardian_checkpoint(self.capture)
+            .map(drop)
+    }
+}
+
+fn prepare_guardian_live_checkpoint(
     pane: &Weak<dyn Pane>,
     generation: &Arc<PaneRegistrationGeneration>,
     pane_id: PaneId,
     delivered_boundary: Option<(GuardianOutputSegmentIdentity, GuardianOutputAppendReceipt)>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<PreparedGuardianLiveCheckpoint> {
     let _generation_lease = generation
         .try_acquire()
         .ok_or(LiveParserCheckpointError::StaleRegistration)?;
@@ -13557,8 +13622,9 @@ fn publish_guardian_live_checkpoint(
     if operation.wire_identity() != generation.wire_identity {
         return Err(LiveParserCheckpointError::StaleRegistration.into());
     }
-    match delivered_boundary {
-        Some((segment, output)) => operation.capture_and_publish_guardian_checkpoint(
+    let publication = generation.try_acquire_guardian_checkpoint_publication()?;
+    let capture = match delivered_boundary {
+        Some((segment, output)) => operation.capture_live_parser_checkpoint(
             segment,
             output,
             mux.guardian_checkpoint_limits(),
@@ -13567,12 +13633,162 @@ fn publish_guardian_live_checkpoint(
         // An acknowledged idle completion has no new record. Use only the
         // parser's retained authenticated cursor, including a restored prefix;
         // never manufacture a receipt or capture ahead of parsed bytes.
-        None => operation.capture_current_guardian_checkpoint(
+        None => operation.capture_current_guardian_parser_checkpoint_cancelling(
             mux.guardian_checkpoint_limits(),
             GUARDIAN_LIVE_CHECKPOINT_CAPTURE_TIMEOUT,
+            || false,
         ),
+    }?;
+    Ok(PreparedGuardianLiveCheckpoint {
+        operation,
+        capture,
+        _publication: publication,
+    })
+}
+
+/// The live reader owns at most one affine capture/publication. Stage uploads
+/// can take seconds on a loaded guardian; doing them on the reader withheld
+/// every subsequent output record for that whole interval. Only publication
+/// runs here: the reader has already acquired and completed the exact parser
+/// fence before it resumes delivery.
+///
+/// A failed upload remains with the pane's existing publisher for exact
+/// reconciliation. This worker neither retries nor manufactures another
+/// adoption, and its JoinHandle is never detached during reader teardown.
+struct GuardianLiveCheckpointWorker {
+    pane_id: PaneId,
+    pending: Option<std::thread::JoinHandle<(Instant, bool)>>,
+}
+
+impl GuardianLiveCheckpointWorker {
+    fn new(pane_id: PaneId) -> Self {
+        Self {
+            pane_id,
+            pending: None,
+        }
     }
-    .map(drop)
+
+    fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    fn start(
+        &mut self,
+        started_at: Instant,
+        publish: impl FnOnce() -> anyhow::Result<()> + Send + 'static,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.pending.is_none(),
+            "guardian live checkpoint publication is already in flight"
+        );
+        let pane_id = self.pane_id;
+        self.pending = Some(
+            thread::Builder::new()
+                .name(format!("mux-guardian-checkpoint-{pane_id}"))
+                .spawn(move || {
+                    let result = catch_recoverable(
+                        RecoverablePanicSite::MuxPaneCallback,
+                        std::panic::AssertUnwindSafe(publish),
+                    )
+                    .unwrap_or_else(|_| {
+                        Err(anyhow!("guardian checkpoint publication worker panicked"))
+                    });
+                    let finished_at = Instant::now();
+                    let committed =
+                        record_guardian_live_checkpoint_outcome(pane_id, started_at, result);
+                    (finished_at, committed)
+                })?,
+        );
+        Ok(())
+    }
+
+    /// Reap only completed work. A busy worker must never stall output or
+    /// admit another capture whose bytes would grow the pending queue.
+    fn poll(&mut self) -> Option<(Instant, bool)> {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|worker| worker.is_finished())
+        {
+            self.finish()
+        } else {
+            None
+        }
+    }
+
+    fn finish(&mut self) -> Option<(Instant, bool)> {
+        self.pending.take().map(|worker| match worker.join() {
+            Ok(outcome) => outcome,
+            Err(payload) => {
+                let _ = catch_recoverable(
+                    RecoverablePanicSite::MuxPaneCallback,
+                    std::panic::AssertUnwindSafe(|| std::panic::resume_unwind(payload)),
+                );
+                let finished_at = Instant::now();
+                let committed = record_guardian_live_checkpoint_outcome(
+                    self.pane_id,
+                    finished_at,
+                    Err(anyhow!("guardian checkpoint publication worker panicked")),
+                );
+                (finished_at, committed)
+            }
+        })
+    }
+}
+
+impl Drop for GuardianLiveCheckpointWorker {
+    fn drop(&mut self) {
+        // Keep the exact-generation operation alive until every admitted
+        // publication returns, including unwinding and early reader exits.
+        let _ = self.finish();
+    }
+}
+
+fn record_guardian_live_checkpoint_outcome(
+    pane_id: PaneId,
+    started_at: Instant,
+    result: anyhow::Result<()>,
+) -> bool {
+    match result {
+        Ok(()) => {
+            metrics::counter!(
+                "mux.guardian_checkpoint.publication_total",
+                "outcome" => "committed"
+            )
+            .increment(1);
+            metrics::histogram!("mux.guardian_checkpoint.publication_seconds")
+                .record(started_at.elapsed().as_secs_f64());
+            true
+        }
+        Err(error)
+            if error.downcast_ref::<LiveParserCheckpointError>()
+                == Some(&LiveParserCheckpointError::StaleRegistration) =>
+        {
+            metrics::counter!(
+                "mux.guardian_checkpoint.publication_total",
+                "outcome" => "registration_ended"
+            )
+            .increment(1);
+            log::info!(
+                "guardian checkpoint publication of pane {} skipped: its registration ended",
+                pane_id
+            );
+            true
+        }
+        Err(error) => {
+            metrics::counter!(
+                "mux.guardian_checkpoint.publication_total",
+                "outcome" => "retryable_failure"
+            )
+            .increment(1);
+            log::error!(
+                "guardian checkpoint publication failed after replay acknowledgement; retained publication state will reconcile before the next capture: pane {} {:?}",
+                pane_id,
+                error
+            );
+            false
+        }
+    }
 }
 
 /// Whether a live checkpoint may be adopted now: always without a recovery
@@ -13622,8 +13838,12 @@ fn read_from_guardian_live_output(
         None => return,
     };
     let mut checkpoint_schedule = GuardianLiveCheckpointSchedule::new(Instant::now());
+    let mut checkpoint_worker = GuardianLiveCheckpointWorker::new(pane_id);
 
     while !dead.load(Ordering::Acquire) {
+        if let Some((finished_at, committed)) = checkpoint_worker.poll() {
+            checkpoint_schedule.record_outcome(finished_at, committed);
+        }
         let mut delivered_boundary = None;
         let result = reader.deliver_next_record(&mut |segment, output, payload| {
             let _generation_lease = generation
@@ -13703,7 +13923,8 @@ fn read_from_guardian_live_output(
             break;
         }
         let now = Instant::now();
-        if checkpoint_schedule.is_due(now)
+        let checkpoint_due = !checkpoint_worker.is_pending() && checkpoint_schedule.is_due(now);
+        if checkpoint_due
             && delivery.has_durable_replay_page_ack()
             && !guardian_live_adoption_allowed(&generation)
         {
@@ -13715,7 +13936,7 @@ fn read_from_guardian_live_output(
             )
             .increment(1);
             checkpoint_schedule.record_outcome(now, true);
-        } else if checkpoint_schedule.is_due(now)
+        } else if checkpoint_due
             && delivery.is_idle()
             && generation
                 .live_parser_checkpoint
@@ -13728,55 +13949,21 @@ fn read_from_guardian_live_output(
             // prefix to capture. Keep polling without manufacturing authority
             // or treating the ordinary empty state as a publication failure.
             checkpoint_schedule.record_outcome(now, true);
-        } else if checkpoint_schedule.is_due(now) && delivery.has_durable_replay_page_ack() {
+        } else if checkpoint_due && delivery.has_durable_replay_page_ack() {
             // An idle capture publishes the final delivered output. Repeated
             // identical captures reuse their acknowledged catalog identity;
             // they do not evict older members or independently resolve a
             // journal whose retained-checkpoint floor still blocks reclaim.
             let started_at = Instant::now();
-            match publish_guardian_live_checkpoint(&pane, &generation, pane_id, delivered_boundary)
-            {
-                Ok(()) => {
-                    metrics::counter!(
-                        "mux.guardian_checkpoint.publication_total",
-                        "outcome" => "committed"
-                    )
-                    .increment(1);
-                    metrics::histogram!("mux.guardian_checkpoint.publication_seconds")
-                        .record(started_at.elapsed().as_secs_f64());
-                    checkpoint_schedule.record_outcome(Instant::now(), true);
-                }
-                // The pane's registration ended under the publication: the
-                // pane closed, or an upgrade handed it to the successor. This
-                // mux has nothing of it left to publish or reconcile.
-                Err(error)
-                    if error.downcast_ref::<LiveParserCheckpointError>()
-                        == Some(&LiveParserCheckpointError::StaleRegistration) =>
-                {
-                    metrics::counter!(
-                        "mux.guardian_checkpoint.publication_total",
-                        "outcome" => "registration_ended"
-                    )
-                    .increment(1);
-                    log::info!(
-                        "guardian checkpoint publication of pane {} skipped: its registration ended",
-                        pane_id
-                    );
-                    checkpoint_schedule.record_outcome(Instant::now(), true);
-                }
-                Err(error) => {
-                    metrics::counter!(
-                        "mux.guardian_checkpoint.publication_total",
-                        "outcome" => "retryable_failure"
-                    )
-                    .increment(1);
-                    log::error!(
-                        "guardian checkpoint publication failed after replay acknowledgement; retained publication state will reconcile before the next capture: pane {} {:?}",
-                        pane_id,
-                        error
-                    );
-                    checkpoint_schedule.record_outcome(Instant::now(), false);
-                }
+            let publication =
+                prepare_guardian_live_checkpoint(&pane, &generation, pane_id, delivered_boundary)
+                    .and_then(|prepared| {
+                        checkpoint_worker.start(started_at, move || prepared.publish())
+                    });
+            if let Err(error) = publication {
+                let committed =
+                    record_guardian_live_checkpoint_outcome(pane_id, started_at, Err(error));
+                checkpoint_schedule.record_outcome(Instant::now(), committed);
             }
         }
         // Later snapshots resume from the newest checkpoint adopted, live or
@@ -13795,6 +13982,10 @@ fn read_from_guardian_live_output(
     // generation; a successor resumes from its durable checkpoint boundary.
     data_writer_guard.close();
     let _ = parser_done.recv();
+
+    // No reader or parser can consume more bytes now. Finish the single
+    // admitted Stage upload before allowing exact-generation EOF retirement.
+    let _ = checkpoint_worker.finish();
 
     let exit_behavior = exit_behavior.unwrap_or_else(|| configuration().exit_behavior);
     schedule_pane_reader_eof(pane_for_lifecycle, generation, pane_id, exit_behavior);
@@ -26048,6 +26239,215 @@ mod tests {
         assert_eq!(
             schedule.next_attempt - now,
             GUARDIAN_LIVE_CHECKPOINT_RETRY_INTERVAL
+        );
+    }
+
+    #[test]
+    fn guardian_live_publication_keeps_its_exact_capture_while_later_output_advances() {
+        let durable_pane_id = uuid::Uuid::new_v4();
+        let first = b"before-publication\r\n";
+        let second = b"output-during-publication\r\n";
+        let (segment, receipts) = live_checkpoint_receipts(durable_pane_id, &[first, second]);
+        let harness = LiveParserTestHarness::new(698, durable_pane_id, None);
+        let missing_prefix = prepare_guardian_live_checkpoint(
+            &Arc::downgrade(&harness.pane),
+            &harness.generation,
+            harness.pane.pane_id(),
+            None,
+        )
+        .err()
+        .expect("an empty genesis pane has no authenticated idle prefix");
+        assert_eq!(
+            missing_prefix.downcast_ref::<LiveParserCheckpointError>(),
+            Some(&LiveParserCheckpointError::GuardianDeliveryStartedLate)
+        );
+        let first_target = harness.authorize(segment, receipts[0], first);
+        harness.write(first).expect("deliver first record");
+        harness.wait_until_parsed(first_target);
+        let prepared = prepare_guardian_live_checkpoint(
+            &Arc::downgrade(&harness.pane),
+            &harness.generation,
+            harness.pane.pane_id(),
+            Some((segment, receipts[0])),
+        )
+        .expect("failed preparation released its permit for the exact record capture");
+        let first_digest = prepared.capture.boundary_digest();
+        let first_payload = prepared
+            .capture
+            .terminal_checkpoint()
+            .canonical_payload()
+            .to_vec();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let mut worker = GuardianLiveCheckpointWorker::new(harness.pane.pane_id());
+        worker
+            .start(Instant::now(), move || {
+                entered_tx.send(())?;
+                release_rx.recv_timeout(Duration::from_secs(5))?;
+                assert_eq!(prepared.capture.parser_stream_bytes(), first_target);
+                assert_eq!(prepared.capture.boundary_digest(), first_digest);
+                assert_eq!(
+                    prepared.capture.terminal_checkpoint().canonical_payload(),
+                    first_payload
+                );
+                // Keep the exact operation lease alongside the affine capture
+                // for the entire simulated stalled Stage exchange.
+                assert_eq!(prepared.operation.pane_id(), 698);
+                drop(prepared);
+                Ok(())
+            })
+            .expect("admit one publication worker");
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("publication reaches its blocked exchange");
+        assert!(
+            worker.poll().is_none(),
+            "polling must not join a busy upload"
+        );
+        assert!(worker.is_pending());
+
+        let duplicate_ran = Arc::new(AtomicBool::new(false));
+        let duplicate_ran_worker = Arc::clone(&duplicate_ran);
+        assert!(
+            worker
+                .start(Instant::now(), move || {
+                    duplicate_ran_worker.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert!(!duplicate_ran.load(Ordering::SeqCst));
+
+        let second_target = harness.authorize(segment, receipts[1], second);
+        harness
+            .write(second)
+            .expect("deliver output while publication is blocked");
+        harness.wait_until_parsed(second_target);
+        let root = harness
+            .mux
+            .capture_pane_operation(harness.pane.pane_id())
+            .expect("admit competing recovery-root operation");
+        let error = root
+            .capture_current_guardian_checkpoint(
+                TerminalCheckpointLimits::default(),
+                Duration::from_secs(2),
+            )
+            .expect_err("newer root capture must not overtake the pending publication");
+        assert_eq!(
+            error.downcast_ref::<LiveParserCheckpointError>(),
+            Some(&LiveParserCheckpointError::CheckpointBusy)
+        );
+        drop(root);
+        let later = harness
+            .capture(segment, receipts[1], Duration::from_secs(2))
+            .expect("the publication permit does not block the parser's current prefix");
+        assert_eq!(later.parser_stream_bytes(), second_target);
+        assert_ne!(later.boundary_digest(), first_digest);
+        assert!(
+            worker.poll().is_none(),
+            "output advanced before the upload finished"
+        );
+        drop(later);
+
+        release_tx.send(()).expect("finish blocked publication");
+        assert!(worker.finish().expect("join publication").1);
+        assert!(!worker.is_pending());
+        assert!(worker.poll().is_none(), "one completion is consumed once");
+        let idle = prepare_guardian_live_checkpoint(
+            &Arc::downgrade(&harness.pane),
+            &harness.generation,
+            harness.pane.pane_id(),
+            None,
+        )
+        .expect("a later idle publication is admitted once the earlier one finishes");
+        assert_eq!(idle.capture.parser_stream_bytes(), second_target);
+    }
+
+    #[test]
+    fn guardian_live_publication_joins_before_releasing_exact_pane_retirement() {
+        let durable_pane_id = uuid::Uuid::new_v4();
+        let payload = b"retire-during-publication";
+        let (segment, receipts) = live_checkpoint_receipts(durable_pane_id, &[payload]);
+        let harness = LiveParserTestHarness::new(699, durable_pane_id, None);
+        let target = harness.authorize(segment, receipts[0], payload);
+        harness.write(payload).expect("deliver retirement fixture");
+        harness.wait_until_parsed(target);
+        let prepared = prepare_guardian_live_checkpoint(
+            &Arc::downgrade(&harness.pane),
+            &harness.generation,
+            harness.pane.pane_id(),
+            Some((segment, receipts[0])),
+        )
+        .expect("capture before retirement");
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let mut worker = GuardianLiveCheckpointWorker::new(harness.pane.pane_id());
+        worker
+            .start(Instant::now(), move || {
+                entered_tx.send(())?;
+                release_rx.recv_timeout(Duration::from_secs(5))?;
+                assert_eq!(prepared.capture.parser_stream_bytes(), target);
+                drop(prepared);
+                Ok(())
+            })
+            .expect("start retirement-fenced publication");
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("publication has started");
+        harness.mux.remove_pane(harness.pane.pane_id());
+        let pane = harness.pane.downcast_ref::<KillCountingPane>().unwrap();
+        assert_eq!(pane.kills.load(Ordering::SeqCst), 0);
+        assert!(harness.mux.pane_retirements.has_in_flight_retirement(699));
+
+        let (dropping_tx, dropping_rx) = std::sync::mpsc::sync_channel(1);
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::sync_channel(1);
+        let teardown = std::thread::spawn(move || {
+            dropping_tx.send(()).unwrap();
+            drop(worker);
+            dropped_tx.send(()).unwrap();
+        });
+        dropping_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            dropped_rx.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(pane.kills.load(Ordering::SeqCst), 0);
+        release_tx.send(()).expect("complete the admitted exchange");
+        dropped_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        teardown.join().expect("reader teardown joins its worker");
+        assert_eq!(pane.kills.load(Ordering::SeqCst), 1);
+        assert!(!harness.mux.pane_retirements.has_in_flight_retirement(699));
+    }
+
+    #[test]
+    fn guardian_live_publication_failures_back_off_and_do_not_detach_or_report_commit() {
+        let mut worker = GuardianLiveCheckpointWorker::new(700);
+        let mut schedule = GuardianLiveCheckpointSchedule::new(Instant::now());
+        worker
+            .start(Instant::now(), || Err(anyhow!("injected Stage reply loss")))
+            .expect("start failed exchange");
+        let (finished_at, committed) = worker.finish().expect("retain failed completion");
+        assert!(!committed);
+        schedule.record_outcome(finished_at, committed);
+        assert_eq!(schedule.next_attempt - finished_at, Duration::from_secs(1));
+        worker
+            .start(Instant::now(), || {
+                panic!("injected publication callback panic")
+            })
+            .expect("admit later attempt after joining previous failure");
+        let (finished_at, committed) = worker.finish().expect("retain panic completion");
+        assert!(!committed);
+        schedule.record_outcome(finished_at, committed);
+        assert_eq!(schedule.next_attempt - finished_at, Duration::from_secs(2));
+        worker
+            .start(Instant::now(), || Ok(()))
+            .expect("admit a later successful completion");
+        let (finished_at, committed) = worker.finish().unwrap();
+        assert!(committed);
+        schedule.record_outcome(finished_at, committed);
+        assert_eq!(
+            schedule.next_attempt - finished_at,
+            GUARDIAN_LIVE_CHECKPOINT_INTERVAL
         );
     }
 
