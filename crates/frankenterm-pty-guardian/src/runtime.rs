@@ -727,15 +727,6 @@ enum RuntimeInputWriter {
     Broker(BrokerPaneInputWriterV1),
 }
 
-impl RuntimeInputWriter {
-    fn writer(&mut self) -> &mut dyn Write {
-        match self {
-            Self::Native(writer) => writer.as_mut(),
-            Self::Broker(writer) => writer,
-        }
-    }
-}
-
 struct InputJob {
     route: GuardianInputRoute,
     pane_id: Uuid,
@@ -1758,7 +1749,13 @@ fn execute_input_job(job: &mut InputJob) -> InputJobExecution {
             accepted_reply: _,
             permit,
         }) => {
-            let outcome = permit.write_once(job.writer.writer(), job.request.payload());
+            let outcome = match &mut job.writer {
+                RuntimeInputWriter::Native(writer) => {
+                    permit.write_once(writer.as_mut(), job.request.payload())
+                }
+                RuntimeInputWriter::Broker(writer) => permit
+                    .write_once_with(job.request.payload(), |payload| writer.write_once(payload)),
+            };
             // The original authenticated byte length remains available for
             // terminal correlation, so plaintext can die before terminal fsync.
             job.request.zeroize_payload();
@@ -7867,6 +7864,136 @@ mod tests {
         assert_eq!(replay.route, retry_route);
         assert_eq!(replay.response, Some(first_response));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn broker_input_certainty_reaches_the_durable_worker_and_exact_retries() {
+        use crate::broker::{BrokerInputTestReply, broker_input_test_writer};
+
+        let payload = b"broker-input";
+        let cases = [
+            (
+                BrokerInputTestReply::Full,
+                Some(GuardianInputDisposition::DurableFull),
+                payload.as_slice(),
+            ),
+            (
+                BrokerInputTestReply::Prefix,
+                Some(GuardianInputDisposition::DurablePrefix { applied_bytes: 2 }),
+                b"br".as_slice(),
+            ),
+            (
+                BrokerInputTestReply::LostAfterApply,
+                None,
+                payload.as_slice(),
+            ),
+            (
+                BrokerInputTestReply::InvalidCountAfterApply,
+                None,
+                payload.as_slice(),
+            ),
+            (
+                BrokerInputTestReply::WrongIdentityAfterApply,
+                None,
+                payload.as_slice(),
+            ),
+            (
+                BrokerInputTestReply::QuarantinedAfterPrefix,
+                None,
+                b"br".as_slice(),
+            ),
+            (
+                BrokerInputTestReply::Busy,
+                Some(GuardianInputDisposition::KnownNotApplied),
+                b"".as_slice(),
+            ),
+            (
+                BrokerInputTestReply::Rejected,
+                Some(GuardianInputDisposition::KnownNotApplied),
+                b"".as_slice(),
+            ),
+        ];
+        for (reply, expected_disposition, expected_applied) in cases {
+            let (_directory, _poll, mut runtime, pane_id) =
+                claimed_runtime_with_writer(Box::new(Vec::<u8>::new()));
+            let (writer, sink) = broker_input_test_writer(pane_id, reply);
+            let request_id = Uuid::from_u128(141);
+            let effect_id = Uuid::from_u128(142);
+            let request = authenticated_input_request_for(request_id, pane_id, effect_id, payload);
+            let mut job = InputJob {
+                route: input_route(7, 1, &request),
+                pane_id,
+                protocol: runtime.protocol.take().expect("test protocol authority"),
+                writer: RuntimeInputWriter::Broker(writer),
+                journal: runtime
+                    .panes
+                    .get_mut(&pane_id)
+                    .expect("test pane authority")
+                    .input_journal
+                    .take()
+                    .expect("test durable input authority"),
+                request: OwnedInputRequest::new(request),
+                token_effect_authority: WorkerTokenEffectAuthority::TestOnlyBypass,
+            };
+            let first = execute_input_job(&mut job);
+            assert_eq!(first.disposition, expected_disposition, "{reply:?}");
+            assert!(job.request.payload().is_empty(), "{reply:?}");
+            assert_eq!(
+                sink.join().expect("join broker input-result sink"),
+                expected_applied,
+                "{reply:?}"
+            );
+            match expected_disposition {
+                None => {
+                    assert!(first.response.is_none(), "{reply:?}");
+                    assert!(
+                        matches!(
+                            job.protocol.pane_state(pane_id),
+                            Some(GuardianPaneState::LiveClaimed {
+                                pending_input_effect: Some(pending),
+                                ..
+                            }) if *pending == effect_id
+                        ),
+                        "an unknown broker effect must keep the pane fenced: {reply:?}"
+                    );
+                }
+                Some(GuardianInputDisposition::KnownNotApplied) => {
+                    let response = first.response.as_ref().expect("known-zero receipt");
+                    assert_eq!(
+                        GuardianRejectionCode::decode(response.header().status, response.payload())
+                            .unwrap(),
+                        GuardianRejectionCode::InputKnownNotApplied,
+                        "{reply:?}"
+                    );
+                }
+                Some(disposition) => {
+                    assert_eq!(
+                        input_reply_state(first.response.as_ref().expect("exact input receipt")),
+                        disposition.recovery_protocol_state(),
+                        "{reply:?}"
+                    );
+                }
+            }
+
+            job.request = OwnedInputRequest::new(authenticated_input_request_for(
+                request_id, pane_id, effect_id, payload,
+            ));
+            let replay = execute_input_job(&mut job);
+            assert_eq!(replay.response, first.response, "exact retry: {reply:?}");
+            if expected_disposition.is_none() {
+                assert_ne!(
+                    replay.disposition,
+                    Some(GuardianInputDisposition::KnownNotApplied)
+                );
+            } else {
+                assert_eq!(
+                    replay.disposition, expected_disposition,
+                    "exact retry: {reply:?}"
+                );
+            }
+            runtime.protocol = Some(job.protocol);
+            runtime.panes.get_mut(&pane_id).unwrap().input_journal = Some(job.journal);
+        }
     }
 
     #[test]

@@ -76,6 +76,7 @@ use mio::{Events, Interest, Poll, Token, Waker};
 use mux::guardian_checkpoint::{
     GuardianGenesisReservationIdentityV1, GuardianSpawnCustodyContextV1,
 };
+use mux::guardian_input_journal::GuardianInputWriteResult;
 use mux::guardian_output_journal::GuardianOutputAppendReceipt;
 #[cfg(test)]
 use mux::guardian_output_journal::{GuardianOutputJournal, GuardianOutputJournalTail};
@@ -8124,27 +8125,28 @@ impl BrokerPaneInputWriterV1 {
     pub(crate) fn into_parts(self) -> (Box<BrokerPaneIoSessionV1>, BrokerPaneOutputHandleV1) {
         (self.session, self.handle)
     }
-}
 
-impl Write for BrokerPaneInputWriterV1 {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+    /// Preserve the broker exchange's effect certainty through the input WAL.
+    /// This deliberately does not implement `Write`: a lost broker response
+    /// can follow a physical write, whereas `Write::write` errors promise zero
+    /// bytes. The connection poison bit is set before the first possible send
+    /// and cleared only after an authenticated, correlated response.
+    pub(crate) fn write_once(&mut self, bytes: &[u8]) -> GuardianInputWriteResult {
         if self.attempted {
-            return Err(std::io::Error::other(
-                "broker input attempt already consumed",
-            ));
+            return GuardianInputWriteResult::Indeterminate;
         }
         self.attempted = true;
         // A short count is the exact prefix the PTY took (ft-twwf2), which the
         // input WAL records as such; the mux sends the rest as new input.
-        self.session
+        match self
+            .session
             .client
             .write_input_once(&self.handle, bytes, self.deadline)
-            .map_err(|_| std::io::Error::other("broker input result unavailable or indeterminate"))
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        // Applied already includes the broker's physical writer flush.
-        Ok(())
+        {
+            Ok(written) => GuardianInputWriteResult::Applied(written),
+            Err(_) if self.session.client.poisoned => GuardianInputWriteResult::Indeterminate,
+            Err(_) => GuardianInputWriteResult::KnownNotApplied,
+        }
     }
 }
 
@@ -21954,6 +21956,9 @@ pub enum BrokerError {
 }
 
 #[cfg(test)]
+pub(crate) use tests::{BrokerInputTestReply, broker_input_test_writer};
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use mux::guardian_output_journal::{
@@ -26281,6 +26286,143 @@ mod tests {
         server.join().expect("join delayed-response broker fixture");
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum BrokerInputTestReply {
+        Full,
+        Prefix,
+        LostAfterApply,
+        InvalidCountAfterApply,
+        WrongIdentityAfterApply,
+        QuarantinedAfterPrefix,
+        Busy,
+        Rejected,
+    }
+
+    /// Exercise the real broker encoder, authenticated exchange and input
+    /// adapter against a sink that independently records what it accepted.
+    /// Runtime tests join this handle to compare physical effects with the
+    /// disposition that the real encrypted input journal retained.
+    pub(crate) fn broker_input_test_writer(
+        pane_id: Uuid,
+        reply: BrokerInputTestReply,
+    ) -> (BrokerPaneInputWriterV1, thread::JoinHandle<Vec<u8>>) {
+        let (client_stream, mut server_stream) =
+            BlockingUnixStream::pair().expect("create input-result socket pair");
+        server_stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("bound input-result fixture");
+        server_stream
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .expect("bound input-result response");
+        let connection_identity =
+            BrokerGuardianConnectionIdentityV1::new(id(1), id(2), sealed(0xb1), sealed(0xb2))
+                .unwrap();
+        let broker_incarnation = id(6_401);
+        let connection_id = id(6_402);
+        let client = BrokerControlClientV1 {
+            stream: client_stream,
+            control_authenticator: control_authenticator(0xb3),
+            identity: connection_identity,
+            connection_id,
+            broker_incarnation,
+            broker_lineage: wal_authenticator(0xb3).lineage_id(),
+            broker_build: sealed(0xb4),
+            recovered_hello: false,
+            poisoned: false,
+        };
+        let handle = BrokerPaneOutputHandleV1 {
+            broker_incarnation,
+            connection_id,
+            pane_id,
+            spawn_effect_id: id(6_403),
+            spawn_ack_id: id(6_404),
+            lease_generation: 1,
+            child_identity: test_kernel_child(6_405),
+        };
+        let server = thread::spawn(move || {
+            let authority = control_authenticator(0xb3);
+            let frame = read_blocking_broker_control_frame(
+                &mut server_stream,
+                BROKER_CONTROL_REQUEST_FIXED_BYTES,
+            )
+            .expect("read input-result request");
+            let request = decode_broker_control_request(&authority, &frame)
+                .expect("authenticate input-result request");
+            assert_eq!(request.header.operation, BrokerControlOperationV1::Write);
+            assert_eq!(request.header.durable_pane_id, pane_id);
+            let applied = match reply {
+                BrokerInputTestReply::Busy | BrokerInputTestReply::Rejected => Vec::new(),
+                BrokerInputTestReply::Prefix | BrokerInputTestReply::QuarantinedAfterPrefix => {
+                    request.payload()[..2].to_vec()
+                }
+                _ => request.payload().to_vec(),
+            };
+            if reply == BrokerInputTestReply::LostAfterApply {
+                return applied;
+            }
+            let status = match reply {
+                BrokerInputTestReply::Busy => BrokerControlResponseStatusV1::Retryable,
+                BrokerInputTestReply::Rejected => BrokerControlResponseStatusV1::Rejected,
+                BrokerInputTestReply::QuarantinedAfterPrefix => {
+                    BrokerControlResponseStatusV1::Quarantined
+                }
+                _ => BrokerControlResponseStatusV1::Applied,
+            };
+            let prefix = match reply {
+                BrokerInputTestReply::Prefix => Some(2_u32.to_be_bytes()),
+                BrokerInputTestReply::InvalidCountAfterApply => Some(
+                    u32::try_from(request.payload().len() + 1)
+                        .unwrap()
+                        .to_be_bytes(),
+                ),
+                _ => None,
+            };
+            let response = BrokerControlResponseV1::new(
+                BrokerControlResponseHeaderV1 {
+                    operation: request.header.operation,
+                    status,
+                    request_id: if reply == BrokerInputTestReply::WrongIdentityAfterApply {
+                        id(6_406)
+                    } else {
+                        request.header.request_id
+                    },
+                    broker_incarnation,
+                    guardian_incarnation: request.header.guardian_incarnation,
+                    connection_id,
+                    durable_pane_id: pane_id,
+                    lease_generation: request.header.lease_generation,
+                    operation_id: request.header.operation_id,
+                    child_identity: None,
+                    output_sequence_start: 0,
+                    output_sequence_end: 0,
+                },
+                prefix.as_ref().map_or(&[], |count| count.as_slice()),
+            )
+            .expect("construct input-result response");
+            let frame = encode_broker_control_response(&authority, &response)
+                .expect("authenticate input-result response");
+            server_stream
+                .write_all(frame.as_slice())
+                .expect("write input-result response");
+            applied
+        });
+        let deadline = if reply == BrokerInputTestReply::Busy {
+            // The first exchange still has its own bounded transport budget;
+            // the clean Retryable answer exhausts admission without a resend.
+            Instant::now()
+        } else {
+            Instant::now() + Duration::from_secs(3)
+        };
+        (
+            BrokerPaneInputWriterV1::new(
+                Box::new(BrokerPaneIoSessionV1 { client }),
+                handle,
+                deadline,
+            ),
+            server,
+        )
+    }
+
     #[test]
     fn spawn_control_payload_round_trips_exact_admission_binding() {
         let authenticated = authority(id(721), id(722), id(723), id(724), 0x81, 0x82);
@@ -28297,8 +28439,14 @@ mod tests {
                 output_handle,
                 output_deadline,
             );
-            assert_eq!(writer.write(b"one-physical-input\n").unwrap(), 19);
-            assert!(writer.write(b"duplicate\n").is_err());
+            assert_eq!(
+                writer.write_once(b"one-physical-input\n"),
+                GuardianInputWriteResult::Applied(19)
+            );
+            assert_eq!(
+                writer.write_once(b"duplicate\n"),
+                GuardianInputWriteResult::Indeterminate
+            );
             let (mut session, handle) = writer.into_parts();
             loop {
                 // Drain what the child wrote: on macOS its exit waits for it.
@@ -28885,10 +29033,14 @@ mod tests {
                     service.output_worker.active = None;
                 });
             });
-            assert_eq!(input_writer.write(b"q").unwrap(), 1);
+            assert_eq!(
+                input_writer.write_once(b"q"),
+                GuardianInputWriteResult::Applied(1)
+            );
         });
-        assert!(
-            input_writer.write(b"q").is_err(),
+        assert_eq!(
+            input_writer.write_once(b"q"),
+            GuardianInputWriteResult::Indeterminate,
             "one input adapter must never replay raw bytes"
         );
         let (returned_session, output_handle) = input_writer.into_parts();
@@ -28909,8 +29061,8 @@ mod tests {
         let mut input_writer =
             BrokerPaneInputWriterV1::new(returned_session, output_handle, soon());
         assert_eq!(
-            input_writer.write(b"abcdef").unwrap(),
-            2,
+            input_writer.write_once(b"abcdef"),
+            GuardianInputWriteResult::Applied(2),
             "a full queue after a prefix is a short write of exactly that prefix"
         );
         assert_eq!(pty_input.lock().unwrap().as_slice(), b"ab");

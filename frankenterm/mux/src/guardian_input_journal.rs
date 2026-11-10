@@ -340,12 +340,25 @@ pub struct GuardianInputWritePermit {
     identity: GuardianInputEffectIdentity,
 }
 
+/// Observed result of one authorized input attempt, before journal publication.
+///
+/// A remote writer may lose its reply after the PTY has consumed bytes. Such a
+/// failure is `Indeterminate`, not a `std::io::Write` error: that trait promises
+/// that an error wrote no bytes. Only an exact count or proof of no effect may
+/// refine the durable `AcceptedNotDurable` fence to a terminal disposition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuardianInputWriteResult {
+    Applied(usize),
+    KnownNotApplied,
+    Indeterminate,
+}
+
 /// Content-free result of consuming one exact PTY-write permit.
 ///
-/// `disposition == None` means the writer violated the `Write` contract by
-/// reporting more bytes than it was given. The caller must retain the durable
-/// `AcceptedNotDurable` fence in that case; it has no defensible exact prefix
-/// to publish. The payload itself is never retained here.
+/// `disposition == None` means the effect is indeterminate, including a remote
+/// writer that lost its result or a writer that reported an impossible count.
+/// The caller must retain the durable `AcceptedNotDurable` fence in that case;
+/// it has no defensible exact prefix to publish. The payload is never retained.
 #[derive(Debug, Eq, PartialEq)]
 #[must_use = "the guardian input write outcome must be durably reconciled"]
 pub struct GuardianInputWriteOutcome {
@@ -476,6 +489,23 @@ impl GuardianInputWritePermit {
         writer: &mut W,
         payload: &[u8],
     ) -> GuardianInputWriteOutcome {
+        self.write_once_with(payload, |payload| match writer.write(payload) {
+            Ok(applied_bytes) => GuardianInputWriteResult::Applied(applied_bytes),
+            Err(_) => GuardianInputWriteResult::KnownNotApplied,
+        })
+    }
+
+    /// Consume this permit in one effect-aware input attempt.
+    ///
+    /// The callback is invoked only after authenticating the payload. Remote
+    /// adapters must report `Indeterminate` whenever their transport cannot
+    /// prove the applied prefix, and may report `KnownNotApplied` only when
+    /// they know no byte reached the PTY. A lost response never proves that.
+    pub fn write_once_with(
+        self,
+        payload: &[u8],
+        write: impl FnOnce(&[u8]) -> GuardianInputWriteResult,
+    ) -> GuardianInputWriteOutcome {
         let identity = self.identity;
         let payload_bytes = u32::try_from(payload.len()).ok();
         let payload_sha256: [u8; 32] = Sha256::digest(payload).into();
@@ -489,15 +519,19 @@ impl GuardianInputWritePermit {
             };
         }
 
-        let disposition = match writer.write(payload) {
-            Ok(0) | Err(_) => Some(GuardianInputDisposition::KnownNotApplied),
-            Ok(applied_bytes) if applied_bytes == payload.len() => {
+        let disposition = match write(payload) {
+            GuardianInputWriteResult::Applied(0) | GuardianInputWriteResult::KnownNotApplied => {
+                Some(GuardianInputDisposition::KnownNotApplied)
+            }
+            GuardianInputWriteResult::Applied(applied_bytes) if applied_bytes == payload.len() => {
                 Some(GuardianInputDisposition::DurableFull)
             }
-            Ok(applied_bytes) if applied_bytes < payload.len() => u32::try_from(applied_bytes)
-                .ok()
-                .map(|applied_bytes| GuardianInputDisposition::DurablePrefix { applied_bytes }),
-            Ok(_) => None,
+            GuardianInputWriteResult::Applied(applied_bytes) if applied_bytes < payload.len() => {
+                u32::try_from(applied_bytes)
+                    .ok()
+                    .map(|applied_bytes| GuardianInputDisposition::DurablePrefix { applied_bytes })
+            }
+            GuardianInputWriteResult::Applied(_) | GuardianInputWriteResult::Indeterminate => None,
         };
         GuardianInputWriteOutcome {
             identity,
@@ -513,8 +547,8 @@ impl GuardianInputWriteOutcome {
         self.identity
     }
 
-    /// Exact terminal disposition, or `None` when the writer's byte count made
-    /// the observable prefix indeterminate.
+    /// Exact terminal disposition, or `None` when the writer could not prove
+    /// the observable prefix.
     #[must_use]
     pub const fn disposition(&self) -> Option<GuardianInputDisposition> {
         self.disposition
@@ -2079,6 +2113,112 @@ mod tests {
         assert_eq!(invalid.calls, 1);
         assert_eq!(outcome.disposition(), None);
         assert_eq!(outcome.applied_bytes(), None);
+    }
+
+    #[test]
+    fn effect_aware_input_authenticates_before_dispatch_and_preserves_unknown_results() {
+        let payload = b"abcd";
+        let identity = GuardianInputEffectIdentity::new(
+            pane(),
+            Uuid::from_bytes([0x52; 16]),
+            3,
+            1,
+            Uuid::from_bytes([0x92; 16]),
+            u32::try_from(payload.len()).unwrap(),
+            Sha256::digest(payload).into(),
+        )
+        .unwrap();
+        let permit = || GuardianInputWritePermit { identity };
+        for mismatched in [b"abce".as_slice(), b"abc".as_slice()] {
+            let result = permit().write_once_with(mismatched, |_| {
+                panic!("an unauthenticated payload must never reach the broker")
+            });
+            assert!(!result.writer_was_invoked());
+            assert_eq!(result.applied_bytes(), Some(0));
+        }
+
+        let mut observed = Vec::new();
+        let result = permit().write_once_with(payload, |bytes| {
+            observed.extend_from_slice(bytes);
+            // The sink applied the bytes, but its acknowledgement was lost.
+            GuardianInputWriteResult::Indeterminate
+        });
+        assert_eq!(observed, payload);
+        assert!(result.writer_was_invoked());
+        assert_eq!(result.disposition(), None);
+        assert_eq!(result.applied_bytes(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ambiguous_remote_input_stays_fenced_after_journal_reopen() {
+        let temp = tempfile::tempdir().expect("create remote-input fixture");
+        let path = temp.path().join("input.journal");
+        let payload = b"one-input";
+        let identity = GuardianInputEffectIdentity::new(
+            pane(),
+            Uuid::from_bytes([0x52; 16]),
+            3,
+            1,
+            Uuid::from_bytes([0x93; 16]),
+            u32::try_from(payload.len()).unwrap(),
+            Sha256::digest(payload).into(),
+        )
+        .unwrap();
+        let mut journal = GuardianInputJournal::create(
+            create_file(&path),
+            pane(),
+            guardian(),
+            cipher(),
+            GuardianInputJournalLimits::default(),
+        )
+        .expect("create remote-input journal");
+        journal
+            .sync_parent_directory_and_activate(&open_directory(temp.path()))
+            .expect("activate remote-input journal");
+        journal.append_intent_and_sync(identity).unwrap();
+        let permit = journal
+            .append_disposition_and_sync(identity, GuardianInputDisposition::AcceptedNotDurable)
+            .unwrap()
+            .into_first_pty_write_permit()
+            .expect("one newly admitted write");
+        let accepted_bytes = journal.committed_bytes();
+        let mut observed = Vec::new();
+        let outcome = permit.write_once_with(payload, |bytes| {
+            observed.extend_from_slice(bytes);
+            GuardianInputWriteResult::Indeterminate
+        });
+        assert!(matches!(
+            commit_guardian_input_outcome(&mut journal, outcome),
+            Err(GuardianInputCompletionError::DispositionIndeterminate)
+        ));
+        assert_eq!(journal.committed_bytes(), accepted_bytes);
+        drop(journal);
+
+        let mut recovered = GuardianInputJournal::open(
+            open_file(&path),
+            pane(),
+            guardian(),
+            cipher(),
+            GuardianInputJournalLimits::default(),
+        )
+        .expect("recover ambiguous remote input");
+        assert_eq!(
+            recovered
+                .effect(identity.effect_id())
+                .unwrap()
+                .disposition(),
+            GuardianInputDisposition::AcceptedNotDurable
+        );
+        assert!(
+            recovered
+                .append_disposition_and_sync(identity, GuardianInputDisposition::AcceptedNotDurable)
+                .unwrap()
+                .into_first_pty_write_permit()
+                .is_none(),
+            "reopening the WAL must never authorize replay of an unknown effect"
+        );
+        assert_eq!(observed, payload);
     }
 
     #[cfg(unix)]
