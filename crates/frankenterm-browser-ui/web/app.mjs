@@ -3,20 +3,37 @@
 // This page owns all network I/O and DOM events. The WASM FleetViewer owns
 // state and renders frames; FrankenTermWeb paints their patches. The viewer is
 // read-only: nothing here writes to a pane.
-import { mountPaneOutput } from "./pane-output.mjs";
+import { decodeFrame, mountPaneOutput } from "./pane-output.mjs";
 import { mountHistorySearch } from "./history-panel.mjs";
 
 const REFRESH_MS = 15_000;
 const CLOCK_MS = 1_000;
 const STREAM_RETRY_MAX_MS = 30_000;
+const STREAM_FRAME_MAX_CHARS = 8 * 1024 * 1024;
 const STREAM = { DISCONNECTED: 0, CONNECTING: 1, LIVE: 2 };
 const FORWARDED_NAV_KEYS = new Set(["ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"]);
 
-// Keep persisted i64 IDs as strings: converting through Number corrupts IDs
-// above 2^53. This is the /stream/events cursor, not a delta-stream cursor.
-function validEventId(id) {
-  return typeof id === "string" && /^[0-9]{1,19}$/.test(id)
-    && BigInt(id) <= 9_223_372_036_854_775_807n;
+// This feed subscribes to all panes. Retain the complete server token, and
+// compare IDs only within its epoch and scope. Number would round i64 IDs.
+function eventCursor(token) {
+  if (typeof token !== "string" || token.length > 128) return null;
+  const match = /^event-v1:([0-9a-f]{32}):all:(0|[1-9][0-9]{0,18})$/.exec(token);
+  if (!match) return null;
+  const id = BigInt(match[2]);
+  return id <= 9_223_372_036_854_775_807n
+    ? { token, epoch: match[1], id, decimal: match[2] } : null;
+}
+
+function streamFrame(payload, kind) {
+  const limit = kind === "event" ? STREAM_FRAME_MAX_CHARS : 4096;
+  if (typeof payload !== "string" || payload.length > limit) throw new Error("invalid frame size");
+  const decoded = decodeFrame(payload);
+  const frame = decoded.frame;
+  if (frame?.schema !== "ft.stream.v1" || frame.stream !== "events" || frame.kind !== kind
+      || !frame.data || typeof frame.data !== "object" || Array.isArray(frame.data)) {
+    throw new Error("invalid frame envelope");
+  }
+  return decoded;
 }
 
 function streamErrorMessage(payload) {
@@ -25,7 +42,7 @@ function streamErrorMessage(payload) {
   try {
     const frame = JSON.parse(payload);
     const code = frame?.data?.code;
-    if (frame.schema === "ft.stream.v1" && frame.kind === "error"
+    if (frame.schema === "ft.stream.v1" && frame.stream === "events" && frame.kind === "error"
         && typeof code === "string" && /^[a-zA-Z0-9_.-]{1,80}$/.test(code)) {
       return `stream: ${code}`;
     }
@@ -34,10 +51,11 @@ function streamErrorMessage(payload) {
 }
 
 // One owner for the EventSource and its replacement timer. Native transient
-// reconnects retain their own Last-Event-ID; a replacement source must carry
-// our last successfully ingested ID explicitly in since_id. Rejected frames
-// never acknowledge an ID, even though EventSource has already advanced its
-// private cursor before invoking our listener.
+// reconnects retain their own Last-Event-ID; a replacement source carries the
+// last accepted ready/event checkpoint in ?cursor. EventSource inherits that
+// ID on live-only and control messages, which cannot advance this boundary.
+// Retire a rejected source before its private cursor can skip the rejected
+// frame on reconnect. A discontinuity requires an explicit new live view.
 export function createFleetStream(viewer, {
   apiRoot,
   EventSourceImpl = globalThis.EventSource,
@@ -48,7 +66,8 @@ export function createFleetStream(viewer, {
   let source = null;
   let retryTimer = null;
   let retryMs = 1_000;
-  let lastEventId = "";
+  let cursor = null;
+  let terminalError = null;
   let stopped = true;
   let generation = 0;
 
@@ -65,14 +84,27 @@ export function createFleetStream(viewer, {
     }
   }
 
-  function reconnect(message) {
+  function retire() {
+    generation += 1;
+    if (retryTimer !== null) clearTimer(retryTimer);
+    retryTimer = null;
     const previous = source;
     source = null;
     if (previous) previous.close();
-    if (stopped) return;
+  }
+
+  function halt(message) {
+    terminalError = `${message}; live updates stopped. Reload to start a new live view.`;
+    retire();
+    viewer.setStreamState(STREAM.DISCONNECTED);
+    viewer.reportError(terminalError);
+  }
+
+  function reconnect(message) {
+    retire();
+    if (stopped || terminalError !== null) return;
     viewer.setStreamState(STREAM.DISCONNECTED);
     if (message) viewer.reportError(message);
-    if (retryTimer !== null) return;
     const expectedGeneration = generation;
     retryTimer = setTimer(() => {
       if (stopped || generation !== expectedGeneration) return;
@@ -82,11 +114,22 @@ export function createFleetStream(viewer, {
     retryMs = Math.min(STREAM_RETRY_MAX_MS, retryMs * 2);
   }
 
+  function rejectFrame(message) {
+    if (cursor === null) halt(`${message}; no accepted checkpoint`);
+    else reconnect(message);
+  }
+
+  function inheritedCursorIsSafe(token) {
+    const inherited = eventCursor(token);
+    return cursor !== null && inherited !== null
+      && inherited.epoch === cursor.epoch && inherited.id <= cursor.id;
+  }
+
   function open() {
-    if (stopped || source !== null) return;
+    if (stopped || terminalError !== null || source !== null) return;
     viewer.setStreamState(STREAM.CONNECTING);
     const url = new URL("stream/events?channel=all&max_hz=20", apiRoot);
-    if (lastEventId !== "") url.searchParams.set("since_id", lastEventId);
+    if (cursor !== null) url.searchParams.set("cursor", cursor.token);
     let candidate;
     try {
       candidate = new EventSourceImpl(url);
@@ -95,43 +138,107 @@ export function createFleetStream(viewer, {
       return;
     }
     source = candidate;
+    let ready = false;
     const current = () => !stopped && source === candidate;
     const onFrame = (message) => {
       if (!current()) return;
-      const id = message.lastEventId ?? "";
-      if (message.type === "event" && id !== "" && !validEventId(id)) {
-        // No accepted boundary exists yet: recover from the beginning rather
-        // than silently stepping over an unprocessed first persisted event.
-        if (lastEventId === "") lastEventId = "0";
-        reconnect("stream: invalid persisted event cursor");
+      let frame;
+      let exact;
+      try {
+        ({ frame, exact } = streamFrame(message.data, message.type));
+      } catch (_) {
+        rejectFrame("stream: invalid stream frame");
         return;
+      }
+      let nextCursor = null;
+      if (message.type === "ready") {
+        nextCursor = eventCursor(frame.data.cursor);
+        if (nextCursor === null || message.lastEventId !== nextCursor.token
+            || frame.data.channel !== "all" || frame.data.pane_id !== null
+            || frame.data.durable_detections !== true) {
+          rejectFrame("stream: invalid ready checkpoint");
+          return;
+        }
+        if (cursor !== null && nextCursor.epoch !== cursor.epoch) {
+          halt("stream: event history changed");
+          return;
+        }
+        if (cursor !== null && nextCursor.id > cursor.id) {
+          rejectFrame("stream: ready checkpoint skipped the accepted cursor");
+          return;
+        }
+      } else if (!ready) {
+        rejectFrame("stream: frame arrived before a ready checkpoint");
+        return;
+      } else if (message.type === "event" && frame.data.delivery === "durable") {
+        nextCursor = eventCursor(message.lastEventId);
+        const event = frame.data.event;
+        if (nextCursor === null || nextCursor.id === 0n || event?.type !== "pattern_detected"
+            || typeof event.event_id !== "number" || exact.data.event?.event_id !== nextCursor.decimal) {
+          rejectFrame("stream: invalid persisted event cursor");
+          return;
+        }
+        if (nextCursor.epoch !== cursor.epoch) {
+          halt("stream: event history changed");
+          return;
+        }
+        if (nextCursor.id <= cursor.id) return; // same history, already admitted
+      } else {
+        // No `id:` is sent on live-only or lag frames. The browser still
+        // exposes its inherited Last-Event-ID; it is never a new checkpoint.
+        if (!inheritedCursorIsSafe(message.lastEventId)
+            || (message.type === "event" && (frame.data.delivery !== "live_only"
+                || !frame.data.event || typeof frame.data.event !== "object"
+                || Array.isArray(frame.data.event) || frame.data.event.event_id != null))
+            || (message.type === "lag" && frame.data.live_only !== true)) {
+          rejectFrame("stream: invalid live-only frame");
+          return;
+        }
       }
       try {
         viewer.ingestStreamFrame(message.data);
       } catch (_) {
-        if (lastEventId === "") lastEventId = "0";
-        reconnect("stream: frame rejected; retrying from the last accepted cursor");
+        rejectFrame("stream: frame rejected; retrying from the last accepted cursor");
         return;
       }
-      if (message.type === "event") {
-        if (id !== "") lastEventId = id;
+      if (message.type === "ready") {
+        if (cursor === null) cursor = nextCursor;
+        ready = true;
+      } else if (nextCursor !== null) {
+        cursor = nextCursor;
         // A TCP open/ready followed by a replay failure is not recovery.
         retryMs = 1_000;
       }
       if (message.type === "ready" || message.type === "lag") resync();
     };
     for (const type of ["ready", "event", "lag"]) candidate.addEventListener(type, onFrame);
+    candidate.addEventListener("cursor_discontinuity", (message) => {
+      if (!current()) return;
+      let reason = "invalid cursor discontinuity";
+      try {
+        const { frame } = streamFrame(message.data, "cursor_discontinuity");
+        const resume = eventCursor(frame.data.resume_cursor);
+        if (frame.data.code === "event_cursor_discontinuity" && frame.data.terminal === true
+            && ["retention_pruned", "legacy_history_unavailable", "cursor_epoch_mismatch",
+              "cursor_ahead_of_high_water"].includes(frame.data.reason)
+            && resume !== null && (cursor === null
+              || (resume.epoch === cursor.epoch && resume.id <= cursor.id))) {
+          reason = `event_cursor_discontinuity (${frame.data.reason})`;
+        }
+      } catch (_) { /* terminal finite diagnostic below */ }
+      halt(`stream: ${reason}`);
+    });
     candidate.addEventListener("error", (message) => {
       if (!current()) return;
       // Named SSE `event: error` is a MessageEvent, whereas a network error
       // is an Event without data. Do not discard replay/storage failures as
       // if they were merely an EventSource transport state transition.
       if (typeof message.data === "string") {
-        if (lastEventId === "") lastEventId = "0";
         reconnect(streamErrorMessage(message.data));
       } else if (candidate.readyState === EventSourceImpl.CLOSED) {
         reconnect("stream: disconnected; reconnecting");
       } else {
+        ready = false;
         viewer.setStreamState(STREAM.CONNECTING);
       }
     });
@@ -142,16 +249,14 @@ export function createFleetStream(viewer, {
       if (!stopped) return;
       stopped = false;
       generation += 1;
-      open();
+      if (terminalError !== null) {
+        viewer.setStreamState(STREAM.DISCONNECTED);
+        viewer.reportError(terminalError);
+      } else open();
     },
     stop() {
       stopped = true;
-      generation += 1;
-      if (retryTimer !== null) clearTimer(retryTimer);
-      retryTimer = null;
-      const previous = source;
-      source = null;
-      if (previous) previous.close();
+      retire();
       viewer.setStreamState(STREAM.DISCONNECTED);
     },
   };

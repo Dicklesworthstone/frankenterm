@@ -14,7 +14,7 @@ function unsigned(value, maximum) {
 // the original JSON first, then quote integer tokens OUTSIDE strings. Parsing
 // the original is important: quoting alone would accept invalid {1:2} JSON.
 // Neither parse is attempted before the caller enforces the frame-size limit.
-function decodeFrame(payload) {
+export function decodeFrame(payload) {
   const frame = JSON.parse(payload);
   const exact = JSON.parse(payload.replace(
     /"(?:[^"\\]|\\.)*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/g,

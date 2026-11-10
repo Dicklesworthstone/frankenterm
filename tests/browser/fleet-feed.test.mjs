@@ -2,6 +2,55 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createFleetStream, createFleetRefresh } from "../../crates/frankenterm-browser-ui/web/app.mjs";
 
+const EPOCH = "0123456789abcdef0123456789abcdef";
+const OTHER_EPOCH = "fedcba9876543210fedcba9876543210";
+const cursor = (id, epoch = EPOCH) => `event-v1:${epoch}:all:${id}`;
+
+function ready(source, id = "0", epoch = EPOCH) {
+  const token = cursor(id, epoch);
+  source.emit("ready", {
+    data: JSON.stringify({
+      schema: "ft.stream.v1", stream: "events", kind: "ready", seq: 1, ts_ms: 1,
+      data: { channel: "all", pane_id: null, durable_detections: true, cursor: token },
+    }),
+    lastEventId: token,
+  });
+}
+
+// Write IDs as JSON integer tokens, including values Number cannot represent.
+function durablePayload(id, label = "accepted") {
+  return `{"schema":"ft.stream.v1","stream":"events","kind":"event","ts_ms":1,"data":{"delivery":"durable","event":{"type":"pattern_detected","pane_id":7,"event_id":${id},"detection":{"rule_id":"test.event","severity":"info"},"label":${JSON.stringify(label)}}}}`;
+}
+
+function livePayload(type = "pane_discovered") {
+  return JSON.stringify({
+    schema: "ft.stream.v1", stream: "events", kind: "event",
+    data: { delivery: "live_only", event: { type, pane_id: 7, domain: "local", title: "live pane" } },
+  });
+}
+
+function discontinuity(source, id, reason = "retention_pruned", fields = {}) {
+  source.emit("cursor_discontinuity", {
+    data: JSON.stringify({
+      schema: "ft.stream.v1", stream: "events", kind: "cursor_discontinuity",
+      data: { code: "event_cursor_discontinuity", terminal: true, reason,
+        resume_cursor: cursor(id), current_cursor_epoch: EPOCH, ...fields },
+    }),
+    lastEventId: cursor(id),
+  });
+}
+
+function startReady(f, id = "0") {
+  f.feed.start();
+  ready(f.sources.at(-1), id);
+  return f.sources.at(-1);
+}
+
+function eventLabels(f) {
+  return f.frames.map((payload) => JSON.parse(payload))
+    .filter((frame) => frame.kind === "event").map((frame) => frame.data.event.label);
+}
+
 function fixture({ reject = () => false, throwConstruct = false, resync = () => {} } = {}) {
   const sources = [];
   const timers = new Map();
@@ -70,45 +119,51 @@ function closed(source) {
   source.emit("error");
 }
 
-function event(source, id, data = "accepted") {
-  source.emit("event", { data, lastEventId: id });
+function event(source, id, label = "accepted", epoch = EPOCH) {
+  source.emit("event", { data: durablePayload(id, label), lastEventId: cursor(id, epoch) });
 }
 
-test("start is idempotent and the first connection is live-only", () => {
+test("start is idempotent and waits for the server's fresh durable checkpoint", () => {
   const f = fixture();
   f.feed.start();
   f.feed.start();
   assert.equal(f.sources.length, 1);
   assert.equal(f.sources[0].url.pathname, "/ft/stream/events");
   assert.equal(f.sources[0].url.searchParams.get("since_id"), null);
+  assert.equal(f.sources[0].url.searchParams.get("cursor"), null);
   assert.equal(f.sources[0].url.searchParams.get("channel"), "all");
   assert.deepEqual(f.states, [1]);
 });
 
-test("closed-source replacement resumes with the exact accepted i64 string", () => {
+test("closed-source replacement resumes with the complete accepted epoch and i64 token", () => {
   const f = fixture();
-  f.feed.start();
+  startReady(f);
   event(f.sources[0], "9223372036854775807");
   closed(f.sources[0]);
   f.runTimer();
-  assert.equal(f.sources[1].url.searchParams.get("since_id"), "9223372036854775807");
+  assert.equal(f.sources[1].url.searchParams.get("cursor"), cursor("9223372036854775807"));
+  assert.equal(f.sources[1].url.searchParams.has("since_id"), false);
+  assert.ok(f.frames.at(-1).includes('"event_id":9223372036854775807'), "original exact JSON reaches WASM");
   assert.equal(f.sources[0].closeCalls, 1);
 });
 
 test("native transient reconnect retains one source and creates no replacement timer", () => {
   const f = fixture();
-  f.feed.start();
+  startReady(f);
   event(f.sources[0], "71");
   f.sources[0].emit("error");
   assert.equal(f.sources.length, 1);
   assert.equal(f.timers.size, 0);
   assert.equal(f.sources[0].closeCalls, 0);
   assert.equal(f.states.at(-1), 1);
+  ready(f.sources[0], "71");
+  event(f.sources[0], "72");
+  assert.equal(eventLabels(f).length, 2);
 });
 
 test("late callbacks and repeated CLOSED errors cannot create duplicate streams", () => {
   const f = fixture();
-  f.feed.start();
+  startReady(f);
   const first = f.sources[0];
   event(first, "12");
   closed(first);
@@ -117,68 +172,74 @@ test("late callbacks and repeated CLOSED errors cannot create duplicate streams"
   assert.equal(f.timers.size, 1);
   f.runTimer();
   assert.equal(f.sources.length, 2);
-  assert.equal(f.sources[1].url.searchParams.get("since_id"), "12");
-  assert.deepEqual(f.frames, ["accepted"]);
+  assert.equal(f.sources[1].url.searchParams.get("cursor"), cursor("12"));
+  assert.deepEqual(eventLabels(f), ["accepted"]);
 });
 
 test("a rejected payload cannot advance the application resume cursor", () => {
-  const f = fixture({ reject: (data) => data === "broken" });
-  f.feed.start();
+  const f = fixture({ reject: (data) => JSON.parse(data).data?.event?.label === "broken" });
+  startReady(f);
   event(f.sources[0], "9");
   event(f.sources[0], "10", "broken");
   f.runTimer();
-  assert.equal(f.sources[1].url.searchParams.get("since_id"), "9");
+  assert.equal(f.sources[1].url.searchParams.get("cursor"), cursor("9"));
   assert.match(f.errors.at(-1), /frame rejected/);
 });
 
-test("rejecting the first persisted frame uses an explicit recovery boundary", () => {
-  const f = fixture({ reject: () => true });
-  f.feed.start();
+test("rejecting the first persisted frame resumes the accepted ready checkpoint", () => {
+  const f = fixture({ reject: (data) => JSON.parse(data).kind === "event" });
+  startReady(f, "6");
   event(f.sources[0], "10", "broken");
   f.runTimer();
-  assert.equal(f.sources[1].url.searchParams.get("since_id"), "0");
+  assert.equal(f.sources[1].url.searchParams.get("cursor"), cursor("6"));
+  assert.equal(f.sources[1].url.searchParams.has("since_id"), false);
 });
 
 test("named application errors are visible and do not acknowledge their inherited id", () => {
   const f = fixture();
-  f.feed.start();
+  startReady(f);
   event(f.sources[0], "15");
   f.sources[0].emit("error", {
     data: JSON.stringify({
-      schema: "ft.stream.v1", kind: "error",
+      schema: "ft.stream.v1", stream: "events", kind: "error",
       data: { code: "event_replay_storage_error", message: "private backend detail" },
     }),
-    lastEventId: "99",
+    lastEventId: cursor("99"),
   });
   assert.equal(f.errors.at(-1), "stream: event_replay_storage_error");
   assert.ok(f.errors.every((message) => !message.includes("private backend detail")));
   assert.equal(f.states.at(-1), 0);
   f.runTimer();
-  assert.equal(f.sources[1].url.searchParams.get("since_id"), "15");
+  assert.equal(f.sources[1].url.searchParams.get("cursor"), cursor("15"));
 });
 
-test("malformed or overflowing cursor ids fail closed without ingestion", () => {
-  for (const id of ["-1", "1e2", "9223372036854775808", "1\n2", "delta-v1:all:9", "x".repeat(100)]) {
+test("legacy, malformed, wrong-scope and overflowing cursors fail closed without ingestion", () => {
+  for (const token of ["9", cursor("-1"), cursor("1e2"), cursor("01"), cursor("0"),
+    cursor("9223372036854775808"), cursor("1\n2"), cursor("9", EPOCH.toUpperCase()),
+    `event-v1:${EPOCH}:pane:7:9`, "delta-v1:pane:7:9", "x".repeat(129)]) {
     const f = fixture();
-    f.feed.start();
+    startReady(f);
     event(f.sources[0], "7");
-    event(f.sources[0], id, "bad cursor");
+    f.sources[0].emit("event", { data: durablePayload("9", "bad cursor"), lastEventId: token });
     f.runTimer();
-    assert.equal(f.sources[1].url.searchParams.get("since_id"), "7", id);
-    assert.deepEqual(f.frames, ["accepted"], id);
+    assert.equal(f.sources[1].url.searchParams.get("cursor"), cursor("7"), token);
+    assert.deepEqual(eventLabels(f), ["accepted"], token);
   }
 });
 
-test("ready and lag request snapshot recovery but cannot replace the event cursor", () => {
+test("resumed ready and lag request snapshots without moving the accepted boundary backward", () => {
   const f = fixture();
-  f.feed.start();
+  startReady(f);
   event(f.sources[0], "22");
-  f.sources[0].emit("ready", { data: "ready", lastEventId: "99" });
-  f.sources[0].emit("lag", { data: "lag", lastEventId: "99" });
-  assert.equal(f.resyncs, 2);
+  ready(f.sources[0], "20");
+  f.sources[0].emit("lag", {
+    data: JSON.stringify({ schema: "ft.stream.v1", stream: "events", kind: "lag", data: { missed_count: 2, live_only: true } }),
+    lastEventId: cursor("20"),
+  });
+  assert.equal(f.resyncs, 3);
   closed(f.sources[0]);
   f.runTimer();
-  assert.equal(f.sources[1].url.searchParams.get("since_id"), "22");
+  assert.equal(f.sources[1].url.searchParams.get("cursor"), cursor("22"));
 });
 
 test("failed reconnects back off to a cap instead of resetting on TCP open or ready", () => {
@@ -187,11 +248,12 @@ test("failed reconnects back off to a cap instead of resetting on TCP open or re
   for (let i = 0; i < 7; i += 1) {
     const current = f.sources.at(-1);
     current.emit("open");
-    current.emit("ready", { data: "ready" });
+    ready(current);
     closed(current);
     f.runTimer();
   }
   assert.deepEqual(f.delays, [1000, 2000, 4000, 8000, 16000, 30000, 30000]);
+  ready(f.sources.at(-1));
   event(f.sources.at(-1), "50");
   closed(f.sources.at(-1));
   assert.equal(f.delays.at(-1), 1000);
@@ -199,7 +261,7 @@ test("failed reconnects back off to a cap instead of resetting on TCP open or re
 
 test("stop cancels retries and stale queued timer callbacks cannot revive an old generation", () => {
   const f = fixture();
-  f.feed.start();
+  startReady(f);
   event(f.sources[0], "81");
   closed(f.sources[0]);
   const lateTimer = f.allCallbacks[0];
@@ -210,10 +272,10 @@ test("stop cancels retries and stale queued timer callbacks cannot revive an old
   f.feed.start();
   lateTimer();
   assert.equal(f.sources.length, 2);
-  assert.equal(f.sources[1].url.searchParams.get("since_id"), "81");
+  assert.equal(f.sources[1].url.searchParams.get("cursor"), cursor("81"));
   f.feed.stop();
   event(f.sources[1], "999", "late after stop");
-  assert.deepEqual(f.frames, ["accepted"]);
+  assert.deepEqual(eventLabels(f), ["accepted"]);
   assert.equal(f.sources[1].closeCalls, 1);
 });
 
@@ -229,12 +291,167 @@ test("EventSource constructor failures remain retryable and cancellable", () => 
 });
 
 test("server error diagnostics are finite for malformed, hostile and oversized payloads", () => {
-  for (const data of ["not JSON", "x".repeat(4097), '{"schema":"ft.stream.v1","kind":"error","data":{"code":"secret\\nraw"}}']) {
+  for (const data of ["not JSON", "x".repeat(4097), '{"schema":"ft.stream.v1","stream":"events","kind":"error","data":{"code":"secret\\nraw"}}']) {
     const f = fixture();
     f.feed.start();
     f.sources[0].emit("error", { data });
     assert.equal(f.errors.at(-1), "stream: invalid server error frame");
     assert.equal(f.timers.size, 1);
+  }
+});
+
+test("the ready checkpoint alone survives a disconnect before the first event", () => {
+  const f = fixture();
+  startReady(f, "9007199254740993");
+  closed(f.sources[0]);
+  f.runTimer();
+  assert.equal(f.sources[1].url.searchParams.get("cursor"), cursor("9007199254740993"));
+  assert.deepEqual(eventLabels(f), []);
+});
+
+test("an unanchored rejected frame cannot fabricate an epoch or silently start over", () => {
+  const f = fixture();
+  f.feed.start();
+  event(f.sources[0], "10");
+  assert.equal(f.timers.size, 0);
+  assert.equal(f.sources[0].closeCalls, 1);
+  assert.match(f.errors.at(-1), /no accepted checkpoint.*Reload/);
+  f.feed.stop();
+  f.feed.start();
+  assert.equal(f.sources.length, 1, "a visibility restart is not consent to lose history");
+  assert.equal(f.frames.length, 0);
+});
+
+test("a ready checkpoint cannot skip the previously accepted resume boundary", () => {
+  const f = fixture();
+  startReady(f, "7");
+  ready(f.sources[0], "99");
+  assert.match(f.errors.at(-1), /ready checkpoint skipped/);
+  f.runTimer();
+  assert.equal(f.sources[1].url.searchParams.get("cursor"), cursor("7"));
+});
+
+test("ready requires matching frame and transport tokens for this durable all-pane feed", () => {
+  for (const change of [
+    (frame) => { frame.data.cursor = cursor("6"); },
+    (frame) => { frame.data.cursor = `event-v1:${EPOCH}:pane:7:5`; },
+    (frame) => { frame.data.durable_detections = false; },
+    (frame) => { frame.data.pane_id = 7; },
+    (frame) => { frame.data.channel = "signals"; },
+  ]) {
+    const f = fixture();
+    f.feed.start();
+    const frame = { schema: "ft.stream.v1", stream: "events", kind: "ready",
+      data: { cursor: cursor("5"), channel: "all", pane_id: null, durable_detections: true } };
+    change(frame);
+    f.sources[0].emit("ready", { data: JSON.stringify(frame), lastEventId: cursor("5") });
+    assert.equal(f.frames.length, 0);
+    assert.equal(f.timers.size, 0);
+    assert.match(f.errors.at(-1), /invalid ready checkpoint/);
+  }
+});
+
+test("persisted identity is checked exactly beyond Number precision and keeps JSON numeric types", () => {
+  for (const [payload, token] of [
+    [durablePayload("9007199254740992"), cursor("9007199254740993")],
+    [durablePayload('"9"'), cursor("9")],
+    [durablePayload("9e0"), cursor("9")],
+    [durablePayload("9.0"), cursor("9")],
+  ]) {
+    const f = fixture();
+    startReady(f, "7");
+    f.sources[0].emit("event", { data: payload, lastEventId: token });
+    assert.deepEqual(eventLabels(f), []);
+    f.runTimer();
+    assert.equal(f.sources[1].url.searchParams.get("cursor"), cursor("7"));
+  }
+});
+
+test("duplicates are suppressed within one epoch before an older ready can rewind state", () => {
+  const f = fixture();
+  startReady(f, "5");
+  event(f.sources[0], "8", "first");
+  ready(f.sources[0], "5");
+  event(f.sources[0], "8", "duplicate");
+  event(f.sources[0], "7", "older");
+  event(f.sources[0], "9", "next");
+  assert.deepEqual(eventLabels(f), ["first", "next"]);
+  closed(f.sources[0]);
+  f.runTimer();
+  assert.equal(f.sources[1].url.searchParams.get("cursor"), cursor("9"));
+});
+
+test("a lower ID from another epoch is rejected before duplicate suppression", () => {
+  for (const type of ["ready", "event"]) {
+    const f = fixture();
+    startReady(f, "90");
+    if (type === "ready") ready(f.sources[0], "1", OTHER_EPOCH);
+    else event(f.sources[0], "1", "different history", OTHER_EPOCH);
+    assert.equal(f.timers.size, 0);
+    assert.equal(f.sources[0].closeCalls, 1);
+    assert.match(f.errors.at(-1), /event history changed.*Reload/);
+    assert.deepEqual(eventLabels(f), []);
+  }
+});
+
+test("live-only events keep their inherited ready ID without acknowledging a new event", () => {
+  const f = fixture();
+  startReady(f, "40");
+  const source = f.sources[0];
+  source.emit("event", { data: livePayload(), lastEventId: cursor("40") });
+  source.emit("event", { data: livePayload("pane_disappeared"), lastEventId: cursor("40") });
+  closed(source);
+  f.runTimer();
+  assert.equal(f.sources[1].url.searchParams.get("cursor"), cursor("40"));
+  assert.equal(f.frames.filter((payload) => JSON.parse(payload).kind === "event").length, 2);
+});
+
+test("a live-only payload cannot install a forged higher transport ID or persisted identity", () => {
+  for (const [payload, token] of [
+    [livePayload(), cursor("100")],
+    [livePayload(), cursor("1", OTHER_EPOCH)],
+    [livePayload(), ""],
+    [durablePayload("9").replace('"delivery":"durable"', '"delivery":"live_only"'), cursor("7")],
+  ]) {
+    const f = fixture();
+    startReady(f, "7");
+    f.sources[0].emit("event", { data: payload, lastEventId: token });
+    assert.deepEqual(eventLabels(f), []);
+    f.runTimer();
+    assert.equal(f.sources[1].url.searchParams.get("cursor"), cursor("7"));
+  }
+});
+
+test("explicit retention and epoch discontinuities stop automatic and visibility reconnects", () => {
+  for (const reason of ["retention_pruned", "legacy_history_unavailable", "cursor_epoch_mismatch", "cursor_ahead_of_high_water"]) {
+    const f = fixture();
+    startReady(f, "7");
+    discontinuity(f.sources[0], "7", reason, { message: "private storage detail" });
+    assert.equal(f.timers.size, 0);
+    assert.equal(f.states.at(-1), 0);
+    assert.ok(f.errors.at(-1).includes(reason));
+    assert.match(f.errors.at(-1), /Reload to start a new live view/);
+    assert.ok(!f.errors.at(-1).includes("private storage detail"));
+    f.feed.stop();
+    f.feed.start();
+    assert.equal(f.sources.length, 1);
+    event(f.sources[0], "8", "late");
+    assert.deepEqual(eventLabels(f), []);
+  }
+});
+
+test("malformed and unanchored discontinuities stop without adopting the supplied epoch", () => {
+  for (const data of ["not JSON", "x".repeat(4097), JSON.stringify({
+    schema: "ft.stream.v1", stream: "events", kind: "cursor_discontinuity",
+    data: { code: "event_cursor_discontinuity", terminal: true, reason: "private detail",
+      resume_cursor: cursor("10", OTHER_EPOCH) },
+  })]) {
+    const f = fixture();
+    f.feed.start();
+    f.sources[0].emit("cursor_discontinuity", { data, lastEventId: cursor("100", OTHER_EPOCH) });
+    assert.equal(f.timers.size, 0);
+    assert.match(f.errors.at(-1), /invalid cursor discontinuity.*Reload/);
+    assert.ok(!f.errors.at(-1).includes("private detail"));
   }
 });
 
@@ -539,8 +756,7 @@ test("invalid UTF-8 is a visible read failure, not silently replaced input", asy
 test("stale resync promise rejection cannot contaminate a new stream generation", async () => {
   const recovery = deferred();
   const f = fixture({ resync: () => recovery.promise });
-  f.feed.start();
-  f.sources[0].emit("ready", { data: "ready" });
+  startReady(f);
   f.feed.stop();
   f.feed.start();
   recovery.reject(new Error("old generation"));
@@ -613,12 +829,13 @@ test("integrated stream and refresh owners retain live data and its acknowledged
   });
   stream.start();
   const pending = f.snapshots.refresh();
+  ready(sources[0], "1");
   sources[0].emit("event", {
-    data: streamPayload("pattern_detected", { event_id: 2, label: "new" }), lastEventId: "2",
+    data: durablePayload("2", "new"), lastEventId: cursor("2"),
   });
   sources[0].emit("error", {
-    data: JSON.stringify({ schema: "ft.stream.v1", kind: "error", data: { code: "event_replay_storage_error" } }),
-    lastEventId: "99",
+    data: JSON.stringify({ schema: "ft.stream.v1", stream: "events", kind: "error", data: { code: "event_replay_storage_error" } }),
+    lastEventId: cursor("99"),
   });
   replyPair(f, 0, [], [{ id: 1, label: "old" }]);
   await pending;
@@ -627,7 +844,7 @@ test("integrated stream and refresh owners retain live data and its acknowledged
   assert.equal(f.viewer.state, 0);
   assert.equal(retryCallbacks.length, 1);
   retryCallbacks[0]();
-  assert.equal(sources[1].url.searchParams.get("since_id"), "2");
+  assert.equal(sources[1].url.searchParams.get("cursor"), cursor("2"));
   stream.stop();
   f.snapshots.stop();
 });
