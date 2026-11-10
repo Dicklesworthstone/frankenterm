@@ -139,6 +139,12 @@ def build_export(source, work, helper):
         "-derivedDataPath", work / "DerivedData", "-clonedSourcePackagesDirPath", work / "Packages",
         "ARCHS=arm64", "CODE_SIGN_IDENTITY=-", "CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO", "build")
     app = work / "DerivedData/Build/Products/Release/FrankenTermExport.app"
+    with (app / "Contents/Info.plist").open("rb") as f:
+        if plistlib.load(f).get("CFBundleIconFile") not in ("Exporter", "Exporter.icns"):
+            raise ValueError("Built Export app is missing its icon declaration")
+    icon = app / "Contents/Resources/Exporter.icns"
+    if not icon.is_file() or icon.read_bytes()[:4] != b"icns":
+        raise ValueError("Built Export app is missing its Mac icon resource")
     entitlements = plistlib.loads(subprocess.check_output(
         ["codesign", "--display", "--entitlements", "-", "--xml", app], timeout=60))
     with (companion / "FrankenTermExport.entitlements").open("rb") as f:
