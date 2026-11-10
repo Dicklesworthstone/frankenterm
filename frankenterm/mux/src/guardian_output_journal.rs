@@ -3357,6 +3357,195 @@ pub struct GuardianOutputJournal {
     writer_lease_held: bool,
 }
 
+/// One unpublished, exclusively owned segment header being made durable.
+///
+/// A rollover may retain this authority while storage is full. Retries keep
+/// the same inode, segment identity and encoded header; they never mint a
+/// second successor or append plaintext before publication has completed.
+#[cfg(unix)]
+pub struct GuardianOutputJournalCreation {
+    file: Option<File>,
+    publication: GuardianOutputNewSegmentPublication,
+    identity: GuardianOutputSegmentIdentity,
+    cipher: GuardianOutputCipher,
+    limits: GuardianOutputJournalLimits,
+    header: [u8; FILE_HEADER_BYTES],
+    failed: bool,
+}
+
+#[cfg(unix)]
+impl GuardianOutputJournalCreation {
+    /// Reserve an exact new segment without writing its header yet. An I/O
+    /// error from the exclusive create has no file effect; all later writes
+    /// happen through [`Self::complete`], which retains their authority.
+    pub fn create_new_at(
+        parent_directory: &File,
+        child_name: &OsStr,
+        identity: GuardianOutputSegmentIdentity,
+        cipher: GuardianOutputCipher,
+        limits: GuardianOutputJournalLimits,
+    ) -> Result<Self, GuardianOutputJournalError> {
+        validate_new_segment_child_name(child_name)?;
+        let limits = limits.validate()?;
+        let header = encode_file_header(identity, &cipher)?;
+        let pinned_parent = parent_directory.try_clone()?;
+        let parent_identity = capture_new_segment_parent_identity(&pinned_parent)?;
+        let file = rustix::fs::openat(
+            &pinned_parent,
+            child_name,
+            rustix::fs::OFlags::RDWR
+                | rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::EXCL
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::from_raw_mode(0o600),
+        )
+        .map(File::from)
+        .map_err(|error| {
+            let error = std::io::Error::from(error);
+            if is_storage_full(&error) {
+                GuardianOutputJournalError::StorageFull(error)
+            } else {
+                GuardianOutputJournalError::Io(error)
+            }
+        })?;
+        rustix::fs::fchmod(&file, rustix::fs::Mode::from_raw_mode(0o600))
+            .map_err(|error| GuardianOutputJournalError::Io(std::io::Error::from(error)))?;
+        acquire_guardian_output_writer_lease(&file)?;
+        let child_identity = capture_new_segment_file_identity(&file)?;
+        if child_identity.bytes != 0
+            || child_identity.device != parent_identity.device
+            || capture_new_segment_parent_identity(&pinned_parent)? != parent_identity
+            || capture_new_segment_named_identity(&pinned_parent, child_name)? != child_identity
+        {
+            return Err(GuardianOutputJournalError::NewSegmentPublicationIdentityChanged);
+        }
+        Ok(Self {
+            file: Some(file),
+            publication: GuardianOutputNewSegmentPublication {
+                parent_directory: pinned_parent,
+                parent_identity,
+                child_name: child_name.to_os_string(),
+                child_identity,
+            },
+            identity,
+            cipher,
+            limits,
+            header,
+            failed: false,
+        })
+    }
+
+    /// Finish the header and both durability boundaries. Only a known
+    /// storage-full error with the exact owned header prefix still intact is
+    /// retryable; all other failures quarantine this creation authority. The
+    /// metadata comes from the held writer descriptor, so the caller can bind
+    /// its path authority to that inode rather than to a later path reopen.
+    pub fn complete(
+        &mut self,
+    ) -> Result<(GuardianOutputJournal, std::fs::Metadata), GuardianOutputJournalError> {
+        if self.failed || self.file.is_none() {
+            return Err(GuardianOutputJournalError::Poisoned);
+        }
+        let result = self.complete_header();
+        if let Err(error) = result {
+            if let GuardianOutputJournalError::Io(source) = error {
+                if is_storage_full(&source) && self.validate_header_prefix().is_ok() {
+                    return Err(GuardianOutputJournalError::StorageFull(source));
+                }
+                self.failed = true;
+                return Err(GuardianOutputJournalError::Io(source));
+            }
+            self.failed = true;
+            return Err(error);
+        }
+        let file = self
+            .file
+            .take()
+            .ok_or(GuardianOutputJournalError::Poisoned)?;
+        let journal = GuardianOutputJournal::authenticate_existing(
+            file,
+            self.identity,
+            self.cipher.clone(),
+            self.limits,
+            true,
+        )?;
+        let metadata = journal.file.metadata()?;
+        Ok((journal, metadata))
+    }
+
+    fn validate_header_prefix(&mut self) -> Result<(), GuardianOutputJournalError> {
+        let file = self
+            .file
+            .as_mut()
+            .ok_or(GuardianOutputJournalError::Poisoned)?;
+        let observed = capture_new_segment_file_identity(file)?;
+        let mut expected = self.publication.child_identity;
+        expected.bytes = observed.bytes;
+        if observed != expected
+            || observed.bytes > FILE_HEADER_BYTES_U64
+            || capture_new_segment_parent_identity(&self.publication.parent_directory)?
+                != self.publication.parent_identity
+            || capture_new_segment_named_identity(
+                &self.publication.parent_directory,
+                &self.publication.child_name,
+            )? != observed
+        {
+            return Err(GuardianOutputJournalError::NewSegmentPublicationIdentityChanged);
+        }
+        let count = usize::try_from(observed.bytes)
+            .map_err(|_| GuardianOutputJournalError::ArithmeticOverflow)?;
+        let mut prefix = [0_u8; FILE_HEADER_BYTES];
+        file.seek(SeekFrom::Start(0))?;
+        file.read_exact(&mut prefix[..count])?;
+        if prefix[..count] != self.header[..count] {
+            return Err(GuardianOutputJournalError::NewSegmentPublicationIdentityChanged);
+        }
+        Ok(())
+    }
+
+    fn complete_header(&mut self) -> Result<(), GuardianOutputJournalError> {
+        self.validate_header_prefix()?;
+        let file = self
+            .file
+            .as_mut()
+            .ok_or(GuardianOutputJournalError::Poisoned)?;
+        file.seek(SeekFrom::Start(0))?;
+        // Rewriting an interrupted header repeats the very same encoded
+        // bytes, including its original nonce; it performs no new sealing.
+        file.write_all(&self.header[..FILE_HEADER_BYTES / 2])?;
+        #[cfg(test)]
+        segment_creation_fault_for_test("header-prefix")?;
+        file.write_all(&self.header[FILE_HEADER_BYTES / 2..])?;
+        file.sync_all()?;
+        #[cfg(test)]
+        segment_creation_fault_for_test("header-sync")?;
+        self.validate_header_prefix()?;
+        self.publication.parent_directory.sync_all()?;
+        #[cfg(test)]
+        segment_creation_fault_for_test("directory-sync")?;
+        self.validate_header_prefix()
+    }
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static SEGMENT_CREATION_FAULT: std::cell::Cell<Option<(&'static str, std::io::ErrorKind)>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+fn segment_creation_fault_for_test(site: &'static str) -> std::io::Result<()> {
+    SEGMENT_CREATION_FAULT.with(|fault| {
+        if let Some((expected, kind)) = fault.get() {
+            if site == expected {
+                fault.set(None);
+                return Err(kind.into());
+            }
+        }
+        Ok(())
+    })
+}
+
 /// Existing-file-only authenticated recovery authority for one raw-output segment.
 ///
 /// On Unix, construction requires an `O_RDONLY` descriptor.  The service layer
@@ -9019,6 +9208,125 @@ mod tests {
             ),
             Err(GuardianOutputJournalError::FileHeaderAuthenticationFailed)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_segment_creation_retries_the_exact_owned_header() {
+        for kind in [
+            std::io::ErrorKind::StorageFull,
+            std::io::ErrorKind::QuotaExceeded,
+        ] {
+            for site in ["header-prefix", "header-sync", "directory-sync"] {
+                let directory = tempfile::tempdir().expect("create journal directory");
+                let parent = File::open(directory.path()).expect("open private parent");
+                rustix::fs::fchmod(&parent, rustix::fs::Mode::from_raw_mode(0o700))
+                    .expect("make journal parent private");
+                let name = OsStr::new("pending.ftgout");
+                let path = directory.path().join(name);
+                let mut creation = GuardianOutputJournalCreation::create_new_at(
+                    &parent,
+                    name,
+                    identity(),
+                    cipher(),
+                    GuardianOutputJournalLimits::default(),
+                )
+                .expect("reserve exact successor");
+                let inode = std::fs::metadata(&path).expect("candidate metadata").ino();
+                let exact_header = creation.header;
+                SEGMENT_CREATION_FAULT.with(|fault| fault.set(Some((site, kind))));
+                assert!(
+                    matches!(
+                        creation.complete(),
+                        Err(GuardianOutputJournalError::StorageFull(_))
+                    ),
+                    "{site}: {kind:?}"
+                );
+                assert!(!creation.failed);
+                let partial = std::fs::read(&path).expect("read retained header prefix");
+                assert_eq!(partial, exact_header[..partial.len()]);
+                assert!(
+                    matches!(
+                        GuardianOutputJournal::open_existing_for_append_at(
+                            &parent,
+                            name,
+                            identity(),
+                            cipher(),
+                            GuardianOutputJournalLimits::default(),
+                        ),
+                        Err(GuardianOutputJournalError::AppendWriterLeaseUnavailable(_))
+                    ),
+                    "pending creation keeps the only append lease"
+                );
+
+                let (mut journal, metadata) =
+                    creation.complete().expect("retry after space returns");
+                assert_eq!(metadata.ino(), inode);
+                assert_eq!(
+                    std::fs::metadata(&path).expect("same candidate").ino(),
+                    inode
+                );
+                assert_eq!(std::fs::read(&path).expect("durable header"), exact_header);
+                assert!(!journal.directory_entry_sync_required());
+                assert_eq!(journal.record_count(), 0);
+                let receipt = journal
+                    .append_and_sync(b"once")
+                    .expect("first record after publication");
+                assert_eq!(receipt.sequence(), 1);
+                assert_eq!(receipt.cumulative_plaintext_bytes(), 4);
+                assert!(matches!(
+                    creation.complete(),
+                    Err(GuardianOutputJournalError::Poisoned)
+                ));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_segment_creation_keeps_unknown_errors_and_tampering_terminal() {
+        for tamper in [false, true] {
+            let directory = tempfile::tempdir().expect("create journal directory");
+            let parent = File::open(directory.path()).expect("open private parent");
+            rustix::fs::fchmod(&parent, rustix::fs::Mode::from_raw_mode(0o700))
+                .expect("make journal parent private");
+            let name = OsStr::new("pending.ftgout");
+            let path = directory.path().join(name);
+            let mut creation = GuardianOutputJournalCreation::create_new_at(
+                &parent,
+                name,
+                identity(),
+                cipher(),
+                GuardianOutputJournalLimits::default(),
+            )
+            .expect("reserve exact successor");
+            let kind = if tamper {
+                std::io::ErrorKind::StorageFull
+            } else {
+                std::io::ErrorKind::Other
+            };
+            SEGMENT_CREATION_FAULT.with(|fault| fault.set(Some(("header-prefix", kind))));
+            assert!(creation.complete().is_err());
+            if tamper {
+                let mut external = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .expect("open same-inode tamper fixture");
+                external.write_all(b"X").expect("corrupt retained prefix");
+                external.sync_all().expect("persist corruption");
+                assert!(matches!(
+                    creation.complete(),
+                    Err(GuardianOutputJournalError::NewSegmentPublicationIdentityChanged)
+                ));
+            }
+            assert!(creation.failed);
+            let evidence = std::fs::read(&path).expect("retain failed creation");
+            assert!(matches!(
+                creation.complete(),
+                Err(GuardianOutputJournalError::Poisoned)
+            ));
+            assert_eq!(std::fs::read(&path).expect("unchanged evidence"), evidence);
+        }
     }
 
     #[cfg(unix)]

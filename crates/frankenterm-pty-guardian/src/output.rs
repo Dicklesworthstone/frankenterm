@@ -37,10 +37,10 @@ use mux::guardian_input_journal::{
 };
 use mux::guardian_output_journal::{
     GuardianOutputAppendReceipt, GuardianOutputAuthenticatedPrefix, GuardianOutputCipher,
-    GuardianOutputJournal, GuardianOutputJournalError, GuardianOutputJournalLimits,
-    GuardianOutputJournalReader, GuardianOutputJournalTail, GuardianOutputKey,
-    GuardianOutputPredecessor, GuardianOutputRecoveryBookmark, GuardianOutputRecoveryCursor,
-    GuardianOutputSegmentIdentity,
+    GuardianOutputJournal, GuardianOutputJournalCreation, GuardianOutputJournalError,
+    GuardianOutputJournalLimits, GuardianOutputJournalReader, GuardianOutputJournalTail,
+    GuardianOutputKey, GuardianOutputPredecessor, GuardianOutputRecoveryBookmark,
+    GuardianOutputRecoveryCursor, GuardianOutputSegmentIdentity,
 };
 use mux::guardian_protocol::{
     AuthenticatedGuardianRequest, GUARDIAN_MAX_CHECKPOINT_BYTES, GUARDIAN_MAX_CHECKPOINT_CHUNKS,
@@ -2466,8 +2466,265 @@ struct ManifestPathAuthority {
     publication_file_identity: FileIdentity,
 }
 
+/// The sole uncommitted rollover of a pane. A full disk retains these exact
+/// authorities rather than leaking candidates or publishing competing heads.
+struct PendingOutputRollover {
+    reclaimed: usize,
+    retained_totals: Option<(u64, u64)>,
+    segment_identity: GuardianOutputSegmentIdentity,
+    segment_path: PathBuf,
+    segment_file_identity: Option<FileIdentity>,
+    creation: Option<GuardianOutputJournalCreation>,
+    journal: Option<GuardianOutputJournal>,
+    manifest: PendingOutputManifest,
+}
+
+struct PendingOutputManifest {
+    snapshot: OutputManifestSnapshot,
+    encoded: Vec<u8>,
+    path: PathBuf,
+    file: Option<(File, FileIdentity)>,
+    publication_path: PathBuf,
+    publication: Option<(File, FileIdentity)>,
+}
+
+impl PendingOutputManifest {
+    fn new(
+        directory_path: &Path,
+        previous: &OutputManifestSnapshot,
+        segments: Vec<GuardianOutputSegmentIdentity>,
+    ) -> Result<Self, GuardianOutputError> {
+        let revision = previous
+            .revision
+            .checked_add(1)
+            .ok_or(GuardianOutputError::Allocation)?;
+        let predecessor = Some(ManifestPredecessor {
+            manifest_id: previous.manifest_id,
+            checksum: previous.checksum,
+        });
+        validate_manifest_structure(revision, predecessor, &segments)?;
+        let mut snapshot = OutputManifestSnapshot {
+            durable_pane_id: previous.durable_pane_id,
+            guardian_incarnation: previous.guardian_incarnation,
+            manifest_id: Uuid::new_v4(),
+            revision,
+            predecessor,
+            segments,
+            checksum: [0; OUTPUT_MANIFEST_CHECKSUM_BYTES],
+        };
+        let encoded = encode_manifest(&mut snapshot)?;
+        Ok(Self {
+            path: manifest_path(
+                directory_path,
+                snapshot.guardian_incarnation,
+                snapshot.durable_pane_id,
+                snapshot.revision,
+                snapshot.manifest_id,
+            ),
+            publication_path: manifest_publication_path(
+                directory_path,
+                snapshot.guardian_incarnation,
+                snapshot.durable_pane_id,
+                snapshot.revision,
+                snapshot.manifest_id,
+                snapshot.checksum,
+            ),
+            snapshot,
+            encoded,
+            file: None,
+            publication: None,
+        })
+    }
+
+    fn validate(
+        &mut self,
+        directory: &File,
+        directory_path: &Path,
+    ) -> Result<(), GuardianOutputError> {
+        if let Some((file, identity)) = self.file.as_mut() {
+            validate_file_identity_at(directory, directory_path, &self.path, *identity)?;
+            let metadata = file.metadata().map_err(|error| {
+                GuardianOutputError::io("output-pending-manifest-metadata", error)
+            })?;
+            let encoded_len =
+                u64::try_from(self.encoded.len()).map_err(|_| GuardianOutputError::Allocation)?;
+            if !identity.matches(&metadata)
+                || metadata.len() > encoded_len
+                || (self.publication.is_some() && metadata.len() != encoded_len)
+            {
+                return Err(GuardianOutputError::FilesystemAuthority(
+                    "pending output manifest identity changed",
+                ));
+            }
+            let length =
+                usize::try_from(metadata.len()).map_err(|_| GuardianOutputError::Allocation)?;
+            file.seek(SeekFrom::Start(0)).map_err(|error| {
+                GuardianOutputError::io("output-pending-manifest-read-seek", error)
+            })?;
+            let prefix = read_manifest_file_bounded(
+                file.try_clone().map_err(|error| {
+                    GuardianOutputError::io("output-pending-manifest-clone", error)
+                })?,
+                &metadata,
+            )?;
+            if prefix != self.encoded[..length] {
+                return Err(GuardianOutputError::FilesystemAuthority(
+                    "pending output manifest prefix changed",
+                ));
+            }
+        } else if self.publication.is_some() {
+            return Err(GuardianOutputError::FilesystemAuthority(
+                "pending output publication has no candidate",
+            ));
+        }
+        if let Some((file, identity)) = self.publication.as_ref() {
+            validate_file_identity_at(
+                directory,
+                directory_path,
+                &self.publication_path,
+                *identity,
+            )?;
+            let metadata = file.metadata().map_err(|error| {
+                GuardianOutputError::io("output-pending-publication-metadata", error)
+            })?;
+            if !identity.matches(&metadata) {
+                return Err(GuardianOutputError::FilesystemAuthority(
+                    "pending output publication identity changed",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn complete(
+        &mut self,
+        directory: &File,
+        directory_path: &Path,
+    ) -> Result<PublishedManifestAuthority, GuardianOutputError> {
+        self.validate(directory, directory_path)?;
+        if self.file.is_none() {
+            output_rollover_fault("manifest-create")?;
+            let file = create_private_file_new_at(directory, directory_path, &self.path)?;
+            // No retry can be admitted without knowing which inode we made.
+            let metadata = file.metadata().map_err(|_| {
+                GuardianOutputError::FilesystemAuthority(
+                    "pending output manifest could not pin its inode",
+                )
+            })?;
+            validate_private_file_metadata(&metadata, Some(0))?;
+            self.file = Some((file, FileIdentity::capture(&metadata, None)));
+        }
+        let (file, _) = self.file.as_mut().ok_or(GuardianOutputError::Allocation)?;
+        if self.publication.is_none() {
+            file.seek(SeekFrom::Start(0))
+                .map_err(|error| GuardianOutputError::io("output-pending-manifest-seek", error))?;
+            let midpoint = self.encoded.len() / 2;
+            file.write_all(&self.encoded[..midpoint])
+                .map_err(|error| GuardianOutputError::io("output-pending-manifest-write", error))?;
+            output_rollover_fault("manifest-prefix")?;
+            file.write_all(&self.encoded[midpoint..])
+                .map_err(|error| GuardianOutputError::io("output-pending-manifest-write", error))?;
+        }
+        file.sync_all()
+            .map_err(|error| GuardianOutputError::io("output-pending-manifest-sync", error))?;
+        output_rollover_fault("manifest-sync")?;
+        directory.sync_all().map_err(|error| {
+            GuardianOutputError::io("output-pending-candidate-directory-sync", error)
+        })?;
+        output_rollover_fault("candidate-directory-sync")?;
+        self.validate(directory, directory_path)?;
+        if self.publication.is_none() {
+            output_rollover_fault("publication-create")?;
+            let file =
+                create_private_file_new_at(directory, directory_path, &self.publication_path)?;
+            let metadata = file.metadata().map_err(|_| {
+                GuardianOutputError::FilesystemAuthority(
+                    "pending output publication could not pin its inode",
+                )
+            })?;
+            validate_private_file_metadata(&metadata, Some(0))?;
+            self.publication = Some((file, FileIdentity::capture(&metadata, Some(0))));
+        }
+        let (publication, _) = self
+            .publication
+            .as_ref()
+            .ok_or(GuardianOutputError::Allocation)?;
+        output_rollover_fault("publication-created")?;
+        publication
+            .sync_all()
+            .map_err(|error| GuardianOutputError::io("output-pending-publication-sync", error))?;
+        output_rollover_fault("publication-sync")?;
+        directory.sync_all().map_err(|error| {
+            GuardianOutputError::io("output-pending-publication-directory-sync", error)
+        })?;
+        output_rollover_fault("publication-directory-sync")?;
+        self.validate(directory, directory_path)?;
+        let mut file_identity = self.file.as_ref().ok_or(GuardianOutputError::Allocation)?.1;
+        file_identity.expected_len =
+            Some(u64::try_from(self.encoded.len()).map_err(|_| GuardianOutputError::Allocation)?);
+        Ok(PublishedManifestAuthority {
+            snapshot: self.snapshot.clone(),
+            path: self.path.clone(),
+            file_identity,
+            publication_path: self.publication_path.clone(),
+            publication_file_identity: self
+                .publication
+                .as_ref()
+                .ok_or(GuardianOutputError::Allocation)?
+                .1,
+        })
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static OUTPUT_ROLLOVER_FAULT: std::cell::Cell<Option<(&'static str, ErrorKind)>> = const { std::cell::Cell::new(None) };
+    static OUTPUT_ROLLOVER_REPLACE_SUCCESSOR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn replace_rollover_successor_at_handoff_for_test(
+    directory: &File,
+    directory_path: &Path,
+    path: &Path,
+) -> Result<(), GuardianOutputError> {
+    if !OUTPUT_ROLLOVER_REPLACE_SUCCESSOR.with(|replace| replace.replace(false)) {
+        return Ok(());
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|error| GuardianOutputError::io("test-successor-copy", error))?;
+    let detached = directory_path.join(format!("detached-successor-{}", Uuid::new_v4()));
+    std::fs::rename(path, detached)
+        .map_err(|error| GuardianOutputError::io("test-successor-detach", error))?;
+    let mut replacement = create_private_file_new_at(directory, directory_path, path)?;
+    replacement
+        .write_all(&bytes)
+        .map_err(|error| GuardianOutputError::io("test-successor-replace", error))?;
+    replacement
+        .sync_all()
+        .map_err(|error| GuardianOutputError::io("test-successor-sync", error))?;
+    Ok(())
+}
+
+fn output_rollover_fault(site: &'static str) -> Result<(), GuardianOutputError> {
+    #[cfg(test)]
+    if let Some(kind) = OUTPUT_ROLLOVER_FAULT.with(|fault| {
+        fault.get().and_then(|(expected, kind)| {
+            (expected == site).then(|| {
+                fault.set(None);
+                kind
+            })
+        })
+    }) {
+        return Err(GuardianOutputError::io(site, kind.into()));
+    }
+    let _ = site;
+    Ok(())
+}
+
 struct PaneJournalAuthority {
     current_journal: GuardianOutputJournal,
+    pending_rollover: Option<Box<PendingOutputRollover>>,
     segments: Vec<SegmentPathAuthority>,
     manifest: PublishedManifestAuthority,
     manifest_history: Vec<ManifestPathAuthority>,
@@ -2678,7 +2935,8 @@ impl PaneJournalAuthority {
             .checked_add(frame_bytes)
             .ok_or(OutputCommitError::Capacity)?
             <= self.policy.max_durable_pane_bytes;
-        if !fits_durable_budget
+        if self.pending_rollover.is_some()
+            || !fits_durable_budget
             || !journal_can_append(
                 &self.current_journal,
                 self.policy.journal_limits,
@@ -2879,7 +3137,12 @@ impl PaneJournalAuthority {
             .current_journal
             .terminal_receipt()
             .ok_or(OutputCommitError::Capacity)?;
-        let reclaimed = self.reclaimable_segment_count(terminal);
+        // A retained candidate fixes the manifest's exact prefix even if a
+        // checkpoint advances the reclaim floor while storage is full.
+        let reclaimed = self.pending_rollover.as_ref().map_or_else(
+            || self.reclaimable_segment_count(terminal),
+            |pending| pending.reclaimed,
+        );
         let superseded_manifests = if reclaimed == 0 {
             0
         } else {
@@ -2927,20 +3190,28 @@ impl PaneJournalAuthority {
         }
         // Authenticate every segment that stays before sealing; reclaimed
         // output is never read again.
-        let retained_totals = match self.segments.get(reclaimed..) {
-            Some(retained) if !retained.is_empty() => Some(
-                authenticate_segment_chain_read_only(
-                    &self.directory,
-                    &self.directory_path,
-                    retained,
-                    &self.cipher,
-                    self.policy,
-                    &[],
-                )
-                .map(|(_, log_bytes, records)| (log_bytes, records))
-                .map_err(|_| OutputCommitError::SegmentManager)?,
-            ),
-            _ => None,
+        let retained_totals = if let Some(pending) = self.pending_rollover.as_ref() {
+            // These immutable segments were authenticated before reserving
+            // this exact successor. No output can append while it is pending;
+            // every retry still checks their pinned identities above. Avoid
+            // rescanning up to a GiB on every paced full-disk retry.
+            pending.retained_totals
+        } else {
+            match self.segments.get(reclaimed..) {
+                Some(retained) if !retained.is_empty() => Some(
+                    authenticate_segment_chain_read_only(
+                        &self.directory,
+                        &self.directory_path,
+                        retained,
+                        &self.cipher,
+                        self.policy,
+                        &[],
+                    )
+                    .map(|(_, log_bytes, records)| (log_bytes, records))
+                    .map_err(|_| OutputCommitError::SegmentManager)?,
+                ),
+                _ => None,
+            }
         };
         self.segments
             .try_reserve(1)
@@ -2948,36 +3219,150 @@ impl PaneJournalAuthority {
         self.manifest_history
             .try_reserve(1)
             .map_err(|_| OutputCommitError::SegmentManager)?;
-        let (successor_journal, successor_path) = create_collision_resistant_segment(
+        if self.pending_rollover.is_none() {
+            output_rollover_fault("segment-create").map_err(retryable_rollover_io)?;
+            for _ in 0..OUTPUT_PATH_COLLISION_ATTEMPTS {
+                let segment_identity = GuardianOutputSegmentIdentity::new(
+                    self.manifest.snapshot.durable_pane_id,
+                    Uuid::new_v4(),
+                    first_sequence,
+                    Some(terminal.into_predecessor()),
+                )?;
+                let path = segment_path(
+                    &self.directory_path,
+                    self.manifest.snapshot.guardian_incarnation,
+                    self.manifest.snapshot.durable_pane_id,
+                    segment_identity.segment_id(),
+                );
+                let retained = self
+                    .manifest
+                    .snapshot
+                    .segments
+                    .get(reclaimed..)
+                    .ok_or(OutputCommitError::SegmentManager)?;
+                let mut identities = Vec::new();
+                identities
+                    .try_reserve_exact(retained.len() + 1)
+                    .map_err(|_| OutputCommitError::SegmentManager)?;
+                identities.extend_from_slice(retained);
+                identities.push(segment_identity);
+                let manifest = PendingOutputManifest::new(
+                    &self.directory_path,
+                    &self.manifest.snapshot,
+                    identities,
+                )
+                .map_err(|_| OutputCommitError::SegmentManager)?;
+                let child_name = output_child_name(&self.directory_path, &path)
+                    .map_err(|_| OutputCommitError::SegmentManager)?;
+                match GuardianOutputJournalCreation::create_new_at(
+                    &self.directory,
+                    child_name,
+                    segment_identity,
+                    self.cipher.clone(),
+                    self.policy.journal_limits,
+                ) {
+                    Ok(creation) => {
+                        self.pending_rollover = Some(Box::new(PendingOutputRollover {
+                            reclaimed,
+                            retained_totals,
+                            segment_identity,
+                            segment_path: path,
+                            segment_file_identity: None,
+                            creation: Some(creation),
+                            journal: None,
+                            manifest,
+                        }));
+                        break;
+                    }
+                    Err(GuardianOutputJournalError::Io(error))
+                        if error.kind() == ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(OutputCommitError::Journal(error)),
+                }
+            }
+        }
+        let pending = self
+            .pending_rollover
+            .as_mut()
+            .ok_or(OutputCommitError::SegmentManager)?;
+        if pending.journal.is_none() {
+            let (journal, metadata) = pending
+                .creation
+                .as_mut()
+                .ok_or(OutputCommitError::SegmentManager)?
+                .complete()?;
+            #[cfg(test)]
+            replace_rollover_successor_at_handoff_for_test(
+                &self.directory,
+                &self.directory_path,
+                &pending.segment_path,
+            )
+            .map_err(|_| OutputCommitError::SegmentManager)?;
+            validate_private_file_metadata(&metadata, Some(OUTPUT_V3_FILE_HEADER_BYTES))
+                .map_err(|_| OutputCommitError::SegmentManager)?;
+            pending.segment_file_identity = Some(FileIdentity::capture(
+                &metadata,
+                Some(OUTPUT_V3_FILE_HEADER_BYTES),
+            ));
+            pending.journal = Some(journal);
+            pending.creation = None;
+        }
+        let segment_file_identity = pending
+            .segment_file_identity
+            .ok_or(OutputCommitError::SegmentManager)?;
+        validate_file_identity_at(
             &self.directory,
             &self.directory_path,
-            self.manifest.snapshot.durable_pane_id,
-            self.manifest.snapshot.guardian_incarnation,
-            first_sequence,
-            Some(terminal.into_predecessor()),
+            &pending.segment_path,
+            segment_file_identity,
+        )
+        .map_err(|_| OutputCommitError::PersistenceAuthority)?;
+        let successor_file = open_private_file_read_only_at_identity(
+            &self.directory,
+            &self.directory_path,
+            &pending.segment_path,
+            segment_file_identity,
+        )
+        .map_err(|_| OutputCommitError::PersistenceAuthority)?;
+        GuardianOutputJournalReader::open_existing(
+            successor_file,
+            pending.segment_identity,
             self.cipher.clone(),
             self.policy.journal_limits,
-        )
-        .map_err(|_| OutputCommitError::SegmentManager)?;
-        let retained_identities = self
+        )?;
+        output_rollover_fault("segment-created").map_err(retryable_rollover_io)?;
+        let next_manifest = match pending
             .manifest
-            .snapshot
-            .segments
-            .get(reclaimed..)
+            .complete(&self.directory, &self.directory_path)
+        {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                // Partial candidate writes and visible markers keep their
+                // exact files. Retry only when their identity/content and the
+                // old append authority still agree; unknown failures poison.
+                pending
+                    .manifest
+                    .validate(&self.directory, &self.directory_path)
+                    .map_err(|_| OutputCommitError::PersistenceAuthority)?;
+                return Err(retryable_rollover_io(error));
+            }
+        };
+        let mut pending = self
+            .pending_rollover
+            .take()
             .ok_or(OutputCommitError::SegmentManager)?;
-        let mut identities = Vec::new();
-        identities
-            .try_reserve_exact(retained_identities.len() + 1)
-            .map_err(|_| OutputCommitError::SegmentManager)?;
-        identities.extend_from_slice(retained_identities);
-        identities.push(successor_path.segment_identity);
-        let next_manifest = publish_successor_manifest(
-            &self.directory,
-            &self.directory_path,
-            &self.manifest.snapshot,
-            identities,
-        )
-        .map_err(|_| OutputCommitError::SegmentManager)?;
+        let successor_journal = pending
+            .journal
+            .take()
+            .ok_or(OutputCommitError::SegmentManager)?;
+        let successor_path = SegmentPathAuthority {
+            segment_identity: pending.segment_identity,
+            path: pending.segment_path,
+            // Once installed, the file is an append authority.
+            file_identity: FileIdentity {
+                expected_len: None,
+                ..segment_file_identity
+            },
+        };
 
         let successor_bytes = successor_journal.committed_bytes();
         let next_manifest_path = ManifestPathAuthority {
@@ -9903,6 +10288,25 @@ impl OutputCommitError {
     }
 }
 
+/// Use only at a rollover boundary whose exact partial files are retained
+/// and validated, or before its exclusive create has made any file.
+fn retryable_rollover_io(error: GuardianOutputError) -> OutputCommitError {
+    match error {
+        GuardianOutputError::Io { source, .. }
+            if matches!(
+                source.kind(),
+                ErrorKind::StorageFull | ErrorKind::QuotaExceeded
+            ) =>
+        {
+            OutputCommitError::Journal(GuardianOutputJournalError::StorageFull(source))
+        }
+        GuardianOutputError::Journal(error @ GuardianOutputJournalError::StorageFull(_)) => {
+            OutputCommitError::Journal(error)
+        }
+        _ => OutputCommitError::SegmentManager,
+    }
+}
+
 pub struct GuardianOutputCompletion {
     pub(crate) pane_id: Uuid,
     pub(crate) payload_bytes: usize,
@@ -10833,30 +11237,6 @@ fn publish_initial_manifest(
         guardian_incarnation,
         1,
         None,
-        segments,
-    )
-}
-
-fn publish_successor_manifest(
-    directory: &File,
-    directory_path: &Path,
-    previous: &OutputManifestSnapshot,
-    segments: Vec<GuardianOutputSegmentIdentity>,
-) -> Result<PublishedManifestAuthority, GuardianOutputError> {
-    let revision = previous
-        .revision
-        .checked_add(1)
-        .ok_or(GuardianOutputError::Allocation)?;
-    publish_manifest_snapshot(
-        directory,
-        directory_path,
-        previous.durable_pane_id,
-        previous.guardian_incarnation,
-        revision,
-        Some(ManifestPredecessor {
-            manifest_id: previous.manifest_id,
-            checksum: previous.checksum,
-        }),
         segments,
     )
 }
@@ -11795,6 +12175,7 @@ fn open_or_create_pane_segment_manager(
         .ok_or(GuardianOutputError::Allocation)?;
     let authority = PaneJournalAuthority {
         current_journal: journal,
+        pending_rollover: None,
         segments,
         manifest,
         manifest_history,
@@ -11936,6 +12317,7 @@ fn open_scanned_pane_segment_manager(
         )?;
     let authority = PaneJournalAuthority {
         current_journal,
+        pending_rollover: None,
         segments: segment_paths,
         manifest: PublishedManifestAuthority {
             snapshot: discovered_head.snapshot,
@@ -26336,6 +26718,226 @@ mod tests {
             .map_err(|_| "journal authority was poisoned")?;
         assert!(authority.failed);
         assert_eq!(authority.current_journal.record_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn storage_full_rollover_retries_one_exact_publication_without_losing_output()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for kind in [ErrorKind::StorageFull, ErrorKind::QuotaExceeded] {
+            for site in [
+                "segment-create",
+                "segment-created",
+                "manifest-create",
+                "manifest-prefix",
+                "manifest-sync",
+                "candidate-directory-sync",
+                "publication-create",
+                "publication-created",
+                "publication-sync",
+                "publication-directory-sync",
+            ] {
+                let (_directory, _poll, pipeline) =
+                    pipeline_with_policy("ft-guardian-rollover-space-", tiny_rotation_policy(3))?;
+                let guardian = Uuid::new_v4();
+                let pane = Uuid::new_v4();
+                let journal = pipeline.prepare_pane(guardian, pane)?;
+                {
+                    let mut authority = journal.authority.lock().map_err(|_| "journal lock")?;
+                    let first = authority.append_and_sync(b"before")?;
+                    assert_eq!(first.sequence(), 1);
+                    OUTPUT_ROLLOVER_FAULT.with(|fault| fault.set(Some((site, kind))));
+                    let failure = authority.append_and_sync(b"after");
+                    assert!(
+                        failure
+                            .as_ref()
+                            .is_err_and(OutputCommitError::is_storage_full),
+                        "{site}: {kind:?}"
+                    );
+                    assert!(
+                        !authority.failed,
+                        "{site}: storage pressure is not corruption"
+                    );
+                    assert_eq!(authority.current_journal.next_sequence(), Some(2));
+                    assert_eq!(authority.manifest.snapshot.revision, 1);
+                    assert_eq!(recover_all_segment_bytes(&authority)?, b"before");
+                    let paths = pipeline.relevant_pane_paths(guardian, pane)?;
+                    let retained = authority.pending_rollover.as_ref().map(|pending| {
+                        (
+                            pending.segment_identity,
+                            pending.manifest.snapshot.manifest_id,
+                        )
+                    });
+                    if retained.is_some() {
+                        // A later checkpoint may advance the floor, but an
+                        // already reserved manifest must keep its exact plan.
+                        authority.raise_reclaim_floor_sequence(first.sequence());
+                    }
+                    OUTPUT_ROLLOVER_FAULT.with(|fault| fault.set(Some((site, kind))));
+                    assert!(
+                        authority
+                            .append_and_sync(b"after")
+                            .as_ref()
+                            .is_err_and(OutputCommitError::is_storage_full)
+                    );
+                    assert_eq!(
+                        pipeline.relevant_pane_paths(guardian, pane)?,
+                        paths,
+                        "repeated pressure cannot leak successor files"
+                    );
+                    assert_eq!(
+                        authority.pending_rollover.as_ref().map(|pending| (
+                            pending.segment_identity,
+                            pending.manifest.snapshot.manifest_id,
+                        )),
+                        retained
+                    );
+
+                    let receipt = authority.append_and_sync(b"after")?;
+                    assert_eq!(receipt.sequence(), 2);
+                    assert_eq!(receipt.cumulative_plaintext_bytes(), 11);
+                    assert!(authority.pending_rollover.is_none());
+                    assert!(!authority.failed);
+                    assert_eq!(authority.manifest.snapshot.revision, 2);
+                    assert_eq!(authority.segments.len(), 2);
+                    assert_eq!(authority.relevant_files, 6);
+                    assert_eq!(recover_all_segment_bytes(&authority)?, b"beforeafter");
+                }
+                drop(journal);
+                let reopened = cold_open_test_pane_after_owner_drop(&pipeline, guardian, pane)?;
+                let authority = reopened
+                    .authority
+                    .lock()
+                    .map_err(|_| "reopened journal lock")?;
+                assert_eq!(authority.current_journal.next_sequence(), Some(3));
+                assert_eq!(recover_all_segment_bytes(&authority)?, b"beforeafter");
+                assert_eq!(authority.relevant_files, 6);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn visible_rollover_marker_recovers_the_same_empty_successor_after_restart()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) =
+            pipeline_with_policy("ft-guardian-rollover-visible-", tiny_rotation_policy(3))?;
+        let guardian = Uuid::new_v4();
+        let pane = Uuid::new_v4();
+        let journal = pipeline.prepare_pane(guardian, pane)?;
+        let successor = {
+            let mut authority = journal.authority.lock().map_err(|_| "journal lock")?;
+            authority.append_and_sync(b"before")?;
+            OUTPUT_ROLLOVER_FAULT
+                .with(|fault| fault.set(Some(("publication-created", ErrorKind::StorageFull))));
+            assert!(
+                authority
+                    .append_and_sync(b"after")
+                    .as_ref()
+                    .is_err_and(OutputCommitError::is_storage_full)
+            );
+            authority
+                .pending_rollover
+                .as_ref()
+                .ok_or("missing pending successor")?
+                .segment_identity
+        };
+        // The owner dies after its marker is visible but before it has
+        // acknowledged a single byte in the new segment.
+        drop(journal);
+        let reopened = cold_open_test_pane_after_owner_drop(&pipeline, guardian, pane)?;
+        let mut authority = reopened
+            .authority
+            .lock()
+            .map_err(|_| "reopened journal lock")?;
+        assert_eq!(authority.current_journal.identity(), successor);
+        assert_eq!(authority.current_journal.record_count(), 0);
+        assert_eq!(authority.append_and_sync(b"after")?.sequence(), 2);
+        assert_eq!(recover_all_segment_bytes(&authority)?, b"beforeafter");
+        assert_eq!(authority.manifest.snapshot.revision, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn rollover_rejects_a_copied_header_swapped_between_creation_and_path_handoff()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) =
+            pipeline_with_policy("ft-guardian-rollover-handoff-", tiny_rotation_policy(3))?;
+        let guardian = Uuid::new_v4();
+        let pane = Uuid::new_v4();
+        let journal = pipeline.prepare_pane(guardian, pane)?;
+        let mut authority = journal.authority.lock().map_err(|_| "journal lock")?;
+        authority.append_and_sync(b"before")?;
+        OUTPUT_ROLLOVER_REPLACE_SUCCESSOR.with(|replace| replace.set(true));
+        assert!(matches!(
+            authority.append_and_sync(b"after"),
+            Err(OutputCommitError::PersistenceAuthority)
+        ));
+        assert!(authority.failed);
+        let pending = authority
+            .pending_rollover
+            .as_ref()
+            .ok_or("missing failed successor")?;
+        let pinned = pending
+            .segment_file_identity
+            .ok_or("missing writer identity")?;
+        let named = std::fs::metadata(&pending.segment_path)?;
+        assert_ne!(
+            named.ino(),
+            pinned.inode,
+            "the replacement copied a valid header but cannot acquire the writer's inode identity"
+        );
+        assert_eq!(
+            pending
+                .journal
+                .as_ref()
+                .ok_or("missing original writer")?
+                .record_count(),
+            0
+        );
+        assert_eq!(named.len(), OUTPUT_V3_FILE_HEADER_BYTES);
+        assert_eq!(recover_all_segment_bytes(&authority)?, b"before");
+        assert_eq!(authority.manifest.snapshot.revision, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn rollover_unknown_errors_and_changed_pending_files_remain_quarantined()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for tamper in [false, true] {
+            let (_directory, _poll, pipeline) =
+                pipeline_with_policy("ft-guardian-rollover-quarantine-", tiny_rotation_policy(3))?;
+            let guardian = Uuid::new_v4();
+            let pane = Uuid::new_v4();
+            let journal = pipeline.prepare_pane(guardian, pane)?;
+            let mut authority = journal.authority.lock().map_err(|_| "journal lock")?;
+            authority.append_and_sync(b"before")?;
+            let kind = if tamper {
+                ErrorKind::StorageFull
+            } else {
+                ErrorKind::Other
+            };
+            OUTPUT_ROLLOVER_FAULT.with(|fault| fault.set(Some(("manifest-prefix", kind))));
+            assert!(authority.append_and_sync(b"after").is_err());
+            if tamper {
+                assert!(!authority.failed);
+                let path = &authority
+                    .pending_rollover
+                    .as_ref()
+                    .ok_or("missing pending manifest")?
+                    .manifest
+                    .path;
+                let mut external = OpenOptions::new().write(true).open(path)?;
+                external.write_all(b"X")?;
+                external.sync_all()?;
+                assert!(authority.append_and_sync(b"after").is_err());
+            }
+            assert!(authority.failed);
+            let paths = pipeline.relevant_pane_paths(guardian, pane)?;
+            assert!(authority.append_and_sync(b"after").is_err());
+            assert_eq!(pipeline.relevant_pane_paths(guardian, pane)?, paths);
+            assert_eq!(recover_all_segment_bytes(&authority)?, b"before");
+        }
         Ok(())
     }
 
