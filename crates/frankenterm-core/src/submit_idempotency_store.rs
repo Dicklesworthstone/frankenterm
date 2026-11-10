@@ -6,11 +6,13 @@
 //! `effect_applied_receipt_pending` and `in_doubt`, so replay never treats a
 //! successful injector call as an unperformed write merely because later wait,
 //! audit, or receipt work was interrupted. This is an at-most-once automatic
-//! effect contract; an unresolved claim changes only through the explicit
-//! [`reconcile`] operation, which settles it or abandons it.
+//! effect contract. A bounded, content-free observation continuation can be
+//! claimed after its observer lease expires, without granting another send.
+//! Unqueryable outcomes still require explicit [`reconcile`] settlement.
 
 use crate::robot_types::{SubmitGuaranteeLevel, SubmitReceipt, SubmitReceiptState};
-use crate::verified_submit::SubmitIdempotencyBinding;
+use crate::verified_submit::{SubmitIdempotencyBinding, VerifiedSubmitBaseline};
+use crate::wezterm::MuxPaneIdentity;
 #[cfg(unix)]
 use cap_fs_ext::MetadataExt as CapMetadataExt;
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
@@ -38,8 +40,11 @@ const STORE_AUXILIARY_FILENAMES: [&str; 3] = [
 ];
 const LEGACY_STORE_NAME: &str = "submit_idempotency";
 const STORE_APPLICATION_ID: i64 = 0x4654_4944;
-const STORE_SCHEMA_VERSION: i64 = 2;
+const STORE_SCHEMA_VERSION: i64 = 3;
+const LEGACY_STORE_SCHEMA_VERSION: i64 = 2;
+const RECORD_SCHEMA_VERSION: i64 = 2;
 const RECEIPT_SCHEMA_VERSION: u16 = 1;
+const OBSERVATION_SCHEMA_VERSION: u16 = 1;
 const STATE_ACTIVE_OWNER: i64 = 1;
 const STATE_EFFECT_APPLIED_RECEIPT_PENDING: i64 = 2;
 const STATE_IN_DOUBT: i64 = 3;
@@ -65,6 +70,13 @@ const OWNER_NONCE_BYTES: usize = 32;
 const OWNER_LEASE_DURATION_MS: i64 = 60_000;
 const MAX_OWNER_LEASE_FUTURE_MS: i64 = OWNER_LEASE_DURATION_MS * 2;
 const MAX_RECEIPT_JSON_BYTES: usize = 64 * 1024;
+// A complete 256-zone baseline can exceed 64 KiB. Never truncate the negative
+// evidence needed to distinguish an old command from this send. Admission
+// reserves the larger continuation representation until atomic completion.
+const MAX_OBSERVATION_JSON_BYTES: usize = 144 * 1024;
+/// Maximum authority window for one observer, including the original sender.
+pub const OBSERVATION_OWNER_LEASE_DURATION_MS: i64 = 15_000;
+const MAX_OBSERVATION_DURATION_MS: i64 = 600_000;
 const MAX_RECEIPT_EVIDENCE_ITEMS: usize = 64;
 const MAX_RECEIPT_FIELD_BYTES: usize = 1024;
 const MAX_RECEIPT_CURSOR_BYTES: usize = 512;
@@ -72,6 +84,10 @@ const MAX_CALLER_KEY_BYTES: usize = 256;
 const MAX_STORE_RECORDS: i64 = 16_384;
 const MAX_STORE_LOGICAL_BYTES: i64 = 128 * 1024 * 1024;
 const LOGICAL_RECORD_OVERHEAD_BYTES: i64 = 128;
+const UNRESOLVED_RESERVE_BYTES: i64 = MAX_OBSERVATION_JSON_BYTES as i64
+    + 90
+    + LOGICAL_RECORD_OVERHEAD_BYTES
+    + std::mem::size_of::<i64>() as i64;
 /// A completed receipt stays exactly replayable for at least this long. Under
 /// capacity pressure an admission may evict older completed rows; the same
 /// caller key is then admitted as a new request.
@@ -88,6 +104,7 @@ const EVICTION_BATCHES_PER_ADMISSION: i64 = 16;
 
 const CREATE_TABLE_SQL: &str = "CREATE TABLE verified_submit_idempotency (idempotency_key TEXT COLLATE BINARY PRIMARY KEY NOT NULL, schema_version INTEGER NOT NULL, pane_id TEXT COLLATE BINARY NOT NULL, request_sha256 TEXT COLLATE BINARY NOT NULL, effect_sha256 TEXT COLLATE BINARY NOT NULL, state INTEGER NOT NULL CHECK (state IN (1, 2, 3, 4, 5)), retryable_reason INTEGER, receipt_json TEXT COLLATE BINARY, generation INTEGER NOT NULL CHECK (generation >= 1), owner_nonce BLOB NOT NULL CHECK (typeof(owner_nonce) = 'blob' AND length(owner_nonce) = 32), lease_expires_unix_ms INTEGER CHECK (lease_expires_unix_ms IS NULL OR lease_expires_unix_ms >= 0), created_unix_ms INTEGER NOT NULL, updated_unix_ms INTEGER NOT NULL, CHECK (created_unix_ms >= 0 AND updated_unix_ms >= created_unix_ms), CHECK (length(CAST(idempotency_key AS BLOB)) BETWEEN 71 AND 90), CHECK (length(CAST(pane_id AS BLOB)) BETWEEN 1 AND 20), CHECK (length(CAST(request_sha256 AS BLOB)) = 64 AND request_sha256 NOT GLOB '*[^0-9a-f]*'), CHECK (length(CAST(effect_sha256 AS BLOB)) = 64 AND effect_sha256 NOT GLOB '*[^0-9a-f]*'), CHECK (receipt_json IS NULL OR length(CAST(receipt_json AS BLOB)) <= 65536), CHECK ((state = 1 AND retryable_reason IS NULL AND receipt_json IS NULL AND lease_expires_unix_ms IS NOT NULL) OR (state IN (2, 3) AND retryable_reason IS NULL AND receipt_json IS NULL AND lease_expires_unix_ms IS NULL) OR (state = 4 AND retryable_reason IS NULL AND receipt_json IS NOT NULL AND lease_expires_unix_ms IS NULL) OR (state = 5 AND retryable_reason IN (1, 2) AND receipt_json IS NULL AND lease_expires_unix_ms IS NULL))) STRICT, WITHOUT ROWID";
 const CREATE_INDEX_SQL: &str = "CREATE INDEX verified_submit_idempotency_request_lookup ON verified_submit_idempotency (pane_id COLLATE BINARY, request_sha256 COLLATE BINARY)";
+const CREATE_OBSERVATION_TABLE_SQL: &str = "CREATE TABLE verified_submit_observations (idempotency_key TEXT COLLATE BINARY PRIMARY KEY NOT NULL REFERENCES verified_submit_idempotency(idempotency_key) ON DELETE CASCADE, continuation_json TEXT COLLATE BINARY NOT NULL CHECK (length(CAST(continuation_json AS BLOB)) BETWEEN 1 AND 147456), lease_expires_unix_ms INTEGER NOT NULL CHECK (lease_expires_unix_ms >= 0)) STRICT, WITHOUT ROWID";
 
 /// Finite failure taxonomy. No variant retains a filesystem path, SQL string,
 /// serialized receipt, or backend error message.
@@ -133,6 +150,10 @@ pub enum SubmitIdempotencyError {
     ReceiptOversize,
     #[error("submit idempotency receipt is invalid")]
     ReceiptInvalid,
+    #[error("submit observation continuation is invalid")]
+    ObservationInvalid,
+    #[error("submit observation continuation exceeds its storage bound")]
+    ObservationOversize,
 }
 
 impl SubmitIdempotencyError {
@@ -159,6 +180,8 @@ impl SubmitIdempotencyError {
             Self::RecordCorrupt => "record_corrupt",
             Self::ReceiptOversize => "receipt_oversize",
             Self::ReceiptInvalid => "receipt_invalid",
+            Self::ObservationInvalid => "observation_invalid",
+            Self::ObservationOversize => "observation_oversize",
         }
     }
 
@@ -341,6 +364,72 @@ impl fmt::Debug for ClaimToken {
             .field("owner_nonce", &"[REDACTED]")
             .finish()
     }
+}
+
+/// Immutable evidence needed to observe one already-applied send. It contains
+/// no command text, pane output, or caller nonce. Only the exact original
+/// request may claim it, and only the same native pane registration may be
+/// observed by the caller. The absolute deadline is never renewed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubmitObservationContinuation {
+    pub baseline: VerifiedSubmitBaseline,
+    pub pane_identity: MuxPaneIdentity,
+    pub audit_action_id: Option<i64>,
+    pub started_unix_ms: i64,
+    pub deadline_unix_ms: i64,
+}
+
+impl SubmitObservationContinuation {
+    fn is_valid_for(&self, binding: &SubmitIdempotencyBinding) -> bool {
+        self.baseline.matches_binding(binding)
+            && self.pane_identity.is_valid()
+            && self.audit_action_id.is_none_or(|id| id > 0)
+            && self.started_unix_ms >= 0
+            && self
+                .deadline_unix_ms
+                .checked_sub(self.started_unix_ms)
+                .is_some_and(|duration| (1..=MAX_OBSERVATION_DURATION_MS).contains(&duration))
+    }
+}
+
+/// Observation authority only: `Claimed` never authorizes input injection.
+/// A takeover replaces the original generation and nonce, fencing all older
+/// completion attempts while preserving exact completed-receipt replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum ObservationClaimOutcome {
+    Claimed {
+        token: ClaimToken,
+        continuation: SubmitObservationContinuation,
+        /// Remaining owner-lease budget at return, capped by the immutable
+        /// observation deadline. Callers must bound work by this duration.
+        remaining_ms: u64,
+    },
+    Completed(SubmitReceipt),
+    InFlight,
+    /// A pre-migration or otherwise nonrecoverable pending claim. It remains
+    /// fenced; absence of a continuation never permits a resend.
+    Unavailable,
+    InDoubt,
+    /// The absolute deadline elapsed or the clock moved behind persisted
+    /// observation authority. The row is durably fenced to `InDoubt`.
+    Expired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredObservationEnvelope {
+    schema_version: u16,
+    internal_claim_key: String,
+    request_sha256: String,
+    effect_sha256: String,
+    continuation: SubmitObservationContinuation,
+}
+
+struct StoredObservation {
+    continuation: SubmitObservationContinuation,
+    lease_expires_unix_ms: i64,
 }
 
 /// Pre-effect terminal outcomes that are proven safe to retry.
@@ -553,7 +642,7 @@ struct PreparedStorePath {
 const PRODUCTION_LIMITS: StoreLimits = StoreLimits {
     max_records: MAX_STORE_RECORDS,
     max_logical_bytes: MAX_STORE_LOGICAL_BYTES,
-    receipt_reserve_bytes: MAX_RECEIPT_JSON_BYTES as i64,
+    receipt_reserve_bytes: UNRESOLVED_RESERVE_BYTES,
     completed_retention_ms: COMPLETED_RETENTION_MS,
     retryable_retention_ms: RETRYABLE_RETENTION_MS,
     eviction_batch_rows: EVICTION_BATCH_ROWS,
@@ -654,7 +743,16 @@ fn schema_header(conn: &Connection) -> Result<(i64, i64), SubmitIdempotencyError
 }
 
 fn validate_initialized_schema_locked(conn: &Connection) -> Result<(), SubmitIdempotencyError> {
-    if schema_header(conn)? != (STORE_APPLICATION_ID, STORE_SCHEMA_VERSION) {
+    validate_store_schema_version_locked(conn, STORE_SCHEMA_VERSION)
+}
+
+fn validate_store_schema_version_locked(
+    conn: &Connection,
+    version: i64,
+) -> Result<(), SubmitIdempotencyError> {
+    if !matches!(version, LEGACY_STORE_SCHEMA_VERSION | STORE_SCHEMA_VERSION)
+        || schema_header(conn)? != (STORE_APPLICATION_ID, version)
+    {
         return Err(SubmitIdempotencyError::SchemaMismatch);
     }
 
@@ -674,7 +772,12 @@ fn validate_initialized_schema_locked(conn: &Connection) -> Result<(), SubmitIde
     )?;
     if table_sql.as_deref() != Some(CREATE_TABLE_SQL)
         || index_sql.as_deref() != Some(CREATE_INDEX_SQL)
-        || user_objects != 2
+        || user_objects
+            != if version == STORE_SCHEMA_VERSION {
+                3
+            } else {
+                2
+            }
     {
         return Err(SubmitIdempotencyError::SchemaMismatch);
     }
@@ -799,10 +902,50 @@ fn validate_initialized_schema_locked(conn: &Connection) -> Result<(), SubmitIde
         && foreign_keys == 0
         && indexes == 2
     {
-        Ok(())
+        if version == STORE_SCHEMA_VERSION {
+            validate_observation_schema_locked(conn)
+        } else {
+            Ok(())
+        }
     } else {
         Err(SubmitIdempotencyError::SchemaMismatch)
     }
+}
+
+fn validate_observation_schema_locked(conn: &Connection) -> Result<(), SubmitIdempotencyError> {
+    let (sql, without_rowid, strict, columns, foreign_keys, indexes) = map_sqlite(
+        conn.query_row(
+            "SELECT \
+             (SELECT sql FROM main.sqlite_schema WHERE type = 'table' AND name = 'verified_submit_observations' COLLATE BINARY), \
+             (SELECT wr FROM pragma_table_list WHERE schema = 'main' AND name = 'verified_submit_observations'), \
+             (SELECT strict FROM pragma_table_list WHERE schema = 'main' AND name = 'verified_submit_observations'), \
+             (SELECT COUNT(*) FROM pragma_table_xinfo('verified_submit_observations')), \
+             (SELECT COUNT(*) FROM pragma_foreign_key_list('verified_submit_observations')), \
+             (SELECT COUNT(*) FROM pragma_index_list('verified_submit_observations'))",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        ),
+        SubmitIdempotencyError::SchemaMismatch,
+    )?;
+    if sql.as_deref() != Some(CREATE_OBSERVATION_TABLE_SQL)
+        || without_rowid != Some(1)
+        || strict != Some(1)
+        || columns != 3
+        || foreign_keys != 1
+        || indexes != 1
+    {
+        return Err(SubmitIdempotencyError::SchemaMismatch);
+    }
+    Ok(())
 }
 
 fn validate_blank_schema(conn: &Connection) -> Result<(), SubmitIdempotencyError> {
@@ -847,6 +990,9 @@ fn preflight_store_schema_observing_header(
         (STORE_APPLICATION_ID, STORE_SCHEMA_VERSION) => {
             validate_initialized_schema_locked(&snapshot)
         }
+        (STORE_APPLICATION_ID, LEGACY_STORE_SCHEMA_VERSION) => {
+            validate_store_schema_version_locked(&snapshot, LEGACY_STORE_SCHEMA_VERSION)
+        }
         (0, 0) if allow_uninitialized => validate_blank_schema(&snapshot),
         _ => Err(SubmitIdempotencyError::SchemaMismatch),
     }
@@ -860,6 +1006,21 @@ fn initialize_or_validate_schema_locked(
     if header == (STORE_APPLICATION_ID, STORE_SCHEMA_VERSION) {
         return validate_initialized_schema_locked(conn);
     }
+    if header == (STORE_APPLICATION_ID, LEGACY_STORE_SCHEMA_VERSION) {
+        // Validate the exact old authority-bearing schema before any write.
+        // The row schema and every existing receipt/claim are unchanged. Old
+        // pending rows have no observation record and remain fail closed.
+        validate_store_schema_version_locked(conn, LEGACY_STORE_SCHEMA_VERSION)?;
+        map_sqlite(
+            conn.execute_batch(CREATE_OBSERVATION_TABLE_SQL),
+            SubmitIdempotencyError::ConfigurationFailed,
+        )?;
+        map_sqlite(
+            conn.pragma_update(None, "user_version", STORE_SCHEMA_VERSION),
+            SubmitIdempotencyError::ConfigurationFailed,
+        )?;
+        return validate_initialized_schema_locked(conn);
+    }
     if header != (0, 0) || !allow_initialize {
         return Err(SubmitIdempotencyError::SchemaMismatch);
     }
@@ -870,6 +1031,10 @@ fn initialize_or_validate_schema_locked(
     )?;
     map_sqlite(
         conn.execute_batch(CREATE_INDEX_SQL),
+        SubmitIdempotencyError::ConfigurationFailed,
+    )?;
+    map_sqlite(
+        conn.execute_batch(CREATE_OBSERVATION_TABLE_SQL),
         SubmitIdempotencyError::ConfigurationFailed,
     )?;
     map_sqlite(
@@ -1482,7 +1647,7 @@ fn read_header(
         return Ok(None);
     };
     let expected_pane = binding.pane_id().to_string();
-    if schema != STORE_SCHEMA_VERSION
+    if schema != RECORD_SCHEMA_VERSION
         || key_len != i64::try_from(binding.key().len()).unwrap_or(i64::MAX)
         || key != binding.key().as_bytes()
         || pane_len != i64::try_from(expected_pane.len()).unwrap_or(i64::MAX)
@@ -1536,6 +1701,17 @@ fn read_header(
         } else {
             Err(SubmitIdempotencyError::RecordCorrupt)
         };
+    }
+    let has_observation: bool = map_sqlite(
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM verified_submit_observations WHERE idempotency_key COLLATE BINARY = ?1 COLLATE BINARY)",
+            [binding.key()],
+            |row| row.get(0),
+        ),
+        fallback,
+    )?;
+    if has_observation && !matches!(state, STATE_EFFECT_APPLIED_RECEIPT_PENDING | STATE_IN_DOUBT) {
+        return Err(SubmitIdempotencyError::RecordCorrupt);
     }
     let owner_nonce: [u8; OWNER_NONCE_BYTES] = nonce
         .try_into()
@@ -1662,6 +1838,89 @@ fn fresh_owner_nonce() -> Result<[u8; OWNER_NONCE_BYTES], SubmitIdempotencyError
     rng.try_fill_bytes(&mut nonce)
         .map_err(|_| SubmitIdempotencyError::EntropyUnavailable)?;
     Ok(nonce)
+}
+
+fn serialize_observation(
+    binding: &SubmitIdempotencyBinding,
+    continuation: &SubmitObservationContinuation,
+) -> Result<String, SubmitIdempotencyError> {
+    if !continuation.is_valid_for(binding) {
+        return Err(SubmitIdempotencyError::ObservationInvalid);
+    }
+    let envelope = StoredObservationEnvelope {
+        schema_version: OBSERVATION_SCHEMA_VERSION,
+        internal_claim_key: binding.key().to_string(),
+        request_sha256: binding.request_sha256().to_string(),
+        effect_sha256: binding.effect_sha256().to_string(),
+        continuation: continuation.clone(),
+    };
+    let encoded =
+        serde_json::to_string(&envelope).map_err(|_| SubmitIdempotencyError::ObservationInvalid)?;
+    if encoded.len() > MAX_OBSERVATION_JSON_BYTES {
+        return Err(SubmitIdempotencyError::ObservationOversize);
+    }
+    Ok(encoded)
+}
+
+fn load_observation(
+    conn: &Connection,
+    binding: &SubmitIdempotencyBinding,
+) -> Result<Option<StoredObservation>, SubmitIdempotencyError> {
+    let stored = map_sqlite(
+        conn.query_row(
+            "SELECT length(CAST(continuation_json AS BLOB)), substr(CAST(continuation_json AS BLOB), 1, ?2), lease_expires_unix_ms FROM verified_submit_observations WHERE idempotency_key COLLATE BINARY = ?1 COLLATE BINARY",
+            params![binding.key(), MAX_OBSERVATION_JSON_BYTES + 1],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional(),
+        SubmitIdempotencyError::RecordCorrupt,
+    )?;
+    let Some((length, encoded, lease_expires_unix_ms)) = stored else {
+        return Ok(None);
+    };
+    if length <= 0
+        || usize::try_from(length).is_err()
+        || encoded.len() != usize::try_from(length).unwrap_or(usize::MAX)
+        || encoded.len() > MAX_OBSERVATION_JSON_BYTES
+    {
+        return Err(SubmitIdempotencyError::ObservationOversize);
+    }
+    let envelope: StoredObservationEnvelope =
+        serde_json::from_slice(&encoded).map_err(|_| SubmitIdempotencyError::RecordCorrupt)?;
+    if envelope.schema_version != OBSERVATION_SCHEMA_VERSION
+        || envelope.internal_claim_key != binding.key()
+        || envelope.request_sha256 != binding.request_sha256()
+        || envelope.effect_sha256 != binding.effect_sha256()
+        || !envelope.continuation.is_valid_for(binding)
+        || lease_expires_unix_ms < envelope.continuation.started_unix_ms
+        || lease_expires_unix_ms > envelope.continuation.deadline_unix_ms
+    {
+        return Err(SubmitIdempotencyError::RecordCorrupt);
+    }
+    Ok(Some(StoredObservation {
+        continuation: envelope.continuation,
+        lease_expires_unix_ms,
+    }))
+}
+
+fn remove_observation_locked(
+    conn: &Connection,
+    binding: &SubmitIdempotencyBinding,
+) -> Result<(), SubmitIdempotencyError> {
+    map_sqlite(
+        conn.execute(
+            "DELETE FROM verified_submit_observations WHERE idempotency_key COLLATE BINARY = ?1 COLLATE BINARY",
+            [binding.key()],
+        ),
+        SubmitIdempotencyError::TransitionFailed,
+    )?;
+    Ok(())
 }
 
 /// Logical bytes one row charges against the byte ceiling. Parameters: ?1 the
@@ -1936,7 +2195,7 @@ where
     if limits.max_records < 1
         || limits.max_logical_bytes < 1
         || limits.receipt_reserve_bytes < 1
-        || limits.receipt_reserve_bytes > MAX_RECEIPT_JSON_BYTES as i64
+        || limits.receipt_reserve_bytes > UNRESOLVED_RESERVE_BYTES
         || limits.eviction_batch_rows < 1
         || limits.eviction_batches_per_admission < 1
         || limits.completed_retention_ms < 0
@@ -1986,7 +2245,7 @@ where
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, 1, ?7, ?8, ?9, ?9)",
                 params![
                     binding.key(),
-                    STORE_SCHEMA_VERSION,
+                    RECORD_SCHEMA_VERSION,
                     binding.pane_id().to_string(),
                     binding.request_sha256(),
                     binding.effect_sha256(),
@@ -2248,7 +2507,21 @@ where
         return Ok(());
     }
     match header.state {
-        STATE_EFFECT_APPLIED_RECEIPT_PENDING => {}
+        STATE_EFFECT_APPLIED_RECEIPT_PENDING => {
+            if let Some(observation) = load_observation(&tx, binding)? {
+                if completed_at < header.updated_unix_ms
+                    || completed_at < observation.continuation.started_unix_ms
+                    || completed_at >= observation.continuation.deadline_unix_ms
+                {
+                    fence_observation_locked(&tx, binding, header, completed_at)?;
+                    map_sqlite(tx.commit(), SubmitIdempotencyError::TransitionFailed)?;
+                    return Err(SubmitIdempotencyError::InvalidTransition);
+                }
+                if completed_at >= observation.lease_expires_unix_ms {
+                    return Err(SubmitIdempotencyError::InvalidTransition);
+                }
+            }
+        }
         STATE_ACTIVE_OWNER if matches!(mode, CompletionMode::EffectConfirmed) => {
             let lease_expires = header
                 .lease_expires_unix_ms
@@ -2257,13 +2530,7 @@ where
                 .checked_add(MAX_OWNER_LEASE_FUTURE_MS)
                 .unwrap_or(i64::MAX);
             if lease_expires <= completed_at || lease_expires > maximum_credible_expiry {
-                expire_active_owner_locked(
-                    &tx,
-                    binding,
-                    header,
-                    completed_at,
-                    SubmitIdempotencyError::TransitionFailed,
-                )?;
+                retain_applied_effect_without_owner_locked(&tx, binding, header, completed_at)?;
                 map_sqlite(tx.commit(), SubmitIdempotencyError::TransitionFailed)?;
                 return Err(SubmitIdempotencyError::InvalidTransition);
             }
@@ -2294,6 +2561,7 @@ where
     if changed != 1 {
         return Err(SubmitIdempotencyError::TransitionFailed);
     }
+    remove_observation_locked(&tx, binding)?;
     map_sqlite(tx.commit(), SubmitIdempotencyError::TransitionFailed)
 }
 
@@ -2368,6 +2636,16 @@ where
         return Ok(());
     }
     if header.state != STATE_ACTIVE_OWNER {
+        if target_state == STATE_EFFECT_APPLIED_RECEIPT_PENDING
+            && header.state == STATE_IN_DOUBT
+            && load_observation(&tx, binding)?.is_none()
+        {
+            // A concurrent lookup may already have expired the send lease.
+            // The matching owner's positive injector result still prohibits
+            // abandoning this row, but must not restore completion authority.
+            retain_applied_effect_without_owner_locked(&tx, binding, header, now)?;
+            map_sqlite(tx.commit(), SubmitIdempotencyError::TransitionFailed)?;
+        }
         return Err(SubmitIdempotencyError::InvalidTransition);
     }
     let lease_expires = header
@@ -2377,13 +2655,17 @@ where
         .checked_add(MAX_OWNER_LEASE_FUTURE_MS)
         .unwrap_or(i64::MAX);
     if lease_expires <= now || lease_expires > maximum_credible_expiry {
-        expire_active_owner_locked(
-            &tx,
-            binding,
-            header,
-            now,
-            SubmitIdempotencyError::TransitionFailed,
-        )?;
+        if target_state == STATE_EFFECT_APPLIED_RECEIPT_PENDING {
+            retain_applied_effect_without_owner_locked(&tx, binding, header, now)?;
+        } else {
+            expire_active_owner_locked(
+                &tx,
+                binding,
+                header,
+                now,
+                SubmitIdempotencyError::TransitionFailed,
+            )?;
+        }
         map_sqlite(tx.commit(), SubmitIdempotencyError::TransitionFailed)?;
         return Err(SubmitIdempotencyError::InvalidTransition);
     }
@@ -2513,7 +2795,8 @@ where
 ///
 /// # Errors
 /// Returns a finite error when the token is stale or the durable transition
-/// cannot be committed.
+/// cannot be committed. An expired matching owner is revoked, but its positive
+/// effect evidence is retained even though this call returns `InvalidTransition`.
 pub fn mark_effect_applied_receipt_pending(
     ft_dir: &Path,
     binding: &SubmitIdempotencyBinding,
@@ -2526,6 +2809,404 @@ pub fn mark_effect_applied_receipt_pending(
         STATE_EFFECT_APPLIED_RECEIPT_PENDING,
         None,
     )
+}
+
+/// Retain positive evidence from an expired send owner without restoring any
+/// authority to finish the receipt. A plain `in_doubt` row permits operator
+/// abandonment; an already-applied effect must instead remain pending until
+/// explicit settlement. The revocation nonce is never returned as a token.
+fn retain_applied_effect_without_owner_locked(
+    conn: &Connection,
+    binding: &SubmitIdempotencyBinding,
+    header: StoredHeader,
+    now: i64,
+) -> Result<(), SubmitIdempotencyError> {
+    let generation = header.generation.saturating_add(1);
+    let mut revoked_nonce = header.owner_nonce;
+    // Even generation saturation cannot leave the old token valid. Entropy
+    // is unnecessary for revocation and must not block recording the effect.
+    revoked_nonce[0] ^= 1;
+    let changed = map_sqlite(
+        conn.execute(
+            "UPDATE verified_submit_idempotency SET state = ?2, generation = ?3, owner_nonce = ?4, lease_expires_unix_ms = NULL, updated_unix_ms = ?5 WHERE idempotency_key COLLATE BINARY = ?1 COLLATE BINARY AND state = ?6 AND generation = ?7 AND owner_nonce = ?8 AND lease_expires_unix_ms IS ?9",
+            params![
+                binding.key(),
+                STATE_EFFECT_APPLIED_RECEIPT_PENDING,
+                generation,
+                &revoked_nonce[..],
+                now.max(header.updated_unix_ms),
+                header.state,
+                header.generation,
+                &header.owner_nonce[..],
+                header.lease_expires_unix_ms,
+            ],
+        ),
+        SubmitIdempotencyError::TransitionFailed,
+    )?;
+    if changed != 1 {
+        return Err(SubmitIdempotencyError::InvalidTransition);
+    }
+    Ok(())
+}
+
+/// Atomically fence a successful send and retain the immutable evidence needed
+/// to resume observation. The existing owner receives the first short observer
+/// lease. Losing this call's response is safe: an identical retry preserves the
+/// original lease and deadline instead of extending either one.
+///
+/// # Errors
+/// Returns a finite error for an invalid continuation, expired/stale send
+/// owner, conflicting continuation, or a failed durable transaction.
+pub fn mark_effect_applied_with_observation(
+    ft_dir: &Path,
+    binding: &SubmitIdempotencyBinding,
+    token: ClaimToken,
+    continuation: &SubmitObservationContinuation,
+) -> Result<(), SubmitIdempotencyError> {
+    mark_effect_applied_with_observation_at(ft_dir, binding, token, continuation, now_unix_ms)
+}
+
+fn mark_effect_applied_with_observation_at<F>(
+    ft_dir: &Path,
+    binding: &SubmitIdempotencyBinding,
+    token: ClaimToken,
+    continuation: &SubmitObservationContinuation,
+    mut clock: F,
+) -> Result<(), SubmitIdempotencyError>
+where
+    F: FnMut() -> i64,
+{
+    validate_binding(binding)?;
+    let encoded = serialize_observation(binding, continuation)?;
+    let mut conn =
+        open_store(ft_dir, StoreOpenMode::Existing)?.ok_or(SubmitIdempotencyError::MissingClaim)?;
+    let tx = map_sqlite(
+        conn.transaction_with_behavior(TransactionBehavior::Immediate),
+        SubmitIdempotencyError::TransitionFailed,
+    )?;
+    initialize_or_validate_schema_locked(&tx, false)?;
+    let now = clock();
+    let header = read_header(&tx, binding, SubmitIdempotencyError::TransitionFailed)?
+        .ok_or(SubmitIdempotencyError::MissingClaim)?;
+    if header.generation != token.generation || header.owner_nonce != token.owner_nonce {
+        return Err(SubmitIdempotencyError::InvalidTransition);
+    }
+    if header.state == STATE_EFFECT_APPLIED_RECEIPT_PENDING {
+        let stored =
+            load_observation(&tx, binding)?.ok_or(SubmitIdempotencyError::InvalidTransition)?;
+        if stored.continuation != *continuation {
+            return Err(SubmitIdempotencyError::InvalidTransition);
+        }
+        // An ambiguous commit retry acknowledges the original commit only;
+        // completion independently enforces its lease and absolute deadline.
+        return map_sqlite(tx.commit(), SubmitIdempotencyError::TransitionFailed);
+    }
+    if header.state != STATE_ACTIVE_OWNER {
+        if header.state == STATE_IN_DOUBT && load_observation(&tx, binding)?.is_none() {
+            retain_applied_effect_without_owner_locked(&tx, binding, header, now)?;
+            map_sqlite(tx.commit(), SubmitIdempotencyError::TransitionFailed)?;
+        }
+        return Err(SubmitIdempotencyError::InvalidTransition);
+    }
+    // A v2 sender may have acquired its claim before the larger observation
+    // reserve existed. Refuse added observation bytes if the migrated store
+    // exceeds the logical ceiling; the caller can retain a plain pending
+    // effect fence instead. New v3 claims reserve this capacity pre-effect.
+    if !usage_admits(&tx, PRODUCTION_LIMITS, 0, 0)? {
+        return Err(SubmitIdempotencyError::CapacityExceeded);
+    }
+    let owner_expiry = header
+        .lease_expires_unix_ms
+        .ok_or(SubmitIdempotencyError::RecordCorrupt)?;
+    if now < header.updated_unix_ms
+        || now < continuation.started_unix_ms
+        || now >= continuation.deadline_unix_ms
+        || owner_expiry <= now
+        || owner_expiry > now.saturating_add(MAX_OWNER_LEASE_FUTURE_MS)
+    {
+        retain_applied_effect_without_owner_locked(&tx, binding, header, now)?;
+        map_sqlite(tx.commit(), SubmitIdempotencyError::TransitionFailed)?;
+        return Err(SubmitIdempotencyError::InvalidTransition);
+    }
+    let observer_expiry = now
+        .checked_add(OBSERVATION_OWNER_LEASE_DURATION_MS)
+        .ok_or(SubmitIdempotencyError::ObservationInvalid)?
+        .min(continuation.deadline_unix_ms);
+    let changed = map_sqlite(
+        tx.execute(
+            "UPDATE verified_submit_idempotency SET state = ?2, lease_expires_unix_ms = NULL, updated_unix_ms = ?3 WHERE idempotency_key COLLATE BINARY = ?1 COLLATE BINARY AND state = ?4 AND generation = ?5 AND owner_nonce = ?6 AND lease_expires_unix_ms = ?7",
+            params![
+                binding.key(),
+                STATE_EFFECT_APPLIED_RECEIPT_PENDING,
+                now,
+                STATE_ACTIVE_OWNER,
+                token.generation,
+                &token.owner_nonce[..],
+                owner_expiry,
+            ],
+        ),
+        SubmitIdempotencyError::TransitionFailed,
+    )?;
+    if changed != 1 {
+        return Err(SubmitIdempotencyError::TransitionFailed);
+    }
+    map_sqlite(
+        tx.execute(
+            "INSERT INTO verified_submit_observations (idempotency_key, continuation_json, lease_expires_unix_ms) VALUES (?1, ?2, ?3)",
+            params![binding.key(), encoded, observer_expiry],
+        ),
+        SubmitIdempotencyError::TransitionFailed,
+    )?;
+    map_sqlite(tx.commit(), SubmitIdempotencyError::TransitionFailed)
+}
+
+fn fence_observation_locked(
+    conn: &Connection,
+    binding: &SubmitIdempotencyBinding,
+    header: StoredHeader,
+    now: i64,
+) -> Result<(), SubmitIdempotencyError> {
+    let changed = map_sqlite(
+        conn.execute(
+            "UPDATE verified_submit_idempotency SET state = ?2, updated_unix_ms = ?3 WHERE idempotency_key COLLATE BINARY = ?1 COLLATE BINARY AND state = ?4 AND generation = ?5 AND owner_nonce = ?6",
+            params![
+                binding.key(),
+                STATE_IN_DOUBT,
+                now.max(header.updated_unix_ms),
+                STATE_EFFECT_APPLIED_RECEIPT_PENDING,
+                header.generation,
+                &header.owner_nonce[..],
+            ],
+        ),
+        SubmitIdempotencyError::TransitionFailed,
+    )?;
+    if changed != 1 {
+        return Err(SubmitIdempotencyError::InvalidTransition);
+    }
+    // Keep the continuation as durable evidence that the effect WAS applied.
+    // InDoubt alone historically allows operator abandonment; this marker
+    // prevents that path from authorizing an unintended second send.
+    Ok(())
+}
+
+/// Claim only observation of a successful send whose previous observer lease
+/// ended. The original canonical request binding is mandatory. Claiming a
+/// continuation never changes the send into a retryable or active-send state.
+///
+/// # Errors
+/// Returns a finite error for conflicting bindings, malformed continuation
+/// data, or failed storage. An absent old continuation is `Unavailable`.
+pub fn claim_observation(
+    ft_dir: &Path,
+    binding: &SubmitIdempotencyBinding,
+) -> Result<ObservationClaimOutcome, SubmitIdempotencyError> {
+    let mut backoff_ms = CLAIM_RETRY_INITIAL_BACKOFF_MS;
+    for attempt in 1..=CLAIM_RETRY_MAX_ATTEMPTS {
+        match claim_observation_with_clock(ft_dir, binding, fresh_owner_nonce, now_unix_ms) {
+            Err(error) if error.is_retryable() && attempt < CLAIM_RETRY_MAX_ATTEMPTS => {
+                std::thread::sleep(Duration::from_millis(backoff_ms));
+                backoff_ms = backoff_ms.saturating_mul(2).min(CLAIM_RETRY_MAX_BACKOFF_MS);
+            }
+            result => return result,
+        }
+    }
+    unreachable!("bounded observation claim retry loop always returns")
+}
+
+fn claim_observation_with_clock<N, F>(
+    ft_dir: &Path,
+    binding: &SubmitIdempotencyBinding,
+    mut nonce_factory: N,
+    mut clock: F,
+) -> Result<ObservationClaimOutcome, SubmitIdempotencyError>
+where
+    N: FnMut() -> Result<[u8; OWNER_NONCE_BYTES], SubmitIdempotencyError>,
+    F: FnMut() -> i64,
+{
+    validate_binding(binding)?;
+    let Some(mut conn) = open_store(ft_dir, StoreOpenMode::Existing)? else {
+        return Ok(ObservationClaimOutcome::Unavailable);
+    };
+    let tx = map_sqlite(
+        conn.transaction_with_behavior(TransactionBehavior::Immediate),
+        SubmitIdempotencyError::ClaimFailed,
+    )?;
+    initialize_or_validate_schema_locked(&tx, false)?;
+    let now = clock();
+    if now < 0 {
+        return Err(SubmitIdempotencyError::ClaimFailed);
+    }
+    let Some(header) = read_header(&tx, binding, SubmitIdempotencyError::ClaimFailed)? else {
+        return Ok(ObservationClaimOutcome::Unavailable);
+    };
+    let outcome = match header.state {
+        STATE_COMPLETED => Some(ObservationClaimOutcome::Completed(load_receipt(
+            &tx, binding,
+        )?)),
+        STATE_IN_DOUBT => Some(ObservationClaimOutcome::InDoubt),
+        STATE_ACTIVE_OWNER => Some(ObservationClaimOutcome::InFlight),
+        STATE_RETRYABLE => Some(ObservationClaimOutcome::Unavailable),
+        STATE_EFFECT_APPLIED_RECEIPT_PENDING => None,
+        _ => return Err(SubmitIdempotencyError::RecordCorrupt),
+    };
+    if let Some(outcome) = outcome {
+        map_sqlite(tx.commit(), SubmitIdempotencyError::ClaimFailed)?;
+        return Ok(outcome);
+    }
+    let Some(stored) = load_observation(&tx, binding)? else {
+        map_sqlite(tx.commit(), SubmitIdempotencyError::ClaimFailed)?;
+        return Ok(ObservationClaimOutcome::Unavailable);
+    };
+    if now < header.updated_unix_ms
+        || now < stored.continuation.started_unix_ms
+        || now >= stored.continuation.deadline_unix_ms
+    {
+        fence_observation_locked(&tx, binding, header, now)?;
+        map_sqlite(tx.commit(), SubmitIdempotencyError::ClaimFailed)?;
+        return Ok(ObservationClaimOutcome::Expired);
+    }
+    if now < stored.lease_expires_unix_ms {
+        map_sqlite(tx.commit(), SubmitIdempotencyError::ClaimFailed)?;
+        return Ok(ObservationClaimOutcome::InFlight);
+    }
+    let token = ClaimToken {
+        generation: header
+            .generation
+            .checked_add(1)
+            .ok_or(SubmitIdempotencyError::RecordCorrupt)?,
+        owner_nonce: nonce_factory()?,
+    };
+    let lease_expires = now
+        .checked_add(OBSERVATION_OWNER_LEASE_DURATION_MS)
+        .ok_or(SubmitIdempotencyError::ClaimFailed)?
+        .min(stored.continuation.deadline_unix_ms);
+    let changed = map_sqlite(
+        tx.execute(
+            "UPDATE verified_submit_idempotency SET generation = ?2, owner_nonce = ?3, updated_unix_ms = ?4 WHERE idempotency_key COLLATE BINARY = ?1 COLLATE BINARY AND state = ?5 AND generation = ?6 AND owner_nonce = ?7",
+            params![
+                binding.key(),
+                token.generation,
+                &token.owner_nonce[..],
+                now,
+                STATE_EFFECT_APPLIED_RECEIPT_PENDING,
+                header.generation,
+                &header.owner_nonce[..],
+            ],
+        ),
+        SubmitIdempotencyError::ClaimFailed,
+    )?;
+    if changed != 1 {
+        return Err(SubmitIdempotencyError::ClaimFailed);
+    }
+    let changed = map_sqlite(
+        tx.execute(
+            "UPDATE verified_submit_observations SET lease_expires_unix_ms = ?2 WHERE idempotency_key COLLATE BINARY = ?1 COLLATE BINARY AND lease_expires_unix_ms = ?3",
+            params![binding.key(), lease_expires, stored.lease_expires_unix_ms],
+        ),
+        SubmitIdempotencyError::ClaimFailed,
+    )?;
+    if changed != 1 {
+        return Err(SubmitIdempotencyError::ClaimFailed);
+    }
+    map_sqlite(tx.commit(), SubmitIdempotencyError::ClaimFailed)?;
+    let returned_at = clock();
+    if returned_at < now || returned_at >= lease_expires {
+        // A slow durable commit must not hand out already-expired authority.
+        // Preserve the pending row for a later bounded claimant; its deadline
+        // remains the immutable persisted value.
+        return Err(SubmitIdempotencyError::InvalidTransition);
+    }
+    Ok(ObservationClaimOutcome::Claimed {
+        token,
+        continuation: stored.continuation,
+        remaining_ms: u64::try_from(lease_expires - returned_at)
+            .map_err(|_| SubmitIdempotencyError::ClaimFailed)?,
+    })
+}
+
+/// Release an observer lease without refunding its absolute deadline. This
+/// gives a same-request replay an immediate opportunity to finish observation
+/// after cooperative cancellation, while never permitting another injection.
+///
+/// # Errors
+/// Returns a finite error for stale authority, corrupt state, or storage.
+pub fn release_observation(
+    ft_dir: &Path,
+    binding: &SubmitIdempotencyBinding,
+    token: ClaimToken,
+) -> Result<(), SubmitIdempotencyError> {
+    finish_observation_ownership(ft_dir, binding, token, false, now_unix_ms)
+}
+
+/// Fence an observation whose exact pane identity or evidence can no longer
+/// be established. Known-applied effects remain non-abandonable and require
+/// audited settlement; this operation never turns them into resend authority.
+///
+/// # Errors
+/// Returns a finite error for stale authority, corrupt state, or storage.
+pub fn mark_observation_in_doubt(
+    ft_dir: &Path,
+    binding: &SubmitIdempotencyBinding,
+    token: ClaimToken,
+) -> Result<(), SubmitIdempotencyError> {
+    finish_observation_ownership(ft_dir, binding, token, true, now_unix_ms)
+}
+
+fn finish_observation_ownership<F>(
+    ft_dir: &Path,
+    binding: &SubmitIdempotencyBinding,
+    token: ClaimToken,
+    in_doubt: bool,
+    mut clock: F,
+) -> Result<(), SubmitIdempotencyError>
+where
+    F: FnMut() -> i64,
+{
+    validate_binding(binding)?;
+    let mut conn =
+        open_store(ft_dir, StoreOpenMode::Existing)?.ok_or(SubmitIdempotencyError::MissingClaim)?;
+    let tx = map_sqlite(
+        conn.transaction_with_behavior(TransactionBehavior::Immediate),
+        SubmitIdempotencyError::TransitionFailed,
+    )?;
+    initialize_or_validate_schema_locked(&tx, false)?;
+    let now = clock();
+    let header = read_header(&tx, binding, SubmitIdempotencyError::TransitionFailed)?
+        .ok_or(SubmitIdempotencyError::MissingClaim)?;
+    if now < 0 || header.generation != token.generation || header.owner_nonce != token.owner_nonce {
+        return Err(SubmitIdempotencyError::InvalidTransition);
+    }
+    let stored =
+        load_observation(&tx, binding)?.ok_or(SubmitIdempotencyError::InvalidTransition)?;
+    if in_doubt && header.state == STATE_IN_DOUBT {
+        return map_sqlite(tx.commit(), SubmitIdempotencyError::TransitionFailed);
+    }
+    if header.state != STATE_EFFECT_APPLIED_RECEIPT_PENDING {
+        return Err(SubmitIdempotencyError::InvalidTransition);
+    }
+    if in_doubt
+        || now < header.updated_unix_ms
+        || now < stored.continuation.started_unix_ms
+        || now >= stored.continuation.deadline_unix_ms
+    {
+        fence_observation_locked(&tx, binding, header, now)?;
+    } else {
+        map_sqlite(
+            tx.execute(
+                "UPDATE verified_submit_observations SET lease_expires_unix_ms = ?2 WHERE idempotency_key COLLATE BINARY = ?1 COLLATE BINARY",
+                params![binding.key(), now],
+            ),
+            SubmitIdempotencyError::TransitionFailed,
+        )?;
+        map_sqlite(
+            tx.execute(
+                "UPDATE verified_submit_idempotency SET updated_unix_ms = ?2 WHERE idempotency_key COLLATE BINARY = ?1 COLLATE BINARY",
+                params![binding.key(), now],
+            ),
+            SubmitIdempotencyError::TransitionFailed,
+        )?;
+    }
+    map_sqlite(tx.commit(), SubmitIdempotencyError::TransitionFailed)
 }
 
 /// Record an injector/backend error whose pane-write outcome is ambiguous.
@@ -2731,7 +3412,7 @@ where
     };
     let effect_applied = match header.state {
         STATE_EFFECT_APPLIED_RECEIPT_PENDING => true,
-        STATE_IN_DOUBT => false,
+        STATE_IN_DOUBT => load_observation(&tx, binding)?.is_some(),
         STATE_ACTIVE_OWNER => {
             let lease_expires = header
                 .lease_expires_unix_ms
@@ -2796,6 +3477,7 @@ where
     if changed != 1 {
         return Err(SubmitIdempotencyError::TransitionFailed);
     }
+    remove_observation_locked(&tx, binding)?;
     map_sqlite(tx.commit(), SubmitIdempotencyError::TransitionFailed)?;
     Ok(outcome)
 }
@@ -2808,7 +3490,7 @@ const MAX_NEW_RECORD_LOGICAL_BYTES: i64 = LOGICAL_RECORD_OVERHEAD_BYTES
     + 64
     + 64
     + OWNER_NONCE_BYTES as i64
-    + MAX_RECEIPT_JSON_BYTES as i64;
+    + UNRESOLVED_RESERVE_BYTES;
 
 /// Per-state row count, oldest update, logical bytes, and the rows (and their
 /// bytes) already past their retention horizon. ?1-?4 as in
@@ -2941,6 +3623,9 @@ fn census_with_limits_at(
     )?;
     match schema_header(&tx)? {
         (STORE_APPLICATION_ID, STORE_SCHEMA_VERSION) => validate_initialized_schema_locked(&tx)?,
+        (STORE_APPLICATION_ID, LEGACY_STORE_SCHEMA_VERSION) => {
+            validate_store_schema_version_locked(&tx, LEGACY_STORE_SCHEMA_VERSION)?;
+        }
         // A claim that failed before initializing leaves a blank database.
         (0, 0) => {
             validate_blank_schema(&tx)?;
@@ -3088,6 +3773,706 @@ mod tests {
             ClaimOutcome::Claimed(token) => token,
             other => panic!("expected a fresh claim, got {other:?}"),
         }
+    }
+
+    fn observation(
+        binding: &SubmitIdempotencyBinding,
+        started_unix_ms: i64,
+    ) -> SubmitObservationContinuation {
+        SubmitObservationContinuation {
+            baseline: crate::verified_submit::prepare_verified_submit_baseline(
+                binding.pane_id(),
+                binding.outbound_text(),
+                crate::patterns::AgentType::Codex,
+                None,
+                Some("private pre-send pane contents"),
+                None,
+            )
+            .expect("bounded baseline"),
+            pane_identity: MuxPaneIdentity {
+                session_incarnation: [1; 16],
+                durable_pane_id: [2; 16],
+                pane_registration: [3; 16],
+            },
+            audit_action_id: Some(17),
+            started_unix_ms,
+            deadline_unix_ms: started_unix_ms + 60_000,
+        }
+    }
+
+    fn pending_observation_at(
+        ft_dir: &Path,
+        binding: &SubmitIdempotencyBinding,
+        now: i64,
+    ) -> (ClaimToken, SubmitObservationContinuation) {
+        let ClaimOutcome::Claimed(token) = claim_with_nonce_limits_and_time(
+            ft_dir,
+            binding,
+            [7; OWNER_NONCE_BYTES],
+            PRODUCTION_LIMITS,
+            now,
+        )
+        .expect("initial send claim") else {
+            panic!("fresh send owner expected");
+        };
+        let continuation = observation(binding, now);
+        mark_effect_applied_with_observation_at(ft_dir, binding, token, &continuation, || now)
+            .expect("atomic effect fence and continuation");
+        (token, continuation)
+    }
+
+    fn recover_observation_at(
+        ft_dir: &Path,
+        binding: &SubmitIdempotencyBinding,
+        now: i64,
+    ) -> Result<ObservationClaimOutcome, SubmitIdempotencyError> {
+        claim_observation_with_clock(ft_dir, binding, || Ok([9; OWNER_NONCE_BYTES]), || now)
+    }
+
+    #[test]
+    fn observation_reopens_without_plaintext_and_fences_original_sender() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binding = binding(41, "private-caller-nonce");
+        let (original, continuation) = pending_observation_at(dir.path(), &binding, 1_000);
+        let encoded: String = raw_connection(dir.path())
+            .query_row(
+                "SELECT continuation_json FROM verified_submit_observations",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read retained continuation from fresh connection");
+        for private in [
+            binding.outbound_text(),
+            binding.caller_key(),
+            "private pre-send",
+        ] {
+            assert!(
+                !encoded.contains(private),
+                "private input must never persist"
+            );
+        }
+        assert_eq!(
+            claim_with_nonce_limits_and_time(
+                dir.path(),
+                &binding,
+                [8; OWNER_NONCE_BYTES],
+                PRODUCTION_LIMITS,
+                20_000,
+            ),
+            Ok(ClaimOutcome::EffectAppliedReceiptPending),
+            "even an expired observer is never a new send claim"
+        );
+        let ObservationClaimOutcome::Claimed {
+            token,
+            continuation: recovered,
+            remaining_ms,
+        } = recover_observation_at(dir.path(), &binding, 20_000).expect("recover observer")
+        else {
+            panic!("observer takeover expected");
+        };
+        assert_eq!(recovered, continuation);
+        assert_eq!(remaining_ms, 15_000);
+        assert_ne!(token, original);
+        let submitted = receipt(&binding, SubmitReceiptState::Submitted);
+        assert_eq!(
+            complete_at(dir.path(), &binding, original, &submitted, 20_001),
+            Err(SubmitIdempotencyError::InvalidTransition)
+        );
+        complete_at(dir.path(), &binding, token, &submitted, 20_001)
+            .expect("new observer completes exact receipt");
+        complete_at(dir.path(), &binding, token, &submitted, 90_000)
+            .expect("lost completion response remains idempotent after deadline");
+        assert_eq!(
+            recover_observation_at(dir.path(), &binding, 90_000),
+            Ok(ObservationClaimOutcome::Completed(submitted))
+        );
+        let remaining: i64 = raw_connection(dir.path())
+            .query_row(
+                "SELECT COUNT(*) FROM verified_submit_observations",
+                [],
+                |row| row.get(0),
+            )
+            .expect("continuation cleanup");
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn observation_mark_retry_never_renews_lease_or_changes_evidence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binding = binding(42, "ambiguous-mark-response");
+        let (token, continuation) = pending_observation_at(dir.path(), &binding, 1_000);
+        assert_eq!(
+            recover_observation_at(dir.path(), &binding, 15_999),
+            Ok(ObservationClaimOutcome::InFlight)
+        );
+        mark_effect_applied_with_observation_at(dir.path(), &binding, token, &continuation, || {
+            15_999
+        })
+        .expect("identical retry");
+        let mut changed = continuation.clone();
+        changed.deadline_unix_ms += 1;
+        assert_eq!(
+            mark_effect_applied_with_observation_at(dir.path(), &binding, token, &changed, || {
+                15_999
+            },),
+            Err(SubmitIdempotencyError::InvalidTransition)
+        );
+        assert!(matches!(
+            recover_observation_at(dir.path(), &binding, 16_000),
+            Ok(ObservationClaimOutcome::Claimed { .. })
+        ));
+    }
+
+    #[test]
+    fn released_observation_is_immediately_claimable_without_deadline_refund() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binding = binding(43, "cooperative-cancel");
+        let (token, continuation) = pending_observation_at(dir.path(), &binding, 1_000);
+        finish_observation_ownership(dir.path(), &binding, token, false, || 2_000)
+            .expect("release after cancellation");
+        let ObservationClaimOutcome::Claimed {
+            token: next,
+            continuation: resumed,
+            ..
+        } = recover_observation_at(dir.path(), &binding, 2_000).expect("immediate recovery")
+        else {
+            panic!("released observer must be claimable");
+        };
+        assert_eq!(resumed.deadline_unix_ms, continuation.deadline_unix_ms);
+        assert_eq!(
+            finish_observation_ownership(dir.path(), &binding, token, false, || 2_001),
+            Err(SubmitIdempotencyError::InvalidTransition),
+            "stale cancellation cannot release a successor"
+        );
+        finish_observation_ownership(dir.path(), &binding, next, false, || 60_999)
+            .expect("late release preserves final millisecond");
+        let ObservationClaimOutcome::Claimed { remaining_ms, .. } =
+            recover_observation_at(dir.path(), &binding, 60_999).expect("last bounded observer")
+        else {
+            panic!("one remaining millisecond");
+        };
+        assert_eq!(remaining_ms, 1);
+        assert_eq!(
+            recover_observation_at(dir.path(), &binding, 61_000),
+            Ok(ObservationClaimOutcome::Expired)
+        );
+    }
+
+    #[test]
+    fn expired_observation_is_in_doubt_but_cannot_abandon_known_applied_effect() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binding = binding(44, "expired-known-effect");
+        let (token, _) = pending_observation_at(dir.path(), &binding, 1_000);
+        assert_eq!(
+            recover_observation_at(dir.path(), &binding, 61_000),
+            Ok(ObservationClaimOutcome::Expired)
+        );
+        assert_eq!(
+            lookup_at(dir.path(), &binding, 61_001),
+            Ok(Some(StoredSubmitState::InDoubt))
+        );
+        assert_eq!(
+            reconcile_with_clock(dir.path(), &binding, SubmitReconciliation::Abandon, || {
+                61_001
+            }),
+            Err(SubmitIdempotencyError::InvalidTransition)
+        );
+        assert_eq!(
+            complete_at(
+                dir.path(),
+                &binding,
+                token,
+                &receipt(&binding, SubmitReceiptState::Submitted),
+                61_001
+            ),
+            Err(SubmitIdempotencyError::InvalidTransition)
+        );
+        assert!(matches!(
+            reconcile_with_clock(dir.path(), &binding, SubmitReconciliation::Settle, || {
+                61_001
+            }),
+            Ok(ReconcileOutcome::Settled(_))
+        ));
+    }
+
+    #[test]
+    fn observation_clock_rollback_fences_instead_of_refunding_budget() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binding = binding(45, "clock-rollback");
+        let _ = pending_observation_at(dir.path(), &binding, 10_000);
+        assert_eq!(
+            recover_observation_at(dir.path(), &binding, 9_999),
+            Ok(ObservationClaimOutcome::Expired)
+        );
+        assert_eq!(
+            recover_observation_at(dir.path(), &binding, 20_000),
+            Ok(ObservationClaimOutcome::InDoubt)
+        );
+        assert_eq!(persisted_updated_at(dir.path(), &binding), 10_000);
+    }
+
+    #[test]
+    fn observation_completion_requires_unexpired_lease_and_absolute_deadline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binding = binding(46, "completion-lease");
+        let (token, _) = pending_observation_at(dir.path(), &binding, 1_000);
+        let submitted = receipt(&binding, SubmitReceiptState::Submitted);
+        assert_eq!(
+            complete_at(dir.path(), &binding, token, &submitted, 16_000),
+            Err(SubmitIdempotencyError::InvalidTransition)
+        );
+        let ObservationClaimOutcome::Claimed {
+            token: recovered, ..
+        } = recover_observation_at(dir.path(), &binding, 60_000).expect("recover near deadline")
+        else {
+            panic!("recovery remains possible before original deadline");
+        };
+        assert_eq!(
+            complete_at(dir.path(), &binding, recovered, &submitted, 61_000),
+            Err(SubmitIdempotencyError::InvalidTransition)
+        );
+        assert_eq!(
+            lookup_at(dir.path(), &binding, 61_000),
+            Ok(Some(StoredSubmitState::InDoubt))
+        );
+    }
+
+    #[test]
+    fn expired_send_owner_keeps_applied_effect_fenced_without_restoring_authority() {
+        let started = 200_000;
+        for (case, use_observation, expire_before_mark, marked_at, deadline) in [
+            (
+                "plain-expired",
+                false,
+                false,
+                started + 60_000,
+                started + 60_000,
+            ),
+            (
+                "plain-after-lookup",
+                false,
+                true,
+                started + 60_000,
+                started + 60_000,
+            ),
+            (
+                "observation-expired",
+                true,
+                false,
+                started + 60_000,
+                started + 60_000,
+            ),
+            (
+                "observation-after-lookup",
+                true,
+                true,
+                started + 60_000,
+                started + 60_000,
+            ),
+            (
+                "observation-deadline",
+                true,
+                false,
+                started + 100,
+                started + 100,
+            ),
+            (
+                "observation-rollback",
+                true,
+                false,
+                started - 1,
+                started + 60_000,
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let binding = binding(47, case);
+            let ClaimOutcome::Claimed(token) = claim_with_nonce_limits_and_time(
+                dir.path(),
+                &binding,
+                [7; OWNER_NONCE_BYTES],
+                PRODUCTION_LIMITS,
+                started,
+            )
+            .expect("initial claim") else {
+                panic!("fresh owner expected");
+            };
+            if expire_before_mark {
+                assert_eq!(
+                    lookup_at(dir.path(), &binding, marked_at),
+                    Ok(Some(StoredSubmitState::InDoubt))
+                );
+            }
+            let result = if use_observation {
+                let mut continuation = observation(&binding, started);
+                continuation.deadline_unix_ms = deadline;
+                mark_effect_applied_with_observation_at(
+                    dir.path(),
+                    &binding,
+                    token,
+                    &continuation,
+                    || marked_at,
+                )
+            } else {
+                transition_from_active_owner_at(
+                    dir.path(),
+                    &binding,
+                    token,
+                    STATE_EFFECT_APPLIED_RECEIPT_PENDING,
+                    None,
+                    marked_at,
+                )
+            };
+            assert_eq!(
+                result,
+                Err(SubmitIdempotencyError::InvalidTransition),
+                "{case}"
+            );
+            assert_eq!(
+                claim(dir.path(), &binding),
+                Ok(ClaimOutcome::EffectAppliedReceiptPending),
+                "{case}: positive effect evidence must survive the expired owner"
+            );
+            assert_eq!(
+                recover_observation_at(dir.path(), &binding, marked_at),
+                Ok(ObservationClaimOutcome::Unavailable),
+                "{case}: the expired owner cannot install new observation authority"
+            );
+            assert_eq!(
+                complete_with_clock(
+                    dir.path(),
+                    &binding,
+                    token,
+                    &receipt(&binding, SubmitReceiptState::Submitted),
+                    CompletionMode::EffectConfirmed,
+                    || started + 1,
+                ),
+                Err(SubmitIdempotencyError::InvalidTransition),
+                "{case}: an earlier clock must not revive the old token"
+            );
+            assert_eq!(
+                reconcile_with_clock(dir.path(), &binding, SubmitReconciliation::Abandon, || {
+                    marked_at
+                },),
+                Err(SubmitIdempotencyError::InvalidTransition),
+                "{case}: abandoning known-applied input would permit a duplicate send"
+            );
+            assert!(matches!(
+                reconcile_with_clock(dir.path(), &binding, SubmitReconciliation::Settle, || {
+                    marked_at
+                },),
+                Ok(ReconcileOutcome::Settled(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn observation_claim_does_not_return_authority_expired_during_commit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binding = binding(47, "slow-observation-commit");
+        let _ = pending_observation_at(dir.path(), &binding, 1_000);
+        let mut clock = [20_000, 35_000].into_iter();
+        assert_eq!(
+            claim_observation_with_clock(
+                dir.path(),
+                &binding,
+                || Ok([8; OWNER_NONCE_BYTES]),
+                || clock.next().unwrap(),
+            ),
+            Err(SubmitIdempotencyError::InvalidTransition)
+        );
+        assert!(matches!(
+            recover_observation_at(dir.path(), &binding, 35_000),
+            Ok(ObservationClaimOutcome::Claimed {
+                remaining_ms: 15_000,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::needless_collect)]
+    fn concurrent_observation_recovery_has_one_owner_and_never_a_send_owner() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = Arc::new(dir.path().to_path_buf());
+        let binding = Arc::new(binding(48, "concurrent-observers"));
+        let now = now_unix_ms();
+        let (original, _) = pending_observation_at(&path, &binding, now);
+        release_observation(&path, &binding, original).expect("release initial observer");
+        let barrier = Arc::new(Barrier::new(8));
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let path = Arc::clone(&path);
+                let binding = Arc::clone(&binding);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    claim_observation(&path, &binding).expect("bounded concurrent claim")
+                })
+            })
+            .collect();
+        let outcomes: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|value| matches!(value, ObservationClaimOutcome::Claimed { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|value| matches!(value, ObservationClaimOutcome::InFlight))
+                .count(),
+            7
+        );
+        assert_eq!(
+            claim(&path, &binding),
+            Ok(ClaimOutcome::EffectAppliedReceiptPending)
+        );
+    }
+
+    #[test]
+    fn observation_corruption_is_bounded_and_never_reinterpreted_as_send_permission() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binding = binding(49, "corrupt-observation");
+        let _ = pending_observation_at(dir.path(), &binding, 1_000);
+        let conn = raw_connection(dir.path());
+        conn.execute(
+            "UPDATE verified_submit_observations SET continuation_json = ?1",
+            ["{\"schema_version\":1,\"unexpected_command\":\"must not be accepted\"}"],
+        )
+        .expect("malformed envelope fixture");
+        assert_eq!(
+            recover_observation_at(dir.path(), &binding, 20_000),
+            Err(SubmitIdempotencyError::RecordCorrupt)
+        );
+        conn.pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
+        conn.execute(
+            "UPDATE verified_submit_observations SET continuation_json = ?1",
+            ["x".repeat(MAX_OBSERVATION_JSON_BYTES + 1)],
+        )
+        .expect("oversized raw fixture");
+        assert_eq!(
+            recover_observation_at(dir.path(), &binding, 20_000),
+            Err(SubmitIdempotencyError::ObservationOversize)
+        );
+        assert_eq!(
+            lookup_at(dir.path(), &binding, 20_000),
+            Ok(Some(StoredSubmitState::EffectAppliedReceiptPending))
+        );
+    }
+
+    #[test]
+    fn observation_rejects_changed_request_identity_and_invalid_budget_before_mutation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binding = binding(50, "request-identity");
+        let token = claim_token(dir.path(), &binding);
+        let now = now_unix_ms();
+        let continuation = observation(&binding, now);
+        for invalid in [
+            SubmitObservationContinuation {
+                pane_identity: MuxPaneIdentity {
+                    pane_registration: [0; 16],
+                    ..continuation.pane_identity
+                },
+                ..continuation.clone()
+            },
+            SubmitObservationContinuation {
+                audit_action_id: Some(0),
+                ..continuation.clone()
+            },
+            SubmitObservationContinuation {
+                deadline_unix_ms: now + MAX_OBSERVATION_DURATION_MS + 1,
+                ..continuation.clone()
+            },
+            SubmitObservationContinuation {
+                deadline_unix_ms: now,
+                ..continuation.clone()
+            },
+        ] {
+            assert_eq!(
+                mark_effect_applied_with_observation_at(
+                    dir.path(),
+                    &binding,
+                    token,
+                    &invalid,
+                    || now
+                ),
+                Err(SubmitIdempotencyError::ObservationInvalid)
+            );
+        }
+        assert_eq!(
+            lookup_at(dir.path(), &binding, now),
+            Ok(Some(StoredSubmitState::ActiveOwner))
+        );
+        mark_effect_applied_with_observation_at(dir.path(), &binding, token, &continuation, || now)
+            .unwrap();
+        let conflict = idempotency_binding(SubmitIdempotencyRequest {
+            pane_id: binding.pane_id(),
+            text: "different command",
+            caller_key: binding.caller_key(),
+            guarantee_level: binding.guarantee_level(),
+            wait_for: None,
+            wait_for_regex: false,
+            timeout_secs: 30,
+        });
+        assert_eq!(
+            claim_observation(dir.path(), &conflict),
+            Err(SubmitIdempotencyError::RequestConflict)
+        );
+    }
+
+    #[test]
+    fn observation_reserve_covers_large_semantic_history_and_atomic_receipt_replacement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binding = binding(54, "large-semantic-history");
+        let reserved = new_record_logical_bytes(&binding, PRODUCTION_LIMITS).unwrap();
+        let limits = StoreLimits {
+            max_records: 1,
+            max_logical_bytes: reserved,
+            ..PRODUCTION_LIMITS
+        };
+        let token = claim_at(dir.path(), &binding, limits, 1_000);
+        let snapshot = crate::wezterm::MuxSemanticSnapshot {
+            zones: (0..256)
+                .map(|row| crate::wezterm::MuxSemanticZone {
+                    start_y: row,
+                    start_x: 0,
+                    end_y: row,
+                    end_x: 127,
+                    semantic_type: crate::wezterm::MuxSemanticZoneKind::Output,
+                    text: "x".repeat(127),
+                })
+                .collect(),
+            last_exit_code: None,
+        };
+        let baseline = crate::verified_submit::prepare_verified_submit_baseline(
+            binding.pane_id(),
+            binding.outbound_text(),
+            crate::patterns::AgentType::Codex,
+            None,
+            Some("private pre-send capture"),
+            Some(&snapshot),
+        )
+        .unwrap();
+        let continuation = SubmitObservationContinuation {
+            baseline,
+            ..observation(&binding, 1_000)
+        };
+        let encoded = serialize_observation(&binding, &continuation).unwrap();
+        assert!(encoded.len() > 32 * 1024, "full history exercises old cap");
+        mark_effect_applied_with_observation_at(dir.path(), &binding, token, &continuation, || {
+            1_000
+        })
+        .expect("complete baseline fits reserved capacity");
+        let conn = raw_connection(dir.path());
+        let retained_bytes: i64 = conn.query_row(
+            "SELECT length(CAST(continuation_json AS BLOB)) + length(CAST(idempotency_key AS BLOB)) + 8 FROM verified_submit_observations", [], |row| row.get(0),
+        ).unwrap();
+        assert!(retained_bytes + LOGICAL_RECORD_OVERHEAD_BYTES <= UNRESOLVED_RESERVE_BYTES);
+        assert_eq!(store_usage(&conn, limits).unwrap(), (1, reserved));
+        drop(conn);
+        complete_at(
+            dir.path(),
+            &binding,
+            token,
+            &receipt(&binding, SubmitReceiptState::Submitted),
+            2_000,
+        )
+        .expect("reserved receipt replaces continuation atomically");
+        let conn = raw_connection(dir.path());
+        assert!(store_usage(&conn, limits).unwrap().1 < reserved);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM verified_submit_observations",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    fn legacy_v2_store(ft_dir: &Path) -> Connection {
+        let conn = raw_connection(ft_dir);
+        conn.execute_batch(CREATE_TABLE_SQL).unwrap();
+        conn.execute_batch(CREATE_INDEX_SQL).unwrap();
+        conn.pragma_update(None, "application_id", STORE_APPLICATION_ID)
+            .unwrap();
+        conn.pragma_update(None, "user_version", LEGACY_STORE_SCHEMA_VERSION)
+            .unwrap();
+        conn
+    }
+
+    #[test]
+    fn exact_v2_migration_preserves_pending_claims_and_completed_receipts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pending = binding(51, "legacy-pending");
+        let completed = binding(52, "legacy-completed");
+        let completed_receipt = receipt(&completed, SubmitReceiptState::Submitted);
+        let conn = legacy_v2_store(dir.path());
+        for (binding, state, receipt_json) in [
+            (&pending, STATE_EFFECT_APPLIED_RECEIPT_PENDING, None),
+            (
+                &completed,
+                STATE_COMPLETED,
+                Some(serialize_receipt(&completed, &completed_receipt).unwrap()),
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO verified_submit_idempotency (idempotency_key, schema_version, pane_id, request_sha256, effect_sha256, state, retryable_reason, receipt_json, generation, owner_nonce, lease_expires_unix_ms, created_unix_ms, updated_unix_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, 1, ?8, NULL, 1000, 1000)",
+                params![binding.key(), RECORD_SCHEMA_VERSION, binding.pane_id().to_string(), binding.request_sha256(), binding.effect_sha256(), state, receipt_json, &[7_u8; OWNER_NONCE_BYTES][..]],
+            ).unwrap();
+        }
+        drop(conn);
+        let before = census(dir.path()).expect("v2 read-only census").unwrap();
+        assert_eq!(before.records(), 2);
+        assert_eq!(
+            schema_header(&raw_connection(dir.path())).unwrap().1,
+            LEGACY_STORE_SCHEMA_VERSION
+        );
+        assert_eq!(
+            recover_observation_at(dir.path(), &pending, 20_000),
+            Ok(ObservationClaimOutcome::Unavailable)
+        );
+        assert_eq!(
+            lookup_at(dir.path(), &pending, 20_000),
+            Ok(Some(StoredSubmitState::EffectAppliedReceiptPending))
+        );
+        assert_eq!(
+            lookup_at(dir.path(), &completed, 20_000),
+            Ok(Some(StoredSubmitState::Completed(completed_receipt)))
+        );
+        let migrated = raw_connection(dir.path());
+        assert_eq!(schema_header(&migrated).unwrap().1, STORE_SCHEMA_VERSION);
+        validate_initialized_schema_locked(&migrated).expect("exact v3 after migration");
+    }
+
+    #[test]
+    fn v2_migration_refuses_spoofed_schema_without_publishing_observation_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = legacy_v2_store(dir.path());
+        conn.execute_batch("CREATE TABLE foreign_authority(value TEXT)")
+            .unwrap();
+        drop(conn);
+        assert_eq!(
+            claim_observation(dir.path(), &binding(53, "legacy-spoof")),
+            Err(SubmitIdempotencyError::SchemaMismatch)
+        );
+        let conn = raw_connection(dir.path());
+        assert_eq!(schema_header(&conn).unwrap().1, LEGACY_STORE_SCHEMA_VERSION);
+        let observation_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'verified_submit_observations'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(observation_tables, 0);
     }
 
     #[test]
@@ -3410,7 +4795,14 @@ mod tests {
             );
             assert_eq!(
                 lookup_at(dir.path(), &binding, completed_at),
-                Ok(Some(StoredSubmitState::InDoubt))
+                Ok(Some(StoredSubmitState::EffectAppliedReceiptPending))
+            );
+            assert_eq!(
+                reconcile_with_clock(dir.path(), &binding, SubmitReconciliation::Abandon, || {
+                    completed_at
+                },),
+                Err(SubmitIdempotencyError::InvalidTransition),
+                "a confirmed effect cannot become abandonable when its owner expires"
             );
             assert_eq!(
                 persisted_updated_at(dir.path(), &binding),
@@ -3959,7 +5351,7 @@ mod tests {
                 started_at + (OWNER_LEASE_DURATION_MS * 2),
             ),
             Err(SubmitIdempotencyError::InvalidTransition),
-            "expiry during the injector call must conservatively fence to in_doubt"
+            "expiry during the injector call must revoke completion authority"
         );
         assert_eq!(
             lookup_at(
@@ -3967,7 +5359,7 @@ mod tests {
                 &during_binding,
                 started_at + (OWNER_LEASE_DURATION_MS * 2),
             ),
-            Ok(Some(StoredSubmitState::InDoubt))
+            Ok(Some(StoredSubmitState::EffectAppliedReceiptPending))
         );
     }
 
@@ -4367,7 +5759,7 @@ mod tests {
 
         let conn = raw_connection(dir.path());
         conn.execute_batch(
-            "DROP TABLE verified_submit_idempotency; PRAGMA application_id = 0; PRAGMA user_version = 0;",
+            "DROP TABLE verified_submit_observations; DROP TABLE verified_submit_idempotency; PRAGMA application_id = 0; PRAGMA user_version = 0;",
         )
         .expect("recreate database schema fixture");
         drop(conn);

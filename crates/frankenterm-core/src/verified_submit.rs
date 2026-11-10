@@ -12,6 +12,10 @@ const CAPTURE_CURSOR_PREFIX: &str = "pane";
 const MAX_CLASSIFIER_CAPTURE_BYTES: usize = 32 * 1024;
 const MAX_CLASSIFIER_CAPTURE_LINES: usize = 200;
 const MAX_CLASSIFIER_SEMANTIC_ZONES: usize = 256;
+const MAX_BASELINE_PROFILE_IDENTITY_BYTES: usize = 256;
+const MAX_BASELINE_ANCHORS_PER_GROUP: usize = 256;
+const VERIFIED_SUBMIT_BASELINE_VERSION: u16 = 1;
+const VERIFIED_SUBMIT_PROFILE_DOMAIN: &[u8] = b"frankenterm:verified-submit:profile:v1\0";
 const SUBMIT_IDEMPOTENCY_REQUEST_DOMAIN: &[u8] =
     b"frankenterm:verified-submit:semantic-request:v2\0";
 const SUBMIT_IDEMPOTENCY_EFFECT_DOMAIN: &[u8] =
@@ -160,6 +164,286 @@ pub struct VerifiedSubmitInput<'a> {
 pub struct VerifiedSubmitObservation {
     pub text: Option<String>,
     pub semantic_snapshot: Option<MuxSemanticSnapshot>,
+}
+
+/// Content-free pre-send evidence that may be retained across process death.
+///
+/// Only bounded metadata, full SHA-256 digests, coordinates, and predicates
+/// survive serialization. Neither the command nor pane/semantic-zone text is
+/// stored. Recovery still requires the exact command and unchanged profile;
+/// an absent pre-send observation never becomes an empty successful baseline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct VerifiedSubmitBaseline(VerifiedSubmitBaselineData);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerifiedSubmitBaselineData {
+    version: u16,
+    pane_id: u64,
+    effect_sha256: String,
+    agent_type: AgentType,
+    #[serde(deserialize_with = "Option::deserialize")]
+    profile: Option<VerifiedSubmitProfileIdentity>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    cursor_before: Option<String>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    fresh_anchors: Option<VerifiedSubmitFreshAnchors>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    composer_before: Option<bool>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    semantic_zones: Option<Vec<VerifiedSubmitSemanticZone>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerifiedSubmitProfileIdentity {
+    id: String,
+    version: String,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerifiedSubmitFreshAnchors {
+    crash_to_shell: Vec<bool>,
+    queued_behind_operation: Vec<bool>,
+    working_state: Vec<bool>,
+    composer_cleared: Vec<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerifiedSubmitSemanticZone {
+    start_y: isize,
+    start_x: usize,
+    end_y: isize,
+    end_x: usize,
+    semantic_type: MuxSemanticZoneKind,
+    text_sha256: String,
+    text_bytes: usize,
+    contains_command: bool,
+}
+
+impl<'de> Deserialize<'de> for VerifiedSubmitBaseline {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let baseline = Self(VerifiedSubmitBaselineData::deserialize(deserializer)?);
+        if baseline.is_bounded() {
+            Ok(baseline)
+        } else {
+            Err(serde::de::Error::custom(
+                "verified-submit baseline is malformed or exceeds evidence bounds",
+            ))
+        }
+    }
+}
+
+impl VerifiedSubmitBaseline {
+    /// Fence the stored evidence to the exact pane effect owned by a claim.
+    #[must_use]
+    pub fn matches_binding(&self, binding: &SubmitIdempotencyBinding) -> bool {
+        self.is_bounded()
+            && binding.is_canonical()
+            && self.0.pane_id == binding.pane_id()
+            && self.0.effect_sha256 == binding.effect_sha256()
+    }
+
+    fn is_bounded(&self) -> bool {
+        let evidence = &self.0;
+        if evidence.version != VERIFIED_SUBMIT_BASELINE_VERSION
+            || !is_lower_hex_sha256(&evidence.effect_sha256)
+            || evidence.profile.as_ref().is_some_and(|profile| {
+                profile.id.len() > MAX_BASELINE_PROFILE_IDENTITY_BYTES
+                    || profile.version.len() > MAX_BASELINE_PROFILE_IDENTITY_BYTES
+                    || !is_lower_hex_sha256(&profile.sha256)
+            })
+            || evidence.fresh_anchors.as_ref().is_some_and(|anchors| {
+                [
+                    &anchors.crash_to_shell,
+                    &anchors.queued_behind_operation,
+                    &anchors.working_state,
+                    &anchors.composer_cleared,
+                ]
+                .iter()
+                .any(|group| group.len() > MAX_BASELINE_ANCHORS_PER_GROUP)
+            })
+            || evidence.fresh_anchors.is_some() != evidence.composer_before.is_some()
+            || evidence.fresh_anchors.is_some()
+                != (evidence.cursor_before.is_some() && evidence.profile.is_some())
+        {
+            return false;
+        }
+        if let Some(cursor) = &evidence.cursor_before {
+            let prefix = format!(
+                "{CAPTURE_CURSOR_PREFIX}:{}:capture:sha256:",
+                evidence.pane_id
+            );
+            if !cursor.strip_prefix(&prefix).is_some_and(|digest| {
+                digest.len() == 16
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            }) {
+                return false;
+            }
+        }
+        let Some(zones) = &evidence.semantic_zones else {
+            return true;
+        };
+        if zones.len() > MAX_CLASSIFIER_SEMANTIC_ZONES {
+            return false;
+        }
+        let mut remaining = MAX_CLASSIFIER_CAPTURE_BYTES;
+        let mut previous_end = None;
+        for zone in zones {
+            let start = (zone.start_y, zone.start_x);
+            let end = (zone.end_y, zone.end_x);
+            if start > end
+                || previous_end.is_some_and(|previous_end| previous_end > start)
+                || !is_lower_hex_sha256(&zone.text_sha256)
+            {
+                return false;
+            }
+            let Some(next_remaining) = remaining.checked_sub(zone.text_bytes) else {
+                return false;
+            };
+            remaining = next_remaining;
+            previous_end = Some(end);
+        }
+        true
+    }
+
+    fn matches_input(&self, input: VerifiedSubmitInput<'_>) -> bool {
+        self.is_bounded()
+            && self.0.pane_id == input.pane_id
+            && self.0.agent_type == input.agent_type
+            && self.0.effect_sha256
+                == hex::encode(submit_effect_digest(input.pane_id, input.command_text))
+            && match (&self.0.profile, input.profile) {
+                (None, None) => true,
+                (Some(identity), Some(profile)) => {
+                    identity.id == profile.id
+                        && identity.version == profile.version
+                        && identity.sha256 == submit_profile_fingerprint(profile)
+                        && self.0.fresh_anchors.as_ref().is_none_or(|anchors| {
+                            anchors.crash_to_shell.len() == profile.anchors.crash_to_shell.len()
+                                && anchors.queued_behind_operation.len()
+                                    == profile.anchors.queued_behind_operation.len()
+                                && anchors.working_state.len()
+                                    == profile.anchors.working_state.len()
+                                && anchors.composer_cleared.len()
+                                    == profile.anchors.composer_cleared.len()
+                        })
+                }
+                _ => false,
+            }
+    }
+}
+
+/// Prepare bounded, serializable evidence before any pane effect is attempted.
+/// `None` means that a durable recovery baseline cannot safely be retained.
+#[must_use]
+pub fn prepare_verified_submit_baseline(
+    pane_id: u64,
+    command_text: &str,
+    agent_type: AgentType,
+    profile: Option<&SubmitProfile>,
+    before_text: Option<&str>,
+    before_semantic_snapshot: Option<&MuxSemanticSnapshot>,
+) -> Option<VerifiedSubmitBaseline> {
+    if command_text.len() > MAX_CLASSIFIER_CAPTURE_BYTES
+        || profile.is_some_and(|profile| {
+            profile.id.len() > MAX_BASELINE_PROFILE_IDENTITY_BYTES
+                || profile.version.len() > MAX_BASELINE_PROFILE_IDENTITY_BYTES
+                || [
+                    &profile.anchors.composer_nonempty,
+                    &profile.anchors.composer_cleared,
+                    &profile.anchors.working_state,
+                    &profile.anchors.queued_behind_operation,
+                    &profile.anchors.crash_to_shell,
+                ]
+                .iter()
+                .any(|group| group.len() > MAX_BASELINE_ANCHORS_PER_GROUP)
+        })
+    {
+        return None;
+    }
+    Some(build_verified_submit_baseline(
+        pane_id,
+        command_text,
+        agent_type,
+        profile,
+        before_text,
+        before_semantic_snapshot,
+    ))
+}
+
+fn build_verified_submit_baseline(
+    pane_id: u64,
+    command_text: &str,
+    agent_type: AgentType,
+    profile: Option<&SubmitProfile>,
+    before_text: Option<&str>,
+    before_semantic_snapshot: Option<&MuxSemanticSnapshot>,
+) -> VerifiedSubmitBaseline {
+    let command_lower = if command_text.len() <= MAX_CLASSIFIER_CAPTURE_BYTES {
+        command_text.trim().to_ascii_lowercase()
+    } else {
+        String::new()
+    };
+    let before_tail = before_text.map(|text| capture_tail(text).to_ascii_lowercase());
+    let before_status = before_tail
+        .as_ref()
+        .map(|before| before.replace(command_lower.as_str(), "\0"));
+    let fresh_anchors = profile
+        .zip(before_status.as_deref())
+        .map(|(profile, before)| {
+            let eligible = |group: &[String]| {
+                group
+                    .iter()
+                    .map(|anchor| {
+                        let anchor = anchor.trim().to_ascii_lowercase();
+                        !anchor.is_empty()
+                            && !command_lower.contains(&anchor)
+                            && !before.contains(&anchor)
+                    })
+                    .collect()
+            };
+            VerifiedSubmitFreshAnchors {
+                crash_to_shell: eligible(&profile.anchors.crash_to_shell),
+                queued_behind_operation: eligible(&profile.anchors.queued_behind_operation),
+                working_state: eligible(&profile.anchors.working_state),
+                composer_cleared: eligible(&profile.anchors.composer_cleared),
+            }
+        });
+    let composer_before = profile
+        .zip(before_tail.as_deref())
+        .map(|(profile, before)| {
+            composer_anchor_holds_command(
+                profile,
+                &profile.anchors.composer_nonempty,
+                before,
+                &command_lower,
+            )
+            .is_some()
+        });
+    VerifiedSubmitBaseline(VerifiedSubmitBaselineData {
+        version: VERIFIED_SUBMIT_BASELINE_VERSION,
+        pane_id,
+        effect_sha256: hex::encode(submit_effect_digest(pane_id, command_text)),
+        agent_type,
+        profile: profile.map(|profile| VerifiedSubmitProfileIdentity {
+            id: profile.id.clone(),
+            version: profile.version.clone(),
+            sha256: submit_profile_fingerprint(profile),
+        }),
+        cursor_before: before_text.map(|text| capture_cursor(pane_id, text)),
+        fresh_anchors,
+        composer_before,
+        semantic_zones: before_semantic_snapshot
+            .filter(|snapshot| bounded_semantic_snapshot(snapshot))
+            .map(|snapshot| semantic_zone_fingerprints(snapshot, command_text.trim())),
+    })
 }
 
 /// Capture bounded live evidence using the caller's exact cancellation scope.
@@ -413,19 +697,99 @@ pub async fn classify_verified_submit_polled(
     attempts: u32,
     polls: usize,
 ) -> VerifiedSubmitReport {
+    let baseline = build_verified_submit_baseline(
+        pane_id,
+        command_text,
+        agent_type,
+        profile,
+        before_text,
+        before_semantic_snapshot,
+    );
+    classify_verified_submit_polled_with_baseline(
+        cx,
+        client,
+        pane_id,
+        command_text,
+        agent_type,
+        profile,
+        &baseline,
+        attempts,
+        polls,
+    )
+    .await
+}
+
+/// Resume observation after a durable send without reissuing any input.
+/// The frozen pre-send evidence remains the baseline for every resumed poll.
+#[allow(clippy::too_many_arguments)]
+pub async fn classify_verified_submit_polled_from_baseline(
+    cx: &crate::cx::Cx,
+    client: &crate::wezterm::WeztermHandle,
+    pane_id: u64,
+    command_text: &str,
+    agent_type: AgentType,
+    profile: Option<&SubmitProfile>,
+    baseline: &VerifiedSubmitBaseline,
+    attempts: u32,
+    polls: usize,
+) -> VerifiedSubmitReport {
+    let input = VerifiedSubmitInput {
+        pane_id,
+        command_text,
+        agent_type,
+        profile,
+        before_text: None,
+        before_semantic_snapshot: None,
+        after_text: None,
+        after_semantic_snapshot: None,
+        attempts,
+        polls,
+    };
+    if !baseline.matches_input(input) {
+        return baseline_mismatch_report(input);
+    }
+    classify_verified_submit_polled_with_baseline(
+        cx,
+        client,
+        pane_id,
+        command_text,
+        agent_type,
+        profile,
+        baseline,
+        attempts,
+        polls,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn classify_verified_submit_polled_with_baseline(
+    cx: &crate::cx::Cx,
+    client: &crate::wezterm::WeztermHandle,
+    pane_id: u64,
+    command_text: &str,
+    agent_type: AgentType,
+    profile: Option<&SubmitProfile>,
+    baseline: &VerifiedSubmitBaseline,
+    attempts: u32,
+    polls: usize,
+) -> VerifiedSubmitReport {
     if command_text.len() > MAX_CLASSIFIER_CAPTURE_BYTES {
-        return classify_verified_submit(VerifiedSubmitInput {
-            pane_id,
-            command_text,
-            agent_type,
-            profile,
-            before_text,
-            before_semantic_snapshot,
-            after_text: None,
-            after_semantic_snapshot: None,
-            attempts,
-            polls: 0,
-        });
+        return classify_verified_submit_with_baseline(
+            baseline,
+            VerifiedSubmitInput {
+                pane_id,
+                command_text,
+                agent_type,
+                profile,
+                before_text: None,
+                before_semantic_snapshot: None,
+                after_text: None,
+                after_semantic_snapshot: None,
+                attempts,
+                polls: 0,
+            },
+        );
     }
     let mut captures = 0usize;
     loop {
@@ -447,18 +811,21 @@ pub async fn classify_verified_submit_polled(
         } else {
             VerifiedSubmitObservation::default()
         };
-        let report = classify_verified_submit(VerifiedSubmitInput {
-            pane_id,
-            command_text,
-            agent_type,
-            profile,
-            before_text,
-            before_semantic_snapshot,
-            after_text: after.text.as_deref(),
-            after_semantic_snapshot: after.semantic_snapshot.as_ref(),
-            attempts,
-            polls: polls.saturating_add(captures - 1),
-        });
+        let report = classify_verified_submit_with_baseline(
+            baseline,
+            VerifiedSubmitInput {
+                pane_id,
+                command_text,
+                agent_type,
+                profile,
+                before_text: None,
+                before_semantic_snapshot: None,
+                after_text: after.text.as_deref(),
+                after_semantic_snapshot: after.semantic_snapshot.as_ref(),
+                attempts,
+                polls: polls.saturating_add(captures - 1),
+            },
+        );
         let inconclusive = matches!(
             report.state,
             SubmitReceiptState::StuckInComposer | SubmitReceiptState::VerificationUnavailable
@@ -476,9 +843,56 @@ pub async fn classify_verified_submit_polled(
 /// Classify the post-send terminal state using a data-driven submit profile.
 #[must_use]
 pub fn classify_verified_submit(input: VerifiedSubmitInput<'_>) -> VerifiedSubmitReport {
-    let cursor_before = input
-        .before_text
-        .map(|text| capture_cursor(input.pane_id, text));
+    let baseline = build_verified_submit_baseline(
+        input.pane_id,
+        input.command_text,
+        input.agent_type,
+        input.profile,
+        input.before_text,
+        input.before_semantic_snapshot,
+    );
+    classify_verified_submit_with_baseline(&baseline, input)
+}
+
+/// Classify using only the retained pre-send baseline and a new observation.
+/// `input.before_text` and `input.before_semantic_snapshot` are ignored: a
+/// post-send read can never replace the durable pre-send evidence.
+#[must_use]
+pub fn classify_verified_submit_from_baseline(
+    baseline: &VerifiedSubmitBaseline,
+    input: VerifiedSubmitInput<'_>,
+) -> VerifiedSubmitReport {
+    if !baseline.matches_input(input) {
+        return baseline_mismatch_report(input);
+    }
+    classify_verified_submit_with_baseline(baseline, input)
+}
+
+fn baseline_mismatch_report(input: VerifiedSubmitInput<'_>) -> VerifiedSubmitReport {
+    VerifiedSubmitReport {
+        state: SubmitReceiptState::VerificationUnavailable,
+        agent_type: receipt_agent_type(input.agent_type),
+        profile_id: input.profile.map(|profile| profile.id.clone()),
+        profile_version: input.profile.map(|profile| profile.version.clone()),
+        attempts: input.attempts.max(1),
+        evidence_rule_ids: vec![input.profile.map_or_else(
+            || "submit_profile:baseline_mismatch".to_string(),
+            |profile| format!("submit_profile:{}:baseline_mismatch", profile.id),
+        )],
+        polls: input.polls,
+        cursor_before: None,
+        cursor_after: input
+            .after_text
+            .map(|text| capture_cursor(input.pane_id, text)),
+    }
+}
+
+fn classify_verified_submit_with_baseline(
+    baseline: &VerifiedSubmitBaseline,
+    input: VerifiedSubmitInput<'_>,
+) -> VerifiedSubmitReport {
+    let baseline = &baseline.0;
+    let cursor_before = baseline.cursor_before.clone();
     let cursor_after = input
         .after_text
         .map(|text| capture_cursor(input.pane_id, text));
@@ -538,9 +952,6 @@ pub fn classify_verified_submit(input: VerifiedSubmitInput<'_>) -> VerifiedSubmi
     };
 
     let after_tail = capture_tail(after_text).to_ascii_lowercase();
-    let before_tail = input
-        .before_text
-        .map(|text| capture_tail(text).to_ascii_lowercase());
     let command_lower = input.command_text.trim().to_ascii_lowercase();
     if command_lower.is_empty() {
         return unavailable_with_profile(
@@ -557,16 +968,14 @@ pub fn classify_verified_submit(input: VerifiedSubmitInput<'_>) -> VerifiedSubmi
     // spans from status evidence without joining their surrounding text into
     // a new marker. Both strings stay within the bounded capture budget.
     let after_status = after_tail.replace(command_lower.as_str(), "\0");
-    let before_status = before_tail
-        .as_ref()
-        .map(|before| before.replace(command_lower.as_str(), "\0"));
-
     if let Some(evidence_id) = first_fresh_anchor_match(
         profile,
         "crash_to_shell",
         &profile.anchors.crash_to_shell,
-        &command_lower,
-        before_status.as_deref(),
+        baseline
+            .fresh_anchors
+            .as_ref()
+            .map(|anchors| anchors.crash_to_shell.as_slice()),
         &after_status,
     ) {
         return report_with_profile(
@@ -584,8 +993,10 @@ pub fn classify_verified_submit(input: VerifiedSubmitInput<'_>) -> VerifiedSubmi
         profile,
         "queued_behind_operation",
         &profile.anchors.queued_behind_operation,
-        &command_lower,
-        before_status.as_deref(),
+        baseline
+            .fresh_anchors
+            .as_ref()
+            .map(|anchors| anchors.queued_behind_operation.as_slice()),
         &after_status,
     ) {
         return report_with_profile(
@@ -600,7 +1011,7 @@ pub fn classify_verified_submit(input: VerifiedSubmitInput<'_>) -> VerifiedSubmi
     }
 
     match fresh_semantic_input(
-        input.before_semantic_snapshot,
+        baseline.semantic_zones.as_deref(),
         input.after_semantic_snapshot,
         input.command_text.trim(),
     ) {
@@ -654,15 +1065,7 @@ pub fn classify_verified_submit(input: VerifiedSubmitInput<'_>) -> VerifiedSubmi
         &after_tail,
         &command_lower,
     ) {
-        let new_composer_text = before_tail.as_deref().is_some_and(|before_tail| {
-            composer_anchor_holds_command(
-                profile,
-                &profile.anchors.composer_nonempty,
-                before_tail,
-                &command_lower,
-            )
-            .is_none()
-        });
+        let new_composer_text = baseline.composer_before == Some(false);
         if !new_composer_text {
             return unavailable_with_profile(
                 profile,
@@ -689,8 +1092,10 @@ pub fn classify_verified_submit(input: VerifiedSubmitInput<'_>) -> VerifiedSubmi
         profile,
         "working_state",
         &profile.anchors.working_state,
-        &command_lower,
-        before_status.as_deref(),
+        baseline
+            .fresh_anchors
+            .as_ref()
+            .map(|anchors| anchors.working_state.as_slice()),
         &after_status,
     )
     .or_else(|| {
@@ -698,8 +1103,10 @@ pub fn classify_verified_submit(input: VerifiedSubmitInput<'_>) -> VerifiedSubmi
             profile,
             "composer_cleared",
             &profile.anchors.composer_cleared,
-            &command_lower,
-            before_status.as_deref(),
+            baseline
+                .fresh_anchors
+                .as_ref()
+                .map(|anchors| anchors.composer_cleared.as_slice()),
             &after_status,
         )
     }) {
@@ -740,6 +1147,52 @@ fn hash_len_prefixed(hasher: &mut Sha256, value: &str) {
     // collision-free even on a hypothetical target whose usize exceeds u64.
     hasher.update((value.len() as u128).to_be_bytes());
     hasher.update(value.as_bytes());
+}
+
+fn submit_profile_fingerprint(profile: &SubmitProfile) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(VERIFIED_SUBMIT_PROFILE_DOMAIN);
+    hash_len_prefixed(&mut hasher, &profile.id);
+    hash_len_prefixed(&mut hasher, &profile.version);
+    hash_len_prefixed(&mut hasher, &profile.agent_type.to_string());
+    for group in [
+        &profile.anchors.composer_nonempty,
+        &profile.anchors.composer_cleared,
+        &profile.anchors.working_state,
+        &profile.anchors.queued_behind_operation,
+        &profile.anchors.crash_to_shell,
+    ] {
+        hasher.update((group.len() as u128).to_be_bytes());
+        for anchor in group {
+            hash_len_prefixed(&mut hasher, anchor);
+        }
+    }
+    hasher.update((profile.remediation.len() as u128).to_be_bytes());
+    for remediation in &profile.remediation {
+        hash_len_prefixed(&mut hasher, &remediation.when);
+        hash_len_prefixed(&mut hasher, &remediation.action);
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn semantic_zone_fingerprints(
+    snapshot: &MuxSemanticSnapshot,
+    command_text: &str,
+) -> Vec<VerifiedSubmitSemanticZone> {
+    snapshot
+        .zones
+        .iter()
+        .map(|zone| VerifiedSubmitSemanticZone {
+            start_y: zone.start_y,
+            start_x: zone.start_x,
+            end_y: zone.end_y,
+            end_x: zone.end_x,
+            semantic_type: zone.semantic_type,
+            text_sha256: hex::encode(Sha256::digest(zone.text.as_bytes())),
+            text_bytes: zone.text.len(),
+            contains_command: zone.text.contains(command_text),
+        })
+        .collect()
 }
 
 const fn guarantee_level_tag(level: SubmitGuaranteeLevel) -> u8 {
@@ -879,23 +1332,19 @@ fn first_fresh_anchor_match(
     profile: &SubmitProfile,
     group: &str,
     anchors: &[String],
-    command_lower: &str,
-    before_tail_lower: Option<&str>,
+    eligible: Option<&[bool]>,
     after_tail_lower: &str,
 ) -> Option<String> {
-    let before_tail_lower = before_tail_lower?;
+    let eligible = eligible?;
     anchors
         .iter()
         .enumerate()
-        .find(|(_, anchor)| {
+        .find(|(index, anchor)| {
             let anchor = anchor.trim().to_ascii_lowercase();
-            !anchor.is_empty()
-                // Wrapped or clipped prompt echoes do not retain a complete
-                // command span. A marker also present in the command cannot
-                // independently prove status, even if another full echo was
-                // removed. Other fresh markers or semantic evidence can.
-                && !command_lower.contains(&anchor)
-                && !before_tail_lower.contains(&anchor)
+            // Eligibility was frozen before the send, after excluding every
+            // marker appearing in the command, including wrapped/clipped echoes.
+            eligible.get(*index) == Some(&true)
+                && !anchor.is_empty()
                 && after_tail_lower.contains(&anchor)
         })
         .map(|(index, _)| format!("submit_profile:{}:{group}:{index}", profile.id))
@@ -976,7 +1425,7 @@ enum FreshSemanticInput {
 }
 
 fn fresh_semantic_input(
-    before: Option<&MuxSemanticSnapshot>,
+    before: Option<&[VerifiedSubmitSemanticZone]>,
     after: Option<&MuxSemanticSnapshot>,
     command_text: &str,
 ) -> Option<FreshSemanticInput> {
@@ -993,22 +1442,22 @@ fn fresh_semantic_input(
     // A current matching input is not made fresh by a failed baseline read.
     // Keep this negative evidence authoritative over generic status markers,
     // including when the baseline was rejected for size or malformed zones.
-    let Some(before) = before.filter(|snapshot| bounded_semantic_snapshot(snapshot)) else {
+    let Some(before) = before else {
         return matches_command.then_some(FreshSemanticInput::UnprovenCurrentCommand);
     };
-    let appended_input = input_index >= before.zones.len()
-        && after.zones.starts_with(&before.zones)
+    let after_fingerprints = semantic_zone_fingerprints(after, command_text);
+    let appended_input = input_index >= before.len()
+        && after_fingerprints.starts_with(before)
         && before
-            .zones
             .last()
             .is_none_or(|last| (last.end_y, last.end_x) < (input.start_y, input.start_x));
-    let edited_composer = before.zones.last().is_some_and(|prior| {
+    let edited_composer = before.last().is_some_and(|prior| {
         prior.semantic_type == MuxSemanticZoneKind::Input
-            && input_index == before.zones.len() - 1
-            && after.zones[..input_index] == before.zones[..input_index]
+            && input_index == before.len() - 1
+            && after_fingerprints[..input_index] == before[..input_index]
             && (input.start_y, input.start_x) == (prior.start_y, prior.start_x)
-            && input.text != prior.text
-            && (!matches_command || !prior.text.contains(command_text))
+            && after_fingerprints[input_index].text_sha256 != prior.text_sha256
+            && (!matches_command || !prior.contains_command)
     });
     if !appended_input && !edited_composer {
         return matches_command.then_some(FreshSemanticInput::UnprovenCurrentCommand);
@@ -1246,6 +1695,444 @@ mod tests {
                 .collect(),
             last_exit_code: None,
         }
+    }
+
+    fn assert_recovered_classification(
+        input: VerifiedSubmitInput<'_>,
+        expected: SubmitReceiptState,
+    ) {
+        let live = classify_verified_submit(input);
+        assert_eq!(live.state, expected);
+        let baseline = prepare_verified_submit_baseline(
+            input.pane_id,
+            input.command_text,
+            input.agent_type,
+            input.profile,
+            input.before_text,
+            input.before_semantic_snapshot,
+        )
+        .unwrap();
+        let serialized = serde_json::to_string(&baseline).unwrap();
+        let recovered: VerifiedSubmitBaseline = serde_json::from_str(&serialized).unwrap();
+        // Restart cannot retrieve the old raw capture. Only the durable
+        // predicates and fingerprints are permitted to establish freshness.
+        let resumed = classify_verified_submit_from_baseline(
+            &recovered,
+            VerifiedSubmitInput {
+                before_text: None,
+                before_semantic_snapshot: None,
+                ..input
+            },
+        );
+        assert_eq!(resumed, live);
+    }
+
+    #[test]
+    fn durable_baseline_preserves_text_classifier_verdicts_after_restart() {
+        let profile = profile();
+        for (command, before, after, state) in [
+            (
+                "run tests",
+                Some("ready\n"),
+                "Running\n",
+                SubmitReceiptState::Submitted,
+            ),
+            (
+                "run tests",
+                Some("ready\n"),
+                "Thinking\n",
+                SubmitReceiptState::Submitted,
+            ),
+            (
+                "run tests",
+                Some("ready\n"),
+                "operation in progress\n",
+                SubmitReceiptState::QueuedBehindOperation,
+            ),
+            (
+                "run tests",
+                Some("ready\n"),
+                "panicked at terminal.rs\nRunning\n",
+                SubmitReceiptState::PaneCrashedToShell,
+            ),
+            (
+                "run tests",
+                Some("Running\n"),
+                "Running\nnew unrelated output\n",
+                SubmitReceiptState::VerificationUnavailable,
+            ),
+            (
+                "run tests",
+                None,
+                "Running\nThinking\n",
+                SubmitReceiptState::VerificationUnavailable,
+            ),
+            (
+                "print Thinking",
+                Some("ready\n"),
+                "print\nThinking\n",
+                SubmitReceiptState::VerificationUnavailable,
+            ),
+            (
+                "print Thinking",
+                Some("ready\n"),
+                "print Thinking\nRunning\n",
+                SubmitReceiptState::Submitted,
+            ),
+            (
+                "run tests",
+                Some("Press Enter to send\n"),
+                "Running\nPress Enter to send\nrun tests\n",
+                SubmitReceiptState::StuckInComposer,
+            ),
+            (
+                "run tests",
+                Some("Press Enter to send\nrun tests\n"),
+                "Running\nPress Enter to send\nrun tests\n",
+                SubmitReceiptState::VerificationUnavailable,
+            ),
+        ] {
+            assert_recovered_classification(
+                VerifiedSubmitInput {
+                    command_text: command,
+                    before_text: before,
+                    attempts: 2,
+                    polls: 5,
+                    ..input(Some(&profile), Some(after))
+                },
+                state,
+            );
+        }
+        assert_recovered_classification(
+            input(None, Some("Running\n")),
+            SubmitReceiptState::VerificationUnavailable,
+        );
+    }
+
+    #[test]
+    fn durable_semantic_baseline_preserves_prior_turn_and_coordinate_fences() {
+        use MuxSemanticZoneKind::{Input, Output};
+        let profile = profile();
+        let empty = semantic_snapshot(&[]);
+        let prior = semantic_snapshot(&[(Input, "run tests"), (Output, "old result")]);
+        let repeated = semantic_snapshot(&[
+            (Input, "run tests"),
+            (Output, "old result"),
+            (Input, "run tests"),
+            (Output, "new result"),
+        ]);
+        let composer = semantic_snapshot(&[(Input, "")]);
+        let edited = semantic_snapshot(&[(Input, "run tests"), (Output, "new result")]);
+        let contains_prior_command = semantic_snapshot(&[(Input, "please run tests later")]);
+        let other = semantic_snapshot(&[(Input, "different command"), (Output, "Running")]);
+        let reused_origin = semantic_snapshot(&[(Output, "")]);
+        let mut reused_coordinate =
+            semantic_snapshot(&[(Output, ""), (Input, "run tests"), (Output, "new result")]);
+        reused_coordinate.zones[1].start_y = 0;
+        let mut oversized = composer.clone();
+        oversized.zones[0].text = "x".repeat(MAX_CLASSIFIER_CAPTURE_BYTES + 1);
+        let mut malformed = composer.clone();
+        malformed.zones[0].start_y = 1;
+        for (before, after, expected) in [
+            (Some(&empty), &edited, SubmitReceiptState::Submitted),
+            (Some(&prior), &repeated, SubmitReceiptState::Submitted),
+            (Some(&composer), &edited, SubmitReceiptState::Submitted),
+            (
+                Some(&prior),
+                &prior,
+                SubmitReceiptState::VerificationUnavailable,
+            ),
+            (
+                Some(&contains_prior_command),
+                &edited,
+                SubmitReceiptState::VerificationUnavailable,
+            ),
+            (
+                Some(&empty),
+                &other,
+                SubmitReceiptState::VerificationUnavailable,
+            ),
+            (
+                Some(&prior),
+                &edited,
+                SubmitReceiptState::VerificationUnavailable,
+            ),
+            (
+                Some(&reused_origin),
+                &reused_coordinate,
+                SubmitReceiptState::VerificationUnavailable,
+            ),
+            (None, &edited, SubmitReceiptState::VerificationUnavailable),
+            (
+                Some(&oversized),
+                &edited,
+                SubmitReceiptState::VerificationUnavailable,
+            ),
+            (
+                Some(&malformed),
+                &edited,
+                SubmitReceiptState::VerificationUnavailable,
+            ),
+        ] {
+            assert_recovered_classification(
+                VerifiedSubmitInput {
+                    before_text: Some("ready\n"),
+                    before_semantic_snapshot: before,
+                    after_semantic_snapshot: Some(after),
+                    ..input(Some(&profile), Some("run tests\nRunning\n"))
+                },
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn durable_baseline_roundtrip_never_persists_command_or_pane_content() {
+        let profile = profile();
+        let command = "private command with credential=DO_NOT_STORE_COMMAND";
+        let before = "DO_NOT_STORE_CAPTURE\nPress Enter to send\n";
+        let semantic = semantic_snapshot(&[
+            (MuxSemanticZoneKind::Input, "DO_NOT_STORE_SEMANTIC_INPUT"),
+            (MuxSemanticZoneKind::Output, "DO_NOT_STORE_SEMANTIC_OUTPUT"),
+        ]);
+        let baseline = prepare_verified_submit_baseline(
+            7,
+            command,
+            AgentType::Codex,
+            Some(&profile),
+            Some(before),
+            Some(&semantic),
+        )
+        .unwrap();
+        let binding = idempotency_binding(SubmitIdempotencyRequest {
+            pane_id: 7,
+            text: command,
+            caller_key: "DO_NOT_STORE_CALLER_KEY",
+            guarantee_level: SubmitGuaranteeLevel::Submitted,
+            wait_for: None,
+            wait_for_regex: false,
+            timeout_secs: 0,
+        });
+        assert!(baseline.matches_binding(&binding));
+        let encoded = serde_json::to_string(&baseline).unwrap();
+        assert!(!encoded.contains("DO_NOT_STORE"));
+        assert!(!format!("{baseline:?}").contains("DO_NOT_STORE"));
+        assert!(!encoded.contains("Press Enter to send"));
+        assert!(!encoded.contains("panicked at"));
+        assert_eq!(
+            serde_json::from_str::<VerifiedSubmitBaseline>(&encoded).unwrap(),
+            baseline
+        );
+    }
+
+    #[test]
+    fn durable_baseline_rejects_exact_command_pane_agent_and_profile_drift() {
+        let profile = profile();
+        let original = input(Some(&profile), Some("Running\n"));
+        let baseline = prepare_verified_submit_baseline(
+            original.pane_id,
+            original.command_text,
+            original.agent_type,
+            original.profile,
+            original.before_text,
+            None,
+        )
+        .unwrap();
+        let mut changed_anchor = profile.clone();
+        changed_anchor.anchors.working_state[0] = "Other status".to_string();
+        let mut changed_remediation = profile.clone();
+        changed_remediation
+            .remediation
+            .push(SubmitProfileRemediation {
+                when: "stuck".to_string(),
+                action: "observe".to_string(),
+            });
+        for changed in [
+            VerifiedSubmitInput {
+                pane_id: 8,
+                ..original
+            },
+            VerifiedSubmitInput {
+                command_text: "run tests ",
+                ..original
+            },
+            VerifiedSubmitInput {
+                command_text: "RUN TESTS",
+                ..original
+            },
+            VerifiedSubmitInput {
+                agent_type: AgentType::ClaudeCode,
+                ..original
+            },
+            VerifiedSubmitInput {
+                profile: None,
+                ..original
+            },
+            VerifiedSubmitInput {
+                profile: Some(&changed_anchor),
+                ..original
+            },
+            VerifiedSubmitInput {
+                profile: Some(&changed_remediation),
+                ..original
+            },
+        ] {
+            let report = classify_verified_submit_from_baseline(&baseline, changed);
+            assert_eq!(report.state, SubmitReceiptState::VerificationUnavailable);
+            assert!(report.evidence_rule_ids[0].ends_with(":baseline_mismatch"));
+            assert_eq!(report.cursor_before, None);
+        }
+        // Supplying a replacement raw baseline cannot turn an old marker fresh.
+        let stale = prepare_verified_submit_baseline(
+            7,
+            "run tests",
+            AgentType::Codex,
+            Some(&profile),
+            Some("Running\n"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            classify_verified_submit_from_baseline(&stale, original).state,
+            SubmitReceiptState::VerificationUnavailable
+        );
+    }
+
+    #[test]
+    fn durable_baseline_deserialization_and_preparation_enforce_bounds() {
+        let profile = profile();
+        let baseline = prepare_verified_submit_baseline(
+            7,
+            "run tests",
+            AgentType::Codex,
+            Some(&profile),
+            Some("ready\n"),
+            Some(&semantic_snapshot(&[])),
+        )
+        .unwrap();
+        let value = serde_json::to_value(&baseline).unwrap();
+        for field in [
+            "profile",
+            "cursor_before",
+            "fresh_anchors",
+            "composer_before",
+            "semantic_zones",
+        ] {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<VerifiedSubmitBaseline>(missing).is_err());
+        }
+        for (field, replacement) in [
+            ("version", serde_json::json!(0)),
+            ("effect_sha256", serde_json::json!("invalid")),
+            (
+                "cursor_before",
+                serde_json::json!("pane:99:capture:sha256:0123456789abcdef"),
+            ),
+            ("composer_before", serde_json::Value::Null),
+        ] {
+            let mut invalid = value.clone();
+            invalid[field] = replacement;
+            assert!(serde_json::from_value::<VerifiedSubmitBaseline>(invalid).is_err());
+        }
+        let mut oversized = value.clone();
+        oversized["fresh_anchors"]["working_state"] =
+            serde_json::json!(vec![true; MAX_BASELINE_ANCHORS_PER_GROUP + 1]);
+        assert!(serde_json::from_value::<VerifiedSubmitBaseline>(oversized).is_err());
+        let mut unknown_content = value;
+        unknown_content["before_text"] = serde_json::json!("must never be accepted");
+        assert!(serde_json::from_value::<VerifiedSubmitBaseline>(unknown_content).is_err());
+
+        let mut oversized_profile = profile;
+        oversized_profile.anchors.working_state =
+            vec!["Running".to_string(); MAX_BASELINE_ANCHORS_PER_GROUP + 1];
+        assert!(
+            prepare_verified_submit_baseline(
+                7,
+                "run tests",
+                AgentType::Codex,
+                Some(&oversized_profile),
+                Some("ready\n"),
+                None,
+            )
+            .is_none()
+        );
+        assert!(
+            prepare_verified_submit_baseline(
+                7,
+                &"x".repeat(MAX_CLASSIFIER_CAPTURE_BYTES + 1),
+                AgentType::Codex,
+                None,
+                None,
+                None,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn durable_baseline_maximum_shape_stays_bounded_without_truncating_history() {
+        let mut profile = profile();
+        profile.id = "p".repeat(MAX_BASELINE_PROFILE_IDENTITY_BYTES);
+        profile.version = "v".repeat(MAX_BASELINE_PROFILE_IDENTITY_BYTES);
+        let anchors = vec!["Running".to_string(); MAX_BASELINE_ANCHORS_PER_GROUP];
+        profile.anchors = SubmitProfileAnchors {
+            composer_nonempty: anchors.clone(),
+            composer_cleared: anchors.clone(),
+            working_state: anchors.clone(),
+            queued_behind_operation: anchors.clone(),
+            crash_to_shell: anchors,
+        };
+        let mut snapshot = MuxSemanticSnapshot {
+            zones: (0..MAX_CLASSIFIER_SEMANTIC_ZONES)
+                .map(|index| MuxSemanticZone {
+                    start_y: isize::MIN + isize::try_from(index).unwrap(),
+                    start_x: usize::MAX,
+                    end_y: isize::MIN + isize::try_from(index).unwrap(),
+                    end_x: usize::MAX,
+                    semantic_type: MuxSemanticZoneKind::Output,
+                    text: "private historical output".to_string(),
+                })
+                .collect(),
+            last_exit_code: None,
+        };
+        let baseline = prepare_verified_submit_baseline(
+            u64::MAX,
+            "run tests",
+            AgentType::Codex,
+            Some(&profile),
+            Some("ready\n"),
+            Some(&snapshot),
+        )
+        .unwrap();
+        assert_eq!(
+            baseline.0.semantic_zones.as_ref().unwrap().len(),
+            MAX_CLASSIFIER_SEMANTIC_ZONES
+        );
+        let encoded = serde_json::to_vec(&baseline).unwrap();
+        assert!(encoded.len() < 128 * 1024);
+        assert_eq!(
+            serde_json::from_slice::<VerifiedSubmitBaseline>(&encoded).unwrap(),
+            baseline
+        );
+        snapshot.zones.push(MuxSemanticZone {
+            start_y: 0,
+            start_x: 0,
+            end_y: 0,
+            end_x: 0,
+            semantic_type: MuxSemanticZoneKind::Input,
+            text: String::new(),
+        });
+        let unavailable = prepare_verified_submit_baseline(
+            7,
+            "run tests",
+            AgentType::Codex,
+            Some(&profile),
+            Some("ready\n"),
+            Some(&snapshot),
+        )
+        .unwrap();
+        assert_eq!(unavailable.0.semantic_zones, None);
     }
 
     #[test]
