@@ -3617,6 +3617,18 @@ macro_rules! pdu_encoded_body_limit {
             max_zstd_encoded_bytes: MAX_CONDITIONAL_RESIZE_RESPONSE_ZSTD_ENCODED_BYTES,
         }
     };
+    (SendPaneInputConditionalV1, none) => {
+        PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: MAX_CONDITIONAL_PANE_INPUT_REQUEST_DECOMPRESSED_BYTES,
+            max_zstd_encoded_bytes: MAX_CONDITIONAL_PANE_INPUT_REQUEST_ZSTD_ENCODED_BYTES,
+        }
+    };
+    (SendPaneInputConditionalV1Response, none) => {
+        PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: MAX_CONDITIONAL_PANE_INPUT_RESPONSE_DECOMPRESSED_BYTES,
+            max_zstd_encoded_bytes: MAX_CONDITIONAL_PANE_INPUT_RESPONSE_ZSTD_ENCODED_BYTES,
+        }
+    };
     (GetImageCellResponse, none) => {
         PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
             max_decompressed_bytes: MAX_GET_IMAGE_CELL_RESPONSE_DECOMPRESSED_BYTES,
@@ -4372,7 +4384,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 73;
+pub const CODEC_VERSION: usize = 74;
 
 /// Lowest codec version this build can decode wire frames from.
 ///
@@ -4986,6 +4998,12 @@ pdu! {
     ListPanesWithDomainsV1Response: 122, 73, server_reply, none,
         bulk_data, bulk_data, bulk
         => deserialize_list_panes_with_domains_v1_response;
+    SendPaneInputConditionalV1: 123, 74, client_request, none,
+        interactive_input, bulk_data, interactive
+        => deserialize_send_pane_input_conditional_v1;
+    SendPaneInputConditionalV1Response: 124, 74, server_reply, none,
+        interactive_input, interactive_input, interactive
+        => deserialize_send_pane_input_conditional_v1_response;
 }
 
 impl Pdu {
@@ -5019,6 +5037,8 @@ impl Pdu {
             Self::GetPaneIdentityV1Response(value) => value.validate()?,
             Self::ResizePaneConditionalV1(value) => value.validate()?,
             Self::ResizePaneConditionalV1Response(value) => value.validate()?,
+            Self::SendPaneInputConditionalV1(value) => value.validate()?,
+            Self::SendPaneInputConditionalV1Response(value) => value.validate()?,
             Self::SendKeyDownTracedV1(value) => value.validate()?,
             Self::SendPasteTracedV1(value) => value.validate()?,
             Self::ReliableKeyEventV1(value) => value.validate()?,
@@ -6505,6 +6525,11 @@ impl Pdu {
             | Pdu::GetPaneIdentityV1Response(GetPaneIdentityV1Response { pane_id, .. })
             | Pdu::ResizePaneConditionalV1(ResizePaneConditionalV1 { pane_id, .. })
             | Pdu::ResizePaneConditionalV1Response(ResizePaneConditionalV1Response {
+                pane_id,
+                ..
+            })
+            | Pdu::SendPaneInputConditionalV1(SendPaneInputConditionalV1 { pane_id, .. })
+            | Pdu::SendPaneInputConditionalV1Response(SendPaneInputConditionalV1Response {
                 pane_id,
                 ..
             })
@@ -14616,6 +14641,205 @@ fn input_serial_from_epoch_duration(duration: std::time::Duration) -> InputSeria
 pub struct SendMouseEvent {
     pub pane_id: PaneId,
     pub event: frankenterm_term::input::MouseEvent,
+}
+
+/// First dialect that carries exact live authority for paste and mouse input.
+pub const CONDITIONAL_PANE_INPUT_V1_MIN_CODEC_VERSION: usize = 74;
+pub const MAX_CONDITIONAL_PANE_INPUT_PASTE_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_CONDITIONAL_PANE_INPUT_WHEEL_STEPS: usize = 1024;
+pub const MAX_CONDITIONAL_PANE_INPUT_REQUEST_DECOMPRESSED_BYTES: usize =
+    MAX_CONDITIONAL_PANE_INPUT_PASTE_BYTES + 256;
+pub const MAX_CONDITIONAL_PANE_INPUT_REQUEST_ZSTD_ENCODED_BYTES: usize =
+    MAX_CONDITIONAL_PANE_INPUT_REQUEST_DECOMPRESSED_BYTES + 64 * 1024;
+pub const MAX_CONDITIONAL_PANE_INPUT_RESPONSE_DECOMPRESSED_BYTES: usize = 128;
+pub const MAX_CONDITIONAL_PANE_INPUT_RESPONSE_ZSTD_ENCODED_BYTES: usize = 256;
+
+/// One non-replayable input effect. The variant order is part of PDU123's
+/// closed positional schema; adding effects requires a new wire identifier.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum PaneInputEffectV1 {
+    Paste(#[serde(deserialize_with = "deserialize_conditional_paste_text")] String),
+    Mouse(frankenterm_term::input::MouseEvent),
+}
+
+/// Input is conditional on the exact live pane observed at client admission.
+/// A durable UUID is deliberately not required: delegated panes can still
+/// have valid live registration authority without durable recovery identity.
+/// The input serial correlates the receipt; it does not authorize retries or
+/// provide deduplication. A lost receipt must remain an unknown outcome.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SendPaneInputConditionalV1 {
+    pub pane_id: PaneId,
+    pub session_incarnation: MuxSessionIncarnation,
+    pub pane_registration: ReliablePaneRegistrationIdentityV1,
+    pub input_serial: InputSerial,
+    pub effect: PaneInputEffectV1,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum PaneInputConditionalOutcomeV1 {
+    /// The exact pane callback accepted the input. This does not prove that
+    /// the shell consumed it or that any asynchronous downstream work ran.
+    Accepted,
+    /// These three refusals did not enter the pane's input callback.
+    PaneGone,
+    IdentityMismatch,
+    Retired,
+    /// The callback failed after entry and may already have produced effects.
+    /// Neither this outcome nor a missing receipt authorizes replay.
+    Indeterminate,
+}
+
+/// Echoes the requested source tuple, never a replacement pane's identity.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SendPaneInputConditionalV1Response {
+    pub pane_id: PaneId,
+    pub session_incarnation: MuxSessionIncarnation,
+    pub pane_registration: ReliablePaneRegistrationIdentityV1,
+    pub input_serial: InputSerial,
+    pub outcome: PaneInputConditionalOutcomeV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum ConditionalPaneInputError {
+    #[error("conditional pane input has a reserved {field}")]
+    ReservedIdentity { field: &'static str },
+    #[error("conditional pane input serial must be nonzero")]
+    ZeroInputSerial,
+    #[error("conditional paste exceeds the {MAX_CONDITIONAL_PANE_INPUT_PASTE_BYTES}-byte limit")]
+    PasteTooLarge,
+    #[error("conditional mouse input exceeds the bounded terminal input profile")]
+    InvalidMouse,
+}
+
+fn validate_conditional_pane_input_identity(
+    session_incarnation: MuxSessionIncarnation,
+    pane_registration: ReliablePaneRegistrationIdentityV1,
+    input_serial: InputSerial,
+) -> Result<(), ConditionalPaneInputError> {
+    for (field, reserved) in [
+        ("session incarnation", session_incarnation.as_bytes() == [0; 16]),
+        ("pane registration", pane_registration.is_reserved()),
+    ] {
+        if reserved {
+            return Err(ConditionalPaneInputError::ReservedIdentity { field });
+        }
+    }
+    if input_serial.is_empty() {
+        return Err(ConditionalPaneInputError::ZeroInputSerial);
+    }
+    Ok(())
+}
+
+impl SendPaneInputConditionalV1 {
+    pub fn validate(&self) -> Result<(), ConditionalPaneInputError> {
+        validate_conditional_pane_input_identity(
+            self.session_incarnation,
+            self.pane_registration,
+            self.input_serial,
+        )?;
+        match &self.effect {
+            PaneInputEffectV1::Paste(text) => {
+                if text.len() > MAX_CONDITIONAL_PANE_INPUT_PASTE_BYTES {
+                    return Err(ConditionalPaneInputError::PasteTooLarge);
+                }
+            }
+            PaneInputEffectV1::Mouse(event) => {
+                use frankenterm_term::input::MouseButton;
+                // Cell coordinates fit the native PTY geometry profile.
+                // Bound wheel counts before they can drive callback work.
+                let wheel_is_valid = match event.button {
+                    MouseButton::WheelUp(count)
+                    | MouseButton::WheelDown(count)
+                    | MouseButton::WheelLeft(count)
+                    | MouseButton::WheelRight(count) => {
+                        (1..=MAX_CONDITIONAL_PANE_INPUT_WHEEL_STEPS).contains(&count)
+                    }
+                    _ => true,
+                };
+                if event.x > u16::MAX as usize
+                    || !(0..=i64::from(u16::MAX)).contains(&event.y)
+                    || event.x_pixel_offset.unsigned_abs() > u16::MAX as usize
+                    || event.y_pixel_offset.unsigned_abs() > u16::MAX as usize
+                    || !wheel_is_valid
+                {
+                    return Err(ConditionalPaneInputError::InvalidMouse);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl SendPaneInputConditionalV1Response {
+    pub fn validate(&self) -> Result<(), ConditionalPaneInputError> {
+        validate_conditional_pane_input_identity(
+            self.session_incarnation,
+            self.pane_registration,
+            self.input_serial,
+        )
+    }
+}
+
+fn deserialize_conditional_paste_text<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct PasteVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for PasteVisitor {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("bounded conditional paste text")
+        }
+
+        fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            let text = String::deserialize(deserializer)?;
+            if text.len() > MAX_CONDITIONAL_PANE_INPUT_PASTE_BYTES {
+                return Err(serde::de::Error::custom(ConditionalPaneInputError::PasteTooLarge));
+            }
+            Ok(text)
+        }
+    }
+
+    // This marker changes no bytes on the wire. The bounded decoder uses it
+    // to reject an oversized string length before allocating its buffer.
+    deserializer.deserialize_newtype_struct(
+        bounded_varbincode::CONDITIONAL_PASTE_TEXT_V1_NEWTYPE,
+        PasteVisitor,
+    )
+}
+
+fn deserialize_send_pane_input_conditional_v1(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<SendPaneInputConditionalV1, Error> {
+    let request: SendPaneInputConditionalV1 = deserialize_exact_payload_with_limit(
+        data,
+        is_compressed,
+        "SendPaneInputConditionalV1",
+        MAX_CONDITIONAL_PANE_INPUT_REQUEST_DECOMPRESSED_BYTES,
+    )?;
+    request.validate()?;
+    Ok(request)
+}
+
+fn deserialize_send_pane_input_conditional_v1_response(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<SendPaneInputConditionalV1Response, Error> {
+    let response: SendPaneInputConditionalV1Response = deserialize_exact_payload_with_limit(
+        data,
+        is_compressed,
+        "SendPaneInputConditionalV1Response",
+        MAX_CONDITIONAL_PANE_INPUT_RESPONSE_DECOMPRESSED_BYTES,
+    )?;
+    response.validate()?;
+    Ok(response)
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
@@ -24203,7 +24427,7 @@ mod test {
 
     #[test]
     fn codec_v65_additive_line_layout_preserves_the_v61_compatibility_floor() {
-        assert_eq!(CODEC_VERSION, 73);
+        assert_eq!(CODEC_VERSION, 74);
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 61);
         assert_eq!(ORDERED_WINDOW_V1_MIN_CODEC_VERSION, 54);
         assert!(!codec_version_supports_ordered_window_v1(50));
@@ -26095,7 +26319,7 @@ mod test {
 
     #[test]
     fn codec_version_is_current() {
-        assert_eq!(CODEC_VERSION, 73);
+        assert_eq!(CODEC_VERSION, 74);
     }
 
     #[test]
@@ -26283,6 +26507,245 @@ mod test {
                     .downcast_ref::<PduEncodedBodyLimitExceeded>()
                     .is_some());
             }
+        }
+    }
+
+    fn conditional_input_fixture() -> SendPaneInputConditionalV1 {
+        SendPaneInputConditionalV1 {
+            pane_id: 42,
+            session_incarnation: MuxSessionIncarnation::from_bytes([0x13; 16]),
+            pane_registration: ReliablePaneRegistrationIdentityV1::from_bytes([0x39; 16]),
+            input_serial: InputSerial::from_millis_since_epoch(91),
+            effect: PaneInputEffectV1::Paste("hello 🦀\n".to_owned()),
+        }
+    }
+
+    fn conditional_mouse_fixture() -> frankenterm_term::input::MouseEvent {
+        use frankenterm_term::input::{MouseButton, MouseEvent, MouseEventKind};
+        MouseEvent {
+            kind: MouseEventKind::Press,
+            x: 10,
+            y: 4,
+            x_pixel_offset: 2,
+            y_pixel_offset: 1,
+            button: MouseButton::WheelDown(1),
+            modifiers: termwiz::input::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn conditional_input_preserves_exact_source_and_receipts_only_at_codec_74() {
+        let request = conditional_input_fixture();
+        let mut mouse = request.clone();
+        mouse.effect = PaneInputEffectV1::Mouse(conditional_mouse_fixture());
+        let mut pdus = vec![
+            Pdu::SendPaneInputConditionalV1(request.clone()),
+            Pdu::SendPaneInputConditionalV1(mouse),
+        ];
+        for outcome in [
+            PaneInputConditionalOutcomeV1::Accepted,
+            PaneInputConditionalOutcomeV1::PaneGone,
+            PaneInputConditionalOutcomeV1::IdentityMismatch,
+            PaneInputConditionalOutcomeV1::Retired,
+            PaneInputConditionalOutcomeV1::Indeterminate,
+        ] {
+            pdus.push(Pdu::SendPaneInputConditionalV1Response(
+                SendPaneInputConditionalV1Response {
+                    pane_id: request.pane_id,
+                    session_incarnation: request.session_incarnation,
+                    pane_registration: request.pane_registration,
+                    input_serial: request.input_serial,
+                    outcome,
+                },
+            ));
+        }
+        for pdu in pdus {
+            for mode in [CompressionMode::Never, CompressionMode::Always] {
+                let frame = pdu.encode_frame_with_mode(31, mode).unwrap();
+                let decoded = Pdu::decode(frame.as_slice()).unwrap();
+                assert_eq!(decoded.serial, 31);
+                assert_eq!(decoded.pdu, pdu);
+            }
+            assert_eq!(pdu.minimum_codec_version(), Some(74));
+            assert_eq!(pdu.pane_id(), Some(42));
+            let (producer, role) = if matches!(&pdu, Pdu::SendPaneInputConditionalV1(_)) {
+                (PduProducer::Client, PduWireRole::Request)
+            } else {
+                (PduProducer::Server, PduWireRole::CorrelatedReply)
+            };
+            assert!(pdu
+                .clone()
+                .prepare_outbound_for_dialect(
+                    MuxWireDialect::current(73).unwrap(),
+                    producer,
+                    role,
+                    None,
+                    CompressionMode::Never,
+                )
+                .is_err());
+            assert!(pdu
+                .prepare_outbound_for_dialect(
+                    MuxWireDialect::current(74).unwrap(),
+                    producer,
+                    role,
+                    None,
+                    CompressionMode::Never,
+                )
+                .is_ok());
+        }
+        assert_eq!(SendPaneInputConditionalV1::IDENT, 123);
+        assert_eq!(SendPaneInputConditionalV1Response::IDENT, 124);
+        assert_eq!(CONDITIONAL_PANE_INPUT_V1_MIN_CODEC_VERSION, 74);
+        assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 61);
+        assert!(!SendPaneInputConditionalV1Response::WIRE_SPEC
+            .authorizes(PduProducer::Server, PduWireRole::Unilateral));
+    }
+
+    #[test]
+    fn conditional_input_rejects_reserved_authority_and_unbounded_effects() {
+        use frankenterm_term::input::MouseButton;
+        for case in 0..11 {
+            let mut request = conditional_input_fixture();
+            let mut mouse = conditional_mouse_fixture();
+            match case {
+                0 => request.session_incarnation = MuxSessionIncarnation::from_bytes([0; 16]),
+                1 => {
+                    request.pane_registration =
+                        ReliablePaneRegistrationIdentityV1::from_bytes([0; 16]);
+                }
+                2 => request.input_serial = InputSerial::empty(),
+                3 => {
+                    request.effect = PaneInputEffectV1::Paste(
+                        "x".repeat(MAX_CONDITIONAL_PANE_INPUT_PASTE_BYTES + 1),
+                    );
+                }
+                4 => mouse.x = usize::MAX,
+                5 => mouse.y = -1,
+                6 => mouse.y = i64::MAX,
+                7 => mouse.x_pixel_offset = isize::MIN,
+                8 => mouse.y_pixel_offset = isize::MAX,
+                9 => mouse.button = MouseButton::WheelUp(0),
+                10 => {
+                    mouse.button =
+                        MouseButton::WheelDown(MAX_CONDITIONAL_PANE_INPUT_WHEEL_STEPS + 1);
+                }
+                _ => unreachable!(),
+            }
+            if case >= 4 {
+                request.effect = PaneInputEffectV1::Mouse(mouse);
+            }
+            let mut output = Vec::new();
+            assert!(Pdu::SendPaneInputConditionalV1(request.clone())
+                .encode(&mut output, 31)
+                .is_err());
+            assert!(output.is_empty());
+            for mode in [CompressionMode::Never, CompressionMode::Always] {
+                let (body, compressed) = serialize_with_mode(&request, mode).unwrap();
+                let mut frame = Vec::new();
+                encode_raw(123, 31, &body, compressed, &mut frame).unwrap();
+                assert!(Pdu::decode(frame.as_slice()).is_err(), "case {case}");
+            }
+        }
+        let mut boundary = conditional_input_fixture();
+        boundary.effect = PaneInputEffectV1::Paste(
+            "x".repeat(MAX_CONDITIONAL_PANE_INPUT_PASTE_BYTES),
+        );
+        let pdu = Pdu::SendPaneInputConditionalV1(boundary);
+        let frame = pdu.encode_frame_with_mode(31, CompressionMode::Always).unwrap();
+        assert_eq!(Pdu::decode(frame.as_slice()).unwrap().pdu, pdu);
+    }
+
+    #[test]
+    fn conditional_input_exact_decoders_reject_ambiguous_or_oversized_receipts() {
+        let request = conditional_input_fixture();
+        let reply = SendPaneInputConditionalV1Response {
+            pane_id: request.pane_id,
+            session_incarnation: request.session_incarnation,
+            pane_registration: request.pane_registration,
+            input_serial: request.input_serial,
+            outcome: PaneInputConditionalOutcomeV1::Accepted,
+        };
+        for (ident, body, plain_cap, compressed_cap) in [
+            (
+                SendPaneInputConditionalV1::IDENT,
+                varbincode::serialize(&request).unwrap(),
+                MAX_CONDITIONAL_PANE_INPUT_REQUEST_DECOMPRESSED_BYTES,
+                MAX_CONDITIONAL_PANE_INPUT_REQUEST_ZSTD_ENCODED_BYTES,
+            ),
+            (
+                SendPaneInputConditionalV1Response::IDENT,
+                varbincode::serialize(&reply).unwrap(),
+                MAX_CONDITIONAL_PANE_INPUT_RESPONSE_DECOMPRESSED_BYTES,
+                MAX_CONDITIONAL_PANE_INPUT_RESPONSE_ZSTD_ENCODED_BYTES,
+            ),
+        ] {
+            for invalid in [
+                body[..body.len() - 1].to_vec(),
+                [body.as_slice(), &[0]].concat(),
+            ] {
+                for compressed in [false, true] {
+                    let encoded = if compressed {
+                        zstd::encode_all(invalid.as_slice(), 0).unwrap()
+                    } else {
+                        invalid.clone()
+                    };
+                    let mut frame = Vec::new();
+                    encode_raw(ident, 31, &encoded, compressed, &mut frame).unwrap();
+                    assert!(Pdu::decode(frame.as_slice()).is_err());
+                }
+            }
+            for (compressed, cap) in [(false, plain_cap), (true, compressed_cap)] {
+                let mut frame = Vec::new();
+                encode_raw(ident, 31, &vec![0; cap + 1], compressed, &mut frame).unwrap();
+                assert!(Pdu::decode(frame.as_slice())
+                    .unwrap_err()
+                    .downcast_ref::<PduEncodedBodyLimitExceeded>()
+                    .is_some());
+            }
+        }
+        for case in 0..3 {
+            let mut invalid = reply;
+            match case {
+                0 => invalid.session_incarnation = MuxSessionIncarnation::from_bytes([0; 16]),
+                1 => {
+                    invalid.pane_registration =
+                        ReliablePaneRegistrationIdentityV1::from_bytes([0; 16]);
+                }
+                2 => invalid.input_serial = InputSerial::empty(),
+                _ => unreachable!(),
+            }
+            assert!(Pdu::SendPaneInputConditionalV1Response(invalid)
+                .encode_frame_with_mode(31, CompressionMode::Never)
+                .is_err());
+            let body = varbincode::serialize(&invalid).unwrap();
+            assert!(deserialize_send_pane_input_conditional_v1_response(&body, false).is_err());
+        }
+    }
+
+    #[test]
+    fn conditional_paste_rejects_hostile_length_before_allocating_text() {
+        let request = conditional_input_fixture();
+        // The tuple encodes the exact prefix through Paste's string length,
+        // but supplies no text bytes. Refusal must be the schema's length
+        // limit, rather than allocating a hostile buffer and reaching EOF.
+        let body = varbincode::serialize(&(
+            request.pane_id,
+            request.session_incarnation,
+            request.pane_registration,
+            request.input_serial,
+            0_u32,
+            MAX_CONDITIONAL_PANE_INPUT_PASTE_BYTES + 1,
+        ))
+        .unwrap();
+        for compressed in [false, true] {
+            let encoded = if compressed {
+                zstd::encode_all(body.as_slice(), 0).unwrap()
+            } else {
+                body.clone()
+            };
+            let error = deserialize_send_pane_input_conditional_v1(&encoded, compressed)
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("conditional paste text bytes"));
         }
     }
 
@@ -27498,7 +27961,7 @@ mod test {
     fn pdu_wire_registry_covers_every_assigned_id_and_only_the_historical_gaps() {
         const GAPS: &[u64] = &[5, 6, 7, 15, 16, 17, 18, 19, 21];
 
-        for ident in 0..=122 {
+        for ident in 0..=124 {
             let spec = Pdu::wire_spec_for_ident(ident);
             assert_eq!(
                 spec.is_none(),
@@ -27512,9 +27975,9 @@ mod test {
             }
         }
 
-        assert!(Pdu::wire_spec_for_ident(123).is_none());
+        assert!(Pdu::wire_spec_for_ident(125).is_none());
         assert!(Pdu::wire_spec_for_ident(u64::MAX).is_none());
-        assert_eq!(Pdu::all_wire_specs().len(), 123 - GAPS.len());
+        assert_eq!(Pdu::all_wire_specs().len(), 125 - GAPS.len());
     }
 
     #[test]
@@ -27563,6 +28026,7 @@ mod test {
                 117..=118 => 71,
                 119..=120 => 72,
                 121..=122 => 73,
+                123..=124 => 74,
                 ident => panic!("unexpected assigned PDU ID {}", ident),
             };
             assert_eq!(
@@ -27598,11 +28062,11 @@ mod test {
             1, 3, 9, 11, 12, 13, 14, 22, 24, 26, 28, 31, 33, 34, 35, 36, 38, 40, 41, 43, 45, 46,
             48, 50, 51, 56, 57, 58, 59, 60, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75,
             77, 80, 81, 85, 86, 88, 91, 93, 95, 96, 98, 99, 100, 102, 104, 106, 108, 110, 112, 114,
-            115, 117, 119, 121,
+            115, 117, 119, 121, 123,
         ];
         const SERVER_REPLIES: &[u64] = &[
             0, 2, 4, 8, 10, 23, 25, 27, 29, 30, 32, 42, 47, 49, 52, 61, 76, 78, 82, 87, 89, 92, 94,
-            97, 101, 103, 105, 107, 109, 111, 113, 116, 118, 120, 122,
+            97, 101, 103, 105, 107, 109, 111, 113, 116, 118, 120, 122, 124,
         ];
         const SERVER_UNILATERALS: &[u64] = &[
             20, 25, 37, 38, 39, 44, 53, 54, 55, 56, 57, 58, 79, 83, 84, 90,
@@ -27683,7 +28147,7 @@ mod test {
 
             let expected_class = match spec.ident {
                 1 | 2 | 26..=30 | 40 => Class::ConnectionControl,
-                9 | 11..=13 | 73 | 95..=101 => Class::InteractiveInput,
+                9 | 11..=13 | 73 | 95..=101 | 123..=124 => Class::InteractiveInput,
                 8
                 | 14
                 | 20
@@ -27736,7 +28200,7 @@ mod test {
             };
             let expected_cap = match spec.ident {
                 1 | 2 | 26..=30 | 40 => Cap::Control,
-                9 | 11 | 12 | 73 | 95..=98 | 100..=101 => Cap::InteractiveInput,
+                9 | 11 | 12 | 73 | 95..=98 | 100..=101 | 124 => Cap::InteractiveInput,
                 8
                 | 14
                 | 33..=36
@@ -27774,7 +28238,7 @@ mod test {
                 | 118
                 | 121 => Cap::Query,
                 4 | 13 | 20 | 23 | 32 | 42 | 47 | 76 | 78 | 82 | 87 | 94 | 99 | 103 | 113 | 116
-                | 122 => {
+                | 122 | 123 => {
                     Cap::BulkData
                 }
                 ident => panic!("PDU {} is missing from the admission-cap census", ident),
@@ -27795,7 +28259,8 @@ mod test {
                 | 88
                 | 89
                 | 95..=101
-                | 119..=120 => Qos::Interactive,
+                | 119..=120
+                | 123..=124 => Qos::Interactive,
                 3
                 | 22
                 | 24
@@ -28775,7 +29240,7 @@ mod test {
     #[test]
     fn check_compat_current_build_keeps_v61_floor_after_additive_v65() {
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 61);
-        assert_eq!(CODEC_VERSION, 73);
+        assert_eq!(CODEC_VERSION, 74);
         assert!(check_compat(62, 61, 60, 58).is_err());
         assert_eq!(
             check_compat(62, 61, 61, 61),

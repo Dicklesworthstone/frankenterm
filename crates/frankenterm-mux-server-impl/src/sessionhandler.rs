@@ -7764,6 +7764,51 @@ fn conditional_resize_response(
     })
 }
 
+/// Compare the client witness to the retained operation authority, never to a
+/// fresh lookup of a numeric pane ID. Proxy panes need no durable UUID here:
+/// the mux incarnation and exact registration identify this live input sink.
+fn conditional_input_source_matches(
+    pane: &SessionPaneMutationGuard,
+    request: &codec::SendPaneInputConditionalV1,
+) -> anyhow::Result<bool> {
+    let incarnation = pane.request().mux().topology_snapshot_authority()?.0;
+    Ok(request.pane_id == pane.pane_id()
+        && request.session_incarnation == incarnation
+        && request.pane_registration.as_bytes() == pane.registration().wire_identity())
+}
+
+fn admit_conditional_input(
+    request_authority: &Rc<SessionMutationGuard>,
+    request: &codec::SendPaneInputConditionalV1,
+) -> anyhow::Result<Result<SessionPaneMutationGuard, codec::PaneInputConditionalOutcomeV1>> {
+    use codec::PaneInputConditionalOutcomeV1 as Outcome;
+    request
+        .validate()
+        .map_err(|_| MuxServerRejection::invalid_request())?;
+    let pane = match request_authority.capture_pane(request.pane_id) {
+        Ok(pane) => pane,
+        Err(SessionAuthorityError::PaneNotFound { .. }) => return Ok(Err(Outcome::PaneGone)),
+        Err(error) => return Err(error.into()),
+    };
+    if !conditional_input_source_matches(&pane, request)? {
+        return Ok(Err(Outcome::IdentityMismatch));
+    }
+    Ok(Ok(pane))
+}
+
+fn conditional_input_response(
+    request: &codec::SendPaneInputConditionalV1,
+    outcome: codec::PaneInputConditionalOutcomeV1,
+) -> Pdu {
+    Pdu::SendPaneInputConditionalV1Response(codec::SendPaneInputConditionalV1Response {
+        pane_id: request.pane_id,
+        session_incarnation: request.session_incarnation,
+        pane_registration: request.pane_registration,
+        input_serial: request.input_serial,
+        outcome,
+    })
+}
+
 /// The owning domain of one exact pane registration, named when the domain is
 /// still registered under a name the reply may carry. A pane that retired
 /// after admission is reported `Missing`, like one that never existed.
@@ -9177,6 +9222,102 @@ impl SessionHandler {
                     send_response,
                 );
             }
+            Pdu::SendPaneInputConditionalV1(request) => {
+                let pane_authority = match admit_conditional_input(&request_authority, &request) {
+                    Ok(Ok(pane)) => pane,
+                    Ok(Err(outcome)) => {
+                        send_response(Ok(conditional_input_response(&request, outcome)));
+                        return;
+                    }
+                    Err(error) => {
+                        send_response(Err(error));
+                        return;
+                    }
+                };
+                let estimated_bytes = match &request.effect {
+                    codec::PaneInputEffectV1::Paste(data) => {
+                        main_thread_rpc_estimated_bytes(data.len())
+                    }
+                    codec::PaneInputEffectV1::Mouse(_) => SEND_KEY_DOWN_MAIN_THREAD_ESTIMATED_BYTES,
+                };
+                let registration = pane_authority.registration();
+                let per_pane = self.per_pane_for_registration(&registration);
+                let input_activity = self.pane_input_activity(request.pane_id);
+                let sender = self.to_write_tx.clone();
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Input,
+                    estimated_bytes,
+                    move |send_response| async move {
+                        catch(
+                            move || {
+                                use codec::PaneInputConditionalOutcomeV1 as Outcome;
+                                let entered = Cell::new(false);
+                                let accepted = Cell::new(false);
+                                let result = catch_recoverable(
+                                    RecoverablePanicSite::MuxPaneCallback,
+                                    AssertUnwindSafe(|| {
+                                        pane_authority.try_with_pane(|pane| {
+                                            // This is the captured registration, held across
+                                            // scheduling. Never re-resolve the numeric ID.
+                                            if !conditional_input_source_matches(
+                                                &pane_authority,
+                                                &request,
+                                            )? {
+                                                return Ok(Outcome::IdentityMismatch);
+                                            }
+                                            entered.set(true);
+                                            match &request.effect {
+                                                codec::PaneInputEffectV1::Paste(data) => {
+                                                    pane.send_paste(data)?;
+                                                }
+                                                codec::PaneInputEffectV1::Mouse(event) => {
+                                                    pane.mouse_event(*event)?;
+                                                }
+                                            }
+                                            // Acceptance is a callback boundary, not proof
+                                            // that the PTY's program consumed this input.
+                                            accepted.set(true);
+                                            input_activity.mark();
+                                            match &request.effect {
+                                                codec::PaneInputEffectV1::Paste(_) => {
+                                                    push_input_dispatch_changes_after_committed_input(
+                                                        pane,
+                                                        sender,
+                                                        per_pane,
+                                                        request.input_serial,
+                                                        "conditional paste",
+                                                    );
+                                                }
+                                                codec::PaneInputEffectV1::Mouse(_) => {
+                                                    push_pane_changes_after_committed_input(
+                                                        pane,
+                                                        sender,
+                                                        per_pane,
+                                                        "conditional mouse event",
+                                                    );
+                                                }
+                                            }
+                                            Ok(Outcome::Accepted)
+                                        })
+                                    }),
+                                );
+                                let outcome = match result {
+                                    Ok(Ok(outcome)) => outcome,
+                                    // A later render failure cannot undo a known accepted
+                                    // effect or invite a duplicate paste/mouse dispatch.
+                                    _ if accepted.get() => Outcome::Accepted,
+                                    _ if entered.get() => Outcome::Indeterminate,
+                                    _ => Outcome::Retired,
+                                };
+                                Ok(conditional_input_response(&request, outcome))
+                            },
+                            send_response,
+                        );
+                    },
+                    send_response,
+                );
+            }
+
             Pdu::SendPaste(SendPaste {
                 pane_id,
                 data,
@@ -11550,6 +11691,7 @@ impl SessionHandler {
             | Pdu::GetPaneUserVarsV1Response { .. }
             | Pdu::GetPaneIdentityV1Response { .. }
             | Pdu::ResizePaneConditionalV1Response { .. }
+            | Pdu::SendPaneInputConditionalV1Response { .. }
             | Pdu::ReorderWindowTabsV1Response { .. }
             | Pdu::WindowOrderEventV1 { .. }
             | Pdu::GetPaneRenderDeliveryV1Response { .. }
@@ -15456,6 +15598,9 @@ mod tests {
         key_down_count: AtomicUsize,
         key_down_probe: Option<KeyDownProbe>,
         paste_count: AtomicUsize,
+        mouse_count: AtomicUsize,
+        input_error_after_apply: AtomicBool,
+        input_panic_after_apply: AtomicBool,
         resize_count: AtomicUsize,
         resize_error_after_apply: AtomicBool,
         callback_probe: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -15499,6 +15644,9 @@ mod tests {
                 key_down_count: AtomicUsize::new(0),
                 key_down_probe: None,
                 paste_count: AtomicUsize::new(0),
+                mouse_count: AtomicUsize::new(0),
+                input_error_after_apply: AtomicBool::new(false),
+                input_panic_after_apply: AtomicBool::new(false),
                 resize_count: AtomicUsize::new(0),
                 resize_error_after_apply: AtomicBool::new(false),
                 state: Mutex::new(FakePaneState {
@@ -15578,6 +15726,17 @@ mod tests {
 
         fn paste_count(&self) -> usize {
             self.paste_count.load(Ordering::Relaxed)
+        }
+
+        fn input_effect_result(&self) -> anyhow::Result<()> {
+            assert!(
+                !self.input_panic_after_apply.load(Ordering::Relaxed),
+                "injected input panic after effect"
+            );
+            if self.input_error_after_apply.load(Ordering::Relaxed) {
+                anyhow::bail!("injected input error after effect");
+            }
+            Ok(())
         }
 
         fn set_writer_behavior(&self, behavior: FakePaneWriteBehavior) {
@@ -15763,7 +15922,7 @@ mod tests {
 
         fn send_paste(&self, _text: &str) -> anyhow::Result<()> {
             self.paste_count.fetch_add(1, Ordering::Relaxed);
-            Ok(())
+            self.input_effect_result()
         }
 
         fn send_user_input(&self, bytes: &[u8]) -> anyhow::Result<()> {
@@ -15810,7 +15969,8 @@ mod tests {
         }
 
         fn mouse_event(&self, _event: MouseEvent) -> anyhow::Result<()> {
-            Ok(())
+            self.mouse_count.fetch_add(1, Ordering::Relaxed);
+            self.input_effect_result()
         }
 
         fn is_dead(&self) -> bool {
@@ -18341,6 +18501,367 @@ mod tests {
             current_registration.wire_identity()
         );
         assert_eq!(identity.durable_pane_id, [0x39; 16]);
+    }
+
+    fn conditional_input_effects() -> [codec::PaneInputEffectV1; 2] {
+        [
+            codec::PaneInputEffectV1::Paste("identity-bound paste".into()),
+            codec::PaneInputEffectV1::Mouse(wezterm_term::input::MouseEvent {
+                kind: wezterm_term::input::MouseEventKind::Press,
+                x: 2,
+                y: 3,
+                x_pixel_offset: 0,
+                y_pixel_offset: 0,
+                button: wezterm_term::input::MouseButton::Left,
+                modifiers: wezterm_term::input::KeyModifiers::NONE,
+            }),
+        ]
+    }
+
+    fn conditional_input_request(
+        mux: &Mux,
+        pane_id: PaneId,
+        effect: codec::PaneInputEffectV1,
+    ) -> codec::SendPaneInputConditionalV1 {
+        codec::SendPaneInputConditionalV1 {
+            pane_id,
+            session_incarnation: mux.topology_snapshot_authority().unwrap().0,
+            pane_registration: ReliablePaneRegistrationIdentityV1::from_bytes(
+                mux.capture_current_pane(pane_id).unwrap().wire_identity(),
+            ),
+            input_serial: InputSerial::from_millis_since_epoch(1_234),
+            effect,
+        }
+    }
+
+    fn conditional_input_effect_count(pane: &FakePane, effect: &codec::PaneInputEffectV1) -> usize {
+        match effect {
+            codec::PaneInputEffectV1::Paste(_) => pane.paste_count(),
+            codec::PaneInputEffectV1::Mouse(_) => pane.mouse_count.load(Ordering::Relaxed),
+        }
+    }
+
+    fn take_conditional_input_response(
+        executor: &SimpleExecutor,
+        captured: &Arc<Mutex<Vec<DecodedPdu>>>,
+        serial: u64,
+        request: &codec::SendPaneInputConditionalV1,
+    ) -> codec::SendPaneInputConditionalV1Response {
+        // Successful input can publish an unsolicited render update before its
+        // receipt. Select by RPC serial rather than assuming one captured PDU.
+        for _ in 0..16 {
+            let response = {
+                let mut messages = captured.lock().unwrap();
+                messages
+                    .iter()
+                    .position(|message| message.serial == serial)
+                    .map(|index| messages.remove(index))
+            };
+            if let Some(response) = response {
+                let Pdu::SendPaneInputConditionalV1Response(response) = response.pdu else {
+                    panic!("expected typed conditional input receipt");
+                };
+                response.validate().unwrap();
+                assert_eq!(response.pane_id, request.pane_id);
+                assert_eq!(response.session_incarnation, request.session_incarnation);
+                assert_eq!(response.pane_registration, request.pane_registration);
+                assert_eq!(response.input_serial, request.input_serial);
+                return response;
+            }
+            executor.tick().unwrap();
+        }
+        panic!("timed out waiting for conditional input receipt {serial}");
+    }
+
+    #[test]
+    fn conditional_input_checks_both_live_witnesses_without_requiring_a_durable_uuid() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = SimpleExecutor::new();
+        for effect in conditional_input_effects() {
+            let pane = Arc::new(FakePane::new_with_id(7_086, None));
+            assert!(pane.durable_pane_id.is_none());
+            let pane_dyn: Arc<dyn Pane> = pane.clone();
+            let mux = Arc::new(Mux::new(None));
+            let _mux_guard = ScopedMux::install(&mux);
+            mux.add_pane(&pane_dyn).unwrap();
+            let request = conditional_input_request(&mux, pane.pane_id, effect.clone());
+            let (sender, captured) = capturing_sender();
+            let mut handler =
+                SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux)))
+                    .unwrap();
+            for field in 0..2 {
+                let mut stale = request.clone();
+                match field {
+                    0 => {
+                        stale.session_incarnation =
+                            mux::MuxSessionIncarnation::from_bytes([0x41; 16]);
+                    }
+                    1 => {
+                        stale.pane_registration =
+                            ReliablePaneRegistrationIdentityV1::from_bytes([0x43; 16]);
+                    }
+                    _ => unreachable!(),
+                }
+                let serial = 700 + field;
+                handler.process_one(DecodedPdu {
+                    serial,
+                    pdu: Pdu::SendPaneInputConditionalV1(stale.clone()),
+                });
+                assert_eq!(
+                    take_conditional_input_response(&executor, &captured, serial, &stale).outcome,
+                    codec::PaneInputConditionalOutcomeV1::IdentityMismatch
+                );
+                assert_eq!(conditional_input_effect_count(&pane, &effect), 0);
+            }
+            handler.process_one(DecodedPdu {
+                serial: 702,
+                pdu: Pdu::SendPaneInputConditionalV1(request.clone()),
+            });
+            assert_eq!(
+                take_conditional_input_response(&executor, &captured, 702, &request).outcome,
+                codec::PaneInputConditionalOutcomeV1::Accepted
+            );
+            assert_eq!(conditional_input_effect_count(&pane, &effect), 1);
+            drop(handler);
+            drain_simple_executor(&executor);
+        }
+    }
+
+    #[test]
+    fn conditional_input_refuses_id_reuse_and_reregistration_before_request_arrival() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = SimpleExecutor::new();
+        for effect in conditional_input_effects() {
+            for same_allocation in [false, true] {
+                let original = Arc::new(FakePane::new_with_id(7_087, None));
+                let original_dyn: Arc<dyn Pane> = original.clone();
+                let mux = Arc::new(Mux::new(None));
+                let _mux_guard = ScopedMux::install(&mux);
+                mux.add_pane(&original_dyn).unwrap();
+                let stale = conditional_input_request(&mux, original.pane_id, effect.clone());
+                assert!(
+                    mux.capture_current_pane(original.pane_id)
+                        .unwrap()
+                        .retire_if_current()
+                );
+                let replacement = if same_allocation {
+                    original.clone()
+                } else {
+                    Arc::new(FakePane::new_with_id(original.pane_id, None))
+                };
+                let replacement_dyn: Arc<dyn Pane> = replacement.clone();
+                mux.add_pane(&replacement_dyn).unwrap();
+                let current = conditional_input_request(&mux, replacement.pane_id, effect.clone());
+                assert_ne!(current.pane_registration, stale.pane_registration);
+                let (sender, captured) = capturing_sender();
+                let mut handler =
+                    SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux)))
+                        .unwrap();
+                handler.process_one(DecodedPdu {
+                    serial: 710,
+                    pdu: Pdu::SendPaneInputConditionalV1(stale.clone()),
+                });
+                assert_eq!(
+                    take_conditional_input_response(&executor, &captured, 710, &stale).outcome,
+                    codec::PaneInputConditionalOutcomeV1::IdentityMismatch
+                );
+                assert_eq!(conditional_input_effect_count(&original, &effect), 0);
+                assert_eq!(conditional_input_effect_count(&replacement, &effect), 0);
+                // The successor is usable, but only with its new live authority.
+                handler.process_one(DecodedPdu {
+                    serial: 711,
+                    pdu: Pdu::SendPaneInputConditionalV1(current.clone()),
+                });
+                assert_eq!(
+                    take_conditional_input_response(&executor, &captured, 711, &current).outcome,
+                    codec::PaneInputConditionalOutcomeV1::Accepted
+                );
+                assert_eq!(conditional_input_effect_count(&replacement, &effect), 1);
+                if !same_allocation {
+                    assert_eq!(conditional_input_effect_count(&original, &effect), 0);
+                }
+                drop(handler);
+                drain_simple_executor(&executor);
+            }
+        }
+    }
+
+    #[test]
+    fn conditional_input_retains_exact_source_through_deferred_retirement_and_cancellation() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = SimpleExecutor::new();
+        for effect in conditional_input_effects() {
+            for cancel_owner in [false, true] {
+                let original = Arc::new(FakePane::new_with_id(7_088, None));
+                let original_dyn: Arc<dyn Pane> = original.clone();
+                let replacement = Arc::new(FakePane::new_with_id(original.pane_id, None));
+                let replacement_dyn: Arc<dyn Pane> = replacement.clone();
+                let mux = Arc::new(Mux::new(None));
+                let _mux_guard = ScopedMux::install(&mux);
+                mux.add_pane(&original_dyn).unwrap();
+                let registration = mux.capture_current_pane(original.pane_id).unwrap();
+                let request = conditional_input_request(&mux, original.pane_id, effect.clone());
+                let (sender, captured) = capturing_sender();
+                let mut handler =
+                    SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux)))
+                        .unwrap();
+                handler.process_one(DecodedPdu {
+                    serial: 720,
+                    pdu: Pdu::SendPaneInputConditionalV1(request.clone()),
+                });
+                assert!(registration.retire_if_current());
+                assert!(
+                    mux.add_pane(&replacement_dyn).is_err(),
+                    "queued input must keep the exact captured registration fenced"
+                );
+                if cancel_owner {
+                    drop(handler);
+                    drain_simple_executor(&executor);
+                    assert!(captured.lock().unwrap().is_empty());
+                    assert_eq!(conditional_input_effect_count(&original, &effect), 0);
+                } else {
+                    // An admitted operation may finish on its original pane;
+                    // retirement must never redirect it to the successor.
+                    assert_eq!(
+                        take_conditional_input_response(&executor, &captured, 720, &request).outcome,
+                        codec::PaneInputConditionalOutcomeV1::Accepted
+                    );
+                    assert_eq!(conditional_input_effect_count(&original, &effect), 1);
+                    drop(handler);
+                    drain_simple_executor(&executor);
+                }
+                mux.add_pane(&replacement_dyn).unwrap();
+                assert_eq!(conditional_input_effect_count(&replacement, &effect), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn conditional_input_errors_and_panics_after_callback_entry_are_indeterminate() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = SimpleExecutor::new();
+        for effect in conditional_input_effects() {
+            for panic_after_apply in [false, true] {
+                let pane = Arc::new(FakePane::new_with_id(7_089, None));
+                pane.input_error_after_apply
+                    .store(!panic_after_apply, Ordering::Relaxed);
+                pane.input_panic_after_apply
+                    .store(panic_after_apply, Ordering::Relaxed);
+                let pane_dyn: Arc<dyn Pane> = pane.clone();
+                let mux = Arc::new(Mux::new(None));
+                let _mux_guard = ScopedMux::install(&mux);
+                mux.add_pane(&pane_dyn).unwrap();
+                let request = conditional_input_request(&mux, pane.pane_id, effect.clone());
+                let (sender, captured) = capturing_sender();
+                let mut handler =
+                    SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux)))
+                        .unwrap();
+                handler.process_one(DecodedPdu {
+                    serial: 730,
+                    pdu: Pdu::SendPaneInputConditionalV1(request.clone()),
+                });
+                assert_eq!(
+                    take_conditional_input_response(&executor, &captured, 730, &request).outcome,
+                    codec::PaneInputConditionalOutcomeV1::Indeterminate
+                );
+                assert_eq!(conditional_input_effect_count(&pane, &effect), 1);
+                drop(handler);
+                drain_simple_executor(&executor);
+                assert_eq!(conditional_input_effect_count(&pane, &effect), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn conditional_input_missing_pane_and_invalid_serial_are_zero_effect() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = SimpleExecutor::new();
+        let pane = Arc::new(FakePane::new_with_id(7_090, None));
+        let pane_dyn: Arc<dyn Pane> = pane.clone();
+        let mux = Arc::new(Mux::new(None));
+        let _mux_guard = ScopedMux::install(&mux);
+        mux.add_pane(&pane_dyn).unwrap();
+        let request = conditional_input_request(
+            &mux,
+            pane.pane_id,
+            codec::PaneInputEffectV1::Paste("must remain unapplied".into()),
+        );
+        let (sender, captured) = capturing_sender();
+        let mut handler =
+            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux))).unwrap();
+        let missing = codec::SendPaneInputConditionalV1 {
+            pane_id: 7_091,
+            ..request.clone()
+        };
+        handler.process_one(DecodedPdu {
+            serial: 740,
+            pdu: Pdu::SendPaneInputConditionalV1(missing.clone()),
+        });
+        assert_eq!(
+            take_conditional_input_response(&executor, &captured, 740, &missing).outcome,
+            codec::PaneInputConditionalOutcomeV1::PaneGone
+        );
+        handler.process_one(DecodedPdu {
+            serial: 741,
+            pdu: Pdu::SendPaneInputConditionalV1(codec::SendPaneInputConditionalV1 {
+                input_serial: InputSerial::empty(),
+                ..request
+            }),
+        });
+        tick_until_response(&executor, &captured, 1);
+        let response = take_response(&captured);
+        let error = expect_error_response(
+            &response.pdu,
+            codec::SendPaneInputConditionalV1::IDENT,
+            MuxErrorCode::INVALID_REQUEST,
+        );
+        assert_eq!(error.effect, MuxErrorEffect::NOT_APPLIED);
+        assert_eq!(pane.paste_count(), 0);
+        assert_eq!(pane.mouse_count.load(Ordering::Relaxed), 0);
+        drop(handler);
+        drain_simple_executor(&executor);
+    }
+
+    #[test]
+    fn conditional_input_acceptance_survives_post_input_render_failure() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = SimpleExecutor::new();
+        for effect in conditional_input_effects() {
+            let pane = Arc::new(FakePane::new_with_id(7_092, None));
+            pane.state.lock().unwrap().dimensions.physical_top = StableRowIndex::MAX;
+            let pane_dyn: Arc<dyn Pane> = pane.clone();
+            let mux = Arc::new(Mux::new(None));
+            let _mux_guard = ScopedMux::install(&mux);
+            mux.add_pane(&pane_dyn).unwrap();
+            let request = conditional_input_request(&mux, pane.pane_id, effect.clone());
+            let (sender, captured) = capturing_sender();
+            let mut handler =
+                SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux)))
+                    .unwrap();
+            handler.process_one(DecodedPdu {
+                serial: 750,
+                pdu: Pdu::SendPaneInputConditionalV1(request.clone()),
+            });
+            assert_eq!(
+                take_conditional_input_response(&executor, &captured, 750, &request).outcome,
+                codec::PaneInputConditionalOutcomeV1::Accepted
+            );
+            assert_eq!(conditional_input_effect_count(&pane, &effect), 1);
+            drop(handler);
+            drain_simple_executor(&executor);
+        }
     }
 
     fn conditional_resize_request(

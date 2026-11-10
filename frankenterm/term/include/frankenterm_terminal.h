@@ -182,8 +182,8 @@ uint32_t ft_terminal_v1_frame_copy(uint64_t frame, uint32_t offset, uint8_t *out
 uint32_t ft_terminal_v1_frame_release(uint64_t frame);
 
 /* Mux client: the protocol of a FrankenTerm mux server (codec v46 and v47,
- * the fleet's v0.13 servers, and the current window 61..71, a FrankenTerm
- * GUI's own mux, or a newer one that still accepts 71) as a
+ * the fleet's v0.13 servers, and the current window 61..74, a FrankenTerm
+ * GUI's own mux, or a newer one that still accepts 74) as a
  * byte-in/byte-out state machine. The caller
  * owns the channel (an SSH command running `nc -N -U <socket>`), the
  * terminals the output is drawn on, and all scheduling; nothing here does
@@ -211,6 +211,10 @@ uint32_t ft_terminal_v1_frame_release(uint64_t frame);
  *              and before the final OUTPUT. Does not establish readiness.
  *   PANE_TITLE pane_id; payload: the title
  *   PANE_GONE  pane_id
+ *   INPUT_REJECTED pane_id; rows and cols 0; payload: a nonempty UTF-8
+ *              notice, at most 512 bytes. Input was refused before admission
+ *              or transmission. Display the notice; viewing and supported
+ *              input remain available. Do not close or retry the operation.
  *   FAILED     payload: why; the session is over, close the channel
  *   SEARCH_RESULTS pane_id; payload: JSON {search, matches: [{row,
  *              start_column, end_row, end_column, text, text_start,
@@ -270,6 +274,7 @@ uint32_t ft_terminal_v1_frame_release(uint64_t frame);
 #define FT_MUX_EVENT_PANE_IDENTITY 15u
 #define FT_MUX_EVENT_PREPARING_OUTPUT 16u
 #define FT_MUX_EVENT_PALETTE 17u
+#define FT_MUX_EVENT_INPUT_REJECTED 18u
 #define FT_MUX_SEARCH_CASE_SENSITIVE 1u
 #define FT_MUX_SEARCH_REGEX 2u
 #define FT_MUX_MAX_RECEIVE_BYTES 1048576u
@@ -317,11 +322,14 @@ uint32_t ft_mux_v1_hide(uint64_t session, uint64_t pane_id);
  * pane's program set; a bracketed paste (OUTPUT turns bracketed paste on in
  * the phone's terminal) goes as one paste; everything else as is. A paste
  * may span writes and waits on its own pane for its end. The rest of a
- * paste for a pane that closed ends the session with FAILED, unsent. */
+ * paste for a pane that closed ends the session with FAILED, unsent.
+ * Current peers before protocol 74 refuse decoded pastes with INPUT_REJECTED
+ * before input admission; this is not a failed session or a receipt. */
 uint32_t ft_mux_v1_write(uint64_t session, uint64_t pane_id, const uint8_t *bytes, uint32_t length);
 /* UTF-8 text the server pastes, bracketed when the program asked for it.
  * While a paste written to the pane is unfinished this ends the session
- * with FAILED instead of jumping ahead of it. */
+ * with FAILED instead of jumping ahead of it. Current peers before protocol
+ * 74 instead report INPUT_REJECTED before admitting or sending the paste. */
 uint32_t ft_mux_v1_paste(uint64_t session, uint64_t pane_id, const uint8_t *text, uint32_t length);
 /* Resizes the remote pane (1..512 each), remembering the size the desktop
  * gave it; restore_size puts that size back. */
@@ -350,11 +358,13 @@ uint32_t ft_mux_v1_adopt_phone_size(uint64_t session, uint64_t pane_id, uint32_t
  * at most 64 sent per call) over the pane's screen cell column,row (each at
  * most 4096). The server reports them to a program that asked for the
  * mouse and sends a full-screen program arrow keys, as for the desktop's
- * wheel; other programs ignore them. */
+ * wheel; other programs ignore them. Current peers before protocol 74 report
+ * INPUT_REJECTED before admitting or sending the gesture. */
 uint32_t ft_mux_v1_wheel(uint64_t session, uint64_t pane_id, int32_t steps, uint32_t column, uint32_t row);
 /* Clicks the left button (press, release) on the pane's screen cell
  * column,row (each at most 4096); the server reports it to a program that
- * asked for the mouse. */
+ * asked for the mouse. Current peers before protocol 74 report INPUT_REJECTED
+ * before admitting or sending either button event. */
 uint32_t ft_mux_v1_click(uint64_t session, uint64_t pane_id, uint32_t column, uint32_t row);
 /* Searches the pane's scrollback on the server, newest rows first, for
  * UTF-8 text (at most 4096 bytes) with FT_MUX_SEARCH_* flags; a

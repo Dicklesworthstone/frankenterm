@@ -136,6 +136,150 @@ fn conditional_resize_matches_the_desktop_schema_and_exact_receipt() {
     );
 }
 
+#[test]
+fn conditional_paste_and_mouse_match_the_desktop_schema_and_exact_receipts() {
+    let incarnation = [0x13; 16];
+    let registration = [0x39; 16];
+    let canonical_incarnation = mux::MuxSessionIncarnation::from_bytes(incarnation);
+    let canonical_registration =
+        codec::ReliablePaneRegistrationIdentityV1::from_bytes(registration);
+    for (ours, canonical) in [
+        (
+            wire::PaneInputEffect::Paste("héllo\nworld"),
+            codec::PaneInputEffectV1::Paste("héllo\nworld".to_owned()),
+        ),
+        (
+            wire::PaneInputEffect::Mouse(wire::MouseEvent {
+                kind: wire::MouseEventKind::Press,
+                x: 65_535,
+                y: 65_535,
+                x_pixel_offset: -65_535,
+                y_pixel_offset: 65_535,
+                button: wire::MouseButton::WheelDown(1024),
+                modifiers: termwiz::input::Modifiers::CTRL | termwiz::input::Modifiers::SHIFT,
+            }),
+            codec::PaneInputEffectV1::Mouse(frankenterm_term::input::MouseEvent {
+                kind: frankenterm_term::input::MouseEventKind::Press,
+                x: 65_535,
+                y: 65_535,
+                x_pixel_offset: -65_535,
+                y_pixel_offset: 65_535,
+                button: frankenterm_term::input::MouseButton::WheelDown(1024),
+                modifiers: termwiz::input::Modifiers::CTRL | termwiz::input::Modifiers::SHIFT,
+            }),
+        ),
+    ] {
+        assert_eq!(
+            phone(
+                wire::ident::SEND_PANE_INPUT_CONDITIONAL,
+                31,
+                &wire::SendPaneInputConditional {
+                    pane_id: 7,
+                    session_incarnation: incarnation,
+                    pane_registration: registration,
+                    input_serial: u64::MAX,
+                    effect: ours,
+                },
+            ),
+            desktop_current(
+                Pdu::SendPaneInputConditionalV1(codec::SendPaneInputConditionalV1 {
+                    pane_id: 7,
+                    session_incarnation: canonical_incarnation,
+                    pane_registration: canonical_registration,
+                    input_serial: InputSerial::from_millis_since_epoch(u64::MAX),
+                    effect: canonical,
+                }),
+                31,
+            ),
+        );
+    }
+    for (canonical, expected) in [
+        (
+            codec::PaneInputConditionalOutcomeV1::Accepted,
+            wire::PaneInputConditionalOutcome::Accepted,
+        ),
+        (
+            codec::PaneInputConditionalOutcomeV1::PaneGone,
+            wire::PaneInputConditionalOutcome::PaneGone,
+        ),
+        (
+            codec::PaneInputConditionalOutcomeV1::IdentityMismatch,
+            wire::PaneInputConditionalOutcome::IdentityMismatch,
+        ),
+        (
+            codec::PaneInputConditionalOutcomeV1::Retired,
+            wire::PaneInputConditionalOutcome::Retired,
+        ),
+        (
+            codec::PaneInputConditionalOutcomeV1::Indeterminate,
+            wire::PaneInputConditionalOutcome::Indeterminate,
+        ),
+    ] {
+        let body = varbincode::serialize(&codec::SendPaneInputConditionalV1Response {
+            pane_id: 7,
+            session_incarnation: canonical_incarnation,
+            pane_registration: canonical_registration,
+            input_serial: InputSerial::from_millis_since_epoch(u64::MAX),
+            outcome: canonical,
+        })
+        .unwrap();
+        let decoded = wire::decode_conditional_input_receipt(&body).unwrap();
+        assert_eq!(
+            decoded,
+            wire::SendPaneInputConditionalResponse {
+                pane_id: 7,
+                session_incarnation: incarnation,
+                pane_registration: registration,
+                input_serial: u64::MAX,
+                outcome: expected,
+            }
+        );
+        let mut with_tail = body.clone();
+        with_tail.push(0);
+        assert!(wire::decode_conditional_input_receipt(&with_tail).is_err());
+        assert!(wire::decode_conditional_input_receipt(&body[..body.len() - 1]).is_err());
+    }
+    assert_eq!(
+        wire::CONDITIONAL_PANE_INPUT_MIN_VERSION,
+        codec::CONDITIONAL_PANE_INPUT_V1_MIN_CODEC_VERSION
+    );
+    assert_eq!(
+        wire::MAX_CONDITIONAL_PANE_INPUT_PASTE_BYTES,
+        codec::MAX_CONDITIONAL_PANE_INPUT_PASTE_BYTES
+    );
+    assert_eq!(
+        wire::MAX_CONDITIONAL_PANE_INPUT_RESPONSE_BYTES,
+        codec::MAX_CONDITIONAL_PANE_INPUT_RESPONSE_DECOMPRESSED_BYTES
+    );
+    assert!(
+        wire::decode_conditional_input_receipt(&vec![
+            0;
+            wire::MAX_CONDITIONAL_PANE_INPUT_RESPONSE_BYTES + 1
+        ])
+        .is_err()
+    );
+    for field in 0..3 {
+        let mut receipt = codec::SendPaneInputConditionalV1Response {
+            pane_id: 7,
+            session_incarnation: canonical_incarnation,
+            pane_registration: canonical_registration,
+            input_serial: InputSerial::from_millis_since_epoch(1),
+            outcome: codec::PaneInputConditionalOutcomeV1::Accepted,
+        };
+        match field {
+            0 => receipt.session_incarnation = mux::MuxSessionIncarnation::from_bytes([0; 16]),
+            1 => {
+                receipt.pane_registration =
+                    codec::ReliablePaneRegistrationIdentityV1::from_bytes([0; 16]);
+            }
+            _ => receipt.input_serial = InputSerial::empty(),
+        }
+        assert!(
+            wire::decode_conditional_input_receipt(&varbincode::serialize(&receipt).unwrap()).is_err()
+        );
+    }
+}
+
 fn key_press(pane_id: usize) -> (wire::SendKeyDown, Pdu) {
     use termwiz::input::{KeyCode, KeyEvent, Modifiers};
     let event = KeyEvent {

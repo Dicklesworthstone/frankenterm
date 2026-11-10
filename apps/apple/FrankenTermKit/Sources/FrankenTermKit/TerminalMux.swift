@@ -153,6 +153,10 @@ public enum TerminalMuxEvent: Equatable, Sendable {
     /// The pane's server keeps refusing, as busy, to send its screen and the
     /// session keeps asking (`waiting`), or it answered again.
     case paneWaiting(paneID: Int, waiting: Bool)
+    /// Refused before input admission or transmission. Show the notice while
+    /// keeping the connection available for viewing and supported input.
+    /// This is not an uncertain outcome and never authorizes a resend.
+    case inputRejected(paneID: Int, reason: String)
     /// The session is over; the channel must close.
     case failed(String)
 }

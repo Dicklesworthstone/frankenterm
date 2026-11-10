@@ -48,6 +48,7 @@ const EVENT_PANE_WAITING: u32 = 14;
 const EVENT_PANE_IDENTITY: u32 = 15;
 const EVENT_PREPARING_OUTPUT: u32 = 16;
 const EVENT_PALETTE: u32 = 17;
+const EVENT_INPUT_REJECTED: u32 = 18;
 /// Search flags.
 const SEARCH_CASE_SENSITIVE: u32 = 1;
 const SEARCH_REGEX: u32 = 2;
@@ -240,6 +241,12 @@ fn event_parts(event: Option<Event>) -> Result<(u32, u64, u32, u32, Vec<u8>), Er
             (EVENT_PALETTE, pane_id as u64, 0, 0, rgba)
         }
         Some(Event::PaneGone { pane_id }) => (EVENT_PANE_GONE, pane_id as u64, 0, 0, Vec::new()),
+        Some(Event::InputRejected { pane_id, reason }) => {
+            if reason.is_empty() || reason.len() > 512 {
+                return Err(Error::Invalid);
+            }
+            (EVENT_INPUT_REJECTED, pane_id as u64, 0, 0, reason.into_bytes())
+        }
         Some(Event::Failed { reason }) => (EVENT_FAILED, 0, 0, 0, reason.into_bytes()),
         Some(Event::MouseGrab { pane_id, grabbed }) => (
             EVENT_MOUSE_GRAB,

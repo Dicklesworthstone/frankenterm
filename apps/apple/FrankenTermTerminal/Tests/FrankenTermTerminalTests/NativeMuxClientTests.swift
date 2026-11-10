@@ -111,6 +111,53 @@ final class NativeMuxClientTests: XCTestCase {
                        "the complete paint must not repeat the separately charged reset")
     }
 
+    func testUnsupportedPasteAndMouseAreNoticesWithoutLosingKeysOrViewing() throws {
+        // v71 supports reliable keys/writes and exact identities, but not the
+        // v74 conditional paste/mouse RPC. Exercise the real Rust/C bridge.
+        let client = try currentClient(clock: MuxTestClock())
+        let attempts: [() throws -> Void] = [
+            { try client.paste(pane: 7, text: "private pasted command") },
+            { try client.write(pane: 7, bytes: Data("\u{1b}[200~private pasted command\u{1b}[201~".utf8)) },
+            { try client.click(pane: 7, column: 0, row: 0) },
+            { try client.wheel(pane: 7, steps: -1, column: 0, row: 0) }
+        ]
+        for attempt in attempts {
+            try attempt()
+            let refused = try events(client)
+            guard refused.count == 1, case let .inputRejected(pane, reason) = refused[0] else {
+                return XCTFail("Expected one nonfatal refusal, received \(refused)")
+            }
+            XCTAssertEqual(pane, 7)
+            XCTAssertTrue(reason.contains("not sent") && reason.contains("74"), reason)
+            XCTAssertFalse(reason.contains("private pasted command"))
+            XCTAssertTrue(try client.outgoing(limit: 4096).isEmpty, "no unsafe fallback reaches the channel")
+            XCTAssertFalse(try client.unansweredInput(pane: 7), "a refusal is not uncertain delivery")
+            XCTAssertNil(try client.pollInputTimer())
+        }
+        for _ in 0..<256 { try client.click(pane: 7, column: 0, row: 0) }
+        XCTAssertEqual(try events(client).count, 1, "undrained refusal notices stay bounded")
+        XCTAssertTrue(try client.outgoing(limit: 4096).isEmpty)
+
+        try client.write(pane: 7, bytes: Data("ok".utf8))
+        _ = try request(client, ident: 100, serial: 7)
+        // No refusal consumed an RPC or input serial; the supported write
+        // still settles against its original reliable receipt.
+        try client.receive(frame(ident: 101, serial: 7, body: [7, 1, 0, 2]))
+        XCTAssertFalse(try client.unansweredInput(pane: 7))
+        try client.hide(pane: 7)
+        try client.show(pane: 7)
+        XCTAssertEqual(try request(client, ident: 114, serial: 8), [7])
+        try settleRender(client, serial: 8)
+        let resumed = try events(client)
+        XCTAssertFalse(resumed.contains { if case .failed = $0 { return true }; return false })
+        XCTAssertTrue(resumed.contains {
+            if case let .output(pane, rows, columns, bytes) = $0 {
+                return pane == 7 && rows == 1 && columns == 1 && !bytes.isEmpty
+            }
+            return false
+        }, "the same session must still draw after refusing unsupported input")
+    }
+
     func testACurrentServerNamesItsRunBeforeItsPanesAndPushesTheirChanges() throws {
         let client = try NativeMuxClient()
         XCTAssertEqual(Array(try client.outgoing(limit: 4096)), [2, 1, 26])
@@ -229,21 +276,21 @@ final class NativeMuxClientTests: XCTestCase {
     func testAServerOnAnotherProtocolEndsTheSessionWithItsReason() throws {
         let client = try NativeMuxClient()
         _ = try client.outgoing(limit: 4096)
-        // Newer than the current window this client speaks (61..72), and no
+        // Newer than the current window this client speaks (61..74), and no
         // longer accepting its newest: version, name, executable, no config
         // file, oldest version accepted.
-        let body = leb(73) + text("v0.17") + text("/usr/local/bin/frankenterm-mux-server") + [0] + leb(73)
+        let body = leb(75) + text("v0.17") + text("/usr/local/bin/frankenterm-mux-server") + [0] + leb(75)
         try client.receive(frame(ident: 27, serial: 1, body: body))
         let all = try events(client)
         guard case let .failed(reason)? = all.first, all.count == 1 else { return XCTFail("\(all)") }
-        XCTAssertTrue(reason.contains("73") && reason.contains("46") && reason.contains("72"), reason)
+        XCTAssertTrue(reason.contains("75") && reason.contains("46") && reason.contains("74"), reason)
         XCTAssertTrue(try client.outgoing(limit: 4096).isEmpty, "nothing more is sent")
     }
 
     func testANewerServerThatStillAcceptsThisClientIsSpokenToInTheCurrentLayout() throws {
         let client = try NativeMuxClient()
         _ = try client.outgoing(limit: 4096)
-        let body = leb(73) + text("v0.17") + text("/usr/local/bin/frankenterm-mux-server") + [0] + leb(61)
+        let body = leb(75) + text("v0.17") + text("/usr/local/bin/frankenterm-mux-server") + [0] + leb(61)
         try client.receive(frame(ident: 27, serial: 1, body: body))
         XCTAssertEqual(try events(client), [])
         _ = try request(client, ident: 40, serial: 2)

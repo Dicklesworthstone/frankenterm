@@ -14,6 +14,7 @@ private final class ObservationMuxClient: TerminalMuxClient, @unchecked Sendable
     static let incarnation = Data(repeating: 0x4a, count: 16)
     static let preparatoryBytes = Data("\u{1b}c\u{1b}[?25l\u{1b}[?2004h".utf8)
     static let completeBytes = Data(repeating: 0x78, count: 40_001)
+    static let refusalReason = "Mouse input was not sent. Viewing and keys remain available."
     static let palette = Data((0..<263).flatMap { index in
         [UInt8(truncatingIfNeeded: index), UInt8(37), UInt8(89), UInt8(255)]
     })
@@ -127,10 +128,23 @@ private final class ObservationMuxClient: TerminalMuxClient, @unchecked Sendable
         lock.withLock { calls.append(.init(name: "adopt", pane: pane)); return true }
     }
     func wheel(pane: Int, steps: Int, column: Int, row: Int) throws {
-        lock.withLock { calls.append(.init(name: "wheel", pane: pane, column: column, row: row)) }
+        lock.withLock {
+            if mode == "input-refused" {
+                calls.append(.init(name: "refused-wheel", pane: pane, column: column, row: row))
+                events.append(.inputRejected(paneID: pane, reason: Self.refusalReason))
+            } else { calls.append(.init(name: "wheel", pane: pane, column: column, row: row)) }
+        }
     }
     func click(pane: Int, column: Int, row: Int) throws {
-        lock.withLock { calls.append(.init(name: "click", pane: pane, column: column, row: row)) }
+        lock.withLock {
+            if mode == "input-refused" {
+                calls.append(.init(name: "refused-click", pane: pane, column: column, row: row))
+                events.append(.inputRejected(paneID: pane, reason: Self.refusalReason))
+                let size = sizes[pane]!
+                events.append(.output(paneID: pane, rows: size.rows, columns: size.columns,
+                    bytes: Data("output-after-refusal\r\n".utf8)))
+            } else { calls.append(.init(name: "click", pane: pane, column: column, row: row)) }
+        }
     }
     func search(pane: Int, text: String, caseSensitive: Bool, regex: Bool) throws -> UInt64 {
         lock.withLock {
@@ -423,7 +437,7 @@ final class MuxObservationTests: XCTestCase {
             throw XCTSkip("Requires the independent mux observation SSH fixture")
         }
         let controlsSize = mode == "interactive"
-        let permitsInput = controlsSize || mode == "input-only" || mode == "input-only-oversize"
+        let permitsInput = controlsSize || mode == "input-only" || mode == "input-only-oversize" || mode == "input-refused"
         let accessMode: TerminalMuxAccessMode = controlsSize ? .interactive : (permitsInput ? .inputOnly : .viewOnly)
         let client = ObservationMuxClient(mode: mode)
         let fixture = try await SSHWorkspaceTestFixture.make(hostname: "127.0.0.1", port: port,
@@ -499,10 +513,23 @@ final class MuxObservationTests: XCTestCase {
                     let column = controlsSize ? 79 : 255, row = controlsSize ? 23 : 99
                     try control.click(column: column, row: row, destination: first)
                     try control.scroll(steps: -1, column: column, row: row, destination: first)
+                    let prefix = mode == "input-refused" ? "refused-" : ""
                     try await waitUntil {
                         client.recorded.filter { $0.name == "write" }.count == 2
-                            && client.recorded.contains(.init(name: "click", pane: 1, column: column, row: row))
-                            && client.recorded.contains(.init(name: "wheel", pane: 1, column: column, row: row))
+                            && client.recorded.contains(.init(name: prefix + "click", pane: 1, column: column, row: row))
+                            && client.recorded.contains(.init(name: prefix + "wheel", pane: 1, column: column, row: row))
+                    }
+                    if mode == "input-refused" {
+                        try await waitUntil {
+                            let summary = await consumer.summary()
+                            return control.current.notice == ObservationMuxClient.refusalReason
+                                && summary.bytes > firstSummary.bytes && control.inputRouting.current.ready
+                        }
+                        XCTAssertNil(control.current.failure)
+                        XCTAssertFalse(control.current.inputUnconfirmed)
+                        XCTAssertEqual(control.inputRouting.current.destination, first)
+                        _ = try await coordinator.submit(focus, encodedBytes: Data("keys-after-refusal".utf8))
+                        try await waitUntil { client.recorded.filter { $0.name == "write" }.count == 3 }
                     }
                 } else {
                     do { _ = try await coordinator.submit(focus, encodedBytes: Data("typed".utf8)); XCTFail("Observer typed") }
@@ -602,8 +629,8 @@ final class MuxObservationTests: XCTestCase {
             }
             if permitsInput, mode != "input-only-oversize" {
                 XCTAssertTrue(client.effects.contains { $0.name == "write" })
-                XCTAssertTrue(client.effects.contains { $0.name == "click" })
-                XCTAssertTrue(client.effects.contains { $0.name == "wheel" })
+                XCTAssertEqual(client.effects.contains { $0.name == "click" }, mode != "input-refused")
+                XCTAssertEqual(client.effects.contains { $0.name == "wheel" }, mode != "input-refused")
             } else { XCTAssertTrue(client.effects.isEmpty, "An observer or unsupported grid cannot cause input or geometry effects") }
             let accounting = await coordinator.accounting()
             XCTAssertEqual(accounting.connections, 0); XCTAssertEqual(accounting.streams, 0)

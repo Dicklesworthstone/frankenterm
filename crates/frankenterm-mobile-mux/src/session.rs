@@ -11,7 +11,7 @@ use crate::wire::{
     LinesResponse, ListPanes, ListPanesCoherent, ListPanesCoherentResponse, LivenessResponse,
     MouseButton, MouseEvent, MouseEventKind, PaneList, PaneRemoved, RenderChanges, RenderHead,
     Resize, SearchResults, SearchScrollback, SendKeyDown, SendMouseEvent, SendPaste,
-    SendPasteCurrent, StableRowIndex, TerminalSize, TopologyChange, TopologyEvent, WriteToPane,
+    StableRowIndex, TerminalSize, TopologyChange, TopologyEvent, WriteToPane,
     ident,
 };
 use serde::Deserialize;
@@ -142,6 +142,12 @@ pub enum Event {
     PaneWaiting {
         pane_id: usize,
         waiting: bool,
+    },
+    /// An operation was refused before input admission or transmission. The
+    /// connection remains usable for viewing and other supported input.
+    InputRejected {
+        pane_id: usize,
+        reason: String,
     },
     /// The session is over; close the channel.
     Failed {
@@ -298,6 +304,9 @@ impl OrderedEffect {
 struct OrderedInput {
     pane_id: usize,
     registration: [u8; 16],
+    /// Captured at admission, never replaced by a later observation while
+    /// the operation waits behind an earlier key or partial byte write.
+    incarnation: Option<[u8; 16]>,
     input_serial: u64,
     last_serial: u64,
     effect: OrderedEffect,
@@ -861,6 +870,14 @@ impl Session {
                 return;
             }
         };
+        // Refuse this whole write's newly decoded pieces before admitting a
+        // prefix. A pasted command cannot lose its unsupported middle and
+        // let later bytes from the same call become ordinary keyboard input.
+        if pieces.iter().any(|piece| matches!(piece, Piece::Paste(_)))
+            && !self.admit_conditional_input(pane_id)
+        {
+            return;
+        }
         for piece in pieces {
             if self.dialect == Dialect::Current {
                 match piece {
@@ -922,12 +939,15 @@ impl Session {
         if !self.is_ready() || text.is_empty() {
             return;
         }
+        if !self.admit_conditional_input(pane_id) {
+            return;
+        }
         if self.input.in_paste(pane_id) {
             self.interrupted_input.insert(pane_id);
             self.fail("a direct paste cannot overtake unfinished input for its pane".to_owned());
             return;
         }
-        if text.len() > MAX_QUEUED_INPUT_BYTES {
+        if text.len() > wire::MAX_CONDITIONAL_PANE_INPUT_PASTE_BYTES {
             self.interrupted_input.insert(pane_id);
             self.fail("mux paste exceeds its bounded admission size".to_owned());
             return;
@@ -947,23 +967,12 @@ impl Session {
         if text.is_empty() {
             return;
         }
-        match self.dialect {
-            Dialect::Legacy => {
-                let request = SendPaste {
-                    pane_id,
-                    data: text,
-                };
-                self.send(ident::SEND_PASTE, &request, Request::Input { pane_id });
-            }
-            Dialect::Current => {
-                let request = SendPasteCurrent {
-                    pane_id,
-                    data: text,
-                    input_serial: 0,
-                };
-                self.send(ident::SEND_PASTE, &request, Request::Input { pane_id });
-            }
+        if self.dialect != Dialect::Legacy {
+            self.reject_input(pane_id, "Current mux paste requires exact-pane input authority; no numeric fallback was sent.");
+            return;
         }
+        let request = SendPaste { pane_id, data: text };
+        self.send(ident::SEND_PASTE, &request, Request::Input { pane_id });
     }
 
     /// Turns a mouse wheel `steps` notches over a cell of the pane's screen
@@ -973,6 +982,9 @@ impl Session {
     /// wheel; other programs ignore them.
     pub fn wheel(&mut self, pane_id: usize, steps: i32, column: usize, row: usize) {
         if !self.is_ready() || steps == 0 {
+            return;
+        }
+        if !self.admit_pointer(pane_id, column, row) {
             return;
         }
         if self.input.in_paste(pane_id) {
@@ -1014,6 +1026,9 @@ impl Session {
     /// mouse (others ignore them).
     pub fn click(&mut self, pane_id: usize, column: usize, row: usize) {
         if !self.is_ready() {
+            return;
+        }
+        if !self.admit_pointer(pane_id, column, row) {
             return;
         }
         if self.input.in_paste(pane_id) {
@@ -1352,8 +1367,49 @@ impl Session {
         Some(first)
     }
 
+    fn reject_input(&mut self, pane_id: usize, reason: &'static str) {
+        // Repeated unsupported gestures must not grow an unbounded notice
+        // queue while the owner is busy. Keep the newest refusal only.
+        self.events
+            .retain(|event| !matches!(event, Event::InputRejected { .. }));
+        self.events.push_back(Event::InputRejected {
+            pane_id,
+            reason: reason.to_owned(),
+        });
+    }
+
+    fn admit_conditional_input(&mut self, pane_id: usize) -> bool {
+        if self.dialect == Dialect::Legacy {
+            return true;
+        }
+        if self.codec_version < wire::CONDITIONAL_PANE_INPUT_MIN_VERSION {
+            self.reject_input(pane_id, "Paste and mouse input were not sent. Update this mux server to protocol 74 or later for exact-pane input; viewing and keys remain available.");
+            return false;
+        }
+        if self.incarnation.is_none_or(|identity| identity == [0; 16]) {
+            self.reject_input(pane_id, "Paste and mouse input were not sent because the mux server incarnation is unavailable; viewing and keys remain available.");
+            return false;
+        }
+        true
+    }
+
+    fn admit_pointer(&mut self, pane_id: usize, column: usize, row: usize) -> bool {
+        if self.dialect == Dialect::Current
+            && (column > usize::from(u16::MAX) || row > usize::from(u16::MAX))
+        {
+            self.reject_input(pane_id, "Mouse input was not sent because its screen coordinates exceed the supported range.");
+            return false;
+        }
+        self.admit_conditional_input(pane_id)
+    }
+
     fn enqueue_input(&mut self, pane_id: usize, effect: OrderedEffect) -> bool {
         if self.failed {
+            return false;
+        }
+        if matches!(&effect, OrderedEffect::Paste(_) | OrderedEffect::Mouse(_))
+            && !self.admit_conditional_input(pane_id)
+        {
             return false;
         }
         let Some(PaneAuthority::Available(registration)) = self.authorities.get(&pane_id).copied()
@@ -1393,6 +1449,7 @@ impl Session {
         self.ordered_input.push_back(OrderedInput {
             pane_id,
             registration,
+            incarnation: self.incarnation,
             input_serial,
             last_serial: self.next_input_serial,
             effect,
@@ -1404,9 +1461,10 @@ impl Session {
         true
     }
 
-    /// All current-dialect effects share this order. Paste and mouse retain
-    /// their existing wire semantics (neither is a server controller lease),
-    /// but cannot pass an unacknowledged key or the tail of a partial write.
+    /// All current-dialect effects share this order. Conditional paste and
+    /// mouse carry their frozen source to the effect boundary; they cannot
+    /// pass an unacknowledged key or the tail of a partial write. Neither
+    /// conditional admission nor callback acceptance is a controller lease.
     fn drive_input(&mut self) {
         if !self.is_ready() {
             return;
@@ -1431,6 +1489,22 @@ impl Session {
         }
         let pane_id = input.pane_id;
         let input_serial = input.input_serial;
+        // Only the conditional effects use this captured witness. Return
+        // before constructing their wire bodies if it is absent or retired.
+        let conditional_incarnation = input.incarnation.unwrap_or([0; 16]);
+        if matches!(&input.effect, OrderedEffect::Paste(_) | OrderedEffect::Mouse(_)) {
+            let Some(incarnation) = input.incarnation.filter(|identity| *identity != [0; 16])
+            else {
+                self.fail("conditional input lost its admitted server incarnation; no numeric fallback was sent".to_owned());
+                return;
+            };
+            if Some(incarnation) != self.incarnation
+                || self.codec_version < wire::CONDITIONAL_PANE_INPUT_MIN_VERSION
+            {
+                self.fail("conditional input no longer belongs to this mux connection; it was not sent".to_owned());
+                return;
+            }
+        }
         let (ident, body) = match &input.effect {
             OrderedEffect::Bytes { data, offset } => (
                 ident::RELIABLE_PANE_WRITE,
@@ -1452,18 +1526,23 @@ impl Session {
                 }),
             ),
             OrderedEffect::Paste(text) => (
-                ident::SEND_PASTE,
-                wire::encode(&SendPasteCurrent {
+                ident::SEND_PANE_INPUT_CONDITIONAL,
+                wire::encode(&wire::SendPaneInputConditional {
                     pane_id,
-                    data: text,
+                    session_incarnation: conditional_incarnation,
+                    pane_registration: input.registration,
                     input_serial,
+                    effect: wire::PaneInputEffect::Paste(text),
                 }),
             ),
             OrderedEffect::Mouse(event) => (
-                ident::SEND_MOUSE_EVENT,
-                wire::encode(&SendMouseEvent {
+                ident::SEND_PANE_INPUT_CONDITIONAL,
+                wire::encode(&wire::SendPaneInputConditional {
                     pane_id,
-                    event: *event,
+                    session_incarnation: conditional_incarnation,
+                    pane_registration: input.registration,
+                    input_serial,
+                    effect: wire::PaneInputEffect::Mouse(*event),
                 }),
             ),
         };
@@ -1567,6 +1646,42 @@ impl Session {
             wire::ReliableKeyOutcome::Rejected(_) => {
                 self.fail("the mux refused reliable key input; input was not replayed".to_owned());
             }
+        }
+        Ok(())
+    }
+
+    fn settle_conditional_input(
+        &mut self,
+        response: wire::SendPaneInputConditionalResponse,
+    ) -> Result<(), crate::Error> {
+        let Some(input) = self.ordered_input.front() else {
+            return Err(crate::Error::Schema);
+        };
+        if !input.in_flight
+            || input.pane_id != response.pane_id
+            || input.incarnation != Some(response.session_incarnation)
+            || input.registration != response.pane_registration
+            || input.input_serial != response.input_serial
+            || !matches!(&input.effect, OrderedEffect::Paste(_) | OrderedEffect::Mouse(_))
+        {
+            return Err(crate::Error::Frame(
+                "conditional input receipt does not match its original source and operation",
+            ));
+        }
+        match response.outcome {
+            wire::PaneInputConditionalOutcome::Accepted => self.finish_input(),
+            wire::PaneInputConditionalOutcome::PaneGone => self.fail(
+                "the original mux pane is gone; conditional input was not replayed".to_owned(),
+            ),
+            wire::PaneInputConditionalOutcome::IdentityMismatch => self.fail(
+                "the mux pane was replaced before input admission; the replacement was not targeted and input was not replayed".to_owned(),
+            ),
+            wire::PaneInputConditionalOutcome::Retired => self.fail(
+                "the mux retired the original pane's input authority; conditional input was not replayed".to_owned(),
+            ),
+            wire::PaneInputConditionalOutcome::Indeterminate => self.fail(
+                "the mux could not confirm conditional input acceptance; input was not replayed".to_owned(),
+            ),
         }
         Ok(())
     }
@@ -2156,11 +2271,11 @@ impl Session {
                 (OrderedEffect::Key(_), ident::RELIABLE_KEY_EVENT_RESPONSE) => {
                     self.settle_key(wire::decode_input_receipt(&frame.body)?)
                 }
-                (OrderedEffect::Paste(_) | OrderedEffect::Mouse(_), ident::UNIT_RESPONSE)
-                    if frame.body.is_empty() =>
-                {
-                    self.finish_input();
-                    Ok(())
+                (
+                    OrderedEffect::Paste(_) | OrderedEffect::Mouse(_),
+                    ident::SEND_PANE_INPUT_CONDITIONAL_RESPONSE,
+                ) => {
+                    self.settle_conditional_input(wire::decode_conditional_input_receipt(&frame.body)?)
                 }
                 (_, ident::ERROR_RESPONSE) => {
                     self.fail("the mux rejected input without a matching effect receipt; input was not replayed".to_owned());
@@ -2277,6 +2392,7 @@ impl Session {
             frame.ident,
             ident::RELIABLE_KEY_EVENT_RESPONSE
                 | ident::RELIABLE_PANE_WRITE_RESPONSE
+                | ident::SEND_PANE_INPUT_CONDITIONAL_RESPONSE
                 | ident::GET_PANE_IDENTITY_RESPONSE
         ) {
             return Err(crate::Error::Frame(
@@ -3221,6 +3337,7 @@ mod paste_routing_tests {
             ready: true,
             dialect,
             codec_version: *wire::CURRENT_VERSIONS.end(),
+            incarnation: Some([0x1c; 16]),
             authorities: (0..=20)
                 .map(|pane| (pane, PaneAuthority::Available([7; 16])))
                 .collect(),
@@ -3228,8 +3345,15 @@ mod paste_routing_tests {
         }
     }
 
+    fn paste_ident(dialect: Dialect) -> u64 {
+        if dialect == Dialect::Current {
+            ident::SEND_PANE_INPUT_CONDITIONAL
+        } else {
+            ident::SEND_PASTE
+        }
+    }
+
     /// Decode the real outbound protocol bytes, not the splitter's pieces.
-    /// The paste prefix is shared by both dialects; Current's serial follows it.
     fn writes(session: &mut Session) -> Vec<(u64, usize, Vec<u8>)> {
         let mut reader = FrameReader::default();
         reader.push(&session.take_outgoing());
@@ -3247,9 +3371,26 @@ mod paste_routing_tests {
                 ident::SEND_PASTE => {
                     let body: PasteBody = wire::decode(&frame.body).expect("valid paste");
                     result.push((frame.ident, body.pane_id, body.data.into_bytes()));
-                    if session.dialect == Dialect::Current {
-                        session.receive(&frame::encode(ident::UNIT_RESPONSE, frame.serial, &[]));
-                    }
+                }
+                ident::SEND_PANE_INPUT_CONDITIONAL => {
+                    let body: codec::SendPaneInputConditionalV1 =
+                        wire::decode(&frame.body).expect("valid conditional input");
+                    let codec::PaneInputEffectV1::Paste(text) = &body.effect else {
+                        panic!("paste routing must not manufacture a mouse event")
+                    };
+                    result.push((frame.ident, body.pane_id, text.as_bytes().to_vec()));
+                    let response = codec::SendPaneInputConditionalV1Response {
+                        pane_id: body.pane_id,
+                        session_incarnation: body.session_incarnation,
+                        pane_registration: body.pane_registration,
+                        input_serial: body.input_serial,
+                        outcome: codec::PaneInputConditionalOutcomeV1::Accepted,
+                    };
+                    session.receive(&frame::encode(
+                        ident::SEND_PANE_INPUT_CONDITIONAL_RESPONSE,
+                        frame.serial,
+                        &wire::encode(&response),
+                    ));
                 }
                 ident::WRITE_TO_PANE => {
                     let body: BytesBody = wire::decode(&frame.body).expect("valid input");
@@ -3304,8 +3445,8 @@ mod paste_routing_tests {
             assert_eq!(
                 writes(&mut session),
                 [
-                    (ident::SEND_PASTE, 10, b"first pane".to_vec()),
-                    (ident::SEND_PASTE, 20, b"second pane".to_vec()),
+                    (paste_ident(dialect), 10, b"first pane".to_vec()),
+                    (paste_ident(dialect), 20, b"second pane".to_vec()),
                 ]
             );
         }
@@ -3346,7 +3487,7 @@ mod paste_routing_tests {
         session.write(2, b"\x1b[201~");
         assert_eq!(
             writes(&mut session),
-            [(ident::SEND_PASTE, 2, b"keep me".to_vec())]
+            [(ident::SEND_PANE_INPUT_CONDITIONAL, 2, b"keep me".to_vec())]
         );
         assert!(!failed(&mut session));
         // A removed pane's incomplete paste remains abandoned even if its
@@ -3407,7 +3548,7 @@ mod paste_routing_tests {
             session.paste(2, "independent");
             assert_eq!(
                 writes(&mut session),
-                [(ident::SEND_PASTE, 2, b"independent".to_vec()),]
+                [(paste_ident(dialect), 2, b"independent".to_vec()),]
             );
             session.paste(1, "must not overtake");
             assert!(!session.is_ready());
@@ -3421,6 +3562,34 @@ mod paste_routing_tests {
         let mut session = ready(Dialect::Current);
         session.next_input_serial = u64::MAX - 1;
         session.write(1, b"two bytes need two serials");
+        assert!(!session.is_ready());
+        assert!(session.unanswered_input(1));
+        assert!(session.take_outgoing().is_empty());
+        assert!(failed(&mut session));
+    }
+
+    #[test]
+    fn a_queued_paste_cannot_gain_a_new_incarnation_before_dispatch() {
+        let mut session = ready(Dialect::Current);
+        session.write(1, b"pending");
+        let mut reader = FrameReader::default();
+        reader.push(&session.take_outgoing());
+        let write = reader.next_frame().unwrap().unwrap();
+        let request: codec::ReliablePaneWriteV1 = wire::decode(&write.body).unwrap();
+        session.paste(1, "bound to the original mux");
+        assert!(session.take_outgoing().is_empty());
+        // Simulate an owner bug changing its observation while a previous
+        // write is in flight. Dispatch must retain admission's source or stop.
+        session.incarnation = Some([0x55; 16]);
+        session.receive(&frame::encode(
+            ident::RELIABLE_PANE_WRITE_RESPONSE,
+            write.serial,
+            &wire::encode(&codec::ReliablePaneWriteV1Response {
+                pane_id: 1,
+                input_serial: request.input_serial,
+                outcome: codec::ReliablePaneWriteOutcomeV1::AppliedPrefix { bytes: 7 },
+            }),
+        ));
         assert!(!session.is_ready());
         assert!(session.unanswered_input(1));
         assert!(session.take_outgoing().is_empty());

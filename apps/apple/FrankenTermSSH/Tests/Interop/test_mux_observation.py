@@ -27,7 +27,7 @@ PREPARING_SELECTOR = "FrankenTermSSHTests.MuxObservationTests/testPreparingOutpu
 
 class MuxObservationInteropTests(unittest.TestCase):
     def test_viewing_and_interactive_effect_boundaries(self):
-        self.check_modes(SELECTOR, ["observe", "input-only", "interactive", "oversize", "input-only-oversize", "invalid-grid", "no-panes"])
+        self.check_modes(SELECTOR, ["observe", "input-only", "input-refused", "interactive", "oversize", "input-only-oversize", "invalid-grid", "no-panes"])
 
     def test_exact_identity_reconnect_and_explicit_selection(self):
         self.check_modes(IDENTITY_SELECTOR, ["identity-same", "identity-moved", "identity-replaced", "identity-unavailable"])

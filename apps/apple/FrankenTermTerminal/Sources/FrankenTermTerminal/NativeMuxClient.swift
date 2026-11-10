@@ -157,6 +157,12 @@ public final class NativeMuxClient: TerminalMuxClient, @unchecked Sendable {
             case UInt32(FT_MUX_EVENT_PANE_TITLE):
                 return .paneTitle(paneID: paneID, title: String(decoding: payload, as: UTF8.self))
             case UInt32(FT_MUX_EVENT_PANE_GONE): return .paneGone(paneID: paneID)
+            case UInt32(FT_MUX_EVENT_INPUT_REJECTED):
+                guard rows == 0, cols == 0, !payload.isEmpty, payload.count <= 512,
+                      let reason = String(data: payload, encoding: .utf8) else {
+                    throw TerminalModelError.invalid
+                }
+                return .inputRejected(paneID: paneID, reason: reason)
             case UInt32(FT_MUX_EVENT_FAILED): return .failed(String(decoding: payload, as: UTF8.self))
             case UInt32(FT_MUX_EVENT_SEARCH_RESULTS):
                 let decoder = JSONDecoder()

@@ -25,9 +25,9 @@ pub const LEGACY_VERSIONS: RangeInclusive<usize> = 46..=47;
 /// the rolling-upgrade window `codec::CODEC_VERSION_MIN_SUPPORTED..=
 /// CODEC_VERSION`. Additive reliable writes (v64) and pane identity (v71)
 /// are gated by the negotiated version; neither silently falls back to a
-/// numeric-pane legacy write on a current connection. v73 only adds the
-/// pane-and-domain listing, which the phone never sends.
-pub const CURRENT_VERSIONS: RangeInclusive<usize> = 61..=73;
+/// numeric-pane legacy write on a current connection. v74 adds exact-pane
+/// paste and mouse requests; older current peers cannot accept those effects.
+pub const CURRENT_VERSIONS: RangeInclusive<usize> = 61..=74;
 
 /// Which of the two layouts a server speaks. They differ, for this client,
 /// in SendPaste (an input serial follows the text) and ErrorResponse (a
@@ -102,6 +102,8 @@ pub mod ident {
     pub const GET_PANE_IDENTITY_RESPONSE: u64 = 118;
     pub const RESIZE_PANE_CONDITIONAL: u64 = 119;
     pub const RESIZE_PANE_CONDITIONAL_RESPONSE: u64 = 120;
+    pub const SEND_PANE_INPUT_CONDITIONAL: u64 = 123;
+    pub const SEND_PANE_INPUT_CONDITIONAL_RESPONSE: u64 = 124;
 }
 
 /// `codec::TopologyCapabilities::FENCED_SNAPSHOT_V1`, the one capability a
@@ -539,6 +541,62 @@ pub struct MouseEvent {
 pub struct SendMouseEvent {
     pub pane_id: usize,
     pub event: MouseEvent,
+}
+
+pub const CONDITIONAL_PANE_INPUT_MIN_VERSION: usize = 74;
+pub const MAX_CONDITIONAL_PANE_INPUT_PASTE_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_CONDITIONAL_PANE_INPUT_RESPONSE_BYTES: usize = 128;
+
+/// Variant order and field order match codec's additive v74 schema exactly.
+/// Borrow the already admitted paste while serializing; no second payload
+/// owner or automatic replay path is created here.
+#[derive(Serialize)]
+pub enum PaneInputEffect<'a> {
+    Paste(&'a str),
+    Mouse(MouseEvent),
+}
+
+#[derive(Serialize)]
+pub struct SendPaneInputConditional<'a> {
+    pub pane_id: usize,
+    pub session_incarnation: [u8; 16],
+    pub pane_registration: [u8; 16],
+    pub input_serial: u64,
+    pub effect: PaneInputEffect<'a>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+pub enum PaneInputConditionalOutcome {
+    Accepted,
+    PaneGone,
+    IdentityMismatch,
+    Retired,
+    Indeterminate,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+pub struct SendPaneInputConditionalResponse {
+    pub pane_id: usize,
+    pub session_incarnation: [u8; 16],
+    pub pane_registration: [u8; 16],
+    pub input_serial: u64,
+    pub outcome: PaneInputConditionalOutcome,
+}
+
+pub fn decode_conditional_input_receipt(
+    body: &[u8],
+) -> Result<SendPaneInputConditionalResponse, crate::Error> {
+    if body.len() > MAX_CONDITIONAL_PANE_INPUT_RESPONSE_BYTES {
+        return Err(crate::Error::Frame("a conditional input receipt is too large"));
+    }
+    let response: SendPaneInputConditionalResponse = decode_input_receipt(body)?;
+    if response.session_incarnation == [0; 16]
+        || response.pane_registration == [0; 16]
+        || response.input_serial == 0
+    {
+        return Err(crate::Error::Frame("reserved conditional input authority"));
+    }
+    Ok(response)
 }
 
 /// PDU 11: a key press the server encodes for the pane's program, in the

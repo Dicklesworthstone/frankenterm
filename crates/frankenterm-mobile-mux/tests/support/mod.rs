@@ -635,6 +635,34 @@ impl Server {
                 self.push();
                 self.reply(10, serial, &UnitResponse {});
             }
+            MuxWireDecodedPayload::Pdu(Pdu::SendPaneInputConditionalV1(request)) => {
+                self.requests.push("SendPaneInputConditionalV1");
+                let outcome = if request.pane_id != self.pane_id {
+                    codec::PaneInputConditionalOutcomeV1::PaneGone
+                } else if request.session_incarnation.as_bytes() != self.incarnation
+                    || request.pane_registration.as_bytes() != self.registration
+                {
+                    codec::PaneInputConditionalOutcomeV1::IdentityMismatch
+                } else {
+                    match &request.effect {
+                        codec::PaneInputEffectV1::Paste(text) => self.pastes.push(text.clone()),
+                        codec::PaneInputEffectV1::Mouse(event) => self.mouse.push(*event),
+                    }
+                    self.push();
+                    codec::PaneInputConditionalOutcomeV1::Accepted
+                };
+                self.reply(
+                    124,
+                    serial,
+                    &codec::SendPaneInputConditionalV1Response {
+                        pane_id: request.pane_id,
+                        session_incarnation: request.session_incarnation,
+                        pane_registration: request.pane_registration,
+                        input_serial: request.input_serial,
+                        outcome,
+                    },
+                );
+            }
             MuxWireDecodedPayload::Pdu(Pdu::SendPaste(paste)) => {
                 self.requests.push("SendPaste");
                 self.pastes.push(paste.data);

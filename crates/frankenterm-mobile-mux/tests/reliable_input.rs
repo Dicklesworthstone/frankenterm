@@ -22,7 +22,7 @@ fn current(version: usize) -> Harness {
 }
 
 fn timed_current() -> Harness {
-    let mut harness = current(71);
+    let mut harness = current(74);
     assert!(harness.session.advance_time(0));
     harness
 }
@@ -85,6 +85,42 @@ fn write_reply(
             input_serial: request.input_serial,
             outcome,
         },
+    );
+}
+
+fn conditional_request(pdu: Pdu) -> codec::SendPaneInputConditionalV1 {
+    let Pdu::SendPaneInputConditionalV1(request) = pdu else {
+        panic!("paste and mouse must carry exact conditional authority")
+    };
+    request
+}
+
+fn conditional_reply(
+    session: &mut Session,
+    rpc: u64,
+    request: &codec::SendPaneInputConditionalV1,
+    outcome: codec::PaneInputConditionalOutcomeV1,
+) {
+    reply(
+        session,
+        124,
+        rpc,
+        &codec::SendPaneInputConditionalV1Response {
+            pane_id: request.pane_id,
+            session_incarnation: request.session_incarnation,
+            pane_registration: request.pane_registration,
+            input_serial: request.input_serial,
+            outcome,
+        },
+    );
+}
+
+fn accept_conditional(session: &mut Session, rpc: u64, pdu: Pdu) {
+    conditional_reply(
+        session,
+        rpc,
+        &conditional_request(pdu),
+        codec::PaneInputConditionalOutcomeV1::Accepted,
     );
 }
 
@@ -195,7 +231,7 @@ fn an_unobserved_pane_cannot_lazily_capture_new_input_authority() {
 
 #[test]
 fn every_partial_suffix_precedes_later_keys_paste_and_mouse() {
-    let mut harness = current(71);
+    let mut harness = current(74);
     let pane = harness.server.pane_id;
     harness.session.write(pane, b"abc\x1b[A");
     harness.session.paste(pane, "later paste");
@@ -244,16 +280,35 @@ fn every_partial_suffix_precedes_later_keys_paste_and_mouse() {
         },
     );
     let (rpc, pdu) = take_one(&mut harness.session);
-    let Pdu::SendPaste(paste) = pdu else {
-        panic!("paste must follow reliable key acknowledgement")
-    };
-    assert_eq!(paste.data, "later paste");
+    let paste = conditional_request(pdu);
+    assert!(
+        matches!(&paste.effect, codec::PaneInputEffectV1::Paste(text) if text == "later paste")
+    );
+    assert_eq!(
+        paste.session_incarnation.as_bytes(),
+        harness.server.incarnation
+    );
+    assert_eq!(paste.pane_registration.as_bytes(), harness.server.registration);
     assert!(paste.input_serial > key.input_serial);
-    reply(&mut harness.session, 10, rpc, &codec::UnitResponse {});
+    conditional_reply(
+        &mut harness.session,
+        rpc,
+        &paste,
+        codec::PaneInputConditionalOutcomeV1::Accepted,
+    );
     for _ in 0..3 {
         let (rpc, pdu) = take_one(&mut harness.session);
-        assert!(matches!(pdu, Pdu::SendMouseEvent(_)));
-        reply(&mut harness.session, 10, rpc, &codec::UnitResponse {});
+        let mouse = conditional_request(pdu);
+        assert!(matches!(&mouse.effect, codec::PaneInputEffectV1::Mouse(_)));
+        assert_eq!(mouse.session_incarnation, paste.session_incarnation);
+        assert_eq!(mouse.pane_registration, paste.pane_registration);
+        assert!(mouse.input_serial > paste.input_serial);
+        conditional_reply(
+            &mut harness.session,
+            rpc,
+            &mouse,
+            codec::PaneInputConditionalOutcomeV1::Accepted,
+        );
     }
     assert!(harness.session.take_outgoing().is_empty());
     assert!(!harness.session.unanswered_input(pane));
@@ -261,7 +316,7 @@ fn every_partial_suffix_precedes_later_keys_paste_and_mouse() {
 
 #[test]
 fn full_partial_writer_integration_keeps_content_and_effect_order() {
-    let mut harness = current(71);
+    let mut harness = current(74);
     harness.server.write_prefix = Some(1);
     let pane = harness.server.pane_id;
     harness.session.write(pane, b"abc\x1b[A");
@@ -281,8 +336,7 @@ fn full_partial_writer_integration_keeps_content_and_effect_order() {
             [
                 "ReliablePaneWriteV1",
                 "ReliableKeyEventV1",
-                "SendPaste",
-                "SendMouseEvent",
+                "SendPaneInputConditionalV1",
             ]
             .contains(name)
         })
@@ -294,17 +348,257 @@ fn full_partial_writer_integration_keeps_content_and_effect_order() {
             "ReliablePaneWriteV1",
             "ReliablePaneWriteV1",
             "ReliableKeyEventV1",
-            "SendPaste",
-            "SendMouseEvent",
-            "SendMouseEvent",
+            "SendPaneInputConditionalV1",
+            "SendPaneInputConditionalV1",
+            "SendPaneInputConditionalV1",
         ]
     );
     assert!(!harness.session.unanswered_input(pane));
 }
 
 #[test]
+fn older_current_servers_refuse_paste_and_mouse_without_losing_keys_or_output() {
+    for version in [61, 64, 71, 72, 73] {
+        let mut harness = current(version);
+        let pane = harness.server.pane_id;
+        let requests_before = harness.server.requests.len();
+        for _ in 0..100 {
+            harness.session.paste(pane, "must not be sent");
+            harness.session.click(pane, 2, 1);
+            harness.session.wheel(pane, 1, 2, 1);
+        }
+        // Reject the entire decoded call: neither a prefix nor a trailing
+        // Return may run after its pasted middle was refused.
+        harness
+            .session
+            .write(pane, b"prefix\x1b[200~secret\x1b[201~\r");
+        assert!(harness.session.is_ready());
+        assert!(!harness.session.unanswered_input(pane));
+        assert!(harness.session.take_outgoing().is_empty());
+        let notices: Vec<_> = std::iter::from_fn(|| harness.session.next_event()).collect();
+        assert_eq!(notices.len(), 1, "unsupported gestures coalesce");
+        assert!(
+            matches!(&notices[0], Event::InputRejected { pane_id, reason }
+                if *pane_id == pane && reason.contains("74") && !reason.contains("secret"))
+        );
+        assert_eq!(harness.server.requests.len(), requests_before);
+        assert!(harness.server.pastes.is_empty());
+        assert!(harness.server.mouse.is_empty());
+        harness.session.write(pane, b"\x1b[A");
+        harness.pump();
+        assert_eq!(harness.server.keys.len(), 1);
+        let output_before = harness.outputs;
+        harness.output(b"still connected");
+        assert!(harness.outputs > output_before);
+        assert!(harness.session.is_ready());
+        assert!(!harness.session.unanswered_input(pane));
+    }
+}
+
+#[test]
+fn live_registration_without_incarnation_cannot_guess_conditional_authority() {
+    let mut harness = Harness::new(4, 30);
+    harness.server.codec_vers = 74;
+    harness.server.min_supported = 61;
+    harness.server.unfenced = true;
+    harness.server.durable_identity = false;
+    harness.attach();
+    let pane = harness.server.pane_id;
+    harness.session.paste(pane, "no guessed epoch");
+    harness.session.click(pane, 1, 1);
+    assert!(harness.session.take_outgoing().is_empty());
+    assert!(harness.session.is_ready());
+    assert!(!harness.session.unanswered_input(pane));
+    assert!(
+        matches!(harness.session.next_event(), Some(Event::InputRejected { reason, .. })
+            if reason.contains("incarnation"))
+    );
+    harness.session.write(pane, b"\x1b[A");
+    harness.pump();
+    assert_eq!(harness.server.keys.len(), 1);
+    assert!(harness.session.is_ready());
+}
+
+#[test]
+fn delegated_panes_need_live_registration_but_not_a_durable_uuid_for_input() {
+    let mut harness = Harness::new(4, 30);
+    harness.server.codec_vers = 74;
+    harness.server.min_supported = 61;
+    harness.server.durable_identity = false;
+    harness.attach();
+    let pane = harness.server.pane_id;
+    harness.session.paste(pane, "proxy pane");
+    harness.session.click(pane, 1, 1);
+    harness.pump();
+    assert_eq!(harness.server.pastes, ["proxy pane"]);
+    assert_eq!(harness.server.mouse.len(), 2);
+    assert!(harness.session.is_ready());
+    assert!(!harness.session.unanswered_input(pane));
+}
+
+#[test]
+fn pointer_coordinates_are_checked_before_admission_without_closing_the_session() {
+    let mut harness = current(74);
+    let pane = harness.server.pane_id;
+    for (column, row) in [(usize::MAX, 0), (0, usize::MAX), (65_536, 1)] {
+        harness.session.click(pane, column, row);
+        harness.session.wheel(pane, 1, column, row);
+        assert!(harness.session.is_ready());
+        assert!(harness.session.take_outgoing().is_empty());
+        assert!(!harness.session.unanswered_input(pane));
+        assert!(matches!(
+            harness.session.next_event(),
+            Some(Event::InputRejected { .. })
+        ));
+    }
+    harness.session.wheel(pane, 1, 65_535, 65_535);
+    harness.pump();
+    assert_eq!(harness.server.mouse.len(), 1);
+    assert!(harness.session.is_ready());
+}
+
+#[test]
+fn explicit_legacy_sessions_keep_their_separate_paste_and_mouse_lane() {
+    for version in [46, 47] {
+        let mut harness = Harness::new(4, 30);
+        harness.server.codec_vers = version;
+        harness.server.min_supported = version;
+        harness.attach();
+        let pane = harness.server.pane_id;
+        harness.session.paste(pane, "legacy");
+        harness.session.click(pane, 2, 1);
+        harness.session.wheel(pane, 1, 2, 1);
+        harness.pump();
+        assert_eq!(harness.server.pastes, ["legacy"]);
+        assert_eq!(harness.server.mouse.len(), 3);
+        assert!(harness.server.requests.contains(&"SendPaste"));
+        assert!(harness.server.requests.contains(&"SendMouseEvent"));
+        assert!(
+            !harness.server.requests.contains(&"SendPaneInputConditionalV1")
+        );
+        assert!(harness.session.is_ready());
+    }
+}
+
+#[test]
+fn delayed_conditional_input_cannot_reach_a_replacement_with_the_same_pane_number() {
+    for replace_incarnation in [false, true] {
+        for effect in 0..3 {
+            let mut harness = current(74);
+            let pane = harness.server.pane_id;
+            match effect {
+                0 => harness.session.paste(pane, "original pane only"),
+                1 => harness.session.click(pane, 2, 1),
+                _ => harness.session.wheel(pane, 1, 2, 1),
+            }
+            // The request has left local admission, but has not reached the
+            // server. Neither transport delay nor numeric reuse grants it new
+            // authority. The queued release of a click must not escape either.
+            if replace_incarnation {
+                harness.server.incarnation = [0x55; 16];
+            } else {
+                harness.server.registration = [0x66; 16];
+            }
+            harness.pump();
+            assert!(!harness.session.is_ready());
+            assert!(harness.session.unanswered_input(pane));
+            assert!(harness.server.pastes.is_empty());
+            assert!(harness.server.mouse.is_empty());
+            assert_eq!(
+                harness
+                    .server
+                    .requests
+                    .iter()
+                    .filter(|name| **name == "SendPaneInputConditionalV1")
+                    .count(),
+                1
+            );
+            assert!(!harness.server.requests.contains(&"SendPaste"));
+            assert!(!harness.server.requests.contains(&"SendMouseEvent"));
+            assert!(harness.session.take_outgoing().is_empty());
+        }
+    }
+}
+
+#[test]
+fn conditional_refusals_never_retry_or_release_later_effects() {
+    use codec::PaneInputConditionalOutcomeV1 as Outcome;
+    for outcome in [
+        Outcome::PaneGone,
+        Outcome::IdentityMismatch,
+        Outcome::Retired,
+        Outcome::Indeterminate,
+    ] {
+        let mut harness = timed_current();
+        let pane = harness.server.pane_id;
+        harness.session.paste(pane, "first");
+        harness.session.write(pane, b"\x1b[A");
+        let (rpc, pdu) = take_one(&mut harness.session);
+        let request = conditional_request(pdu);
+        conditional_reply(&mut harness.session, rpc, &request, outcome);
+        assert_stopped(&mut harness.session, pane);
+    }
+}
+
+#[test]
+fn only_a_bounded_exact_conditional_receipt_can_release_the_queue() {
+    for fault in 0..11 {
+        let mut harness = timed_current();
+        let pane = harness.server.pane_id;
+        harness.session.paste(pane, "first");
+        harness.session.write(pane, b"\x1b[A");
+        let (rpc, pdu) = take_one(&mut harness.session);
+        let request = conditional_request(pdu);
+        let mut receipt = codec::SendPaneInputConditionalV1Response {
+            pane_id: request.pane_id,
+            session_incarnation: request.session_incarnation,
+            pane_registration: request.pane_registration,
+            input_serial: request.input_serial,
+            outcome: codec::PaneInputConditionalOutcomeV1::Accepted,
+        };
+        match fault {
+            0 => receipt.pane_id += 1,
+            1 => receipt.session_incarnation = mux::MuxSessionIncarnation::from_bytes([0x55; 16]),
+            2 => {
+                receipt.pane_registration =
+                    codec::ReliablePaneRegistrationIdentityV1::from_bytes([0x66; 16]);
+            }
+            3 => {
+                receipt.input_serial =
+                    InputSerial::from_millis_since_epoch(request.input_serial.get() + 1);
+            }
+            4 => receipt.input_serial = InputSerial::empty(),
+            _ => {}
+        }
+        let mut body = varbincode::serialize(&receipt).unwrap();
+        let mut ident = 124;
+        match fault {
+            5 => body.push(0),
+            6 => {
+                body.pop();
+            }
+            7 => body.resize(wire::MAX_CONDITIONAL_PANE_INPUT_RESPONSE_BYTES + 1, 0),
+            8 => {
+                ident = 10;
+                body.clear();
+            }
+            9 => {
+                ident = 0;
+                body = varbincode::serialize(&codec::ErrorResponse::backend_failure(123)).unwrap();
+            }
+            10 => *body.last_mut().unwrap() = 0x7f,
+            _ => {}
+        }
+        harness
+            .session
+            .receive(&server_frame(ident, rpc, &body, false));
+        assert_stopped(&mut harness.session, pane);
+    }
+}
+
+#[test]
 fn stale_registration_is_never_refreshed_or_downgraded() {
-    let mut harness = current(71);
+    let mut harness = current(74);
     let pane = harness.server.pane_id;
     harness.server.registration = [0x55; 16];
     harness.session.write(pane, b"old pane only");
@@ -342,7 +636,7 @@ fn missing_or_ambiguous_receipts_cannot_replay_or_release_later_input() {
             },
         )),
     ] {
-        let mut harness = current(71);
+        let mut harness = current(74);
         let pane = harness.server.pane_id;
         harness.session.write(pane, b"abc");
         harness.session.paste(pane, "later");
@@ -353,7 +647,7 @@ fn missing_or_ambiguous_receipts_cannot_replay_or_release_later_input() {
         write_reply(&mut harness.session, rpc, &request, outcome);
         assert_stopped(&mut harness.session, pane);
     }
-    let mut harness = current(71);
+    let mut harness = current(74);
     let pane = harness.server.pane_id;
     harness.session.write(pane, b"possibly applied");
     harness.session.click(pane, 0, 0);
@@ -367,7 +661,7 @@ fn missing_or_ambiguous_receipts_cannot_replay_or_release_later_input() {
 #[test]
 fn malformed_unrelated_or_invalid_prefix_receipts_leave_input_unsettled() {
     for fault in 0..7 {
-        let mut harness = current(71);
+        let mut harness = current(74);
         let pane = harness.server.pane_id;
         harness.session.write(pane, b"abc");
         harness.session.click(pane, 1, 1);
@@ -466,7 +760,7 @@ fn current_remote_panes_without_durable_identity_keep_live_input_authority() {
 
 #[test]
 fn removing_a_pane_cancels_the_queue_without_sending_to_a_reused_number() {
-    let mut harness = current(71);
+    let mut harness = current(74);
     let pane = harness.server.pane_id;
     harness.session.write(pane, b"pending");
     take_one(&mut harness.session);
@@ -484,7 +778,7 @@ fn removing_a_pane_cancels_the_queue_without_sending_to_a_reused_number() {
 
 #[test]
 fn writes_are_bounded_and_chunked_before_the_wire() {
-    let mut harness = current(71);
+    let mut harness = current(74);
     let pane = harness.server.pane_id;
     let bytes = vec![b'x'; 3 * wire::MAX_RELIABLE_WRITE_BYTES + 1];
     harness.session.write(pane, &bytes);
@@ -779,12 +1073,10 @@ fn a_no_effect_write_retries_on_time_with_identical_identity_and_fifo_order() {
         },
     );
     let (paste_rpc, pdu) = take_one(&mut harness.session);
-    assert!(matches!(pdu, Pdu::SendPaste(_)));
-    reply(&mut harness.session, 10, paste_rpc, &codec::UnitResponse {});
+    accept_conditional(&mut harness.session, paste_rpc, pdu);
     for _ in 0..2 {
         let (mouse_rpc, pdu) = take_one(&mut harness.session);
-        assert!(matches!(pdu, Pdu::SendMouseEvent(_)));
-        reply(&mut harness.session, 10, mouse_rpc, &codec::UnitResponse {});
+        accept_conditional(&mut harness.session, mouse_rpc, pdu);
     }
     assert!(!harness.session.unanswered_input(pane));
     assert_eq!(harness.session.next_input_wake_ns(), None);
@@ -1024,8 +1316,7 @@ fn a_duplicate_pending_write_goes_again_as_the_same_request_before_later_input()
         ReliablePaneWriteOutcomeV1::DuplicateAppliedPrefix { bytes: 3 },
     );
     let (paste_rpc, pdu) = take_one(&mut harness.session);
-    assert!(matches!(pdu, Pdu::SendPaste(_)));
-    reply(&mut harness.session, 10, paste_rpc, &codec::UnitResponse {});
+    accept_conditional(&mut harness.session, paste_rpc, pdu);
     assert!(!harness.session.unanswered_input(pane));
     assert_eq!(harness.session.next_input_wake_ns(), None);
 }
@@ -1112,7 +1403,8 @@ fn a_lone_paste_expires_without_replay_or_later_input() {
     let pane = harness.server.pane_id;
     harness.session.paste(pane, "possibly applied paste");
     let (rpc, pdu) = take_one(&mut harness.session);
-    assert!(matches!(pdu, Pdu::SendPaste(_)));
+    let request = conditional_request(pdu);
+    assert!(matches!(&request.effect, codec::PaneInputEffectV1::Paste(_)));
     assert_eq!(
         harness.session.next_input_wake_ns(),
         Some(INPUT_DEADLINE_NS)
@@ -1123,7 +1415,12 @@ fn a_lone_paste_expires_without_replay_or_later_input() {
     assert_stopped(&mut harness.session, pane);
 
     // A late ACK cannot revive the failed connection or clear its uncertainty.
-    reply(&mut harness.session, 10, rpc, &codec::UnitResponse {});
+    conditional_reply(
+        &mut harness.session,
+        rpc,
+        &request,
+        codec::PaneInputConditionalOutcomeV1::Accepted,
+    );
     assert!(!harness.session.is_ready());
     assert!(harness.session.unanswered_input(pane));
     assert!(harness.session.take_outgoing().is_empty());
@@ -1136,13 +1433,22 @@ fn either_unanswered_half_of_a_click_keeps_the_original_deadline() {
         let pane = harness.server.pane_id;
         harness.session.click(pane, 2, 3);
         let (press_rpc, pdu) = take_one(&mut harness.session);
-        assert!(matches!(pdu, Pdu::SendMouseEvent(_)));
+        let press = conditional_request(pdu);
+        assert!(matches!(&press.effect, codec::PaneInputEffectV1::Mouse(_)));
         assert!(harness.session.advance_time(INPUT_DEADLINE_NS - 1));
         assert!(harness.session.take_outgoing().is_empty());
         if acknowledge_press {
-            reply(&mut harness.session, 10, press_rpc, &codec::UnitResponse {});
+            conditional_reply(
+                &mut harness.session,
+                press_rpc,
+                &press,
+                codec::PaneInputConditionalOutcomeV1::Accepted,
+            );
             let (_, release) = take_one(&mut harness.session);
-            assert!(matches!(release, Pdu::SendMouseEvent(_)));
+            assert!(matches!(
+                &conditional_request(release).effect,
+                codec::PaneInputEffectV1::Mouse(_)
+            ));
         }
         assert_eq!(
             harness.session.next_input_wake_ns(),
@@ -1160,7 +1466,6 @@ fn settling_paste_and_mouse_receipts_retires_only_their_own_deadlines() {
     let pane = harness.server.pane_id;
     harness.session.paste(pane, "first");
     let (paste_rpc, paste) = take_one(&mut harness.session);
-    assert!(matches!(paste, Pdu::SendPaste(_)));
     assert!(harness.session.advance_time(1_000));
     harness.session.click(pane, 2, 3);
     assert!(harness.session.take_outgoing().is_empty());
@@ -1168,15 +1473,14 @@ fn settling_paste_and_mouse_receipts_retires_only_their_own_deadlines() {
         harness.session.next_input_wake_ns(),
         Some(INPUT_DEADLINE_NS)
     );
-    reply(&mut harness.session, 10, paste_rpc, &codec::UnitResponse {});
+    accept_conditional(&mut harness.session, paste_rpc, paste);
     for _ in 0..2 {
         assert_eq!(
             harness.session.next_input_wake_ns(),
             Some(INPUT_DEADLINE_NS + 1_000)
         );
         let (rpc, mouse) = take_one(&mut harness.session);
-        assert!(matches!(mouse, Pdu::SendMouseEvent(_)));
-        reply(&mut harness.session, 10, rpc, &codec::UnitResponse {});
+        accept_conditional(&mut harness.session, rpc, mouse);
     }
     assert!(!harness.session.unanswered_input(pane));
     assert_eq!(harness.session.next_input_wake_ns(), None);
@@ -1191,7 +1495,10 @@ fn a_lone_mouse_wheel_operation_expires_without_replay() {
     let pane = harness.server.pane_id;
     harness.session.wheel(pane, 1, 2, 3);
     let (_, pdu) = take_one(&mut harness.session);
-    assert!(matches!(pdu, Pdu::SendMouseEvent(_)));
+    assert!(matches!(
+        &conditional_request(pdu).effect,
+        codec::PaneInputEffectV1::Mouse(_)
+    ));
     assert_eq!(
         harness.session.next_input_wake_ns(),
         Some(INPUT_DEADLINE_NS)

@@ -1155,6 +1155,10 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                 state.control.noteActivity(pane: pane)
             case .paneWaiting(let pane, let waiting):
                 state.control.setWaiting(pane: pane, waiting)
+            case .inputRejected(_, let reason):
+                // Nothing reached the wire. Keep viewing and supported input
+                // alive; do not mark uncertainty or queue a resend.
+                state.control.recordNotice(reason)
             case .failed(let reason):
                 // Once attached, a failure still ends this connection (and may
                 // be reconnected), but its reason reaches the screen.
@@ -1546,6 +1550,8 @@ private actor WorkspaceNativeSSHTransport: TerminalSessionTransport {
                     state.sizes.remove(pane: pane)
                 case .phoneSize(let pane, let desktop, let rows, let columns):
                     state.rememberPhoneSize(pane: pane, desktop: desktop, rows: rows, columns: columns)
+                case .inputRejected(_, let reason):
+                    state.control.recordNotice(reason)
                 case .failed: failed = true
                 default: break
                 }
