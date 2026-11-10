@@ -2195,7 +2195,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
         },
         ToggleDashboard => CommandDef {
             brief: "Toggle Dashboard".into(),
-            doc: "Show or hide the integrated agent swarm dashboard panel".into(),
+            doc: "Find and focus live panes across this window's tabs".into(),
             keys: vec![(Modifiers::SUPER.union(Modifiers::SHIFT), "d".into())],
             args: &[ArgType::ActiveWindow],
             menubar: &["View"],

@@ -2518,9 +2518,6 @@ pub struct TermWindow {
 
     /// Per-pane agent state classification, updated each render tick.
     agent_pane_states: HashMap<PaneId, frankenterm_core::agent_pane_state::AgentPaneState>,
-
-    /// Integrated agent swarm dashboard panel.
-    dashboard: crate::dashboard::DashboardPanel,
 }
 
 /// Pure predicate used only to classify a successful cached-quad hit as clean
@@ -4941,7 +4938,6 @@ impl TermWindow {
             modal: RefCell::new(None),
             opengl_info: None,
             agent_pane_states: HashMap::new(),
-            dashboard: crate::dashboard::DashboardPanel::default(),
         };
 
         let tw = Rc::new(RefCell::new(myself));
@@ -10574,15 +10570,7 @@ impl TermWindow {
                 log::info!("CycleAgentAutoLayout: cycling agent auto-layout policy");
             }
             ToggleDashboard => {
-                self.dashboard.toggle();
-                log::info!(
-                    "ToggleDashboard: dashboard {}",
-                    if self.dashboard.visible {
-                        "shown"
-                    } else {
-                        "hidden"
-                    }
-                );
+                self.set_modal(Rc::new(palette::PaneDashboard::new()));
             }
             SplitPane(split) => {
                 log::trace!("SplitPane {:?}", split);

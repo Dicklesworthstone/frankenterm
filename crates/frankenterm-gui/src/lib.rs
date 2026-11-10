@@ -7,6 +7,7 @@ pub mod accessibility_preferences;
 pub mod adaptive_fps_loop;
 pub mod cli;
 pub mod click_to_move;
+pub mod dashboard;
 pub mod domain_reconnect_manifest;
 pub mod floating_panes;
 pub mod gpu_regression;

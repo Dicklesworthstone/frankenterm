@@ -140,6 +140,33 @@ Global launch options:
 - `--skip-config`: run without loading config files
 - `--workspace <name>` / `--session <name>`: select or create named session namespace
 
+### Pane dashboard
+
+Choose **View → Toggle Dashboard**, or find **Toggle Dashboard** in the command
+palette, to browse panes across the current window's tabs. Each row shows its
+tab position, pane ID, domain, and published terminal title; a dot marks the
+focused pane. The list refreshes once per second while the window is focused.
+Missing title metadata is displayed as **Title unavailable**.
+
+| Control | Action |
+|---|---|
+| Type text | Filter by all entered words, ignoring case |
+| Up / Down, or Ctrl+P / Ctrl+N | Select a pane |
+| Enter | Focus the selected pane and its tab, then close the dashboard |
+| Ctrl+R | Refresh immediately |
+| Ctrl+U | Clear the filter |
+| Esc, Ctrl+G, or the configured Toggle Dashboard shortcut | Close the dashboard |
+
+Selection follows the same live pane through row reordering. If that pane closes,
+selection clears; a new pane reusing its numeric ID must be selected explicitly.
+The dashboard retains at most 4,096 rows and adds `+` to the pane count when the
+list is truncated. Navigation is currently by keyboard.
+
+**Agent state unavailable** means that the GUI does not yet receive canonical
+watcher activity classifications. This pane dashboard currently provides pane
+discovery and focus, without live agent, health, or event summaries. The remaining
+agent dashboard integration is tracked in `ft-7h5da.7.10`.
+
 ## Config Reference (`frankenterm.toml`)
 
 Primary GUI config location:

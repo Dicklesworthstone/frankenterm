@@ -1,4 +1,7 @@
 use crate::commands::{CommandDef, ExpandedCommand};
+use crate::dashboard::{
+    LiveDashboardPane, LivePaneDashboard, MAX_LIVE_DASHBOARD_PANES, dashboard_text,
+};
 use crate::overlay::selector::{matcher_pattern, matcher_score};
 use crate::termwindow::box_model::*;
 use crate::termwindow::modal::Modal;
@@ -13,14 +16,17 @@ use config::Dimension;
 use config::keyassignment::KeyAssignment;
 use frecency::Frecency;
 use luahelper::{from_lua_value_dynamic, impl_lua_conversion_dynamic};
+use mux::{Mux, PaneRegistrationHandle};
 use mux_lua::MuxPane;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::cell::{Ref, RefCell};
+use std::cell::{Cell, Ref, RefCell};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use termwiz::nerdfonts::NERD_FONTS;
 use wezterm_dynamic::{FromDynamic, ToDynamic};
 use wezterm_term::{KeyCode, KeyModifiers, MouseEvent};
@@ -237,6 +243,7 @@ impl CommandPalette {
         max_rows_on_screen: usize,
         selected_row: usize,
         top_row: usize,
+        heading: Option<&str>,
     ) -> anyhow::Result<Vec<ComputedElement>> {
         let font = term_window
             .fonts
@@ -255,7 +262,16 @@ impl CommandPalette {
         let border = term_window.get_os_border();
         let top_pixel_y = top_bar_height + padding_top + border.top.get() as f32;
 
-        let mut elements = vec![
+        let mut elements = Vec::new();
+        if let Some(heading) = heading {
+            for line in heading.lines() {
+                elements.push(
+                    Element::new(&font, ElementContent::Text(line.to_string()))
+                        .display(DisplayType::Block),
+                );
+            }
+        }
+        elements.push(
             Element::new(&font, ElementContent::Text(format!("> {selection}_")))
                 .colors(ElementColors {
                     border: BorderColor::default(),
@@ -267,7 +283,14 @@ impl CommandPalette {
                         .into(),
                 })
                 .display(DisplayType::Block),
-        ];
+        );
+
+        if heading.is_some() && matches.matches.is_empty() {
+            elements.push(
+                Element::new(&font, ElementContent::Text("No matching panes".into()))
+                    .display(DisplayType::Block),
+            );
+        }
 
         for (display_idx, command) in matches
             .matches
@@ -677,11 +700,272 @@ impl Modal for CommandPalette {
                 max_rows_on_screen,
                 *self.selected_row.borrow(),
                 *self.top_row.borrow(),
+                None,
             )?;
             self.element.borrow_mut().replace(element);
         }
         Ok(Ref::map(self.element.borrow(), |v| {
             v.as_ref().unwrap().as_slice()
+        }))
+    }
+
+    fn reconfigure(&self, _term_window: &mut TermWindow) {
+        self.element.borrow_mut().take();
+    }
+}
+
+/// Read-only pane dashboard. Rows come from the current window's mux topology;
+/// only an explicit selection performs a focus transaction. The retained
+/// handles are weak, exact registration capabilities, not cached pane IDs.
+pub struct PaneDashboard {
+    element: RefCell<Option<Vec<ComputedElement>>>,
+    model: RefCell<LivePaneDashboard>,
+    targets: RefCell<HashMap<[u8; 16], PaneRegistrationHandle>>,
+    last_refresh: Cell<Option<Instant>>,
+    notice: RefCell<Option<&'static str>>,
+}
+
+impl PaneDashboard {
+    pub fn new() -> Self {
+        Self {
+            element: RefCell::new(None),
+            model: RefCell::new(LivePaneDashboard::default()),
+            targets: RefCell::new(HashMap::new()),
+            last_refresh: Cell::new(None),
+            notice: RefCell::new(None),
+        }
+    }
+
+    fn refresh(&self, term_window: &TermWindow) {
+        let mut rows = Vec::new();
+        let mut targets = HashMap::new();
+        let mut truncated = false;
+        if let Some(mux) = Mux::try_get() {
+            // Never invoke pane callbacks while holding the window registry.
+            let tabs: Vec<_> = mux
+                .get_window(term_window.mux_window_id)
+                .map(|window| {
+                    truncated = window.iter().count() > MAX_LIVE_DASHBOARD_PANES;
+                    window
+                        .iter()
+                        .take(MAX_LIVE_DASHBOARD_PANES)
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let focused = mux
+                .get_active_tab_for_window(term_window.mux_window_id)
+                .and_then(|tab| tab.get_active_pane());
+            'tabs: for (tab_position, tab) in tabs.iter().enumerate() {
+                for pane in tab.iter_all_panes() {
+                    if rows.len() == MAX_LIVE_DASHBOARD_PANES {
+                        truncated = true;
+                        break 'tabs;
+                    }
+                    let Some(registration) = mux.capture_pane_registration(&pane) else {
+                        continue;
+                    };
+                    let Some(title) = registration.try_with_current(|current| {
+                        // Published facts are nonblocking. Missing metadata is
+                        // visible; the dashboard never reaches into terminal
+                        // history or waits on the parser for a title.
+                        current
+                            .coherent_render_facts()
+                            .map(|facts| dashboard_text(&facts.title))
+                            .unwrap_or_else(|| "Title unavailable".into())
+                    }) else {
+                        continue;
+                    };
+                    let domain = mux
+                        .get_domain(pane.domain_id())
+                        .map(|domain| dashboard_text(domain.domain_name()))
+                        .unwrap_or_else(|| "Domain unavailable".into());
+                    let identity = registration.wire_identity();
+                    rows.push(LiveDashboardPane {
+                        pane_id: registration.pane_id(),
+                        registration: identity,
+                        tab_id: tab.tab_id(),
+                        tab_position,
+                        domain,
+                        title,
+                        is_focused: focused
+                            .as_ref()
+                            .is_some_and(|focused| Arc::ptr_eq(focused, &pane)),
+                    });
+                    targets.insert(identity, registration);
+                }
+            }
+        }
+        self.model.borrow_mut().replace_panes(rows, truncated);
+        self.targets.replace(targets);
+        self.last_refresh.set(Some(Instant::now()));
+        self.element.borrow_mut().take();
+    }
+
+    fn focus_selection(&self, term_window: &mut TermWindow) -> anyhow::Result<()> {
+        let selected = self.model.borrow().selected_registration();
+        let target = selected.and_then(|identity| self.targets.borrow().get(&identity).cloned());
+        let Some(target) = target else {
+            return Ok(());
+        };
+        let focused = (|| {
+            let mux = Mux::try_get().context("dashboard mux is unavailable")?;
+            let target = target
+                .operation_guard(&mux)
+                .context("dashboard pane registration has retired")?;
+            let (_, window_id, _) = target.exact_location_ids()?;
+            anyhow::ensure!(
+                window_id == term_window.mux_window_id,
+                "dashboard pane moved to another window"
+            );
+            target.with_current_pane(|pane| pane.focus_pane_and_containing_tab())
+        })();
+        match focused {
+            Ok(()) => term_window.cancel_modal(),
+            Err(_) => {
+                self.notice
+                    .replace(Some("Pane closed or moved; choose a pane again."));
+                self.refresh(term_window);
+                term_window.invalidate_modal();
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Modal for PaneDashboard {
+    fn perform_assignment(&self, assignment: &KeyAssignment, term_window: &mut TermWindow) -> bool {
+        if matches!(assignment, KeyAssignment::ToggleDashboard) {
+            term_window.cancel_modal();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn mouse_event(&self, _event: MouseEvent, _term_window: &mut TermWindow) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn key_down(
+        &self,
+        key: KeyCode,
+        mods: KeyModifiers,
+        term_window: &mut TermWindow,
+    ) -> anyhow::Result<bool> {
+        match (key, mods) {
+            (KeyCode::Escape, KeyModifiers::NONE) | (KeyCode::Char('g'), KeyModifiers::CTRL) => {
+                term_window.cancel_modal();
+                return Ok(true);
+            }
+            (KeyCode::Enter, KeyModifiers::NONE) => {
+                self.focus_selection(term_window)?;
+                return Ok(true);
+            }
+            (KeyCode::UpArrow, KeyModifiers::NONE) | (KeyCode::Char('p'), KeyModifiers::CTRL) => {
+                self.model.borrow_mut().move_selection(false);
+            }
+            (KeyCode::DownArrow, KeyModifiers::NONE) | (KeyCode::Char('n'), KeyModifiers::CTRL) => {
+                self.model.borrow_mut().move_selection(true);
+            }
+            (KeyCode::Char('r'), KeyModifiers::CTRL) => self.refresh(term_window),
+            (KeyCode::Char('u'), KeyModifiers::CTRL) => {
+                self.model.borrow_mut().set_query(String::new());
+            }
+            (KeyCode::Backspace, KeyModifiers::NONE) => {
+                let mut model = self.model.borrow_mut();
+                let mut query = model.query().to_string();
+                query.pop();
+                model.set_query(query);
+            }
+            (KeyCode::Char(ch), KeyModifiers::NONE) | (KeyCode::Char(ch), KeyModifiers::SHIFT) => {
+                let mut model = self.model.borrow_mut();
+                let mut query = model.query().to_string();
+                query.push(ch);
+                model.set_query(query);
+            }
+            // Let configured shortcuts (including ToggleDashboard) reach the
+            // assignment dispatcher. Its final modal dispatch still consumes
+            // unbound keys before they can reach the underlying shell.
+            _ => return Ok(false),
+        }
+        term_window.invalidate_modal();
+        Ok(true)
+    }
+
+    fn computed_element(
+        &self,
+        term_window: &mut TermWindow,
+    ) -> anyhow::Result<Ref<'_, [ComputedElement]>> {
+        if self
+            .last_refresh
+            .get()
+            .is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
+        {
+            self.refresh(term_window);
+        }
+        // Data refresh is operational rather than a cosmetic animation. Keep
+        // quiet panes and closed tabs fresh even when their terminal contents
+        // no longer cause repaints, including when reduce-motion is enabled.
+        if term_window.focused.is_some() {
+            if let Some(last_refresh) = self.last_refresh.get() {
+                term_window.schedule_animation_wake(last_refresh + Duration::from_secs(1));
+            }
+        }
+        if self.element.borrow().is_none() {
+            let model = self.model.borrow();
+            let matches = MatchResults {
+                selection: model.query().to_string(),
+                matches: model.matching_indices(),
+            };
+            let commands: Vec<_> = model
+                .panes()
+                .iter()
+                .map(|pane| ExpandedCommand {
+                    brief: pane.label().into(),
+                    doc: "".into(),
+                    action: KeyAssignment::Nop,
+                    keys: vec![],
+                    menubar: &[],
+                    icon: None,
+                })
+                .collect();
+            let font = term_window.fonts.command_palette_font()?;
+            let metrics = RenderMetrics::with_font_metrics(&font.metrics());
+            let available = ((term_window.dimensions.pixel_height * 8 / 10)
+                / (metrics.cell_size.height as usize).max(1))
+            .saturating_sub(4)
+            .max(1);
+            let visible_rows = term_window
+                .config
+                .command_palette_rows
+                .unwrap_or(available)
+                .max(1)
+                .min(available);
+            let selected = model.selected_row(&matches.matches);
+            let top = selected.unwrap_or(0).saturating_sub(visible_rows - 1);
+            let status = self.notice.borrow();
+            let heading = format!(
+                "Pane dashboard · {}{} panes · Agent state unavailable\n{}",
+                model.panes().len(),
+                if model.truncated { "+" } else { "" },
+                status.unwrap_or(
+                    "Type to filter; ↑/↓ select; Enter focus; Ctrl+R refresh; Esc close"
+                ),
+            );
+            self.element.replace(Some(CommandPalette::compute(
+                term_window,
+                model.query(),
+                &commands,
+                &matches,
+                visible_rows,
+                selected.unwrap_or(usize::MAX),
+                top,
+                Some(&heading),
+            )?));
+        }
+        Ok(Ref::map(self.element.borrow(), |elements| {
+            elements.as_ref().unwrap().as_slice()
         }))
     }
 

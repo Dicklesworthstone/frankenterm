@@ -1,21 +1,143 @@
-//! Embedded agent swarm dashboard panel.
+//! Dashboard models for frankenterm-gui.
 //!
-//! Provides a side-panel/overlay within frankenterm-gui that shows:
-//! - Pane list with agent state indicators
-//! - Health/backpressure status per pane
-//! - Event stream (recent watchdog, circuit-breaker, error events)
-//! - Search across all panes (with click-to-focus results)
-//!
-//! Toggled via Cmd+Shift+D (macOS) or Ctrl+Shift+D (Linux).
-//!
-//! Data sources: mux pane state, agent_pane_state detection,
-//! backpressure manager, watchdog health reports.
+//! `LivePaneDashboard` powers the visible pane dashboard with current mux
+//! registrations, text filtering, and exact focus selection. The older agent
+//! panel models below remain available for the future watcher integration;
+//! agent activity, health, and events are not yet live GUI data sources.
 #![allow(dead_code)]
 
 use frankenterm_core::agent_pane_state::{AgentPaneState, AutoLayoutPolicy};
 use mux::pane::PaneId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+/// Bound the operator's pane picker independently of the mux's fleet limit.
+pub const MAX_LIVE_DASHBOARD_PANES: usize = 4096;
+const MAX_DASHBOARD_TEXT_CHARS: usize = 256;
+
+/// Display metadata from one exact, live mux registration. Agent state is
+/// deliberately absent: the watcher has not yet published an identity-bound
+/// activity snapshot to the GUI (ft-7h5da.7.10).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveDashboardPane {
+    pub pane_id: PaneId,
+    pub registration: [u8; 16],
+    pub tab_id: mux::tab::TabId,
+    pub tab_position: usize,
+    pub domain: String,
+    pub title: String,
+    pub is_focused: bool,
+}
+
+/// Keep terminal-controlled titles out of the dashboard's control syntax and
+/// bound their contribution to filtering and layout.
+pub fn dashboard_text(text: &str) -> String {
+    text.chars()
+        .filter(|ch| !ch.is_control())
+        .take(MAX_DASHBOARD_TEXT_CHARS)
+        .collect()
+}
+
+impl LiveDashboardPane {
+    pub fn label(&self) -> String {
+        format!(
+            "{}Tab {} / pane {} · {} · {}",
+            if self.is_focused { "● " } else { "" },
+            self.tab_position.saturating_add(1),
+            self.pane_id,
+            self.domain,
+            self.title,
+        )
+    }
+
+    fn matches(&self, query: &str) -> bool {
+        let text = self.label().to_lowercase();
+        query.split_whitespace().all(|word| text.contains(word))
+    }
+}
+
+/// Selection is tied to the registration generation rather than a row index
+/// or reusable numeric pane id. Refreshing cannot silently retarget Enter.
+#[derive(Default)]
+pub struct LivePaneDashboard {
+    panes: Vec<LiveDashboardPane>,
+    query: String,
+    selected: Option<[u8; 16]>,
+    initialized: bool,
+    pub truncated: bool,
+}
+
+impl LivePaneDashboard {
+    pub fn replace_panes(&mut self, mut panes: Vec<LiveDashboardPane>, truncated: bool) {
+        self.truncated = truncated || panes.len() > MAX_LIVE_DASHBOARD_PANES;
+        panes.truncate(MAX_LIVE_DASHBOARD_PANES);
+        self.panes = panes;
+        let matches = self.matching_indices();
+        if !self.initialized {
+            self.selected = matches
+                .iter()
+                .find(|&&index| self.panes[index].is_focused)
+                .or_else(|| matches.first())
+                .map(|&index| self.panes[index].registration);
+            self.initialized = true;
+        } else if !matches
+            .iter()
+            .any(|&index| Some(self.panes[index].registration) == self.selected)
+        {
+            self.selected = None;
+        }
+    }
+
+    pub fn panes(&self) -> &[LiveDashboardPane] {
+        &self.panes
+    }
+
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    pub fn set_query(&mut self, query: String) {
+        self.query = dashboard_text(&query);
+        self.selected = self
+            .matching_indices()
+            .first()
+            .map(|&index| self.panes[index].registration);
+    }
+
+    pub fn matching_indices(&self) -> Vec<usize> {
+        let query = self.query.to_lowercase();
+        self.panes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, pane)| pane.matches(&query).then_some(index))
+            .collect()
+    }
+
+    pub fn selected_registration(&self) -> Option<[u8; 16]> {
+        self.selected
+    }
+
+    pub fn selected_row(&self, matches: &[usize]) -> Option<usize> {
+        matches
+            .iter()
+            .position(|&index| Some(self.panes[index].registration) == self.selected)
+    }
+
+    pub fn move_selection(&mut self, forward: bool) {
+        let matches = self.matching_indices();
+        if matches.is_empty() {
+            self.selected = None;
+            return;
+        }
+        let row = match self.selected_row(&matches) {
+            Some(row) if forward => row.saturating_add(1).min(matches.len() - 1),
+            Some(row) => row.saturating_sub(1),
+            None if forward => 0,
+            None => matches.len() - 1,
+        };
+        self.selected = Some(self.panes[matches[row]].registration);
+    }
+}
 
 /// Which section of the dashboard is currently focused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -238,6 +360,75 @@ impl DashboardPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn live_pane(pane_id: PaneId, generation: u8, title: &str) -> LiveDashboardPane {
+        LiveDashboardPane {
+            pane_id,
+            registration: [generation; 16],
+            tab_id: 7,
+            tab_position: 0,
+            domain: "build-host".into(),
+            title: title.into(),
+            is_focused: false,
+        }
+    }
+
+    #[test]
+    fn live_refresh_preserves_exact_selection_across_reorder() {
+        let first = live_pane(1, 1, "first");
+        let second = live_pane(2, 2, "second");
+        let mut panel = LivePaneDashboard::default();
+        panel.replace_panes(vec![first.clone(), second.clone()], false);
+        panel.move_selection(true);
+        panel.replace_panes(vec![second, first], false);
+        assert_eq!(panel.selected_registration(), Some([2; 16]));
+        assert_eq!(panel.selected_row(&panel.matching_indices()), Some(0));
+    }
+
+    #[test]
+    fn retired_selection_never_inherits_a_reused_pane_id() {
+        let mut panel = LivePaneDashboard::default();
+        panel.replace_panes(vec![live_pane(5, 1, "old")], false);
+        panel.replace_panes(vec![live_pane(5, 2, "replacement")], false);
+        assert_eq!(panel.selected_registration(), None);
+        assert_eq!(panel.selected_row(&panel.matching_indices()), None);
+        panel.move_selection(true);
+        assert_eq!(panel.selected_registration(), Some([2; 16]));
+        panel.replace_panes(vec![], false);
+        panel.move_selection(false);
+        assert_eq!(panel.selected_registration(), None);
+    }
+
+    #[test]
+    fn live_dashboard_filters_all_terms_and_handles_no_matches() {
+        let mut panel = LivePaneDashboard::default();
+        panel.replace_panes(
+            vec![live_pane(1, 1, "Compile Rust"), live_pane(2, 2, "Python")],
+            false,
+        );
+        panel.set_query("RUST BUILD-HOST".into());
+        assert_eq!(panel.matching_indices(), vec![0]);
+        assert_eq!(panel.selected_registration(), Some([1; 16]));
+        panel.set_query("absent".into());
+        panel.move_selection(true);
+        assert!(panel.matching_indices().is_empty());
+        assert_eq!(panel.selected_registration(), None);
+    }
+
+    #[test]
+    fn live_dashboard_bounds_rows_and_terminal_controlled_text() {
+        let mut panel = LivePaneDashboard::default();
+        panel.replace_panes(
+            (0..MAX_LIVE_DASHBOARD_PANES + 1)
+                .map(|id| live_pane(id, 1, "pane"))
+                .collect(),
+            false,
+        );
+        assert_eq!(panel.panes().len(), MAX_LIVE_DASHBOARD_PANES);
+        assert!(panel.truncated);
+        assert_eq!(dashboard_text("a\nb\rc\t\u{1b}"), "abc");
+        assert_eq!(dashboard_text(&"λ".repeat(1024)).chars().count(), 256);
+    }
 
     #[test]
     fn dashboard_toggle() {
