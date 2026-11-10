@@ -4993,6 +4993,14 @@ impl Pdu {
     fn validate_before_encode(&self) -> Result<(), Error> {
         match self {
             Self::ErrorResponse(value) => value.validate()?,
+            Self::ListPanesResponse(value) => {
+                validate_native_pane_trees(&value.tabs)?;
+            }
+            Self::ListPanesCoherentResponse(value) => {
+                if let Some(snapshot) = value.outcome.snapshot() {
+                    validate_native_pane_trees(&snapshot.panes.tabs)?;
+                }
+            }
             Self::ListPanesOrderedV1(value) => value.validate()?,
             Self::ListPanesOrderedV1Response(value) => value.validate()?,
             Self::ReorderWindowTabsV1(value) => value.validate()?,
@@ -19125,6 +19133,16 @@ mod test {
         }
         // There are no child fields or geometries after the final Split tag.
         // A depth refusal, rather than EOF, proves admission precedes descent.
+        let mut partial_right_prefix =
+            serialize_uncompressed(&1_usize).expect("encode root count");
+        partial_right_prefix.extend_from_slice(&split_tag);
+        partial_right_prefix.extend_from_slice(
+            &serialize_uncompressed(&left_deep_pane_tree(MAX_ORDERED_PANE_TREE_DEPTH - 1))
+                .expect("encode admitted left subtree"),
+        );
+        for _ in 1..MAX_ORDERED_PANE_TREE_DEPTH {
+            partial_right_prefix.extend_from_slice(&split_tag);
+        }
         let excessive_roots = MAX_ORDERED_TABS_PER_SNAPSHOT + 1;
         let root_only_prefix = serialize_uncompressed(&excessive_roots).expect("encode root prefix");
         let root_error = format!(
@@ -19139,7 +19157,8 @@ mod test {
             .expect("encode next outer frame");
 
         for (pane_payload, expected) in [
-            (split_only_prefix, depth_error),
+            (split_only_prefix, depth_error.clone()),
+            (partial_right_prefix, depth_error),
             (root_only_prefix, root_error),
             (
                 trailing_payload,
@@ -19221,6 +19240,160 @@ mod test {
             serde_json::from_str::<ListPanesResponse>(r#"{"tabs":[{"Split":{"unexpected":"#)
                 .expect_err("unknown Split fields must fail closed before their body");
         assert!(error.to_string().contains("unknown field"), "{error}");
+    }
+
+    fn native_pane_outbound_test_pdus(panes: &ListPanesResponse) -> [Pdu; 3] {
+        [
+            native_pane_test_pdu(4, panes.clone()),
+            native_pane_test_pdu(82, panes.clone()),
+            Pdu::ListPanesCoherentResponse(ListPanesCoherentResponse {
+                negotiated: TopologyCapabilities::from_bits(
+                    TopologyCapabilities::FENCED_SNAPSHOT_V1.bits()
+                        | TopologyCapabilities::RESTORED_LINEAGE_V1.bits(),
+                ),
+                stream_id: TopologyStreamId::from_bytes([0x71; 16]),
+                outcome: ListPanesCoherentOutcome::RestoredSnapshot {
+                    snapshot: CoherentPaneSnapshot {
+                        session_incarnation: MuxSessionIncarnation::from_bytes([0x72; 16]),
+                        snapshot_revision: TopologyRevision::new(73),
+                        panes: panes.clone(),
+                    },
+                    lineage: mux::RestoredTopologyLineage {
+                        predecessor: MuxSessionIncarnation::from_bytes([0x70; 16]),
+                        max_pane_id: Some(7),
+                        max_tab_id: Some(3),
+                        max_window_id: Some(1),
+                    },
+                },
+            }),
+        ]
+    }
+
+    #[test]
+    fn native_pane_outbound_plans_reject_before_payload_allocation_or_compression() {
+        let mut aggregate_overflow = native_pane_snapshot_at_aggregate_limits();
+        aggregate_overflow.tabs.push(PaneNode::Empty);
+        for panes in [
+            ListPanesResponse {
+                tabs: vec![left_deep_pane_tree(MAX_ORDERED_PANE_TREE_DEPTH + 1)],
+                ..empty_pane_list()
+            },
+            ListPanesResponse {
+                tabs: vec![PaneNode::Empty; MAX_ORDERED_TABS_PER_SNAPSHOT + 1],
+                ..empty_pane_list()
+            },
+            aggregate_overflow,
+        ] {
+            let expected = validate_native_pane_trees(&panes.tabs)
+                .expect_err("fixture must exceed native tree bounds");
+            for pdu in native_pane_outbound_test_pdus(&panes) {
+                let expected_ident = pdu.wire_spec().expect("native wire spec").ident;
+                for mode in [CompressionMode::Never, CompressionMode::Always] {
+                    reset_test_serialize_invocations();
+                    reset_test_bounded_serialize_growth_events();
+                    reset_test_compression_invocations();
+
+                    let error = pdu
+                        .plan_outbound(
+                            PduProducer::Server,
+                            PduWireRole::CorrelatedReply,
+                            None,
+                            mode,
+                        )
+                        .expect_err("invalid topology must fail during payload validation");
+                    match error {
+                        PduOutboundPlanError::InvalidPayload { ident, cause } => {
+                            assert_eq!(ident, expected_ident);
+                            assert_eq!(
+                                cause.downcast_ref::<PaneTreeBoundsError>(),
+                                Some(&expected),
+                            );
+                        }
+                        other => panic!("expected typed payload refusal, got {:?}", other),
+                    }
+                    let error = pdu
+                        .encode_frame_with_mode(76, mode)
+                        .expect_err("direct encoder must refuse before codec allocation");
+                    assert_eq!(
+                        error.downcast_ref::<PaneTreeBoundsError>(),
+                        Some(&expected),
+                    );
+                    assert_eq!(test_serialize_invocations(), 0);
+                    assert_eq!(test_bounded_serialize_buffer_constructions(), 0);
+                    assert_eq!(test_bounded_serialize_growth_events(), 0);
+                    assert_eq!(test_compression_invocations(), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_pane_outbound_plans_preserve_valid_restored_snapshots() {
+        let panes = ListPanesResponse {
+            tabs: vec![left_deep_pane_tree(MAX_ORDERED_PANE_TREE_DEPTH)],
+            ..empty_pane_list()
+        };
+        for pdu in native_pane_outbound_test_pdus(&panes) {
+            for mode in [CompressionMode::Never, CompressionMode::Always] {
+                let prepared = pdu
+                    .plan_outbound(
+                        PduProducer::Server,
+                        PduWireRole::CorrelatedReply,
+                        None,
+                        mode,
+                    )
+                    .expect("admit exact-depth native or restored snapshot");
+                assert!(std::ptr::eq(prepared.pdu(), &pdu));
+                let frame = pdu
+                    .encode_frame_with_mode(77, mode)
+                    .expect("encode admitted snapshot");
+                let decoded = Pdu::decode(frame.as_slice()).expect("decode admitted snapshot");
+                assert_eq!(decoded.serial, 77);
+                assert_eq!(decoded.pdu, pdu);
+            }
+        }
+    }
+
+    #[test]
+    fn native_pane_borrowed_producer_guard_refuses_extreme_depth_iteratively() {
+        // The codec borrows the invalid producer value; its owner must also
+        // avoid recursive destruction. Keep cleanup iterative even if an
+        // assertion fails, so the fixture cannot mask a regression on unwind.
+        struct IterativeDrop(ListPanesResponse);
+
+        impl Drop for IterativeDrop {
+            fn drop(&mut self) {
+                let mut pending = std::mem::take(&mut self.0.tabs);
+                while let Some(node) = pending.pop() {
+                    if let PaneNode::Split { left, right, .. } = node {
+                        pending.push(*left);
+                        pending.push(*right);
+                    }
+                }
+            }
+        }
+
+        let fixture = IterativeDrop(ListPanesResponse {
+            tabs: vec![left_deep_pane_tree(10_000)],
+            ..empty_pane_list()
+        });
+        let expected = PaneTreeBoundsError::TreeLimit {
+            tree_index: 0,
+            resource: "levels",
+            count: MAX_ORDERED_PANE_TREE_DEPTH + 1,
+            max: MAX_ORDERED_PANE_TREE_DEPTH,
+        };
+        assert_eq!(
+            validate_native_pane_trees(&fixture.0.tabs)
+                .expect_err("refuse an extreme borrowed producer tree"),
+            expected,
+        );
+        let error =
+            serialize_uncompressed(&fixture.0).expect_err("refuse before recursive wire encoding");
+        assert!(format!("{error:#}").contains(&expected.to_string()));
+        let error =
+            serde_json::to_vec(&fixture.0).expect_err("guard non-varbincode serializers too");
+        assert!(error.to_string().contains(&expected.to_string()));
     }
 
     fn sample_flat_wire() -> OrderedPanesFlatWireOwned {
