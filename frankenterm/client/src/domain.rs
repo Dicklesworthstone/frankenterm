@@ -4544,11 +4544,26 @@ impl ClientDomain {
         // A partially applied or rejected successor must not leave the old
         // layout receipt usable while its numeric mappings are changing.
         *lock_or_recover(&inner.layout_snapshot, "layout_snapshot") = None;
+        let mut previous_input_sources = Vec::new();
+        for pane in mux.iter_panes() {
+            if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
+                if client_pane.belongs_to_client(&inner) {
+                    if let Some(source) = client_pane.withdraw_conditional_input_source() {
+                        previous_input_sources.push((
+                            pane.pane_id(),
+                            client_pane.remote_pane_id(),
+                            source,
+                        ));
+                    }
+                }
+            }
+        }
         match snapshot {
             RpcTopologySnapshot::Current {
                 session_incarnation,
                 lineage,
                 panes,
+                input_sources,
             } => {
                 if let Some(lineage) = inner.pin_topology_session_with_lineage(
                     ClientTopologySession::Current(session_incarnation),
@@ -4561,6 +4576,20 @@ impl ClientDomain {
                 panes
                     .validate_floating_panes()
                     .context("validating bounded floating-pane snapshot")?;
+                if let Some(sources) = &input_sources {
+                    for (local_id, remote_id, previous) in previous_input_sources {
+                        if sources.get(&remote_id).is_some_and(|source| *source != previous) {
+                            if let Some(pane) = mux.get_pane(local_id) {
+                                if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
+                                    // Prune the old mirror without asking the
+                                    // server to kill its numeric successor.
+                                    client_pane.renderable.lock().inner.borrow_mut().dead = true;
+                                }
+                            }
+                            mux.remove_pane(local_id);
+                        }
+                    }
+                }
                 let ListPanesResponse {
                     tabs,
                     tab_titles,
@@ -4569,13 +4598,28 @@ impl ClientDomain {
                 } = panes;
                 Self::process_pane_snapshot(
                     mux,
-                    inner,
+                    Arc::clone(&inner),
                     tabs,
                     tab_titles,
                     window_titles,
                     Some(floating_panes),
                     primary_window_id,
-                )
+                )?;
+                // Publish only after the whole display snapshot succeeds.
+                // Reentrant input during installation sees unavailable
+                // authority and cannot adopt a registration from a probe.
+                for pane in mux.iter_panes() {
+                    if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
+                        if client_pane.belongs_to_client(&inner) {
+                            client_pane.publish_conditional_input_source(
+                                input_sources.as_ref().and_then(|sources| {
+                                    sources.get(&client_pane.remote_pane_id()).copied()
+                                }),
+                            );
+                        }
+                    }
+                }
+                Ok(())
             }
             RpcTopologySnapshot::Legacy46(panes) => {
                 inner.pin_topology_session(ClientTopologySession::Legacy46)?;
@@ -8692,6 +8736,63 @@ mod tests {
     }
 
     #[test]
+    fn current_topology_replaces_reused_pane_mirror_even_after_an_unavailable_join() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_024);
+        let _domain = register_test_client_domain(&mux, &inner);
+        let session_incarnation = MuxSessionIncarnation::from_bytes([0xa4; 16]);
+        let original = crate::client::ConditionalPaneInputSource {
+            session_incarnation,
+            pane_registration: codec::ReliablePaneRegistrationIdentityV1::from_bytes([0xb1; 16]),
+        };
+        let replacement = crate::client::ConditionalPaneInputSource {
+            session_incarnation,
+            pane_registration: codec::ReliablePaneRegistrationIdentityV1::from_bytes([0xb2; 16]),
+        };
+        let apply = |source: Option<crate::client::ConditionalPaneInputSource>| {
+            ClientDomain::process_topology_snapshot(
+                &mux,
+                Arc::clone(&inner),
+                RpcTopologySnapshot::Current {
+                    session_incarnation,
+                    lineage: None,
+                    panes: sample_remote_tab_listing(),
+                    input_sources: source.map(|source| HashMap::from([(61, source)])),
+                },
+                None,
+            )
+        };
+        apply(Some(original)).expect("initial exact pane snapshot installs");
+        let old_id = inner.remote_to_local_pane_id(61).unwrap();
+        let old = mux.get_pane(old_id).unwrap();
+        let old_registration = mux.capture_pane_registration(&old).unwrap();
+        let old_client = old.downcast_ref::<ClientPane>().unwrap();
+        assert_eq!(old_client.withdraw_conditional_input_source(), Some(original));
+        old_client.publish_conditional_input_source(Some(original));
+
+        apply(None).expect("missing input authority must preserve viewing");
+        assert!(Arc::ptr_eq(&mux.get_pane(old_id).unwrap(), &old));
+        assert_eq!(old_client.withdraw_conditional_input_source(), Some(original));
+        apply(Some(original)).expect("same-source refresh preserves the local mirror");
+        assert!(Arc::ptr_eq(&mux.get_pane(old_id).unwrap(), &old));
+        apply(None).unwrap();
+
+        apply(Some(replacement)).expect("a changed registration must create a new mirror");
+        let new_id = inner.remote_to_local_pane_id(61).unwrap();
+        let new = mux.get_pane(new_id).unwrap();
+        assert!(!Arc::ptr_eq(&new, &old), "a reused numeric id must not rebind the old display");
+        assert!(old_client.is_dead(), "pruning the old mirror must not kill its numeric successor");
+        assert!(old_registration.try_with_current(|_| ()).is_none());
+        assert_eq!(old_client.withdraw_conditional_input_source(), Some(original));
+        let new_client = new.downcast_ref::<ClientPane>().unwrap();
+        assert_eq!(new_client.withdraw_conditional_input_source(), Some(replacement));
+        new_client.publish_conditional_input_source(Some(replacement));
+        assert_eq!(mux.iter_panes().len(), 1);
+    }
+
+    #[test]
     fn current_topology_rejects_reused_ids_from_another_session_before_mutation() {
         let scope = MuxTestScope::enter();
         let mux = Arc::new(Mux::new(None));
@@ -8716,6 +8817,7 @@ mod tests {
                 &mux,
                 Arc::clone(&inner),
                 RpcTopologySnapshot::Current {
+                    input_sources: None,
                     session_incarnation,
                     lineage: None,
                     panes,
@@ -8785,6 +8887,7 @@ mod tests {
             &mux,
             Arc::clone(&fresh),
             RpcTopologySnapshot::Current {
+                input_sources: None,
                 session_incarnation: replacement_session,
                 lineage: None,
                 panes: listing(),
@@ -8825,6 +8928,7 @@ mod tests {
                 &mux,
                 Arc::clone(&inner),
                 RpcTopologySnapshot::Current {
+                    input_sources: None,
                     session_incarnation,
                     lineage,
                     panes,
@@ -8926,6 +9030,7 @@ mod tests {
             &mux,
             Arc::clone(&inner),
             RpcTopologySnapshot::Current {
+                input_sources: None,
                 session_incarnation: restored_session,
                 lineage: Some(lineage),
                 panes: sample_remote_tab_listing(),
@@ -8952,6 +9057,7 @@ mod tests {
                 &mux,
                 Arc::clone(&inner),
                 RpcTopologySnapshot::Current {
+                    input_sources: None,
                     session_incarnation: MuxSessionIncarnation::from_bytes(bytes),
                     lineage: None,
                     panes: sample_remote_tab_listing(),
@@ -9035,6 +9141,7 @@ mod tests {
                     &mux,
                     Arc::clone(&inner),
                     RpcTopologySnapshot::Current {
+                        input_sources: None,
                         session_incarnation: MuxSessionIncarnation::from_bytes([0x92; 16]),
                         lineage: None,
                         panes,
@@ -9222,6 +9329,7 @@ mod tests {
                 &mux,
                 Arc::clone(&inner),
                 RpcTopologySnapshot::Current {
+                    input_sources: None,
                     session_incarnation: MuxSessionIncarnation::from_bytes([0x93; 16]),
                     lineage: None,
                     panes,
@@ -9341,6 +9449,7 @@ mod tests {
                     &mux,
                     Arc::clone(&inner),
                     RpcTopologySnapshot::Current {
+                        input_sources: None,
                         session_incarnation: MuxSessionIncarnation::from_bytes([0x91; 16]),
                         lineage: None,
                         panes,

@@ -1,10 +1,15 @@
-use crate::client::{admit_interactive_rpc_now, Client, RpcGenerationScope};
+use super::clientpane::ConditionalInputDelivery;
+use crate::client::{
+    admit_interactive_rpc_now, validate_conditional_input_receipt, with_rpc_deadline, Client,
+    ConditionalPaneInputSource, RpcGenerationScope,
+};
 use codec::*;
 use mux::pane::PaneId;
 use mux::PaneRegistrationHandle;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Duration;
 use wezterm_term::{MouseButton, MouseEvent, MouseEventKind};
 
 const MOUSE_QUEUE_CAPACITY: usize = 256;
@@ -20,6 +25,8 @@ struct QueuedMouseEvent {
     event: MouseEvent,
     scope: RpcGenerationScope,
     registration: PaneRegistrationHandle,
+    source: Option<ConditionalPaneInputSource>,
+    input_serial: InputSerial,
 }
 
 /// An admitted worker owns the entire queue until it drains. Cancellation must
@@ -96,21 +103,51 @@ impl MouseState {
         state: &Arc<Mutex<Self>>,
         event: MouseEvent,
         registration: PaneRegistrationHandle,
+        scope: RpcGenerationScope,
+        source: Option<ConditionalPaneInputSource>,
     ) -> anyhow::Result<()> {
         let mut mouse = state.lock();
-        let scope = mouse.client.rpc_scope();
-        if !scope.is_available() {
+        if !scope.is_available() || !scope.same_generation(&mouse.client.rpc_scope()) {
             metrics::counter!("mux.client.mouse_queue", "outcome" => "unavailable").increment(1);
             anyhow::bail!("cannot enqueue mouse input while mux RPC transport is unavailable");
         }
         if registration.try_with_current(|_| ()).is_none() {
             anyhow::bail!("cannot enqueue mouse input for a retired pane registration");
         }
+        let input_serial = if let Some(source) = source {
+            if !scope.agreed_codec_version().is_some_and(|version| {
+                version >= CONDITIONAL_PANE_INPUT_V1_MIN_CODEC_VERSION
+            }) || scope.render_connection_identity().is_none_or(|identity| {
+                identity.session_incarnation != source.session_incarnation
+            }) {
+                anyhow::bail!("mouse input identity does not belong to this supported mux connection");
+            }
+            let input_serial = InputSerial::try_now()
+                .ok_or_else(|| anyhow::anyhow!("process-local input serial space exhausted"))?;
+            SendPaneInputConditionalV1 {
+                pane_id: mouse.remote_pane_id,
+                session_incarnation: source.session_incarnation,
+                pane_registration: source.pane_registration,
+                input_serial,
+                effect: PaneInputEffectV1::Mouse(event),
+            }
+            .validate()?;
+            input_serial
+        } else {
+            if scope.agreed_codec_version() != Some(LEGACY46_CODEC_VERSION) {
+                anyhow::bail!("current mux mouse input requires exact pane identity and codec 74 or later");
+            }
+            InputSerial::empty()
+        };
         if let Some(last) = mouse.queue.back_mut() {
+            let mut merged = last.event;
             if last.scope.same_generation(&scope)
                 && last.registration.same_registration(&registration)
-                && coalesce_mouse_event(&mut last.event, &event)
+                && last.source == source
+                && coalesce_mouse_event(&mut merged, &event)
+                && (source.is_none() || conditional_wheel_is_bounded(&merged))
             {
+                last.event = merged;
                 return Ok(());
             }
         }
@@ -149,6 +186,8 @@ impl MouseState {
             event,
             scope,
             registration,
+            source,
+            input_serial,
         });
         mouse.worker_running = true;
         drop(mouse);
@@ -167,6 +206,7 @@ impl MouseState {
     }
 
     async fn run(mut guard: MouseWorkerGuard) {
+        let mut failure_notified = false;
         loop {
             let (entry, remote_pane_id) = {
                 let mut mouse = guard.state.lock();
@@ -183,20 +223,67 @@ impl MouseState {
                 event,
                 scope,
                 registration,
+                source,
+                input_serial,
             } = entry;
-            let admitted = registration.try_with_current(|_| {
-                admit_interactive_rpc_now(scope.mouse_event(SendMouseEvent {
+            let result = if let Some(source) = source {
+                // Everything here was frozen when the input callback queued
+                // the event. A later topology read cannot reauthorize it.
+                let request = SendPaneInputConditionalV1 {
                     pane_id: remote_pane_id,
-                    event,
-                }))
-            });
-            let result = match admitted {
-                None => Err(anyhow::anyhow!(
-                    "mouse input pane registration retired before dispatch"
-                )),
-                Some(Err(error)) => Err(error),
-                Some(Ok(None)) => Ok(()),
-                Some(Ok(Some(request))) => request.await.map(|_| ()),
+                    session_incarnation: source.session_incarnation,
+                    pane_registration: source.pane_registration,
+                    input_serial,
+                    effect: PaneInputEffectV1::Mouse(event),
+                };
+                let expected = SendPaneInputConditionalV1Response {
+                    pane_id: remote_pane_id,
+                    session_incarnation: source.session_incarnation,
+                    pane_registration: source.pane_registration,
+                    input_serial,
+                    outcome: PaneInputConditionalOutcomeV1::Accepted,
+                };
+                let admitted = registration.try_with_current(|_| {
+                    let request = scope.send_pane_input_conditional_v1(request);
+                    admit_interactive_rpc_now(async move {
+                        validate_conditional_input_receipt(expected, request.await?)
+                    })
+                });
+                let mut delivery = ConditionalInputDelivery::new(
+                    registration.clone(),
+                    !failure_notified,
+                );
+                let result = match admitted {
+                    None => Err(anyhow::anyhow!(
+                        "mouse input pane registration retired before dispatch"
+                    )),
+                    Some(Err(error)) => Err(error),
+                    Some(Ok(None)) => Ok(()),
+                    Some(Ok(Some(request))) => with_rpc_deadline(
+                        Duration::from_secs(30),
+                        "conditional mouse receipt",
+                        request,
+                    )
+                    .await,
+                };
+                delivery.settle(result.is_ok());
+                failure_notified |= result.is_err();
+                result
+            } else {
+                let admitted = registration.try_with_current(|_| {
+                    admit_interactive_rpc_now(scope.mouse_event(SendMouseEvent {
+                        pane_id: remote_pane_id,
+                        event,
+                    }))
+                });
+                match admitted {
+                    None => Err(anyhow::anyhow!(
+                        "mouse input pane registration retired before dispatch"
+                    )),
+                    Some(Err(error)) => Err(error),
+                    Some(Ok(None)) => Ok(()),
+                    Some(Ok(Some(request))) => request.await.map(|_| ()),
+                }
             };
             if let Err(error) = result {
                 // Mouse RPCs are not idempotent: never replay an ambiguous
@@ -220,10 +307,47 @@ impl MouseState {
     }
 }
 
+fn conditional_wheel_is_bounded(event: &MouseEvent) -> bool {
+    match event.button {
+        MouseButton::WheelUp(count)
+        | MouseButton::WheelDown(count)
+        | MouseButton::WheelLeft(count)
+        | MouseButton::WheelRight(count) => {
+            (1..=MAX_CONDITIONAL_PANE_INPUT_WHEEL_STEPS).contains(&count)
+        }
+        _ => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use wezterm_term::KeyModifiers;
+
+    #[test]
+    fn current_mouse_coalescing_never_exceeds_the_server_effect_bound() {
+        let original = MouseEvent {
+            kind: MouseEventKind::Press,
+            button: MouseButton::WheelUp(MAX_CONDITIONAL_PANE_INPUT_WHEEL_STEPS),
+            x: 3,
+            y: 4,
+            x_pixel_offset: 0,
+            y_pixel_offset: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(conditional_wheel_is_bounded(&original));
+        let mut merged = original;
+        assert!(coalesce_mouse_event(&mut merged, &original));
+        assert!(!conditional_wheel_is_bounded(&merged));
+        for button in [
+            MouseButton::WheelUp(0),
+            MouseButton::WheelDown(0),
+            MouseButton::WheelLeft(MAX_CONDITIONAL_PANE_INPUT_WHEEL_STEPS + 1),
+            MouseButton::WheelRight(usize::MAX),
+        ] {
+            assert!(!conditional_wheel_is_bounded(&MouseEvent { button, ..original }));
+        }
+    }
 
     #[test]
     fn mouse_coalescing_preserves_wheel_identity_and_overflow() {

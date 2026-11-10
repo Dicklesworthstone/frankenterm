@@ -1,5 +1,6 @@
 use crate::client::{
-    admit_interactive_rpc_now, ClientOutboundAdmissionError, RpcConsumerKind, RpcGenerationScope,
+    admit_interactive_rpc_now, validate_conditional_input_receipt, with_rpc_deadline,
+    ClientOutboundAdmissionError, ConditionalPaneInputSource, RpcConsumerKind, RpcGenerationScope,
 };
 use crate::domain::{lock_or_recover, ClientInner};
 use crate::pane::mousestate::MouseState;
@@ -545,6 +546,89 @@ where
     Ok(())
 }
 
+/// An admitted non-replayable effect retains its completion owner even when
+/// the waiter is cancelled. Notifications contain no paste or mouse payload.
+pub(super) struct ConditionalInputDelivery {
+    registration: PaneRegistrationHandle,
+    notify: bool,
+    settled: bool,
+}
+
+impl ConditionalInputDelivery {
+    pub(super) fn new(registration: PaneRegistrationHandle, notify: bool) -> Self {
+        Self {
+            registration,
+            notify,
+            settled: false,
+        }
+    }
+
+    pub(super) fn settle(&mut self, accepted: bool) {
+        self.settled = true;
+        metrics::counter!(
+            "mux.client.conditional_input.delivery.total",
+            "outcome" => if accepted { "accepted" } else { "failed_or_unknown" },
+        )
+        .increment(1);
+        if !accepted && self.notify {
+            let _ = self.registration.try_with_current(|pane| {
+                pane.dispatch_alert(Alert::ToastNotification {
+                    title: Some("Remote input was not confirmed".to_string()),
+                    body: "The original remote pane did not confirm this input. It may already have taken effect; it was not replayed. Check the pane before trying again.".to_string(),
+                    focus: false,
+                });
+            });
+        }
+    }
+}
+
+impl Drop for ConditionalInputDelivery {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.settle(false);
+        }
+    }
+}
+
+fn dispatch_conditional_paste(
+    rpc: &RpcGenerationScope,
+    request: SendPaneInputConditionalV1,
+    registration: PaneRegistrationHandle,
+) -> anyhow::Result<()> {
+    let reservation = match promise::spawn::try_reserve_main_thread(
+        promise::spawn::MainThreadServiceClass::Input,
+        4 * 1024,
+    ) {
+        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+        rejected => bail!("main-thread scheduler rejected conditional paste before transport admission: {rejected:?}"),
+    };
+    let expected = SendPaneInputConditionalV1Response {
+        pane_id: request.pane_id,
+        session_incarnation: request.session_incarnation,
+        pane_registration: request.pane_registration,
+        input_serial: request.input_serial,
+        outcome: PaneInputConditionalOutcomeV1::Accepted,
+    };
+    let request = rpc.send_pane_input_conditional_v1(request);
+    let checked = async move { validate_conditional_input_receipt(expected, request.await?) };
+    let Some(pending) = admit_interactive_rpc_now(checked)? else {
+        return Ok(());
+    };
+    let mut delivery = ConditionalInputDelivery::new(registration, true);
+    reservation
+        .spawn_local(async move {
+            let result = with_rpc_deadline(
+                Duration::from_secs(30),
+                "conditional paste receipt",
+                pending,
+            )
+            .await;
+            delivery.settle(result.is_ok());
+        })
+        .detach();
+    Ok(())
+}
+
 pub(crate) const MAX_COALESCED_RESIZE_INTENTS: usize = 64;
 pub(crate) const MAX_CONCURRENT_RESIZE_REPLIES: usize = 8;
 
@@ -910,6 +994,14 @@ struct QueuedReliableInput {
 struct ReliablePaneInputAuthority {
     session_incarnation: MuxSessionIncarnation,
     pane_registration: ReliablePaneRegistrationIdentityV1,
+}
+
+#[derive(Default)]
+struct ConditionalPaneInputState {
+    // Retain the last exact source while unavailable so a later same-number
+    // registration is recognized as a replacement, not rebound in place.
+    source: Option<ConditionalPaneInputSource>,
+    ready: bool,
 }
 
 /// Exact authority that fences one queued non-idempotent input attempt.
@@ -3499,6 +3591,7 @@ pub struct ClientPane {
     )]
     render_application_limits: ClientRenderApplicationLimits,
     reliable_input_pane_authority: Arc<Mutex<Option<ReliablePaneInputAuthority>>>,
+    conditional_input: Mutex<ConditionalPaneInputState>,
     mux_registration: Arc<PaneRegistrationSlot>,
     resize_delivery: Arc<Mutex<ResizeDeliveryState>>,
 }
@@ -4362,6 +4455,7 @@ impl ClientPane {
             render_application_state: Mutex::new(ClientRenderApplicationState::default()),
             render_application_limits: ClientRenderApplicationLimits::default(),
             reliable_input_pane_authority,
+            conditional_input: Mutex::new(ConditionalPaneInputState::default()),
             mux_registration,
             resize_delivery: Arc::new(Mutex::new(ResizeDeliveryState::default())),
         })
@@ -5147,9 +5241,9 @@ impl ClientPane {
     }
 
     /// Send one sampled paste without placing its content in trace metadata.
-    /// Peers below the additive traced-paste dialect receive the unchanged
-    /// PDU13 request; the context is consumed rather than retained across a
-    /// later connection generation.
+    /// The conditional-input dialect has no trace envelope. Consume the
+    /// context with an explicit local omission disposition; do not weaken the
+    /// pane identity fence to propagate it through numeric-only PDU99.
     pub fn send_paste_with_trace_context(
         &self,
         text: &str,
@@ -5173,8 +5267,6 @@ impl ClientPane {
                 );
             }
         }
-        let input_serial = InputSerial::try_now()
-            .ok_or_else(|| anyhow::anyhow!("process-local input serial space exhausted"))?;
         let client = Arc::clone(&self.client);
         let rpc = client.client.rpc_scope();
         let agreed_codec_version = rpc.agreed_codec_version();
@@ -5182,27 +5274,48 @@ impl ClientPane {
         client
             .reliable_input_queue
             .trigger_after_interactive_scope_capture_generation_barrier(&client.client);
-        let request = SendPaste {
-            pane_id: self.remote_pane_id,
-            data: text.to_owned(),
-            input_serial,
+        let conditional = if agreed_codec_version == Some(LEGACY46_CODEC_VERSION) {
+            None
+        } else {
+            if text.len() > MAX_CONDITIONAL_PANE_INPUT_PASTE_BYTES {
+                bail!("paste exceeds the fixed {MAX_CONDITIONAL_PANE_INPUT_PASTE_BYTES}-byte conditional-input limit");
+            }
+            Some(self.capture_conditional_input_source(&rpc)?)
         };
+        let input_serial = InputSerial::try_now()
+            .ok_or_else(|| anyhow::anyhow!("process-local input serial space exhausted"))?;
         let renderable = self.renderable.lock();
         let mut inner = renderable.inner.borrow_mut();
-        match trace_context {
-            Some(trace_context)
-                if agreed_codec_version
-                    .is_some_and(|version| version >= SEND_PASTE_TRACED_V1_MIN_CODEC_VERSION) =>
-            {
-                dispatch_interactive_rpc(
-                    rpc.send_paste_traced_v1(SendPasteTracedV1 {
-                        request,
-                        trace_context,
-                    }),
-                    "send_paste_traced_v1",
-                )?;
+        if let Some((source, registration)) = conditional {
+            let request = SendPaneInputConditionalV1 {
+                pane_id: self.remote_pane_id,
+                session_incarnation: source.session_incarnation,
+                pane_registration: source.pane_registration,
+                input_serial,
+                effect: PaneInputEffectV1::Paste(text.to_owned()),
+            };
+            request.validate()?;
+            registration
+                .try_with_current(|_| {
+                    dispatch_conditional_paste(&rpc, request, registration.clone())
+                })
+                .ok_or_else(|| anyhow::anyhow!("paste pane registration retired before dispatch"))??;
+            if trace_context.is_some() {
+                metrics::counter!(
+                    "mux.client.sampled_paste.disposition.total",
+                    "outcome" => "conditional_context_omitted",
+                )
+                .increment(1);
             }
-            _ => dispatch_interactive_rpc(rpc.send_paste(request), "send_paste")?,
+        } else {
+            dispatch_interactive_rpc(
+                rpc.send_paste(SendPaste {
+                    pane_id: self.remote_pane_id,
+                    data: text.to_owned(),
+                    input_serial,
+                }),
+                "send_paste",
+            )?;
         }
         inner.input_serial = input_serial;
         inner.predict_from_paste(text);
@@ -5212,6 +5325,54 @@ impl ClientPane {
 
     pub(crate) fn belongs_to_client(&self, client: &ClientInner) -> bool {
         std::ptr::eq(self.client.as_ref(), client)
+    }
+
+    /// Withdraw admission before replacing a displayed topology. Keep its
+    /// last identity so an unavailable join cannot hide later numeric reuse.
+    pub(crate) fn withdraw_conditional_input_source(&self) -> Option<ConditionalPaneInputSource> {
+        let mut state = self.conditional_input.lock();
+        state.ready = false;
+        state.source
+    }
+
+    pub(crate) fn publish_conditional_input_source(
+        &self,
+        source: Option<ConditionalPaneInputSource>,
+    ) {
+        let mut state = self.conditional_input.lock();
+        state.ready = false;
+        if let Some(source) = source {
+            // A successor belongs in a new local mirror, never in the old
+            // pane's queued actions or cached display.
+            if state.source.is_none_or(|previous| previous == source) {
+                state.source = Some(source);
+                state.ready = true;
+            }
+        }
+    }
+
+    fn capture_conditional_input_source(
+        &self,
+        rpc: &RpcGenerationScope,
+    ) -> anyhow::Result<(ConditionalPaneInputSource, PaneRegistrationHandle)> {
+        if !rpc.agreed_codec_version().is_some_and(|version| {
+            version >= CONDITIONAL_PANE_INPUT_V1_MIN_CODEC_VERSION
+        }) {
+            bail!("this mux peer does not support identity-bound paste and mouse input; codec 74 or later is required");
+        }
+        let state = self.conditional_input.lock();
+        let source = state.source.filter(|_| state.ready).ok_or_else(|| {
+            anyhow::anyhow!("remote pane identity is unavailable for this displayed topology; refresh the mux connection before sending paste or mouse input")
+        })?;
+        if rpc.render_connection_identity().is_none_or(|identity| {
+            identity.session_incarnation != source.session_incarnation
+        }) {
+            bail!("remote pane identity belongs to a retired mux session; input was not sent");
+        }
+        let registration = self.mux_registration.load().ok_or_else(|| {
+            anyhow::anyhow!("cannot send input for an unregistered remote pane")
+        })?;
+        Ok((source, registration))
     }
 
     pub(crate) fn flush_resize_after_ready(&self) -> anyhow::Result<()> {
@@ -5984,10 +6145,17 @@ impl Pane for ClientPane {
     }
 
     fn mouse_event(&self, event: MouseEvent) -> anyhow::Result<()> {
-        let registration = self.mux_registration.load().ok_or_else(|| {
-            anyhow::anyhow!("cannot enqueue mouse input for an unregistered remote pane")
-        })?;
-        MouseState::enqueue(&self.mouse, event, registration)?;
+        let rpc = self.client.client.rpc_scope();
+        let (source, registration) = if rpc.agreed_codec_version() == Some(LEGACY46_CODEC_VERSION) {
+            let registration = self.mux_registration.load().ok_or_else(|| {
+                anyhow::anyhow!("cannot enqueue mouse input for an unregistered remote pane")
+            })?;
+            (None, registration)
+        } else {
+            let (source, registration) = self.capture_conditional_input_source(&rpc)?;
+            (Some(source), registration)
+        };
+        MouseState::enqueue(&self.mouse, event, registration, rpc, source)?;
         self.renderable.lock().inner.borrow_mut().update_last_send();
         Ok(())
     }
@@ -8158,6 +8326,26 @@ mod tests {
         assert!(!needs_push_tracking_request(None));
     }
 
+    fn test_conditional_input_source(byte: u8) -> ConditionalPaneInputSource {
+        ConditionalPaneInputSource {
+            session_incarnation: TEST_RENDER_CONNECTION_IDENTITY.session_incarnation,
+            pane_registration: ReliablePaneRegistrationIdentityV1::from_bytes([byte; 16]),
+        }
+    }
+
+    fn register_conditional_input_test_pane(
+        mux: &Arc<Mux>,
+        executor: &promise::spawn::SimpleExecutor,
+        inner: &Arc<ClientInner>,
+        peer: &TestRpcPeer,
+        local_id: PaneId,
+        remote_id: PaneId,
+    ) -> Arc<ClientPane> {
+        let pane = register_resize_test_pane(mux, executor, inner, peer, local_id, remote_id);
+        pane.publish_conditional_input_source(Some(test_conditional_input_source(0x69)));
+        pane
+    }
+
     fn mouse_test_event(kind: wezterm_term::MouseEventKind) -> MouseEvent {
         MouseEvent {
             kind,
@@ -8188,7 +8376,7 @@ mod tests {
         let mux = Arc::new(Mux::new(None));
         scope.set_mux(&mux);
         let (inner, peer) = test_client_inner_with_rpc_peer(17);
-        let pane = register_resize_test_pane(&mux, &executor, &inner, &peer, 40, 29);
+        let pane = register_conditional_input_test_pane(&mux, &executor, &inner, &peer, 40, 29);
         let press = mouse_test_event(wezterm_term::MouseEventKind::Press);
         let release = mouse_test_event(wezterm_term::MouseEventKind::Release);
         pane.mouse_event(press).unwrap();
@@ -8209,15 +8397,15 @@ mod tests {
             promise::spawn::MainThreadReservationOutcome::RetryableFull(_)
         ));
         pane.mouse_event(release).unwrap();
-        let sent = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
-        assert!(matches!(sent, Pdu::SendMouseEvent(request) if request.event == press));
+        let sent = promise::spawn::block_on(peer.respond_next_conditional_input(PaneInputConditionalOutcomeV1::Accepted)).unwrap();
+        assert_eq!(sent.effect, PaneInputEffectV1::Mouse(press));
         pump_mouse_test(&executor);
         assert!(
             !peer.is_empty(),
             "accepted release must advance without another click or scheduler slot"
         );
-        let sent = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
-        assert!(matches!(sent, Pdu::SendMouseEvent(request) if request.event == release));
+        let sent = promise::spawn::block_on(peer.respond_next_conditional_input(PaneInputConditionalOutcomeV1::Accepted)).unwrap();
+        assert_eq!(sent.effect, PaneInputEffectV1::Mouse(release));
         pump_mouse_test(&executor);
         assert!(peer.is_empty());
         drop(occupying);
@@ -8233,7 +8421,7 @@ mod tests {
         let mux = Arc::new(Mux::new(None));
         scope.set_mux(&mux);
         let (inner, peer) = test_client_inner_with_rpc_peer(17);
-        let pane = register_resize_test_pane(&mux, &executor, &inner, &peer, 40, 29);
+        let pane = register_conditional_input_test_pane(&mux, &executor, &inner, &peer, 40, 29);
         let occupying = match promise::spawn::try_reserve_main_thread(
             promise::spawn::MainThreadServiceClass::Input,
             16,
@@ -8254,8 +8442,8 @@ mod tests {
         pane.mouse_event(fresh).unwrap();
         pump_mouse_test(&executor);
         assert!(!peer.is_empty());
-        let sent = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
-        assert!(matches!(sent, Pdu::SendMouseEvent(request) if request.event == fresh));
+        let sent = promise::spawn::block_on(peer.respond_next_conditional_input(PaneInputConditionalOutcomeV1::Accepted)).unwrap();
+        assert_eq!(sent.effect, PaneInputEffectV1::Mouse(fresh));
         pump_mouse_test(&executor);
     }
 
@@ -8266,7 +8454,7 @@ mod tests {
         let mux = Arc::new(Mux::new(None));
         scope.set_mux(&mux);
         let (inner, peer) = test_client_inner_with_rpc_peer(17);
-        let pane = register_resize_test_pane(&mux, &executor, &inner, &peer, 40, 29);
+        let pane = register_conditional_input_test_pane(&mux, &executor, &inner, &peer, 40, 29);
         let press = mouse_test_event(wezterm_term::MouseEventKind::Press);
         for _ in 0..256 {
             pane.mouse_event(press).unwrap();
@@ -8287,8 +8475,8 @@ mod tests {
         pane.mouse_event(press).unwrap();
         pump_mouse_test(&executor);
         assert!(!peer.is_empty());
-        let sent = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
-        assert!(matches!(sent, Pdu::SendMouseEvent(request) if request.event == press));
+        let sent = promise::spawn::block_on(peer.respond_next_conditional_input(PaneInputConditionalOutcomeV1::Accepted)).unwrap();
+        assert_eq!(sent.effect, PaneInputEffectV1::Mouse(press));
         pump_mouse_test(&executor);
     }
 
@@ -8299,7 +8487,7 @@ mod tests {
         let mux = Arc::new(Mux::new(None));
         scope.set_mux(&mux);
         let (inner, peer) = test_client_inner_with_rpc_peer(17);
-        let old = register_resize_test_pane(&mux, &executor, &inner, &peer, 40, 29);
+        let old = register_conditional_input_test_pane(&mux, &executor, &inner, &peer, 40, 29);
         let press = mouse_test_event(wezterm_term::MouseEventKind::Press);
         old.mouse_event(press).unwrap();
         assert!(
@@ -8310,7 +8498,7 @@ mod tests {
         // Retire only the local registration, without killing the remote pane.
         *old.ignore_next_kill.lock() = true;
         mux.remove_pane(40);
-        let replacement = register_resize_test_pane(&mux, &executor, &inner, &peer, 40, 30);
+        let replacement = register_conditional_input_test_pane(&mux, &executor, &inner, &peer, 40, 30);
         // The registration helper drains the executor and checks that the only
         // RPC was the replacement's palette: neither old nor replacement mouse
         // target may receive the accepted event from the retired registration.
@@ -8326,9 +8514,87 @@ mod tests {
         replacement.mouse_event(release).unwrap();
         pump_mouse_test(&executor);
         assert!(!peer.is_empty());
+        let sent = promise::spawn::block_on(peer.respond_next_conditional_input(PaneInputConditionalOutcomeV1::Accepted)).unwrap();
+        assert_eq!(sent.pane_id, 30);
+        assert_eq!(sent.effect, PaneInputEffectV1::Mouse(release));
+        pump_mouse_test(&executor);
+        assert!(peer.is_empty());
+    }
+
+    #[test]
+    fn queued_mouse_keeps_admitted_source_after_topology_authority_is_withdrawn() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, peer) = test_client_inner_with_rpc_peer(17);
+        let pane = register_conditional_input_test_pane(&mux, &executor, &inner, &peer, 40, 29);
+        let press = mouse_test_event(wezterm_term::MouseEventKind::Press);
+        pane.mouse_event(press).unwrap();
+        let source = pane.withdraw_conditional_input_source().unwrap();
+        pane.publish_conditional_input_source(Some(test_conditional_input_source(0x70)));
+        pump_mouse_test(&executor);
+        let sent = promise::spawn::block_on(peer.respond_next_conditional_input(
+            PaneInputConditionalOutcomeV1::IdentityMismatch,
+        )).unwrap();
+        assert_eq!(sent.session_incarnation, source.session_incarnation);
+        assert_eq!(sent.pane_registration, source.pane_registration);
+        assert_eq!(sent.effect, PaneInputEffectV1::Mouse(press));
+        pump_mouse_test(&executor);
+        assert!(peer.is_empty(), "a rejected source must not be probed and replayed");
+        pane.mouse_event(press).expect_err("a later event cannot adopt the replacement source");
+    }
+
+    #[test]
+    fn current_mouse_wheel_queue_splits_coalescing_at_the_wire_effect_limit() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, peer) = test_client_inner_with_rpc_peer(17);
+        let pane = register_conditional_input_test_pane(&mux, &executor, &inner, &peer, 40, 29);
+        let wheel = MouseEvent {
+            button: wezterm_term::MouseButton::WheelDown(512),
+            ..mouse_test_event(wezterm_term::MouseEventKind::Press)
+        };
+        for _ in 0..3 {
+            pane.mouse_event(wheel).unwrap();
+        }
+        pump_mouse_test(&executor);
+        let first = promise::spawn::block_on(peer.respond_next_conditional_input(
+            PaneInputConditionalOutcomeV1::Accepted,
+        )).unwrap();
+        let PaneInputEffectV1::Mouse(first_event) = first.effect else {
+            panic!("wheel queue must emit mouse input");
+        };
+        assert_eq!(first_event.button, wezterm_term::MouseButton::WheelDown(1024));
+        pump_mouse_test(&executor);
+        let second = promise::spawn::block_on(peer.respond_next_conditional_input(
+            PaneInputConditionalOutcomeV1::Accepted,
+        )).unwrap();
+        let PaneInputEffectV1::Mouse(second_event) = second.effect else {
+            panic!("wheel queue must emit mouse input");
+        };
+        assert_eq!(second_event.button, wezterm_term::MouseButton::WheelDown(512));
+        assert!(first.input_serial < second.input_serial);
+        pump_mouse_test(&executor);
+        assert!(peer.is_empty());
+    }
+
+    #[test]
+    fn explicit_legacy_mouse_keeps_its_existing_numeric_wire_lane() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, peer) = test_client_inner_with_rpc_peer(17);
+        peer.replace_ready_generation(&inner.client, LEGACY46_CODEC_VERSION).unwrap();
+        let pane = register_resize_test_pane(&mux, &executor, &inner, &peer, 40, 29);
+        let press = mouse_test_event(wezterm_term::MouseEventKind::Press);
+        pane.mouse_event(press).unwrap();
+        pump_mouse_test(&executor);
         let sent = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
-        assert!(matches!(sent, Pdu::SendMouseEvent(request)
-            if request.pane_id == 30 && request.event == release));
+        assert!(matches!(sent, Pdu::SendMouseEvent(request) if request.event == press));
         pump_mouse_test(&executor);
         assert!(peer.is_empty());
     }
@@ -8340,7 +8606,7 @@ mod tests {
         let mux = Arc::new(Mux::new(None));
         scope.set_mux(&mux);
         let (inner, peer) = test_client_inner_with_rpc_peer(17);
-        let pane = register_resize_test_pane(&mux, &executor, &inner, &peer, 40, 29);
+        let pane = register_conditional_input_test_pane(&mux, &executor, &inner, &peer, 40, 29);
         pane.mouse_event(mouse_test_event(wezterm_term::MouseEventKind::Press))
             .unwrap();
         drop(executor);
@@ -8350,8 +8616,8 @@ mod tests {
         pane.mouse_event(fresh).unwrap();
         pump_mouse_test(&executor);
         assert!(!peer.is_empty());
-        let sent = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
-        assert!(matches!(sent, Pdu::SendMouseEvent(request) if request.event == fresh));
+        let sent = promise::spawn::block_on(peer.respond_next_conditional_input(PaneInputConditionalOutcomeV1::Accepted)).unwrap();
+        assert_eq!(sent.effect, PaneInputEffectV1::Mouse(fresh));
         pump_mouse_test(&executor);
         assert!(
             peer.is_empty(),
@@ -9089,92 +9355,154 @@ mod tests {
     }
 
     #[test]
-    fn sampled_paste_uses_pdu99_once_and_preserves_operational_bytes() {
-        let _scope = MuxTestScope::enter();
-        let executor = promise::spawn::ScopedExecutor::new();
+    fn sampled_paste_uses_exact_pdu123_once_and_preserves_operational_bytes() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
         let (inner, peer) = test_client_inner_with_rpc_peer(17);
-        let pane = test_client_pane(&inner, 40, 29);
+        let pane = register_conditional_input_test_pane(&mux, &executor, &inner, &peer, 40, 29);
+        let source = test_conditional_input_source(0x69);
         let payload = "private paste bytes\nwith ordering";
 
         pane.send_paste_with_trace_context(payload, sampled_paste_context())
-            .expect("sampled paste should enter the live test transport");
-        let request = promise::spawn::block_on(executor.run(peer.respond_next_unit()))
-            .expect("test peer should receive sampled paste");
-        let Pdu::SendPasteTracedV1(traced) = request else {
-            panic!("sampled paste used unexpected wire request");
+            .expect("sampled paste should enter the exact current transport");
+        let request = promise::spawn::block_on(peer.respond_next_conditional_input(
+            PaneInputConditionalOutcomeV1::Accepted,
+        ))
+        .expect("test peer should receive conditional paste");
+        assert_eq!(request.pane_id, 29);
+        assert_eq!(request.effect, PaneInputEffectV1::Paste(payload.to_string()));
+        assert_eq!(request.session_incarnation, source.session_incarnation);
+        assert_eq!(request.pane_registration, source.pane_registration);
+        assert!(!request.input_serial.is_empty());
+        assert_eq!(pane.renderable.lock().inner.borrow().input_serial, request.input_serial);
+        pump_mouse_test(&executor);
+        assert!(peer.is_empty(), "trace omission must not create a numeric-only second effect");
+    }
+
+    #[test]
+    fn paste_generation_swaps_never_redirect_the_frozen_request() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, peer) = test_client_inner_with_rpc_peer(17);
+        let pane = register_conditional_input_test_pane(&mux, &executor, &inner, &peer, 155, 141);
+        let payload = "generation-bound paste";
+        let before = pane.renderable.lock().inner.borrow().input_serial;
+        inner.reliable_input_queue.arm_after_interactive_scope_capture_generation_barrier(
+            peer.clone(),
+            LEGACY46_CODEC_VERSION,
+        );
+        pane.send_paste_with_trace_context(payload, sampled_paste_context())
+            .expect_err("a captured current request must not redirect onto a legacy successor");
+        assert!(peer.is_empty());
+        assert_eq!(pane.renderable.lock().inner.borrow().input_serial, before);
+
+        pane.send_paste_with_trace_context(payload, sampled_paste_context())
+            .expect("an explicit new legacy action keeps its old dialect");
+        let Pdu::SendPaste(request) = promise::spawn::block_on(peer.respond_next_unit()).unwrap()
+        else {
+            panic!("explicit legacy paste must use PDU13");
         };
-        assert_eq!(traced.request.pane_id, 29);
-        assert_eq!(traced.request.data, payload);
-        assert!(!traced.request.input_serial.is_empty());
-        assert_eq!(traced.trace_context.path, InteractionTracePath::Paste);
+        assert_eq!(request.data, payload);
+        pump_mouse_test(&executor);
+        let before = pane.renderable.lock().inner.borrow().input_serial;
+        inner.reliable_input_queue.arm_after_interactive_scope_capture_generation_barrier(
+            peer.clone(),
+            CONDITIONAL_PANE_INPUT_V1_MIN_CODEC_VERSION,
+        );
+        pane.send_paste(payload)
+            .expect_err("a captured legacy request must not redirect onto a current successor");
+        assert!(peer.is_empty());
+        assert_eq!(pane.renderable.lock().inner.borrow().input_serial, before);
+
+        pane.send_paste(payload).expect("new current action uses its original pane witness");
+        let request = promise::spawn::block_on(peer.respond_next_conditional_input(
+            PaneInputConditionalOutcomeV1::Accepted,
+        )).unwrap();
+        assert_eq!(request.pane_registration, test_conditional_input_source(0x69).pane_registration);
+        pump_mouse_test(&executor);
         assert!(peer.is_empty());
     }
 
     #[test]
-    fn sampled_paste_generation_swaps_never_split_dialect_from_rpc_scope() {
-        let _scope = MuxTestScope::enter();
-        let executor = promise::spawn::ScopedExecutor::new();
+    fn current_paste_and_mouse_refuse_missing_or_unsupported_identity_before_admission() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
         let (inner, peer) = test_client_inner_with_rpc_peer(17);
-        let pane = test_client_pane(&inner, 155, 141);
-        let payload = "generation-bound paste";
-
-        peer.replace_ready_generation(&inner.client, SEND_PASTE_TRACED_V1_MIN_CODEC_VERSION)
-            .expect("install exact traced-paste generation");
-        let before_downgrade = pane.renderable.lock().inner.borrow().input_serial;
-        inner
-            .reliable_input_queue
-            .arm_after_interactive_scope_capture_generation_barrier(
-                peer.clone(),
-                SEND_PASTE_TRACED_V1_MIN_CODEC_VERSION - 1,
-            );
-        pane.send_paste_with_trace_context(payload, sampled_paste_context())
-            .expect_err(
-                "retired traced scope must not redirect its PDU99 decision onto a base successor",
-            );
+        let pane = register_resize_test_pane(&mux, &executor, &inner, &peer, 40, 29);
+        let before = pane.renderable.lock().inner.borrow().input_serial;
+        let mouse = mouse_test_event(wezterm_term::MouseEventKind::Press);
+        pane.send_paste("no topology witness").expect_err("viewing alone grants no input authority");
+        pane.mouse_event(mouse).expect_err("no late identity probe for queued mouse");
         assert!(peer.is_empty());
-        assert_eq!(
-            pane.renderable.lock().inner.borrow().input_serial,
-            before_downgrade,
-            "failed exact-scope admission must not publish paste prediction authority"
-        );
+        assert_eq!(pane.renderable.lock().inner.borrow().input_serial, before);
 
-        pane.send_paste_with_trace_context(payload, sampled_paste_context())
-            .expect("retry on the exact base generation must remain operational");
-        let base = promise::spawn::block_on(executor.run(peer.respond_next_unit()))
-            .expect("base successor receives the explicit retry");
-        let Pdu::SendPaste(base) = base else {
-            panic!("pre-trace successor must receive only PDU13");
-        };
-        assert_eq!(base.data, payload);
-
-        let before_upgrade = pane.renderable.lock().inner.borrow().input_serial;
-        inner
-            .reliable_input_queue
-            .arm_after_interactive_scope_capture_generation_barrier(
-                peer.clone(),
-                SEND_PASTE_TRACED_V1_MIN_CODEC_VERSION,
-            );
-        pane.send_paste_with_trace_context(payload, sampled_paste_context())
-            .expect_err(
-                "retired base scope must not redirect its PDU13 decision onto a traced successor",
-            );
+        pane.publish_conditional_input_source(Some(test_conditional_input_source(0x69)));
+        for version in [CODEC_VERSION_MIN_SUPPORTED, 63, 73] {
+            peer.replace_ready_generation(&inner.client, version).unwrap();
+            pane.send_paste("no numeric fallback").expect_err("old current peer must refuse paste");
+            pane.mouse_event(mouse).expect_err("old current peer must refuse mouse");
+            assert!(peer.is_empty());
+            assert_eq!(pane.renderable.lock().inner.borrow().input_serial, before);
+        }
+        peer.replace_ready_generation(&inner.client, CODEC_VERSION).unwrap();
+        let oversized = "x".repeat(MAX_CONDITIONAL_PANE_INPUT_PASTE_BYTES + 1);
+        pane.send_paste(&oversized).expect_err("paste bound is checked before admission");
+        pane.mouse_event(MouseEvent { y: -1, ..mouse })
+            .expect_err("mouse coordinates are checked before queue admission");
         assert!(peer.is_empty());
-        assert_eq!(
-            pane.renderable.lock().inner.borrow().input_serial,
-            before_upgrade,
-            "failed upgrade-race admission must not publish paste prediction authority"
-        );
+        assert_eq!(pane.renderable.lock().inner.borrow().input_serial, before);
+    }
 
-        pane.send_paste_with_trace_context(payload, sampled_paste_context())
-            .expect("retry on the exact traced generation must use PDU99");
-        let traced = promise::spawn::block_on(executor.run(peer.respond_next_unit()))
-            .expect("traced successor receives the explicit retry");
-        let Pdu::SendPasteTracedV1(traced) = traced else {
-            panic!("traced successor must receive PDU99");
-        };
-        assert_eq!(traced.request.data, payload);
-        assert_eq!(traced.trace_context, sampled_paste_context());
+    #[test]
+    fn conditional_paste_unknown_or_cancelled_receipt_is_never_replayed() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, peer) = test_client_inner_with_rpc_peer(17);
+        let pane = register_conditional_input_test_pane(&mux, &executor, &inner, &peer, 40, 29);
+        pane.send_paste("one ambiguous action").unwrap();
+        promise::spawn::block_on(peer.respond_next_conditional_input(
+            PaneInputConditionalOutcomeV1::Indeterminate,
+        )).unwrap();
+        pump_mouse_test(&executor);
+        assert!(peer.is_empty(), "unknown callback outcome does not authorize replay");
+
+        pane.send_paste("one cancelled waiter").unwrap();
+        drop(executor);
+        promise::spawn::block_on(peer.discard_next_queued_rpc()).unwrap();
+        assert!(peer.is_empty(), "cancelling an admitted waiter does not replay the paste");
+        let _executor = promise::spawn::SimpleExecutor::new();
+    }
+
+    #[test]
+    fn conditional_input_source_withdrawal_never_adopts_a_later_replacement() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, peer) = test_client_inner_with_rpc_peer(17);
+        let pane = register_conditional_input_test_pane(&mux, &executor, &inner, &peer, 40, 29);
+        let original = test_conditional_input_source(0x69);
+        assert_eq!(pane.withdraw_conditional_input_source(), Some(original));
+        pane.publish_conditional_input_source(None);
+        pane.send_paste("unavailable join").expect_err("unavailable authority disables input");
+        pane.publish_conditional_input_source(Some(test_conditional_input_source(0x70)));
+        pane.send_paste("replacement").expect_err("the old mirror cannot adopt its successor");
+        assert_eq!(pane.withdraw_conditional_input_source(), Some(original));
         assert!(peer.is_empty());
+        pane.publish_conditional_input_source(Some(original));
+        pane.send_paste("same original").expect("an exact same-source refresh may restore readiness");
+        promise::spawn::block_on(peer.respond_next_conditional_input(
+            PaneInputConditionalOutcomeV1::Accepted,
+        )).unwrap();
+        pump_mouse_test(&executor);
     }
 
     #[test]
