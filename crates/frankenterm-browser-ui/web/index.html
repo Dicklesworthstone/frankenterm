@@ -22,7 +22,23 @@
 </header>
 <main id="workspace" data-output-open="false">
   <section id="container" aria-label="Fleet inventory and detections">
-    <canvas id="terminal" tabindex="0" aria-label="FrankenTerm fleet viewer. Use arrows to select, 1 or 2 to switch views, Enter to inspect output, Tab to leave."></canvas>
+    <p id="fleet-mode" role="status">Loading fleet inventory. Search captured history or open a pane by ID above.</p>
+    <nav id="fleet-navigation" aria-label="Fleet navigation">
+      <button id="fleet-panes" type="button" disabled>Panes (1)</button>
+      <button id="fleet-events" type="button" disabled>Detections (2)</button>
+      <button id="fleet-first" type="button" disabled>First</button>
+      <button id="fleet-previous" type="button" disabled>Previous</button>
+      <button id="fleet-next" type="button" disabled>Next</button>
+      <button id="fleet-last" type="button" disabled>Last</button>
+      <button id="fleet-refresh" type="button" disabled>Refresh</button>
+      <button id="fleet-text-toggle" type="button" aria-pressed="false" disabled>Use text view</button>
+    </nav>
+    <p id="fleet-selection" role="status">No fleet selection yet.</p>
+    <p id="fleet-text-help">Text view supports native selection and copying. Select text to hold it steady; clear the selection to show updates. Use the navigation buttons, or focus the text and use arrows, 1/2, and Enter. Tab leaves the fleet.</p>
+    <div id="fleet-viewport">
+      <canvas id="terminal" tabindex="-1" hidden aria-label="FrankenTerm fleet viewer. Use arrows to select, 1 or 2 to switch views, Enter to inspect output, Tab to leave."></canvas>
+      <pre id="screen-text" class="fleet-text" tabindex="-1" aria-label="Fleet inventory and detections as text" aria-describedby="fleet-text-help fleet-selection"></pre>
+    </div>
   </section>
   <section id="pane-output" aria-labelledby="pane-output-title" hidden>
     <div class="output-toolbar">
@@ -75,8 +91,6 @@
   <p id="history-note">Open a captured segment to inspect that historical result without following a current pane. Deleted or changed captures appear unavailable. Opening current output is a separate action: the pane may no longer exist or its ID may have been reused. All views are read-only. Results are capped, not paginated; narrow the query for older matches. Closing clears this view.</p>
   <ol id="history-results" aria-label="Ranked captured-history matches"></ol>
 </dialog>
-<!-- The rendered fleet frame as text: for screen readers and browser tests. -->
-<pre id="screen-text" class="visually-hidden" aria-live="polite"></pre>
 <div id="error" role="alert" hidden></div>
 <script type="module" src="./app.mjs"></script>
 </body>

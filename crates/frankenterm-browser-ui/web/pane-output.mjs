@@ -383,6 +383,7 @@ export function mountPaneOutput({
   document: doc = globalThis.document,
   apiRoot,
   getSelectedPane,
+  restoreFocus,
   output = createPaneOutput({ apiRoot }),
 } = {}) {
   const element = (id) => {
@@ -509,7 +510,8 @@ export function mountPaneOutput({
     findStatus.textContent = "";
     hint.textContent = "Captured output is read-only; no keys are sent to a pane.";
     render();
-    canvas.focus();
+    if (restoreFocus) restoreFocus();
+    else canvas.focus();
   }
 
   function find(backward = false) {

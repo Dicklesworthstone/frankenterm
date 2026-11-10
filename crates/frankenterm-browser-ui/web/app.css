@@ -28,7 +28,7 @@ button, input[type="text"], input[type="search"] {
 }
 button { cursor: pointer; }
 button:disabled { cursor: default; opacity: 0.5; }
-button:focus-visible, input:focus-visible, textarea:focus-visible, #terminal:focus-visible {
+button:focus-visible, input:focus-visible, textarea:focus-visible, #terminal:focus-visible, #screen-text:focus-visible {
   outline: 2px solid #5fafff;
   outline-offset: -2px;
 }
@@ -49,7 +49,21 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, #terminal:foc
   grid-template-columns: minmax(0, 1fr);
 }
 #workspace[data-output-open="true"] { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
-#container { position: relative; min-width: 0; min-height: 0; }
+#container { position: relative; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+#fleet-mode, #fleet-selection, #fleet-text-help { margin: 6px 10px; font-size: 12px; }
+#fleet-navigation { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 10px; }
+#fleet-viewport { position: relative; flex: 1; min-width: 0; min-height: 0; overflow: auto; }
+.fleet-text {
+  box-sizing: border-box;
+  min-width: 100%;
+  min-height: 100%;
+  margin: 0;
+  padding: 8px;
+  font: 14px/1.4 "Pragmasevka NF", ui-monospace, monospace;
+  white-space: pre;
+  direction: ltr;
+  unicode-bidi: plaintext;
+}
 #terminal { display: block; width: 100%; height: 100%; }
 #pane-output {
   display: flex;

@@ -3,7 +3,7 @@
 // This page owns all network I/O and DOM events. The WASM FleetViewer owns
 // state and renders frames; FrankenTermWeb paints their patches. The viewer is
 // read-only: nothing here writes to a pane.
-import { decodeFrame, mountPaneOutput } from "./pane-output.mjs";
+import { createPaneOutput, decodeFrame, mountPaneOutput } from "./pane-output.mjs";
 import { mountHistorySearch } from "./history-panel.mjs";
 
 const REFRESH_MS = 15_000;
@@ -12,6 +12,10 @@ const STREAM_RETRY_MAX_MS = 30_000;
 const STREAM_FRAME_MAX_CHARS = 8 * 1024 * 1024;
 const STREAM = { DISCONNECTED: 0, CONNECTING: 1, LIVE: 2 };
 const FORWARDED_NAV_KEYS = new Set(["ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"]);
+const TEXT_NAV_KEYS = new Set(["ArrowUp", "ArrowDown", "Home", "End", "j", "k", "g", "G", "1", "2", "r"]);
+const GRID_MAX_COLS = 240;
+const GRID_MAX_ROWS = 100;
+const SCREEN_TEXT_MAX_CHARS = 2 * GRID_MAX_COLS * GRID_MAX_ROWS + GRID_MAX_ROWS;
 
 // This feed subscribes to all panes. Retain the complete server token, and
 // compare IDs only within its epoch and scope. Number would round i64 IDs.
@@ -477,10 +481,21 @@ function keyInput(event, phase) {
 // Native controls own their keys. In particular Tab must escape the canvas,
 // and typing in the pane selector/search box must not move the fleet selection.
 export function handleFleetKey(event, { canvas, term, viewer, inspector }) {
-  if (event.target !== canvas || event.metaKey || event.ctrlKey || event.altKey || event.key === "Tab") return;
+  if (event.target !== canvas || event.metaKey || event.ctrlKey || event.altKey
+      || event.key === "Tab" || event.isComposing) return;
+  // The native text view keeps Shift navigation for browser text selection.
+  if (!term && event.shiftKey && event.key !== "G") return;
   if (event.key === "Enter") {
     event.preventDefault();
     if (!event.repeat) inspector.openSelected();
+    return;
+  }
+  if (!term) {
+    // This is the pinned ftui-web input_parser contract, also emitted by the
+    // renderer. Both presentations drive the very same Rust fleet model.
+    if (TEXT_NAV_KEYS.has(event.key) && viewer.pushEncodedInput(JSON.stringify(keyInput(event, "down")))) {
+      event.preventDefault();
+    }
     return;
   }
   try {
@@ -493,121 +508,318 @@ export function handleFleetKey(event, { canvas, term, viewer, inspector }) {
   if (FORWARDED_NAV_KEYS.has(event.key)) event.preventDefault();
 }
 
-async function main() {
-  // Dynamic imports keep the actual transport owner testable without loading
-  // a generated WASM bundle, DOM, renderer or network in the Node harness.
-  const [{ default: initRenderer, FrankenTermWeb }, { default: initViewer, FleetViewer }] =
-    await Promise.all([import("./pkg/FrankenTerm.js"), import("./pkg/ft_fleet_viewer.js")]);
-  await Promise.all([initRenderer(), initViewer()]);
-  await document.fonts.load('16px "Pragmasevka NF"').catch(() => undefined);
-
-  const apiRoot = new URL("..", window.location.href);
-  const container = document.getElementById("container");
-  const canvas = document.getElementById("terminal");
-  const screenText = document.getElementById("screen-text");
-  const term = new FrankenTermWeb();
-  const contract = typeof term.apiContract === "function" ? term.apiContract() : null;
-  if (contract?.apiLine !== "frankenterm-js" || contract.apiVersion !== "1.0.0") {
-    throw new Error("unsupported FrankenTerm web renderer API contract");
-  }
-  let dpr = window.devicePixelRatio || 1;
-  await term.init(canvas, { cols: 80, rows: 24, cellWidth: 8, cellHeight: 16, dpr, focused: true });
-  let geometry = term.fitToContainer(container.clientWidth, container.clientHeight, dpr);
-  const viewer = new FleetViewer(geometry.cols, geometry.rows);
-  viewer.setTime(Date.now());
-  viewer.init();
-
-  function present() {
-    const { cells, spans } = viewer.takeFlatPatches();
-    if (cells.length > 0) term.applyPatchBatchFlat(spans, cells);
-    term.render();
-    screenText.textContent = viewer.screenText();
-  }
-  present();
-
-  const snapshots = createFleetRefresh(viewer, { apiRoot });
-  const refresh = snapshots.refresh;
-  const stream = createFleetStream(snapshots, { apiRoot, onResync: refresh });
-  const inspector = mountPaneOutput({
-    apiRoot,
-    getSelectedPane: () => {
-      // Apply queued navigation before sampling its identity. Once opened,
-      // later row changes never retarget this pane's output subscription.
-      if (viewer.step()) present();
-      return viewer.selectedPaneId();
-    },
-  });
-  const historySearch = mountHistorySearch({
-    inspectCapture: (hit) => inspector.openCapture(hit),
-    readBody: (path, signal) => readSnapshot(path, apiRoot, globalThis.fetch, signal, 8 * 1024 * 1024),
-    inspectPane: (paneId) => {
-      // Route the exact captured identity through the same validated native
-      // form as a manual Open action, never through the mutable fleet row.
-      document.getElementById("pane-output-id").value = paneId;
-      document.getElementById("pane-output-form").requestSubmit();
-    },
-  });
-
-  window.addEventListener("keydown", (event) => {
-    handleFleetKey(event, { canvas, term, viewer, inspector });
-  });
-
-  new ResizeObserver(() => {
-    if (container.clientWidth <= 0 || container.clientHeight <= 0) return;
-    dpr = window.devicePixelRatio || 1;
-    geometry = term.fitToContainer(container.clientWidth, container.clientHeight, dpr);
-    viewer.resize(geometry.cols, geometry.rows);
-  }).observe(container);
-
+// Mount the ordinary DOM tools before importing either WASM bundle. A missing
+// model still permits manual pane/history inspection; a missing renderer uses
+// the same FleetViewer, snapshots and durable stream through a native text view.
+export function mountFleetApp({
+  document: doc = globalThis.document,
+  window: host = globalThis.window,
+  apiRoot = new URL("..", host.location.href),
+  loadViewer = () => import("./pkg/ft_fleet_viewer.js"),
+  loadRenderer = () => import("./pkg/FrankenTerm.js"),
+  fetchImpl = globalThis.fetch,
+  EventSourceImpl = globalThis.EventSource,
+  setTimer = globalThis.setTimeout,
+  clearTimer = globalThis.clearTimeout,
+  setRepeating = globalThis.setInterval,
+  clearRepeating = globalThis.clearInterval,
+  requestFrame = (callback) => host.requestAnimationFrame(callback),
+  cancelFrame = (handle) => host.cancelAnimationFrame(handle),
+  ResizeObserverImpl = globalThis.ResizeObserver,
+  now = Date.now,
+} = {}) {
+  const element = (id) => doc.getElementById(id);
+  const viewport = element("fleet-viewport");
+  const canvas = element("terminal");
+  const screenText = element("screen-text");
+  const modeLine = element("fleet-mode");
+  const selectionLine = element("fleet-selection");
+  const textToggle = element("fleet-text-toggle");
+  const navigation = new Map([
+    ["fleet-panes", "1"], ["fleet-events", "2"], ["fleet-first", "Home"],
+    ["fleet-previous", "ArrowUp"], ["fleet-next", "ArrowDown"],
+    ["fleet-last", "End"], ["fleet-refresh", "r"],
+  ]);
+  let viewer = null;
+  let term = null;
+  let snapshots = null;
+  let stream = null;
+  let modelFailed = false;
+  let rendererFailed = false;
+  let preferText = false;
   let active = false;
+  let networkActive = false;
   let refreshTimer = null;
   let frameHandle = null;
   let lastClock = 0;
+  const textView = () => !term || preferText;
+  const setText = (node, text) => { if (node.textContent !== text) node.textContent = text; };
+  const textSelected = () => {
+    const selection = host.getSelection?.();
+    return !selection?.isCollapsed && selection?.rangeCount > 0
+      && (screenText.contains(selection.anchorNode) || screenText.contains(selection.focusNode));
+  };
+  const clearTextSelection = () => { if (textSelected()) host.getSelection().removeAllRanges(); };
+
+  function updateMode() {
+    const asText = textView();
+    const moveFocus = doc.activeElement === (asText ? canvas : screenText);
+    canvas.hidden = asText;
+    canvas.tabIndex = asText ? -1 : 0;
+    screenText.className = asText ? "fleet-text" : "visually-hidden";
+    screenText.tabIndex = asText && viewer ? 0 : -1;
+    element("fleet-text-help").hidden = !asText || !viewer;
+    for (const id of navigation.keys()) element(id).disabled = !viewer;
+    element("pane-output-open").disabled = !viewer;
+    textToggle.disabled = !viewer || !term;
+    textToggle.setAttribute("aria-pressed", String(asText));
+    setText(textToggle, asText ? "Use canvas view" : "Use text view");
+    const mode = viewer ? (asText ? "text" : "canvas") : modelFailed ? "capture-only" : "loading";
+    doc.documentElement.dataset.viewerMode = mode;
+    doc.documentElement.dataset.viewerReady = viewer ? "1" : modelFailed ? "capture-only" : "loading";
+    const message = modelFailed
+      ? "Fleet inventory is unavailable. Search captured history or open a pane by ID above; both tools remain available."
+      : !viewer ? "Loading fleet inventory. Search captured history or open a pane by ID above."
+      : !asText ? "Live fleet inventory. Text view and captured output are read-only."
+      : textSelected() ? "Text is held steady while selected. Clear the selection to show the latest fleet frame."
+      : rendererFailed ? "Canvas rendering is unavailable. Live fleet text, navigation, captured output and history search remain available."
+      : term ? "Live fleet text. Navigate with the buttons or keyboard; select text to copy."
+      : "Live fleet text is ready while canvas rendering starts. Navigation and captured-history tools are available.";
+    setText(modeLine, message);
+    if (moveFocus && active && viewer) (asText ? screenText : canvas).focus();
+  }
+
+  function mirrorText() {
+    if (!viewer) return;
+    // Native selection must survive clock ticks and incoming frames. Keep
+    // draining model patches while copying; resume from its latest frame.
+    if (!textView() || !textSelected()) {
+      const text = viewer.screenText();
+      if (typeof text !== "string" || text.length > SCREEN_TEXT_MAX_CHARS) throw new Error("invalid fleet frame");
+      setText(screenText, text);
+    }
+    const paneId = viewer.selectedPaneId();
+    setText(selectionLine, typeof paneId === "string" ? `Selected pane ${paneId}. Enter or Inspect selected pane opens its captured output.`
+      : "No pane or detection selected. Open captured output by pane ID, or search history.");
+  }
+
+  function retireRenderer() {
+    const previous = term;
+    term = null;
+    rendererFailed = true;
+    try { previous?.destroy(); } catch (_) { /* a lost renderer must not stop DOM tools */ }
+    updateMode();
+  }
+
+  function present() {
+    // takeFlatPatches also drains StepProgram's output buffers in text mode.
+    const { cells, spans } = viewer.takeFlatPatches();
+    if (term && !preferText) {
+      try {
+        if (cells.length > 0) term.applyPatchBatchFlat(spans, cells);
+        term.render();
+      } catch (_) { retireRenderer(); }
+    }
+    mirrorText();
+  }
+
+  function stopFleet() {
+    networkActive = false;
+    if (refreshTimer !== null) clearRepeating(refreshTimer);
+    refreshTimer = null;
+    try { stream?.stop(); } finally { snapshots?.stop(); }
+  }
+
+  function failModel() {
+    try { stopFleet(); } catch (_) { /* stop still aborts outstanding snapshots */ }
+    viewer = null;
+    modelFailed = true;
+    retireRenderer();
+    setText(screenText, "Captured history and manual pane output remain available in the toolbar above.");
+    setText(selectionLine, "Enter a pane ID above, or search captured history.");
+  }
+
+  function advance() {
+    if (!viewer) return;
+    try { if (viewer.step()) present(); } catch (_) { failModel(); }
+  }
+
+  const refresh = () => {
+    if (active && snapshots && viewer) void snapshots.refresh().catch(failModel);
+  };
+  function startFleet() {
+    if (!active || !viewer || !snapshots || networkActive) return;
+    networkActive = true;
+    snapshots.start();
+    stream.start();
+    refresh();
+    refreshTimer = setRepeating(refresh, REFRESH_MS);
+  }
+
+  const inspector = mountPaneOutput({
+    document: doc, apiRoot,
+    output: createPaneOutput({ apiRoot, EventSourceImpl, setTimer, clearTimer }),
+    restoreFocus: () => {
+      if (active) (viewer ? (textView() ? screenText : canvas) : element("pane-output-id")).focus();
+    },
+    getSelectedPane: () => {
+      // Apply queued navigation before sampling its identity. Once opened,
+      // later row changes never retarget this pane's output subscription.
+      advance();
+      return viewer?.selectedPaneId();
+    },
+  });
+  const historySearch = mountHistorySearch({
+    document: doc,
+    inspectCapture: (hit) => inspector.openCapture(hit),
+    readBody: (path, signal) => readSnapshot(path, apiRoot, fetchImpl, signal, 8 * 1024 * 1024),
+    inspectPane: (paneId) => {
+      // Route the exact captured identity through the same validated native
+      // form as a manual Open action, never through the mutable fleet row.
+      element("pane-output-id").value = paneId;
+      element("pane-output-form").requestSubmit();
+    },
+  });
+
+  host.addEventListener("keydown", (event) => {
+    if (!active || !viewer) return;
+    const target = textView() ? screenText : canvas;
+    if (event.target === target && !event.metaKey && !event.ctrlKey && !event.altKey
+        && !event.shiftKey && !event.isComposing && (TEXT_NAV_KEYS.has(event.key) || event.key === "Enter")) clearTextSelection();
+    try { handleFleetKey(event, { canvas: target, term: textView() ? null : term, viewer, inspector }); }
+    catch (_) { retireRenderer(); }
+    advance();
+  });
+  for (const [id, key] of navigation) element(id).addEventListener("click", () => {
+    if (!active || !viewer) return;
+    clearTextSelection();
+    try { viewer.pushEncodedInput(JSON.stringify(keyInput({ key }, "down"))); }
+    catch (_) { failModel(); }
+    advance();
+    if (viewer?.takeRefreshRequest()) refresh();
+  });
+  textToggle.addEventListener("click", () => {
+    if (!active || !viewer || !term) return;
+    preferText = !preferText;
+    clearTextSelection();
+    updateMode();
+    resize();
+  });
+  doc.addEventListener("selectionchange", () => {
+    if (!active || !viewer || !textView()) return;
+    try { mirrorText(); updateMode(); } catch (_) { failModel(); }
+  });
+
+  function resize() {
+    if (!active || !viewer || viewport.clientWidth <= 0 || viewport.clientHeight <= 0) return;
+    let cols = Math.max(80, Math.min(GRID_MAX_COLS, Math.floor(viewport.clientWidth / 8)));
+    let rows = Math.max(12, Math.min(GRID_MAX_ROWS, Math.floor(viewport.clientHeight / 20)));
+    if (term && !preferText) {
+      try {
+        const geometry = term.fitToContainer(Math.min(viewport.clientWidth, GRID_MAX_COLS * 8),
+          Math.min(viewport.clientHeight, GRID_MAX_ROWS * 16), host.devicePixelRatio || 1);
+        if (!Number.isInteger(geometry.cols) || !Number.isInteger(geometry.rows)
+            || geometry.cols < 20 || geometry.cols > GRID_MAX_COLS || geometry.rows < 4 || geometry.rows > GRID_MAX_ROWS) {
+          throw new Error("invalid renderer geometry");
+        }
+        ({ cols, rows } = geometry);
+      } catch (_) { retireRenderer(); }
+    }
+    try {
+      // The pinned StepProgram invalidates its diff baseline for every resize,
+      // including unchanged dimensions: a late/restored canvas gets a full
+      // frame without replacing the model, cursor, selection or network owner.
+      if (!viewer.resize(cols, rows)) {
+        advance();
+        if (!viewer || !viewer.resize(cols, rows)) throw new Error("resize queue full");
+      }
+      advance();
+    } catch (_) { failModel(); }
+  }
+  if (ResizeObserverImpl) new ResizeObserverImpl(resize).observe(viewport);
+  else host.addEventListener("resize", resize);
+
   function frame() {
     frameHandle = null;
     if (!active) return;
-    const now = Date.now();
-    if (now - lastClock >= CLOCK_MS) {
-      viewer.setTime(now);
-      lastClock = now;
+    const time = now();
+    if (viewer) {
+      try {
+        if (time - lastClock >= CLOCK_MS) { viewer.setTime(time); lastClock = time; }
+        if (viewer.takeRefreshRequest()) refresh();
+        advance();
+      } catch (_) { failModel(); }
     }
-    if (viewer.takeRefreshRequest()) refresh();
-    if (viewer.step()) present();
     inspector.render();
-    frameHandle = requestAnimationFrame(frame);
+    frameHandle = requestFrame(frame);
   }
   function resume() {
     if (active) return;
     active = true;
-    snapshots.start();
-    stream.start();
     inspector.restore();
-    refresh();
-    refreshTimer = setInterval(refresh, REFRESH_MS);
-    frameHandle = requestAnimationFrame(frame);
+    resize();
+    startFleet();
+    frameHandle = requestFrame(frame);
   }
   function suspend() {
+    if (!active) return;
     active = false;
-    stream.stop();
-    snapshots.stop();
+    stopFleet();
     inspector.suspend();
     historySearch.suspend();
-    if (refreshTimer !== null) clearInterval(refreshTimer);
-    if (frameHandle !== null) cancelAnimationFrame(frameHandle);
-    refreshTimer = frameHandle = null;
+    if (frameHandle !== null) cancelFrame(frameHandle);
+    frameHandle = null;
   }
-  window.addEventListener("pagehide", suspend);
-  window.addEventListener("pageshow", resume);
+  host.addEventListener("pagehide", suspend);
+  host.addEventListener("pageshow", resume);
+  updateMode();
   resume();
-  canvas.focus();
-  document.documentElement.dataset.viewerReady = "1";
+
+  const modelReady = Promise.resolve().then(loadViewer).then(async ({ default: initViewer, FleetViewer }) => {
+    await initViewer();
+    viewer = new FleetViewer(80, 24);
+    viewer.setTime(now());
+    viewer.init();
+    present();
+    snapshots = createFleetRefresh(viewer, { apiRoot, fetchImpl, setTimer, clearTimer });
+    stream = createFleetStream(snapshots, { apiRoot, EventSourceImpl, setTimer, clearTimer, onResync: refresh });
+    updateMode();
+    resize();
+    startFleet();
+    return true;
+  }).catch(() => { failModel(); return false; });
+
+  const rendererReady = Promise.resolve().then(loadRenderer).then(async ({ default: initRenderer, FrankenTermWeb }) => {
+    await initRenderer();
+    if (!await modelReady || !viewer) return;
+    await doc.fonts?.load('16px "Pragmasevka NF"').catch(() => undefined);
+    if (!viewer) return;
+    const candidate = new FrankenTermWeb();
+    try {
+      const contract = typeof candidate.apiContract === "function" ? candidate.apiContract() : null;
+      if (contract?.apiLine !== "frankenterm-js" || contract.apiVersion !== "1.0.0") throw new Error("unsupported renderer");
+      await candidate.init(canvas, { cols: 80, rows: 24, cellWidth: 8, cellHeight: 16,
+        dpr: host.devicePixelRatio || 1, focused: false });
+      if (!viewer) { candidate.destroy(); return; }
+      term = candidate;
+      // A user already reading or selecting text must not have that surface
+      // hidden when a slow GPU/font initialization finally completes.
+      if (doc.activeElement === screenText || textSelected()) preferText = true;
+      updateMode();
+      resize();
+    } catch (error) {
+      try { candidate.destroy(); } catch (_) { /* best-effort failed initialization cleanup */ }
+      throw error;
+    }
+  }).catch(() => { retireRenderer(); });
+  return { ready: Promise.all([modelReady, rendererReady]), suspend, resume };
 }
 
 if (typeof document !== "undefined") {
-  main().catch((error) => {
+  try { mountFleetApp(); } catch (_) {
     const errorBox = document.getElementById("error");
-    errorBox.textContent = `FrankenTerm fleet viewer failed to start: ${error?.message ?? error}`;
+    errorBox.textContent = "FrankenTerm browser controls could not start. Reload this page to try again.";
     errorBox.hidden = false;
     document.documentElement.dataset.viewerReady = "error";
-  });
+  }
 }
