@@ -14363,6 +14363,17 @@ mod unified_tests {
         assert_eq!(round_trip, socket);
     }
 
+    /// A socket file nobody accepts stream connections on, as a GUI instance
+    /// leaves behind when it exits. A dropped stream listener cannot stand in
+    /// for it: a child forked by a concurrent test holds a copy of the
+    /// listening descriptor until it execs, so the "stale" socket can still
+    /// accept a connection. A datagram socket refuses stream connections
+    /// whoever holds its descriptor.
+    #[cfg(all(feature = "vendored", unix))]
+    fn bind_refusing_socket_file(path: &std::path::Path) {
+        drop(std::os::unix::net::UnixDatagram::bind(path).expect("bind stale socket file"));
+    }
+
     #[cfg(all(feature = "vendored", unix))]
     #[test]
     fn gui_socket_candidates_advertise_only_live_sockets() {
@@ -14373,7 +14384,7 @@ mod unified_tests {
         let _live_listener = UnixListener::bind(&live).expect("bind live");
         // Stale GUI instance: the socket file lingers after its owner exits.
         let stale = ::config::gui_socket::gui_socket_path_for_pid_in(dir.path(), 7);
-        drop(UnixListener::bind(&stale).expect("bind stale"));
+        bind_refusing_socket_file(&stale);
         assert!(
             stale.exists(),
             "stale socket file must linger for this test"
@@ -14405,7 +14416,7 @@ mod unified_tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let class = "test.frankenterm.class";
         let stale = ::config::gui_socket::gui_socket_path_for_pid_in(dir.path(), 9);
-        drop(UnixListener::bind(&stale).expect("bind stale"));
+        bind_refusing_socket_file(&stale);
         symlink(
             &stale,
             ::config::gui_socket::published_gui_sock_path_in(dir.path(), class),
