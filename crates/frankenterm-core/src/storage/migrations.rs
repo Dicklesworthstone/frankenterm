@@ -5951,14 +5951,24 @@ fn run_owned_migration_transaction(
             transaction,
             StorageError::MigrationFailed(format!("{context}: migration mutation panicked")).into(),
         ),
-        Ok(Err(_error)) => {
+        Ok(Err(error)) => {
             #[cfg(test)]
-            eprintln!("{context}: inner migration mutation error: {_error}");
-            rollback_migration_transaction(
-                transaction,
+            eprintln!("{context}: inner migration mutation error: {error}");
+            // A corruption refusal is a classification, not an internal cause:
+            // its details name only schema objects, reopening a current schema
+            // reports the same refusal unwrapped, and its remedy (restore a
+            // backup) is not a failed step's (retry). Every other inner error
+            // stays behind the finite phase message.
+            let primary = if matches!(
+                error,
+                crate::Error::Storage(StorageError::Corruption { .. })
+            ) {
+                error
+            } else {
                 StorageError::MigrationFailed(format!("{context}: migration mutation failed"))
-                    .into(),
-            )
+                    .into()
+            };
+            rollback_migration_transaction(transaction, primary)
         }
         Ok(Ok(())) => {
             let commit_failed = take_migration_commit_fault()
@@ -7845,6 +7855,28 @@ mod tests {
         assert!(conn.is_autocommit());
         assert!(!migration_connection_is_query_only(&conn).unwrap());
         assert!(!table_exists(&conn, "error_probe").unwrap());
+    }
+
+    #[test]
+    fn migration_corruption_refusal_survives_proven_rollback() {
+        let conn = Connection::open_in_memory().expect("in-memory database");
+        let error = run_owned_migration_transaction(&conn, "migration step", |transaction| {
+            execute_migration_test_sql(transaction, "CREATE TABLE corruption_probe(id INTEGER)")?;
+            Err(StorageError::Corruption {
+                details: "synthetic schema drift".to_string(),
+            }
+            .into())
+        })
+        .expect_err("corruption refusal must be visible");
+
+        assert!(matches!(
+            &error,
+            crate::Error::Storage(StorageError::Corruption { details })
+                if details == "synthetic schema drift"
+        ));
+        assert!(conn.is_autocommit());
+        assert!(!migration_connection_is_query_only(&conn).unwrap());
+        assert!(!table_exists(&conn, "corruption_probe").unwrap());
     }
 
     #[test]
