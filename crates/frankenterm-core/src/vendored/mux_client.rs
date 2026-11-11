@@ -1547,6 +1547,10 @@ pub struct DirectMuxClient {
     connection_id: u64,
     protocol_state: DirectMuxProtocolState,
     peer_generation: Option<MuxPeerGeneration>,
+    /// Last coherent pane-domain cut observed on this exact transport. A
+    /// reconnect gets a fresh authority; a surviving socket cannot silently
+    /// switch mux incarnations or move its topology revision backwards.
+    pane_domain_snapshot_authority: Option<(mux::MuxSessionIncarnation, mux::TopologyRevision)>,
     stream: UnixStream,
     socket_path: PathBuf,
     read_buf: StreamingPduBuffer,
@@ -2405,6 +2409,7 @@ impl DirectMuxClient {
             connection_id,
             protocol_state: DirectMuxProtocolState::AwaitingCodec { connection_id },
             peer_generation: None,
+            pane_domain_snapshot_authority: None,
             stream,
             compression_mode,
             socket_path,
@@ -2513,6 +2518,71 @@ impl DirectMuxClient {
             Pdu::ListPanesResponse(payload) => Ok(payload),
             other => self.unexpected_response("ListPanesResponse", &other, true),
         }
+    }
+
+    /// Read pane metadata and its owning domains at one mux-owned cut.
+    ///
+    /// Unlike a legacy listing followed by a domain query, every entry binds
+    /// its metadata and domain to the same exact pane registration. Codec 73
+    /// is required and an older peer is refused before any request is sent.
+    /// Contention and exhausted revisions remain explicit outcomes, never an
+    /// empty inventory. This observation does not establish process custody or
+    /// authorize retirement of the owning mux.
+    pub async fn list_panes_with_domains_with_cx(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<codec::ListPanesWithDomainsV1Response, DirectMuxError> {
+        let response = self
+            .send_request_with_cx(
+                cx,
+                Pdu::ListPanesWithDomainsV1(codec::ListPanesWithDomainsV1 {}),
+            )
+            .await?;
+        let result = match response {
+            Pdu::ListPanesWithDomainsV1Response(response) => {
+                self.accept_pane_domain_snapshot(response)
+            }
+            other => Err(DirectMuxError::UnexpectedResponse {
+                expected: "ListPanesWithDomainsV1Response".to_string(),
+                got: other.pdu_name().to_string(),
+            }),
+        };
+        self.settle_transport_result(result, "pane-domain snapshot contract failure", true)
+    }
+
+    fn accept_pane_domain_snapshot(
+        &mut self,
+        response: codec::ListPanesWithDomainsV1Response,
+    ) -> Result<codec::ListPanesWithDomainsV1Response, DirectMuxError> {
+        let invalid = || DirectMuxError::AlignedUnexpectedResponse {
+            expected: "coherent pane-domain snapshot authority".to_string(),
+            got: "invalid pane-domain snapshot authority".to_string(),
+        };
+        response.validate().map_err(|_| invalid())?;
+        if let codec::ListPanesWithDomainsOutcomeV1::Snapshot {
+            session_incarnation,
+            snapshot_revision,
+            panes,
+        } = &response.outcome
+        {
+            if self
+                .pane_domain_snapshot_authority
+                .is_some_and(|(session, revision)| {
+                    session != *session_incarnation || revision > *snapshot_revision
+                })
+            {
+                return Err(invalid());
+            }
+            let mut registrations = HashSet::with_capacity(panes.len());
+            if panes
+                .iter()
+                .any(|pane| !registrations.insert(pane.pane_registration.as_bytes()))
+            {
+                return Err(invalid());
+            }
+            self.pane_domain_snapshot_authority = Some((*session_incarnation, *snapshot_revision));
+        }
+        Ok(response)
     }
 
     /// Read durable identity from the exact native registration. A peer below
@@ -7686,6 +7756,187 @@ mod tests {
             (Vec::new(), handle(connection, pdu), Vec::new())
         })
         .await
+    }
+
+    fn pane_domain_snapshot_fixture(
+        session: u8,
+        revision: u64,
+        duplicate_registration: bool,
+    ) -> codec::ListPanesWithDomainsV1Response {
+        codec::ListPanesWithDomainsV1Response {
+            outcome: codec::ListPanesWithDomainsOutcomeV1::Snapshot {
+                session_incarnation: mux::MuxSessionIncarnation::from_bytes([session; 16]),
+                snapshot_revision: mux::TopologyRevision::new(revision),
+                panes: (1..=2)
+                    .map(|id| codec::PaneWithDomainV1 {
+                        pane: mux::tab::PaneEntry {
+                            pane_id: id,
+                            tab_id: 1,
+                            window_id: 1,
+                            title: format!("pane-{id}"),
+                            size: frankenterm_term::TerminalSize::default(),
+                            working_dir: None,
+                            alt_screen_active: false,
+                            is_active_pane: id == 1,
+                            is_zoomed_pane: false,
+                            workspace: "default".to_string(),
+                            cursor_pos: mux::renderable::StableCursorPosition::default(),
+                            physical_top: 0,
+                            top_row: 0,
+                            left_col: 0,
+                            tty_name: None,
+                        },
+                        pane_registration: codec::ReliablePaneRegistrationIdentityV1::from_bytes(
+                            [if duplicate_registration { 1 } else { id as u8 }; 16],
+                        ),
+                        domain: codec::PaneDomainOutcomeV1::Named {
+                            domain_id: id,
+                            domain_name: format!("domain-{id}"),
+                        },
+                    })
+                    .collect(),
+            },
+        }
+    }
+
+    #[test]
+    fn coherent_pane_domain_listing_preserves_and_fences_exact_authority() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let expected = pane_domain_snapshot_fixture(7, 10, false);
+            let mut replies = vec![
+                expected.clone(),
+                expected.clone(), // unchanged topology with fresh metadata is valid
+                pane_domain_snapshot_fixture(7, 11, false),
+                pane_domain_snapshot_fixture(7, 10, false), // revision rollback
+                pane_domain_snapshot_fixture(8, 12, false), // changed mux on one socket
+                pane_domain_snapshot_fixture(7, 12, true),  // reused registration
+                pane_domain_snapshot_fixture(7, 12, false),
+                codec::ListPanesWithDomainsV1Response {
+                    outcome: codec::ListPanesWithDomainsOutcomeV1::Contended {
+                        attempts: 3,
+                        first_revision: mux::TopologyRevision::new(12),
+                        last_revision: mux::TopologyRevision::new(13),
+                    },
+                },
+            ]
+            .into_iter();
+            let (_dir, path, server) = text_read_server(1, move |_, request| {
+                assert!(matches!(request, Pdu::ListPanesWithDomainsV1(_)));
+                Some(Pdu::ListPanesWithDomainsV1Response(
+                    replies.next().expect("one reply per coherent listing"),
+                ))
+            })
+            .await;
+            let mut client = DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                .await
+                .unwrap();
+            assert_eq!(
+                client.list_panes_with_domains_with_cx(&cx).await.unwrap(),
+                expected
+            );
+            for accepted in [true, true, false, false, false, true] {
+                let result = client.list_panes_with_domains_with_cx(&cx).await;
+                if accepted {
+                    assert!(result.is_ok(), "valid coherent cut refused: {result:?}");
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(DirectMuxError::AlignedUnexpectedResponse { .. })
+                    ));
+                }
+                assert!(!client.is_connection_poisoned());
+            }
+            assert!(matches!(
+                client
+                    .list_panes_with_domains_with_cx(&cx)
+                    .await
+                    .unwrap()
+                    .outcome,
+                codec::ListPanesWithDomainsOutcomeV1::Contended { attempts: 3, .. }
+            ));
+            drop(client);
+            timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn coherent_pane_domain_listing_refuses_old_codec_before_writing() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let (_dir, path, server) = render_read_server_at_codec(72, 1, |_, request| {
+                assert!(
+                    matches!(request, Pdu::ListPanes(_)),
+                    "unsupported request reached peer"
+                );
+                (Vec::new(), Some(empty_list_panes_response()), Vec::new())
+            })
+            .await;
+            let mut client = DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                .await
+                .unwrap();
+            assert!(matches!(
+                client.list_panes_with_domains_with_cx(&cx).await,
+                Err(DirectMuxError::OutboundPduRequiresCodec {
+                    pdu: "ListPanesWithDomainsV1",
+                    agreed: 72,
+                    required: 73,
+                })
+            ));
+            assert!(!client.is_connection_poisoned());
+            assert!(
+                client
+                    .list_panes_with_cx(&cx)
+                    .await
+                    .unwrap()
+                    .tabs
+                    .is_empty()
+            );
+            drop(client);
+            timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn coherent_pane_domain_listing_cancellation_does_not_send_a_request() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let expected = pane_domain_snapshot_fixture(7, 1, false);
+            let reply = expected.clone();
+            let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let received = Arc::clone(&requests);
+            let (_dir, path, server) = text_read_server(1, move |_, request| {
+                assert!(matches!(request, Pdu::ListPanesWithDomainsV1(_)));
+                received.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(Pdu::ListPanesWithDomainsV1Response(reply.clone()))
+            })
+            .await;
+            let mut client = DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                .await
+                .unwrap();
+            let cancelled = cancelled_test_cx("coherent listing cancelled");
+            let error = client
+                .list_panes_with_domains_with_cx(&cancelled)
+                .await
+                .unwrap_err();
+            assert_cancelled_mux_error(&error);
+            assert_eq!(
+                client.list_panes_with_domains_with_cx(&cx).await.unwrap(),
+                expected
+            );
+            drop(client);
+            timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        });
     }
 
     #[test]

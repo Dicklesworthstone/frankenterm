@@ -906,6 +906,24 @@ impl MuxPool {
         .await
     }
 
+    /// Read one coherent pane/domain inventory, including floating panes.
+    ///
+    /// The response retains the mux-session incarnation, topology revision,
+    /// and exact pane registrations. A pre-v73 peer returns its explicit
+    /// pre-write capability refusal; the pool never substitutes a legacy
+    /// listing or joins independently observed domain metadata.
+    pub async fn list_panes_with_domains_with_cx(
+        &self,
+        cx: &Cx,
+    ) -> Result<codec::ListPanesWithDomainsV1Response, MuxPoolError> {
+        let op_cx = cx.clone();
+        self.execute_with_recovery_with_cx(cx, "list_panes_with_domains_v1", move |client| {
+            let op_cx = op_cx.clone();
+            Box::pin(async move { client.list_panes_with_domains_with_cx(&op_cx).await })
+        })
+        .await
+    }
+
     /// Read the mux-owned durable identity and current registration for one
     /// pane. Numeric IDs, legacy listings, and capture UUIDs cannot substitute
     /// for this response. The caller must still bind the result to its

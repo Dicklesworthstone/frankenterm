@@ -248,9 +248,10 @@ pub trait MuxInterface: Send + Sync {
         self.list_panes()
     }
 
-    /// Fill `domain_id`/`domain_name` on listed panes from the mux that owns
-    /// them (codec 68, ft-pdawh). The pane listing carries no domain, and the
-    /// cwd fallback cannot tell a proxied remote pane from a local one.
+    /// Fill `domain_id`/`domain_name` on legacy listings from the mux that owns
+    /// them (codec 68, ft-pdawh). Native codec-73 listings already contain a
+    /// coherent domain observation and must not be annotated a second time.
+    /// The legacy cwd fallback cannot identify a pane's owning mux domain.
     /// Best effort and user-facing only: a backend or peer without the
     /// request leaves the fields untouched, so callers keep the inferred
     /// domain. Background loops should not pay this extra round trip; the
@@ -878,7 +879,7 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-/// Information about a WezTerm pane from `wezterm cli list --format json`
+/// Pane metadata from a coherent native mux snapshot or CLI JSON listing.
 ///
 /// This struct is designed to tolerate unknown fields and missing optional fields.
 /// Required fields (pane_id, tab_id, window_id) will cause parse failure if missing.
@@ -973,14 +974,20 @@ impl PaneInfo {
             .and_then(Value::as_bool)
     }
 
-    /// Get the effective domain name, falling back to "local" if not specified
+    /// Get the explicit domain name. A known but unnamed mux domain remains
+    /// unknown; only legacy metadata without any domain identity uses the
+    /// historical local fallback.
     #[must_use]
     pub fn effective_domain(&self) -> &str {
         self.domain_name
             .as_deref()
             .map(str::trim)
             .filter(|name| !name.is_empty())
-            .unwrap_or("local")
+            .unwrap_or(if self.domain_id.is_some() {
+                "unknown"
+            } else {
+                "local"
+            })
     }
 
     /// Get the effective number of rows
@@ -1013,8 +1020,9 @@ impl PaneInfo {
     ///
     /// Priority:
     /// 1. Explicit `domain_name` field
-    /// 2. Remote host from `cwd` URI
-    /// 3. Default to "local"
+    /// 2. Numeric label for an explicitly known but unnamed domain
+    /// 3. Remote host from `cwd` URI (legacy metadata only)
+    /// 4. Default to "local" (legacy metadata only)
     #[must_use]
     pub fn inferred_domain(&self) -> String {
         // First try explicit domain_name
@@ -1025,6 +1033,12 @@ impl PaneInfo {
             .filter(|name| !name.is_empty())
         {
             return name.to_string();
+        }
+
+        // A mux that supplied an exact domain ID but withheld its name did
+        // not delegate name authority to shell-controlled cwd metadata.
+        if let Some(domain_id) = self.domain_id {
+            return format!("domain:{domain_id}");
         }
 
         // Try to infer from cwd URI, else default to local
@@ -1186,15 +1200,73 @@ impl From<codec::PaneTieredScrollbackSummaryV1> for PaneTieredScrollbackSummary 
 
 /// Convert a `ListPanesResponse` from the mux protocol into a flat `Vec<PaneInfo>`.
 ///
-/// The mux protocol returns a tree of `PaneNode` per tab. This function walks
-/// every tree, collects leaf `PaneEntry` nodes, and converts them to `PaneInfo`.
+/// The mux protocol returns a tree of `PaneNode` per tab and a separate
+/// floating-pane list. Both pane classes are included in this projection.
 #[cfg(all(feature = "vendored", unix))]
 pub fn pane_info_from_mux_response(response: &codec::ListPanesResponse) -> Vec<PaneInfo> {
     let mut panes = Vec::new();
     for tab_node in &response.tabs {
         collect_pane_entries(tab_node, &mut panes);
     }
+    for floating in &response.floating_panes {
+        panes.push(PaneInfo::from(&floating.pane));
+    }
     panes
+}
+
+/// Project a validated coherent mux observation into ordinary pane metadata.
+///
+/// Domain fields are copied only from the same registration-bound entry as
+/// the pane fields. The raw snapshot API retains exact identity for consumers
+/// that need it; this projection is an observation, not process-custody or
+/// shutdown authority. A contended cut is never reported as an empty fleet.
+#[cfg(all(feature = "vendored", unix))]
+fn pane_info_from_domain_snapshot(
+    response: &codec::ListPanesWithDomainsV1Response,
+) -> Result<Vec<PaneInfo>> {
+    response
+        .validate()
+        .map_err(|_| WeztermError::ParseError("invalid mux pane-domain snapshot".to_string()))?;
+    let entries = match &response.outcome {
+        codec::ListPanesWithDomainsOutcomeV1::Snapshot { panes, .. } => panes,
+        codec::ListPanesWithDomainsOutcomeV1::Contended { .. } => {
+            return Err(WeztermError::CommandFailed(
+                "mux_pane_domain_snapshot_contended".to_string(),
+            )
+            .into());
+        }
+        codec::ListPanesWithDomainsOutcomeV1::RevisionExhausted => {
+            return Err(WeztermError::CommandFailed(
+                "mux_pane_domain_snapshot_revision_exhausted".to_string(),
+            )
+            .into());
+        }
+    };
+    entries
+        .iter()
+        .map(|entry| {
+            let mut pane = PaneInfo::from(&entry.pane);
+            match &entry.domain {
+                codec::PaneDomainOutcomeV1::Named {
+                    domain_id,
+                    domain_name,
+                } => {
+                    pane.domain_id = Some(*domain_id as u64);
+                    pane.domain_name = Some(domain_name.clone());
+                }
+                codec::PaneDomainOutcomeV1::Unnamed { domain_id } => {
+                    pane.domain_id = Some(*domain_id as u64);
+                }
+                codec::PaneDomainOutcomeV1::Missing => {
+                    return Err(WeztermError::ParseError(
+                        "missing mux pane-domain snapshot registration".to_string(),
+                    )
+                    .into());
+                }
+            }
+            Ok(pane)
+        })
+        .collect()
 }
 
 #[cfg(all(feature = "vendored", unix))]
@@ -1232,7 +1304,7 @@ fn mux_stable_row_to_u32_saturating(value: isize) -> u32 {
 #[cfg(all(feature = "vendored", unix))]
 fn apply_pane_domain_entries(panes: &mut [PaneInfo], entries: &[codec::PaneDomainEntryV1]) {
     for (pane, entry) in panes.iter_mut().zip(entries) {
-        if u64::try_from(entry.pane_id).ok() != Some(pane.pane_id) {
+        if pane.domain_id.is_some() || u64::try_from(entry.pane_id).ok() != Some(pane.pane_id) {
             continue;
         }
         match &entry.outcome {
@@ -1245,6 +1317,7 @@ fn apply_pane_domain_entries(panes: &mut [PaneInfo], entries: &[codec::PaneDomai
             }
             codec::PaneDomainOutcomeV1::Unnamed { domain_id } => {
                 pane.domain_id = u64::try_from(*domain_id).ok();
+                pane.domain_name = None;
             }
             codec::PaneDomainOutcomeV1::Missing => {}
         }
@@ -1807,9 +1880,11 @@ impl WeztermClient {
     /// List all panes bound to the caller's asupersync capability
     /// context (ft-xbnl0.2.3 Cx-first entry point).
     ///
-    /// Same semantics as [`list_panes`](Self::list_panes) with the
-    /// mux-pool call rebound via `MuxPool::list_panes_with_cx(cx)`
-    /// (already Cx-first from prior ticks). Eligible transport failures retain
+    /// Same semantics as [`list_panes`](Self::list_panes). The native pool
+    /// prefers a coherent pane/domain snapshot (codec 73). Only an
+    /// explicit older-codec pre-write refusal selects the legacy listing;
+    /// invalid snapshots and contention never degrade to weaker observations.
+    /// Eligible transport failures retain
     /// CLI fallback, while `run_cli_with_retry_with_cx` keeps subprocess
     /// attempts and retry sleeps on this same caller context. Full `PaneInfo`
     /// contains volatile focus, cursor, cwd, title, viewport, and zoom state,
@@ -1828,7 +1903,25 @@ impl WeztermClient {
     pub async fn list_panes_with_cx(&self, cx: &crate::cx::Cx) -> Result<Vec<PaneInfo>> {
         if let Some(ref pool) = self.mux_pool {
             if self.mux_circuit_guard() {
-                match pool.list_panes_with_cx(cx).await {
+                let legacy_response = match pool.list_panes_with_domains_with_cx(cx).await {
+                    Ok(response) => {
+                        self.mux_circuit_record_success();
+                        return pane_info_from_domain_snapshot(&response);
+                    }
+                    Err(crate::vendored::MuxPoolError::Mux(
+                        crate::vendored::DirectMuxError::OutboundPduRequiresCodec {
+                            pdu: "ListPanesWithDomainsV1",
+                            agreed,
+                            required,
+                        },
+                    )) if required == codec::LIST_PANES_WITH_DOMAINS_V1_MIN_CODEC_VERSION
+                        && agreed < required =>
+                    {
+                        pool.list_panes_with_cx(cx).await
+                    }
+                    Err(error) => Err(error),
+                };
+                match legacy_response {
                     Ok(response) => {
                         self.mux_circuit_record_success();
                         return Ok(pane_info_from_mux_response(&response));
@@ -1867,13 +1960,18 @@ impl WeztermClient {
         serde_json::from_str(&output).map_err(|e| WeztermError::ParseError(e.to_string()).into())
     }
 
-    /// Fill each listed pane's owning domain from the vendored mux (codec 68,
-    /// ft-pdawh), one bounded batch per 256 panes. Best effort and read-only:
+    /// Enrich legacy listings from the vendored mux (codec 68, ft-pdawh), one
+    /// bounded batch per 256 panes. Coherent listings already carry domains
+    /// from the exact metadata cut and must not be overwritten by a later
+    /// independently sampled reply. Legacy enrichment remains best effort:
     /// without a mux pool, with the circuit open, or against a pre-v68 mux
     /// (refused before any byte is written) the panes keep their inferred
     /// domain, and the circuit breaker is left untouched.
     #[cfg(all(feature = "vendored", unix))]
     pub async fn annotate_pane_domains_with_cx(&self, cx: &crate::cx::Cx, panes: &mut [PaneInfo]) {
+        if panes.iter().all(|pane| pane.domain_id.is_some()) {
+            return;
+        }
         let Some(pool) = self.mux_pool.as_ref() else {
             return;
         };
@@ -6189,9 +6287,358 @@ mod tests {
         assert_eq!(panes[0].domain_id, Some(7));
         assert_eq!(panes[1].inferred_domain(), "local");
         assert_eq!(panes[2].domain_id, Some(9));
-        assert_eq!(panes[2].inferred_domain(), "local");
+        assert_eq!(panes[2].inferred_domain(), "domain:9");
+        assert_eq!(panes[2].effective_domain(), "unknown");
         assert_eq!(panes[3].domain_id, None);
         assert_eq!(panes[3].domain_name, None);
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    fn coherent_domain_test_response() -> codec::ListPanesWithDomainsV1Response {
+        codec::ListPanesWithDomainsV1Response {
+            outcome: codec::ListPanesWithDomainsOutcomeV1::Snapshot {
+                session_incarnation: mux::MuxSessionIncarnation::from_bytes([1; 16]),
+                snapshot_revision: mux::TopologyRevision::new(42),
+                panes: (1..=3)
+                    .map(|id| codec::PaneWithDomainV1 {
+                        pane: mux::tab::PaneEntry {
+                            pane_id: id,
+                            tab_id: 4,
+                            window_id: 5,
+                            title: format!("observed-pane-{id}"),
+                            size: frankenterm_term::TerminalSize::default(),
+                            working_dir: Some(
+                                (if id == 1 {
+                                    "file:///looks/local"
+                                } else {
+                                    "file://misleading-remote.example/work"
+                                })
+                                .parse()
+                                .unwrap(),
+                            ),
+                            alt_screen_active: id == 2,
+                            is_active_pane: id == 1,
+                            is_zoomed_pane: false,
+                            workspace: "default".to_string(),
+                            cursor_pos: mux::renderable::StableCursorPosition::default(),
+                            physical_top: 0,
+                            top_row: 0,
+                            left_col: 0,
+                            tty_name: None,
+                        },
+                        pane_registration: codec::ReliablePaneRegistrationIdentityV1::from_bytes(
+                            [id as u8; 16],
+                        ),
+                        domain: match id {
+                            1 => codec::PaneDomainOutcomeV1::Named {
+                                domain_id: 7,
+                                domain_name: "remote-build".to_string(),
+                            },
+                            2 => codec::PaneDomainOutcomeV1::Named {
+                                domain_id: 0,
+                                domain_name: "local".to_string(),
+                            },
+                            _ => codec::PaneDomainOutcomeV1::Unnamed { domain_id: 9 },
+                        },
+                    })
+                    .collect(),
+            },
+        }
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn coherent_pane_domains_keep_metadata_and_domains_in_one_projection() {
+        let response = coherent_domain_test_response();
+        let panes = pane_info_from_domain_snapshot(&response).unwrap();
+        assert_eq!(panes.len(), 3);
+        assert_eq!(panes[0].pane_id, 1);
+        assert_eq!(panes[0].title.as_deref(), Some("observed-pane-1"));
+        assert_eq!(panes[0].domain_id, Some(7));
+        assert_eq!(panes[0].inferred_domain(), "remote-build");
+        assert_eq!(panes[1].domain_id, Some(0));
+        assert_eq!(panes[1].inferred_domain(), "local");
+        assert_eq!(panes[1].mux_alt_screen_active(), Some(true));
+        assert_eq!(panes[2].domain_id, Some(9));
+        assert_eq!(panes[2].domain_name, None);
+        assert_eq!(panes[2].inferred_domain(), "domain:9");
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn legacy_pane_projection_includes_floating_panes() {
+        let codec::ListPanesWithDomainsOutcomeV1::Snapshot { mut panes, .. } =
+            coherent_domain_test_response().outcome
+        else {
+            panic!("fixture must be a snapshot");
+        };
+        let floating = panes.pop().unwrap().pane;
+        let response = codec::ListPanesResponse {
+            tabs: panes
+                .into_iter()
+                .map(|entry| mux::tab::PaneNode::Leaf(entry.pane))
+                .collect(),
+            tab_titles: Vec::new(),
+            window_titles: std::collections::HashMap::new(),
+            floating_panes: vec![codec::FloatingPaneSnapshotEntry {
+                rect: mux::tab::FloatingPaneRect {
+                    left: 0,
+                    top: 0,
+                    width: floating.size.cols,
+                    height: floating.size.rows,
+                },
+                pane: floating,
+                z_order: 0,
+                visible: true,
+                pinned: false,
+                opacity: 1.0,
+                focused: false,
+            }],
+        };
+        response.validate_floating_panes().unwrap();
+        let panes = pane_info_from_mux_response(&response);
+        assert_eq!(
+            panes.iter().map(|pane| pane.pane_id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(panes[2].title.as_deref(), Some("observed-pane-3"));
+        assert!(panes.iter().all(|pane| pane.domain_id.is_none()));
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn later_domain_annotation_preserves_coherent_entries_in_a_mixed_inventory() {
+        let mut panes = pane_info_from_domain_snapshot(&coherent_domain_test_response()).unwrap();
+        let mut legacy_pane = panes[0].clone();
+        legacy_pane.pane_id = 4;
+        legacy_pane.domain_id = None;
+        legacy_pane.domain_name = None;
+        panes.push(legacy_pane);
+        let entries = panes
+            .iter()
+            .map(|pane| codec::PaneDomainEntryV1 {
+                pane_id: pane.pane_id as usize,
+                outcome: codec::PaneDomainOutcomeV1::Named {
+                    domain_id: 100,
+                    domain_name: "successor-domain".to_string(),
+                },
+            })
+            .collect::<Vec<_>>();
+        apply_pane_domain_entries(&mut panes, &entries);
+        assert_eq!(panes[0].inferred_domain(), "remote-build");
+        assert_eq!(panes[1].inferred_domain(), "local");
+        assert_eq!(panes[2].inferred_domain(), "domain:9");
+        assert_eq!(panes[0].domain_id, Some(7));
+        assert_eq!(panes[1].domain_id, Some(0));
+        assert_eq!(panes[2].domain_id, Some(9));
+        assert_eq!(panes[3].domain_id, Some(100));
+        assert_eq!(panes[3].inferred_domain(), "successor-domain");
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn coherent_pane_domain_unavailability_never_becomes_an_empty_inventory() {
+        for outcome in [
+            codec::ListPanesWithDomainsOutcomeV1::Contended {
+                attempts: 3,
+                first_revision: mux::TopologyRevision::new(10),
+                last_revision: mux::TopologyRevision::new(11),
+            },
+            codec::ListPanesWithDomainsOutcomeV1::RevisionExhausted,
+            codec::ListPanesWithDomainsOutcomeV1::Snapshot {
+                session_incarnation: mux::MuxSessionIncarnation::from_bytes([0; 16]),
+                snapshot_revision: mux::TopologyRevision::new(1),
+                panes: Vec::new(),
+            },
+        ] {
+            assert!(
+                pane_info_from_domain_snapshot(&codec::ListPanesWithDomainsV1Response { outcome })
+                    .is_err()
+            );
+        }
+        let empty = codec::ListPanesWithDomainsV1Response {
+            outcome: codec::ListPanesWithDomainsOutcomeV1::Snapshot {
+                session_incarnation: mux::MuxSessionIncarnation::from_bytes([1; 16]),
+                snapshot_revision: mux::TopologyRevision::new(1),
+                panes: Vec::new(),
+            },
+        };
+        assert!(pane_info_from_domain_snapshot(&empty).unwrap().is_empty());
+    }
+
+    /// Exercise the production WeztermClient -> MuxPool -> DirectMuxClient
+    /// path on an isolated Unix socket. The server accepts only the requested
+    /// listing dialect; a separate annotation query is a causal test failure.
+    #[cfg(all(feature = "vendored", unix))]
+    fn coherent_pane_listing_fixture(
+        peer_codec: usize,
+        response: codec::ListPanesWithDomainsV1Response,
+        annotate: bool,
+    ) -> (Result<Vec<PaneInfo>>, Vec<&'static str>) {
+        use codec::{Pdu, UnitResponse};
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir_in("/tmp").expect("listing fixture directory");
+        let socket_path = dir.path().join("list.sock");
+        let listener = UnixListener::bind(&socket_path).expect("listing fixture listener");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("listing fixture connection");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut buffer = codec::StreamingPduBuffer::new();
+            let mut requests = Vec::new();
+            loop {
+                let mut bytes = [0u8; 4096];
+                let count = stream.read(&mut bytes).expect("read listing request");
+                if count == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&bytes[..count]);
+                while let Some(decoded) =
+                    Pdu::stream_decode(&mut buffer).expect("decode listing request")
+                {
+                    let reply = match decoded.pdu {
+                        Pdu::GetCodecVersion(_) => {
+                            Pdu::GetCodecVersionResponse(codec::GetCodecVersionResponse {
+                                codec_vers: peer_codec,
+                                version_string: "coherent-listing-fixture".to_string(),
+                                executable_path: std::path::PathBuf::from("/fixture/ft"),
+                                config_file_path: None,
+                                min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
+                            })
+                        }
+                        Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                        Pdu::ListPanesWithDomainsV1(_) => {
+                            assert!(
+                                peer_codec >= codec::LIST_PANES_WITH_DOMAINS_V1_MIN_CODEC_VERSION
+                            );
+                            requests.push("coherent");
+                            Pdu::ListPanesWithDomainsV1Response(response.clone())
+                        }
+                        Pdu::ListPanes(_) => {
+                            assert!(
+                                peer_codec < codec::LIST_PANES_WITH_DOMAINS_V1_MIN_CODEC_VERSION,
+                                "a failed coherent observation must not silently downgrade"
+                            );
+                            requests.push("legacy");
+                            let codec::ListPanesWithDomainsOutcomeV1::Snapshot { panes, .. } =
+                                &response.outcome
+                            else {
+                                panic!("legacy fixture needs pane metadata");
+                            };
+                            Pdu::ListPanesResponse(codec::ListPanesResponse {
+                                tabs: panes
+                                    .iter()
+                                    .map(|entry| mux::tab::PaneNode::Leaf(entry.pane.clone()))
+                                    .collect(),
+                                tab_titles: Vec::new(),
+                                window_titles: std::collections::HashMap::new(),
+                                floating_panes: Vec::new(),
+                            })
+                        }
+                        other => panic!("unexpected listing fixture request: {}", other.pdu_name()),
+                    };
+                    let mut frame = Vec::new();
+                    reply
+                        .encode(&mut frame, decoded.serial)
+                        .expect("encode listing reply");
+                    stream.write_all(&frame).expect("write listing reply");
+                }
+            }
+            requests
+        });
+        let mut result = None;
+        run_async_test(async {
+            let pool = Arc::new(crate::vendored::MuxPool::new(
+                crate::vendored::MuxPoolConfig {
+                    mux: crate::vendored::DirectMuxClientConfig {
+                        read_timeout: Duration::from_secs(2),
+                        ..crate::vendored::DirectMuxClientConfig::default()
+                            .with_socket_path(&socket_path)
+                    },
+                    ..crate::vendored::MuxPoolConfig::default()
+                },
+            ));
+            let client = isolated_cli_client_with_socket(socket_path.to_string_lossy())
+                .with_mux_pool(pool.clone());
+            let cx = crate::cx::for_testing();
+            let mut listed = client.list_panes_with_cx(&cx).await;
+            if annotate && let Ok(panes) = listed.as_mut() {
+                client.annotate_pane_domains_with_cx(&cx, panes).await;
+            }
+            result = Some(listed);
+            let stats = pool.stats_with_cx(&cx).await.unwrap();
+            assert_eq!(stats.connections_created, 1);
+            assert_eq!(stats.recovery_attempts, 0);
+        });
+        (
+            result.unwrap(),
+            server.join().expect("listing fixture completes"),
+        )
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn native_listing_uses_one_coherent_request_without_later_domain_annotation() {
+        let (result, requests) = coherent_pane_listing_fixture(
+            codec::CODEC_VERSION,
+            coherent_domain_test_response(),
+            true,
+        );
+        let panes = result.unwrap();
+        assert_eq!(requests, vec!["coherent"]);
+        assert_eq!(
+            panes
+                .iter()
+                .map(PaneInfo::inferred_domain)
+                .collect::<Vec<_>>(),
+            vec!["remote-build", "local", "domain:9"]
+        );
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn native_listing_uses_legacy_metadata_only_after_older_codec_refusal() {
+        let (result, requests) =
+            coherent_pane_listing_fixture(72, coherent_domain_test_response(), false);
+        let panes = result.unwrap();
+        assert_eq!(requests, vec!["legacy"]);
+        assert_eq!(panes.len(), 3);
+        assert!(
+            panes
+                .iter()
+                .all(|pane| pane.domain_id.is_none() && pane.domain_name.is_none())
+        );
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn native_listing_does_not_downgrade_contended_or_invalid_coherent_inventory() {
+        let mut duplicate = coherent_domain_test_response();
+        if let codec::ListPanesWithDomainsOutcomeV1::Snapshot { panes, .. } = &mut duplicate.outcome
+        {
+            panes[1].pane_registration = panes[0].pane_registration;
+        }
+        for response in [
+            codec::ListPanesWithDomainsV1Response {
+                outcome: codec::ListPanesWithDomainsOutcomeV1::Contended {
+                    attempts: 3,
+                    first_revision: mux::TopologyRevision::new(1),
+                    last_revision: mux::TopologyRevision::new(2),
+                },
+            },
+            codec::ListPanesWithDomainsV1Response {
+                outcome: codec::ListPanesWithDomainsOutcomeV1::RevisionExhausted,
+            },
+            duplicate,
+        ] {
+            let (result, requests) =
+                coherent_pane_listing_fixture(codec::CODEC_VERSION, response, false);
+            assert!(result.is_err());
+            assert_eq!(requests, vec!["coherent"]);
+        }
     }
 
     #[test]
