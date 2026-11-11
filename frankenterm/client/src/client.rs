@@ -2760,9 +2760,7 @@ fn join_conditional_input_sources(
     let mut sources = HashMap::new();
     sources.try_reserve(panes.len()).ok()?;
     for entry in panes {
-        if expected.remove(&entry.pane.pane_id)
-            != Some((entry.pane.window_id, entry.pane.tab_id))
-        {
+        if expected.remove(&entry.pane.pane_id) != Some((entry.pane.window_id, entry.pane.tab_id)) {
             return None;
         }
         sources.insert(
@@ -3783,9 +3781,10 @@ impl RpcGenerationScope {
         request_guard.disarm();
         // Registrations come from the same frozen server history as the
         // displayed topology. A bounded failed join leaves viewing available.
-        let input_sources = if self.agreed_codec_version().is_some_and(|version| {
-            version >= CONDITIONAL_PANE_INPUT_V1_MIN_CODEC_VERSION
-        }) {
+        let input_sources = if self
+            .agreed_codec_version()
+            .is_some_and(|version| version >= CONDITIONAL_PANE_INPUT_V1_MIN_CODEC_VERSION)
+        {
             match with_rpc_deadline(
                 Duration::from_secs(2),
                 "pane input authority snapshot",
@@ -3793,7 +3792,9 @@ impl RpcGenerationScope {
             )
             .await
             {
-                Ok(response) => join_conditional_input_sources(authority, &snapshot.panes, response),
+                Ok(response) => {
+                    join_conditional_input_sources(authority, &snapshot.panes, response)
+                }
                 Err(_) => None,
             }
         } else {
@@ -11744,27 +11745,38 @@ impl TestRpcPeer {
         outcome: PaneInputConditionalOutcomeV1,
     ) -> anyhow::Result<SendPaneInputConditionalV1> {
         let message = self.receiver.recv().await?;
-        let ReaderMessage::SendPdu { binding, lease, promise } = message else {
+        let ReaderMessage::SendPdu {
+            binding,
+            lease,
+            promise,
+        } = message
+        else {
             bail!("conditional input peer received a non-PDU control message");
         };
-        anyhow::ensure!(lease.matches(binding), "conditional input RPC binding changed");
+        anyhow::ensure!(
+            lease.matches(binding),
+            "conditional input RPC binding changed"
+        );
         let prepared = lease
             .claim_for_reader()?
             .context("conditional input was cancelled before reader claim")?;
         let Pdu::SendPaneInputConditionalV1(request) = prepared.pdu() else {
-            bail!("conditional input peer received {}", prepared.pdu().pdu_name());
+            bail!(
+                "conditional input peer received {}",
+                prepared.pdu().pdu_name()
+            );
         };
         let request = request.clone();
         promise
-            .send(Ok(PendingRpcReply::pdu(Pdu::SendPaneInputConditionalV1Response(
-                SendPaneInputConditionalV1Response {
+            .send(Ok(PendingRpcReply::pdu(
+                Pdu::SendPaneInputConditionalV1Response(SendPaneInputConditionalV1Response {
                     pane_id: request.pane_id,
                     session_incarnation: request.session_incarnation,
                     pane_registration: request.pane_registration,
                     input_serial: request.input_serial,
                     outcome,
-                },
-            ))))
+                }),
+            )))
             .await
             .map_err(|_| anyhow!("conditional input consumer retired before its receipt"))?;
         Ok(request)
@@ -20651,12 +20663,16 @@ mod tests {
                 panes: vec![
                     PaneWithDomainV1 {
                         pane: tiled,
-                        pane_registration: ReliablePaneRegistrationIdentityV1::from_bytes([0x61; 16]),
+                        pane_registration: ReliablePaneRegistrationIdentityV1::from_bytes(
+                            [0x61; 16],
+                        ),
                         domain: PaneDomainOutcomeV1::Unnamed { domain_id: 1 },
                     },
                     PaneWithDomainV1 {
                         pane: floating,
-                        pane_registration: ReliablePaneRegistrationIdentityV1::from_bytes([0x62; 16]),
+                        pane_registration: ReliablePaneRegistrationIdentityV1::from_bytes(
+                            [0x62; 16],
+                        ),
                         domain: PaneDomainOutcomeV1::Unnamed { domain_id: 1 },
                     },
                 ],
@@ -20668,9 +20684,17 @@ mod tests {
     #[test]
     fn conditional_input_registration_join_requires_exact_snapshot_history_and_membership() {
         let (authority, topology, response) = conditional_input_join_fixture();
-        let sources = join_conditional_input_sources(authority, &topology, response.clone()).unwrap();
-        assert_eq!(sources.len(), 2, "floating panes need the same authority as tiled panes");
-        assert_eq!(sources[&61].session_incarnation, authority.session_incarnation);
+        let sources =
+            join_conditional_input_sources(authority, &topology, response.clone()).unwrap();
+        assert_eq!(
+            sources.len(),
+            2,
+            "floating panes need the same authority as tiled panes"
+        );
+        assert_eq!(
+            sources[&61].session_incarnation,
+            authority.session_incarnation
+        );
         assert_eq!(
             sources[&62].pane_registration,
             ReliablePaneRegistrationIdentityV1::from_bytes([0x62; 16]),
@@ -20678,14 +20702,21 @@ mod tests {
 
         for revision in [6, 8] {
             let mut changed = response.clone();
-            let ListPanesWithDomainsOutcomeV1::Snapshot { snapshot_revision, .. } = &mut changed.outcome else {
+            let ListPanesWithDomainsOutcomeV1::Snapshot {
+                snapshot_revision, ..
+            } = &mut changed.outcome
+            else {
                 unreachable!();
             };
             *snapshot_revision = TopologyRevision::new(revision);
             assert!(join_conditional_input_sources(authority, &topology, changed).is_none());
         }
         let mut changed = response.clone();
-        let ListPanesWithDomainsOutcomeV1::Snapshot { session_incarnation, .. } = &mut changed.outcome else {
+        let ListPanesWithDomainsOutcomeV1::Snapshot {
+            session_incarnation,
+            ..
+        } = &mut changed.outcome
+        else {
             unreachable!();
         };
         *session_incarnation = MuxSessionIncarnation::from_bytes([0x53; 16]);
@@ -20697,11 +20728,22 @@ mod tests {
                 unreachable!();
             };
             match mismatch {
-                0 => { panes.pop(); }
-                1 => { panes[1].pane.tab_id += 1; }
-                2 => { panes[1].pane.window_id += 1; }
-                3 => { panes[1].pane.pane_id = panes[0].pane.pane_id; }
-                4 => { panes[1].pane_registration = ReliablePaneRegistrationIdentityV1::from_bytes([0; 16]); }
+                0 => {
+                    panes.pop();
+                }
+                1 => {
+                    panes[1].pane.tab_id += 1;
+                }
+                2 => {
+                    panes[1].pane.window_id += 1;
+                }
+                3 => {
+                    panes[1].pane.pane_id = panes[0].pane.pane_id;
+                }
+                4 => {
+                    panes[1].pane_registration =
+                        ReliablePaneRegistrationIdentityV1::from_bytes([0; 16]);
+                }
                 _ => unreachable!(),
             }
             assert!(join_conditional_input_sources(authority, &topology, changed).is_none());
@@ -20719,7 +20761,8 @@ mod tests {
                     last_revision: TopologyRevision::new(8),
                 },
             },
-        ).is_none());
+        )
+        .is_none());
     }
 
     #[test]
@@ -20737,7 +20780,8 @@ mod tests {
                     session_incarnation,
                     snapshot_revision,
                     ..
-                } = &mut census.outcome else {
+                } = &mut census.outcome
+                else {
                     unreachable!();
                 };
                 *session_incarnation = authority.session_incarnation;
@@ -20758,8 +20802,16 @@ mod tests {
                 let application = rpc.with_coherent_topology_snapshot(
                     RpcConsumerKind::TopologySnapshot,
                     |snapshot| {
-                        assert!(census_answered.get(), "publication must follow the bounded census join");
-                        let RpcTopologySnapshot::Current { input_sources, panes, .. } = snapshot else {
+                        assert!(
+                            census_answered.get(),
+                            "publication must follow the bounded census join"
+                        );
+                        let RpcTopologySnapshot::Current {
+                            input_sources,
+                            panes,
+                            ..
+                        } = snapshot
+                        else {
                             panic!("current peer must preserve its current topology dialect");
                         };
                         assert_eq!(panes.tabs.len(), 1);
@@ -20767,7 +20819,10 @@ mod tests {
                         assert_eq!(input_sources.is_some(), !mismatched_revision);
                         if let Some(sources) = input_sources {
                             assert_eq!(sources.len(), 2);
-                            assert_eq!(sources[&61].session_incarnation, authority.session_incarnation);
+                            assert_eq!(
+                                sources[&61].session_incarnation,
+                                authority.session_incarnation
+                            );
                         }
                         applied.set(true);
                         Ok(())
@@ -20784,38 +20839,56 @@ mod tests {
                             Pdu::ListPanesWithDomainsV1Response(census),
                         ),
                     ] {
-                        let ReaderMessage::SendPdu { binding, lease, promise } = peer.receiver.recv().await?
+                        let ReaderMessage::SendPdu {
+                            binding,
+                            lease,
+                            promise,
+                        } = peer.receiver.recv().await?
                         else {
                             bail!("topology test expected a read request");
                         };
                         anyhow::ensure!(lease.matches(binding), "read request lost its lease");
-                        let prepared = lease.claim_for_reader()?.context("topology read was cancelled")?;
+                        let prepared = lease
+                            .claim_for_reader()?
+                            .context("topology read was cancelled")?;
                         anyhow::ensure!(
-                            prepared.pdu().wire_spec().map(|spec| spec.ident) == Some(request_ident),
+                            prepared.pdu().wire_spec().map(|spec| spec.ident)
+                                == Some(request_ident),
                             "topology read sequence used the wrong PDU"
                         );
                         if request_ident == <ListPanesWithDomainsV1 as PduWireIdent>::IDENT {
-                            assert!(!applied.get(), "a registration census must precede local publication");
+                            assert!(
+                                !applied.get(),
+                                "a registration census must precede local publication"
+                            );
                             census_answered.set(true);
                         }
-                        promise.send(Ok(PendingRpcReply::pdu(response))).await
+                        promise
+                            .send(Ok(PendingRpcReply::pdu(response)))
+                            .await
                             .map_err(|_| anyhow!("topology test read receiver retired"))?;
                     }
                     let ReaderMessage::CommitTopologySnapshot {
                         authority: committed,
                         promise,
                         ..
-                    } = peer.receiver.recv().await? else {
+                    } = peer.receiver.recv().await?
+                    else {
                         bail!("current topology must still commit its original stream fence");
                     };
                     assert_eq!(committed, authority);
                     assert!(applied.get());
-                    promise.send(Ok(TopologySnapshotDecisionAck::CommittedLive)).await
+                    promise
+                        .send(Ok(TopologySnapshotDecisionAck::CommittedLive))
+                        .await
                         .map_err(|_| anyhow!("topology commit receiver retired"))?;
                     Ok::<(), anyhow::Error>(())
                 };
                 futures::try_join!(application, answer_peer).unwrap();
-                assert!(peer.is_empty(), "topology joining must not add a later input probe");
+                assert!(
+                    peer.is_empty(),
+                    "topology joining must not add a later input probe"
+                );
                 assert!(client.rpc_scope().is_available());
             });
         }
@@ -20832,7 +20905,10 @@ mod tests {
         };
         validate_conditional_input_receipt(expected, expected).unwrap();
         for response in [
-            SendPaneInputConditionalV1Response { pane_id: 62, ..expected },
+            SendPaneInputConditionalV1Response {
+                pane_id: 62,
+                ..expected
+            },
             SendPaneInputConditionalV1Response {
                 session_incarnation: MuxSessionIncarnation::from_bytes([0x53; 16]),
                 ..expected
@@ -20860,8 +20936,12 @@ mod tests {
         ] {
             assert!(validate_conditional_input_receipt(
                 expected,
-                SendPaneInputConditionalV1Response { outcome, ..expected },
-            ).is_err());
+                SendPaneInputConditionalV1Response {
+                    outcome,
+                    ..expected
+                },
+            )
+            .is_err());
         }
     }
 

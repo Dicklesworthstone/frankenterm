@@ -5299,7 +5299,9 @@ impl ClientPane {
                 .try_with_current(|_| {
                     dispatch_conditional_paste(&rpc, request, registration.clone())
                 })
-                .ok_or_else(|| anyhow::anyhow!("paste pane registration retired before dispatch"))??;
+                .ok_or_else(|| {
+                    anyhow::anyhow!("paste pane registration retired before dispatch")
+                })??;
             if trace_context.is_some() {
                 metrics::counter!(
                     "mux.client.sampled_paste.disposition.total",
@@ -5355,23 +5357,26 @@ impl ClientPane {
         &self,
         rpc: &RpcGenerationScope,
     ) -> anyhow::Result<(ConditionalPaneInputSource, PaneRegistrationHandle)> {
-        if !rpc.agreed_codec_version().is_some_and(|version| {
-            version >= CONDITIONAL_PANE_INPUT_V1_MIN_CODEC_VERSION
-        }) {
+        if !rpc
+            .agreed_codec_version()
+            .is_some_and(|version| version >= CONDITIONAL_PANE_INPUT_V1_MIN_CODEC_VERSION)
+        {
             bail!("this mux peer does not support identity-bound paste and mouse input; codec 74 or later is required");
         }
         let state = self.conditional_input.lock();
         let source = state.source.filter(|_| state.ready).ok_or_else(|| {
             anyhow::anyhow!("remote pane identity is unavailable for this displayed topology; refresh the mux connection before sending paste or mouse input")
         })?;
-        if rpc.render_connection_identity().is_none_or(|identity| {
-            identity.session_incarnation != source.session_incarnation
-        }) {
+        if rpc
+            .render_connection_identity()
+            .is_none_or(|identity| identity.session_incarnation != source.session_incarnation)
+        {
             bail!("remote pane identity belongs to a retired mux session; input was not sent");
         }
-        let registration = self.mux_registration.load().ok_or_else(|| {
-            anyhow::anyhow!("cannot send input for an unregistered remote pane")
-        })?;
+        let registration = self
+            .mux_registration
+            .load()
+            .ok_or_else(|| anyhow::anyhow!("cannot send input for an unregistered remote pane"))?;
         Ok((source, registration))
     }
 
@@ -8397,14 +8402,20 @@ mod tests {
             promise::spawn::MainThreadReservationOutcome::RetryableFull(_)
         ));
         pane.mouse_event(release).unwrap();
-        let sent = promise::spawn::block_on(peer.respond_next_conditional_input(PaneInputConditionalOutcomeV1::Accepted)).unwrap();
+        let sent = promise::spawn::block_on(
+            peer.respond_next_conditional_input(PaneInputConditionalOutcomeV1::Accepted),
+        )
+        .unwrap();
         assert_eq!(sent.effect, PaneInputEffectV1::Mouse(press));
         pump_mouse_test(&executor);
         assert!(
             !peer.is_empty(),
             "accepted release must advance without another click or scheduler slot"
         );
-        let sent = promise::spawn::block_on(peer.respond_next_conditional_input(PaneInputConditionalOutcomeV1::Accepted)).unwrap();
+        let sent = promise::spawn::block_on(
+            peer.respond_next_conditional_input(PaneInputConditionalOutcomeV1::Accepted),
+        )
+        .unwrap();
         assert_eq!(sent.effect, PaneInputEffectV1::Mouse(release));
         pump_mouse_test(&executor);
         assert!(peer.is_empty());
@@ -8442,7 +8453,10 @@ mod tests {
         pane.mouse_event(fresh).unwrap();
         pump_mouse_test(&executor);
         assert!(!peer.is_empty());
-        let sent = promise::spawn::block_on(peer.respond_next_conditional_input(PaneInputConditionalOutcomeV1::Accepted)).unwrap();
+        let sent = promise::spawn::block_on(
+            peer.respond_next_conditional_input(PaneInputConditionalOutcomeV1::Accepted),
+        )
+        .unwrap();
         assert_eq!(sent.effect, PaneInputEffectV1::Mouse(fresh));
         pump_mouse_test(&executor);
     }
@@ -8475,7 +8489,10 @@ mod tests {
         pane.mouse_event(press).unwrap();
         pump_mouse_test(&executor);
         assert!(!peer.is_empty());
-        let sent = promise::spawn::block_on(peer.respond_next_conditional_input(PaneInputConditionalOutcomeV1::Accepted)).unwrap();
+        let sent = promise::spawn::block_on(
+            peer.respond_next_conditional_input(PaneInputConditionalOutcomeV1::Accepted),
+        )
+        .unwrap();
         assert_eq!(sent.effect, PaneInputEffectV1::Mouse(press));
         pump_mouse_test(&executor);
     }
@@ -8498,7 +8515,8 @@ mod tests {
         // Retire only the local registration, without killing the remote pane.
         *old.ignore_next_kill.lock() = true;
         mux.remove_pane(40);
-        let replacement = register_conditional_input_test_pane(&mux, &executor, &inner, &peer, 40, 30);
+        let replacement =
+            register_conditional_input_test_pane(&mux, &executor, &inner, &peer, 40, 30);
         // The registration helper drains the executor and checks that the only
         // RPC was the replacement's palette: neither old nor replacement mouse
         // target may receive the accepted event from the retired registration.
@@ -8514,7 +8532,10 @@ mod tests {
         replacement.mouse_event(release).unwrap();
         pump_mouse_test(&executor);
         assert!(!peer.is_empty());
-        let sent = promise::spawn::block_on(peer.respond_next_conditional_input(PaneInputConditionalOutcomeV1::Accepted)).unwrap();
+        let sent = promise::spawn::block_on(
+            peer.respond_next_conditional_input(PaneInputConditionalOutcomeV1::Accepted),
+        )
+        .unwrap();
         assert_eq!(sent.pane_id, 30);
         assert_eq!(sent.effect, PaneInputEffectV1::Mouse(release));
         pump_mouse_test(&executor);
@@ -8534,15 +8555,20 @@ mod tests {
         let source = pane.withdraw_conditional_input_source().unwrap();
         pane.publish_conditional_input_source(Some(test_conditional_input_source(0x70)));
         pump_mouse_test(&executor);
-        let sent = promise::spawn::block_on(peer.respond_next_conditional_input(
-            PaneInputConditionalOutcomeV1::IdentityMismatch,
-        )).unwrap();
+        let sent = promise::spawn::block_on(
+            peer.respond_next_conditional_input(PaneInputConditionalOutcomeV1::IdentityMismatch),
+        )
+        .unwrap();
         assert_eq!(sent.session_incarnation, source.session_incarnation);
         assert_eq!(sent.pane_registration, source.pane_registration);
         assert_eq!(sent.effect, PaneInputEffectV1::Mouse(press));
         pump_mouse_test(&executor);
-        assert!(peer.is_empty(), "a rejected source must not be probed and replayed");
-        pane.mouse_event(press).expect_err("a later event cannot adopt the replacement source");
+        assert!(
+            peer.is_empty(),
+            "a rejected source must not be probed and replayed"
+        );
+        pane.mouse_event(press)
+            .expect_err("a later event cannot adopt the replacement source");
     }
 
     #[test]
@@ -8561,21 +8587,29 @@ mod tests {
             pane.mouse_event(wheel).unwrap();
         }
         pump_mouse_test(&executor);
-        let first = promise::spawn::block_on(peer.respond_next_conditional_input(
-            PaneInputConditionalOutcomeV1::Accepted,
-        )).unwrap();
+        let first = promise::spawn::block_on(
+            peer.respond_next_conditional_input(PaneInputConditionalOutcomeV1::Accepted),
+        )
+        .unwrap();
         let PaneInputEffectV1::Mouse(first_event) = first.effect else {
             panic!("wheel queue must emit mouse input");
         };
-        assert_eq!(first_event.button, wezterm_term::MouseButton::WheelDown(1024));
+        assert_eq!(
+            first_event.button,
+            wezterm_term::MouseButton::WheelDown(1024)
+        );
         pump_mouse_test(&executor);
-        let second = promise::spawn::block_on(peer.respond_next_conditional_input(
-            PaneInputConditionalOutcomeV1::Accepted,
-        )).unwrap();
+        let second = promise::spawn::block_on(
+            peer.respond_next_conditional_input(PaneInputConditionalOutcomeV1::Accepted),
+        )
+        .unwrap();
         let PaneInputEffectV1::Mouse(second_event) = second.effect else {
             panic!("wheel queue must emit mouse input");
         };
-        assert_eq!(second_event.button, wezterm_term::MouseButton::WheelDown(512));
+        assert_eq!(
+            second_event.button,
+            wezterm_term::MouseButton::WheelDown(512)
+        );
         assert!(first.input_serial < second.input_serial);
         pump_mouse_test(&executor);
         assert!(peer.is_empty());
@@ -8588,7 +8622,8 @@ mod tests {
         let mux = Arc::new(Mux::new(None));
         scope.set_mux(&mux);
         let (inner, peer) = test_client_inner_with_rpc_peer(17);
-        peer.replace_ready_generation(&inner.client, LEGACY46_CODEC_VERSION).unwrap();
+        peer.replace_ready_generation(&inner.client, LEGACY46_CODEC_VERSION)
+            .unwrap();
         let pane = register_resize_test_pane(&mux, &executor, &inner, &peer, 40, 29);
         let press = mouse_test_event(wezterm_term::MouseEventKind::Press);
         pane.mouse_event(press).unwrap();
@@ -8616,7 +8651,10 @@ mod tests {
         pane.mouse_event(fresh).unwrap();
         pump_mouse_test(&executor);
         assert!(!peer.is_empty());
-        let sent = promise::spawn::block_on(peer.respond_next_conditional_input(PaneInputConditionalOutcomeV1::Accepted)).unwrap();
+        let sent = promise::spawn::block_on(
+            peer.respond_next_conditional_input(PaneInputConditionalOutcomeV1::Accepted),
+        )
+        .unwrap();
         assert_eq!(sent.effect, PaneInputEffectV1::Mouse(fresh));
         pump_mouse_test(&executor);
         assert!(
@@ -9367,18 +9405,27 @@ mod tests {
 
         pane.send_paste_with_trace_context(payload, sampled_paste_context())
             .expect("sampled paste should enter the exact current transport");
-        let request = promise::spawn::block_on(peer.respond_next_conditional_input(
-            PaneInputConditionalOutcomeV1::Accepted,
-        ))
+        let request = promise::spawn::block_on(
+            peer.respond_next_conditional_input(PaneInputConditionalOutcomeV1::Accepted),
+        )
         .expect("test peer should receive conditional paste");
         assert_eq!(request.pane_id, 29);
-        assert_eq!(request.effect, PaneInputEffectV1::Paste(payload.to_string()));
+        assert_eq!(
+            request.effect,
+            PaneInputEffectV1::Paste(payload.to_string())
+        );
         assert_eq!(request.session_incarnation, source.session_incarnation);
         assert_eq!(request.pane_registration, source.pane_registration);
         assert!(!request.input_serial.is_empty());
-        assert_eq!(pane.renderable.lock().inner.borrow().input_serial, request.input_serial);
+        assert_eq!(
+            pane.renderable.lock().inner.borrow().input_serial,
+            request.input_serial
+        );
         pump_mouse_test(&executor);
-        assert!(peer.is_empty(), "trace omission must not create a numeric-only second effect");
+        assert!(
+            peer.is_empty(),
+            "trace omission must not create a numeric-only second effect"
+        );
     }
 
     #[test]
@@ -9391,10 +9438,12 @@ mod tests {
         let pane = register_conditional_input_test_pane(&mux, &executor, &inner, &peer, 155, 141);
         let payload = "generation-bound paste";
         let before = pane.renderable.lock().inner.borrow().input_serial;
-        inner.reliable_input_queue.arm_after_interactive_scope_capture_generation_barrier(
-            peer.clone(),
-            LEGACY46_CODEC_VERSION,
-        );
+        inner
+            .reliable_input_queue
+            .arm_after_interactive_scope_capture_generation_barrier(
+                peer.clone(),
+                LEGACY46_CODEC_VERSION,
+            );
         pane.send_paste_with_trace_context(payload, sampled_paste_context())
             .expect_err("a captured current request must not redirect onto a legacy successor");
         assert!(peer.is_empty());
@@ -9409,20 +9458,27 @@ mod tests {
         assert_eq!(request.data, payload);
         pump_mouse_test(&executor);
         let before = pane.renderable.lock().inner.borrow().input_serial;
-        inner.reliable_input_queue.arm_after_interactive_scope_capture_generation_barrier(
-            peer.clone(),
-            CONDITIONAL_PANE_INPUT_V1_MIN_CODEC_VERSION,
-        );
+        inner
+            .reliable_input_queue
+            .arm_after_interactive_scope_capture_generation_barrier(
+                peer.clone(),
+                CONDITIONAL_PANE_INPUT_V1_MIN_CODEC_VERSION,
+            );
         pane.send_paste(payload)
             .expect_err("a captured legacy request must not redirect onto a current successor");
         assert!(peer.is_empty());
         assert_eq!(pane.renderable.lock().inner.borrow().input_serial, before);
 
-        pane.send_paste(payload).expect("new current action uses its original pane witness");
-        let request = promise::spawn::block_on(peer.respond_next_conditional_input(
-            PaneInputConditionalOutcomeV1::Accepted,
-        )).unwrap();
-        assert_eq!(request.pane_registration, test_conditional_input_source(0x69).pane_registration);
+        pane.send_paste(payload)
+            .expect("new current action uses its original pane witness");
+        let request = promise::spawn::block_on(
+            peer.respond_next_conditional_input(PaneInputConditionalOutcomeV1::Accepted),
+        )
+        .unwrap();
+        assert_eq!(
+            request.pane_registration,
+            test_conditional_input_source(0x69).pane_registration
+        );
         pump_mouse_test(&executor);
         assert!(peer.is_empty());
     }
@@ -9437,22 +9493,29 @@ mod tests {
         let pane = register_resize_test_pane(&mux, &executor, &inner, &peer, 40, 29);
         let before = pane.renderable.lock().inner.borrow().input_serial;
         let mouse = mouse_test_event(wezterm_term::MouseEventKind::Press);
-        pane.send_paste("no topology witness").expect_err("viewing alone grants no input authority");
-        pane.mouse_event(mouse).expect_err("no late identity probe for queued mouse");
+        pane.send_paste("no topology witness")
+            .expect_err("viewing alone grants no input authority");
+        pane.mouse_event(mouse)
+            .expect_err("no late identity probe for queued mouse");
         assert!(peer.is_empty());
         assert_eq!(pane.renderable.lock().inner.borrow().input_serial, before);
 
         pane.publish_conditional_input_source(Some(test_conditional_input_source(0x69)));
         for version in [CODEC_VERSION_MIN_SUPPORTED, 63, 73] {
-            peer.replace_ready_generation(&inner.client, version).unwrap();
-            pane.send_paste("no numeric fallback").expect_err("old current peer must refuse paste");
-            pane.mouse_event(mouse).expect_err("old current peer must refuse mouse");
+            peer.replace_ready_generation(&inner.client, version)
+                .unwrap();
+            pane.send_paste("no numeric fallback")
+                .expect_err("old current peer must refuse paste");
+            pane.mouse_event(mouse)
+                .expect_err("old current peer must refuse mouse");
             assert!(peer.is_empty());
             assert_eq!(pane.renderable.lock().inner.borrow().input_serial, before);
         }
-        peer.replace_ready_generation(&inner.client, CODEC_VERSION).unwrap();
+        peer.replace_ready_generation(&inner.client, CODEC_VERSION)
+            .unwrap();
         let oversized = "x".repeat(MAX_CONDITIONAL_PANE_INPUT_PASTE_BYTES + 1);
-        pane.send_paste(&oversized).expect_err("paste bound is checked before admission");
+        pane.send_paste(&oversized)
+            .expect_err("paste bound is checked before admission");
         pane.mouse_event(MouseEvent { y: -1, ..mouse })
             .expect_err("mouse coordinates are checked before queue admission");
         assert!(peer.is_empty());
@@ -9468,16 +9531,23 @@ mod tests {
         let (inner, peer) = test_client_inner_with_rpc_peer(17);
         let pane = register_conditional_input_test_pane(&mux, &executor, &inner, &peer, 40, 29);
         pane.send_paste("one ambiguous action").unwrap();
-        promise::spawn::block_on(peer.respond_next_conditional_input(
-            PaneInputConditionalOutcomeV1::Indeterminate,
-        )).unwrap();
+        promise::spawn::block_on(
+            peer.respond_next_conditional_input(PaneInputConditionalOutcomeV1::Indeterminate),
+        )
+        .unwrap();
         pump_mouse_test(&executor);
-        assert!(peer.is_empty(), "unknown callback outcome does not authorize replay");
+        assert!(
+            peer.is_empty(),
+            "unknown callback outcome does not authorize replay"
+        );
 
         pane.send_paste("one cancelled waiter").unwrap();
         drop(executor);
         promise::spawn::block_on(peer.discard_next_queued_rpc()).unwrap();
-        assert!(peer.is_empty(), "cancelling an admitted waiter does not replay the paste");
+        assert!(
+            peer.is_empty(),
+            "cancelling an admitted waiter does not replay the paste"
+        );
         let _executor = promise::spawn::SimpleExecutor::new();
     }
 
@@ -9492,16 +9562,20 @@ mod tests {
         let original = test_conditional_input_source(0x69);
         assert_eq!(pane.withdraw_conditional_input_source(), Some(original));
         pane.publish_conditional_input_source(None);
-        pane.send_paste("unavailable join").expect_err("unavailable authority disables input");
+        pane.send_paste("unavailable join")
+            .expect_err("unavailable authority disables input");
         pane.publish_conditional_input_source(Some(test_conditional_input_source(0x70)));
-        pane.send_paste("replacement").expect_err("the old mirror cannot adopt its successor");
+        pane.send_paste("replacement")
+            .expect_err("the old mirror cannot adopt its successor");
         assert_eq!(pane.withdraw_conditional_input_source(), Some(original));
         assert!(peer.is_empty());
         pane.publish_conditional_input_source(Some(original));
-        pane.send_paste("same original").expect("an exact same-source refresh may restore readiness");
-        promise::spawn::block_on(peer.respond_next_conditional_input(
-            PaneInputConditionalOutcomeV1::Accepted,
-        )).unwrap();
+        pane.send_paste("same original")
+            .expect("an exact same-source refresh may restore readiness");
+        promise::spawn::block_on(
+            peer.respond_next_conditional_input(PaneInputConditionalOutcomeV1::Accepted),
+        )
+        .unwrap();
         pump_mouse_test(&executor);
     }
 

@@ -1645,7 +1645,10 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(parsed.after_id, 9, "valid header overrides the bootstrap URL");
+        assert_eq!(
+            parsed.after_id, 9,
+            "valid header overrides the bootstrap URL"
+        );
         assert_eq!(
             super::parse_event_resume(Some(b" \t "), Some(&bootstrap), None, Some(7))
                 .unwrap()
@@ -1735,7 +1738,11 @@ mod tests {
             let second = super::replay_event_frames(
                 &cx,
                 |query| {
-                    assert_eq!(query.after_id, Some(90), "scan must not repeat excluded rows");
+                    assert_eq!(
+                        query.after_id,
+                        Some(90),
+                        "scan must not repeat excluded rows"
+                    );
                     std::future::ready(Ok(checked_fixture_page(vec![replay_fixture(95)], 90, 100)))
                 },
                 Some(7),
@@ -1839,7 +1846,10 @@ mod tests {
                     },
                     "legacy_history_unavailable",
                 ),
-                (EventRetentionStatus::CursorEpochMismatch, "cursor_epoch_mismatch"),
+                (
+                    EventRetentionStatus::CursorEpochMismatch,
+                    "cursor_epoch_mismatch",
+                ),
                 (
                     EventRetentionStatus::CursorAheadOfHighWater { max_event_id: 5 },
                     "cursor_ahead_of_high_water",
@@ -1873,7 +1883,10 @@ mod tests {
                 let frames = drain_replay_frames(rx);
                 assert_eq!(frames.len(), 1);
                 assert_eq!(frames[0].id, None);
-                assert_eq!(frames[0].event_type.as_deref(), Some("cursor_discontinuity"));
+                assert_eq!(
+                    frames[0].event_type.as_deref(),
+                    Some("cursor_discontinuity")
+                );
                 let payload = frames[0].data.as_deref().unwrap();
                 assert!(!payload.contains("captured detection"));
                 let frame: serde_json::Value = serde_json::from_str(payload).unwrap();
@@ -1898,8 +1911,7 @@ mod tests {
             let mut regressed_high_water =
                 checked_fixture_page((11..=266).map(replay_fixture).collect(), 10, 300);
             regressed_high_water.check.snapshot.max_event_id = 290;
-            let mut regressed_generation =
-                checked_fixture_page(vec![replay_fixture(11)], 10, 11);
+            let mut regressed_generation = checked_fixture_page(vec![replay_fixture(11)], 10, 11);
             regressed_generation.page.retention.generation = 2;
             regressed_generation.check.snapshot.generation = 1;
             for page in [
@@ -1935,7 +1947,13 @@ mod tests {
                 let frames = drain_replay_frames(rx);
                 assert_eq!(frames.len(), 1);
                 assert_eq!(frames[0].id, None);
-                assert!(frames[0].data.as_deref().unwrap().contains("event_replay_invalid_page"));
+                assert!(
+                    frames[0]
+                        .data
+                        .as_deref()
+                        .unwrap()
+                        .contains("event_replay_invalid_page")
+                );
             }
         });
     }

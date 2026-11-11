@@ -11,8 +11,7 @@ use crate::wire::{
     LinesResponse, ListPanes, ListPanesCoherent, ListPanesCoherentResponse, LivenessResponse,
     MouseButton, MouseEvent, MouseEventKind, PaneList, PaneRemoved, RenderChanges, RenderHead,
     Resize, SearchResults, SearchScrollback, SendKeyDown, SendMouseEvent, SendPaste,
-    StableRowIndex, TerminalSize, TopologyChange, TopologyEvent, WriteToPane,
-    ident,
+    StableRowIndex, TerminalSize, TopologyChange, TopologyEvent, WriteToPane, ident,
 };
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -514,7 +513,10 @@ impl Session {
             .pending_shell_creation
             .is_some_and(|pending| now_ns >= pending.deadline_ns)
         {
-            self.fail("shell creation was not confirmed before its deadline; it was not retried".to_owned());
+            self.fail(
+                "shell creation was not confirmed before its deadline; it was not retried"
+                    .to_owned(),
+            );
             return false;
         }
         let expired: Vec<_> = self
@@ -624,7 +626,10 @@ impl Session {
                     .filter_map(|sizing| sizing.restore_observation)
                     .map(|observation| observation.deadline_ns.min(observation.next_read_ns)),
             )
-            .chain(self.pending_shell_creation.map(|pending| pending.deadline_ns))
+            .chain(
+                self.pending_shell_creation
+                    .map(|pending| pending.deadline_ns),
+            )
             .min()
     }
 
@@ -644,14 +649,15 @@ impl Session {
         if self.dialect != Dialect::Current || self.codec_version < 61 {
             return Err(ShellCreationError::Unsupported);
         }
-        if expected_incarnation == [0; 16]
-            || self.incarnation != Some(expected_incarnation)
-        {
+        if expected_incarnation == [0; 16] || self.incarnation != Some(expected_incarnation) {
             return Err(ShellCreationError::Stale);
         }
         if self.pending_shell_creation.is_some()
             || self.events.iter().any(|event| {
-                matches!(event, Event::ShellCreated { .. } | Event::ShellCreationFailed { .. })
+                matches!(
+                    event,
+                    Event::ShellCreated { .. } | Event::ShellCreationFailed { .. }
+                )
             })
         {
             return Err(ShellCreationError::Busy);
@@ -661,7 +667,9 @@ impl Session {
             || workspace.chars().any(char::is_control)
             || !(1..=512).contains(&rows)
             || !(1..=512).contains(&cols)
-            || rows.checked_mul(cols).is_none_or(|cells| cells > wire::MAX_SHELL_CELLS)
+            || rows
+                .checked_mul(cols)
+                .is_none_or(|cells| cells > wire::MAX_SHELL_CELLS)
         {
             return Err(ShellCreationError::Invalid);
         }
@@ -669,7 +677,10 @@ impl Session {
             .monotonic_ns
             .and_then(|now| now.checked_add(SHELL_CREATION_DEADLINE_NS))
             .ok_or(ShellCreationError::ClockUnavailable)?;
-        let request = self.next_serial.checked_add(1).ok_or(ShellCreationError::SerialExhausted)?;
+        let request = self
+            .next_serial
+            .checked_add(1)
+            .ok_or(ShellCreationError::SerialExhausted)?;
         let spawn = wire::SpawnDefaultShell::new(
             workspace,
             TerminalSize {
@@ -1086,7 +1097,10 @@ impl Session {
             self.reject_input(pane_id, "Current mux paste requires exact-pane input authority; no numeric fallback was sent.");
             return;
         }
-        let request = SendPaste { pane_id, data: text };
+        let request = SendPaste {
+            pane_id,
+            data: text,
+        };
         self.send(ident::SEND_PASTE, &request, Request::Input { pane_id });
     }
 
@@ -1607,7 +1621,10 @@ impl Session {
         // Only the conditional effects use this captured witness. Return
         // before constructing their wire bodies if it is absent or retired.
         let conditional_incarnation = input.incarnation.unwrap_or([0; 16]);
-        if matches!(&input.effect, OrderedEffect::Paste(_) | OrderedEffect::Mouse(_)) {
+        if matches!(
+            &input.effect,
+            OrderedEffect::Paste(_) | OrderedEffect::Mouse(_)
+        ) {
             let Some(incarnation) = input.incarnation.filter(|identity| *identity != [0; 16])
             else {
                 self.fail("conditional input lost its admitted server incarnation; no numeric fallback was sent".to_owned());
@@ -1616,7 +1633,10 @@ impl Session {
             if Some(incarnation) != self.incarnation
                 || self.codec_version < wire::CONDITIONAL_PANE_INPUT_MIN_VERSION
             {
-                self.fail("conditional input no longer belongs to this mux connection; it was not sent".to_owned());
+                self.fail(
+                    "conditional input no longer belongs to this mux connection; it was not sent"
+                        .to_owned(),
+                );
                 return;
             }
         }
@@ -1777,7 +1797,10 @@ impl Session {
             || input.incarnation != Some(response.session_incarnation)
             || input.registration != response.pane_registration
             || input.input_serial != response.input_serial
-            || !matches!(&input.effect, OrderedEffect::Paste(_) | OrderedEffect::Mouse(_))
+            || !matches!(
+                &input.effect,
+                OrderedEffect::Paste(_) | OrderedEffect::Mouse(_)
+            )
         {
             return Err(crate::Error::Frame(
                 "conditional input receipt does not match its original source and operation",
@@ -2006,7 +2029,9 @@ impl Session {
             return Err(crate::Error::Schema);
         };
         if frame.serial != pending.request || self.incarnation != Some(pending.incarnation) {
-            return Err(crate::Error::Frame("shell creation receipt lost its original mux authority"));
+            return Err(crate::Error::Frame(
+                "shell creation receipt lost its original mux authority",
+            ));
         }
         if frame.oversized {
             return Err(crate::Error::Frame("a shell creation receipt is too large"));
@@ -2024,11 +2049,14 @@ impl Session {
                 Ok(())
             }
             ident::ERROR_RESPONSE => {
-                let definitely_not_applied = wire::shell_creation_definitely_not_applied(&frame.body)?;
+                let definitely_not_applied =
+                    wire::shell_creation_definitely_not_applied(&frame.body)?;
                 self.finish_shell_creation_failure(!definitely_not_applied);
                 Ok(())
             }
-            _ => Err(crate::Error::Frame("shell creation received an unexpected reply")),
+            _ => Err(crate::Error::Frame(
+                "shell creation received an unexpected reply",
+            )),
         }
     }
 
@@ -2439,9 +2467,8 @@ impl Session {
                 (
                     OrderedEffect::Paste(_) | OrderedEffect::Mouse(_),
                     ident::SEND_PANE_INPUT_CONDITIONAL_RESPONSE,
-                ) => {
-                    self.settle_conditional_input(wire::decode_conditional_input_receipt(&frame.body)?)
-                }
+                ) => self
+                    .settle_conditional_input(wire::decode_conditional_input_receipt(&frame.body)?),
                 (_, ident::ERROR_RESPONSE) => {
                     self.fail("the mux rejected input without a matching effect receipt; input was not replayed".to_owned());
                     Ok(())
@@ -3536,7 +3563,11 @@ mod shell_creation_tests {
                 pane_id: 7,
                 window_id: 3,
                 size: frankenterm_term::TerminalSize {
-                    rows: 24, cols: 80, pixel_width: 0, pixel_height: 0, dpi: 0,
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                    dpi: 0,
                 },
             }),
         ));

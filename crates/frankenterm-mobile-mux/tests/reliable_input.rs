@@ -288,7 +288,10 @@ fn every_partial_suffix_precedes_later_keys_paste_and_mouse() {
         paste.session_incarnation.as_bytes(),
         harness.server.incarnation
     );
-    assert_eq!(paste.pane_registration.as_bytes(), harness.server.registration);
+    assert_eq!(
+        paste.pane_registration.as_bytes(),
+        harness.server.registration
+    );
     assert!(paste.input_serial > key.input_serial);
     conditional_reply(
         &mut harness.session,
@@ -474,7 +477,10 @@ fn explicit_legacy_sessions_keep_their_separate_paste_and_mouse_lane() {
         assert!(harness.server.requests.contains(&"SendPaste"));
         assert!(harness.server.requests.contains(&"SendMouseEvent"));
         assert!(
-            !harness.server.requests.contains(&"SendPaneInputConditionalV1")
+            !harness
+                .server
+                .requests
+                .contains(&"SendPaneInputConditionalV1")
         );
         assert!(harness.session.is_ready());
     }
@@ -1404,7 +1410,10 @@ fn a_lone_paste_expires_without_replay_or_later_input() {
     harness.session.paste(pane, "possibly applied paste");
     let (rpc, pdu) = take_one(&mut harness.session);
     let request = conditional_request(pdu);
-    assert!(matches!(&request.effect, codec::PaneInputEffectV1::Paste(_)));
+    assert!(matches!(
+        &request.effect,
+        codec::PaneInputEffectV1::Paste(_)
+    ));
     assert_eq!(
         harness.session.next_input_wake_ns(),
         Some(INPUT_DEADLINE_NS)

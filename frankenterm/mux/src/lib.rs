@@ -18026,7 +18026,10 @@ impl Mux {
             .context("reserving bounded pane-domain registration snapshot")?;
         for (&pane_id, registered) in panes.iter() {
             anyhow::ensure!(
-                registered.generation.operation_state.load(Ordering::Acquire)
+                registered
+                    .generation
+                    .operation_state
+                    .load(Ordering::Acquire)
                     & PANE_REGISTRATION_RETIRED
                     == 0,
                 "pane-domain snapshot encountered a retired pane registration"
@@ -26308,14 +26311,12 @@ mod tests {
 
         let duplicate_ran = Arc::new(AtomicBool::new(false));
         let duplicate_ran_worker = Arc::clone(&duplicate_ran);
-        assert!(
-            worker
-                .start(Instant::now(), move || {
-                    duplicate_ran_worker.store(true, Ordering::SeqCst);
-                    Ok(())
-                })
-                .is_err()
-        );
+        assert!(worker
+            .start(Instant::now(), move || {
+                duplicate_ran_worker.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .is_err());
         assert!(!duplicate_ran.load(Ordering::SeqCst));
 
         let second_target = harness.authorize(segment, receipts[1], second);
@@ -31223,12 +31224,18 @@ mod tests {
         );
         assert!(mux.capture_pane_domain_snapshot(0, 64).is_err());
         let foreign_mux = Mux::new(None);
-        assert_eq!(foreign_mux.validate_pane_domain_snapshot(&snapshot).unwrap(), None);
+        assert_eq!(
+            foreign_mux
+                .validate_pane_domain_snapshot(&snapshot)
+                .unwrap(),
+            None
+        );
 
         let (successor, _successor_kills) = KillCountingPane::new(305, test_size());
         assert!(!snapshot.matches_pane(305, &successor));
         mux.remove_pane(305);
-        mux.add_pane(&successor).expect("register same-ID successor");
+        mux.add_pane(&successor)
+            .expect("register same-ID successor");
         assert_eq!(mux.validate_pane_domain_snapshot(&snapshot).unwrap(), None);
         let replacement = mux.capture_pane_domain_snapshot(1, 64).unwrap();
         assert_ne!(
@@ -31267,7 +31274,10 @@ mod tests {
         assert_eq!(mux.topology_snapshot_authority().unwrap(), before);
         assert_eq!(mux.validate_pane_domain_snapshot(&snapshot).unwrap(), None);
         let current = mux.capture_pane_domain_snapshot(1, 64).unwrap();
-        assert_eq!(mux.validate_pane_domain_snapshot(&current).unwrap(), Some(before));
+        assert_eq!(
+            mux.validate_pane_domain_snapshot(&current).unwrap(),
+            Some(before)
+        );
         replacement.generation.retire();
         assert_eq!(mux.validate_pane_domain_snapshot(&current).unwrap(), None);
     }

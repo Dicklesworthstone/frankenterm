@@ -192,13 +192,17 @@ pub fn decode_spawn_response(body: &[u8]) -> Result<SpawnResponse, crate::Error>
     }
     let response: SpawnResponse = decode_input_receipt(body)?;
     if response.size.rows == 0 || response.size.cols == 0 {
-        return Err(crate::Error::Frame("a shell creation receipt has an empty grid"));
+        return Err(crate::Error::Frame(
+            "a shell creation receipt has an empty grid",
+        ));
     }
     if response.pane_id > isize::MAX as usize
         || response.tab_id > isize::MAX as usize
         || response.window_id > isize::MAX as usize
     {
-        return Err(crate::Error::Frame("a shell creation receipt exceeds native ID bounds"));
+        return Err(crate::Error::Frame(
+            "a shell creation receipt exceeds native ID bounds",
+        ));
     }
     Ok(response)
 }
@@ -207,11 +211,15 @@ pub fn decode_spawn_response(body: &[u8]) -> Result<SpawnResponse, crate::Error>
 /// prove no shell was created. Retry advice never makes creation replayable.
 pub fn shell_creation_definitely_not_applied(body: &[u8]) -> Result<bool, crate::Error> {
     if body.len() > MAX_SPAWN_RESPONSE_BYTES {
-        return Err(crate::Error::Frame("a shell creation rejection is too large"));
+        return Err(crate::Error::Frame(
+            "a shell creation rejection is too large",
+        ));
     }
     let response: ErrorResponse = decode_input_receipt(body)?;
     if response.request_ident != ident::SPAWN_V2 {
-        return Err(crate::Error::Frame("a shell creation rejection names another request"));
+        return Err(crate::Error::Frame(
+            "a shell creation rejection names another request",
+        ));
     }
     if response.schema_version != 1
         || !matches!(response.code, 1..=12)
@@ -222,7 +230,9 @@ pub fn shell_creation_definitely_not_applied(body: &[u8]) -> Result<bool, crate:
     // Mirrors codec::ErrorResponse::validate's closed object/effect/retry
     // combinations. Unknown future authority remains an uncertain outcome.
     let object_valid = match response.code {
-        1..=3 => response.object.is_some_and(|object| u16::from(object.kind) == response.code),
+        1..=3 => response
+            .object
+            .is_some_and(|object| u16::from(object.kind) == response.code),
         4 => response.object.is_none_or(|object| object.kind == 4),
         11 => false, // INDETERMINATE_MUTATION can never prove no effect.
         _ => response.object.is_none(),
@@ -683,7 +693,9 @@ pub fn decode_conditional_input_receipt(
     body: &[u8],
 ) -> Result<SendPaneInputConditionalResponse, crate::Error> {
     if body.len() > MAX_CONDITIONAL_PANE_INPUT_RESPONSE_BYTES {
-        return Err(crate::Error::Frame("a conditional input receipt is too large"));
+        return Err(crate::Error::Frame(
+            "a conditional input receipt is too large",
+        ));
     }
     let response: SendPaneInputConditionalResponse = decode_input_receipt(body)?;
     if response.session_incarnation == [0; 16]

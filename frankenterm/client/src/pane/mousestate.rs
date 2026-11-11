@@ -115,12 +115,16 @@ impl MouseState {
             anyhow::bail!("cannot enqueue mouse input for a retired pane registration");
         }
         let input_serial = if let Some(source) = source {
-            if !scope.agreed_codec_version().is_some_and(|version| {
-                version >= CONDITIONAL_PANE_INPUT_V1_MIN_CODEC_VERSION
-            }) || scope.render_connection_identity().is_none_or(|identity| {
-                identity.session_incarnation != source.session_incarnation
-            }) {
-                anyhow::bail!("mouse input identity does not belong to this supported mux connection");
+            if !scope
+                .agreed_codec_version()
+                .is_some_and(|version| version >= CONDITIONAL_PANE_INPUT_V1_MIN_CODEC_VERSION)
+                || scope.render_connection_identity().is_none_or(|identity| {
+                    identity.session_incarnation != source.session_incarnation
+                })
+            {
+                anyhow::bail!(
+                    "mouse input identity does not belong to this supported mux connection"
+                );
             }
             let input_serial = InputSerial::try_now()
                 .ok_or_else(|| anyhow::anyhow!("process-local input serial space exhausted"))?;
@@ -135,7 +139,9 @@ impl MouseState {
             input_serial
         } else {
             if scope.agreed_codec_version() != Some(LEGACY46_CODEC_VERSION) {
-                anyhow::bail!("current mux mouse input requires exact pane identity and codec 74 or later");
+                anyhow::bail!(
+                    "current mux mouse input requires exact pane identity and codec 74 or later"
+                );
             }
             InputSerial::empty()
         };
@@ -249,22 +255,22 @@ impl MouseState {
                         validate_conditional_input_receipt(expected, request.await?)
                     })
                 });
-                let mut delivery = ConditionalInputDelivery::new(
-                    registration.clone(),
-                    !failure_notified,
-                );
+                let mut delivery =
+                    ConditionalInputDelivery::new(registration.clone(), !failure_notified);
                 let result = match admitted {
                     None => Err(anyhow::anyhow!(
                         "mouse input pane registration retired before dispatch"
                     )),
                     Some(Err(error)) => Err(error),
                     Some(Ok(None)) => Ok(()),
-                    Some(Ok(Some(request))) => with_rpc_deadline(
-                        Duration::from_secs(30),
-                        "conditional mouse receipt",
-                        request,
-                    )
-                    .await,
+                    Some(Ok(Some(request))) => {
+                        with_rpc_deadline(
+                            Duration::from_secs(30),
+                            "conditional mouse receipt",
+                            request,
+                        )
+                        .await
+                    }
                 };
                 delivery.settle(result.is_ok());
                 failure_notified |= result.is_err();
@@ -345,7 +351,10 @@ mod tests {
             MouseButton::WheelLeft(MAX_CONDITIONAL_PANE_INPUT_WHEEL_STEPS + 1),
             MouseButton::WheelRight(usize::MAX),
         ] {
-            assert!(!conditional_wheel_is_bounded(&MouseEvent { button, ..original }));
+            assert!(!conditional_wheel_is_bounded(&MouseEvent {
+                button,
+                ..original
+            }));
         }
     }
 

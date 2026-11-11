@@ -18729,7 +18729,8 @@ mod tests {
                     // An admitted operation may finish on its original pane;
                     // retirement must never redirect it to the successor.
                     assert_eq!(
-                        take_conditional_input_response(&executor, &captured, 720, &request).outcome,
+                        take_conditional_input_response(&executor, &captured, 720, &request)
+                            .outcome,
                         codec::PaneInputConditionalOutcomeV1::Accepted
                     );
                     assert_eq!(conditional_input_effect_count(&original, &effect), 1);

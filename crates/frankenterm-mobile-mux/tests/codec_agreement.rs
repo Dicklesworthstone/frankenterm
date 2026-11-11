@@ -51,21 +51,35 @@ fn desktop_current(pdu: Pdu, serial: u64) -> Vec<u8> {
 fn explicit_default_shell_creation_matches_the_existing_spawn_protocol() {
     for workspace in ["default".to_owned(), "é".repeat(128)] {
         let native_size = wire::TerminalSize {
-            rows: 64, cols: 512, pixel_width: 0, pixel_height: 0, dpi: 0,
+            rows: 64,
+            cols: 512,
+            pixel_width: 0,
+            pixel_height: 0,
+            dpi: 0,
         };
         assert_eq!(
-            phone(wire::ident::SPAWN_V2, u64::MAX,
-                  &wire::SpawnDefaultShell::new(&workspace, native_size)),
-            desktop_current(Pdu::SpawnV2(codec::SpawnV2 {
-                domain: config::keyassignment::SpawnTabDomain::DefaultDomain,
-                window_id: None,
-                command: None,
-                command_dir: None,
-                size: frankenterm_term::TerminalSize {
-                    rows: 64, cols: 512, pixel_width: 0, pixel_height: 0, dpi: 0,
-                },
-                workspace,
-            }), u64::MAX)
+            phone(
+                wire::ident::SPAWN_V2,
+                u64::MAX,
+                &wire::SpawnDefaultShell::new(&workspace, native_size)
+            ),
+            desktop_current(
+                Pdu::SpawnV2(codec::SpawnV2 {
+                    domain: config::keyassignment::SpawnTabDomain::DefaultDomain,
+                    window_id: None,
+                    command: None,
+                    command_dir: None,
+                    size: frankenterm_term::TerminalSize {
+                        rows: 64,
+                        cols: 512,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                        dpi: 0,
+                    },
+                    workspace,
+                }),
+                u64::MAX
+            )
         );
     }
     for id in [0, isize::MAX as usize] {
@@ -74,13 +88,23 @@ fn explicit_default_shell_creation_matches_the_existing_spawn_protocol() {
             pane_id: id,
             window_id: id,
             size: frankenterm_term::TerminalSize {
-                rows: 24, cols: 80, pixel_width: 640, pixel_height: 384, dpi: 96,
+                rows: 24,
+                cols: 80,
+                pixel_width: 640,
+                pixel_height: 384,
+                dpi: 96,
             },
         };
         let body = varbincode::serialize(&canonical).unwrap();
         let decoded = wire::decode_spawn_response(&body).unwrap();
-        assert_eq!((decoded.tab_id, decoded.pane_id, decoded.window_id), (id, id, id));
-        assert_eq!((decoded.size.rows, decoded.size.cols, decoded.size.dpi), (24, 80, 96));
+        assert_eq!(
+            (decoded.tab_id, decoded.pane_id, decoded.window_id),
+            (id, id, id)
+        );
+        assert_eq!(
+            (decoded.size.rows, decoded.size.cols, decoded.size.dpi),
+            (24, 80, 96)
+        );
         let mut with_tail = body.clone();
         with_tail.push(0);
         assert!(wire::decode_spawn_response(&with_tail).is_err());
@@ -100,14 +124,24 @@ fn shell_creation_error_certainty_matches_all_current_codec_authority_classes() 
             _ => None,
         };
         let (effect, retry) = match number {
-            11 => (codec::MuxErrorEffect::INDETERMINATE, codec::MuxErrorRetry::RECONCILE_BEFORE_RETRY),
-            8..=10 | 12 => (codec::MuxErrorEffect::NOT_APPLIED, codec::MuxErrorRetry::SAFE_AFTER_BACKOFF),
-            _ => (codec::MuxErrorEffect::NOT_APPLIED, codec::MuxErrorRetry::NEVER),
+            11 => (
+                codec::MuxErrorEffect::INDETERMINATE,
+                codec::MuxErrorRetry::RECONCILE_BEFORE_RETRY,
+            ),
+            8..=10 | 12 => (
+                codec::MuxErrorEffect::NOT_APPLIED,
+                codec::MuxErrorRetry::SAFE_AFTER_BACKOFF,
+            ),
+            _ => (
+                codec::MuxErrorEffect::NOT_APPLIED,
+                codec::MuxErrorRetry::NEVER,
+            ),
         };
         let error = codec::ErrorResponse::new(36, code, object, effect, retry);
         error.validate().unwrap();
         assert_eq!(
-            wire::shell_creation_definitely_not_applied(&varbincode::serialize(&error).unwrap()).unwrap(),
+            wire::shell_creation_definitely_not_applied(&varbincode::serialize(&error).unwrap())
+                .unwrap(),
             number != 11,
         );
     }
@@ -320,7 +354,8 @@ fn conditional_paste_and_mouse_match_the_desktop_schema_and_exact_receipts() {
     assert!(
         wire::decode_conditional_input_receipt(&vec![
             0;
-            wire::MAX_CONDITIONAL_PANE_INPUT_RESPONSE_BYTES + 1
+            wire::MAX_CONDITIONAL_PANE_INPUT_RESPONSE_BYTES
+                + 1
         ])
         .is_err()
     );
@@ -341,7 +376,8 @@ fn conditional_paste_and_mouse_match_the_desktop_schema_and_exact_receipts() {
             _ => receipt.input_serial = InputSerial::empty(),
         }
         assert!(
-            wire::decode_conditional_input_receipt(&varbincode::serialize(&receipt).unwrap()).is_err()
+            wire::decode_conditional_input_receipt(&varbincode::serialize(&receipt).unwrap())
+                .is_err()
         );
     }
 }

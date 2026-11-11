@@ -15,8 +15,8 @@
 
 use crate::native::NativeTerminalError as Error;
 use crate::native_ffi::{input_bytes, output_bytes, output_scalar, utf8};
-use frankenterm_mobile_mux::{Event, SearchQuery, Session};
 use frankenterm_mobile_mux::session::ShellCreationError;
+use frankenterm_mobile_mux::{Event, SearchQuery, Session};
 use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use std::convert::TryFrom;
 use std::panic::AssertUnwindSafe;
@@ -248,9 +248,20 @@ fn event_parts(event: Option<Event>) -> Result<(u32, u64, u32, u32, Vec<u8>), Er
             if reason.is_empty() || reason.len() > 512 {
                 return Err(Error::Invalid);
             }
-            (EVENT_INPUT_REJECTED, pane_id as u64, 0, 0, reason.into_bytes())
+            (
+                EVENT_INPUT_REJECTED,
+                pane_id as u64,
+                0,
+                0,
+                reason.into_bytes(),
+            )
         }
-        Some(Event::ShellCreated { request, pane_id, tab_id, window_id }) => {
+        Some(Event::ShellCreated {
+            request,
+            pane_id,
+            tab_id,
+            window_id,
+        }) => {
             if request == 0 {
                 return Err(Error::Invalid);
             }
@@ -263,10 +274,15 @@ fn event_parts(event: Option<Event>) -> Result<(u32, u64, u32, u32, Vec<u8>), Er
                     "request": request,
                     "tab_id": tab_id,
                     "window_id": window_id,
-                })).map_err(|_| Error::Invalid)?,
+                }))
+                .map_err(|_| Error::Invalid)?,
             )
         }
-        Some(Event::ShellCreationFailed { request, reason, uncertain }) => {
+        Some(Event::ShellCreationFailed {
+            request,
+            reason,
+            uncertain,
+        }) => {
             if request == 0 || reason.is_empty() || reason.len() > 512 {
                 return Err(Error::Invalid);
             }
@@ -279,7 +295,8 @@ fn event_parts(event: Option<Event>) -> Result<(u32, u64, u32, u32, Vec<u8>), Er
                     "request": request,
                     "reason": reason,
                     "uncertain": uncertain,
-                })).map_err(|_| Error::Invalid)?,
+                }))
+                .map_err(|_| Error::Invalid)?,
             )
         }
         Some(Event::Failed { reason }) => (EVENT_FAILED, 0, 0, 0, reason.into_bytes()),
@@ -558,25 +575,36 @@ pub unsafe extern "C" fn ft_mux_v1_create_shell(
     request: *mut u64,
 ) -> u32 {
     boundary(Some(session), |registry| {
-        unsafe { output_scalar(request, 0)?; }
+        unsafe {
+            output_scalar(request, 0)?;
+        }
         let workspace = utf8(unsafe {
-            input_bytes(workspace, workspace_length,
-                        frankenterm_mobile_mux::wire::MAX_SHELL_WORKSPACE_BYTES)?
+            input_bytes(
+                workspace,
+                workspace_length,
+                frankenterm_mobile_mux::wire::MAX_SHELL_WORKSPACE_BYTES,
+            )?
         })?;
-        let incarnation: [u8; 16] = unsafe {
-            input_bytes(expected_incarnation, incarnation_length, 16)?
-        }.try_into().map_err(|_| Error::Invalid)?;
-        let serial = registry.session(session)?
+        let incarnation: [u8; 16] =
+            unsafe { input_bytes(expected_incarnation, incarnation_length, 16)? }
+                .try_into()
+                .map_err(|_| Error::Invalid)?;
+        let serial = registry
+            .session(session)?
             .create_shell(workspace, rows as usize, cols as usize, incarnation)
             .map_err(|error| match error {
                 ShellCreationError::NotReady => Error::Closed,
                 ShellCreationError::Unsupported => Error::Unsupported,
                 ShellCreationError::Stale => Error::Stale,
                 ShellCreationError::Busy => Error::Busy,
-                ShellCreationError::Invalid | ShellCreationError::ClockUnavailable => Error::Invalid,
+                ShellCreationError::Invalid | ShellCreationError::ClockUnavailable => {
+                    Error::Invalid
+                }
                 ShellCreationError::SerialExhausted => Error::SequenceExhausted,
             })?;
-        unsafe { output_scalar(request, serial)?; }
+        unsafe {
+            output_scalar(request, serial)?;
+        }
         Ok(())
     })
 }
@@ -839,7 +867,8 @@ mod tests {
             pane_id: 17,
             tab_id: 9,
             window_id: 23,
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!((kind, pane, rows, cols), (EVENT_SHELL_CREATED, 17, 0, 0));
         assert!(payload.len() <= 256);
         let decoded: serde_json::Value = serde_json::from_slice(&payload).unwrap();
@@ -853,8 +882,12 @@ mod tests {
                 request: 4,
                 reason: reason.clone(),
                 uncertain,
-            })).unwrap();
-            assert_eq!((kind, pane, rows, cols), (EVENT_SHELL_CREATION_FAILED, 0, 0, 0));
+            }))
+            .unwrap();
+            assert_eq!(
+                (kind, pane, rows, cols),
+                (EVENT_SHELL_CREATION_FAILED, 0, 0, 0)
+            );
             assert!(payload.len() <= 4096);
             let decoded: serde_json::Value = serde_json::from_slice(&payload).unwrap();
             assert_eq!(decoded["request"].as_u64(), Some(4));
@@ -862,12 +895,23 @@ mod tests {
             assert_eq!(decoded["uncertain"].as_bool(), Some(uncertain));
         }
         assert!(event_parts(Some(Event::ShellCreated {
-            request: 0, pane_id: 17, tab_id: 9, window_id: 23,
-        })).is_err());
-        for (request, reason) in [(0, "reason".to_owned()), (4, String::new()), (4, "x".repeat(513))] {
+            request: 0,
+            pane_id: 17,
+            tab_id: 9,
+            window_id: 23,
+        }))
+        .is_err());
+        for (request, reason) in [
+            (0, "reason".to_owned()),
+            (4, String::new()),
+            (4, "x".repeat(513)),
+        ] {
             assert!(event_parts(Some(Event::ShellCreationFailed {
-                request, reason, uncertain: true,
-            })).is_err());
+                request,
+                reason,
+                uncertain: true,
+            }))
+            .is_err());
         }
     }
 
@@ -880,11 +924,17 @@ mod tests {
             assert_eq!(ft_mux_v1_create(&mut session), 0);
             assert_eq!(take_outgoing(session), [2, 1, 26]);
             let version = frankenterm_mobile_mux::frame::encode(27, 1, &[71, 1, b'x']);
-            assert_eq!(ft_mux_v1_receive(session, version.as_ptr(), version.len() as u32), 0);
+            assert_eq!(
+                ft_mux_v1_receive(session, version.as_ptr(), version.len() as u32),
+                0
+            );
             let registration = take_outgoing(session);
             assert_eq!(registration[1..3], [2, 40]);
             let unit = frankenterm_mobile_mux::frame::encode(10, 2, &[]);
-            assert_eq!(ft_mux_v1_receive(session, unit.as_ptr(), unit.len() as u32), 0);
+            assert_eq!(
+                ft_mux_v1_receive(session, unit.as_ptr(), unit.len() as u32),
+                0
+            );
             assert_eq!(take_outgoing(session), [4, 3, 81, 1, 1]);
             let mut snapshot = vec![1];
             snapshot.extend_from_slice(&[0x5a; 16]);
@@ -892,53 +942,138 @@ mod tests {
             snapshot.extend_from_slice(&[0x1c; 16]);
             snapshot.extend_from_slice(&[0; 5]);
             let inventory = frankenterm_mobile_mux::frame::encode(82, 3, &snapshot);
-            assert_eq!(ft_mux_v1_receive(session, inventory.as_ptr(), inventory.len() as u32), 0);
+            assert_eq!(
+                ft_mux_v1_receive(session, inventory.as_ptr(), inventory.len() as u32),
+                0
+            );
             assert!(take_outgoing(session).is_empty());
             let (mut has_wake, mut wake) = (0, 0);
             assert_eq!(ft_mux_v1_tick(session, 0, &mut has_wake, &mut wake), 0);
             assert_eq!((has_wake, wake), (0, 0));
             let workspace = b"default";
             let incarnation = [0x1c; 16];
-            assert_eq!(ft_mux_v1_create_shell(session, workspace.as_ptr(), 7, 24, 80,
-                incarnation.as_ptr(), 16, std::ptr::null_mut()), Error::Invalid as u32);
+            assert_eq!(
+                ft_mux_v1_create_shell(
+                    session,
+                    workspace.as_ptr(),
+                    7,
+                    24,
+                    80,
+                    incarnation.as_ptr(),
+                    16,
+                    std::ptr::null_mut()
+                ),
+                Error::Invalid as u32
+            );
             let mut request = 99;
-            assert_eq!(ft_mux_v1_create_shell(session, workspace.as_ptr(), 7, 24, 80,
-                incarnation.as_ptr(), 15, &mut request), Error::Invalid as u32);
+            assert_eq!(
+                ft_mux_v1_create_shell(
+                    session,
+                    workspace.as_ptr(),
+                    7,
+                    24,
+                    80,
+                    incarnation.as_ptr(),
+                    15,
+                    &mut request
+                ),
+                Error::Invalid as u32
+            );
             assert_eq!(request, 0);
             let stale = [0x55; 16];
-            assert_eq!(ft_mux_v1_create_shell(session, workspace.as_ptr(), 7, 24, 80,
-                stale.as_ptr(), 16, &mut request), Error::Stale as u32);
+            assert_eq!(
+                ft_mux_v1_create_shell(
+                    session,
+                    workspace.as_ptr(),
+                    7,
+                    24,
+                    80,
+                    stale.as_ptr(),
+                    16,
+                    &mut request
+                ),
+                Error::Stale as u32
+            );
             assert_eq!(request, 0);
-            assert!(take_outgoing(session).is_empty(), "no refused call may enqueue a spawn");
-            assert_eq!(ft_mux_v1_create_shell(session, workspace.as_ptr(), 7, 24, 80,
-                incarnation.as_ptr(), 16, &mut request), 0);
+            assert!(
+                take_outgoing(session).is_empty(),
+                "no refused call may enqueue a spawn"
+            );
+            assert_eq!(
+                ft_mux_v1_create_shell(
+                    session,
+                    workspace.as_ptr(),
+                    7,
+                    24,
+                    80,
+                    incarnation.as_ptr(),
+                    16,
+                    &mut request
+                ),
+                0
+            );
             assert_eq!(request, 4, "refusal cannot consume the RPC serial");
             let mut expected = vec![19, 4, 36, 0, 0, 0, 0, 24, 80, 0, 0, 0, 7];
             expected.extend_from_slice(workspace);
             assert_eq!(take_outgoing(session), expected);
-            assert_eq!(ft_mux_v1_create_shell(session, workspace.as_ptr(), 7, 24, 80,
-                incarnation.as_ptr(), 16, &mut request), Error::Busy as u32);
+            assert_eq!(
+                ft_mux_v1_create_shell(
+                    session,
+                    workspace.as_ptr(),
+                    7,
+                    24,
+                    80,
+                    incarnation.as_ptr(),
+                    16,
+                    &mut request
+                ),
+                Error::Busy as u32
+            );
             assert_eq!(request, 0);
             assert_eq!(ft_mux_v1_tick(session, 0, &mut has_wake, &mut wake), 0);
             assert_eq!((has_wake, wake), (1, 15_000_000_000));
-            let receipt = frankenterm_mobile_mux::frame::encode(8, 4, &[9, 17, 23, 24, 80, 0, 0, 0]);
-            assert_eq!(ft_mux_v1_receive(session, receipt.as_ptr(), receipt.len() as u32), 0);
+            let receipt =
+                frankenterm_mobile_mux::frame::encode(8, 4, &[9, 17, 23, 24, 80, 0, 0, 0]);
+            assert_eq!(
+                ft_mux_v1_receive(session, receipt.as_ptr(), receipt.len() as u32),
+                0
+            );
             let (mut kind, mut pane, mut rows, mut cols, mut length) = (0, 0, 0, 0, 0);
-            for expected in [EVENT_READY, EVENT_INCARNATION, EVENT_PANES, EVENT_SHELL_CREATED] {
-                assert_eq!(ft_mux_v1_next_event(session, &mut kind, &mut pane,
-                    &mut rows, &mut cols, &mut length), 0);
+            for expected in [
+                EVENT_READY,
+                EVENT_INCARNATION,
+                EVENT_PANES,
+                EVENT_SHELL_CREATED,
+            ] {
+                assert_eq!(
+                    ft_mux_v1_next_event(
+                        session,
+                        &mut kind,
+                        &mut pane,
+                        &mut rows,
+                        &mut cols,
+                        &mut length
+                    ),
+                    0
+                );
                 assert_eq!(kind, expected);
             }
             assert_eq!((pane, rows, cols), (17, 0, 0));
             let mut payload = vec![0; length as usize];
             let mut written = 0;
-            assert_eq!(ft_mux_v1_event_copy(session, 0, payload.as_mut_ptr(), length, &mut written), 0);
+            assert_eq!(
+                ft_mux_v1_event_copy(session, 0, payload.as_mut_ptr(), length, &mut written),
+                0
+            );
             assert_eq!(written, length);
             let decoded: serde_json::Value = serde_json::from_slice(&payload).unwrap();
             assert_eq!(decoded["request"].as_u64(), Some(4));
             assert_eq!(decoded["tab_id"].as_u64(), Some(9));
             assert_eq!(decoded["window_id"].as_u64(), Some(23));
-            assert!(take_outgoing(session).is_empty(), "the receipt has no automatic pane effect");
+            assert!(
+                take_outgoing(session).is_empty(),
+                "the receipt has no automatic pane effect"
+            );
             assert_eq!(ft_mux_v1_tick(session, 0, &mut has_wake, &mut wake), 0);
             assert_eq!((has_wake, wake), (0, 0));
             assert_eq!(ft_mux_v1_release(session), 0);

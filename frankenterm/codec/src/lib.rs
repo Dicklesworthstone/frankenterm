@@ -13821,10 +13821,12 @@ impl<'de> serde::de::Visitor<'de> for NativePaneTreesVisitor {
     {
         let hinted = sequence.size_hint().unwrap_or(0);
         if hinted > MAX_ORDERED_TABS_PER_SNAPSHOT {
-            return Err(serde::de::Error::custom(PaneTreeBoundsError::TooManyTrees {
-                count: hinted,
-                max: MAX_ORDERED_TABS_PER_SNAPSHOT,
-            }));
+            return Err(serde::de::Error::custom(
+                PaneTreeBoundsError::TooManyTrees {
+                    count: hinted,
+                    max: MAX_ORDERED_TABS_PER_SNAPSHOT,
+                },
+            ));
         }
         let mut trees = Vec::new();
         trees
@@ -13837,7 +13839,8 @@ impl<'de> serde::de::Visitor<'de> for NativePaneTreesVisitor {
                 tree_index: trees.len(),
                 depth: 1,
                 budget: &mut budget,
-            })? else {
+            })?
+            else {
                 return Ok(trees);
             };
             trees
@@ -14718,7 +14721,10 @@ fn validate_conditional_pane_input_identity(
     input_serial: InputSerial,
 ) -> Result<(), ConditionalPaneInputError> {
     for (field, reserved) in [
-        ("session incarnation", session_incarnation.as_bytes() == [0; 16]),
+        (
+            "session incarnation",
+            session_incarnation.as_bytes() == [0; 16],
+        ),
         ("pane registration", pane_registration.is_reserved()),
     ] {
         if reserved {
@@ -14800,7 +14806,9 @@ where
         {
             let text = String::deserialize(deserializer)?;
             if text.len() > MAX_CONDITIONAL_PANE_INPUT_PASTE_BYTES {
-                return Err(serde::de::Error::custom(ConditionalPaneInputError::PasteTooLarge));
+                return Err(serde::de::Error::custom(
+                    ConditionalPaneInputError::PasteTooLarge,
+                ));
             }
             Ok(text)
         }
@@ -15909,7 +15917,10 @@ impl ListPanesWithDomainsV1Response {
                 last_revision,
             } = &self.outcome
             {
-                anyhow::ensure!((1..=3).contains(attempts), "invalid pane-domain snapshot attempts");
+                anyhow::ensure!(
+                    (1..=3).contains(attempts),
+                    "invalid pane-domain snapshot attempts"
+                );
                 anyhow::ensure!(
                     first_revision <= last_revision && last_revision.get() != u64::MAX,
                     "invalid pane-domain snapshot contention revisions"
@@ -15951,7 +15962,10 @@ impl ListPanesWithDomainsV1Response {
                 (pane.workspace.as_str(), 16 * 1024),
                 (pane.tty_name.as_deref().unwrap_or(""), 16 * 1024),
             ] {
-                anyhow::ensure!(value.len() <= maximum, "pane-domain snapshot metadata is too long");
+                anyhow::ensure!(
+                    value.len() <= maximum,
+                    "pane-domain snapshot metadata is too long"
+                );
                 metadata_bytes = metadata_bytes
                     .checked_add(value.len())
                     .context("counting pane-domain snapshot metadata")?;
@@ -19138,11 +19152,7 @@ mod test {
         }
     }
 
-    fn frozen_native_pane_frame(
-        ident: u64,
-        pane_payload: &[u8],
-        mode: CompressionMode,
-    ) -> Vec<u8> {
+    fn frozen_native_pane_frame(ident: u64, pane_payload: &[u8], mode: CompressionMode) -> Vec<u8> {
         let mut payload = match ident {
             4 => Vec::new(),
             82 => serialize_uncompressed(&(
@@ -19190,7 +19200,8 @@ mod test {
             for mode in [CompressionMode::Never, CompressionMode::Always] {
                 let original_frame = frozen_native_pane_frame(ident, &original_payload, mode);
                 assert_eq!(
-                    pdu.encode_frame_with_mode(74, mode).expect("encode native frame"),
+                    pdu.encode_frame_with_mode(74, mode)
+                        .expect("encode native frame"),
                     original_frame,
                     "native PDU {ident} under {mode:?} changed its admitted wire bytes",
                 );
@@ -19231,7 +19242,8 @@ mod test {
                 original,
             );
             assert_eq!(
-                deserialize_list_panes_response(&original, false).expect("decode bounded pane tree"),
+                deserialize_list_panes_response(&original, false)
+                    .expect("decode bounded pane tree"),
                 panes,
             );
         }
@@ -19282,7 +19294,9 @@ mod test {
         aggregate_nodes.tabs.push(PaneNode::Empty);
         let mut aggregate_leaves = ListPanesResponse {
             tabs: (0..4)
-                .map(|index| pane_tree_with_slots(MAX_ORDERED_PANE_LEAVES_PER_TREE, 0, index * 4096))
+                .map(|index| {
+                    pane_tree_with_slots(MAX_ORDERED_PANE_LEAVES_PER_TREE, 0, index * 4096)
+                })
                 .collect(),
             ..empty_pane_list()
         };
@@ -19339,7 +19353,8 @@ mod test {
         };
         let original = frozen_native_pane_payload(&panes);
         assert_eq!(
-            deserialize_list_panes_response(&original, false).expect("consume only the tree marker"),
+            deserialize_list_panes_response(&original, false)
+                .expect("consume only the tree marker"),
             panes,
         );
     }
@@ -19357,8 +19372,7 @@ mod test {
         }
         // There are no child fields or geometries after the final Split tag.
         // A depth refusal, rather than EOF, proves admission precedes descent.
-        let mut partial_right_prefix =
-            serialize_uncompressed(&1_usize).expect("encode root count");
+        let mut partial_right_prefix = serialize_uncompressed(&1_usize).expect("encode root count");
         partial_right_prefix.extend_from_slice(&split_tag);
         partial_right_prefix.extend_from_slice(
             &serialize_uncompressed(&left_deep_pane_tree(MAX_ORDERED_PANE_TREE_DEPTH - 1))
@@ -19368,7 +19382,8 @@ mod test {
             partial_right_prefix.extend_from_slice(&split_tag);
         }
         let excessive_roots = MAX_ORDERED_TABS_PER_SNAPSHOT + 1;
-        let root_only_prefix = serialize_uncompressed(&excessive_roots).expect("encode root prefix");
+        let root_only_prefix =
+            serialize_uncompressed(&excessive_roots).expect("encode root prefix");
         let root_error = format!(
             "native pane trees length {excessive_roots} exceeds maximum {}",
             MAX_ORDERED_TABS_PER_SNAPSHOT,
@@ -19538,10 +19553,7 @@ mod test {
                     let error = pdu
                         .encode_frame_with_mode(76, mode)
                         .expect_err("direct encoder must refuse before codec allocation");
-                    assert_eq!(
-                        error.downcast_ref::<PaneTreeBoundsError>(),
-                        Some(&expected),
-                    );
+                    assert_eq!(error.downcast_ref::<PaneTreeBoundsError>(), Some(&expected),);
                     assert_eq!(test_serialize_invocations(), 0);
                     assert_eq!(test_bounded_serialize_buffer_constructions(), 0);
                     assert_eq!(test_bounded_serialize_growth_events(), 0);
@@ -26647,11 +26659,12 @@ mod test {
             }
         }
         let mut boundary = conditional_input_fixture();
-        boundary.effect = PaneInputEffectV1::Paste(
-            "x".repeat(MAX_CONDITIONAL_PANE_INPUT_PASTE_BYTES),
-        );
+        boundary.effect =
+            PaneInputEffectV1::Paste("x".repeat(MAX_CONDITIONAL_PANE_INPUT_PASTE_BYTES));
         let pdu = Pdu::SendPaneInputConditionalV1(boundary);
-        let frame = pdu.encode_frame_with_mode(31, CompressionMode::Always).unwrap();
+        let frame = pdu
+            .encode_frame_with_mode(31, CompressionMode::Always)
+            .unwrap();
         assert_eq!(Pdu::decode(frame.as_slice()).unwrap().pdu, pdu);
     }
 
@@ -26743,8 +26756,8 @@ mod test {
             } else {
                 body.clone()
             };
-            let error = deserialize_send_pane_input_conditional_v1(&encoded, compressed)
-                .unwrap_err();
+            let error =
+                deserialize_send_pane_input_conditional_v1(&encoded, compressed).unwrap_err();
             assert!(format!("{error:#}").contains("conditional paste text bytes"));
         }
     }
@@ -27225,15 +27238,14 @@ mod test {
                 domain_name: "private-production".to_string(),
             },
         };
-        let response = |panes, session_incarnation, snapshot_revision| {
-            ListPanesWithDomainsV1Response {
+        let response =
+            |panes, session_incarnation, snapshot_revision| ListPanesWithDomainsV1Response {
                 outcome: ListPanesWithDomainsOutcomeV1::Snapshot {
                     session_incarnation,
                     snapshot_revision,
                     panes,
                 },
-            }
-        };
+            };
         let session = MuxSessionIncarnation::from_bytes([9; 16]);
         let revision = TopologyRevision::new(17);
         for invalid_domain in [
@@ -27249,11 +27261,15 @@ mod test {
         ] {
             let mut invalid = valid.clone();
             invalid.domain = invalid_domain;
-            assert!(response(vec![invalid], session, revision).validate().is_err());
+            assert!(response(vec![invalid], session, revision)
+                .validate()
+                .is_err());
         }
-        assert!(response(vec![valid.clone(), valid.clone()], session, revision)
-            .validate()
-            .is_err());
+        assert!(
+            response(vec![valid.clone(), valid.clone()], session, revision)
+                .validate()
+                .is_err()
+        );
         let mut earlier = valid.clone();
         earlier.pane.pane_id = 0;
         assert!(response(vec![valid.clone(), earlier], session, revision)
@@ -27266,12 +27282,18 @@ mod test {
         )
         .validate()
         .is_err());
-        assert!(response(vec![valid.clone()], session, TopologyRevision::new(u64::MAX))
-            .validate()
-            .is_err());
+        assert!(response(
+            vec![valid.clone()],
+            session,
+            TopologyRevision::new(u64::MAX)
+        )
+        .validate()
+        .is_err());
         let mut reserved = valid;
         reserved.pane_registration = ReliablePaneRegistrationIdentityV1::from_bytes([0; 16]);
-        assert!(response(vec![reserved], session, revision).validate().is_err());
+        assert!(response(vec![reserved], session, revision)
+            .validate()
+            .is_err());
     }
 
     #[test]
@@ -27306,8 +27328,14 @@ mod test {
                     payload.clone()
                 };
                 let mut frame = Vec::new();
-                encode_raw(ListPanesWithDomainsV1Response::IDENT, 402, &body, compressed, &mut frame)
-                    .unwrap();
+                encode_raw(
+                    ListPanesWithDomainsV1Response::IDENT,
+                    402,
+                    &body,
+                    compressed,
+                    &mut frame,
+                )
+                .unwrap();
                 let error = Pdu::decode(frame.as_slice()).unwrap_err();
                 assert!(format!("{error:#}").contains(expected), "{error:#}");
             }
@@ -27345,7 +27373,11 @@ mod test {
                 encode_raw(ident, 403, &body, compressed, &mut frame).unwrap();
                 assert!(format!("{:#}", Pdu::decode(frame.as_slice()).unwrap_err())
                     .contains("trailing"));
-                let cap = if compressed { compressed_cap } else { plain_cap };
+                let cap = if compressed {
+                    compressed_cap
+                } else {
+                    plain_cap
+                };
                 let header = declared_pdu_frame_header(ident, 403, cap + 1, compressed);
                 assert!(decode_raw(header.as_slice())
                     .unwrap_err()
@@ -28238,9 +28270,7 @@ mod test {
                 | 118
                 | 121 => Cap::Query,
                 4 | 13 | 20 | 23 | 32 | 42 | 47 | 76 | 78 | 82 | 87 | 94 | 99 | 103 | 113 | 116
-                | 122 | 123 => {
-                    Cap::BulkData
-                }
+                | 122 | 123 => Cap::BulkData,
                 ident => panic!("PDU {} is missing from the admission-cap census", ident),
             };
             let expected_qos = match spec.ident {

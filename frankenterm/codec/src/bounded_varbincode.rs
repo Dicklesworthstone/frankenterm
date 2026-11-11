@@ -38,7 +38,8 @@ pub(crate) const PANE_USER_VARS_V1_NEWTYPE: &str = "frankenterm.codec.PaneUserVa
 pub(crate) const PANE_USER_VAR_TEXT_V1_NEWTYPE: &str = "frankenterm.codec.PaneUserVarTextV1";
 pub(crate) const PANES_WITH_DOMAINS_V1_NEWTYPE: &str = "frankenterm.codec.PanesWithDomainsV1";
 pub(crate) const SNAPSHOT_PANE_DOMAIN_V1_NEWTYPE: &str = "frankenterm.codec.SnapshotPaneDomainV1";
-pub(crate) const CONDITIONAL_PASTE_TEXT_V1_NEWTYPE: &str = "frankenterm.codec.ConditionalPasteTextV1";
+pub(crate) const CONDITIONAL_PASTE_TEXT_V1_NEWTYPE: &str =
+    "frankenterm.codec.ConditionalPasteTextV1";
 pub(crate) const IMAGE_WIRE_BYTES_V1_NEWTYPE: &str = termwiz::image::IMAGE_WIRE_BYTES_V1_NEWTYPE;
 pub(crate) const EXACT_RENDER_ROW_UTF8_V1_MAX_BYTES: usize = 1_000_000;
 pub(crate) const EXACT_RENDER_METADATA_UTF8_V1_MAX_BYTES: usize = 65_536;

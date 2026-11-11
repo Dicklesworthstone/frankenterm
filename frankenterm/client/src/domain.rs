@@ -4578,7 +4578,10 @@ impl ClientDomain {
                     .context("validating bounded floating-pane snapshot")?;
                 if let Some(sources) = &input_sources {
                     for (local_id, remote_id, previous) in previous_input_sources {
-                        if sources.get(&remote_id).is_some_and(|source| *source != previous) {
+                        if sources
+                            .get(&remote_id)
+                            .is_some_and(|source| *source != previous)
+                        {
                             if let Some(pane) = mux.get_pane(local_id) {
                                 if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
                                     // Prune the old mirror without asking the
@@ -8769,12 +8772,18 @@ mod tests {
         let old = mux.get_pane(old_id).unwrap();
         let old_registration = mux.capture_pane_registration(&old).unwrap();
         let old_client = old.downcast_ref::<ClientPane>().unwrap();
-        assert_eq!(old_client.withdraw_conditional_input_source(), Some(original));
+        assert_eq!(
+            old_client.withdraw_conditional_input_source(),
+            Some(original)
+        );
         old_client.publish_conditional_input_source(Some(original));
 
         apply(None).expect("missing input authority must preserve viewing");
         assert!(Arc::ptr_eq(&mux.get_pane(old_id).unwrap(), &old));
-        assert_eq!(old_client.withdraw_conditional_input_source(), Some(original));
+        assert_eq!(
+            old_client.withdraw_conditional_input_source(),
+            Some(original)
+        );
         apply(Some(original)).expect("same-source refresh preserves the local mirror");
         assert!(Arc::ptr_eq(&mux.get_pane(old_id).unwrap(), &old));
         apply(None).unwrap();
@@ -8782,12 +8791,24 @@ mod tests {
         apply(Some(replacement)).expect("a changed registration must create a new mirror");
         let new_id = inner.remote_to_local_pane_id(61).unwrap();
         let new = mux.get_pane(new_id).unwrap();
-        assert!(!Arc::ptr_eq(&new, &old), "a reused numeric id must not rebind the old display");
-        assert!(old_client.is_dead(), "pruning the old mirror must not kill its numeric successor");
+        assert!(
+            !Arc::ptr_eq(&new, &old),
+            "a reused numeric id must not rebind the old display"
+        );
+        assert!(
+            old_client.is_dead(),
+            "pruning the old mirror must not kill its numeric successor"
+        );
         assert!(old_registration.try_with_current(|_| ()).is_none());
-        assert_eq!(old_client.withdraw_conditional_input_source(), Some(original));
+        assert_eq!(
+            old_client.withdraw_conditional_input_source(),
+            Some(original)
+        );
         let new_client = new.downcast_ref::<ClientPane>().unwrap();
-        assert_eq!(new_client.withdraw_conditional_input_source(), Some(replacement));
+        assert_eq!(
+            new_client.withdraw_conditional_input_source(),
+            Some(replacement)
+        );
         new_client.publish_conditional_input_source(Some(replacement));
         assert_eq!(mux.iter_panes().len(), 1);
     }

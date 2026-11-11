@@ -471,9 +471,19 @@ fn durable_subscription_replays_and_polls_silent_commits_over_real_socket() {
             })
             .await
             .unwrap();
-        let epoch = storage.get_event_retention_snapshot().await.unwrap().cursor_epoch;
-        let first = storage.record_event(subscription_fixture_event(1)).await.unwrap();
-        let second = storage.record_event(subscription_fixture_event(2)).await.unwrap();
+        let epoch = storage
+            .get_event_retention_snapshot()
+            .await
+            .unwrap()
+            .cursor_epoch;
+        let first = storage
+            .record_event(subscription_fixture_event(1))
+            .await
+            .unwrap();
+        let second = storage
+            .record_event(subscription_fixture_event(2))
+            .await
+            .unwrap();
         // No EventBus publication accompanies any stored row in this test.
         let bus = Arc::new(EventBus::new(4));
         let context = IpcHandlerContext::new(bus).with_event_storage(Arc::clone(&storage));
@@ -489,7 +499,10 @@ fn durable_subscription_replays_and_polls_silent_commits_over_real_socket() {
         let mut stream = client
             .subscribe_events_from_cursor_with_cx(
                 &cx,
-                Some(DurableStreamCursor { after_id: 0, epoch: epoch.clone() }),
+                Some(DurableStreamCursor {
+                    after_id: 0,
+                    epoch: epoch.clone(),
+                }),
                 Some(7),
                 Some("warning".to_string()),
                 Some("codex.*".to_string()),
@@ -510,7 +523,10 @@ fn durable_subscription_replays_and_polls_silent_commits_over_real_socket() {
         let mut resumed = client
             .subscribe_events_from_cursor_with_cx(
                 &cx,
-                Some(DurableStreamCursor { after_id: first, epoch: epoch.clone() }),
+                Some(DurableStreamCursor {
+                    after_id: first,
+                    epoch: epoch.clone(),
+                }),
                 None,
                 None,
                 None,
@@ -518,9 +534,18 @@ fn durable_subscription_replays_and_polls_silent_commits_over_real_socket() {
             )
             .await
             .unwrap();
-        assert_eq!(read_subscription_record(&cx, &mut resumed).await["id"], second);
-        let third = storage.record_event(subscription_fixture_event(3)).await.unwrap();
-        assert_eq!(read_subscription_record(&cx, &mut resumed).await["id"], third);
+        assert_eq!(
+            read_subscription_record(&cx, &mut resumed).await["id"],
+            second
+        );
+        let third = storage
+            .record_event(subscription_fixture_event(3))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_subscription_record(&cx, &mut resumed).await["id"],
+            third
+        );
 
         // The compatibility API deliberately starts at the current tail and
         // publishes its exact epoch/baseline before a later silent commit.
@@ -533,20 +558,24 @@ fn durable_subscription_replays_and_polls_silent_commits_over_real_socket() {
         assert_eq!(checkpoint["cursor"], third);
         assert_eq!(checkpoint["cursor_epoch"], epoch);
         assert_eq!(checkpoint["reason"], "fresh_tail_baseline");
-        let fourth = storage.record_event(subscription_fixture_event(4)).await.unwrap();
-        assert_eq!(read_subscription_record(&cx, &mut fresh).await["id"], fourth);
+        let fourth = storage
+            .record_event(subscription_fixture_event(4))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_subscription_record(&cx, &mut fresh).await["id"],
+            fourth
+        );
         drop(fresh);
         drop(resumed);
 
-        frankenterm_core::runtime_async::mpsc_send(&shutdown_tx, ()).await.unwrap();
-        frankenterm_core::runtime_async::timeout_with_cx(
-            &cx,
-            Duration::from_secs(2),
-            server_task,
-        )
-        .await
-        .expect("subscription shutdown deadline")
-        .expect("server task settles");
+        frankenterm_core::runtime_async::mpsc_send(&shutdown_tx, ())
+            .await
+            .unwrap();
+        frankenterm_core::runtime_async::timeout_with_cx(&cx, Duration::from_secs(2), server_task)
+            .await
+            .expect("subscription shutdown deadline")
+            .expect("server task settles");
         assert!(!path.exists());
         storage.shutdown().await.unwrap();
     });
