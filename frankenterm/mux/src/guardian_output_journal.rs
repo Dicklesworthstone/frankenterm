@@ -9240,7 +9240,9 @@ mod tests {
                         creation.complete(),
                         Err(GuardianOutputJournalError::StorageFull(_))
                     ),
-                    "{site}: {kind:?}"
+                    "{}: {:?}",
+                    site,
+                    kind
                 );
                 assert!(!creation.failed);
                 let partial = std::fs::read(&path).expect("read retained header prefix");
