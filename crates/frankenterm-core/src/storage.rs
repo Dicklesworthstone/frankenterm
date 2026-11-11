@@ -1045,6 +1045,13 @@ enum WriteCommand {
         workflow: WorkflowRecord,
         respond: oneshot::Sender<Result<()>>,
     },
+    /// Write a workflow's terminal record and settle its trigger event in one
+    /// writer transaction.
+    SettleWorkflowTerminal {
+        workflow: WorkflowRecord,
+        handled_status: String,
+        respond: oneshot::Sender<Result<()>>,
+    },
     /// Create an execution without resetting an existing identity.
     CreateWorkflow {
         workflow: WorkflowRecord,
@@ -1485,6 +1492,7 @@ impl std::fmt::Debug for WriteCommand {
             Self::DeleteEventMute { .. } => "DeleteEventMute",
             Self::UpsertPane { .. } => "UpsertPane",
             Self::UpsertWorkflow { .. } => "UpsertWorkflow",
+            Self::SettleWorkflowTerminal { .. } => "SettleWorkflowTerminal",
             Self::CreateWorkflow { .. } => "CreateWorkflow",
             Self::CreateWorkflowBudget { .. } => "CreateWorkflowBudget",
             Self::CompareExchangeWorkflowBudget { .. } => "CompareExchangeWorkflowBudget",
@@ -7738,6 +7746,32 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// Persist a workflow's terminal record (`completed` or `failed`) and mark
+    /// its trigger event handled by it with `handled_status`, in one writer
+    /// transaction. Once the command is queued, cancelling the caller cannot
+    /// separate the two: either both are durable or neither is.
+    pub async fn settle_workflow_terminal_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        workflow: WorkflowRecord,
+        handled_status: &str,
+    ) -> Result<()> {
+        Self::checkpoint_storage_operation(cx, "settle_workflow_terminal")?;
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::SettleWorkflowTerminal {
+                    workflow,
+                    handled_status: handled_status.to_owned(),
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|error| Self::writer_send_error("settle_workflow_terminal", error))?;
+        Self::recv_writer_response(rx).await
+    }
+
     /// Create an execution identity exactly once. Unlike progress upserts, a
     /// duplicate start must not overwrite a running or terminal execution.
     /// A persisted trigger may admit only one automatic workflow, even when a
@@ -13713,6 +13747,7 @@ fn fail_undispatched_write_command(cmd: WriteCommand, failure: &WriterFailure) -
         | WriteCommand::UpsertEventMute { respond, .. }
         | WriteCommand::UpsertPane { respond, .. }
         | WriteCommand::UpsertWorkflow { respond, .. }
+        | WriteCommand::SettleWorkflowTerminal { respond, .. }
         | WriteCommand::CreateWorkflow { respond, .. }
         | WriteCommand::CreateWorkflowBudget { respond, .. }
         | WriteCommand::UpsertActionPlan { respond, .. }
@@ -19221,6 +19256,15 @@ fn dispatch_write_command_raw(
             let result = upsert_workflow_backend(backend, &workflow);
             respond_oneshot_best_effort(respond, result);
         }
+        WriteCommand::SettleWorkflowTerminal {
+            workflow,
+            handled_status,
+            respond,
+        } => {
+            let respond = WriterResultResponder::new(respond);
+            let result = settle_workflow_terminal_backend(backend, &workflow, &handled_status);
+            respond_oneshot_best_effort(respond, result);
+        }
         WriteCommand::CreateWorkflow { workflow, respond } => {
             let respond = WriterResultResponder::new(respond);
             let result = create_workflow_backend(backend, &workflow);
@@ -23209,6 +23253,41 @@ fn upsert_workflow_backend(backend: &dyn StorageBackend, workflow: &WorkflowReco
     }
 
     Ok(())
+}
+
+/// Write a terminal workflow record and mark its trigger event handled by it
+/// in one writer transaction, as `abort_workflow_backend` already does for
+/// aborts. As two separate writes, a runner shutdown that cancelled the
+/// workflow task between them left a completed (or failed) execution whose
+/// trigger still read unhandled; a replay of that event only ever meets
+/// `AlreadyClaimed`, so nothing settled it again. A refused upsert (an aborted
+/// execution cannot be revived) now also leaves the trigger as the abort
+/// settled it instead of overwriting its status.
+fn settle_workflow_terminal_backend(
+    backend: &dyn StorageBackend,
+    workflow: &WorkflowRecord,
+    handled_status: &str,
+) -> Result<()> {
+    if !matches!(workflow.status.as_str(), "completed" | "failed") || handled_status.is_empty() {
+        return Err(StorageError::Database(format!(
+            "invalid terminal workflow settlement: status={}, handled_status_empty={}",
+            workflow.status,
+            handled_status.is_empty()
+        ))
+        .into());
+    }
+    run_writer_transaction(
+        backend,
+        WriterTransactionBeginMode::Immediate,
+        "settle terminal workflow",
+        || {
+            upsert_workflow_backend(backend, workflow)?;
+            if let Some(event_id) = workflow.trigger_event_id {
+                mark_event_handled_backend(backend, event_id, Some(&workflow.id), handled_status)?;
+            }
+            Ok(())
+        },
+    )
 }
 
 /// Upsert workflow action plan (synchronous)
@@ -37266,6 +37345,111 @@ fn workflow_trigger_admits_one_owner_across_execution_ids_and_terminal_states() 
         assert!(RowReader::new(&row).optional_i64(0).unwrap().is_none(),
             "duplicate admission must not mark the original trigger handled");
     }
+}
+
+#[test]
+fn workflow_terminal_settlement_commits_record_and_trigger_together() {
+    fn settlement(backend: &dyn StorageBackend, event_id: i64) -> (Option<i64>, Option<String>, Option<String>) {
+        let row = backend.query_row_cells(
+            "SELECT handled_at, handled_by_workflow_id, handled_status FROM events WHERE id = ?1",
+            &[ToSqlValue::Integer(event_id)],
+        ).unwrap().unwrap();
+        let reader = CellRowReader::new(&row);
+        (reader.optional_i64(0).unwrap(), reader.optional_string(1).unwrap(), reader.optional_string(2).unwrap())
+    }
+
+    let backend = memory_backend();
+    seed_pane_backend(&backend, 1, 1_000);
+    let admit = |id: &str, ts: i64| {
+        let event_id = seed_retention_event_backend(&backend, 1, "warning", "trigger", ts, None);
+        let running = WorkflowRecord {
+            id: id.to_string(),
+            workflow_name: "probe".to_string(),
+            pane_id: 1,
+            trigger_event_id: Some(event_id),
+            current_step: 0,
+            status: "running".to_string(),
+            wait_condition: None,
+            context: None,
+            result: None,
+            error: None,
+            started_at: ts,
+            updated_at: ts,
+            completed_at: None,
+        };
+        create_workflow_backend(&backend, &running).unwrap();
+        running
+    };
+    let terminal = |running: &WorkflowRecord, status: &str| {
+        let mut record = running.clone();
+        record.current_step = 3;
+        record.status = status.to_string();
+        record.updated_at = 5_000;
+        record.completed_at = Some(5_000);
+        record
+    };
+
+    // Completed and failed executions settle their trigger with the given
+    // status, owned by the execution, in the same write as the record.
+    for (index, (status, handled_status)) in [("completed", "completed"), ("failed", "error")].into_iter().enumerate() {
+        let running = admit(&format!("settle-{status}"), 1_000 + i64::try_from(index).unwrap());
+        let event_id = running.trigger_event_id.unwrap();
+        settle_workflow_terminal_backend(&backend, &terminal(&running, status), handled_status).unwrap();
+        assert_eq!(query_workflow_backend(&backend, &running.id).unwrap().unwrap().status, status);
+        let (handled_at, owner, recorded_status) = settlement(&backend, event_id);
+        assert!(handled_at.is_some());
+        assert_eq!(owner.as_deref(), Some(running.id.as_str()));
+        assert_eq!(recorded_status.as_deref(), Some(handled_status));
+    }
+
+    // A trigger write that fails rolls the terminal record back with it:
+    // neither half is durable on its own.
+    let running = admit("settle-rollback", 2_000);
+    let event_id = running.trigger_event_id.unwrap();
+    backend.execute_batch(&format!(
+        "CREATE TRIGGER reject_trigger_settlement BEFORE UPDATE ON events
+         WHEN NEW.id = {event_id}
+         BEGIN SELECT RAISE(ABORT, 'injected trigger settlement failure'); END;"
+    )).unwrap();
+    assert!(settle_workflow_terminal_backend(&backend, &terminal(&running, "completed"), "completed").is_err());
+    assert_eq!(
+        serde_json::to_value(query_workflow_backend(&backend, &running.id).unwrap().unwrap()).unwrap(),
+        serde_json::to_value(&running).unwrap(),
+        "the completed record must roll back with the failed trigger write",
+    );
+    assert_eq!(settlement(&backend, event_id), (None, None, None));
+    backend.execute_batch("DROP TRIGGER reject_trigger_settlement;").unwrap();
+
+    // An execution that was aborted (its trigger settled 'aborted' in the
+    // same transaction) cannot be revived, and its trigger keeps the abort's
+    // status instead of the stale completion's.
+    let running = admit("settle-after-abort", 3_000);
+    let event_id = running.trigger_event_id.unwrap();
+    backend.execute_batch(&format!(
+        "UPDATE workflow_executions SET status = 'aborted', updated_at = 4000, completed_at = 4000
+         WHERE id = 'settle-after-abort';
+         UPDATE events SET handled_at = 4000, handled_by_workflow_id = 'settle-after-abort',
+         handled_status = 'aborted' WHERE id = {event_id};"
+    )).unwrap();
+    assert!(settle_workflow_terminal_backend(&backend, &terminal(&running, "completed"), "completed").is_err());
+    assert_eq!(query_workflow_backend(&backend, &running.id).unwrap().unwrap().status, "aborted");
+    assert_eq!(
+        settlement(&backend, event_id),
+        (Some(4_000), Some(running.id.clone()), Some("aborted".to_string())),
+    );
+
+    // Only terminal records with a status to record are settled; nothing is
+    // written otherwise.
+    let running = admit("settle-invalid", 6_000);
+    let event_id = running.trigger_event_id.unwrap();
+    for (status, handled_status) in [("running", "completed"), ("waiting", "completed"), ("aborted", "aborted"), ("completed", "")] {
+        assert!(settle_workflow_terminal_backend(&backend, &terminal(&running, status), handled_status).is_err());
+    }
+    assert_eq!(
+        serde_json::to_value(query_workflow_backend(&backend, &running.id).unwrap().unwrap()).unwrap(),
+        serde_json::to_value(&running).unwrap(),
+    );
+    assert_eq!(settlement(&backend, event_id), (None, None, None));
 }
 
 #[test]

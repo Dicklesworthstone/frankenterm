@@ -923,8 +923,8 @@ pub struct WorkflowRunnerConfig {
     /// Maximum total time from original execution creation to completion,
     /// including retry waits and time spent stopped between restarts. Exceeding
     /// this deadline triggers the same cleanup path as a cx-cancellation:
-    /// `fail_execution`, `mark_trigger_event_handled("error")`, lock
-    /// release, and a terminal-action audit row, then returns
+    /// the failed record and its trigger settled as `"error"` (one writer
+    /// transaction), lock release, and a terminal-action audit row, then returns
     /// `WorkflowExecutionResult::Error`. Default 600_000 ms (10 min) — a
     /// pathologically retrying workflow can no longer pin a pane forever.
     /// The original deadline and retry policy are persisted at creation and
@@ -1931,21 +1931,13 @@ impl WorkflowRunner {
                     "Action plan validation failed"
                 );
                 let reason = format!("Plan validation failed: {validation_error}");
-                if let Err(cleanup_error) =
-                    self.fail_execution_with_cx(cx, execution_id, &reason).await
-                {
-                    return workflow_execution_error(
-                        execution_id,
-                        format!("{reason}; failure-state persistence also failed: {cleanup_error}"),
-                    );
-                }
                 if let Err(cleanup_error) = self
-                    .mark_trigger_event_handled_with_cx(cx, execution_id, "error")
+                    .persist_aborted_execution_with_cx(cx, execution_id, &reason, "error")
                     .await
                 {
                     return workflow_execution_error(
                         execution_id,
-                        format!("{reason}; trigger-state persistence also failed: {cleanup_error}"),
+                        format!("{reason}; failure-state persistence also failed: {cleanup_error}"),
                     );
                 }
                 if let Err(error) = record_workflow_terminal_action_with_cx(
@@ -1992,7 +1984,7 @@ impl WorkflowRunner {
         while current_step < step_count {
             // Tick 181: per-step cancellation seam. On cx-cancel
             // we do the same cleanup sequence as a plan-validation
-            // error (fail_execution + mark_trigger_event_handled +
+            // error (failed record + trigger settlement in one write +
             // lock release + terminal-action audit) so the pane
             // lock and trigger state don't leak under a cancelled
             // parent. Cleanup deliberately uses a new request-rooted Cx because
@@ -3463,8 +3455,7 @@ impl WorkflowRunner {
         if let Err(err) = cx.checkpoint() {
             // ft-rlbvg: pre-start cancel path. Take a release
             // guard so the lock drops on every exit branch
-            // (including panics inside `fail_execution` /
-            // `mark_trigger_event_handled`).
+            // (including panics inside the failure-state persistence).
             let _release_guard = self
                 .lock_manager
                 .held_lock_release_guard(pane_id, execution_id);
@@ -4657,10 +4648,18 @@ impl WorkflowRunner {
         self.storage.upsert_workflow_with_cx(cx, record).await
     }
 
-    /// Persists completion and its usage metric with the workflow Cx.
-    /// Routes get_workflow + upsert_workflow + record_usage_metric
-    /// through Cx-first calls and preserves every persistence failure.
-    async fn complete_execution_with_cx(
+    /// Persists completion, settles the trigger event as `completed`, then
+    /// records the usage metric, all with the workflow Cx.
+    ///
+    /// The completed record and the trigger settlement are one writer
+    /// transaction (`settle_workflow_terminal_with_cx`). As two writes, a
+    /// runner shutdown that aborted this task between them left a completed
+    /// workflow whose trigger event read unhandled, and nothing settled it
+    /// again: a replay meets the completed owner, and startup recovery only
+    /// resumes running workflows. The metric comes after the settlement, so
+    /// its failure is still reported but can no longer leave the trigger
+    /// replayable.
+    async fn persist_completed_execution_with_cx(
         &self,
         cx: &crate::cx::Cx,
         execution_id: &str,
@@ -4708,74 +4707,29 @@ impl WorkflowRunner {
             created_at: now,
         };
 
-        self.storage.upsert_workflow_with_cx(cx, record).await?;
+        self.storage
+            .settle_workflow_terminal_with_cx(cx, record, "completed")
+            .await?;
         self.storage
             .record_usage_metric_with_cx(cx, metric)
             .await
             .map(|_| ())
     }
 
-    async fn persist_completed_execution_with_cx(
-        &self,
-        cx: &crate::cx::Cx,
-        execution_id: &str,
-        result: Option<serde_json::Value>,
-    ) -> crate::Result<()> {
-        // Completion persistence can fail after the workflow row itself is
-        // durable (for example, while writing the usage metric). Trigger
-        // settlement must still be attempted or the source event remains
-        // replayable and can duplicate already-completed side effects.
-        let completion_result = self
-            .complete_execution_with_cx(cx, execution_id, result)
-            .await;
-        let trigger_result = self
-            .mark_trigger_event_handled_with_cx(cx, execution_id, "completed")
-            .await;
-        match (completion_result, trigger_result) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(error), Ok(())) => Err(error),
-            (Ok(()), Err(error)) => Err(error),
-            (Err(completion_error), Err(trigger_error)) => Err(crate::Error::Workflow(
-                crate::error::WorkflowError::Aborted(format!(
-                    "workflow completion persistence failed: {completion_error}; trigger \
-                     settlement failed: {trigger_error}"
-                )),
-            )),
-        }
-    }
-
+    /// Persists failure, settles the trigger event with `handled_status`, then
+    /// records the usage metric, all with an explicit Cx.
+    ///
+    /// The failed record and the trigger settlement are one writer
+    /// transaction, for the reason given on
+    /// `persist_completed_execution_with_cx`. If this execution was already
+    /// aborted, the storage refuses to revive it and the trigger keeps the
+    /// status the abort settled it with.
     async fn persist_aborted_execution_with_cx(
         &self,
         cx: &crate::cx::Cx,
         execution_id: &str,
         reason: &str,
         handled_status: &str,
-    ) -> crate::Result<()> {
-        let failure_result = self.fail_execution_with_cx(cx, execution_id, reason).await;
-        let trigger_result = self
-            .mark_trigger_event_handled_with_cx(cx, execution_id, handled_status)
-            .await;
-        match (failure_result, trigger_result) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(error), Ok(())) => Err(error),
-            (Ok(()), Err(error)) => Err(error),
-            (Err(failure_error), Err(trigger_error)) => Err(crate::Error::Workflow(
-                crate::error::WorkflowError::Aborted(format!(
-                    "workflow failure-state persistence failed: {failure_error}; trigger \
-                     settlement failed: {trigger_error}"
-                )),
-            )),
-        }
-    }
-
-    /// Persists failure and its usage metric with an explicit Cx.
-    /// All storage calls route through Cx-first siblings, and metric failures
-    /// remain typed instead of being mistaken for a fully persisted outcome.
-    async fn fail_execution_with_cx(
-        &self,
-        cx: &crate::cx::Cx,
-        execution_id: &str,
-        error: &str,
     ) -> crate::Result<()> {
         let mut record = self
             .storage
@@ -4788,7 +4742,7 @@ impl WorkflowRunner {
             })?;
 
         record.status = "failed".to_string();
-        record.error = Some(error.to_string());
+        record.error = Some(reason.to_string());
         let now = now_ms();
         record.updated_at = now;
         record.completed_at = Some(now);
@@ -4819,52 +4773,13 @@ impl WorkflowRunner {
             created_at: now,
         };
 
-        self.storage.upsert_workflow_with_cx(cx, record).await?;
+        self.storage
+            .settle_workflow_terminal_with_cx(cx, record, handled_status)
+            .await?;
         self.storage
             .record_usage_metric_with_cx(cx, metric)
             .await
             .map(|_| ())
-    }
-
-    /// Mark the triggering event as handled after workflow completion.
-    ///
-    /// This ensures proper event lifecycle management - events that triggered
-    /// workflows are marked with the outcome so they won't be re-processed.
-    ///
-    /// # Arguments
-    /// * `execution_id` - The workflow execution ID
-    /// * `status` - The handling status ("completed", "failed", "aborted", "denied")
-    ///
-    /// Routes get_workflow + mark_event_handled through one explicit Cx.
-    async fn mark_trigger_event_handled_with_cx(
-        &self,
-        cx: &crate::cx::Cx,
-        execution_id: &str,
-        status: &str,
-    ) -> crate::Result<()> {
-        let record = self.storage.get_workflow_with_cx(cx, execution_id).await?;
-
-        if let Some(record) = record {
-            if let Some(event_id) = record.trigger_event_id {
-                self.storage
-                    .mark_event_handled_with_cx(
-                        cx,
-                        event_id,
-                        Some(execution_id.to_string()),
-                        status,
-                    )
-                    .await?;
-
-                tracing::debug!(
-                    execution_id,
-                    event_id,
-                    status,
-                    "Marked trigger event as handled (cx path)"
-                );
-            }
-        }
-
-        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
