@@ -1046,6 +1046,21 @@ fn release_tx_contract_lock_key(key: &Path) {
     }
 }
 
+/// Releases the sidecar flock and registry key of an acquisition that failed
+/// after it took both (ft-d1n3l).
+///
+/// A flock belongs to the open file description, and a child that another
+/// thread forks or spawns holds a copy of every descriptor until it execs.
+/// Closing alone would leave the lock held through that copy, and the next
+/// contender would be refused `InProgress`. An explicit unlock releases it for
+/// every copy, as [`TxContractLockGuard`]'s drop does.
+#[cfg(not(windows))]
+fn release_failed_tx_contract_lock(file: File, key: &Path) {
+    let _ = FileExt::unlock(&file);
+    drop(file);
+    release_tx_contract_lock_key(key);
+}
+
 /// Acquire a transaction contract lock from a pinned workspace-root
 /// capability before loading mutable state.
 ///
@@ -1640,8 +1655,7 @@ fn acquire_tx_contract_lock_supported(
     let contract_file = match pinned_contract {
         Ok(contract_file) => contract_file,
         Err(err) => {
-            drop(file);
-            release_tx_contract_lock_key(&key);
+            release_failed_tx_contract_lock(file, &key);
             return Err(err);
         }
     };
@@ -8092,10 +8106,10 @@ mod tests {
             })
             .err()
             .unwrap();
-            assert_eq!(error.kind(), TxContractStoreErrorKind::Lock);
+            assert_eq!(error.kind(), TxContractStoreErrorKind::Lock, "{error}");
             assert_eq!(std::fs::read(&retained).unwrap(), original);
             let again = acquire_tx_contract_lock(&root, &path).err().unwrap();
-            assert_eq!(again.kind(), TxContractStoreErrorKind::Lock);
+            assert_eq!(again.kind(), TxContractStoreErrorKind::Lock, "{again}");
             assert!(
                 !TX_CONTRACT_LOCKS
                     .lock()
@@ -8103,6 +8117,44 @@ mod tests {
                     .contains(&root.canonicalize().unwrap().join("mission.json"))
             );
         }
+    }
+
+    /// ft-d1n3l: a failed acquisition must release its sidecar flock even
+    /// while a forked child still shares the descriptor. `try_clone` stands in
+    /// for the child's copy: it shares the same open file description, so a
+    /// close-only release would leave the lock held and refuse the next
+    /// contender with `WouldBlock`.
+    #[cfg(unix)]
+    #[test]
+    fn failed_acquisition_release_unlocks_a_sidecar_a_child_still_shares() {
+        let root = tempfile::tempdir().unwrap();
+        let lock_path = root.path().join("sidecar.lock");
+        let file = File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        file.try_lock_exclusive().unwrap();
+        let child_copy = file.try_clone().unwrap();
+        let key = root.path().join("mission.json");
+        assert!(TX_CONTRACT_LOCKS.lock().unwrap().insert(key.clone()));
+
+        release_failed_tx_contract_lock(file, &key);
+
+        let contender = File::options()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        let locked = contender.try_lock_exclusive();
+        assert!(
+            locked.is_ok(),
+            "the released sidecar must be lockable while a shared copy is open; got {locked:?}"
+        );
+        assert!(!TX_CONTRACT_LOCKS.lock().unwrap().contains(&key));
+        drop(child_copy);
     }
 
     #[cfg(target_os = "linux")]
