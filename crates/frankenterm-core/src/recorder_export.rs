@@ -992,7 +992,7 @@ mod casr_export {
                 // matcher. Inspect the whole stream after ANSI removal too.
                 // Without a byte mapping for that normalization, mask the
                 // entire affected stream conservatively.
-                let normalized = crate::output::table::strip_ansi(&stream.text);
+                let normalized = crate::output::strip_ansi(&stream.text);
                 let normalized = normalized
                     .chars()
                     .filter(|ch| !ch.is_control() || *ch == '\n' || *ch == '\t')
