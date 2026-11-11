@@ -979,15 +979,16 @@ impl PaneInfo {
     /// historical local fallback.
     #[must_use]
     pub fn effective_domain(&self) -> &str {
+        let unnamed = if self.domain_id.is_some() {
+            "unknown"
+        } else {
+            "local"
+        };
         self.domain_name
             .as_deref()
             .map(str::trim)
             .filter(|name| !name.is_empty())
-            .unwrap_or(if self.domain_id.is_some() {
-                "unknown"
-            } else {
-                "local"
-            })
+            .unwrap_or(unnamed)
     }
 
     /// Get the effective number of rows
@@ -6308,12 +6309,14 @@ mod tests {
                             title: format!("observed-pane-{id}"),
                             size: frankenterm_term::TerminalSize::default(),
                             working_dir: Some(
-                                (if id == 1 {
-                                    "file:///looks/local"
-                                } else {
-                                    "file://misleading-remote.example/work"
-                                })
-                                .parse()
+                                mux::tab::SerdeUrl::try_from(
+                                    if id == 1 {
+                                        "file:///looks/local"
+                                    } else {
+                                        "file://misleading-remote.example/work"
+                                    }
+                                    .to_owned(),
+                                )
                                 .unwrap(),
                             ),
                             alt_screen_active: id == 2,
