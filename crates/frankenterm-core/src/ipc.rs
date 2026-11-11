@@ -3240,9 +3240,15 @@ async fn handle_request_with_context_with_cx(
 /// Wake both unread connections and admitted RPC owners on the same server
 /// stop signal, without cancelling their shared caller Cx. Only the former
 /// may drop their work immediately; admitted RPCs must await settlement.
+///
+/// A cancelled `cx` also ends the wait. asupersync 0.6's `Sleep` completes
+/// early, with `Ok`, once its context is cancelled (other than by a timeout
+/// or deadline, which `sleep_with_cx` reports as `Err`), so without that
+/// check the 10 ms poll became one scheduler trip per iteration until the
+/// server cancelled `connection_shutdown`.
 #[cfg(any(unix, windows))]
 async fn wait_for_ipc_shutdown(cx: &crate::cx::Cx, ctx: &IpcHandlerContext) {
-    while !ctx.connection_shutdown.is_cancelled() {
+    while !ctx.connection_shutdown.is_cancelled() && !cx.is_cancel_requested() {
         if crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(10))
             .await
             .is_err()
@@ -5383,6 +5389,58 @@ mod tests {
             );
 
             assert!(!shutdown_signal_pending_with_cx(&mut shutdown_rx, &cx).await);
+        });
+    }
+
+    /// A connection's wait for server shutdown ends on either signal: the
+    /// server's `connection_shutdown`, or its own Cx's cancellation. Before,
+    /// a cancelled Cx made each 10 ms sleep complete at once with Ok, and the
+    /// wait went on, one scheduler trip per iteration, until the server
+    /// cancelled `connection_shutdown`; here that leaves it pending and the
+    /// 2 s bound wins.
+    #[test]
+    fn wait_for_ipc_shutdown_ends_on_its_cx_cancellation() {
+        use futures::future::Either;
+        run_async_test(async {
+            let ctx = IpcHandlerContext::new(Arc::new(EventBus::new(16)));
+            let cx = crate::cx::for_testing();
+
+            let idle = futures::future::select(
+                Box::pin(wait_for_ipc_shutdown(&cx, &ctx)),
+                Box::pin(crate::runtime_async::sleep(Duration::from_millis(50))),
+            )
+            .await;
+            assert!(
+                matches!(idle, Either::Right(_)),
+                "with neither signal the wait must stay pending"
+            );
+
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("test connection cancellation"),
+            );
+            let cancelled = futures::future::select(
+                Box::pin(wait_for_ipc_shutdown(&cx, &ctx)),
+                Box::pin(crate::runtime_async::sleep(Duration::from_secs(2))),
+            )
+            .await;
+            assert!(
+                matches!(cancelled, Either::Left(_)),
+                "a cancelled Cx must end the wait without connection_shutdown"
+            );
+            assert!(!ctx.connection_shutdown.is_cancelled());
+
+            let server_cx = crate::cx::for_testing();
+            ctx.connection_shutdown.cancel();
+            let shutdown = futures::future::select(
+                Box::pin(wait_for_ipc_shutdown(&server_cx, &ctx)),
+                Box::pin(crate::runtime_async::sleep(Duration::from_secs(2))),
+            )
+            .await;
+            assert!(
+                matches!(shutdown, Either::Left(_)),
+                "connection_shutdown must end the wait"
+            );
         });
     }
 
