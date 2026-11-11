@@ -6402,6 +6402,30 @@ mod tests {
         receipt(binding, SubmitReceiptState::Submitted)
     }
 
+    /// The logical bytes the store charges one completed workload row, read
+    /// from its own accounting. "workload-0" is the shortest workload key, so
+    /// no workload row is smaller.
+    fn completed_workload_record_bytes(limits: StoreLimits) -> i64 {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binding = binding(22, "workload-0");
+        let token = claim_at(dir.path(), &binding, limits, 10_000);
+        transition_from_active_owner_at(
+            dir.path(),
+            &binding,
+            token,
+            STATE_EFFECT_APPLIED_RECEIPT_PENDING,
+            None,
+            10_000,
+        )
+        .expect("mark effect applied");
+        complete_at(dir.path(), &binding, token, &receipt_for(&binding), 10_000)
+            .expect("complete receipt");
+        let (records, bytes) =
+            store_usage(&raw_connection(dir.path()), limits).expect("store usage");
+        assert_eq!(records, 1);
+        bytes
+    }
+
     #[test]
     fn unique_keys_past_the_ceiling_keep_admitting_within_bounded_usage() {
         let record_bound = StoreLimits {
@@ -6421,10 +6445,20 @@ mod tests {
             max_logical_bytes: record_bytes.checked_mul(2).expect("test capacity"),
             ..record_bound
         };
-        let (records, bytes) = run_unique_key_workload(byte_bound, 150);
+        // A completed row holds only its receipt, far less than the reserve a
+        // new claim needs, so byte pressure starts only once completed rows
+        // fill the one reserved record's worth of the ceiling. Run twice that
+        // many keys, sized from the store's own accounting: a fixed count fell
+        // short of the ceiling once the reserve grew to cover observations.
+        let completed_bytes = completed_workload_record_bytes(byte_bound);
+        let keys = usize::try_from(record_bytes / completed_bytes)
+            .expect("small row count")
+            .checked_mul(2)
+            .expect("test capacity");
+        let (records, bytes) = run_unique_key_workload(byte_bound, keys);
         assert!(bytes <= byte_bound.max_logical_bytes, "bytes {bytes}");
         assert!(
-            records < 150,
+            records < i64::try_from(keys).expect("small key count"),
             "byte pressure must have evicted, records {records}"
         );
     }
