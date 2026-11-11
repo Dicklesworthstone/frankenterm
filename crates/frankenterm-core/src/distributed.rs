@@ -1102,7 +1102,11 @@ fn distributed_http_context_termination(cx: &Cx) -> runtime_http::ClientError {
 /// `cx.cancel_with(...)` (pinned by the
 /// `*_wakes_on_mid_flight_cancel_without_a_watcher` tests in
 /// `runtime_async`). For these the pattern is correct but redundant.
-/// Semaphore acquires register no waker and still need it.
+/// asupersync's Semaphore and RwLock acquires register no waker, so
+/// `runtime_async`'s `Semaphore::acquire_with_cx`, `acquire_owned_with_cx`,
+/// `RwLock::read_with_cx` and `write_with_cx` race them against
+/// cancellation themselves (`until_cancelled`). Their callers need
+/// nothing extra either.
 ///
 /// The `mpsc_recv_with_cx_mid_flight_cancel_via_select_race_pattern`
 /// (tick 432), `oneshot_recv_with_cx_mid_flight_cancel_via_select_race_pattern`

@@ -214,10 +214,13 @@ and asupersync 0.6 closed most of it. A suspended mpsc, broadcast or
 watch receive now registers a cancellation waker, as do oneshot's
 receive and a contended `Mutex::lock_with_cx`. Cancelling the Cx ends
 the wait without a watcher. `*_wakes_on_mid_flight_cancel_without_a_watcher`
-in `runtime_async.rs` pins each of the five. Semaphore acquire still
-only checkpoints on each poll, so it still needs the select-race
-pattern. asupersync's Notify and RwLock read futures behave the same
-way. The socket line read (`unix::next_line_with_cx`) now goes through
+in `runtime_async.rs` pins each of the five. asupersync's Semaphore
+acquire and RwLock read and write futures still only checkpoint on
+each poll, so `runtime_async`'s `Semaphore::acquire_with_cx`,
+`acquire_owned_with_cx`, `RwLock::read_with_cx` and `write_with_cx`
+race them against cancellation themselves (`until_cancelled`). Tests
+of the same name pin those four as well. asupersync's Notify takes no
+Cx at all. The socket line read (`unix::next_line_with_cx`) now goes through
 asupersync's `Next::with_cx`, which wakes on cancellation. The table
 and the paragraphs after it record the original finding.
 
@@ -241,9 +244,10 @@ all six asupersync-backed long-lived wait primitives:
 | oneshot_recv_with_cx                | ✓ tick 419               | ✗ (tick 433)     | tick 433            | ✓ waker              |
 | broadcast_recv_with_cx              | ✓ tick 420               | ✗ (tick 434)     | tick 434            | ✓ waker              |
 | watch::Receiver::changed            | ✓ tick 423               | ✗ (tick 438)     | tick 438            | ✓ waker              |
-| Semaphore::acquire_with_cx          | ✓ tick 421               | ✗ (tick 439a)    | tick 439a           | ✗ still needs select |
+| Semaphore::acquire_with_cx          | ✓ tick 421               | ✗ (tick 439a)    | tick 439a           | ✓ until_cancelled    |
 | JoinSet::join_next_with_cx          | ✓ tick 426               | tolerant (tick 439b)* | tick 439b       | unchanged            |
 | Mutex::lock_with_cx (not in ticks)  | n/a                      | n/a              | n/a                 | ✓ waker              |
+| RwLock read/write_with_cx (not in ticks) | n/a                 | n/a              | n/a                 | ✓ until_cancelled    |
 
 *JoinSet::join_next_with_cx is a runtime_compat-owned primitive with
 a per-poll `caller_cx.checkpoint()` inside its `poll_fn` closure
@@ -251,10 +255,13 @@ a per-poll `caller_cx.checkpoint()` inside its `poll_fn` closure
 tick-439b test tolerates either branch firing; both converge on
 fast observation. The other five primitives are asupersync-delegated
 and, before asupersync 0.6, all required the select-race pattern. Of
-those five, only Semaphore still does.
+those five, only Semaphore's asupersync acquire still has no waker,
+and the `runtime_async` wrappers now race it themselves.
 
-**Caller workaround** (universal before 0.6; now needed for Semaphore
-acquire and other primitives with no cancellation waker): wrap the recv in
+**Caller workaround** (universal before 0.6; since ft-3268r the
+`runtime_async` Semaphore and RwLock wrappers do the equivalent with
+`until_cancelled`, so it is needed only for a wait with no
+cancellation waker that nothing wraps): wrap the recv in
 `futures::future::select` against a poll-sleep cancel watcher:
 
 ```rust

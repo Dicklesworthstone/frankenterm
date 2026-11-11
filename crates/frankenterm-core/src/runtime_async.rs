@@ -934,9 +934,14 @@ impl<T> RwLock<T> {
     /// Preferred over [`read`](Self::read) when the call site already threads
     /// `&Cx` through its public API.
     ///
-    /// Cancellation requested while a contended read is suspended is observed
-    /// on its next poll. Callers requiring cancellation itself to wake the
-    /// waiter must race the acquire against a cancellation signal.
+    /// Also observes mid-flight cancel. asupersync's read future only
+    /// checkpoints when polled and registers no cancellation waker, so the
+    /// wait runs under [`until_cancelled`]: a contended read ends with the
+    /// Cx's failure class (usually [`LockAcquireError::Cancelled`]) when the
+    /// Cx is cancelled, without a release or a watcher (pinned by
+    /// `rwlock_read_with_cx_wakes_on_mid_flight_cancel_without_a_watcher`).
+    /// Dropping asupersync's read future dequeues the waiter, so the lock is
+    /// left as if it had never asked.
     ///
     /// # Errors
     ///
@@ -947,11 +952,12 @@ impl<T> RwLock<T> {
         &self,
         cx: &crate::cx::Cx,
     ) -> Result<RwLockReadGuard<'_, T>, LockAcquireError> {
-        self.inner
-            .read(cx)
-            .await
-            .map(|inner| RwLockReadGuard { inner })
-            .map_err(|error| map_rwlock_error(cx, error))
+        match until_cancelled(cx, self.inner.read(cx)).await {
+            Ok(result) => result
+                .map(|inner| RwLockReadGuard { inner })
+                .map_err(|error| map_rwlock_error(cx, error)),
+            Err(_) => Err(classify_lock_context_failure(cx)),
+        }
     }
 
     #[allow(clippy::future_not_send)] // asupersync RwLock is !Sync by design
@@ -968,9 +974,13 @@ impl<T> RwLock<T> {
     /// Preferred over [`write`](Self::write) when the call site already
     /// threads `&Cx`.
     ///
-    /// Cancellation requested while a contended write is suspended is observed
-    /// on its next poll. Callers requiring cancellation itself to wake the
-    /// waiter must race the acquire against a cancellation signal.
+    /// Also observes mid-flight cancel, as [`read_with_cx`](Self::read_with_cx)
+    /// does: a contended write ends with the Cx's failure class when the Cx is
+    /// cancelled, without a release or a watcher (pinned by
+    /// `rwlock_write_with_cx_wakes_on_mid_flight_cancel_without_a_watcher`).
+    /// Dropping asupersync's write future dequeues the waiter. If it was the
+    /// last queued writer, the readers queued behind it are admitted, and a
+    /// grant it never took is passed on.
     ///
     /// # Errors
     ///
@@ -981,11 +991,12 @@ impl<T> RwLock<T> {
         &self,
         cx: &crate::cx::Cx,
     ) -> Result<RwLockWriteGuard<'_, T>, LockAcquireError> {
-        self.inner
-            .write(cx)
-            .await
-            .map(|inner| RwLockWriteGuard { inner })
-            .map_err(|error| map_rwlock_error(cx, error))
+        match until_cancelled(cx, self.inner.write(cx)).await {
+            Ok(result) => result
+                .map(|inner| RwLockWriteGuard { inner })
+                .map_err(|error| map_rwlock_error(cx, error)),
+            Err(_) => Err(classify_lock_context_failure(cx)),
+        }
     }
 }
 
@@ -1236,9 +1247,11 @@ impl OwnedSemaphorePermit {
 /// `mpsc_recv_wakes_on_mid_flight_cancel_without_a_watcher`). The
 /// select-race pattern of
 /// `mpsc_recv_with_cx_mid_flight_cancel_via_select_race_pattern` is
-/// still correct, only redundant here. It is still needed for oneshot
-/// receives and Semaphore and Mutex acquires, whose futures register no
-/// cancellation waker.
+/// still correct, only redundant here. The other `runtime_async` waits
+/// do not need it either: oneshot receives and contended Mutex acquires
+/// register a cancellation waker of their own, and the Semaphore and
+/// RwLock wrappers race their acquires against cancellation
+/// (`until_cancelled`).
 pub mod mpsc {
     use asupersync::channel::mpsc as inner;
     use std::future::Future;
@@ -2891,8 +2904,9 @@ pub mod task {
         /// registers no cancellation waker, so a join with no task
         /// finishing and no other wake sees the cancel only at its next
         /// poll. Since asupersync 0.6 the mpsc, oneshot, broadcast and
-        /// watch receives do register one; Semaphore acquire, like this,
-        /// does not. The tick-439b select-race test tolerates either
+        /// watch receives do register one, and the Semaphore and RwLock
+        /// wrappers race their acquires against cancellation; this join
+        /// does neither. The tick-439b select-race test tolerates either
         /// branch firing; both observe cancel fast. See
         /// `docs/ft-xbnl0-2-4-completion-evidence.md` §2.6.1.
         pub async fn join_next_with_cx(
@@ -17492,6 +17506,105 @@ mod tests {
             assert!(
                 again.is_ok(),
                 "the cancelled waiter must leave the released permit free; got {again:?}"
+            );
+        });
+    }
+
+    /// asupersync's rwlock read future registers no cancellation waker, so
+    /// `read_with_cx` waits under `until_cancelled`. A reader behind a write
+    /// guard that is never released ends Cancelled when its Cx is cancelled,
+    /// without a watcher, and leaves no queue entry behind.
+    #[test]
+    fn rwlock_read_with_cx_wakes_on_mid_flight_cancel_without_a_watcher() {
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let lock = Arc::new(RwLock::new(7_u32));
+            let holder_cx = crate::cx::Cx::for_testing();
+            let held = lock
+                .write_with_cx(&holder_cx)
+                .await
+                .expect("an uncontended write succeeds");
+            let cx = crate::cx::Cx::for_testing();
+            let wait_cx = cx.clone();
+            let contender = Arc::clone(&lock);
+            let ended = end_of_cancelled_wait(&cx, async move {
+                contender.read_with_cx(&wait_cx).await.map(|_guard| ())
+            })
+            .await;
+            match ended {
+                Err(LockAcquireError::Cancelled) => {}
+                Err(other) => {
+                    panic!("a cancelled contended read must end Cancelled; got {other:?}")
+                }
+                Ok(()) => panic!("a read was granted while the write guard was held"),
+            }
+
+            drop(held);
+            let probe_cx = crate::cx::Cx::for_testing();
+            let freed = matches!(
+                timeout_with_cx(
+                    &crate::cx::Cx::for_testing(),
+                    Duration::from_secs(2),
+                    lock.write_with_cx(&probe_cx),
+                )
+                .await,
+                Ok(Ok(_))
+            );
+            assert!(
+                freed,
+                "the cancelled reader must leave the released lock free for a writer"
+            );
+        });
+    }
+
+    /// `write_with_cx` waits under `until_cancelled` too. A writer behind a
+    /// read guard that is never released ends Cancelled when its Cx is
+    /// cancelled, without a watcher, and leaves the lock free afterwards.
+    #[test]
+    fn rwlock_write_with_cx_wakes_on_mid_flight_cancel_without_a_watcher() {
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let lock = Arc::new(RwLock::new(7_u32));
+            let holder_cx = crate::cx::Cx::for_testing();
+            let held = lock
+                .read_with_cx(&holder_cx)
+                .await
+                .expect("an uncontended read succeeds");
+            let cx = crate::cx::Cx::for_testing();
+            let wait_cx = cx.clone();
+            let contender = Arc::clone(&lock);
+            let ended = end_of_cancelled_wait(&cx, async move {
+                contender.write_with_cx(&wait_cx).await.map(|_guard| ())
+            })
+            .await;
+            match ended {
+                Err(LockAcquireError::Cancelled) => {}
+                Err(other) => {
+                    panic!("a cancelled contended write must end Cancelled; got {other:?}")
+                }
+                Ok(()) => panic!("a write was granted while a read guard was held"),
+            }
+
+            drop(held);
+            let probe_cx = crate::cx::Cx::for_testing();
+            let freed = matches!(
+                timeout_with_cx(
+                    &crate::cx::Cx::for_testing(),
+                    Duration::from_secs(2),
+                    lock.write_with_cx(&probe_cx),
+                )
+                .await,
+                Ok(Ok(_))
+            );
+            assert!(
+                freed,
+                "the cancelled writer must leave the released lock free"
             );
         });
     }
