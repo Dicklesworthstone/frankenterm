@@ -1221,17 +1221,19 @@ impl OwnedSemaphorePermit {
 
 /// Project-owned MPSC wrappers for the active runtime.
 ///
-/// Under asupersync the receiver's `recv(cx)` method observes
-/// **pre-cancel** on cx via the per-poll `cx.checkpoint()`
-/// short-circuit (pinned by `mpsc_recv_with_cx_observes_pre_cancel`,
-/// ft-xbnl0.2.4 tick 422) but does NOT register a cx-cancel-waker.
-/// An already-suspended recv will NOT wake when `cx.cancel_with(...)`
-/// fires afterward (pinned by
-/// `mpsc_recv_with_cx_mid_flight_cancel_via_select_race_pattern`,
-/// tick 432). Callers needing mid-flight cancel must wrap in
-/// `futures::future::select` against a poll-sleep watcher (same
-/// pattern as `DistributedHttpClient::race_with_cx_cancel`, tick
-/// 387). See `docs/ft-xbnl0-2-4-completion-evidence.md` §2.6.1.
+/// The receiver's `recv(cx)` observes a cancellation requested before it
+/// is polled (pinned by `mpsc_recv_with_cx_observes_pre_cancel`). Since
+/// asupersync 0.6 its receive future also registers a cancellation waker
+/// while it is pending, and this wrapper forwards that wake through its
+/// contained waker proxy: a receive already suspended on an empty channel
+/// ends with `RecvError::Cancelled` when `cx.cancel_with(...)` fires,
+/// with no watcher racing it (pinned by
+/// `mpsc_recv_wakes_on_mid_flight_cancel_without_a_watcher`). The
+/// select-race pattern of
+/// `mpsc_recv_with_cx_mid_flight_cancel_via_select_race_pattern` is
+/// still correct, only redundant here. It is still needed for oneshot
+/// receives and Semaphore and Mutex acquires, whose futures register no
+/// cancellation waker.
 pub mod mpsc {
     use asupersync::channel::mpsc as inner;
     use std::future::Future;
@@ -17132,6 +17134,127 @@ mod tests {
                 }
                 Either::Right((Ok(()), _)) => {
                     unreachable!("watcher always returns Err on cancel")
+                }
+            }
+        });
+    }
+
+    /// asupersync 0.6's mpsc receive future registers a cancellation waker
+    /// while it is pending, and the project wrapper forwards it through its
+    /// contained waker proxy, so a receive already suspended on an empty
+    /// channel ends with `RecvError::Cancelled` when its Cx is cancelled.
+    /// No watcher races it here: a missed wake leaves the receive pending
+    /// and the 2 s bound wins.
+    #[test]
+    fn mpsc_recv_wakes_on_mid_flight_cancel_without_a_watcher() {
+        use futures::future::Either;
+        use futures::future::select;
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (_tx, mut rx) = mpsc::channel::<u64>(4);
+            let cx = crate::cx::Cx::for_testing();
+            let cancel_trigger = cx.clone();
+
+            task::spawn(async move {
+                sleep(Duration::from_millis(100)).await;
+                cancel_trigger.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("mpsc receive cancelled mid-flight"),
+                );
+            });
+
+            let recv_fut = std::pin::pin!(rx.recv(&cx));
+            let bound = std::pin::pin!(sleep(Duration::from_secs(2)));
+            match select(recv_fut, bound).await {
+                Either::Left((Err(mpsc::RecvError::Cancelled), _)) => {}
+                Either::Left((other, _)) => {
+                    panic!("a cancelled pending receive must end Cancelled; got {other:?}")
+                }
+                Either::Right(((), _)) => {
+                    panic!("the pending receive did not wake within 2 s of its Cx's cancellation")
+                }
+            }
+        });
+    }
+
+    /// The broadcast receive future registers a cancellation waker too, so
+    /// a subscriber suspended with nothing published ends with
+    /// `RecvError::Cancelled` when its Cx is cancelled, without a watcher.
+    #[test]
+    fn broadcast_recv_wakes_on_mid_flight_cancel_without_a_watcher() {
+        use futures::future::Either;
+        use futures::future::select;
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (tx, _rx_keepalive) = broadcast::channel::<u64>(4);
+            let mut rx = tx.subscribe();
+            let cx = crate::cx::Cx::for_testing();
+            let cancel_trigger = cx.clone();
+
+            task::spawn(async move {
+                sleep(Duration::from_millis(100)).await;
+                cancel_trigger.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("broadcast receive cancelled mid-flight"),
+                );
+            });
+
+            let recv_fut = std::pin::pin!(broadcast_recv_with_cx(&cx, &mut rx));
+            let bound = std::pin::pin!(sleep(Duration::from_secs(2)));
+            match select(recv_fut, bound).await {
+                Either::Left((Err(broadcast::RecvError::Cancelled), _)) => {}
+                Either::Left((other, _)) => {
+                    panic!("a cancelled pending receive must end Cancelled; got {other:?}")
+                }
+                Either::Right(((), _)) => {
+                    panic!("the pending receive did not wake within 2 s of its Cx's cancellation")
+                }
+            }
+        });
+    }
+
+    /// The watch `changed` future registers a cancellation waker too, so a
+    /// receiver waiting for a change that never comes ends with
+    /// `RecvError::Cancelled` when its Cx is cancelled, without a watcher.
+    #[test]
+    fn watch_changed_wakes_on_mid_flight_cancel_without_a_watcher() {
+        use futures::future::Either;
+        use futures::future::select;
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (_tx, mut rx) = watch::channel::<u64>(0);
+            let _ = rx.borrow_and_update();
+            let cx = crate::cx::Cx::for_testing();
+            let cancel_trigger = cx.clone();
+
+            task::spawn(async move {
+                sleep(Duration::from_millis(100)).await;
+                cancel_trigger.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("watch change wait cancelled mid-flight"),
+                );
+            });
+
+            let changed_fut = std::pin::pin!(rx.changed(&cx));
+            let bound = std::pin::pin!(sleep(Duration::from_secs(2)));
+            match select(changed_fut, bound).await {
+                Either::Left((Err(watch::RecvError::Cancelled), _)) => {}
+                Either::Left((other, _)) => {
+                    panic!("a cancelled pending change wait must end Cancelled; got {other:?}")
+                }
+                Either::Right(((), _)) => {
+                    panic!(
+                        "the pending change wait did not wake within 2 s of its Cx's cancellation"
+                    )
                 }
             }
         });

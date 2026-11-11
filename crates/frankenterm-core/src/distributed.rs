@@ -1087,13 +1087,21 @@ fn distributed_http_context_termination(cx: &Cx) -> runtime_http::ClientError {
 /// # Canonical pattern for mid-flight cx-cancel observability
 ///
 /// This helper is the original instance of a pattern that was later
-/// found (ft-xbnl0.2.4 ticks 432-439) to apply to ALL six asupersync-
-/// backed long-lived wait primitives in `runtime_async`
+/// found (ft-xbnl0.2.4 ticks 432-439, on asupersync 0.5) to apply to ALL
+/// six asupersync-backed long-lived wait primitives in `runtime_async`
 /// (mpsc/oneshot/broadcast/watch/Semaphore plus JoinSet's
-/// asupersync-delegated code paths): the primitives observe pre-cancel
-/// via their per-poll `cx.checkpoint()` short-circuit but do NOT
-/// register cx-cancel-wakers, so an already-suspended primitive will
-/// not wake when `cx.cancel_with(...)` fires.
+/// asupersync-delegated code paths): the primitives observed pre-cancel
+/// via their per-poll `cx.checkpoint()` short-circuit but registered no
+/// cx-cancel-waker, so an already-suspended primitive did not wake when
+/// `cx.cancel_with(...)` fired.
+///
+/// Since asupersync 0.6 the mpsc, broadcast and watch receive futures
+/// register their own cancellation waker, so a suspended receive ends
+/// with its `Cancelled` error on `cx.cancel_with(...)` (pinned by the
+/// `*_wakes_on_mid_flight_cancel_without_a_watcher` tests in
+/// `runtime_async`); for them the pattern is correct but redundant.
+/// oneshot receives and Semaphore and Mutex acquires register none and
+/// still need it.
 ///
 /// The `mpsc_recv_with_cx_mid_flight_cancel_via_select_race_pattern`
 /// (tick 432), `oneshot_recv_with_cx_mid_flight_cancel_via_select_race_pattern`
