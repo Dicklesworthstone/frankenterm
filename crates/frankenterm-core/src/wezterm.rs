@@ -3919,9 +3919,13 @@ impl WeztermClient {
         match codec::Pdu::pdu_name_for_ident(request_ident) {
             Some("Ping" | "GetCodecVersion") => MuxOperation::ProtocolHandshake,
             Some("SetClientId") => MuxOperation::ClientRegistration,
-            Some("ListPanes" | "ListPanesCoherent" | "ListPanesOrderedV1" | "GetPaneDomainsV1") => {
-                MuxOperation::ListPanes
-            }
+            Some(
+                "ListPanes"
+                | "ListPanesCoherent"
+                | "ListPanesOrderedV1"
+                | "GetPaneDomainsV1"
+                | "ListPanesWithDomainsV1",
+            ) => MuxOperation::ListPanes,
             Some("GetPaneIdentityV1") => MuxOperation::ReadPaneIdentity,
             Some("GetPaneTieredScrollbackStatusesV1") => MuxOperation::ReadTieredScrollbackStatus,
             Some("EvictPaneWarmScrollbackV1") => MuxOperation::EvictWarmScrollback,
@@ -3976,6 +3980,7 @@ impl WeztermClient {
                 | "ReliableKeyEventTracedV1",
             ) => MuxOperation::KeyInput,
             Some("SendMouseEvent") => MuxOperation::MouseInput,
+            Some("SendPaneInputConditionalV1") => MuxOperation::PasteOrMouseInput,
             Some("GetImageCell") => MuxOperation::ReadImage,
             Some("GetPaneDirection") => MuxOperation::ReadPaneDirection,
             Some("SetPalette") => MuxOperation::SetPalette,
@@ -9093,6 +9098,20 @@ mod tests {
             ),
             MuxOperation::KeyInput,
         );
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn conditional_pane_input_rejections_never_claim_send_text_identity() {
+        // tx_execution treats a NotApplied SendText rejection as proof that a
+        // send had no effect; a refused PDU 123 paste or mouse event must not
+        // be able to stand in for one.
+        let operation = WeztermClient::mux_operation_from_request_ident(
+            <codec::SendPaneInputConditionalV1 as codec::PduWireIdent>::IDENT,
+        );
+        assert_eq!(operation, MuxOperation::PasteOrMouseInput);
+        assert_ne!(operation, MuxOperation::SendText);
+        assert_eq!(operation.label(), "paste_or_mouse_input");
     }
 
     #[cfg(all(feature = "vendored", unix))]

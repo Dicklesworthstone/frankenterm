@@ -566,6 +566,10 @@ pub enum MuxOperation {
     SearchScrollback,
     KeyInput,
     MouseInput,
+    /// One pane-fenced, non-replayable paste or mouse effect (PDU 123). A wire
+    /// rejection names only the request, not which effect it carried, so it is
+    /// neither `SendText` nor `MouseInput`.
+    PasteOrMouseInput,
     ReadImage,
     ReadPaneDirection,
     SetPalette,
@@ -622,6 +626,7 @@ impl MuxOperation {
             Self::SearchScrollback => "search_scrollback",
             Self::KeyInput => "key_input",
             Self::MouseInput => "mouse_input",
+            Self::PasteOrMouseInput => "paste_or_mouse_input",
             Self::ReadImage => "read_image",
             Self::ReadPaneDirection => "read_pane_direction",
             Self::SetPalette => "set_palette",
