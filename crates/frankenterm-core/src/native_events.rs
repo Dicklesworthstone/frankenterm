@@ -646,10 +646,13 @@ mod socket_transport {
 
             cx.checkpoint()
                 .map_err(|_| super::super::native_context_io_error("connection_read"))?;
-            let result: io::Result<Option<String>> = match lines.next().await {
-                Some(Ok(line)) => Ok(Some(line)),
-                Some(Err(err)) => Err(err),
-                None => Ok(None),
+            // As runtime_async::unix::next_line_with_cx: the read itself
+            // ends on cancellation through Next::with_cx.
+            let result: io::Result<Option<String>> = match lines.next().with_cx(cx).await {
+                Ok(Some(Ok(line))) => Ok(Some(line)),
+                Ok(Some(Err(err))) => Err(err),
+                Ok(None) => Ok(None),
+                Err(_) => Err(super::super::native_context_io_error("connection_read")),
             };
             cx.checkpoint()
                 .map_err(|_| super::super::native_context_io_error("connection_read"))?;

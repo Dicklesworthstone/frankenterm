@@ -3498,11 +3498,17 @@ pub mod unix {
         }
     }
 
-    /// ft-xbnl0.2.3 Cx-first sibling of [`next_line`]. Performs a pre-flight
-    /// `cx.checkpoint()` folded into `io::ErrorKind::Interrupted` so cancelled
-    /// line-reading loops bail before the next `lines.next()` poll. The
-    /// underlying asupersync stream does not itself observe cx here; this seam
-    /// gates entry to the wait.
+    /// ft-xbnl0.2.3 Cx-first sibling of [`next_line`]. A `cx` that has
+    /// already failed its checkpoint returns before reading, and a read
+    /// still waiting for a line ends as soon as `cx` is cancelled; both fold
+    /// into `io::ErrorKind::Interrupted`. A deadline in `cx`'s budget sets no
+    /// timer here: it is seen when the read is next polled, so bound the wait
+    /// with `timeout_with_cx`, which does observe it.
+    ///
+    /// The socket stream registers no cancellation wake of its own, so the
+    /// read goes through asupersync's `Next::with_cx`, which does. No line
+    /// is lost to a cancellation: a line yielded by the poll that also sees
+    /// it is returned, and anything not yet yielded stays buffered in `lines`.
     pub async fn next_line_with_cx<T>(
         cx: &crate::cx::Cx,
         lines: &mut LineReader<T>,
@@ -3512,16 +3518,18 @@ pub mod unix {
     {
         use asupersync::stream::StreamExt;
 
-        cx.checkpoint().map_err(|err| {
+        let cancelled = |err: &dyn std::fmt::Display| {
             io::Error::new(
                 io::ErrorKind::Interrupted,
                 format!("next_line cancelled: {err}"),
             )
-        })?;
-        match lines.next().await {
-            Some(Ok(line)) => Ok(Some(line)),
-            Some(Err(err)) => Err(err),
-            None => Ok(None),
+        };
+        cx.checkpoint().map_err(|err| cancelled(&err))?;
+        match lines.next().with_cx(cx).await {
+            Ok(Some(Ok(line))) => Ok(Some(line)),
+            Ok(Some(Err(err))) => Err(err),
+            Ok(None) => Ok(None),
+            Err(err) => Err(cancelled(&err)),
         }
     }
 }
@@ -7558,6 +7566,43 @@ pub fn wait_for_cancellation_boxed(
     Box::pin(wait_for_cancellation(cx))
 }
 
+/// Runs `future` unless `cx` fails its checkpoint first: cancellation, or a
+/// deadline in its budget.
+///
+/// For a wait that registers no cancellation wake of its own, such as socket
+/// I/O. `future` is polled first, so an output that is ready wins over a
+/// cancellation that arrives with it. The [`wait_for_cancellation`] waiter is
+/// created only once `future` is pending, so a future that completes at once
+/// registers nothing. When `cx` wins, `future` is dropped unfinished.
+///
+/// # Errors
+///
+/// Returns [`wait_for_cancellation`]'s structural cause when `cx` fails its
+/// checkpoint before `future` completes.
+pub async fn until_cancelled<F: Future>(
+    cx: &crate::cx::Cx,
+    future: F,
+) -> Result<F::Output, Box<ContextError>> {
+    use std::task::Poll;
+
+    let mut future = std::pin::pin!(future);
+    let mut cancelled = None;
+    std::future::poll_fn(|task_cx| {
+        if let Poll::Ready(output) = future.as_mut().poll(task_cx) {
+            return Poll::Ready(Ok(output));
+        }
+        let waiter = cancelled.get_or_insert_with(|| wait_for_cancellation_boxed(cx));
+        match waiter.as_mut().poll(task_cx) {
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Ready(Ok(())) => Poll::Ready(Err(Box::new(ContextError::internal(
+                "cancellation waiter completed without context termination",
+            )))),
+            Poll::Pending => Poll::Pending,
+        }
+    })
+    .await
+}
+
 /// Maximum number of concurrently admitted interruptible timer registrations.
 ///
 /// One entry consists of one asupersync wheel entry plus one inline
@@ -10160,6 +10205,33 @@ mod tests {
             0,
             "dropped waiter must be unregistered"
         );
+    }
+
+    #[test]
+    fn until_cancelled_prefers_a_ready_output_and_ends_a_pending_wait_on_cancel() {
+        let (probe, waker) = probe_waker(false);
+        let mut context = std::task::Context::from_waker(&waker);
+
+        // A ready output wins, even from a context that is already cancelled.
+        let cancelled = crate::cx::for_testing();
+        cancelled.cancel_with(crate::outcome::CancelKind::User, Some("ready output proof"));
+        let mut ready = Box::pin(until_cancelled(&cancelled, std::future::ready(7)));
+        let std::task::Poll::Ready(Ok(7)) = ready.as_mut().poll(&mut context) else {
+            panic!("a ready output must win over cancellation");
+        };
+
+        // A pending future waits on the cancellation waker and ends with the
+        // structural cause once its context is cancelled.
+        let cx = crate::cx::for_testing();
+        let mut pending = Box::pin(until_cancelled(&cx, std::future::pending::<()>()));
+        assert!(pending.as_mut().poll(&mut context).is_pending());
+        assert_eq!(probe.count(), 0, "waiting must not self-wake");
+        cx.cancel_with(crate::outcome::CancelKind::User, Some("pending wait proof"));
+        assert_eq!(probe.count(), 1, "cancellation must wake the waiting task");
+        let std::task::Poll::Ready(Err(error)) = pending.as_mut().poll(&mut context) else {
+            panic!("a cancelled context must end the pending wait");
+        };
+        assert_eq!(error.kind(), ContextErrorKind::Cancelled);
     }
 
     #[test]
@@ -17529,9 +17601,9 @@ mod tests {
     /// `next_line_with_cx` is a seam-level cx-first primitive: it gates
     /// entry to the underlying `lines.next()` wait with a
     /// `cx.checkpoint()` folded into `io::ErrorKind::Interrupted`.
-    /// The underlying asupersync stream does NOT itself observe cx on
-    /// each poll — the pre-flight is the sole cancel-observability
-    /// point. This test pins that pre-flight:
+    /// A cancellation that arrives while the read waits is pinned
+    /// separately by `unix_next_line_with_cx_ends_on_mid_flight_cancel`.
+    /// This test pins the pre-flight:
     ///
     ///     cx.checkpoint().map_err(|err| io::Error::new(
     ///         io::ErrorKind::Interrupted,
@@ -17617,6 +17689,66 @@ mod tests {
             }
 
             // _accept_task will be aborted when the runtime drops.
+            drop(lines);
+        });
+    }
+
+    /// A read already waiting for a line ends as soon as its `cx` is
+    /// cancelled. When only the pre-flight checkpoint saw cancellation, this
+    /// read waited for the peer to write (ft-3268r).
+    #[cfg(all(feature = "asupersync-runtime", unix))]
+    #[test]
+    fn unix_next_line_with_cx_ends_on_mid_flight_cancel() {
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let socket_path = tempdir.path().join("midflight.sock");
+            let listener = unix::bind(&socket_path).await.expect("bind");
+
+            // Accept and hold the connection open, never writing.
+            let _accept_task = task::spawn(async move {
+                let _held = listener.accept().await;
+                sleep(Duration::from_secs(10)).await;
+                drop(_held);
+            });
+
+            let client = unix::connect(&socket_path).await.expect("connect");
+            let mut lines = unix::lines(unix::buffered(client));
+
+            let cx = crate::cx::Cx::for_testing();
+            let canceller = cx.clone();
+            let _cancel_task = task::spawn(async move {
+                sleep(Duration::from_millis(100)).await;
+                canceller.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("mid-flight unix::next_line_with_cx test"),
+                );
+            });
+
+            let started = std::time::Instant::now();
+            let result = timeout_with_cx(
+                &crate::cx::for_request(),
+                Duration::from_secs(5),
+                unix::next_line_with_cx(&cx, &mut lines),
+            )
+            .await;
+            let elapsed = started.elapsed();
+
+            let err = result
+                .expect("cancelling mid-read must end the read before the 5 s bound")
+                .expect_err("the peer wrote nothing, so only cancellation can end the read");
+            assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+            assert!(
+                err.to_string().contains("next_line cancelled"),
+                "error should name the seam's cancellation; got: {err}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "the read must end soon after the 100 ms cancel; took {elapsed:?}"
+            );
             drop(lines);
         });
     }

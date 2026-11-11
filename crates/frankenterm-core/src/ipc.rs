@@ -101,6 +101,29 @@ fn remaining_ipc_io_budget(limit: Duration, elapsed: Duration) -> Option<Duratio
         .filter(|remaining| !remaining.is_zero())
 }
 
+/// The error for an `IpcClient` request whose `cx` ended one of its waits.
+/// A deadline in the caller's budget keeps the label an expired I/O timeout
+/// gets; any other termination is reported as a cancellation during `stage`.
+#[cfg(any(unix, windows))]
+fn ipc_client_wait_ended(
+    cx: &crate::cx::Cx,
+    stage: &str,
+    detail: &dyn std::fmt::Display,
+) -> UserVarError {
+    use crate::outcome::CancelKind;
+    let deadline = matches!(
+        cx.root_cancel_cause().map(|reason| reason.kind),
+        Some(CancelKind::Deadline | CancelKind::Timeout)
+    );
+    UserVarError::IpcSendFailed {
+        message: if deadline {
+            "IPC I/O deadline exceeded".to_string()
+        } else {
+            format!("cancelled during {stage}: {detail}")
+        },
+    }
+}
+
 fn record_ipc_initial_request_timeout() {
     let timeout_count = IPC_INITIAL_REQUEST_TIMEOUT_COUNT
         .fetch_add(1, Ordering::Relaxed)
@@ -273,16 +296,20 @@ mod socket_transport {
         {
             use asupersync::stream::StreamExt;
 
-            cx.checkpoint().map_err(|err| {
+            // As runtime_async::unix::next_line_with_cx: the read itself
+            // ends on cancellation through Next::with_cx.
+            let cancelled = |err: &dyn std::fmt::Display| {
                 io::Error::new(
                     io::ErrorKind::Interrupted,
                     format!("next_line cancelled: {err}"),
                 )
-            })?;
-            match lines.next().await {
-                Some(Ok(line)) => Ok(Some(line)),
-                Some(Err(err)) => Err(err),
-                None => Ok(None),
+            };
+            cx.checkpoint().map_err(|err| cancelled(&err))?;
+            match lines.next().with_cx(cx).await {
+                Ok(Some(Ok(line))) => Ok(Some(line)),
+                Ok(Some(Err(err))) => Err(err),
+                Ok(None) => Ok(None),
+                Err(err) => Err(cancelled(&err)),
             }
         }
     }
@@ -3889,8 +3916,14 @@ impl IpcClient {
     ///   4. before read: a pre-cancelled caller skips the response wait.
     ///
     /// One absolute I/O deadline covers connect, request write/flush, and
-    /// response read (and is shortened by any earlier capability deadline),
-    /// because the underlying socket futures have no direct cancellation wake.
+    /// response read (and is shortened by any earlier capability deadline).
+    /// Each of those waits also ends as soon as `cx` is cancelled: since
+    /// asupersync 0.6 that deadline does not expire on cancellation, and the
+    /// socket futures register no cancellation wake of their own, so connect
+    /// and write run under [`crate::runtime_async::until_cancelled`] and the
+    /// read through `next_line_with_cx`. Before that, a request cancelled
+    /// while the watcher was slow to answer waited for the reply or the whole
+    /// I/O timeout (30 s by default; ft-3268r).
     ///
     /// All cancellation errors wrap into `UserVarError::IpcSendFailed`
     /// with "cancelled" prefix for pattern-matching.
@@ -3926,12 +3959,13 @@ impl IpcClient {
         let stream = crate::runtime_async::timeout_with_cx(
             cx,
             connect_budget,
-            socket_transport::connect(&self.socket_path),
+            crate::runtime_async::until_cancelled(cx, socket_transport::connect(&self.socket_path)),
         )
         .await
         .map_err(|_elapsed| UserVarError::IpcSendFailed {
             message: "IPC I/O deadline exceeded".to_string(),
         })?
+        .map_err(|err| ipc_client_wait_ended(cx, "connect", &err))?
         .map_err(|e| UserVarError::IpcSendFailed {
             message: format!("failed to connect: {e}"),
         })?;
@@ -3961,15 +3995,20 @@ impl IpcClient {
                 .ok_or_else(|| UserVarError::IpcSendFailed {
                     message: "IPC I/O deadline exceeded".to_string(),
                 })?;
-            crate::runtime_async::timeout_with_cx(cx, write_budget, async {
-                writer.write_all(request_json.as_slice()).await?;
-                writer.write_all(b"\n").await?;
-                writer.flush().await
-            })
+            crate::runtime_async::timeout_with_cx(
+                cx,
+                write_budget,
+                crate::runtime_async::until_cancelled(cx, async {
+                    writer.write_all(request_json.as_slice()).await?;
+                    writer.write_all(b"\n").await?;
+                    writer.flush().await
+                }),
+            )
             .await
             .map_err(|_elapsed| UserVarError::IpcSendFailed {
                 message: "IPC I/O deadline exceeded".to_string(),
             })?
+            .map_err(|err| ipc_client_wait_ended(cx, "write", &err))?
             .map_err(|e| UserVarError::IpcSendFailed {
                 message: format!("failed to write request: {e}"),
             })?;
@@ -3981,15 +4020,20 @@ impl IpcClient {
                 .ok_or_else(|| UserVarError::IpcSendFailed {
                     message: "IPC I/O deadline exceeded".to_string(),
                 })?;
-            crate::runtime_async::timeout_with_cx(cx, write_budget, async {
-                stream.write_all(request_json.as_slice()).await?;
-                stream.write_all(b"\n").await?;
-                stream.flush().await
-            })
+            crate::runtime_async::timeout_with_cx(
+                cx,
+                write_budget,
+                crate::runtime_async::until_cancelled(cx, async {
+                    stream.write_all(request_json.as_slice()).await?;
+                    stream.write_all(b"\n").await?;
+                    stream.flush().await
+                }),
+            )
             .await
             .map_err(|_elapsed| UserVarError::IpcSendFailed {
                 message: "IPC I/O deadline exceeded".to_string(),
             })?
+            .map_err(|err| ipc_client_wait_ended(cx, "write", &err))?
             .map_err(|e| UserVarError::IpcSendFailed {
                 message: format!("failed to write request: {e}"),
             })?;
@@ -4028,8 +4072,14 @@ impl IpcClient {
             message: "IPC I/O deadline exceeded".to_string(),
         })?;
         let line = response_line
-            .map_err(|e| UserVarError::IpcSendFailed {
-                message: format!("failed to read response: {e}"),
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::Interrupted && cx.checkpoint().is_err() {
+                    ipc_client_wait_ended(cx, "read", &e)
+                } else {
+                    UserVarError::IpcSendFailed {
+                        message: format!("failed to read response: {e}"),
+                    }
+                }
             })?
             .ok_or_else(|| UserVarError::IpcSendFailed {
                 message: "failed to read response: server closed connection".to_string(),
@@ -4070,8 +4120,9 @@ pub struct IpcEventStream {
 impl IpcEventStream {
     /// Read the next NDJSON line from the live event stream. `Ok(None)` means
     /// the watcher closed the connection (it shut down or dropped the
-    /// `EventBus`) — callers should fall back to DB-cursor tailing. Honors `cx`
-    /// cancellation at the pre-read checkpoint.
+    /// `EventBus`) — callers should fall back to DB-cursor tailing. Ends with
+    /// an `Interrupted` error as soon as `cx` is cancelled, also while it is
+    /// waiting for a line.
     ///
     /// # Errors
     /// Returns an I/O error if the underlying socket read fails.
@@ -4155,12 +4206,13 @@ impl IpcClient {
         let mut stream = crate::runtime_async::timeout_with_cx(
             cx,
             connect_budget,
-            socket_transport::connect(&self.socket_path),
+            crate::runtime_async::until_cancelled(cx, socket_transport::connect(&self.socket_path)),
         )
         .await
         .map_err(|_elapsed| UserVarError::IpcSendFailed {
             message: "IPC I/O deadline exceeded".to_string(),
         })?
+        .map_err(|err| ipc_client_wait_ended(cx, "connect", &err))?
         .map_err(|e| UserVarError::IpcSendFailed {
             message: format!("failed to connect: {e}"),
         })?;
@@ -5442,6 +5494,88 @@ mod tests {
                 "connection_shutdown must end the wait"
             );
         });
+    }
+
+    /// A request whose `cx` is cancelled while it waits for the watcher's
+    /// reply ends at once. Before, nothing woke that read on cancellation:
+    /// it waited for the reply or the whole I/O timeout (30 s by default;
+    /// ft-3268r), and here the 10 s bound would have ended it instead.
+    #[test]
+    fn ipc_client_request_ends_when_cancelled_while_awaiting_the_reply() {
+        run_async_test(async {
+            let temp_dir = TempDir::new().unwrap();
+            let socket_path = temp_dir.path().join("silent.sock");
+            let listener = crate::runtime_async::unix::bind(&socket_path)
+                .await
+                .expect("bind silent watcher");
+            // Accept the request and never answer it.
+            let _silent_watcher = crate::runtime_async::task::spawn(async move {
+                let held = listener.accept().await;
+                crate::runtime_async::sleep(Duration::from_secs(15)).await;
+                drop(held);
+            });
+
+            let client = IpcClient::new(&socket_path);
+            let cx = crate::cx::for_testing();
+            let cancel_cx = cx.clone();
+            let _canceller = crate::runtime_async::task::spawn(async move {
+                crate::runtime_async::sleep(Duration::from_millis(200)).await;
+                cancel_cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("caller gave up on the reply"),
+                );
+            });
+
+            let started = std::time::Instant::now();
+            let outcome = crate::runtime_async::timeout_with_cx(
+                &crate::cx::for_request(),
+                Duration::from_secs(10),
+                client.ping_with_cx(&cx),
+            )
+            .await;
+            let elapsed = started.elapsed();
+
+            let error = outcome
+                .expect("cancellation must end the request before the 10 s bound")
+                .expect_err("the watcher never answers, so only cancellation can end the request");
+            let UserVarError::IpcSendFailed { message } = &error else {
+                panic!("expected IpcSendFailed, got {error:?}");
+            };
+            assert!(
+                message.starts_with("cancelled during read"),
+                "the cancellation must be reported as such; got: {message}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "the request must end soon after the 200 ms cancel; took {elapsed:?}"
+            );
+        });
+    }
+
+    /// A deadline in the caller's budget keeps the I/O-timeout label, so a
+    /// message classifier does not count it as a cancellation.
+    #[test]
+    fn ipc_client_wait_ended_labels_deadlines_apart_from_cancellation() {
+        let cancelled = crate::cx::for_testing();
+        cancelled.cancel_with(crate::outcome::CancelKind::User, Some("caller cancel"));
+        let UserVarError::IpcSendFailed { message } =
+            ipc_client_wait_ended(&cancelled, "read", &"cause")
+        else {
+            panic!("expected IpcSendFailed");
+        };
+        assert_eq!(message, "cancelled during read: cause");
+
+        let expired = crate::cx::for_testing();
+        expired.cancel_with(
+            crate::outcome::CancelKind::Deadline,
+            Some("budget deadline"),
+        );
+        let UserVarError::IpcSendFailed { message } =
+            ipc_client_wait_ended(&expired, "connect", &"cause")
+        else {
+            panic!("expected IpcSendFailed");
+        };
+        assert_eq!(message, "IPC I/O deadline exceeded");
     }
 
     /// frankenterm#135: one accept-loop wait covers the idle bound, a ready
