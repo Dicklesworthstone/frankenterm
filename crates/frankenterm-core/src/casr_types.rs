@@ -58,9 +58,10 @@ pub struct CanonicalMessage {
     pub timestamp: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    // CASR requires both collection fields on the wire, including empty arrays.
+    #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub tool_results: Vec<ToolResult>,
     /// Provider-specific fields for round-trip fidelity.
     #[serde(default)]
@@ -555,7 +556,15 @@ mod tests {
     }
 
     #[test]
-    fn skip_serializing_empty_tool_vectors() {
+    fn canonical_message_emits_required_casr_tool_vectors() {
+        // Unlike our permissive reader, CASR requires these Vec fields without
+        // serde defaults. A self-roundtrip would not detect missing arrays.
+        #[derive(Deserialize)]
+        struct RequiredToolCollections {
+            tool_calls: Vec<serde_json::Value>,
+            tool_results: Vec<serde_json::Value>,
+        }
+
         let msg = CanonicalMessage {
             idx: 0,
             role: MessageRole::User,
@@ -567,7 +576,9 @@ mod tests {
             extra: json!({}),
         };
         let json_str = serde_json::to_string(&msg).unwrap();
-        assert!(!json_str.contains("tool_calls"));
-        assert!(!json_str.contains("tool_results"));
+        let decoded: RequiredToolCollections = serde_json::from_str(&json_str).unwrap();
+        assert!(decoded.tool_calls.is_empty());
+        assert!(decoded.tool_results.is_empty());
+        assert!(serde_json::from_str::<RequiredToolCollections>("{}").is_err());
     }
 }
