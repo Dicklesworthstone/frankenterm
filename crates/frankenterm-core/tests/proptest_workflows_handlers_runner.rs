@@ -942,8 +942,12 @@ proptest! {
         })?;
     }
 
+    // The delay only has to outlast the cancellation (at most 35 ms after the
+    // retry boundary). It starts at 2 s, above the 1 s promptness bound below,
+    // so the wall-clock checks measure cancellation and not the durable
+    // cleanup writes, which took over 300 ms on a loaded shared worker.
     #[test]
-    fn cancel_during_retry_backoff_property(cancel_after_ms in 1u64..35, retry_delay_ms in 250u64..2_000) {
+    fn cancel_during_retry_backoff_property(cancel_after_ms in 1u64..35, retry_delay_ms in 2_000u64..4_000) {
         let fixture = RuntimeFixture::current_thread();
         fixture.block_on(async move {
             let config = WorkflowRunnerConfig {
@@ -1065,8 +1069,11 @@ proptest! {
         })?;
     }
 
+    // As in the retry-backoff property: the wait starts at 2 s, above the 1 s
+    // promptness bound, so the wall-clock checks measure cancellation and not
+    // the durable cleanup writes.
     #[test]
-    fn cancel_during_wait_condition_property(cancel_after_ms in 1u64..35, wait_ms in 250u64..2_000) {
+    fn cancel_during_wait_condition_property(cancel_after_ms in 1u64..35, wait_ms in 2_000u64..4_000) {
         let fixture = RuntimeFixture::current_thread();
         fixture.block_on(async move {
             let config = WorkflowRunnerConfig {
@@ -1159,11 +1166,17 @@ proptest! {
         })?;
     }
 
+    // The runner caps a wait by the remaining workflow deadline and reports
+    // the timeout it applied, so the abort reason names exactly which bound
+    // ended the wait. The deadline's margin over the wait timeout starts at
+    // 2 s: elapsed time also covers setup and the durable abort writes, which
+    // took over 300 ms on a loaded shared worker and failed this property
+    // with a 289 ms deadline although the wait timeout had fired first.
     #[test]
     fn wait_timeout_beats_overall_deadline_property(
         wait_timeout_ms in 5u64..35,
-        deadline_margin_ms in 250u64..600,
-        wait_overrun_ms in 1_000u64..2_000,
+        deadline_margin_ms in 2_000u64..4_000,
+        wait_overrun_ms in 5_000u64..8_000,
     ) {
         let fixture = RuntimeFixture::current_thread();
         fixture.block_on(async move {
@@ -1195,8 +1208,12 @@ proptest! {
                 .await;
             let elapsed = started_at.elapsed();
 
+            // A deadline-capped wait would report a shorter timeout here.
+            let wait_timeout_reason = format!(
+                "sleep wait timed out after {wait_timeout_ms}ms before required {wait_ms}ms elapsed"
+            );
             prop_assert!(
-                matches!(result, WorkflowExecutionResult::Aborted { ref reason, step_index: 0, .. } if reason.contains("sleep wait timed out")),
+                matches!(result, WorkflowExecutionResult::Aborted { ref reason, step_index: 0, .. } if reason.contains(&wait_timeout_reason)),
                 "explicit wait timeout should abort before overall deadline; got {result:?}"
             );
             prop_assert_eq!(
