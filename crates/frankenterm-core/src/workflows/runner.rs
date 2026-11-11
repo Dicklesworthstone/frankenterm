@@ -7312,7 +7312,7 @@ mod tests {
                     );
                 }
                 let observer_cx = crate::cx::for_testing();
-                crate::runtime_async::timeout_with_cx(
+                Box::pin(crate::runtime_async::timeout_with_cx(
                     &observer_cx,
                     Duration::from_secs(1),
                     runner.run_subscribed_with_cx(
@@ -7320,7 +7320,7 @@ mod tests {
                         subscriber,
                         Some((&shutdown_flag, &shutdown_notify)),
                     ),
-                )
+                ))
                 .await
                 .expect("pre-stopped runner must return without resuming or dispatching");
                 assert_eq!(probe.detections.load(Ordering::SeqCst), 0);

@@ -2182,7 +2182,10 @@ mod web_tests {
             let mut chunk = [0_u8; 2048];
             let read_count = read(stream, &mut chunk).await?;
             anyhow::ensure!(read_count != 0, "stream ended before {kind}");
-            anyhow::ensure!(response.len() + read_count <= 256 * 1024, "stream byte budget");
+            anyhow::ensure!(
+                response.len() + read_count <= 256 * 1024,
+                "stream byte budget"
+            );
             response.extend_from_slice(&chunk[..read_count]);
         }
     }
@@ -2236,7 +2239,7 @@ mod web_tests {
                 // Reversed notifications carry deliberately wrong content.
                 // Only the durable rows may determine order and payload.
                 for event_id in [second, first] {
-                    event_bus.publish(Event::PatternDetected {
+                    let _ = event_bus.publish(Event::PatternDetected {
                         pane_id: 7,
                         pane_uuid: None,
                         event_id: Some(event_id),
@@ -2266,7 +2269,7 @@ mod web_tests {
                 let deadline = Instant::now() + Duration::from_secs(3);
                 while durable_stream_ids(&String::from_utf8_lossy(&response)).len() < 3 {
                     ensure!(Instant::now() < deadline, "periodic catchup starved by bus traffic");
-                    event_bus.publish(Event::SegmentCaptured {
+                    let _ = event_bus.publish(Event::SegmentCaptured {
                         pane_id: 999,
                         seq: 0,
                         content_len: 0,
@@ -2325,8 +2328,12 @@ mod web_tests {
                 Ok::<_, anyhow::Error>(())
             })
             .await;
-            teardown.expect("durable stream teardown deadline").expect("durable stream teardown");
-            scenario.expect("durable stream scenario deadline").expect("durable stream assertions");
+            teardown
+                .expect("durable stream teardown deadline")
+                .expect("durable stream teardown");
+            scenario
+                .expect("durable stream scenario deadline")
+                .expect("durable stream assertions");
             assert_eq!(event_bus.subscriber_count(), 0);
         });
     }
@@ -2345,16 +2352,48 @@ mod web_tests {
             let addr = server.bound_addr();
             let token = "event-v1:0123456789abcdef0123456789abcdef:all:0";
             let requests = [
-                ("channel=all".to_owned(), "", 503, "event_replay_unavailable"),
-                ("channel=detections".to_owned(), "", 503, "event_replay_unavailable"),
-                ("channel=detections&since_id=0".to_owned(), "", 400, "invalid_event_cursor"),
-                ("channel=detections".to_owned(), "Last-Event-ID: 0\r\n", 400, "invalid_event_cursor"),
-                (format!("channel=signals&cursor={token}"), "", 400, "event_cursor_channel_mismatch"),
-                (format!("channel=detections&pane_id=7&cursor={token}"), "", 400, "event_cursor_scope_mismatch"),
+                (
+                    "channel=all".to_owned(),
+                    "",
+                    503,
+                    "event_replay_unavailable",
+                ),
+                (
+                    "channel=detections".to_owned(),
+                    "",
+                    503,
+                    "event_replay_unavailable",
+                ),
+                (
+                    "channel=detections&since_id=0".to_owned(),
+                    "",
+                    400,
+                    "invalid_event_cursor",
+                ),
+                (
+                    "channel=detections".to_owned(),
+                    "Last-Event-ID: 0\r\n",
+                    400,
+                    "invalid_event_cursor",
+                ),
+                (
+                    format!("channel=signals&cursor={token}"),
+                    "",
+                    400,
+                    "event_cursor_channel_mismatch",
+                ),
+                (
+                    format!("channel=detections&pane_id=7&cursor={token}"),
+                    "",
+                    400,
+                    "event_cursor_scope_mismatch",
+                ),
             ];
             let mut responses = Vec::new();
             for (query, header, status, code) in requests {
-                let request = format!("GET /stream/events?{query} HTTP/1.1\r\nHost: localhost\r\n{header}Connection: close\r\n\r\n");
+                let request = format!(
+                    "GET /stream/events?{query} HTTP/1.1\r\nHost: localhost\r\n{header}Connection: close\r\n\r\n"
+                );
                 responses.push((fetch_raw(addr, request.as_bytes()).await, status, code));
             }
             let signal = fetch_stream_until_kind_count(

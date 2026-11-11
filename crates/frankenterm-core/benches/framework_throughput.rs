@@ -7,6 +7,9 @@
 //! benchmark group, covering the p50/p95/p99 evidence requested by the bead.
 
 #![cfg(all(feature = "mcp", feature = "web"))]
+// Asupersync 0.6 nests FastMCP's generic server loop past the default
+// recursion limit where this crate instantiates it over MemoryTransport.
+#![recursion_limit = "256"]
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::mcp_framework::{
@@ -198,7 +201,8 @@ impl McpBenchHarness {
         });
 
         let mut client =
-            FrameworkMcpTestClient::new(client_transport).with_client_info(client_name, "1.0.0");
+            FrameworkMcpTestClient::new(client_transport, frankenterm_core::cx::for_testing())
+                .with_client_info(client_name, "1.0.0");
         client
             .initialize()
             .expect("benchmark client should initialize");

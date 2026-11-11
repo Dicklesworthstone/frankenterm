@@ -26,7 +26,7 @@
     "code": "InvalidParams",
     "data": null,
     "kind": "framework_error",
-    "message": "Input validation failed: root.agent: expected type string, got integer"
+    "message": "Input validation failed: root.agent: integer does not match the expected type"
   },
   "success_envelope": {
     "data": [

@@ -161,6 +161,10 @@ pub(super) fn parse_limit(qs: &QueryString<'_>, limits: WebRuntimeLimits) -> usi
 }
 
 /// Parse a `u64` query parameter by key.
+///
+/// Test-only since 6aa3f7d3a retired the SSE `since_id` fallback, its last
+/// production caller (streams resume from epoch-bound storage cursors).
+#[cfg(test)]
 pub(super) fn parse_u64(qs: &QueryString<'_>, key: &str) -> Option<u64> {
     qs.get(key).and_then(|v: &str| v.parse::<u64>().ok())
 }
@@ -168,7 +172,9 @@ pub(super) fn parse_u64(qs: &QueryString<'_>, key: &str) -> Option<u64> {
 /// Parse an optional pane scope without turning malformed input into an
 /// unfiltered read. The framework silently ignores query pairs after 256;
 /// reject that truncation before looking for a scope or duplicate instead.
-pub(super) fn parse_pane_filter(qs: &QueryString<'_>) -> std::result::Result<Option<u64>, Response> {
+pub(super) fn parse_pane_filter(
+    qs: &QueryString<'_>,
+) -> std::result::Result<Option<u64>, Response> {
     const MAX_QUERY_PARAMS: usize = 256;
     if qs
         .raw()
@@ -205,9 +211,7 @@ pub(super) fn parse_pane_filter(qs: &QueryString<'_>) -> std::result::Result<Opt
             return Err(invalid());
         }
         let value = percent_decode(value);
-        if value.is_empty()
-            || value.len() > 20
-            || !value.bytes().all(|byte| byte.is_ascii_digit())
+        if value.is_empty() || value.len() > 20 || !value.bytes().all(|byte| byte.is_ascii_digit())
         {
             return Err(invalid());
         }

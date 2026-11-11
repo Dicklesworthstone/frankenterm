@@ -84,13 +84,13 @@
     "code": "InvalidParams",
     "data": null,
     "kind": "framework_error",
-    "message": "Input validation failed: root.format: value must be one of: [String(\"json\"), String(\"toon\")]"
+    "message": "Input validation failed: root.format: value does not match any enum candidate"
   },
   "missing_required_response": {
     "code": "InvalidParams",
     "data": null,
     "kind": "framework_error",
-    "message": "Input validation failed: root: missing required field: text"
+    "message": "Input validation failed: root.text: missing required field"
   },
   "tool": "wa.rules_test"
 }

@@ -1,4 +1,7 @@
 #![cfg(feature = "mcp")]
+// Asupersync 0.6 nests FastMCP's generic server loop past the default
+// recursion limit where this crate instantiates it over MemoryTransport.
+#![recursion_limit = "256"]
 
 //! Conformance + golden-artifact coverage for `wa.rules_test`.
 //!
@@ -65,7 +68,8 @@ fn spawn_client() -> FrameworkTestClient {
             .expect("run MCP transport");
         });
     });
-    let mut client = FrameworkTestClient::new(client_transport);
+    let mut client =
+        FrameworkTestClient::new(client_transport, frankenterm_core::cx::for_testing());
     client
         .initialize()
         .expect("initialize in-memory MCP client");
@@ -542,7 +546,10 @@ fn mcp_conformance_rules_test_invalid_format_returns_documented_envelope() {
         "wa.rules_test",
         json!({ "text": ANCHOR_TEXT_COMPACTION, "format": "yaml" }),
     ));
-    assert_framework_invalid_params_response(&response, "root.format: value must be one of");
+    assert_framework_invalid_params_response(
+        &response,
+        "root.format: value does not match any enum candidate",
+    );
 }
 
 #[test]

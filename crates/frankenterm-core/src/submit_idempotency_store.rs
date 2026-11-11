@@ -1869,7 +1869,9 @@ fn load_observation(
     let stored = map_sqlite(
         conn.query_row(
             "SELECT length(CAST(continuation_json AS BLOB)), substr(CAST(continuation_json AS BLOB), 1, ?2), lease_expires_unix_ms FROM verified_submit_observations WHERE idempotency_key COLLATE BINARY = ?1 COLLATE BINARY",
-            params![binding.key(), MAX_OBSERVATION_JSON_BYTES + 1],
+            // SQLite integers are i64 and rusqlite binds no usize; the
+            // 144 KiB bound converts losslessly, as UNRESOLVED_RESERVE_BYTES does.
+            params![binding.key(), MAX_OBSERVATION_JSON_BYTES as i64 + 1],
             |row| {
                 Ok((
                     row.get::<_, i64>(0)?,

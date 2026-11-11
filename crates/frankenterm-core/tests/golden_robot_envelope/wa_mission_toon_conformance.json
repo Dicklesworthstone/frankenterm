@@ -1,6 +1,6 @@
 [
   {
-    "boundary_invalid_params_error": "[-32602] Input validation failed: root.limit: value must be >= 1",
+    "boundary_invalid_params_error": "[-32602] Input validation failed: root.limit: value is below minimum",
     "input_schema": {
       "additionalProperties": false,
       "properties": {
@@ -229,7 +229,7 @@
     }
   },
   {
-    "boundary_invalid_params_error": "[-32602] Input validation failed: root.assignment_id: expected type string, got integer",
+    "boundary_invalid_params_error": "[-32602] Input validation failed: root.assignment_id: integer does not match the expected type",
     "input_schema": {
       "additionalProperties": false,
       "properties": {
@@ -461,7 +461,7 @@
     }
   },
   {
-    "boundary_invalid_params_error": "[-32602] Input validation failed: root.reason: expected type string, got integer",
+    "boundary_invalid_params_error": "[-32602] Input validation failed: root.reason: integer does not match the expected type",
     "input_schema": {
       "additionalProperties": false,
       "properties": {
@@ -585,7 +585,7 @@
     }
   },
   {
-    "boundary_invalid_params_error": "[-32602] Input validation failed: root.requested_by: expected type string, got integer",
+    "boundary_invalid_params_error": "[-32602] Input validation failed: root.requested_by: integer does not match the expected type",
     "input_schema": {
       "additionalProperties": false,
       "properties": {
@@ -704,7 +704,7 @@
     }
   },
   {
-    "boundary_invalid_params_error": "[-32602] Input validation failed: root.reason: expected type string, got integer",
+    "boundary_invalid_params_error": "[-32602] Input validation failed: root.reason: integer does not match the expected type",
     "input_schema": {
       "additionalProperties": false,
       "properties": {

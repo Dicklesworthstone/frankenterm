@@ -1,6 +1,6 @@
 [
   {
-    "boundary_invalid_params_error": "[-32602] Input validation failed: root.contract_file: expected type string, got integer",
+    "boundary_invalid_params_error": "[-32602] Input validation failed: root.contract_file: integer does not match the expected type",
     "input_schema": {
       "type": "object",
       "properties": {
@@ -64,7 +64,7 @@
     }
   },
   {
-    "boundary_invalid_params_error": "[-32602] Input validation failed: root.include_contract: expected type boolean, got string",
+    "boundary_invalid_params_error": "[-32602] Input validation failed: root.include_contract: string does not match the expected type",
     "input_schema": {
       "type": "object",
       "properties": {
@@ -273,7 +273,7 @@
     }
   },
   {
-    "boundary_invalid_params_error": "[-32602] Input validation failed: root.paused: expected type boolean, got string",
+    "boundary_invalid_params_error": "[-32602] Input validation failed: root.paused: string does not match the expected type",
     "input_schema": {
       "type": "object",
       "properties": {
@@ -394,7 +394,7 @@
     }
   },
   {
-    "boundary_invalid_params_error": "[-32602] Input validation failed: root.fail_compensation_for_step: expected type string, got integer",
+    "boundary_invalid_params_error": "[-32602] Input validation failed: root.fail_compensation_for_step: integer does not match the expected type",
     "input_schema": {
       "type": "object",
       "properties": {

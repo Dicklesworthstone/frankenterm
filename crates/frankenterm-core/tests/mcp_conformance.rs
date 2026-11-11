@@ -1,4 +1,7 @@
 #![cfg(feature = "mcp")]
+// Asupersync 0.6 nests FastMCP's generic server loop past the default
+// recursion limit where this crate instantiates it over MemoryTransport.
+#![recursion_limit = "256"]
 
 use frankenterm_core::VERSION;
 use frankenterm_core::config::Config;
@@ -40,7 +43,8 @@ fn spawn_client(db_path: Option<PathBuf>) -> FrameworkTestClient {
         });
     });
 
-    let mut client = FrameworkTestClient::new(client_transport);
+    let mut client =
+        FrameworkTestClient::new(client_transport, frankenterm_core::cx::for_testing());
     client
         .initialize()
         .expect("initialize in-memory MCP client");
@@ -311,7 +315,7 @@ fn mcp_conformance_invalid_format_returns_framework_error() {
     let mut client = spawn_client(None);
     assert_framework_invalid_params(
         client.call_tool("wa.rules_list", json!({"verbose": true, "format": "yaml"})),
-        "root.format: value must be one of",
+        "root.format: value does not match any enum candidate",
     );
 }
 
@@ -320,7 +324,7 @@ fn mcp_conformance_schema_type_errors_return_framework_error() {
     let mut client = spawn_client(None);
     assert_framework_invalid_params(
         client.call_tool("wa.rules_list", json!({"agent_type": 7, "format": "json"})),
-        "root.agent_type: expected type string",
+        "root.agent_type: integer does not match the expected type",
     );
 }
 

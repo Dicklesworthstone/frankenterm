@@ -945,10 +945,13 @@ fn mcp_tx_contract_save_failure_after_effects(
         hint.push_str(&recovery_hint);
     }
 
+    // The warning precedes the store detail: the MCP envelope bounds error
+    // text, and a long contract path in the detail must not truncate away the
+    // fact that effects may already exist.
     McpToolError::new(
         save_err.code,
         format!(
-            "{completion_context}, but updated transaction evidence could not be confirmed durably persisted: {}. {effect_label} may already exist.",
+            "{completion_context}, but updated transaction evidence could not be confirmed durably persisted, and {effect_label} may already exist: {}",
             save_err.message
         ),
         Some(hint),
@@ -23521,7 +23524,13 @@ mod tests {
                         ),
                     };
                     *observed_receipt.lock().expect("record observed receipt") = Some(receipt);
-                    cx.set_cancel_requested(true);
+                    // A cancellation with a cause, as the MCP request's own
+                    // cancellation carries: a bare cancel request has no root
+                    // cause, which the wait reports as a context failure.
+                    cx.cancel_with(
+                        crate::outcome::CancelKind::User,
+                        Some("test cancels the optional output wait"),
+                    );
                 })),
             });
             let _pane_state = set_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
@@ -23545,7 +23554,10 @@ mod tests {
             );
             assert_eq!(first["ok"], true, "first envelope: {first:?}");
             assert_eq!(first["data"]["injection"]["status"], "allowed");
-            assert_eq!(first["data"]["wait_for"]["matched"], false);
+            assert_eq!(
+                first["data"]["wait_for"]["matched"], false,
+                "first envelope: {first:?}"
+            );
             assert_eq!(first["data"]["wait_for"]["polls"], 1);
             assert_eq!(first["data"]["verification_error"], "Wait cancelled");
             assert!(
@@ -25022,9 +25034,13 @@ mod tests {
         let (_db_dir, db_path) = temp_db_path();
         let workspace = workspace_tempdir();
         super::set_tx_contract_workspace_test_root(Some(workspace.path().to_path_buf()));
-        let active_dir = workspace.path().join("active");
-        let foreign_dir = workspace.path().join("foreign");
-        let detached_dir = workspace.path().join("active-detached");
+        // The envelope bounds error text. A deep contract path must not
+        // truncate away the namespace classification, on any host.
+        let namespace_root = workspace.path().join("deep-namespace-".repeat(10));
+        std::fs::create_dir(&namespace_root).unwrap();
+        let active_dir = namespace_root.join("active");
+        let foreign_dir = namespace_root.join("foreign");
+        let detached_dir = namespace_root.join("active-detached");
         std::fs::create_dir(&active_dir).unwrap();
         std::fs::create_dir(&foreign_dir).unwrap();
         let contract_path = active_dir.join("tx-contract.json");
@@ -25066,7 +25082,8 @@ mod tests {
             envelope["error"]
                 .as_str()
                 .expect("error text")
-                .contains("namespace-detached")
+                .contains("namespace-detached"),
+            "{envelope}"
         );
         assert_eq!(tx_run_mock_pane_content(&mock, 1), "step-1");
         assert_eq!(tx_run_mock_pane_content(&mock, 2), "step-2");
@@ -25077,8 +25094,7 @@ mod tests {
         );
         assert_eq!(
             mcp_load_mission_tx_contract_from_path(
-                &workspace
-                    .path()
+                &namespace_root
                     .join("active-detached")
                     .join("tx-contract.json")
             )
@@ -25259,9 +25275,13 @@ mod tests {
         let _pane_state_overrides = seed_tx_run_real_targets(&db_path, &mock);
         let root_contract =
             write_tx_contract_with_proven_commit_receipts(&workspace, &db_path, None);
-        let active_dir = workspace.path().join("active");
-        let foreign_dir = workspace.path().join("foreign");
-        let detached_dir = workspace.path().join("active-detached");
+        // The envelope bounds error text. A deep contract path must not
+        // truncate away the namespace classification, on any host.
+        let namespace_root = workspace.path().join("deep-namespace-".repeat(10));
+        std::fs::create_dir(&namespace_root).unwrap();
+        let active_dir = namespace_root.join("active");
+        let foreign_dir = namespace_root.join("foreign");
+        let detached_dir = namespace_root.join("active-detached");
         std::fs::create_dir(&active_dir).unwrap();
         std::fs::create_dir(&foreign_dir).unwrap();
         let contract_path = active_dir.join("tx-contract.json");
@@ -25302,7 +25322,8 @@ mod tests {
             envelope["error"]
                 .as_str()
                 .expect("error text")
-                .contains("namespace-detached")
+                .contains("namespace-detached"),
+            "{envelope}"
         );
         assert_eq!(tx_run_mock_pane_content(&mock, 1), "step-1undo-1");
         assert_eq!(tx_run_mock_pane_content(&mock, 2), "step-2undo-2");
@@ -25313,8 +25334,7 @@ mod tests {
         );
         assert_eq!(
             mcp_load_mission_tx_contract_from_path(
-                &workspace
-                    .path()
+                &namespace_root
                     .join("active-detached")
                     .join("tx-contract.json")
             )

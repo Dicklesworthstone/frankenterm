@@ -1,4 +1,7 @@
 #![cfg(feature = "mcp")]
+// Asupersync 0.6 nests FastMCP's generic server loop past the default
+// recursion limit where this crate instantiates it over MemoryTransport.
+#![recursion_limit = "256"]
 
 use frankenterm_core::config::Config;
 use frankenterm_core::mcp::build_server_with_db;
@@ -39,7 +42,7 @@ impl<T: FrameworkTransport> FrameworkTransport for FailResponseTransport<T> {
                 // Closing the memory endpoint makes the peer observe a terminal
                 // disconnect instead of waiting forever for the injected-lost
                 // response.
-                let _ = self.inner.close();
+                let _ = self.inner.close(cx);
                 return Err(FrameworkTransportError::Io(std::io::Error::other(
                     "injected MCP response write failure",
                 )));
@@ -55,8 +58,8 @@ impl<T: FrameworkTransport> FrameworkTransport for FailResponseTransport<T> {
         self.inner.recv(cx)
     }
 
-    fn close(&mut self) -> Result<(), FrameworkTransportError> {
-        self.inner.close()
+    fn close(&mut self, cx: &frankenterm_core::cx::Cx) -> Result<(), FrameworkTransportError> {
+        self.inner.close(cx)
     }
 }
 
@@ -70,7 +73,7 @@ impl<T: FrameworkDeliveryAcknowledgingTransport> FrameworkDeliveryAcknowledgingT
     ) -> Result<(), FrameworkTransportError> {
         if matches!(message, FrameworkJsonRpcMessage::Response(_)) {
             if self.armed.load(std::sync::atomic::Ordering::Acquire) {
-                let _ = self.inner.close();
+                let _ = self.inner.close(cx);
                 return Err(FrameworkTransportError::Io(std::io::Error::other(
                     "injected MCP response write failure",
                 )));
@@ -160,7 +163,7 @@ impl Drop for BoundedTestClient {
 fn conformance_client_watchdog_bounds_a_peer_that_never_replies() {
     let (transport, _silent_peer) = framework_create_memory_transport_pair();
     let mut client = BoundedTestClient::with_timeout(
-        |cx| FrameworkTestClient::with_cx(transport, cx),
+        |cx| FrameworkTestClient::new(transport, cx),
         std::time::Duration::from_millis(100),
     );
     let started = std::time::Instant::now();
@@ -200,8 +203,7 @@ fn spawn_client(db_path: Option<PathBuf>) -> BoundedTestClient {
         });
     });
 
-    let mut client =
-        BoundedTestClient::new(|cx| FrameworkTestClient::with_cx(client_transport, cx));
+    let mut client = BoundedTestClient::new(|cx| FrameworkTestClient::new(client_transport, cx));
     client
         .initialize()
         .expect("initialize in-memory MCP client");
@@ -429,7 +431,7 @@ fn assert_boundary_invalid_params_error(error: &str) {
         "expected framework invalid-params code in error: {error}"
     );
     assert!(
-        error.contains("root.limit: value must be >= 1"),
+        error.contains("root.limit: value is below minimum"),
         "expected wa.events limit schema boundary failure in error: {error}"
     );
 }
@@ -1155,7 +1157,7 @@ fn mcp_conformance_wa_await_event_contract_matches_expected_envelope() {
         "expected framework invalid-params code in error: {err}"
     );
     assert!(
-        err.contains("root.timeout_secs: value must be >= 1"),
+        err.contains("root.timeout_secs: value is below minimum"),
         "expected wa.await_event timeout lower-bound schema failure in error: {err}"
     );
 }
@@ -1399,8 +1401,7 @@ fn assert_await_event_claim_send_failure_releases_lease(
             .expect("join MCP transport worker")
         })
     });
-    let mut client =
-        BoundedTestClient::new(|cx| FrameworkTestClient::with_cx(client_transport, cx));
+    let mut client = BoundedTestClient::new(|cx| FrameworkTestClient::new(client_transport, cx));
     client.initialize().expect("initialize MCP client");
     wait_for_await_service_ready(&mut client);
     seed_events_fixture_at(&db_path);
@@ -2197,7 +2198,7 @@ fn mcp_conformance_wa_events_rejects_limit_above_schema_maximum() {
         "expected framework invalid-params code in error: {err}"
     );
     assert!(
-        err.contains("root.limit: value must be <= 1000"),
+        err.contains("root.limit: value is above maximum"),
         "expected wa.events limit upper-bound schema failure in error: {err}"
     );
 }

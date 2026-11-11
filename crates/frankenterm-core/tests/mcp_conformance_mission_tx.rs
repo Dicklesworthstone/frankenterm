@@ -155,7 +155,7 @@ fn spawn_client(config: &Config, db_path: Option<PathBuf>) -> OwnedTestClient {
     });
 
     let mut client = OwnedTestClient {
-        inner: FrameworkTestClient::new(client_transport),
+        inner: FrameworkTestClient::new(client_transport, frankenterm_core::cx::for_testing()),
         server_join: Some(server_join),
     };
     client

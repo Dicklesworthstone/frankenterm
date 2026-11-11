@@ -2453,12 +2453,10 @@ async fn handle_client_with_context_with_cx(
         heartbeat_interval_ms,
     } = &envelope.request
     {
-        if let Err(response) = validate_subscribe_events(
-            *version,
-            cursor.as_ref(),
-            ctx.event_storage.is_some(),
-        ) {
-            let encoded = serialize_ipc_response_bounded(response, limits.max_message_size)?;
+        if let Err(response) =
+            validate_subscribe_events(*version, cursor.as_ref(), ctx.event_storage.is_some())
+        {
+            let encoded = serialize_ipc_response_bounded(*response, limits.max_message_size)?;
             return write_ipc_line_with_deadline(
                 &cx,
                 &mut writer,
@@ -2799,18 +2797,20 @@ fn subscribe_event_record(
 }
 
 /// Validate admission before taking a subscription or reading storage.
+/// The refusal is boxed: an `IpcResponse` is ~280 bytes, too large to return
+/// by value in every `Result` (clippy::result_large_err).
 #[cfg(unix)]
 fn validate_subscribe_events(
     version: u32,
     cursor: Option<&crate::event_stream::DurableStreamCursor>,
     storage_available: bool,
-) -> Result<(), IpcResponse> {
+) -> Result<(), Box<IpcResponse>> {
     if version != IPC_EVENT_STREAM_VERSION || !storage_available {
-        return Err(IpcResponse::error_with_code(
+        return Err(Box::new(IpcResponse::error_with_code(
             "ipc.subscribe_events.unavailable",
             "Storage-authoritative event subscriptions require protocol version 2 and event storage",
             None,
-        ));
+        )));
     }
     if cursor.is_some_and(|cursor| {
         cursor.after_id < 0
@@ -2820,11 +2820,11 @@ fn validate_subscribe_events(
                 .bytes()
                 .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
     }) {
-        return Err(IpcResponse::error_with_code(
+        return Err(Box::new(IpcResponse::error_with_code(
             "ipc.subscribe_events.invalid_cursor",
             "Event resume cursor requires a nonnegative ID and a canonical storage epoch",
             None,
-        ));
+        )));
     }
     Ok(())
 }
@@ -2898,7 +2898,10 @@ where
     use crate::event_stream::{DurableFilteredEventStream, DurableStreamError, DurableStreamItem};
 
     let storage = ctx.event_storage.as_ref().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotConnected, "event storage unavailable")
+        std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "event storage unavailable",
+        )
     })?;
     let mut stream = DurableFilteredEventStream::new(&ctx.event_bus, Arc::clone(storage), cursor);
     let heartbeat = Duration::from_millis(heartbeat_interval_ms.max(1));
@@ -2943,7 +2946,9 @@ where
                 ) {
                     Some(record) => record,
                     None => {
-                        stream.acknowledge(event.id).map_err(std::io::Error::other)?;
+                        stream
+                            .acknowledge(event.id)
+                            .map_err(std::io::Error::other)?;
                         continue;
                     }
                 }
@@ -3000,7 +3005,9 @@ where
             return Ok(());
         }
         if let Some(event_id) = acknowledge {
-            stream.acknowledge(event_id).map_err(std::io::Error::other)?;
+            stream
+                .acknowledge(event_id)
+                .map_err(std::io::Error::other)?;
         }
         last_emit = Instant::now();
         if terminal {
@@ -4495,19 +4502,21 @@ mod tests {
                 ..cursor.clone()
             },
         ] {
-            let error =
-                validate_subscribe_events(IPC_EVENT_STREAM_VERSION, Some(&invalid), true).unwrap_err();
+            let error = validate_subscribe_events(IPC_EVENT_STREAM_VERSION, Some(&invalid), true)
+                .unwrap_err();
             assert_eq!(
                 error.error_code.as_deref(),
                 Some("ipc.subscribe_events.invalid_cursor")
             );
         }
-        assert!(serde_json::from_value::<DurableStreamCursor>(serde_json::json!({
-            "after_id": 0,
-            "epoch": cursor.epoch,
-            "unknown": true,
-        }))
-        .is_err());
+        assert!(
+            serde_json::from_value::<DurableStreamCursor>(serde_json::json!({
+                "after_id": 0,
+                "epoch": cursor.epoch,
+                "unknown": true,
+            }))
+            .is_err()
+        );
     }
 
     #[cfg(unix)]
@@ -4535,14 +4544,9 @@ mod tests {
             handled_by_workflow_id: Some("workflow-1".to_string()),
             handled_status: Some(format!("completed {secret}")),
         };
-        let record = subscribe_stored_event_record(
-            &event,
-            epoch,
-            Some(7),
-            Some("WARNING"),
-            Some("codex.*"),
-        )
-        .expect("matching stored record");
+        let record =
+            subscribe_stored_event_record(&event, epoch, Some(7), Some("WARNING"), Some("codex.*"))
+                .expect("matching stored record");
         assert_eq!(record["cursor"], 42);
         assert_eq!(record["id"], 42);
         assert_eq!(record["cursor_epoch"], epoch);

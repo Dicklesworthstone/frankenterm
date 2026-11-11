@@ -1,4 +1,7 @@
 #![cfg(feature = "mcp")]
+// Asupersync 0.6 nests FastMCP's generic server loop past the default
+// recursion limit where this crate instantiates it over MemoryTransport.
+#![recursion_limit = "256"]
 
 use frankenterm_core::accounts::AccountRecord;
 use frankenterm_core::cass::set_cass_cli_override;
@@ -218,7 +221,8 @@ fn spawn_client(mut config: Config, db_path: Option<PathBuf>) -> FrameworkTestCl
         });
     });
 
-    let mut client = FrameworkTestClient::new(client_transport);
+    let mut client =
+        FrameworkTestClient::new(client_transport, frankenterm_core::cx::for_testing());
     client
         .initialize()
         .expect("initialize in-memory MCP client");
@@ -595,7 +599,7 @@ fn mcp_conformance_wa_accounts_matches_snapshot() {
     assert_accounts_success(&capture.success_envelope);
     assert_framework_invalid_params_response(
         &capture.invalid_args_response,
-        "missing required field: service",
+        "root.service: missing required field",
     );
 
     assert_snapshot!("wa_accounts_conformance", snapshot_capture(&capture));
@@ -653,7 +657,7 @@ fn mcp_conformance_wa_cass_search_matches_snapshot() {
     assert_cass_search_success(&capture.success_envelope);
     assert_framework_invalid_params_response(
         &capture.invalid_args_response,
-        "missing required field: query",
+        "root.query: missing required field",
     );
 
     assert_snapshot!("wa_cass_search_conformance", snapshot_capture(&capture));
@@ -713,7 +717,7 @@ fn mcp_conformance_wa_cass_view_matches_snapshot() {
     assert_cass_view_success(&capture.success_envelope);
     assert_framework_invalid_params_response(
         &capture.invalid_args_response,
-        "missing required field: line_number",
+        "root.line_number: missing required field",
     );
 
     assert_snapshot!("wa_cass_view_conformance", snapshot_capture(&capture));
@@ -816,7 +820,7 @@ fn mcp_conformance_wa_workflow_run_matches_snapshot() {
     assert_workflow_run_success(&capture.success_envelope);
     assert_framework_invalid_params_response(
         &capture.invalid_args_response,
-        "missing required field: name",
+        "root.name: missing required field",
     );
 
     assert_snapshot!("wa_workflow_run_conformance", snapshot_capture(&capture));

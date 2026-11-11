@@ -551,7 +551,7 @@ impl TxContractLockGuard {
             return Err(TxContractStoreError::new(
                 TxContractStoreErrorKind::Lock,
                 format!(
-                    "transaction contract parent namespace changed before effect dispatch: last-known path {} no longer names the pinned parent",
+                    "transaction contract parent namespace changed before effect dispatch: the last-known path no longer names the pinned parent: {}",
                     self.parent_display.display()
                 ),
             ));
@@ -2057,7 +2057,7 @@ where
         TxContractStoreError::new(
             TxContractStoreErrorKind::Rename,
             format!(
-                "transaction contract was durably saved through its pinned parent, but the last-known namespace {} could not be revalidated: {err}",
+                "transaction contract was durably saved through its pinned parent, but the last-known namespace could not be revalidated ({err}): {}",
                 path.display()
             ),
         ).after_publication()
@@ -2066,7 +2066,7 @@ where
         return Err(TxContractStoreError::new(
             TxContractStoreErrorKind::Rename,
             format!(
-                "transaction contract was durably saved through its pinned parent, but the last-known contract path {} is namespace-detached and may resolve to stale or foreign data",
+                "transaction contract was durably saved through its pinned parent, but the last-known contract path is namespace-detached and may resolve to stale or foreign data: {}",
                 path.display()
             ),
         ).after_publication());
@@ -2077,7 +2077,7 @@ where
             TxContractStoreError::new(
                 TxContractStoreErrorKind::Rename,
                 format!(
-                    "transaction contract was durably saved through its pinned parent, but the last-known basename {} could not be revalidated: {err}",
+                    "transaction contract was durably saved through its pinned parent, but the last-known basename could not be revalidated ({err}): {}",
                     path.display()
                 ),
             ).after_publication()
@@ -2086,7 +2086,7 @@ where
         return Err(TxContractStoreError::new(
             TxContractStoreErrorKind::Rename,
             format!(
-                "transaction contract was durably saved through its pinned parent, but the last-known basename {} is stale or now resolves to foreign data",
+                "transaction contract was durably saved through its pinned parent, but the last-known basename is stale or now resolves to foreign data: {}",
                 path.display()
             ),
         ).after_publication());

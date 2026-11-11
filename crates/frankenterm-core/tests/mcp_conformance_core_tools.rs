@@ -1,4 +1,7 @@
 #![cfg(feature = "mcp")]
+// Asupersync 0.6 nests FastMCP's generic server loop past the default
+// recursion limit where this crate instantiates it over MemoryTransport.
+#![recursion_limit = "256"]
 
 use frankenterm_core::config::{
     Config, PolicyRule, PolicyRuleDecision, PolicyRuleMatch, PolicyRulesConfig,
@@ -371,7 +374,8 @@ fn spawn_client_with_config(config: Config, db_path: Option<PathBuf>) -> Framewo
         });
     });
 
-    let mut client = FrameworkTestClient::new(client_transport);
+    let mut client =
+        FrameworkTestClient::new(client_transport, frankenterm_core::cx::for_testing());
     client
         .initialize()
         .expect("initialize in-memory MCP client");
@@ -1338,7 +1342,7 @@ fn mcp_conformance_wa_search_contract_matches_golden() {
     assert_search_success_data(&capture.success_envelope);
     assert_framework_invalid_params_response(
         &capture.invalid_args_response,
-        "root.limit: value must be >= 1",
+        "root.limit: value is below minimum",
     );
     let toon_envelope = parse_tool_envelope_with_format(
         &harness
@@ -1398,7 +1402,7 @@ fn mcp_conformance_wa_get_text_contract_matches_golden() {
     assert_get_text_success_data(&capture.success_envelope);
     assert_framework_invalid_params_response(
         &capture.invalid_args_response,
-        "root.tail: value must be >= 1",
+        "root.tail: value is below minimum",
     );
     let toon_envelope = parse_tool_envelope_with_format(
         &harness
@@ -1457,7 +1461,7 @@ fn mcp_conformance_wa_send_contract_matches_golden() {
     assert_send_success_data(&capture.success_envelope);
     assert_framework_invalid_params_response(
         &capture.invalid_args_response,
-        "root.timeout_secs: value must be >= 1",
+        "root.timeout_secs: value is below minimum",
     );
     let toon_envelope = parse_tool_envelope_with_format(
         &harness
@@ -1516,7 +1520,7 @@ fn mcp_conformance_wa_wait_for_contract_matches_golden() {
     assert_wait_for_success_data(&capture.success_envelope);
     assert_framework_invalid_params_response(
         &capture.invalid_args_response,
-        "root.timeout_secs: value must be >= 1",
+        "root.timeout_secs: value is below minimum",
     );
     let toon_envelope = parse_tool_envelope_with_format(
         &harness
@@ -1577,6 +1581,9 @@ fn mcp_conformance_core_tools_invalid_format_returns_documented_envelope() {
 
     for (tool_name, args) in cases {
         let response = parse_invalid_args_response(harness.client.call_tool(tool_name, args));
-        assert_framework_invalid_params_response(&response, "root.format: value must be one of");
+        assert_framework_invalid_params_response(
+            &response,
+            "root.format: value does not match any enum candidate",
+        );
     }
 }

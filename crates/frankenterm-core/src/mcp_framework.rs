@@ -420,13 +420,13 @@ impl<T: FrameworkDeliveryAcknowledgingTransport> FrameworkTransport
         }
     }
 
-    fn close(&mut self) -> Result<(), FrameworkTransportError> {
+    fn close(&mut self, cx: &crate::cx::Cx) -> Result<(), FrameworkTransportError> {
         // A graceful close with an unsent response is a known delivery failure.
         // A hard process death cannot run this path; the durable lease expiry is
         // the recovery authority in that case.
         self.coordinator
             .complete_next(FrameworkResponseDeliveryOutcome::Failed);
-        self.inner.close()
+        self.inner.close(cx)
     }
 }
 
@@ -780,7 +780,7 @@ impl OutboundFrameworkClient {
 
         let args_ref: Vec<&str> = server.args.iter().map(String::as_str).collect();
         let client = builder
-            .connect_stdio_with_cx(&server.command, &args_ref, cx)
+            .connect_stdio_with_cx(cx, &server.command, &args_ref)
             .await?;
         Ok(Self {
             inner: client,
@@ -1180,7 +1180,7 @@ mod server_compat_tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let operation = std::thread::spawn(move || {
             exercise(&mut client, &operation_cx);
-            client.close().expect("close client transport");
+            client.close(&operation_cx).expect("close client transport");
             server_worker
                 .join()
                 .expect("server loop returns on EOF")
@@ -1451,7 +1451,7 @@ mod tests {
             mapped.into_iter().map(|item| item.0).collect::<Vec<_>>(),
             content.as_array().unwrap().clone()
         );
-        peer.close().expect("close peer");
+        peer.close(&cx).expect("close peer");
     }
 
     #[test]

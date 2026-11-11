@@ -11,6 +11,10 @@
 //! - Actionable error messages for failure paths
 //! - Secret-like strings never leak unredacted
 
+// Asupersync 0.6 nests FastMCP's generic server loop past the default
+// recursion limit where this crate instantiates it over MemoryTransport.
+#![recursion_limit = "256"]
+
 use assert_cmd::Command;
 
 #[cfg(unix)]
@@ -2545,7 +2549,8 @@ printf '%s\n' '{"schemaVersion":"caut.v1","generatedAt":"2026-02-27T21:05:00Z","
                 .expect("MCP parity transport");
         });
     });
-    let mut client = FrameworkTestClient::new(client_transport);
+    let mut client =
+        FrameworkTestClient::new(client_transport, frankenterm_core::cx::for_testing());
     client.initialize().unwrap();
 
     let mut paths = vec![bin.clone()];

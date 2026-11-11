@@ -1,4 +1,7 @@
 #![cfg(all(feature = "mcp", feature = "mcp-client"))]
+// Asupersync 0.6 nests FastMCP's generic server loop past the default
+// recursion limit where this crate instantiates it over MemoryTransport.
+#![recursion_limit = "256"]
 
 use frankenterm_core::config::{Config, McpClientConfig};
 use frankenterm_core::cx::Cx;
@@ -505,7 +508,8 @@ fn proxy_routes_calls_to_remote_tools() {
         });
     });
 
-    let mut client = FrameworkTestClient::new(client_transport);
+    let mut client =
+        FrameworkTestClient::new(client_transport, frankenterm_core::cx::for_testing());
     client.initialize().expect("initialize in-memory client");
 
     let reply = client
@@ -559,7 +563,8 @@ fn proxy_routes_remote_calls_with_audit_traceability() {
         });
     });
 
-    let mut client = FrameworkTestClient::new(client_transport);
+    let mut client =
+        FrameworkTestClient::new(client_transport, frankenterm_core::cx::for_testing());
     client.initialize().expect("initialize in-memory client");
 
     let secret_payload = "audit-secret-value";

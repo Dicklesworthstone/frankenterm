@@ -9289,7 +9289,6 @@ log_level = "debug"
             "/relative/hook",
             "ftp://example.invalid/hook",
             "file:///tmp/hook",
-            "hTtPs://example.invalid/hook",
             "https:/example.invalid/hook",
             "https:///example.invalid/hook",
             " https://example.invalid/hook",
@@ -9325,6 +9324,9 @@ log_level = "debug"
             "https://[::1]:8443/hook",
             "https://example.invalid?query=value",
             "https://example.invalid/path%40name?query=user%40value",
+            // The scheme is case-insensitive (RFC 3986 section 3.1), and the
+            // HTTP transport honors that since asupersync 0.6.
+            "hTtPs://example.invalid/hook",
         ] {
             let mut config = Config::default();
             config

@@ -1,6 +1,9 @@
 //! Property-based tests for the public `mcp` protocol surface.
 
 #![cfg(feature = "mcp")]
+// Asupersync 0.6 nests FastMCP's generic server loop past the default
+// recursion limit where this crate instantiates it over MemoryTransport.
+#![recursion_limit = "256"]
 
 use frankenterm_core::VERSION;
 use frankenterm_core::config::Config;
@@ -68,7 +71,7 @@ fn spawn_client(db_path: Option<PathBuf>) -> (ClientHarness, ServerSnapshot) {
     });
     // Own cleanup before receiving metadata so startup failures also join.
     let harness = ClientHarness {
-        client: FrameworkTestClient::new(client_transport),
+        client: FrameworkTestClient::new(client_transport, frankenterm_core::cx::for_testing()),
         server_join: Some(server_join),
     };
     let snapshot = snapshot_receiver.recv().expect("receive MCP metadata");
@@ -79,7 +82,7 @@ fn spawn_client(db_path: Option<PathBuf>) -> (ClientHarness, ServerSnapshot) {
 fn client_harness_propagates_server_thread_failure() {
     let (client_transport, _server_transport) = framework_create_memory_transport_pair();
     let harness = ClientHarness {
-        client: FrameworkTestClient::new(client_transport),
+        client: FrameworkTestClient::new(client_transport, frankenterm_core::cx::for_testing()),
         server_join: Some(std::thread::spawn(|| panic!("server failure oracle"))),
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(harness)));

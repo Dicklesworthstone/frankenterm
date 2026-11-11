@@ -1418,6 +1418,7 @@ fn bounded_semantic_snapshot(snapshot: &MuxSemanticSnapshot) -> bool {
 /// command from a prior matching turn. An in-place composer edit is admissible
 /// only while that Input was the last pre-send zone and did not hold this
 /// command already.
+#[allow(clippy::enum_variant_names)]
 enum FreshSemanticInput {
     CurrentCommand { has_output: bool },
     OtherCommand,

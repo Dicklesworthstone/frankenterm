@@ -48641,7 +48641,10 @@ async fn run_watcher(
                             Some(search_config),
                         )
                         .with_semantic_source(wezterm_handle.clone())
-                        .with_event_storage(Arc::clone(&shared_storage));
+                        // The same thread-safe handle shared_storage wraps
+                        // (nothing replaces it there); subscriptions take it
+                        // unlocked.
+                        .with_event_storage(Arc::new(handle.storage.clone()));
                     let ipc_task = frankenterm_core::runtime_async::task::spawn(async move {
                         server
                             .run_with_handler_context_with_cx(

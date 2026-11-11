@@ -1686,7 +1686,6 @@ impl AppendLogRecorderStorage {
     /// subsequent appends; a maintenance error never invalidates that prior batch.
     #[cfg(unix)]
     fn roll_and_prune(
-        &self,
         inner: &mut AppendLogInner,
         retention: AppendLogRetention,
     ) -> std::result::Result<(), RecorderStorageError> {
@@ -2195,7 +2194,7 @@ impl AppendLogRecorderStorage {
                 if let Some(retention) = self.retention {
                     // The batch is committed; a failed roll only postpones
                     // retention and is retried after the next append.
-                    if let Err(err) = self.roll_and_prune(&mut inner, retention) {
+                    if let Err(err) = Self::roll_and_prune(&mut inner, retention) {
                         tracing::warn!(error = %err, "recorder append-log roll failed");
                         Self::record_last_error(&mut inner, "append_log_roll", &err);
                     }
@@ -5554,7 +5553,7 @@ recorder_backend = "frankensqlite"
                             .fail_after_rename
                             .store(true, Ordering::SeqCst);
                     }
-                    let result = storage.roll_and_prune(
+                    let result = AppendLogRecorderStorage::roll_and_prune(
                         &mut inner,
                         AppendLogRetention {
                             roll_at_bytes: 1,
@@ -5695,7 +5694,7 @@ recorder_backend = "frankensqlite"
                 {
                     let mut inner = storage.inner.lock().await;
                     directory_sync_test_hook::start(Some(0));
-                    let result = storage.roll_and_prune(
+                    let result = AppendLogRecorderStorage::roll_and_prune(
                         &mut inner,
                         AppendLogRetention {
                             roll_at_bytes: 1,
@@ -5788,7 +5787,7 @@ recorder_backend = "frankensqlite"
                 let mut inner = storage.inner.lock().await;
                 inner.segment_id = u64::MAX;
                 assert!(matches!(
-                    storage.roll_and_prune(
+                    AppendLogRecorderStorage::roll_and_prune(
                         &mut inner,
                         AppendLogRetention {
                             roll_at_bytes: 1,

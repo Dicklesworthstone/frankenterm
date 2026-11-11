@@ -94,7 +94,9 @@ impl FleetMutationRequestBinding {
         Ok(Self {
             idempotency_key: key.to_string(),
             action: action.to_string(),
-            request_sha256: format!("{:x}", hasher.finalize()),
+            // sha2 0.11 digests are hybrid-array Arrays, which do not
+            // implement LowerHex; hex::encode gives the same lowercase digits.
+            request_sha256: hex::encode(hasher.finalize()),
         })
     }
 
@@ -255,7 +257,7 @@ fn hash_fleet_request_value(
             hasher.update(b"o");
             budget.field(hasher, values.len().to_string().as_bytes())?;
             let mut entries: Vec<_> = values.iter().collect();
-            entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            entries.sort_unstable_by_key(|(key, _)| *key);
             for (key, value) in entries {
                 budget.field(hasher, key.as_bytes())?;
                 hash_fleet_request_value(hasher, value, budget, depth + 1)?;
@@ -1227,7 +1229,7 @@ mod tests {
         use FleetMutationRequestBindingError::{InvalidAction, InvalidKey, RequestTooLarge};
         let request = serde_json::json!({"target_count": 3});
         for key in [
-            "".to_string(),
+            String::new(),
             " \n".to_string(),
             "nul\0key".to_string(),
             "k".repeat(513),

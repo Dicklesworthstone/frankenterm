@@ -1,4 +1,7 @@
 #![cfg(feature = "mcp")]
+// Asupersync 0.6 nests FastMCP's generic server loop past the default
+// recursion limit where this crate instantiates it over MemoryTransport.
+#![recursion_limit = "256"]
 
 use frankenterm_core::config::Config;
 use frankenterm_core::mcp::build_server_with_db;
@@ -123,7 +126,7 @@ fn spawn_client(db_path: Option<PathBuf>) -> OwnedTestClient {
     });
 
     let mut client = OwnedTestClient {
-        inner: FrameworkTestClient::new(client_transport),
+        inner: FrameworkTestClient::new(client_transport, frankenterm_core::cx::for_testing()),
         server_join: Some(server_join),
     };
     client

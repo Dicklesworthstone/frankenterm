@@ -1,6 +1,6 @@
 [
   {
-    "boundary_invalid_params_error": "[-32602] Input validation failed: root.note: expected type string, got integer",
+    "boundary_invalid_params_error": "[-32602] Input validation failed: root.note: integer does not match the expected type",
     "input_schema": {
       "additionalProperties": false,
       "properties": {
@@ -55,7 +55,7 @@
     "tool": "wa.events_annotate"
   },
   {
-    "boundary_invalid_params_error": "[-32602] Input validation failed: root.state: expected type string, got integer",
+    "boundary_invalid_params_error": "[-32602] Input validation failed: root.state: integer does not match the expected type",
     "input_schema": {
       "additionalProperties": false,
       "properties": {
@@ -110,7 +110,7 @@
     "tool": "wa.events_triage"
   },
   {
-    "boundary_invalid_params_error": "[-32602] Input validation failed: root.add: expected type string, got integer",
+    "boundary_invalid_params_error": "[-32602] Input validation failed: root.add: integer does not match the expected type",
     "input_schema": {
       "additionalProperties": false,
       "properties": {

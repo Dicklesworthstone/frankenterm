@@ -837,8 +837,8 @@ mod tests {
     #[test]
     fn gate_decision_json_roundtrips_every_variant_with_typed_numbers() {
         // Workspace feature unification enables serde_json/arbitrary_precision:
-        // fastmcp_rust 180a7c88890705217bb8e202d19555adabf24187 declares it for
-        // serde_json =1.0.151. Run this same test with and without that feature.
+        // the fastmcp_rust rev pinned in the workspace manifest declares it for
+        // serde_json =1.0.154. Run this same test with and without that feature.
         // The tag is deliberately last so decoding cannot rely on key order.
         for (json, expected) in [
             (

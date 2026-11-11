@@ -215,10 +215,12 @@ impl DurableFilteredEventStream {
     fn bus_item(&mut self, event: Event) -> DurableStreamItem {
         match event {
             Event::PatternDetected {
-                event_id: Some(id),
-                ..
+                event_id: Some(id), ..
             } => {
-                self.needs_drain |= self.cursor.as_ref().is_none_or(|cursor| id > cursor.after_id);
+                self.needs_drain |= self
+                    .cursor
+                    .as_ref()
+                    .is_none_or(|cursor| id > cursor.after_id);
                 // Stale notifications need no query. Yield so queued wakeups
                 // cannot monopolize the caller's heartbeat deadline.
                 DurableStreamItem::Idle
@@ -283,7 +285,8 @@ impl DurableFilteredEventStream {
                 .next_poll
                 .saturating_duration_since(Instant::now())
                 .min(idle_budget.max(Duration::from_millis(1)));
-            match crate::runtime_async::timeout_with_cx(cx, wait, self.subscriber.recv_cx(cx)).await {
+            match crate::runtime_async::timeout_with_cx(cx, wait, self.subscriber.recv_cx(cx)).await
+            {
                 Ok(Ok(event)) => return Ok(Some(self.bus_item(event))),
                 Ok(Err(crate::events::RecvError::Lagged { missed_count })) => {
                     self.needs_drain = true;
@@ -305,7 +308,10 @@ impl DurableFilteredEventStream {
     }
 }
 
-fn durable_page_is_ordered(cursor: &DurableStreamCursor, page: &crate::storage::EventStreamPage) -> bool {
+fn durable_page_is_ordered(
+    cursor: &DurableStreamCursor,
+    page: &crate::storage::EventStreamPage,
+) -> bool {
     if page.events.len() > DURABLE_EVENT_PAGE_SIZE {
         return false;
     }
@@ -1561,8 +1567,8 @@ mod tests {
             let first = storage.record_event(durable_test_event(1)).await.unwrap();
             let second = storage.record_event(durable_test_event(2)).await.unwrap();
             // Notification ordering and payload deliberately contradict storage.
-            bus.publish(make_pattern_event(99, "wrong.second", Some(second)));
-            bus.publish(make_pattern_event(99, "wrong.first", Some(first)));
+            let _ = bus.publish(make_pattern_event(99, "wrong.second", Some(second)));
+            let _ = bus.publish(make_pattern_event(99, "wrong.first", Some(first)));
             let row = next_durable_row(&mut stream, &cx).await;
             assert_eq!(row.id, first);
             assert_eq!(row.pane_id, 7);
@@ -1619,7 +1625,7 @@ mod tests {
             // None of these stored rows has a PatternDetected notification.
             // Overflow independent live signals while the durable backlog runs.
             for pane_id in 0..4 {
-                bus.publish(Event::PaneDisappeared { pane_id });
+                let _ = bus.publish(Event::PaneDisappeared { pane_id });
             }
             for expected in &ids[..DURABLE_EVENT_PAGE_SIZE] {
                 let row = next_durable_row(&mut stream, &cx).await;
@@ -1658,12 +1664,18 @@ mod tests {
                 DurableFilteredEventStream::new(&bus, Arc::clone(&storage), Some(start.clone()));
             stream.drain_page_cx(&cx).await.unwrap();
             let deadline = stream.next_poll;
-            bus.publish(make_pattern_event(7, "stale", Some(start.after_id)));
+            let _ = bus.publish(make_pattern_event(7, "stale", Some(start.after_id)));
             assert!(matches!(
-                stream.next_item_cx(&cx, Duration::from_millis(1)).await.unwrap(),
+                stream
+                    .next_item_cx(&cx, Duration::from_millis(1))
+                    .await
+                    .unwrap(),
                 Some(DurableStreamItem::Idle)
             ));
-            assert!(!stream.needs_drain, "stale IDs must not trigger another query");
+            assert!(
+                !stream.needs_drain,
+                "stale IDs must not trigger another query"
+            );
             assert_eq!(stream.next_poll, deadline);
 
             let id = storage.record_event(durable_test_event(1)).await.unwrap();
@@ -1671,7 +1683,7 @@ mod tests {
             // unrelated live traffic must not postpone this silent commit.
             stream.next_poll = Instant::now();
             for pane_id in 0..8 {
-                bus.publish(Event::PaneDisappeared { pane_id });
+                let _ = bus.publish(Event::PaneDisappeared { pane_id });
             }
             assert_eq!(next_durable_row(&mut stream, &cx).await.id, id);
             stream.acknowledge(id).unwrap();
@@ -1688,7 +1700,11 @@ mod tests {
             let cx = crate::cx::Cx::current().expect("runtime context");
             let bus = EventBus::new(4);
             let mut stream = DurableFilteredEventStream::new(&bus, Arc::clone(&storage), None);
-            assert_eq!(bus.subscriber_count(), 1, "subscribe before capturing the tail");
+            assert_eq!(
+                bus.subscriber_count(),
+                1,
+                "subscribe before capturing the tail"
+            );
             let baseline = match stream
                 .next_item_cx(&cx, Duration::from_millis(1))
                 .await
@@ -1782,7 +1798,9 @@ mod tests {
             let cancelled = crate::cx::for_testing();
             cancelled.cancel_with(crate::outcome::CancelKind::User, Some("stream test"));
             assert!(matches!(
-                stream.next_item_cx(&cancelled, Duration::from_millis(1)).await,
+                stream
+                    .next_item_cx(&cancelled, Duration::from_millis(1))
+                    .await,
                 Err(DurableStreamError::Cancelled)
             ));
             assert_eq!(stream.cursor(), Some(&start));

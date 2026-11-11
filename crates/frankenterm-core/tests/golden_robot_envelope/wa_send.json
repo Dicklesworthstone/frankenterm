@@ -68,7 +68,7 @@
     "code": "InvalidParams",
     "data": null,
     "kind": "framework_error",
-    "message": "Input validation failed: root.timeout_secs: value must be >= 1"
+    "message": "Input validation failed: root.timeout_secs: value is below minimum"
   },
   "success_envelope": {
     "data": {

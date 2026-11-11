@@ -983,10 +983,18 @@ mod tests {
                     .upsert_pane(sample_pane(pane_id))
                     .await
                     .expect("upsert pane");
-                storage
-                    .record_event(sample_event(pane_id))
+                // Event dedupe keys are unique across panes, so each pane's
+                // event needs its own key or the second is deduplicated away.
+                let mut event = sample_event(pane_id);
+                event.dedupe_key = Some(format!("dedupe-pane-{pane_id}"));
+                let outcome = storage
+                    .record_event_outcome(event)
                     .await
                     .expect("record event");
+                assert!(
+                    outcome.was_inserted(),
+                    "pane {pane_id} event must be stored"
+                );
                 storage
                     .append_segment(pane_id, "needle in both panes", None)
                     .await
