@@ -13493,11 +13493,26 @@ mod tests {
                     let (mut stream, _) = listener.accept().await.expect("accept");
                     let mut buffer = StreamingPduBuffer::new();
                     let mut requests = 0;
-                    loop {
+                    // The deadline case's client gives up mid-exchange: it can close
+                    // with a response still unread (Linux reports that to this end as
+                    // a reset, not EOF) or before the response is written (EPIPE).
+                    // Either is that client hanging up; every other case reads all
+                    // its responses, so there a reset still fails the test.
+                    let hung_up = |error: &std::io::Error| {
+                        case == "deadline"
+                            && matches!(
+                                error.kind(),
+                                std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::BrokenPipe
+                            )
+                    };
+                    'serve: loop {
                         let mut bytes = [0u8; 4096];
-                        let count = unix_stream_read(&mut stream, &mut bytes)
-                            .await
-                            .expect("read");
+                        let count = match unix_stream_read(&mut stream, &mut bytes).await {
+                            Ok(count) => count,
+                            Err(error) if hung_up(&error) => break,
+                            Err(error) => panic!("read: {error:?}"),
+                        };
                         if count == 0 {
                             break;
                         }
@@ -13567,9 +13582,11 @@ mod tests {
                                 }
                                 _ => continue,
                             };
-                            write_response_pdu(&mut stream, &response, decoded.serial)
-                                .await
-                                .expect("response");
+                            match write_response_pdu(&mut stream, &response, decoded.serial).await {
+                                Ok(()) => {}
+                                Err(error) if hung_up(&error) => break 'serve,
+                                Err(error) => panic!("response: {error:?}"),
+                            }
                         }
                     }
                     requests
