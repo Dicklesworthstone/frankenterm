@@ -1,13 +1,22 @@
 # Plan to Deeply Integrate cross_agent_session_resumer into FrankenTerm
 
-> **Product scope (2026-09-04):** provider discovery and session resume have
-> real CLI callers. The proposed recorder-to-conversation pipeline does not:
-> `recorder_casr_export.rs` is absent, and `SessionResumer::export_for_recorder`
-> only packages caller-supplied canonical messages. It performs no recorder
-> reads, role inference, redaction, session splitting, or cross-provider import.
-> A module/types test does not prove resuming an observed terminal recording.
-> The runtime examples below are historical; current implementation must use
-> `runtime_async`/Cx with bounded subprocess lifetime, never direct Tokio.
+> **Product scope (2026-11-11):** provider discovery and session resume have
+> real CLI callers. `ft record export-casr --pane <id>` now connects bounded,
+> read-only native recorder snapshots to the converter in `recorder_export.rs`.
+> It emits a redacted bundle of CASR canonical sessions with terminal-observation
+> roles, provenance, session boundaries, and explicit history-gap information.
+> Input attempts are not proof of delivered user turns, and captured output is
+> not proof of assistant or tool messages. The existing
+> `SessionResumer::export_for_recorder` remains a helper for caller-supplied
+> canonical messages.
+>
+> This is a terminal-context export surface. Provider-native import, authenticated
+> role inference, and an observed cross-provider resume remain separate work.
+> The new converter and CLI regressions were authored but could not be executed
+> in the implementation session because the execution environment disconnected
+> and the required RCH setup was unavailable. No live-resume or remote-test proof
+> follows from source integration. The runtime examples below are historical;
+> current implementation must use `runtime_async`/Cx, never direct Tokio.
 
 > Integration plan for FrankenTerm bead `ft-2vuw7.27.3`
 > Author: DarkMill (claude-code, opus-4.6)

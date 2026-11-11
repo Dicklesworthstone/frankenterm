@@ -3209,6 +3209,46 @@ These four words refer to four distinct mechanisms. They are often conflated; th
 
 A recording, replayed on the same `ft` version with the same seed, produces byte-equal results. This is the project's definition of replay determinism. The replay subsystem owns the harness; deviations are caught by the diff engine.
 
+
+### Export terminal context in CASR format
+
+Export one pane's retained native flight-recorder history as a JSON bundle of
+CASR canonical sessions:
+
+```bash
+ft record export-casr --pane 7 --output conversation.json
+
+# Write JSON to stdout, or raise source admission limits for a larger recorder.
+ft record export-casr --pane 7 > conversation.json
+ft record export-casr --pane 7 \
+  --max-source-bytes 1073741824 \
+  --max-scan-events 500000 \
+  --output conversation-large.json
+```
+
+This command uses the workspace's configured append-log or SQLite recorder and
+a read-only snapshot. It does not open a recorder writer or repair its files.
+A missing or unavailable selected backend is an error; the command does not
+silently read a different backend. It is included in the default
+`session-resume` feature and does not require the `casr` executable to export.
+
+Terminal input and output carry explicit terminal-observation roles. They are
+not authenticated conversation turns: input may be an attempted or denied
+send, and output may contain echoes, status lines, or screen snapshots. The
+bundle preserves session boundaries and history-gap information, always
+redacts text, and omits raw recorder identity and marker-detail strings.
+Exporting does not import the bundle into a provider or resume an agent.
+
+The default bounds are 10,000 selected events, 100,000 scanned events, 256 MiB of
+stored event data including framing, and 16 MiB each for selected text and the
+serialized bundle. Source admission includes other panes in the retained
+recorder. Exceeding a bound refuses the export instead of silently returning a
+complete-looking truncated history. The bundle is fully
+converted before output publication. `--output` uses private, no-overwrite
+publication on supported platforms; stdout remains available where that
+publication mechanism is unavailable. A concurrent rotation or incomplete
+active frame can require retrying the read.
+
 ---
 
 ## Deep Dive: Pane Filter Rules

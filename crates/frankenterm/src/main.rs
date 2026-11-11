@@ -1878,7 +1878,7 @@ SEE ALSO:
         command: ExtCommands,
     },
 
-    /// Export session recordings to Asciinema or HTML
+    /// Manage pane recordings and export retained terminal history
     #[command(after_help = r#"EXAMPLES:
     ft record export session.war                        Export to Asciinema cast
     ft record export session.war --format html -o out.html  Export to HTML player
@@ -3240,8 +3240,47 @@ enum ReproduceCommands {
     },
 }
 
+#[cfg(feature = "session-resume")]
+#[derive(Args, Clone)]
+struct RecordCasrExportArgs {
+    /// Export exactly one pane's retained native recorder history
+    #[arg(long)]
+    pane: u64,
+
+    /// New private output artifact (default: write the JSON bundle to stdout)
+    #[arg(short = 'o', long)]
+    output: Option<PathBuf>,
+
+    /// Maximum selected events; exceeding a limit refuses the whole export
+    #[arg(long, default_value_t = 10_000)]
+    max_events: usize,
+
+    /// Maximum selected text bytes and serialized JSON bundle bytes
+    #[arg(long, default_value_t = 16_777_216)]
+    max_bytes: usize,
+
+    /// Maximum recorder events scanned, including other panes
+    #[arg(long, default_value_t = 100_000)]
+    max_scan_events: usize,
+
+    /// Maximum source bytes admitted to the bounded read
+    #[arg(long, default_value_t = 268_435_456)]
+    max_source_bytes: u64,
+}
+
 #[derive(Subcommand)]
 enum RecordCommands {
+    /// Export one pane's native flight recorder as a redacted CASR session bundle
+    #[cfg(feature = "session-resume")]
+    #[command(after_help = r#"EXAMPLES:
+    ft record export-casr --pane 7 > conversation.json
+    ft record export-casr --pane 7 --output conversation.json
+
+The configured workspace recorder backend is read without acquiring a writer
+lease or repairing its files. The export preserves terminal input/output roles,
+session boundaries and explicit history gaps. It does not infer provider chat
+roles, execute input, or resume an agent. Redaction is always enabled."#)]
+    ExportCasr(RecordCasrExportArgs),
     /// Start recording a pane's terminal output
     Start {
         /// Pane ID to record (default: current pane)
@@ -43886,6 +43925,106 @@ fn recorder_rusqlite_storage_config(
     }
 }
 
+#[cfg(feature = "session-resume")]
+fn export_record_casr_snapshot(
+    cx: &frankenterm_core::cx::Cx,
+    backend: frankenterm_core::recorder_storage::RecorderBackendKind,
+    recorder_dir: &Path,
+    request: &frankenterm_core::recorder_export::CasrExportRequest,
+) -> anyhow::Result<frankenterm_core::recorder_export::CasrExportResult> {
+    use frankenterm_core::policy::ActorKind;
+    use frankenterm_core::recorder_audit::{ActorIdentity, AuditLog};
+    use frankenterm_core::recorder_export::export_casr_with_cx;
+    use frankenterm_core::recorder_storage::{
+        AppendLogEventReader, AppendLogReadLimits, RecorderBackendSelection, RecorderEventReader,
+        RusqliteEventReader, select_recorder_backend,
+    };
+
+    // Refuse invalid limits and unsupported backends before touching the source.
+    request.validate()?;
+    let selected = select_recorder_backend(backend)?;
+    anyhow::ensure!(cx.checkpoint().is_ok(), "recorder.casr_export.cancelled");
+    let read_limits = AppendLogReadLimits {
+        max_snapshot_bytes: request.max_source_bytes,
+        max_records: u64::try_from(request.max_scan_events)?,
+        ..AppendLogReadLimits::default()
+    };
+    let reader: Box<dyn RecorderEventReader> = match selected {
+        RecorderBackendSelection::AppendLog => Box::new(AppendLogEventReader::open_with_cx(
+            cx,
+            &recorder_dir.join("events.log"),
+            read_limits,
+        )?),
+        RecorderBackendSelection::Rusqlite => Box::new(RusqliteEventReader::open_bounded_with_cx(
+            cx,
+            recorder_dir.join("events.sqlite3"),
+            read_limits.max_record_payload_bytes,
+        )?),
+    };
+    let actor = ActorIdentity::new(ActorKind::Human, "cli.record.export_casr");
+    let audit_log = AuditLog::new(Default::default());
+    Ok(export_casr_with_cx(
+        cx,
+        reader.as_ref(),
+        &actor,
+        request,
+        &audit_log,
+        now_ms(),
+    )?)
+}
+
+#[cfg(feature = "session-resume")]
+async fn handle_record_export_casr(
+    cx: &frankenterm_core::cx::Cx,
+    config: &frankenterm_core::config::Config,
+    layout: &frankenterm_core::config::WorkspaceLayout,
+    args: RecordCasrExportArgs,
+) -> anyhow::Result<()> {
+    let request = frankenterm_core::recorder_export::CasrExportRequest {
+        pane_id: args.pane,
+        max_events: args.max_events,
+        max_output_bytes: args.max_bytes,
+        max_scan_events: args.max_scan_events,
+        max_source_bytes: args.max_source_bytes,
+    };
+    request.validate()?;
+    let backend = config.storage.recorder_backend;
+    let recorder_dir = layout.ft_dir.join("recorder-log");
+    let read_cx = cx.clone();
+    // Snapshot admission, scanning and conversion all stay off the async worker.
+    let export = run_cli_blocking_with_cx(cx, "recorder CASR export", move || {
+        export_record_casr_snapshot(&read_cx, backend, &recorder_dir, &request)
+    })
+    .await?;
+
+    if let Some(output) = args.output {
+        let data = export.data;
+        // Reuse atomic, private, no-replace publication. In particular an output
+        // alias cannot truncate or overwrite the recorder that was just read.
+        let receipt = run_cli_settled_blocking_effect(cx, "recorder CASR publication", move || {
+            write_new_private_artifact(&output, &data)
+        })
+        .await?;
+        eprintln!(
+            "Exported {} event(s) in {} session(s), {} bytes (redacted; SHA-256 {})",
+            export.events_exported, export.sessions_exported, receipt.bytes, receipt.sha256
+        );
+    } else {
+        anyhow::ensure!(cx.checkpoint().is_ok(), "recorder.casr_export.cancelled");
+        let stdout = std::io::stdout();
+        let mut writer = stdout.lock();
+        writer.write_all(&export.data)?;
+        writer.write_all(b"\n")?;
+        writer.flush()?;
+    }
+    if export.source_prefix_missing {
+        eprintln!(
+            "The retained recorder starts after a pruned history prefix; the bundle records this gap."
+        );
+    }
+    Ok(())
+}
+
 fn recorder_startup_health_failure_reason(
     health: &frankenterm_core::recorder_storage::RecorderStorageHealth,
 ) -> Option<String> {
@@ -70960,6 +71099,10 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
         }
 
         Some(Commands::Record { command }) => match command {
+            #[cfg(feature = "session-resume")]
+            RecordCommands::ExportCasr(args) => {
+                handle_record_export_casr(cx, &config, &layout, args).await?;
+            }
             RecordCommands::Start {
                 pane,
                 title,
@@ -141502,6 +141645,168 @@ A  docs/new-proof.md\n";
             },
             _ => panic!("expected Robot command"),
         }
+    }
+
+    #[cfg(feature = "session-resume")]
+    #[test]
+    fn cli_record_export_casr_requires_explicit_pane_and_parses_bounds() {
+        assert!(Cli::try_parse_from(["ft", "record", "export-casr"]).is_err());
+        assert!(
+            Cli::try_parse_from(["ft", "record", "export-casr", "--pane", "7", "--no-redact"])
+                .is_err()
+        );
+        let cli = Cli::try_parse_from([
+            "ft",
+            "record",
+            "export-casr",
+            "--pane",
+            "7",
+            "--output",
+            "conversation.json",
+            "--max-events",
+            "20",
+            "--max-bytes",
+            "65536",
+            "--max-scan-events",
+            "100",
+            "--max-source-bytes",
+            "1048576",
+        ])
+        .expect("native recorder export should parse");
+        match cli.command.map(|command| *command) {
+            Some(Commands::Record {
+                command: RecordCommands::ExportCasr(args),
+            }) => {
+                assert_eq!(args.pane, 7);
+                assert_eq!(args.output, Some(PathBuf::from("conversation.json")));
+                assert_eq!(args.max_events, 20);
+                assert_eq!(args.max_bytes, 65_536);
+                assert_eq!(args.max_scan_events, 100);
+                assert_eq!(args.max_source_bytes, 1_048_576);
+            }
+            _ => panic!("expected native recorder CASR export"),
+        }
+    }
+
+    #[cfg(feature = "session-resume")]
+    #[test]
+    fn record_export_casr_reads_selected_native_source_without_mutation_or_fallback() {
+        use frankenterm_core::recorder_export::CasrExportRequest;
+        use frankenterm_core::recorder_storage::RecorderBackendKind;
+        use frankenterm_core::recording::{
+            RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventCausality,
+            RecorderEventPayload, RecorderEventSource, RecorderRedactionLevel,
+            RecorderSegmentKind, RecorderTextEncoding,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let log_path = directory.path().join("events.log");
+        let state_path = directory.path().join("state.json");
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        let mut source = Vec::new();
+        for (pane_id, text) in [
+            (7, format!("visible terminal output token={secret}")),
+            (8, "foreign-pane-private-content".to_string()),
+        ] {
+            let event = RecorderEvent {
+                schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+                event_id: format!("cli-export-{pane_id}"),
+                pane_id,
+                session_id: None,
+                workflow_id: None,
+                correlation_id: None,
+                source: RecorderEventSource::RobotMode,
+                occurred_at_ms: 1_700_000_000_000 + pane_id,
+                recorded_at_ms: 1_700_000_000_001 + pane_id,
+                sequence: pane_id,
+                causality: RecorderEventCausality::default(),
+                payload: RecorderEventPayload::EgressOutput {
+                    text,
+                    encoding: RecorderTextEncoding::Utf8,
+                    redaction: RecorderRedactionLevel::None,
+                    segment_kind: RecorderSegmentKind::Delta,
+                    is_gap: false,
+                },
+            };
+            let payload = serde_json::to_vec(&event).unwrap();
+            source.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
+            source.extend_from_slice(&payload);
+        }
+        std::fs::write(&log_path, &source).unwrap();
+        std::fs::write(&state_path, b"writer-owned-state-must-not-be-repaired").unwrap();
+        let cx = frankenterm_core::cx::for_testing();
+        let request = CasrExportRequest {
+            pane_id: 7,
+            ..CasrExportRequest::default()
+        };
+        let export = export_record_casr_snapshot(
+            &cx,
+            RecorderBackendKind::AppendLog,
+            directory.path(),
+            &request,
+        )
+        .unwrap();
+        assert_eq!(export.events_exported, 1);
+        assert_eq!(export.events_scanned, 2);
+        serde_json::from_slice::<serde_json::Value>(&export.data).unwrap();
+        let json = String::from_utf8(export.data).unwrap();
+        assert!(json.contains(frankenterm_core::redactor::REDACTED_MARKER));
+        assert!(!json.contains(secret));
+        assert!(!json.contains("foreign-pane-private-content"));
+        assert_eq!(std::fs::read(&log_path).unwrap(), source);
+        assert_eq!(
+            std::fs::read(&state_path).unwrap(),
+            b"writer-owned-state-must-not-be-repaired"
+        );
+
+        // A missing selected SQLite source must not fall back to this valid log.
+        assert!(
+            export_record_casr_snapshot(
+                &cx,
+                RecorderBackendKind::Rusqlite,
+                directory.path(),
+                &request,
+            )
+            .is_err()
+        );
+        assert!(!directory.path().join("events.sqlite3").exists());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(feature = "session-resume")]
+    #[test]
+    fn record_export_casr_validates_limits_and_backend_before_source_open() {
+        use frankenterm_core::recorder_export::{CasrExportError, CasrExportRequest};
+        use frankenterm_core::recorder_storage::{
+            RecorderBackendKind, RecorderBackendSelectionError,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let cx = frankenterm_core::cx::for_testing();
+        let request = CasrExportRequest {
+            pane_id: 7,
+            max_events: 0,
+            ..CasrExportRequest::default()
+        };
+        let error = export_record_casr_snapshot(
+            &cx,
+            RecorderBackendKind::AppendLog,
+            directory.path(),
+            &request,
+        )
+        .err()
+        .expect("zero event cap must fail before opening the missing source");
+        assert!(error.downcast_ref::<CasrExportError>().is_some());
+        let error = export_record_casr_snapshot(
+            &cx,
+            RecorderBackendKind::FrankenSqlite,
+            directory.path(),
+            &CasrExportRequest::default(),
+        )
+        .err()
+        .expect("unavailable backend must fail before source I/O");
+        assert!(error.downcast_ref::<RecorderBackendSelectionError>().is_some());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
     }
 
     #[cfg(feature = "session-resume")]
