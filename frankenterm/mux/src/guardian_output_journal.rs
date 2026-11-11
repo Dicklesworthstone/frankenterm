@@ -3373,6 +3373,19 @@ pub struct GuardianOutputJournalCreation {
     failed: bool,
 }
 
+/// A creation still holding its file holds that file's writer lease (taken in
+/// `create_new_at`); [`GuardianOutputJournalCreation::complete`] moves both to
+/// the journal. Abandoning the creation unlocks the lease before the file
+/// closes (see [`release_guardian_output_writer_lease`]).
+#[cfg(unix)]
+impl Drop for GuardianOutputJournalCreation {
+    fn drop(&mut self) {
+        if let Some(file) = &self.file {
+            release_guardian_output_writer_lease(file);
+        }
+    }
+}
+
 #[cfg(unix)]
 impl GuardianOutputJournalCreation {
     /// Reserve an exact new segment without writing its header yet. An I/O
@@ -3412,14 +3425,18 @@ impl GuardianOutputJournalCreation {
         rustix::fs::fchmod(&file, rustix::fs::Mode::from_raw_mode(0o600))
             .map_err(|error| GuardianOutputJournalError::Io(std::io::Error::from(error)))?;
         acquire_guardian_output_writer_lease(&file)?;
-        let child_identity = capture_new_segment_file_identity(&file)?;
-        if child_identity.bytes != 0
-            || child_identity.device != parent_identity.device
-            || capture_new_segment_parent_identity(&pinned_parent)? != parent_identity
-            || capture_new_segment_named_identity(&pinned_parent, child_name)? != child_identity
-        {
-            return Err(GuardianOutputJournalError::NewSegmentPublicationIdentityChanged);
-        }
+        let child_identity = match validate_new_segment_child_identity(
+            &file,
+            &pinned_parent,
+            child_name,
+            parent_identity,
+        ) {
+            Ok(child_identity) => child_identity,
+            Err(error) => {
+                release_guardian_output_writer_lease(&file);
+                return Err(error);
+            }
+        };
         Ok(Self {
             file: Some(file),
             publication: GuardianOutputNewSegmentPublication {
@@ -3674,6 +3691,50 @@ fn acquire_guardian_output_writer_lease(_file: &File) -> Result<(), GuardianOutp
     Err(GuardianOutputJournalError::AppendWriterLeaseUnsupported)
 }
 
+/// Unlock a writer lease that `file` holds, before the descriptor closes.
+///
+/// The lease is a flock on the open file description, and a child that
+/// another thread forks (every pane spawn does) shares that description until
+/// its pre-exec close sweep. Releasing by close alone left the lease held for
+/// that window, so an immediate reopen of the same segment, such as a pane
+/// retry after a failed spawn, was refused AppendWriterLeaseUnavailable
+/// (ft-q1lol's test retries, ft-hsczw). An unlock releases every copy. Call it
+/// only for a descriptor whose own acquire succeeded: a read-only view built
+/// from a clone of a writer's descriptor would release the writer's lease.
+#[cfg(any(
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+))]
+fn release_guardian_output_writer_lease(file: &File) {
+    // Closing the descriptor stays the fallback if this fails.
+    let _ = rustix::fs::flock(file, rustix::fs::FlockOperation::Unlock);
+}
+
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+)))]
+#[cfg(unix)]
+fn release_guardian_output_writer_lease(_file: &File) {}
+
 #[cfg(unix)]
 fn validate_new_segment_child_name(name: &OsStr) -> Result<(), GuardianOutputJournalError> {
     let mut components = Path::new(name).components();
@@ -3702,6 +3763,27 @@ fn capture_new_segment_parent_identity(
         mode: metadata.mode(),
         owner: metadata.uid(),
     })
+}
+
+/// The new segment's identity, checked after its writer lease is taken: still
+/// empty, on the parent's device, and still the file named `child_name` in
+/// the unchanged parent.
+#[cfg(unix)]
+fn validate_new_segment_child_identity(
+    file: &File,
+    pinned_parent: &File,
+    child_name: &OsStr,
+    parent_identity: GuardianOutputDirectoryIdentity,
+) -> Result<GuardianOutputFileIdentity, GuardianOutputJournalError> {
+    let child_identity = capture_new_segment_file_identity(file)?;
+    if child_identity.bytes != 0
+        || child_identity.device != parent_identity.device
+        || capture_new_segment_parent_identity(pinned_parent)? != parent_identity
+        || capture_new_segment_named_identity(pinned_parent, child_name)? != child_identity
+    {
+        return Err(GuardianOutputJournalError::NewSegmentPublicationIdentityChanged);
+    }
+    Ok(child_identity)
 }
 
 #[cfg(unix)]
@@ -3760,6 +3842,18 @@ fn capture_new_segment_named_identity(
         links,
         bytes,
     })
+}
+
+/// An append journal unlocks its writer lease before its file closes (see
+/// [`release_guardian_output_writer_lease`]). A read-only journal never took
+/// one, so it unlocks nothing.
+impl Drop for GuardianOutputJournal {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if self.writer_lease_held {
+            release_guardian_output_writer_lease(&self.file);
+        }
+    }
 }
 
 impl GuardianOutputJournal {
@@ -3872,6 +3966,23 @@ impl GuardianOutputJournal {
         #[cfg(unix)]
         require_guardian_output_read_write_descriptor(&file)?;
         acquire_guardian_output_writer_lease(&file)?;
+        let limits = match Self::write_new_file_header(&mut file, limits, &header) {
+            Ok(limits) => limits,
+            Err(error) => {
+                release_guardian_output_writer_lease(&file);
+                return Err(error);
+            }
+        };
+        Self::authenticate_existing(file, identity, cipher, limits, true)
+    }
+
+    /// Write and sync the header of a new, still empty, regular file.
+    #[cfg(unix)]
+    fn write_new_file_header(
+        file: &mut File,
+        limits: GuardianOutputJournalLimits,
+        header: &[u8; FILE_HEADER_BYTES],
+    ) -> Result<GuardianOutputJournalLimits, GuardianOutputJournalError> {
         let limits = limits.validate()?;
         let metadata = file.metadata()?;
         if !metadata.file_type().is_file() {
@@ -3883,9 +3994,9 @@ impl GuardianOutputJournal {
             });
         }
         file.seek(SeekFrom::Start(0))?;
-        file.write_all(&header)?;
+        file.write_all(header)?;
         file.sync_all()?;
-        Self::authenticate_existing(file, identity, cipher, limits, true)
+        Ok(limits)
     }
 
     /// Open one existing journal segment relative to an exact private directory
@@ -3978,6 +4089,10 @@ impl GuardianOutputJournal {
     }
 
     /// Authenticate one existing descriptor without ever modifying it.
+    ///
+    /// With `writer_lease_held`, `file` holds a writer lease that the caller
+    /// just took. A failure unlocks it before the file closes, and success
+    /// moves it to the journal, whose drop unlocks it.
     #[cfg(unix)]
     fn authenticate_existing(
         mut file: File,
@@ -3986,6 +4101,41 @@ impl GuardianOutputJournal {
         limits: GuardianOutputJournalLimits,
         writer_lease_held: bool,
     ) -> Result<Self, GuardianOutputJournalError> {
+        let (limits, scan) = match Self::scan_existing(&mut file, identity, &cipher, limits) {
+            Ok(scanned) => scanned,
+            Err(error) => {
+                if writer_lease_held {
+                    release_guardian_output_writer_lease(&file);
+                }
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            file,
+            identity,
+            cipher,
+            limits,
+            committed_bytes: scan.committed_bytes,
+            record_count: scan.record_count,
+            cumulative_plaintext_bytes: scan.cumulative_plaintext_bytes,
+            next_sequence: scan.next_sequence,
+            terminal_receipt: scan.terminal_receipt,
+            authenticated_prefix_digest: scan.authenticated_prefix_digest,
+            tail: scan.tail,
+            new_segment_publication: None,
+            poisoned: false,
+            writer_lease_held,
+        })
+    }
+
+    /// The validation and record scan of [`Self::authenticate_existing`].
+    #[cfg(unix)]
+    fn scan_existing(
+        file: &mut File,
+        identity: GuardianOutputSegmentIdentity,
+        cipher: &GuardianOutputCipher,
+        limits: GuardianOutputJournalLimits,
+    ) -> Result<(GuardianOutputJournalLimits, JournalScan), GuardianOutputJournalError> {
         let limits = limits.validate()?;
         let metadata = file.metadata()?;
         if !metadata.file_type().is_file() {
@@ -4021,23 +4171,8 @@ impl GuardianOutputJournal {
                 actual: physical_bytes,
             });
         }
-        let scan = scan_journal(&mut file, physical_bytes, identity, &cipher, limits)?;
-        Ok(Self {
-            file,
-            identity,
-            cipher,
-            limits,
-            committed_bytes: scan.committed_bytes,
-            record_count: scan.record_count,
-            cumulative_plaintext_bytes: scan.cumulative_plaintext_bytes,
-            next_sequence: scan.next_sequence,
-            terminal_receipt: scan.terminal_receipt,
-            authenticated_prefix_digest: scan.authenticated_prefix_digest,
-            tail: scan.tail,
-            new_segment_publication: None,
-            poisoned: false,
-            writer_lease_held,
-        })
+        let scan = scan_journal(file, physical_bytes, identity, cipher, limits)?;
+        Ok((limits, scan))
     }
 
     /// [`Self::authenticate_existing`] (read-only) of a file whose header and
@@ -7197,6 +7332,80 @@ mod tests {
             .append_and_sync(b"successor exclusive record")
             .expect("append through successor authority");
         assert_eq!(successor_receipt.sequence(), first_receipt.sequence() + 1);
+    }
+
+    /// ft-hsczw: dropping an append journal frees its writer lease at once,
+    /// even while a child forked during the hold still shares its file until
+    /// the child's pre-exec close sweep. The try_clone stands in for that
+    /// child's copy; a close-only release would refuse the reopen
+    /// AppendWriterLeaseUnavailable.
+    #[cfg(unix)]
+    #[test]
+    fn dropped_journal_frees_its_writer_lease_while_a_forked_child_still_shares_it() {
+        let directory = tempfile::tempdir().expect("create writer-lease directory");
+        let path = directory.path().join("forked-lease.ftgout");
+        let parent = File::open(directory.path()).expect("open writer-lease parent");
+        let mut journal = create_new_test_journal(
+            &parent,
+            &path,
+            identity(),
+            cipher(),
+            GuardianOutputJournalLimits::default(),
+        )
+        .expect("create append authority");
+        journal
+            .sync_parent_directory_and_activate()
+            .expect("activate append authority");
+        let child_copy = journal.file.try_clone().expect("child's descriptor copy");
+
+        drop(journal);
+
+        let reopened = open_test_journal_for_append(
+            &parent,
+            &path,
+            identity(),
+            cipher(),
+            GuardianOutputJournalLimits::default(),
+        );
+        assert!(reopened.is_ok(), "{:?}", reopened.err());
+        drop(child_copy);
+    }
+
+    /// ft-hsczw: the same for an abandoned creation, which holds the lease
+    /// before its header is written.
+    #[cfg(unix)]
+    #[test]
+    fn abandoned_creation_frees_its_writer_lease_while_a_forked_child_still_shares_it() {
+        let directory = tempfile::tempdir().expect("create creation-lease directory");
+        let parent = File::open(directory.path()).expect("open creation-lease parent");
+        rustix::fs::fchmod(&parent, rustix::fs::Mode::from_raw_mode(0o700))
+            .expect("make creation-lease parent private");
+        let name = OsStr::new("abandoned.ftgout");
+        let creation = GuardianOutputJournalCreation::create_new_at(
+            &parent,
+            name,
+            identity(),
+            cipher(),
+            GuardianOutputJournalLimits::default(),
+        )
+        .expect("reserve a successor");
+        let child_copy = creation
+            .file
+            .as_ref()
+            .expect("an unfinished creation holds its file")
+            .try_clone()
+            .expect("child's descriptor copy");
+
+        drop(creation);
+
+        let contender =
+            File::open(directory.path().join(name)).expect("open an independent description");
+        let locked = rustix::fs::flock(
+            &contender,
+            rustix::fs::FlockOperation::NonBlockingLockExclusive,
+        );
+        assert!(locked.is_ok(), "{:?}", locked);
+        drop(child_copy);
     }
 
     #[cfg(unix)]

@@ -18339,27 +18339,12 @@ mod tests {
         guardian_incarnation: Uuid,
         pane_id: Uuid,
     ) -> Result<GuardianPaneOutputJournal, GuardianOutputError> {
-        // Parallel broker tests fork the test binary while unrelated output
-        // tests own journal descriptors. The child inherits that open-file
-        // description until the portable-pty pre-exec close sweep, so an
-        // immediate test-only cold reopen can transiently observe the old
-        // `flock` even after this process dropped its final handle. Production
-        // writer admission remains nonblocking and fail-closed; only this
-        // bounded restart witness waits for the CLOEXEC/pre-exec handoff.
-        for attempt in 0..100 {
-            match pipeline.cold_open_pane_for_validation(guardian_incarnation, pane_id) {
-                Err(GuardianOutputError::Journal(
-                    GuardianOutputJournalError::AppendWriterLeaseUnavailable(_),
-                )) if attempt < 99 => std::thread::sleep(Duration::from_millis(1)),
-                Err(GuardianOutputError::Journal(
-                    GuardianOutputJournalError::AppendWriterLeaseUnavailable(error),
-                )) => panic!(
-                    "test output writer lease remained unavailable after bounded handoff: {error}"
-                ),
-                result => return result,
-            }
-        }
-        unreachable!("the bounded output cold-open retry loop always returns")
+        // This once retried AppendWriterLeaseUnavailable: a child that a
+        // parallel test forks shares a dropped journal's file until its
+        // pre-exec close sweep, and the old close-only release left the
+        // writer lease held through that copy. The journal now unlocks its
+        // lease on drop (ft-hsczw), so the cold reopen must succeed at once.
+        pipeline.cold_open_pane_for_validation(guardian_incarnation, pane_id)
     }
 
     fn durable_commit(
@@ -26712,19 +26697,9 @@ mod tests {
 
         // Models PTY spawn or mio registration failure after preparation:
         // the exact empty publication is reopened rather than create_new'd.
-        // A child another test forks before its exec briefly holds a copy of
-        // the dropped journal's descriptor, and with it the writer lease.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let retry = loop {
-            match pipeline.prepare_pane(guardian_incarnation, pane_id) {
-                Err(GuardianOutputError::Journal(
-                    GuardianOutputJournalError::AppendWriterLeaseUnavailable(_),
-                )) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                other => break other?,
-            }
-        };
+        // The dropped journal unlocked its writer lease, so a child another
+        // test forked meanwhile cannot hold it over to this retry (ft-hsczw).
+        let retry = pipeline.prepare_pane(guardian_incarnation, pane_id)?;
         {
             let authority = retry
                 .authority
