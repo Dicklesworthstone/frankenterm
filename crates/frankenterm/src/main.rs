@@ -141695,8 +141695,8 @@ A  docs/new-proof.md\n";
         use frankenterm_core::recorder_storage::RecorderBackendKind;
         use frankenterm_core::recording::{
             RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventCausality,
-            RecorderEventPayload, RecorderEventSource, RecorderRedactionLevel,
-            RecorderSegmentKind, RecorderTextEncoding,
+            RecorderEventPayload, RecorderEventSource, RecorderRedactionLevel, RecorderSegmentKind,
+            RecorderTextEncoding,
         };
 
         let directory = tempfile::tempdir().unwrap();
@@ -141805,7 +141805,11 @@ A  docs/new-proof.md\n";
         )
         .err()
         .expect("unavailable backend must fail before source I/O");
-        assert!(error.downcast_ref::<RecorderBackendSelectionError>().is_some());
+        assert!(
+            error
+                .downcast_ref::<RecorderBackendSelectionError>()
+                .is_some()
+        );
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
     }
 

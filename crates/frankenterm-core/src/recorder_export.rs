@@ -546,15 +546,12 @@ fn format_transcript(
     Ok(output)
 }
 
-
 // =============================================================================
 // Bounded recorder snapshots -> CASR canonical sessions
 // =============================================================================
 
 #[cfg(feature = "session-resume")]
-pub use casr_export::{
-    CasrExportError, CasrExportRequest, CasrExportResult, export_casr_with_cx,
-};
+pub use casr_export::{CasrExportError, CasrExportRequest, CasrExportResult, export_casr_with_cx};
 
 #[cfg(feature = "session-resume")]
 mod casr_export {
@@ -573,8 +570,8 @@ mod casr_export {
     };
     use crate::recorder_storage::RecorderEventReader;
     use crate::recording::{
-        RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventPayload,
-        RecorderEventSource, RecorderLifecyclePhase, RecorderRedactionLevel, RecorderSegmentKind,
+        RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventPayload, RecorderEventSource,
+        RecorderLifecyclePhase, RecorderRedactionLevel, RecorderSegmentKind,
     };
     use crate::redactor::{REDACTED_MARKER, Redactor};
 
@@ -917,13 +914,23 @@ mod casr_export {
                         )
                     }
                 }
-                RecorderEventPayload::ControlMarker { control_marker_type, .. } => {
+                RecorderEventPayload::ControlMarker {
+                    control_marker_type,
+                    ..
+                } => {
                     extra["control_marker_type"] = json!(control_marker_type);
                     ("recorder_control", "Recorder control marker.", None, false)
                 }
-                RecorderEventPayload::LifecycleMarker { lifecycle_phase, .. } => {
+                RecorderEventPayload::LifecycleMarker {
+                    lifecycle_phase, ..
+                } => {
                     extra["lifecycle_phase"] = json!(lifecycle_phase);
-                    ("recorder_lifecycle", "Recorder lifecycle marker.", None, false)
+                    (
+                        "recorder_lifecycle",
+                        "Recorder lifecycle marker.",
+                        None,
+                        false,
+                    )
                 }
             };
             let message_content = if protected {
@@ -997,8 +1004,8 @@ mod casr_export {
                     .chars()
                     .filter(|ch| !ch.is_control() || *ch == '\n' || *ch == '\t')
                     .collect::<String>();
-                let mask_stream = normalized != stream.text
-                    && redactor.redact(&normalized) != normalized;
+                let mask_stream =
+                    normalized != stream.text && redactor.redact(&normalized) != normalized;
                 let mut span_index = 0;
                 for &(idx, start, end) in &stream.chunks {
                     while span_index < trace.replacements.len()
@@ -1051,8 +1058,8 @@ mod casr_export {
         matches!(
             event.payload,
             RecorderEventPayload::LifecycleMarker {
-                lifecycle_phase:
-                    RecorderLifecyclePhase::CaptureStarted | RecorderLifecyclePhase::PaneOpened,
+                lifecycle_phase: RecorderLifecyclePhase::CaptureStarted
+                    | RecorderLifecyclePhase::PaneOpened,
                 ..
             }
         )
@@ -1062,8 +1069,8 @@ mod casr_export {
         matches!(
             event.payload,
             RecorderEventPayload::LifecycleMarker {
-                lifecycle_phase:
-                    RecorderLifecyclePhase::CaptureStopped | RecorderLifecyclePhase::PaneClosed,
+                lifecycle_phase: RecorderLifecyclePhase::CaptureStopped
+                    | RecorderLifecyclePhase::PaneClosed,
                 ..
             }
         )
@@ -1130,9 +1137,7 @@ mod casr_export {
                 .next_batch(1)
                 .map_err(|_| CasrExportError::SourceUnavailable)?;
             if records.is_empty() {
-                if next_ordinal != head.ordinal
-                    || cursor.current_offset().ordinal != head.ordinal
-                {
+                if next_ordinal != head.ordinal || cursor.current_offset().ordinal != head.ordinal {
                     return Err(CasrExportError::InvalidSource);
                 }
                 break;
@@ -1200,7 +1205,13 @@ mod casr_export {
             if current.as_ref().is_some_and(|session| {
                 session.raw_session_id != event.session_id || starts_session(&event) || gap
             }) {
-                finish_session(&mut current, &mut sessions, &mut redacted_events, cx, &redactor)?;
+                finish_session(
+                    &mut current,
+                    &mut sessions,
+                    &mut redacted_events,
+                    cx,
+                    &redactor,
+                )?;
             }
             let session = current.get_or_insert_with(|| {
                 SessionBuilder::new(&event, record.offset.ordinal, timestamp)
@@ -1210,7 +1221,13 @@ mod casr_export {
                 session.canonical.ended_at = Some(timestamp);
             }
             if ends_session(&event) || gap {
-                finish_session(&mut current, &mut sessions, &mut redacted_events, cx, &redactor)?;
+                finish_session(
+                    &mut current,
+                    &mut sessions,
+                    &mut redacted_events,
+                    cx,
+                    &redactor,
+                )?;
             }
         }
         checkpoint(cx)?;
@@ -1224,7 +1241,13 @@ mod casr_export {
         if events_exported == 0 {
             return Err(CasrExportError::NoMatchingEvents);
         }
-        finish_session(&mut current, &mut sessions, &mut redacted_events, cx, &redactor)?;
+        finish_session(
+            &mut current,
+            &mut sessions,
+            &mut redacted_events,
+            cx,
+            &redactor,
+        )?;
         checkpoint(cx)?;
         let source_prefix_missing = source_start_ordinal != 0;
         let bundle = Bundle {
@@ -1313,9 +1336,10 @@ mod casr_export {
             }
 
             fn bytes(&self) -> u64 {
-                self.events.iter().map(|event| {
-                    4 + serde_json::to_vec(event).unwrap().len() as u64 + self.padding
-                }).sum()
+                self.events
+                    .iter()
+                    .map(|event| 4 + serde_json::to_vec(event).unwrap().len() as u64 + self.padding)
+                    .sum()
             }
         }
 
@@ -1326,7 +1350,11 @@ mod casr_export {
         }
 
         fn offset(ordinal: u64, byte_offset: u64) -> RecorderOffset {
-            RecorderOffset { segment_id: 0, byte_offset, ordinal }
+            RecorderOffset {
+                segment_id: 0,
+                byte_offset,
+                ordinal,
+            }
         }
 
         impl RecorderEventReader for Snapshot {
@@ -1336,9 +1364,10 @@ mod casr_export {
             ) -> Result<Box<dyn RecorderEventCursor>, EventCursorError> {
                 let index = from.ordinal.saturating_sub(self.start) as usize;
                 let index = index.min(self.events.len());
-                let byte_offset = self.events[..index].iter().map(|event| {
-                    4 + serde_json::to_vec(event).unwrap().len() as u64 + self.padding
-                }).sum();
+                let byte_offset = self.events[..index]
+                    .iter()
+                    .map(|event| 4 + serde_json::to_vec(event).unwrap().len() as u64 + self.padding)
+                    .sum();
                 Ok(Box::new(SnapshotCursor {
                     snapshot: self.clone(),
                     index,
@@ -1354,7 +1383,9 @@ mod casr_export {
         impl RecorderEventCursor for SnapshotCursor {
             fn next_batch(&mut self, max: usize) -> Result<Vec<CursorRecord>, EventCursorError> {
                 if self.snapshot.fail_after == Some(self.index) {
-                    return Err(EventCursorError::Unavailable("RAW_SECRET_DIAGNOSTIC".into()));
+                    return Err(EventCursorError::Unavailable(
+                        "RAW_SECRET_DIAGNOSTIC".into(),
+                    ));
                 }
                 if max == 0
                     || self.index == self.snapshot.events.len()
@@ -1371,7 +1402,8 @@ mod casr_export {
                     event,
                     offset: offset(ordinal, self.byte_offset),
                 };
-                self.byte_offset += 4 + serde_json::to_vec(&record.event).unwrap().len() as u64
+                self.byte_offset += 4
+                    + serde_json::to_vec(&record.event).unwrap().len() as u64
                     + self.snapshot.padding;
                 self.index += 1;
                 Ok(vec![record])
@@ -1425,7 +1457,10 @@ mod casr_export {
         }
 
         fn request() -> CasrExportRequest {
-            CasrExportRequest { pane_id: 7, ..CasrExportRequest::default() }
+            CasrExportRequest {
+                pane_id: 7,
+                ..CasrExportRequest::default()
+            }
         }
 
         fn export(
@@ -1465,9 +1500,16 @@ mod casr_export {
             assert_eq!(export.events_exported, 4);
             assert_eq!(export.redacted_events, 2);
             let text = String::from_utf8(export.data.clone()).unwrap();
-            for private in ["sk-", "abcdefghijklmnopqrstuvwxyz123456", "FOREIGN_PANE",
-                "PRIVATE_EVENT_ID", "PRIVATE_SESSION_ID", "PRIVATE_WORKFLOW_ID",
-                "PRIVATE_CORRELATION_ID", "PRIVATE_CONTROL_DETAILS"] {
+            for private in [
+                "sk-",
+                "abcdefghijklmnopqrstuvwxyz123456",
+                "FOREIGN_PANE",
+                "PRIVATE_EVENT_ID",
+                "PRIVATE_SESSION_ID",
+                "PRIVATE_WORKFLOW_ID",
+                "PRIVATE_CORRELATION_ID",
+                "PRIVATE_CONTROL_DETAILS",
+            ] {
                 assert!(!text.contains(private), "{private}");
             }
             let decoded = bundle(&export);
@@ -1518,14 +1560,29 @@ mod casr_export {
             let robot = export(&source, ActorKind::Robot, request()).unwrap();
             let robot_json = bundle(&robot);
             assert_eq!(robot.redacted_events, 2);
-            assert_eq!(robot_json["sessions"][0]["messages"][0]["content"], REDACTED_MARKER);
-            assert_eq!(robot_json["sessions"][0]["messages"][0]["role"]["Other"], "terminal_input_attempt");
-            assert_eq!(robot_json["sessions"][0]["messages"][0]["extra"]["delivery_verified"], false);
+            assert_eq!(
+                robot_json["sessions"][0]["messages"][0]["content"],
+                REDACTED_MARKER
+            );
+            assert_eq!(
+                robot_json["sessions"][0]["messages"][0]["role"]["Other"],
+                "terminal_input_attempt"
+            );
+            assert_eq!(
+                robot_json["sessions"][0]["messages"][0]["extra"]["delivery_verified"],
+                false
+            );
             let human = export(&source, ActorKind::Human, request()).unwrap();
             let human_json = bundle(&human);
             assert_eq!(human.redacted_events, 1);
-            assert_eq!(human_json["sessions"][0]["messages"][0]["content"], "possibly denied command");
-            assert_eq!(human_json["sessions"][0]["messages"][2]["content"], REDACTED_MARKER);
+            assert_eq!(
+                human_json["sessions"][0]["messages"][0]["content"],
+                "possibly denied command"
+            );
+            assert_eq!(
+                human_json["sessions"][0]["messages"][2]["content"],
+                REDACTED_MARKER
+            );
         }
 
         #[test]
@@ -1534,10 +1591,17 @@ mod casr_export {
             if let RecorderEventPayload::EgressOutput { redaction, .. } = &mut protected.payload {
                 *redaction = RecorderRedactionLevel::Full;
             }
-            let source = Snapshot::new(vec![protected, output("abcdefghijklmnopqrstuvwxyz123456", 7)]);
+            let source = Snapshot::new(vec![
+                protected,
+                output("abcdefghijklmnopqrstuvwxyz123456", 7),
+            ]);
             let export = export(&source, ActorKind::Human, request()).unwrap();
             assert_eq!(export.redacted_events, 2);
-            assert!(!String::from_utf8(export.data).unwrap().contains("abcdefghijklmnopqrstuvwxyz"));
+            assert!(
+                !String::from_utf8(export.data)
+                    .unwrap()
+                    .contains("abcdefghijklmnopqrstuvwxyz")
+            );
         }
 
         #[test]
@@ -1572,12 +1636,19 @@ mod casr_export {
             assert_eq!(sessions[0]["ended_at"], 1_000);
             assert!(sessions[1].get("ended_at").is_none());
             assert_eq!(sessions[2]["metadata"]["contains_gap"], true);
-            assert_eq!(sessions[3]["messages"][0]["role"]["Other"], "terminal_snapshot");
+            assert_eq!(
+                sessions[3]["messages"][0]["role"]["Other"],
+                "terminal_snapshot"
+            );
             assert!(sessions[4].get("ended_at").is_none());
             assert_eq!(decoded["receipt"]["complete_original_conversation"], false);
             let data = String::from_utf8(export.data).unwrap();
-            for private in ["PRIVATE_GAP_FRAGMENT", "PRIVATE_LIFECYCLE_REASON",
-                "PRIVATE_LIFECYCLE_DETAILS", "ANOTHER_PRIVATE_SESSION_ID"] {
+            for private in [
+                "PRIVATE_GAP_FRAGMENT",
+                "PRIVATE_LIFECYCLE_REASON",
+                "PRIVATE_LIFECYCLE_DETAILS",
+                "ANOTHER_PRIVATE_SESSION_ID",
+            ] {
                 assert!(!data.contains(private), "{private}");
             }
         }
@@ -1594,19 +1665,34 @@ mod casr_export {
             limits.max_events = 1;
             let exact = export(&source, ActorKind::Human, limits).unwrap();
             assert_eq!(exact.events_exported, 1);
-            assert_eq!(bundle(&exact)["receipt"]["source_framed_bytes_scanned"], source.bytes());
+            assert_eq!(
+                bundle(&exact)["receipt"]["source_framed_bytes_scanned"],
+                source.bytes()
+            );
             limits.max_source_bytes -= 1;
-            assert_eq!(export(&source, ActorKind::Human, limits).unwrap_err(), CasrExportError::SourceLimitExceeded);
+            assert_eq!(
+                export(&source, ActorKind::Human, limits).unwrap_err(),
+                CasrExportError::SourceLimitExceeded
+            );
             limits = request();
             limits.max_scan_events = 1;
-            assert_eq!(export(&source, ActorKind::Human, limits).unwrap_err(), CasrExportError::SourceLimitExceeded);
+            assert_eq!(
+                export(&source, ActorKind::Human, limits).unwrap_err(),
+                CasrExportError::SourceLimitExceeded
+            );
             let selected = Snapshot::new(vec![output("first", 7), output("second", 7)]);
             limits = request();
             limits.max_events = 1;
-            assert_eq!(export(&selected, ActorKind::Human, limits).unwrap_err(), CasrExportError::EventLimitExceeded);
+            assert_eq!(
+                export(&selected, ActorKind::Human, limits).unwrap_err(),
+                CasrExportError::EventLimitExceeded
+            );
             limits = request();
             limits.max_output_bytes = 10;
-            assert_eq!(export(&source, ActorKind::Human, limits).unwrap_err(), CasrExportError::OutputLimitExceeded);
+            assert_eq!(
+                export(&source, ActorKind::Human, limits).unwrap_err(),
+                CasrExportError::OutputLimitExceeded
+            );
         }
 
         #[test]
@@ -1614,15 +1700,26 @@ mod casr_export {
             let mut invalid = output("safe", 8);
             invalid.schema_version = "PRIVATE_UNSUPPORTED_SCHEMA".into();
             assert_eq!(
-                export(&Snapshot::new(vec![invalid, output("selected", 7)]), ActorKind::Human, request()).unwrap_err(),
+                export(
+                    &Snapshot::new(vec![invalid, output("selected", 7)]),
+                    ActorKind::Human,
+                    request()
+                )
+                .unwrap_err(),
                 CasrExportError::InvalidSource
             );
             let mut hole = Snapshot::new(vec![output("first", 7), output("second", 7)]);
             hole.hole_at = Some(1);
-            assert_eq!(export(&hole, ActorKind::Human, request()).unwrap_err(), CasrExportError::InvalidSource);
+            assert_eq!(
+                export(&hole, ActorKind::Human, request()).unwrap_err(),
+                CasrExportError::InvalidSource
+            );
             hole.hole_at = None;
             hole.stop_after = Some(1);
-            assert_eq!(export(&hole, ActorKind::Human, request()).unwrap_err(), CasrExportError::InvalidSource);
+            assert_eq!(
+                export(&hole, ActorKind::Human, request()).unwrap_err(),
+                CasrExportError::InvalidSource
+            );
         }
 
         #[test]
@@ -1631,23 +1728,34 @@ mod casr_export {
             source.fail_after = Some(0);
             let audit = AuditLog::new(AuditLogConfig::default());
             let error = export_casr_with_cx(
-                &Cx::for_testing(), &source,
+                &Cx::for_testing(),
+                &source,
                 &ActorIdentity::new(ActorKind::Human, "cli.record.export_casr"),
-                &request(), &audit, 2_000,
-            ).unwrap_err();
+                &request(),
+                &audit,
+                2_000,
+            )
+            .unwrap_err();
             assert_eq!(error, CasrExportError::SourceUnavailable);
             assert!(!error.to_string().contains("RAW_SECRET_DIAGNOSTIC"));
             let entries = audit.entries();
             assert_eq!(entries.len(), 1);
             assert_eq!(entries[0].scope.pane_ids, vec![7]);
-            assert!(!serde_json::to_string(&entries).unwrap().contains("RAW_SECRET_DIAGNOSTIC"));
+            assert!(
+                !serde_json::to_string(&entries)
+                    .unwrap()
+                    .contains("RAW_SECRET_DIAGNOSTIC")
+            );
         }
 
         #[test]
         fn invalid_limits_and_pre_cancelled_context_do_not_open_the_reader() {
             struct NeverOpen;
             impl RecorderEventReader for NeverOpen {
-                fn open_cursor(&self, _: RecorderOffset) -> Result<Box<dyn RecorderEventCursor>, EventCursorError> {
+                fn open_cursor(
+                    &self,
+                    _: RecorderOffset,
+                ) -> Result<Box<dyn RecorderEventCursor>, EventCursorError> {
                     panic!("reader must not open");
                 }
                 fn head_offset(&self) -> Result<RecorderOffset, EventCursorError> {
@@ -1673,7 +1781,12 @@ mod casr_export {
         #[test]
         fn absent_pane_and_unrepresentable_timestamp_are_typed_refusals() {
             assert_eq!(
-                export(&Snapshot::new(vec![output("other", 8)]), ActorKind::Human, request()).unwrap_err(),
+                export(
+                    &Snapshot::new(vec![output("other", 8)]),
+                    ActorKind::Human,
+                    request()
+                )
+                .unwrap_err(),
                 CasrExportError::NoMatchingEvents
             );
             let mut event = output("selected", 7);
@@ -1689,14 +1802,27 @@ mod casr_export {
             let source = Snapshot::new(vec![output("public", 7)]);
             let first = bundle(&export(&source, ActorKind::Human, request()).unwrap());
             let again = bundle(&export(&source, ActorKind::Human, request()).unwrap());
-            assert_eq!(first["sessions"][0]["session_id"], again["sessions"][0]["session_id"]);
+            assert_eq!(
+                first["sessions"][0]["session_id"],
+                again["sessions"][0]["session_id"]
+            );
             let mut other = source.clone();
             other.events[0].event_id = "ANOTHER_PRIVATE_EVENT_ID".into();
             let other_export = export(&other, ActorKind::Human, request()).unwrap();
             let other_json = bundle(&other_export);
-            assert_ne!(first["sessions"][0]["session_id"], other_json["sessions"][0]["session_id"]);
-            assert_ne!(first["sessions"][0]["source_path"], other_json["sessions"][0]["source_path"]);
-            assert!(!String::from_utf8(other_export.data).unwrap().contains("ANOTHER_PRIVATE_EVENT_ID"));
+            assert_ne!(
+                first["sessions"][0]["session_id"],
+                other_json["sessions"][0]["session_id"]
+            );
+            assert_ne!(
+                first["sessions"][0]["source_path"],
+                other_json["sessions"][0]["source_path"]
+            );
+            assert!(
+                !String::from_utf8(other_export.data)
+                    .unwrap()
+                    .contains("ANOTHER_PRIVATE_EVENT_ID")
+            );
         }
 
         #[test]
@@ -1704,7 +1830,8 @@ mod casr_export {
             let mut events = vec![output("key=sk-", 7)];
             for index in 0..128 {
                 let mut event = output(&format!("visible snapshot {index}"), 7);
-                if let RecorderEventPayload::EgressOutput { segment_kind, .. } = &mut event.payload {
+                if let RecorderEventPayload::EgressOutput { segment_kind, .. } = &mut event.payload
+                {
                     *segment_kind = RecorderSegmentKind::Snapshot;
                 }
                 events.push(event);
