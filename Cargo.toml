@@ -635,8 +635,8 @@ trybuild = { version = "1.0.116", default-features = false }
 # defaults (logging, std, tls12) so behavior is otherwise unchanged.
 rustls = { version = "0.23.40", default-features = false, features = ["logging", "std", "tls12", "ring"] }
 rustls-pemfile = "2.2.0"
-fastmcp = { version = "=0.13.0", git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "7663cf56ccaabfa6bce5e681ddc14e38460c224b", package = "fastmcp-rust", features = ["legacy-2024-11-05", "testing-lab"] }
-fastmcp-server = { version = "=0.13.0", git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "7663cf56ccaabfa6bce5e681ddc14e38460c224b" }
+fastmcp = { version = "=0.13.0", git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "d04c583971677eac3a20ee657ca35f889b3a0bbd", package = "fastmcp-rust", features = ["legacy-2024-11-05", "testing-lab"] }
+fastmcp-server = { version = "=0.13.0", git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "d04c583971677eac3a20ee657ca35f889b3a0bbd" }
 fastapi = { version = "=0.5.0", git = "https://github.com/Dicklesworthstone/fastapi_rust", rev = "d265d45ecbc52cc8d9deb1cbd2019d49fd65dffa", package = "fastapi-rust" }
 
 # FrankenSearch (optional integration, enabled via frankenterm-core feature flag)
