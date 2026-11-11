@@ -21,8 +21,30 @@ fn core_src(file: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
+/// Matches token text, not layout: rustfmt may break a method chain
+/// (`stream\n    .acknowledge(event_id)`) without changing the wiring these
+/// guards pin. Dropping whitespace on both sides can only turn a mismatch
+/// that differed by whitespace into a match; different tokens still miss.
 fn contains_all(src: &str, needles: &[&str]) -> bool {
-    needles.iter().all(|needle| src.contains(needle))
+    let src = without_whitespace(src);
+    needles
+        .iter()
+        .all(|needle| src.contains(&without_whitespace(needle)))
+}
+
+fn without_whitespace(text: &str) -> String {
+    text.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+#[test]
+fn contains_all_ignores_layout_but_not_tokens() {
+    let reflowed = "if let Some(event_id) = acknowledge {\n    stream\n        .acknowledge(event_id)\n        .map_err(std::io::Error::other)?;\n}";
+    assert!(contains_all(reflowed, &["stream.acknowledge(event_id)"]));
+    assert!(!contains_all(reflowed, &["stream.acknowledge(event.id)"]));
+    assert!(!contains_all(
+        "stream.acknowledge(other_id)",
+        &["stream.acknowledge(event_id)"]
+    ));
 }
 
 fn watch_events_unification_contract() -> serde_json::Value {
