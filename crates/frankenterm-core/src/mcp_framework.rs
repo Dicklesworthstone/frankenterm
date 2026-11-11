@@ -580,6 +580,34 @@ pub(crate) struct OutboundFrameworkClient {
     ///      bound across every supported platform and synchronous transport.
     configured_response_timeout_ms: u64,
     connection_cx: crate::cx::Cx,
+    /// Whether this wrapper has asked FastMCP to close the connection, so
+    /// that its `Drop` does not close it a second time.
+    closed: bool,
+}
+
+/// Closes a connection its owner dropped without [`OutboundFrameworkClient::shutdown`]
+/// the way MCP stdio shutdown asks: the server's stdin first, then FastMCP's
+/// bounded wait for it to exit on its own, and a signal only after that.
+/// FastMCP's own `Drop` for its client closes stdin and signals a server that
+/// is still running at once, so a server with work left to do on EOF is killed
+/// before it can do it. `ft mcp serve` drops its proxy's upstream clients this
+/// way when its own stdin closes; their upstream servers were killed instead
+/// of seeing EOF.
+#[cfg(feature = "mcp-client")]
+impl Drop for OutboundFrameworkClient {
+    fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
+        if let Err(err) = self.close_connection() {
+            tracing::warn!(
+                target: "ft::mcp_framework",
+                event = "mcp_framework_client_drop_close_failed",
+                error = %err,
+                "Closing a dropped outbound MCP client did not verify subprocess cleanup"
+            );
+        }
+    }
 }
 
 #[cfg(feature = "mcp-client")]
@@ -786,6 +814,7 @@ impl OutboundFrameworkClient {
             inner: client,
             configured_response_timeout_ms: settings.timeout_ms,
             connection_cx: cx.clone(),
+            closed: false,
         })
     }
 
@@ -856,8 +885,7 @@ impl OutboundFrameworkClient {
                 _ => {
                     // A result contradicting its negotiated core method is
                     // terminal, just as in the framework's typed adapter.
-                    self.inner
-                        .close()
+                    self.close_connection()
                         .map_err(OutboundFrameworkError::Transport)?;
                     return Err(invalid("Invalid remote tools/list result payload"));
                 }
@@ -967,6 +995,15 @@ impl OutboundFrameworkClient {
 
     /// Close the connection and report whether owned subprocess cleanup succeeded.
     pub(crate) fn shutdown(mut self) -> FrameworkMcpResult<()> {
+        self.close_connection()
+    }
+
+    /// The one close this wrapper makes. FastMCP's close shuts the server's
+    /// stdin, gives an initialized server a bounded grace to exit on EOF, then
+    /// signals and reaps it; a close it reports as failed is not retried here,
+    /// and FastMCP's own `Drop` still stops a child it retained.
+    fn close_connection(&mut self) -> FrameworkMcpResult<()> {
+        self.closed = true;
         self.inner.close()
     }
 }

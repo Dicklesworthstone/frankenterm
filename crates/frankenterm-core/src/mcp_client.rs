@@ -1169,6 +1169,71 @@ mod tests {
         client.shutdown().expect("settle MCP subprocess cleanup");
     }
 
+    /// `ft mcp serve` drops its proxy's upstream clients when it exits. A
+    /// dropped client must close the way `shutdown` does: the server's stdin
+    /// first, then a bounded wait for it to exit on EOF. FastMCP's own drop
+    /// signals a server that is still running at once, so this server was
+    /// killed before it could record EOF.
+    #[test]
+    fn dropped_outbound_client_lets_its_server_finish_on_eof() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+
+        let temp_dir = tempdir().expect("temp dir");
+        let script_path = temp_dir.path().join("mock_mcp_server.py");
+        let closed_path = temp_dir.path().join("stdin-closed");
+        // The mock answers until EOF. This tail then takes a moment before
+        // recording that it saw EOF, as a server flushing its state would.
+        std::fs::write(
+            &script_path,
+            format!(
+                "{}\nimport pathlib, time\ntime.sleep(0.3)\npathlib.Path(sys.argv[1]).write_text('stdin closed')\n",
+                mock_server_script()
+            ),
+        )
+        .expect("write mock script");
+        let server = ExternalServerConfig {
+            name: "mock".to_string(),
+            command: "python3".to_string(),
+            args: vec![
+                "-u".to_string(),
+                script_path.display().to_string(),
+                closed_path.display().to_string(),
+            ],
+            env: HashMap::new(),
+            cwd: None,
+            disabled: false,
+        };
+        let settings = McpClientConfig {
+            enabled: true,
+            timeout_ms: 5_000,
+            ..McpClientConfig::default()
+        };
+
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::multi_thread()
+            .worker_threads(2)
+            .build()
+            .expect("MCP client test runtime");
+        let mut client = runtime.block_on(async {
+            let cx = crate::cx::Cx::current().expect("runtime-owned client context");
+            FtMcpClient::connect_external(&cx, server, &settings)
+                .await
+                .expect("connect to mock server")
+        });
+        client.list_tools().expect("list tools");
+        drop(client);
+        assert!(
+            closed_path.exists(),
+            "a dropped client must let its server see EOF and finish before signalling it"
+        );
+    }
+
     #[test]
     fn outbound_mcp_logs_redact_secret_shaped_server_labels() {
         if std::process::Command::new("python3")
