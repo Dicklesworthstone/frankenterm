@@ -23690,6 +23690,63 @@ static POOL_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 static POOL_RETURNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static POOL_CAPACITY_DISCARDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// One read-pool event. `record` adds it to its process-global counter. Test
+/// builds also count it for the current thread, so a pool regression can
+/// assert exact counts for its own acquires and returns
+/// (`thread_pool_telemetry_snapshot`) while unrelated tests in the same
+/// process use the pool concurrently.
+#[derive(Clone, Copy)]
+enum PoolEvent {
+    Hit,
+    Miss,
+    Return,
+    CapacityDiscard,
+}
+
+#[cfg(test)]
+thread_local! {
+    static THREAD_POOL_EVENTS: std::cell::Cell<PoolTelemetrySnapshot> = const {
+        std::cell::Cell::new(PoolTelemetrySnapshot {
+            hits: 0,
+            misses: 0,
+            returns: 0,
+            capacity_discards: 0,
+            pool_lock_poisoned: 0,
+        })
+    };
+}
+
+impl PoolEvent {
+    fn record(self) {
+        let counter = match self {
+            Self::Hit => &POOL_HITS,
+            Self::Miss => &POOL_MISSES,
+            Self::Return => &POOL_RETURNS,
+            Self::CapacityDiscard => &POOL_CAPACITY_DISCARDS,
+        };
+        saturating_atomic_u64_add(counter, 1);
+        #[cfg(test)]
+        THREAD_POOL_EVENTS.with(|events| {
+            let mut counts = events.get();
+            let count = match self {
+                Self::Hit => &mut counts.hits,
+                Self::Miss => &mut counts.misses,
+                Self::Return => &mut counts.returns,
+                Self::CapacityDiscard => &mut counts.capacity_discards,
+            };
+            *count = count.saturating_add(1);
+            events.set(counts);
+        });
+    }
+}
+
+/// Test builds: the pool events recorded on the current thread so far.
+/// Poison recoveries are not tracked per thread; `pool_lock_poisoned` reads 0.
+#[cfg(test)]
+fn thread_pool_telemetry_snapshot() -> PoolTelemetrySnapshot {
+    THREAD_POOL_EVENTS.with(std::cell::Cell::get)
+}
+
 // br-ft-ac4j0: pool-lock poison-recovery counter.
 //
 // Pre-fix `PooledReadConn::acquire` used `.expect("read connection
@@ -24219,7 +24276,7 @@ impl PooledReadConn {
                 Some(c) => {
                     // br-ft-rvt1z: pool hit — recycled an existing
                     // pre-warmed connection.
-                    saturating_atomic_u64_add(&POOL_HITS, 1);
+                    PoolEvent::Hit.record();
                     c.backend
                 }
                 None => {
@@ -24228,7 +24285,7 @@ impl PooledReadConn {
                     // open call so a failed open still counts as a miss
                     // attempt (the test invariant is hit-rate, not
                     // success-rate).
-                    saturating_atomic_u64_add(&POOL_MISSES, 1);
+                    PoolEvent::Miss.record();
                     open_read_storage_backend(db_path)?
                 }
             };
@@ -24383,7 +24440,7 @@ impl Drop for PooledReadConn {
                                 pool.remove(&evict_path);
                             }
                             if evicted_backend.is_some() {
-                                saturating_atomic_u64_add(&POOL_CAPACITY_DISCARDS, 1);
+                                PoolEvent::CapacityDiscard.record();
                             }
                         }
                     }
@@ -24400,9 +24457,9 @@ impl Drop for PooledReadConn {
                             returned_at: std::time::Instant::now(),
                         });
                         // br-ft-rvt1z: counted only on successful return.
-                        saturating_atomic_u64_add(&POOL_RETURNS, 1);
+                        PoolEvent::Return.record();
                     } else {
-                        saturating_atomic_u64_add(&POOL_CAPACITY_DISCARDS, 1);
+                        PoolEvent::CapacityDiscard.record();
                     }
                 }
                 Err(_) => {
@@ -46755,7 +46812,7 @@ mod pool_telemetry_tests {
         StorageBackendProvider, StorageHandle, StorageWriterOpenRequest,
         default_storage_backend_provider, pool_telemetry_snapshot, pooled_backend, read_pool,
         register_storage_backend_provider, reset_pool_lock_poisoned_count_for_test,
-        run_storage_async_test, with_provider_read_backend,
+        run_storage_async_test, thread_pool_telemetry_snapshot, with_provider_read_backend,
     };
     use crate::storage_backend_trait::{
         BackendError, MockBackend, OpenConfig, RusqliteBackend, StorageBackend, ToSqlValue,
@@ -46827,6 +46884,16 @@ mod pool_telemetry_tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    /// Serializes the tests that share the isolated pool or the counters.
+    /// The lock guards no data, and `IsolatedPool` cleans up while a failed
+    /// test unwinds, so a later test recovers the guard instead of failing
+    /// on the poison: each failure is then reported by the test that failed.
+    fn pool_counter_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        pool_counter_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     // Callers hold pool_counter_test_lock for this guard's entire lifetime.
     struct IsolatedPool;
 
@@ -46856,9 +46923,7 @@ mod pool_telemetry_tests {
     fn pooled_return_preserves_cached_statement_and_immutable_authorizer() {
         use rusqlite::hooks::{AuthAction, Authorization};
 
-        let _guard = pool_counter_test_lock()
-            .lock()
-            .expect("pool telemetry test lock should not be poisoned");
+        let _guard = pool_counter_test_guard();
         let directory = tempfile::tempdir().expect("cache regression directory");
         let _isolated_pool = IsolatedPool::enter();
         let path = directory
@@ -47097,7 +47162,7 @@ mod pool_telemetry_tests {
 
     #[test]
     fn read_pool_evicts_oldest_idle_backend_instead_of_hot_hash_bucket() {
-        let _guard = pool_counter_test_lock().lock().expect("pool test lock");
+        let _guard = pool_counter_test_guard();
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let _isolated_pool = IsolatedPool::enter();
         for index in 0..MAX_IDLE_READ_BACKENDS {
@@ -47162,9 +47227,7 @@ mod pool_telemetry_tests {
 
     #[test]
     fn read_pool_process_wide_idle_capacity_is_bounded_across_paths() {
-        let _guard = pool_counter_test_lock()
-            .lock()
-            .expect("pool telemetry test lock should not be poisoned");
+        let _guard = pool_counter_test_guard();
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let start = baseline();
         let mut db_paths = Vec::with_capacity(MAX_IDLE_READ_BACKENDS + 1);
@@ -47211,9 +47274,7 @@ mod pool_telemetry_tests {
 
     #[test]
     fn read_pool_panicked_borrow_does_not_retain_empty_path_entries() {
-        let _guard = pool_counter_test_lock()
-            .lock()
-            .expect("pool telemetry test lock should not be poisoned");
+        let _guard = pool_counter_test_guard();
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let _isolated_pool = IsolatedPool::enter();
 
@@ -47259,9 +47320,7 @@ mod pool_telemetry_tests {
     /// be useless because every database read would inflate it.
     #[test]
     fn pool_lock_poisoned_unchanged_for_clean_acquire_release() {
-        let _guard = pool_counter_test_lock()
-            .lock()
-            .expect("pool telemetry test lock should not be poisoned");
+        let _guard = pool_counter_test_guard();
         reset_pool_lock_poisoned_count_for_test();
 
         let dir = tempfile::tempdir().unwrap();
@@ -47283,9 +47342,13 @@ mod pool_telemetry_tests {
 
     #[test]
     fn pool_acquire_release_cycle_records_hits() {
-        let _guard = pool_counter_test_lock()
-            .lock()
-            .expect("pool telemetry test lock should not be poisoned");
+        let _guard = pool_counter_test_guard();
+        // The isolated pool keeps unrelated tests' returns from evicting this
+        // path's idle backend, and the counts below are this thread's own, so
+        // concurrent pool users elsewhere in the process change neither. On
+        // the shared pool and process-global counters this test once counted
+        // 21 acquires for its 20.
+        let _isolated_pool = IsolatedPool::enter();
 
         // br-ft-rvt1z acceptance: N sequential acquires against the
         // same db_path should yield 1 miss + (N-1) hits, since the
@@ -47303,7 +47366,7 @@ mod pool_telemetry_tests {
         // file without using a raw rusqlite seed connection.
         std::fs::File::create(&db_path).expect("seed database file");
 
-        let start = baseline();
+        let start = thread_pool_telemetry_snapshot();
         const N: u64 = 20;
         for _ in 0..N {
             let pooled = PooledReadConn::acquire(&db_path_str).expect("acquire");
@@ -47316,7 +47379,7 @@ mod pool_telemetry_tests {
             });
             // Drop returns the backend to the pool.
         }
-        let end = baseline();
+        let end = thread_pool_telemetry_snapshot();
         let d = delta(start, end);
 
         assert_eq!(
@@ -47326,19 +47389,11 @@ mod pool_telemetry_tests {
             d.hits,
             d.misses,
         );
-        assert!(
-            d.misses >= 1,
-            "first acquire for a fresh db_path must miss (got {} misses)",
-            d.misses,
-        );
-        // The first acquire is necessarily a miss; every subsequent
-        // acquire should hit because the Drop returned the conn to
-        // the LIFO. Allow up to 2 misses to absorb the rare case
-        // where another pool consumer in the same process drained
-        // our slot mid-loop.
-        assert!(
-            d.misses <= 2,
-            "sequential reuse should produce at most 2 misses (got {} misses)",
+        // The first acquire is necessarily a miss; every later one pops the
+        // backend the previous Drop returned to the LIFO.
+        assert_eq!(
+            d.misses, 1,
+            "only the first acquire for a fresh db_path may miss (got {} misses)",
             d.misses,
         );
         // br-ft-rvt1z hit-rate floor: > 80%.
@@ -47351,21 +47406,23 @@ mod pool_telemetry_tests {
             d.hits,
             d.misses,
         );
-        // Returns count must be at most acquires (each PooledReadConn
-        // returns its conn at most once on Drop).
-        assert!(
-            d.returns <= N,
-            "returns ({}) must be <= acquires ({}) — Drop counts at most once per acquire",
-            d.returns,
-            N,
+        // Each Drop returns its autocommit backend to the pool exactly once,
+        // and one idle backend never needs a capacity discard.
+        assert_eq!(
+            d.returns, N,
+            "every Drop must return its backend to the pool (got {} returns for {} acquires)",
+            d.returns, N,
+        );
+        assert_eq!(
+            d.capacity_discards, 0,
+            "one idle backend must not be discarded for capacity (got {})",
+            d.capacity_discards,
         );
     }
 
     #[test]
     fn pooled_backend_lends_trait_object() {
-        let _guard = pool_counter_test_lock()
-            .lock()
-            .expect("pool telemetry test lock should not be poisoned");
+        let _guard = pool_counter_test_guard();
 
         fn require_trait_object(_: &dyn StorageBackend) {}
 
@@ -47531,9 +47588,7 @@ mod pool_telemetry_tests {
 
     #[test]
     fn default_provider_read_lending_preserves_pool_ft_qz6wi() {
-        let _guard = pool_counter_test_lock()
-            .lock()
-            .expect("pool telemetry test lock should not be poisoned");
+        let _guard = pool_counter_test_guard();
 
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let db_path = temp_dir.path().join("provider_pool_trait.db");
@@ -47584,9 +47639,7 @@ mod pool_telemetry_tests {
 
     #[test]
     fn registered_provider_overrides_pooled_backend_lending_ft_qz6wi() {
-        let _guard = pool_counter_test_lock()
-            .lock()
-            .expect("pool telemetry test lock should not be poisoned");
+        let _guard = pool_counter_test_guard();
 
         let db_path = format!(
             "mock-provider-{}-{}",
@@ -47622,9 +47675,7 @@ mod pool_telemetry_tests {
 
     #[test]
     fn storage_handle_default_rusqlite_provider_roundtrip_and_pool_parity_ft_3hfif() {
-        let _guard = pool_counter_test_lock()
-            .lock()
-            .expect("pool telemetry test lock should not be poisoned");
+        let _guard = pool_counter_test_guard();
 
         run_storage_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
