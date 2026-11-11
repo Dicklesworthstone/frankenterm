@@ -16,7 +16,7 @@
       "status": "ok"
     },
     {
-      "detail": "schema v48, wal mode",
+      "detail": "schema v50, wal mode",
       "name": "database",
       "status": "ok"
     },
