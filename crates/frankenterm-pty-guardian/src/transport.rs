@@ -4008,10 +4008,37 @@ impl Drop for GuardianTokenPublicationLease {
 }
 
 struct PreparedTokenStage {
-    stage: File,
-    readiness: File,
+    stage: TokenStageFlock,
+    readiness: TokenStageFlock,
     material_digest: [u8; 32],
     readiness_record: [u8; TOKEN_STAGE_COMMIT_BYTES],
+}
+
+/// A token stage or readiness file that lock_token_stage locked. Drop
+/// unlocks it before the file closes: a pane child forked meanwhile shares
+/// its open file description, and a close-only release would leave the next
+/// provisioner refused with token-stage-lock until that child execs
+/// (ft-hsczw). Built right after the lock, so every early return releases it.
+struct TokenStageFlock(File);
+
+impl std::ops::Deref for TokenStageFlock {
+    type Target = File;
+
+    fn deref(&self) -> &File {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for TokenStageFlock {
+    fn deref_mut(&mut self) -> &mut File {
+        &mut self.0
+    }
+}
+
+impl Drop for TokenStageFlock {
+    fn drop(&mut self) {
+        let _ = unlock_token_stage(&self.0);
+    }
 }
 
 #[cfg(any(
@@ -4137,7 +4164,7 @@ fn prepare_token_stage(
     stage_name: &OsStr,
     commit_name: &OsStr,
 ) -> Result<PreparedTokenStage, GuardianServiceError> {
-    let mut file = match open_private_file_at(parent, stage_name, false) {
+    let file = match open_private_file_at(parent, stage_name, false) {
         Ok(file) => {
             let metadata = file
                 .metadata()
@@ -4165,6 +4192,7 @@ fn prepare_token_stage(
         Err(error) => return Err(nofollow_open_error("token-stage-open", error)),
     };
     lock_token_stage(&file).map_err(|error| GuardianServiceError::io("token-stage-lock", error))?;
+    let mut file = TokenStageFlock(file);
     let before = file
         .metadata()
         .map_err(|error| GuardianServiceError::io("token-stage-opened-metadata", error))?;
@@ -4490,7 +4518,10 @@ fn validate_published_token_binding(
     Ok(())
 }
 
-fn open_token_stage_commit(parent: &File, name: &OsStr) -> Result<File, GuardianServiceError> {
+fn open_token_stage_commit(
+    parent: &File,
+    name: &OsStr,
+) -> Result<TokenStageFlock, GuardianServiceError> {
     let file = match open_private_file_at(parent, name, false) {
         Ok(file) => {
             let opened = file.metadata().map_err(|error| {
@@ -4518,7 +4549,7 @@ fn open_token_stage_commit(parent: &File, name: &OsStr) -> Result<File, Guardian
     };
     lock_token_stage(&file)
         .map_err(|error| GuardianServiceError::io("token-stage-commit-lock", error))?;
-    Ok(file)
+    Ok(TokenStageFlock(file))
 }
 
 fn token_stage_commit_record(token: &[u8]) -> [u8; TOKEN_STAGE_COMMIT_BYTES] {
@@ -4779,6 +4810,35 @@ fn lock_token_stage(_file: &std::fs::File) -> std::io::Result<()> {
     Err(std::io::Error::new(
         ErrorKind::Unsupported,
         "safe guardian token stage locking is unsupported on this Unix target",
+    ))
+}
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+))]
+fn unlock_token_stage(file: &std::fs::File) -> std::io::Result<()> {
+    rustix::fs::flock(file, rustix::fs::FlockOperation::Unlock).map_err(std::io::Error::from)
+}
+
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+)))]
+fn unlock_token_stage(_file: &std::fs::File) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        ErrorKind::Unsupported,
+        "safe guardian token stage unlocking is unsupported on this Unix target",
     ))
 }
 
@@ -10100,6 +10160,46 @@ mod tests {
         );
         assert!(!active_path.exists());
         assert!(displaced.exists());
+    }
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+    ))]
+    #[test]
+    fn dropped_token_stage_is_free_while_a_forked_child_still_shares_its_locks() {
+        let canonical_temp = crate::canonical_test_temp_root();
+        let directory = tempfile::Builder::new()
+            .prefix("frankenterm-guardian-token-stage-fork-")
+            .tempdir_in(canonical_temp)
+            .unwrap()
+            .keep();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let active_path = directory.join("guardian.token");
+        let stage_path = token_stage_path(&active_path).unwrap();
+        let commit_path = token_stage_commit_path(&stage_path).unwrap();
+        let stage_name = stage_path.file_name().unwrap();
+        let commit_name = commit_path.file_name().unwrap();
+        let pinned = open_private_parent(&active_path).unwrap();
+        let prepared = prepare_token_stage(&pinned, stage_name, commit_name).unwrap();
+        let digest = prepared.material_digest;
+        // These copies stand in for a pane child forked while the stage was
+        // held: it shares both open file descriptions until it execs.
+        let child_stage = prepared.stage.try_clone().unwrap();
+        let child_readiness = prepared.readiness.try_clone().unwrap();
+        drop(prepared);
+
+        let reprepared = prepare_token_stage(&pinned, stage_name, commit_name)
+            .expect("a dropped stage must not stay locked through a forked child's copy");
+        assert_eq!(reprepared.material_digest, digest);
+        drop(reprepared);
+        drop(child_stage);
+        drop(child_readiness);
     }
 
     #[test]
