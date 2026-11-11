@@ -3447,11 +3447,139 @@ fn sqlite_recorder_lag(conn: &Connection) -> Result<RecorderStorageLag, Recorder
 #[derive(Debug, Clone)]
 pub struct RusqliteEventReader {
     db_path: PathBuf,
+    snapshot: Option<Arc<RusqliteReadSnapshot>>,
 }
 
 impl RusqliteEventReader {
     pub fn new(db_path: PathBuf) -> Self {
-        Self { db_path }
+        Self {
+            db_path,
+            snapshot: None,
+        }
+    }
+
+    /// Open a finite-head, read-only transaction with bounded JSON allocation.
+    ///
+    /// Unlike the live reader returned by `new`, all cursors share the captured
+    /// database view. The caller must bound the number of rows it consumes.
+    /// SQLite's own value limit is set before schema reads, and actual payload
+    /// byte lengths are checked before copying JSON into Rust. A progress hook
+    /// makes database work cancellation-aware. Run this on a blocking worker.
+    pub fn open_bounded_with_cx(
+        cx: &crate::cx::Cx,
+        db_path: PathBuf,
+        max_record_payload_bytes: u64,
+    ) -> std::result::Result<Self, EventCursorError> {
+        sqlite_snapshot_checkpoint(cx)?;
+        if max_record_payload_bytes == 0
+            || max_record_payload_bytes
+                > crate::tuning_config::IngestTuning::DEFAULT_MAX_RECORD_PAYLOAD_BYTES as u64
+        {
+            return Err(sqlite_snapshot_unavailable("rusqlite_invalid_read_limit"));
+        }
+        // SQLite's VFS open precedes its progress handler. Reject ordinary
+        // FIFO/device/symlink inputs before that potentially blocking operation.
+        let (directory, name) = recorder_parent(&db_path)
+            .map_err(|_| sqlite_snapshot_unavailable("rusqlite_source_unavailable"))?;
+        let metadata = directory
+            .symlink_metadata(&name)
+            .map_err(|_| sqlite_snapshot_unavailable("rusqlite_source_unavailable"))?;
+        if !metadata.is_file() {
+            return Err(sqlite_snapshot_unavailable("rusqlite_nonregular_source"));
+        }
+        let source_identity = recorder_file_identity(&metadata)
+            .map_err(|_| sqlite_snapshot_unavailable("rusqlite_identity_unavailable"))?;
+        let conn = Connection::open_with_flags(
+            &db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(|_| sqlite_snapshot_unavailable("rusqlite_source_unavailable"))?;
+        // Leave finite space for the remaining columns in SQLite's encoded row.
+        // This prevents even a dishonest payload_bytes column or an oversized
+        // schema value from bypassing the Rust-side allocation guard.
+        let sqlite_value_limit = i32::try_from(max_record_payload_bytes + 64 * 1024)
+            .map_err(|_| sqlite_snapshot_unavailable("rusqlite_invalid_read_limit"))?;
+        conn.set_limit(
+            rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH,
+            sqlite_value_limit,
+        )
+        .map_err(|_| sqlite_snapshot_unavailable("rusqlite_read_limit_unavailable"))?;
+        conn.busy_timeout(std::time::Duration::ZERO)
+            .map_err(|_| sqlite_snapshot_unavailable("rusqlite_source_unavailable"))?;
+        let progress_cx = cx.clone();
+        conn.progress_handler(1_000, Some(move || progress_cx.checkpoint().is_err()))
+            .map_err(|_| sqlite_snapshot_unavailable("rusqlite_source_unavailable"))?;
+        conn.pragma_update(None, "trusted_schema", false)
+            .map_err(|_| sqlite_snapshot_unavailable("rusqlite_source_unavailable"))?;
+        conn.execute_batch("BEGIN DEFERRED")
+            .map_err(|_| sqlite_snapshot_unavailable("rusqlite_snapshot_unavailable"))?;
+        // Require the indexed table shape used by the recorder. A view or an
+        // unindexed ordinal column could turn one bounded page into a full scan.
+        let indexed_table: bool = conn
+            .query_row(
+                "SELECT EXISTS (
+                     SELECT 1 FROM pragma_table_list
+                     WHERE schema = 'main' AND name = 'recorder_events' AND type = 'table'
+                 ) AND EXISTS (
+                     SELECT 1 FROM pragma_table_info('recorder_events')
+                     WHERE name = 'ordinal' AND upper(type) = 'INTEGER' AND pk = 1
+                 ) AND (
+                     SELECT COUNT(*) FROM pragma_table_info('recorder_events') WHERE pk > 0
+                 ) = 1 AND NOT EXISTS (
+                     SELECT 1 FROM pragma_index_list('recorder_events') WHERE origin = 'pk'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| sqlite_snapshot_unavailable("rusqlite_invalid_schema"))?;
+        if !indexed_table {
+            return Err(sqlite_snapshot_unavailable("rusqlite_invalid_schema"));
+        }
+        conn.prepare(
+            "SELECT ordinal, segment_id, byte_offset, payload_json, payload_bytes
+             FROM recorder_events LIMIT 0",
+        )
+        .map_err(|_| sqlite_snapshot_unavailable("rusqlite_invalid_schema"))?;
+        let head = match sqlite_last_record(&conn)
+            .map_err(|_| sqlite_snapshot_unavailable("rusqlite_invalid_head"))?
+        {
+            Some((last, payload_bytes)) => {
+                if payload_bytes > max_record_payload_bytes {
+                    return Err(sqlite_snapshot_corrupt(
+                        last,
+                        "rusqlite_record_payload_limit",
+                    ));
+                }
+                sqlite_snapshot_next_offset(&last, payload_bytes)?
+            }
+            None => RecorderOffset {
+                segment_id: 0,
+                byte_offset: 0,
+                ordinal: 0,
+            },
+        };
+        let (named_directory, named_leaf) = recorder_parent(&db_path)
+            .map_err(|_| sqlite_snapshot_unavailable("rusqlite_source_changed"))?;
+        let named = named_directory
+            .symlink_metadata(&named_leaf)
+            .map_err(|_| sqlite_snapshot_unavailable("rusqlite_source_changed"))?;
+        if !named.is_file()
+            || recorder_file_identity(&named)
+                .map_err(|_| sqlite_snapshot_unavailable("rusqlite_identity_unavailable"))?
+                != source_identity
+        {
+            return Err(sqlite_snapshot_unavailable("rusqlite_source_changed"));
+        }
+        sqlite_snapshot_checkpoint(cx)?;
+        Ok(Self {
+            db_path,
+            snapshot: Some(Arc::new(RusqliteReadSnapshot {
+                conn: std::sync::Mutex::new(conn),
+                head,
+                max_record_payload_bytes,
+                cx: cx.clone(),
+            })),
+        })
     }
 
     fn open_connection(&self) -> std::result::Result<Connection, EventCursorError> {
@@ -3489,6 +3617,28 @@ impl RecorderEventReader for RusqliteEventReader {
         &self,
         target_ordinal: u64,
     ) -> std::result::Result<Box<dyn RecorderEventCursor>, EventCursorError> {
+        if let Some(snapshot) = &self.snapshot {
+            sqlite_snapshot_checkpoint(&snapshot.cx)?;
+            if target_ordinal > snapshot.head.ordinal {
+                return Err(sqlite_snapshot_unavailable(
+                    "rusqlite_ordinal_beyond_snapshot",
+                ));
+            }
+            let next_offset = if target_ordinal == snapshot.head.ordinal {
+                snapshot.head.clone()
+            } else {
+                let conn = snapshot
+                    .conn
+                    .lock()
+                    .map_err(|_| sqlite_snapshot_unavailable("rusqlite_read_lock_poisoned"))?;
+                sqlite_cursor_start(&conn, target_ordinal)
+                    .map_err(|_| sqlite_snapshot_unavailable("rusqlite_cursor_unavailable"))?
+            };
+            return Ok(Box::new(RusqliteSnapshotCursor {
+                snapshot: Arc::clone(snapshot),
+                next_offset,
+            }));
+        }
         let conn = self.open_connection()?;
         let start = sqlite_cursor_start(&conn, target_ordinal)?;
         Ok(Box::new(RusqliteCursor {
@@ -3498,8 +3648,161 @@ impl RecorderEventReader for RusqliteEventReader {
     }
 
     fn head_offset(&self) -> std::result::Result<RecorderOffset, EventCursorError> {
+        if let Some(snapshot) = &self.snapshot {
+            sqlite_snapshot_checkpoint(&snapshot.cx)?;
+            return Ok(snapshot.head.clone());
+        }
         let conn = self.open_connection()?;
         sqlite_head_offset(&conn).map_err(|err| EventCursorError::Unavailable(err.to_string()))
+    }
+}
+
+struct RusqliteReadSnapshot {
+    conn: std::sync::Mutex<Connection>,
+    head: RecorderOffset,
+    max_record_payload_bytes: u64,
+    cx: crate::cx::Cx,
+}
+
+impl std::fmt::Debug for RusqliteReadSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RusqliteReadSnapshot")
+            .field("head", &self.head)
+            .field("max_record_payload_bytes", &self.max_record_payload_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+fn sqlite_snapshot_unavailable(reason: &'static str) -> EventCursorError {
+    EventCursorError::Unavailable(reason.to_string())
+}
+
+fn sqlite_snapshot_corrupt(offset: RecorderOffset, reason: &'static str) -> EventCursorError {
+    EventCursorError::Corrupt {
+        offset,
+        reason: reason.to_string(),
+    }
+}
+
+fn sqlite_snapshot_checkpoint(cx: &crate::cx::Cx) -> Result<(), EventCursorError> {
+    cx.checkpoint()
+        .map_err(|_| sqlite_snapshot_unavailable("rusqlite_read_cancelled"))
+}
+
+fn sqlite_snapshot_next_offset(
+    offset: &RecorderOffset,
+    payload_bytes: u64,
+) -> Result<RecorderOffset, EventCursorError> {
+    Ok(RecorderOffset {
+        segment_id: offset.segment_id,
+        byte_offset: offset
+            .byte_offset
+            .checked_add(4)
+            .and_then(|value| value.checked_add(payload_bytes))
+            .ok_or_else(|| sqlite_snapshot_corrupt(offset.clone(), "rusqlite_offset_exhausted"))?,
+        ordinal: offset
+            .ordinal
+            .checked_add(1)
+            .ok_or_else(|| sqlite_snapshot_corrupt(offset.clone(), "rusqlite_ordinal_exhausted"))?,
+    })
+}
+
+struct RusqliteSnapshotCursor {
+    snapshot: Arc<RusqliteReadSnapshot>,
+    next_offset: RecorderOffset,
+}
+
+impl RecorderEventCursor for RusqliteSnapshotCursor {
+    fn next_batch(&mut self, max: usize) -> Result<Vec<CursorRecord>, EventCursorError> {
+        sqlite_snapshot_checkpoint(&self.snapshot.cx)?;
+        if max == 0 || self.next_offset.ordinal >= self.snapshot.head.ordinal {
+            return Ok(Vec::new());
+        }
+        let conn = self
+            .snapshot
+            .conn
+            .lock()
+            .map_err(|_| sqlite_snapshot_unavailable("rusqlite_read_lock_poisoned"))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT ordinal, segment_id, byte_offset, payload_bytes,
+                        length(CAST(payload_json AS BLOB)),
+                        CASE WHEN length(CAST(payload_json AS BLOB)) <= ?3
+                             THEN payload_json ELSE NULL END
+                 FROM recorder_events
+                 WHERE ordinal >= ?1 AND ordinal <= ?2
+                 ORDER BY ordinal ASC LIMIT ?4",
+            )
+            .map_err(|_| sqlite_snapshot_unavailable("rusqlite_query_failed"))?;
+        let mut rows = stmt
+            .query(params![
+                i64::try_from(self.next_offset.ordinal)
+                    .map_err(|_| sqlite_snapshot_unavailable("rusqlite_invalid_ordinal"))?,
+                i64::try_from(self.snapshot.head.ordinal - 1)
+                    .map_err(|_| sqlite_snapshot_unavailable("rusqlite_invalid_ordinal"))?,
+                self.snapshot.max_record_payload_bytes as i64,
+                max.min(256) as i64,
+            ])
+            .map_err(|_| sqlite_snapshot_unavailable("rusqlite_query_failed"))?;
+        let mut batch = Vec::with_capacity(max.min(256));
+        let mut batch_bytes = 0u64;
+        while let Some(row) = rows
+            .next()
+            .map_err(|_| sqlite_snapshot_unavailable("rusqlite_query_failed"))?
+        {
+            sqlite_snapshot_checkpoint(&self.snapshot.cx)?;
+            let read_unsigned = |column| -> Result<u64, EventCursorError> {
+                row.get::<_, i64>(column)
+                    .ok()
+                    .and_then(|value| u64::try_from(value).ok())
+                    .ok_or_else(|| {
+                        sqlite_snapshot_corrupt(
+                            self.next_offset.clone(),
+                            "rusqlite_invalid_record_metadata",
+                        )
+                    })
+            };
+            let offset = RecorderOffset {
+                ordinal: read_unsigned(0)?,
+                segment_id: read_unsigned(1)?,
+                byte_offset: read_unsigned(2)?,
+            };
+            let declared_bytes = read_unsigned(3)?;
+            let payload_bytes = read_unsigned(4)?;
+            if payload_bytes > self.snapshot.max_record_payload_bytes {
+                return Err(sqlite_snapshot_corrupt(
+                    offset,
+                    "rusqlite_record_payload_limit",
+                ));
+            }
+            if declared_bytes != payload_bytes {
+                return Err(sqlite_snapshot_corrupt(
+                    offset,
+                    "rusqlite_payload_length_mismatch",
+                ));
+            }
+            if !batch.is_empty()
+                && payload_bytes > self.snapshot.max_record_payload_bytes - batch_bytes
+            {
+                break;
+            }
+            let payload_json = row
+                .get_ref(5)
+                .map_err(|_| sqlite_snapshot_corrupt(offset.clone(), "rusqlite_invalid_event"))?;
+            let rusqlite::types::ValueRef::Text(payload_json) = payload_json else {
+                return Err(sqlite_snapshot_corrupt(offset, "rusqlite_invalid_event"));
+            };
+            let event = serde_json::from_slice::<RecorderEvent>(payload_json)
+                .map_err(|_| sqlite_snapshot_corrupt(offset.clone(), "rusqlite_invalid_event"))?;
+            self.next_offset = sqlite_snapshot_next_offset(&offset, payload_bytes)?;
+            batch_bytes += payload_bytes;
+            batch.push(CursorRecord { event, offset });
+        }
+        Ok(batch)
+    }
+
+    fn current_offset(&self) -> RecorderOffset {
+        self.next_offset.clone()
     }
 }
 
@@ -4763,6 +5066,569 @@ pub trait RecorderEventCursor: Send {
     fn current_offset(&self) -> RecorderOffset;
 }
 
+/// Finite admission bounds for a read-only append-log snapshot.
+///
+/// The source byte bound covers retained sealed segments and the captured active
+/// prefix, not just the events selected by an export. Payloads are decoded only
+/// when a cursor reads them; opening scans bounded frame headers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppendLogReadLimits {
+    pub max_directory_entries: usize,
+    /// Includes the active segment, even when it is empty.
+    pub max_segments: usize,
+    pub max_record_payload_bytes: u64,
+    pub max_snapshot_bytes: u64,
+    pub max_records: u64,
+}
+
+impl Default for AppendLogReadLimits {
+    fn default() -> Self {
+        Self {
+            max_directory_entries: 4096,
+            max_segments: 64,
+            max_record_payload_bytes:
+                crate::tuning_config::IngestTuning::DEFAULT_MAX_RECORD_PAYLOAD_BYTES as u64,
+            max_snapshot_bytes: 4 * 1024 * 1024 * 1024,
+            max_records: 1_000_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppendSnapshotEntry {
+    name: PathBuf,
+    segment_id: u64,
+    first_ordinal: u64,
+    sealed_end: Option<u64>,
+    bytes: u64,
+    identity: (u64, u64),
+}
+
+struct AppendSnapshotFile {
+    entry: AppendSnapshotEntry,
+    end_ordinal: u64,
+    // A cloned File shares its seek position on Unix. Serialize each complete
+    // seek/read instead, so independent cursors cannot corrupt one another.
+    file: std::sync::Mutex<File>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static APPEND_SNAPSHOT_ADMISSION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A bounded, read-only cut of the retained append-log event stream.
+///
+/// This opens existing regular files without writer leases, state publication,
+/// recovery, or truncation. Sealed filenames supply segment/ordinal authority;
+/// their frame counts and continuity are checked before any cursor is exposed.
+/// Handles pin the selected files across later rotation or retention. Later
+/// appends are outside the frozen head. An incomplete active tail is a typed
+/// error, never silently accepted as a complete export.
+///
+/// The format is append-only, not an authenticated archive: this reader does
+/// not establish provenance against an actor rewriting bytes in an open inode.
+#[derive(Clone)]
+pub struct AppendLogEventReader {
+    files: Arc<Vec<AppendSnapshotFile>>,
+    head: RecorderOffset,
+    snapshot_bytes: u64,
+    limits: AppendLogReadLimits,
+    cx: Option<crate::cx::Cx>,
+}
+
+impl AppendLogEventReader {
+    /// Capture existing retained segments without changing the recorder.
+    pub fn open(data_path: &Path, limits: AppendLogReadLimits) -> Result<Self, EventCursorError> {
+        Self::open_inner(None, data_path, limits)
+    }
+
+    /// Cancellation-aware snapshot admission and cursor reads.
+    ///
+    /// This is synchronous filesystem work; async callers must run it on their
+    /// owned blocking worker. Cancellation is checked per directory entry and
+    /// record header, including ordinal seeks.
+    pub fn open_with_cx(
+        cx: &crate::cx::Cx,
+        data_path: &Path,
+        limits: AppendLogReadLimits,
+    ) -> Result<Self, EventCursorError> {
+        Self::open_inner(Some(cx), data_path, limits)
+    }
+
+    fn open_inner(
+        cx: Option<&crate::cx::Cx>,
+        data_path: &Path,
+        limits: AppendLogReadLimits,
+    ) -> Result<Self, EventCursorError> {
+        append_snapshot_checkpoint(cx)?;
+        if limits.max_directory_entries == 0
+            || limits.max_segments == 0
+            || limits.max_record_payload_bytes == 0
+            || limits.max_record_payload_bytes > u64::from(u32::MAX)
+            || limits.max_snapshot_bytes == 0
+            || limits.max_records == 0
+        {
+            return Err(append_snapshot_unavailable(
+                "append_log_invalid_read_limits",
+            ));
+        }
+        let (directory, name) = recorder_parent(data_path)
+            .map_err(|_| append_snapshot_unavailable("append_log_parent_unavailable"))?;
+        let log_name = name
+            .to_str()
+            .ok_or_else(|| append_snapshot_unavailable("append_log_invalid_name"))?
+            .to_string();
+        let directory_identity = recorder_file_identity(
+            &directory
+                .dir_metadata()
+                .map_err(|_| append_snapshot_unavailable("append_log_parent_unavailable"))?,
+        )
+        .map_err(|_| append_snapshot_unavailable("append_log_identity_unavailable"))?;
+        let sealed = append_snapshot_catalog(&directory, &log_name, limits, cx)?;
+        let (active_segment, active_first) = match sealed.last() {
+            Some(last) => (
+                last.segment_id.checked_add(1).ok_or_else(|| {
+                    append_snapshot_unavailable("append_log_segment_identity_exhausted")
+                })?,
+                last.sealed_end.expect("catalog entries are sealed"),
+            ),
+            None => (0, 0),
+        };
+        let active_metadata = directory
+            .symlink_metadata(&name)
+            .map_err(|_| append_snapshot_unavailable("append_log_active_unavailable"))?;
+        if !active_metadata.is_file() {
+            return Err(append_snapshot_unavailable("append_log_nonregular_source"));
+        }
+        let active = AppendSnapshotEntry {
+            name,
+            segment_id: active_segment,
+            first_ordinal: active_first,
+            sealed_end: None,
+            bytes: active_metadata.len(),
+            identity: recorder_file_identity(&active_metadata)
+                .map_err(|_| append_snapshot_unavailable("append_log_identity_unavailable"))?,
+        };
+        let mut files = Vec::with_capacity(sealed.len() + 1);
+        let mut snapshot_bytes = 0u64;
+        let mut records = 0u64;
+        for entry in sealed.iter().chain(std::iter::once(&active)) {
+            append_snapshot_checkpoint(cx)?;
+            snapshot_bytes = snapshot_bytes
+                .checked_add(entry.bytes)
+                .filter(|bytes| *bytes <= limits.max_snapshot_bytes)
+                .ok_or_else(|| append_snapshot_unavailable("append_log_snapshot_byte_limit"))?;
+            if files
+                .iter()
+                .any(|prior: &AppendSnapshotFile| prior.entry.identity == entry.identity)
+            {
+                return Err(append_snapshot_unavailable("append_log_aliased_segments"));
+            }
+            let mut options = recorder_open_options();
+            options.read(true);
+            let mut file = directory
+                .open_with(&entry.name, &options)
+                .map_err(|_| append_snapshot_unavailable("append_log_source_changed"))?
+                .into_std();
+            check_append_snapshot_file(&file, entry)?;
+            let mut position = RecorderOffset {
+                segment_id: entry.segment_id,
+                byte_offset: 0,
+                ordinal: entry.first_ordinal,
+            };
+            while position.byte_offset < entry.bytes {
+                append_snapshot_checkpoint(cx)?;
+                if records == limits.max_records {
+                    return Err(append_snapshot_unavailable(
+                        "append_log_snapshot_record_limit",
+                    ));
+                }
+                let payload = append_snapshot_record_length(
+                    &mut file,
+                    &position,
+                    entry.bytes,
+                    limits.max_record_payload_bytes,
+                )?;
+                position = append_snapshot_next_offset(&position, payload)?;
+                records += 1;
+            }
+            if entry
+                .sealed_end
+                .is_some_and(|expected| position.ordinal != expected)
+            {
+                return Err(append_snapshot_corrupt(
+                    position,
+                    "append_log_sealed_range_mismatch",
+                ));
+            }
+            check_append_snapshot_file(&file, entry)?;
+            files.push(AppendSnapshotFile {
+                entry: entry.clone(),
+                end_ordinal: position.ordinal,
+                file: std::sync::Mutex::new(file),
+            });
+        }
+        // A rotation between inventory and open must not attribute a new active
+        // inode to an old ordinal base. Pinning only the active path is not enough.
+        #[cfg(test)]
+        if let Some(hook) = APPEND_SNAPSHOT_ADMISSION_HOOK.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+        if append_snapshot_catalog(&directory, &log_name, limits, cx)? != sealed {
+            return Err(append_snapshot_unavailable("append_log_source_changed"));
+        }
+        for snapshot in &files {
+            let named = directory
+                .symlink_metadata(&snapshot.entry.name)
+                .map_err(|_| append_snapshot_unavailable("append_log_source_changed"))?;
+            if !named.is_file()
+                || named.len() < snapshot.entry.bytes
+                || snapshot.entry.sealed_end.is_some() && named.len() != snapshot.entry.bytes
+                || recorder_file_identity(&named)
+                    .map_err(|_| append_snapshot_unavailable("append_log_identity_unavailable"))?
+                    != snapshot.entry.identity
+            {
+                return Err(append_snapshot_unavailable("append_log_source_changed"));
+            }
+        }
+        let (named_directory, _) = recorder_parent(data_path)
+            .map_err(|_| append_snapshot_unavailable("append_log_source_changed"))?;
+        if recorder_file_identity(
+            &named_directory
+                .dir_metadata()
+                .map_err(|_| append_snapshot_unavailable("append_log_source_changed"))?,
+        )
+        .map_err(|_| append_snapshot_unavailable("append_log_identity_unavailable"))?
+            != directory_identity
+        {
+            return Err(append_snapshot_unavailable("append_log_source_changed"));
+        }
+        append_snapshot_checkpoint(cx)?;
+        let last = files.last().expect("snapshot always includes active file");
+        let head = RecorderOffset {
+            segment_id: last.entry.segment_id,
+            byte_offset: last.entry.bytes,
+            ordinal: last.end_ordinal,
+        };
+        Ok(Self {
+            files: Arc::new(files),
+            head,
+            snapshot_bytes,
+            limits,
+            cx: cx.cloned(),
+        })
+    }
+
+    /// Earliest retained position. An ordinal above zero is an explicit pruned
+    /// prefix, not the beginning of the original recording.
+    pub fn first_offset(&self) -> RecorderOffset {
+        let first = &self.files[0].entry;
+        RecorderOffset {
+            segment_id: first.segment_id,
+            byte_offset: 0,
+            ordinal: first.first_ordinal,
+        }
+    }
+
+    pub fn snapshot_bytes(&self) -> u64 {
+        self.snapshot_bytes
+    }
+}
+
+fn append_snapshot_unavailable(reason: &'static str) -> EventCursorError {
+    EventCursorError::Unavailable(reason.to_string())
+}
+
+fn append_snapshot_corrupt(offset: RecorderOffset, reason: &'static str) -> EventCursorError {
+    EventCursorError::Corrupt {
+        offset,
+        reason: reason.to_string(),
+    }
+}
+
+fn append_snapshot_checkpoint(cx: Option<&crate::cx::Cx>) -> Result<(), EventCursorError> {
+    if cx.is_some_and(|cx| cx.checkpoint().is_err()) {
+        return Err(append_snapshot_unavailable("append_log_read_cancelled"));
+    }
+    Ok(())
+}
+
+fn append_snapshot_catalog(
+    directory: &CapDir,
+    log_name: &str,
+    limits: AppendLogReadLimits,
+    cx: Option<&crate::cx::Cx>,
+) -> Result<Vec<AppendSnapshotEntry>, EventCursorError> {
+    let mut sealed = Vec::new();
+    let entries = directory
+        .entries()
+        .map_err(|_| append_snapshot_unavailable("append_log_directory_unavailable"))?;
+    for (index, entry) in entries.enumerate() {
+        append_snapshot_checkpoint(cx)?;
+        if index >= limits.max_directory_entries {
+            return Err(append_snapshot_unavailable(
+                "append_log_directory_entry_limit",
+            ));
+        }
+        let entry =
+            entry.map_err(|_| append_snapshot_unavailable("append_log_directory_unavailable"))?;
+        let name = entry.file_name();
+        let Some(file_name) = name.to_str() else {
+            continue;
+        };
+        if file_name == rolling_file_name(log_name) {
+            return Err(append_snapshot_unavailable(
+                "append_log_rotation_in_progress",
+            ));
+        }
+        let Some((segment_id, first_ordinal, end_ordinal)) =
+            parse_sealed_segment_file_name(log_name, file_name)
+        else {
+            continue;
+        };
+        if sealed.len() >= limits.max_segments - 1 {
+            return Err(append_snapshot_unavailable("append_log_segment_limit"));
+        }
+        let metadata = directory
+            .symlink_metadata(&name)
+            .map_err(|_| append_snapshot_unavailable("append_log_source_changed"))?;
+        if !metadata.is_file() || end_ordinal <= first_ordinal {
+            return Err(append_snapshot_unavailable(
+                "append_log_invalid_sealed_segment",
+            ));
+        }
+        sealed.push(AppendSnapshotEntry {
+            name: PathBuf::from(name),
+            segment_id,
+            first_ordinal,
+            sealed_end: Some(end_ordinal),
+            bytes: metadata.len(),
+            identity: recorder_file_identity(&metadata)
+                .map_err(|_| append_snapshot_unavailable("append_log_identity_unavailable"))?,
+        });
+    }
+    sealed.sort_by_key(|entry| entry.segment_id);
+    for pair in sealed.windows(2) {
+        if pair[0].segment_id.checked_add(1) != Some(pair[1].segment_id)
+            || pair[0].sealed_end != Some(pair[1].first_ordinal)
+        {
+            return Err(append_snapshot_unavailable(
+                "append_log_noncontiguous_segments",
+            ));
+        }
+    }
+    Ok(sealed)
+}
+
+fn check_append_snapshot_file(
+    file: &File,
+    entry: &AppendSnapshotEntry,
+) -> Result<(), EventCursorError> {
+    let metadata = CapMetadata::from_file(file)
+        .map_err(|_| append_snapshot_unavailable("append_log_source_changed"))?;
+    if !metadata.is_file()
+        || recorder_file_identity(&metadata)
+            .map_err(|_| append_snapshot_unavailable("append_log_identity_unavailable"))?
+            != entry.identity
+        || metadata.len() < entry.bytes
+        || entry.sealed_end.is_some() && metadata.len() != entry.bytes
+    {
+        return Err(append_snapshot_unavailable("append_log_source_changed"));
+    }
+    Ok(())
+}
+
+fn append_snapshot_record_length(
+    file: &mut File,
+    position: &RecorderOffset,
+    captured_bytes: u64,
+    payload_limit: u64,
+) -> Result<u64, EventCursorError> {
+    let remaining = captured_bytes.saturating_sub(position.byte_offset);
+    if remaining < 4 {
+        return Err(append_snapshot_corrupt(
+            position.clone(),
+            "append_log_torn_header",
+        ));
+    }
+    let mut header = [0; 4];
+    file.seek(SeekFrom::Start(position.byte_offset))
+        .and_then(|_| file.read_exact(&mut header))
+        .map_err(|_| append_snapshot_corrupt(position.clone(), "append_log_frame_read_failed"))?;
+    let payload = u64::from(u32::from_le_bytes(header));
+    if payload > payload_limit {
+        return Err(append_snapshot_corrupt(
+            position.clone(),
+            "append_log_record_payload_limit",
+        ));
+    }
+    if payload > remaining - 4 {
+        return Err(append_snapshot_corrupt(
+            position.clone(),
+            "append_log_torn_payload",
+        ));
+    }
+    Ok(payload)
+}
+
+fn append_snapshot_next_offset(
+    position: &RecorderOffset,
+    payload: u64,
+) -> Result<RecorderOffset, EventCursorError> {
+    Ok(RecorderOffset {
+        segment_id: position.segment_id,
+        byte_offset: position
+            .byte_offset
+            .checked_add(4)
+            .and_then(|offset| offset.checked_add(payload))
+            .ok_or_else(|| {
+                append_snapshot_corrupt(position.clone(), "append_log_offset_exhausted")
+            })?,
+        ordinal: position.ordinal.checked_add(1).ok_or_else(|| {
+            append_snapshot_corrupt(position.clone(), "append_log_ordinal_exhausted")
+        })?,
+    })
+}
+
+impl RecorderEventReader for AppendLogEventReader {
+    fn open_cursor(
+        &self,
+        from: RecorderOffset,
+    ) -> Result<Box<dyn RecorderEventCursor>, EventCursorError> {
+        // Only the ordinal is public seek authority. Reconstruct its frame
+        // boundary instead of trusting a caller-supplied byte offset.
+        self.open_cursor_at_ordinal(from.ordinal)
+    }
+
+    fn open_cursor_at_ordinal(
+        &self,
+        target: u64,
+    ) -> Result<Box<dyn RecorderEventCursor>, EventCursorError> {
+        append_snapshot_checkpoint(self.cx.as_ref())?;
+        if target > self.head.ordinal {
+            return Err(append_snapshot_unavailable(
+                "append_log_ordinal_beyond_snapshot",
+            ));
+        }
+        let segment_index = self
+            .files
+            .iter()
+            .position(|file| file.end_ordinal > target)
+            .unwrap_or(self.files.len() - 1);
+        let segment = &self.files[segment_index];
+        let mut position = RecorderOffset {
+            segment_id: segment.entry.segment_id,
+            byte_offset: 0,
+            ordinal: segment.entry.first_ordinal,
+        };
+        let mut file = segment
+            .file
+            .lock()
+            .map_err(|_| append_snapshot_unavailable("append_log_read_lock_poisoned"))?;
+        check_append_snapshot_file(&file, &segment.entry)?;
+        while position.ordinal < target {
+            append_snapshot_checkpoint(self.cx.as_ref())?;
+            let payload = append_snapshot_record_length(
+                &mut file,
+                &position,
+                segment.entry.bytes,
+                self.limits.max_record_payload_bytes,
+            )?;
+            position = append_snapshot_next_offset(&position, payload)?;
+        }
+        drop(file);
+        Ok(Box::new(AppendSnapshotCursor {
+            source: self.clone(),
+            segment_index,
+            position,
+        }))
+    }
+
+    fn head_offset(&self) -> Result<RecorderOffset, EventCursorError> {
+        append_snapshot_checkpoint(self.cx.as_ref())?;
+        Ok(self.head.clone())
+    }
+}
+
+struct AppendSnapshotCursor {
+    source: AppendLogEventReader,
+    segment_index: usize,
+    position: RecorderOffset,
+}
+
+impl RecorderEventCursor for AppendSnapshotCursor {
+    fn next_batch(&mut self, max: usize) -> Result<Vec<CursorRecord>, EventCursorError> {
+        let mut batch = Vec::with_capacity(max.min(256));
+        let mut batch_bytes = 0u64;
+        // Bound one call independently of a caller's requested usize. Returning
+        // fewer than max is permitted by RecorderEventCursor; EOF alone is empty.
+        for _ in 0..max.min(256) {
+            append_snapshot_checkpoint(self.source.cx.as_ref())?;
+            let mut segment = &self.source.files[self.segment_index];
+            if self.position.ordinal == segment.end_ordinal {
+                if self.position.byte_offset != segment.entry.bytes {
+                    return Err(append_snapshot_corrupt(
+                        self.position.clone(),
+                        "append_log_sealed_range_mismatch",
+                    ));
+                }
+                if self.segment_index + 1 == self.source.files.len() {
+                    break;
+                }
+                self.segment_index += 1;
+                segment = &self.source.files[self.segment_index];
+                self.position = RecorderOffset {
+                    segment_id: segment.entry.segment_id,
+                    byte_offset: 0,
+                    ordinal: segment.entry.first_ordinal,
+                };
+                if self.position.ordinal == segment.end_ordinal {
+                    break; // the captured active segment can be empty
+                }
+            }
+            let mut file = segment
+                .file
+                .lock()
+                .map_err(|_| append_snapshot_unavailable("append_log_read_lock_poisoned"))?;
+            check_append_snapshot_file(&file, &segment.entry)?;
+            let payload = append_snapshot_record_length(
+                &mut file,
+                &self.position,
+                segment.entry.bytes,
+                self.source.limits.max_record_payload_bytes,
+            )?;
+            if !batch.is_empty()
+                && payload > self.source.limits.max_record_payload_bytes - batch_bytes
+            {
+                break;
+            }
+            let size = usize::try_from(payload).map_err(|_| {
+                append_snapshot_corrupt(self.position.clone(), "append_log_record_payload_limit")
+            })?;
+            let mut bytes = vec![0; size];
+            file.read_exact(&mut bytes).map_err(|_| {
+                append_snapshot_corrupt(self.position.clone(), "append_log_frame_read_failed")
+            })?;
+            check_append_snapshot_file(&file, &segment.entry)?;
+            append_snapshot_checkpoint(self.source.cx.as_ref())?;
+            let event = serde_json::from_slice(&bytes).map_err(|_| {
+                append_snapshot_corrupt(self.position.clone(), "append_log_invalid_event")
+            })?;
+            let offset = self.position.clone();
+            self.position = append_snapshot_next_offset(&self.position, payload)?;
+            batch_bytes += payload;
+            batch.push(CursorRecord { event, offset });
+        }
+        Ok(batch)
+    }
+
+    fn current_offset(&self) -> RecorderOffset {
+        self.position.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5446,6 +6312,362 @@ recorder_backend = "frankensqlite"
                 None,
                 "{other}"
             );
+        }
+    }
+
+    fn write_append_snapshot_fixture(path: &Path, events: &[RecorderEvent]) -> u64 {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        for event in events {
+            let payload = serde_json::to_vec(event).unwrap();
+            file.write_all(&u32::try_from(payload.len()).unwrap().to_le_bytes())
+                .unwrap();
+            file.write_all(&payload).unwrap();
+        }
+        file.metadata().unwrap().len()
+    }
+
+    #[test]
+    fn append_snapshot_reads_retained_segments_with_absolute_ordinals() {
+        let dir = tempdir().unwrap();
+        let data = dir.path().join("events.log");
+        let retained = dir
+            .path()
+            .join(sealed_segment_file_name("events.log", 3, 9, 11));
+        let sealed_bytes = write_append_snapshot_fixture(
+            &retained,
+            &[
+                sample_event("a", 1, 9, "first"),
+                sample_event("b", 1, 10, "second"),
+            ],
+        );
+        let active_bytes =
+            write_append_snapshot_fixture(&data, &[sample_event("c", 1, 11, "third")]);
+        let source = AppendLogEventReader::open(&data, AppendLogReadLimits::default()).unwrap();
+        assert_eq!(source.first_offset().ordinal, 9);
+        assert_eq!(source.first_offset().segment_id, 3);
+        assert_eq!(source.snapshot_bytes(), sealed_bytes + active_bytes);
+        assert_eq!(
+            source.head_offset().unwrap(),
+            RecorderOffset {
+                segment_id: 4,
+                byte_offset: active_bytes,
+                ordinal: 12,
+            }
+        );
+        let mut cursor = source.open_cursor_from_start().unwrap();
+        let rows = cursor.next_batch(20).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.offset.ordinal)
+                .collect::<Vec<_>>(),
+            [9, 10, 11]
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.offset.segment_id)
+                .collect::<Vec<_>>(),
+            [3, 3, 4]
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.event.event_id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+        assert!(cursor.next_batch(20).unwrap().is_empty());
+        assert_eq!(cursor.current_offset(), source.head_offset().unwrap());
+        // Byte positions supplied by a caller cannot jump inside a JSON body.
+        let mut sought = source
+            .open_cursor(RecorderOffset {
+                segment_id: 999,
+                byte_offset: 13,
+                ordinal: 10,
+            })
+            .unwrap();
+        assert_eq!(sought.next_batch(1).unwrap()[0].event.event_id, "b");
+    }
+
+    #[test]
+    fn append_snapshot_cursors_are_independent_and_handles_survive_rename() {
+        let dir = tempdir().unwrap();
+        let data = dir.path().join("events.log");
+        write_append_snapshot_fixture(
+            &data,
+            &[
+                sample_event("a", 1, 0, "first"),
+                sample_event("b", 1, 1, "second"),
+            ],
+        );
+        let source = AppendLogEventReader::open(&data, AppendLogReadLimits::default()).unwrap();
+        let mut left = source.open_cursor_from_start().unwrap();
+        let mut right = source.open_cursor_from_start().unwrap();
+        std::fs::rename(&data, dir.path().join("retained-old-log")).unwrap();
+        write_append_snapshot_fixture(&data, &[sample_event("replacement", 2, 0, "other inode")]);
+        assert_eq!(left.next_batch(1).unwrap()[0].event.event_id, "a");
+        assert_eq!(right.next_batch(1).unwrap()[0].event.event_id, "a");
+        assert_eq!(left.next_batch(1).unwrap()[0].event.event_id, "b");
+        assert_eq!(right.next_batch(1).unwrap()[0].event.event_id, "b");
+        assert!(left.next_batch(1).unwrap().is_empty());
+        assert!(right.next_batch(1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn append_snapshot_refuses_rotation_during_admission() {
+        let dir = tempdir().unwrap();
+        let data = dir.path().join("events.log");
+        write_append_snapshot_fixture(&data, &[sample_event("old", 1, 0, "old")]);
+        let rotated_data = data.clone();
+        let sealed = dir
+            .path()
+            .join(sealed_segment_file_name("events.log", 0, 0, 1));
+        APPEND_SNAPSHOT_ADMISSION_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::rename(&rotated_data, &sealed).unwrap();
+                write_append_snapshot_fixture(&rotated_data, &[sample_event("new", 1, 1, "new")]);
+            }));
+        });
+        let error = AppendLogEventReader::open(&data, AppendLogReadLimits::default())
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("append_log_source_changed"));
+        let source = AppendLogEventReader::open(&data, AppendLogReadLimits::default()).unwrap();
+        let rows = source
+            .open_cursor_from_start()
+            .unwrap()
+            .next_batch(10)
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.event.event_id.as_str())
+                .collect::<Vec<_>>(),
+            ["old", "new"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_snapshot_coexists_with_live_writer_and_freezes_its_head() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let config = test_config(dir.path());
+            let storage = AppendLogRecorderStorage::open(config.clone())
+                .unwrap()
+                .with_retention(TINY_RETENTION);
+            for ordinal in 0..30 {
+                append_one(&storage, ordinal).await;
+            }
+            let state_before = std::fs::read(&config.state_path).unwrap();
+            let source =
+                AppendLogEventReader::open(&config.data_path, AppendLogReadLimits::default())
+                    .unwrap();
+            let first = source.first_offset().ordinal;
+            assert!(first > 0, "writer retention must have pruned the prefix");
+            assert_eq!(source.head_offset().unwrap().ordinal, 30);
+            assert_eq!(std::fs::read(&config.state_path).unwrap(), state_before);
+            for ordinal in 30..60 {
+                append_one(&storage, ordinal).await;
+            }
+            let rows = source
+                .open_cursor_from_start()
+                .unwrap()
+                .next_batch(256)
+                .unwrap();
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.offset.ordinal)
+                    .collect::<Vec<_>>(),
+                (first..30).collect::<Vec<_>>()
+            );
+            assert_eq!(source.head_offset().unwrap().ordinal, 30);
+        });
+    }
+
+    #[test]
+    fn append_snapshot_refuses_incomplete_frames_without_repair() {
+        for bytes in [
+            vec![1, 2],
+            vec![10, 0, 0, 0, b'{'],
+            u32::MAX.to_le_bytes().to_vec(),
+        ] {
+            let dir = tempdir().unwrap();
+            let data = dir.path().join("events.log");
+            std::fs::write(&data, &bytes).unwrap();
+            let error = AppendLogEventReader::open(&data, AppendLogReadLimits::default())
+                .err()
+                .unwrap();
+            assert!(matches!(error, EventCursorError::Corrupt { .. }));
+            assert_eq!(std::fs::read(&data).unwrap(), bytes);
+            assert!(!dir.path().join("state.json").exists());
+        }
+        let dir = tempdir().unwrap();
+        let data = dir.path().join("events.log");
+        std::fs::write(&data, [1, 0, 0, 0, b'{']).unwrap();
+        let source = AppendLogEventReader::open(&data, AppendLogReadLimits::default()).unwrap();
+        let error = source
+            .open_cursor_from_start()
+            .unwrap()
+            .next_batch(1)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("append_log_invalid_event"));
+    }
+
+    #[test]
+    fn append_snapshot_rejects_mismatched_and_noncontiguous_segment_ranges() {
+        for (second_segment, second_first) in [(2, 1), (1, 2), (1, 0)] {
+            let dir = tempdir().unwrap();
+            let data = dir.path().join("events.log");
+            write_append_snapshot_fixture(&data, &[]);
+            write_append_snapshot_fixture(
+                &dir.path()
+                    .join(sealed_segment_file_name("events.log", 0, 0, 1)),
+                &[sample_event("first", 1, 0, "first")],
+            );
+            write_append_snapshot_fixture(
+                &dir.path().join(sealed_segment_file_name(
+                    "events.log",
+                    second_segment,
+                    second_first,
+                    second_first + 1,
+                )),
+                &[sample_event("next", 1, 1, "next")],
+            );
+            let error = AppendLogEventReader::open(&data, AppendLogReadLimits::default())
+                .err()
+                .unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains("append_log_noncontiguous_segments")
+            );
+        }
+        let dir = tempdir().unwrap();
+        let data = dir.path().join("events.log");
+        write_append_snapshot_fixture(&data, &[]);
+        write_append_snapshot_fixture(
+            &dir.path()
+                .join(sealed_segment_file_name("events.log", 0, 0, 2)),
+            &[sample_event("only-one", 1, 0, "one")],
+        );
+        let error = AppendLogEventReader::open(&data, AppendLogReadLimits::default())
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("append_log_sealed_range_mismatch")
+        );
+    }
+
+    #[test]
+    fn append_snapshot_enforces_byte_record_entry_and_segment_budgets() {
+        let dir = tempdir().unwrap();
+        let data = dir.path().join("events.log");
+        let bytes = write_append_snapshot_fixture(
+            &data,
+            &[
+                sample_event("a", 1, 0, "first"),
+                sample_event("b", 1, 1, "second"),
+            ],
+        );
+        for (limits, reason) in [
+            (
+                AppendLogReadLimits {
+                    max_snapshot_bytes: bytes - 1,
+                    ..Default::default()
+                },
+                "append_log_snapshot_byte_limit",
+            ),
+            (
+                AppendLogReadLimits {
+                    max_records: 1,
+                    ..Default::default()
+                },
+                "append_log_snapshot_record_limit",
+            ),
+            (
+                AppendLogReadLimits {
+                    max_record_payload_bytes: 1,
+                    ..Default::default()
+                },
+                "append_log_record_payload_limit",
+            ),
+        ] {
+            let error = AppendLogEventReader::open(&data, limits).err().unwrap();
+            assert!(error.to_string().contains(reason), "{error}");
+        }
+        write_append_snapshot_fixture(&dir.path().join("unrelated"), &[]);
+        let error = AppendLogEventReader::open(
+            &data,
+            AppendLogReadLimits {
+                max_directory_entries: 1,
+                ..Default::default()
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("append_log_directory_entry_limit")
+        );
+        write_append_snapshot_fixture(
+            &dir.path()
+                .join(sealed_segment_file_name("events.log", 0, 0, 1)),
+            &[sample_event("old", 1, 0, "old")],
+        );
+        let error = AppendLogEventReader::open(
+            &data,
+            AppendLogReadLimits {
+                max_segments: 1,
+                ..Default::default()
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("append_log_segment_limit"));
+    }
+
+    #[test]
+    fn append_snapshot_requires_existing_regular_source_and_honors_cancellation() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("missing").join("events.log");
+        assert!(AppendLogEventReader::open(&missing, AppendLogReadLimits::default()).is_err());
+        assert!(!missing.parent().unwrap().exists());
+        let data = dir.path().join("events.log");
+        write_append_snapshot_fixture(&data, &[sample_event("a", 1, 0, "first")]);
+        let cx = crate::cx::Cx::for_testing();
+        let source =
+            AppendLogEventReader::open_with_cx(&cx, &data, AppendLogReadLimits::default()).unwrap();
+        let mut cursor = source.open_cursor_from_start().unwrap();
+        cx.cancel_with(
+            crate::outcome::CancelKind::User,
+            Some("read test cancellation"),
+        );
+        assert!(
+            cursor
+                .next_batch(1)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("append_log_read_cancelled")
+        );
+        assert!(
+            AppendLogEventReader::open_with_cx(&cx, &data, AppendLogReadLimits::default())
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("append_log_read_cancelled")
+        );
+        #[cfg(unix)]
+        {
+            let alias = dir.path().join("aliased.log");
+            std::os::unix::fs::symlink(&data, &alias).unwrap();
+            assert!(AppendLogEventReader::open(&alias, AppendLogReadLimits::default()).is_err());
         }
     }
 
@@ -6793,6 +8015,188 @@ recorder_backend = "frankensqlite"
                 ..
             }
         ));
+    }
+
+    fn insert_sqlite_snapshot_fixture(
+        conn: &Connection,
+        ordinal: i64,
+        payload_json: &str,
+        declared_bytes: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO recorder_events (
+                 ordinal, segment_id, byte_offset, payload_json, payload_bytes,
+                 event_id, pane_id, schema_version, recorded_at_ms, batch_id, inserted_at_ms
+             ) VALUES (?1, 0, ?2, ?3, ?4, ?5, 1, ?6, 1, ?7, 1)",
+            params![
+                ordinal,
+                ordinal * 4096,
+                payload_json,
+                declared_bytes,
+                format!("snapshot-{ordinal}"),
+                RECORDER_EVENT_SCHEMA_VERSION_V1,
+                format!("batch-{ordinal}"),
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn bounded_rusqlite_reader_pins_wal_snapshot_and_independent_cursors() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("recorder.sqlite3");
+        let writer = Connection::open(&db_path).unwrap();
+        writer.execute_batch("PRAGMA journal_mode = WAL").unwrap();
+        initialize_rusqlite_schema(&writer).unwrap();
+        for ordinal in 0..2 {
+            let payload = serde_json::to_string(&sample_event(
+                &format!("event-{ordinal}"),
+                1,
+                ordinal as u64,
+                "unicode café output",
+            ))
+            .unwrap();
+            insert_sqlite_snapshot_fixture(&writer, ordinal, &payload, payload.len() as i64);
+        }
+        let cx = crate::cx::Cx::for_testing();
+        let source = RusqliteEventReader::open_bounded_with_cx(&cx, db_path.clone(), 4096).unwrap();
+        assert_eq!(source.head_offset().unwrap().ordinal, 2);
+        let later = serde_json::to_string(&sample_event("later", 1, 2, "after capture")).unwrap();
+        insert_sqlite_snapshot_fixture(&writer, 2, &later, later.len() as i64);
+        let mut left = source.open_cursor_from_start().unwrap();
+        let mut right = source.open_cursor_at_ordinal(1).unwrap();
+        assert_eq!(left.next_batch(1).unwrap()[0].event.event_id, "event-0");
+        assert_eq!(right.next_batch(20).unwrap()[0].event.event_id, "event-1");
+        assert_eq!(left.next_batch(20).unwrap()[0].event.event_id, "event-1");
+        assert!(left.next_batch(20).unwrap().is_empty());
+        assert!(right.next_batch(20).unwrap().is_empty());
+        assert_eq!(source.head_offset().unwrap().ordinal, 2);
+        assert_eq!(
+            RusqliteEventReader::new(db_path)
+                .head_offset()
+                .unwrap()
+                .ordinal,
+            3
+        );
+    }
+
+    #[test]
+    fn bounded_rusqlite_reader_checks_actual_bytes_before_decoding() {
+        for (payload, declared, limit, expected) in [
+            (
+                "not-json".repeat(32),
+                1,
+                64,
+                "rusqlite_record_payload_limit",
+            ),
+            (
+                serde_json::to_string(&sample_event("valid", 1, 0, "café")).unwrap(),
+                1,
+                4096,
+                "rusqlite_payload_length_mismatch",
+            ),
+            ("{broken".to_string(), 7, 4096, "rusqlite_invalid_event"),
+        ] {
+            let dir = tempdir().unwrap();
+            let db_path = dir.path().join("recorder.sqlite3");
+            let conn = Connection::open(&db_path).unwrap();
+            initialize_rusqlite_schema(&conn).unwrap();
+            insert_sqlite_snapshot_fixture(&conn, 0, &payload, declared);
+            drop(conn);
+            let cx = crate::cx::Cx::for_testing();
+            let source = RusqliteEventReader::open_bounded_with_cx(&cx, db_path, limit).unwrap();
+            let error = source
+                .open_cursor_from_start()
+                .unwrap()
+                .next_batch(1)
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+        // A forged row larger than SQLite's own value cap must fail without
+        // constructing a Rust String or attempting event deserialization.
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("large.sqlite3");
+        let conn = Connection::open(&db_path).unwrap();
+        initialize_rusqlite_schema(&conn).unwrap();
+        insert_sqlite_snapshot_fixture(&conn, 0, &"x".repeat(128 * 1024), 1);
+        drop(conn);
+        let cx = crate::cx::Cx::for_testing();
+        let source = RusqliteEventReader::open_bounded_with_cx(&cx, db_path, 64).unwrap();
+        assert!(
+            source
+                .open_cursor_from_start()
+                .unwrap()
+                .next_batch(1)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn bounded_rusqlite_reader_rejects_unindexed_sources_and_cancellation() {
+        let dir = tempdir().unwrap();
+        let cx = crate::cx::Cx::for_testing();
+        for (name, ordinal_schema, extra_constraint) in [
+            ("unindexed", "INTEGER", ""),
+            (
+                "composite",
+                "INTEGER",
+                ", PRIMARY KEY (ordinal, segment_id)",
+            ),
+            ("nullable_pk", "INTEGER PRIMARY KEY DESC", ""),
+        ] {
+            let db_path = dir.path().join(format!("{name}.sqlite3"));
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TABLE recorder_events (
+                     ordinal {ordinal_schema}, segment_id INTEGER, byte_offset INTEGER,
+                     payload_json TEXT, payload_bytes INTEGER {extra_constraint}
+                 )"
+            ))
+            .unwrap();
+            drop(conn);
+            let error = RusqliteEventReader::open_bounded_with_cx(&cx, db_path, 4096).unwrap_err();
+            assert!(error.to_string().contains("rusqlite_invalid_schema"));
+        }
+        let db_path = dir.path().join("valid.sqlite3");
+        let conn = Connection::open(&db_path).unwrap();
+        initialize_rusqlite_schema(&conn).unwrap();
+        let payload = serde_json::to_string(&sample_event("valid", 1, 0, "first")).unwrap();
+        insert_sqlite_snapshot_fixture(&conn, 0, &payload, payload.len() as i64);
+        drop(conn);
+        let source = RusqliteEventReader::open_bounded_with_cx(&cx, db_path.clone(), 4096).unwrap();
+        assert!(
+            RusqliteEventReader::open_bounded_with_cx(&cx, dir.path().to_path_buf(), 4096)
+                .unwrap_err()
+                .to_string()
+                .contains("rusqlite_nonregular_source")
+        );
+        #[cfg(unix)]
+        {
+            let alias = dir.path().join("aliased.sqlite3");
+            std::os::unix::fs::symlink(&db_path, &alias).unwrap();
+            assert!(
+                RusqliteEventReader::open_bounded_with_cx(&cx, alias, 4096)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("rusqlite_nonregular_source")
+            );
+        }
+        let mut cursor = source.open_cursor_from_start().unwrap();
+        cx.cancel_with(crate::outcome::CancelKind::User, Some("read cancelled"));
+        assert!(
+            cursor
+                .next_batch(1)
+                .unwrap_err()
+                .to_string()
+                .contains("rusqlite_read_cancelled")
+        );
+        assert!(
+            RusqliteEventReader::open_bounded_with_cx(&cx, db_path, 4096)
+                .unwrap_err()
+                .to_string()
+                .contains("rusqlite_read_cancelled")
+        );
     }
 
     #[test]
