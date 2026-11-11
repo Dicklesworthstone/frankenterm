@@ -3565,7 +3565,33 @@ fn validate_lock_file(
     Ok(())
 }
 
-fn open_locked_file(primary: &Path, exclusive: bool) -> Result<File, PersistenceFailure> {
+/// A window-state lock file this process holds flocked. Dropping it unlocks
+/// the file before its descriptor closes. A child forked while the lock is
+/// held shares the open file description until its exec, and the flock lives
+/// while any copy does, so a close-only release kept the state locked for that
+/// window and the next writer or reader waited it out (ft-hsczw). An unlock
+/// releases every copy.
+struct WindowStateLock(File);
+
+impl std::ops::Deref for WindowStateLock {
+    type Target = File;
+
+    fn deref(&self) -> &File {
+        &self.0
+    }
+}
+
+impl Drop for WindowStateLock {
+    fn drop(&mut self) {
+        // Closing the descriptor stays the fallback if this fails.
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
+fn open_locked_file(
+    primary: &Path,
+    exclusive: bool,
+) -> Result<WindowStateLock, PersistenceFailure> {
     let lock_path = lock_file_name(primary);
     let lock = open_lock_file(primary)?;
     let result = if exclusive {
@@ -3574,6 +3600,8 @@ fn open_locked_file(primary: &Path, exclusive: bool) -> Result<File, Persistence
         fs2::FileExt::lock_shared(&lock)
     };
     result.map_err(|error| PersistenceFailure::io("lock state authority", error))?;
+    // Wrapped before validation so its failure unlocks too.
+    let lock = WindowStateLock(lock);
     validate_lock_file(primary, &lock_path, &lock)?;
     Ok(lock)
 }
@@ -7498,6 +7526,25 @@ mod tests {
             );
             assert!(!primary.exists());
         }
+    }
+
+    /// ft-hsczw: dropping a window-state lock frees it at once, even while a
+    /// child forked during the hold still shares the lock file until its exec.
+    /// The try_clone stands in for that child's copy; a close-only release
+    /// would leave the lock held.
+    #[test]
+    fn dropped_window_state_lock_is_free_while_a_forked_child_still_shares_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let lock = open_locked_file(&path, true).expect("take the window-state lock");
+        let child_copy = lock.try_clone().expect("child's descriptor copy");
+
+        drop(lock);
+
+        let contender = File::open(lock_file_name(&path)).expect("open an independent description");
+        let locked = fs2::FileExt::try_lock_exclusive(&contender);
+        assert!(locked.is_ok(), "{locked:?}");
+        drop(child_copy);
     }
 
     #[cfg(unix)]

@@ -879,10 +879,19 @@ impl GuardianTokenPathAuthority {
         require_same_directory_identity(&retained_parent_metadata, &lease_parent_metadata)?;
         lock_guardian_token_effect_parent_shared(&parent)
             .map_err(|error| GuardianServiceError::io("token-effect-parent-lock", error))?;
+        let token = match open_private_file_read_at(&self.parent, &self.leaf_name) {
+            Ok(token) => token,
+            Err(error) => {
+                // Unlock before the parent closes: a child forked meanwhile
+                // shares its description, and a close-only release would
+                // keep publication locked out through it (ft-hsczw).
+                let _ = unlock_guardian_token_parent(&parent);
+                return Err(nofollow_open_error("token-effect-open", error));
+            }
+        };
         let mut lease = GuardianTokenEffectLease {
             parent,
-            token: open_private_file_read_at(&self.parent, &self.leaf_name)
-                .map_err(|error| nofollow_open_error("token-effect-open", error))?,
+            token,
             token_path: self.token_path.clone(),
             leaf_name: self.leaf_name.clone(),
             identity: self.identity,
@@ -3963,13 +3972,20 @@ impl GuardianTokenPublicationLease {
         require_same_directory_identity(&expected_parent_metadata, &publication_parent_metadata)?;
         lock_guardian_token_publication_parent_exclusive(&parent)
             .map_err(|error| GuardianServiceError::io("token-publication-parent-lock", error))?;
+        // Built at once so every failure below unlocks through Drop: a
+        // close-only release would leave the parent exclusively locked while
+        // a forked child shares it, refusing every effect lease (ft-hsczw).
+        let lease = Self {
+            parent,
+            locked: true,
+        };
         let expected_parent_metadata = expected_parent.metadata().map_err(|error| {
             GuardianServiceError::io(
                 "token-publication-expected-parent-metadata-after-lock",
                 error,
             )
         })?;
-        let publication_parent_metadata = parent.metadata().map_err(|error| {
+        let publication_parent_metadata = lease.parent.metadata().map_err(|error| {
             GuardianServiceError::io(
                 "token-publication-independent-parent-metadata-after-lock",
                 error,
@@ -3977,11 +3993,8 @@ impl GuardianTokenPublicationLease {
         })?;
         require_same_directory_identity(&expected_parent_metadata, &publication_parent_metadata)?;
         validate_pinned_private_parent(path, expected_parent)?;
-        validate_pinned_private_parent(path, &parent)?;
-        Ok(Self {
-            parent,
-            locked: true,
-        })
+        validate_pinned_private_parent(path, &lease.parent)?;
+        Ok(lease)
     }
 }
 

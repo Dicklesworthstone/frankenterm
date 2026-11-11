@@ -7557,6 +7557,11 @@ fn acquire_live_scrollback_filesystem_mutation_lease(
         Err(error) => return Err(error.into()),
     };
     fs2::FileExt::lock_exclusive(&file)?;
+    // Built at once so every failure below unlocks through Drop. A close-only
+    // release would keep the lock held while a child the mux forked shares
+    // the file, until that child's pre-exec close sweep (ft-hsczw).
+    let lease = LiveScrollbackFilesystemMutationLease { file };
+    let file = &lease.file;
     let metadata = file.metadata()?;
     anyhow::ensure!(
         metadata.is_file() && metadata.len() == 0,
@@ -7593,7 +7598,7 @@ fn acquire_live_scrollback_filesystem_mutation_lease(
         #[cfg(not(windows))]
         std::fs::File::open(pane_dir)?.sync_all()?;
     }
-    Ok(LiveScrollbackFilesystemMutationLease { file })
+    Ok(lease)
 }
 
 #[derive(Debug)]

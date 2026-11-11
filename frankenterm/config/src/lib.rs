@@ -678,7 +678,36 @@ fn validate_user_owned_file(
     Ok(())
 }
 
-fn open_user_owned_file_for_write(path: &Path, append: bool) -> anyhow::Result<std::fs::File> {
+/// A private user file this process holds flocked. Dropping it unlocks the
+/// file before its descriptor closes. A child that another thread forks (the
+/// mux spawns panes constantly) shares the open file description until its
+/// exec, and the flock lives while any copy does, so a close-only release kept
+/// the file locked for that window and the next reader or writer waited it out
+/// (ft-hsczw). An unlock releases every copy.
+struct UserOwnedFileLock(std::fs::File);
+
+impl std::ops::Deref for UserOwnedFileLock {
+    type Target = std::fs::File;
+
+    fn deref(&self) -> &std::fs::File {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for UserOwnedFileLock {
+    fn deref_mut(&mut self) -> &mut std::fs::File {
+        &mut self.0
+    }
+}
+
+impl Drop for UserOwnedFileLock {
+    fn drop(&mut self) {
+        // Closing the descriptor stays the fallback if this fails.
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
+fn open_user_owned_file_for_write(path: &Path, append: bool) -> anyhow::Result<UserOwnedFileLock> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("private user file has no parent: {}", path.display()))?;
@@ -698,6 +727,8 @@ fn open_user_owned_file_for_write(path: &Path, append: bool) -> anyhow::Result<s
         .with_context(|| format!("opening private user file {}", path.display()))?;
     fs2::FileExt::lock_exclusive(&file)
         .with_context(|| format!("locking private user file {}", path.display()))?;
+    // Wrapped before validation so its failure unlocks too.
+    let file = UserOwnedFileLock(file);
     validate_user_owned_file(path, &file, true)?;
     Ok(file)
 }
@@ -716,11 +747,13 @@ pub fn read_user_owned_file(path: &Path) -> anyhow::Result<Vec<u8>> {
 
         options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
     }
-    let mut file = options
+    let file = options
         .open(path)
         .with_context(|| format!("opening private user file {}", path.display()))?;
     fs2::FileExt::lock_shared(&file)
         .with_context(|| format!("locking private user file {}", path.display()))?;
+    // Every return from here on unlocks the file through Drop.
+    let mut file = UserOwnedFileLock(file);
     #[cfg(unix)]
     let requires_mode_normalization = {
         use std::os::unix::fs::PermissionsExt as _;
@@ -735,15 +768,15 @@ pub fn read_user_owned_file(path: &Path) -> anyhow::Result<Vec<u8>> {
     #[cfg(not(unix))]
     let requires_mode_normalization = false;
     if requires_mode_normalization {
-        fs2::FileExt::unlock(&file)
+        fs2::FileExt::unlock(&*file)
             .with_context(|| format!("upgrading private user file lock {}", path.display()))?;
-        fs2::FileExt::lock_exclusive(&file)
+        fs2::FileExt::lock_exclusive(&*file)
             .with_context(|| format!("locking private user file {} exclusively", path.display()))?;
     }
     validate_user_owned_file(path, &file, requires_mode_normalization)?;
     let maximum = MAX_USER_OWNED_FILE_BYTES;
     let mut bytes = Vec::new();
-    (&mut file)
+    (&mut *file)
         .take(maximum.saturating_add(1))
         .read_to_end(&mut bytes)
         .with_context(|| format!("reading private user file {}", path.display()))?;
@@ -2347,6 +2380,28 @@ mod tests {
             read_user_owned_file(&path).expect("read replaced private file"),
             b"new-tail"
         );
+    }
+
+    /// ft-hsczw: a released private-file lock is free at once, even while a
+    /// child forked during the hold still shares the file until its exec. The
+    /// try_clone stands in for that child's copy; a close-only release would
+    /// leave the lock held.
+    #[cfg(unix)]
+    #[test]
+    fn dropped_user_owned_file_lock_is_free_while_a_forked_child_still_shares_it() {
+        let fixture = tempfile::tempdir().expect("private-file fixture");
+        let private = fixture.path().join("state");
+        create_user_owned_dirs(&private).expect("create private file directory");
+        let path = private.join("state.json");
+        let lock = open_user_owned_file_for_write(&path, false).expect("lock private file");
+        let child_copy = lock.try_clone().expect("child's descriptor copy");
+
+        drop(lock);
+
+        let contender = std::fs::File::open(&path).expect("open an independent description");
+        let locked = fs2::FileExt::try_lock_exclusive(&contender);
+        assert!(locked.is_ok(), "{:?}", locked);
+        drop(child_copy);
     }
 
     #[cfg(unix)]

@@ -20,7 +20,36 @@ enum AcceptErrorAction {
 pub struct LocalListener {
     listener: UnixListener,
     dispatch_config: crate::dispatch::DispatchRuntimeConfig,
-    _socket_lock: Option<File>,
+    _socket_lock: Option<SocketLock>,
+}
+
+/// A socket lock file whose exclusive flock this process holds. Dropping it
+/// unlocks the file before its descriptor closes. A child the mux forks (every
+/// pane spawn does) shares the open file description until its pre-exec close
+/// sweep, and the flock lives while any copy does, so a close-only release left
+/// the socket locked for that window and a mux starting meanwhile was refused
+/// "locking socket lock" (ft-hsczw). An unlock releases every copy.
+struct SocketLock(File);
+
+impl std::ops::Deref for SocketLock {
+    type Target = File;
+
+    fn deref(&self) -> &File {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for SocketLock {
+    fn deref_mut(&mut self) -> &mut File {
+        &mut self.0
+    }
+}
+
+impl Drop for SocketLock {
+    fn drop(&mut self) {
+        // Closing the descriptor stays the fallback if this fails.
+        let _ = FileExt::unlock(&self.0);
+    }
 }
 
 impl LocalListener {
@@ -128,7 +157,7 @@ where
     })
 }
 
-fn safely_create_sock_path(unix_dom: &UnixDomain) -> anyhow::Result<(UnixListener, File)> {
+fn safely_create_sock_path(unix_dom: &UnixDomain) -> anyhow::Result<(UnixListener, SocketLock)> {
     let sock_path = &unix_dom.socket_path();
     log::trace!("setting up {}", sock_path.display());
 
@@ -189,7 +218,7 @@ fn socket_lock_path(sock_path: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
-fn acquire_socket_lock(sock_path: &Path) -> anyhow::Result<File> {
+fn acquire_socket_lock(sock_path: &Path) -> anyhow::Result<SocketLock> {
     let lock_path = socket_lock_path(sock_path);
     let mut options = OpenOptions::new();
     options.create(true).read(true).truncate(false).write(true);
@@ -211,6 +240,8 @@ fn acquire_socket_lock(sock_path: &Path) -> anyhow::Result<File> {
     lock_file
         .try_lock_exclusive()
         .with_context(|| format!("locking socket lock {}", lock_path.display()))?;
+    // Wrapped at once so every failure below unlocks the file too.
+    let lock_file = SocketLock(lock_file);
 
     #[cfg(unix)]
     {
@@ -711,6 +742,29 @@ mod tests {
             socket_lock_path(Path::new("/tmp/tmux-501/default")),
             PathBuf::from("/tmp/tmux-501/default.lock")
         );
+    }
+
+    /// ft-hsczw: dropping a socket lock frees it at once, even while a child
+    /// the mux forked during the hold still shares the lock file until its
+    /// pre-exec close sweep. The try_clone stands in for that child's copy; a
+    /// close-only release would refuse the next acquire.
+    #[cfg(unix)]
+    #[test]
+    fn dropped_socket_lock_is_free_while_a_forked_child_still_shares_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let runtime = socket_runtime("forked socket lock runtime");
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("make forked socket lock runtime private");
+        let socket = runtime.path().join("gui.sock");
+        let lock = acquire_socket_lock(&socket).expect("first socket lock");
+        let child_copy = lock.try_clone().expect("child's descriptor copy");
+
+        drop(lock);
+
+        let reacquired = acquire_socket_lock(&socket).map(drop);
+        assert!(reacquired.is_ok(), "{reacquired:?}");
+        drop(child_copy);
     }
 
     #[cfg(unix)]
