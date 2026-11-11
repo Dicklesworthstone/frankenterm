@@ -1095,13 +1095,14 @@ fn distributed_http_context_termination(cx: &Cx) -> runtime_http::ClientError {
 /// cx-cancel-waker, so an already-suspended primitive did not wake when
 /// `cx.cancel_with(...)` fired.
 ///
-/// Since asupersync 0.6 the mpsc, broadcast and watch receive futures
-/// register their own cancellation waker, so a suspended receive ends
-/// with its `Cancelled` error on `cx.cancel_with(...)` (pinned by the
+/// Since asupersync 0.6 the mpsc, broadcast, watch and oneshot receive
+/// futures register their own cancellation waker, and a contended
+/// `Mutex::lock_with_cx` subscribes to its Cx's cancellation. A
+/// suspended wait therefore ends with its `Cancelled` error on
+/// `cx.cancel_with(...)` (pinned by the
 /// `*_wakes_on_mid_flight_cancel_without_a_watcher` tests in
-/// `runtime_async`); for them the pattern is correct but redundant.
-/// oneshot receives and Semaphore and Mutex acquires register none and
-/// still need it.
+/// `runtime_async`). For these the pattern is correct but redundant.
+/// Semaphore acquires register no waker and still need it.
 ///
 /// The `mpsc_recv_with_cx_mid_flight_cancel_via_select_race_pattern`
 /// (tick 432), `oneshot_recv_with_cx_mid_flight_cancel_via_select_race_pattern`

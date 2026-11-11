@@ -790,10 +790,11 @@ impl<T> Mutex<T> {
     /// of relying on `Cx::current()` thread-local lookup.
     ///
     /// This method never turns cancellation, poisoning, or deadline expiry into
-    /// a panic. A cancellation requested while the future is suspended is
-    /// observed on its next poll; cancellation does not itself guarantee that a
-    /// contended lock waiter is woken, so callers requiring prompt cancellation
-    /// must race the acquire against a cancellation signal.
+    /// a panic. Since asupersync 0.6 a contended acquire also subscribes to
+    /// its Cx's cancellation, so a suspended waiter ends with
+    /// [`LockAcquireError::Cancelled`] when the Cx is cancelled, without an
+    /// unlock or a watcher (pinned by
+    /// `mutex_lock_with_cx_wakes_on_mid_flight_cancel_without_a_watcher`).
     ///
     /// # Errors
     ///
@@ -1122,23 +1123,26 @@ impl Semaphore {
     /// `semaphore_acquire_with_cx_observes_pre_cancel`, ft-xbnl0.2.4
     /// tick 421).
     ///
-    /// Does NOT observe **mid-flight cancel**: asupersync's semaphore
-    /// acquire does not register a cx-cancel-waker for an already-
-    /// suspended acquire (pinned by
-    /// `semaphore_acquire_with_cx_mid_flight_cancel_via_select_race_pattern`,
-    /// tick 439a). Callers needing mid-flight cancel observability
-    /// must wrap in `futures::future::select` against a poll-sleep
-    /// watcher (same pattern as `DistributedHttpClient::race_with_cx_cancel`,
-    /// tick 387). See `docs/ft-xbnl0-2-4-completion-evidence.md` §2.6.1.
+    /// Also observes **mid-flight cancel**: asupersync's semaphore acquire
+    /// registers no cancellation waker of its own (it only checkpoints when
+    /// polled), so the wait runs under [`until_cancelled`] and a suspended
+    /// acquire ends with `Err(AcquireError::Cancelled)` as soon as `cx` is
+    /// cancelled (pinned by
+    /// `semaphore_acquire_with_cx_wakes_on_mid_flight_cancel_without_a_watcher`).
+    /// Dropping asupersync's acquire future leaves the wait queue and passes
+    /// any wake on, so no permit is lost. A permit granted by the poll that
+    /// also sees the cancel is returned. See
+    /// `docs/ft-xbnl0-2-4-completion-evidence.md` §2.6.1.
     pub async fn acquire_with_cx(
         &self,
         cx: &crate::cx::Cx,
     ) -> Result<SemaphorePermit<'_>, AcquireError> {
-        self.inner
-            .acquire(cx, 1)
-            .await
-            .map(|inner| SemaphorePermit { inner })
-            .map_err(Self::map_acquire_error)
+        match until_cancelled(cx, self.inner.acquire(cx, 1)).await {
+            Ok(result) => result
+                .map(|inner| SemaphorePermit { inner })
+                .map_err(Self::map_acquire_error),
+            Err(_) => Err(AcquireError::Cancelled),
+        }
     }
 
     pub fn try_acquire_owned(self: Arc<Self>) -> Result<OwnedSemaphorePermit, TryAcquireError> {
@@ -1171,20 +1175,21 @@ impl Semaphore {
     ///
     /// Same as [`acquire_with_cx`]: observes pre-cancel (pinned by
     /// `semaphore_acquire_owned_with_cx_observes_pre_cancel`, tick
-    /// 427); does NOT register a cx-cancel-waker for already-suspended
-    /// acquires. The tick-421/439a tests pin the borrow variant; the
-    /// tick-427 pre-cancel test pins the owned variant. Callers
-    /// needing mid-flight cancel observability should use the same
-    /// select-race pattern. See
-    /// `docs/ft-xbnl0-2-4-completion-evidence.md` §2.6.1.
+    /// 427), and a suspended acquire ends as soon as `cx` is cancelled,
+    /// through [`until_cancelled`] (pinned by
+    /// `semaphore_acquire_owned_with_cx_wakes_on_mid_flight_cancel_without_a_watcher`).
+    /// See `docs/ft-xbnl0-2-4-completion-evidence.md` §2.6.1.
     pub async fn acquire_owned_with_cx(
         self: Arc<Self>,
         cx: &crate::cx::Cx,
     ) -> Result<OwnedSemaphorePermit, AcquireError> {
-        asupersync::sync::OwnedSemaphorePermit::acquire(self.inner.clone(), cx, 1)
-            .await
-            .map(|inner| OwnedSemaphorePermit { inner })
-            .map_err(Self::map_acquire_error)
+        let acquire = asupersync::sync::OwnedSemaphorePermit::acquire(self.inner.clone(), cx, 1);
+        match until_cancelled(cx, acquire).await {
+            Ok(result) => result
+                .map(|inner| OwnedSemaphorePermit { inner })
+                .map_err(Self::map_acquire_error),
+            Err(_) => Err(AcquireError::Cancelled),
+        }
     }
 }
 
@@ -1734,16 +1739,11 @@ pub mod mpsc {
 /// short-circuit (pinned by `watch_changed_with_cx_observes_pre_cancel`,
 /// ft-xbnl0.2.4 tick 423).
 ///
-/// Does NOT observe **mid-flight cancel**: asupersync's watch receiver
-/// does not register a cx-cancel-waker (pinned by
-/// `watch_changed_with_cx_mid_flight_cancel_via_select_race_pattern`,
-/// tick 438 — extends the tick 432/433/434 finding from
-/// mpsc/oneshot/broadcast to watch, confirming all four asupersync
-/// channel types share the same design). Callers needing mid-flight
-/// cancel observability must wrap in `futures::future::select`
-/// against a poll-sleep watcher (same pattern as
-/// `DistributedHttpClient::race_with_cx_cancel`, tick 387). See
-/// `docs/ft-xbnl0-2-4-completion-evidence.md` §2.6.1.
+/// Also observes **mid-flight cancel**: since asupersync 0.6 a pending
+/// `changed(cx)` registers a cancellation waker, so a wait already
+/// suspended ends when its Cx is cancelled, with no watcher (pinned by
+/// `watch_changed_wakes_on_mid_flight_cancel_without_a_watcher`). The
+/// ticks 432-438 finding that no channel registered one predates 0.6.
 pub mod watch {
     use asupersync::channel::watch as inner;
     use std::future::Future;
@@ -2887,12 +2887,13 @@ pub mod task {
         ///
         /// Also observes **mid-flight cancel** on any external re-poll
         /// (task completion, external wake) via the per-poll-iteration
-        /// `caller_cx.checkpoint()` inside the `poll_fn` closure — this
-        /// is the key distinction from the asupersync-delegated recv
-        /// primitives (mpsc/oneshot/broadcast/watch/Semaphore) which
-        /// require the caller-side select-race workaround for
-        /// mid-flight cancel. The tick-439b select-race test tolerates
-        /// either branch firing; both observe cancel fast. See
+        /// `caller_cx.checkpoint()` inside the `poll_fn` closure. It
+        /// registers no cancellation waker, so a join with no task
+        /// finishing and no other wake sees the cancel only at its next
+        /// poll. Since asupersync 0.6 the mpsc, oneshot, broadcast and
+        /// watch receives do register one; Semaphore acquire, like this,
+        /// does not. The tick-439b select-race test tolerates either
+        /// branch firing; both observe cancel fast. See
         /// `docs/ft-xbnl0-2-4-completion-evidence.md` §2.6.1.
         pub async fn join_next_with_cx(
             &mut self,
@@ -9049,15 +9050,11 @@ pub async fn broadcast_recv<T: Clone>(
 /// `poll_recv` returns `Err(RecvError::Cancelled)` (pinned by
 /// `broadcast_recv_with_cx_observes_pre_cancel`, ft-xbnl0.2.4 tick 420).
 ///
-/// Does NOT observe **mid-flight cancel**: asupersync's broadcast
-/// receiver does not register a cx-cancel-waker. A recv that has
-/// already suspended on the send-side waker will NOT wake when
-/// `cx.cancel_with(...)` fires afterward (pinned by
-/// `broadcast_recv_with_cx_mid_flight_cancel_via_select_race_pattern`,
-/// tick 434). Callers needing mid-flight cancel observability must
-/// wrap this call in `futures::future::select` against a poll-sleep
-/// watcher (same pattern as `DistributedHttpClient::race_with_cx_cancel`,
-/// tick 387). See `docs/ft-xbnl0-2-4-completion-evidence.md` §2.6.1.
+/// Also observes **mid-flight cancel**: since asupersync 0.6 a pending
+/// broadcast receive registers a cancellation waker, so a recv already
+/// suspended on an empty channel ends with `RecvError::Cancelled` when
+/// its Cx is cancelled, with no watcher (pinned by
+/// `broadcast_recv_wakes_on_mid_flight_cancel_without_a_watcher`).
 pub async fn broadcast_recv_with_cx<T: Clone>(
     cx: &crate::cx::Cx,
     rx: &mut broadcast::Receiver<T>,
@@ -9135,14 +9132,11 @@ pub async fn oneshot_recv<T>(rx: oneshot::Receiver<T>) -> Result<T, String> {
 /// asupersync's `poll_recv` `cx.checkpoint()` short-circuit (pinned
 /// by `oneshot_recv_with_cx_observes_pre_cancel`, tick 419).
 ///
-/// Does NOT observe **mid-flight cancel**: asupersync's oneshot
-/// receiver does not register a cx-cancel-waker. An already-suspended
-/// recv will NOT wake when `cx.cancel_with(...)` fires afterward
-/// (pinned by `oneshot_recv_with_cx_mid_flight_cancel_via_select_race_pattern`,
-/// tick 433). Callers needing mid-flight cancel must wrap in
-/// `futures::future::select` against a poll-sleep watcher (same
-/// pattern as `DistributedHttpClient::race_with_cx_cancel`, tick 387).
-/// See `docs/ft-xbnl0-2-4-completion-evidence.md` §2.6.1.
+/// Also observes **mid-flight cancel**: since asupersync 0.6 a pending
+/// oneshot receive registers a cancellation waker, which the contained
+/// proxy below forwards, so a recv already suspended ends with an error
+/// when its Cx is cancelled, with no watcher (pinned by
+/// `oneshot_recv_wakes_on_mid_flight_cancel_without_a_watcher`).
 pub async fn oneshot_recv_with_cx<T>(
     cx: &crate::cx::Cx,
     rx: oneshot::Receiver<T>,
@@ -16887,6 +16881,9 @@ mod tests {
     /// cancel-waker gap with the four channel types. Together with
     /// tick 439b (JoinSet) this completes the mid-flight matrix
     /// across all six long-lived-wait primitives in runtime_async.
+    /// `acquire_with_cx` now waits under `until_cancelled` (ft-3268r),
+    /// so either branch may win the race; see
+    /// `semaphore_acquire_with_cx_wakes_on_mid_flight_cancel_without_a_watcher`.
     #[test]
     fn semaphore_acquire_with_cx_mid_flight_cancel_via_select_race_pattern() {
         use futures::future::Either;
@@ -17030,6 +17027,9 @@ mod tests {
     /// upgraded to "confirmed" — all four asupersync channel types
     /// observe pre-cancel via per-poll checkpoint but do NOT
     /// register cx-cancel-wakers for already-suspended recvs.
+    /// asupersync 0.6 changed that: a pending `changed(cx)` now wakes on
+    /// cancellation itself (pinned by
+    /// `watch_changed_wakes_on_mid_flight_cancel_without_a_watcher`).
     #[test]
     fn watch_changed_with_cx_mid_flight_cancel_via_select_race_pattern() {
         use futures::future::Either;
@@ -17098,7 +17098,9 @@ mod tests {
     /// asupersync broadcast receivers do not register cx-cancel-wakers
     /// for already-suspended recvs. Together with ticks 432/433, this
     /// generalises the finding to the three most-used channel recv
-    /// primitives across the core.
+    /// primitives across the core. asupersync 0.6 changed that: a pending
+    /// broadcast recv now wakes on cancellation itself (pinned by
+    /// `broadcast_recv_wakes_on_mid_flight_cancel_without_a_watcher`).
     ///
     /// Broadcast is especially impacted: it underpins the event fanout
     /// layer (`events.rs`, `ipc.rs`), so cx-cancel mid-flight on a
@@ -17178,8 +17180,9 @@ mod tests {
     ///
     /// **Outcome when written**: watcher branch fires consistently,
     /// confirming the same gap applies to oneshot_recv_with_cx as to
-    /// mpsc. Callers needing mid-flight cancel on oneshot must use
-    /// the same `futures::future::select` race pattern.
+    /// mpsc. asupersync 0.6 changed that: a pending oneshot recv now wakes
+    /// on cancellation itself, so the race is no longer needed (pinned by
+    /// `oneshot_recv_wakes_on_mid_flight_cancel_without_a_watcher`).
     #[test]
     fn oneshot_recv_with_cx_mid_flight_cancel_via_select_race_pattern() {
         use futures::future::Either;
@@ -17223,13 +17226,12 @@ mod tests {
             );
             match outcome {
                 Either::Right((Err(_), _)) => {
-                    // Expected: watcher branch fired with cancel
-                    // (same gap as mpsc — no cx-cancel-waker).
+                    // The watcher branch fired with the cancel.
                 }
                 Either::Left((Err(_), _)) => {
-                    // Acceptable: oneshot itself observed the cancel
-                    // (would mean asupersync gained waker support —
-                    // improvement, not regression).
+                    // The oneshot observed the cancel itself: since
+                    // asupersync 0.6 its pending recv registers a
+                    // cancellation waker.
                 }
                 Either::Left((Ok(()), _)) => {
                     panic!("recv branch returned Ok — sender should not have fired")
@@ -17241,6 +17243,48 @@ mod tests {
         });
     }
 
+    /// Runs `wait` as a task of its own, cancels `cx` once that task is
+    /// suspended, and returns what `wait` ended with. Panics if the wait was
+    /// not pending when cancelled, or is still pending 2 s after the cancel.
+    ///
+    /// The wait needs its own task. Polled inline in the test's root task
+    /// next to a 2 s bound, the Semaphore pins passed with the Semaphore fix
+    /// undone (gate 31's planted negative, 2026-11-11). Something other than
+    /// a cancellation wake re-polled the root, and the wait's per-poll
+    /// checkpoint then saw the cancel. In a task of its own, only the wait's
+    /// own wakes poll it. The pool pin, which already ran its waiter that way,
+    /// did fail on that negative.
+    async fn end_of_cancelled_wait<T: Send + 'static>(
+        cx: &crate::cx::Cx,
+        wait: impl Future<Output = T> + Send + 'static,
+    ) -> T {
+        let waiter = task::spawn(wait);
+        sleep(Duration::from_millis(100)).await;
+        assert!(
+            !waiter.is_finished(),
+            "the wait must still be pending when its Cx is cancelled"
+        );
+        cx.cancel_with(
+            crate::outcome::CancelKind::User,
+            Some("cancelled mid-wait by a wake pin"),
+        );
+        match timeout_with_cx(
+            &crate::cx::Cx::for_testing(),
+            Duration::from_secs(2),
+            waiter,
+        )
+        .await
+        {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) => panic!("the waiting task failed: {error:?}"),
+            Err(elapsed) => {
+                panic!(
+                    "the pending wait did not end within 2 s of its Cx's cancellation: {elapsed}"
+                )
+            }
+        }
+    }
+
     /// asupersync 0.6's mpsc receive future registers a cancellation waker
     /// while it is pending, and the project wrapper forwards it through its
     /// contained waker proxy, so a receive already suspended on an empty
@@ -17249,8 +17293,6 @@ mod tests {
     /// and the 2 s bound wins.
     #[test]
     fn mpsc_recv_wakes_on_mid_flight_cancel_without_a_watcher() {
-        use futures::future::Either;
-        use futures::future::select;
         let rt = RuntimeBuilder::current_thread()
             .enable_all()
             .build()
@@ -17258,27 +17300,12 @@ mod tests {
         rt.block_on(async {
             let (_tx, mut rx) = mpsc::channel::<u64>(4);
             let cx = crate::cx::Cx::for_testing();
-            let cancel_trigger = cx.clone();
-
-            task::spawn(async move {
-                sleep(Duration::from_millis(100)).await;
-                cancel_trigger.cancel_with(
-                    crate::outcome::CancelKind::User,
-                    Some("mpsc receive cancelled mid-flight"),
-                );
-            });
-
-            let recv_fut = std::pin::pin!(rx.recv(&cx));
-            let bound = std::pin::pin!(sleep(Duration::from_secs(2)));
-            match select(recv_fut, bound).await {
-                Either::Left((Err(mpsc::RecvError::Cancelled), _)) => {}
-                Either::Left((other, _)) => {
-                    panic!("a cancelled pending receive must end Cancelled; got {other:?}")
-                }
-                Either::Right(((), _)) => {
-                    panic!("the pending receive did not wake within 2 s of its Cx's cancellation")
-                }
-            }
+            let wait_cx = cx.clone();
+            let ended = end_of_cancelled_wait(&cx, async move { rx.recv(&wait_cx).await }).await;
+            assert!(
+                matches!(ended, Err(mpsc::RecvError::Cancelled)),
+                "a cancelled pending receive must end Cancelled; got {ended:?}"
+            );
         });
     }
 
@@ -17287,8 +17314,6 @@ mod tests {
     /// `RecvError::Cancelled` when its Cx is cancelled, without a watcher.
     #[test]
     fn broadcast_recv_wakes_on_mid_flight_cancel_without_a_watcher() {
-        use futures::future::Either;
-        use futures::future::select;
         let rt = RuntimeBuilder::current_thread()
             .enable_all()
             .build()
@@ -17297,27 +17322,16 @@ mod tests {
             let (tx, _rx_keepalive) = broadcast::channel::<u64>(4);
             let mut rx = tx.subscribe();
             let cx = crate::cx::Cx::for_testing();
-            let cancel_trigger = cx.clone();
-
-            task::spawn(async move {
-                sleep(Duration::from_millis(100)).await;
-                cancel_trigger.cancel_with(
-                    crate::outcome::CancelKind::User,
-                    Some("broadcast receive cancelled mid-flight"),
-                );
-            });
-
-            let recv_fut = std::pin::pin!(broadcast_recv_with_cx(&cx, &mut rx));
-            let bound = std::pin::pin!(sleep(Duration::from_secs(2)));
-            match select(recv_fut, bound).await {
-                Either::Left((Err(broadcast::RecvError::Cancelled), _)) => {}
-                Either::Left((other, _)) => {
-                    panic!("a cancelled pending receive must end Cancelled; got {other:?}")
-                }
-                Either::Right(((), _)) => {
-                    panic!("the pending receive did not wake within 2 s of its Cx's cancellation")
-                }
-            }
+            let wait_cx = cx.clone();
+            let ended = end_of_cancelled_wait(&cx, async move {
+                broadcast_recv_with_cx(&wait_cx, &mut rx).await
+            })
+            .await;
+            assert!(
+                matches!(ended, Err(broadcast::RecvError::Cancelled)),
+                "a cancelled pending receive must end Cancelled; got {ended:?}"
+            );
+            drop(tx);
         });
     }
 
@@ -17326,8 +17340,6 @@ mod tests {
     /// `RecvError::Cancelled` when its Cx is cancelled, without a watcher.
     #[test]
     fn watch_changed_wakes_on_mid_flight_cancel_without_a_watcher() {
-        use futures::future::Either;
-        use futures::future::select;
         let rt = RuntimeBuilder::current_thread()
             .enable_all()
             .build()
@@ -17336,29 +17348,151 @@ mod tests {
             let (_tx, mut rx) = watch::channel::<u64>(0);
             let _ = rx.borrow_and_update();
             let cx = crate::cx::Cx::for_testing();
-            let cancel_trigger = cx.clone();
+            let wait_cx = cx.clone();
+            let ended = end_of_cancelled_wait(&cx, async move { rx.changed(&wait_cx).await }).await;
+            assert!(
+                matches!(ended, Err(watch::RecvError::Cancelled)),
+                "a cancelled pending change wait must end Cancelled; got {ended:?}"
+            );
+        });
+    }
 
-            task::spawn(async move {
-                sleep(Duration::from_millis(100)).await;
-                cancel_trigger.cancel_with(
-                    crate::outcome::CancelKind::User,
-                    Some("watch change wait cancelled mid-flight"),
-                );
-            });
-
-            let changed_fut = std::pin::pin!(rx.changed(&cx));
-            let bound = std::pin::pin!(sleep(Duration::from_secs(2)));
-            match select(changed_fut, bound).await {
-                Either::Left((Err(watch::RecvError::Cancelled), _)) => {}
-                Either::Left((other, _)) => {
-                    panic!("a cancelled pending change wait must end Cancelled; got {other:?}")
-                }
-                Either::Right(((), _)) => {
-                    panic!(
-                        "the pending change wait did not wake within 2 s of its Cx's cancellation"
-                    )
-                }
+    /// The oneshot receive future registers a cancellation waker as well,
+    /// and `oneshot_recv_with_cx`'s contained proxy forwards it, so a
+    /// receive waiting on a sender that never sends ends with the
+    /// cancellation error when its Cx is cancelled, without a watcher.
+    #[test]
+    fn oneshot_recv_wakes_on_mid_flight_cancel_without_a_watcher() {
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (_tx, rx) = oneshot::channel::<u64>();
+            let cx = crate::cx::Cx::for_testing();
+            let wait_cx = cx.clone();
+            let ended =
+                end_of_cancelled_wait(&cx, async move { oneshot_recv_with_cx(&wait_cx, rx).await })
+                    .await;
+            match ended {
+                Err(error) => assert!(
+                    error.contains("receive operation cancelled"),
+                    "a cancelled pending receive must end with the cancellation error; got {error}"
+                ),
+                Ok(value) => panic!("the sender never sent, yet the receive returned {value}"),
             }
+        });
+    }
+
+    /// A contended `Mutex::lock_with_cx` subscribes to its Cx's cancellation,
+    /// so a waiter blocked behind a guard that is never released ends with
+    /// `LockAcquireError::Cancelled` when its Cx is cancelled, without an
+    /// unlock or a watcher.
+    #[test]
+    fn mutex_lock_with_cx_wakes_on_mid_flight_cancel_without_a_watcher() {
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mutex = Arc::new(Mutex::new(0_u64));
+            let holder_cx = crate::cx::Cx::for_testing();
+            let held = mutex
+                .lock_with_cx(&holder_cx)
+                .await
+                .expect("an uncontended lock succeeds");
+            let cx = crate::cx::Cx::for_testing();
+            let wait_cx = cx.clone();
+            let contender = Arc::clone(&mutex);
+            let ended = end_of_cancelled_wait(&cx, async move {
+                contender.lock_with_cx(&wait_cx).await.map(|_guard| ())
+            })
+            .await;
+            match ended {
+                Err(LockAcquireError::Cancelled) => {}
+                Err(other) => {
+                    panic!("a cancelled contended lock must end Cancelled; got {other:?}")
+                }
+                Ok(()) => panic!("the lock was acquired while still held"),
+            }
+            drop(held);
+        });
+    }
+
+    /// asupersync's semaphore acquire registers no cancellation waker, so
+    /// `acquire_with_cx` waits under `until_cancelled` (ft-3268r). A waiter
+    /// behind a permit that is never released ends Cancelled when its Cx is
+    /// cancelled, without a watcher, and leaves the permit for the next taker.
+    #[test]
+    fn semaphore_acquire_with_cx_wakes_on_mid_flight_cancel_without_a_watcher() {
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let sem = Arc::new(Semaphore::new(1));
+            let held = sem.try_acquire().expect("the only permit is free");
+            let cx = crate::cx::Cx::for_testing();
+            let wait_cx = cx.clone();
+            let contender = Arc::clone(&sem);
+            let ended = end_of_cancelled_wait(&cx, async move {
+                contender.acquire_with_cx(&wait_cx).await.map(|_permit| ())
+            })
+            .await;
+            match ended {
+                Err(AcquireError::Cancelled) => {}
+                Err(other) => {
+                    panic!("a cancelled contended acquire must end Cancelled; got {other:?}")
+                }
+                Ok(()) => panic!("a permit was granted while the only one was held"),
+            }
+
+            drop(held);
+            let again = sem.try_acquire();
+            assert!(
+                again.is_ok(),
+                "the cancelled waiter must leave the released permit free; got {again:?}"
+            );
+        });
+    }
+
+    /// Owned-permit companion of
+    /// `semaphore_acquire_with_cx_wakes_on_mid_flight_cancel_without_a_watcher`.
+    #[test]
+    fn semaphore_acquire_owned_with_cx_wakes_on_mid_flight_cancel_without_a_watcher() {
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let sem = Arc::new(Semaphore::new(1));
+            let held = Arc::clone(&sem)
+                .try_acquire_owned()
+                .expect("the only permit is free");
+            let cx = crate::cx::Cx::for_testing();
+            let wait_cx = cx.clone();
+            let contender = Arc::clone(&sem);
+            let ended = end_of_cancelled_wait(&cx, async move {
+                contender
+                    .acquire_owned_with_cx(&wait_cx)
+                    .await
+                    .map(|_permit| ())
+            })
+            .await;
+            match ended {
+                Err(AcquireError::Cancelled) => {}
+                Err(other) => {
+                    panic!("a cancelled contended acquire must end Cancelled; got {other:?}")
+                }
+                Ok(()) => panic!("a permit was granted while the only one was held"),
+            }
+
+            drop(held);
+            let again = Arc::clone(&sem).try_acquire_owned();
+            assert!(
+                again.is_ok(),
+                "the cancelled waiter must leave the released permit free; got {again:?}"
+            );
         });
     }
 
@@ -17366,21 +17500,16 @@ mod tests {
     /// mid-flight cx-cancel pattern for `mpsc::Receiver::recv` —
     /// `select!` race against a poll-based cx-cancel watcher.
     ///
-    /// **Finding**: asupersync `mpsc::Receiver::recv(cx)` observes
-    /// pre-cancel via its per-poll `cx.checkpoint().is_err()`
-    /// short-circuit (pinned by tick 422) but does NOT register a
-    /// cx-cancel-waker. A recv that has already suspended on the
-    /// send-side waker will not wake when `cx.cancel_with(...)` fires
-    /// after the suspension. The test-worthy mid-flight cancel
-    /// pattern is therefore the same caller-side workaround that
-    /// `DistributedHttpClient` uses (tick 387 `race_with_cx_cancel`):
-    /// wrap the recv in a `select!` against a poll-sleep cancel
-    /// watcher.
+    /// **Finding (tick 432, before asupersync 0.6)**: `recv(cx)` observed
+    /// pre-cancel via its per-poll checkpoint (pinned by tick 422) but
+    /// registered no cancellation waker, so the caller-side workaround
+    /// `DistributedHttpClient` used (tick 387 `race_with_cx_cancel`) was
+    /// needed: race the recv against a poll-sleep cancel watcher.
     ///
-    /// This test pins that pattern works, giving callers a template.
-    /// It also documents the underlying gap: if asupersync ever
-    /// registers cx-cancel-wakers on the recv path, the polling
-    /// watcher becomes redundant but remains correct.
+    /// Since 0.6 a pending recv registers that waker itself (pinned by
+    /// `mpsc_recv_wakes_on_mid_flight_cancel_without_a_watcher`), so the
+    /// watcher is redundant. This test still pins that the pattern works,
+    /// and either branch may win the race.
     ///
     /// Shape:
     /// - Create `(tx, mut rx) = mpsc::channel(4)` — keep `_tx` alive.

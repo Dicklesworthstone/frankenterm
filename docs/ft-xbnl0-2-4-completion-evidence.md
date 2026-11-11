@@ -208,6 +208,19 @@ are covered:
 
 #### 2.6.1 Mid-flight cancel pattern (ticks 432-439)
 
+**Update, asupersync 0.6 (2026-11-11, ft-3268r).** The gap described
+below was real for the asupersync release these ticks ran against,
+and asupersync 0.6 closed most of it. A suspended mpsc, broadcast or
+watch receive now registers a cancellation waker, as do oneshot's
+receive and a contended `Mutex::lock_with_cx`. Cancelling the Cx ends
+the wait without a watcher. `*_wakes_on_mid_flight_cancel_without_a_watcher`
+in `runtime_async.rs` pins each of the five. Semaphore acquire still
+only checkpoints on each poll, so it still needs the select-race
+pattern. asupersync's Notify and RwLock read futures behave the same
+way. The socket line read (`unix::next_line_with_cx`) now goes through
+asupersync's `Next::with_cx`, which wakes on cancellation. The table
+and the paragraphs after it record the original finding.
+
 The pre-cancel tests above verify the `cx.checkpoint()` short-circuit
 fires on ENTRY to the recv / acquire. Mid-flight cancel — firing
 `cx.cancel_with(...)` AFTER the primitive has already suspended —
@@ -222,23 +235,26 @@ This matches the earlier ft-l9mxa finding on the HTTP client (tick
 finding is now captured explicitly at the primitive level across
 all six asupersync-backed long-lived wait primitives:
 
-| Primitive                           | Pre-cancel short-circuit | Mid-flight waker | Caller pattern test |
-|-------------------------------------|--------------------------|------------------|---------------------|
-| mpsc::Receiver::recv                | ✓ tick 422               | ✗ (tick 432)     | tick 432            |
-| oneshot_recv_with_cx                | ✓ tick 419               | ✗ (tick 433)     | tick 433            |
-| broadcast_recv_with_cx              | ✓ tick 420               | ✗ (tick 434)     | tick 434            |
-| watch::Receiver::changed            | ✓ tick 423               | ✗ (tick 438)     | tick 438            |
-| Semaphore::acquire_with_cx          | ✓ tick 421               | ✗ (tick 439a)    | tick 439a           |
-| JoinSet::join_next_with_cx          | ✓ tick 426               | tolerant (tick 439b)* | tick 439b       |
+| Primitive                           | Pre-cancel short-circuit | Mid-flight waker | Caller pattern test | Since asupersync 0.6 |
+|-------------------------------------|--------------------------|------------------|---------------------|----------------------|
+| mpsc::Receiver::recv                | ✓ tick 422               | ✗ (tick 432)     | tick 432            | ✓ waker              |
+| oneshot_recv_with_cx                | ✓ tick 419               | ✗ (tick 433)     | tick 433            | ✓ waker              |
+| broadcast_recv_with_cx              | ✓ tick 420               | ✗ (tick 434)     | tick 434            | ✓ waker              |
+| watch::Receiver::changed            | ✓ tick 423               | ✗ (tick 438)     | tick 438            | ✓ waker              |
+| Semaphore::acquire_with_cx          | ✓ tick 421               | ✗ (tick 439a)    | tick 439a           | ✗ still needs select |
+| JoinSet::join_next_with_cx          | ✓ tick 426               | tolerant (tick 439b)* | tick 439b       | unchanged            |
+| Mutex::lock_with_cx (not in ticks)  | n/a                      | n/a              | n/a                 | ✓ waker              |
 
 *JoinSet::join_next_with_cx is a runtime_compat-owned primitive with
 a per-poll `caller_cx.checkpoint()` inside its `poll_fn` closure
 (tick 426), so on external re-polls it DOES re-check cancel. The
 tick-439b test tolerates either branch firing; both converge on
 fast observation. The other five primitives are asupersync-delegated
-and consistently require the select-race pattern.
+and, before asupersync 0.6, all required the select-race pattern. Of
+those five, only Semaphore still does.
 
-**Caller workaround** (universal): wrap the recv in
+**Caller workaround** (universal before 0.6; now needed for Semaphore
+acquire and other primitives with no cancellation waker): wrap the recv in
 `futures::future::select` against a poll-sleep cancel watcher:
 
 ```rust
@@ -431,7 +447,7 @@ inside the repo's shared `target/`.
 These items have been verified in-session and are durable evidence:
 
 - [x] `rch workers probe --all --json` shows reachable workers (tick 373 — 6 Contabo VPS hosts green).
-- [x] **Local smoke**: `./scripts/check_ft_xbnl0_2_4.sh` exits 0 with all 109 tests passing (34 HTTP + 45 TLS + 3 guards + 3 metrics + 2 web + 22 primitive). Confirmed at every post-tick run. Run 5 web grew 1→2 at tick 417 (`run_web_server_with_cx` mid-flight cancel); Run 6 primitive grew 2→22 across ticks 418-439: the first 16 pin the pre-cancel matrix (long-lived wait primitives + seam-level primitives + pre-existing bonus tests from filter broadening), and ticks 432/433/434/438/439a/439b document the mid-flight-cancel-waker gap across all six asupersync-backed primitives (mpsc / oneshot / broadcast / watch / Semaphore / JoinSet). All recv/acquire primitives observe pre-cancel via per-poll `cx.checkpoint()` but do NOT register cx-cancel-wakers; already-suspended recvs won't wake when cx is cancelled afterward. The select-race caller pattern (same as tick-387 `DistributedHttpClient::race_with_cx_cancel` fix for ft-l9mxa) is the universal workaround.
+- [x] **Local smoke**: `./scripts/check_ft_xbnl0_2_4.sh` exits 0 with all 109 tests passing (34 HTTP + 45 TLS + 3 guards + 3 metrics + 2 web + 22 primitive). Confirmed at every post-tick run. Run 5 web grew 1→2 at tick 417 (`run_web_server_with_cx` mid-flight cancel); Run 6 primitive grew 2→22 across ticks 418-439: the first 16 pin the pre-cancel matrix (long-lived wait primitives + seam-level primitives + pre-existing bonus tests from filter broadening), and ticks 432/433/434/438/439a/439b document the mid-flight-cancel-waker gap across all six asupersync-backed primitives (mpsc / oneshot / broadcast / watch / Semaphore / JoinSet). All recv/acquire primitives observe pre-cancel via per-poll `cx.checkpoint()` but do NOT register cx-cancel-wakers; already-suspended recvs won't wake when cx is cancelled afterward. The select-race caller pattern (same as tick-387 `DistributedHttpClient::race_with_cx_cancel` fix for ft-l9mxa) is the universal workaround. (asupersync 0.6 later gave mpsc, oneshot, broadcast and watch cancellation wakers; Semaphore still needs the workaround. See §2.6.1.)
 - [x] **Full Level-C remote evidence**: all 6 test groups verified on `vmi1149989` via rch exec. **109/109 remote PASS** matches local 109/109 exactly at HEAD after the tick 449 (Run 6 runtime_compat 22/22) + tick 450 (Run 5 web 2/2) warm-cache re-verifications closed the 21-test gap that had opened since tick 413's 88/88 snapshot. Captured logs at `/tmp/ft-xbnl0.2.4-rch-artifacts-tick374/` (tick 393 baseline) + `/tmp/ft-xbnl0.2.4-rch-artifacts-tick447/` (ticks 449/450 warm re-verifies). Recipe to reproduce in [ft-xbnl0-2-4-rch-attempt-tick374.md](ft-xbnl0-2-4-rch-attempt-tick374.md) §"Command recipe for full Level-C capture".
 - [x] **`cargo test --lib distributed::tests::` broader filter**: 154/154 ok (tick 362 verified locally, re-confirmed at HEAD by the tick-392 HTTP rch run which used a broader filter and saw all 29 HTTP tests plus pre-existing tests pass).
 - [x] `cargo fmt --check` is clean for files touched this session (`distributed.rs`, `metrics.rs`, `tests/web.rs`) — tick 355 formatted them pre-emptively.

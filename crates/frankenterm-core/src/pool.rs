@@ -322,10 +322,13 @@ impl<C: Send + 'static> Pool<C> {
     /// This preserves existing timeout behavior while allowing upstream
     /// call graphs to carry `Cx` explicitly. The acquire timeout is
     /// bound to the caller's `Cx` via
-    /// [`crate::runtime_async::timeout_with_cx`] (ft-xbnl0.2.3) so
-    /// cancellation on the caller's Cx cuts the semaphore wait
-    /// deterministically instead of being pulled from
-    /// `Cx::current()` thread-local state.
+    /// [`crate::runtime_async::timeout_with_cx`] (ft-xbnl0.2.3), which
+    /// observes a deadline in the caller's budget. A cancellation of the
+    /// caller's Cx ends the permit wait itself:
+    /// `Semaphore::acquire_owned_with_cx` wakes on it (ft-3268r), so a
+    /// cancelled waiter returns [`PoolError::Cancelled`] without waiting
+    /// out `acquire_timeout` (pinned by
+    /// `pool_acquire_with_cx_cancel_ends_the_wait_before_a_long_acquire_timeout`).
     pub async fn acquire_with_cx(&self, cx: &Cx) -> Result<PoolAcquireResult<C>, PoolError> {
         Self::checkpoint_explicit_cx(cx)?;
 
@@ -2330,6 +2333,62 @@ mod tests {
                 stats.total_acquired, 1,
                 "cancelled waiter must not consume a permit"
             );
+            assert_eq!(
+                stats.active_count, 1,
+                "held permit should remain the only active one"
+            );
+
+            drop(held);
+        });
+    }
+
+    /// `pool_acquire_with_cx_cancelled_while_waiting_returns_cancelled` runs
+    /// with the 100 ms test `acquire_timeout`, so it would also pass if the
+    /// cancel were seen only when that timeout fired. This one uses a 30 s
+    /// timeout and requires the cancelled waiter to end well before it.
+    #[test]
+    fn pool_acquire_with_cx_cancel_ends_the_wait_before_a_long_acquire_timeout() {
+        run_async_test(async {
+            let pool = Arc::new(Pool::<String>::new(PoolConfig {
+                max_size: 1,
+                idle_timeout: Duration::from_secs(60),
+                acquire_timeout: Duration::from_secs(30),
+            }));
+            let held = pool.acquire().await.expect("hold only slot");
+
+            let wait_cx = crate::cx::for_testing();
+            let task_cx = wait_cx.clone();
+            let waiter_pool = pool.clone();
+            let waiter = crate::runtime_async::task::spawn(async move {
+                waiter_pool.acquire_with_cx(&task_cx).await
+            });
+
+            crate::runtime_async::sleep(Duration::from_millis(100)).await;
+            let cancelled_at = std::time::Instant::now();
+            wait_cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("cancel while waiting behind a long acquire timeout"),
+            );
+
+            let joined = crate::runtime_async::timeout_with_cx(
+                &crate::cx::for_testing(),
+                Duration::from_secs(5),
+                waiter,
+            )
+            .await
+            .expect("the cancelled waiter must end before the 5 s bound");
+            let elapsed = cancelled_at.elapsed();
+            let err = joined
+                .expect("waiter task should join")
+                .expect_err("cancelled wait should fail");
+            assert_eq!(err, PoolError::Cancelled);
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "the cancel must end the permit wait, not the 30 s timeout; took {elapsed:?}"
+            );
+
+            let stats = pool.stats().await;
+            assert_eq!(stats.total_timeouts, 0, "a cancel is not a timeout");
             assert_eq!(
                 stats.active_count, 1,
                 "held permit should remain the only active one"
