@@ -16449,8 +16449,10 @@ fn list_agent_config_xattr_names(
         )
     };
     for _ in 0..MAX_ATTEMPTS {
-        let mut empty = [0_u8; 0];
-        let size = match rustix::fs::flistxattr(file.as_fd(), &mut empty[..]) {
+        // The explicit size query: since rustix 1.1.6, `flistxattr` with an
+        // empty buffer reports 0 rather than the list's length, which would
+        // read as "no attributes" and let every file through.
+        let size = match rustix::fs::flistxattr_query(file.as_fd()) {
             Ok(0) => return Ok(Vec::new()),
             Ok(size) => size,
             Err(err) if err == rustix::io::Errno::NOTSUP || err == rustix::io::Errno::OPNOTSUPP => {

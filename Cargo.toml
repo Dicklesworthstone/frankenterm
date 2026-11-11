@@ -621,7 +621,9 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 glob = "0.3.3"
 console = "0.16.3"
 getrandom = "0.4.2"
-rustix = { version = "1.1.4", features = ["fs"] }
+# 1.1.6: ft's agent-config xattr check needs flistxattr_query (1.1.6 also
+# stopped treating an empty flistxattr buffer as a size query).
+rustix = { version = "1.1.6", features = ["fs"] }
 trybuild = { version = "1.0.116", default-features = false }
 # Crypto provider: ring, NOT the rustls default of aws-lc-rs (#67). aws-lc-rs
 # spawns a jitter-entropy background thread whose Windows FLS teardown during
