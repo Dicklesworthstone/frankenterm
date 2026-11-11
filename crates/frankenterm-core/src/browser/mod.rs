@@ -2211,7 +2211,7 @@ impl std::fmt::Debug for BrowserProfile {
 pub(super) struct BrowserProfileOperationLock {
     directory: cap_std::fs::Dir,
     lock_directory: cap_std::fs::Dir,
-    _file: std::fs::File,
+    _file: crate::lock::FlockedFile,
     lock_file_name: String,
     profiles_root: PathBuf,
     storage_service: String,
@@ -2571,6 +2571,9 @@ impl BrowserProfile {
             attempted = true;
             match fs2::FileExt::try_lock_exclusive(&file) {
                 Ok(()) => {
+                    // Held from here, so a failed check below also unlocks
+                    // rather than only closing (ft-d1n3l).
+                    let file = crate::lock::FlockedFile::new(file, "browser_profile_operation");
                     let handle_metadata = file.metadata().map_err(|_| {
                         StorageError::Database(
                             "Browser profile operation lock could not be verified".to_string(),
@@ -5278,6 +5281,30 @@ mod tests {
                 ))
                 .exists()
         );
+    }
+
+    /// ft-d1n3l: a dropped profile operation lock is free at once, even while
+    /// a child forked during the operation still shares the lock file until
+    /// it execs. The try_clone stands in for that child's inherited copy.
+    #[cfg(unix)]
+    #[test]
+    fn dropped_profile_operation_lock_is_free_while_a_child_still_shares_it() {
+        let temp = tempfile::tempdir().expect("isolated shared lock root");
+        let profile = BrowserProfile::new(temp.path().join("profiles"), "openai", "shared");
+        profile.ensure_dir().expect("shared profile directory");
+        let operation_lock = profile
+            .acquire_operation_lock(1_000)
+            .expect("first profile lock");
+        let child_copy = operation_lock
+            ._file
+            .try_clone()
+            .expect("child's descriptor copy");
+
+        drop(operation_lock);
+
+        let again = profile.acquire_operation_lock(50).map(drop);
+        assert!(again.is_ok(), "{again:?}");
+        drop(child_copy);
     }
 
     #[test]

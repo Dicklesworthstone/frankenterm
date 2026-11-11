@@ -207,6 +207,59 @@ impl Drop for AdvisoryUnlockOnDrop<'_> {
     }
 }
 
+/// A file whose advisory lock this process holds. Dropping it unlocks the
+/// file before its descriptor closes.
+///
+/// A flock belongs to the open file description. A child that another thread
+/// forks or spawns holds a copy of every descriptor, close-on-exec ones
+/// included, until it execs, and the lock lives while any copy does. A
+/// close-only release can therefore leave the lock held after its owner let
+/// go, and a contender in that window is refused as busy (ft-d1n3l). An
+/// explicit unlock releases it for every copy. Wrap a file as soon as its lock
+/// succeeds, so that every later early return releases the lock too.
+#[derive(Debug)]
+pub(crate) struct FlockedFile {
+    file: File,
+    kind: &'static str,
+}
+
+impl FlockedFile {
+    /// Take ownership of `locked`, whose lock the caller has just acquired.
+    /// `kind` names the lock in a failed-release warning.
+    #[must_use]
+    pub(crate) fn new(locked: File, kind: &'static str) -> Self {
+        Self { file: locked, kind }
+    }
+}
+
+impl std::ops::Deref for FlockedFile {
+    type Target = File;
+
+    fn deref(&self) -> &File {
+        &self.file
+    }
+}
+
+impl std::ops::DerefMut for FlockedFile {
+    fn deref_mut(&mut self) -> &mut File {
+        &mut self.file
+    }
+}
+
+impl Drop for FlockedFile {
+    fn drop(&mut self) {
+        if let Err(error) = FileExt::unlock(&self.file) {
+            tracing::warn!(
+                target: "frankenterm::lock",
+                event = "ft-d1n3l",
+                lock_kind = self.kind,
+                error_kind = ?error.kind(),
+                "advisory lock release failed; closing the descriptor is the fallback"
+            );
+        }
+    }
+}
+
 fn report_lock_metadata_read_failure(failure: LockSidecarReadFailure) {
     record_lock_metadata_admission_failure();
     let size_known = failure.observed_bytes.is_some();
@@ -1609,6 +1662,31 @@ fn check_running_with_hooks(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// ft-d1n3l: dropping a FlockedFile releases its lock while another
+    /// descriptor still shares its open file description, as a child forked
+    /// by another thread does until it execs. Closing alone would not.
+    #[cfg(unix)]
+    #[test]
+    fn flocked_file_drop_unlocks_a_description_a_child_still_shares() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("shared.lock");
+        let locked = File::create(&path).unwrap();
+        FileExt::try_lock_exclusive(&locked).unwrap();
+        let child_copy = locked.try_clone().unwrap();
+        let contender = File::open(&path).unwrap();
+        assert_eq!(
+            FileExt::try_lock_exclusive(&contender).unwrap_err().kind(),
+            fs2::lock_contended_error().kind()
+        );
+
+        drop(FlockedFile::new(locked, "test"));
+
+        FileExt::try_lock_exclusive(&contender)
+            .expect("the lock must be free while the shared copy is still open");
+        FileExt::unlock(&contender).unwrap();
+        drop(child_copy);
+    }
 
     /// ft-nd1c0: the shared-name opener creates an absent file, opens an
     /// existing one without truncating it, and never creates non-exclusively,

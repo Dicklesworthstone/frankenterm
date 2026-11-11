@@ -212,11 +212,13 @@ fn decode_kill_switch_document(raw: &str) -> Result<PersistedKillSwitch, KillSwi
     Ok(persisted)
 }
 
-/// An exclusive workspace effect fence. Closing the file releases the lock,
-/// including on cancellation or unwind; the persistent lock file is never
-/// unlinked because replacing its inode would split the fencing domain.
+/// An exclusive workspace effect fence. Dropping it unlocks the file, also on
+/// cancellation or unwind. Closing alone would not release a lock that a
+/// concurrently forked child still shares (ft-d1n3l). The persistent lock file
+/// is never unlinked because replacing its inode would split the fencing
+/// domain.
 pub struct KillSwitchFence {
-    _file: std::fs::File,
+    _file: crate::lock::FlockedFile,
     workspace: PathBuf,
 }
 
@@ -253,7 +255,7 @@ pub fn acquire_kill_switch_fence(db_path: &Path) -> Result<KillSwitchFence, Kill
         }
     })?;
     Ok(KillSwitchFence {
-        _file: file,
+        _file: crate::lock::FlockedFile::new(file, "policy_kill_switch_fence"),
         workspace: canonical,
     })
 }
@@ -1036,6 +1038,27 @@ pub(crate) mod tests {
                 ));
                 assert!(started.elapsed() >= std::time::Duration::from_millis(60));
             });
+    }
+
+    /// ft-d1n3l: a dropped fence is free at once, even while a child forked
+    /// during the hold still shares its lock file's open description. The
+    /// try_clone stands in for that child's inherited copy.
+    #[cfg(unix)]
+    #[test]
+    fn dropped_fence_is_free_while_a_child_still_shares_its_lock_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("policy.db");
+        let _backend =
+            crate::storage_backend_trait::RusqliteBackend::open_path(&path, &Default::default())
+                .unwrap();
+        let fence = acquire_kill_switch_fence(&path).unwrap();
+        let child_copy = fence._file.try_clone().unwrap();
+
+        drop(fence);
+
+        let again = acquire_kill_switch_fence(&path).map(drop);
+        assert!(again.is_ok(), "{again:?}");
+        drop(child_copy);
     }
 
     #[test]

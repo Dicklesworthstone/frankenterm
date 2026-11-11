@@ -328,8 +328,9 @@ pub struct MmapAppendReport {
 }
 
 pub struct MmapScrollback {
-    file: File,
-    lock_file: File,
+    // Both are flocked; dropping each unlocks it before its descriptor closes.
+    file: crate::lock::FlockedFile,
+    lock_file: crate::lock::FlockedFile,
     path: PathBuf,
     lock_path: PathBuf,
     header: ScrollbackHeader,
@@ -453,6 +454,10 @@ impl MmapScrollback {
                 });
             }
         }
+        // Held from here, so every early return below unlocks rather than
+        // only closing; a concurrently forked child shares the descriptor
+        // until it execs (ft-d1n3l).
+        let lock_file = crate::lock::FlockedFile::new(lock_file, "scrollback_writer_sidecar");
         after_lock();
         revalidate_writer_file(
             &base_directory,
@@ -470,7 +475,7 @@ impl MmapScrollback {
             }
         })?;
         let opened_data = open_writer_file(&base_directory, &data_leaf, &path)?;
-        let mut file = opened_data.file;
+        let file = opened_data.file;
         revalidate_writer_file(
             &base_directory,
             &data_leaf,
@@ -493,6 +498,7 @@ impl MmapScrollback {
                 });
             }
         }
+        let mut file = crate::lock::FlockedFile::new(file, "scrollback_writer_data");
         revalidate_writer_file(
             &base_directory,
             &data_leaf,
@@ -1224,13 +1230,6 @@ impl MmapScrollback {
                 })?;
         }
         Ok(())
-    }
-}
-
-impl Drop for MmapScrollback {
-    fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
-        let _ = FileExt::unlock(&self.lock_file);
     }
 }
 
@@ -4112,6 +4111,27 @@ mod tests {
 
         assert!(matches!(error, MmapScrollbackError::WriterBusy { .. }));
         drop(first);
+    }
+
+    /// ft-d1n3l: a dropped writer frees both of its locks at once, even while
+    /// a child forked during its life still shares both descriptors until it
+    /// execs. The try_clones stand in for that child's inherited copies.
+    #[cfg(unix)]
+    #[test]
+    fn dropped_writer_frees_its_locks_while_a_child_still_shares_them() {
+        let dir = test_dir("writer-shared-copies");
+        let config = MmapScrollbackConfig::new(&dir, "writer-shared-copies").with_cap_bytes(4096);
+        let first = MmapScrollback::open(config.clone()).unwrap();
+        let child_copies = (
+            first.file.try_clone().unwrap(),
+            first.lock_file.try_clone().unwrap(),
+        );
+
+        drop(first);
+
+        let second = MmapScrollback::open(config).map(drop);
+        assert!(second.is_ok(), "{second:?}");
+        drop(child_copies);
     }
 
     #[test]

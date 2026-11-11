@@ -13011,9 +13011,11 @@ fn checkpoint_artifact_staging_name(leaf: &Path) -> String {
     format!(".ft-checkpoint-scrollback-{leaf_digest}.staging")
 }
 
+/// The returned guard unlocks the file when dropped; closing alone would leave
+/// the lock held by a concurrently forked child's copy (ft-d1n3l).
 fn acquire_checkpoint_artifact_publication_lock(
     parent: &cap_std::fs::Dir,
-) -> Result<std::fs::File, CheckpointScrollbackArtifactError> {
+) -> Result<crate::lock::FlockedFile, CheckpointScrollbackArtifactError> {
     let lock_leaf = Path::new(CHECKPOINT_SCROLLBACK_PUBLICATION_LOCK);
     let mut options = crate::snapshot_publication::snapshot_read_options();
     options
@@ -13056,6 +13058,8 @@ fn acquire_checkpoint_artifact_publication_lock(
             Err(error) => return Err(error.into()),
         }
     }
+    // Held from here, so a failed check below also unlocks it.
+    let file = crate::lock::FlockedFile::new(file, "checkpoint_artifact_publication");
 
     let locked_snapshot = CheckpointArtifactFileSnapshot::capture_std(&file.metadata()?)?;
     let locked_path_snapshot =
@@ -19734,6 +19738,28 @@ mod tests {
             Ok(true),
             "artifact FIFO admission blocked or failed"
         );
+    }
+
+    /// ft-d1n3l: a dropped checkpoint artifact publication lock is free at
+    /// once, even while a child forked during publication still shares the
+    /// lock file until it execs. The try_clone stands in for that child's
+    /// inherited copy; without the unlock the second acquire would wait out
+    /// its full timeout and report PublicationBusy.
+    #[cfg(unix)]
+    #[test]
+    fn dropped_checkpoint_artifact_publication_lock_is_free_while_a_child_still_shares_it() {
+        let directory = checkpoint_artifact_test_directory();
+        let parent =
+            cap_std::fs::Dir::open_ambient_dir(directory.path(), cap_std::ambient_authority())
+                .unwrap();
+        let first = acquire_checkpoint_artifact_publication_lock(&parent).unwrap();
+        let child_copy = first.try_clone().unwrap();
+
+        drop(first);
+
+        let again = acquire_checkpoint_artifact_publication_lock(&parent).map(drop);
+        assert!(again.is_ok(), "{again:?}");
+        drop(child_copy);
     }
 
     fn write_private_checkpoint_artifact_test_file(path: &Path, bytes: &[u8]) {

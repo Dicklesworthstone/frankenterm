@@ -677,14 +677,9 @@ fn generate_stage_name(sha256_prefix: &str) -> String {
 }
 
 /// RAII guard representing an exclusive, descriptor-bound cross-process publication lock.
+/// Dropping it unlocks the file before the descriptor closes (ft-d1n3l).
 pub struct PublicationLock {
-    file: std::fs::File,
-}
-
-impl Drop for PublicationLock {
-    fn drop(&mut self) {
-        let _ = fs2::FileExt::unlock(&self.file);
-    }
+    _file: crate::lock::FlockedFile,
 }
 
 /// Verify that a directory has private permissions (0700) and is owned by the current process.
@@ -1605,6 +1600,9 @@ impl SnapshotPublicationStore {
                     PublicationError::io(&lock_path, e)
                 }
             })?;
+            // Held from here, so a failed check below also unlocks rather
+            // than only closing (ft-d1n3l).
+            let std_file = crate::lock::FlockedFile::new(std_file, "snapshot_publication");
 
             // Revalidate named lock inode after nonblocking acquisition.
             let opened_meta = std_file
@@ -1634,13 +1632,13 @@ impl SnapshotPublicationStore {
             {
                 use std::os::unix::fs::MetadataExt as _;
                 if opened_meta.dev() != named_meta.dev() || opened_meta.ino() != named_meta.ino() {
-                    // The name changed during acquisition; close the old locked descriptor and retry.
+                    // The name changed during acquisition; release the old lock and retry.
                     drop(std_file);
                     continue;
                 }
             }
 
-            return Ok(PublicationLock { file: std_file });
+            return Ok(PublicationLock { _file: std_file });
         }
         Err(PublicationError::PublicationBusy)
     }
@@ -5997,6 +5995,25 @@ mod tests {
         ));
         drop(first);
         let _next = store.acquire_publication_lock().unwrap();
+    }
+
+    /// ft-d1n3l: a dropped publication lock is free at once, even while a
+    /// child forked during publication still shares the lock file until it
+    /// execs. The try_clone stands in for that child's inherited copy.
+    #[cfg(unix)]
+    #[test]
+    fn dropped_publication_lock_is_free_while_a_child_still_shares_it() {
+        let temp = private_test_directory();
+        let store =
+            SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
+        let first = store.acquire_publication_lock().unwrap();
+        let child_copy = first._file.try_clone().unwrap();
+
+        drop(first);
+
+        let again = store.acquire_publication_lock().map(drop);
+        assert!(again.is_ok(), "{again:?}");
+        drop(child_copy);
     }
 
     #[test]

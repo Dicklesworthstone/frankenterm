@@ -144,9 +144,11 @@ impl BuildLockMetadata {
 
 // ── Build lock guard ────────────────────────────────────────────────────────
 
-/// An acquired build lock. Released automatically on drop.
+/// An acquired build lock. Released automatically on drop: the metadata is
+/// removed first, then the lock file is unlocked before it closes, so a
+/// concurrently forked child cannot keep the lock held (ft-d1n3l).
 pub struct BuildLock {
-    _lock_file: File,
+    _lock_file: crate::lock::FlockedFile,
     meta_path: PathBuf,
     project_root: PathBuf,
 }
@@ -176,7 +178,7 @@ impl BuildLock {
         match lock_file.try_lock_exclusive() {
             Ok(()) => {
                 let lock = Self {
-                    _lock_file: lock_file,
+                    _lock_file: crate::lock::FlockedFile::new(lock_file, "build_coord"),
                     meta_path,
                     project_root: project_root.to_path_buf(),
                 };
@@ -362,8 +364,10 @@ pub fn check_build_running(
 
     match lock_file.try_lock_exclusive() {
         Ok(()) => {
-            // Got the lock — nothing was holding it
-            drop(lock_file);
+            // Got the lock, so nothing was holding it. Unlock rather than only
+            // close, or a child forked meanwhile keeps this probe's lock held.
+            let probe = crate::lock::FlockedFile::new(lock_file, "build_coord_probe");
+            drop(probe);
             None
         }
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -1075,6 +1079,24 @@ mod tests {
 
         drop(lock);
         assert!(!meta_path.exists());
+    }
+
+    /// ft-d1n3l: a released build lock is free at once, even while a child
+    /// forked during the build still shares its lock file. The try_clone
+    /// stands in for that child's inherited copy.
+    #[cfg(unix)]
+    #[test]
+    fn released_build_lock_is_free_while_a_child_still_shares_its_file() {
+        let tmp = setup_project();
+        let config = BuildCoordConfig::default();
+        let lock = BuildLock::try_acquire(tmp.path(), "build", &config).unwrap();
+        let child_copy = lock._lock_file.try_clone().unwrap();
+
+        drop(lock);
+
+        let again = BuildLock::try_acquire(tmp.path(), "check", &config).map(drop);
+        assert!(again.is_ok(), "{again:?}");
+        drop(child_copy);
     }
 
     #[test]

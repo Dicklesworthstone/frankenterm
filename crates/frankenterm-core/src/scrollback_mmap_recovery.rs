@@ -82,7 +82,6 @@ use cap_fs_ext::{DirExt as _, FollowSymlinks, MetadataExt as _, OpenOptionsFollo
 use cap_std::fs::{Dir as CapDir, OpenOptions as CapOpenOptions};
 use fs2::FileExt;
 use std::fmt::Write as _;
-use std::fs::File;
 use std::io::{ErrorKind, Read as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1443,7 +1442,7 @@ impl PinnedScrollbackDirectory {
 pub struct RecoveryLease(RecoveryLeaseInner);
 
 struct RecoveryLeaseInner {
-    lock_file: File,
+    lock_file: crate::lock::FlockedFile,
     lock_path: PathBuf,
     lock_leaf: PathBuf,
     directory_path: PathBuf,
@@ -1592,6 +1591,9 @@ fn acquire_recovery_lease(lock_path: &Path) -> std::io::Result<LockProbeOutcome>
 
     match lock_file.try_lock_exclusive() {
         Ok(()) => {
+            // Held from here, so a failed check below also unlocks rather
+            // than only closing (ft-d1n3l).
+            let lock_file = crate::lock::FlockedFile::new(lock_file, "scrollback_recovery");
             let path_metadata_after = directory.symlink_metadata(&lock_leaf)?;
             let handle_metadata_after = lock_file.metadata()?;
             validate_candidate_metadata(&path_metadata_after, &directory_metadata).map_err(
@@ -2687,6 +2689,42 @@ mod tests {
         drop(candidate);
         competing.try_lock_exclusive().unwrap();
         FileExt::unlock(&competing).unwrap();
+    }
+
+    /// ft-d1n3l: dropping a candidate frees its recovery lease at once, even
+    /// while a child forked during recovery still shares the lock file until
+    /// it execs. The try_clone stands in for that child's inherited copy.
+    #[cfg(unix)]
+    #[test]
+    fn dropped_candidate_frees_its_lease_while_a_child_still_shares_it() {
+        let dir = temp_dir("lease-shared-copy");
+        let path = write_valid_scrollback(&dir, 0x62);
+        let candidate = scan_orphans(&dir, &FlockLockProbe, recovery_limits())
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.path == path)
+            .unwrap();
+        let child_copy = candidate
+            .recovery_lease
+            .as_ref()
+            .expect("a production orphan retains its lease")
+            .0
+            .lock_file
+            .try_clone()
+            .unwrap();
+        let competing = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.with_extension("bin.lock"))
+            .unwrap();
+
+        drop(candidate);
+
+        competing
+            .try_lock_exclusive()
+            .expect("the lease must be free while the shared copy is still open");
+        FileExt::unlock(&competing).unwrap();
+        drop(child_copy);
     }
 
     #[test]
