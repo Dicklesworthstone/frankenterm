@@ -4853,6 +4853,36 @@ pub mod process {
             result
         }
 
+        /// [`Command::output`] with the blocking supervisor itself watching
+        /// `cx`: it calls `cx.checkpoint()` every `PROCESS_POLL_INTERVAL`, and
+        /// once that fails (`cx` cancelled or its budget exhausted) it
+        /// terminates and reaps the process group and returns the typed
+        /// `CommandCancelled` error. A `cx` that has already failed refuses
+        /// the spawn. Unlike [`Command::output_with_cx`] it spawns no watcher
+        /// task, so it runs wherever `spawn_blocking` does, a bare
+        /// `LabRuntime` included.
+        ///
+        /// Wrapping plain [`Command::output`] in
+        /// [`crate::runtime_async::timeout_with_cx`] does not do this: since
+        /// asupersync 0.6 that timeout does not expire when its `cx` is
+        /// cancelled, so a cancelled caller waited out the whole timeout
+        /// (ft-3268r).
+        pub async fn output_observing_cx(&mut self, cx: &crate::cx::Cx) -> std::io::Result<Output> {
+            cx.checkpoint()
+                .map_err(|_| CommandCancelled.into_io_error())?;
+            let mut spec = self.output_spec();
+            spec.request_cx = Some(cx.clone());
+            let cancel = Arc::new(AtomicBool::new(false));
+            let mut kill_guard = KillOnDropGuard::new(Arc::clone(&cancel), self.kill_on_drop);
+
+            let result = super::spawn_blocking(move || run_output_command(spec, cancel, None))
+                .await
+                .map_err(std::io::Error::other)?;
+
+            kill_guard.disarm();
+            result
+        }
+
         /// ft-xbnl0.2.3 Cx-first sibling of [`Command::output`].
         ///
         /// Pre-flight `cx.checkpoint()` gates spawn, and a dedicated

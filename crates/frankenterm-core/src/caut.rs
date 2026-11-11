@@ -10,7 +10,7 @@ use crate::agent_provider::AgentProvider;
 use crate::error::Remediation;
 use crate::policy::Redactor;
 use crate::runtime_async::process::{
-    Command, CommandOutputLimitExceeded, decode_captured_bytes_lossy,
+    Command, CommandCancelled, CommandOutputLimitExceeded, decode_captured_bytes_lossy,
 };
 use crate::suggestions::Platform;
 use serde::de::DeserializeOwned;
@@ -235,7 +235,13 @@ impl CautClient {
     }
 
     /// Cx-first subprocess execution (ft-xbnl0.2.2). The subprocess timeout
-    /// is bound to the provided `Cx` via [`crate::runtime_async::timeout_with_cx`].
+    /// is bound to the provided `Cx` via [`crate::runtime_async::timeout_with_cx`],
+    /// and the process supervisor watches the same `Cx`
+    /// ([`Command::output_observing_cx`]): cancelling it, or exhausting its
+    /// budget, terminates and reaps the `caut` process group within one poll
+    /// interval, and the call ends as the timeout it reported before
+    /// asupersync 0.6. Since 0.6 the timeout alone no longer expires on
+    /// cancellation, so a cancelled caller waited out all of it (ft-3268r).
     async fn run_with_cx(&self, cx: &crate::cx::Cx, args: &[String]) -> Result<String, CautError> {
         let mut cmd = Command::new(&self.binary);
         cmd.args(args);
@@ -243,15 +249,23 @@ impl CautClient {
         cmd.stdout_limit(self.max_output_bytes);
         cmd.stderr_limit(self.max_error_bytes);
 
-        let output =
-            match crate::runtime_async::timeout_with_cx(cx, self.timeout, cmd.output()).await {
-                Ok(result) => result.map_err(|err| categorize_io_error(&err))?,
-                Err(_) => {
-                    return Err(CautError::Timeout {
-                        timeout_secs: self.timeout.as_secs(),
-                    });
-                }
-            };
+        let timed_out = || CautError::Timeout {
+            timeout_secs: self.timeout.as_secs(),
+        };
+        let output = match crate::runtime_async::timeout_with_cx(
+            cx,
+            self.timeout,
+            cmd.output_observing_cx(cx),
+        )
+        .await
+        {
+            Ok(Ok(output)) => output,
+            Ok(Err(err)) if CommandCancelled::from_io_error(&err).is_some() => {
+                return Err(timed_out());
+            }
+            Ok(Err(err)) => return Err(categorize_io_error(&err)),
+            Err(_) => return Err(timed_out()),
+        };
 
         self.finalize_output(output)
     }
@@ -702,6 +716,63 @@ mod tests {
             wall_start.elapsed() < Duration::from_secs(2),
             "Cx-first caut client must not consume real seconds; elapsed {:?}",
             wall_start.elapsed()
+        );
+    }
+
+    /// ft-3268r: cancelling the caller's Cx ends a running caut call promptly,
+    /// as the same timeout it reported before. With `output()` under an outer
+    /// timeout_with_cx (asupersync 0.6: the timer ignores cancellation) this
+    /// call ran for the full 20 s timeout.
+    #[cfg(unix)]
+    #[test]
+    fn usage_cx_ends_promptly_when_the_caller_is_cancelled() {
+        use crate::runtime_async::CompatRuntime;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = dir.path().join("caut");
+        std::fs::write(&fake, "#!/bin/sh\nexec sleep 30\n").expect("write fake caut");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
+            .expect("make fake caut executable");
+        let client = CautClient::new()
+            .with_binary(fake.to_string_lossy().into_owned())
+            .with_timeout_secs(20);
+
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async {
+                let cx = crate::cx::for_request();
+                let canceller = cx.clone();
+                let cancel = std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(200));
+                    canceller.cancel_with(
+                        crate::outcome::CancelKind::User,
+                        Some("test cancels the caut call"),
+                    );
+                });
+                let started = std::time::Instant::now();
+                let outcome = client.usage_cx(&cx, CautService::OpenAI).await;
+                let elapsed = started.elapsed();
+                cancel.join().expect("canceller thread");
+                (outcome, elapsed)
+            })
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_async::clear_runtime_handle();
+        }));
+        let (outcome, elapsed) =
+            result.unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+        assert!(
+            matches!(outcome, Err(CautError::Timeout { timeout_secs: 20 })),
+            "a cancelled caut call reports the timeout: {outcome:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "a cancelled caut call must end promptly, took {elapsed:?}"
         );
     }
 
