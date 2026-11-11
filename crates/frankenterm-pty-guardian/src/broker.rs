@@ -26327,7 +26327,7 @@ mod tests {
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub(crate) enum BrokerInputTestReply {
+    pub enum BrokerInputTestReply {
         Full,
         Prefix,
         LostAfterApply,
@@ -26342,7 +26342,7 @@ mod tests {
     /// adapter against a sink that independently records what it accepted.
     /// Runtime tests join this handle to compare physical effects with the
     /// disposition that the real encrypted input journal retained.
-    pub(crate) fn broker_input_test_writer(
+    pub fn broker_input_test_writer(
         pane_id: Uuid,
         reply: BrokerInputTestReply,
     ) -> (BrokerPaneInputWriterV1, thread::JoinHandle<Vec<u8>>) {

@@ -141794,8 +141794,7 @@ A  docs/new-proof.md\n";
             directory.path(),
             &request,
         )
-        .err()
-        .expect("zero event cap must fail before opening the missing source");
+        .expect_err("zero event cap must fail before opening the missing source");
         assert!(error.downcast_ref::<CasrExportError>().is_some());
         let error = export_record_casr_snapshot(
             &cx,
@@ -141803,8 +141802,7 @@ A  docs/new-proof.md\n";
             directory.path(),
             &CasrExportRequest::default(),
         )
-        .err()
-        .expect("unavailable backend must fail before source I/O");
+        .expect_err("unavailable backend must fail before source I/O");
         assert!(
             error
                 .downcast_ref::<RecorderBackendSelectionError>()
