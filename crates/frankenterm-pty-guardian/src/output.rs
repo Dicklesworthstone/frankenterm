@@ -767,8 +767,23 @@ pub struct GuardianDurableRecoveryClaimIntentV1 {
 pub struct GuardianRecoveryClaimAdmission {
     store: GuardianCheckpointStageStore,
     context: GuardianSpawnCustodyContextV1,
-    _custody_file: File,
+    _custody_file: RecoveryAdmissionFlock,
     custody_identity: FileIdentity,
+}
+
+/// The custody file of a recovery admission, exclusively flocked. Dropping it
+/// unlocks the file before its descriptor closes. A child the mux forks while
+/// the admission is held shares the open file description until its pre-exec
+/// close sweep, and the flock lives while any copy does, so a close-only
+/// release left the lineage admitted for that window and the next
+/// admit_recovery was refused (ft-hsczw). An unlock releases every copy.
+struct RecoveryAdmissionFlock(File);
+
+impl Drop for RecoveryAdmissionFlock {
+    fn drop(&mut self) {
+        // Closing the descriptor stays the fallback if this fails.
+        let _ = rustix::fs::flock(&self.0, rustix::fs::FlockOperation::Unlock);
+    }
 }
 
 impl GuardianDurableRecoveryClaimIntentV1 {
@@ -1083,6 +1098,8 @@ impl GuardianDurableSpawnCustodyV1 {
                 .map_err(|error| {
                     GuardianCheckpointStageStoreError::io("recovery-admission-lock", error.into())
                 })?;
+            // Wrapped before the identity check so its failure unlocks too.
+            let file = RecoveryAdmissionFlock(file);
             validate_file_identity_at(&inner.directory, &inner.directory_path, &path, identity)?;
             Ok((file, identity))
         })?;
@@ -17303,6 +17320,32 @@ mod tests {
             wire_ack_generation: 0,
             secret_lease_generation: 1,
         }
+    }
+
+    /// ft-hsczw: dropping a recovery admission frees the lineage at once, even
+    /// while a child forked during the hold still shares the custody file
+    /// until its pre-exec close sweep. The try_clone stands in for that
+    /// child's copy; a close-only release would refuse the readmission.
+    #[test]
+    fn dropped_recovery_admission_is_free_while_a_forked_child_still_shares_its_lock()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) =
+            pipeline_with_policy("ft-recovery-admission-", OutputSegmentPolicy::production())?;
+        let store = pipeline.checkpoint_stage_store();
+        let context = spawn_custody_context();
+        let admission = store
+            .persist_spawn_custody(&context, &[0x94; 32])?
+            .admit_recovery()?;
+        let child_copy = admission._custody_file.0.try_clone()?;
+
+        drop(admission);
+
+        let readmitted = store
+            .lookup_spawn_custody(context.scope())?
+            .admit_recovery();
+        assert!(readmitted.is_ok(), "{:?}", readmitted.err());
+        drop(child_copy);
+        Ok(())
     }
 
     #[test]

@@ -12312,7 +12312,7 @@ pub struct BrokerSpawnJournalV1 {
 pub(crate) struct BrokerSpawnWalCatalogV1 {
     directory_path: PathBuf,
     directory: File,
-    lock: File,
+    lock: BrokerCatalogFlock,
     #[cfg(test)]
     creation_fault: Option<BrokerSpawnCreationInjectedFault>,
 }
@@ -12934,7 +12934,7 @@ struct BrokerPaneLeaseHeadScanV1 {
 struct BrokerPaneLeaseWalCatalogV1 {
     directory_path: PathBuf,
     directory: File,
-    lock: File,
+    lock: BrokerCatalogFlock,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -14569,7 +14569,7 @@ impl BrokerPaneLeaseWalCatalogV1 {
             lock.sync_all()?;
             directory.sync_all()?;
         }
-        lock_broker_spawn_catalog(&lock)?;
+        let lock = lock_broker_spawn_catalog(lock)?;
         let catalog = Self {
             directory_path,
             directory,
@@ -15369,7 +15369,7 @@ pub(crate) fn inspect_historical_genesis_binding(
         .map_err(std::io::Error::from)?,
     );
     revalidate_open_broker_spawn_catalog_file(&directory, lock_name, &lock, 0, 0)?;
-    lock_broker_spawn_catalog(&lock)?;
+    let lock = lock_broker_spawn_catalog(lock)?;
     let open = |name: &OsStr, maximum| -> Result<File, BrokerSpawnWalError> {
         let identity = broker_spawn_catalog_stat_identity_at(
             &directory,
@@ -16819,15 +16819,55 @@ fn revalidate_open_broker_spawn_catalog_file(
     target_os = "visionos",
     target_os = "watchos",
 ))]
-fn lock_broker_spawn_catalog(file: &File) -> Result<(), BrokerSpawnWalError> {
-    rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockExclusive).map_err(|error| {
-        let error = std::io::Error::from(error);
-        if error.kind() == ErrorKind::WouldBlock {
-            BrokerSpawnWalError::CatalogAlreadyOwned
-        } else {
-            BrokerSpawnWalError::Io(error)
+fn lock_broker_spawn_catalog(file: File) -> Result<BrokerCatalogFlock, BrokerSpawnWalError> {
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        .map(|()| BrokerCatalogFlock(file))
+        .map_err(|error| {
+            let error = std::io::Error::from(error);
+            if error.kind() == ErrorKind::WouldBlock {
+                BrokerSpawnWalError::CatalogAlreadyOwned
+            } else {
+                BrokerSpawnWalError::Io(error)
+            }
+        })
+}
+
+/// A broker catalog lock file whose exclusive flock this process holds.
+/// Dropping it unlocks the file before its descriptor closes.
+///
+/// A child that another thread forks (every pane spawn does) shares the open
+/// file description until its pre-exec close sweep, and the flock lives while
+/// any copy does. A close-only release therefore left the catalog owned for
+/// that window, and an immediate reopen or broker restart was refused
+/// CatalogAlreadyOwned (ft-q1lol's test retries, ft-hsczw). An unlock
+/// releases it for every copy. Wrapping happens in lock_broker_spawn_catalog,
+/// so every early return after the lock releases it too.
+struct BrokerCatalogFlock(File);
+
+impl std::ops::Deref for BrokerCatalogFlock {
+    type Target = File;
+
+    fn deref(&self) -> &File {
+        &self.0
+    }
+}
+
+impl Drop for BrokerCatalogFlock {
+    fn drop(&mut self) {
+        #[cfg(any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos",
+        ))]
+        {
+            // Closing the descriptor stays the fallback if this fails.
+            let _ = rustix::fs::flock(&self.0, rustix::fs::FlockOperation::Unlock);
         }
-    })
+    }
 }
 
 #[cfg(not(any(
@@ -16839,7 +16879,7 @@ fn lock_broker_spawn_catalog(file: &File) -> Result<(), BrokerSpawnWalError> {
     target_os = "visionos",
     target_os = "watchos",
 )))]
-fn lock_broker_spawn_catalog(_file: &File) -> Result<(), BrokerSpawnWalError> {
+fn lock_broker_spawn_catalog(_file: File) -> Result<BrokerCatalogFlock, BrokerSpawnWalError> {
     Err(BrokerSpawnWalError::CatalogLockUnsupported)
 }
 
@@ -16928,7 +16968,7 @@ impl BrokerSpawnWalCatalogV1 {
             lock.sync_all()?;
             directory.sync_all()?;
         }
-        lock_broker_spawn_catalog(&lock)?;
+        let lock = lock_broker_spawn_catalog(lock)?;
         let catalog = Self {
             directory_path,
             directory,
@@ -30148,77 +30188,64 @@ mod tests {
         directory
     }
 
-    /// How many 1 ms pauses the test reopen helpers below wait out an
-    /// inherited catalog lock for. 100 (0.1 s) was too short on a loaded RCH
-    /// worker, where a forked child can take longer to reach its pre-exec close
-    /// sweep (ft-q1lol).
-    const TEST_INHERITED_LOCK_ATTEMPTS: usize = 2_000;
+    // The three reopen helpers below once retried CatalogAlreadyOwned for up
+    // to 2 s (ft-q1lol). A parallel test that forks while a catalog is owned
+    // gives its child a copy of the lock file's open description until the
+    // portable-pty pre-exec close sweep, and the old close-only release left
+    // the catalog owned through that copy. BrokerCatalogFlock now unlocks on
+    // drop, which releases every copy (ft-hsczw), so each helper opens once
+    // and the tests that use them check that release.
 
     fn reopen_test_catalog_after_owner_drop(
         directory: &Path,
     ) -> Result<BrokerSpawnWalCatalogV1, BrokerSpawnWalError> {
-        // Parallel spawn tests can fork while this process owns the catalog
-        // lock. The child inherits that open-file description until the
-        // portable-pty pre-exec close sweep runs, so an immediate same-process
-        // restart can transiently observe CatalogAlreadyOwned even after the
-        // parent descriptor was explicitly dropped. Production admission must
-        // still fail immediately on a real competing owner; only this bounded
-        // test restart helper waits for the CLOEXEC/pre-exec handoff to settle.
-        for attempt in 1..=TEST_INHERITED_LOCK_ATTEMPTS {
-            match BrokerSpawnWalCatalogV1::open(directory.to_path_buf()) {
-                Err(BrokerSpawnWalError::CatalogAlreadyOwned)
-                    if attempt < TEST_INHERITED_LOCK_ATTEMPTS =>
-                {
-                    thread::sleep(Duration::from_millis(1));
-                }
-                result => return result,
-            }
-        }
-        unreachable!("the bounded catalog reopen loop always returns")
+        BrokerSpawnWalCatalogV1::open(directory.to_path_buf())
     }
 
     fn reopen_test_lease_catalog_after_owner_drop(
         directory: &Path,
     ) -> Result<BrokerPaneLeaseWalCatalogV1, BrokerPaneLeaseWalErrorV1> {
-        for attempt in 1..=TEST_INHERITED_LOCK_ATTEMPTS {
-            match BrokerPaneLeaseWalCatalogV1::open(directory.to_path_buf()) {
-                Err(BrokerPaneLeaseWalErrorV1::CatalogAuthority(
-                    BrokerSpawnWalError::CatalogAlreadyOwned,
-                )) if attempt < TEST_INHERITED_LOCK_ATTEMPTS => {
-                    thread::sleep(Duration::from_millis(1));
-                }
-                result => return result,
-            }
-        }
-        unreachable!("the bounded pane-lease catalog reopen loop always returns")
+        BrokerPaneLeaseWalCatalogV1::open(directory.to_path_buf())
     }
 
     fn bind_test_service_after_owner_drop(
         config: &BrokerControlServiceConfigV1,
     ) -> Result<BrokerControlServiceV1, BrokerControlServiceError> {
-        // Like direct catalog reopen, service bind can race a parallel test's
-        // fork between descriptor inheritance and the pre-exec close sweep.
-        // Retry only that transient inherited-lock classification. Any real
-        // competing owner survives the fixed ceiling, and every other startup
-        // error remains immediate and unchanged.
-        for attempt in 1..=TEST_INHERITED_LOCK_ATTEMPTS {
-            match BrokerControlServiceV1::bind(config.clone()) {
-                Err(BrokerControlServiceError::SpawnCatalog(
-                    BrokerSpawnWalError::CatalogAlreadyOwned,
-                )) if attempt < TEST_INHERITED_LOCK_ATTEMPTS => {
-                    thread::sleep(Duration::from_millis(1));
-                }
-                Err(BrokerControlServiceError::LeaseCatalog(
-                    BrokerPaneLeaseWalErrorV1::CatalogAuthority(
-                        BrokerSpawnWalError::CatalogAlreadyOwned,
-                    ),
-                )) if attempt < TEST_INHERITED_LOCK_ATTEMPTS => {
-                    thread::sleep(Duration::from_millis(1));
-                }
-                result => return result,
-            }
-        }
-        unreachable!("the bounded service-bind retry loop always returns")
+        BrokerControlServiceV1::bind(config.clone())
+    }
+
+    /// ft-hsczw: dropping a Spawn-WAL catalog frees its lock at once, even
+    /// while a child forked during the hold still shares the lock file until
+    /// its pre-exec close sweep. The try_clone stands in for that child's
+    /// copy; a close-only release would leave the reopen CatalogAlreadyOwned.
+    #[test]
+    fn dropped_spawn_catalog_is_free_while_a_forked_child_still_shares_its_lock() {
+        let directory = private_catalog_directory();
+        let owner = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf())
+            .expect("first catalog owner");
+        let child_copy = owner.lock.try_clone().expect("child's descriptor copy");
+
+        drop(owner);
+
+        let reopened = BrokerSpawnWalCatalogV1::open(directory.path().to_path_buf()).map(drop);
+        assert!(reopened.is_ok(), "{reopened:?}");
+        drop(child_copy);
+    }
+
+    /// ft-hsczw: the same for the pane-lease catalog, which takes its lock
+    /// through the same lock_broker_spawn_catalog.
+    #[test]
+    fn dropped_lease_catalog_is_free_while_a_forked_child_still_shares_its_lock() {
+        let directory = private_catalog_directory();
+        let owner = BrokerPaneLeaseWalCatalogV1::open(directory.path().to_path_buf())
+            .expect("first lease catalog owner");
+        let child_copy = owner.lock.try_clone().expect("child's descriptor copy");
+
+        drop(owner);
+
+        let reopened = BrokerPaneLeaseWalCatalogV1::open(directory.path().to_path_buf()).map(drop);
+        assert!(reopened.is_ok(), "{reopened:?}");
+        drop(child_copy);
     }
 
     fn create_private_broker_token_with_bytes(path: &Path, bytes: &[u8]) {
@@ -35421,25 +35448,17 @@ mod tests {
             secret_lease_generation: 1,
         };
         let encoded = binding.encode();
-        // Each inspection takes the catalog lock. A child another test forks
-        // meanwhile can briefly hold the previous inspection's descriptor
-        // (see reopen_test_catalog_after_owner_drop): wait that out.
+        // Each inspection takes the catalog lock and unlocks it on return, so
+        // a child another test forks meanwhile cannot hold it over to the next
+        // inspection (ft-hsczw).
         let inspect = |bytes: &[u8], context: &GuardianSpawnCustodyContextV1| {
-            for attempt in 0..100 {
-                match inspect_historical_genesis_binding(
-                    &catalog,
-                    &token,
-                    identity.journal_id,
-                    bytes,
-                    context,
-                ) {
-                    Err(BrokerSpawnWalError::CatalogAlreadyOwned) if attempt < 99 => {
-                        thread::sleep(Duration::from_millis(5));
-                    }
-                    result => return result,
-                }
-            }
-            unreachable!("the bounded inspection loop always returns")
+            inspect_historical_genesis_binding(
+                &catalog,
+                &token,
+                identity.journal_id,
+                bytes,
+                context,
+            )
         };
         inspect(&encoded, &custody).unwrap();
         for offset in [16, 48, 72, 172, 176, 208, 240] {
