@@ -8490,10 +8490,12 @@ where
 /// This function observes the cx **budget deadline** (via
 /// [`asupersync::time::budget_timeout`], which bounds the effective
 /// timeout by the remaining budget), but does **not** directly check
-/// `cx.is_cancel_requested()`. The underlying timer can return early on
-/// cancellation of the supplied context. An unrelated ambient context
-/// cannot terminate this timeout. Each poll of the wrapped future runs
-/// under the supplied context as well.
+/// `cx.is_cancel_requested()`. Since asupersync 0.6, cancelling the
+/// supplied context does not expire the timer either: the wrapped future,
+/// which is polled under that context, sees the cancellation and may
+/// finish early, but a future that ignores cancellation runs until the
+/// duration or the budget deadline elapses. An unrelated ambient context
+/// cannot terminate this timeout.
 ///
 /// Callers who need pre-cancellation short-circuit MUST add an explicit
 /// `cx.checkpoint()?` (or equivalent `if cx.is_cancel_requested()` bail)
@@ -9759,11 +9761,95 @@ mod tests {
         finish_async_test(runtime, test_result);
     }
 
+    std::thread_local! {
+        static TEARDOWN_PANIC: std::cell::RefCell<TeardownRecorder> =
+            const { std::cell::RefCell::new(TeardownRecorder::Idle) };
+    }
+
+    /// The teardown recorder's state on one thread.
+    enum TeardownRecorder {
+        /// No test runtime is being torn down on this thread.
+        Idle,
+        /// `finish_async_test` is tearing a test runtime down; no panic yet.
+        Armed,
+        /// The first panic raised during that teardown.
+        Caught(TeardownPanic),
+    }
+
+    /// A panic raised while a test runtime is torn down. asupersync 0.6
+    /// catches a local task's destructor panic in `LocalTaskStore::drop` and
+    /// records it as that task's retirement instead of unwinding through
+    /// `Runtime::drop`, and nothing observes the retirement of a task whose
+    /// handle was dropped. The recorder keeps that failure from passing
+    /// silently.
+    enum TeardownPanic {
+        Static(&'static str),
+        Owned(String),
+    }
+
+    impl TeardownPanic {
+        fn into_payload(self) -> Box<dyn std::any::Any + Send> {
+            match self {
+                Self::Static(message) => Box::new(message),
+                Self::Owned(message) => Box::new(message),
+            }
+        }
+    }
+
+    fn install_teardown_panic_recorder_once() {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                // An audited recovery boundary is not a teardown failure. The
+                // try_ accessors keep a panic from a TLS destructor, or one
+                // raised while the slot is borrowed, from panicking again.
+                if !frankenterm_sigpipe::is_recoverable_panic() {
+                    let _ = TEARDOWN_PANIC.try_with(|slot| {
+                        if let Ok(mut slot) = slot.try_borrow_mut()
+                            && matches!(*slot, TeardownRecorder::Armed)
+                        {
+                            let payload = info.payload();
+                            *slot = TeardownRecorder::Caught(
+                                if let Some(message) =
+                                    payload.downcast_ref::<&'static str>().copied()
+                                {
+                                    TeardownPanic::Static(message)
+                                } else if let Some(message) = payload.downcast_ref::<String>() {
+                                    TeardownPanic::Owned(message.clone())
+                                } else {
+                                    TeardownPanic::Static(
+                                        "runtime teardown panicked with a non-string payload",
+                                    )
+                                },
+                            );
+                        }
+                    });
+                }
+                previous(info);
+            }));
+        });
+    }
+
     fn finish_async_test(runtime: Runtime, test_result: std::thread::Result<()>) {
         // These are test failure boundaries, not production recovery: every
         // failure must still fail the test, after both cleanup steps run.
+        install_teardown_panic_recorder_once();
+        TEARDOWN_PANIC.with(|slot| *slot.borrow_mut() = TeardownRecorder::Armed);
         let teardown = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
         let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(clear_runtime_handle));
+        let isolated = TEARDOWN_PANIC.with(|slot| {
+            match std::mem::replace(&mut *slot.borrow_mut(), TeardownRecorder::Idle) {
+                TeardownRecorder::Caught(isolated) => Some(isolated),
+                TeardownRecorder::Idle | TeardownRecorder::Armed => None,
+            }
+        });
+        // A teardown panic the runtime caught and isolated fails the test too,
+        // unless a panic already unwound out of teardown or cleanup.
+        let teardown = match (teardown, &cleanup, isolated) {
+            (Ok(()), Ok(()), Some(isolated)) => Err(isolated.into_payload()),
+            (teardown, _, _) => teardown,
+        };
         let mut first_failure = None;
         for payload in [test_result, teardown, cleanup]
             .into_iter()
@@ -16260,23 +16346,36 @@ mod tests {
         let ambient = crate::cx::for_request();
         ambient.cancel_with(crate::outcome::CancelKind::Shutdown, None);
         let _ambient_guard = crate::cx::Cx::set_current(Some(ambient.clone()));
+        // The wrapped operation completes once the context it runs under is
+        // cancelled. asupersync 0.6 leaves an owner's cancellation to the
+        // operation (its TimeoutFuture timer no longer expires on it), so
+        // this observes which context the timeout polls the operation under.
+        let completes_on_cancellation = std::future::poll_fn(|_| {
+            if crate::cx::Cx::current().is_some_and(|current| current.is_cancel_requested()) {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        });
         let mut timeout = std::pin::pin!(timeout_with_cx_typed(
             &explicit,
             Duration::from_secs(60),
-            std::future::pending::<()>()
+            completes_on_cancellation
         ));
         let waker = futures::task::noop_waker();
         let mut task_cx = std::task::Context::from_waker(&waker);
 
+        // The cancelled ambient context never reaches the operation.
         assert!(timeout.as_mut().poll(&mut task_cx).is_pending());
         assert!(timeout.as_mut().poll(&mut task_cx).is_pending());
         let restored = crate::cx::Cx::current().expect("ambient context restored after poll");
         assert_eq!(restored.task_id(), ambient.task_id());
         assert!(restored.is_cancel_requested());
+        // The explicit context's cancellation does.
         explicit.cancel_with(crate::outcome::CancelKind::Shutdown, None);
         assert!(matches!(
             timeout.as_mut().poll(&mut task_cx),
-            std::task::Poll::Ready(Err(TimeoutError::Elapsed))
+            std::task::Poll::Ready(Ok(()))
         ));
     }
 
