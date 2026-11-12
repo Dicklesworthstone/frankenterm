@@ -199,7 +199,8 @@ pub trait FrameDriver {
 
     /// Whether an idle-to-active wake can draw once before restarting the
     /// display link. Drivers that require a callback's drawable stay tick
-    /// paced; Metal can acquire one directly while its link is paused.
+    /// paced; Metal acquires one directly only when no display link is
+    /// attached to its layer.
     fn can_draw_on_idle_wake(&self) -> bool {
         false
     }

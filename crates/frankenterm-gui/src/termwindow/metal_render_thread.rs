@@ -19,9 +19,11 @@
 //! `CAMetalDisplayLink` (ft-yccm0.4.1.3): active frames use the drawable each
 //! callback hands over, on the ticks `render_thread::VsyncCadence` picks
 //! under `max_fps`, and latch terminal state near its CPU submit deadline.
-//! The link pauses while nothing changes; an idle output/input wake draws
-//! once immediately before resuming it. Earlier macOS paces to the
-//! `max_fps` interval instead.
+//! The link pauses while nothing changes; an output/input wake resumes it
+//! and draws into its next callback's drawable, since a layer with a
+//! display link must not be asked for one directly. Earlier macOS (and
+//! `FRANKENTERM_METAL_DISPLAY_LINK=0`) paces to the `max_fps` interval
+//! instead, where an idle wake draws once immediately.
 //!
 //! A submitted frame can still fail later on the GPU. Completion feedback
 //! wakes the render thread even after output stops, and retries back off
@@ -311,8 +313,8 @@ struct MetalDriver {
     #[cfg(test)]
     submitted_size: Arc<AtomicU64>,
     /// The display link's latest update, when the link paces this thread.
-    /// Active frames use this drawable; the first idle wake acquires one
-    /// directly while the display link is still paused.
+    /// Every frame then uses this drawable: a layer with a display link must
+    /// not be asked for one directly.
     link_update: Rc<RefCell<Option<LinkUpdate>>>,
     paced_by_link: bool,
     /// The layer opacity last applied.
@@ -400,14 +402,18 @@ impl FrameDriver for MetalDriver {
     }
 
     fn can_draw_on_idle_wake(&self) -> bool {
-        true
+        // A layer with a CAMetalDisplayLink must never be asked for a
+        // drawable: `-[CAMetalLayer nextDrawable]` then raises
+        // CAMetalLayerInvalidOperation ("should not be called when using
+        // CAMetalDisplayLink"), which Rust cannot unwind, so the GUI
+        // aborted at launch (macOS 27). Paced by the link, the first frame
+        // after an idle wake waits for the resumed link's drawable.
+        !self.paced_by_link
     }
 
     fn frame_on_idle_wake(&mut self, surface: &Surface) -> FrameReport {
-        // The scheduler calls this only while the display link is paused.
-        // Acquire a drawable directly so the first output/input does not
-        // wait for the link to start delivering callbacks again.
-        self.link_update.borrow_mut().take();
+        // Paced by the interval only (see `can_draw_on_idle_wake`): there
+        // is no display link, so acquire a drawable directly.
         self.draw(surface, false)
     }
 }
@@ -1374,6 +1380,47 @@ mod tests {
             quiescent.immediate_frames <= quiescent.link_starts,
             "an immediate frame is allowed only once before each link start"
         );
+    }
+
+    /// A wake paced by a display link resumes the link and draws nothing
+    /// before its callback. The first launch of 97e0839a2's immediate
+    /// idle-wake frame aborted the GUI on macOS 27: with a
+    /// CAMetalDisplayLink on the layer, `-[CAMetalLayer nextDrawable]`
+    /// raised CAMetalLayerInvalidOperation, which Rust cannot unwind, so
+    /// this test binary aborted at the first wake. The offscreen layer's
+    /// link never calls back (see the ignored test above), so this proves
+    /// only that no drawable is requested outside a callback.
+    #[test]
+    fn a_wake_paced_by_a_display_link_never_acquires_a_drawable_itself() {
+        let probe = MetalRenderer::offscreen().expect("this Mac runs the Metal front end");
+        let has_link = probe.display_link().is_some();
+        drop(probe);
+        let pane = TestPane::new(9_412_005);
+        let pane_id = pane.0.pane_id();
+        let output = Arc::new(MetalOutputWake::default());
+        let render = spawn_paced(&pane, &output, Pacing::DisplayLink);
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_millis(200) {
+            output.wake_for(pane_id);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            eventually(|| render.stats().link_starts > 0),
+            "a wake never started the vsync source"
+        );
+        assert!(render.is_running());
+        let stats = render.stats();
+        eprintln!("display link present: {has_link}; {stats:?}");
+        if has_link {
+            assert_eq!(
+                stats.immediate_frames, 0,
+                "a frame was drawn outside a display-link callback: {stats:?}"
+            );
+            assert!(
+                stats.frames_built <= stats.vsync_ticks,
+                "more frames than link callbacks: {stats:?}"
+            );
+        }
     }
 
     /// ft-yccm0.4.6 acceptance: two panes side by side, one active. Output
