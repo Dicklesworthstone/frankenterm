@@ -321,6 +321,32 @@ fn stage_genesis_birth(
     Ok(client)
 }
 
+/// Spell out "run the default shell" for a guardian birth.
+///
+/// With no `default_prog` configured, the command is a builder with an empty
+/// argv. A native spawn resolves that at exec time (`$SHELL`, else the
+/// password database, run as a login shell), but the guardian's Spawn schema
+/// refuses an empty argv. So a mux whose config predates the guardian, and
+/// sets no `default_prog`, could not start a single pane: its first birth
+/// failed, the mux exited, and its service restarted it forever. Resolve the
+/// program here the way the native spawn does: the same shell, as a login
+/// shell (`-l`, as `mux-guardian-host.sh` writes it), with `SHELL` set.
+/// An explicit command is returned unchanged.
+fn resolve_guardian_default_program(
+    mut command: portable_pty::CommandBuilder,
+) -> portable_pty::CommandBuilder {
+    if command.is_default_prog() {
+        let shell = command.get_shell();
+        if command.get_env("SHELL").is_none() {
+            command.env("SHELL", &shell);
+        }
+        let argv = command.get_argv_mut();
+        argv.push(shell.into());
+        argv.push("-l".into());
+    }
+    command
+}
+
 fn reconcile_genesis_birth(
     mut client: GuardianClient,
     birth: (Uuid, Uuid, Uuid),
@@ -813,10 +839,11 @@ impl Domain for GuardianDomain {
             state.publication = None;
         }
         let pane_id = mux::pane::alloc_pane_id()?;
-        let command = self
-            .commands
-            .build_command(mux, command, command_dir, pane_id)
-            .await?;
+        let command = resolve_guardian_default_program(
+            self.commands
+                .build_command(mux, command, command_dir, pane_id)
+                .await?,
+        );
         self.validate_owner(mux)?;
         let domain_id = self.domain_id();
         let pane = Uuid::new_v4();
@@ -8684,6 +8711,67 @@ mod tests {
     use wezterm_term::color::ColorPalette;
     use wezterm_term::terminalstate::checkpoint::{TerminalCheckpointLimits, TerminalCheckpointV3};
     use wezterm_term::{InertTerminal, Terminal, TerminalConfiguration, TerminalSize};
+
+    #[cfg(unix)]
+    #[test]
+    fn guardian_birth_spells_out_the_default_shell_so_its_spawn_encodes() -> anyhow::Result<()> {
+        use mux::guardian_protocol::{GuardianProtocolError, GuardianSpawnPayload};
+        use portable_pty::CommandBuilder;
+        use std::ffi::{OsStr, OsString};
+
+        let size = PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        // The defect: with no default_prog configured, the guardian refuses
+        // the unresolved default program, so the mux's first birth failed.
+        assert!(matches!(
+            GuardianSpawnPayload::new(CommandBuilder::new_default_prog(), size),
+            Err(GuardianProtocolError::InvalidOperationPayload)
+        ));
+
+        // $SHELL names the shell: it runs as a login shell, and the rest of
+        // the builder (its environment and cwd) is kept.
+        let mut default = CommandBuilder::new_default_prog();
+        default.env("SHELL", "/bin/sh");
+        default.env("FT_DEFAULT_PROGRAM_MARKER", "kept");
+        default.cwd("/");
+        let resolved = resolve_guardian_default_program(default);
+        let expected = [OsString::from("/bin/sh"), OsString::from("-l")];
+        assert_eq!(resolved.get_argv().as_slice(), &expected);
+        assert_eq!(resolved.get_env("SHELL"), Some(OsStr::new("/bin/sh")));
+        assert_eq!(
+            resolved.get_env("FT_DEFAULT_PROGRAM_MARKER"),
+            Some(OsStr::new("kept"))
+        );
+        assert_eq!(resolved.get_cwd(), Some(&OsString::from("/")));
+        // It now passes the guardian's Spawn schema in both directions.
+        let encoded = GuardianSpawnPayload::new(resolved, size)?.encode()?;
+        let (decoded, decoded_size) = GuardianSpawnPayload::decode(&encoded)?.into_parts();
+        assert_eq!(decoded.get_argv().as_slice(), &expected);
+        assert_eq!(decoded.get_env("SHELL"), Some(OsStr::new("/bin/sh")));
+        assert_eq!(decoded_size, size);
+
+        // Without $SHELL the shell comes from the password database, and
+        // SHELL is set to it, as for a native default-program spawn.
+        let mut bare = CommandBuilder::new_default_prog();
+        bare.env_remove("SHELL");
+        let resolved = resolve_guardian_default_program(bare);
+        let argv = resolved.get_argv();
+        assert_eq!(argv.len(), 2);
+        assert!(std::path::Path::new(&argv[0]).is_absolute(), "{argv:?}");
+        assert_eq!(argv[1], OsString::from("-l"));
+        assert_eq!(resolved.get_env("SHELL"), Some(argv[0].as_os_str()));
+        GuardianSpawnPayload::new(resolved, size)?.encode()?;
+
+        // An explicit command is left exactly as it was.
+        let mut explicit = CommandBuilder::new("/bin/echo");
+        explicit.arg("guardian");
+        assert_eq!(resolve_guardian_default_program(explicit.clone()), explicit);
+        Ok(())
+    }
 
     #[cfg(unix)]
     #[test]
