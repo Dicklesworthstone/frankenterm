@@ -900,9 +900,9 @@ ft robot send 0 "/compact"
 
 ```bash
 ft web                                                          # start local server
-curl -N http://127.0.0.1:8000/stream/events
-curl -N "http://127.0.0.1:8000/stream/events?channel=detections&pane_id=7&max_hz=25"
-curl -N "http://127.0.0.1:8000/stream/deltas?pane_id=7&max_hz=50"
+curl -N http://127.0.0.1:9999/stream/events
+curl -N "http://127.0.0.1:9999/stream/events?channel=detections&pane_id=7&max_hz=25"
+curl -N "http://127.0.0.1:9999/stream/deltas?pane_id=7&max_hz=50"
 ```
 
 - `/stream/events` delivers persisted detections in database ID order as `text/event-stream`. Fresh subscriptions start at an atomic database checkpoint; reconnects resume from the last received checkpoint or detection cursor. EventBus notifications wake storage reads promptly, and periodic reads recover detections whose notifications were lost. Lifecycle and diagnostic signals remain best-effort live events; bus overflow produces an explicit `lag` frame.
@@ -1088,14 +1088,14 @@ Cargo, target-class capacity, live-pane mutation, or production-scale behavior.
 
 ### Web API (feature-gated)
 
-Run `ft web` (the `web` feature is in default builds) to expose a local HTTP surface on `127.0.0.1:8000` by default.
+Run `ft web` (the `web` feature is in default builds) to expose a local HTTP surface on `127.0.0.1:9999` by default. Builds before 2026-11 used port 8000. Set `[tuning.web] default_port` in `ft.toml`, or pass `--port`, to choose another.
 
 ```bash
 ft web
-curl http://127.0.0.1:8000/health
-curl http://127.0.0.1:8000/panes
-curl -N http://127.0.0.1:8000/stream/events
-curl -N "http://127.0.0.1:8000/stream/deltas?pane_id=3&max_hz=50"
+curl http://127.0.0.1:9999/health
+curl http://127.0.0.1:9999/panes
+curl -N http://127.0.0.1:9999/stream/events
+curl -N "http://127.0.0.1:9999/stream/deltas?pane_id=3&max_hz=50"
 ```
 
 Streaming query parameters: `pane_id` filters to one pane; `max_hz` caps delivery rate for backpressure control; `/stream/events` also accepts `channel=all|deltas|detections|signals`. Streaming responses use schema `ft.stream.v1`, send keepalive comments when idle, emit `lag` frames when a slow client misses events, and redact secret material before emission.
@@ -1106,7 +1106,7 @@ The first `ready` frame establishes an accepted durable checkpoint and includes 
 
 ```bash
 curl -N -H "Last-Event-ID: $CURSOR" \
-  "http://127.0.0.1:8000/stream/events?channel=detections&pane_id=7"
+  "http://127.0.0.1:9999/stream/events?channel=detections&pane_id=7"
 ```
 
 Treat these values as opaque tokens. Their versioned form is `event-v1:<epoch>:all:<id>` or `event-v1:<epoch>:pane:<pane_id>:<id>`, where the epoch binds the cursor to the database's retention history. Keep the same pane filter when resuming. Numeric legacy IDs and `since_id` bootstrap requests are rejected; begin a fresh subscription without a cursor to deliberately start at the current tail. A nonempty `Last-Event-ID` takes precedence over a URL cursor. Invalid tokens fail before streaming, and an expired cursor, changed database epoch, or unprovable retention interval produces an explicit discontinuity instead of silently resetting the position. Lifecycle, lag, and error frames do not overwrite the durable checkpoint. Delivery is at least once across reconnects; clients should deduplicate by cursor when necessary.
@@ -1117,12 +1117,21 @@ Treat these values as opaque tokens. Their versioned form is `event-v1:<epoch>:a
 
 ```bash
 RCH_CARGO_WRAPPER_BYPASS=1 scripts/build-browser-ui.sh /tmp/ft-ui    # needs the wasm32 target and wasm-bindgen 0.2.128
-ft web --ui-dir /tmp/ft-ui/site                                       # then open http://127.0.0.1:8000/ui/
+ft web --ui-dir /tmp/ft-ui/site                                       # then open http://127.0.0.1:9999/ui/
 ```
 
 The build script fetches the renderer's last source revision from the frankentui repository, checks the archive's SHA-256, and builds it with the dependency lock vendored in `crates/frankenterm-browser-ui/renderer.lock`. The package's `manifest.json` records every file's SHA-256. At startup `ft web` reads exactly those files, checks each digest, and serves them from memory: a tampered or incomplete package stops startup, and no request path reaches the filesystem. The page carries a same-origin Content-Security-Policy. WebGPU is required; browsers without it show an error instead of a blank page. `tests/e2e/test_browser_fleet_viewer.sh` drives a real headless Chrome against a viewer fed by the headless capture-and-detect smoke.
 
-The server is still loopback-only and unauthenticated, so the viewer is for the local machine (or a tunnel you control). Authenticated tailnet access, terminal attach and DSR packaging are the open milestones of `ft-browser-frankenterm-7z4il`.
+The server is still loopback-only and unauthenticated. It refuses to bind any non-loopback address, so another device on your network cannot reach it directly, even on the same tailnet. To use the viewer from a laptop, tablet or phone, put Tailscale Serve in front of it. Tailscale terminates HTTPS with the machine's tailnet certificate and accepts only devices on your tailnet:
+
+```bash
+ft web --ui-dir /tmp/ft-ui/site &
+tailscale serve --bg 9999           # then open https://<this-machine>.<tailnet>.ts.net/ui/ on any tailnet device
+tailscale serve status              # show what is shared
+tailscale serve --https=443 off     # stop sharing
+```
+
+Everything `ft web` serves is then readable from every device on the tailnet. That includes captured pane output and history search. The streams redact the secrets they recognize, but nothing checks who is asking. Use tailnet access rules if that is broader than you want. Never use `tailscale funnel`: it publishes to the whole internet. The milestones still open in `ft-browser-frankenterm-7z4il` are authenticated tailnet access (identity checks and strict Host/Origin), terminal attach, and DSR packaging.
 
 `ft web` runs no capture pipeline of its own. Its storage tail follows newly persisted `events` rows written by the watcher and republishes wakeups on its in-process bus. Subscriptions always obtain detection content and ordering from storage, so a delayed or reordered wakeup cannot skip an earlier row. The tail starts after existing history; explicit subscription cursors control replay. Embedders that publish to the same bus in-process can disable the extra wakeup tail with `WebServerConfig::with_storage_event_tail(false)`.
 

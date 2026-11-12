@@ -421,7 +421,8 @@ pub struct WebTuning {
     pub default_host: String,
 
     /// Port for the web server.
-    /// Source: web.rs DEFAULT_PORT = 8000
+    /// Source: WebTuning::DEFAULT_PORT = 9999 (web.rs DEFAULT_PORT uses it).
+    /// 9999 rather than 8000, which many development servers take.
     pub default_port: u16,
 
     /// Hard ceiling on list endpoint results.
@@ -459,7 +460,7 @@ pub struct WebTuning {
 
 impl WebTuning {
     pub const DEFAULT_HOST: &'static str = "127.0.0.1";
-    pub const DEFAULT_PORT: u16 = 8000;
+    pub const DEFAULT_PORT: u16 = 9999;
     pub const DEFAULT_MAX_LIST_LIMIT: usize = 500;
     pub const DEFAULT_LIST_LIMIT: usize = 50;
     pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
@@ -1216,7 +1217,7 @@ default_port = 9000
 
         // Web
         assert_eq!(cfg.web.default_host, "127.0.0.1");
-        assert_eq!(cfg.web.default_port, 8000);
+        assert_eq!(cfg.web.default_port, 9999);
         assert_eq!(cfg.web.max_list_limit, 500);
         assert_eq!(cfg.web.default_list_limit, 50);
         assert_eq!(cfg.web.max_request_body_bytes, 64 * 1024);

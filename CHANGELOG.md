@@ -59,7 +59,7 @@ Fast paths across `pagegrid`, `term`, `surface`, and `escape-parser`: a printed 
 
 ### SSH, config, and fleet viewer
 
-Imported workspaces connect through one authenticated jump host; RSA-SHA2 hosts are supported with verified mux authentication; `freetype_lcd_filter`, `text_gamma`, and `text_contrast` config options land ([#130](https://github.com/Dicklesworthstone/frankenterm/pull/130)); and indexed captured-history search is wired into the browser fleet viewer with a cancellable search controller.
+Imported workspaces connect through one authenticated jump host; RSA-SHA2 hosts are supported with verified mux authentication; `freetype_lcd_filter`, `text_gamma`, and `text_contrast` config options land ([#130](https://github.com/Dicklesworthstone/frankenterm/pull/130)); and indexed captured-history search is wired into the browser fleet viewer with a cancellable search controller. `ft web` now listens on port 9999 by default instead of 8000, which many development servers take; set `[tuning.web] default_port = 8000` to keep the old port. The README shows how to reach it from other devices through Tailscale Serve.
 
 - Representative commits: [`d67aaa2`](https://github.com/Dicklesworthstone/frankenterm/commit/d67aaa296), [`c54b828`](https://github.com/Dicklesworthstone/frankenterm/commit/c54b82883), [`de07940`](https://github.com/Dicklesworthstone/frankenterm/commit/de0794052), [`88806ae`](https://github.com/Dicklesworthstone/frankenterm/commit/88806aa2e)
 

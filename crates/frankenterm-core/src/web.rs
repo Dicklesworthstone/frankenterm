@@ -72,7 +72,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Default host — overridable via `[tuning.web] default_host` in ft.toml.
 const DEFAULT_HOST: &str = "127.0.0.1";
 /// Default port — overridable via `[tuning.web] default_port` in ft.toml.
-const DEFAULT_PORT: u16 = 8000;
+/// Shares the tuning default, so the two cannot drift apart.
+const DEFAULT_PORT: u16 = crate::tuning_config::WebTuning::DEFAULT_PORT;
 
 /// Resolve web server host from TuningConfig, falling back to compile-time default.
 pub fn resolve_host(tuning: Option<&crate::tuning_config::WebTuning>) -> String {
@@ -511,8 +512,8 @@ mod tests {
 
     #[test]
     fn config_new_sets_custom_port() {
-        let cfg = WebServerConfig::new(9999);
-        assert_eq!(cfg.port, 9999);
+        let cfg = WebServerConfig::new(4321);
+        assert_eq!(cfg.port, 4321);
         assert_eq!(cfg.host, DEFAULT_HOST);
     }
 

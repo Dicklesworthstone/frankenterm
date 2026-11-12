@@ -227,7 +227,7 @@ Behind the `web` feature, which is on by default.
 ft web [--port <n>]
 ```
 
-Default bind is `127.0.0.1:8000`. The web server exposes:
+Default bind is `127.0.0.1:9999` (set `[tuning.web] default_port` to change it; releases before 2026-11 used 8000). The web server exposes:
 
 ```bash
 GET /health
@@ -256,10 +256,24 @@ Examples:
 
 ```bash
 ft web
-curl -N http://127.0.0.1:8000/stream/events
-curl -N "http://127.0.0.1:8000/stream/events?channel=detections&pane_id=7&max_hz=25"
-curl -N "http://127.0.0.1:8000/stream/deltas?pane_id=7&max_hz=50"
+curl -N http://127.0.0.1:9999/stream/events
+curl -N "http://127.0.0.1:9999/stream/events?channel=detections&pane_id=7&max_hz=25"
+curl -N "http://127.0.0.1:9999/stream/deltas?pane_id=7&max_hz=50"
 ```
+
+The server binds loopback only, and it refuses any other address because its
+routes have no authentication. To reach it from your other devices, put
+Tailscale Serve in front of it. Tailscale then provides HTTPS and limits
+access to your tailnet:
+
+```bash
+tailscale serve --bg 9999          # https://<this-machine>.<tailnet>.ts.net/ -> 127.0.0.1:9999
+tailscale serve --https=443 off    # stop sharing
+```
+
+Every device on the tailnet can then read all captured pane output. Use
+tailnet access rules to narrow that if it is too wide. Never use
+`tailscale funnel`, which publishes to the internet.
 
 Behavior notes:
 - Streams emit keepalive comments while idle.

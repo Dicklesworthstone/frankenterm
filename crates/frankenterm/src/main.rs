@@ -2161,9 +2161,9 @@ SEE ALSO:
     #[command(after_help = r#"EXAMPLES:
     ft web                            Start the read-only web server on configured host/port
     ft web --port 0                   Bind to an ephemeral port (tests)
-    curl -N "http://127.0.0.1:8000/stream/deltas?pane_id=7&max_hz=50"
+    curl -N "http://127.0.0.1:9999/stream/deltas?pane_id=7&max_hz=50"
                                      Redacted output deltas + gaps for one pane (DB-backed)
-    curl -N "http://127.0.0.1:8000/stream/events?channel=detections&pane_id=7&max_hz=25"
+    curl -N "http://127.0.0.1:9999/stream/events?channel=detections&pane_id=7&max_hz=25"
                                      Detection event SSE (see the NOTE below)
 
 STREAMING ENDPOINTS:
