@@ -16,9 +16,11 @@ use super::*;
 use crate::ingest::Osc133State;
 use crate::patterns::PatternEngine;
 use crate::runtime_async::{
-    ContextError, ContextErrorKind, RuntimeTime, sleep_with_cx, timer_now_with_cx,
+    ContextError, ContextErrorKind, RuntimeTime, RwLock, sleep_with_cx, timeout_with_cx_typed,
+    timer_now_with_cx, until_cancelled,
 };
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 /// In-memory registry of named external signals (ft-6gqga).
@@ -282,6 +284,42 @@ impl Default for WaitConditionOptions {
     }
 }
 
+enum WaitPatternEngine<'a> {
+    Unavailable,
+    Borrowed(&'a PatternEngine),
+    Shared(&'a RwLock<PatternEngine>),
+}
+
+struct CountingWaitSource<'a, S: PaneTextSource + Sync + ?Sized> {
+    source: &'a S,
+    polls: &'a AtomicUsize,
+}
+
+impl<S: PaneTextSource + Sync + ?Sized> PaneTextSource for CountingWaitSource<'_, S> {
+    type Fut<'a>
+        = std::pin::Pin<Box<dyn std::future::Future<Output = crate::Result<String>> + Send + 'a>>
+    where
+        Self: 'a;
+
+    fn get_text(&self, pane_id: u64, escapes: bool) -> Self::Fut<'_> {
+        self.polls.fetch_add(1, Ordering::Relaxed);
+        Box::pin(self.source.get_text(pane_id, escapes))
+    }
+
+    fn get_text_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        escapes: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::Result<String>> + Send + 'a>>
+    where
+        Self: 'a + Sync,
+    {
+        self.polls.fetch_add(1, Ordering::Relaxed);
+        self.source.get_text_with_cx(cx, pane_id, escapes)
+    }
+}
+
 /// Executor for wait conditions.
 ///
 /// This struct wraps the necessary dependencies for executing wait conditions:
@@ -303,7 +341,7 @@ impl Default for WaitConditionOptions {
 /// ```
 pub struct WaitConditionExecutor<'a, S: PaneTextSource + Sync + ?Sized> {
     source: &'a S,
-    pattern_engine: &'a PatternEngine,
+    pattern_engine: WaitPatternEngine<'a>,
     osc_state: Option<&'a Osc133State>,
     options: WaitConditionOptions,
     external_signals: Option<&'a ExternalSignalRegistry>,
@@ -315,7 +353,30 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
     pub fn new(source: &'a S, pattern_engine: &'a PatternEngine) -> Self {
         Self {
             source,
-            pattern_engine,
+            pattern_engine: WaitPatternEngine::Borrowed(pattern_engine),
+            osc_state: None,
+            options: WaitConditionOptions::default(),
+            external_signals: None,
+        }
+    }
+
+    /// Use the configured pattern registry, including live pack changes.
+    /// The read guard is held only while detecting patterns in one observation.
+    #[must_use]
+    pub fn new_shared(source: &'a S, pattern_engine: &'a RwLock<PatternEngine>) -> Self {
+        Self {
+            pattern_engine: WaitPatternEngine::Shared(pattern_engine),
+            ..Self::new_without_patterns(source)
+        }
+    }
+
+    /// Execute conditions that do not need a pattern registry.
+    /// Pattern waits fail explicitly rather than using unrelated default packs.
+    #[must_use]
+    pub fn new_without_patterns(source: &'a S) -> Self {
+        Self {
+            source,
+            pattern_engine: WaitPatternEngine::Unavailable,
             osc_state: None,
             options: WaitConditionOptions::default(),
             external_signals: None,
@@ -362,8 +423,55 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
         timeout: Duration,
     ) -> crate::Result<WaitConditionResult> {
         wait_checkpoint(cx, "wait execution")?;
-        self.execute_inner(cx, condition, context_pane_id, timeout)
-            .await
+        let start = wait_clock_now(cx);
+        let deadline = wait_deadline_after(start, timeout, "wait execution")?;
+        let polls = AtomicUsize::new(0);
+        if matches!(
+            condition,
+            WaitCondition::Sleep { .. } | WaitCondition::External { .. }
+        ) {
+            // These loops own every await and already cap their timers to the
+            // deadline; preserve their condition-specific timeout evidence.
+            let result = until_cancelled(
+                cx,
+                self.execute_inner(cx, condition, context_pane_id, timeout, &polls),
+            )
+            .await;
+            wait_checkpoint(cx, "wait execution after timer")?;
+            return result.map_err(|error| wait_cancelled(cx, "wait execution", error.as_ref()))?;
+        }
+        // The polling loops reject late observations, but a pane backend or a
+        // pattern writer can remain pending without waking on cancellation.
+        // Bound the whole operation, including those dependency waits.
+        let result = until_cancelled(
+            cx,
+            timeout_with_cx_typed(
+                cx,
+                timeout,
+                self.execute_inner(cx, condition, context_pane_id, timeout, &polls),
+            ),
+        )
+        .await;
+        wait_checkpoint(cx, "wait execution after observation")?;
+        let observed_at = wait_clock_now(cx);
+        match result {
+            Ok(Ok(Ok(WaitConditionResult::Satisfied { .. })))
+                if wait_timed_out(deadline, observed_at) =>
+            {
+                Ok(WaitConditionResult::TimedOut {
+                    elapsed_ms: wait_elapsed_ms(start, observed_at),
+                    polls: polls.load(Ordering::Relaxed),
+                    last_observed: None,
+                })
+            }
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Ok(WaitConditionResult::TimedOut {
+                elapsed_ms: wait_elapsed_ms(start, observed_at),
+                polls: polls.load(Ordering::Relaxed),
+                last_observed: None,
+            }),
+            Err(error) => Err(wait_cancelled(cx, "wait execution", error.as_ref())),
+        }
     }
 
     pub async fn execute(
@@ -383,11 +491,12 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
         condition: &WaitCondition,
         context_pane_id: u64,
         timeout: Duration,
+        polls_observed: &AtomicUsize,
     ) -> crate::Result<WaitConditionResult> {
         match condition {
             WaitCondition::Pattern { pane_id, rule_id } => {
                 let target_pane = pane_id.unwrap_or(context_pane_id);
-                self.execute_pattern_wait(cx, target_pane, rule_id, timeout)
+                self.execute_pattern_wait(cx, target_pane, rule_id, timeout, polls_observed)
                     .await
             }
             WaitCondition::PaneIdle {
@@ -395,20 +504,32 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
                 idle_threshold_ms,
             } => {
                 let target_pane = pane_id.unwrap_or(context_pane_id);
-                self.execute_pane_idle_wait(cx, target_pane, *idle_threshold_ms, timeout)
-                    .await
+                self.execute_pane_idle_wait(
+                    cx,
+                    target_pane,
+                    *idle_threshold_ms,
+                    timeout,
+                    polls_observed,
+                )
+                .await
             }
             WaitCondition::StableTail {
                 pane_id,
                 stable_for_ms,
             } => {
                 let target_pane = pane_id.unwrap_or(context_pane_id);
-                self.execute_stable_tail_wait(cx, target_pane, *stable_for_ms, timeout)
-                    .await
+                self.execute_stable_tail_wait(
+                    cx,
+                    target_pane,
+                    *stable_for_ms,
+                    timeout,
+                    polls_observed,
+                )
+                .await
             }
             WaitCondition::TextMatch { pane_id, matcher } => {
                 let target_pane = pane_id.unwrap_or(context_pane_id);
-                self.execute_text_match_wait(cx, target_pane, matcher, timeout)
+                self.execute_text_match_wait(cx, target_pane, matcher, timeout, polls_observed)
                     .await
             }
             WaitCondition::Sleep { duration_ms } => {
@@ -481,6 +602,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
                     }
 
                     polls = polls.saturating_add(1);
+                    polls_observed.store(polls, Ordering::Relaxed);
                     let signaled = registry.is_signaled(key);
                     wait_checkpoint(cx, "external signal wait after registry read")?;
                     let observed_at = wait_clock_now(cx);
@@ -534,7 +656,13 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
         pane_id: u64,
         rule_id: &str,
         timeout: Duration,
+        polls_observed: &AtomicUsize,
     ) -> crate::Result<WaitConditionResult> {
+        if matches!(self.pattern_engine, WaitPatternEngine::Unavailable) {
+            return Ok(WaitConditionResult::Unsupported {
+                reason: "pattern wait requires the configured pattern engine".to_string(),
+            });
+        }
         let start = wait_clock_now(cx);
         let deadline = wait_deadline_after(start, timeout, "pattern")?;
         let mut polls = 0usize;
@@ -555,6 +683,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
                 });
             }
             polls = polls.saturating_add(1);
+            polls_observed.store(polls, Ordering::Relaxed);
 
             // Get pane text
             let text_result = self.source.get_text_with_cx(cx, pane_id, false).await;
@@ -571,7 +700,11 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
             let tail = tail_text(&text, self.options.tail_lines);
 
             // Run pattern detection
-            let detections = self.pattern_engine.detect(tail);
+            let detections = match &self.pattern_engine {
+                WaitPatternEngine::Borrowed(engine) => engine.detect(tail),
+                WaitPatternEngine::Shared(engine) => engine.read().await.detect(tail),
+                WaitPatternEngine::Unavailable => unreachable!("pattern engine checked above"),
+            };
             wait_checkpoint(cx, "pattern wait after detection")?;
             let observed_at = wait_clock_now(cx);
             if wait_timed_out(deadline, observed_at) {
@@ -637,6 +770,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
         pane_id: u64,
         idle_threshold_ms: u64,
         timeout: Duration,
+        polls_observed: &AtomicUsize,
     ) -> crate::Result<WaitConditionResult> {
         let start = wait_clock_now(cx);
         let deadline = wait_deadline_after(start, timeout, "pane_idle")?;
@@ -669,6 +803,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
                 });
             }
             polls = polls.saturating_add(1);
+            polls_observed.store(polls, Ordering::Relaxed);
 
             // Check idle state
             let state_result = self.check_idle_state(cx, pane_id).await;
@@ -778,6 +913,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
         pane_id: u64,
         stable_for_ms: u64,
         timeout: Duration,
+        polls_observed: &AtomicUsize,
     ) -> crate::Result<WaitConditionResult> {
         let start = wait_clock_now(cx);
         let deadline = wait_deadline_after(start, timeout, "stable_tail")?;
@@ -809,6 +945,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
                 });
             }
             polls = polls.saturating_add(1);
+            polls_observed.store(polls, Ordering::Relaxed);
 
             let text_result = self.source.get_text_with_cx(cx, pane_id, false).await;
             wait_checkpoint(cx, "stable tail wait after pane read")?;
@@ -918,6 +1055,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
         pane_id: u64,
         matcher: &TextMatch,
         timeout: Duration,
+        polls_observed: &AtomicUsize,
     ) -> crate::Result<WaitConditionResult> {
         let start = wait_clock_now(cx);
         let deadline = wait_deadline_after(start, timeout, "text_match")?;
@@ -939,7 +1077,11 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
             });
         }
         let wait_matcher = matcher_result?;
-        let waiter = PaneWaiter::new(self.source).with_options(WaitOptions {
+        let counted_source = CountingWaitSource {
+            source: self.source,
+            polls: polls_observed,
+        };
+        let waiter = PaneWaiter::new(&counted_source).with_options(WaitOptions {
             tail_lines: self.options.tail_lines,
             escapes: false,
             poll_initial: self.options.poll_initial,
@@ -1588,6 +1730,173 @@ mod tests {
         assert_eq!(executor.options.tail_lines, 50);
         assert_eq!(executor.options.max_polls, 5);
         assert!(!executor.options.allow_idle_heuristics);
+    }
+
+    #[test]
+    fn shared_executor_uses_configured_packs_and_observes_pack_replacement() {
+        let rt = test_runtime();
+        rt.block_on(async {
+            let rule = RuleDef {
+                id: "workspace.custom.ready".to_string(),
+                agent_type: AgentType::Wezterm,
+                event_type: "ready".to_string(),
+                severity: Severity::Info,
+                anchors: vec!["WORKSPACE_READY".to_string()],
+                regex: None,
+                description: "Workspace-specific readiness".to_string(),
+                remediation: None,
+                workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            };
+            let engine = RwLock::new(
+                PatternEngine::with_packs(vec![PatternPack::new(
+                    "workspace:test",
+                    "1",
+                    vec![rule],
+                )])
+                .unwrap(),
+            );
+            let source = MockPaneSource::new(vec!["WORKSPACE_READY".to_string()]);
+            let executor = WaitConditionExecutor::new_shared(&source, &engine).with_options(
+                WaitConditionOptions {
+                    max_polls: 1,
+                    ..WaitConditionOptions::default()
+                },
+            );
+            let condition = WaitCondition::pattern("workspace.custom.ready");
+            assert!(
+                executor
+                    .execute(&condition, 1, Duration::from_secs(1))
+                    .await
+                    .unwrap()
+                    .is_satisfied()
+            );
+
+            *engine.write().await = PatternEngine::with_packs(Vec::new()).unwrap();
+            assert!(
+                executor
+                    .execute(&condition, 1, Duration::from_secs(1))
+                    .await
+                    .unwrap()
+                    .is_timed_out()
+            );
+            assert_eq!(source.calls(), 2);
+        });
+    }
+
+    #[test]
+    fn executor_without_patterns_still_observes_text_and_rejects_pattern_waits() {
+        let rt = test_runtime();
+        let source = MockPaneSource::new(vec!["ready".to_string()]);
+        let executor = WaitConditionExecutor::new_without_patterns(&source);
+        let unsupported = rt
+            .block_on(executor.execute(
+                &WaitCondition::pattern("workspace.custom.ready"),
+                1,
+                Duration::from_secs(1),
+            ))
+            .unwrap();
+        assert!(matches!(
+            unsupported,
+            WaitConditionResult::Unsupported { .. }
+        ));
+        assert_eq!(source.calls(), 0, "missing packs must not start polling");
+        assert!(
+            rt.block_on(executor.execute(
+                &WaitCondition::text_match(TextMatch::substring("ready")),
+                1,
+                Duration::from_secs(1),
+            ))
+            .unwrap()
+            .is_satisfied()
+        );
+        assert_eq!(source.calls(), 1);
+    }
+
+    struct PendingPaneSource;
+
+    impl PaneTextSource for PendingPaneSource {
+        type Fut<'a> = std::future::Pending<crate::Result<String>>;
+
+        fn get_text(&self, _pane_id: u64, _escapes: bool) -> Self::Fut<'_> {
+            std::future::pending()
+        }
+    }
+
+    #[test]
+    fn every_pane_wait_bounds_a_backend_that_never_returns() {
+        let rt = test_runtime();
+        let source = PendingPaneSource;
+        let engine = PatternEngine::new();
+        let executor = WaitConditionExecutor::new(&source, &engine);
+        for condition in [
+            WaitCondition::pattern("workspace.ready"),
+            WaitCondition::pane_idle(0),
+            WaitCondition::stable_tail(0),
+            WaitCondition::text_match(TextMatch::substring("ready")),
+        ] {
+            let start = Instant::now();
+            let result = rt
+                .block_on(executor.execute(&condition, 1, Duration::from_millis(10)))
+                .unwrap();
+            assert!(
+                matches!(result, WaitConditionResult::TimedOut { polls: 1, .. }),
+                "{result:?}"
+            );
+            assert!(start.elapsed() < Duration::from_secs(1));
+        }
+    }
+
+    #[test]
+    fn pane_wait_cancellation_interrupts_a_backend_without_cancellation_support() {
+        let rt = test_runtime();
+        let cx = crate::cx::for_testing();
+        let cancel_cx = cx.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            cancel_cx.cancel_with(crate::outcome::CancelKind::User, Some("pending read test"));
+        });
+        let source = PendingPaneSource;
+        let executor = WaitConditionExecutor::new_without_patterns(&source);
+        let start = Instant::now();
+        let error = rt
+            .block_on(executor.execute_with_cx(
+                &cx,
+                &WaitCondition::text_match(TextMatch::substring("ready")),
+                1,
+                Duration::from_secs(30),
+            ))
+            .expect_err("cancellation must drop the pending backend read");
+        canceller.join().unwrap();
+        assert_finite_post_read_cancellation(&error);
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn shared_pattern_lock_wait_is_bounded_by_the_observation_deadline() {
+        let rt = test_runtime();
+        rt.block_on(async {
+            let engine = RwLock::new(PatternEngine::new());
+            let source = MockPaneSource::new(vec!["ready".to_string()]);
+            let executor = WaitConditionExecutor::new_shared(&source, &engine);
+            let guard = engine.write().await;
+            let result = executor
+                .execute(
+                    &WaitCondition::pattern("workspace.ready"),
+                    1,
+                    Duration::from_millis(10),
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(result, WaitConditionResult::TimedOut { polls: 1, .. }),
+                "{result:?}"
+            );
+            assert_eq!(source.calls(), 1);
+            drop(guard);
+        });
     }
 
     // ========================================================================
