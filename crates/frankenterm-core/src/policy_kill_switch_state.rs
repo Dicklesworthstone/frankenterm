@@ -331,13 +331,14 @@ impl KillSwitchFreshness {
         Ok(())
     }
 
-    pub(crate) fn apply(
+    /// Validate persisted authority without changing an admission engine.
+    /// Durable transport owners use this under the effect fence so a
+    /// temporary stop pauses delivery without permanently rejecting queued work.
+    pub(crate) fn validate(
         &mut self,
-        engine: &mut PolicyEngine,
         loaded: Result<Option<String>, KillSwitchStateError>,
-        now_ms: u64,
-    ) -> KillSwitchRestore {
-        let checked = loaded.and_then(|raw| {
+    ) -> Result<Option<String>, KillSwitchStateError> {
+        loaded.and_then(|raw| {
             match raw.as_deref() {
                 Some(value) => {
                     let document = decode_kill_switch_document(value)?;
@@ -359,7 +360,16 @@ impl KillSwitchFreshness {
                 None => {}
             }
             Ok(raw)
-        });
+        })
+    }
+
+    pub(crate) fn apply(
+        &mut self,
+        engine: &mut PolicyEngine,
+        loaded: Result<Option<String>, KillSwitchStateError>,
+        now_ms: u64,
+    ) -> KillSwitchRestore {
+        let checked = self.validate(loaded);
         apply_persisted_kill_switch(engine, checked, now_ms)
     }
 }

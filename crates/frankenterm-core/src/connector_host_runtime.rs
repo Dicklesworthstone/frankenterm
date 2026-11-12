@@ -45,6 +45,7 @@ pub(crate) struct FcpDeliverySession {
     next_poll: Vec<std::time::Instant>,
     poll_cursor: usize,
     pending_admission: Option<(i64, Vec<crate::connector_reliability::ConnectorOutboxEntry>)>,
+    kill_switch_freshness: crate::policy_kill_switch_state::KillSwitchFreshness,
 }
 
 impl FcpDeliverySession {
@@ -114,7 +115,59 @@ impl FcpDeliverySession {
             next_poll,
             poll_cursor: 0,
             pending_admission: None,
+            kill_switch_freshness: Default::default(),
         })
+    }
+
+    /// Queue admission does not grant authority to perform a later external
+    /// effect. Refresh the persisted switch under the same workspace fence as
+    /// operator transitions, and return the owned guard to the dispatch path.
+    /// The caller must retain it through invocation, including receipt lookup.
+    async fn fence_transport_effect(
+        &mut self,
+        cx: &crate::cx::Cx,
+        action: crate::policy::ActionKind,
+    ) -> DeliveryResult<crate::policy_kill_switch_state::KillSwitchFence> {
+        use crate::policy_kill_switch_state::{
+            KILL_SWITCH_FENCE_WAIT, acquire_kill_switch_fence_within_with_cx,
+            decode_kill_switch_state, load_kill_switch_state_from_storage_with_cx,
+        };
+
+        cx.checkpoint().map_err(|_| FcpTransportError::Cancelled)?;
+        let fence = acquire_kill_switch_fence_within_with_cx(
+            cx,
+            std::path::Path::new(self.storage.db_path()),
+            KILL_SWITCH_FENCE_WAIT,
+        )
+        .await
+        .map_err(|_| FcpDeliveryError::State("connector_kill_switch_fence_unavailable"))?;
+        self.kill_switch_freshness
+            .bind(&fence)
+            .map_err(|_| FcpDeliveryError::State("connector_kill_switch_fence_unavailable"))?;
+        let loaded = load_kill_switch_state_from_storage_with_cx(cx, &self.storage).await;
+        let raw = self
+            .kill_switch_freshness
+            .validate(loaded)
+            .map_err(|_| FcpDeliveryError::State("connector_kill_switch_state_unavailable"))?;
+        let mut switch = raw
+            .as_deref()
+            .map(decode_kill_switch_state)
+            .transpose()
+            .map_err(|_| FcpDeliveryError::State("connector_kill_switch_state_unavailable"))?
+            .unwrap_or_else(crate::policy_quarantine::KillSwitch::disarmed);
+        switch.tick(u64::try_from(delivery_now_ms()?)?);
+        cx.checkpoint().map_err(|_| FcpTransportError::Cancelled)?;
+
+        // Match the global graduated gate in PolicyEngine. Route-specific
+        // admission remains authoritative; reconstructing its pane/text context
+        // from an outbox row would silently change that original decision.
+        if switch.is_emergency()
+            || (!switch.allows_inflight() && !action.is_read_only())
+            || (!switch.allows_new_workflows() && action.is_workflow_launch())
+        {
+            return Err(FcpDeliveryError::State("connector_kill_switch_paused"));
+        }
+        Ok(fence)
     }
 
     pub(crate) async fn tick(&mut self, cx: &crate::cx::Cx) -> DeliveryResult<()> {
@@ -400,6 +453,14 @@ impl FcpDeliverySession {
                 .await?;
                 continue;
             }
+            let effect_fence = match self
+                .fence_transport_effect(cx, entry.action_kind.policy_action())
+                .await
+            {
+                Ok(fence) => fence,
+                Err(FcpDeliveryError::State("connector_kill_switch_paused")) => continue,
+                Err(error) => return Err(error),
+            };
             let deadline = self.client.operation_deadline()?;
             let preflight = async {
                 self.client
@@ -465,7 +526,9 @@ impl FcpDeliverySession {
             let dispatched = self
                 .transition(cx, &entry, State::Dispatched, None, None)
                 .await?;
-            match self.client.invoke(cx, deadline, prepared).await {
+            let outcome = self.client.invoke(cx, deadline, prepared).await;
+            drop(effect_fence);
+            match outcome {
                 Ok(ack) => {
                     self.transition(
                         cx,
@@ -520,6 +583,14 @@ impl FcpDeliverySession {
         use crate::connector_reliability::{
             ConnectorStorageMutation as Mutation, ConnectorStorageOutcome as Outcome,
         };
+        let effect_fence = match self
+            .fence_transport_effect(cx, crate::policy::ActionKind::ReadOutput)
+            .await
+        {
+            Ok(fence) => fence,
+            Err(FcpDeliveryError::State("connector_kill_switch_paused")) => return Ok(()),
+            Err(error) => return Err(error),
+        };
         let subscription = &self.config.inbound[index];
         let key = fcp_identity_hash(&serde_json::to_string(&(
             &self.generation,
@@ -560,7 +631,9 @@ impl FcpDeliverySession {
                 &fcp_identity_hash(&request_id),
             )
             .await?;
-        let ack = self.client.invoke(cx, deadline, prepared).await?;
+        let outcome = self.client.invoke(cx, deadline, prepared).await;
+        drop(effect_fence);
+        let ack = outcome?;
         if !ack.success {
             return Err(FcpDeliveryError::State("connector_ingress_poll_failed"));
         }
@@ -2571,6 +2644,585 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(first.as_bytes()[14], b'4');
         assert!(b"89ab".contains(&first.as_bytes()[19]));
+    }
+
+
+    #[cfg(unix)]
+    async fn delivery_session_fixture(
+        endpoint: &str,
+        request_timeout_ms: u64,
+    ) -> (
+        tempfile::TempDir,
+        crate::config::SafetyConfig,
+        crate::storage::StorageHandle,
+        FcpDeliverySession,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = crate::storage::StorageHandle::new(
+            temp.path().join("delivery.db").to_str().unwrap(),
+        )
+        .await
+        .unwrap();
+        storage
+            .upsert_pane(crate::storage::PaneRecord {
+                pane_id: 1,
+                pane_uuid: None,
+                domain: "delivery-test".into(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 1,
+                last_seen_at: 1,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            })
+            .await
+            .unwrap();
+        let mut safety = crate::config::SafetyConfig::default();
+        safety.connector_transport = Some(FcpTransportConfig {
+            endpoint: endpoint.into(),
+            capability_token_file: temp.path().join("capability"),
+            admin_token_file: temp.path().join("admin"),
+            request_timeout_ms,
+            max_payload_bytes: 4096,
+            max_pending_actions: 8,
+            max_retained_actions: 16,
+            max_ingress_batch: 4,
+            outbound: vec![FcpOutboundRoute {
+                rule: crate::connector_outbound_bridge::OutboundRoutingRule {
+                    rule_id: "test-route".into(),
+                    source_filter: None,
+                    event_type_prefix: Some("pattern.test".into()),
+                    min_severity: None,
+                    target_connector: "fcp.sqlite".into(),
+                    action_kind: crate::connector_outbound_bridge::ConnectorActionKind::Invoke,
+                    enabled: true,
+                    priority: 0,
+                },
+                invoke: introspection_operation(),
+                correlation_input_pointer: None,
+            }],
+            inbound: vec![FcpInboundSubscription {
+                subscription_id: "test-poll".into(),
+                invoke: FcpOperation {
+                    input: serde_json::json!({"cursor": 0}),
+                    ..introspection_operation()
+                },
+                pane_id: 1,
+                records_pointer: "/records".into(),
+                identity_pointer: "/id".into(),
+                cursor_input_pointer: "/cursor".into(),
+                poll_interval_ms: 1000,
+            }],
+        });
+        let cx = crate::cx::for_request();
+        let session = FcpDeliverySession::open(
+            &cx,
+            &safety,
+            storage.clone(),
+            std::sync::Arc::new(crate::events::EventBus::new(8)),
+        )
+        .await
+        .unwrap();
+        (temp, safety, storage, session)
+    }
+
+    #[cfg(unix)]
+    async fn record_delivery_fixture_event(storage: &crate::storage::StorageHandle) -> i64 {
+        storage
+            .record_event(crate::storage::StoredEvent {
+                id: 0,
+                pane_id: 1,
+                rule_id: "test.rule".into(),
+                agent_type: "unknown".into(),
+                event_type: "test".into(),
+                severity: "info".into(),
+                confidence: 1.0,
+                extracted: None,
+                matched_text: Some("source-private-canary".into()),
+                segment_id: None,
+                detected_at: 1,
+                dedupe_key: None,
+                handled_at: None,
+                handled_by_workflow_id: None,
+                handled_status: None,
+            })
+            .await
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delivery_session_live_stop_preserves_work_and_reset_resumes_preflight() {
+        use crate::connector_reliability::ConnectorDeliveryState as State;
+        use crate::policy::ActionKind;
+        use crate::policy_kill_switch_state::tests::transition_in_test_process;
+
+        crate::storage::run_storage_async_test(async {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+            let (_temp, _safety, storage, mut session) =
+                delivery_session_fixture(&endpoint, 100).await;
+            let cx = crate::cx::for_request();
+            record_delivery_fixture_event(&storage).await;
+            session.admit_events(&cx).await.unwrap();
+            let admitted = storage
+                .get_connector_outbox_with_cx(&cx, &session.generation, false, 8)
+                .await
+                .unwrap();
+            assert_eq!(admitted.len(), 1);
+            assert_eq!(admitted[0].state, State::Admitted);
+
+            let fence = session
+                .fence_transport_effect(&cx, ActionKind::ConnectorInvoke)
+                .await
+                .unwrap();
+            assert!(
+                transition_in_test_process(
+                    std::path::Path::new(storage.db_path()),
+                    "pending",
+                )
+                .contains("KILL_SWITCH_CHILD_PENDING"),
+                "an admitted external effect must exclude an operator transition",
+            );
+            drop(fence);
+            transition_in_test_process(std::path::Path::new(storage.db_path()), "trip");
+
+            // The trip happened in another process after both session creation
+            // and durable admission. Neither discovery nor invocation may run.
+            session.dispatch_pending(&cx).await.unwrap();
+            assert!(matches!(
+                listener.accept(),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ));
+            let paused = storage
+                .get_connector_outbox_with_cx(&cx, &session.generation, false, 8)
+                .await
+                .unwrap();
+            assert_eq!(paused[0].state, State::Admitted);
+            assert_eq!(paused[0].revision, admitted[0].revision);
+            assert_eq!(paused[0].invoke.input, admitted[0].invoke.input);
+            assert!(paused[0].receipt_id.is_none());
+
+            transition_in_test_process(std::path::Path::new(storage.db_path()), "reset");
+            // The endpoint deliberately never answers. Reaching it after reset
+            // is the positive control; preflight may defer, but cannot dispatch.
+            session.dispatch_pending(&cx).await.unwrap();
+            assert!(listener.accept().is_ok(), "reset must resume real preflight");
+            let resumed = storage
+                .get_connector_outbox_with_cx(&cx, &session.generation, false, 8)
+                .await
+                .unwrap();
+            assert_eq!(resumed[0].state, State::Admitted);
+            assert!(resumed[0].revision > admitted[0].revision);
+            drop(session);
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delivery_session_refuses_corrupt_rollback_and_missing_switch_authority() {
+        use crate::policy::ActionKind;
+        use crate::policy_kill_switch_state::{
+            KILL_SWITCH_REVISION_KEY, KILL_SWITCH_STATE_KEY,
+        };
+        use crate::policy_kill_switch_state::tests::transition_in_test_process;
+
+        crate::storage::run_storage_async_test(async {
+            let (_temp, _safety, storage, mut session) =
+                delivery_session_fixture("http://127.0.0.1:1/", 100).await;
+            let cx = crate::cx::for_request();
+            transition_in_test_process(std::path::Path::new(storage.db_path()), "trip");
+            assert!(matches!(
+                session
+                    .fence_transport_effect(&cx, ActionKind::ConnectorInvoke)
+                    .await,
+                Err(FcpDeliveryError::State("connector_kill_switch_paused")),
+            ));
+            let old = storage
+                .get_config_value_with_cx(&cx, KILL_SWITCH_STATE_KEY)
+                .await
+                .unwrap()
+                .unwrap();
+            transition_in_test_process(std::path::Path::new(storage.db_path()), "reset");
+            drop(
+                session
+                    .fence_transport_effect(&cx, ActionKind::ConnectorInvoke)
+                    .await
+                    .unwrap(),
+            );
+            let current = storage
+                .get_config_value_with_cx(&cx, KILL_SWITCH_STATE_KEY)
+                .await
+                .unwrap()
+                .unwrap();
+
+            for invalid in ["{broken", old.as_str()] {
+                storage
+                    .set_config_value_with_cx(&cx, KILL_SWITCH_STATE_KEY, invalid)
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    session
+                        .fence_transport_effect(&cx, ActionKind::ReadOutput)
+                        .await,
+                    Err(FcpDeliveryError::State(
+                        "connector_kill_switch_state_unavailable"
+                    )),
+                ));
+            }
+            // Restoring both old fields agrees internally but must still fail
+            // the running session's monotone revision watermark.
+            storage
+                .set_config_value_with_cx(&cx, KILL_SWITCH_REVISION_KEY, "1")
+                .await
+                .unwrap();
+            assert!(matches!(
+                session
+                    .fence_transport_effect(&cx, ActionKind::ReadOutput)
+                    .await,
+                Err(FcpDeliveryError::State(
+                    "connector_kill_switch_state_unavailable"
+                )),
+            ));
+            storage
+                .set_config_value_with_cx(&cx, KILL_SWITCH_STATE_KEY, &current)
+                .await
+                .unwrap();
+            storage
+                .set_config_value_with_cx(&cx, KILL_SWITCH_REVISION_KEY, "2")
+                .await
+                .unwrap();
+            drop(
+                session
+                    .fence_transport_effect(&cx, ActionKind::ConnectorInvoke)
+                    .await
+                    .unwrap(),
+            );
+
+            let backend = crate::storage_backend_trait::RusqliteBackend::open(
+                storage.db_path(),
+                &crate::storage_backend_trait::OpenConfig {
+                    wal_mode: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            use crate::storage_backend_trait::StorageBackend as _;
+            backend
+                .execute_batch(
+                    "DELETE FROM config WHERE key IN (
+                        'policy.kill_switch_v1', 'policy.kill_switch_revision_v1'
+                    )",
+                )
+                .unwrap();
+            assert!(matches!(
+                session
+                    .fence_transport_effect(&cx, ActionKind::ReadOutput)
+                    .await,
+                Err(FcpDeliveryError::State(
+                    "connector_kill_switch_state_unavailable"
+                )),
+            ));
+            drop(backend);
+            drop(session);
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delivery_session_ingress_obeys_graduated_stop_without_poisoning_admission() {
+        use crate::policy::ActionKind;
+        use crate::policy_kill_switch_state::{
+            KillSwitchTransition, transition_kill_switch_from_backend,
+        };
+        use crate::policy_quarantine::KillSwitchLevel;
+
+        crate::storage::run_storage_async_test(async {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+            let (_temp, _safety, storage, mut session) =
+                delivery_session_fixture(&endpoint, 100).await;
+            let cx = crate::cx::for_request();
+            let backend = crate::storage_backend_trait::RusqliteBackend::open(
+                storage.db_path(),
+                &crate::storage_backend_trait::OpenConfig {
+                    wal_mode: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            for (level, action, allowed) in [
+                (KillSwitchLevel::SoftStop, ActionKind::ConnectorTriggerWorkflow, false),
+                (KillSwitchLevel::SoftStop, ActionKind::ConnectorNotify, true),
+                (KillSwitchLevel::HardStop, ActionKind::ConnectorNotify, false),
+                (KillSwitchLevel::HardStop, ActionKind::ReadOutput, true),
+                (KillSwitchLevel::EmergencyHalt, ActionKind::ReadOutput, false),
+            ] {
+                transition_kill_switch_from_backend(
+                    &backend,
+                    KillSwitchTransition::Reset { by: "test-operator" },
+                    1_000,
+                )
+                .unwrap();
+                transition_kill_switch_from_backend(
+                    &backend,
+                    KillSwitchTransition::Trip {
+                        level,
+                        by: "test-operator",
+                        reason: "graduated transport stop",
+                    },
+                    2_000,
+                )
+                .unwrap();
+                let outcome = session.fence_transport_effect(&cx, action).await;
+                if allowed {
+                    drop(outcome.unwrap());
+                } else {
+                    assert!(matches!(
+                        outcome,
+                        Err(FcpDeliveryError::State("connector_kill_switch_paused")),
+                    ));
+                }
+            }
+            // EmergencyHalt must suppress the real poll, not merely hide its
+            // result. Queue admission is separate and retains events for reset.
+            session.poll_ingress(&cx, 0).await.unwrap();
+            assert!(matches!(
+                listener.accept(),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ));
+            assert_eq!(
+                session.bridge.policy_engine().kill_switch_state().level,
+                KillSwitchLevel::Disarmed,
+            );
+            record_delivery_fixture_event(&storage).await;
+            session.admit_events(&cx).await.unwrap();
+            let pending = storage
+                .get_connector_outbox_with_cx(&cx, &session.generation, false, 8)
+                .await
+                .unwrap();
+            assert_eq!(
+                pending[0].state,
+                crate::connector_reliability::ConnectorDeliveryState::Admitted,
+            );
+            transition_kill_switch_from_backend(
+                &backend,
+                KillSwitchTransition::Reset { by: "test-operator" },
+                3_000,
+            )
+            .unwrap();
+            assert!(session.poll_ingress(&cx, 0).await.is_err());
+            assert!(listener.accept().is_ok(), "reset must resume real polling");
+            drop(backend);
+            drop(session);
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+
+    #[cfg(unix)]
+    #[test]
+    fn delivery_session_holds_workspace_fence_until_authenticated_receipt() {
+        use crate::connector_reliability::ConnectorDeliveryState as State;
+        use crate::policy_kill_switch_state::{
+            KillSwitchStateError, acquire_kill_switch_fence,
+        };
+        use std::io::{Read, Write};
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        crate::storage::run_storage_async_test(async {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+            let (_temp, safety, storage, mut session) =
+                delivery_session_fixture(&endpoint, 5_000).await;
+            let config = safety.connector_transport.as_ref().unwrap();
+            for (path, bytes) in [
+                (&config.capability_token_file, b"capability-test-only".as_slice()),
+                (&config.admin_token_file, b"admin-test-only".as_slice()),
+            ] {
+                std::fs::write(path, bytes).unwrap();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                    .unwrap();
+            }
+
+            let db_path = std::path::PathBuf::from(storage.db_path());
+            let server_db_path = db_path.clone();
+            let expected_receipt_id = fcp_identity_hash("fenced-loopback-receipt");
+            let receipt_id = expected_receipt_id.clone();
+            let server = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut invocation: Option<serde_json::Value> = None;
+                let mut observed = Vec::new();
+                for expected_path in [
+                    "/rpc/discover",
+                    "/rpc/introspect/fcp.sqlite",
+                    "/rpc/invoke",
+                    "/rpc/admin/receipts",
+                ] {
+                    let mut stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                assert!(
+                                    Instant::now() < deadline,
+                                    "missing expected request: {expected_path}"
+                                );
+                                std::thread::sleep(Duration::from_millis(2));
+                            }
+                            Err(error) => panic!("loopback accept failed: {error}"),
+                        }
+                    };
+                    let remaining = deadline
+                        .checked_duration_since(Instant::now())
+                        .expect("loopback fixture exceeded its deadline");
+                    stream.set_read_timeout(Some(remaining)).unwrap();
+                    stream.set_write_timeout(Some(remaining)).unwrap();
+                    let mut request = Vec::new();
+                    let mut chunk = [0_u8; 1024];
+                    let header_end = loop {
+                        let read = stream.read(&mut chunk).unwrap();
+                        assert_ne!(read, 0, "connection ended before request headers");
+                        request.extend_from_slice(&chunk[..read]);
+                        assert!(request.len() <= 65_536, "fixture request exceeded cap");
+                        if let Some(index) =
+                            request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                        {
+                            break index + 4;
+                        }
+                    };
+                    let headers =
+                        std::str::from_utf8(&request[..header_end]).unwrap().to_string();
+                    let path = headers
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap();
+                    assert_eq!(path, expected_path);
+                    let content_length = headers
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                        .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                        .unwrap_or(0);
+                    assert!(content_length <= 65_536 - header_end);
+                    while request.len() < header_end + content_length {
+                        let read = stream.read(&mut chunk).unwrap();
+                        assert_ne!(read, 0, "connection ended before request body");
+                        request.extend_from_slice(&chunk[..read]);
+                        assert!(request.len() <= 65_536);
+                    }
+                    assert!(
+                        matches!(
+                            acquire_kill_switch_fence(&server_db_path),
+                            Err(KillSwitchStateError::FencePending)
+                        ),
+                        "workspace effect fence was not held at {expected_path}"
+                    );
+                    observed.push(expected_path.to_string());
+                    let body = if content_length == 0 {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::from_slice(
+                            &request[header_end..header_end + content_length],
+                        )
+                        .unwrap()
+                    };
+                    let response = match expected_path {
+                        "/rpc/discover" => serde_json::json!({
+                            "connectors": [{
+                                "id": "fcp.sqlite",
+                                "enabled": true,
+                                "health": {"status": "healthy"}
+                            }]
+                        }),
+                        "/rpc/introspect/fcp.sqlite" => serde_json::json!({
+                            "connector": {"id": "fcp.sqlite"},
+                            "tools": [{"name": "sqlite.query"}]
+                        }),
+                        "/rpc/invoke" => {
+                            assert_eq!(body["connector_id"], "fcp.sqlite");
+                            assert_eq!(body["operation"], "sqlite.query");
+                            assert_eq!(
+                                body["capability_token"],
+                                serde_json::json!(b"capability-test-only".to_vec())
+                            );
+                            let response = serde_json::json!({
+                                "type": "response",
+                                "id": body["id"].clone(),
+                                "status": "ok",
+                                "receipt_id": receipt_id.clone(),
+                                "result": {"accepted": true}
+                            });
+                            invocation = Some(body);
+                            response
+                        }
+                        "/rpc/admin/receipts" => {
+                            assert!(
+                                headers.to_ascii_lowercase().contains(
+                                    "authorization: bearer admin-test-only"
+                                )
+                            );
+                            let invocation = invocation.as_ref().unwrap();
+                            serde_json::json!({
+                                "receipts": [{
+                                    "receipt_id": receipt_id.clone(),
+                                    "connector_id": invocation["connector_id"].clone(),
+                                    "operation": invocation["operation"].clone(),
+                                    "idempotency_key": invocation["idempotency_key"].clone(),
+                                    "success": true
+                                }]
+                            })
+                        }
+                        _ => unreachable!(),
+                    };
+                    let encoded = serde_json::to_vec(&response).unwrap();
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        encoded.len()
+                    )
+                    .unwrap();
+                    stream.write_all(&encoded).unwrap();
+                    stream.flush().unwrap();
+                }
+                observed
+            });
+
+            let cx = crate::cx::for_request();
+            record_delivery_fixture_event(&storage).await;
+            session.admit_events(&cx).await.unwrap();
+            let result = session.dispatch_pending(&cx).await;
+            let observed = server.join().expect("bounded loopback fixture failed");
+            result.unwrap();
+            assert_eq!(observed.len(), 4);
+            let rows = storage
+                .get_connector_outbox_with_cx(&cx, &session.generation, false, 8)
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].state, State::Completed);
+            assert_eq!(rows[0].revision, 2);
+            assert_eq!(
+                rows[0].receipt_id.as_deref(),
+                Some(expected_receipt_id.as_str())
+            );
+            assert!(rows[0].receipt_hash.is_some());
+            drop(acquire_kill_switch_fence(&db_path).unwrap());
+            drop(session);
+            storage.shutdown().await.unwrap();
+        });
     }
 
     #[cfg(unix)]
