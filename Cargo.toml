@@ -637,7 +637,7 @@ rustls = { version = "0.23.40", default-features = false, features = ["logging",
 rustls-pemfile = "2.2.0"
 fastmcp = { version = "=0.13.0", git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "d04c583971677eac3a20ee657ca35f889b3a0bbd", package = "fastmcp-rust", features = ["legacy-2024-11-05", "testing-lab"] }
 fastmcp-server = { version = "=0.13.0", git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "d04c583971677eac3a20ee657ca35f889b3a0bbd" }
-fastapi = { version = "=0.5.0", git = "https://github.com/Dicklesworthstone/fastapi_rust", rev = "2498d3ff96ba7bee5c21c4f39eba954d489ede31", package = "fastapi-rust" }
+fastapi = { version = "=0.5.0", git = "https://github.com/Dicklesworthstone/fastapi_rust", rev = "6d9b4cacb408cef7da944023a17a3a9ad1519277", package = "fastapi-rust" }
 
 # FrankenSearch (optional integration, enabled via frankenterm-core feature flag)
 # Pinned to a specific rev of the upstream GitHub repo for reproducibility.

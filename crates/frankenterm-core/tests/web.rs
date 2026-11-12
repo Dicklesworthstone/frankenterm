@@ -930,6 +930,112 @@ mod web_tests {
         });
     }
 
+    /// ft-xxfwy.55.15: every request the parser refuses, at the production
+    /// parse limits, gets its final status and `connection: close` instead of
+    /// a bare close, and no handler runs. The last case has no header fields
+    /// at all and arrives whole while the server checks for the HTTP/2
+    /// preface; it is answered (no Host, so 400) instead of left until the
+    /// keep-alive timeout closes it.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn web_malformed_requests_get_a_final_status() {
+        run_async_test_with_cx(|cx, cleanup_cx| async move {
+            let effects = Arc::new(AtomicUsize::new(0));
+            let (addr, mut runtime) = FrameworkWebRuntime::start_with_cx(
+                &cx,
+                "127.0.0.1:0".to_string(),
+                counted_upload_app(&effects),
+            )
+            .await
+            .expect("production runtime should start");
+            let long_target = "a".repeat(9 * 1024);
+            let long_value = "v".repeat(9 * 1024);
+            let many_headers = "X-Extra: v\r\n".repeat(101);
+            let cases = [
+                (
+                    format!("POST /{long_target} HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+                    "414 URI Too Long",
+                ),
+                (
+                    format!("POST /upload HTTP/1.1\r\nHost: localhost\r\n{many_headers}\r\n"),
+                    "431 Request Header Fields Too Large",
+                ),
+                (
+                    format!(
+                        "POST /upload HTTP/1.1\r\nHost: localhost\r\nX-Long: {long_value}\r\n\r\n"
+                    ),
+                    "431 Request Header Fields Too Large",
+                ),
+                (
+                    "BREW /upload HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string(),
+                    "501 Not Implemented",
+                ),
+                (
+                    "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip\r\n\r\n"
+                        .to_string(),
+                    "501 Not Implemented",
+                ),
+                (
+                    "POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\
+                     Transfer-Encoding: chunked\r\n\r\nhello"
+                        .to_string(),
+                    "400 Bad Request",
+                ),
+                (
+                    "POST /upload HTTP/1.1\r\nHost: localhost\r\nBad Header: x\r\n\r\n"
+                        .to_string(),
+                    "400 Bad Request",
+                ),
+                (
+                    "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n\
+                     zz\r\nhello\r\n0\r\n\r\n"
+                        .to_string(),
+                    "400 Bad Request",
+                ),
+                ("GET / HTTP/1.0\r\n\r\n".to_string(), "400 Bad Request"),
+            ];
+            let mut observed = Vec::new();
+            for (request, status) in &cases {
+                observed.push((request, *status, fetch_raw(addr, request.as_bytes()).await));
+            }
+            let effects_after_refusals = effects.load(Ordering::SeqCst);
+            let positive = fetch_raw(
+                addr,
+                b"POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\
+                  Connection: close\r\n\r\nhello",
+            )
+            .await;
+
+            runtime.signal_shutdown();
+            let joined = runtime.join_handle_mut().await;
+            runtime.finish_with_cx(&cleanup_cx, joined).await.unwrap();
+
+            for (request, status, response) in observed {
+                let case: String = request.chars().take(60).collect();
+                let response = response.unwrap_or_else(|err| panic!("{case:?}: {err}"));
+                assert!(
+                    response.starts_with(&format!("HTTP/1.1 {status}\r\n")),
+                    "{case:?} needs {status}: {response:?}"
+                );
+                assert_eq!(
+                    header_value(&response, "connection"),
+                    Some("close"),
+                    "{case:?}"
+                );
+            }
+            assert_eq!(
+                effects_after_refusals, 0,
+                "no handler for a refused request"
+            );
+            assert_eq!(extract_status(&positive.unwrap()), 200);
+            assert_eq!(
+                effects.load(Ordering::SeqCst),
+                1,
+                "the in-cap control is handled"
+            );
+        });
+    }
+
     #[test]
     fn web_openapi_discovery_invokes_advertised_health() {
         use anyhow::{Context, ensure};
