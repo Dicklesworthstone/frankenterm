@@ -5391,7 +5391,7 @@ pub trait PaneTextSource {
     where
         Self: 'a;
 
-    /// Fetch the pane text. Implementations may ignore tail_lines and return full text.
+    /// Fetch the complete pane text.
     fn get_text(&self, pane_id: u64, escapes: bool) -> Self::Fut<'_>;
 
     /// Cx-first sibling of [`get_text`] (ft-xbnl0.2.3 tick 264).
@@ -5410,6 +5410,33 @@ pub trait PaneTextSource {
         Self: 'a + Sync,
     {
         Box::pin(async move { self.get_text(pane_id, escapes).await })
+    }
+
+    /// Fetch the trailing rows needed by a wait operation.
+    ///
+    /// Native sources carry this limit to the mux so each poll avoids
+    /// hydrating unrelated cold scrollback. Native tails count content rows,
+    /// excluding blank screen padding. The default preserves the existing
+    /// full-read behavior for sources without a bounded transport, then
+    /// slices its result while retaining the caller's capability context.
+    /// Zero means empty text and must never become an unbounded backend read.
+    fn get_text_tail_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        escapes: bool,
+        tail_lines: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>
+    where
+        Self: 'a + Sync,
+    {
+        Box::pin(async move {
+            if tail_lines == 0 {
+                return Ok(String::new());
+            }
+            let text = self.get_text_with_cx(cx, pane_id, escapes).await?;
+            Ok(tail_text(&text, tail_lines).to_string())
+        })
     }
 }
 
@@ -5431,6 +5458,28 @@ impl PaneTextSource for WeztermClient {
     {
         Box::pin(async move { self.get_text_with_cx(cx, pane_id, escapes).await })
     }
+
+    fn get_text_tail_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        escapes: bool,
+        tail_lines: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>
+    where
+        Self: 'a + Sync,
+    {
+        Box::pin(async move {
+            // The mux API uses Some(0) for unlimited history; waits use zero
+            // for an empty observation and must not forward that sentinel.
+            if tail_lines == 0 {
+                return Ok(String::new());
+            }
+            WeztermClient::get_text_tail_with_cx(self, cx, pane_id, escapes, Some(tail_lines))
+                .await
+                .map(|text| text.text)
+        })
+    }
 }
 
 impl PaneTextSource for WeztermHandleSource {
@@ -5450,6 +5499,27 @@ impl PaneTextSource for WeztermHandleSource {
         Self: 'a + Sync,
     {
         Box::pin(async move { self.handle.get_text_with_cx(cx, pane_id, escapes).await })
+    }
+
+    fn get_text_tail_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        escapes: bool,
+        tail_lines: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>
+    where
+        Self: 'a + Sync,
+    {
+        Box::pin(async move {
+            if tail_lines == 0 {
+                return Ok(String::new());
+            }
+            self.handle
+                .get_text_tail_with_cx(cx, pane_id, escapes, Some(tail_lines))
+                .await
+                .map(|text| text.text)
+        })
     }
 }
 
@@ -5730,10 +5800,10 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> PaneWaiter<'a, S> {
     ///     each sleep. Direct cancellation does not wake `sleep_with_cx`
     ///     itself, but is observed no later than the end of the current step.
     ///
-    /// The loop invokes `PaneTextSource::get_text_with_cx`; source
-    /// implementations that override that method propagate the caller's Cx,
-    /// while the trait default retains its ambient read behavior. Loop
-    /// checkpoints and backoff always use the explicit Cx. The ambient
+    /// The loop invokes `PaneTextSource::get_text_tail_with_cx` with the
+    /// configured row limit. Native sources bound the mux read itself; the
+    /// default delegates to the source's Cx-aware full read and slices it.
+    /// Loop checkpoints and backoff always use the explicit Cx. The ambient
     /// [`wait_for`](Self::wait_for) wrapper delegates here.
     pub async fn wait_for_with_cx(
         &self,
@@ -5771,10 +5841,9 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> PaneWaiter<'a, S> {
 
         loop {
             polls = next_poll_count(polls);
-            // ft-xbnl0.2.3 tick 281: cx-first get_text inside wait_for_with_cx.
             let text = self
                 .source
-                .get_text_with_cx(cx, pane_id, self.options.escapes)
+                .get_text_tail_with_cx(cx, pane_id, self.options.escapes, self.options.tail_lines)
                 .await?;
             if cx.checkpoint().is_err() {
                 let error = wezterm_cx_error(
@@ -5935,9 +6004,10 @@ pub async fn wait_for_codex_session_summary<S: PaneTextSource + Sync + ?Sized>(
 ///     cancellation is returned as a typed runtime error rather than a
 ///     timeout-shaped `matched: false` result.
 ///
-/// The loop invokes `PaneTextSource::get_text_with_cx`; overriding sources
-/// propagate cancellation through reads, while the trait default preserves
-/// ambient read behavior. Loop checkpoints and backoff always use `cx`.
+/// The loop invokes `PaneTextSource::get_text_tail_with_cx`, carrying both
+/// the configured row limit and caller context to the source. Native sources
+/// avoid hydrating unrelated history; sources without a bounded transport
+/// fall back to their Cx-aware full read. Loop checkpoints and backoff use `cx`.
 pub async fn wait_for_codex_session_summary_with_cx<S: PaneTextSource + Sync + ?Sized>(
     cx: &crate::cx::Cx,
     source: &S,
@@ -5966,9 +6036,8 @@ pub async fn wait_for_codex_session_summary_with_cx<S: PaneTextSource + Sync + ?
 
     loop {
         polls = next_poll_count(polls);
-        // ft-xbnl0.2.3 tick 281: cx-first get_text inside codex_summary_wait.
         let text = source
-            .get_text_with_cx(cx, pane_id, options.escapes)
+            .get_text_tail_with_cx(cx, pane_id, options.escapes, options.tail_lines)
             .await?;
         cx.checkpoint().map_err(|_| {
             wezterm_cx_error(
@@ -7261,6 +7330,47 @@ mod tests {
                 );
                 Ok(self.0.to_string())
             })
+        }
+    }
+
+    struct TailRecordingPaneText {
+        text: &'static str,
+        requests: Mutex<Vec<(u64, bool, usize)>>,
+    }
+
+    impl TailRecordingPaneText {
+        fn new(text: &'static str) -> Self {
+            Self {
+                text,
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl PaneTextSource for TailRecordingPaneText {
+        type Fut<'a> = std::future::Ready<Result<String>>;
+
+        fn get_text(&self, _pane_id: u64, _escapes: bool) -> Self::Fut<'_> {
+            panic!("wait polling must not fetch the complete history");
+        }
+
+        fn get_text_tail_with_cx<'a>(
+            &'a self,
+            _cx: &'a crate::cx::Cx,
+            pane_id: u64,
+            escapes: bool,
+            tail_lines: usize,
+        ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>
+        where
+            Self: 'a + Sync,
+        {
+            self.requests
+                .lock()
+                .unwrap()
+                .push((pane_id, escapes, tail_lines));
+            // An over-returning source also exercises the waiter's final
+            // defensive slice, independently of transport-side bounds.
+            Box::pin(async move { Ok(self.text.to_string()) })
         }
     }
 
@@ -10863,6 +10973,134 @@ mod tests {
             let source = WeztermHandleSource::new(handle);
             let text = source.get_text(0, false).await.unwrap();
             assert_eq!(text, "source test");
+        });
+    }
+
+    #[test]
+    fn pane_text_source_tail_fallback_preserves_unicode_and_line_boundaries() {
+        run_async_test(async {
+            let source = StaticPaneText("old\n雪\nready\n");
+            let cx = crate::cx::for_testing();
+            for (limit, expected) in [
+                (1, "ready\n"),
+                (2, "雪\nready\n"),
+                (usize::MAX, "old\n雪\nready\n"),
+            ] {
+                let text = source
+                    .get_text_tail_with_cx(&cx, 7, false, limit)
+                    .await
+                    .unwrap();
+                assert_eq!(text, expected);
+            }
+
+            let would_cancel = CancelAfterReadPaneText("must not be read");
+            assert!(
+                would_cancel
+                    .get_text_tail_with_cx(&cx, 7, false, 0)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(cx.checkpoint().is_ok(), "a zero tail must skip the read");
+        });
+    }
+
+    #[test]
+    fn wezterm_handle_source_bounds_tail_and_zero_skips_missing_pane() {
+        run_async_test(async {
+            let mock = MockWezterm::new();
+            mock.add_default_pane(7).await;
+            mock.inject_output(7, "old\n雪\nready").await.unwrap();
+            let source = WeztermHandleSource::new(Arc::new(mock));
+            let cx = crate::cx::for_testing();
+
+            assert_eq!(
+                source
+                    .get_text_tail_with_cx(&cx, 7, false, 2)
+                    .await
+                    .unwrap(),
+                "雪\nready"
+            );
+            assert!(
+                source
+                    .get_text_tail_with_cx(&cx, 99, false, 0)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "zero must not become the mux unlimited-history sentinel"
+            );
+            assert!(
+                source
+                    .get_text_tail_with_cx(&cx, 99, false, 1)
+                    .await
+                    .is_err(),
+                "nonempty reads must preserve missing-pane errors"
+            );
+        });
+    }
+
+    #[test]
+    fn pane_waiter_requests_only_the_configured_tail() {
+        run_async_test(async {
+            let source = TailRecordingPaneText::new("old\n雪\nready\n");
+            let waiter = PaneWaiter::new(&source).with_options(WaitOptions {
+                tail_lines: 2,
+                escapes: true,
+                max_polls: 1,
+                ..WaitOptions::default()
+            });
+            let result = waiter
+                .wait_for(7, &WaitMatcher::substring("ready"), Duration::from_secs(5))
+                .await
+                .unwrap();
+            assert!(matches!(result, WaitResult::Matched { polls: 1, .. }));
+            assert_eq!(*source.requests.lock().unwrap(), vec![(7, true, 2)]);
+        });
+    }
+
+    #[test]
+    fn pane_waiter_does_not_match_text_outside_the_requested_tail() {
+        run_async_test(async {
+            for limit in [0, 1] {
+                let source = TailRecordingPaneText::new("complete\n雪\nstill running\n");
+                let waiter = PaneWaiter::new(&source).with_options(WaitOptions {
+                    tail_lines: limit,
+                    max_polls: 1,
+                    ..WaitOptions::default()
+                });
+                let result = waiter
+                    .wait_for(7, &WaitMatcher::substring("complete"), Duration::from_secs(5))
+                    .await
+                    .unwrap();
+                assert!(matches!(result, WaitResult::TimedOut { polls: 1, .. }));
+                assert_eq!(*source.requests.lock().unwrap(), vec![(7, false, limit)]);
+            }
+        });
+    }
+
+    #[test]
+    fn codex_summary_wait_requests_and_respects_the_configured_tail() {
+        run_async_test(async {
+            for (limit, matched) in [(2, true), (1, false), (0, false)] {
+                let source =
+                    TailRecordingPaneText::new("old\nToken usage:\nrun codex resume now\n");
+                let result = wait_for_codex_session_summary(
+                    &source,
+                    7,
+                    Duration::from_secs(5),
+                    WaitOptions {
+                        tail_lines: limit,
+                        escapes: true,
+                        max_polls: 1,
+                        ..WaitOptions::default()
+                    },
+                )
+                .await
+                .unwrap();
+                assert_eq!(result.matched, matched);
+                assert_eq!(result.polls, 1);
+                assert_eq!(*source.requests.lock().unwrap(), vec![(7, true, limit)]);
+            }
         });
     }
 

@@ -318,6 +318,21 @@ impl<S: PaneTextSource + Sync + ?Sized> PaneTextSource for CountingWaitSource<'_
         self.polls.fetch_add(1, Ordering::Relaxed);
         self.source.get_text_with_cx(cx, pane_id, escapes)
     }
+
+    fn get_text_tail_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        escapes: bool,
+        tail_lines: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::Result<String>> + Send + 'a>>
+    where
+        Self: 'a + Sync,
+    {
+        self.polls.fetch_add(1, Ordering::Relaxed);
+        self.source
+            .get_text_tail_with_cx(cx, pane_id, escapes, tail_lines)
+    }
 }
 
 /// Executor for wait conditions.
@@ -685,8 +700,10 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
             polls = polls.saturating_add(1);
             polls_observed.store(polls, Ordering::Relaxed);
 
-            // Get pane text
-            let text_result = self.source.get_text_with_cx(cx, pane_id, false).await;
+            let text_result = self
+                .source
+                .get_text_tail_with_cx(cx, pane_id, false, self.options.tail_lines)
+                .await;
             wait_checkpoint(cx, "pattern wait after pane read")?;
             let text = text_result?;
             let after_read = wait_clock_now(cx);
@@ -892,8 +909,10 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
 
         // Fallback: Use heuristic prompt detection
         if self.options.allow_idle_heuristics {
-            // ft-xbnl0.2.3 tick 264: cx-first heuristic idle check.
-            let text_result = self.source.get_text_with_cx(cx, pane_id, false).await;
+            let text_result = self
+                .source
+                .get_text_tail_with_cx(cx, pane_id, false, self.options.tail_lines.min(10))
+                .await;
             wait_checkpoint(cx, "pane idle heuristic after pane read")?;
             let text = text_result?;
             let (is_idle, desc) = heuristic_idle_check(&text, self.options.tail_lines);
@@ -947,7 +966,10 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
             polls = polls.saturating_add(1);
             polls_observed.store(polls, Ordering::Relaxed);
 
-            let text_result = self.source.get_text_with_cx(cx, pane_id, false).await;
+            let text_result = self
+                .source
+                .get_text_tail_with_cx(cx, pane_id, false, self.options.tail_lines)
+                .await;
             wait_checkpoint(cx, "stable tail wait after pane read")?;
             let text = text_result?;
             let observed_at = wait_clock_now(cx);
@@ -1813,6 +1835,82 @@ mod tests {
             .is_satisfied()
         );
         assert_eq!(source.calls(), 1);
+    }
+
+    struct TailRecordingPaneSource {
+        requests: StdMutex<Vec<(u64, bool, usize)>>,
+    }
+
+    impl PaneTextSource for TailRecordingPaneSource {
+        type Fut<'a> = std::future::Ready<crate::Result<String>>;
+
+        fn get_text(&self, _pane_id: u64, _escapes: bool) -> Self::Fut<'_> {
+            panic!("workflow waits must not fetch the complete pane history");
+        }
+
+        fn get_text_tail_with_cx<'a>(
+            &'a self,
+            _cx: &'a crate::cx::Cx,
+            pane_id: u64,
+            escapes: bool,
+            tail_lines: usize,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::Result<String>> + Send + 'a>>
+        where
+            Self: 'a + Sync,
+        {
+            self.requests
+                .lock()
+                .unwrap()
+                .push((pane_id, escapes, tail_lines));
+            Box::pin(async move { Ok("ready\n$ ".to_string()) })
+        }
+    }
+
+    #[test]
+    fn every_workflow_pane_wait_propagates_its_tail_limit() {
+        let rt = test_runtime();
+        let engine = PatternEngine::with_packs(Vec::new()).unwrap();
+        for (condition, expected_limit, satisfied) in [
+            (WaitCondition::pattern("absent.rule"), 37, false),
+            (WaitCondition::pane_idle(0), 10, true),
+            (WaitCondition::stable_tail(0), 37, true),
+            (
+                WaitCondition::text_match(TextMatch::substring("ready")),
+                37,
+                true,
+            ),
+        ] {
+            let source = TailRecordingPaneSource {
+                requests: StdMutex::new(Vec::new()),
+            };
+            let executor = WaitConditionExecutor::new(&source, &engine).with_options(
+                WaitConditionOptions {
+                    tail_lines: 37,
+                    poll_initial: Duration::ZERO,
+                    poll_max: Duration::ZERO,
+                    max_polls: 2,
+                    ..WaitConditionOptions::default()
+                },
+            );
+            let result = rt
+                .block_on(executor.execute(&condition, 7, Duration::from_secs(5)))
+                .unwrap();
+            assert_eq!(result.is_satisfied(), satisfied, "{condition:?}");
+            let polls = match result {
+                WaitConditionResult::Satisfied { polls, .. }
+                | WaitConditionResult::TimedOut { polls, .. } => polls,
+                other => panic!("unexpected pane-wait result: {other:?}"),
+            };
+            let requests = source.requests.lock().unwrap();
+            assert!(!requests.is_empty());
+            assert_eq!(requests.len(), polls, "counting wrappers must forward once");
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| *request == (7, false, expected_limit)),
+                "{requests:?}"
+            );
+        }
     }
 
     struct PendingPaneSource;
