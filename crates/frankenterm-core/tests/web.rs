@@ -635,16 +635,227 @@ mod web_tests {
 
             let small = small.expect("a small chunked body is ordinary framing");
             assert_eq!(extract_status(&small), 200, "{small}");
-            // The parser refuses it ("request too large") and closes the
-            // connection: no response, an error status, or a reset, but
-            // never a handled 2xx.
-            if let Ok(response) = oversized {
-                let status = extract_status(&response);
-                assert!(
-                    status == 0 || status >= 400,
-                    "300 KiB chunked body must be refused, got {status}: {response}"
-                );
+            // The parser refuses it ("request too large") with a finite 413,
+            // then drains what the client is still sending before closing,
+            // so the refusal is not lost to a connection reset.
+            let response = oversized.expect("a parser refusal must still be a finite response");
+            assert_eq!(
+                extract_status(&response),
+                413,
+                "300 KiB chunked body must be refused: {response}"
+            );
+            assert_eq!(header_value(&response, "connection"), Some("close"));
+            assert_eq!(response.matches("HTTP/1.1 ").count(), 1, "{response}");
+        });
+    }
+
+    /// Reads one response head (through the blank line) or up to EOF, so a
+    /// test can see an interim `100 Continue` before it sends the body.
+    async fn read_one_head(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+        let mut received = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !received.ends_with(b"\r\n\r\n") {
+            if read(stream, &mut byte).await? == 0 {
+                break;
             }
+            received.push(byte[0]);
+        }
+        Ok(received)
+    }
+
+    async fn read_to_eof(stream: &mut TcpStream) -> std::io::Result<String> {
+        let mut received = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let count = read(stream, &mut chunk).await?;
+            if count == 0 {
+                return Ok(String::from_utf8_lossy(&received).into_owned());
+            }
+            received.extend_from_slice(&chunk[..count]);
+        }
+    }
+
+    /// ft-xxfwy.55.15: at the production defaults, a head declaring one byte
+    /// more than the advertised cap is refused from the head alone. The
+    /// client sends no body, as an `Expect: 100-continue` client waits to do.
+    /// The keep-alive timeout is 1 s, so a server that waited for body bytes
+    /// would close this connection without any response.
+    #[test]
+    fn web_default_cap_refuses_a_declared_overflow_from_the_head() {
+        run_async_test(async {
+            let config = WebServerConfig::default().with_port(0);
+            let cap = config.runtime_limits().max_request_body_bytes;
+            let server = start_web_server(config).await.unwrap();
+            let addr = server.bound_addr();
+            let mut observed = Vec::new();
+            for expect in ["", "Expect: 100-continue\r\n"] {
+                let head = format!(
+                    "GET /health HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n{expect}\r\n",
+                    cap + 1
+                );
+                observed.push((expect, fetch_raw(addr, head.as_bytes()).await));
+            }
+            let healthy = fetch_health(addr).await;
+            server.shutdown().await.unwrap();
+
+            for (expect, response) in observed {
+                let response = response.expect("a refused head must receive a finite response");
+                assert_eq!(extract_status(&response), 413, "{expect:?}: {response}");
+                assert!(!response.contains("100 Continue"), "{expect:?}: {response}");
+                assert_eq!(response.matches("HTTP/1.1 ").count(), 1, "{response}");
+                assert_eq!(header_value(&response, "connection"), Some("close"));
+                let body: serde_json::Value =
+                    serde_json::from_str(extract_body(&response)).unwrap();
+                assert_eq!(body["error_code"], "body_too_large", "{expect:?}");
+            }
+            assert_eq!(extract_status(&healthy.unwrap()), 200);
+        });
+    }
+
+    /// The production runtime with a 1 KiB cap, a POST route and a
+    /// WebSocket route, each counting its effects.
+    #[cfg(feature = "asupersync-runtime")]
+    fn counted_upload_app(effects: &Arc<AtomicUsize>) -> FrameworkApp {
+        let upload_effects = Arc::clone(effects);
+        let ws_effects = Arc::clone(effects);
+        FrameworkApp::builder()
+            .config(FrameworkAppConfig::new().max_body_size(1024))
+            .post("/upload", move |_, _| {
+                upload_effects.fetch_add(1, Ordering::SeqCst);
+                async { FrameworkResponse::ok() }
+            })
+            .websocket("/ws", move |_, _, _| {
+                ws_effects.fetch_add(1, Ordering::SeqCst);
+                async { Ok(()) }
+            })
+            .build()
+    }
+
+    /// ft-xxfwy.55.15: headers-only overflow is denied before any payload.
+    /// A declared length one byte over the cap is refused by BodySizeGuard
+    /// from the head; 8 MiB is past the parser's own body limit and is
+    /// refused as unparseable. Neither sends 100 or 101, and no handler runs,
+    /// including for a WebSocket handshake that declares a body.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn web_headers_only_overflow_is_denied_before_the_payload() {
+        run_async_test_with_cx(|cx, cleanup_cx| async move {
+            let effects = Arc::new(AtomicUsize::new(0));
+            let (addr, mut runtime) = FrameworkWebRuntime::start_with_cx(
+                &cx,
+                "127.0.0.1:0".to_string(),
+                counted_upload_app(&effects),
+            )
+            .await
+            .expect("production runtime should start");
+            let mut observed = Vec::new();
+            for declared in [1025_usize, 8 * 1024 * 1024] {
+                for extra in [
+                    "",
+                    "Expect: 100-continue\r\n",
+                    "Connection: Upgrade\r\nUpgrade: websocket\r\n\
+                     Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                     Sec-WebSocket-Version: 13\r\n",
+                ] {
+                    let (method, path) = if extra.contains("websocket") {
+                        ("GET", "/ws")
+                    } else {
+                        ("POST", "/upload")
+                    };
+                    let head = format!(
+                        "{method} {path} HTTP/1.1\r\nHost: localhost\r\n\
+                         Content-Length: {declared}\r\n{extra}\r\n"
+                    );
+                    observed.push((declared, extra, fetch_raw(addr, head.as_bytes()).await));
+                }
+            }
+            let effects_after_refusals = effects.load(Ordering::SeqCst);
+            let positive = fetch_raw(
+                addr,
+                b"POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\
+                  Connection: close\r\n\r\nhello",
+            )
+            .await;
+            let effects_after_positive = effects.load(Ordering::SeqCst);
+
+            runtime.signal_shutdown();
+            let joined = runtime.join_handle_mut().await;
+            runtime.finish_with_cx(&cleanup_cx, joined).await.unwrap();
+
+            for (declared, extra, response) in observed {
+                let case = format!("declared {declared} with {extra:?}");
+                let response = response.unwrap_or_else(|err| panic!("{case}: {err}"));
+                assert_eq!(extract_status(&response), 413, "{case}: {response}");
+                assert!(!response.contains(" 100 "), "{case}: no 100: {response}");
+                assert!(!response.contains(" 101 "), "{case}: no 101: {response}");
+                assert_eq!(response.matches("HTTP/1.1 ").count(), 1, "{case}");
+                assert_eq!(
+                    header_value(&response, "connection"),
+                    Some("close"),
+                    "{case}"
+                );
+                if declared == 1025 {
+                    let body: serde_json::Value =
+                        serde_json::from_str(extract_body(&response)).unwrap();
+                    assert_eq!(body["error_code"], "body_too_large", "{case}");
+                }
+            }
+            assert_eq!(effects_after_refusals, 0, "no handler for a refused head");
+            assert_eq!(extract_status(&positive.unwrap()), 200);
+            assert_eq!(effects_after_positive, 1, "the in-cap control is handled");
+        });
+    }
+
+    /// ft-xxfwy.55.15: a client that sends `Expect: 100-continue` and waits
+    /// gets the interim response before its body, then one final response.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn web_expect_continue_is_answered_before_the_body() {
+        run_async_test_with_cx(|cx, cleanup_cx| async move {
+            let effects = Arc::new(AtomicUsize::new(0));
+            let (addr, mut runtime) = FrameworkWebRuntime::start_with_cx(
+                &cx,
+                "127.0.0.1:0".to_string(),
+                counted_upload_app(&effects),
+            )
+            .await
+            .expect("production runtime should start");
+            let exchange = timeout(Duration::from_secs(5), async {
+                let mut stream = TcpStream::connect(addr).await?;
+                stream
+                    .write_all(
+                        b"POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\
+                          Expect: 100-continue\r\nConnection: close\r\n\r\n",
+                    )
+                    .await?;
+                let interim = read_one_head(&mut stream).await?;
+                let effects_before_body = effects.load(Ordering::SeqCst);
+                stream.write_all(b"hello").await?;
+                let final_response = read_to_eof(&mut stream).await?;
+                Ok::<_, std::io::Error>((interim, effects_before_body, final_response))
+            })
+            .await;
+            let effects_after = effects.load(Ordering::SeqCst);
+
+            runtime.signal_shutdown();
+            let joined = runtime.join_handle_mut().await;
+            runtime.finish_with_cx(&cleanup_cx, joined).await.unwrap();
+
+            let (interim, effects_before_body, final_response) = exchange
+                .expect("the exchange must finish within 5 s")
+                .expect("exchange I/O");
+            assert_eq!(
+                String::from_utf8_lossy(&interim),
+                "HTTP/1.1 100 Continue\r\n\r\n",
+                "100 Continue must precede the body"
+            );
+            assert_eq!(effects_before_body, 0, "no handler before the body");
+            assert_eq!(extract_status(&final_response), 200, "{final_response}");
+            assert!(
+                !final_response.contains("100 Continue"),
+                "the 100 is sent once: {final_response}"
+            );
+            assert_eq!(effects_after, 1);
         });
     }
 

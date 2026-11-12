@@ -95,10 +95,12 @@ impl Middleware for StateInjector {
 
 /// Rejects decoded bodies and declared lengths above the configured body cap.
 ///
-/// The pinned framework buffers bodies before its admission hook, and its
-/// parser's total-request allowance includes space for headers. That allowance
-/// must not become extra body capacity for chunked requests. Checking the
-/// actual body also protects routes that never invoke a body extractor.
+/// The pinned framework runs this hook on the parsed head, where the body is
+/// still empty and only a declared length can be refused, and again once the
+/// body is buffered. Its parser's total-request allowance includes space for
+/// headers. That allowance must not become extra body capacity for chunked
+/// requests. Checking the actual body also protects routes that never invoke a
+/// body extractor.
 #[derive(Clone)]
 pub struct BodySizeGuard {
     max_request_body_bytes: usize,

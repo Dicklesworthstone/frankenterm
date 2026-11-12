@@ -541,10 +541,11 @@ impl FrameworkWebRuntime {
 
         let server_config = ServerConfig::new(resolved_bind_addr.to_string())
             .with_parse_limits(web_parse_limits(app.config().max_body_size))
-            // Despite the hook's name, the pinned App server calls it only
-            // after bounded parsing. It does run before 100/101, handler
-            // dispatch and keep-alive selection, so rejection closes the
-            // connection instead of dispatching a pipelined follow-up.
+            // The pinned server calls it twice: on the parsed head, before
+            // any body byte is read or 100 Continue is sent, and again on the
+            // complete request, before 101, handler dispatch and keep-alive
+            // selection. Either rejection closes the connection instead of
+            // dispatching a pipelined follow-up.
             .with_pre_body_validator(crate::web::BodySizeGuard::new(app.config().max_body_size))
             .with_keep_alive_timeout(WEB_KEEP_ALIVE_TIMEOUT)
             .with_drain_timeout(WEB_CONNECTION_DRAIN_TIMEOUT);
