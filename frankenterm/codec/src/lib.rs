@@ -19339,7 +19339,7 @@ mod test {
                     let frame = frozen_native_pane_frame(ident, &original, mode);
                     let error =
                         Pdu::decode(frame.as_slice()).expect_err("reject native frame overflow");
-                    assert!(format!("{error:#}").contains(&expected), "{error:#}");
+                    assert!(format!("{error:#}").contains(&expected), "{:#}", error);
                 }
             }
         }
@@ -19412,7 +19412,7 @@ mod test {
 
                     let mut reader = Cursor::new(concatenated.clone());
                     let error = Pdu::decode(&mut reader).expect_err("reject native frame");
-                    assert!(format!("{error:#}").contains(&expected), "{error:#}");
+                    assert!(format!("{error:#}").contains(&expected), "{:#}", error);
                     assert_eq!(reader.position() as usize, rejected_frame.len());
                     let next = Pdu::decode(&mut reader).expect("decode next sync frame");
                     assert_eq!(next.serial, 75);
@@ -19428,14 +19428,14 @@ mod test {
                             .expect("decode next async frame");
                         (error, next)
                     });
-                    assert!(format!("{error:#}").contains(&expected), "{error:#}");
+                    assert!(format!("{error:#}").contains(&expected), "{:#}", error);
                     assert_eq!(next.serial, 75);
                     assert_eq!(next.pdu, next_pdu);
 
                     let mut buffered = StreamingPduBuffer::from(concatenated.clone());
                     let error =
                         Pdu::stream_decode(&mut buffered).expect_err("reject buffered frame");
-                    assert!(format!("{error:#}").contains(&expected), "{error:#}");
+                    assert!(format!("{error:#}").contains(&expected), "{:#}", error);
                     assert_eq!(buffered.as_slice(), concatenated.as_slice());
                     buffered
                         .consume_prefix(rejected_frame.len())
@@ -19471,14 +19471,14 @@ mod test {
         let duplicated = encoded.replacen("\"left\":", "\"left\":\"Empty\",\"left\":", 1);
         let error = serde_json::from_str::<ListPanesResponse>(&duplicated)
             .expect_err("duplicate Split fields must be rejected");
-        assert!(error.to_string().contains("duplicate field"), "{error}");
+        assert!(error.to_string().contains("duplicate field"), "{}", error);
 
         // Reject the unknown key before trying to deserialize its value. This
         // also prevents an ignored arbitrary object from evading tree bounds.
         let error =
             serde_json::from_str::<ListPanesResponse>(r#"{"tabs":[{"Split":{"unexpected":"#)
                 .expect_err("unknown Split fields must fail closed before their body");
-        assert!(error.to_string().contains("unknown field"), "{error}");
+        assert!(error.to_string().contains("unknown field"), "{}", error);
     }
 
     fn native_pane_outbound_test_pdus(panes: &ListPanesResponse) -> [Pdu; 3] {
@@ -26663,7 +26663,7 @@ mod test {
                 let (body, compressed) = serialize_with_mode(&request, mode).unwrap();
                 let mut frame = Vec::new();
                 encode_raw(123, 31, &body, compressed, &mut frame).unwrap();
-                assert!(Pdu::decode(frame.as_slice()).is_err(), "case {case}");
+                assert!(Pdu::decode(frame.as_slice()).is_err(), "case {}", case);
             }
         }
         let mut boundary = conditional_input_fixture();
@@ -27345,7 +27345,7 @@ mod test {
                 )
                 .unwrap();
                 let error = Pdu::decode(frame.as_slice()).unwrap_err();
-                assert!(format!("{error:#}").contains(expected), "{error:#}");
+                assert!(format!("{error:#}").contains(expected), "{:#}", error);
             }
         }
     }

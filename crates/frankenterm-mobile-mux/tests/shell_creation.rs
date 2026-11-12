@@ -262,7 +262,7 @@ fn creation_does_not_retarget_or_settle_existing_pane_input() {
 #[test]
 fn invalid_or_stale_admission_consumes_no_serial_or_wire_bytes() {
     let invalid = [
-        ("".to_owned(), 24, 80),
+        (String::new(), 24, 80),
         ("bad\nworkspace".to_owned(), 24, 80),
         ("bad\u{0085}workspace".to_owned(), 24, 80),
         ("x".repeat(257), 24, 80),
@@ -439,7 +439,7 @@ fn only_validated_explicit_no_effect_authority_can_report_a_refusal() {
                     None,
                     MuxErrorEffect::NOT_APPLIED,
                     MuxErrorRetry::SAFE_AFTER_BACKOFF,
-                )
+                );
             }
             2 => {
                 error = codec::ErrorResponse::new(
@@ -448,7 +448,7 @@ fn only_validated_explicit_no_effect_authority_can_report_a_refusal() {
                     None,
                     MuxErrorEffect::INDETERMINATE,
                     MuxErrorRetry::RECONCILE_BEFORE_RETRY,
-                )
+                );
             }
             3 => error.schema_version = 2,
             4 => error.code = MuxErrorCode(999),
@@ -457,7 +457,7 @@ fn only_validated_explicit_no_effect_authority_can_report_a_refusal() {
                 error.object = Some(codec::MuxErrorObject {
                     kind: codec::MuxErrorObjectKind::PANE,
                     id: 7,
-                })
+                });
             }
             7 => error.effect = MuxErrorEffect(0),
             _ => unreachable!(),
