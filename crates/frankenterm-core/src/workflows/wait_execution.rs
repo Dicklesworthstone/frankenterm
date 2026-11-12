@@ -1883,15 +1883,14 @@ mod tests {
             let source = TailRecordingPaneSource {
                 requests: StdMutex::new(Vec::new()),
             };
-            let executor = WaitConditionExecutor::new(&source, &engine).with_options(
-                WaitConditionOptions {
+            let executor =
+                WaitConditionExecutor::new(&source, &engine).with_options(WaitConditionOptions {
                     tail_lines: 37,
                     poll_initial: Duration::ZERO,
                     poll_max: Duration::ZERO,
                     max_polls: 2,
                     ..WaitConditionOptions::default()
-                },
-            );
+                });
             let result = rt
                 .block_on(executor.execute(&condition, 7, Duration::from_secs(5)))
                 .unwrap();
@@ -1899,7 +1898,9 @@ mod tests {
             let polls = match result {
                 WaitConditionResult::Satisfied { polls, .. }
                 | WaitConditionResult::TimedOut { polls, .. } => polls,
-                other => panic!("unexpected pane-wait result: {other:?}"),
+                other @ WaitConditionResult::Unsupported { .. } => {
+                    panic!("unexpected pane-wait result: {other:?}")
+                }
             };
             let requests = source.requests.lock().unwrap();
             assert!(!requests.is_empty());

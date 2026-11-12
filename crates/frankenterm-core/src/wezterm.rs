@@ -11069,7 +11069,11 @@ mod tests {
                     ..WaitOptions::default()
                 });
                 let result = waiter
-                    .wait_for(7, &WaitMatcher::substring("complete"), Duration::from_secs(5))
+                    .wait_for(
+                        7,
+                        &WaitMatcher::substring("complete"),
+                        Duration::from_secs(5),
+                    )
                     .await
                     .unwrap();
                 assert!(matches!(result, WaitResult::TimedOut { polls: 1, .. }));
