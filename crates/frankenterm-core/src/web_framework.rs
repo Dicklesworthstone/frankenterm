@@ -49,12 +49,13 @@ pub type FrameworkServerJoinResult =
 /// time inside the connection-drain window for a stalled read to terminate.
 const WEB_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// The longest one request may take to arrive, from its first byte to its
-/// last. The keep-alive timeout bounds each read, not the request, so without
-/// this a client sending a byte just inside it could hold a connection for
-/// hours with a body under the cap. At 1 Mbit/s the 64 KiB default cap takes
-/// about half a second. A request still incomplete at the deadline gets 408
-/// and the connection closes.
+/// The shortest time one request may take to arrive, from its first byte to
+/// its last; a raised body cap lengthens it (see [`web_request_read_timeout`]).
+/// The keep-alive timeout bounds each read, not the request, so without a
+/// deadline a client sending a byte just inside it could hold a connection
+/// for hours with a body under the cap. At 1 Mbit/s the 64 KiB default cap
+/// takes about half a second. A request still incomplete at the deadline
+/// gets 408 and the connection closes.
 const WEB_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// FastAPI applies this bound while its concurrent accept loop drains spawned
@@ -78,6 +79,24 @@ fn web_parse_limits(max_body_bytes: usize) -> ParseLimits {
             .saturating_add(defaults.max_request_line_len),
         ..defaults
     }
+}
+
+/// The slowest sender a raised body cap still allows for (512 kbit/s): the
+/// read deadline leaves the largest request the parser admits time to arrive
+/// at this rate.
+const WEB_REQUEST_MIN_BYTES_PER_SEC: u64 = 64 * 1024;
+
+/// The request read deadline for an app's body cap: the floor, or longer
+/// when the largest request the cap admits would not arrive by then at
+/// [`WEB_REQUEST_MIN_BYTES_PER_SEC`]. `tuning.web.max_request_body_bytes` has
+/// no upper bound, and a fixed deadline would silently refuse uploads the
+/// configured cap allows. A larger cap also lets a slow client hold a
+/// connection that much longer.
+fn web_request_read_timeout(max_body_bytes: usize) -> Duration {
+    let max_request =
+        u64::try_from(web_parse_limits(max_body_bytes).max_request_size).unwrap_or(u64::MAX);
+    Duration::from_secs(max_request.div_ceil(WEB_REQUEST_MIN_BYTES_PER_SEC))
+        .max(WEB_REQUEST_READ_TIMEOUT)
 }
 
 /// One-way shutdown authority shared by the server and its streaming bodies.
@@ -556,7 +575,7 @@ impl FrameworkWebRuntime {
             // dispatching a pipelined follow-up.
             .with_pre_body_validator(crate::web::BodySizeGuard::new(app.config().max_body_size))
             .with_keep_alive_timeout(WEB_KEEP_ALIVE_TIMEOUT)
-            .with_request_read_timeout(WEB_REQUEST_READ_TIMEOUT)
+            .with_request_read_timeout(web_request_read_timeout(app.config().max_body_size))
             // No FrankenTerm client speaks HTTP/2 prior knowledge (h2c), and
             // the pinned server's HTTP/2 path applies neither timeout above
             // and validates only after the whole body. The preface is
@@ -798,6 +817,29 @@ mod tests {
             super::web_parse_limits(usize::MAX).max_request_size,
             usize::MAX
         );
+    }
+
+    #[test]
+    fn read_deadline_is_the_floor_or_what_the_body_cap_needs() {
+        let floor = super::WEB_REQUEST_READ_TIMEOUT;
+        let rate = super::WEB_REQUEST_MIN_BYTES_PER_SEC;
+        // The default cap arrives well inside the floor.
+        let default_cap = crate::web::resolve_runtime_limits(None).max_request_body_bytes;
+        assert_eq!(super::web_request_read_timeout(default_cap), floor);
+        // A raised cap leaves its largest request time to arrive at the
+        // minimum rate, and no more than a second beyond that.
+        for cap in [16 << 20, 1 << 30] {
+            let deadline = super::web_request_read_timeout(cap);
+            let largest = u64::try_from(super::web_parse_limits(cap).max_request_size).unwrap();
+            assert!(deadline > floor, "{cap}: {deadline:?}");
+            assert!(deadline.as_secs() * rate >= largest, "{cap}: {deadline:?}");
+            assert!(
+                (deadline.as_secs() - 1) * rate < largest,
+                "{cap}: {deadline:?}"
+            );
+        }
+        // The largest cap does not overflow.
+        assert!(super::web_request_read_timeout(usize::MAX) > floor);
     }
 
     #[test]
