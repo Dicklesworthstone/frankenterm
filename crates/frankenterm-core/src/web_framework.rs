@@ -557,6 +557,11 @@ impl FrameworkWebRuntime {
             .with_pre_body_validator(crate::web::BodySizeGuard::new(app.config().max_body_size))
             .with_keep_alive_timeout(WEB_KEEP_ALIVE_TIMEOUT)
             .with_request_read_timeout(WEB_REQUEST_READ_TIMEOUT)
+            // No FrankenTerm client speaks HTTP/2 prior knowledge (h2c), and
+            // the pinned server's HTTP/2 path applies neither timeout above
+            // and validates only after the whole body. The preface is
+            // refused as HTTP/1.1 instead: 501 and a close.
+            .with_http2_prior_knowledge(false)
             .with_drain_timeout(WEB_CONNECTION_DRAIN_TIMEOUT);
         let server = Arc::new(TcpServer::new(server_config));
         if let Err(err) = cx.checkpoint() {

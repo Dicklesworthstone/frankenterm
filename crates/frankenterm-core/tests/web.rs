@@ -1036,6 +1036,46 @@ mod web_tests {
         });
     }
 
+    /// ft-xxfwy.55.15: the web server does not serve HTTP/2 prior knowledge
+    /// (h2c), whose path in the pinned server has no read timeouts and
+    /// validates only after the whole body. The preface and an empty
+    /// SETTINGS frame are refused as an HTTP/1.1 request: 501 and a close,
+    /// and no handler runs. Served as HTTP/2, they would get binary SETTINGS
+    /// frames and a connection that stays open past this exchange's 5 s
+    /// bound.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn web_h2c_preface_is_refused() {
+        run_async_test_with_cx(|cx, cleanup_cx| async move {
+            let effects = Arc::new(AtomicUsize::new(0));
+            let (addr, mut runtime) = FrameworkWebRuntime::start_with_cx(
+                &cx,
+                "127.0.0.1:0".to_string(),
+                counted_upload_app(&effects),
+            )
+            .await
+            .expect("production runtime should start");
+            let refused = fetch_raw(
+                addr,
+                b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0\0\x04\0\0\0\0\0",
+            )
+            .await;
+            let effects_after = effects.load(Ordering::SeqCst);
+
+            runtime.signal_shutdown();
+            let joined = runtime.join_handle_mut().await;
+            runtime.finish_with_cx(&cleanup_cx, joined).await.unwrap();
+
+            let response = refused.expect("the h2c preface must get a finite HTTP/1.1 response");
+            assert!(
+                response.starts_with("HTTP/1.1 501 Not Implemented\r\n"),
+                "{response:?}"
+            );
+            assert_eq!(header_value(&response, "connection"), Some("close"));
+            assert_eq!(effects_after, 0, "no handler for the preface");
+        });
+    }
+
     #[test]
     fn web_openapi_discovery_invokes_advertised_health() {
         use anyhow::{Context, ensure};
