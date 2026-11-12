@@ -49,6 +49,14 @@ pub type FrameworkServerJoinResult =
 /// time inside the connection-drain window for a stalled read to terminate.
 const WEB_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// The longest one request may take to arrive, from its first byte to its
+/// last. The keep-alive timeout bounds each read, not the request, so without
+/// this a client sending a byte just inside it could hold a connection for
+/// hours with a body under the cap. At 1 Mbit/s the 64 KiB default cap takes
+/// about half a second. A request still incomplete at the deadline gets 408
+/// and the connection closes.
+const WEB_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// FastAPI applies this bound while its concurrent accept loop drains spawned
 /// connection tasks. FrankenTerm applies the same bound once more after the
 /// server task joins, covering fatal accept-loop exits that bypass FastAPI's
@@ -548,6 +556,7 @@ impl FrameworkWebRuntime {
             // dispatching a pipelined follow-up.
             .with_pre_body_validator(crate::web::BodySizeGuard::new(app.config().max_body_size))
             .with_keep_alive_timeout(WEB_KEEP_ALIVE_TIMEOUT)
+            .with_request_read_timeout(WEB_REQUEST_READ_TIMEOUT)
             .with_drain_timeout(WEB_CONNECTION_DRAIN_TIMEOUT);
         let server = Arc::new(TcpServer::new(server_config));
         if let Err(err) = cx.checkpoint() {

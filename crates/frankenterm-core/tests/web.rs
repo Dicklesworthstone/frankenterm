@@ -859,6 +859,77 @@ mod web_tests {
         });
     }
 
+    /// ft-xxfwy.55.15: the production runtime bounds how long one request may
+    /// take to arrive. A 100-byte body sent a byte every 500 ms, each inside
+    /// the 1 s keep-alive timeout, would take 50 s. It gets 408 at the
+    /// request read deadline and never reaches the handler; without the
+    /// deadline nothing answers within this test's 20 s bound.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn web_trickled_request_is_refused_at_the_read_deadline() {
+        run_async_test_with_cx(|cx, cleanup_cx| async move {
+            let effects = Arc::new(AtomicUsize::new(0));
+            let (addr, mut runtime) = FrameworkWebRuntime::start_with_cx(
+                &cx,
+                "127.0.0.1:0".to_string(),
+                counted_upload_app(&effects),
+            )
+            .await
+            .expect("production runtime should start");
+            let trickled = Box::pin(timeout(Duration::from_secs(20), async {
+                let mut stream = TcpStream::connect(addr).await?;
+                stream
+                    .write_all(
+                        b"POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n",
+                    )
+                    .await?;
+                let mut chunk = [0_u8; 4096];
+                for _ in 0..100 {
+                    stream.write_all(b"x").await?;
+                    if let Ok(read) =
+                        timeout(Duration::from_millis(500), read(&mut stream, &mut chunk)).await
+                    {
+                        let read = read?;
+                        let rest = read_to_eof(&mut stream).await?;
+                        return Ok::<_, std::io::Error>(format!(
+                            "{}{rest}",
+                            String::from_utf8_lossy(&chunk[..read])
+                        ));
+                    }
+                }
+                Ok(String::new())
+            }))
+            .await;
+            let effects_after_trickle = effects.load(Ordering::SeqCst);
+            let in_time = fetch_raw(
+                addr,
+                b"POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\
+                  Connection: close\r\n\r\nhello",
+            )
+            .await;
+
+            runtime.signal_shutdown();
+            let joined = runtime.join_handle_mut().await;
+            runtime.finish_with_cx(&cleanup_cx, joined).await.unwrap();
+
+            let response = trickled
+                .expect("the trickled request must be answered within 20 s")
+                .expect("trickle I/O");
+            assert!(
+                response.starts_with("HTTP/1.1 408 Request Timeout\r\n"),
+                "{response}"
+            );
+            assert_eq!(header_value(&response, "connection"), Some("close"));
+            assert_eq!(effects_after_trickle, 0, "no handler for a refused request");
+            assert_eq!(extract_status(&in_time.unwrap()), 200);
+            assert_eq!(
+                effects.load(Ordering::SeqCst),
+                1,
+                "the in-time control is handled"
+            );
+        });
+    }
+
     #[test]
     fn web_openapi_discovery_invokes_advertised_health() {
         use anyhow::{Context, ensure};
