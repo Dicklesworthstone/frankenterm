@@ -3254,7 +3254,7 @@ impl StorageHandle {
         pending_only: bool,
         limit: usize,
     ) -> Result<Vec<crate::connector_reliability::ConnectorOutboxEntry>> {
-        self.connector_outbox_query_with_cx(cx, generation, i64::from(pending_only), limit)
+        self.connector_outbox_query_with_cx(cx, generation, i64::from(pending_only), limit, None)
             .await
     }
 
@@ -3264,7 +3264,18 @@ impl StorageHandle {
         generation: &str,
         limit: usize,
     ) -> Result<Vec<crate::connector_reliability::ConnectorOutboxEntry>> {
-        self.connector_outbox_query_with_cx(cx, generation, 2, limit)
+        self.dispatchable_connector_outbox_after_with_cx(cx, generation, None, limit)
+            .await
+    }
+
+    pub(crate) async fn dispatchable_connector_outbox_after_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        generation: &str,
+        after: Option<(i64, String)>,
+        limit: usize,
+    ) -> Result<Vec<crate::connector_reliability::ConnectorOutboxEntry>> {
+        self.connector_outbox_query_with_cx(cx, generation, 2, limit, after)
             .await
     }
 
@@ -3274,11 +3285,19 @@ impl StorageHandle {
         generation: &str,
         selection: i64,
         limit: usize,
+        after: Option<(i64, String)>,
     ) -> Result<Vec<crate::connector_reliability::ConnectorOutboxEntry>> {
         Self::checkpoint_storage_operation(cx, "connector_outbox")?;
-        if !connector_hash_valid(generation) || !(1..=256).contains(&limit) {
+        if !connector_hash_valid(generation)
+            || !(1..=256).contains(&limit)
+            || after
+                .as_ref()
+                .is_some_and(|(due_at, key)| *due_at < 0 || !connector_hash_valid(key))
+        {
             return Err(connector_storage_invalid());
         }
+        let has_after = i64::from(after.is_some());
+        let (after_due_at, after_key) = after.unwrap_or_default();
         let generation = generation.to_string();
         let db_path = Arc::clone(&self.db_path);
         let provider = Arc::clone(&self.backend_provider);
@@ -3290,10 +3309,13 @@ impl StorageHandle {
                      AND (?2 = 0 OR (?2 = 1 AND state IN ('admitted','dispatched'))
                           OR (?2 = 2 AND state = 'admitted'))
                      AND (?2 != 2 OR due_at <= ?4)
+                     AND (?5 = 0 OR due_at > ?6 OR (due_at = ?6 AND item_key > ?7))
                      ORDER BY due_at, item_key LIMIT ?3",
                     &[ToSqlValue::Text(&generation), ToSqlValue::Integer(selection),
                         ToSqlValue::Integer(i64::try_from(limit).map_err(|_| connector_storage_invalid())?),
-                        ToSqlValue::Integer(now_ms_strict()?)],
+                        ToSqlValue::Integer(now_ms_strict()?),
+                        ToSqlValue::Integer(has_after), ToSqlValue::Integer(after_due_at),
+                        ToSqlValue::Text(&after_key)],
                 ).map_err(|_| connector_storage_invalid())?;
                 rows.iter().map(|row| connector_outbox_from_cells(row)).collect()
             })

@@ -11,6 +11,7 @@ use thiserror::Error;
 
 const TRANSITION_HISTORY_CAPACITY: usize = 64;
 const SANDBOX_DECISION_HISTORY_CAPACITY: usize = 128;
+const CONNECTOR_DISPATCH_SCAN_LIMIT: usize = 16;
 
 #[derive(Debug, Error)]
 pub(crate) enum FcpDeliveryError {
@@ -46,6 +47,8 @@ pub(crate) struct FcpDeliverySession {
     poll_cursor: usize,
     pending_admission: Option<(i64, Vec<crate::connector_reliability::ConnectorOutboxEntry>)>,
     kill_switch_freshness: crate::policy_kill_switch_state::KillSwitchFreshness,
+    dispatch_cursor: Option<(i64, String)>,
+    dispatch_scanned: usize,
 }
 
 impl FcpDeliverySession {
@@ -116,6 +119,8 @@ impl FcpDeliverySession {
             poll_cursor: 0,
             pending_admission: None,
             kill_switch_freshness: Default::default(),
+            dispatch_cursor: None,
+            dispatch_scanned: 0,
         })
     }
 
@@ -415,12 +420,39 @@ impl FcpDeliverySession {
 
     async fn dispatch_pending(&mut self, cx: &crate::cx::Cx) -> DeliveryResult<()> {
         use crate::connector_reliability::ConnectorDeliveryState as State;
-        let pending = self
+        // Bound each tick's local scan and each sweep. The sweep budget ensures
+        // earlier rows are revisited even while new due rows keep arriving.
+        if self.dispatch_scanned >= self.config.max_pending_actions {
+            self.dispatch_cursor = None;
+            self.dispatch_scanned = 0;
+        }
+        let limit = CONNECTOR_DISPATCH_SCAN_LIMIT
+            .min(self.config.max_pending_actions - self.dispatch_scanned);
+        let mut pending = self
             .storage
-            .dispatchable_connector_outbox_with_cx(cx, &self.generation, 1)
+            .dispatchable_connector_outbox_after_with_cx(
+                cx,
+                &self.generation,
+                self.dispatch_cursor.clone(),
+                limit,
+            )
             .await?;
+        if pending.is_empty() && self.dispatch_cursor.is_some() {
+            self.dispatch_cursor = None;
+            self.dispatch_scanned = 0;
+            pending = self
+                .storage
+                .dispatchable_connector_outbox_with_cx(
+                    cx,
+                    &self.generation,
+                    CONNECTOR_DISPATCH_SCAN_LIMIT.min(self.config.max_pending_actions),
+                )
+                .await?;
+        }
         for entry in pending {
             cx.checkpoint().map_err(|_| FcpTransportError::Cancelled)?;
+            self.dispatch_cursor = Some((entry.due_at_ms, entry.key.clone()));
+            self.dispatch_scanned += 1;
             if entry.state == State::Dispatched {
                 // Another owner may still be settling this exact request.
                 // Preserve its CAS revision and never resend. Dispatched is
@@ -509,7 +541,7 @@ impl FcpDeliverySession {
                             "connector_preflight_ownership_conflict",
                         ));
                     }
-                    continue;
+                    return Ok(());
                 }
                 Err(_) => {
                     self.transition(
@@ -520,7 +552,7 @@ impl FcpDeliverySession {
                         Some("connector_preflight_rejected"),
                     )
                     .await?;
-                    continue;
+                    return Ok(());
                 }
             };
             let dispatched = self
@@ -574,6 +606,8 @@ impl FcpDeliverySession {
                     );
                 }
             }
+            // One provider attempt per tick, including preflight failures.
+            break;
         }
         Ok(())
     }
@@ -2752,6 +2786,195 @@ mod tests {
             })
             .await
             .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delivery_session_rotates_past_large_paused_queue_and_bounds_attempts() {
+        use crate::connector_outbound_bridge::ConnectorActionKind;
+        use crate::connector_reliability::{
+            ConnectorDeliveryState as State, ConnectorOutboxEntry,
+        };
+        use crate::policy_kill_switch_state::{
+            KillSwitchTransition, transition_kill_switch_from_backend,
+        };
+        use crate::policy_quarantine::KillSwitchLevel;
+        use crate::storage_backend_trait::{StorageBackend as _, ToSqlValue};
+
+        crate::storage::run_storage_async_test(async {
+            const PAUSED: usize = 320;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+            let (_temp, mut safety, storage, original) =
+                delivery_session_fixture(&endpoint, 100).await;
+            drop(original);
+            let config = safety.connector_transport.as_mut().unwrap();
+            config.max_pending_actions = 512;
+            config.max_retained_actions = 1024;
+            let cx = crate::cx::for_request();
+            let mut session = FcpDeliverySession::open(
+                &cx,
+                &safety,
+                storage.clone(),
+                std::sync::Arc::new(crate::events::EventBus::new(8)),
+            )
+            .await
+            .unwrap();
+
+            // All rows share a due time, so reaching the allowed tail also
+            // proves that keyset pagination advances across timestamp ties.
+            for start in (0..PAUSED + 2).step_by(64) {
+                let event_id = record_delivery_fixture_event(&storage).await;
+                let entries = (start..(start + 64).min(PAUSED + 2))
+                    .map(|index| ConnectorOutboxEntry {
+                        key: format!("{index:064x}"),
+                        generation: session.generation.clone(),
+                        source_event_id: event_id,
+                        rule_id: "test-route".into(),
+                        invoke: introspection_operation(),
+                        action_kind: if index < PAUSED {
+                            ConnectorActionKind::TriggerWorkflow
+                        } else {
+                            ConnectorActionKind::Invoke
+                        },
+                        correlation_id: delivery_request_id(),
+                        state: State::Admitted,
+                        revision: 0,
+                        due_at_ms: 1,
+                        created_at_ms: 1,
+                        updated_at_ms: 1,
+                        receipt_id: None,
+                        receipt_hash: None,
+                        reason_code: None,
+                    })
+                    .collect();
+                session.pending_admission = Some((event_id, entries));
+                assert!(session.flush_admission(&cx).await.unwrap());
+            }
+            let backend = crate::storage_backend_trait::RusqliteBackend::open(
+                storage.db_path(),
+                &crate::storage_backend_trait::OpenConfig {
+                    wal_mode: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let read_entry = |index: usize| -> ConnectorOutboxEntry {
+                let key = format!("{index:064x}");
+                let row = backend
+                    .query_row_cells(
+                        "SELECT record_json FROM connector_outbox WHERE item_key = ?1",
+                        &[ToSqlValue::Text(&key)],
+                    )
+                    .unwrap()
+                    .unwrap();
+                serde_json::from_str(row[0].as_text().unwrap()).unwrap()
+            };
+            transition_kill_switch_from_backend(
+                &backend,
+                KillSwitchTransition::Trip {
+                    level: KillSwitchLevel::SoftStop,
+                    by: "test-operator",
+                    reason: "pause workflow launches",
+                },
+                1_000,
+            )
+            .unwrap();
+
+            for page in 0..PAUSED / CONNECTOR_DISPATCH_SCAN_LIMIT {
+                session.dispatch_pending(&cx).await.unwrap();
+                assert_eq!(
+                    session.dispatch_scanned,
+                    (page + 1) * CONNECTOR_DISPATCH_SCAN_LIMIT,
+                );
+                assert!(matches!(
+                    listener.accept(),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                ));
+            }
+            session.dispatch_pending(&cx).await.unwrap();
+            assert!(
+                listener.accept().is_ok(),
+                "an allowed action beyond 256 paused rows must reach preflight",
+            );
+            assert_eq!(read_entry(PAUSED).revision, 1);
+            assert_eq!(
+                read_entry(PAUSED + 1).revision,
+                0,
+                "a failed preflight must consume this tick's single attempt",
+            );
+            assert!(matches!(
+                listener.accept(),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ));
+            session.dispatch_pending(&cx).await.unwrap();
+            assert!(listener.accept().is_ok());
+            assert_eq!(read_entry(PAUSED + 1).revision, 1);
+            let untouched = backend
+                .query_scalar(
+                    "SELECT COUNT(*) FROM connector_outbox
+                     WHERE state = 'admitted' AND revision = 0 AND due_at = 1",
+                )
+                .unwrap()
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            assert_eq!(untouched, PAUSED);
+            assert_eq!(read_entry(0).invoke.input, introspection_operation().input);
+
+            // Settle the two attempted fixture rows through ordinary CAS so
+            // wraparound does not depend on their wall-clock retry deadlines.
+            for index in PAUSED..PAUSED + 2 {
+                session
+                    .transition(
+                        &cx,
+                        &read_entry(index),
+                        State::Rejected,
+                        None,
+                        Some("connector_preflight_rejected"),
+                    )
+                    .await
+                    .unwrap();
+            }
+            transition_kill_switch_from_backend(
+                &backend,
+                KillSwitchTransition::Reset { by: "test-operator" },
+                2_000,
+            )
+            .unwrap();
+            session.dispatch_pending(&cx).await.unwrap();
+            assert!(
+                listener.accept().is_ok(),
+                "an exhausted suffix must wrap and resume earlier work after reset",
+            );
+            assert_eq!(read_entry(0).revision, 1);
+
+            // Model a full sweep under continuous arrivals: a nonempty suffix
+            // must not prevent reconsidering older due work behind the cursor.
+            session.dispatch_cursor = Some((1, format!("{:064x}", 16)));
+            session.dispatch_scanned = session.config.max_pending_actions;
+            assert!(
+                !storage
+                    .dispatchable_connector_outbox_after_with_cx(
+                        &cx,
+                        &session.generation,
+                        session.dispatch_cursor.clone(),
+                        1,
+                    )
+                    .await
+                    .unwrap()
+                    .is_empty(),
+            );
+            session.dispatch_pending(&cx).await.unwrap();
+            assert!(listener.accept().is_ok());
+            assert_eq!(read_entry(1).revision, 1);
+            assert_eq!(read_entry(17).revision, 0);
+            assert_eq!(session.dispatch_scanned, 1);
+            drop(backend);
+            drop(session);
+            storage.shutdown().await.unwrap();
+        });
     }
 
     #[cfg(unix)]
