@@ -124632,6 +124632,114 @@ test "$VERSION" = v0.15.5
         );
     }
 
+    /// The newest GitHub release can be macOS-only while the newest Linux
+    /// archive sits in an older one. Resolution must pick a release that ships
+    /// this platform's archive with the files the installer verifies, or
+    /// refuse with the options, never point the download at a 404.
+    #[cfg(unix)]
+    #[test]
+    fn installer_version_resolution_picks_a_release_that_ships_this_platforms_archive() {
+        let fixture = InstallerTestDir::new("create release-selection fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let errors = fixture.path().join("resolve-errors");
+        let script = r#"set -euo pipefail
+export FT_INSTALL_TEST_LIBRARY_ONLY=1
+source @INSTALLER@
+QUIET=1
+HAS_GUM=0
+signed_amd64='{"name":"ft-linux-amd64.tar.xz"},{"name":"ft-linux-amd64.tar.xz.sha256"},{"name":"ft-linux-amd64.tar.xz.minisig"}'
+latest='{"tag_name":"v0.16.0-mac.1","created_at":"2026-11-07T00:00:00Z","assets":[{"name":"ft-darwin-arm64.tar.xz"},{"name":"ft-darwin-arm64.tar.xz.sha256"},{"name":"ft-darwin-arm64.tar.xz.minisig"}]}'
+releases='[{"tag_name":"v0.15.2","created_at":"2026-09-01T00:00:00Z","assets":['"$signed_amd64"']},
+'"$latest"',
+{"tag_name":"v0.16.1-rc.1","prerelease":true,"created_at":"2026-11-09T00:00:00Z","assets":['"$signed_amd64"']},
+{"tag_name":"v0.16.2","draft":true,"created_at":"2026-11-10T00:00:00Z","assets":['"$signed_amd64"']},
+{"tag_name":"v0.15.9","created_at":"2026-10-01T00:00:00Z","assets":['"$signed_amd64"']},
+{"tag_name":"v0.15.1","created_at":"2026-08-21T00:00:00Z","assets":[{"name":"ft-linux-arm64.tar.xz"},{"name":"ft-linux-arm64.tar.xz.sha256"}]}]'
+api_status=0
+list_status=0
+download_status=22
+curl() {
+  case "$*" in
+    *api.github.com*/releases/latest*)
+      [ "$api_status" -eq 0 ] || return "$api_status"
+      printf '%s' "$latest" ;;
+    *api.github.com*/releases\?per_page=*)
+      [ "$list_status" -eq 0 ] || return "$list_status"
+      printf '%s' "$releases" ;;
+    */releases/download/*) return "$download_status" ;;
+    */releases/latest*)
+      printf '%s' 'https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.16.0-mac.1' ;;
+    *) return 99 ;;
+  esac
+}
+errors=@ERRORS@
+pick() {
+  VERSION=''
+  ASSET=$1
+  resolve_version 2>"$errors"
+}
+# The newest release carries the macOS archive: it is chosen as before.
+pick ft-darwin-arm64.tar.xz
+test "$VERSION" = v0.16.0-mac.1
+# The newest release has no Linux archive: the newest stable release that
+# ships it signed wins, not the prerelease, not the draft, not list order.
+pick ft-linux-amd64.tar.xz
+test "$VERSION" = v0.15.9
+# Only an unsigned archive exists: nothing is chosen, and the operator is told
+# which release has one and how its own installer installs it.
+if pick ft-linux-arm64.tar.xz; then exit 91; fi
+test -z "$VERSION"
+grep -q 'No published release ships a verifiable ft-linux-arm64.tar.xz' "$errors"
+grep -qF 'v0.15.1/install.sh | bash -s -- --version v0.15.1' "$errors"
+# --no-verify drops the signature requirement only.
+NO_MINISIGN=1
+pick ft-linux-arm64.tar.xz
+test "$VERSION" = v0.15.1
+NO_MINISIGN=0
+# A caller-supplied digest drops the sidecar requirement only.
+releases=${releases//'{"name":"ft-linux-amd64.tar.xz.sha256"},'/}
+if pick ft-linux-amd64.tar.xz; then exit 92; fi
+CHECKSUM_URL=https://example.invalid/digest
+pick ft-linux-amd64.tar.xz
+test "$VERSION" = v0.15.9
+CHECKSUM_URL=''
+# A source build needs only a tag.
+FROM_SOURCE=1
+pick ft-linux-arm64.tar.xz
+test "$VERSION" = v0.16.0-mac.1
+FROM_SOURCE=0
+# The release list is unreadable: no guess.
+list_status=22
+if pick ft-linux-amd64.tar.xz; then exit 93; fi
+test -z "$VERSION"
+grep -q 'could not be read' "$errors"
+list_status=0
+# The API is unreachable: the redirect names the tag, and a HEAD request
+# decides whether it ships this platform's archive.
+api_status=7
+if pick ft-linux-amd64.tar.xz; then exit 94; fi
+test -z "$VERSION"
+grep -q 'GitHub API is unreachable' "$errors"
+download_status=0
+pick ft-darwin-arm64.tar.xz
+test "$VERSION" = v0.16.0-mac.1
+"#
+        .replace("@INSTALLER@", &shell_single_quote(&installer.to_string_lossy()))
+        .replace("@ERRORS@", &shell_single_quote(&errors.to_string_lossy()));
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .expect("execute installer platform-archive release selection proof");
+        assert!(
+            output.status.success(),
+            "release selection by platform archive failed ({:?}): {}\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr),
+            std::fs::read_to_string(&errors).unwrap_or_default()
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn installer_requires_minisign_unless_the_operator_explicitly_disables_release_signatures() {

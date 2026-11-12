@@ -341,35 +341,119 @@ set_artifact_url() {
   fi
 }
 
+# Prints the tag of the newest published, non-prerelease release in the GitHub
+# releases JSON on stdin (one release object or a list of them) that ships
+# every asset named in the arguments; with no arguments, the newest release.
+# Exit 1: no release ships them all. Exit 2: the input holds no release at all
+# (API unreachable, rate-limited, or not JSON).
+release_tag_with_assets() {
+  python3 -c '
+import json, re, sys
+
+try:
+    data = json.load(sys.stdin)
+except ValueError:
+    sys.exit(2)
+releases = [
+    release for release in (data if isinstance(data, list) else [data])
+    if isinstance(release, dict) and not release.get("draft")
+    and not release.get("prerelease")
+    and re.match(r"v?[0-9]", str(release.get("tag_name") or ""))
+]
+if not releases:
+    sys.exit(2)
+# GitHub ranks "latest" by creation time; rank the candidates the same way.
+releases.sort(key=lambda release: str(release.get("created_at") or ""), reverse=True)
+for release in releases:
+    names = {asset.get("name") for asset in release.get("assets") or []
+             if isinstance(asset, dict)}
+    if all(name in names for name in sys.argv[1:]):
+        print(release["tag_name"])
+        sys.exit(0)
+sys.exit(1)
+' "$@"
+}
+
 resolve_version() {
   if [ -n "$VERSION" ]; then
     info "Using requested version: $VERSION"
     return 0
   fi
-  # Primary: GitHub API
-  if command -v curl >/dev/null 2>&1; then
-    local api_url="https://api.github.com/repos/${OWNER}/${REPO}/releases/latest"
-    local resolved
-    resolved=$(curl -fsSL --max-time 10 ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "$api_url" 2>/dev/null \
-      | grep -o '"tag_name": *"[^"]*"' \
-      | sed -E 's/.*"([^"]*)"$/\1/' \
-      | head -1 || true)
-    case "$resolved" in v[0-9]*|[0-9]*) ;; *) resolved="" ;; esac
-    if [ -n "$resolved" ]; then
-      VERSION="$resolved"
+  if ! command -v curl >/dev/null 2>&1; then
+    err "Could not resolve the latest release without curl. Specify --version vX.Y.Z."
+    return 1
+  fi
+  # A binary install needs this platform's archive, its checksum sidecar
+  # (unless --checksum/--checksum-url supplies the digest) and its DSR
+  # signature (unless --no-verify). The newest release need not ship them: a
+  # macOS-only release can be "latest" while the newest Linux archive sits in
+  # an older release. A source build needs only a tag.
+  local binary_release=0
+  local -a needed=()
+  if [ "$FROM_SOURCE" -eq 0 ] && [ -z "$ARTIFACT_URL" ] && [ -n "${ASSET:-}" ]; then
+    binary_release=1
+    needed=("$ASSET")
+    [ -n "$CHECKSUM" ] || [ -n "$CHECKSUM_URL" ] || needed+=("${ASSET}.sha256")
+    [ "$NO_MINISIGN" -eq 1 ] || needed+=("${ASSET}.minisig")
+  fi
+  local api="https://api.github.com/repos/${OWNER}/${REPO}/releases"
+  local latest_json latest_tag releases_json resolved status
+  latest_json=$(curl -fsSL --max-time 10 ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} \
+    "$api/latest" 2>/dev/null || true)
+  latest_tag=$(printf '%s' "$latest_json" | release_tag_with_assets) || latest_tag=""
+  if [ -n "$latest_tag" ]; then
+    if [ "$binary_release" -eq 0 ]; then
+      VERSION="$latest_tag"
       info "Resolved latest version: $VERSION"
       return 0
     fi
-    # Fallback: parse redirect URL of /releases/latest
-    resolved=$(curl -fsSL --max-time 10 ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} \
-      -o /dev/null -w '%{url_effective}' \
-      "https://github.com/${OWNER}/${REPO}/releases/latest" 2>/dev/null \
-      | sed -E 's|.*/tag/||' || true)
-    if [ -n "$resolved" ] && [[ "$resolved" == v* ]]; then
+    if printf '%s' "$latest_json" | release_tag_with_assets "${needed[@]}" >/dev/null; then
+      VERSION="$latest_tag"
+      info "Resolved latest version: $VERSION"
+      return 0
+    fi
+    releases_json=$(curl -fsSL --max-time 30 ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} \
+      "$api?per_page=100" 2>/dev/null || true)
+    status=0
+    resolved=$(printf '%s' "$releases_json" | release_tag_with_assets "${needed[@]}") || status=$?
+    if [ "$status" -eq 0 ]; then
+      VERSION="$resolved"
+      info "The latest release ($latest_tag) ships no $ASSET; using $VERSION, the newest release that does"
+      return 0
+    fi
+    if [ "$status" -ne 1 ]; then
+      err "The latest release ($latest_tag) ships no $ASSET, and the GitHub release list"
+      err "could not be read to find one that does. Retry later, or pass --version vX.Y.Z or --from-source."
+      return 1
+    fi
+    err "No published release ships a verifiable $ASSET for ${OS:-this OS}/${ARCH:-this arch} yet"
+    err "(the latest release, $latest_tag, has none). Nothing was installed. Options:"
+    resolved=$(printf '%s' "$releases_json" | release_tag_with_assets "$ASSET") || resolved=""
+    if [ -n "$resolved" ]; then
+      err "  * $resolved ships $ASSET but not every file this installer requires"
+      err "    (${needed[*]}). The installer published with that release can install it:"
+      err "      curl -fsSL https://raw.githubusercontent.com/${OWNER}/${REPO}/${resolved}/install.sh | bash -s -- --version ${resolved}"
+    fi
+    err "  * build from source:  --from-source"
+    return 1
+  fi
+  # The API is unreachable or rate-limited: the /releases/latest redirect still
+  # names the tag, and a HEAD request shows whether it ships this archive.
+  resolved=$(curl -fsSL --max-time 10 ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} \
+    -o /dev/null -w '%{url_effective}' \
+    "https://github.com/${OWNER}/${REPO}/releases/latest" 2>/dev/null \
+    | sed -E 's|.*/tag/||' || true)
+  if [ -n "$resolved" ] && [[ "$resolved" == v* ]]; then
+    if [ "$binary_release" -eq 0 ] ||
+        curl -fsSIL --max-time 15 ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} -o /dev/null \
+          "https://github.com/${OWNER}/${REPO}/releases/download/${resolved}/${ASSET}" 2>/dev/null; then
       VERSION="$resolved"
       info "Resolved latest version (via redirect): $VERSION"
       return 0
     fi
+    err "The latest release ($resolved) ships no $ASSET, and the GitHub API is unreachable"
+    err "to find one that does. Retry later, or pass --version vX.Y.Z or --from-source."
+    return 1
   fi
   err "Could not resolve the latest release. Retry when GitHub is reachable or specify --version vX.Y.Z."
   return 1
@@ -6678,8 +6762,11 @@ if [ -z "$ACTIVATE_GENERATION" ]; then
     TAR=$(basename "$OFFLINE_TARBALL")
     URL=""
   else
-    resolve_version || exit 1
+    # Release selection parses the GitHub release list with python3 and needs
+    # this platform's asset name, so both come first.
+    check_python_runtime
     detect_platform
+    resolve_version || exit 1
     set_artifact_url
   fi
 
@@ -6894,7 +6981,7 @@ else
     err "  * build from source:                                      --from-source"
     if [ -n "$VERSION" ]; then
       err "  * use the installer published with that release:"
-      err "      curl -fsSL https://raw.githubusercontent.com/${OWNER}/${REPO}/${VERSION}/install.sh | bash"
+      err "      curl -fsSL https://raw.githubusercontent.com/${OWNER}/${REPO}/${VERSION}/install.sh | bash -s -- --version ${VERSION}"
     fi
     exit 1
   elif [ "$extract_status" -ne 0 ]; then
