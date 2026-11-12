@@ -447,13 +447,17 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
         ) {
             // These loops own every await and already cap their timers to the
             // deadline; preserve their condition-specific timeout evidence.
-            let result = until_cancelled(
+            // Their own errors, a cancellation included, return as they are.
+            // Only an outcome that completed alongside a cancellation yields
+            // to the checkpoint, so it is never reported after the cancel.
+            let outcome = until_cancelled(
                 cx,
                 self.execute_inner(cx, condition, context_pane_id, timeout, &polls),
             )
-            .await;
+            .await
+            .map_err(|error| wait_cancelled(cx, "wait execution", error.as_ref()))??;
             wait_checkpoint(cx, "wait execution after timer")?;
-            return result.map_err(|error| wait_cancelled(cx, "wait execution", error.as_ref()))?;
+            return Ok(outcome);
         }
         // The polling loops reject late observations, but a pane backend or a
         // pattern writer can remain pending without waking on cancellation.
@@ -1758,8 +1762,11 @@ mod tests {
     fn shared_executor_uses_configured_packs_and_observes_pack_replacement() {
         let rt = test_runtime();
         rt.block_on(async {
+            // PatternEngine::with_packs validates built-in packs, whose rule
+            // ids need a reserved agent prefix; only file packs may use custom
+            // ones.
             let rule = RuleDef {
-                id: "workspace.custom.ready".to_string(),
+                id: "wezterm.workspace.ready".to_string(),
                 agent_type: AgentType::Wezterm,
                 event_type: "ready".to_string(),
                 severity: Severity::Info,
@@ -1787,7 +1794,7 @@ mod tests {
                     ..WaitConditionOptions::default()
                 },
             );
-            let condition = WaitCondition::pattern("workspace.custom.ready");
+            let condition = WaitCondition::pattern("wezterm.workspace.ready");
             assert!(
                 executor
                     .execute(&condition, 1, Duration::from_secs(1))
