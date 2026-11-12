@@ -339,7 +339,7 @@ toml_edit = "0.25.12"
 serde_yaml = "0.9.34"
 
 # Serialization
-toon_rust = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/toon_rust", rev = "d48c5b55caeedc99368a1461535b7e0c143afe06", package = "tru" }
+toon_rust = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/toon_rust", rev = "5be0992fb978faef6f8f1aabc9ea38dbee4ec56f", package = "tru" }
 
 # FrankenTerm crates (in-tree, ex-WezTerm)
 async_ossl = { path = "frankenterm/async_ossl", default-features = false }
@@ -641,11 +641,11 @@ fastapi = { version = "=0.5.0", git = "https://github.com/Dicklesworthstone/fast
 
 # FrankenSearch (optional integration, enabled via frankenterm-core feature flag)
 # Pinned to a specific rev of the upstream GitHub repo for reproducibility.
-frankensearch = { version = "=0.7.1", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "0ae53a65eba5d57da48037776501a91fbffdb12e", package = "frankensearch", default-features = false, features = ["hybrid"] }
+frankensearch = { version = "=0.7.1", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "7d899e67f21efa59796ca06ff13a71f9fa932c92", package = "frankensearch", default-features = false, features = ["hybrid"] }
 # Narrow alias for the audited descriptor-bound ACL presence probe, from the
 # same FrankenSearch rev as above: the registry's frankensearch-index releases
 # pin rustix 1.1.5 or older, and fastmcp pins rustix =1.1.6.
-frankensearch-index-acl = { package = "frankensearch-index", version = "=0.4.0", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "0ae53a65eba5d57da48037776501a91fbffdb12e", default-features = false }
+frankensearch-index-acl = { package = "frankensearch-index", version = "=0.4.0", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "7d899e67f21efa59796ca06ff13a71f9fa932c92", default-features = false }
 # Agent detection (optional integration, enabled via frankenterm-core feature flag)
 franken-agent-detection = "0.3.0"
 
@@ -757,4 +757,4 @@ k9 = { git = "https://github.com/aaronabramov/k9", rev = "db63bcd7f6766051f3767b
 # FastMCP and FastAPI request rich_rust from crates.io. Patch that source to the
 # reviewed 0.2.3 revision that carries the repaired `time` bound; patching the
 # FastMCP Git source itself cannot affect a crates.io dependency.
-rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", rev = "60ca9a06697b79378b6569b678405d3121194114" }
+rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", rev = "179f71e97c9b20678338657805ba3f629aa77d2b" }
