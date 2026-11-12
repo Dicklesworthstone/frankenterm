@@ -2680,7 +2680,6 @@ mod tests {
         assert!(b"89ab".contains(&first.as_bytes()[19]));
     }
 
-
     #[cfg(unix)]
     async fn delivery_session_fixture(
         endpoint: &str,
@@ -2692,11 +2691,10 @@ mod tests {
         FcpDeliverySession,
     ) {
         let temp = tempfile::tempdir().unwrap();
-        let storage = crate::storage::StorageHandle::new(
-            temp.path().join("delivery.db").to_str().unwrap(),
-        )
-        .await
-        .unwrap();
+        let storage =
+            crate::storage::StorageHandle::new(temp.path().join("delivery.db").to_str().unwrap())
+                .await
+                .unwrap();
         storage
             .upsert_pane(crate::storage::PaneRecord {
                 pane_id: 1,
@@ -2792,9 +2790,7 @@ mod tests {
     #[test]
     fn delivery_session_rotates_past_large_paused_queue_and_bounds_attempts() {
         use crate::connector_outbound_bridge::ConnectorActionKind;
-        use crate::connector_reliability::{
-            ConnectorDeliveryState as State, ConnectorOutboxEntry,
-        };
+        use crate::connector_reliability::{ConnectorDeliveryState as State, ConnectorOutboxEntry};
         use crate::policy_kill_switch_state::{
             KillSwitchTransition, transition_kill_switch_from_backend,
         };
@@ -2939,7 +2935,9 @@ mod tests {
             }
             transition_kill_switch_from_backend(
                 &backend,
-                KillSwitchTransition::Reset { by: "test-operator" },
+                KillSwitchTransition::Reset {
+                    by: "test-operator",
+                },
                 2_000,
             )
             .unwrap();
@@ -3005,11 +3003,8 @@ mod tests {
                 .await
                 .unwrap();
             assert!(
-                transition_in_test_process(
-                    std::path::Path::new(storage.db_path()),
-                    "pending",
-                )
-                .contains("KILL_SWITCH_CHILD_PENDING"),
+                transition_in_test_process(std::path::Path::new(storage.db_path()), "pending",)
+                    .contains("KILL_SWITCH_CHILD_PENDING"),
                 "an admitted external effect must exclude an operator transition",
             );
             drop(fence);
@@ -3035,7 +3030,10 @@ mod tests {
             // The endpoint deliberately never answers. Reaching it after reset
             // is the positive control; preflight may defer, but cannot dispatch.
             session.dispatch_pending(&cx).await.unwrap();
-            assert!(listener.accept().is_ok(), "reset must resume real preflight");
+            assert!(
+                listener.accept().is_ok(),
+                "reset must resume real preflight"
+            );
             let resumed = storage
                 .get_connector_outbox_with_cx(&cx, &session.generation, false, 8)
                 .await
@@ -3051,10 +3049,8 @@ mod tests {
     #[test]
     fn delivery_session_refuses_corrupt_rollback_and_missing_switch_authority() {
         use crate::policy::ActionKind;
-        use crate::policy_kill_switch_state::{
-            KILL_SWITCH_REVISION_KEY, KILL_SWITCH_STATE_KEY,
-        };
         use crate::policy_kill_switch_state::tests::transition_in_test_process;
+        use crate::policy_kill_switch_state::{KILL_SWITCH_REVISION_KEY, KILL_SWITCH_STATE_KEY};
 
         crate::storage::run_storage_async_test(async {
             let (_temp, _safety, storage, mut session) =
@@ -3183,15 +3179,29 @@ mod tests {
             )
             .unwrap();
             for (level, action, allowed) in [
-                (KillSwitchLevel::SoftStop, ActionKind::ConnectorTriggerWorkflow, false),
+                (
+                    KillSwitchLevel::SoftStop,
+                    ActionKind::ConnectorTriggerWorkflow,
+                    false,
+                ),
                 (KillSwitchLevel::SoftStop, ActionKind::ConnectorNotify, true),
-                (KillSwitchLevel::HardStop, ActionKind::ConnectorNotify, false),
+                (
+                    KillSwitchLevel::HardStop,
+                    ActionKind::ConnectorNotify,
+                    false,
+                ),
                 (KillSwitchLevel::HardStop, ActionKind::ReadOutput, true),
-                (KillSwitchLevel::EmergencyHalt, ActionKind::ReadOutput, false),
+                (
+                    KillSwitchLevel::EmergencyHalt,
+                    ActionKind::ReadOutput,
+                    false,
+                ),
             ] {
                 transition_kill_switch_from_backend(
                     &backend,
-                    KillSwitchTransition::Reset { by: "test-operator" },
+                    KillSwitchTransition::Reset {
+                        by: "test-operator",
+                    },
                     1_000,
                 )
                 .unwrap();
@@ -3238,7 +3248,9 @@ mod tests {
             );
             transition_kill_switch_from_backend(
                 &backend,
-                KillSwitchTransition::Reset { by: "test-operator" },
+                KillSwitchTransition::Reset {
+                    by: "test-operator",
+                },
                 3_000,
             )
             .unwrap();
@@ -3250,14 +3262,11 @@ mod tests {
         });
     }
 
-
     #[cfg(unix)]
     #[test]
     fn delivery_session_holds_workspace_fence_until_authenticated_receipt() {
         use crate::connector_reliability::ConnectorDeliveryState as State;
-        use crate::policy_kill_switch_state::{
-            KillSwitchStateError, acquire_kill_switch_fence,
-        };
+        use crate::policy_kill_switch_state::{KillSwitchStateError, acquire_kill_switch_fence};
         use std::io::{Read, Write};
         use std::os::unix::fs::PermissionsExt;
         use std::time::{Duration, Instant};
@@ -3270,12 +3279,14 @@ mod tests {
                 delivery_session_fixture(&endpoint, 5_000).await;
             let config = safety.connector_transport.as_ref().unwrap();
             for (path, bytes) in [
-                (&config.capability_token_file, b"capability-test-only".as_slice()),
+                (
+                    &config.capability_token_file,
+                    b"capability-test-only".as_slice(),
+                ),
                 (&config.admin_token_file, b"admin-test-only".as_slice()),
             ] {
                 std::fs::write(path, bytes).unwrap();
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-                    .unwrap();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
             }
 
             let db_path = std::path::PathBuf::from(storage.db_path());
@@ -3323,8 +3334,9 @@ mod tests {
                             break index + 4;
                         }
                     };
-                    let headers =
-                        std::str::from_utf8(&request[..header_end]).unwrap().to_string();
+                    let headers = std::str::from_utf8(&request[..header_end])
+                        .unwrap()
+                        .to_string();
                     let path = headers
                         .lines()
                         .next()
@@ -3357,10 +3369,8 @@ mod tests {
                     let body = if content_length == 0 {
                         serde_json::Value::Null
                     } else {
-                        serde_json::from_slice(
-                            &request[header_end..header_end + content_length],
-                        )
-                        .unwrap()
+                        serde_json::from_slice(&request[header_end..header_end + content_length])
+                            .unwrap()
                     };
                     let response = match expected_path {
                         "/rpc/discover" => serde_json::json!({
@@ -3393,9 +3403,9 @@ mod tests {
                         }
                         "/rpc/admin/receipts" => {
                             assert!(
-                                headers.to_ascii_lowercase().contains(
-                                    "authorization: bearer admin-test-only"
-                                )
+                                headers
+                                    .to_ascii_lowercase()
+                                    .contains("authorization: bearer admin-test-only")
                             );
                             let invocation = invocation.as_ref().unwrap();
                             serde_json::json!({
