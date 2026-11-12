@@ -107,8 +107,13 @@ try {
   check("event stream is live", text.includes("live ·"), text.split("\n")[0]?.trim());
 
   // The detection comes from the real capture -> detect pipeline running
-  // beside this driver. Watch the Events view while it works.
-  await pressKey("Tab", "Tab", 9);
+  // beside this driver. Watch the Events view while it works. Tab leaves the
+  // viewer for the page's buttons (90f756b14), so focus the fleet surface and
+  // press 2, the Events key, as a user would.
+  await evaluate(
+    "(document.documentElement.dataset.viewerMode === 'text' ? document.getElementById('screen-text') : document.getElementById('terminal')).focus()",
+  );
+  await pressKey("2", "Digit2", 50);
   ({ text } = await waitForScreen((t) => t.includes(config.expectDetection), 180_000));
   check(`pipeline detection ${config.expectDetection} shown`, text.includes(config.expectDetection));
 

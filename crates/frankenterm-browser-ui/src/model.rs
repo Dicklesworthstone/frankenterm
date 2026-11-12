@@ -468,7 +468,7 @@ impl FleetModel {
                 Style::fg(RED).bg(BAR_BG),
             );
         } else {
-            let hint = "Tab switch view · j/k move · g/G top/bottom · r refresh";
+            let hint = "1/2 switch view · j/k move · g/G top/bottom · r refresh";
             put(
                 frame,
                 1,

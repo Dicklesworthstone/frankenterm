@@ -1113,7 +1113,7 @@ Treat these values as opaque tokens. Their versioned form is `event-v1:<epoch>:a
 
 #### Browser fleet viewer (preview)
 
-`ft web --ui-dir <package>` (or `FT_WEB_UI_DIR`, or `ft watch --web --web-ui-dir <package>`) also serves a read-only fleet viewer at `/ui/`: a FrankenTUI model compiled to WebAssembly, painted by the FrankenTerm WebGPU renderer from frankentui. It lists the recorded panes, shows recent and live detections from `/stream/events`, and marks the stream live, connecting or offline with the age of its data. Keys: `Tab`/`1`/`2` switch views, `j`/`k` move, `r` refetches. It never writes to a pane.
+`ft web --ui-dir <package>` (or `FT_WEB_UI_DIR`, or `ft watch --web --web-ui-dir <package>`) also serves a read-only fleet viewer at `/ui/`: a FrankenTUI model compiled to WebAssembly, painted by the FrankenTerm WebGPU renderer from frankentui. It lists the recorded panes, shows recent and live detections from `/stream/events`, and marks the stream live, connecting or offline with the age of its data. Keys: `1`/`2` switch views, `j`/`k` move, `r` refetches, and `Tab` leaves the viewer for the page's buttons. It never writes to a pane.
 
 ```bash
 RCH_CARGO_WRAPPER_BYPASS=1 scripts/build-browser-ui.sh /tmp/ft-ui    # needs the wasm32 target and wasm-bindgen 0.2.128
