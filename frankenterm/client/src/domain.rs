@@ -8768,7 +8768,7 @@ mod tests {
             )
         };
         apply(Some(original)).expect("initial exact pane snapshot installs");
-        let old_id = inner.remote_to_local_pane_id(61).unwrap();
+        let old_id = inner.remote_to_local_pane_id(&mux, 61).unwrap();
         let old = mux.get_pane(old_id).unwrap();
         let old_registration = mux.capture_pane_registration(&old).unwrap();
         let old_client = old.downcast_ref::<ClientPane>().unwrap();
@@ -8789,7 +8789,7 @@ mod tests {
         apply(None).unwrap();
 
         apply(Some(replacement)).expect("a changed registration must create a new mirror");
-        let new_id = inner.remote_to_local_pane_id(61).unwrap();
+        let new_id = inner.remote_to_local_pane_id(&mux, 61).unwrap();
         let new = mux.get_pane(new_id).unwrap();
         assert!(
             !Arc::ptr_eq(&new, &old),

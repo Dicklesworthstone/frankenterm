@@ -26585,8 +26585,16 @@ mod test {
             } else {
                 (PduProducer::Server, PduWireRole::CorrelatedReply)
             };
-            assert!(pdu
-                .clone()
+            // Pdu is not Clone; the frame round trip asserted equal above
+            // yields an identical second copy for the codec-73 refusal.
+            let copy = Pdu::decode(
+                pdu.encode_frame_with_mode(31, CompressionMode::Never)
+                    .unwrap()
+                    .as_slice(),
+            )
+            .unwrap()
+            .pdu;
+            assert!(copy
                 .prepare_outbound_for_dialect(
                     MuxWireDialect::current(73).unwrap(),
                     producer,

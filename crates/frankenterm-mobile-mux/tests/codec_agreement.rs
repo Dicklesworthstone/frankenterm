@@ -351,14 +351,8 @@ fn conditional_paste_and_mouse_match_the_desktop_schema_and_exact_receipts() {
         wire::MAX_CONDITIONAL_PANE_INPUT_RESPONSE_BYTES,
         codec::MAX_CONDITIONAL_PANE_INPUT_RESPONSE_DECOMPRESSED_BYTES
     );
-    assert!(
-        wire::decode_conditional_input_receipt(&vec![
-            0;
-            wire::MAX_CONDITIONAL_PANE_INPUT_RESPONSE_BYTES
-                + 1
-        ])
-        .is_err()
-    );
+    let oversized = [0u8; wire::MAX_CONDITIONAL_PANE_INPUT_RESPONSE_BYTES + 1];
+    assert!(wire::decode_conditional_input_receipt(&oversized).is_err());
     for field in 0..3 {
         let mut receipt = codec::SendPaneInputConditionalV1Response {
             pane_id: 7,
