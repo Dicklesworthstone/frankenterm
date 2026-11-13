@@ -138,9 +138,12 @@ impl MouseState {
             .validate()?;
             input_serial
         } else {
-            if scope.agreed_codec_version() != Some(LEGACY46_CODEC_VERSION) {
+            if !scope
+                .agreed_codec_version()
+                .is_some_and(|version| version < CONDITIONAL_PANE_INPUT_V1_MIN_CODEC_VERSION)
+            {
                 anyhow::bail!(
-                    "current mux mouse input requires exact pane identity and codec 74 or later"
+                    "a codec 74 mux connection takes mouse input only with a pane identity"
                 );
             }
             InputSerial::empty()

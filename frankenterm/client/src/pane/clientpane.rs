@@ -5315,7 +5315,11 @@ impl ClientPane {
         client
             .reliable_input_queue
             .trigger_after_interactive_scope_capture_generation_barrier(&client.client);
-        let conditional = if agreed_codec_version == Some(LEGACY46_CODEC_VERSION) {
+        // A peer older than codec 74 has no pane identity to bind input to,
+        // so its paste names the pane by number, as its keystrokes do.
+        let conditional = if agreed_codec_version
+            .is_some_and(|version| version < CONDITIONAL_PANE_INPUT_V1_MIN_CODEC_VERSION)
+        {
             None
         } else {
             if text.len() > MAX_CONDITIONAL_PANE_INPUT_PASTE_BYTES {
@@ -5351,14 +5355,27 @@ impl ClientPane {
                 .increment(1);
             }
         } else {
-            dispatch_interactive_rpc(
-                rpc.send_paste(SendPaste {
-                    pane_id: self.remote_pane_id,
-                    data: text.to_owned(),
-                    input_serial,
-                }),
-                "send_paste",
-            )?;
+            let request = SendPaste {
+                pane_id: self.remote_pane_id,
+                data: text.to_owned(),
+                input_serial,
+            };
+            match trace_context {
+                Some(trace_context)
+                    if agreed_codec_version.is_some_and(|version| {
+                        version >= SEND_PASTE_TRACED_V1_MIN_CODEC_VERSION
+                    }) =>
+                {
+                    dispatch_interactive_rpc(
+                        rpc.send_paste_traced_v1(SendPasteTracedV1 {
+                            request,
+                            trace_context,
+                        }),
+                        "send_paste_traced_v1",
+                    )?;
+                }
+                _ => dispatch_interactive_rpc(rpc.send_paste(request), "send_paste")?,
+            }
         }
         inner.input_serial = input_serial;
         inner.predict_from_paste(text);
@@ -5402,7 +5419,7 @@ impl ClientPane {
             .agreed_codec_version()
             .is_some_and(|version| version >= CONDITIONAL_PANE_INPUT_V1_MIN_CODEC_VERSION)
         {
-            bail!("this mux peer does not support identity-bound paste and mouse input; codec 74 or later is required");
+            bail!("the mux connection has no agreed codec; paste and mouse input were not sent");
         }
         let state = self.conditional_input.lock();
         let source = state.source.filter(|_| state.ready).ok_or_else(|| {
@@ -6322,7 +6339,10 @@ impl Pane for ClientPane {
 
     fn mouse_event(&self, event: MouseEvent) -> anyhow::Result<()> {
         let rpc = self.client.client.rpc_scope();
-        let (source, registration) = if rpc.agreed_codec_version() == Some(LEGACY46_CODEC_VERSION) {
+        let (source, registration) = if rpc
+            .agreed_codec_version()
+            .is_some_and(|version| version < CONDITIONAL_PANE_INPUT_V1_MIN_CODEC_VERSION)
+        {
             let registration = self.mux_registration.load().ok_or_else(|| {
                 anyhow::anyhow!("cannot enqueue mouse input for an unregistered remote pane")
             })?;
@@ -9857,7 +9877,7 @@ mod tests {
     }
 
     #[test]
-    fn current_paste_and_mouse_refuse_missing_or_unsupported_identity_before_admission() {
+    fn current_paste_and_mouse_refuse_missing_identity_before_admission() {
         let scope = MuxTestScope::enter();
         let executor = promise::spawn::SimpleExecutor::new();
         let mux = Arc::new(Mux::new(None));
@@ -9874,16 +9894,6 @@ mod tests {
         assert_eq!(pane.renderable.lock().inner.borrow().input_serial, before);
 
         pane.publish_conditional_input_source(Some(test_conditional_input_source(0x69)));
-        for version in [CODEC_VERSION_MIN_SUPPORTED, 63, 73] {
-            peer.replace_ready_generation(&inner.client, version)
-                .unwrap();
-            pane.send_paste("no numeric fallback")
-                .expect_err("old current peer must refuse paste");
-            pane.mouse_event(mouse)
-                .expect_err("old current peer must refuse mouse");
-            assert!(peer.is_empty());
-            assert_eq!(pane.renderable.lock().inner.borrow().input_serial, before);
-        }
         peer.replace_ready_generation(&inner.client, CODEC_VERSION)
             .unwrap();
         let oversized = "x".repeat(MAX_CONDITIONAL_PANE_INPUT_PASTE_BYTES + 1);
@@ -9893,6 +9903,70 @@ mod tests {
             .expect_err("mouse coordinates are checked before queue admission");
         assert!(peer.is_empty());
         assert_eq!(pane.renderable.lock().inner.borrow().input_serial, before);
+    }
+
+    #[test]
+    fn pre74_current_peers_take_paste_and_mouse_by_pane_number() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, peer) = test_client_inner_with_rpc_peer(17);
+        let pane = register_resize_test_pane(&mux, &executor, &inner, &peer, 40, 29);
+        let press = mouse_test_event(wezterm_term::MouseEventKind::Press);
+        for version in [
+            CODEC_VERSION_MIN_SUPPORTED,
+            SEND_PASTE_TRACED_V1_MIN_CODEC_VERSION,
+            CONDITIONAL_PANE_INPUT_V1_MIN_CODEC_VERSION - 1,
+        ] {
+            peer.replace_ready_generation(&inner.client, version)
+                .unwrap();
+            pane.send_paste("by pane number").unwrap();
+            let Pdu::SendPaste(request) =
+                promise::spawn::block_on(peer.respond_next_unit()).unwrap()
+            else {
+                panic!("codec {} paste must use PDU13", version);
+            };
+            assert_eq!(request.pane_id, 29);
+            assert_eq!(request.data, "by pane number");
+            assert_eq!(
+                pane.renderable.lock().inner.borrow().input_serial,
+                request.input_serial
+            );
+            pump_mouse_test(&executor);
+
+            pane.send_paste_with_trace_context("sampled", sampled_paste_context())
+                .unwrap();
+            let sent = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
+            pump_mouse_test(&executor);
+            if version >= SEND_PASTE_TRACED_V1_MIN_CODEC_VERSION {
+                let Pdu::SendPasteTracedV1(traced) = sent else {
+                    panic!("codec {} sampled paste must keep its trace", version);
+                };
+                assert_eq!(traced.request.pane_id, 29);
+                assert_eq!(traced.request.data, "sampled");
+                assert_eq!(traced.trace_context, sampled_paste_context());
+            } else {
+                assert!(
+                    matches!(&sent, Pdu::SendPaste(request) if request.data == "sampled"),
+                    "codec {} predates the traced paste: {:?}",
+                    version,
+                    sent
+                );
+            }
+
+            pane.mouse_event(press).unwrap();
+            pump_mouse_test(&executor);
+            let sent = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
+            assert!(
+                matches!(&sent, Pdu::SendMouseEvent(request) if request.pane_id == 29 && request.event == press),
+                "codec {} mouse must use the pane number: {:?}",
+                version,
+                sent
+            );
+            pump_mouse_test(&executor);
+            assert!(peer.is_empty());
+        }
     }
 
     #[test]
