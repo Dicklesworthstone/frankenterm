@@ -5878,6 +5878,28 @@ fn legacy46_serialized_lines_are_text_only(lines: &SerializedLines) -> bool {
         })
 }
 
+/// Keep the text of codec-46 rows whose cells carry images, without the
+/// images. This client cannot read a codec-46 mux's image placements, and
+/// refusing such a frame failed it and, with it, the connection: a pane that
+/// had shown an image dropped and reattached its domain whenever its rows
+/// were read (2026-11-12). The rows' text is still the pane's text. A
+/// malformed reference fails the frame before anything is dropped.
+fn strip_legacy46_images(mut lines: SerializedLines) -> Result<SerializedLines, Error> {
+    lines.validate_references(false)?;
+    let mut dropped = lines.images.len();
+    lines.images.clear();
+    for (_, line) in &mut lines.lines {
+        for cell in line.cells_mut_for_attr_changes_only() {
+            if cell.attrs().images().is_some() {
+                cell.attrs_mut().clear_images();
+                dropped += 1;
+            }
+        }
+    }
+    metrics::counter!("mux.codec.legacy46.images_dropped.total").increment(dropped as u64);
+    Ok(lines)
+}
+
 fn normalize_legacy46_text_lines(lines: SerializedLines) -> Result<SerializedLines, Error> {
     match lines.validate_structure() {
         Ok(_) => return Ok(lines),
@@ -5993,16 +6015,11 @@ fn decode_materialized_for_dialect(
                     "Legacy46GetLinesResponse",
                     MAX_LEGACY46_TEXT_RENDER_RESPONSE_DECOMPRESSED_BYTES,
                 )?;
-                if legacy46_serialized_lines_are_text_only(&response.lines) {
-                    response.lines = normalize_legacy46_text_lines(response.lines)?;
-                    MuxWireDecodedPayload::Pdu(Pdu::GetLinesResponse(response))
-                } else {
-                    response.lines.validate_structure()?;
-                    unsupported_mux_wire_payload(
-                        ident,
-                        MuxWireUnsupportedReason::Legacy46ImageContentSemanticsUnavailable,
-                    )
+                if !legacy46_serialized_lines_are_text_only(&response.lines) {
+                    response.lines = strip_legacy46_images(response.lines)?;
                 }
+                response.lines = normalize_legacy46_text_lines(response.lines)?;
+                MuxWireDecodedPayload::Pdu(Pdu::GetLinesResponse(response))
             }
             25 => {
                 let mut response: GetPaneRenderChangesResponse =
@@ -6012,16 +6029,11 @@ fn decode_materialized_for_dialect(
                         "Legacy46GetPaneRenderChangesResponse",
                         MAX_LEGACY46_TEXT_RENDER_RESPONSE_DECOMPRESSED_BYTES,
                     )?;
-                if legacy46_serialized_lines_are_text_only(&response.bonus_lines) {
-                    response.bonus_lines = normalize_legacy46_text_lines(response.bonus_lines)?;
-                    MuxWireDecodedPayload::Pdu(Pdu::GetPaneRenderChangesResponse(response))
-                } else {
-                    response.bonus_lines.validate_structure()?;
-                    unsupported_mux_wire_payload(
-                        ident,
-                        MuxWireUnsupportedReason::Legacy46ImageContentSemanticsUnavailable,
-                    )
+                if !legacy46_serialized_lines_are_text_only(&response.bonus_lines) {
+                    response.bonus_lines = strip_legacy46_images(response.bonus_lines)?;
                 }
+                response.bonus_lines = normalize_legacy46_text_lines(response.bonus_lines)?;
+                MuxWireDecodedPayload::Pdu(Pdu::GetPaneRenderChangesResponse(response))
             }
             47 => unsupported_mux_wire_payload(
                 ident,
@@ -32801,41 +32813,79 @@ mod test {
         );
     }
 
+    fn legacy46_image_cell(line_idx: StableRowIndex) -> SerializedImageCell {
+        SerializedImageCell {
+            line_idx,
+            cell_idx: 0,
+            top_left: TextureCoordinate::new_f32(0.0, 0.0),
+            bottom_right: TextureCoordinate::new_f32(1.0, 1.0),
+            data_hash: [7; 32],
+            z_index: 0,
+            padding_left: 0,
+            padding_top: 0,
+            padding_right: 0,
+            padding_bottom: 0,
+            image_id: Some(1),
+            placement_id: Some(2),
+        }
+    }
+
     #[test]
-    fn legacy46_image_bearing_pdu23_is_consumed_but_not_forged_as_text_complete() {
+    fn legacy46_image_bearing_rows_keep_their_text_without_images() {
+        let attrs = termwiz::cell::CellAttributes::default();
+        let imaged = Line::from_text("x", &attrs, 1, None);
+        let plain = Line::from_text("y", &attrs, 1, None);
+        // Row 5 arrives twice, as from two clipped ranges of one request.
+        // With an image on it, that frame failed the connection live.
         let lines = SerializedLines {
-            lines: vec![(
-                5,
-                Line::from_text("x", &termwiz::cell::CellAttributes::default(), 1, None),
-            )],
+            lines: vec![(5, imaged.clone()), (6, plain.clone()), (5, imaged.clone())],
             hyperlinks: Vec::new(),
-            images: vec![SerializedImageCell {
-                line_idx: 5,
-                cell_idx: 0,
-                top_left: TextureCoordinate::new_f32(0.0, 0.0),
-                bottom_right: TextureCoordinate::new_f32(1.0, 1.0),
-                data_hash: [7; 32],
-                z_index: 0,
-                padding_left: 0,
-                padding_top: 0,
-                padding_right: 0,
-                padding_bottom: 0,
-                image_id: Some(1),
-                placement_id: Some(2),
-            }],
+            images: vec![legacy46_image_cell(5)],
         };
-        let wire = Pdu::GetLinesResponse(GetLinesResponse { pane_id: 3, lines })
-            .encode_frame_with_mode(23, CompressionMode::Never)
-            .expect("encode image-bearing PDU23 fixture");
+        assert!(!legacy46_serialized_lines_are_text_only(&lines));
+        let expected = SerializedLines::from(vec![(5, imaged.clone()), (6, plain)]);
+
+        let wire = Pdu::GetLinesResponse(GetLinesResponse {
+            pane_id: 3,
+            lines: lines.clone(),
+        })
+        .encode_frame_with_mode(23, CompressionMode::Never)
+        .expect("encode image-bearing PDU23 fixture");
         let decoded = Pdu::decode_for_dialect(wire.as_slice(), MuxWireDialect::LEGACY46)
-            .expect("bounded legacy image PDU23 classification");
-        let (_, MuxWireDecodedPayload::Unsupported(unsupported)) = decoded.into_parts() else {
-            panic!("legacy image PDU23 was exposed as complete text");
+            .expect("an image-bearing codec-46 GetLines reply must not fail the connection");
+        let (_, MuxWireDecodedPayload::Pdu(Pdu::GetLinesResponse(response))) = decoded.into_parts()
+        else {
+            panic!("an image-bearing codec-46 GetLines reply must deliver its text");
         };
-        assert_eq!(unsupported.ident(), GetLinesResponse::IDENT);
+        assert_eq!(response.pane_id, 3);
+        assert_eq!(response.lines, expected);
+        assert!(legacy46_serialized_lines_are_text_only(&response.lines));
+
+        let mut push = sample_retention_metadata_render_change();
+        push.bonus_lines = lines;
+        let wire = Pdu::GetPaneRenderChangesResponse(push.clone())
+            .encode_frame_with_mode(0, CompressionMode::Never)
+            .expect("encode image-bearing render push fixture");
+        let decoded = Pdu::decode_for_dialect(wire.as_slice(), MuxWireDialect::LEGACY46)
+            .expect("an image-bearing codec-46 render push must not fail the connection");
+        let (0, MuxWireDecodedPayload::Pdu(Pdu::GetPaneRenderChangesResponse(actual))) =
+            decoded.into_parts()
+        else {
+            panic!("an image-bearing codec-46 render push must stay routable");
+        };
+        push.bonus_lines = expected;
+        assert_eq!(actual, push, "only the image is dropped from the push");
+
+        let malformed = SerializedLines {
+            lines: vec![(5, imaged)],
+            hyperlinks: Vec::new(),
+            images: vec![legacy46_image_cell(9)],
+        };
+        let error = strip_legacy46_images(malformed).unwrap_err();
         assert_eq!(
-            unsupported.reason(),
-            MuxWireUnsupportedReason::Legacy46ImageContentSemanticsUnavailable
+            error.downcast_ref::<SerializedLinesStructureError>(),
+            Some(&SerializedLinesStructureError::ImageLineMissing),
+            "an image reference to a missing row still fails the frame"
         );
     }
 }
