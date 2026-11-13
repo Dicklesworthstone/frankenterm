@@ -4822,6 +4822,17 @@ mod pane_registration_handle {
             self.pane.publish_lines_at_layout_capability(state, publish)
         }
 
+        pub fn read_lines_forwarded_capability(
+            &self,
+            ranges: &[std::ops::Range<frankenterm_term::StableRowIndex>],
+            state: &mut Option<crate::pane::PaneLayoutRead>,
+        ) -> Result<
+            Option<Vec<(frankenterm_term::StableRowIndex, termwiz::surface::Line)>>,
+            crate::pane::PaneSelectionAnchorError,
+        > {
+            self.pane.read_lines_forwarded_capability(ranges, state)
+        }
+
         pub fn get_current_seqno(&self) -> termwiz::surface::SequenceNo {
             self.pane.get_current_seqno()
         }
@@ -4937,6 +4948,11 @@ mod pane_registration_handle {
 
         fn local(&self) -> Option<&crate::localpane::LocalPane> {
             self.pane.downcast_ref::<crate::localpane::LocalPane>()
+        }
+
+        /// The pane owns its terminal here, as opposed to proxying another.
+        pub fn is_local(&self) -> bool {
+            self.local().is_some()
         }
 
         /// [`Self::capture_surface_snapshot`] that waits up to `wait` for a

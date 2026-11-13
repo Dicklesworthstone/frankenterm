@@ -3228,6 +3228,22 @@ impl DirectMuxClient {
                     .await;
                 diagnostics.phase("chunk", phase_started);
                 let response = match response {
+                    // A chunk of at most 512 rows is never otherwise invalid:
+                    // this pane cannot answer at a layout, as a client pane of
+                    // a remote mux that predates fenced reads cannot
+                    // (ft-vllc3). Read it as from a peer that predates them.
+                    Err(DirectMuxError::RemoteRejection(error))
+                        if error.validate().is_ok()
+                            && error.request_ident
+                                == <GetLinesAtLayout as codec::PduWireIdent>::IDENT
+                            && error.code == codec::MuxErrorCode::INVALID_REQUEST
+                            && error.effect == codec::MuxErrorEffect::NOT_APPLIED =>
+                    {
+                        return self
+                            .get_text_tail_legacy_with_cx(cx, pane_id, max_output_bytes, tail)
+                            .await
+                            .map(Ok);
+                    }
                     Err(DirectMuxError::RemoteRejection(error))
                         if error.validate().is_ok()
                             && error.request_ident
@@ -8472,6 +8488,76 @@ mod tests {
                 .unwrap()
                 .unwrap();
         });
+    }
+
+    /// ft-vllc3: a GUI refuses a fenced read of a client pane whose remote
+    /// mux predates fenced reads as an invalid request. The read continues
+    /// unfenced, as against a peer that predates them. A refusal naming
+    /// another request is not that answer and still fails the read.
+    #[test]
+    fn text_read_of_a_pane_that_cannot_fence_reads_it_unfenced() {
+        for refusal in [GetLinesAtLayout::IDENT, GetLines::IDENT] {
+            run_async_test(async move {
+                let cx = crate::cx::for_testing();
+                let fenced = Arc::new(AtomicUsize::new(0));
+                let ranges = Arc::new(StdMutex::new(Vec::new()));
+                let (seen_fenced, seen_ranges) = (Arc::clone(&fenced), Arc::clone(&ranges));
+                let (_dir, path, server) = text_read_server(1, move |_, pdu| {
+                    Some(match pdu {
+                        Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
+                            text_read_state(7, -7, 600)
+                        }
+                        Pdu::GetLinesAtLayout(_) => {
+                            seen_fenced.fetch_add(1, Ordering::SeqCst);
+                            Pdu::ErrorResponse(codec::ErrorResponse::invalid_request(refusal))
+                        }
+                        Pdu::GetLines(request) => {
+                            assert_eq!(request.lines.len(), 1);
+                            let range = request.lines[0].clone();
+                            seen_ranges.lock().unwrap().push(range.clone());
+                            let lines = range
+                                .map(|row| {
+                                    let line = frankenterm_term::Line::from_text(
+                                        &text_read_row(row, "unfenced"),
+                                        &termwiz::cell::CellAttributes::default(),
+                                        1,
+                                        None,
+                                    );
+                                    (row, line)
+                                })
+                                .collect::<Vec<_>>();
+                            Pdu::GetLinesResponse(GetLinesResponse {
+                                pane_id: 9,
+                                lines: lines.into(),
+                            })
+                        }
+                        other => panic!("unexpected text request {other:?}"),
+                    })
+                })
+                .await;
+                let mut client =
+                    DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                        .await
+                        .unwrap();
+                let result = client.get_text_with_cx(&cx, 9, 100_000).await;
+                assert_eq!(fenced.load(Ordering::SeqCst), 1, "one fenced attempt");
+                if refusal == GetLinesAtLayout::IDENT {
+                    assert_eq!(
+                        result.unwrap(),
+                        MuxTextReadResult::Text(text_read_expected(-7..593, "unfenced"))
+                    );
+                    assert_eq!(*ranges.lock().unwrap(), vec![-7..249, 249..505, 505..593]);
+                } else {
+                    assert!(result.is_err(), "a mismatched refusal is not that answer");
+                    assert!(ranges.lock().unwrap().is_empty());
+                }
+                drop(client);
+                timeout(Duration::from_secs(5), server)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            });
+        }
     }
 
     #[test]

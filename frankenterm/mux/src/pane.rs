@@ -1120,6 +1120,20 @@ pub trait Pane: Downcast + Send + Sync {
         Err(PaneSelectionAnchorError::Unsupported)
     }
 
+    /// An unfenced read of `ranges` from the pane's own source, for a proxy
+    /// whose local rows are only those it fetched to draw (ft-vllc3). Its
+    /// cache answers a row it never fetched with a blank placeholder, which a
+    /// server must not hand out as the pane's text. A range reaching past
+    /// the newest row reads the newest rows, as on a local pane. `Ok(None)`
+    /// is pending: retry with the same state, which the backend installs.
+    fn read_lines_forwarded_capability(
+        &self,
+        _ranges: &[Range<StableRowIndex>],
+        _state: &mut Option<PaneLayoutRead>,
+    ) -> Result<Option<Vec<(StableRowIndex, Line)>>, PaneSelectionAnchorError> {
+        Err(PaneSelectionAnchorError::Unsupported)
+    }
+
     fn publish_line_reads_at_layout(
         &self,
         _reads: &[frankenterm_term::screen::ScreenLineRead],

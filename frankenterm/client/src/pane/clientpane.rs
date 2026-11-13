@@ -250,6 +250,36 @@ struct ForwardedLayoutRead {
     completed: bool,
 }
 
+/// An unfenced outer read answered by the remote pane (ft-vllc3). Dropping
+/// it cancels the unfinished RPC; a cache placeholder is never its reply.
+struct ForwardedLineRead {
+    ranges: Vec<Range<StableRowIndex>>,
+    remote_pane_id: PaneId,
+    registration: PaneRegistrationHandle,
+    rpc: RpcGenerationScope,
+    pending: Option<SelectionRpcResult<Vec<(StableRowIndex, Line)>>>,
+}
+
+/// The rows an unfenced read of `range` takes from a pane holding stable
+/// rows `oldest..newest`, by the rule of a local pane's line read: a range
+/// reaching past the newest row reads the newest rows. A remote mux that
+/// predates that rule clamps such a range to nothing, so the proxy sends it
+/// the resolved rows.
+fn resolve_forwarded_rows(
+    range: &Range<StableRowIndex>,
+    oldest: StableRowIndex,
+    newest: StableRowIndex,
+) -> Range<StableRowIndex> {
+    let count = range.end.saturating_sub(range.start).max(0);
+    let len = count.min(newest.saturating_sub(oldest).max(0));
+    let first = if count > 0 && range.end > newest {
+        newest.saturating_sub(len).max(oldest)
+    } else {
+        range.start.max(oldest)
+    };
+    first..first.saturating_add(len)
+}
+
 fn forwarded_selection_error(error: SelectionReadError) -> PaneSelectionAnchorError {
     match error {
         SelectionReadError::Busy => PaneSelectionAnchorError::Busy,
@@ -3940,11 +3970,22 @@ impl ClientPane {
     }
 
     fn owns_forwarded_read(&self, read: &ForwardedLayoutRead) -> bool {
-        read.request.pane_id == self.remote_pane_id
-            && read.rpc.same_generation(&self.client.client.rpc_scope())
-            && self.mux_registration.load().is_some_and(|registration| {
-                registration.wire_identity() == read.registration.wire_identity()
-                    && registration.try_with_current(|_| ()).is_some()
+        self.owns_forwarded_source(read.request.pane_id, &read.rpc, &read.registration)
+    }
+
+    /// The remote pane, connection generation and registration a forwarded
+    /// read started under are all still this pane's.
+    fn owns_forwarded_source(
+        &self,
+        remote_pane_id: PaneId,
+        rpc: &RpcGenerationScope,
+        registration: &PaneRegistrationHandle,
+    ) -> bool {
+        remote_pane_id == self.remote_pane_id
+            && rpc.same_generation(&self.client.client.rpc_scope())
+            && self.mux_registration.load().is_some_and(|current| {
+                current.wire_identity() == registration.wire_identity()
+                    && current.try_with_current(|_| ()).is_some()
             })
     }
 
@@ -5847,6 +5888,121 @@ impl Pane for ClientPane {
             .map_err(|_| PaneSelectionAnchorError::SourceChanged)?
     }
 
+    fn read_lines_forwarded_capability(
+        &self,
+        ranges: &[Range<StableRowIndex>],
+        state: &mut Option<PaneLayoutRead>,
+    ) -> Result<Option<Vec<(StableRowIndex, Line)>>, PaneSelectionAnchorError> {
+        if state.is_none() {
+            let rpc = self.client.client.rpc_scope();
+            if rpc.agreed_codec_version().is_none() {
+                return Err(PaneSelectionAnchorError::Busy);
+            }
+            let dimensions = self
+                .renderable
+                .try_lock()
+                .ok_or(PaneSelectionAnchorError::Busy)?
+                .get_dimensions();
+            let oldest = dimensions.scrollback_top;
+            let newest = isize::try_from(dimensions.scrollback_rows)
+                .ok()
+                .and_then(|rows| oldest.checked_add(rows))
+                .ok_or(PaneSelectionAnchorError::SourceChanged)?;
+            let rows: Vec<_> = ranges
+                .iter()
+                .map(|range| resolve_forwarded_rows(range, oldest, newest))
+                .filter(|rows| !rows.is_empty())
+                .collect();
+            let count = rows
+                .iter()
+                .try_fold(0usize, |count, rows| {
+                    count.checked_add(usize::try_from(rows.end - rows.start).ok()?)
+                })
+                .filter(|count| *count <= wezterm_term::screen::ScreenLineRead::MAX_ROWS)
+                .ok_or(PaneSelectionAnchorError::SourceChanged)?;
+            if rows.is_empty() {
+                return Ok(Some(Vec::new()));
+            }
+            let registration = self
+                .mux_registration
+                .load()
+                .ok_or(PaneSelectionAnchorError::SourceChanged)?;
+            let remote_pane_id = self.remote_pane_id;
+            let rpc_request = rpc.clone();
+            let pending = start_selection_rpc(
+                async move {
+                    let response = rpc_request
+                        .get_lines(GetLines {
+                            pane_id: remote_pane_id,
+                            lines: rows.clone(),
+                        })
+                        .await?;
+                    anyhow::ensure!(
+                        response.pane_id == remote_pane_id,
+                        "forwarded line reply identity changed"
+                    );
+                    let (lines, incomplete) =
+                        hydrate_lines(&rpc_request, remote_pane_id, response.lines)
+                            .await?
+                            .into_parts();
+                    // An unfenced read can find fewer rows than the mirrored
+                    // dimensions promised, never rows it did not ask for.
+                    anyhow::ensure!(
+                        incomplete.is_empty() && lines.len() <= count,
+                        "forwarded line reply is incomplete"
+                    );
+                    let mut bytes = wezterm_term::screen::ScreenLineRead::MAX_PAYLOAD_BYTES;
+                    let mut work = 65_536;
+                    let mut bounded = Vec::with_capacity(lines.len());
+                    for (row, line) in lines {
+                        anyhow::ensure!(
+                            rows.iter().any(|rows| rows.contains(&row)),
+                            "forwarded line reply names row {row}, which was not asked for"
+                        );
+                        let line = line
+                            .try_clone_for_snapshot(&mut bytes, &mut work)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("forwarded line reply payload budget")
+                            })?;
+                        bounded.push((row, line));
+                    }
+                    Ok(bounded)
+                },
+                registration.clone(),
+            )
+            .map_err(|_| PaneSelectionAnchorError::Busy)?;
+            *state = Some(Box::new(ForwardedLineRead {
+                ranges: ranges.to_vec(),
+                remote_pane_id,
+                registration,
+                rpc,
+                pending: Some(pending),
+            }));
+            return Ok(None);
+        }
+        let read = state
+            .as_mut()
+            .and_then(|state| state.downcast_mut::<ForwardedLineRead>())
+            .ok_or(PaneSelectionAnchorError::SourceChanged)?;
+        if read.ranges != ranges
+            || !self.owns_forwarded_source(read.remote_pane_id, &read.rpc, &read.registration)
+        {
+            return Err(PaneSelectionAnchorError::SourceChanged);
+        }
+        let pending = read
+            .pending
+            .as_ref()
+            .ok_or(PaneSelectionAnchorError::SourceChanged)?;
+        let Some(result) = pending.take() else {
+            return Ok(None);
+        };
+        read.pending = None;
+        result.map(Some).map_err(|error| {
+            log::debug!("forwarded line read refused: {error:#}");
+            PaneSelectionAnchorError::SourceChanged
+        })
+    }
+
     fn pane_id(&self) -> PaneId {
         self.local_pane_id
     }
@@ -7609,6 +7765,144 @@ mod tests {
                 Err(PaneSelectionAnchorError::SourceChanged)
             ));
             assert!(!emitted);
+        }
+    }
+
+    /// The rule of `Screen::capture_line_read_with_budget`, on a pane holding
+    /// stable rows 10..110.
+    #[test]
+    fn forwarded_rows_resolve_like_a_local_line_read() {
+        for (asked, rows) in [
+            (isize::MAX - 5..isize::MAX, 105..110),
+            (100..120, 90..110),
+            (20..30, 20..30),
+            (0..5, 10..15),
+            (isize::MAX - 500..isize::MAX, 10..110),
+            (40..40, 40..40),
+            // Inverted: reads nothing.
+            (Range { start: 50, end: 40 }, 50..50),
+        ] {
+            assert_eq!(resolve_forwarded_rows(&asked, 10, 110), rows, "{:?}", asked);
+        }
+        assert!(resolve_forwarded_rows(&(isize::MAX - 5..isize::MAX), 7, 7).is_empty());
+    }
+
+    /// ft-vllc3: a server answering a line read of a client pane read the
+    /// render cache, whose never-fetched rows are blank placeholders, so a
+    /// robot tail of every remote pane "succeeded" empty. The forwarded read
+    /// asks the remote, and resolves "the newest rows" itself: a remote mux
+    /// that predates that rule reads such a range as nothing.
+    #[test]
+    fn forwarded_line_read_asks_the_remote_for_the_newest_rows() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, peer) = test_client_inner_with_rpc_peer(921);
+        let pane = register_resize_test_pane(&mux, &executor, &inner, &peer, 923, 929);
+        {
+            let cache = pane.renderable.lock();
+            let mut cache = cache.inner.borrow_mut();
+            cache.dimensions.scrollback_top = 0;
+            cache.dimensions.scrollback_rows = 100;
+        }
+        let newest = std::slice::from_ref(&(isize::MAX - 2..isize::MAX));
+        let mut state = None;
+        assert!(pane
+            .read_lines_forwarded_capability(newest, &mut state)
+            .unwrap()
+            .is_none());
+        let line =
+            |text: &str| Line::from_text(text, &termwiz::cell::CellAttributes::default(), 3, None);
+        let asked = promise::spawn::block_on(peer.respond_next_lines(vec![
+            (98, line("ninety-eight")),
+            (99, line("界 ninety-nine")),
+        ]))
+        .unwrap();
+        assert_eq!(asked, vec![98..100], "the remote is asked for actual rows");
+        let mut payload = None;
+        for _ in 0..64 {
+            payload = pane
+                .read_lines_forwarded_capability(newest, &mut state)
+                .unwrap();
+            if payload.is_some() {
+                break;
+            }
+            assert!(executor.try_tick().unwrap());
+        }
+        let rows: Vec<_> = payload
+            .expect("bounded reply delivery")
+            .iter()
+            .map(|(row, line)| (*row, line.as_str().into_owned()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (98, "ninety-eight".to_string()),
+                (99, "界 ninety-nine".to_string())
+            ]
+        );
+        assert!(
+            matches!(
+                pane.read_lines_forwarded_capability(newest, &mut state),
+                Err(PaneSelectionAnchorError::SourceChanged)
+            ),
+            "a settled read answers once"
+        );
+    }
+
+    #[test]
+    fn forwarded_line_read_refuses_unasked_rows_and_a_replaced_connection() {
+        for replace_connection in [false, true] {
+            let scope = MuxTestScope::enter();
+            let executor = promise::spawn::SimpleExecutor::new();
+            let mux = Arc::new(Mux::new(None));
+            scope.set_mux(&mux);
+            let (inner, peer) = test_client_inner_with_rpc_peer(931);
+            let pane = register_resize_test_pane(&mux, &executor, &inner, &peer, 933, 939);
+            {
+                let cache = pane.renderable.lock();
+                let mut cache = cache.inner.borrow_mut();
+                cache.dimensions.scrollback_top = 0;
+                cache.dimensions.scrollback_rows = 100;
+            }
+            let rows = std::slice::from_ref(&(20..22));
+            let mut state = None;
+            assert!(pane
+                .read_lines_forwarded_capability(rows, &mut state)
+                .unwrap()
+                .is_none());
+            let line = |text: &str| {
+                Line::from_text(text, &termwiz::cell::CellAttributes::default(), 3, None)
+            };
+            // Either the remote names a row it was not asked for, or it
+            // answers exactly but the connection is replaced before the
+            // reply is taken: the reply then belongs to a retired remote.
+            let reply = if replace_connection {
+                vec![(20, line("twenty")), (21, line("twenty-one"))]
+            } else {
+                vec![(5, line("not asked for"))]
+            };
+            let asked = promise::spawn::block_on(peer.respond_next_lines(reply)).unwrap();
+            assert_eq!(asked, vec![20..22]);
+            if replace_connection {
+                peer.replace_ready_generation(&inner.client, CODEC_VERSION)
+                    .unwrap();
+            }
+            let mut refused = false;
+            for _ in 0..64 {
+                match pane.read_lines_forwarded_capability(rows, &mut state) {
+                    Err(PaneSelectionAnchorError::SourceChanged) => {
+                        refused = true;
+                        break;
+                    }
+                    Ok(None) => {
+                        assert!(executor.try_tick().unwrap());
+                    }
+                    other => panic!("the read was not refused: {:?}", other),
+                }
+            }
+            assert!(refused, "replace_connection={}", replace_connection);
         }
     }
 

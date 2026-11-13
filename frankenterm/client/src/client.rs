@@ -11876,10 +11876,12 @@ impl TestRpcPeer {
         }
     }
 
+    /// Answers the next line read with `lines` and returns the row ranges it
+    /// asked for.
     pub(crate) async fn respond_next_lines(
         &self,
         lines: Vec<(wezterm_term::StableRowIndex, wezterm_term::Line)>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<std::ops::Range<wezterm_term::StableRowIndex>>> {
         let message = self
             .receiver
             .recv()
@@ -11897,25 +11899,29 @@ impl TestRpcPeer {
         let prepared = lease
             .claim_for_reader()?
             .context("test line RPC cancelled")?;
-        let response = match prepared.pdu() {
-            Pdu::GetLinesAtLayout(request) => {
+        let (asked, response) = match prepared.pdu() {
+            Pdu::GetLinesAtLayout(request) => (
+                request.lines.clone(),
                 Pdu::GetLinesAtLayoutResponse(GetLinesAtLayoutResponse {
                     pane_id: request.pane_id,
                     layout: request.layout,
                     lines: lines.into(),
-                })
-            }
-            Pdu::GetLines(request) => Pdu::GetLinesResponse(GetLinesResponse {
-                pane_id: request.pane_id,
-                lines: lines.into(),
-            }),
+                }),
+            ),
+            Pdu::GetLines(request) => (
+                request.lines.clone(),
+                Pdu::GetLinesResponse(GetLinesResponse {
+                    pane_id: request.pane_id,
+                    lines: lines.into(),
+                }),
+            ),
             other => bail!("unexpected test line RPC {}", other.pdu_name()),
         };
         promise
             .send(Ok(PendingRpcReply::pdu(response)))
             .await
             .map_err(|_| anyhow!("test line RPC caller retired"))?;
-        Ok(())
+        Ok(asked)
     }
 
     pub(crate) async fn reject_next_lines(&self, retry: MuxErrorRetry) -> anyhow::Result<()> {

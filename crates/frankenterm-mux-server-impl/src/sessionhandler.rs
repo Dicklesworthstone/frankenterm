@@ -289,6 +289,12 @@ struct LineReadPublicationChanged;
 #[error("cold read worker capacity exhausted")]
 struct LineReadWorkerCapacity;
 
+/// A proxy pane's own source did not answer a forwarded unfenced read in
+/// time (ft-vllc3). The client is told to retry after backoff.
+#[derive(Debug, thiserror::Error)]
+#[error("forwarded line read did not settle")]
+struct LineReadForwardingUnsettled;
+
 /// The requester abandoned this read (a refused capture, or a retired
 /// session) while its reply was being prepared.
 #[derive(Debug, thiserror::Error)]
@@ -2705,6 +2711,13 @@ impl MuxRequestErrorContext {
             self.request_ident,
             GetLines::IDENT | GetLinesAtLayout::IDENT
         ) && error.downcast_ref::<LineReadWorkerCapacity>().is_some()
+        {
+            return ErrorResponse::resource_busy(self.request_ident);
+        }
+        if self.request_ident == GetLines::IDENT
+            && error
+                .downcast_ref::<LineReadForwardingUnsettled>()
+                .is_some()
         {
             return ErrorResponse::resource_busy(self.request_ident);
         }
@@ -10791,7 +10804,30 @@ impl SessionHandler {
                                     })
                                 });
                                 match read {
-                                    Ok(Err(Error::Unsupported)) if state.is_none() => break,
+                                    Ok(Err(Error::Unsupported)) if state.is_none() => {
+                                        let local = recover_line_read_callback(|| {
+                                            with_current_pane(&authority, &registration, |pane| {
+                                                Ok(pane.is_local())
+                                            })
+                                        });
+                                        if !matches!(local, Ok(false)) {
+                                            break;
+                                        }
+                                        // Neither a terminal here nor a fence
+                                        // forwarded to one: a client pane of a
+                                        // remote mux that predates fenced reads
+                                        // (ft-vllc3). Refuse the request as
+                                        // invalid for this pane, never retried,
+                                        // so the reader reads it unfenced
+                                        // instead of retrying a backend failure.
+                                        if let Some(timing) = &mut timing {
+                                            timing.outcome = "unfenceable";
+                                        }
+                                        send_response(Err(
+                                            MuxServerRejection::invalid_request().into()
+                                        ));
+                                        return;
+                                    }
                                     Ok(Ok(Some(rows))) => {
                                         let Some(state) = state.as_ref() else {
                                             send_response(Err(anyhow!(
@@ -11030,7 +11066,80 @@ impl SessionHandler {
                                     )));
                                     return;
                                 }
-                                // Non-local pane types retain their existing
+                                // A proxy pane (a client pane of a remote mux)
+                                // reads its own source: its cache answers rows
+                                // it never fetched to draw with blank
+                                // placeholders, which made every remote pane's
+                                // tail read "succeed" empty (ft-vllc3).
+                                {
+                                    use mux::pane::PaneSelectionAnchorError as Error;
+                                    let mut forwarded = None;
+                                    // Past the forwarded RPC's own 5 s deadline,
+                                    // so that refusal is reported as itself.
+                                    let deadline =
+                                        Instant::now() + std::time::Duration::from_secs(6);
+                                    loop {
+                                        let read = recover_line_read_callback(|| {
+                                            with_current_pane(&authority, &registration, |pane| {
+                                                Ok(pane.read_lines_forwarded_capability(
+                                                    &lines,
+                                                    &mut forwarded,
+                                                ))
+                                            })
+                                        });
+                                        match read {
+                                            Ok(Err(Error::Unsupported)) if forwarded.is_none() => {
+                                                break;
+                                            }
+                                            Ok(Ok(Some(rows))) => {
+                                                if let Some(timing) = &mut timing {
+                                                    timing.outcome = "forwarded";
+                                                }
+                                                let rows: Vec<_> = rows
+                                                    .into_iter()
+                                                    .map(|(row, mut line)| {
+                                                        line.compress_for_scrollback();
+                                                        (row, line)
+                                                    })
+                                                    .collect();
+                                                send_response(Ok(Pdu::GetLinesResponse(
+                                                    GetLinesResponse {
+                                                        pane_id,
+                                                        lines: rows.into(),
+                                                    },
+                                                )));
+                                                return;
+                                            }
+                                            Ok(Ok(None) | Err(Error::Busy))
+                                                if Instant::now() < deadline =>
+                                            {
+                                                promise::spawn::sleep(
+                                                    std::time::Duration::from_millis(10),
+                                                )
+                                                .await;
+                                            }
+                                            Ok(Ok(None) | Err(Error::Busy)) => {
+                                                if let Some(timing) = &mut timing {
+                                                    timing.outcome = "forwarded_unsettled";
+                                                }
+                                                send_response(Err(
+                                                    LineReadForwardingUnsettled.into()
+                                                ));
+                                                return;
+                                            }
+                                            other => {
+                                                if let Some(timing) = &mut timing {
+                                                    timing.outcome = "forwarded_read_refused";
+                                                }
+                                                send_response(Err(anyhow!(
+                                                    "forwarded line read refused: {other:?}"
+                                                )));
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+                                // Other non-local pane types keep their
                                 // transport-specific behavior; LocalPane never
                                 // falls back to synchronous storage on refusal.
                                 if let Some(timing) = &mut timing {
@@ -16546,6 +16655,33 @@ mod tests {
                 MuxErrorCode::RESOURCE_BUSY,
                 "only the typed capacity refusal authorizes a retry"
             );
+        }
+    }
+
+    /// ft-vllc3: a forwarded unfenced read that has not settled asks the
+    /// reader to retry. Only the unfenced read forwards, so only it may.
+    #[test]
+    fn an_unsettled_forwarded_read_answers_busy_only_for_unfenced_line_reads() {
+        for request_ident in [
+            GetLines::IDENT,
+            GetLinesAtLayout::IDENT,
+            GetPaneRenderChanges::IDENT,
+            KillPane::IDENT,
+        ] {
+            let context = MuxRequestErrorContext {
+                request_ident,
+                object: None,
+                may_mutate: request_ident == KillPane::IDENT,
+            };
+            let response = context.response_for_error(&LineReadForwardingUnsettled.into());
+            response.validate().unwrap();
+            if request_ident == GetLines::IDENT {
+                assert_eq!(response.code, MuxErrorCode::RESOURCE_BUSY);
+                assert_eq!(response.effect, MuxErrorEffect::NOT_APPLIED);
+                assert_eq!(response.retry, MuxErrorRetry::SAFE_AFTER_BACKOFF);
+            } else {
+                assert_ne!(response.code, MuxErrorCode::RESOURCE_BUSY);
+            }
         }
     }
 
