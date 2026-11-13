@@ -63,6 +63,7 @@ use crate::customglyph::BlockKey;
 use crate::glyphcache::{GlyphCache, GlyphPositionScale};
 use crate::shapecache::{BorrowedShapeCacheKey, CachedShape, ShapeCacheKey, ShapeCacheKeyTrait};
 use crate::utilsprites::RenderMetrics;
+use ahash::AHashMap;
 use config::TextStyle;
 use frankenterm_font::shaper::PresentationWidth;
 use frankenterm_font::units::PixelLength;
@@ -237,8 +238,10 @@ pub(crate) struct FontGlyphs {
     style_foregrounds: bool,
     /// Font style ids by the address `match_style` returned (stable while
     /// `config` lives), and by value: equal styles share an id, as they
-    /// share WebGpu's cache entries.
-    style_addresses: HashMap<usize, u32>,
+    /// share WebGpu's cache entries. The per-glyph and per-cluster maps here
+    /// use aHash, as WebGpu's glyph cache does: SipHash on these small keys
+    /// was a tenth of a busy render thread (B20).
+    style_addresses: AHashMap<usize, u32>,
     style_ids: HashMap<TextStyle, u32>,
     /// The default font style, which the password lock is shaped in, kept
     /// where its address stays put while the address map holds it.
@@ -252,13 +255,13 @@ pub(crate) struct FontGlyphs {
     bindings: RunBindings,
     /// Rasterized font glyphs, `None` for inkless ones. Shaper positions are
     /// applied per occurrence after lookup, not retained under a glyph id.
-    glyphs: HashMap<GlyphKey, Option<CachedFontGlyph>>,
+    glyphs: AHashMap<GlyphKey, Option<CachedFontGlyph>>,
     /// Custom block glyphs placed in the grayscale atlas.
-    blocks: HashMap<BlockKey, PlacedGlyph>,
+    blocks: AHashMap<BlockKey, PlacedGlyph>,
     /// Line sprites placed in the grayscale atlas (ft-yccm0.4.7.3).
-    lines: HashMap<LineSprite, PlacedGlyph>,
+    lines: AHashMap<LineSprite, PlacedGlyph>,
     /// Cursor sprites by shape and width in cells (ft-yccm0.4.7.3).
-    cursors: HashMap<(CursorSprite, u8), PlacedGlyph>,
+    cursors: AHashMap<(CursorSprite, u8), PlacedGlyph>,
     /// Page lifetimes referenced by the append-only glyph and sprite caches.
     /// Image slices age out independently, so their slots are not included.
     cached_pages: AtlasPageSet,
@@ -322,15 +325,15 @@ impl FontGlyphs {
             metrics: *metrics,
             config_generation,
             style_foregrounds,
-            style_addresses: HashMap::new(),
+            style_addresses: AHashMap::new(),
             style_ids: HashMap::new(),
             lock_style: Rc::new(TextStyle::default()),
             shapes,
             bindings,
-            glyphs: HashMap::new(),
-            blocks: HashMap::new(),
-            lines: HashMap::new(),
-            cursors: HashMap::new(),
+            glyphs: AHashMap::new(),
+            blocks: AHashMap::new(),
+            lines: AHashMap::new(),
+            cursors: AHashMap::new(),
             cached_pages: AtlasPageSet::default(),
             images: None,
             fallback_resolved: Arc::new(AtomicBool::new(false)),
