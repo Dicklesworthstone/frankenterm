@@ -4,6 +4,7 @@ use crate::TermWindow;
 use crate::termwindow::TermWindowNotif;
 use config::keyassignment::{ClipboardCopyDestination, KeyAssignment};
 use flume::bounded;
+use frankenterm_gui::window_request::{reserve_window_request, window_request_unanswered};
 use frankenterm_toast_notification::ToastNotification;
 use luahelper::*;
 use mlua::{UserData, UserDataMethods, UserDataRef};
@@ -55,6 +56,24 @@ fn gui_window_dimensions(
         can_paint: window_state.can_paint(),
         window_level: window_state.as_window_level(),
     }
+}
+
+/// Send `notif` to `window` and wait for the reply on `rx`. Admission is
+/// reserved first, so a busy GUI is waited for and a refusal is named; see
+/// `frankenterm_gui::window_request`.
+async fn ask_window<T>(
+    window: &::window::Window,
+    method: &'static str,
+    notif: TermWindowNotif,
+    rx: flume::Receiver<T>,
+) -> mlua::Result<T> {
+    let reservation = reserve_window_request(method).await.map_err(luaerr)?;
+    window
+        .notify_with_reservation(notif, reservation, None)
+        .detach();
+    rx.recv_async()
+        .await
+        .map_err(|_| luaerr(window_request_unanswered(method)))
 }
 
 impl GuiWin {
@@ -145,12 +164,9 @@ impl UserData for GuiWin {
         });
         methods.add_async_method("get_dimensions", |_, this, _: ()| async move {
             let (tx, rx) = bounded(1);
-            this.window.notify(TermWindowNotif::GetDimensions(tx));
-            let (dims, window_state) = rx
-                .recv_async()
-                .await
-                .map_err(|e| anyhow::anyhow!("{:#}", e))
-                .map_err(luaerr)?;
+            let notif = TermWindowNotif::GetDimensions(tx);
+            let (dims, window_state) =
+                ask_window(&this.window, "get_dimensions", notif, rx).await?;
 
             Ok(gui_window_dimensions(dims, window_state))
         });
@@ -158,15 +174,12 @@ impl UserData for GuiWin {
             "get_selection_text_for_pane",
             |_, this, pane: UserDataRef<MuxPane>| async move {
                 let (tx, rx) = bounded(1);
-                this.window.notify(TermWindowNotif::GetSelectionForPane {
+                let notif = TermWindowNotif::GetSelectionForPane {
                     pane_id: (*pane).0,
                     tx,
-                });
-                let text = rx
-                    .recv_async()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{:#}", e))
-                    .map_err(luaerr)?
+                };
+                let text = ask_window(&this.window, "get_selection_text_for_pane", notif, rx)
+                    .await?
                     .map_err(luaerr)?;
 
                 Ok(text)
@@ -174,45 +187,36 @@ impl UserData for GuiWin {
         );
         methods.add_async_method("current_event", |lua, this, _: ()| async move {
             let (tx, rx) = bounded(1);
-            this.window
-                .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                    tx.try_send(term_window.current_event.to_dynamic()).ok();
-                })));
-            let result = rx.recv_async().await.map_err(mlua::Error::external)?;
+            let notif = TermWindowNotif::Apply(Box::new(move |term_window| {
+                tx.try_send(term_window.current_event.to_dynamic()).ok();
+            }));
+            let result = ask_window(&this.window, "current_event", notif, rx).await?;
             luahelper::dynamic_to_lua_value(&lua, result)
         });
         methods.add_async_method(
             "perform_action",
             |_, this, (assignment, pane): (KeyAssignment, UserDataRef<MuxPane>)| async move {
                 let (tx, rx) = bounded(1);
-                this.window.notify(TermWindowNotif::PerformAssignment {
+                let notif = TermWindowNotif::PerformAssignment {
                     pane_id: (*pane).0,
                     assignment,
                     tx: Some(tx),
-                });
-                let result = rx.recv_async().await.map_err(mlua::Error::external)?;
+                };
+                let result = ask_window(&this.window, "perform_action", notif, rx).await?;
                 result.map_err(mlua::Error::external)
             },
         );
         methods.add_async_method("effective_config", |_, this, _: ()| async move {
             let (tx, rx) = bounded(1);
-            this.window.notify(TermWindowNotif::GetEffectiveConfig(tx));
-            let config = rx
-                .recv_async()
-                .await
-                .map_err(|e| anyhow::anyhow!("{:#}", e))
-                .map_err(luaerr)?;
+            let notif = TermWindowNotif::GetEffectiveConfig(tx);
+            let config = ask_window(&this.window, "effective_config", notif, rx).await?;
 
             Ok((*config).clone())
         });
         methods.add_async_method("get_config_overrides", |lua, this, _: ()| async move {
             let (tx, rx) = bounded(1);
-            this.window.notify(TermWindowNotif::GetConfigOverrides(tx));
-            let overrides = rx
-                .recv_async()
-                .await
-                .map_err(|e| anyhow::anyhow!("{:#}", e))
-                .map_err(luaerr)?;
+            let notif = TermWindowNotif::GetConfigOverrides(tx);
+            let overrides = ask_window(&this.window, "get_config_overrides", notif, rx).await?;
 
             dynamic_to_lua_value(&lua, overrides)
         });
@@ -224,97 +228,57 @@ impl UserData for GuiWin {
         });
         methods.add_async_method("is_focused", |_, this, _: ()| async move {
             let (tx, rx) = bounded(1);
-            this.window
-                .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                    tx.try_send(term_window.focused.is_some()).ok();
-                })));
-            let result = rx
-                .recv_async()
-                .await
-                .map_err(|e| anyhow::anyhow!("{:#}", e))
-                .map_err(luaerr)?;
-
-            Ok(result)
+            let notif = TermWindowNotif::Apply(Box::new(move |term_window| {
+                tx.try_send(term_window.focused.is_some()).ok();
+            }));
+            ask_window(&this.window, "is_focused", notif, rx).await
         });
         methods.add_async_method("leader_is_active", |_, this, _: ()| async move {
             let (tx, rx) = bounded(1);
-            this.window
-                .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                    tx.try_send(term_window.leader_is_active()).ok();
-                })));
-            let result = rx
-                .recv_async()
-                .await
-                .map_err(|e| anyhow::anyhow!("{:#}", e))
-                .map_err(luaerr)?;
-
-            Ok(result)
+            let notif = TermWindowNotif::Apply(Box::new(move |term_window| {
+                tx.try_send(term_window.leader_is_active()).ok();
+            }));
+            ask_window(&this.window, "leader_is_active", notif, rx).await
         });
         methods.add_async_method("composition_status", |_, this, _: ()| async move {
             let (tx, rx) = bounded(1);
-            this.window
-                .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                    tx.try_send(match term_window.composition_status() {
-                        DeadKeyStatus::None => None,
-                        DeadKeyStatus::Composing(s) => Some(s.clone()),
-                    })
-                    .ok();
-                })));
-            let result = rx
-                .recv_async()
-                .await
-                .map_err(|e| anyhow::anyhow!("{:#}", e))
-                .map_err(luaerr)?;
-
-            Ok(result)
+            let notif = TermWindowNotif::Apply(Box::new(move |term_window| {
+                tx.try_send(match term_window.composition_status() {
+                    DeadKeyStatus::None => None,
+                    DeadKeyStatus::Composing(s) => Some(s.clone()),
+                })
+                .ok();
+            }));
+            ask_window(&this.window, "composition_status", notif, rx).await
         });
         methods.add_async_method("active_key_table", |_, this, _: ()| async move {
             let (tx, rx) = bounded(1);
-            this.window
-                .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                    tx.try_send(term_window.current_key_table_name()).ok();
-                })));
-            let result = rx
-                .recv_async()
-                .await
-                .map_err(|e| anyhow::anyhow!("{:#}", e))
-                .map_err(luaerr)?;
-
-            Ok(result)
+            let notif = TermWindowNotif::Apply(Box::new(move |term_window| {
+                tx.try_send(term_window.current_key_table_name()).ok();
+            }));
+            ask_window(&this.window, "active_key_table", notif, rx).await
         });
         methods.add_async_method("keyboard_modifiers", |_, this, _: ()| async move {
             let (tx, rx) = bounded(1);
-            this.window
-                .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                    tx.try_send(term_window.current_modifier_and_led_state())
-                        .ok();
-                })));
-            let (mods, leds) = rx
-                .recv_async()
-                .await
-                .map_err(|e| anyhow::anyhow!("{:#}", e))
-                .map_err(luaerr)?;
+            let notif = TermWindowNotif::Apply(Box::new(move |term_window| {
+                tx.try_send(term_window.current_modifier_and_led_state())
+                    .ok();
+            }));
+            let (mods, leds) = ask_window(&this.window, "keyboard_modifiers", notif, rx).await?;
 
             Ok((mods.to_string(), leds.to_string()))
         });
         methods.add_async_method("active_pane", |_, this, _: ()| async move {
             let (tx, rx) = bounded::<Option<MuxPane>>(1);
-            this.window
-                .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                    tx.try_send(
-                        term_window
-                            .get_active_pane_or_overlay()
-                            .map(|pane| MuxPane(pane.pane_id())),
-                    )
-                    .ok();
-                })));
-            let result = rx
-                .recv_async()
-                .await
-                .map_err(|e| anyhow::anyhow!("{:#}", e))
-                .map_err(luaerr)?;
-
-            Ok(result)
+            let notif = TermWindowNotif::Apply(Box::new(move |term_window| {
+                tx.try_send(
+                    term_window
+                        .get_active_pane_or_overlay()
+                        .map(|pane| MuxPane(pane.pane_id())),
+                )
+                .ok();
+            }));
+            ask_window(&this.window, "active_pane", notif, rx).await
         });
         methods.add_method("active_workspace", |_, _, _: ()| {
             let mux = Mux::try_get()
@@ -338,23 +302,23 @@ impl UserData for GuiWin {
             |_, this, pane: UserDataRef<MuxPane>| async move {
                 let (tx, rx) = bounded(1);
                 let pane_id = (*pane).0;
-                this.window
-                    .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                        fn do_it(
-                            pane_id: PaneId,
-                            term_window: &mut TermWindow,
-                        ) -> anyhow::Result<String> {
-                            let mux = Mux::try_get().ok_or_else(|| anyhow::anyhow!("no mux"))?;
-                            let pane = mux
-                                .get_pane(pane_id)
-                                .ok_or_else(|| anyhow::anyhow!("invalid pane {pane_id}"))?;
-                            let lines = term_window.selection_lines(&pane);
-                            lines_to_escapes(lines)
-                        }
-                        tx.try_send(do_it(pane_id, term_window).map_err(|err| format!("{err:#}")))
-                            .ok();
-                    })));
-                let result = rx.recv_async().await.map_err(mlua::Error::external)?;
+                let notif = TermWindowNotif::Apply(Box::new(move |term_window| {
+                    fn do_it(
+                        pane_id: PaneId,
+                        term_window: &mut TermWindow,
+                    ) -> anyhow::Result<String> {
+                        let mux = Mux::try_get().ok_or_else(|| anyhow::anyhow!("no mux"))?;
+                        let pane = mux
+                            .get_pane(pane_id)
+                            .ok_or_else(|| anyhow::anyhow!("invalid pane {pane_id}"))?;
+                        let lines = term_window.selection_lines(&pane);
+                        lines_to_escapes(lines)
+                    }
+                    tx.try_send(do_it(pane_id, term_window).map_err(|err| format!("{err:#}")))
+                        .ok();
+                }));
+                let result =
+                    ask_window(&this.window, "get_selection_escapes_for_pane", notif, rx).await?;
 
                 Ok(result)
             },

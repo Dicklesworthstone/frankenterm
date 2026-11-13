@@ -21,6 +21,7 @@ pub mod render_corpus;
 pub mod render_thread;
 pub mod renderer_slo;
 pub mod rollout_env;
+pub mod window_request;
 pub mod window_state_persist;
 
 /// Release ordering shared with the GUI's banner and notification paths.
