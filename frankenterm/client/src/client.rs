@@ -11805,6 +11805,7 @@ impl TestRpcPeer {
         let request = match prepared.pdu() {
             Pdu::Resize(request) => Pdu::Resize(request.clone()),
             Pdu::SetPalette(request) => Pdu::SetPalette(request.clone()),
+            Pdu::SetFocusedPane(request) => Pdu::SetFocusedPane(request.clone()),
             Pdu::SendMouseEvent(request) => Pdu::SendMouseEvent(request.clone()),
             Pdu::WriteToPane(request) => Pdu::WriteToPane(request.clone()),
             Pdu::SendPaste(request) => Pdu::SendPaste(request.clone()),

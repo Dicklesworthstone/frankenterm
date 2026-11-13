@@ -6524,21 +6524,35 @@ impl Pane for ClientPane {
     }
 
     fn advise_focus(&self) {
-        let mut focused_pane = lock_or_recover(
-            &self.client.focused_remote_pane_id,
-            "focused_remote_pane_id",
-        );
-        if *focused_pane != Some(self.remote_pane_id) {
+        {
+            let mut focused_pane = lock_or_recover(
+                &self.client.focused_remote_pane_id,
+                "focused_remote_pane_id",
+            );
+            if *focused_pane == Some(self.remote_pane_id) {
+                return;
+            }
             focused_pane.replace(self.remote_pane_id);
-            lock_or_recover(&self.client.focus_advisories, "focus_advisories")
-                .advised(self.remote_pane_id, Instant::now());
-            let client = Arc::clone(&self.client);
-            let remote_pane_id = self.remote_pane_id;
-            let request = client.client.set_focused_pane_id(SetFocusedPane {
-                pane_id: remote_pane_id,
-            });
+            // Pending until it is sent. Before the connection is ready (a GUI
+            // launch focuses its windows while they attach),
+            // `ClientDomain::flush_pending_focus` sends it once ready.
+            self.client
+                .focus_delivery_pending
+                .store(true, Ordering::Release);
+        }
+        let rpc = self.client.client.rpc_scope();
+        if !rpc.is_available() {
+            return;
+        }
+        if let Some(request) = self.client.take_pending_focus_delivery(&rpc) {
             if let Err(error) = dispatch_interactive_rpc(request, "set focused pane") {
-                log::error!("failed to schedule remote focused-pane convergence: {error:#}");
+                self.client
+                    .focus_delivery_pending
+                    .store(true, Ordering::Release);
+                log::warn!(
+                    "focused pane not sent; it is sent when the connection is next ready: \
+                     {error:#}"
+                );
             }
         }
     }
@@ -9006,6 +9020,68 @@ mod tests {
         let requests = answer_registration_requests(&executor, &peer);
         assert_eq!(palettes_for(&requests, 29), 1, "{requests:?}");
         assert!(!pane.palette_delivery_is_pending());
+    }
+
+    #[test]
+    fn a_focus_given_before_readiness_is_sent_once_ready() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let pump = || {
+            for _ in 0..16 {
+                if !executor.try_tick().unwrap() {
+                    break;
+                }
+            }
+        };
+        let (inner, peer) = test_client_inner_with_rpc_peer(17);
+        let pane = test_client_pane(&inner, 40, 29);
+        let other = test_client_pane(&inner, 41, 30);
+
+        // A GUI launch focuses its windows while they attach.
+        peer.activate_reconnect_generation(&inner.client).unwrap();
+        pane.focus_changed(true);
+        pump();
+        assert!(peer.is_empty(), "nothing may enter an unready transport");
+        assert!(inner.focus_delivery_pending.load(Ordering::Acquire));
+
+        peer.complete_current_bootstrap(&inner.client).unwrap();
+        ClientDomain::flush_pending_focus(&inner, inner.client.rpc_scope());
+        pump();
+        assert!(
+            !peer.is_empty(),
+            "readiness must send the focus given before it"
+        );
+        let request = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
+        assert!(
+            matches!(request, Pdu::SetFocusedPane(SetFocusedPane { pane_id: 29 })),
+            "{:?}",
+            request
+        );
+        pump();
+        assert!(!inner.focus_delivery_pending.load(Ordering::Acquire));
+
+        ClientDomain::flush_pending_focus(&inner, inner.client.rpc_scope());
+        pump();
+        assert!(peer.is_empty(), "a delivered focus is not sent again");
+
+        // On a ready connection a focus change is sent at once.
+        other.focus_changed(true);
+        pump();
+        assert!(
+            !peer.is_empty(),
+            "a focus change on a ready connection is sent at once"
+        );
+        let request = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
+        assert!(
+            matches!(request, Pdu::SetFocusedPane(SetFocusedPane { pane_id: 30 })),
+            "{:?}",
+            request
+        );
+        pump();
+        assert!(!inner.focus_delivery_pending.load(Ordering::Acquire));
+        assert!(peer.is_empty());
     }
 
     fn test_conditional_input_source(byte: u8) -> ConditionalPaneInputSource {

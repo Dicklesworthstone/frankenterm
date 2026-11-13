@@ -377,6 +377,11 @@ pub struct ClientInner {
     remote_to_local_pane: Mutex<HashMap<PaneId, PaneId>>,
     spare_local_pane_ids: Mutex<Vec<PaneId>>,
     pub focused_remote_pane_id: Mutex<Option<PaneId>>,
+    /// The server has not been sent `focused_remote_pane_id`: the GUI focused
+    /// the pane before the connection was ready, or the send failed.
+    /// `ClientDomain::flush_pending_focus` sends it once the connection is
+    /// ready.
+    pub(crate) focus_delivery_pending: Arc<AtomicBool>,
     pub(crate) focus_advisories: Mutex<FocusAdvisories>,
     pub(crate) reliable_input_queue: Arc<ReliableInputQueue>,
     pub(crate) resize_coordinator: Arc<ClientResizeCoordinator>,
@@ -1594,6 +1599,36 @@ impl ClientInner {
         self.local_to_remote_window(local_window_id)
     }
 
+    /// Send the focused remote pane on `rpc` if its advice is still pending,
+    /// taking the pending mark so that only one sender sends it. A failed send
+    /// marks it pending again, for the next time the connection is ready.
+    ///
+    /// The server reports focus in and out to the programs in its panes
+    /// (DECSET 1004) and answers which pane is active from it. A GUI launch
+    /// focuses its windows while they attach, before the connection is ready;
+    /// that advice failed and was never sent again, so the server kept its
+    /// previous focus (twice at each GUI launch on 2026-11-13).
+    pub(crate) fn take_pending_focus_delivery(
+        &self,
+        rpc: &RpcGenerationScope,
+    ) -> Option<impl Future<Output = anyhow::Result<()>> + Send + 'static> {
+        if !self.focus_delivery_pending.swap(false, Ordering::AcqRel) {
+            return None;
+        }
+        let pane_id = (*lock_or_recover(&self.focused_remote_pane_id, "focused_remote_pane_id"))?;
+        lock_or_recover(&self.focus_advisories, "focus_advisories")
+            .advised(pane_id, Instant::now());
+        let request = rpc.set_focused_pane_id(codec::SetFocusedPane { pane_id });
+        let pending = Arc::clone(&self.focus_delivery_pending);
+        Some(async move {
+            let delivered = request.await.map(|_| ());
+            if delivered.is_err() {
+                pending.store(true, Ordering::Release);
+            }
+            delivered
+        })
+    }
+
     /// How many remote panes this attachment maps.
     pub(crate) fn attached_pane_count(&self) -> usize {
         lock_or_recover(&self.remote_to_local_pane, "remote_to_local_pane").len()
@@ -2049,6 +2084,7 @@ impl ClientInner {
             remote_to_local_pane: Mutex::new(HashMap::new()),
             spare_local_pane_ids: Mutex::new(Vec::new()),
             focused_remote_pane_id: Mutex::new(None),
+            focus_delivery_pending: Arc::new(AtomicBool::new(false)),
             focus_advisories: Mutex::new(FocusAdvisories::default()),
             reliable_input_queue: ReliableInputQueue::new(),
             resize_coordinator: ClientResizeCoordinator::new(),
@@ -3563,6 +3599,7 @@ impl ClientDomain {
         Self::request_user_var_hydration(Arc::clone(&mux), Arc::clone(&expected), rpc.clone())?;
         Self::start_pane_push_tracking(&expected, rpc.clone());
         Self::flush_pending_palettes(&mux, &expected, rpc.clone());
+        Self::flush_pending_focus(&expected, rpc.clone());
         Self::flush_bootstrap_resizes(&mux, &expected);
         client_domain.refresh_layout_snapshot(&mux, &expected);
         ui.close();
@@ -3994,6 +4031,36 @@ impl ClientDomain {
                     if !rpc.is_ready() {
                         break;
                     }
+                }
+            })
+            .detach();
+    }
+
+    /// Send the focused remote pane once the connection is ready, when the
+    /// GUI focused it before then or its send failed.
+    pub(crate) fn flush_pending_focus(inner: &ClientInner, rpc: RpcGenerationScope) {
+        if !rpc.is_available() || !inner.focus_delivery_pending.load(Ordering::Acquire) {
+            return;
+        }
+        let reservation = match reserve_client_main_thread(
+            promise::spawn::MainThreadServiceClass::Background,
+            1024,
+            "focused pane delivery",
+        ) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                // It stays pending for the next time the connection is ready.
+                log::warn!("focused pane not sent after readiness: {error:#}");
+                return;
+            }
+        };
+        let Some(request) = inner.take_pending_focus_delivery(&rpc) else {
+            return;
+        };
+        reservation
+            .spawn(async move {
+                if let Err(error) = request.await {
+                    log::debug!("focused pane not delivered; it stays pending: {error:#}");
                 }
             })
             .detach();
@@ -5658,6 +5725,7 @@ impl ClientDomain {
         Self::request_user_var_hydration(Arc::clone(mux), Arc::clone(&inner), rpc.clone())?;
         Self::start_pane_push_tracking(&inner, rpc.clone());
         Self::flush_pending_palettes(mux, &inner, rpc.clone());
+        Self::flush_pending_focus(&inner, rpc.clone());
         Self::flush_bootstrap_resizes(mux, &inner);
         domain.refresh_layout_snapshot(mux, &inner);
         cleanup.disarm();
