@@ -187,7 +187,8 @@ impl UiAtlas<'_> {
 }
 
 /// What one independently reusable GPU texture currently holds. The native
-/// renderer keeps one alongside each leased frame slot's chrome texture.
+/// renderer keeps one alongside each chrome texture, which the frame slots
+/// holding that version share.
 #[derive(Debug, Default)]
 #[cfg(any(target_os = "macos", test))]
 pub(crate) struct UiAtlasUploads {

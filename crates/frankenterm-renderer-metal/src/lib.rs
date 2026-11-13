@@ -163,10 +163,13 @@
 //!     bytes-per-pixel bytes at a tight row pitch and is borrowed for the
 //!     call; the texture is in shared storage, which the CPU may write.
 //!     Chrome atlases use the same operation on validated full-width pixel
-//!     stripes. Each chrome texture belongs to one frame slot; a lease from
-//!     that slot's ring is required before changing or replacing it, so all
-//!     earlier GPU reads of those pixels have completed. Every stripe's byte
-//!     length and the complete extent are checked before the first write.
+//!     stripes. Frame slots holding one chrome atlas version share its
+//!     texture, and a slot changes the texture it holds only under a lease
+//!     from its ring, so a frame in flight samples only textures its slot
+//!     holds. A chrome texture is written only while the leased slot holds
+//!     it alone, so all earlier GPU reads of those pixels have completed,
+//!     and released once no slot holds it. Every stripe's byte length and
+//!     the complete extent are checked before the first write.
 //! 11. **THREAD-HANDOFF: moving a renderer to its render thread.**
 //!     `MetalRendererHandoff` is `Send` (ft-yccm0.4.1.2). A window's renderer
 //!     is attached on the main thread, as AppKit requires, then moved whole to

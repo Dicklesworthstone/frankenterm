@@ -126,6 +126,9 @@ pub(crate) struct FrameSlots {
     panes: HashMap<u64, PaneBuffers>,
     /// Per slot: the window frame's uniform blocks and fill cell.
     window: Vec<WindowSlot>,
+    /// The chrome textures, by the ids in [`WindowSlot::ui_atlas`]. Slots
+    /// that hold one atlas version share its texture (ft-ulmi2).
+    ui_atlases: Vec<Option<UiAtlasTexture>>,
 }
 
 /// Frames a pane may go undrawn (a tab switched away, say) before its
@@ -174,9 +177,12 @@ struct WindowSlot {
     /// The chrome quads (ft-yccm0.4.7.1): their uniforms, then the quads
     /// from [`UI_UNIFORMS_BYTES`] on.
     ui: Option<SlotAllocation>,
-    /// A persistent chrome atlas. The slot lease guarantees its previous
-    /// readers have completed before pixels are changed or it is replaced.
-    ui_atlas: Option<UiAtlasTexture>,
+    /// Which of [`FrameSlots::ui_atlases`] the chrome samples. A slot
+    /// changes it only under its lease, once its previous frame completed,
+    /// so a frame in flight samples only textures that its slot still
+    /// holds. A texture is therefore written only while one slot alone
+    /// holds it, and released once no slot does.
+    ui_atlas: Option<usize>,
 }
 
 /// The texture chrome quads sample (ft-yccm0.4.7.1), holding the
@@ -211,6 +217,7 @@ impl FrameSlots {
             upload_plan: UploadPlan::default(),
             panes: HashMap::new(),
             window: (0..FRAME_SLOTS).map(|_| WindowSlot::default()).collect(),
+            ui_atlases: Vec::new(),
         };
         for index in 0..FRAME_SLOTS {
             let mut buffers = Vec::with_capacity(SlotBuffer::ALL.len());
@@ -912,38 +919,61 @@ impl FrameSlots {
         Ok(layer.quads.len())
     }
 
-    /// Fits and updates only the leased slot's chrome texture. Every slot
-    /// catches up from its own stripe versions, with no in-flight texture
-    /// mutation and no full-atlas allocation on ordinary glyph additions.
+    /// Makes the leased slot's chrome texture hold `atlas` (ft-ulmi2). The
+    /// slot shares the texture of a slot that already holds this version.
+    /// Otherwise it updates its texture in place when no other slot holds
+    /// it, catching up from the texture's own stripe versions, and else
+    /// takes a new texture: one that other slots hold may be in flight and
+    /// is never written. Chrome that stops changing so ends up in one
+    /// texture for all slots, where each slot used to keep its own copy.
     fn write_ui_atlas(&mut self, lease: &SlotLease, atlas: UiAtlas<'_>) -> Result<u64, FrameError> {
         assert!(lease.is_from(&self.ring), "a foreign chrome atlas lease");
         let slot = lease.slot();
-        if self.window[slot]
-            .ui_atlas
-            .as_ref()
+        if self
+            .ui_atlas(slot)
             .is_some_and(|texture| texture.uploads.is_current(atlas))
         {
             return Ok(0);
         }
         atlas.validate()?;
-        let replace = self.window[slot].ui_atlas.as_ref().is_none_or(|texture| {
-            texture.texture.width() != atlas.width as usize
-                || texture.texture.height() != atlas.height as usize
+        let held = self.window.iter().find_map(|window| {
+            let id = window.ui_atlas?;
+            let texture = self.ui_atlases[id].as_ref()?;
+            texture.uploads.is_current(atlas).then_some(id)
         });
-        if replace {
+        if let Some(id) = held {
+            if self.hold_ui_atlas(slot, Some(id)) {
+                self.commit_residency();
+            }
+            return Ok(0);
+        }
+        let own = self.window[slot].ui_atlas.filter(|&id| {
+            self.ui_atlas_holders(id) == 1
+                && self.ui_atlases[id].as_ref().is_some_and(|texture| {
+                    texture.texture.width() == atlas.width as usize
+                        && texture.texture.height() == atlas.height as usize
+                })
+        });
+        let id = if let Some(id) = own {
+            id
+        } else {
             let replacement = self.allocate_ui_atlas(atlas)?;
             if let Some(set) = &self.residency {
                 set.addAllocation(ProtocolObject::from_ref(&*replacement.texture));
             }
-            if let Some(old) = self.window[slot].ui_atlas.replace(replacement)
-                && let Some(set) = &self.residency
-            {
-                set.removeAllocation(ProtocolObject::from_ref(&*old.texture));
-            }
+            let id = if let Some(free) = self.ui_atlases.iter().position(Option::is_none) {
+                self.ui_atlases[free] = Some(replacement);
+                free
+            } else {
+                self.ui_atlases.push(Some(replacement));
+                self.ui_atlases.len() - 1
+            };
+            self.hold_ui_atlas(slot, Some(id));
             self.commit_residency();
-        }
-        let Some(texture) = self.window[slot].ui_atlas.as_mut() else {
-            unreachable!("the chrome texture was just allocated");
+            id
+        };
+        let Some(texture) = self.ui_atlases[id].as_mut() else {
+            unreachable!("the slot's chrome texture is held");
         };
         let bytes_per_row = atlas.width as usize * 4;
         let UiAtlasTexture {
@@ -965,8 +995,10 @@ impl FrameSlots {
                 },
             };
             #[allow(unsafe_code)]
-            // SAFETY: ATLAS-UPLOAD. The same-ring lease guarantees every
-            // previous GPU reader of this slot's texture has completed.
+            // SAFETY: ATLAS-UPLOAD. The texture is new or held by this slot
+            // alone, a frame in flight samples only textures its own slot
+            // holds, and the same-ring lease guarantees this slot's previous
+            // GPU readers have completed. So no reader is in flight.
             // All stripes were validated before any write; this full-width
             // region fits the texture and rgba holds exactly rows * pitch
             // bytes. Its borrow stays alive for the synchronous copy into
@@ -1017,11 +1049,44 @@ impl FrameSlots {
         })
     }
 
+    /// The chrome texture `slot` holds.
+    fn ui_atlas(&self, slot: usize) -> Option<&UiAtlasTexture> {
+        self.ui_atlases[self.window[slot].ui_atlas?].as_ref()
+    }
+
+    /// How many slots hold the chrome texture `id`.
+    fn ui_atlas_holders(&self, id: usize) -> usize {
+        self.window
+            .iter()
+            .filter(|window| window.ui_atlas == Some(id))
+            .count()
+    }
+
+    /// Points `slot`'s chrome at texture `id`, releasing the texture it held
+    /// once no slot holds that. True when the residency set changed and
+    /// needs a commit.
+    fn hold_ui_atlas(&mut self, slot: usize, id: Option<usize>) -> bool {
+        let Some(previous) = std::mem::replace(&mut self.window[slot].ui_atlas, id) else {
+            return false;
+        };
+        if Some(previous) == id || self.ui_atlas_holders(previous) > 0 {
+            return false;
+        }
+        let Some(released) = self.ui_atlases[previous].take() else {
+            return false;
+        };
+        let Some(set) = &self.residency else {
+            return false;
+        };
+        set.removeAllocation(ProtocolObject::from_ref(&*released.texture));
+        true
+    }
+
     /// The leased slot's chrome buffer and the chrome atlas, once written.
     pub(crate) fn ui_buffers(&self, slot: usize) -> Option<UiBuffers<'_>> {
         Some(UiBuffers {
             buffer: &self.window[slot].ui.as_ref()?.buffer,
-            atlas: &self.window[slot].ui_atlas.as_ref()?.texture,
+            atlas: &self.ui_atlas(slot)?.texture,
         })
     }
 
@@ -2866,161 +2931,209 @@ mod tests {
     }
 
     #[test]
-    // One lifecycle exercises all three slot histories, in-flight exclusion,
-    // malformed input and replacement without losing its resource identities.
+    // One lifecycle exercises sharing, in-flight exclusion, in-place
+    // catch-up, malformed input, replacement and release (ft-ulmi2).
     #[allow(clippy::too_many_lines)]
-    fn chrome_atlas_slots_reuse_textures_and_catch_up_without_touching_in_flight_pixels() {
+    fn chrome_atlas_slots_share_one_texture_and_never_write_one_in_flight() {
         use crate::ui_quads::{UiAtlasPixels, UiAtlasStripe};
 
+        const WIDTH: u32 = 16;
+        const HEIGHT: u32 = 65;
+        fn atlas(version: u64, stripes: &[UiAtlasStripe]) -> UiAtlas<'_> {
+            UiAtlas {
+                width: WIDTH,
+                height: HEIGHT,
+                version,
+                pixels: UiAtlasPixels::Stripes(stripes),
+            }
+        }
+        let full = u64::from(WIDTH * HEIGHT * 4);
         let device = device();
         let queue = device.newCommandQueue().unwrap();
         let ledger = private_ledger();
         let mut frames = FrameSlots::new(device.clone(), SMALL, ledger).unwrap();
-        let width = 16_u32;
-        let height = 65_u32;
         let stripe = |version, rows, byte| UiAtlasStripe {
             version,
-            rgba: Arc::from(vec![byte; width as usize * rows * 4]),
+            rgba: Arc::from(vec![byte; WIDTH as usize * rows * 4]),
         };
-        let original = vec![stripe(10, 32, 1), stripe(10, 32, 2), stripe(10, 1, 3)];
         let flatten = |stripes: &[UiAtlasStripe]| {
             stripes
                 .iter()
                 .flat_map(|stripe| stripe.rgba.iter().copied())
                 .collect::<Vec<_>>()
         };
-        let mut tokens = Vec::new();
-        let mut identities = Vec::new();
-        for index in 0..FRAME_SLOTS {
-            let lease = frames.begin(SMALL, LONG).unwrap();
-            assert_eq!(lease.slot(), index);
-            let atlas = UiAtlas {
-                width,
-                height,
-                version: 10,
-                pixels: UiAtlasPixels::Stripes(&original),
-            };
-            assert_eq!(
-                frames.write_ui_atlas(&lease, atlas).unwrap(),
-                u64::from(width * height * 4)
-            );
-            assert_eq!(frames.write_ui_atlas(&lease, atlas).unwrap(), 0);
-            identities.push(std::ptr::from_ref(
-                &*frames.window[index].ui_atlas.as_ref().unwrap().texture,
-            ));
-            tokens.push(lease.submit());
-        }
-        assert!(
-            frames.begin(SMALL, Duration::ZERO).is_err(),
-            "all three textures are in flight"
-        );
-        let original_resident = frames.residency().map(MTLResidencySet::allocationCount);
-        let read = |frames: &FrameSlots, index: usize| {
+        let identity = |frames: &FrameSlots, slot: usize| {
+            std::ptr::from_ref(&*frames.ui_atlas(slot).unwrap().texture).addr()
+        };
+        let read = |frames: &FrameSlots, slot: usize| {
             // The readback helper copies raw four-byte texels; RGBA chrome
             // bytes retain their order just as BGRA render targets do.
             read_texture_bgra(
                 &device,
                 &queue,
-                &frames.window[index].ui_atlas.as_ref().unwrap().texture,
-                width,
-                height,
+                &frames.ui_atlas(slot).unwrap().texture,
+                WIDTH,
+                HEIGHT,
             )
             .unwrap()
         };
+        let textures = || {
+            let counter = ledger.texture_counter(GpuTexturePurpose::Atlas);
+            (counter.created_total, counter.live_count)
+        };
+
+        // Every slot draws version 10. The first uploads it; the others
+        // share its texture.
+        let original = vec![stripe(10, 32, 1), stripe(10, 32, 2), stripe(10, 1, 3)];
+        let mut tokens = Vec::new();
+        for slot in 0..FRAME_SLOTS {
+            let lease = frames.begin(SMALL, LONG).unwrap();
+            assert_eq!(lease.slot(), slot);
+            assert_eq!(
+                frames.write_ui_atlas(&lease, atlas(10, &original)).unwrap(),
+                if slot == 0 { full } else { 0 }
+            );
+            assert_eq!(
+                frames.write_ui_atlas(&lease, atlas(10, &original)).unwrap(),
+                0
+            );
+            assert_eq!(identity(&frames, slot), identity(&frames, 0));
+            tokens.push(lease.submit());
+        }
+        assert!(
+            frames.begin(SMALL, Duration::ZERO).is_err(),
+            "all three slots are in flight"
+        );
+        assert_eq!(textures(), (1, 1));
+        let resident = frames.residency().map(MTLResidencySet::allocationCount);
+
+        // Slot 0 changes a stripe while slots 1 and 2 still draw the shared
+        // texture: it takes a new, fully initialized texture.
         let mut changed = original.clone();
         changed[1] = stripe(11, 32, 7);
+        let version_11 = flatten(&changed);
         tokens[0].complete();
         let lease = frames.begin(SMALL, LONG).unwrap();
         assert_eq!(lease.slot(), 0);
-        let atlas = UiAtlas {
-            width,
-            height,
-            version: 11,
-            pixels: UiAtlasPixels::Stripes(&changed),
-        };
         assert_eq!(
-            frames.write_ui_atlas(&lease, atlas).unwrap(),
-            u64::from(width * 32 * 4)
+            frames.write_ui_atlas(&lease, atlas(11, &changed)).unwrap(),
+            full
         );
-        assert_eq!(read(&frames, 0), flatten(&changed));
-        for index in 1..FRAME_SLOTS {
+        assert_eq!(read(&frames, 0), version_11);
+        for slot in 1..FRAME_SLOTS {
             assert_eq!(
-                read(&frames, index),
+                read(&frames, slot),
                 flatten(&original),
                 "in-flight pixels stay unchanged"
             );
         }
-        drop(lease);
+        assert_ne!(identity(&frames, 0), identity(&frames, 1));
+        assert_eq!(textures(), (2, 2));
+        tokens[0] = lease.submit();
 
-        // Slot 1 missed version 11: it must upload both changed stripes,
-        // including the one-row tail, directly from version 12's snapshot.
+        // Slot 1 moves on to version 12, which changes the one-row tail too.
+        // It still shares its texture with slot 2, and slot 0's is in flight
+        // as well, so it takes a third.
         changed[2] = stripe(12, 1, 9);
+        let version_12 = flatten(&changed);
         tokens[1].complete();
         let lease = frames.begin(SMALL, LONG).unwrap();
         assert_eq!(lease.slot(), 1);
-        let atlas = UiAtlas {
-            width,
-            height,
-            version: 12,
-            pixels: UiAtlasPixels::Stripes(&changed),
-        };
         assert_eq!(
-            frames.write_ui_atlas(&lease, atlas).unwrap(),
-            u64::from(width * 33 * 4)
+            frames.write_ui_atlas(&lease, atlas(12, &changed)).unwrap(),
+            full
         );
-        assert_eq!(read(&frames, 1), flatten(&changed));
+        assert_eq!(read(&frames, 0), version_11);
+        assert_eq!(read(&frames, 1), version_12);
         assert_eq!(read(&frames, 2), flatten(&original));
-        for (index, identity) in identities.into_iter().enumerate() {
-            assert!(std::ptr::eq(
-                &raw const *frames.window[index].ui_atlas.as_ref().unwrap().texture,
-                identity
-            ));
-        }
-        let counter = ledger.texture_counter(GpuTexturePurpose::Atlas);
-        assert_eq!(counter.created_total, slots_u64());
-        assert_eq!(counter.live_count, slots_u64());
+        assert_eq!(textures(), (3, 3));
+        tokens[1] = lease.submit();
+
+        // Slot 2 shares slot 1's texture for version 12. No slot holds the
+        // first texture any more, so it is released.
+        tokens[2].complete();
+        let lease = frames.begin(SMALL, LONG).unwrap();
+        assert_eq!(lease.slot(), 2);
         assert_eq!(
-            counter.live_bytes,
-            u64::from(width * height * 4) * slots_u64()
+            frames.write_ui_atlas(&lease, atlas(12, &changed)).unwrap(),
+            0
         );
+        assert_eq!(identity(&frames, 2), identity(&frames, 1));
+        assert_eq!(textures(), (3, 2));
+        tokens[2] = lease.submit();
+
+        // Slot 0 alone holds its texture, at version 11. It catches up in
+        // place to version 13, uploading only the two stripes changed since,
+        // including the tail it missed at version 12.
+        let mut latest = changed.clone();
+        latest[0] = stripe(13, 32, 4);
+        tokens[0].complete();
+        let lease = frames.begin(SMALL, LONG).unwrap();
+        assert_eq!(lease.slot(), 0);
+        let own = identity(&frames, 0);
         assert_eq!(
-            frames.residency().map(MTLResidencySet::allocationCount),
-            original_resident
+            frames.write_ui_atlas(&lease, atlas(13, &latest)).unwrap(),
+            u64::from(WIDTH * 33 * 4)
         );
+        assert_eq!(identity(&frames, 0), own);
+        assert_eq!(read(&frames, 0), flatten(&latest));
+        assert_eq!(
+            read(&frames, 1),
+            version_12,
+            "in-flight pixels stay unchanged"
+        );
+        assert_eq!(textures(), (3, 2));
 
         // Validate the entire snapshot before any write, including a bad
         // final stripe after an earlier stripe changed.
-        let mut invalid = changed.clone();
-        invalid[0] = stripe(13, 32, 8);
+        let mut invalid = latest.clone();
+        invalid[1] = stripe(14, 32, 8);
         invalid[2].rgba = Arc::from([0_u8; 1]);
-        assert!(
-            frames
-                .write_ui_atlas(
-                    &lease,
-                    UiAtlas {
-                        version: 13,
-                        pixels: UiAtlasPixels::Stripes(&invalid),
-                        ..atlas
-                    }
-                )
-                .is_err()
-        );
-        assert_eq!(read(&frames, 1), flatten(&changed));
+        assert!(frames.write_ui_atlas(&lease, atlas(14, &invalid)).is_err());
+        assert_eq!(read(&frames, 0), flatten(&latest));
         assert_eq!(
-            frames.write_ui_atlas(&lease, atlas).unwrap(),
+            frames.write_ui_atlas(&lease, atlas(13, &latest)).unwrap(),
             0,
             "invalid input did not advance history"
         );
+        tokens[0] = lease.submit();
 
-        // A size change creates and fully initializes one replacement only
-        // after validation. It does not leave a retired texture resident.
-        let resized_pixels = vec![0x5a; 8 * height as usize * 4];
+        // Once the chrome stops changing, every slot shares one texture
+        // again and the others are released.
+        for (slot, token) in tokens.iter_mut().enumerate().skip(1) {
+            token.complete();
+            let lease = frames.begin(SMALL, LONG).unwrap();
+            assert_eq!(lease.slot(), slot);
+            assert_eq!(
+                frames.write_ui_atlas(&lease, atlas(13, &latest)).unwrap(),
+                0
+            );
+            assert_eq!(identity(&frames, slot), identity(&frames, 0));
+            *token = lease.submit();
+        }
+        assert_eq!(textures(), (3, 1));
+        assert_eq!(
+            ledger.texture_counter(GpuTexturePurpose::Atlas).live_bytes,
+            full
+        );
+        assert_eq!(
+            frames.residency().map(MTLResidencySet::allocationCount),
+            resident
+        );
+
+        // A size change creates and fully initializes a replacement only
+        // after validation. The texture it replaces is released once the
+        // other slots move on too, and leaves nothing resident behind.
+        let resized_pixels = vec![0x5a; 8 * HEIGHT as usize * 4];
         let resized = UiAtlas {
             width: 8,
-            height,
-            version: 14,
+            height: HEIGHT,
+            version: 15,
             pixels: UiAtlasPixels::Rgba(&resized_pixels),
         };
+        tokens[0].complete();
+        let lease = frames.begin(SMALL, LONG).unwrap();
+        assert_eq!(lease.slot(), 0);
         assert_eq!(
             frames.write_ui_atlas(&lease, resized).unwrap(),
             resized_pixels.len() as u64
@@ -3029,26 +3142,27 @@ mod tests {
             read_texture_bgra(
                 &device,
                 &queue,
-                &frames.window[1].ui_atlas.as_ref().unwrap().texture,
+                &frames.ui_atlas(0).unwrap().texture,
                 8,
-                height
+                HEIGHT
             )
             .unwrap(),
             resized_pixels
         );
-        assert_eq!(
-            ledger
-                .texture_counter(GpuTexturePurpose::Atlas)
-                .created_total,
-            slots_u64() + 1
-        );
-        assert_eq!(
-            ledger.texture_counter(GpuTexturePurpose::Atlas).live_count,
-            slots_u64()
-        );
+        assert_eq!(read(&frames, 1), flatten(&latest));
+        assert_eq!(textures(), (4, 2));
+        tokens[0] = lease.submit();
+        for (slot, token) in tokens.iter_mut().enumerate().skip(1) {
+            token.complete();
+            let lease = frames.begin(SMALL, LONG).unwrap();
+            assert_eq!(lease.slot(), slot);
+            assert_eq!(frames.write_ui_atlas(&lease, resized).unwrap(), 0);
+            *token = lease.submit();
+        }
+        assert_eq!(textures(), (4, 1));
         assert_eq!(
             frames.residency().map(MTLResidencySet::allocationCount),
-            original_resident
+            resident
         );
     }
 
