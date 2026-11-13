@@ -164,10 +164,11 @@
 //!     call; the texture is in shared storage, which the CPU may write.
 //!     Chrome atlases use the same operation on validated full-width pixel
 //!     stripes. Frame slots holding one chrome atlas version share its
-//!     texture, and a slot changes the texture it holds only under a lease
-//!     from its ring, so a frame in flight samples only textures its slot
-//!     holds. A chrome texture is written only while the leased slot holds
-//!     it alone, so all earlier GPU reads of those pixels have completed,
+//!     texture. A slot changes the texture it holds only under a lease from
+//!     its ring, and loses it only while no frame of its is in flight, so a
+//!     frame in flight samples only textures its slot holds. A chrome
+//!     texture is written only while no other slot with a frame in flight
+//!     holds it, so all earlier GPU reads of those pixels have completed,
 //!     and released once no slot holds it. Every stripe's byte length and
 //!     the complete extent are checked before the first write.
 //! 11. **THREAD-HANDOFF: moving a renderer to its render thread.**

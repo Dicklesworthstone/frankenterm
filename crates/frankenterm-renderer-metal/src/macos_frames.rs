@@ -13,7 +13,7 @@ use crate::cell_bg::{BACKGROUND_SHADER, BackgroundUniforms, CellBgGrid};
 use crate::cell_text::{CellTextGrid, TEXT_SHADER, TextUniforms, atlas_texture_index};
 use crate::frame::{
     CELL_TEXT_INSTANCE_BYTES, CompletionToken, FRAME_SLOTS, FrameUniforms, GridExtent,
-    ROW_TABLE_BYTES_PER_ROW, SlotBuffer, SlotLease, SlotRing, SlotSizes, UNIFORMS_BYTES,
+    ROW_TABLE_BYTES_PER_ROW, SlotBuffer, SlotLease, SlotRing, SlotSizes, SlotState, UNIFORMS_BYTES,
     grown_capacity,
 };
 use crate::macos_atlas::GlyphAtlases;
@@ -178,9 +178,10 @@ struct WindowSlot {
     /// from [`UI_UNIFORMS_BYTES`] on.
     ui: Option<SlotAllocation>,
     /// Which of [`FrameSlots::ui_atlases`] the chrome samples. A slot
-    /// changes it only under its lease, once its previous frame completed,
-    /// so a frame in flight samples only textures that its slot still
-    /// holds. A texture is therefore written only while one slot alone
+    /// changes it under its lease, once its previous frame completed, and
+    /// loses it only while no frame of its is in flight. So a frame in
+    /// flight samples only textures that its slot still holds. A texture is
+    /// therefore written only while no other slot with a frame in flight
     /// holds it, and released once no slot does.
     ui_atlas: Option<usize>,
 }
@@ -921,11 +922,13 @@ impl FrameSlots {
 
     /// Makes the leased slot's chrome texture hold `atlas` (ft-ulmi2). The
     /// slot shares the texture of a slot that already holds this version.
-    /// Otherwise it updates its texture in place when no other slot holds
-    /// it, catching up from the texture's own stripe versions, and else
-    /// takes a new texture: one that other slots hold may be in flight and
-    /// is never written. Chrome that stops changing so ends up in one
-    /// texture for all slots, where each slot used to keep its own copy.
+    /// Otherwise it updates a texture in place that no slot with a frame in
+    /// flight holds, its own first, catching up from that texture's own
+    /// stripe versions; else it takes a new texture. A texture that a frame
+    /// in flight may sample is never written. Idle slots then let go of
+    /// other textures. So chrome that stops changing ends up in one texture
+    /// for all slots, where each slot used to keep its own copy, and an
+    /// idle window's chrome change rewrites that one texture in place.
     fn write_ui_atlas(&mut self, lease: &SlotLease, atlas: UiAtlas<'_>) -> Result<u64, FrameError> {
         assert!(lease.is_from(&self.ring), "a foreign chrome atlas lease");
         let slot = lease.slot();
@@ -933,6 +936,7 @@ impl FrameSlots {
             .ui_atlas(slot)
             .is_some_and(|texture| texture.uploads.is_current(atlas))
         {
+            self.release_idle_ui_atlases(slot);
             return Ok(0);
         }
         atlas.validate()?;
@@ -945,16 +949,29 @@ impl FrameSlots {
             if self.hold_ui_atlas(slot, Some(id)) {
                 self.commit_residency();
             }
+            self.release_idle_ui_atlases(slot);
             return Ok(0);
         }
-        let own = self.window[slot].ui_atlas.filter(|&id| {
-            self.ui_atlas_holders(id) == 1
+        let writable = |id: usize| {
+            !self.ui_atlas_in_flight(id, slot)
                 && self.ui_atlases[id].as_ref().is_some_and(|texture| {
                     texture.texture.width() == atlas.width as usize
                         && texture.texture.height() == atlas.height as usize
                 })
-        });
+        };
+        let own = self.window[slot]
+            .ui_atlas
+            .filter(|&id| writable(id))
+            .or_else(|| {
+                self.window
+                    .iter()
+                    .filter_map(|window| window.ui_atlas)
+                    .find(|&id| writable(id))
+            });
         let id = if let Some(id) = own {
+            if self.hold_ui_atlas(slot, Some(id)) {
+                self.commit_residency();
+            }
             id
         } else {
             let replacement = self.allocate_ui_atlas(atlas)?;
@@ -972,6 +989,7 @@ impl FrameSlots {
             self.commit_residency();
             id
         };
+        self.release_idle_ui_atlases(slot);
         let Some(texture) = self.ui_atlases[id].as_mut() else {
             unreachable!("the slot's chrome texture is held");
         };
@@ -995,10 +1013,11 @@ impl FrameSlots {
                 },
             };
             #[allow(unsafe_code)]
-            // SAFETY: ATLAS-UPLOAD. The texture is new or held by this slot
-            // alone, a frame in flight samples only textures its own slot
-            // holds, and the same-ring lease guarantees this slot's previous
-            // GPU readers have completed. So no reader is in flight.
+            // SAFETY: ATLAS-UPLOAD. The texture is new, or no other slot with
+            // a frame in flight holds it; a frame in flight samples only
+            // textures its own slot holds, and the same-ring lease guarantees
+            // this slot's previous GPU readers have completed. So no reader
+            // is in flight.
             // All stripes were validated before any write; this full-width
             // region fits the texture and rgba holds exactly rows * pitch
             // bytes. Its borrow stays alive for the synchronous copy into
@@ -1060,6 +1079,36 @@ impl FrameSlots {
             .iter()
             .filter(|window| window.ui_atlas == Some(id))
             .count()
+    }
+
+    /// Whether a slot other than the leased `slot` holds chrome texture `id`
+    /// while a frame of its may be in flight. Only the render thread's own
+    /// lease moves a slot out of Free, so a Free slot stays idle until this
+    /// frame is encoded.
+    fn ui_atlas_in_flight(&self, id: usize, slot: usize) -> bool {
+        (0..FRAME_SLOTS).any(|other| {
+            other != slot
+                && self.window[other].ui_atlas == Some(id)
+                && self.ring.state(other) != SlotState::Free
+        })
+    }
+
+    /// Makes the slots other than the leased `slot` that have no frame in
+    /// flight let go of chrome textures other than `slot`'s. They draw
+    /// nothing until their next lease, which picks a texture again. A
+    /// texture that no slot holds any more is released.
+    fn release_idle_ui_atlases(&mut self, slot: usize) {
+        let keep = self.window[slot].ui_atlas;
+        let mut released = false;
+        for other in (0..FRAME_SLOTS).filter(|&other| other != slot) {
+            let held = self.window[other].ui_atlas;
+            if held.is_some() && held != keep && self.ring.state(other) == SlotState::Free {
+                released |= self.hold_ui_atlas(other, None);
+            }
+        }
+        if released {
+            self.commit_residency();
+        }
     }
 
     /// Points `slot`'s chrome at texture `id`, releasing the texture it held
@@ -3164,6 +3213,123 @@ mod tests {
             frames.residency().map(MTLResidencySet::allocationCount),
             resident
         );
+    }
+
+    #[test]
+    fn idle_slots_let_an_idle_windows_chrome_change_reuse_its_one_texture() {
+        use crate::ui_quads::{UiAtlasPixels, UiAtlasStripe};
+
+        const WIDTH: u32 = 16;
+        const HEIGHT: u32 = 40;
+        fn atlas(version: u64, stripes: &[UiAtlasStripe]) -> UiAtlas<'_> {
+            UiAtlas {
+                width: WIDTH,
+                height: HEIGHT,
+                version,
+                pixels: UiAtlasPixels::Stripes(stripes),
+            }
+        }
+        let full = u64::from(WIDTH * HEIGHT * 4);
+        let device = device();
+        let queue = device.newCommandQueue().unwrap();
+        let ledger = private_ledger();
+        let mut frames = FrameSlots::new(device.clone(), SMALL, ledger).unwrap();
+        let stripe = |version, rows, byte| UiAtlasStripe {
+            version,
+            rgba: Arc::from(vec![byte; WIDTH as usize * rows * 4]),
+        };
+        let identity = |frames: &FrameSlots, slot: usize| {
+            std::ptr::from_ref(&*frames.ui_atlas(slot).unwrap().texture).addr()
+        };
+        let textures = || {
+            let counter = ledger.texture_counter(GpuTexturePurpose::Atlas);
+            (counter.created_total, counter.live_count)
+        };
+
+        // Every slot draws version 20 and every frame completes: an idle
+        // window.
+        let original = vec![stripe(20, 32, 1), stripe(20, 8, 2)];
+        for slot in 0..FRAME_SLOTS {
+            let lease = frames.begin(SMALL, LONG).unwrap();
+            assert_eq!(lease.slot(), slot);
+            assert_eq!(
+                frames.write_ui_atlas(&lease, atlas(20, &original)).unwrap(),
+                if slot == 0 { full } else { 0 }
+            );
+            lease.submit().complete();
+        }
+        assert_eq!(textures(), (1, 1));
+
+        // Its chrome changes. No frame is in flight, so the one texture is
+        // rewritten in place: only the changed stripe is uploaded.
+        let mut changed = original.clone();
+        changed[1] = stripe(21, 8, 3);
+        let lease = frames.begin(SMALL, LONG).unwrap();
+        assert_eq!(lease.slot(), 0);
+        let texture = identity(&frames, 0);
+        assert_eq!(
+            frames.write_ui_atlas(&lease, atlas(21, &changed)).unwrap(),
+            u64::from(WIDTH * 8 * 4)
+        );
+        assert_eq!(identity(&frames, 0), texture);
+        assert_eq!(textures(), (1, 1));
+        let pixels: Vec<u8> = changed
+            .iter()
+            .flat_map(|stripe| stripe.rgba.iter().copied())
+            .collect();
+        assert_eq!(
+            read_texture_bgra(
+                &device,
+                &queue,
+                &frames.ui_atlas(0).unwrap().texture,
+                WIDTH,
+                HEIGHT
+            )
+            .unwrap(),
+            pixels
+        );
+        lease.submit().complete();
+
+        // Slots 1 and 2 draw it with frames left in flight, so the next
+        // change takes a second texture.
+        let mut tokens = Vec::new();
+        for slot in 1..FRAME_SLOTS {
+            let lease = frames.begin(SMALL, LONG).unwrap();
+            assert_eq!(lease.slot(), slot);
+            assert_eq!(
+                frames.write_ui_atlas(&lease, atlas(21, &changed)).unwrap(),
+                0
+            );
+            assert_eq!(identity(&frames, slot), texture);
+            tokens.push(lease.submit());
+        }
+        let mut latest = changed.clone();
+        latest[0] = stripe(22, 32, 4);
+        let lease = frames.begin(SMALL, LONG).unwrap();
+        assert_eq!(lease.slot(), 0);
+        assert_eq!(
+            frames.write_ui_atlas(&lease, atlas(22, &latest)).unwrap(),
+            full
+        );
+        assert_ne!(identity(&frames, 0), texture);
+        assert_eq!(textures(), (2, 2));
+        lease.submit().complete();
+
+        // Those frames complete and the window goes idle. Its next frame,
+        // in slot 1, shares the new texture and makes idle slot 2 let go of
+        // the old one, which is released.
+        for token in &tokens {
+            token.complete();
+        }
+        let lease = frames.begin(SMALL, LONG).unwrap();
+        assert_eq!(lease.slot(), 1);
+        assert_eq!(
+            frames.write_ui_atlas(&lease, atlas(22, &latest)).unwrap(),
+            0
+        );
+        assert_eq!(identity(&frames, 1), identity(&frames, 0));
+        assert!(frames.ui_atlas(2).is_none());
+        assert_eq!(textures(), (2, 1));
     }
 
     /// The buffers of one slot that resizing from `from` to `to` reallocates,
