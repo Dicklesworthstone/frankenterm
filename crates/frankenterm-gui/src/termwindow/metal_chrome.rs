@@ -283,6 +283,46 @@ fn ui_quad(
     }
 }
 
+/// Runs `attempt(side, restart)` until one frame's chrome fits the chrome
+/// atlas, and returns the side that held it. `attempt` paints the chrome
+/// into an atlas of `side`, which it creates afresh when `restart` is set or
+/// the current atlas has another side, and says whether it created one.
+///
+/// A full atlas that earlier frames filled first starts over at its own
+/// side, as the WebGpu paint loop recreates its glyph atlas at its current
+/// size before growing it. Such an atlas may hold mostly stale glyphs and
+/// images: a window gradient for each size the window has had, each up to
+/// 2040 pixels wide. Growing it instead kept 2048-side atlases at 4096, a
+/// 64 MiB texture per frame slot plus two CPU copies, for good. Only a
+/// fresh atlas too small for one frame's chrome grows, up to [`MAX_SIDE`].
+fn paint_until_fits(
+    mut side: usize,
+    mut attempt: impl FnMut(usize, bool) -> (bool, anyhow::Result<()>),
+) -> anyhow::Result<usize> {
+    let mut restart = false;
+    loop {
+        let (fresh, painted) = attempt(side, restart);
+        let Err(err) = painted else {
+            return Ok(side);
+        };
+        if err
+            .root_cause()
+            .downcast_ref::<OutOfTextureSpace>()
+            .is_none()
+        {
+            return Err(err);
+        }
+        if !fresh && !restart {
+            restart = true;
+        } else if side < MAX_SIDE {
+            side *= 2;
+            restart = false;
+        } else {
+            return Err(err);
+        }
+    }
+}
+
 impl TermWindow {
     /// Lays out and paints this Metal window's chrome, the tab bar and any
     /// modal overlay, appending their hit-test items to `ui_items`
@@ -297,20 +337,21 @@ impl TermWindow {
         if !tab_bar && !backgrounds && self.get_modal().is_none() {
             return None;
         }
-        let mut side = self
+        let side = self
             .metal_chrome
             .as_ref()
             .map_or(FIRST_SIDE, |chrome| chrome.side);
-        loop {
-            let fresh = !self.metal_chrome.as_ref().is_some_and(|chrome| {
-                chrome.side == side && chrome.serves(&self.fonts, &self.render_metrics)
-            });
+        let painted = paint_until_fits(side, |side, restart| {
+            let fresh = restart
+                || !self.metal_chrome.as_ref().is_some_and(|chrome| {
+                    chrome.side == side && chrome.serves(&self.fonts, &self.render_metrics)
+                });
             if fresh {
                 match MetalChrome::new(&self.fonts, &self.render_metrics, side) {
                     Ok(chrome) => self.metal_chrome = Some(chrome),
                     Err(err) => {
                         log::error!("Metal chrome: {err:#}");
-                        return None;
+                        return (fresh, Err(err));
                     }
                 }
                 // Its cached glyphs point into the old glyph cache's texture.
@@ -320,25 +361,15 @@ impl TermWindow {
                 chrome.layers.borrow_mut().clear();
             }
             let items_before = self.ui_items.len();
-            match self.paint_metal_chrome(backgrounds, tab_bar) {
-                Ok(()) => break,
-                Err(err)
-                    if err
-                        .root_cause()
-                        .downcast_ref::<OutOfTextureSpace>()
-                        .is_some()
-                        && side < MAX_SIDE =>
-                {
-                    // Grow the glyph cache and lay the chrome out again.
-                    self.ui_items.truncate(items_before);
-                    side *= 2;
-                }
-                Err(err) => {
-                    self.ui_items.truncate(items_before);
-                    log::warn!("Metal chrome not drawn: {err:#}");
-                    return None;
-                }
+            let painted = self.paint_metal_chrome(backgrounds, tab_bar);
+            if painted.is_err() {
+                self.ui_items.truncate(items_before);
             }
+            (fresh, painted)
+        });
+        if let Err(err) = painted {
+            log::warn!("Metal chrome not drawn: {err:#}");
+            return None;
         }
         let chrome = self.metal_chrome.as_ref()?;
         let (quads, under) = chrome.quads(
@@ -403,8 +434,140 @@ impl TermWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::glyphcache::LoadState;
     use ::window::bitmaps::Image;
+    use ::window::bitmaps::atlas::AtlasAllocationFailure;
     use ::window::{Point, Rect, Size};
+    use std::time::{Duration, Instant};
+    use termwiz::image::{ImageData, ImageDataType};
+
+    fn out_of_space() -> anyhow::Error {
+        anyhow::Error::new(OutOfTextureSpace {
+            size: None,
+            current_size: 0,
+            failure: AtlasAllocationFailure::Capacity,
+        })
+    }
+
+    /// The (side, fresh) attempts `paint_until_fits` makes, and its result,
+    /// against a model atlas: the current atlas (of side `current`, if any)
+    /// is full of stale content, and one frame's chrome fits a fresh atlas
+    /// whose side is at least `need`.
+    fn attempts(
+        current: Option<usize>,
+        need: usize,
+    ) -> (Vec<(usize, bool)>, anyhow::Result<usize>) {
+        let mut existing = current;
+        let mut calls = Vec::new();
+        let result = paint_until_fits(current.unwrap_or(FIRST_SIDE), |side, restart| {
+            let fresh = restart || existing != Some(side);
+            existing = Some(side);
+            calls.push((side, fresh));
+            let painted = if fresh && side >= need {
+                Ok(())
+            } else {
+                Err(out_of_space())
+            };
+            (fresh, painted)
+        });
+        (calls, result)
+    }
+
+    #[test]
+    fn a_full_chrome_atlas_starts_over_at_its_side_before_it_grows() {
+        // A 2048 atlas full of earlier window sizes' gradients: a fresh
+        // 2048 atlas holds this frame's chrome, so it does not grow.
+        let (calls, side) = attempts(Some(2048), 2048);
+        assert_eq!(calls, [(2048, false), (2048, true)]);
+        assert_eq!(side.unwrap(), 2048);
+
+        // A window's first chrome grows from FIRST_SIDE until it fits.
+        let (calls, side) = attempts(None, 2048);
+        assert_eq!(calls, [(512, true), (1024, true), (2048, true)]);
+        assert_eq!(side.unwrap(), 2048);
+
+        // A fresh atlas too small for one frame still grows.
+        let (calls, side) = attempts(Some(1024), 4096);
+        assert_eq!(
+            calls,
+            [(1024, false), (1024, true), (2048, true), (4096, true)]
+        );
+        assert_eq!(side.unwrap(), 4096);
+
+        // At MAX_SIDE a fresh atlas that overflows ends the attempts.
+        let (calls, side) = attempts(Some(MAX_SIDE), MAX_SIDE * 2);
+        assert_eq!(calls, [(MAX_SIDE, false), (MAX_SIDE, true)]);
+        let err = side.unwrap_err();
+        assert!(
+            err.root_cause()
+                .downcast_ref::<OutOfTextureSpace>()
+                .is_some(),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn a_chrome_paint_error_other_than_atlas_space_is_not_retried() {
+        let mut calls = 0;
+        let result = paint_until_fits(2048, |_, _| {
+            calls += 1;
+            (false, Err(anyhow::anyhow!("no fonts")))
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(result.unwrap_err().to_string(), "no fonts");
+    }
+
+    /// A window gradient as `load_background_layer` generates it for a
+    /// 6144-pixel-wide window: capped to 2040 pixels wide.
+    fn gradient(height: u32) -> Arc<ImageData> {
+        let data = vec![0x40; 2040 * height as usize * 4];
+        Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            2040, height, data,
+        )))
+    }
+
+    /// Places `image` in `chrome`'s atlas as a window background layer is
+    /// placed, waiting out a background decode.
+    fn place(chrome: &MetalChrome, image: &Arc<ImageData>) -> anyhow::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let (_, _, state) =
+                chrome
+                    .glyph_cache
+                    .borrow_mut()
+                    .cached_image(image, None, AllowImage::Yes)?;
+            if state == LoadState::Loaded {
+                return Ok(());
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "the gradient never loaded: {state:?}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Why a full chrome atlas starts over before it grows: a 6144x3200
+    /// window's gradient leaves no room in a 2048 atlas for the same
+    /// window's gradient at 6144x3456, which a fresh 2048 atlas holds.
+    #[test]
+    fn a_stale_window_gradient_fills_a_2048_chrome_atlas_that_a_fresh_one_holds() {
+        config::use_test_configuration();
+        let fonts = Rc::new(FontConfiguration::new(None, 96).unwrap());
+        let metrics = RenderMetrics::new(&fonts).unwrap();
+        let (before, after) = (gradient(1063), gradient(1148));
+        let chrome = MetalChrome::new(&fonts, &metrics, 2048).unwrap();
+        place(&chrome, &before).unwrap();
+        let err = place(&chrome, &after).unwrap_err();
+        assert!(
+            err.root_cause()
+                .downcast_ref::<OutOfTextureSpace>()
+                .is_some(),
+            "{err:#}"
+        );
+        let fresh = MetalChrome::new(&fonts, &metrics, 2048).unwrap();
+        place(&fresh, &after).unwrap();
+    }
 
     fn snapshot_pixels(atlas: &ChromeAtlas) -> Vec<u8> {
         atlas
