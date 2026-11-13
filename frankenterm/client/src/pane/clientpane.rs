@@ -3140,6 +3140,38 @@ pub(crate) fn needs_push_tracking_request(
     }
 }
 
+/// Send a pane's configured palette on `rpc` if it is still pending, taking
+/// the pending mark so that only one sender sends it. A failed send marks it
+/// pending again, for the next time the connection is ready.
+///
+/// The server answers OSC 4, 10 and 11 colour queries from this palette, and
+/// keeps its own default until one arrives. A GUI launch or a reconnect often
+/// applies its config before the connection is ready, and a pane attached
+/// then registers before it too; neither can send (on 2026-11-13 a relaunch
+/// could not send 51 panes' palettes, and nothing sent them later).
+fn take_pending_palette_delivery(
+    pending: &Arc<AtomicBool>,
+    configured_palette: &Mutex<ColorPalette>,
+    remote_pane_id: PaneId,
+    rpc: &RpcGenerationScope,
+) -> Option<impl Future<Output = anyhow::Result<()>> + Send + 'static> {
+    if !pending.swap(false, Ordering::AcqRel) {
+        return None;
+    }
+    let request = rpc.set_configured_palette_for_pane(SetPalette {
+        pane_id: remote_pane_id,
+        palette: Arc::new(configured_palette.lock().clone()),
+    });
+    let pending = Arc::clone(pending);
+    Some(async move {
+        let delivered = request.await.map(|_| ());
+        if delivered.is_err() {
+            pending.store(true, Ordering::Release);
+        }
+        delivered
+    })
+}
+
 fn should_process_unilateral_render_delta(
     current_seqno: SequenceNo,
     incoming_seqno: SequenceNo,
@@ -3637,7 +3669,12 @@ pub struct ClientPane {
     /// the topology snapshot that reports the move updates it.
     remote_tab_id: AtomicUsize,
     pub renderable: Arc<Mutex<RenderableState>>,
-    configured_palette: Mutex<ColorPalette>,
+    configured_palette: Arc<Mutex<ColorPalette>>,
+    /// The server has not been sent `configured_palette`: the pane registered,
+    /// or its config was applied, before the connection was ready, or the
+    /// send failed. `ClientDomain::flush_pending_palettes` sends it once the
+    /// connection is ready.
+    palette_delivery_pending: Arc<AtomicBool>,
     palette: Mutex<ColorPalette>,
     application_palette: Mutex<bool>,
     writer: Mutex<PaneWriter>,
@@ -4523,7 +4560,8 @@ impl ClientPane {
             application_palette: Mutex::new(false),
             renderable,
             writer: Mutex::new(writer),
-            configured_palette: Mutex::new(palette.clone()),
+            configured_palette: Arc::new(Mutex::new(palette.clone())),
+            palette_delivery_pending: Arc::new(AtomicBool::new(false)),
             palette: Mutex::new(palette),
             clipboard: Mutex::new(None),
             mouse_grabbed: Mutex::new(false),
@@ -5480,6 +5518,24 @@ impl ClientPane {
         Ok((source, registration))
     }
 
+    /// Whether the server has yet to be sent this pane's configured palette.
+    pub(crate) fn palette_delivery_is_pending(&self) -> bool {
+        self.palette_delivery_pending.load(Ordering::Acquire)
+    }
+
+    /// Send the configured palette on `rpc` if it is still pending.
+    pub(crate) fn take_pending_palette_delivery(
+        &self,
+        rpc: &RpcGenerationScope,
+    ) -> Option<impl Future<Output = anyhow::Result<()>> + Send + 'static> {
+        take_pending_palette_delivery(
+            &self.palette_delivery_pending,
+            &self.configured_palette,
+            self.remote_pane_id,
+            rpc,
+        )
+    }
+
     pub(crate) fn flush_resize_after_ready(&self) -> anyhow::Result<()> {
         let ready = self.client.client.rpc_scope();
         if !ready.is_available() {
@@ -6110,11 +6166,8 @@ impl Pane for ClientPane {
         let mux_registration = Arc::clone(&self.mux_registration);
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
-        let palette = self.configured_palette.lock().clone();
-        let request = SetPalette {
-            pane_id: remote_pane_id,
-            palette: Arc::new(palette),
-        };
+        let configured_palette = Arc::clone(&self.configured_palette);
+        let palette_pending = Arc::clone(&self.palette_delivery_pending);
         let rpc = client.client.rpc_scope();
         match promise::spawn::try_reserve_main_thread(
             promise::spawn::MainThreadServiceClass::Topology,
@@ -6131,7 +6184,29 @@ impl Pane for ClientPane {
                             return Ok(());
                         }
 
-                        let palette = rpc.set_configured_palette_for_pane(request);
+                        // Mark the palette pending, then take it on the
+                        // connection as it is now. Whichever of this task and
+                        // `ClientDomain::flush_pending_palettes` runs second
+                        // finds the connection ready, so the palette is sent
+                        // once, even when this task runs after readiness.
+                        palette_pending.store(true, Ordering::Release);
+                        let current = client.client.rpc_scope();
+                        let palette = if current.is_available() {
+                            take_pending_palette_delivery(
+                                &palette_pending,
+                                &configured_palette,
+                                remote_pane_id,
+                                &current,
+                            )
+                        } else {
+                            None
+                        };
+                        let palette = async move {
+                            match palette {
+                                Some(delivery) => delivery.await,
+                                None => Ok(()),
+                            }
+                        };
                         // Count here, not at bind: an attach registers all of
                         // its panes before it records any of their mappings.
                         let attached_panes = client.attached_pane_count();
@@ -6142,7 +6217,7 @@ impl Pane for ClientPane {
                             // that scope carries no codec, and
                             // `ClientDomain::start_pane_push_tracking` asks
                             // about the pane once the connection is ready.
-                            return palette.await.map(|_| ());
+                            return palette.await;
                         }
                         // A pane created on a ready connection (a new tab or
                         // split). Its reply is not needed, and its failure
@@ -6151,11 +6226,13 @@ impl Pane for ClientPane {
                             pane_id: remote_pane_id,
                         });
                         let (palette, _tracking) = futures::join!(palette, tracking);
-                        palette.map(|_| ())
+                        palette
                     })
                     .detach();
             }
             rejected => {
+                // The aborted generation's successor sends it once ready.
+                self.palette_delivery_pending.store(true, Ordering::Release);
                 let abort = client.client.abort_rpc_transport_generation(
                     &rpc,
                     "pane-bind palette scheduler admission failed",
@@ -6544,17 +6621,30 @@ impl Pane for ClientPane {
         if !*self.application_palette.lock() {
             *self.palette.lock() = palette.clone();
         }
-        *self.configured_palette.lock() = palette.clone();
+        *self.configured_palette.lock() = palette;
 
-        // and now send the color palette to the server
-        let client = Arc::clone(&self.client);
-        let remote_pane_id = self.remote_pane_id;
-        let request = client.client.set_configured_palette_for_pane(SetPalette {
-            pane_id: remote_pane_id,
-            palette: Arc::new(palette),
-        });
-        if let Err(error) = dispatch_interactive_rpc(request, "set configured pane palette") {
-            log::error!("failed to schedule configured palette convergence: {error:#}");
+        // and now send the color palette to the server. Before the connection
+        // is ready (a GUI launch or a reconnect applies its config while
+        // attaching) it stays pending, and `ClientDomain::flush_pending_palettes`
+        // sends it once the connection is ready.
+        self.palette_delivery_pending.store(true, Ordering::Release);
+        let rpc = self.client.client.rpc_scope();
+        if rpc.is_available() {
+            if let Some(request) = take_pending_palette_delivery(
+                &self.palette_delivery_pending,
+                &self.configured_palette,
+                self.remote_pane_id,
+                &rpc,
+            ) {
+                if let Err(error) = dispatch_interactive_rpc(request, "set configured pane palette")
+                {
+                    self.palette_delivery_pending.store(true, Ordering::Release);
+                    log::warn!(
+                        "configured palette not sent; it is sent when the connection is next \
+                         ready: {error:#}"
+                    );
+                }
+            }
         }
         self.config.lock().replace(config);
         // Implicit hyperlink rules are selected by each GUI window when it
@@ -8349,10 +8439,18 @@ mod tests {
         assert!(matches!(request, Pdu::Resize(Resize { size: observed, .. }) if observed == size));
         executor.try_tick().unwrap();
         pane.flush_resize_after_ready().unwrap();
+        // The pane registered before the reconnect and its registration task
+        // runs only now, so it sends the palette on the ready connection.
+        let requests = answer_registration_requests(&executor, &peer);
         assert!(
-            peer.is_empty(),
-            "readiness must admit the retained size only once"
+            !requests
+                .iter()
+                .any(|request| matches!(request, Pdu::Resize(_))),
+            "readiness must admit the retained size only once: {:?}",
+            requests
         );
+        assert_eq!(palettes_for(&requests, 29), 1, "{:?}", requests);
+        assert!(peer.is_empty());
         assert!(!pane.resize_delivery.lock().failed);
     }
 
@@ -8818,6 +8916,96 @@ mod tests {
         ));
         // No agreed codec: the connection is not ready, or is gone.
         assert!(!needs_push_tracking_request(None, 1));
+    }
+
+    fn palettes_for(requests: &[Pdu], remote_id: PaneId) -> usize {
+        requests
+            .iter()
+            .filter(|request| {
+                matches!(request, Pdu::SetPalette(SetPalette { pane_id, .. }) if *pane_id == remote_id)
+            })
+            .count()
+    }
+
+    #[test]
+    fn a_pane_registered_before_readiness_gets_its_palette_once_ready() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, peer) = test_client_inner_with_rpc_peer(17);
+        let pane = test_client_pane(&inner, 40, 29);
+        // A GUI launch or a reconnect registers its panes while the
+        // connection bootstraps.
+        peer.activate_reconnect_generation(&inner.client).unwrap();
+        let registered: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&registered).unwrap();
+        let requests = answer_registration_requests(&executor, &peer);
+        assert!(
+            requests.is_empty(),
+            "nothing may enter an unready transport: {:?}",
+            requests
+        );
+        assert!(pane.palette_delivery_is_pending());
+
+        peer.complete_current_bootstrap(&inner.client).unwrap();
+        ClientDomain::flush_pending_palettes(&mux, &inner, inner.client.rpc_scope());
+        let requests = answer_registration_requests(&executor, &peer);
+        assert_eq!(
+            palettes_for(&requests, 29),
+            1,
+            "readiness must send the pending palette: {requests:?}"
+        );
+        assert!(!pane.palette_delivery_is_pending());
+
+        ClientDomain::flush_pending_palettes(&mux, &inner, inner.client.rpc_scope());
+        let requests = answer_registration_requests(&executor, &peer);
+        assert!(
+            requests.is_empty(),
+            "a delivered palette is not sent again: {:?}",
+            requests
+        );
+    }
+
+    #[test]
+    fn a_config_applied_before_readiness_sends_its_palette_once_ready() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, peer) = test_client_inner_with_rpc_peer(17);
+        let pane = test_client_pane(&inner, 40, 29);
+        let registered: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&registered).unwrap();
+        let requests = answer_registration_requests(&executor, &peer);
+        assert_eq!(palettes_for(&requests, 29), 1, "{requests:?}");
+        assert!(!pane.palette_delivery_is_pending());
+
+        peer.activate_reconnect_generation(&inner.client).unwrap();
+        pane.set_config(Arc::new(config::TermConfig::new()));
+        let requests = answer_registration_requests(&executor, &peer);
+        assert!(
+            requests.is_empty(),
+            "nothing may enter an unready transport: {:?}",
+            requests
+        );
+        assert!(pane.palette_delivery_is_pending());
+
+        peer.complete_current_bootstrap(&inner.client).unwrap();
+        ClientDomain::flush_pending_palettes(&mux, &inner, inner.client.rpc_scope());
+        let requests = answer_registration_requests(&executor, &peer);
+        assert_eq!(
+            palettes_for(&requests, 29),
+            1,
+            "readiness must send the palette the config set: {requests:?}"
+        );
+        assert!(!pane.palette_delivery_is_pending());
+
+        // On a ready connection the config sends its palette at once.
+        pane.set_config(Arc::new(config::TermConfig::new()));
+        let requests = answer_registration_requests(&executor, &peer);
+        assert_eq!(palettes_for(&requests, 29), 1, "{requests:?}");
+        assert!(!pane.palette_delivery_is_pending());
     }
 
     fn test_conditional_input_source(byte: u8) -> ConditionalPaneInputSource {

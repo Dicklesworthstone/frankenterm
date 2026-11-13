@@ -3562,6 +3562,7 @@ impl ClientDomain {
             .await?;
         Self::request_user_var_hydration(Arc::clone(&mux), Arc::clone(&expected), rpc.clone())?;
         Self::start_pane_push_tracking(&expected, rpc.clone());
+        Self::flush_pending_palettes(&mux, &expected, rpc.clone());
         Self::flush_bootstrap_resizes(&mux, &expected);
         client_domain.refresh_layout_snapshot(&mux, &expected);
         ui.close();
@@ -3922,6 +3923,74 @@ impl ClientDomain {
                 }))
                 .buffer_unordered(4);
                 while requests.next().await.is_some() {
+                    if !rpc.is_ready() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+    }
+
+    /// Send the configured palette of every pane of this attachment whose
+    /// palette has not reached the server, once the connection is ready:
+    /// panes that registered, or had their config applied, while the
+    /// connection was bootstrapping, and panes whose send failed. Four
+    /// requests are outstanding at a time. Each palette is read when its
+    /// request is sent, so it cannot overtake a newer one.
+    pub(crate) fn flush_pending_palettes(mux: &Mux, inner: &ClientInner, rpc: RpcGenerationScope) {
+        if !rpc.is_available() {
+            return;
+        }
+        let panes = mux
+            .iter_panes()
+            .into_iter()
+            .filter(|pane| {
+                pane.downcast_ref::<ClientPane>()
+                    .is_some_and(|client_pane| {
+                        client_pane.belongs_to_client(inner)
+                            && client_pane.palette_delivery_is_pending()
+                    })
+            })
+            .collect::<Vec<_>>();
+        if panes.is_empty() {
+            return;
+        }
+        let reservation = match reserve_client_main_thread(
+            promise::spawn::MainThreadServiceClass::Background,
+            4096,
+            "pane palette delivery",
+        ) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                // They stay pending for the next time the connection is ready.
+                log::warn!("configured palettes not sent after readiness: {error:#}");
+                return;
+            }
+        };
+        reservation
+            .spawn(async move {
+                let mut panes = panes.into_iter();
+                let mut requests = futures::stream::FuturesUnordered::new();
+                loop {
+                    while requests.len() < 4 {
+                        let Some(pane) = panes.next() else {
+                            break;
+                        };
+                        let Some(client_pane) = pane.downcast_ref::<ClientPane>() else {
+                            continue;
+                        };
+                        if let Some(delivery) = client_pane.take_pending_palette_delivery(&rpc) {
+                            requests.push(delivery);
+                        }
+                    }
+                    let Some(delivered) = requests.next().await else {
+                        break;
+                    };
+                    if let Err(error) = delivered {
+                        log::debug!(
+                            "configured palette not delivered; it stays pending: {error:#}"
+                        );
+                    }
                     if !rpc.is_ready() {
                         break;
                     }
@@ -5588,6 +5657,7 @@ impl ClientDomain {
         bootstrap_result?;
         Self::request_user_var_hydration(Arc::clone(mux), Arc::clone(&inner), rpc.clone())?;
         Self::start_pane_push_tracking(&inner, rpc.clone());
+        Self::flush_pending_palettes(mux, &inner, rpc.clone());
         Self::flush_bootstrap_resizes(mux, &inner);
         domain.refresh_layout_snapshot(mux, &inner);
         cleanup.disarm();
