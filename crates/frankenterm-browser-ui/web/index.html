@@ -10,7 +10,19 @@
 <link rel="stylesheet" href="./history-panel.css">
 </head>
 <body>
-<header id="inspect-toolbar">
+<section id="web-auth" aria-labelledby="web-auth-title">
+  <h1 id="web-auth-title">FrankenTerm fleet viewer</h1>
+  <p id="web-auth-status" role="status" aria-live="polite">Checking your session…</p>
+  <form id="web-auth-form" hidden>
+    <label for="web-auth-token">Access token</label>
+    <input id="web-auth-token" type="password" minlength="32" maxlength="256" autocomplete="off" spellcheck="false" required>
+    <button id="web-auth-submit" type="submit">Sign in</button>
+  </form>
+  <button id="web-auth-retry" type="button" hidden>Check connection again</button>
+  <p>Use the local address supplied by the operator. Your token is used only to establish a session.</p>
+</section>
+<div id="web-auth-controls" hidden><span>Authenticated local session</span><button id="web-auth-logout" type="button">Sign out</button></div>
+<header id="inspect-toolbar" hidden>
   <button id="history-search-open" type="button" disabled>Search captured history</button>
   <button id="pane-output-open" type="button" disabled>Inspect selected pane (Enter)</button>
   <form id="pane-output-form">
@@ -20,7 +32,7 @@
   </form>
   <span id="pane-output-hint" role="status">Use 1/2 to switch fleet views. Captured output is read-only.</span>
 </header>
-<main id="workspace" data-output-open="false">
+<main id="workspace" data-output-open="false" hidden>
   <section id="container" aria-label="Fleet inventory and detections">
     <p id="fleet-mode" role="status">Loading fleet inventory. Search captured history or open a pane by ID above.</p>
     <nav id="fleet-navigation" aria-label="Fleet navigation">

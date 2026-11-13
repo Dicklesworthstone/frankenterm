@@ -157,9 +157,9 @@ test("page wiring and hashed package include the search controller, panel and st
   const html = readFileSync(new URL("crates/frankenterm-browser-ui/web/index.html", root), "utf8");
   for (const name of ["history-search.mjs", "history-panel.mjs", "history-panel.css"]) assert.ok(script.includes(`$crate_dir/web/${name}`), name);
   assert.match(app, /mountHistorySearch\(\{/);
-  assert.match(app, /readBody:.*readSnapshot\(path, apiRoot, globalThis.fetch, signal, 8 \* 1024 \* 1024\)/);
+  assert.match(app, /readBody:.*readSnapshot\(path, apiRoot, fetchImpl, signal, 8 \* 1024 \* 1024\)/);
   assert.match(app, /historySearch\.suspend\(\)/);
-  assert.match(app, /getElementById\("pane-output-id"\)\.value = paneId/);
+  assert.match(app, /element\("pane-output-id"\)\.value = paneId/);
   assert.match(html, /<dialog id="history-search"/);
   const ids = [...html.matchAll(/\bid="([^"]+)"/g)].map((m) => m[1]);
   assert.equal(new Set(ids).size, ids.length);

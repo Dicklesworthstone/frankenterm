@@ -224,13 +224,17 @@ retains the lock inode to preserve one flock authority.
 Behind the `web` feature, which is on by default.
 
 ```bash
-ft web [--port <n>]
+ft web [--port <n>] [--ui-dir <package>] [--auth-token-env <ENV>]
+ft watch --web [--web-port <n>] [--web-ui-dir <package>] [--web-auth-token-env <ENV>]
 ```
 
 Default bind is `127.0.0.1:9999` (set `[tuning.web] default_port` to change it; releases before 2026-11 used 8000). The web server exposes:
 
 ```bash
 GET /health
+GET /auth/status
+POST /auth/session
+DELETE /auth/session
 GET /panes
 GET /events
 GET /search
@@ -261,10 +265,33 @@ curl -N "http://127.0.0.1:9999/stream/events?channel=detections&pane_id=7&max_hz
 curl -N "http://127.0.0.1:9999/stream/deltas?pane_id=7&max_hz=50"
 ```
 
-The server binds loopback only, and it refuses any other address because its
-routes have no authentication. To reach it from your other devices, put
-Tailscale Serve in front of it. Tailscale then provides HTTPS and limits
-access to your tailnet:
+The server binds loopback only. To require browser sign-in, put a randomly
+generated 32–256 character visible ASCII access token in an environment
+variable and pass its name with `--auth-token-env` (or
+`--web-auth-token-env` on `watch`). Missing or invalid values fail startup;
+the secret is never accepted as a command-line token or URL parameter.
+
+The `/ui/` sign-in form posts JSON to `/auth/session`, which requires an
+exact local Origin and `Content-Type: application/json`. Successful sign-in
+sets a `HttpOnly`, `SameSite=Strict` session cookie. The default lifetime is
+one hour, with a maximum of 16 active sessions. `/auth/status` reports
+whether authentication is required and whether the current cookie is valid;
+an authenticated response includes `expires_at_ms` and a nonsecret
+`session_epoch`. Authenticated SSE requests must include
+`session_epoch=<epoch>` in the query, and read clients can send
+`x-ft-session-epoch: <epoch>` to reject a changed cookie. The browser viewer
+does both automatically. `DELETE /auth/session` revokes the cookie's
+session and its stream producers. Server restart revokes every session.
+Health, session status and UI assets remain public; all data routes and
+OpenAPI are protected. The viewer clears its previous data when a session
+ends and reloads after sign-in instead of reusing old stream cursors.
+
+Authenticated mode requires the exact loopback Host/Origin and listener
+port, including on reconnect. It does not support reverse-proxy or Tailscale
+origins. Omitting the token flag preserves unauthenticated local access.
+To forward that unauthenticated mode to your other devices, put Tailscale
+Serve in front of it. Tailscale provides HTTPS and limits access to your
+tailnet:
 
 ```bash
 tailscale serve --bg 9999          # https://<this-machine>.<tailnet>.ts.net/ -> 127.0.0.1:9999

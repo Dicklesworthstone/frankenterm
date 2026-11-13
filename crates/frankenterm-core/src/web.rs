@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use crate::web_framework::{App, FrameworkWebRuntime, QueryString, Request, Response, StatusCode};
 
+mod auth;
 mod error;
 mod extractors;
 mod handlers;
@@ -35,6 +36,8 @@ pub mod terminal_projection;
 mod ui_assets;
 pub mod websocket;
 
+pub(crate) use auth::SessionAuthMiddleware;
+pub use auth::{WebSessionAuth, WebSessionAuthError};
 pub use extractors::redact_depth_limit_hit_count;
 pub(crate) use middleware::BodySizeGuard;
 pub use server::{run_web_server, start_web_server};
@@ -167,6 +170,8 @@ pub struct WebServerConfig {
     storage_event_tail: bool,
     /// The verified browser fleet viewer package served under `/ui/`.
     ui_assets: Option<Arc<UiAssetSet>>,
+    /// Optional bounded local-operator sessions for data reads and streams.
+    session_auth: Option<WebSessionAuth>,
 }
 
 impl std::fmt::Debug for WebServerConfig {
@@ -179,6 +184,7 @@ impl std::fmt::Debug for WebServerConfig {
             .field("event_bus", &self.event_bus.is_some())
             .field("allow_public_bind", &self.allow_public_bind)
             .field("storage_event_tail", &self.storage_event_tail)
+            .field("session_auth", &self.session_auth)
             .field(
                 "ui_assets",
                 &self.ui_assets.as_ref().map(|set| set.manifest_sha256()),
@@ -200,6 +206,7 @@ impl WebServerConfig {
             allow_public_bind: false,
             storage_event_tail: true,
             ui_assets: None,
+            session_auth: None,
         }
     }
 
@@ -207,6 +214,14 @@ impl WebServerConfig {
     #[must_use]
     pub fn with_ui_assets(mut self, ui_assets: Arc<UiAssetSet>) -> Self {
         self.ui_assets = Some(ui_assets);
+        self
+    }
+
+    /// Require expiring local-operator browser sessions for data reads,
+    /// generated API schemas and streams. This does not permit public binds.
+    #[must_use]
+    pub fn with_session_auth(mut self, auth: WebSessionAuth) -> Self {
+        self.session_auth = Some(auth);
         self
     }
 
@@ -486,8 +501,16 @@ fn build_app(
     runtime_limits: WebRuntimeLimits,
     event_source: &'static str,
     ui_assets: Option<Arc<UiAssetSet>>,
+    session_auth: Option<WebSessionAuth>,
 ) -> App {
-    router::build_app(storage, event_bus, runtime_limits, event_source, ui_assets)
+    router::build_app(
+        storage,
+        event_bus,
+        runtime_limits,
+        event_source,
+        ui_assets,
+        session_auth,
+    )
 }
 
 #[cfg(test)]

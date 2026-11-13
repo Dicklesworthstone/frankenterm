@@ -383,3 +383,50 @@ test("a model trap or oversized text frame retires fleet traffic but leaves capt
     assert.equal(f.get("history-search-open").disabled, false);
   }
 });
+
+test("session disposal clears captured data and cannot resume on pageshow", async (t) => {
+  const f = fixture(t); await f.app.ready; await flush(); f.frame();
+  f.openPane();
+  const outputSource = f.sources.at(-1);
+  outputSource.message("delta", { schema: "ft.stream.v1", stream: "deltas", kind: "delta", data: {
+    pane_id: 7, segment_id: 1, content: "private captured session output",
+  } }, "delta-v1:pane:7:1");
+  f.frame();
+  f.get("history-search-open").emit("click");
+  f.get("history-query").value = "private query";
+  f.get("history-search-form").requestSubmit(); await flush();
+  assert.match(f.get("pane-output-text").value, /private captured/);
+  assert.equal(f.get("history-results").children.length, 1);
+  const sourceCount = f.sources.length;
+  f.app.dispose();
+  assert.equal(f.get("pane-output-text").value, "");
+  assert.equal(f.get("pane-output-id").value, "");
+  assert.equal(f.get("screen-text").textContent, "");
+  assert.equal(f.get("history-query").value, "");
+  assert.equal(f.get("history-results").children.length, 0);
+  assert.ok(f.sources.every((source) => source.closed));
+  assert.equal(f.frames.size, 0);
+  assert.equal(f.intervals.size, 0);
+  assert.equal(f.renderers[0].destroyed, 1);
+  f.host.emit("pageshow"); f.app.resume(); await flush();
+  assert.equal(f.sources.length, sourceCount);
+  assert.equal(f.frames.size, 0);
+  assert.equal(f.get("screen-text").textContent, "");
+});
+
+test("session disposal fences late WASM imports and pending GPU initialization", async (t) => {
+  const pending = fixture(t, { pendingModel: true, pendingRenderer: true });
+  await flush(); pending.app.dispose();
+  pending.resolveModel(); pending.resolveRenderer(); await pending.app.ready;
+  assert.equal(pending.viewers.length, 0);
+  assert.equal(pending.renderers.length, 0);
+  assert.equal(pending.sources.length, 0);
+  assert.equal(pending.get("screen-text").textContent, "");
+  const gpu = fixture(t, { pendingRendererInit: true }); await flush();
+  assert.equal(gpu.renderers.length, 1);
+  gpu.app.dispose(); gpu.resolveRendererInit(); await gpu.app.ready;
+  assert.equal(gpu.renderers[0].destroyed, 1);
+  assert.ok(gpu.sources.every((source) => source.closed));
+  assert.equal(gpu.get("screen-text").textContent, "");
+  assert.equal(gpu.doc.documentElement.dataset.viewerReady, "locked");
+});

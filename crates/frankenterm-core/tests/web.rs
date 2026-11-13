@@ -26,7 +26,9 @@ mod web_tests {
     };
     use frankenterm_core::storage::{EventQuery, PaneRecord, StorageHandle, StoredEvent};
 
-    use frankenterm_core::web::{WebRuntimeLimits, WebServerConfig, start_web_server};
+    use frankenterm_core::web::{
+        WebRuntimeLimits, WebServerConfig, WebSessionAuth, start_web_server,
+    };
     #[cfg(feature = "asupersync-runtime")]
     use frankenterm_core::web::{run_web_server_with_cx, start_web_server_with_cx};
     #[cfg(feature = "asupersync-runtime")]
@@ -335,6 +337,329 @@ mod web_tests {
         let request =
             format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
         fetch_raw(addr, request.as_bytes()).await
+    }
+
+    const VIEWER_TEST_CREDENTIAL: &str = "viewer-test-credential-with-at-least-32-characters";
+
+    fn session_request(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        cookie: Option<&str>,
+        body: Option<&str>,
+    ) -> String {
+        let mut request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://{addr}\r\nConnection: close\r\n"
+        );
+        if let Some(cookie) = cookie {
+            request.push_str(&format!("Cookie: {cookie}\r\n"));
+        }
+        if body.is_some() || method == "DELETE" {
+            request.push_str("Content-Type: application/json\r\n");
+            request.push_str(&format!("Content-Length: {}\r\n", body.map_or(0, str::len)));
+        }
+        request.push_str("\r\n");
+        if let Some(body) = body {
+            request.push_str(body);
+        }
+        request
+    }
+
+    async fn login_viewer(addr: SocketAddr, cookie: Option<&str>) -> anyhow::Result<String> {
+        use anyhow::{Context, ensure};
+
+        let body = serde_json::json!({ "token": VIEWER_TEST_CREDENTIAL }).to_string();
+        let request = session_request(addr, "POST", "/auth/session", cookie, Some(&body));
+        let response = fetch_raw(addr, request.as_bytes()).await?;
+        ensure!(
+            extract_status(&response) == 200,
+            "viewer login must succeed"
+        );
+        ensure!(header_value(&response, "cache-control") == Some("no-store"));
+        let header = header_value(&response, "set-cookie").context("issued session cookie")?;
+        ensure!(header.contains("HttpOnly") && header.contains("SameSite=Strict"));
+        ensure!(header.contains("Path=/") && header.contains("Max-Age="));
+        ensure!(!header.to_ascii_lowercase().contains("domain="));
+        let cookie = header.split(';').next().context("cookie value")?.to_owned();
+        ensure!(
+            !extract_body(&response).contains(&cookie),
+            "cookie must remain HTTP-only"
+        );
+        ensure!(
+            !response.contains(VIEWER_TEST_CREDENTIAL),
+            "bootstrap credential must not echo"
+        );
+        Ok(cookie)
+    }
+
+    async fn viewer_session_epoch(addr: SocketAddr, cookie: &str) -> anyhow::Result<String> {
+        use anyhow::{Context, ensure};
+
+        let request = session_request(addr, "GET", "/auth/status", Some(cookie), None);
+        let response = fetch_raw(addr, request.as_bytes()).await?;
+        ensure!(
+            extract_status(&response) == 200,
+            "authenticated session status"
+        );
+        let status: serde_json::Value = serde_json::from_str(extract_body(&response))?;
+        ensure!(
+            status["data"]["authenticated"] == true,
+            "live session grant"
+        );
+        let epoch = status["data"]["session_epoch"]
+            .as_str()
+            .context("session status must identify its grant epoch")?;
+        ensure!(epoch.len() == 32 && epoch.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        Ok(epoch.to_owned())
+    }
+
+    #[test]
+    fn web_sessions_protect_real_data_and_openapi_and_rotate_on_login() {
+        use anyhow::ensure;
+
+        run_async_test(async {
+            let (storage, _tmp) = create_test_storage_with_pane(7).await.unwrap();
+            let auth = WebSessionAuth::new(VIEWER_TEST_CREDENTIAL)
+                .unwrap()
+                .with_max_sessions(1)
+                .unwrap();
+            let server = start_web_server(
+                WebServerConfig::default()
+                    .with_port(0)
+                    .with_storage(storage.clone())
+                    .with_storage_event_tail(false)
+                    .with_session_auth(auth),
+            )
+            .await
+            .unwrap();
+            let addr = server.bound_addr();
+            let scenario = timeout(Duration::from_secs(12), async {
+                for path in [
+                    "/panes",
+                    "/events",
+                    "/search?q=test",
+                    "/bookmarks",
+                    "/ruleset-profile",
+                    "/saved-searches",
+                    "/stream/events",
+                    "/stream/deltas",
+                    "/openapi.json",
+                    "/not-yet-a-route",
+                ] {
+                    let request = session_request(addr, "GET", path, None, None);
+                    let response = fetch_raw(addr, request.as_bytes()).await?;
+                    ensure!(extract_status(&response) == 401, "protected route {path}");
+                    ensure!(
+                        !response.contains("test-pane"),
+                        "no unauthenticated pane title"
+                    );
+                    ensure!(header_value(&response, "cache-control") == Some("no-store"));
+                }
+                for path in ["/health", "/auth/status"] {
+                    let request = session_request(addr, "GET", path, None, None);
+                    let response = fetch_raw(addr, request.as_bytes()).await?;
+                    ensure!(extract_status(&response) == 200, "public status {path}");
+                    ensure!(!response.contains("test-pane"));
+                }
+                let wrong_body = serde_json::json!({ "token": "x".repeat(64) }).to_string();
+                let wrong = session_request(addr, "POST", "/auth/session", None, Some(&wrong_body));
+                let response = fetch_raw(addr, wrong.as_bytes()).await?;
+                ensure!(extract_status(&response) == 401, "wrong credential refused");
+                ensure!(header_value(&response, "set-cookie").is_none());
+
+                let first_cookie = login_viewer(addr, None).await?;
+                let first_epoch = viewer_session_epoch(addr, &first_cookie).await?;
+                for path in ["/panes", "/openapi.json"] {
+                    let request = session_request(addr, "GET", path, Some(&first_cookie), None);
+                    let response = fetch_raw(addr, request.as_bytes()).await?;
+                    ensure!(extract_status(&response) == 200, "authorized route {path}");
+                    if path == "/panes" {
+                        ensure!(
+                            response.contains("test-pane"),
+                            "real stored pane is visible"
+                        );
+                    } else {
+                        ensure!(
+                            response.contains("\"openapi\""),
+                            "generated API schema is visible"
+                        );
+                    }
+                }
+
+                let alias = format!(
+                    "GET /panes HTTP/1.1\r\nHost: localhost:{}\r\nOrigin: http://localhost:{}\r\nCookie: {first_cookie}\r\nConnection: close\r\n\r\n",
+                    addr.port(), addr.port(),
+                );
+                let response = fetch_raw(addr, alias.as_bytes()).await?;
+                ensure!(
+                    extract_status(&response) == 401,
+                    "a session is bound to its exact login origin, even on another loopback alias"
+                );
+
+                // Rotation succeeds even at capacity, and the previous token
+                // ceases to authorize reads instead of sharing the new lease.
+                let second_cookie = login_viewer(addr, Some(&first_cookie)).await?;
+                ensure!(first_cookie != second_cookie, "login rotates session token");
+                let second_epoch = viewer_session_epoch(addr, &second_cookie).await?;
+                ensure!(first_epoch != second_epoch, "login also rotates viewer state epoch");
+                let stale = session_request(addr, "GET", "/panes", Some(&first_cookie), None);
+                let response = fetch_raw(addr, stale.as_bytes()).await?;
+                ensure!(extract_status(&response) == 401, "old token revoked");
+
+                // A native EventSource retries its original URL after a
+                // different tab has replaced the HttpOnly cookie. The new
+                // credential must not admit that old viewer's stream epoch.
+                for path in ["/stream/events", "/stream/deltas"] {
+                    let path = format!("{path}?session_epoch={first_epoch}");
+                    let stale = session_request(addr, "GET", &path, Some(&second_cookie), None);
+                    let response = fetch_raw(addr, stale.as_bytes()).await?;
+                    ensure!(extract_status(&response) == 401, "old viewer epoch cannot reconnect");
+                }
+                let stale_read = format!(
+                    "GET /panes HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://{addr}\r\nCookie: {second_cookie}\r\nX-FT-Session-Epoch: {first_epoch}\r\nConnection: close\r\n\r\n"
+                );
+                let response = fetch_raw(addr, stale_read.as_bytes()).await?;
+                ensure!(extract_status(&response) == 401, "old viewer epoch cannot read with a replacement cookie");
+
+                let logout =
+                    session_request(addr, "DELETE", "/auth/session", Some(&second_cookie), None);
+                let response = fetch_raw(addr, logout.as_bytes()).await?;
+                ensure!(extract_status(&response) == 200, "logout succeeds");
+                ensure!(
+                    header_value(&response, "set-cookie")
+                        .is_some_and(|value| value.contains("Max-Age=0"))
+                );
+                let stale = session_request(addr, "GET", "/panes", Some(&second_cookie), None);
+                let response = fetch_raw(addr, stale.as_bytes()).await?;
+                ensure!(extract_status(&response) == 401, "logged-out token revoked");
+                Ok::<_, anyhow::Error>(())
+            })
+            .await;
+            server.shutdown().await.unwrap();
+            storage.shutdown().await.unwrap();
+            scenario
+                .expect("session scenario deadline")
+                .expect("session assertions");
+        });
+    }
+
+    #[test]
+    fn web_session_boundary_refuses_untrusted_and_oversized_heads_before_body() {
+        run_async_test(async {
+            let server = start_web_server(
+                WebServerConfig::default()
+                    .with_port(0)
+                    .with_session_auth(WebSessionAuth::new(VIEWER_TEST_CREDENTIAL).unwrap()),
+            )
+            .await
+            .unwrap();
+            let addr = server.bound_addr();
+            let other_port = if addr.port() == u16::MAX {
+                addr.port() - 1
+            } else {
+                addr.port() + 1
+            };
+            let heads = [
+                (format!("POST /auth/session HTTP/1.1\r\nHost: {addr}\r\nOrigin: https://elsewhere.invalid\r\nContent-Type: application/json\r\nContent-Length: 128\r\nExpect: 100-continue\r\n\r\n"), 403),
+                (format!("POST /auth/session HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: 128\r\nExpect: 100-continue\r\n\r\n"), 403),
+                (format!("POST /auth/session HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://{addr}\r\nContent-Type: application/json\r\nContent-Length: 1025\r\nExpect: 100-continue\r\n\r\n"), 413),
+                (format!("POST /panes HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://{addr}\r\nContent-Length: 128\r\nExpect: 100-continue\r\n\r\n"), 401),
+                ("GET /auth/status HTTP/1.1\r\nHost: rebind.invalid\r\nConnection: close\r\n\r\n".to_owned(), 403),
+                (format!("GET /auth/status HTTP/1.1\r\nHost: {addr}\r\nSec-Fetch-Site: same-site\r\nConnection: close\r\n\r\n"), 403),
+                (format!("GET /auth/status HTTP/1.1\r\nHost: 127.0.0.1:{other_port}\r\nConnection: close\r\n\r\n"), 403),
+            ];
+            let mut observations = Vec::new();
+            for (request, expected) in heads {
+                observations.push((expected, fetch_raw(addr, request.as_bytes()).await));
+            }
+            server.shutdown().await.unwrap();
+            for (expected, response) in observations {
+                let response = response.expect("head rejection must not wait for body");
+                assert_eq!(extract_status(&response), expected);
+                assert!(!response.contains("100 Continue"));
+                assert_eq!(header_value(&response, "connection"), Some("close"));
+            }
+        });
+    }
+
+    #[test]
+    fn web_session_logout_closes_idle_event_and_delta_streams() {
+        use anyhow::ensure;
+
+        run_async_test(async {
+            let (storage, _tmp) = create_test_storage_with_pane(7).await.unwrap();
+            let event_bus = Arc::new(EventBus::new(16));
+            let limits = WebRuntimeLimits {
+                stream_keepalive_secs: 60,
+                ..frankenterm_core::web::resolve_runtime_limits(None)
+            };
+            let server = start_web_server(
+                WebServerConfig::default()
+                    .with_port(0)
+                    .with_storage(storage.clone())
+                    .with_event_bus(event_bus.clone())
+                    .with_runtime_limits(limits)
+                    .with_session_auth(WebSessionAuth::new(VIEWER_TEST_CREDENTIAL).unwrap()),
+            )
+            .await
+            .unwrap();
+            let addr = server.bound_addr();
+            let scenario = timeout(Duration::from_secs(8), async {
+                let cookie = login_viewer(addr, None).await?;
+                let epoch = viewer_session_epoch(addr, &cookie).await?;
+                let mut streams = Vec::new();
+                for path in [
+                    "/stream/events?channel=all&pane_id=7",
+                    "/stream/deltas?pane_id=7",
+                ] {
+                    let mut stream = TcpStream::connect(addr).await?;
+                    let path = format!("{path}&session_epoch={epoch}");
+                    let request = session_request(addr, "GET", &path, Some(&cookie), None);
+                    stream.write_all(request.as_bytes()).await?;
+                    let mut response = Vec::new();
+                    let ready =
+                        read_event_stream_until(&mut stream, &mut response, "ready", 1).await?;
+                    ensure!(extract_status(&ready) == 200, "authorized SSE starts");
+                    streams.push(stream);
+                }
+                ensure!(
+                    event_bus.subscriber_count() >= 2,
+                    "both producers have subscribed"
+                );
+                let logout = session_request(addr, "DELETE", "/auth/session", Some(&cookie), None);
+                let response = fetch_raw(addr, logout.as_bytes()).await?;
+                ensure!(extract_status(&response) == 200, "logout acknowledged");
+                for mut stream in streams {
+                    // The client keeps reading: this checks application lease
+                    // cancellation, not the upstream blocked-write limitation.
+                    let mut tail = Vec::new();
+                    timeout(Duration::from_secs(2), stream.read_to_end(&mut tail))
+                        .await
+                        .map_err(anyhow::Error::msg)??;
+                    ensure!(
+                        !String::from_utf8_lossy(&tail).contains("data: "),
+                        "no application frame after idle revocation"
+                    );
+                }
+                ensure!(
+                    event_bus.subscriber_count() == 0,
+                    "logout drops both owned producers"
+                );
+                let reconnect = session_request(addr, "GET", "/stream/events", Some(&cookie), None);
+                let response = fetch_raw(addr, reconnect.as_bytes()).await?;
+                ensure!(
+                    extract_status(&response) == 401,
+                    "old stream cookie cannot reconnect"
+                );
+                Ok::<_, anyhow::Error>(())
+            })
+            .await;
+            server.shutdown().await.unwrap();
+            storage.shutdown().await.unwrap();
+            scenario
+                .expect("stream logout deadline")
+                .expect("stream logout assertions");
+        });
     }
 
     /// An invalid pane selection must be rejected before either data access

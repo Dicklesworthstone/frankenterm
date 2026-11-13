@@ -968,6 +968,7 @@ pub(super) fn handle_stream_events(
     };
     let result = require_event_bus(req);
     let lifecycle = req.get_extension::<WebStreamLifecycle>().cloned();
+    let session = req.get_extension::<super::auth::SessionGrant>().cloned();
     let resume = match parse_event_resume(
         req.headers().get("last-event-id"),
         qs.get("cursor"),
@@ -1027,7 +1028,11 @@ pub(super) fn handle_stream_events(
                 "Stream runtime context is unavailable",
             );
         };
-        let shutdown = lifecycle.shutdown_waiter(&stream_cx);
+        let shutdown = super::auth::stream_shutdown(
+            lifecycle.shutdown_waiter(&stream_cx),
+            session,
+            &stream_cx,
+        );
         let recv_cx = stream_cx.clone();
 
         let mut subscriber = match channel {

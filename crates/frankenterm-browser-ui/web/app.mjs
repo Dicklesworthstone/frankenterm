@@ -527,6 +527,7 @@ export function mountFleetApp({
   cancelFrame = (handle) => host.cancelAnimationFrame(handle),
   ResizeObserverImpl = globalThis.ResizeObserver,
   now = Date.now,
+  managePageLifecycle = true,
 } = {}) {
   const element = (id) => doc.getElementById(id);
   const viewport = element("fleet-viewport");
@@ -548,6 +549,7 @@ export function mountFleetApp({
   let rendererFailed = false;
   let preferText = false;
   let active = false;
+  let disposed = false;
   let networkActive = false;
   let refreshTimer = null;
   let frameHandle = null;
@@ -608,7 +610,7 @@ export function mountFleetApp({
     term = null;
     rendererFailed = true;
     try { previous?.destroy(); } catch (_) { /* a lost renderer must not stop DOM tools */ }
-    updateMode();
+    if (!disposed) updateMode();
   }
 
   function present() {
@@ -631,6 +633,7 @@ export function mountFleetApp({
   }
 
   function failModel() {
+    if (disposed) return;
     try { stopFleet(); } catch (_) { /* stop still aborts outstanding snapshots */ }
     viewer = null;
     modelFailed = true;
@@ -736,7 +739,8 @@ export function mountFleetApp({
       advance();
     } catch (_) { failModel(); }
   }
-  if (ResizeObserverImpl) new ResizeObserverImpl(resize).observe(viewport);
+  const resizeObserver = ResizeObserverImpl ? new ResizeObserverImpl(resize) : null;
+  if (resizeObserver) resizeObserver.observe(viewport);
   else host.addEventListener("resize", resize);
 
   function frame() {
@@ -754,7 +758,7 @@ export function mountFleetApp({
     frameHandle = requestFrame(frame);
   }
   function resume() {
-    if (active) return;
+    if (active || disposed) return;
     active = true;
     inspector.restore();
     resize();
@@ -770,13 +774,42 @@ export function mountFleetApp({
     if (frameHandle !== null) cancelFrame(frameHandle);
     frameHandle = null;
   }
-  host.addEventListener("pagehide", suspend);
-  host.addEventListener("pageshow", resume);
+  // Session retirement is terminal. A new login reloads the page so neither
+  // captured data nor an old stream cursor crosses the authentication boundary.
+  function dispose() {
+    if (disposed) return;
+    disposed = true;
+    suspend();
+    inspector.close();
+    historySearch.close();
+    resizeObserver?.disconnect?.();
+    clearTextSelection();
+    retireRenderer();
+    try { viewer?.free?.(); } catch (_) { /* the stopped model cannot publish */ }
+    viewer = null;
+    snapshots = null;
+    stream = null;
+    canvas.width = canvas.width; // clear the backing surface even after device loss
+    screenText.textContent = "";
+    selectionLine.textContent = "";
+    element("pane-output-id").value = "";
+    for (const id of [...navigation.keys(), "pane-output-open", "pane-output-submit",
+      "pane-output-id", "history-search-open", "fleet-text-toggle"]) element(id).disabled = true;
+    doc.documentElement.dataset.viewerReady = "locked";
+  }
+  if (managePageLifecycle) {
+    host.addEventListener("pagehide", suspend);
+    host.addEventListener("pageshow", resume);
+  }
   updateMode();
   resume();
 
-  const modelReady = Promise.resolve().then(loadViewer).then(async ({ default: initViewer, FleetViewer }) => {
+  const modelReady = Promise.resolve().then(async () => {
+    if (disposed) return false;
+    const { default: initViewer, FleetViewer } = await loadViewer();
+    if (disposed) return false;
     await initViewer();
+    if (disposed) return false;
     viewer = new FleetViewer(80, 24);
     viewer.setTime(now());
     viewer.init();
@@ -789,7 +822,10 @@ export function mountFleetApp({
     return true;
   }).catch(() => { failModel(); return false; });
 
-  const rendererReady = Promise.resolve().then(loadRenderer).then(async ({ default: initRenderer, FrankenTermWeb }) => {
+  const rendererReady = Promise.resolve().then(async () => {
+    if (disposed) return;
+    const { default: initRenderer, FrankenTermWeb } = await loadRenderer();
+    if (disposed) return;
     await initRenderer();
     if (!await modelReady || !viewer) return;
     await doc.fonts?.load('16px "Pragmasevka NF"').catch(() => undefined);
@@ -812,11 +848,272 @@ export function mountFleetApp({
       throw error;
     }
   }).catch(() => { retireRenderer(); });
-  return { ready: Promise.all([modelReady, rendererReady]), suspend, resume };
+  return { ready: Promise.all([modelReady, rendererReady]), suspend, resume, dispose };
+}
+
+// Authenticate before mounting any data consumer. Session changes retire the
+// entire viewer; sign-in reloads it instead of reusing a previous user's data,
+// pending fetches or resumable stream cursor. Credentials never enter a URL or
+// browser storage, and only the server can read the HttpOnly session cookie.
+export function mountAuthenticatedFleet({
+  document: doc = globalThis.document,
+  window: host = globalThis.window,
+  apiRoot = new URL("..", host.location.href),
+  fetchImpl = globalThis.fetch,
+  EventSourceImpl = globalThis.EventSource,
+  mountApp = mountFleetApp,
+  setTimer = globalThis.setTimeout,
+  clearTimer = globalThis.clearTimeout,
+  now = Date.now,
+} = {}) {
+  const element = (id) => doc.getElementById(id);
+  const panel = element("web-auth");
+  const form = element("web-auth-form");
+  const token = element("web-auth-token");
+  const submit = element("web-auth-submit");
+  const status = element("web-auth-status");
+  const retry = element("web-auth-retry");
+  const logout = element("web-auth-logout");
+  const controls = element("web-auth-controls");
+  let app = null;
+  let mounted = false;
+  let retired = false;
+  let active = true;
+  let disposed = false;
+  let required = false;
+  let sessionEpoch = null;
+  let generation = 0;
+  let pollTimer = null;
+  let expiryTimer = null;
+  let pending = null;
+  let channel = null;
+  try { if (host.BroadcastChannel) channel = new host.BroadcastChannel("frankenterm-web-session"); }
+  catch (_) { /* server expiry and status polling remain authoritative */ }
+
+  function clearTimers() {
+    if (pollTimer !== null) clearTimer(pollTimer);
+    if (expiryTimer !== null) clearTimer(expiryTimer);
+    pollTimer = expiryTimer = null;
+  }
+
+  function lock(message) {
+    generation += 1;
+    clearTimers();
+    pending?.abort();
+    pending = null;
+    app?.dispose();
+    app = null;
+    retired ||= mounted;
+    token.value = "";
+    element("inspect-toolbar").hidden = true;
+    element("workspace").hidden = true;
+    controls.hidden = true;
+    panel.hidden = false;
+    form.hidden = !required;
+    retry.hidden = false;
+    token.disabled = submit.disabled = false;
+    form.setAttribute("aria-busy", "false");
+    status.textContent = message;
+    doc.documentElement.dataset.viewerReady = "locked";
+  }
+
+  // One bounded control request at a time. The body is either bounded status
+  // JSON or an ignored login/logout response; never echo proxy error bodies.
+  async function request(method, secret) {
+    pending?.abort();
+    const controller = new AbortController();
+    pending = controller;
+    const timeout = setTimer(() => controller.abort(), 10_000);
+    try {
+      if (method === "GET") {
+        const body = await readSnapshot("auth/status", apiRoot,
+          (url, init) => fetchImpl(url, { ...init, redirect: "error" }), controller.signal, 4096);
+        const reply = JSON.parse(body);
+        const session = reply?.data;
+        if (reply?.ok !== true || typeof session?.required !== "boolean"
+            || typeof session?.authenticated !== "boolean"
+            || (!session.required && !session.authenticated)
+            || (session.required && session.authenticated
+                && (!Number.isSafeInteger(session.expires_at_ms) || session.expires_at_ms <= now()
+                    || typeof session.session_epoch !== "string" || !/^[0-9a-f]{32}$/.test(session.session_epoch)))) {
+          throw new Error("invalid session response");
+        }
+        return session;
+      }
+      let abortListener;
+      const aborted = new Promise((_, reject) => {
+        abortListener = () => reject(new Error("session request cancelled"));
+        controller.signal.addEventListener("abort", abortListener, { once: true });
+      });
+      const work = (async () => {
+        const response = await fetchImpl(new URL("auth/session", apiRoot), {
+          method, credentials: "same-origin", cache: "no-store", redirect: "error",
+          signal: controller.signal,
+          headers: { "content-type": "application/json", accept: "application/json" },
+          ...(method === "POST" ? { body: JSON.stringify({ token: secret }) } : {}),
+        });
+        void response.body?.cancel().catch(() => {});
+        if (!response.ok || controller.signal.aborted) throw new Error("session request refused");
+      })();
+      try { await Promise.race([work, aborted]); }
+      finally { controller.signal.removeEventListener("abort", abortListener); }
+      return null;
+    } finally {
+      clearTimer(timeout);
+      if (pending === controller) pending = null;
+    }
+  }
+
+  function schedule(session) {
+    clearTimers();
+    if (!active) return;
+    if (session.required) expiryTimer = setTimer(() => {
+      lock("Your session expired. Sign in again to reconnect.");
+    }, Math.min(86_400_000, Math.max(1, session.expires_at_ms - now())));
+    // Revalidate revocation from another tab and server restarts. This also
+    // detects a server that has newly enabled authentication.
+    pollTimer = setTimer(() => { pollTimer = null; void check(); }, 15_000);
+  }
+
+  async function check() {
+    if (!active || pending) return;
+    const expected = generation;
+    try {
+      const session = await request("GET");
+      if (!active || generation !== expected) return;
+      required = session.required;
+      if (!session.authenticated) {
+        lock("Enter the access token configured by the operator to view this fleet.");
+        return;
+      }
+      const nextEpoch = session.required ? session.session_epoch : null;
+      if (mounted && sessionEpoch !== nextEpoch) {
+        lock("Your session changed. Reloading the viewer with fresh state…");
+        host.location.reload();
+        return;
+      }
+      if (retired) {
+        host.location.reload();
+        return;
+      }
+      sessionEpoch = nextEpoch;
+      panel.hidden = true;
+      element("inspect-toolbar").hidden = false;
+      element("workspace").hidden = false;
+      controls.hidden = !required;
+      logout.disabled = false;
+      if (!app) {
+        const appEpoch = sessionEpoch;
+        const appGeneration = generation;
+        const current = () => active && generation === appGeneration;
+        const guardedFetch = async (url, init = {}) => {
+          if (!current()) throw new Error("viewer session retired");
+          const headers = new Headers(init.headers);
+          if (appEpoch !== null) headers.set("x-ft-session-epoch", appEpoch);
+          const response = await fetchImpl(url, { ...init, headers, redirect: "error" });
+          if (!current()) {
+            void response.body?.cancel().catch(() => {});
+            throw new Error("viewer session retired");
+          }
+          if (response.status === 401 || response.status === 403) {
+            lock("Your session is no longer authorized. Sign in again to reconnect.");
+          }
+          return response;
+        };
+        // Native EventSource retries reuse their original URL but automatically
+        // pick up a rotated cookie. Bind every stream to this nonsecret epoch
+        // so the server rejects an old viewer reconnecting under a new grant.
+        function SessionEventSource(url, options) {
+          if (!current()) throw new Error("viewer session retired");
+          const boundUrl = new URL(url, apiRoot);
+          if (appEpoch !== null) boundUrl.searchParams.set("session_epoch", appEpoch);
+          const source = new EventSourceImpl(boundUrl, options);
+          if (appEpoch !== null) source.addEventListener("error", () => {
+            if (current()) void check();
+          });
+          return source;
+        }
+        SessionEventSource.CLOSED = EventSourceImpl?.CLOSED ?? 2;
+        app = mountApp({ document: doc, window: host, apiRoot, fetchImpl: guardedFetch,
+          EventSourceImpl: SessionEventSource, managePageLifecycle: false });
+        mounted = true;
+      }
+      schedule(session);
+    } catch (_) {
+      if (active && generation === expected) {
+        lock("The server's session status could not be verified. Retry when it is available.");
+      }
+    }
+  }
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!active || pending || !required) return;
+    const secret = token.value;
+    token.value = "";
+    if (!/^[\x21-\x7e]{32,256}$/.test(secret)) {
+      status.textContent = "Enter the operator's 32–256 character access token.";
+      return;
+    }
+    const expected = generation;
+    token.disabled = submit.disabled = true;
+    form.setAttribute("aria-busy", "true");
+    status.textContent = "Signing in…";
+    try {
+      await request("POST", secret);
+      if (active && generation === expected) {
+        channel?.postMessage({ type: "session-changed" });
+        host.location.reload();
+      }
+    } catch (_) {
+      if (active && generation === expected) {
+        lock("Sign-in was not completed. Check the token and local server address, then retry.");
+      }
+    }
+  });
+  logout.addEventListener("click", async () => {
+    if (!active) return;
+    lock("Signing out…");
+    const expected = generation;
+    try {
+      await request("DELETE");
+      if (!active || generation !== expected) return;
+      channel?.postMessage({ type: "signed-out" });
+      status.textContent = "Signed out. Sign in to reconnect.";
+    } catch (_) {
+      if (active && generation === expected) {
+        status.textContent = "The viewer is locked, but server sign-out could not be confirmed. Retry sign-out or wait for the session to expire.";
+        controls.hidden = false;
+      }
+    }
+  });
+  retry.addEventListener("click", () => { void check(); });
+  channel?.addEventListener("message", (event) => {
+    if (required && ["signed-out", "session-changed"].includes(event.data?.type)) {
+      lock("Your session changed in another tab. Check the connection or sign in to reconnect.");
+    }
+  });
+  function suspend() {
+    if (!active) return;
+    active = false;
+    lock("Checking your session before reconnecting…");
+  }
+  function resume() {
+    if (active || disposed) return;
+    active = true;
+    void check();
+  }
+  host.addEventListener("pagehide", suspend);
+  host.addEventListener("pageshow", resume);
+  doc.addEventListener("visibilitychange", () => {
+    if (doc.visibilityState === "visible" && active && app) void check();
+  });
+  lock("Checking your session…");
+  return { ready: check(), suspend, resume, dispose() { suspend(); disposed = true; channel?.close(); } };
 }
 
 if (typeof document !== "undefined") {
-  try { mountFleetApp(); } catch (_) {
+  try { mountAuthenticatedFleet(); } catch (_) {
     const errorBox = document.getElementById("error");
     errorBox.textContent = "FrankenTerm browser controls could not start. Reload this page to try again.";
     errorBox.hidden = false;

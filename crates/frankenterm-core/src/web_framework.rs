@@ -566,7 +566,7 @@ impl FrameworkWebRuntime {
             return rollback_started_app(app.as_ref(), primary_error).await;
         }
 
-        let server_config = ServerConfig::new(resolved_bind_addr.to_string())
+        let mut server_config = ServerConfig::new(resolved_bind_addr.to_string())
             .with_parse_limits(web_parse_limits(app.config().max_body_size))
             // The pinned server calls it twice: on the parsed head, before
             // any body byte is read or 100 Continue is sent, and again on the
@@ -582,6 +582,12 @@ impl FrameworkWebRuntime {
             // refused as HTTP/1.1 instead: 501 and a close.
             .with_http2_prior_knowledge(false)
             .with_drain_timeout(WEB_CONNECTION_DRAIN_TIMEOUT);
+        if let Some(auth) = app.get_state::<crate::web::SessionAuthMiddleware>() {
+            // The same session boundary runs on the parsed head before body
+            // collection and again before any upgrade or handler dispatch.
+            auth.bind_listener(local_addr);
+            server_config = server_config.with_pre_body_validator((*auth).clone());
+        }
         let server = Arc::new(TcpServer::new(server_config));
         if let Err(err) = cx.checkpoint() {
             drop(listener);

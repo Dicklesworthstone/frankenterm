@@ -539,6 +539,11 @@ SEE ALSO:
         #[arg(long, requires = "web", value_name = "DIR")]
         web_ui_dir: Option<PathBuf>,
 
+        /// Require browser sign-in using the secret in this environment variable
+        #[cfg(feature = "web")]
+        #[arg(long, requires = "web", value_name = "ENV")]
+        web_auth_token_env: Option<String>,
+
         /// Disable single-instance lock (DANGEROUS: may corrupt data)
         #[arg(long)]
         dangerous_disable_lock: bool,
@@ -2196,6 +2201,11 @@ SEE ALSO:
         /// directory (built by scripts/build-browser-ui.sh)
         #[arg(long, env = "FT_WEB_UI_DIR", value_name = "DIR")]
         ui_dir: Option<PathBuf>,
+
+        /// Require browser sign-in using the secret in this environment variable
+        /// (32–256 ASCII characters; never put the secret in the command line)
+        #[arg(long, value_name = "ENV")]
+        auth_token_env: Option<String>,
     },
 
     /// Launch the interactive TUI (requires --features tui or --features ftui)
@@ -47512,6 +47522,30 @@ fn load_web_ui_assets(
     Ok(Some(Arc::new(set)))
 }
 
+/// Resolve an explicitly requested browser credential before opening storage
+/// or starting the watcher. Missing or invalid credentials never downgrade an
+/// authenticated server to the ordinary local read-only API.
+#[cfg(feature = "web")]
+fn load_web_session_auth(
+    token_env: Option<&str>,
+) -> anyhow::Result<Option<frankenterm_core::web::WebSessionAuth>> {
+    let Some(name) = token_env else {
+        return Ok(None);
+    };
+    let mut bytes = name.bytes();
+    if !matches!(bytes.next(), Some(b'A'..=b'Z' | b'a'..=b'z' | b'_'))
+        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        anyhow::bail!("web authentication requires a valid environment variable name");
+    }
+    let secret = std::env::var(name).map_err(|_| {
+        anyhow::anyhow!("web authentication variable {name} is unset or not valid UTF-8")
+    })?;
+    let auth = frankenterm_core::web::WebSessionAuth::new(&secret)
+        .map_err(|error| anyhow::anyhow!("invalid web authentication configuration: {error}"))?;
+    Ok(Some(auth))
+}
+
 /// How `ft watch` should serve the read-only web API, if at all.
 ///
 /// In-process serving is the only way a client sees an event at publish time:
@@ -47526,6 +47560,9 @@ struct WatcherWebOptions {
     /// Browser fleet viewer package, verified before the watcher starts.
     #[cfg(feature = "web")]
     ui_assets: Option<Arc<frankenterm_core::web::UiAssetSet>>,
+    /// Shared session authority for this watcher and its restart loop.
+    #[cfg(feature = "web")]
+    session_auth: Option<frankenterm_core::web::WebSessionAuth>,
 }
 
 /// Run the observation watcher daemon with crash-loop backoff.
@@ -48622,6 +48659,9 @@ async fn run_watcher(
             .with_storage_event_tail(false);
         if let Some(ui_assets) = &web.ui_assets {
             web_config = web_config.with_ui_assets(Arc::clone(ui_assets));
+        }
+        if let Some(auth) = &web.session_auth {
+            web_config = web_config.with_session_auth(auth.clone());
         }
         let web_cx =
             frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
@@ -50909,6 +50949,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             web_port,
             #[cfg(feature = "web")]
             web_ui_dir,
+            #[cfg(feature = "web")]
+            web_auth_token_env,
             dangerous_disable_lock,
             dangerous_bind_any,
         }) => {
@@ -50924,6 +50966,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 enabled: web,
                 port: web_port,
                 ui_assets: load_web_ui_assets(web_ui_dir.as_deref())?,
+                session_auth: load_web_session_auth(web_auth_token_env.as_deref())?,
             };
             #[cfg(not(feature = "web"))]
             let web_options = WatcherWebOptions::default();
@@ -73214,7 +73257,12 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
         }
 
         #[cfg(feature = "web")]
-        Some(Commands::Web { port, ui_dir }) => {
+        Some(Commands::Web {
+            port,
+            ui_dir,
+            auth_token_env,
+        }) => {
+            let session_auth = load_web_session_auth(auth_token_env.as_deref())?;
             let ui_assets = load_web_ui_assets(ui_dir.as_deref())?;
             let db_path = layout.db_path.to_string_lossy();
             // ft-xbnl0.2.3 tick 298/300: cx-first web server storage + orchestrator.
@@ -73240,6 +73288,9 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 );
             if let Some(ui_assets) = ui_assets {
                 web_config = web_config.with_ui_assets(ui_assets);
+            }
+            if let Some(auth) = session_auth {
+                web_config = web_config.with_session_auth(auth);
             }
             frankenterm_core::web::run_web_server_with_cx(&web_cx, web_config).await?;
         }
@@ -102106,6 +102157,67 @@ mod tests {
         ApprovalTokenRecord, PaneRecord, PreparedPlanRecord, StorageHandle,
     };
     use std::future::Future;
+
+    #[cfg(feature = "web")]
+    #[test]
+    fn web_auth_flags_select_a_named_secret_without_implicitly_enabling_web() {
+        let standalone = Cli::try_parse_from([
+            "ft",
+            "web",
+            "--auth-token-env",
+            "FT_TEST_BROWSER_SECRET",
+            "--port",
+            "9999",
+        ])
+        .expect("standalone web authentication flags");
+        assert!(matches!(
+            standalone.command.as_deref(),
+            Some(Commands::Web { auth_token_env: Some(name), port: Some(9999), .. })
+                if name == "FT_TEST_BROWSER_SECRET"
+        ));
+        let watcher = Cli::try_parse_from([
+            "ft",
+            "watch",
+            "--web",
+            "--web-auth-token-env",
+            "FT_TEST_BROWSER_SECRET",
+        ])
+        .expect("watcher web authentication flags");
+        assert!(matches!(
+            watcher.command.as_deref(),
+            Some(Commands::Watch { web: true, web_auth_token_env: Some(name), .. })
+                if name == "FT_TEST_BROWSER_SECRET"
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "ft",
+                "watch",
+                "--web-auth-token-env",
+                "FT_TEST_BROWSER_SECRET",
+            ])
+            .is_err()
+        );
+    }
+
+    #[cfg(feature = "web")]
+    #[test]
+    fn web_auth_configuration_rejects_invalid_variable_names_before_lookup() {
+        assert!(load_web_session_auth(None).unwrap().is_none());
+        for name in [
+            "",
+            "9SECRET",
+            "WITH SPACE",
+            "TOKEN=secret",
+            "TOKEN\n",
+            "TOKEN-ENV",
+        ] {
+            let error = load_web_session_auth(Some(name)).unwrap_err().to_string();
+            assert_eq!(
+                error,
+                "web authentication requires a valid environment variable name"
+            );
+        }
+    }
 
     fn now_ms() -> i64 {
         std::time::SystemTime::now()

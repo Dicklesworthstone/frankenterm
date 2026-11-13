@@ -372,7 +372,7 @@ Honest status of every shipped surface, without migration-era hand-waving.
 | Reality-check + attestation | **Supported** | `ft attestation verify` / `show` ship as a thin Rust wrapper over `scripts/attestation-verify.sh`. Signed bundles live in `docs/attestations/` |
 | Deferred proof queue | **Supported with fail-closed proof prerequisite** | `ft proof queue/status/replay/attach` and `ft robot proof status` expose source-landed proof intents. Replay executes only through remote-required RCH when admission is explicitly `admitted`; local Cargo is never substituted. Release-slot evidence stays under `docs/attestations/proofs/deferred-proof-replay.json`; current W8.2 remote proof remains blocked on RCH admission. |
 | Web API / SSE | **Supported (`web` feature, on by default)** | `/health`, `/panes`, `/events`, `/search`, `/stream/events`, `/stream/deltas` |
-| Browser fleet viewer | **Preview: read-only, loopback only** | `ft web --ui-dir <package>` serves a FrankenTUI WASM viewer of panes and live detections at `/ui/` ([Browser fleet viewer](#browser-fleet-viewer-preview)). No authentication, Tailscale mode, terminal attach or DSR-packaged asset set yet; those are tracked under `ft-browser-frankenterm-7z4il` |
+| Browser fleet viewer | **Preview: read-only, loopback only** | `ft web --ui-dir <package>` serves a FrankenTUI WASM viewer of panes and live detections at `/ui/` ([Browser fleet viewer](#browser-fleet-viewer-preview)). Optional operator-token sign-in protects HTTP reads and live streams. Authenticated Tailscale access, terminal attach and DSR-packaged assets remain under `ft-browser-frankenterm-7z4il` |
 | Distributed mode | **Supported (`distributed` feature, on by default)** | Remote panes persist into the same DB and surface through status/search/state; live `get-text` for distributed panes is intentionally unavailable |
 | MCP server | **Supported (`mcp` feature, on by default)** | stdio tool surface; per-family Robot parity is scoped in [`docs/robot-contracts/mcp-robot-surface-matrix.md`](docs/robot-contracts/mcp-robot-surface-matrix.md) |
 | Semantic search | **Supported (hash embeddings)** | Hybrid mode fuses FTS5 with a built-in FNV-1a hash-embedding lane via RRF; fastembed/ML models and a Tantivy index are not on the production path |
@@ -1120,9 +1120,20 @@ RCH_CARGO_WRAPPER_BYPASS=1 scripts/build-browser-ui.sh /tmp/ft-ui    # needs the
 ft web --ui-dir /tmp/ft-ui/site                                       # then open http://127.0.0.1:9999/ui/
 ```
 
-The build script fetches the renderer's last source revision from the frankentui repository, checks the archive's SHA-256, and builds it with the dependency lock vendored in `crates/frankenterm-browser-ui/renderer.lock`. The package's `manifest.json` records every file's SHA-256. At startup `ft web` reads exactly those files, checks each digest, and serves them from memory: a tampered or incomplete package stops startup, and no request path reaches the filesystem. The page carries a same-origin Content-Security-Policy. WebGPU is required; browsers without it show an error instead of a blank page. `tests/e2e/test_browser_fleet_viewer.sh` drives a real headless Chrome against a viewer fed by the headless capture-and-detect smoke.
+The build script fetches the renderer's last source revision from the frankentui repository, checks the archive's SHA-256, and builds it with the dependency lock vendored in `crates/frankenterm-browser-ui/renderer.lock`. The package's `manifest.json` records every file's SHA-256. At startup `ft web` reads exactly those files, checks each digest, and serves them from memory: a tampered or incomplete package stops startup, and no request path reaches the filesystem. The page carries a same-origin Content-Security-Policy. Browsers without WebGPU use the fleet viewer's native text view. `tests/e2e/test_browser_fleet_viewer.sh` drives a real headless Chrome against a viewer fed by the headless capture-and-detect smoke.
 
-The server is still loopback-only and unauthenticated. It refuses to bind any non-loopback address, so another device on your network cannot reach it directly, even on the same tailnet. To use the viewer from a laptop, tablet or phone, put Tailscale Serve in front of it. Tailscale terminates HTTPS with the machine's tailnet certificate and accepts only devices on your tailnet:
+To require local browser sign-in, set an environment variable to a randomly generated access token of 32–256 visible ASCII characters, then pass its **name** to either server entry point:
+
+```bash
+ft web --ui-dir /tmp/ft-ui/site --auth-token-env FT_BROWSER_TOKEN
+ft watch --web --web-ui-dir /tmp/ft-ui/site --web-auth-token-env FT_BROWSER_TOKEN
+```
+
+The viewer checks `/auth/status` before starting any data requests. Sign-in exchanges the operator token for an opaque `HttpOnly`, `SameSite=Strict` cookie; the token is never placed in a URL or browser storage. Sessions expire after one hour, with at most 16 concurrent sessions. Sign-out revokes that session, stops its stream producers, and clears the viewer, pane output and history results. Restarting the server revokes all sessions. Each session has an independent nonsecret epoch that binds reads and stream reconnects to the original viewer; a changed session starts with a fresh model and cursor. Health, session status and UI assets stay public; data routes and OpenAPI require a valid session.
+
+Authentication is opt-in. With either token flag, Host and Origin checks require the actual loopback listener address and port, and a session stays bound to its original origin. This mode does not accept reverse-proxy or Tailscale origins, and does not qualify remote authenticated access. The pinned HTTP substrate still collapses duplicate raw header lines and does not provide a cancellation deadline for a blocked socket write; those transport requirements remain part of `ft-xxfwy.55.3`.
+
+The server always refuses to bind any non-loopback address. Without a token flag, the existing unauthenticated local mode remains available. To forward that mode from a laptop, tablet or phone, put Tailscale Serve in front of it. Tailscale terminates HTTPS with the machine's tailnet certificate and accepts only devices on your tailnet:
 
 ```bash
 ft web --ui-dir /tmp/ft-ui/site &
@@ -1131,7 +1142,7 @@ tailscale serve status              # show what is shared
 tailscale serve --https=443 off     # stop sharing
 ```
 
-Everything `ft web` serves is then readable from every device on the tailnet. That includes captured pane output and history search. The streams redact the secrets they recognize, but nothing checks who is asking. Use tailnet access rules if that is broader than you want. Never use `tailscale funnel`: it publishes to the whole internet. The milestones still open in `ft-browser-frankenterm-7z4il` are authenticated tailnet access (identity checks and strict Host/Origin), terminal attach, and DSR packaging.
+In this unauthenticated forwarding mode, everything `ft web` serves is readable from every device allowed by the tailnet rules. That includes captured pane output and history search. The streams redact the secrets they recognize, but the application does not authenticate the reader. Use tailnet access rules to restrict access. Never use `tailscale funnel`: it publishes to the whole internet. The milestones still open in `ft-browser-frankenterm-7z4il` are authenticated tailnet access, terminal attach, and DSR packaging.
 
 `ft web` runs no capture pipeline of its own. Its storage tail follows newly persisted `events` rows written by the watcher and republishes wakeups on its in-process bus. Subscriptions always obtain detection content and ordering from storage, so a delayed or reordered wakeup cannot skip an earlier row. The tail starts after existing history; explicit subscription cursors control replay. Embedders that publish to the same bus in-process can disable the extra wakeup tail with `WebServerConfig::with_storage_event_tail(false)`.
 

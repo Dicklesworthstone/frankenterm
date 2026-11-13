@@ -288,6 +288,9 @@ pub fn handle_stream_deltas(
     let max_hz = parse_stream_max_hz(&qs, limits);
     let result = require_storage_and_event_bus(req);
     let lifecycle = req.get_extension::<WebStreamLifecycle>().cloned();
+    let session = req
+        .get_extension::<super::super::auth::SessionGrant>()
+        .cloned();
 
     Box::pin(async move {
         let (storage, event_bus, redactor) = match result {
@@ -308,7 +311,11 @@ pub fn handle_stream_deltas(
                 "Stream runtime context is unavailable",
             );
         };
-        let shutdown = lifecycle.shutdown_waiter(&stream_cx);
+        let shutdown = super::super::auth::stream_shutdown(
+            lifecycle.shutdown_waiter(&stream_cx),
+            session,
+            &stream_cx,
+        );
         let recv_cx = stream_cx.clone();
         let started_at_ms = epoch_ms_now();
         let mut subscriber = event_bus.subscribe_deltas();

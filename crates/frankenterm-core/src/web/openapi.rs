@@ -14,7 +14,7 @@ pub(super) fn config() -> OpenApiConfig {
         .title("FrankenTerm observation API")
         .version(crate::VERSION)
         .description(
-            "Live read-only route discovery. Query, response, error and SSE schemas are not yet complete. Terminal WebSocket and mutation APIs are not provided by this document.",
+            "Live observation and local viewer session route discovery. Query, response, error and SSE schemas are not yet complete. Terminal WebSocket and pane mutation APIs are not provided by this document.",
         )
 }
 
@@ -26,8 +26,14 @@ mod tests {
 
     #[test]
     fn openapi_discovery_matches_live_route_inventory() {
-        let app =
-            super::super::router::build_app(None, None, resolve_runtime_limits(None), "none", None);
+        let app = super::super::router::build_app(
+            None,
+            None,
+            resolve_runtime_limits(None),
+            "none",
+            None,
+            None,
+        );
         let spec: serde_json::Value = serde_json::from_str(
             app.openapi_spec()
                 .expect("production builder must enable route discovery"),
@@ -40,6 +46,7 @@ mod tests {
             .collect();
         let expected: BTreeSet<_> = [
             "/health",
+            "/auth/status",
             "/panes",
             "/events",
             "/search",
@@ -51,6 +58,10 @@ mod tests {
         ]
         .into_iter()
         .map(|path| (path.to_owned(), "get".to_owned()))
+        .chain([
+            ("/auth/session".to_owned(), "post".to_owned()),
+            ("/auth/session".to_owned(), "delete".to_owned()),
+        ])
         .collect();
         assert_eq!(actual, expected, "review missing or newly exposed routes");
         let mut documented = BTreeSet::new();
@@ -63,17 +74,26 @@ mod tests {
                     .filter(|id| !id.is_empty())
                     .expect("every operation must have a nonempty ID");
                 assert!(operation_ids.insert(id), "duplicate operation ID: {id}");
-                assert!(operation.get("security").is_none(), "auth is not wired yet");
+                assert!(
+                    operation.get("security").is_none(),
+                    "this fixture selects private operator mode"
+                );
             }
         }
         assert_eq!(documented, actual, "discovery and live routes must agree");
-        assert_eq!(documented.len(), 9, "review newly exposed operations");
-        assert!(documented.iter().all(|(_, method)| method == "get"));
-        assert_eq!(app.routes().count(), 10, "no external docs UI routes");
+        assert_eq!(documented.len(), 12, "review newly exposed operations");
+        assert!(documented.iter().all(|(path, method)| {
+            method == "get"
+                || (path == "/auth/session" && matches!(method.as_str(), "post" | "delete"))
+        }));
+        assert_eq!(app.routes().count(), 13, "no external docs UI routes");
         assert_eq!(spec["info"]["title"], "FrankenTerm observation API");
         assert_eq!(spec["info"]["version"], crate::VERSION);
         assert_eq!(spec["openapi"], "3.1.0");
-        assert!(spec.get("security").is_none(), "no unwired global auth");
+        assert!(
+            spec.get("security").is_none(),
+            "private mode has no cookie requirement"
+        );
         assert!(spec["components"].get("securitySchemes").is_none());
         assert!(
             spec["info"]["description"]

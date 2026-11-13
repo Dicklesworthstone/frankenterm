@@ -3,7 +3,7 @@
 //! This is the first strangler-fig extraction from `web.rs`, keeping
 //! behavior identical while moving route wiring into `web/` modules.
 
-use super::WebRuntimeLimits;
+use super::auth::{SessionAuthMiddleware, handle_login, handle_logout, handle_status};
 use super::handlers::{
     handle_bookmarks, handle_events, handle_panes, handle_ruleset_profile, handle_saved_searches,
     handle_search, health_response,
@@ -11,6 +11,7 @@ use super::handlers::{
 use super::middleware::{AppState, BodySizeGuard, RequestSpanLogger, StateInjector};
 use super::sse::{handle_stream_deltas, handle_stream_events};
 use super::ui_assets::UiAssetSet;
+use super::{WebRuntimeLimits, WebSessionAuth};
 use crate::events::EventBus;
 use crate::policy::Redactor;
 use crate::storage::StorageHandle;
@@ -26,6 +27,7 @@ pub(super) fn build_app(
     runtime_limits: WebRuntimeLimits,
     event_source: &'static str,
     ui_assets: Option<Arc<UiAssetSet>>,
+    session_auth: Option<WebSessionAuth>,
 ) -> App {
     let streams = WebStreamLifecycle::new();
     let state = AppState {
@@ -34,6 +36,15 @@ pub(super) fn build_app(
         redactor: Arc::new(Redactor::new()),
         runtime_limits,
     };
+    let public_assets = ui_assets.as_ref().map_or_else(Vec::new, |ui| {
+        let mut paths = ui
+            .paths()
+            .map(|path| format!("/ui/{path}"))
+            .collect::<Vec<_>>();
+        paths.extend(["/ui".to_string(), "/ui/".to_string()]);
+        paths
+    });
+    let auth = SessionAuthMiddleware::new(session_auth, public_assets.into_iter());
 
     let builder = App::builder()
         // The framework's own body cap (and, through it, the server's parser
@@ -41,10 +52,36 @@ pub(super) fn build_app(
         .config(AppConfig::new().max_body_size(runtime_limits.max_request_body_bytes))
         .openapi(super::openapi::config())
         .state(streams.clone())
+        .state(auth.clone())
         .middleware(streams)
         .middleware(BodySizeGuard::new(runtime_limits.max_request_body_bytes))
+        .middleware(auth)
         .middleware(RequestSpanLogger)
         .middleware(StateInjector { state })
+        .route(
+            "/auth/status",
+            Method::Get,
+            |_ctx: &RequestContext, req: &mut Request| {
+                let response = handle_status(req);
+                async move { response }
+            },
+        )
+        .route(
+            "/auth/session",
+            Method::Post,
+            |_ctx: &RequestContext, req: &mut Request| {
+                let response = handle_login(req);
+                async move { response }
+            },
+        )
+        .route(
+            "/auth/session",
+            Method::Delete,
+            |_ctx: &RequestContext, req: &mut Request| {
+                let response = handle_logout(req);
+                async move { response }
+            },
+        )
         .route(
             "/health",
             Method::Get,

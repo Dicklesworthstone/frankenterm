@@ -19,7 +19,7 @@ html, body {
 body { display: flex; flex-direction: column; }
 [hidden] { display: none !important; }
 button, input { font: inherit; }
-button, input[type="text"], input[type="search"] {
+button, input[type="text"], input[type="search"], input[type="password"] {
   color: #eeeeee;
   background: #20242c;
   border: 1px solid #808080;
@@ -28,6 +28,11 @@ button, input[type="text"], input[type="search"] {
 }
 button { cursor: pointer; }
 button:disabled { cursor: default; opacity: 0.5; }
+#web-auth { margin: auto; padding: 24px; max-width: 38em; }
+#web-auth h1 { font-size: 22px; }
+#web-auth-form { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 18px 0; }
+#web-auth-token { flex: 1; min-width: 12em; max-width: 100%; }
+#web-auth-controls { display: flex; justify-content: flex-end; align-items: center; gap: 12px; padding: 6px 8px; border-bottom: 1px solid #444; }
 button:focus-visible, input:focus-visible, textarea:focus-visible, #terminal:focus-visible, #screen-text:focus-visible {
   outline: 2px solid #5fafff;
   outline-offset: -2px;
