@@ -16,7 +16,7 @@ use crate::glyphcache::GlyphCache;
 use crate::quad::{HeapQuadAllocator, TripleLayerQuadAllocator, V_BOT_RIGHT, V_TOP_LEFT, Vertex};
 use crate::utilsprites::{RenderMetrics, UtilSprites};
 use ::window::bitmaps::atlas::OutOfTextureSpace;
-use ::window::bitmaps::{BitmapImage, ImageTexture, Texture2d};
+use ::window::bitmaps::{BitmapImage, Image, ImageTexture, Texture2d};
 use frankenterm_font::FontConfiguration;
 use frankenterm_renderer_metal::ui_quads::{UI_ATLAS_STRIPE_ROWS, UiAtlasPixels, UiAtlasStripe};
 use frankenterm_renderer_metal::{UiAtlas, UiLayer, UiQuad};
@@ -47,8 +47,18 @@ pub(crate) struct ChromeAtlas {
 
 /// Tracks writes at the texture boundary, including atlas clears. Damage
 /// does not depend on how the glyph cache allocates or reuses its sprites.
+///
+/// The pixels live only in stripes that snapshots share (ft-ulmi2). A write
+/// replaces the stripes it touches, so earlier snapshots, and the frames
+/// drawing them, keep their pixels. The texture used to keep a full image
+/// besides the latest snapshot's copy of it: two copies of every pixel,
+/// 32 MiB per window at a 2048 side.
 struct ChromeTexture {
-    texture: ImageTexture,
+    width: usize,
+    height: usize,
+    /// RGBA rows, [`UI_ATLAS_STRIPE_ROWS`] per stripe. Untouched stripes of
+    /// one height share one zeroed allocation.
+    stripes: RefCell<Vec<Arc<[u8]>>>,
     dirty: RefCell<Vec<bool>>,
     changed: Cell<bool>,
     snapshot: RefCell<Option<Arc<ChromeAtlas>>>,
@@ -56,17 +66,33 @@ struct ChromeTexture {
 
 impl ChromeTexture {
     fn new(width: usize, height: usize) -> Self {
+        let rows = UI_ATLAS_STRIPE_ROWS as usize;
+        let count = height.div_ceil(rows);
+        let full: Arc<[u8]> = Arc::from(vec![0; width * rows * 4]);
+        let stripes: Vec<Arc<[u8]>> = (0..count)
+            .map(|index| {
+                let stripe_rows = rows.min(height - index * rows);
+                if stripe_rows == rows {
+                    Arc::clone(&full)
+                } else {
+                    Arc::from(vec![0; width * stripe_rows * 4])
+                }
+            })
+            .collect();
         Self {
-            texture: ImageTexture::new(width, height),
-            dirty: RefCell::new(vec![true; height.div_ceil(UI_ATLAS_STRIPE_ROWS as usize)]),
+            width,
+            height,
+            stripes: RefCell::new(stripes),
+            dirty: RefCell::new(vec![true; count]),
             changed: Cell::new(true),
             snapshot: RefCell::new(None),
         }
     }
 
-    /// Shares unchanged pixels, copying only the stripes touched since the
-    /// previous snapshot. Every snapshot remains complete, so skipped frame
-    /// publications and independently lagging GPU slots need no damage log.
+    /// Shares every stripe with the texture, and the unchanged ones with
+    /// the previous snapshot too; it copies no pixels. Every snapshot
+    /// remains complete, so skipped frame publications and independently
+    /// lagging GPU slots need no damage log.
     fn snapshot(&self) -> Arc<ChromeAtlas> {
         let mut snapshot = self.snapshot.borrow_mut();
         if let Some(atlas) = snapshot.as_ref()
@@ -74,33 +100,30 @@ impl ChromeTexture {
         {
             return Arc::clone(atlas);
         }
-        let image = self.texture.image.borrow();
-        let (width, height) = image.image_dimensions();
         let version = NEXT_ATLAS_VERSION
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
             })
             .expect("chrome atlas content version space exhausted");
-        let rgba = bytemuck::cast_slice::<u32, u8>(image.pixels());
+        let pixels = self.stripes.borrow();
         let mut dirty = self.dirty.borrow_mut();
-        let stripes = dirty
+        let stripes = pixels
             .iter()
+            .zip(dirty.iter())
             .enumerate()
-            .map(|(index, changed)| {
+            .map(|(index, (rgba, changed))| {
                 if !changed && let Some(previous) = snapshot.as_ref() {
                     return previous.stripes[index].clone();
                 }
-                let first = index * UI_ATLAS_STRIPE_ROWS as usize;
-                let end = (first + UI_ATLAS_STRIPE_ROWS as usize).min(height);
                 UiAtlasStripe {
                     version,
-                    rgba: Arc::from(&rgba[first * width * 4..end * width * 4]),
+                    rgba: Arc::clone(rgba),
                 }
             })
             .collect();
         let atlas = Arc::new(ChromeAtlas {
-            width: u32::try_from(width).unwrap_or(u32::MAX),
-            height: u32::try_from(height).unwrap_or(u32::MAX),
+            width: u32::try_from(self.width).unwrap_or(u32::MAX),
+            height: u32::try_from(self.height).unwrap_or(u32::MAX),
             version,
             stripes,
         });
@@ -109,36 +132,71 @@ impl ChromeTexture {
         self.changed.set(false);
         atlas
     }
+
+    /// A copy of the stripes `first_stripe..end_stripe` as one image.
+    fn rows(&self, first_stripe: usize, end_stripe: usize) -> Image {
+        let rows = UI_ATLAS_STRIPE_ROWS as usize;
+        let top = first_stripe * rows;
+        let bottom = (end_stripe * rows).min(self.height);
+        let stripes = self.stripes.borrow();
+        let mut pixels = Vec::with_capacity(self.width * (bottom - top) * 4);
+        for stripe in &stripes[first_stripe..end_stripe] {
+            pixels.extend_from_slice(stripe);
+        }
+        Image::from_raw(self.width, bottom - top, pixels)
+    }
 }
 
 impl Texture2d for ChromeTexture {
     // The clipped image coordinates are nonnegative and fit usize.
     #[allow(clippy::cast_sign_loss)]
     fn write(&self, rect: ::window::Rect, image: &dyn BitmapImage) {
-        self.texture.write(rect, image);
         // ImageTexture draws the source image at rect.origin. Include its
         // actual height and clip the damage as the bitmap does.
-        let height = isize::try_from(self.height()).unwrap_or(isize::MAX);
+        let height = isize::try_from(self.height).unwrap_or(isize::MAX);
         let source_height = isize::try_from(image.image_dimensions().1).unwrap_or(isize::MAX);
         let first = rect.origin.y.clamp(0, height) as usize;
         let end = rect.origin.y.saturating_add(source_height).clamp(0, height) as usize;
-        if first < end {
-            let rows = UI_ATLAS_STRIPE_ROWS as usize;
-            self.dirty.borrow_mut()[first / rows..end.div_ceil(rows)].fill(true);
-            self.changed.set(true);
+        if first >= end {
+            return;
         }
+        let rows = UI_ATLAS_STRIPE_ROWS as usize;
+        let (first_stripe, end_stripe) = (first / rows, end.div_ceil(rows));
+        // Draw into a copy of the touched stripes, as ImageTexture draws
+        // into the whole texture: snapshots keep the stripes they hold.
+        let region = ImageTexture {
+            image: RefCell::new(self.rows(first_stripe, end_stripe)),
+        };
+        let top = isize::try_from(first_stripe * rows).unwrap_or(isize::MAX);
+        let origin = ::window::Point::new(rect.origin.x, rect.origin.y - top);
+        region.write(::window::Rect::new(origin, rect.size), image);
+        let region = region.image.into_inner();
+        let pixels = region.pixel_data_slice();
+        let mut stripes = self.stripes.borrow_mut();
+        let mut start = 0;
+        for stripe in &mut stripes[first_stripe..end_stripe] {
+            let end = start + stripe.len();
+            *stripe = Arc::from(&pixels[start..end]);
+            start = end;
+        }
+        self.dirty.borrow_mut()[first_stripe..end_stripe].fill(true);
+        self.changed.set(true);
     }
 
     fn read(&self, rect: ::window::Rect, image: &mut dyn BitmapImage) -> anyhow::Result<()> {
-        self.texture.read(rect, image)
+        let count = self.stripes.borrow().len();
+        ImageTexture {
+            image: RefCell::new(self.rows(0, count)),
+        }
+        .read(rect, image)
     }
 
     fn width(&self) -> usize {
-        self.texture.width()
+        self.width
     }
 
     fn height(&self) -> usize {
-        self.texture.height()
+        self.height
     }
 }
 
@@ -435,7 +493,6 @@ impl TermWindow {
 mod tests {
     use super::*;
     use crate::glyphcache::LoadState;
-    use ::window::bitmaps::Image;
     use ::window::bitmaps::atlas::AtlasAllocationFailure;
     use ::window::{Point, Rect, Size};
     use std::time::{Duration, Instant};
@@ -709,5 +766,44 @@ mod tests {
             );
         }
         assert_eq!(snapshot_pixels(&recreated), vec![0; 520]);
+    }
+
+    #[test]
+    fn chrome_snapshots_hold_the_texture_pixels_without_a_second_copy() {
+        let texture = ChromeTexture::new(2, 70);
+        let shares_texture = |atlas: &ChromeAtlas| {
+            let stripes = texture.stripes.borrow();
+            assert_eq!(stripes.len(), atlas.stripes.len());
+            for (own, published) in stripes.iter().zip(&atlas.stripes) {
+                assert!(Arc::ptr_eq(own, &published.rgba));
+            }
+        };
+        {
+            // Untouched full stripes share one zeroed allocation.
+            let stripes = texture.stripes.borrow();
+            assert!(Arc::ptr_eq(&stripes[0], &stripes[1]));
+            assert_eq!(stripes[2].len(), 48);
+        }
+        let initial = texture.snapshot();
+        shares_texture(&initial);
+
+        texture.write(
+            Rect::new(Point::new(1, 40), Size::new(1, 1)),
+            &Image::from_raw(1, 1, vec![5; 4]),
+        );
+        let written = texture.snapshot();
+        shares_texture(&written);
+        assert!(Arc::ptr_eq(
+            &written.stripes[0].rgba,
+            &initial.stripes[0].rgba
+        ));
+        assert!(!Arc::ptr_eq(
+            &written.stripes[1].rgba,
+            &initial.stripes[1].rgba
+        ));
+        let mut expected = vec![0; 560];
+        expected[40 * 8 + 4..41 * 8].fill(5);
+        assert_eq!(snapshot_pixels(&written), expected);
+        assert_eq!(snapshot_pixels(&initial), vec![0; 560]);
     }
 }
