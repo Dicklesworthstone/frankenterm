@@ -1588,7 +1588,8 @@ fn replay_store_error_response(
         GuardianCheckpointStageStoreError::Conflict
         | GuardianCheckpointStageStoreError::OutOfOrder
         | GuardianCheckpointStageStoreError::CandidateAbsent
-        | GuardianCheckpointStageStoreError::OriginAuthorityMismatch => {
+        | GuardianCheckpointStageStoreError::OriginAuthorityMismatch
+        | GuardianCheckpointStageStoreError::RecoveryIntentOfAnotherBuild => {
             GuardianRejectionCode::InvalidRequest
         }
         GuardianCheckpointStageStoreError::ReplaySnapshotExpired => {

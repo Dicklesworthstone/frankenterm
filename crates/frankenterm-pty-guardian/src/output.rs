@@ -372,6 +372,10 @@ pub enum GuardianCheckpointStageStoreError {
     CandidateAbsent,
     #[error("guardian checkpoint staging origin authority does not match its scope")]
     OriginAuthorityMismatch,
+    /// The pane's durable recovery Claim intent matches this recovery but
+    /// names another mux build as its target: that build wrote it.
+    #[error("a durable recovery Claim intent for this pane was written by another mux build")]
+    RecoveryIntentOfAnotherBuild,
 }
 
 impl GuardianCheckpointStageStoreError {
@@ -1130,11 +1134,35 @@ impl GuardianRecoveryClaimAdmission {
 
     /// Persist before issuing any recovery Claim. A retry adopts the original
     /// target/request/effect identities; it cannot replace an ambiguous intent.
+    /// An intent another mux build wrote is `RecoveryIntentOfAnotherBuild`.
     pub fn prepare_recovery_claim_intent(
         &self,
         proposed: mux::guardian_checkpoint::GuardianRecoveryClaimIntentV1,
         allow_create: bool,
     ) -> Result<GuardianDurableRecoveryClaimIntentV1, GuardianCheckpointStageStoreError> {
+        self.recovery_claim_intent(&proposed, allow_create, false)
+    }
+
+    /// Adopt the stored intent another mux build wrote for this recovery,
+    /// target build included. Only for an intent whose Claim the guardian
+    /// has settled: the pane's generation is past the intent's predecessor,
+    /// so that Claim either applied, and a replay only reads its receipt,
+    /// or can never apply. An unsettled one stays that build's to resolve.
+    /// This never writes an intent.
+    pub fn adopt_settled_recovery_claim_intent(
+        &self,
+        proposed: mux::guardian_checkpoint::GuardianRecoveryClaimIntentV1,
+    ) -> Result<GuardianDurableRecoveryClaimIntentV1, GuardianCheckpointStageStoreError> {
+        self.recovery_claim_intent(&proposed, false, true)
+    }
+
+    fn recovery_claim_intent(
+        &self,
+        proposed: &mux::guardian_checkpoint::GuardianRecoveryClaimIntentV1,
+        allow_create: bool,
+        adopt_target_build: bool,
+    ) -> Result<GuardianDurableRecoveryClaimIntentV1, GuardianCheckpointStageStoreError> {
+        let proposed = *proposed;
         use mux::guardian_checkpoint::GUARDIAN_RECOVERY_CLAIM_INTENT_BYTES;
         if proposed.pane_id != self.context.pane_id
             || proposed.guardian_incarnation != self.context.guardian_incarnation
@@ -1169,8 +1197,17 @@ impl GuardianRecoveryClaimAdmission {
                         effect_id: stored.effect_id,
                         ..proposed
                     };
-                    return if stored == expected {
+                    // ubs:ignore[rust.security.constant-time-compare] — Build identities are public release digests, not secret authentication material.
+                    let of_another_build = stored.target_mux_build != expected.target_mux_build
+                        && stored
+                            == mux::guardian_checkpoint::GuardianRecoveryClaimIntentV1 {
+                                target_mux_build: stored.target_mux_build,
+                                ..expected
+                            };
+                    return if stored == expected || (of_another_build && adopt_target_build) {
                         Ok(stored)
+                    } else if of_another_build {
+                        Err(GuardianCheckpointStageStoreError::RecoveryIntentOfAnotherBuild)
                     } else {
                         Err(GuardianCheckpointStageStoreError::Conflict)
                     };
@@ -17410,17 +17447,38 @@ mod tests {
         );
         // An upgrade needs explicit new authority. It may not reinterpret
         // the old ambiguous operation under a different compiled build.
-        assert!(
+        let of_another_build = GuardianRecoveryClaimIntentV1 {
+            target_mux_build: [7; 32],
+            ..retry
+        };
+        assert!(matches!(
+            admission.prepare_recovery_claim_intent(of_another_build, true),
+            Err(GuardianCheckpointStageStoreError::RecoveryIntentOfAnotherBuild)
+        ));
+        // Once the guardian settled that operation, another build adopts the
+        // stored intent as it stands, its target build included.
+        assert_eq!(
             admission
-                .prepare_recovery_claim_intent(
-                    GuardianRecoveryClaimIntentV1 {
-                        target_mux_build: [7; 32],
-                        ..retry
-                    },
-                    true
-                )
-                .is_err()
+                .adopt_settled_recovery_claim_intent(of_another_build)?
+                .context(),
+            intent
         );
+        // Adoption takes the target's identities and nothing else.
+        assert!(matches!(
+            admission.adopt_settled_recovery_claim_intent(GuardianRecoveryClaimIntentV1 {
+                predecessor_mux_build: [8; 32],
+                ..of_another_build
+            }),
+            Err(GuardianCheckpointStageStoreError::Conflict)
+        ));
+        // And it never writes one.
+        assert!(matches!(
+            admission.adopt_settled_recovery_claim_intent(GuardianRecoveryClaimIntentV1 {
+                parent_request_id: Uuid::new_v4(),
+                ..of_another_build
+            }),
+            Err(GuardianCheckpointStageStoreError::CandidateAbsent)
+        ));
         assert!(
             admission
                 .prepare_recovery_claim_intent(

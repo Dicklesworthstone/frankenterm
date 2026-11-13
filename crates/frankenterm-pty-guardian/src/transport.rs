@@ -2466,6 +2466,21 @@ impl GuardianAcknowledgedSuccessorClaim {
         original: mux::guardian_checkpoint::GuardianSpawnCustodyScopeV1,
     ) -> Result<mux::guardian_checkpoint::GuardianSuccessorCustodyContextV1, GuardianClientError>
     {
+        let build = crate::guardian_runtime_build_identity()
+            .map_err(|_| GuardianClientError::Setup(GuardianServiceError::OutputInitialization))?;
+        self.reopen_as(token_path, original, build.into_bytes())
+    }
+
+    /// As `reopen`, for a Claim the mux build `mux_build` sent: the custody
+    /// of a successor names the build that claimed, which a recovery
+    /// continuing another build's settled Claim is not.
+    pub fn reopen_as(
+        self,
+        token_path: &Path,
+        original: mux::guardian_checkpoint::GuardianSpawnCustodyScopeV1,
+        mux_build: [u8; 32],
+    ) -> Result<mux::guardian_checkpoint::GuardianSuccessorCustodyContextV1, GuardianClientError>
+    {
         let reject = || GuardianClientError::Setup(GuardianServiceError::OutputInitialization);
         if original.pane_id != self.pane || original.guardian_incarnation != self.guardian {
             return Err(reject());
@@ -2473,7 +2488,6 @@ impl GuardianAcknowledgedSuccessorClaim {
         let original =
             crate::output::GuardianDurableSpawnCustodyV1::open_existing(token_path, original)
                 .map_err(|_| reject())?;
-        let build = crate::guardian_runtime_build_identity().map_err(|_| reject())?;
         let context = original.context();
         let custody = crate::output::GuardianDurableSuccessorCustodyV1::open_acknowledged_rotation(
             token_path,
@@ -2486,7 +2500,7 @@ impl GuardianAcknowledgedSuccessorClaim {
                     connection_id: Uuid::nil(),
                     mux_incarnation: self.mux,
                     guardian_build: context.guardian_build,
-                    mux_build: build.into_bytes(),
+                    mux_build,
                 },
                 pane_id: self.pane,
                 handoff_id: self.handoff,

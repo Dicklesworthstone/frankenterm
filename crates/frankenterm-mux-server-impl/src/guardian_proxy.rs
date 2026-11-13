@@ -6688,6 +6688,7 @@ impl GuardianProxyLeasePlan {
         request_id: Uuid,
         effect_id: Uuid,
     ) -> Result<GuardianProxyStaging, GuardianProxyError> {
+        use frankenterm_pty_guardian::GuardianCheckpointStageStoreError;
         use mux::guardian_protocol::{GuardianCensusPaneStatus, GuardianRejectionCode};
         let rejected = || {
             GuardianProxyError::InvalidConfiguration(
@@ -6697,6 +6698,8 @@ impl GuardianProxyLeasePlan {
         let recovery = self.recovery_claim.take().ok_or_else(rejected)?;
         let original = self.spawn_custody.ok_or_else(rejected)?;
         let selected = self.selected_checkpoint.ok_or_else(rejected)?;
+        // The child intents this attempt writes name this build as target.
+        let own_build = recovery.proposed.target_mux_build;
         let mut proposed = mux::guardian_checkpoint::GuardianRecoveryClaimIntentV1 {
             request_id,
             effect_id,
@@ -6718,11 +6721,50 @@ impl GuardianProxyLeasePlan {
             if started.elapsed() >= GUARDIAN_RECOVERY_CLAIM_RETRY_BUDGET {
                 return Err(rejected());
             }
-            let intent = recovery
+            let intent = match recovery
                 .admission
                 .prepare_recovery_claim_intent(proposed, allow_create)
-                .map_err(|_| rejected())?
-                .context();
+            {
+                Ok(intent) => intent,
+                // An upgrade that failed after its Claim, then a rollback,
+                // leaves the failed build's intent behind. Its Claim is this
+                // build's to continue once the guardian has settled it: the
+                // pane's generation is past the intent's predecessor, so a
+                // replay of it only reads its receipt. An unsettled one may
+                // still apply under that build's identity.
+                Err(GuardianCheckpointStageStoreError::RecoveryIntentOfAnotherBuild) => {
+                    let settled = self
+                        .client
+                        .census_snapshot()
+                        .map_err(map_replay_client_error)?
+                        .into_iter()
+                        .find(|entry| entry.pane_id == proposed.pane_id)
+                        .is_some_and(|entry| entry.generation > proposed.predecessor_generation);
+                    if !settled {
+                        return Err(GuardianProxyError::InvalidConfiguration(
+                            "another mux build's recovery Claim for this pane is unsettled; \
+                             only that build can resolve it",
+                        ));
+                    }
+                    recovery
+                        .admission
+                        .adopt_settled_recovery_claim_intent(proposed)
+                        .map_err(|_| rejected())?
+                }
+                Err(GuardianCheckpointStageStoreError::CandidateAbsent) => {
+                    return Err(GuardianProxyError::InvalidConfiguration(
+                        "the pane's guardian generation moved past this recovery's last durable \
+                         Claim intent",
+                    ));
+                }
+                Err(_) => {
+                    return Err(GuardianProxyError::InvalidConfiguration(
+                        "durable recovery Claim intent is unavailable or conflicts with this \
+                         recovery",
+                    ));
+                }
+            }
+            .context();
             #[cfg(test)]
             tests::pause_recovery_claim_at_process_cut(if intent.parent_request_id.is_nil() {
                 "after_intent"
@@ -6901,8 +6943,10 @@ impl GuardianProxyLeasePlan {
                 return Ok(staging);
             }
 
+            // The intent may be another build's settled Claim: its custody
+            // names the build that claimed.
             let successor = acknowledged
-                .reopen(&self.token_path, original)
+                .reopen_as(&self.token_path, original, intent.target_mux_build)
                 .map_err(map_replay_client_error)?;
             // A stored operation may have been applied by this resolution for
             // the first time. Close only our temporary attachment. Never retire
@@ -6957,6 +7001,7 @@ impl GuardianProxyLeasePlan {
                 predecessor_mux_incarnation: intent.target_mux_incarnation,
                 predecessor_mux_build: intent.target_mux_build,
                 target_mux_incarnation: self.census.mux_incarnation(),
+                target_mux_build: own_build,
                 request_id: Uuid::new_v4(),
                 effect_id: Uuid::new_v4(),
                 ..intent
