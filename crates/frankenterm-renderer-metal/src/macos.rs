@@ -17,7 +17,7 @@ use crate::{
     WindowFrame, appkit_view,
 };
 use frankenterm_alloc::resource_ledger::GpuResourceLedger;
-use objc2::rc::Retained;
+use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::{NSObject, ProtocolObject};
 use objc2::{MainThreadMarker, msg_send};
 use objc2_core_foundation::CGSize;
@@ -605,15 +605,18 @@ impl MetalRenderer {
         } else {
             1.0
         };
-        CATransaction::begin();
-        CATransaction::setDisableActions(true);
-        if (self.layer.contentsScale() - scale).abs() > f64::EPSILON {
-            self.layer.setContentsScale(scale);
-        }
-        if self.layer.isOpaque() != opaque {
-            self.layer.setOpaque(opaque);
-        }
-        CATransaction::commit();
+        // Drains what Core Animation autoreleases here, as a frame does.
+        autoreleasepool(|_| {
+            CATransaction::begin();
+            CATransaction::setDisableActions(true);
+            if (self.layer.contentsScale() - scale).abs() > f64::EPSILON {
+                self.layer.setContentsScale(scale);
+            }
+            if self.layer.isOpaque() != opaque {
+                self.layer.setOpaque(opaque);
+            }
+            CATransaction::commit();
+        });
     }
 
     /// Parks an occluded window's drawable pool at one pixel, or restores
@@ -628,7 +631,8 @@ impl MetalRenderer {
         } else {
             (width, height)
         };
-        self.fit_drawable(width, height);
+        // Drains what Core Animation autoreleases here, as a frame does.
+        autoreleasepool(|_| self.fit_drawable(width, height));
     }
 
     /// [`Self::render_frame`] into an offscreen `width x height` texture,
@@ -805,7 +809,19 @@ impl MetalRenderer {
         result
     }
 
+    /// Renders a window frame inside its own autorelease pool, as
+    /// [`Self::render`] does.
     fn render_window_with(
+        &self,
+        width: u32,
+        height: u32,
+        frame: &WindowFrame<'_>,
+        provided: Option<Retained<ProtocolObject<dyn CAMetalDrawable>>>,
+    ) -> Result<FrameOutcome, FrameError> {
+        autoreleasepool(|_| self.render_window_unpooled(width, height, frame, provided))
+    }
+
+    fn render_window_unpooled(
         &self,
         width: u32,
         height: u32,
@@ -998,9 +1014,30 @@ impl MetalRenderer {
         )
     }
 
+    /// Renders a frame inside its own autorelease pool. Metal and Core
+    /// Animation autorelease objects of every frame: its encoders, its
+    /// drawable's IOSurface transactions and events. The render thread has
+    /// no pool of its own, so without this they were never released: about
+    /// 66,000 render encoders and 220,000 IOSurface transactions and events
+    /// after 35 minutes of 11 windows.
     // One parameter per frame input; a struct would only rename them.
     #[allow(clippy::too_many_arguments)]
     fn render(
+        &self,
+        width: u32,
+        height: u32,
+        grid: GridExtent,
+        color: ClearColor,
+        cells: Option<(&CellBgGrid, BackgroundUniforms)>,
+        text: Option<(&CellTextGrid, TextUniforms)>,
+        provided: Option<Retained<ProtocolObject<dyn CAMetalDrawable>>>,
+    ) -> Result<FrameOutcome, FrameError> {
+        autoreleasepool(|_| self.render_unpooled(width, height, grid, color, cells, text, provided))
+    }
+
+    // One parameter per frame input; a struct would only rename them.
+    #[allow(clippy::too_many_arguments)]
+    fn render_unpooled(
         &self,
         width: u32,
         height: u32,
@@ -1215,6 +1252,44 @@ mod tests {
         );
         assert!(caps.unified_memory, "{caps}");
         assert_ne!(caps.name, "");
+    }
+
+    /// Where this thread's next autoreleased object would go.
+    fn next_pool_slot() -> usize {
+        #[allow(unsafe_code)]
+        // SAFETY: POOL-PROBE. Pushing a pool has no preconditions.
+        let token = unsafe { objc2::ffi::objc_autoreleasePoolPush() };
+        #[allow(unsafe_code)]
+        // SAFETY: POOL-PROBE. The token is the innermost pool, just pushed
+        // and holding no objects.
+        unsafe {
+            objc2::ffi::objc_autoreleasePoolPop(token);
+        }
+        token.addr()
+    }
+
+    /// The render thread has no autorelease pool of its own: a frame must
+    /// drain what Metal and Core Animation autorelease for it.
+    #[test]
+    fn a_frame_leaves_nothing_in_its_callers_autorelease_pool() {
+        let renderer = MetalRenderer::offscreen().expect("this test needs a Metal renderer");
+        let grid = GridExtent { rows: 4, cols: 8 };
+        let color = ClearColor::from_srgba(0.1, 0.2, 0.3, 1.0);
+        autoreleasepool(|_| {
+            for frame in 0..2 {
+                let before = next_pool_slot();
+                renderer
+                    .render_clear(64, 64, grid, color)
+                    .expect("an offscreen frame");
+                renderer.set_surface_occluded(frame == 0, 64, 64);
+                renderer.configure_surface(64, true);
+                assert_eq!(
+                    next_pool_slot(),
+                    before,
+                    "frame {frame} left objects in its caller's pool"
+                );
+            }
+        });
     }
 
     #[test]

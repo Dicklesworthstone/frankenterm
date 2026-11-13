@@ -11,7 +11,7 @@
 //! loop the next time it runs in that mode, so an interrupt that comes just
 //! before the wait begins is not lost.
 
-use objc2::rc::Retained;
+use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::{AnyClass, NSObject, ProtocolObject};
 use objc2::{AnyThread, DefinedClass, define_class, msg_send};
 use objc2_core_foundation::{
@@ -215,7 +215,10 @@ impl MetalDisplayLink {
         }
         let seconds = timeout.map_or(FOREVER, |timeout| timeout.as_secs_f64());
         let mode: &CFRunLoopMode = &self.mode;
-        let result = CFRunLoop::run_in_mode(Some(mode), seconds, true);
+        // The render thread has no autorelease pool of its own: drain what
+        // the link's callbacks autorelease. A taken update holds its own
+        // references.
+        let result = autoreleasepool(|_| CFRunLoop::run_in_mode(Some(mode), seconds, true));
         if let Some(update) = self.take_update() {
             return LinkWait::Update(update);
         }

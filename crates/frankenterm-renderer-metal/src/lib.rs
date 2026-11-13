@@ -207,6 +207,12 @@
 //!     and `CFRunLoopWakeUp`, which Core Foundation documents as callable
 //!     from any thread; its mode is an immutable `CFString`, and the block is
 //!     a valid, non-null block that Core Foundation copies.
+//! 15. **POOL-PROBE: reading the autorelease pool's next slot (tests).**
+//!     A native test pushes an autorelease pool and pops it at once, to
+//!     learn where the thread's next autoreleased object would go.
+//!     *Invariant:* the pop takes the token of the push just before it, the
+//!     innermost pool, which holds no objects; the thread's pools are left
+//!     as they were.
 //!
 //! Thread affinity: `MetalRenderer` holds Objective-C objects that are not
 //! `Send`, so it stays on the thread that created it unless it is moved
