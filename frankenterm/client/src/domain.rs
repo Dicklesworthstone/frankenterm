@@ -1594,6 +1594,11 @@ impl ClientInner {
         self.local_to_remote_window(local_window_id)
     }
 
+    /// How many remote panes this attachment maps.
+    pub(crate) fn attached_pane_count(&self) -> usize {
+        lock_or_recover(&self.remote_to_local_pane, "remote_to_local_pane").len()
+    }
+
     pub fn remote_to_local_pane_id(&self, mux: &Mux, remote_pane_id: PaneId) -> Option<PaneId> {
         let mut pane_map = lock_or_recover(&self.remote_to_local_pane, "remote_to_local_pane");
 
@@ -1630,7 +1635,11 @@ impl ClientInner {
         pane_map.remove(&remote_pane_id);
     }
 
-    fn record_remote_to_local_pane_mapping(&self, remote_pane_id: PaneId, local_pane_id: PaneId) {
+    pub(crate) fn record_remote_to_local_pane_mapping(
+        &self,
+        remote_pane_id: PaneId,
+        local_pane_id: PaneId,
+    ) {
         let mut pane_map = lock_or_recover(&self.remote_to_local_pane, "remote_to_local_pane");
         pane_map.insert(remote_pane_id, local_pane_id);
     }
@@ -3884,14 +3893,13 @@ impl ClientDomain {
     /// outstanding at a time, whatever the population, and their replies are
     /// not needed: the changes arrive as ordinary pushes.
     pub(crate) fn start_pane_push_tracking(inner: &Arc<ClientInner>, rpc: RpcGenerationScope) {
-        if !crate::pane::needs_push_tracking_request(rpc.agreed_codec_version()) {
-            return;
-        }
         let mut panes = lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane")
             .keys()
             .copied()
             .collect::<Vec<_>>();
-        if panes.is_empty() {
+        if panes.is_empty()
+            || !crate::pane::needs_push_tracking_request(rpc.agreed_codec_version(), panes.len())
+        {
             return;
         }
         panes.sort_unstable();
@@ -6822,7 +6830,7 @@ mod tests {
         pump();
         assert!(
             peer.is_empty(),
-            "a codec 46 server is not asked about panes that are not painted"
+            "a codec 46 attachment of 50 panes is not asked about panes that are not painted"
         );
 
         // The initial attachment, then a reconnect: the new server session
@@ -6860,6 +6868,61 @@ mod tests {
             assert_eq!(asked, (10_000..10_050).collect());
             assert!(peer.is_empty());
         }
+    }
+
+    /// ft-zxm86: the operator's codec 46 hosts hold 2 to 10 panes. A tab never
+    /// shown after a GUI relaunch kept its attach-time title because a codec
+    /// 46 server was never asked about its panes. A small codec 46 attachment
+    /// is now asked about every pane, four at a time, as a current one is.
+    #[test]
+    fn a_small_codec_46_attachment_asks_about_every_pane() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let config = ClientDomainConfig::Unix(UnixDomain::default());
+        let (client, peer) = Client::new_test_client_with_rpc_peer(Some(91_042), config);
+        let inner = Arc::new(ClientInner::new(91_042, client, None, None, false));
+        let _domain = register_test_client_domain(&mux, &inner);
+        let pump = || {
+            for _ in 0..32 {
+                if !executor.try_tick().unwrap() {
+                    break;
+                }
+            }
+        };
+        for index in 0..10 {
+            lock_or_recover(&inner.remote_to_local_pane, "test pane mapping")
+                .insert(30_000 + index, 40_000 + index);
+        }
+        assert_eq!(inner.attached_pane_count(), 10);
+
+        peer.replace_ready_generation(&inner.client, codec::LEGACY46_CODEC_VERSION)
+            .unwrap();
+        ClientDomain::start_pane_push_tracking(&inner, inner.client.rpc_scope());
+        pump();
+        let mut asked = HashSet::new();
+        for _ in 0..10 {
+            assert!(
+                (1..=4).contains(&peer.queued_len()),
+                "at most four requests may be outstanding: {}",
+                peer.queued_len()
+            );
+            let request =
+                promise::spawn::block_on(peer.respond_next_registration_request()).unwrap();
+            let codec::Pdu::GetPaneRenderChanges(codec::GetPaneRenderChanges { pane_id }) = request
+            else {
+                panic!("the pass sends only pane polls, got {:?}", request);
+            };
+            assert!(
+                asked.insert(pane_id),
+                "pane {} was asked about twice",
+                pane_id
+            );
+            pump();
+        }
+        assert_eq!(asked, (30_000..30_010).collect());
+        assert!(peer.is_empty());
     }
 
     #[test]

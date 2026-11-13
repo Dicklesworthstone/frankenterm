@@ -3109,19 +3109,35 @@ impl ReliableInputQueue {
     }
 }
 
+/// The most panes a codec 46 attachment may hold for this client to ask
+/// about each of them. The operator's Linux hosts hold 2 to 10 panes each;
+/// a swarm host with hundreds stays on first-paint polling.
+pub(crate) const LEGACY46_PUSH_TRACKING_MAX_PANES: usize = 32;
+
 /// Whether this client must ask a server at this codec version about a pane
-/// before the server pushes that pane's changes.
+/// before the server pushes that pane's changes, for an attachment holding
+/// `attached_panes` panes.
 ///
 /// A server pushes a pane's title, working directory and output only to a
 /// session that has already asked about that pane. The paint path asks, but
 /// only for panes it draws, so a tab that has never been shown would keep the
-/// title it was created or attached with (ft-pzu8b). Current-codec servers get
-/// one request per pane. Codec 46 servers have the same rule but stay on
-/// first-paint polling: those hosts hold hundreds of panes, and asking about
-/// each one would subscribe this client to every pane's output on a server
-/// without the current push coordinator and admission budgets.
-pub(crate) fn needs_push_tracking_request(agreed_codec_version: Option<usize>) -> bool {
-    agreed_codec_version.is_some_and(|version| version != LEGACY46_CODEC_VERSION)
+/// title it was created or attached with (ft-pzu8b): on 2026-11-13 five agent
+/// tabs on codec 46 hosts showed the spinner title they had at a GUI relaunch
+/// eight hours earlier while their output kept changing (ft-zxm86).
+/// Current-codec servers get one request per pane. A codec 46 server has no
+/// push coordinator or admission budgets, so asking subscribes this client to
+/// each pane's output unbudgeted. That is the steady state a long-running GUI
+/// reaches once every tab has been shown, so it is asked only while the
+/// attachment is small (`LEGACY46_PUSH_TRACKING_MAX_PANES`).
+pub(crate) fn needs_push_tracking_request(
+    agreed_codec_version: Option<usize>,
+    attached_panes: usize,
+) -> bool {
+    match agreed_codec_version {
+        None => false,
+        Some(LEGACY46_CODEC_VERSION) => attached_panes <= LEGACY46_PUSH_TRACKING_MAX_PANES,
+        Some(_) => true,
+    }
 }
 
 fn should_process_unilateral_render_delta(
@@ -6116,11 +6132,16 @@ impl Pane for ClientPane {
                         }
 
                         let palette = rpc.set_configured_palette_for_pane(request);
-                        if !needs_push_tracking_request(rpc.agreed_codec_version()) {
-                            // Codec 46, or a pane created while the connection
-                            // was still bootstrapping: that scope carries no
-                            // codec, and `ClientDomain::start_pane_push_tracking`
-                            // asks about the pane once the connection is ready.
+                        // Count here, not at bind: an attach registers all of
+                        // its panes before it records any of their mappings.
+                        let attached_panes = client.attached_pane_count();
+                        if !needs_push_tracking_request(rpc.agreed_codec_version(), attached_panes)
+                        {
+                            // A large codec 46 attachment, or a pane created
+                            // while the connection was still bootstrapping:
+                            // that scope carries no codec, and
+                            // `ClientDomain::start_pane_push_tracking` asks
+                            // about the pane once the connection is ready.
                             return palette.await.map(|_| ());
                         }
                         // A pane created on a ready connection (a new tab or
@@ -8709,7 +8730,32 @@ mod tests {
     }
 
     #[test]
-    fn codec46_pane_keeps_polling_from_its_first_paint() {
+    fn small_codec46_attachment_pane_asks_about_itself_when_it_registers() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, peer) = test_client_inner_with_rpc_peer(17);
+        peer.replace_ready_generation(&inner.client, LEGACY46_CODEC_VERSION)
+            .unwrap();
+        let pane = test_client_pane(&inner, 40, 29);
+        let registered: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&registered).unwrap();
+        inner.record_remote_to_local_pane_mapping(29, 40);
+
+        // ft-zxm86: a new tab on a host of a few codec 46 panes keeps its
+        // title live without being shown.
+        let requests = answer_registration_requests(&executor, &peer);
+        assert_eq!(
+            liveness_polls_for(&requests, 29),
+            1,
+            "a pane of a small codec 46 attachment must be asked about at registration: \
+             {requests:?}"
+        );
+    }
+
+    #[test]
+    fn large_codec46_attachment_pane_keeps_polling_from_its_first_paint() {
         let scope = MuxTestScope::enter();
         let executor = promise::spawn::SimpleExecutor::new();
         let mux = Arc::new(Mux::new(None));
@@ -8726,11 +8772,18 @@ mod tests {
 
         let registered: Arc<dyn Pane> = pane.clone();
         mux.add_pane(&registered).unwrap();
+        // An attach registers its panes first and maps them after, so at
+        // bind this pane sees none of its 40 siblings.
+        inner.record_remote_to_local_pane_mapping(29, 40);
+        for sibling in 0..40 {
+            inner.record_remote_to_local_pane_mapping(1_000 + sibling, 2_000 + sibling);
+        }
         let requests = answer_registration_requests(&executor, &peer);
         assert_eq!(
             liveness_polls_for(&requests, 29),
             0,
-            "a codec 46 pane must not be asked about at registration: {requests:?}"
+            "a pane of a large codec 46 attachment must not be asked about at registration: \
+             {requests:?}"
         );
 
         let _ = pane.get_changed_since(0..1, 0);
@@ -8743,11 +8796,28 @@ mod tests {
     }
 
     #[test]
-    fn only_current_codec_servers_get_a_push_tracking_request() {
-        assert!(needs_push_tracking_request(Some(codec::CODEC_VERSION)));
-        assert!(!needs_push_tracking_request(Some(LEGACY46_CODEC_VERSION)));
+    fn current_servers_and_small_codec_46_attachments_get_a_push_tracking_request() {
+        assert!(needs_push_tracking_request(
+            Some(codec::CODEC_VERSION),
+            1_000
+        ));
+        // ft-zxm86: the operator's codec 46 hosts hold 2 to 10 panes.
+        assert!(needs_push_tracking_request(
+            Some(LEGACY46_CODEC_VERSION),
+            10
+        ));
+        assert!(needs_push_tracking_request(
+            Some(LEGACY46_CODEC_VERSION),
+            LEGACY46_PUSH_TRACKING_MAX_PANES
+        ));
+        // A swarm host stays on first-paint polling, as every codec 46 host
+        // did before.
+        assert!(!needs_push_tracking_request(
+            Some(LEGACY46_CODEC_VERSION),
+            LEGACY46_PUSH_TRACKING_MAX_PANES + 1
+        ));
         // No agreed codec: the connection is not ready, or is gone.
-        assert!(!needs_push_tracking_request(None));
+        assert!(!needs_push_tracking_request(None, 1));
     }
 
     fn test_conditional_input_source(byte: u8) -> ConditionalPaneInputSource {
