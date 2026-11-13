@@ -418,6 +418,19 @@ impl ResizeDeliveryState {
     }
 }
 
+/// The log line for a resize that was not confirmed, with the server's or
+/// transport's error when there was a reply.
+fn resize_failure_message(error: Option<&anyhow::Error>) -> String {
+    match error {
+        Some(error) => format!(
+            "remote resize failed or has an unknown outcome; no automatic replay: {error:#}"
+        ),
+        None => "remote resize failed or has an unknown outcome; no automatic replay: \
+                 no reply (the request was cancelled, or its connection or pane retired)"
+            .to_string(),
+    }
+}
+
 /// Own the terminal result even if the scheduled waiter is dropped. No failed
 /// resize is replayed: a reply failure may follow a partially applied effect.
 struct ResizeDelivery {
@@ -429,6 +442,15 @@ struct ResizeDelivery {
 
 impl ResizeDelivery {
     fn settle(&mut self, success: bool) {
+        self.finish(success, None);
+    }
+
+    /// Settle from the server's reply; a failure logs the reply's error.
+    fn settle_reply<T>(&mut self, reply: &anyhow::Result<T>) {
+        self.finish(reply.is_ok(), reply.as_ref().err());
+    }
+
+    fn finish(&mut self, success: bool, error: Option<&anyhow::Error>) {
         self.settled = true;
         let notify = self.state.lock().settle(self.attempt, success);
         metrics::counter!(
@@ -437,7 +459,7 @@ impl ResizeDelivery {
         )
         .increment(1);
         if !success {
-            log::error!("remote resize failed or has an unknown outcome; no automatic replay");
+            log::error!("{}", resize_failure_message(error));
         }
         if notify {
             if let Some(registration) = &self.registration {
@@ -535,7 +557,7 @@ where
     reservation
         .spawn_local(async move {
             let result = request.await;
-            delivery.settle(result.is_ok());
+            delivery.settle_reply(&result);
         })
         .detach();
     Ok(DispatchResizeOutcome::Admitted)
@@ -653,6 +675,10 @@ fn dispatch_conditional_paste(
                 pending,
             )
             .await;
+            if let Err(error) = &result {
+                // The receipt and transport errors carry no paste text.
+                log::error!("remote paste was not confirmed and was not replayed: {error:#}");
+            }
             delivery.settle(result.is_ok());
         })
         .detach();
@@ -868,7 +894,7 @@ impl ClientResizeCoordinator {
                             }
                             in_flight.push(async move {
                                 let result = admitted.await;
-                                delivery.settle(result.is_ok());
+                                delivery.settle_reply(&result);
                             });
                         }
                         Some(Ok(RetriedAdmissionOutcome::ImmediateCompletion)) => {
@@ -9475,6 +9501,43 @@ mod tests {
             state.lock().failed,
             "old success cannot clear newer failure"
         );
+    }
+
+    /// A refused resize used to log only "remote resize failed or has an
+    /// unknown outcome", so the operator's bursts of them could not be told
+    /// apart. A reply's error now settles the attempt and names its cause.
+    #[test]
+    fn a_refused_resize_reply_settles_failed_and_names_its_cause() {
+        let state = Arc::new(Mutex::new(ResizeDeliveryState::default()));
+        let attempt = state.lock().begin().unwrap();
+        let mut delivery = ResizeDelivery {
+            state: Arc::clone(&state),
+            attempt,
+            registration: None,
+            settled: false,
+        };
+        let reply: anyhow::Result<UnitResponse> =
+            Err(anyhow::anyhow!("no such tab 23").context("mux rejected Resize for pane 7"));
+        delivery.settle_reply(&reply);
+        assert!(delivery.settled);
+        assert!(state.lock().failed);
+        assert_eq!(
+            resize_failure_message(reply.as_ref().err()),
+            "remote resize failed or has an unknown outcome; no automatic replay: \
+             mux rejected Resize for pane 7: no such tab 23"
+        );
+        assert!(resize_failure_message(None)
+            .ends_with("no reply (the request was cancelled, or its connection or pane retired)"));
+
+        let next = state.lock().begin().unwrap();
+        let mut delivery = ResizeDelivery {
+            state: Arc::clone(&state),
+            attempt: next,
+            registration: None,
+            settled: false,
+        };
+        delivery.settle_reply(&Ok::<_, anyhow::Error>(UnitResponse {}));
+        assert!(!state.lock().failed, "a confirmed reply clears the failure");
     }
 
     #[test]
