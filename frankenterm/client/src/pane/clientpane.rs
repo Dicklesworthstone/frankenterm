@@ -6463,6 +6463,15 @@ impl Pane for ClientPane {
 
     fn mouse_event(&self, event: MouseEvent) -> anyhow::Result<()> {
         let rpc = self.client.client.rpc_scope();
+        let motion = event.kind == wezterm_term::MouseEventKind::Move;
+        if motion && rpc.agreed_codec_version().is_none() {
+            // Nothing can be sent before the connection is ready, and a GUI
+            // launch moves the pointer over its windows meanwhile. The next
+            // motion supersedes this one (MouseState coalesces motion the same
+            // way), so drop it rather than report lost input. A click or wheel
+            // event still fails below.
+            return Ok(());
+        }
         let (source, registration) = if rpc
             .agreed_codec_version()
             .is_some_and(|version| version < CONDITIONAL_PANE_INPUT_V1_MIN_CODEC_VERSION)
@@ -9212,6 +9221,46 @@ mod tests {
         .unwrap();
         assert_eq!(sent.effect, PaneInputEffectV1::Mouse(fresh));
         pump_mouse_test(&executor);
+    }
+
+    #[test]
+    fn pointer_motion_before_readiness_is_dropped_and_a_click_still_fails() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, peer) = test_client_inner_with_rpc_peer(17);
+        let pane = register_conditional_input_test_pane(&mux, &executor, &inner, &peer, 40, 29);
+        let motion = MouseEvent {
+            button: wezterm_term::MouseButton::None,
+            ..mouse_test_event(wezterm_term::MouseEventKind::Move)
+        };
+
+        // On a ready connection motion is sent.
+        pane.mouse_event(motion).unwrap();
+        pump_mouse_test(&executor);
+        assert!(!peer.is_empty(), "motion on a ready connection is sent");
+        let sent = promise::spawn::block_on(
+            peer.respond_next_conditional_input(PaneInputConditionalOutcomeV1::Accepted),
+        )
+        .unwrap();
+        assert_eq!(sent.effect, PaneInputEffectV1::Mouse(motion));
+        pump_mouse_test(&executor);
+        assert!(peer.is_empty());
+
+        // A GUI launch moves the pointer while the connection bootstraps.
+        peer.activate_reconnect_generation(&inner.client).unwrap();
+        pane.mouse_event(MouseEvent { x: 5, ..motion }).unwrap();
+        let error = pane
+            .mouse_event(mouse_test_event(wezterm_term::MouseEventKind::Press))
+            .unwrap_err();
+        assert!(
+            format!("{:#}", error).contains("no agreed codec"),
+            "a click before readiness is lost input and must still fail: {:#}",
+            error
+        );
+        pump_mouse_test(&executor);
+        assert!(peer.is_empty(), "nothing may enter an unready transport");
     }
 
     #[test]
