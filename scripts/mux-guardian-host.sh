@@ -10,7 +10,7 @@
 #
 # Usage (on the host):
 #   mux-guardian-host.sh install  --family DIR [--accept-pane-loss] [--manager M]
-#   mux-guardian-host.sh upgrade  --family DIR [--timeout SECS] [--force]
+#   mux-guardian-host.sh upgrade  --family DIR [--timeout SECS] [--force] [--recover]
 #   mux-guardian-host.sh rollback
 #   mux-guardian-host.sh status
 #   mux-guardian-host.sh run-broker | run-guardian | run-mux     (service entry points)
@@ -25,6 +25,9 @@
 # whatever is not running; a running unit keeps its settings until it restarts
 # (the mux: `upgrade --force` onto its current family). `upgrade --timeout`
 # (default 90) bounds the new mux's restore, plus five seconds per guardian pane.
+# `upgrade --recover` is for a mux that serves none of the panes the guardian
+# still holds, as after an upgrade and its rollback both failed: it starts
+# DIR's mux to restore them, where a stop-all would end them.
 #
 # Invariants:
 #   * The broker owns every pane's child process. It is never restarted by this
@@ -811,7 +814,14 @@ verify_mux() {  # <expected family dir> <expected panes> <expected pane ids> <ex
     panes=$(guardian_probe | awk '{print $2}')
     ids=$(mux_pane_ids)
     children=$(broker_children) || continue
-    if [ "$panes" = "$want_panes" ] && [ "$ids" = "$want_ids" ] && [ "$children" = "$want_children" ]; then
+    # "*": no mux reported ids before, so any ids, one for each pane.
+    local ids_match=0
+    if [ "$want_ids" = "*" ]; then
+      [ "$(echo $ids | wc -w | tr -d ' ')" = "$want_panes" ] && ids_match=1
+    elif [ "$ids" = "$want_ids" ]; then
+      ids_match=1
+    fi
+    if [ "$panes" = "$want_panes" ] && [ "$ids_match" = 1 ] && [ "$children" = "$want_children" ]; then
       log "verified: mux pid $pid from $fam, $panes guardian pane(s), pane ids [$ids], same pane processes"
       return 0
     fi
@@ -940,10 +950,38 @@ load_manager() {
 # Replace the running mux with family <to> losslessly and verify it; when
 # that fails, put back <from>, its links and its host script, and verify
 # that.
+recover_mux() {  # <from dir> <to dir> <timeout>: start <to> to serve the panes no mux serves
+  local from=$1 to=$2 timeout=$3 previous probe panes ids children
+  previous=$(link_target "$BASE/mux-previous")
+  probe=$(wait_guardian_ready 60) || die "guardian is not ready; refusing"
+  case "$probe" in ready\ [0-9]*) ;; *) die "guardian is not ready; refusing" ;; esac
+  panes=$(echo "$probe" | awk '{print $2}')
+  [ "${panes:-0}" -gt 0 ] || die "guardian holds no panes; nothing to recover (use install for a fresh start)"
+  ids=$(mux_pane_ids)
+  [ -z "$ids" ] || die "the mux serves panes [$ids]; --recover is for a mux that serves none (use upgrade)"
+  children=$(broker_children) || die "cannot verify the running broker's pane processes; refusing to recover"
+  log "recover: no mux serves the guardian's $panes pane(s), pane processes [$children]"
+  [ -e "$(family_script "$from")" ] \
+    || record_family_script "$from" "$BASE/bin/mux-guardian-host.sh"
+  use_family_script "$to"
+  set_link "$BASE/mux-previous" "$from"
+  set_link "$BASE/mux-current" "$to"
+  log "starting mux $(basename "$to") to restore them"
+  if svc_restart_mux && verify_mux "$to" "$panes" "*" "$children" "$(( timeout + 5 * panes ))"; then
+    log "recover complete: mux $(basename "$to") serves the guardian's panes"
+    return 0
+  fi
+  use_family_script "$from"
+  set_link "$BASE/mux-current" "$from"
+  if [ -n "$previous" ]; then set_link "$BASE/mux-previous" "$previous"; fi
+  die "recover: mux $(basename "$to") did not restore the panes, which the guardian still holds; mux-current is $(basename "$from") again (see the mux log)"
+}
+
 swap_mux() {  # <from dir> <to dir> <timeout> <verb>
   local from=$1 to=$2 timeout=$3 verb=$4 previous
   previous=$(link_target "$BASE/mux-previous")
-  svc_active mux-server || die "mux is not running; refusing to $verb a stopped mux"
+  svc_active mux-server \
+    || die "mux is not running; refusing to $verb a stopped mux (if the guardian still holds panes, upgrade --recover starts a family's mux to restore them)"
   # A guardian busy with checkpoints and replay closes probes retryably.
   local probe panes ids children
   probe=$(wait_guardian_ready 60) || die "guardian is not ready; refusing"
@@ -987,16 +1025,17 @@ swap_mux() {  # <from dir> <to dir> <timeout> <verb>
   if svc_restart_mux && verify_mux "$from" "$panes" "$ids" "$children" "$verify_within"; then
     die "$verb rolled back to $(basename "$from"); panes preserved"
   fi
-  die "$verb AND rollback verification failed; inspect status and logs before acting"
+  die "$verb AND rollback verification failed; the guardian still holds the panes. Inspect status and logs, then start a family that can restore them with: upgrade --family DIR --recover"
 }
 
 cmd_upgrade() {
-  local family="" timeout=90 force=0
+  local family="" timeout=90 force=0 recover=0
   while [ $# -gt 0 ]; do
     case $1 in
       --family) family=$2; shift 2 ;;
       --timeout) timeout=$2; shift 2 ;;
       --force) force=1; shift ;;  # restart losslessly even onto the same family
+      --recover) recover=1; shift ;;  # no mux serves the guardian's panes
       *) die "upgrade: unknown option $1" ;;
     esac
   done
@@ -1008,13 +1047,17 @@ cmd_upgrade() {
   local dest current
   dest=$(publish_family "$family")
   current=$(readlink "$BASE/mux-current")
-  if [ "$current" = "$dest" ] && [ "$force" != 1 ]; then
+  if [ "$current" = "$dest" ] && [ "$force" != 1 ] && [ "$recover" != 1 ]; then
     log "mux already runs $(basename "$dest")"
     return 0
   fi
   # This script's run-mux goes with the family it installs.
   record_family_script "$dest" "$SELF"
-  swap_mux "$current" "$dest" "$timeout" upgrade
+  if [ "$recover" = 1 ]; then
+    recover_mux "$current" "$dest" "$timeout"
+  else
+    swap_mux "$current" "$dest" "$timeout" upgrade
+  fi
 }
 
 cmd_rollback() {
