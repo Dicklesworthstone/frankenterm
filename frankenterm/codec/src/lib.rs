@@ -5879,13 +5879,14 @@ fn legacy46_serialized_lines_are_text_only(lines: &SerializedLines) -> bool {
 }
 
 /// Keep the text of codec-46 rows whose cells carry images, without the
-/// images. This client cannot read a codec-46 mux's image placements, and
-/// refusing such a frame failed it and, with it, the connection: a pane that
-/// had shown an image dropped and reattached its domain whenever its rows
-/// were read (2026-11-12). The rows' text is still the pane's text. A
-/// malformed reference fails the frame before anything is dropped.
-fn strip_legacy46_images(mut lines: SerializedLines) -> Result<SerializedLines, Error> {
-    lines.validate_references(false)?;
+/// images. This client cannot read a codec-46 mux's image placements (their
+/// texture coordinates fail this client's checks), and refusing such a frame
+/// failed it and, with it, the connection: a pane that had shown an image
+/// dropped and reattached its domain whenever its rows were read
+/// (2026-11-12). The rows' text is still the pane's text. The images are
+/// not checked, since none is kept; the normalizer that follows still fails
+/// the frame on a malformed row or hyperlink reference.
+fn strip_legacy46_images(mut lines: SerializedLines) -> SerializedLines {
     let mut dropped = lines.images.len();
     lines.images.clear();
     for (_, line) in &mut lines.lines {
@@ -5897,7 +5898,7 @@ fn strip_legacy46_images(mut lines: SerializedLines) -> Result<SerializedLines, 
         }
     }
     metrics::counter!("mux.codec.legacy46.images_dropped.total").increment(dropped as u64);
-    Ok(lines)
+    lines
 }
 
 fn normalize_legacy46_text_lines(lines: SerializedLines) -> Result<SerializedLines, Error> {
@@ -6016,7 +6017,7 @@ fn decode_materialized_for_dialect(
                     MAX_LEGACY46_TEXT_RENDER_RESPONSE_DECOMPRESSED_BYTES,
                 )?;
                 if !legacy46_serialized_lines_are_text_only(&response.lines) {
-                    response.lines = strip_legacy46_images(response.lines)?;
+                    response.lines = strip_legacy46_images(response.lines);
                 }
                 response.lines = normalize_legacy46_text_lines(response.lines)?;
                 MuxWireDecodedPayload::Pdu(Pdu::GetLinesResponse(response))
@@ -6030,7 +6031,7 @@ fn decode_materialized_for_dialect(
                         MAX_LEGACY46_TEXT_RENDER_RESPONSE_DECOMPRESSED_BYTES,
                     )?;
                 if !legacy46_serialized_lines_are_text_only(&response.bonus_lines) {
-                    response.bonus_lines = strip_legacy46_images(response.bonus_lines)?;
+                    response.bonus_lines = strip_legacy46_images(response.bonus_lines);
                 }
                 response.bonus_lines = normalize_legacy46_text_lines(response.bonus_lines)?;
                 MuxWireDecodedPayload::Pdu(Pdu::GetPaneRenderChangesResponse(response))
@@ -32876,16 +32877,46 @@ mod test {
         push.bonus_lines = expected;
         assert_eq!(actual, push, "only the image is dropped from the push");
 
-        let malformed = SerializedLines {
-            lines: vec![(5, imaged)],
+        // The live codec-46 mux sent texture coordinates this client's checks
+        // refuse. Such an image is dropped, not checked.
+        let mut outside = legacy46_image_cell(5);
+        outside.bottom_right = TextureCoordinate::new_f32(2.0, 3.0);
+        let lone = SerializedLines {
+            lines: vec![(5, imaged.clone())],
             hyperlinks: Vec::new(),
-            images: vec![legacy46_image_cell(9)],
+            images: vec![outside],
         };
-        let error = strip_legacy46_images(malformed).unwrap_err();
+        assert_eq!(
+            lone.validate_structure(),
+            Err(SerializedLinesStructureError::ImageTextureCoordinatesInvalid)
+        );
+        let wire = Pdu::GetLinesResponse(GetLinesResponse {
+            pane_id: 3,
+            lines: lone,
+        })
+        .encode_frame_with_mode(24, CompressionMode::Never)
+        .expect("encode PDU23 fixture with unplaceable image");
+        let decoded = Pdu::decode_for_dialect(wire.as_slice(), MuxWireDialect::LEGACY46)
+            .expect("a codec-46 image this client cannot place must not fail the frame");
+        let (_, MuxWireDecodedPayload::Pdu(Pdu::GetLinesResponse(response))) = decoded.into_parts()
+        else {
+            panic!("a codec-46 reply with an unplaceable image must deliver its text");
+        };
+        assert_eq!(response.lines, SerializedLines::from(vec![(5, imaged)]));
+
+        let mut linked = termwiz::cell::CellAttributes::default();
+        linked.set_hyperlink(Some(Arc::new(Hyperlink::new_implicit(
+            "https://example.com/legacy-image",
+        ))));
+        let mut malformed =
+            SerializedLines::from(vec![(5, Line::from_text("z", &linked, 1, None))]);
+        malformed.images = vec![legacy46_image_cell(5)];
+        malformed.hyperlinks[0].coords[0].line_idx = 2;
+        let error = normalize_legacy46_text_lines(strip_legacy46_images(malformed)).unwrap_err();
         assert_eq!(
             error.downcast_ref::<SerializedLinesStructureError>(),
-            Some(&SerializedLinesStructureError::ImageLineMissing),
-            "an image reference to a missing row still fails the frame"
+            Some(&SerializedLinesStructureError::HyperlinkLineOutOfRange),
+            "a malformed hyperlink reference still fails an image-bearing frame"
         );
     }
 }
