@@ -607,6 +607,77 @@ impl MirrorRow {
         }
     }
 
+    /// Whether [`Self::update_from_line`] with `stable` and `line` would
+    /// leave this row exactly as it is, apart from its sequence number and
+    /// generation. Allocates nothing. Rows with images never match: they are
+    /// recaptured every frame ([`Self::always_recapture`]) and keep doing so.
+    pub fn same_as_line(&self, stable: StableRowIndex, line: &Line) -> bool {
+        if self.has_images
+            || !self.images.is_empty()
+            || self.stable != stable
+            || self.line_mode != MirrorLineMode::from_line(line)
+            || self.physical_len != line.len()
+            || self.wrapped != line.last_cell_was_wrapped()
+        {
+            return false;
+        }
+        let mut held = self.cells.iter();
+        let mut text_len = 0;
+        // How many of this row's links the line has reached, in the order
+        // `update_from_line` first meets them.
+        let mut links = 0;
+        for cell in line.visible_cells() {
+            let link = match cell.attrs().hyperlink() {
+                None => 0,
+                Some(link) => {
+                    let same =
+                        |known: &Arc<Hyperlink>| Arc::ptr_eq(known, link) || **known == **link;
+                    match self.links[..links].iter().position(same) {
+                        Some(index) => index + 1,
+                        // A link not met yet is appended: it must be the
+                        // next one this row holds.
+                        None if self.links.get(links).is_some_and(same) => {
+                            links += 1;
+                            links
+                        }
+                        None => return false,
+                    }
+                }
+            };
+            let converted = MirrorCell::from_cell(cell, text_len, link);
+            if converted.has_image() || held.next() != Some(&converted) {
+                return false;
+            }
+            let text = cell.str();
+            let end = text_len + text.len();
+            if self.text.get(text_len..end) != Some(text) {
+                return false;
+            }
+            text_len = end;
+        }
+        held.next().is_none() && text_len == self.text.len() && links == self.links.len()
+    }
+
+    /// [`Self::update_from_line`], except that a line that leaves the row as
+    /// it is ([`Self::same_as_line`]) only advances its sequence number and
+    /// keeps its generation. An application repainting unchanged text still
+    /// advances the line's sequence number, so the row is copied again;
+    /// renderers that rebuild a row when its generation changes then leave it
+    /// alone. Returns whether the contents changed.
+    pub fn refresh_from_line(
+        &mut self,
+        stable: StableRowIndex,
+        line: &Line,
+        generation: u64,
+    ) -> bool {
+        if self.same_as_line(stable, line) {
+            self.seqno = line.current_seqno();
+            return false;
+        }
+        self.update_from_line(stable, line, generation);
+        true
+    }
+
     /// Resolves a copied native row after releasing the terminal lock. The
     /// conversion writes the same semantic cells as `update_from_line`,
     /// without constructing temporary `Cell`, `CellAttributes` or `Line`
@@ -2116,6 +2187,158 @@ mod tests {
             converted.clear(0, 2);
             assert_eq!(converted.line_mode(), MirrorLineMode::SingleWidth);
         }
+    }
+
+    /// Whether two rows `update_from_line` made hold the same contents, as
+    /// `same_as_line` compares them: all but sequence number and generation.
+    fn same_contents(a: &MirrorRow, b: &MirrorRow) -> bool {
+        let mut b = b.clone();
+        b.seqno = a.seqno;
+        b.generation = a.generation;
+        *a == b
+    }
+
+    /// Lines an application might repaint one row with: the same contents at
+    /// a later sequence number, and each way the contents can differ.
+    fn repaint_variants() -> Vec<(&'static str, Line)> {
+        let blank = CellAttributes::blank();
+        let plain = |text: &str, seqno| Line::from_text(text, &blank, seqno, None);
+        let styled = |seqno, attrs: &CellAttributes| {
+            let mut line = plain("hello", seqno);
+            line.set_cell(1, Cell::new('e', attrs.clone()), seqno);
+            line
+        };
+        let mut bold = CellAttributes::blank();
+        bold.set_intensity(Intensity::Bold);
+        let mut italic = CellAttributes::blank();
+        italic.set_italic(true);
+        let mut foreground = CellAttributes::blank();
+        foreground.set_foreground(ColorAttribute::PaletteIndex(3));
+        let mut background = CellAttributes::blank();
+        background.set_background(ColorAttribute::PaletteIndex(3));
+        let mut underline_color = CellAttributes::blank();
+        underline_color.set_underline_color(ColorAttribute::PaletteIndex(3));
+        let linked = |seqno, first: &Arc<Hyperlink>, second: &Arc<Hyperlink>| {
+            let mut line = plain("ab cd ef", seqno);
+            let cells = [
+                (0, 'a', first),
+                (1, 'b', first),
+                (3, 'c', second),
+                (6, 'e', first),
+            ];
+            for (col, ch, link) in cells {
+                let mut attrs = CellAttributes::blank();
+                attrs.set_hyperlink(Some(Arc::clone(link)));
+                line.set_cell(col, Cell::new(ch, attrs), seqno);
+            }
+            line
+        };
+        let one = Arc::new(Hyperlink::new("https://one.test"));
+        let two = Arc::new(Hyperlink::new("https://two.test"));
+        let one_again = Arc::new(Hyperlink::new("https://one.test"));
+        let two_again = Arc::new(Hyperlink::new("https://two.test"));
+        let mut wrapped = plain("hello", 9);
+        wrapped.set_last_cell_was_wrapped(true, 9);
+        let mut double = plain("hello", 9);
+        double.set_double_width(9);
+        let mut longer = plain("hello", 9);
+        longer.resize(8, 9);
+        vec![
+            ("plain", plain("hello", 1)),
+            ("plain repainted", plain("hello", 9)),
+            ("one letter", plain("hellp", 9)),
+            ("shorter", plain("hell", 9)),
+            ("bold", styled(9, &bold)),
+            ("bold repainted", styled(12, &bold)),
+            ("italic", styled(9, &italic)),
+            ("foreground", styled(9, &foreground)),
+            ("background", styled(9, &background)),
+            ("underline color", styled(9, &underline_color)),
+            ("links", linked(9, &one, &two)),
+            ("links, new handles", linked(12, &one_again, &two_again)),
+            ("links swapped", linked(9, &two, &one)),
+            ("one link", linked(9, &one, &one)),
+            ("wide", plain("界a", 9)),
+            ("wide, other text", plain("界b", 9)),
+            ("combining", plain("e\u{301}x", 9)),
+            ("combining, other mark", plain("e\u{300}x", 9)),
+            ("wrapped", wrapped),
+            ("double width", double),
+            ("longer", longer),
+        ]
+    }
+
+    /// B20: `same_as_line` holds for exactly the lines whose capture
+    /// `update_from_line` would leave unchanged, checked both ways over the
+    /// repaints and every kind of change above, and never for another row.
+    #[test]
+    fn same_as_line_matches_exactly_the_lines_that_capture_the_same_row() {
+        let variants = repaint_variants();
+        let mut matches = 0;
+        for (held_name, held_line) in &variants {
+            let held = MirrorRow::from_line(3, held_line, 1);
+            for (name, line) in &variants {
+                let expected = same_contents(&held, &MirrorRow::from_line(3, line, 1));
+                assert_eq!(
+                    held.same_as_line(3, line),
+                    expected,
+                    "{held_name} held, {name} captured"
+                );
+                matches += usize::from(expected);
+            }
+            assert!(
+                !held.same_as_line(4, held_line),
+                "{} at another row",
+                held_name
+            );
+        }
+        // Each line matches itself, and each of the three repaints matches
+        // its original both ways: the comparison is not vacuous.
+        assert_eq!(matches, variants.len() + 2 * 3);
+    }
+
+    /// B20: a repaint of unchanged contents keeps the row's generation and
+    /// storage and takes the new sequence number; a change is a capture.
+    #[test]
+    fn refresh_from_line_keeps_the_generation_of_an_unchanged_row() {
+        let blank = CellAttributes::blank();
+        let line = |text: &str, seqno| Line::from_text(text, &blank, seqno, None);
+        let mut row = MirrorRow::from_line(2, &line("status: ok", 4), 1);
+        let cells = row.cells().as_ptr();
+        assert!(!row.refresh_from_line(2, &line("status: ok", 9), 2));
+        assert_eq!((row.generation(), row.seqno()), (1, 9));
+        assert_eq!(row.cells().as_ptr(), cells);
+        assert!(row.refresh_from_line(2, &line("status: no", 11), 3));
+        assert_eq!((row.generation(), row.seqno()), (3, 11));
+        assert_eq!(row, MirrorRow::from_line(2, &line("status: no", 11), 3));
+        // The same contents at another row are another row.
+        assert!(row.refresh_from_line(5, &line("status: no", 12), 4));
+        assert_eq!((row.stable(), row.generation()), (5, 4));
+    }
+
+    /// B20: a row with images is recaptured every frame, so a repaint of it
+    /// is always taken as a change, never kept.
+    #[test]
+    fn rows_with_images_are_never_kept_on_repaint() {
+        use termwiz::image::{ImageData, ImageDataType, TextureCoordinate};
+        let data = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            1,
+            1,
+            vec![255, 0, 0, 255],
+        )));
+        let mut attrs = CellAttributes::blank();
+        attrs.attach_image(Box::new(ImageCell::new(
+            TextureCoordinate::new_f32(0.0, 0.0),
+            TextureCoordinate::new_f32(1.0, 1.0),
+            data,
+        )));
+        let mut line = Line::from_text("ab", &CellAttributes::blank(), 4, None);
+        line.set_cell(1, Cell::new('b', attrs), 4);
+        let mut row = MirrorRow::from_line(0, &line, 1);
+        assert!(row.always_recapture());
+        assert!(!row.same_as_line(0, &line));
+        assert!(row.refresh_from_line(0, &line, 2));
+        assert_eq!(row.generation(), 2);
     }
 
     #[test]

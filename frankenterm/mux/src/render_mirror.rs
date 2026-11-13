@@ -57,6 +57,10 @@ pub struct CaptureStats {
     pub rows_examined: usize,
     /// Rows copied into the mirror.
     pub rows_captured: usize,
+    /// Of `rows_captured`, those whose copy left the row as it was (an
+    /// application repainting unchanged text): they keep their generation,
+    /// so renderers do not rebuild them. Only [`capture_pane_rows`] checks.
+    pub rows_unchanged: usize,
     /// Cells copied into the mirror.
     pub cells_captured: usize,
     /// Rows copied as packed page cells and resolved after the terminal lock.
@@ -779,7 +783,11 @@ pub fn capture_pane_rows(
             let Some(slot) = mirror.rows.get_mut(index) else {
                 continue;
             };
-            slot.update_from_line(stable, line, generation);
+            // A mux client's rows arrive whenever their sequence number moves,
+            // which a repaint of the same text also does (B20).
+            if !slot.refresh_from_line(stable, line, generation) {
+                stats.rows_unchanged += 1;
+            }
             mirror.dirty[index] = false;
             stats.rows_captured += 1;
             stats.cells_captured += slot.cells().len();
@@ -948,6 +956,173 @@ mod tests {
             row.has_images(),
             row.images(),
         )
+    }
+
+    /// A pane read through the public row API only, as a mux client's pane
+    /// is: what [`capture_pane_rows`] copies from. The rows are a terminal's.
+    struct TerminalPane {
+        term: parking_lot::Mutex<Terminal>,
+        writes: parking_lot::Mutex<Vec<u8>>,
+        registration: Arc<crate::PaneRegistrationSlot>,
+    }
+
+    impl TerminalPane {
+        fn new(term: Terminal) -> Self {
+            Self {
+                term: parking_lot::Mutex::new(term),
+                writes: parking_lot::Mutex::new(Vec::new()),
+                registration: Arc::new(crate::PaneRegistrationSlot::default()),
+            }
+        }
+    }
+
+    impl Pane for TerminalPane {
+        fn pane_id(&self) -> crate::pane::PaneId {
+            0
+        }
+        fn mux_registration_slot(&self) -> &Arc<crate::PaneRegistrationSlot> {
+            &self.registration
+        }
+        fn get_cursor_position(&self) -> StableCursorPosition {
+            terminal_get_cursor_position(&mut self.term.lock())
+        }
+        fn get_current_seqno(&self) -> SequenceNo {
+            self.term.lock().current_seqno()
+        }
+        fn get_changed_since(
+            &self,
+            lines: Range<StableRowIndex>,
+            seqno: SequenceNo,
+        ) -> rangeset::RangeSet<StableRowIndex> {
+            crate::renderable::terminal_get_dirty_lines(&mut self.term.lock(), lines, seqno)
+        }
+        fn with_lines_mut(
+            &self,
+            lines: Range<StableRowIndex>,
+            with_lines: &mut dyn crate::pane::WithPaneLines,
+        ) {
+            crate::renderable::terminal_with_lines_mut(&mut self.term.lock(), lines, with_lines)
+        }
+        fn for_each_logical_line_in_stable_range_mut(
+            &self,
+            lines: Range<StableRowIndex>,
+            for_line: &mut dyn crate::pane::ForEachPaneLogicalLine,
+        ) {
+            crate::renderable::terminal_for_each_logical_line_in_stable_range_mut(
+                &mut self.term.lock(),
+                lines,
+                for_line,
+            )
+        }
+        fn get_logical_lines(&self, lines: Range<StableRowIndex>) -> Vec<crate::pane::LogicalLine> {
+            crate::pane::impl_get_logical_lines_via_get_lines(self, lines)
+        }
+        fn get_lines(&self, lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
+            crate::renderable::terminal_get_lines(&mut self.term.lock(), lines)
+        }
+        fn get_dimensions(&self) -> RenderableDimensions {
+            terminal_get_dimensions(&mut self.term.lock())
+        }
+        fn get_title(&self) -> String {
+            "terminal-pane".to_string()
+        }
+        fn send_paste(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn reader(&self) -> anyhow::Result<Option<Box<dyn std::io::Read + Send>>> {
+            Ok(None)
+        }
+        fn writer(&self) -> parking_lot::MappedMutexGuard<'_, dyn std::io::Write> {
+            parking_lot::MutexGuard::map(self.writes.lock(), |writes| {
+                let writer: &mut dyn std::io::Write = writes;
+                writer
+            })
+        }
+        fn resize(&self, _: TerminalSize) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn mouse_event(&self, _: frankenterm_term::MouseEvent) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn is_dead(&self) -> bool {
+            false
+        }
+        fn palette(&self) -> ColorPalette {
+            ColorPalette::default()
+        }
+        fn domain_id(&self) -> crate::domain::DomainId {
+            1
+        }
+        fn is_mouse_grabbed(&self) -> bool {
+            false
+        }
+        fn is_alt_screen_active(&self) -> bool {
+            false
+        }
+        fn get_current_working_dir(&self, _: crate::pane::CachePolicy) -> Option<url::Url> {
+            None
+        }
+        fn key_down(
+            &self,
+            _: frankenterm_term::KeyCode,
+            _: frankenterm_term::KeyModifiers,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn key_up(
+            &self,
+            _: frankenterm_term::KeyCode,
+            _: frankenterm_term::KeyModifiers,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// B20: a mux client's pane reports a row changed whenever its sequence
+    /// number moves, and a TUI that erases and rewrites its status area moves
+    /// it for every line it rewrites, changed or not. Rows rewritten with the
+    /// same contents keep their generation, so the renderer does not rebuild
+    /// them; the row whose text changed takes the new one. The mirror still
+    /// equals a fresh copy of the screen, sequence numbers included.
+    #[test]
+    fn pane_capture_keeps_the_generation_of_rows_repainted_unchanged() {
+        let pane = TerminalPane::new(terminal(4, 20));
+        let repaint = |spinner: &str| {
+            let frame =
+                format!("\x1b[H\x1b[2K{spinner} working\r\n\x1b[2Kstatus: ok\r\n\x1b[2Kinput >");
+            pane.term.lock().advance_bytes(frame);
+        };
+        let mut mirror = RenderMirror::new();
+        repaint("|");
+        assert!(capture_pane_rows(&pane, &mut mirror, &LIVE).full);
+        repaint("/");
+        let stats = capture_pane_rows(&pane, &mut mirror, &LIVE);
+        let before: Vec<u64> = mirror.rows().iter().map(MirrorRow::generation).collect();
+
+        repaint("-");
+        let stats_after = capture_pane_rows(&pane, &mut mirror, &LIVE);
+        let after: Vec<u64> = mirror.rows().iter().map(MirrorRow::generation).collect();
+        for stats in [stats, stats_after] {
+            assert!(!stats.full);
+            assert_eq!((stats.rows_captured, stats.rows_unchanged), (3, 2));
+        }
+        assert_ne!(after[0], before[0], "the spinner row changed");
+        assert_eq!(
+            after[1..],
+            before[1..],
+            "unchanged rows keep their generation"
+        );
+        let reference = fresh(&mut pane.term.lock(), &LIVE);
+        assert_eq!(mirror.rows().len(), reference.rows().len());
+        for (row, expected) in mirror.rows().iter().zip(reference.rows()) {
+            assert_eq!(content(row), content(expected));
+        }
+
+        // Unchanged pane: nothing is captured and nothing moves.
+        let idle = capture_pane_rows(&pane, &mut mirror, &LIVE);
+        assert_eq!((idle.rows_captured, idle.rows_unchanged), (0, 0));
+        let idle_generations: Vec<u64> = mirror.rows().iter().map(MirrorRow::generation).collect();
+        assert_eq!(idle_generations, after);
     }
 
     /// ft-yccm0.4.7.2: a row keeps its cells' images by column, and each

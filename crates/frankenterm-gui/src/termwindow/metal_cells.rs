@@ -344,6 +344,8 @@ impl MetalFrame {
             .and_then(|local| local.capture_render_rows(&mut frame.mirror, &request))
             .unwrap_or_else(|| capture_pane_rows(&**pane, &mut frame.mirror, &request));
         metrics::histogram!("gui.metal.capture.rows_copied").record(captured.rows_captured as f64);
+        metrics::histogram!("gui.metal.capture.rows_unchanged")
+            .record(captured.rows_unchanged as f64);
 
         if frame.glyphs.begin_frame() {
             frame.scene.invalidate();
