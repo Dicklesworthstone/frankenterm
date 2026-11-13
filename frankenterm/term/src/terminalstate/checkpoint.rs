@@ -3323,12 +3323,14 @@ impl PendingReplayConfigV2 {
         })
     }
 
-    fn matches_checkpoint(
+    /// The first value the live configuration holds differently from the
+    /// checkpoint, by its configuration name; `None` when replay may proceed.
+    fn mismatched_field(
         &self,
         checkpoint: &CheckpointReplayConfigV2,
         limits: TerminalCheckpointLimits,
         tables: &[Arc<HashMap<u32, u8>>],
-    ) -> Result<bool, TerminalCheckpointError> {
+    ) -> Result<Option<&'static str>, TerminalCheckpointError> {
         let expected_unicode = checkpoint.unicode_version.clone().into_live(tables)?;
         // A retention the limits cover at every height is recorded as it is. A
         // larger one can be recorded smaller, by a height the checkpoint alone
@@ -3342,21 +3344,54 @@ impl PendingReplayConfigV2 {
         let retention_matches = checkpoint.scrollback_size == self.scrollback_size
             || (checkpoint.scrollback_size < self.scrollback_size
                 && self.scrollback_size > fits_at_every_height);
-        Ok(checkpoint.version == self.version
-            && retention_matches
-            && checkpoint.color_palette == self.color_palette
-            && checkpoint.enable_kitty_keyboard == self.enable_kitty_keyboard
-            && checkpoint.max_user_vars == self.max_user_vars
-            && checkpoint.max_unicode_version_stack_depth == self.max_unicode_version_stack_depth
-            && checkpoint.max_accumulating_title_len == self.max_accumulating_title_len
-            && expected_unicode == self.unicode_version
-            && checkpoint.normalize_output_to_unicode_nfc == self.normalize_output_to_unicode_nfc
-            && checkpoint.bidi_enabled == self.bidi_enabled
-            && checkpoint.bidi_hint == self.bidi_hint)
+        let differences = [
+            (checkpoint.version != self.version, "replay_config.version"),
+            (!retention_matches, "config.scrollback_size"),
+            (
+                checkpoint.enable_kitty_keyboard != self.enable_kitty_keyboard,
+                "config.enable_kitty_keyboard",
+            ),
+            (
+                checkpoint.max_user_vars != self.max_user_vars,
+                "config.max_user_vars",
+            ),
+            (
+                checkpoint.max_unicode_version_stack_depth != self.max_unicode_version_stack_depth,
+                "config.max_unicode_version_stack_depth",
+            ),
+            (
+                checkpoint.max_accumulating_title_len != self.max_accumulating_title_len,
+                "config.max_accumulating_title_len",
+            ),
+            (
+                expected_unicode != self.unicode_version,
+                "config.unicode_version",
+            ),
+            (
+                checkpoint.normalize_output_to_unicode_nfc != self.normalize_output_to_unicode_nfc,
+                "config.normalize_output_to_unicode_nfc",
+            ),
+            (
+                checkpoint.bidi_enabled != self.bidi_enabled,
+                "config.bidi_enabled",
+            ),
+            (checkpoint.bidi_hint != self.bidi_hint, "config.bidi_hint"),
+        ];
+        Ok(differences
+            .iter()
+            .find_map(|&(differs, field)| differs.then_some(field)))
         // The graphics configuration need not match: replay applies image
         // output under the checkpoint's own, and once activated the terminal
         // takes the live one, as a configuration reload would. Requiring it
         // would fail every restore after a release changed a Kitty default.
+        //
+        // Nor need the color palette. A client sets a pane's palette at run
+        // time (the GUI pushes its color scheme to the mux), so the restored
+        // pane's fresh configuration differs from it in every case where a
+        // GUI with a color scheme was attached. Replay runs under the
+        // checkpoint's palette; a palette the output forked is terminal
+        // state the checkpoint holds itself; once activated the terminal
+        // takes the live palette, as SetPalette or a reload would.
     }
 }
 
@@ -3477,13 +3512,15 @@ impl CheckpointReplayConfigV2 {
             .is_some_and(|graphics| graphics.enable_kitty_graphics)
     }
 
-    pub(crate) fn matches_stable(
+    /// The first stable value `config` holds differently from this
+    /// checkpoint, by its configuration name; `None` when they agree.
+    pub(crate) fn stable_mismatch(
         &self,
         config: &dyn TerminalConfiguration,
         limits: TerminalCheckpointLimits,
         tables: &[Arc<HashMap<u32, u8>>],
-    ) -> Result<bool, TerminalCheckpointError> {
-        PendingReplayConfigV2::capture(config, limits)?.matches_checkpoint(self, limits, tables)
+    ) -> Result<Option<&'static str>, TerminalCheckpointError> {
+        PendingReplayConfigV2::capture(config, limits)?.mismatched_field(self, limits, tables)
     }
 }
 
@@ -6875,12 +6912,12 @@ impl ValidatedTerminalCheckpointV3 {
         let intended_live_config_revision = {
             let _lease = lease_config.acquire_recovery_activation_lease();
             let revision = lease_config.revision();
-            if !self.checkpoint.replay_config.matches_stable(
+            if let Some(field) = self.checkpoint.replay_config.stable_mismatch(
                 lease_config.as_ref(),
                 self.limits,
                 &custom_cell_width_maps,
             )? {
-                return Err(TerminalCheckpointError::ReplayConfigurationMismatch);
+                return Err(TerminalCheckpointError::ReplayConfigurationMismatch { field });
             }
             revision
         };
@@ -7293,7 +7330,9 @@ pub enum TerminalCheckpointError {
         reason: &'static str,
     },
     ConfigurationChangedDuringProjection,
-    ReplayConfigurationMismatch,
+    ReplayConfigurationMismatch {
+        field: &'static str,
+    },
     Serialization,
     NonCanonicalEncoding,
 }
@@ -7402,8 +7441,9 @@ impl std::fmt::Display for TerminalCheckpointError {
             Self::ConfigurationChangedDuringProjection => formatter.write_str(
                 "terminal configuration changed while its replay projection was captured",
             ),
-            Self::ReplayConfigurationMismatch => formatter.write_str(
-                "terminal checkpoint replay configuration does not match the intended live configuration",
+            Self::ReplayConfigurationMismatch { field } => write!(
+                formatter,
+                "terminal checkpoint replay configuration does not match the intended live configuration: {field} differs"
             ),
             Self::Serialization => {
                 formatter.write_str("terminal checkpoint serialization failed")
@@ -8903,7 +8943,9 @@ mod tests {
         // A live retention below the checkpoint's would not keep what it holds.
         assert!(matches!(
             restore(Arc::new(RetentionConfig(100))),
-            Err(TerminalCheckpointError::ReplayConfigurationMismatch)
+            Err(TerminalCheckpointError::ReplayConfigurationMismatch {
+                field: "config.scrollback_size"
+            })
         ));
 
         // A taller terminal has less of the limits left for its retention.
@@ -8940,9 +8982,83 @@ mod tests {
         for other in [retention - 1, retention + 1] {
             assert!(matches!(
                 restore(other),
-                Err(TerminalCheckpointError::ReplayConfigurationMismatch)
+                Err(TerminalCheckpointError::ReplayConfigurationMismatch {
+                    field: "config.scrollback_size"
+                })
             ));
         }
+    }
+
+    #[derive(Debug)]
+    struct PaletteConfig {
+        foreground: SrgbaTuple,
+        enable_kitty_keyboard: bool,
+    }
+
+    impl TerminalConfiguration for PaletteConfig {
+        fn color_palette(&self) -> ColorPalette {
+            ColorPalette {
+                foreground: self.foreground,
+                ..ColorPalette::default()
+            }
+        }
+
+        fn enable_kitty_keyboard(&self) -> bool {
+            self.enable_kitty_keyboard
+        }
+    }
+
+    /// The GUI pushes its color scheme to a pane at run time, so a pane's
+    /// recorded palette and a restoring mux's fresh configuration differ
+    /// whenever a GUI with a color scheme was attached. Refusing that lost
+    /// every such pane on a guardian upgrade (ft-tbo75). The restore replays
+    /// under the recorded palette and activates under the live one.
+    #[test]
+    fn a_restore_takes_the_live_palette_and_names_a_field_that_differs() {
+        let limits = TerminalCheckpointLimits::default();
+        let scheme = SrgbaTuple(1.0, 0.53, 0.0, 1.0);
+        let fresh = ColorPalette::default().foreground;
+        assert_ne!(scheme, fresh);
+        let mut live = Terminal::new(
+            TerminalSize::default(),
+            Arc::new(PaletteConfig {
+                foreground: scheme,
+                enable_kitty_keyboard: false,
+            }),
+            "FrankenTerm",
+            "palette-pushed-by-a-client",
+            Box::new(Vec::<u8>::new()),
+        );
+        live.advance_bytes(b"prompt\r\n");
+        let checkpoint = TerminalCheckpointV3::capture_with_limits(&live, limits).unwrap();
+        let payload = checkpoint.to_canonical_json(limits).unwrap();
+        let restore = |config: PaletteConfig| {
+            TerminalCheckpointV3::decode_canonical_json(&payload, limits)
+                .unwrap()
+                .restore_inert(Arc::new(config))
+        };
+
+        let inert = restore(PaletteConfig {
+            foreground: fresh,
+            enable_kitty_keyboard: false,
+        })
+        .expect("a palette the live configuration lacks must not refuse the restore");
+        let activated = match inert.into_live(Box::new(std::io::sink())) {
+            Ok(activated) => activated,
+            Err(failure) => panic!("the restore must activate: {:?}", failure.error()),
+        };
+        assert_eq!(activated.palette().foreground, fresh);
+
+        // A value replay depends on still refuses, and says which one.
+        assert!(matches!(
+            restore(PaletteConfig {
+                foreground: scheme,
+                enable_kitty_keyboard: true,
+            }),
+            Err(TerminalCheckpointError::ReplayConfigurationMismatch {
+                field: "config.enable_kitty_keyboard"
+            })
+        ));
     }
 
     /// A row the visible screen needs cannot give way.

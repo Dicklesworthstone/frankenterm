@@ -8869,6 +8869,13 @@ mod tests {
     }
 
     fn record_terminal_checkpoint_with(content: &[u8]) -> RecoveryTerminalCheckpointV3 {
+        record_terminal_checkpoint_under(content, Arc::new(CheckpointTerminalConfig))
+    }
+
+    fn record_terminal_checkpoint_under(
+        content: &[u8],
+        config: Arc<dyn TerminalConfiguration>,
+    ) -> RecoveryTerminalCheckpointV3 {
         let mut terminal = Terminal::new(
             TerminalSize {
                 rows: 24,
@@ -8877,7 +8884,7 @@ mod tests {
                 pixel_height: 384,
                 dpi: 96,
             },
-            Arc::new(CheckpointTerminalConfig),
+            config,
             "FrankenTerm",
             "guardian-checkpoint-test",
             Box::new(Vec::<u8>::new()),
@@ -8976,6 +8983,63 @@ mod tests {
         ] {
             assert!(!fatal.leaves_live_parser_consistent(), "{:?}", fatal);
         }
+    }
+
+    /// A GUI pushes its color scheme into the pane's TermConfig as a client
+    /// palette, and the checkpoint records it. A restoring mux builds a fresh
+    /// TermConfig without one. That restore refused, so a guardian upgrade
+    /// lost every pane a GUI with a color scheme had attached (ft-tbo75).
+    #[test]
+    fn a_pane_restores_after_a_client_pushed_its_palette() {
+        use crate::guardian_protocol::GuardianCheckpointDescriptorV1;
+        use frankenterm_dynamic::Value;
+        // A pane's TermConfig carries a cold-store sink whenever the tiered
+        // scrollback is on; a bare one has none, so this test turns the tier
+        // off rather than stand up a store. The palette is the subject here.
+        let untiered = || {
+            let mut overrides = std::collections::BTreeMap::new();
+            overrides.insert(
+                Value::String("scrollback_tiered_enabled".into()),
+                Value::Bool(false),
+            );
+            config::TermConfig::with_config(
+                config::overridden_config(&Value::Object(overrides.into()))
+                    .expect("override the scrollback tier"),
+            )
+        };
+        let pushed = untiered();
+        let mut scheme = frankenterm_term::color::ColorPalette::default();
+        scheme.foreground = frankenterm_term::color::SrgbaTuple(1.0, 0.5, 0.0, 1.0);
+        pushed.set_client_palette(scheme.clone());
+        assert_eq!(pushed.color_palette(), scheme);
+
+        let pane = Uuid::new_v4();
+        let (segment, output) = synchronized_output(pane);
+        let checkpoint = record_terminal_checkpoint_under(b"prompt$ ", Arc::new(pushed));
+        let capture = live_capture([1; 16], pane, segment, output, checkpoint);
+        let descriptor = GuardianCheckpointDescriptorV1::from_live_capture(&capture, 1).unwrap();
+
+        let fresh = Arc::new(untiered());
+        assert_ne!(fresh.color_palette(), scheme);
+        let (terminal, prefix) = GuardianRestoredTerminal::from_checkpoint(
+            capture.durable_pane_id(),
+            descriptor,
+            capture.terminal_checkpoint().canonical_payload(),
+            (640, 384),
+            fresh.clone(),
+            TerminalCheckpointLimits::default(),
+        )
+        .expect("a client palette the fresh configuration lacks must not refuse")
+        .activate(Box::new(Vec::<u8>::new()))
+        .unwrap();
+        prefix
+            .validate_model(&terminal, capture.durable_pane_id())
+            .unwrap();
+        assert_eq!(terminal.palette(), fresh.color_palette());
+
+        // The GUI pushes its scheme again once it reattaches.
+        fresh.set_client_palette(scheme.clone());
+        assert_eq!(terminal.palette(), scheme);
     }
 
     #[test]

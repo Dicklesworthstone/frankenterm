@@ -680,7 +680,9 @@ pub enum InertTerminalError {
     ActivationPoisoned,
     ParserNotRecoveryGround,
     UnsupportedGraphicsAction,
-    ReplayConfigurationMismatch,
+    ReplayConfigurationMismatch {
+        field: &'static str,
+    },
     LiveConfigurationChanged,
     ScrollbackActivation(crate::config::ScrollbackActivationError),
     WriterActivation,
@@ -725,8 +727,9 @@ impl std::fmt::Display for InertTerminalError {
             Self::UnsupportedGraphicsAction => formatter.write_str(
                 "guardian replay rejected a graphics action with external or uncheckpointed state",
             ),
-            Self::ReplayConfigurationMismatch => formatter.write_str(
-                "guardian replay configuration does not match the intended live configuration",
+            Self::ReplayConfigurationMismatch { field } => write!(
+                formatter,
+                "guardian replay configuration does not match the intended live configuration: {field} differs"
             ),
             Self::LiveConfigurationChanged => {
                 formatter.write_str("intended live configuration changed during guardian recovery")
@@ -1153,16 +1156,16 @@ impl InertTerminal {
                 if live_config.revision() != self.intended_live_config_revision {
                     return Err(InertTerminalError::LiveConfigurationChanged);
                 }
-                let live_projection_matches = self
+                if let Some(field) = self
                     .replay_projection
-                    .matches_stable(
+                    .stable_mismatch(
                         live_config.as_ref(),
                         self.checkpoint_limits,
                         &self.custom_cell_width_maps,
                     )
-                    .map_err(InertTerminalError::Checkpoint)?;
-                if !live_projection_matches {
-                    return Err(InertTerminalError::ReplayConfigurationMismatch);
+                    .map_err(InertTerminalError::Checkpoint)?
+                {
+                    return Err(InertTerminalError::ReplayConfigurationMismatch { field });
                 }
                 let prepared_config = self
                     .terminal
