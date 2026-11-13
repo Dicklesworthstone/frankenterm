@@ -2726,6 +2726,19 @@ fn client_inner_is_current(
             .is_some_and(|client_domain| client_domain.inner_is_current(inner))
 }
 
+/// The notifications [`mux_notify_client_domain`] acts on: exactly the arms of
+/// its match, which must change together with this list.
+fn client_domain_handles(notif: &MuxNotification) -> bool {
+    matches!(
+        notif,
+        MuxNotification::ActiveWorkspaceChanged(_)
+            | MuxNotification::WorkspaceRenamed { .. }
+            | MuxNotification::WindowWorkspaceChanged { .. }
+            | MuxNotification::TabTitleChanged { .. }
+            | MuxNotification::WindowTitleChanged { .. }
+    )
+}
+
 fn mux_notify_client_domain(
     owner: &Weak<Mux>,
     local_domain_id: DomainId,
@@ -2734,6 +2747,12 @@ fn mux_notify_client_domain(
     let Some(mux) = owner.upgrade() else {
         return false;
     };
+    // Pane output and alerts, by far the most frequent notifications, concern
+    // no client domain; looking the domain up for them anyway took the mux's
+    // domain registration lock on every delivery (B20).
+    if !client_domain_handles(&notif) {
+        return true;
+    }
     let domain = match mux.get_domain(local_domain_id) {
         Some(domain) => domain,
         // ClientDomain::new installs the subscriber before the caller can
@@ -3014,6 +3033,7 @@ fn mux_notify_client_domain(
                 }
             }
         }
+        // Filtered out by client_domain_handles before the domain lookup.
         _ => {}
     }
     true
@@ -6658,6 +6678,78 @@ mod tests {
             "an equal-valued stale client Arc must not inherit replacement authority"
         );
         assert_eq!(active_workspace_sync_request(None, &owner, &mux), None);
+    }
+
+    #[test]
+    fn client_domain_subscriber_looks_up_its_domain_only_for_what_it_handles() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        // A domain id that resolves to something other than a ClientDomain
+        // makes the lookup observable: a subscriber that looks finds no
+        // ClientDomain there and asks to be dropped (false).
+        let local: Arc<dyn Domain> =
+            Arc::new(mux::domain::LocalDomain::new("not-a-client").expect("local domain"));
+        mux.add_domain(&local).expect("register local domain");
+        let owner = Arc::downgrade(&mux);
+        let id = local.domain_id();
+
+        let handled = vec![
+            MuxNotification::ActiveWorkspaceChanged(test_client_id("handled", 41_101)),
+            MuxNotification::WorkspaceRenamed {
+                old_workspace: "old".to_string(),
+                new_workspace: "new".to_string(),
+            },
+            MuxNotification::WindowWorkspaceChanged {
+                window_id: 1,
+                workspace: "w".to_string(),
+            },
+            MuxNotification::TabTitleChanged {
+                tab_id: 1,
+                title: "t".to_string(),
+            },
+            MuxNotification::WindowTitleChanged {
+                window_id: 1,
+                title: "t".to_string(),
+            },
+        ];
+        for notif in handled {
+            let name = format!("{:?}", notif);
+            assert!(client_domain_handles(&notif), "{}", name);
+            assert!(!mux_notify_client_domain(&owner, id, notif), "{}", name);
+        }
+
+        let ignored = vec![
+            MuxNotification::PaneOutput(1),
+            MuxNotification::Alert {
+                pane_id: 1,
+                alert: wezterm_term::Alert::Bell,
+            },
+            MuxNotification::PaneFocused(1),
+            MuxNotification::TabResized(1),
+            MuxNotification::Empty,
+        ];
+        for notif in ignored {
+            let name = format!("{:?}", notif);
+            assert!(!client_domain_handles(&notif), "{}", name);
+            assert!(mux_notify_client_domain(&owner, id, notif), "{}", name);
+        }
+
+        // An id not yet published keeps the subscriber either way.
+        let unpublished = alloc_domain_id();
+        assert!(mux_notify_client_domain(
+            &owner,
+            unpublished,
+            MuxNotification::TabResized(1)
+        ));
+        assert!(mux_notify_client_domain(
+            &owner,
+            unpublished,
+            MuxNotification::TabTitleChanged {
+                tab_id: 1,
+                title: "t".to_string(),
+            }
+        ));
     }
 
     #[test]
