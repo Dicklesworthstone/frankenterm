@@ -222,10 +222,35 @@ impl BackendImpl {
 #[cfg(test)]
 mod tests {
     use super::{
-        backing_dimensions_from_rect, covered_windows, normalize_backing_dimension, retitle,
-        CoverFacts,
+        backing_dimensions_from_rect, covered_windows, normalize_backing_dimension,
+        nswindow_level_to_window_level, retitle, window_level_to_nswindow_level, CoverFacts,
     };
     use cocoa::foundation::{NSPoint, NSRect, NSSize};
+    use config::window::WindowLevel;
+
+    #[test]
+    fn every_nswindow_level_maps_to_a_window_level() {
+        for level in [
+            WindowLevel::AlwaysOnBottom,
+            WindowLevel::Normal,
+            WindowLevel::AlwaysOnTop,
+        ] {
+            let native = window_level_to_nswindow_level(level.clone());
+            assert_eq!(nswindow_level_to_window_level(native), level);
+        }
+        // Levels this crate never sets, such as AppKit's modal panel (8),
+        // status (25), pop-up menu (101) and a desktop-icon level (-20).
+        assert_eq!(nswindow_level_to_window_level(8), WindowLevel::AlwaysOnTop);
+        assert_eq!(nswindow_level_to_window_level(25), WindowLevel::AlwaysOnTop);
+        assert_eq!(
+            nswindow_level_to_window_level(101),
+            WindowLevel::AlwaysOnTop
+        );
+        assert_eq!(
+            nswindow_level_to_window_level(-20),
+            WindowLevel::AlwaysOnBottom
+        );
+    }
 
     #[test]
     fn only_a_different_title_retitles_the_window() {
@@ -962,12 +987,15 @@ impl HasWindowHandle for Window {
 /// @see https://developer.apple.com/documentation/appkit/nswindow/level
 pub type NSWindowLevel = i64;
 
+/// The [`WindowLevel`] a window at `nswindow_level` is in. This reads the
+/// level back on every resize, so a level we did not set (AppKit has modal
+/// panel, status, pop-up and screen-saver levels, among others) must not
+/// panic: below normal is on the bottom, above it on top.
 pub fn nswindow_level_to_window_level(nswindow_level: NSWindowLevel) -> WindowLevel {
     match nswindow_level {
-        -1 => WindowLevel::AlwaysOnBottom,
+        level if level < 0 => WindowLevel::AlwaysOnBottom,
         0 => WindowLevel::Normal,
-        3 => WindowLevel::AlwaysOnTop,
-        _ => panic!("Invalid window level: {}", nswindow_level),
+        _ => WindowLevel::AlwaysOnTop,
     }
 }
 
