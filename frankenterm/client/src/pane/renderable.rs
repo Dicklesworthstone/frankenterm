@@ -386,6 +386,31 @@ fn hyperlink_rules_equal(left: &[Rule], right: &[Rule]) -> bool {
         })
 }
 
+/// The one live copy of a hyperlink rule set that equals `rules`, made if no
+/// pane holds one yet.
+///
+/// A cloned Regex starts with an empty cache pool, so every copy pays for its
+/// search caches and lazy DFA again: per-call copies rebuilt them on each
+/// content update (B20), and per-pane copies would keep a set of caches for
+/// every pane. Weak entries leave each copy's lifetime to its panes.
+fn shared_hyperlink_rules(rules: &[Rule]) -> Arc<[Rule]> {
+    static SHARED: Mutex<Vec<Weak<[Rule]>>> = Mutex::new(Vec::new());
+    let mut shared = SHARED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    shared.retain(|copy| copy.strong_count() > 0);
+    if let Some(copy) = shared
+        .iter()
+        .filter_map(Weak::upgrade)
+        .find(|copy| hyperlink_rules_equal(copy, rules))
+    {
+        return copy;
+    }
+    let copy: Arc<[Rule]> = rules.into();
+    shared.push(Arc::downgrade(&copy));
+    copy
+}
+
 fn rebuild_cache_as_stale(lines: &mut LruCache<StableRowIndex, LineEntry>, capacity: NonZeroUsize) {
     let mut stale_lines = LruCache::new(capacity);
     while let Some((stable_row, entry)) = lines.pop_lru() {
@@ -610,8 +635,9 @@ pub struct RenderableInner {
     /// Exact rules used for the persisted implicit links in `lines`. GUI
     /// windows can supply different rule sets for the same remote pane, so this
     /// cannot be inferred from process-global configuration. Comparing these
-    /// borrowed fields avoids allocating a signature on every paint.
-    implicit_hyperlink_rules: Vec<Rule>,
+    /// borrowed fields avoids allocating a signature on every paint. Shared
+    /// with every pane on equal rules; see [`shared_hyperlink_rules`].
+    implicit_hyperlink_rules: Arc<[Rule]>,
 
     fetch_limiter: RateLimiter,
     /// The latest render delta scrolled the screen (`physical_top` moved).
@@ -729,7 +755,7 @@ impl RenderableInner {
             seqno: SEQ_ZERO,
             render_cache_generation: 0,
             selection_layout_generation: SEQ_ZERO,
-            implicit_hyperlink_rules: config.hyperlink_rules.clone(),
+            implicit_hyperlink_rules: shared_hyperlink_rules(&config.hyperlink_rules),
             predictions: Vec::new(),
             alt_screen_active,
             prediction_score: 0,
@@ -1770,7 +1796,7 @@ impl RenderableInner {
             let seqno = line.current_seqno();
             line.invalidate_implicit_hyperlinks(seqno);
         }
-        self.implicit_hyperlink_rules = rules.to_vec();
+        self.implicit_hyperlink_rules = shared_hyperlink_rules(rules);
         true
     }
 
@@ -1835,7 +1861,7 @@ impl RenderableInner {
         &mut self,
         touched_rows: impl IntoIterator<Item = StableRowIndex>,
     ) {
-        let rules = self.implicit_hyperlink_rules.clone();
+        let rules = Arc::clone(&self.implicit_hyperlink_rules);
         self.normalize_implicit_hyperlinks_for_rows(touched_rows, &rules);
     }
 
@@ -6415,6 +6441,79 @@ mod tests {
             unlinked[0].get_appdata().is_none(),
             "removing links without advancing the terminal seqno must invalidate cached shape appdata",
         );
+    }
+
+    #[test]
+    fn panes_on_equal_hyperlink_rules_share_one_copy_of_them() {
+        // A cloned Regex starts with an empty cache pool: a copy per pane or
+        // per content update rebuilds its search caches every time (B20).
+        let rules_of = |state: &Arc<parking_lot::Mutex<super::RenderableState>>| {
+            Arc::clone(&state.lock().inner.borrow().implicit_hyperlink_rules)
+        };
+        let select = |state: &Arc<parking_lot::Mutex<super::RenderableState>>, rules: &[Rule]| {
+            state
+                .lock()
+                .inner
+                .borrow_mut()
+                .select_implicit_hyperlink_rules(rules)
+        };
+        let window_rules = || {
+            vec![
+                Rule::new(r"https://shared\.example\S*", "$0").expect("valid hyperlink rule"),
+                Rule::new(r"\bB20-(\d+)\b", "issue:$1").expect("valid hyperlink rule"),
+            ]
+        };
+        let first = test_renderable_state();
+        let second = test_renderable_state();
+
+        // Two windows' equal rule sets are different Regex values; the panes
+        // still end up holding the same copy.
+        assert!(select(&first, &window_rules()));
+        assert!(select(&second, &window_rules()));
+        let shared = rules_of(&first);
+        assert!(Arc::ptr_eq(&shared, &rules_of(&second)));
+        assert_eq!(shared.len(), 2);
+        assert_eq!(shared[1].format, "issue:$1");
+
+        // Normalizing after a content update uses that copy, not a clone.
+        {
+            let state = first.lock();
+            let mut inner = state.inner.borrow_mut();
+            inner.seqno = 7;
+            let seqno = inner.seqno;
+            assert!(inner.put_line(
+                0,
+                Line::from_text(
+                    "see B20-1 at https://shared.example/x",
+                    &CellAttributes::default(),
+                    seqno,
+                    None,
+                ),
+                None,
+            ));
+            inner.normalize_current_implicit_hyperlinks_for_rows(vec![0]);
+            let line = fresh_cached_line(inner.lines.peek(&0)).expect("row 0 is cached");
+            let links = line
+                .visible_cells()
+                .filter_map(|cell| cell.attrs().hyperlink().map(|link| link.uri().to_string()))
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                links.into_iter().collect::<Vec<_>>(),
+                vec![
+                    "https://shared.example/x".to_string(),
+                    "issue:1".to_string()
+                ]
+            );
+        }
+        assert!(Arc::ptr_eq(&shared, &rules_of(&first)));
+
+        // A different rule set gets its own copy; selecting the first set
+        // again finds the copy the other pane still holds.
+        let other = vec![Rule::new(r"other", "$0").expect("valid hyperlink rule")];
+        assert!(select(&first, &other));
+        assert!(!Arc::ptr_eq(&rules_of(&first), &rules_of(&second)));
+        assert!(select(&first, &window_rules()));
+        assert!(Arc::ptr_eq(&rules_of(&first), &rules_of(&second)));
     }
 
     #[test]
