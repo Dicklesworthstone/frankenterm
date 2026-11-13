@@ -5923,6 +5923,13 @@ impl Pane for ClientPane {
             if rows.is_empty() {
                 return Ok(Some(Vec::new()));
             }
+            // A remote whose newest row is older than the mirrored one reads
+            // a range past its newest row as its newest rows, by the rule
+            // above. A tail's answer can then start before the rows asked.
+            let tail = match rows.as_slice() {
+                [only] if only.end == newest => Some(only.clone()),
+                _ => None,
+            };
             let registration = self
                 .mux_registration
                 .load()
@@ -5946,17 +5953,25 @@ impl Pane for ClientPane {
                             .await?
                             .into_parts();
                     // An unfenced read can find fewer rows than the mirrored
-                    // dimensions promised, never rows it did not ask for.
+                    // dimensions promised, never rows it did not ask for,
+                    // except that a tail may get the remote's newest rows:
+                    // consecutive, no more than asked, and below its end.
                     anyhow::ensure!(
                         incomplete.is_empty() && lines.len() <= count,
                         "forwarded line reply is incomplete"
                     );
+                    let remote_newest_rows = tail.is_some_and(|tail| {
+                        lines.last().is_some_and(|(row, _)| *row < tail.end)
+                            && lines
+                                .windows(2)
+                                .all(|pair| pair[0].0.checked_add(1) == Some(pair[1].0))
+                    });
                     let mut bytes = wezterm_term::screen::ScreenLineRead::MAX_PAYLOAD_BYTES;
                     let mut work = 65_536;
                     let mut bounded = Vec::with_capacity(lines.len());
                     for (row, line) in lines {
                         anyhow::ensure!(
-                            rows.iter().any(|rows| rows.contains(&row)),
+                            remote_newest_rows || rows.iter().any(|rows| rows.contains(&row)),
                             "forwarded line reply names row {row}, which was not asked for"
                         );
                         let line = line
@@ -7849,6 +7864,70 @@ mod tests {
             ),
             "a settled read answers once"
         );
+    }
+
+    /// A remote whose newest row is older than the mirrored one (a codec-46
+    /// mux on 2026-11-12) answers a tail with its own newest rows, before
+    /// the rows asked. That answer is the tail; anything else is refused.
+    #[test]
+    fn forwarded_tail_takes_the_remote_newest_rows_from_before_the_asked_ones() {
+        let line =
+            |text: &str| Line::from_text(text, &termwiz::cell::CellAttributes::default(), 3, None);
+        for (reply, expected) in [
+            // The remote's newest rows are 94 and 95, the mirror's 98 and 99.
+            (
+                vec![(94, line("ninety-four")), (95, line("ninety-five"))],
+                Some(vec![
+                    (94, "ninety-four".to_string()),
+                    (95, "ninety-five".to_string()),
+                ]),
+            ),
+            // Not consecutive: not a newest-rows answer.
+            (vec![(94, line("a")), (96, line("b"))], None),
+            // Reaching the asked end: not older than the mirror.
+            (vec![(99, line("a")), (100, line("b"))], None),
+        ] {
+            let scope = MuxTestScope::enter();
+            let executor = promise::spawn::SimpleExecutor::new();
+            let mux = Arc::new(Mux::new(None));
+            scope.set_mux(&mux);
+            let (inner, peer) = test_client_inner_with_rpc_peer(941);
+            let pane = register_resize_test_pane(&mux, &executor, &inner, &peer, 943, 949);
+            {
+                let cache = pane.renderable.lock();
+                let mut cache = cache.inner.borrow_mut();
+                cache.dimensions.scrollback_top = 0;
+                cache.dimensions.scrollback_rows = 100;
+            }
+            let newest = std::slice::from_ref(&(isize::MAX - 2..isize::MAX));
+            let mut state = None;
+            assert!(pane
+                .read_lines_forwarded_capability(newest, &mut state)
+                .unwrap()
+                .is_none());
+            let asked = promise::spawn::block_on(peer.respond_next_lines(reply)).unwrap();
+            assert_eq!(asked, vec![98..100]);
+            let mut outcome = None;
+            for _ in 0..64 {
+                match pane.read_lines_forwarded_capability(newest, &mut state) {
+                    Ok(None) => assert!(executor.try_tick().unwrap()),
+                    Ok(Some(rows)) => {
+                        outcome = Some(Some(
+                            rows.iter()
+                                .map(|(row, line)| (*row, line.as_str().into_owned()))
+                                .collect::<Vec<_>>(),
+                        ));
+                        break;
+                    }
+                    Err(PaneSelectionAnchorError::SourceChanged) => {
+                        outcome = Some(None);
+                        break;
+                    }
+                    Err(other) => panic!("unexpected outcome: {:?}", other),
+                }
+            }
+            assert_eq!(outcome.expect("the read settles"), expected);
+        }
     }
 
     #[test]
