@@ -222,9 +222,24 @@ impl BackendImpl {
 #[cfg(test)]
 mod tests {
     use super::{
-        backing_dimensions_from_rect, covered_windows, normalize_backing_dimension, CoverFacts,
+        backing_dimensions_from_rect, covered_windows, normalize_backing_dimension, retitle,
+        CoverFacts,
     };
     use cocoa::foundation::{NSPoint, NSRect, NSSize};
+
+    #[test]
+    fn only_a_different_title_retitles_the_window() {
+        let mut current = "frankenterm".to_owned();
+        assert!(!retitle(&mut current, "frankenterm"));
+        assert!(retitle(&mut current, "⠹ build | repo"));
+        assert_eq!(current, "⠹ build | repo");
+        // The spinner's next frame is a change; repeating it is not.
+        assert!(retitle(&mut current, "⠸ build | repo"));
+        assert!(!retitle(&mut current, "⠸ build | repo"));
+        assert!(retitle(&mut current, ""));
+        assert!(!retitle(&mut current, ""));
+        assert_eq!(current, "");
+    }
 
     fn facts(rank: usize, x: f64, width: f64, opaque: bool) -> CoverFacts {
         CoverFacts {
@@ -588,6 +603,23 @@ pub(crate) struct WindowInner {
     view: StrongPtr,
     window: StrongPtr,
     config: ConfigHandle,
+    /// The title this window was last given: the creation name, then each
+    /// `set_title`. Nothing else retitles the NSWindow.
+    title: String,
+}
+
+/// Records `title` as `current` and returns whether that changed it. Every
+/// `setTitle:` makes AppKit lay out the title bar and open a window-server
+/// fence even for the same string, and a window's title is reapplied on
+/// every coalesced title update, including those for its background tabs'
+/// spinners (B20).
+fn retitle(current: &mut String, title: &str) -> bool {
+    if current == title {
+        return false;
+    }
+    current.clear();
+    current.push_str(title);
+    true
 }
 
 fn function_key_to_keycode(function_key: char) -> KeyCode {
@@ -869,6 +901,7 @@ impl Window {
                 window,
                 view,
                 config: config.clone(),
+                title: name.to_owned(),
             }));
             {
                 let mut inner = inner.borrow_mut();
@@ -1548,6 +1581,9 @@ impl WindowInner {
         }
     }
     fn set_title(&mut self, title: &str) {
+        if !retitle(&mut self.title, title) {
+            return;
+        }
         let title = nsstring(title);
         unsafe {
             NSWindow::setTitle_(*self.window, *title);
