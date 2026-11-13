@@ -7056,8 +7056,12 @@ mod tests {
         mux.subscribe(move |notification| {
             if matches!(notification, mux::MuxNotification::PaneOutput(753)) {
                 let owner = weak_renderable.upgrade().expect("exact pane is alive");
+                // The output drain runs after the handoff returns, when the
+                // fetch driver on its background thread may briefly take this
+                // lock again. Wait out such a hold; a repaint sent while this
+                // thread holds the lock still fails.
                 assert!(
-                    owner.try_lock().is_some(),
+                    owner.try_lock_for(Duration::from_secs(2)).is_some(),
                     "repaint must run outside render lock"
                 );
                 observed_repaints.fetch_add(1, Ordering::SeqCst);
