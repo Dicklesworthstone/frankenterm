@@ -1447,8 +1447,11 @@ mod web_tests {
                     "application version must match"
                 );
                 let paths = spec["paths"].as_object().context("live paths object")?;
+                // The same inventory as web::openapi's unit test: ten reads
+                // plus local viewer sign-in and sign-out.
                 let expected: std::collections::BTreeSet<_> = [
                     "/health",
+                    "/auth/status",
                     "/panes",
                     "/events",
                     "/search",
@@ -1460,6 +1463,7 @@ mod web_tests {
                 ]
                 .into_iter()
                 .map(|path| (path, "get"))
+                .chain([("/auth/session", "post"), ("/auth/session", "delete")])
                 .collect();
                 let mut documented = std::collections::BTreeSet::new();
                 let mut operation_ids = std::collections::BTreeSet::new();
@@ -1473,17 +1477,17 @@ mod web_tests {
                         ensure!(operation_ids.insert(id), "operation IDs must be unique");
                         ensure!(
                             operation.get("security").is_none(),
-                            "auth is not implemented yet"
+                            "the default server runs in private operator mode"
                         );
                     }
                 }
                 ensure!(
                     documented == expected,
-                    "live document must describe exactly nine GET routes"
+                    "live document must describe exactly the live operations"
                 );
                 ensure!(
                     spec.get("security").is_none(),
-                    "global auth is not implemented yet"
+                    "private mode has no cookie requirement"
                 );
                 ensure!(
                     spec["components"].get("securitySchemes").is_none(),
@@ -1498,7 +1502,7 @@ mod web_tests {
                     "health operation must map to /health"
                 );
                 ensure!(
-                    paths.len() == 9,
+                    paths.len() == 11,
                     "review missing or newly exposed operations"
                 );
                 ensure!(
