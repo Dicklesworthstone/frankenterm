@@ -828,7 +828,10 @@ mod tests {
 
     #[test]
     fn reconnect_ui_created_on_reader_thread_runs_on_gui_owner() {
-        let _guard = crate::MUX_TEST_LOCK.lock().unwrap();
+        // Like every other holder: another test's panic must not fail this one.
+        let _guard = crate::MUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let executor = promise::spawn::SimpleExecutor::new();
         let mux = Arc::new(Mux::new(None));
         Mux::set_mux(&mux);
