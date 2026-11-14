@@ -201,7 +201,11 @@ enum Request {
         pane_id: usize,
         input_serial: u64,
     },
-    ListPanes,
+    ListPanes {
+        /// A plain inventory has no wire revision. Do not publish it if the
+        /// established topology stream advanced while it was in flight.
+        topology_revision: Option<u64>,
+    },
     /// The first pane list from a current server, with its incarnation.
     CoherentPanes,
     Subscribe {
@@ -423,6 +427,15 @@ struct PendingShellCreation {
     deadline_ns: u64,
 }
 
+/// Authority for numeric topology notifications on this connection. The
+/// establishing snapshot already includes every revision through `revision`;
+/// only its immediate successor may change the live pane inventory.
+#[derive(Debug)]
+struct TopologyFence {
+    stream_id: [u8; 16],
+    revision: u64,
+}
+
 #[derive(Debug, Default)]
 pub struct Session {
     next_serial: u64,
@@ -432,6 +445,7 @@ pub struct Session {
     dialect: Dialect,
     codec_version: usize,
     incarnation: Option<[u8; 16]>,
+    topology: Option<TopologyFence>,
     failed: bool,
     requests: HashMap<u64, Request>,
     panes: Vec<PaneInfo>,
@@ -754,7 +768,13 @@ impl Session {
             self.list_again = true;
         } else {
             self.listing = true;
-            self.send(ident::LIST_PANES, &ListPanes {}, Request::ListPanes);
+            self.send(
+                ident::LIST_PANES,
+                &ListPanes {},
+                Request::ListPanes {
+                    topology_revision: self.topology.as_ref().map(|fence| fence.revision),
+                },
+            );
         }
     }
 
@@ -2176,6 +2196,20 @@ impl Session {
     }
 
     fn handle(&mut self, frame: Frame) -> Result<(), crate::Error> {
+        let legacy_topology = matches!(
+            frame.ident,
+            ident::PANE_REMOVED | ident::TAB_RESIZED | ident::TAB_ADDED_TO_WINDOW
+        );
+        if (legacy_topology || frame.ident == ident::TOPOLOGY_EVENT) && frame.serial != 0 {
+            return Err(crate::Error::Frame(
+                "a topology notification carried a reply serial",
+            ));
+        }
+        if legacy_topology && self.topology.is_some() {
+            return Err(crate::Error::Frame(
+                "an unstamped topology notification crossed the established stream fence",
+            ));
+        }
         if self.dialect == Dialect::Legacy
             && matches!(
                 frame.ident,
@@ -2228,6 +2262,23 @@ impl Session {
                 }
                 _ => Err(crate::Error::Frame("a reply too large to read")),
             };
+        }
+        match (&request, frame.ident) {
+            (
+                Some(Request::ListPanes { .. }),
+                ident::LIST_PANES_RESPONSE | ident::ERROR_RESPONSE,
+            )
+            | (
+                Some(Request::CoherentPanes),
+                ident::LIST_PANES_COHERENT_RESPONSE | ident::ERROR_RESPONSE,
+            ) => {}
+            (Some(Request::ListPanes { .. } | Request::CoherentPanes), _)
+            | (_, ident::LIST_PANES_RESPONSE | ident::LIST_PANES_COHERENT_RESPONSE) => {
+                return Err(crate::Error::Frame(
+                    "a pane inventory reply did not match its exact request",
+                ));
+            }
+            _ => {}
         }
         if self.codec_version >= wire::OBSERVED_LINES_MIN_VERSION {
             match &request {
@@ -2676,10 +2727,20 @@ impl Session {
                 }
             }
             ident::LIST_PANES_RESPONSE => {
-                let list: PaneList = wire::decode(&frame.body)?;
-                if matches!(request, Some(Request::ListPanes)) {
-                    self.listing = false;
+                let Some(Request::ListPanes { topology_revision }) = request else {
+                    return Err(crate::Error::Schema);
+                };
+                self.listing = false;
+                if topology_revision != self.topology.as_ref().map(|fence| fence.revision) {
+                    // A delayed plain list can predate a removal already
+                    // received on the stamped stream. It must not resurrect
+                    // that pane or retire input using obsolete membership.
+                    // Fold every queued refresh into one fresh request.
+                    self.list_again = false;
+                    self.refresh_panes();
+                    return Ok(());
                 }
+                let list: PaneList = wire::decode(&frame.body)?;
                 self.listed(&list, frame.serial);
                 self.list_again_if_asked();
             }
@@ -2687,6 +2748,15 @@ impl Session {
                 let response: ListPanesCoherentResponse = wire::decode(&frame.body)?;
                 self.listing = false;
                 if let CoherentOutcome::Snapshot(snapshot) = response.outcome {
+                    if response.negotiated != wire::FENCED_SNAPSHOT
+                        || response.stream_id == [0; 16]
+                        || snapshot.snapshot_revision == u64::MAX
+                        || self.topology.is_some()
+                    {
+                        return Err(crate::Error::Frame(
+                            "the coherent pane snapshot carried invalid topology authority",
+                        ));
+                    }
                     if snapshot.session_incarnation == [0; 16]
                         || self
                             .incarnation
@@ -2697,6 +2767,10 @@ impl Session {
                         ));
                     }
                     self.incarnation = Some(snapshot.session_incarnation);
+                    self.topology = Some(TopologyFence {
+                        stream_id: response.stream_id,
+                        revision: snapshot.snapshot_revision,
+                    });
                     self.events.push_back(Event::Incarnation {
                         id: snapshot.session_incarnation,
                     });
@@ -2773,15 +2847,25 @@ impl Session {
             }
             ident::GET_LINES_RESPONSE => {
                 let reply = wire::decode::<LinesResponse>(&frame.body);
-                if let Some(Request::Lines {
-                    pane_id, layout, ..
-                }) = &request
-                {
-                    if layout.is_some()
-                        || reply.as_ref().is_ok_and(|reply| reply.pane_id != *pane_id)
-                    {
-                        return Err(crate::Error::Schema);
+                let expected_pane = match &request {
+                    Some(Request::Lines {
+                        pane_id, layout, ..
+                    }) => {
+                        if layout.is_some() {
+                            return Err(crate::Error::Schema);
+                        }
+                        Some(*pane_id)
                     }
+                    Some(Request::SearchLines { search }) => {
+                        self.searches.get(search).map(|job| job.pane_id)
+                    }
+                    Some(Request::Context { pane_id, .. }) => Some(*pane_id),
+                    _ => None,
+                };
+                if expected_pane.is_some_and(|pane_id| {
+                    reply.as_ref().is_ok_and(|reply| reply.pane_id != pane_id)
+                }) {
+                    return Err(crate::Error::Schema);
                 }
                 let lines = reply.map(|reply| reply.lines).unwrap_or_default();
                 match request {
@@ -2932,27 +3016,43 @@ impl Session {
             }
             // A tab or split appeared or changed shape on the desktop.
             ident::TAB_RESIZED | ident::TAB_ADDED_TO_WINDOW => self.refresh_panes(),
-            // The same changes from a server that answered a coherent list.
-            ident::TOPOLOGY_EVENT => match wire::decode::<TopologyEvent>(&frame.body) {
-                Ok(TopologyEvent {
-                    event: TopologyChange::PaneRemoved { pane_id },
-                    ..
-                }) => {
-                    self.pane_gone(pane_id);
-                    self.refresh_panes();
+            // The server queues the establishing snapshot before subsequent
+            // revisions. Validate that authority before a numeric removal can
+            // retire the current pane, its input, or its resize ownership.
+            ident::TOPOLOGY_EVENT => {
+                let event: TopologyEvent = wire::decode(&frame.body)?;
+                let Some(fence) = self.topology.as_mut() else {
+                    return Err(crate::Error::Frame(
+                        "a stamped topology event arrived before its establishing snapshot",
+                    ));
+                };
+                if event.stream_id != fence.stream_id
+                    || event.revision == u64::MAX
+                    || fence.revision.checked_add(1) != Some(event.revision)
+                {
+                    return Err(crate::Error::Frame(
+                        "the mux topology stream changed identity or lost revision continuity",
+                    ));
                 }
-                Ok(TopologyEvent {
-                    event:
-                        TopologyChange::FloatingPaneSpawned { .. }
-                        | TopologyChange::WindowInvalidated { .. }
-                        | TopologyChange::TabAddedToWindow { .. }
-                        | TopologyChange::TabResized { .. },
-                    ..
-                }) => self.refresh_panes(),
-                Ok(_) => {}
-                // A change this client does not know; the list says what it did.
-                Err(_) => self.refresh_panes(),
-            },
+                // Even events with no inventory effect occupy a revision.
+                fence.revision = event.revision;
+                match event.event {
+                    TopologyChange::PaneRemoved { pane_id } => {
+                        self.pane_gone(pane_id);
+                        self.refresh_panes();
+                    }
+                    TopologyChange::PaneAdded { .. }
+                    | TopologyChange::FloatingPaneSpawned { .. }
+                    | TopologyChange::WindowCreated { .. }
+                    | TopologyChange::WindowRemoved { .. }
+                    | TopologyChange::WindowInvalidated { .. }
+                    | TopologyChange::WindowWorkspaceChanged { .. }
+                    | TopologyChange::TabAddedToWindow { .. }
+                    | TopologyChange::TabResized { .. }
+                    | TopologyChange::WorkspaceRenamed { .. } => self.refresh_panes(),
+                    _ => {}
+                }
+            }
             ident::ERROR_RESPONSE => {
                 match request {
                     Some(Request::RegisterClient { .. }) => {
@@ -2964,7 +3064,7 @@ impl Session {
                     Some(Request::Version) => {
                         self.fail("the mux server refused the protocol check".to_owned());
                     }
-                    Some(Request::ListPanes) => {
+                    Some(Request::ListPanes { .. }) => {
                         self.fail("the mux server could not list its panes".to_owned());
                     }
                     Some(Request::CoherentPanes) => {

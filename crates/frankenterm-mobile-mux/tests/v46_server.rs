@@ -558,6 +558,54 @@ fn lists(harness: &Harness) -> usize {
         .count()
 }
 
+fn canonical_frame<T: serde::Serialize>(ident: u64, serial: u64, body: &T) -> Vec<u8> {
+    server_frame(ident, serial, &varbincode::serialize(body).unwrap(), false)
+}
+
+fn topology_frame(stream_id: [u8; 16], revision: u64, serial: u64) -> Vec<u8> {
+    canonical_frame(
+        83,
+        serial,
+        &codec::TopologyEvent {
+            stream_id: codec::TopologyStreamId::from_bytes(stream_id),
+            revision: mux::TopologyRevision::new(revision),
+            event: TopologyEventKind::PaneRemoved { pane_id: 7 },
+        },
+    )
+}
+
+/// Complete registration, then hold the actual canonical server snapshot so
+/// tests can control its authority and its order relative to notifications.
+fn held_initial_snapshot() -> (Harness, u64, codec::ListPanesCoherentResponse) {
+    let mut harness = Harness::new(4, 20);
+    for _ in 0..2 {
+        harness.server.receive(&harness.session.take_outgoing());
+        harness
+            .session
+            .receive(&std::mem::take(&mut harness.server.to_phone));
+    }
+    harness.server.receive(&harness.session.take_outgoing());
+    assert_eq!(
+        harness.server.requests,
+        ["GetCodecVersion", "SetClientId", "ListPanesCoherent"]
+    );
+    let bytes = std::mem::take(&mut harness.server.to_phone);
+    let mut cursor = std::io::Cursor::new(bytes.as_slice());
+    let decoded = codec::Pdu::decode_for_dialect(
+        &mut cursor,
+        codec::MuxWireDialect::current(codec::CODEC_VERSION).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cursor.position() as usize, bytes.len());
+    let (serial, payload) = decoded.into_parts();
+    let codec::MuxWireDecodedPayload::Pdu(codec::Pdu::ListPanesCoherentResponse(response)) =
+        payload
+    else {
+        panic!("the canonical server must answer the coherent pane request");
+    };
+    (harness, serial, response)
+}
+
 #[test]
 fn a_current_mux_names_its_incarnation_before_its_first_pane_list() {
     let mut harness = Harness::new(4, 20);
@@ -608,21 +656,309 @@ fn a_current_muxs_topology_changes_list_the_panes_again() {
     harness.server.notify_tab_added();
     harness.pump();
     assert_eq!(lists(&harness), 1);
-    // A change a newer server knows and this client does not: the list
-    // says what it did.
-    let mut unknown = vec![0x5a; 16];
-    unknown.extend_from_slice(&[9, 99]);
-    harness
-        .server
-        .to_phone
-        .extend_from_slice(&server_frame(83, 0, &unknown, false));
-    harness.pump();
-    assert_eq!(lists(&harness), 2);
     assert!(harness.session.is_ready());
     harness.server.remove_pane();
     harness.pump();
     assert!(harness.events.contains(&Event::PaneGone { pane_id: 7 }));
-    assert_eq!(lists(&harness), 3);
+    assert_eq!(lists(&harness), 2);
+}
+
+#[test]
+fn structural_topology_events_refresh_the_mobile_inventory() {
+    let mut harness = Harness::new(4, 20);
+    harness.attach();
+    for (index, event) in [
+        TopologyEventKind::PaneAdded { pane_id: 8 },
+        TopologyEventKind::WindowCreated { window_id: 1 },
+        TopologyEventKind::WindowRemoved { window_id: 1 },
+        TopologyEventKind::WindowWorkspaceChanged {
+            window_id: 0,
+            workspace: Some("work".to_owned()),
+        },
+        TopologyEventKind::WorkspaceRenamed {
+            old_workspace: "work".to_owned(),
+            new_workspace: "renamed".to_owned(),
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        harness.server.topology(event);
+        harness.pump();
+        assert!(harness.session.is_ready());
+        assert_eq!(lists(&harness), index + 1);
+    }
+}
+
+#[test]
+fn a_snapshot_accepts_its_queued_successors_in_wire_order() {
+    for chunk in [1, usize::MAX] {
+        let (mut harness, serial, mut response) = held_initial_snapshot();
+        harness.chunk = chunk;
+        let codec::ListPanesCoherentOutcome::Snapshot(snapshot) = &mut response.outcome else {
+            panic!("expected a snapshot");
+        };
+        snapshot.snapshot_revision = mux::TopologyRevision::new(41);
+        harness.server.to_phone = canonical_frame(82, serial, &response);
+        // A title event consumes a revision even though it needs no list.
+        harness.server.to_phone.extend_from_slice(&canonical_frame(
+            83,
+            0,
+            &codec::TopologyEvent {
+                stream_id: codec::TopologyStreamId::from_bytes([0x5a; 16]),
+                revision: mux::TopologyRevision::new(42),
+                event: TopologyEventKind::TabTitleChanged {
+                    tab_id: 3,
+                    title: "renamed".to_owned(),
+                },
+            },
+        ));
+        harness
+            .server
+            .to_phone
+            .extend_from_slice(&topology_frame([0x5a; 16], 43, 0));
+        harness.pump();
+        assert!(harness.session.is_ready(), "{:?}", harness.events);
+        let listed = harness
+            .events
+            .iter()
+            .position(|event| matches!(event, Event::Panes(_)))
+            .unwrap();
+        let removed = harness
+            .events
+            .iter()
+            .position(|event| *event == Event::PaneGone { pane_id: 7 })
+            .unwrap();
+        assert!(
+            listed < removed,
+            "the snapshot commits before its successor"
+        );
+        assert_eq!(lists(&harness), 1);
+    }
+}
+
+#[test]
+fn invalid_topology_cannot_remove_a_live_pane_or_replay_unanswered_input() {
+    for (case, stream, revision, serial) in [
+        ("zero stream", [0; 16], 2, 0),
+        ("another stream", [0x6b; 16], 2, 0),
+        ("snapshot-only revision", [0x5a; 16], 0, 0),
+        ("duplicate revision", [0x5a; 16], 1, 0),
+        ("missing revision", [0x5a; 16], 3, 0),
+        ("exhausted revision", [0x5a; 16], u64::MAX, 0),
+        ("reply serial", [0x5a; 16], 2, 1),
+    ] {
+        let mut harness = Harness::new(4, 20);
+        harness.attach();
+        harness.server.topology(TopologyEventKind::TabTitleChanged {
+            tab_id: 3,
+            title: "renamed".to_owned(),
+        });
+        harness.pump();
+        let panes = harness.session.panes().to_vec();
+        harness.events.clear();
+
+        // The first write took effect, but its receipt has not reached the
+        // phone. The second write must remain unsent after authority fails.
+        harness.session.write(7, b"first");
+        harness.server.receive(&harness.session.take_outgoing());
+        let receipt = std::mem::take(&mut harness.server.to_phone);
+        assert!(!receipt.is_empty());
+        harness.session.write(7, b"second");
+        assert!(harness.session.take_outgoing().is_empty());
+        assert!(harness.session.unanswered_input(7));
+        harness.server.to_phone = topology_frame(stream, revision, serial);
+        harness.pump();
+
+        assert!(!harness.session.is_ready(), "{case}");
+        assert_eq!(harness.session.panes(), panes, "{case}");
+        assert_eq!(lists(&harness), 0, "{case}");
+        assert!(harness.session.unanswered_input(7), "{case}");
+        assert!(
+            !harness.events.contains(&Event::PaneGone { pane_id: 7 }),
+            "{case}"
+        );
+        assert_eq!(
+            harness
+                .events
+                .iter()
+                .filter(|event| matches!(event, Event::Failed { .. }))
+                .count(),
+            1,
+            "{case}"
+        );
+        // A late successful receipt cannot resume input on the failed stream.
+        harness.server.to_phone = receipt;
+        harness.pump();
+        assert_eq!(harness.server.written, b"first", "{case}");
+        assert!(harness.session.unanswered_input(7), "{case}");
+        assert!(harness.session.take_outgoing().is_empty(), "{case}");
+    }
+}
+
+#[test]
+fn unknown_or_truncated_topology_is_not_an_unfenced_refresh() {
+    let mut unknown = vec![0x5a; 16];
+    unknown.extend_from_slice(&[1, 99]);
+    let truncated = vec![0x5a; 16];
+    for body in [unknown, truncated] {
+        let mut harness = Harness::new(4, 20);
+        harness.attach();
+        let panes = harness.session.panes().to_vec();
+        harness.events.clear();
+        harness.server.to_phone = server_frame(83, 0, &body, false);
+        harness.pump();
+        assert!(!harness.session.is_ready());
+        assert_eq!(harness.session.panes(), panes);
+        assert_eq!(lists(&harness), 0);
+        assert!(!harness.events.contains(&Event::PaneGone { pane_id: 7 }));
+    }
+}
+
+#[test]
+fn topology_cannot_overtake_its_establishing_snapshot() {
+    let (mut harness, serial, response) = held_initial_snapshot();
+    harness.server.to_phone = topology_frame([0x5a; 16], 1, 0);
+    harness
+        .server
+        .to_phone
+        .extend_from_slice(&canonical_frame(82, serial, &response));
+    harness.pump();
+    assert!(!harness.session.is_ready());
+    assert!(harness.session.panes().is_empty());
+    assert!(!harness.events.iter().any(|event| matches!(
+        event,
+        Event::Incarnation { .. } | Event::Panes(_) | Event::PaneGone { .. }
+    )));
+}
+
+#[test]
+fn legacy_topology_cannot_bypass_an_established_fence() {
+    for frame in [
+        canonical_frame(37, 0, &codec::PaneRemoved { pane_id: 7 }),
+        canonical_frame(54, 0, &codec::TabResized { tab_id: 3 }),
+        canonical_frame(
+            55,
+            0,
+            &codec::TabAddedToWindow {
+                tab_id: 4,
+                window_id: 0,
+            },
+        ),
+    ] {
+        let mut harness = Harness::new(4, 20);
+        harness.attach();
+        let panes = harness.session.panes().to_vec();
+        harness.events.clear();
+        harness.server.to_phone = frame;
+        harness.pump();
+        assert!(!harness.session.is_ready());
+        assert_eq!(harness.session.panes(), panes);
+        assert_eq!(lists(&harness), 0);
+        assert!(!harness.events.contains(&Event::PaneGone { pane_id: 7 }));
+    }
+}
+
+#[test]
+fn invalid_snapshot_authority_is_never_published() {
+    for case in [
+        "no capability",
+        "unoffered capability",
+        "zero stream",
+        "zero incarnation",
+        "exhausted revision",
+    ] {
+        let (mut harness, serial, mut response) = held_initial_snapshot();
+        let codec::ListPanesCoherentOutcome::Snapshot(snapshot) = &mut response.outcome else {
+            panic!("expected a snapshot");
+        };
+        match case {
+            "no capability" => response.negotiated = codec::TopologyCapabilities::NONE,
+            "unoffered capability" => {
+                response.negotiated = codec::TopologyCapabilities::from_bits(
+                    codec::TopologyCapabilities::FENCED_SNAPSHOT_V1.bits()
+                        | codec::TopologyCapabilities::RESTORED_LINEAGE_V1.bits(),
+                );
+            }
+            "zero stream" => response.stream_id = codec::TopologyStreamId::from_bytes([0; 16]),
+            "zero incarnation" => {
+                snapshot.session_incarnation = mux::MuxSessionIncarnation::from_bytes([0; 16]);
+            }
+            "exhausted revision" => {
+                snapshot.snapshot_revision = mux::TopologyRevision::new(u64::MAX);
+            }
+            _ => unreachable!(),
+        }
+        harness.server.to_phone = canonical_frame(82, serial, &response);
+        harness.pump();
+        assert!(!harness.session.is_ready(), "{case}");
+        assert!(harness.session.panes().is_empty(), "{case}");
+        assert!(
+            !harness
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Incarnation { .. } | Event::Panes(_))),
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn inventory_replies_must_match_the_exact_pending_request() {
+    let empty = support::v46_pane_list(Vec::new(), Vec::new());
+    for reply_ident in [4, 10] {
+        let (mut harness, serial, _) = held_initial_snapshot();
+        harness.server.to_phone = if reply_ident == 4 {
+            server_frame(4, serial, &empty, false)
+        } else {
+            canonical_frame(10, serial, &codec::UnitResponse {})
+        };
+        harness.pump();
+        assert!(!harness.session.is_ready());
+        assert!(harness.session.panes().is_empty());
+        assert!(
+            !harness
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Panes(_)))
+        );
+    }
+
+    for unsolicited in [true, false] {
+        for coherent in [true, false] {
+            let (mut harness, serial, response) = held_initial_snapshot();
+            harness.server.to_phone = canonical_frame(82, serial, &response);
+            harness.pump();
+            let panes = harness.session.panes().to_vec();
+            harness.events.clear();
+            let serial = if unsolicited {
+                0
+            } else {
+                harness.session.refresh_panes();
+                let mut reader = frankenterm_mobile_mux::frame::FrameReader::default();
+                reader.push(&harness.session.take_outgoing());
+                let request = reader.next_frame().unwrap().unwrap();
+                assert_eq!(request.ident, 3);
+                assert!(reader.next_frame().unwrap().is_none());
+                request.serial
+            };
+            harness.server.to_phone = if coherent {
+                canonical_frame(82, serial, &response)
+            } else if unsolicited {
+                server_frame(4, serial, &empty, false)
+            } else {
+                // A Unit reply must not leave an inventory request hung.
+                canonical_frame(10, serial, &codec::UnitResponse {})
+            };
+            harness.pump();
+            assert!(!harness.session.is_ready());
+            assert_eq!(harness.session.panes(), panes);
+            assert!(!harness.events.iter().any(|event| matches!(
+                event,
+                Event::Incarnation { .. } | Event::Panes(_) | Event::PaneGone { .. }
+            )));
+        }
+    }
 }
 
 #[test]
@@ -815,6 +1151,57 @@ fn a_refused_search_reports_why_and_context_reads_rows() {
         .map(|line| (line.row, line.text.as_str()))
         .collect();
     assert_eq!(rows, [(4, "line 4"), (5, "line 5"), (6, "line 6")]);
+}
+
+#[test]
+fn search_and_context_reject_line_text_from_another_pane() {
+    for context in [false, true] {
+        let mut harness = Harness::new(4, 20);
+        harness.quiet_output(b"needle\r\n");
+        harness.attach();
+        harness.events.clear();
+        let request = if context {
+            harness.session.context(7, 0..1)
+        } else {
+            harness.session.search(7, &query("needle"))
+        }
+        .expect("a text request");
+        let mut replaced = false;
+        for _ in 0..4 {
+            let outgoing = harness.session.take_outgoing();
+            assert!(!outgoing.is_empty(), "the text request must progress");
+            harness.server.receive(&outgoing);
+            let bytes = std::mem::take(&mut harness.server.to_phone);
+            let mut reader = frankenterm_mobile_mux::frame::FrameReader::default();
+            reader.push(&bytes);
+            let frame = reader.next_frame().unwrap().expect("a text request reply");
+            assert!(reader.next_frame().unwrap().is_none());
+            if frame.ident == 23 {
+                let mut reply: codec::GetLinesResponse =
+                    varbincode::deserialize(&frame.body).unwrap();
+                reply.pane_id = 8;
+                harness.server.to_phone = canonical_frame(23, frame.serial, &reply);
+                replaced = true;
+                break;
+            }
+            harness.session.receive(&bytes);
+        }
+        assert!(
+            replaced,
+            "the canonical server must return the matched rows"
+        );
+        harness.pump();
+        assert!(!harness.session.is_ready());
+        assert!(
+            !harness.events.iter().any(|event| match event {
+                Event::SearchResults { search, .. } => *search == request,
+                Event::Context { request: id, .. } => *id == request,
+                _ => false,
+            }),
+            "text from a different pane must never be published: {:?}",
+            harness.events
+        );
+    }
 }
 
 #[test]
@@ -1852,4 +2239,126 @@ fn a_refusal_the_server_does_not_allow_repeating_still_closes_the_pane() {
             "codec {version}"
         );
     }
+}
+
+#[test]
+fn a_delayed_plain_inventory_cannot_resurrect_a_removed_pane() {
+    for chunk in [1, usize::MAX] {
+        let mut harness = Harness::new(4, 20);
+        harness.attach();
+        harness.session.refresh_panes();
+        harness.server.receive(&harness.session.take_outgoing());
+        let stale = std::mem::take(&mut harness.server.to_phone);
+        assert!(!stale.is_empty());
+
+        harness.server.remove_pane();
+        let removed = std::mem::take(&mut harness.server.to_phone);
+        for bytes in removed.chunks(chunk) {
+            harness.session.receive(bytes);
+        }
+        assert!(harness.session.panes().is_empty());
+        assert_eq!(
+            harness.session.next_event(),
+            Some(Event::PaneGone { pane_id: 7 })
+        );
+        assert!(harness.session.next_event().is_none());
+        for _ in 0..4 {
+            harness.session.refresh_panes();
+        }
+        assert!(harness.session.take_outgoing().is_empty());
+
+        for bytes in stale.chunks(chunk) {
+            harness.session.receive(bytes);
+        }
+        assert!(harness.session.is_ready());
+        assert!(harness.session.panes().is_empty());
+        assert!(
+            harness.session.next_event().is_none(),
+            "the stale reply cannot publish inventory or another removal"
+        );
+        let mut reader = frankenterm_mobile_mux::frame::FrameReader::default();
+        reader.push(&harness.session.take_outgoing());
+        let fresh = reader.next_frame().unwrap().expect("one fresh list");
+        assert_eq!(fresh.ident, 3);
+        assert!(reader.next_frame().unwrap().is_none());
+        let empty = codec::ListPanesResponse {
+            tabs: Vec::new(),
+            tab_titles: Vec::new(),
+            window_titles: Default::default(),
+            floating_panes: Vec::new(),
+        };
+        harness
+            .session
+            .receive(&canonical_frame(4, fresh.serial, &empty));
+        assert_eq!(harness.session.next_event(), Some(Event::Panes(Vec::new())));
+        assert!(harness.session.next_event().is_none());
+        assert!(harness.session.take_outgoing().is_empty());
+    }
+}
+
+#[test]
+fn stale_inventory_membership_cannot_retire_unanswered_input() {
+    let mut harness = Harness::new(4, 20);
+    harness.attach();
+    let panes = harness.session.panes().to_vec();
+    harness.session.refresh_panes();
+    harness.server.receive(&harness.session.take_outgoing());
+    let bytes = std::mem::take(&mut harness.server.to_phone);
+    let mut reader = frankenterm_mobile_mux::frame::FrameReader::default();
+    reader.push(&bytes);
+    let stale = reader.next_frame().unwrap().expect("a pane inventory");
+    assert_eq!(stale.ident, 4);
+    assert!(reader.next_frame().unwrap().is_none());
+
+    harness.session.write(7, b"first");
+    harness.server.receive(&harness.session.take_outgoing());
+    let receipt = std::mem::take(&mut harness.server.to_phone);
+    assert!(!receipt.is_empty());
+    harness.session.write(7, b"second");
+    assert!(harness.session.take_outgoing().is_empty());
+    assert!(harness.session.unanswered_input(7));
+
+    // This event advances the fence without itself asking for another list.
+    harness.server.topology(TopologyEventKind::TabTitleChanged {
+        tab_id: 3,
+        title: "renamed".to_owned(),
+    });
+    harness
+        .session
+        .receive(&std::mem::take(&mut harness.server.to_phone));
+    let empty = codec::ListPanesResponse {
+        tabs: Vec::new(),
+        tab_titles: Vec::new(),
+        window_titles: Default::default(),
+        floating_panes: Vec::new(),
+    };
+    harness
+        .session
+        .receive(&canonical_frame(4, stale.serial, &empty));
+    assert!(harness.session.is_ready());
+    assert_eq!(harness.session.panes(), panes);
+    assert!(harness.session.unanswered_input(7));
+    assert!(
+        harness.session.next_event().is_none(),
+        "a stale omission cannot remove the pane or fail its input"
+    );
+
+    let outgoing = harness.session.take_outgoing();
+    let mut reader = frankenterm_mobile_mux::frame::FrameReader::default();
+    reader.push(&outgoing);
+    assert_eq!(reader.next_frame().unwrap().unwrap().ident, 3);
+    assert!(reader.next_frame().unwrap().is_none());
+    harness.server.receive(&outgoing);
+    harness
+        .session
+        .receive(&std::mem::take(&mut harness.server.to_phone));
+    assert!(harness.session.is_ready());
+    assert_eq!(harness.session.panes(), panes);
+    assert!(harness.session.unanswered_input(7));
+    assert!(harness.session.take_outgoing().is_empty());
+
+    harness.server.to_phone = receipt;
+    harness.pump();
+    assert_eq!(harness.server.written, b"firstsecond");
+    assert!(!harness.session.unanswered_input(7));
 }
