@@ -48,9 +48,13 @@ use zeroize::{Zeroize as _, Zeroizing};
 // Connection ownership, threads, and socket buffers are bounded independently
 // of pane count. A connection is shared by every pane of its authenticated mux
 // and goes when no pane needs it, so this bounds muxes served at once, not muxes
-// served ever. Each pane no successor claimed holds one, and running out refuses
-// the next mux every pane, so the bound stays well clear of a host's crashes.
+// served ever. Keep one slot for an authenticated successor Claim: its old
+// connection must remain open until every pane has transferred or been released.
+// Spawn must not consume that overlap slot, even after its mux has sent Hello.
+// This preserves restart capacity at the ordinary admission limit; it cannot
+// recover an already full set of 64 owners that still retain pane authority.
 const MAX_BROKER_CONNECTIONS: usize = 64;
+const MAX_BROKER_SPAWN_CONNECTIONS: usize = MAX_BROKER_CONNECTIONS - 1;
 const BROKER_IO_DEADLINE: Duration = Duration::from_secs(5);
 // The broker declines a released pane while a lease handoff or another
 // retirement is in flight, and a retirement can outlast one ask's deadline,
@@ -458,6 +462,16 @@ pub(crate) struct BrokerRetirementProbe {
     pub handle_retained: bool,
     pub settled: bool,
     pub release_due: bool,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct BrokerRotationCapacityProbe {
+    pub connections: usize,
+    pub predecessor_retained: bool,
+    pub successor_owns_both_panes: bool,
+    pub pane_owner_can_spawn: bool,
+    pub new_mux_can_spawn: bool,
 }
 
 fn activate_ready_broker_pane(
@@ -1968,6 +1982,60 @@ impl GuardianRuntime {
             .is_some_and(|pending| pending.pane_id == pane_id && pending.rotation.is_some())
     }
 
+    /// Fill logical admission slots around the sealed fixture's real sessions.
+    /// These unrelated owners have no socket or pane; this exercises admission
+    /// and rotation, not the resource cost of 63 real broker sessions.
+    #[cfg(test)]
+    pub(crate) fn fill_broker_spawn_capacity_for_test(&mut self) {
+        assert!(!self.broker_connections.is_empty());
+        while self.broker_connections.len() < MAX_BROKER_SPAWN_CONNECTIONS {
+            let mux = Uuid::new_v4();
+            assert!(self.broker_connection_room(mux));
+            self.broker_connections.insert(
+                mux,
+                RuntimeBrokerConnection {
+                    worker: None,
+                    retained_session: None,
+                    active_pane: None,
+                    last_pane: None,
+                    retired_last: false,
+                    failed: false,
+                    retired_outer_owner: false,
+                    fully_retired_outer_owner: false,
+                },
+            );
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn broker_rotation_capacity_for_test(
+        &mut self,
+        predecessor: Uuid,
+        panes: [Uuid; 2],
+    ) -> BrokerRotationCapacityProbe {
+        let owners = panes.map(|id| {
+            self.starting_broker_panes
+                .get(&id)
+                .map(|pane| pane.mux_incarnation)
+                .or_else(|| {
+                    self.settled_broker_panes
+                        .get(&id)
+                        .map(|pane| pane.mux_incarnation)
+                })
+        });
+        let pane_owner_can_spawn =
+            owners[0].is_some_and(|owner| self.broker_connection_room(owner));
+        let new_mux_can_spawn = self.broker_connection_room(Uuid::new_v4());
+        BrokerRotationCapacityProbe {
+            connections: self.broker_connections.len(),
+            predecessor_retained: self.broker_connections.contains_key(&predecessor),
+            successor_owns_both_panes: owners[0]
+                .is_some_and(|owner| owner != predecessor && owners[1] == Some(owner)),
+            pane_owner_can_spawn,
+            new_mux_can_spawn,
+        }
+    }
+
     /// Exercise the same idle cleanup a mux rotation or full connection set
     /// invokes, using a real admitted handle from the sealed service fixture.
     #[cfg(test)]
@@ -2716,7 +2784,7 @@ impl GuardianRuntime {
                 if old_mux != successor {
                     let refusal = if !retired {
                         Some(("not retired", GuardianRejectionCode::InvalidRequest))
-                    } else if !self.broker_connection_room(successor) {
+                    } else if !self.broker_rotation_connection_room(successor) {
                         Some((
                             "retired but every broker connection is in use",
                             GuardianRejectionCode::CapacityExhausted,
@@ -3801,6 +3869,25 @@ impl GuardianRuntime {
                                     } else {
                                         false
                                     }
+                                } else if !failed
+                                    && rotation.successor_handle.is_none()
+                                    && completion.response.as_ref().is_some_and(|response| {
+                                        matches!(
+                                            response.header().status,
+                                            mux::guardian_protocol::GuardianResponseStatus::Rejected
+                                                | mux::guardian_protocol::GuardianResponseStatus::Terminal
+                                        )
+                                    })
+                                {
+                                    // Pure provenance validation can reject after
+                                    // connecting but before sending any fence.
+                                    // No pane moved to this new session; keeping
+                                    // it would let a rejected Claim hold the
+                                    // rotation reserve through an unrelated Hello.
+                                    // Existing sessions took the restoration path
+                                    // above, and uncertain outcomes stay retained.
+                                    drop(session);
+                                    true
                                 } else if self.broker_connections.len() < MAX_BROKER_CONNECTIONS {
                                     self.broker_connections.insert(
                                         rotation.successor_mux,
@@ -4197,8 +4284,22 @@ impl GuardianRuntime {
             });
     }
 
-    /// Whether `mux_incarnation` has a broker connection or can open one.
+    /// Whether Spawn can reuse a connection or open one without consuming the
+    /// slot reserved for a successor's authenticated ownership transfer.
     fn broker_connection_room(&mut self, mux_incarnation: Uuid) -> bool {
+        if self.broker_connections.contains_key(&mux_incarnation) {
+            return true;
+        }
+        if self.broker_connections.len() >= MAX_BROKER_SPAWN_CONNECTIONS {
+            self.release_idle_broker_connections();
+        }
+        self.broker_connections.len() < MAX_BROKER_SPAWN_CONNECTIONS
+    }
+
+    /// Only Claim, after checking the exact predecessor's retirement, may use
+    /// the overlap slot. Both sessions remain counted until their last pane
+    /// releases them; a pre-existing full set still refuses new connections.
+    fn broker_rotation_connection_room(&mut self, mux_incarnation: Uuid) -> bool {
         if self.broker_connections.contains_key(&mux_incarnation) {
             return true;
         }
@@ -8887,7 +8988,7 @@ mod tests {
                 .broker_connections
                 .insert(mux, broker_connection(true));
         }
-        assert!(runtime.broker_connections.len() <= MAX_BROKER_CONNECTIONS);
+        assert!(runtime.broker_connections.len() <= MAX_BROKER_SPAWN_CONNECTIONS);
     }
 
     #[test]
@@ -9118,7 +9219,88 @@ mod tests {
     }
 
     #[test]
-    fn a_full_set_of_needed_broker_connections_refuses_a_new_mux() {
+    fn ordinary_admission_keeps_one_slot_for_successor_rotation() {
+        let (_directory, _poll, mut runtime) = runtime_for_input_rejection();
+        let mut owners = Vec::new();
+        for _ in 0..MAX_BROKER_SPAWN_CONNECTIONS {
+            let mux = Uuid::new_v4();
+            let pane = Uuid::new_v4();
+            assert!(runtime.broker_connection_room(mux));
+            runtime
+                .broker_connections
+                .insert(mux, broker_connection(true));
+            runtime
+                .starting_broker_panes
+                .insert(pane, broker_pane_of(mux));
+            owners.push((mux, pane));
+        }
+        let successor = Uuid::new_v4();
+        let hello = runtime
+            .dispatch(&authenticated_hello_request(Uuid::new_v4(), successor))
+            .expect("Hello needs no broker connection");
+        assert_eq!(hello.header().status, GuardianResponseStatus::Success);
+        assert_eq!(
+            runtime.broker_connections.len(),
+            MAX_BROKER_SPAWN_CONNECTIONS
+        );
+        assert!(!runtime.broker_connection_room(successor));
+        assert!(runtime.broker_rotation_connection_room(successor));
+
+        // A rotation temporarily needs both owners. The same successor can
+        // take every remaining pane, but no additional mux may open a session.
+        runtime
+            .broker_connections
+            .insert(successor, broker_connection(false));
+        let (predecessor, first_pane) = owners[0];
+        let second_pane = Uuid::new_v4();
+        runtime
+            .starting_broker_panes
+            .insert(second_pane, broker_pane_of(predecessor));
+        runtime
+            .starting_broker_panes
+            .get_mut(&first_pane)
+            .unwrap()
+            .mux_incarnation = successor;
+        runtime.release_idle_broker_connections();
+        assert_eq!(runtime.broker_connections.len(), MAX_BROKER_CONNECTIONS);
+        assert!(runtime.broker_connections.contains_key(&predecessor));
+        assert!(runtime.broker_connection_room(successor));
+        assert!(runtime.broker_rotation_connection_room(successor));
+        assert!(!runtime.broker_connection_room(Uuid::new_v4()));
+        assert!(!runtime.broker_rotation_connection_room(Uuid::new_v4()));
+
+        runtime
+            .starting_broker_panes
+            .get_mut(&second_pane)
+            .unwrap()
+            .mux_incarnation = successor;
+        runtime.release_idle_broker_connections();
+        assert!(!runtime.broker_connections.contains_key(&predecessor));
+        assert_eq!(
+            runtime.broker_connections.len(),
+            MAX_BROKER_SPAWN_CONNECTIONS
+        );
+        assert!(runtime.broker_connection_room(successor));
+        assert!(!runtime.broker_connection_room(Uuid::new_v4()));
+        assert!(runtime.broker_rotation_connection_room(Uuid::new_v4()));
+
+        // An unrelated new mux waits for an ordinary slot, not the reserve.
+        let (retired, pane) = owners[1];
+        runtime
+            .starting_broker_panes
+            .get_mut(&pane)
+            .unwrap()
+            .failed_before_spawn = true;
+        assert!(runtime.broker_connection_room(Uuid::new_v4()));
+        assert!(!runtime.broker_connections.contains_key(&retired));
+        assert_eq!(
+            runtime.broker_connections.len(),
+            MAX_BROKER_SPAWN_CONNECTIONS - 1
+        );
+    }
+
+    #[test]
+    fn a_preexisting_full_set_refuses_even_a_successor_connection() {
         let (_directory, _poll, mut runtime) = runtime_for_input_rejection();
         for _ in 0..MAX_BROKER_CONNECTIONS {
             let mux = Uuid::new_v4();
@@ -9135,7 +9317,9 @@ mod tests {
             .next()
             .expect("connection");
         assert!(runtime.broker_connection_room(held));
+        assert!(runtime.broker_rotation_connection_room(held));
         assert!(!runtime.broker_connection_room(Uuid::new_v4()));
+        assert!(!runtime.broker_rotation_connection_room(Uuid::new_v4()));
         assert_eq!(runtime.broker_connections.len(), MAX_BROKER_CONNECTIONS);
     }
 

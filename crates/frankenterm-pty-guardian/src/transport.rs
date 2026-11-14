@@ -7547,6 +7547,12 @@ mod tests {
 
     #[test]
     #[ignore = "requires actual sealed candidate identity; run explicitly in strict RCH/DSR"]
+    fn configured_mux_rotation_uses_reserved_capacity_after_rejected_claim() {
+        run_configured_genesis_service(GenesisServiceScenario::RotateAtCapacity);
+    }
+
+    #[test]
+    #[ignore = "requires actual sealed candidate identity; run explicitly in strict RCH/DSR"]
     fn configured_mux_rotation_preserves_children_across_two_successor_processes() {
         run_configured_genesis_service(GenesisServiceScenario::RepeatedRotation);
     }
@@ -7886,6 +7892,12 @@ mod tests {
             return;
         }
         let delayed = std::env::var_os("FT_ROTATION_TEST_DELAYED").is_some();
+        let at_capacity = std::env::var_os("FT_ROTATION_TEST_CAPACITY").is_some();
+        let rejected_mux = if at_capacity { Uuid::new_v4() } else { new_mux };
+        // Keep the rejected mux authenticated. Its unused broker session must
+        // be released by definite rejection, not incidental outer disconnect.
+        let _rejected_keepalive = at_capacity
+            .then(|| GuardianClient::connect_for_genesis(&socket, &token, rejected_mux).unwrap());
         let wal_fault = std::env::var("FT_ROTATION_TEST_WAL_FAULT").ok();
         let lost_request = std::env::var("FT_ROTATION_TEST_DROP_REQUEST")
             .ok()
@@ -7945,9 +7957,17 @@ mod tests {
                     .unwrap();
                 assert!(
                     matches!(
-                        GuardianClient::connect_for_genesis(&socket, &token, new_mux)
-                            .unwrap()
-                            .claim_mux_successor(historical, Uuid::new_v4(), Uuid::new_v4()),
+                        GuardianClient::connect_for_genesis(
+                            &socket,
+                            &token,
+                            if index == 0 { rejected_mux } else { new_mux },
+                        )
+                        .unwrap()
+                        .claim_mux_successor(
+                            historical,
+                            Uuid::new_v4(),
+                            Uuid::new_v4()
+                        ),
                         Err(GuardianClientError::Rejected(_))
                     ),
                     "authenticated wrong-effect history with the same broker and child must refuse before any live mutation"
@@ -8307,6 +8327,7 @@ mod tests {
         MissingBroker,
         ReleaseAfterDisconnect { close_first: bool },
         Rotate,
+        RotateAtCapacity,
         RepeatedRotation,
         DelayedOutput,
         DistinctBuild,
@@ -8319,6 +8340,7 @@ mod tests {
         let rotate_mux = matches!(
             scenario,
             GenesisServiceScenario::Rotate
+                | GenesisServiceScenario::RotateAtCapacity
                 | GenesisServiceScenario::RepeatedRotation
                 | GenesisServiceScenario::DelayedOutput
                 | GenesisServiceScenario::DistinctBuild
@@ -8326,6 +8348,7 @@ mod tests {
                 | GenesisServiceScenario::WalFault(_)
         );
         let delay_output = matches!(scenario, GenesisServiceScenario::DelayedOutput);
+        let at_capacity = matches!(scenario, GenesisServiceScenario::RotateAtCapacity);
         let distinct_build = matches!(scenario, GenesisServiceScenario::DistinctBuild);
         let lost_reply_request =
             matches!(scenario, GenesisServiceScenario::OuterReplyLoss).then(Uuid::new_v4);
@@ -8464,6 +8487,8 @@ mod tests {
             let (diagnostic_result_tx, diagnostic_result_rx) = std::sync::mpsc::sync_channel(1);
             let (prune_tx, prune_rx) = std::sync::mpsc::sync_channel(1);
             let (pruned_tx, pruned_rx) = std::sync::mpsc::sync_channel(1);
+            let (capacity_tx, capacity_rx) = std::sync::mpsc::sync_channel(1);
+            let (capacity_result_tx, capacity_result_rx) = std::sync::mpsc::sync_channel(1);
             let guardian_stop = &stop;
             let guardian = scope.spawn(move || {
                 let mut service = GuardianService::bind(guardian_config).unwrap();
@@ -8474,6 +8499,18 @@ mod tests {
                 let mut await_retirement = false;
                 while !guardian_stop.load(Ordering::Acquire) {
                     service.poll_once().unwrap();
+                    if let Ok((fill, panes)) = capacity_rx.try_recv() {
+                        if fill {
+                            service.runtime.fill_broker_spawn_capacity_for_test();
+                        }
+                        capacity_result_tx
+                            .send(
+                                service
+                                    .runtime
+                                    .broker_rotation_capacity_for_test(mux, panes),
+                            )
+                            .unwrap();
+                    }
                     if let Ok(pane) = prune_rx.try_recv() {
                         pruned_tx
                             .send((
@@ -8681,6 +8718,14 @@ mod tests {
                 assert_eq!(first_lease.generation(), 1);
                 assert_eq!(second_lease.generation(), 1);
                 let mut first_client = first_lease.into_client();
+                if at_capacity {
+                    capacity_tx.send((true, [pane, second_pane])).unwrap();
+                    let capacity = capacity_result_rx.recv_timeout(CLIENT_IO_TIMEOUT).unwrap();
+                    assert_eq!(capacity.connections, 63, "{capacity:?}");
+                    assert!(capacity.predecessor_retained, "{capacity:?}");
+                    assert!(capacity.pane_owner_can_spawn, "{capacity:?}");
+                    assert!(!capacity.new_mux_can_spawn, "{capacity:?}");
+                }
                 let live_scope = mux::guardian_checkpoint::GuardianSpawnCustodyScopeV1 {
                     broker_lineage: load_guardian_secret(&broker_token)
                         .unwrap()
@@ -8760,6 +8805,11 @@ mod tests {
                     child_command.env("FT_ROTATION_TEST_DELAYED", "1");
                 } else {
                     child_command.env_remove("FT_ROTATION_TEST_DELAYED");
+                }
+                if at_capacity {
+                    child_command.env("FT_ROTATION_TEST_CAPACITY", "1");
+                } else {
+                    child_command.env_remove("FT_ROTATION_TEST_CAPACITY");
                 }
                 if let Some(request) = lost_reply_request {
                     child_command.env("FT_ROTATION_TEST_DROP_REQUEST", request.to_string());
@@ -8883,6 +8933,17 @@ mod tests {
                     return;
                 }
                 assert!(stdout.contains("MUX_ROTATION_TWO_PANES_SUCCESS"));
+                if at_capacity {
+                    capacity_tx.send((false, [pane, second_pane])).unwrap();
+                    let capacity = capacity_result_rx.recv_timeout(CLIENT_IO_TIMEOUT).unwrap();
+                    assert_eq!(capacity.connections, 63, "{capacity:?}");
+                    assert!(!capacity.predecessor_retained, "{capacity:?}");
+                    assert!(capacity.successor_owns_both_panes, "{capacity:?}");
+                    assert!(capacity.pane_owner_can_spawn, "{capacity:?}");
+                    // Replacing one owner frees the overlap slot, not an
+                    // ordinary slot for an unrelated sixty-fourth owner.
+                    assert!(!capacity.new_mux_can_spawn, "{capacity:?}");
+                }
                 if matches!(scenario, GenesisServiceScenario::RepeatedRotation) {
                     let second_stdout = directory.join("second-successor.stdout");
                     let second_stderr = directory.join("second-successor.stderr");
