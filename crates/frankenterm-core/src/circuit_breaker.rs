@@ -569,6 +569,9 @@ pub(crate) struct TransportCircuitKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum TransportCircuitKind {
     Cli,
+    /// Keyed only by `WeztermClient::with_mux_pool`, which needs the
+    /// vendored mux; builds without it never construct this.
+    #[cfg_attr(not(all(feature = "vendored", unix)), allow(dead_code))]
     Mux,
 }
 
