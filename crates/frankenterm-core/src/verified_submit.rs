@@ -1773,10 +1773,12 @@ mod tests {
             ..input(Some(&profile), None)
         });
         assert_eq!(unchanged.state, SubmitReceiptState::VerificationUnavailable);
-        assert!(unchanged
-            .evidence_rule_ids
-            .iter()
-            .any(|rule| rule.ends_with(":semantic_input_not_new")));
+        assert!(
+            unchanged
+                .evidence_rule_ids
+                .iter()
+                .any(|rule| rule.ends_with(":semantic_input_not_new"))
+        );
     }
 
     fn assert_recovered_classification(
