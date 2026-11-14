@@ -23,6 +23,7 @@ struct WorkflowRecoveryTasks {
     active: std::sync::atomic::AtomicUsize,
     // Keep only the earliest deferred cursor, rather than an unbounded queue
     // of blocked executions. None inside Some means retry from the beginning.
+    #[allow(clippy::option_option)]
     retry_after: Mutex<Option<Option<String>>>,
 }
 
@@ -42,6 +43,16 @@ impl WorkflowRecoveryTaskGuard {
             // silently lose the durable record from this recovery sweep.
             retry: true,
         }
+    }
+
+    /// Record the child's disposition and release its recovery slot.
+    ///
+    /// Taking `self` makes the child task own the whole guard. Assigning
+    /// `guard.retry` inside a `move` closure captured only that `Copy`
+    /// field, so the guard itself dropped in the runner loop before the
+    /// child ran: the slot was released at once and every record retried.
+    fn settle(mut self, retry: bool) {
+        self.retry = retry;
     }
 }
 
@@ -68,6 +79,8 @@ impl Drop for WorkflowRecoveryTaskGuard {
 struct WorkflowStartupRecovery {
     after_id: Option<String>,
     through_id: Option<String>,
+    // None inside Some means retry from the beginning.
+    #[allow(clippy::option_option)]
     retry_after: Option<Option<String>>,
     rows: std::collections::VecDeque<crate::storage::WorkflowRecord>,
     page_loaded: bool,
@@ -3892,11 +3905,11 @@ impl WorkflowRunner {
                 Ok(Some((after_id, record))) => {
                     if let Some(workflow) = self.find_workflow_by_name(&record.workflow_name) {
                         let runner = self.runner_for_workflow(workflow);
-                        let mut recovery_guard =
+                        let recovery_guard =
                             WorkflowRecoveryTaskGuard::new(Arc::clone(&recovery.tasks), after_id);
                         child_tasks.spawn_with_cx(cx, move |child_cx| async move {
                             let attempt = runner.resume_record_with_cx(&child_cx, &record).await;
-                            recovery_guard.retry = attempt.retry;
+                            recovery_guard.settle(attempt.retry);
                             if let Some(result) = attempt.result {
                                 log_workflow_execution_result(&result);
                             }
@@ -7411,7 +7424,7 @@ mod tests {
                 crate::runtime_async::timeout_with_cx(
                     &observer_cx,
                     Duration::from_secs(5),
-                    restarted.resume_incomplete_with_cx(&observer_cx),
+                    Box::pin(restarted.resume_incomplete_with_cx(&observer_cx)),
                 )
                 .await
                 .expect("restart must refuse the indeterminate attempt and finish queued work");
@@ -7420,6 +7433,72 @@ mod tests {
                 assert_eq!(restarted_locks.active_count(), 0);
                 reopened.shutdown().await.unwrap();
             }
+        });
+    }
+
+    /// A restored child holds its recovery slot until it settles. With a
+    /// global limit of two, recovery runs one child at a time: while pane
+    /// 77's restored step waits, recovery must not start pane 78. 0cb662337
+    /// let the slot guard drop in the runner loop (the move closure captured
+    /// only its Copy `retry` field), so each child freed its slot at spawn.
+    #[test]
+    fn workflow_recovery_holds_its_child_slot_until_the_child_settles() {
+        run_async_test(async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("recovery-slot.db");
+            let (storage, mut runner, locks) = unlimited_gate_runner(path.to_str().unwrap()).await;
+            runner.config.max_concurrent = 2;
+            runner.config.step_timeout_ms = 60_000;
+            let probe = Arc::new(StartupIngressProbeWorkflow::new());
+            runner.register_workflow(probe.clone());
+            seed_startup_recovery(&runner).await;
+            seed_startup_recovery_record(&runner, 78, "startup-recovery-queued").await;
+            let event_bus = crate::events::EventBus::new(8);
+            let cx = crate::cx::for_testing();
+            let subscription = runner.subscribe_with_cx(&cx, &event_bus).await.unwrap();
+            let task = crate::runtime_async::task::spawn(async move {
+                runner.run_subscribed_with_cx(&cx, subscription, None).await;
+            });
+            let observer_cx = crate::cx::for_testing();
+            crate::runtime_async::timeout_with_cx(
+                &observer_cx,
+                Duration::from_secs(5),
+                probe
+                    .recovery_notify
+                    .wait_until(|| probe.recovery_entered.load(Ordering::SeqCst)),
+            )
+            .await
+            .expect("restored execution must enter its pending step");
+
+            // Four recovery poll intervals: ample time for a freed slot to
+            // admit pane 78.
+            for _ in 0..100 {
+                let health = locks.health();
+                assert_eq!(
+                    (
+                        health.acquisitions_total,
+                        health.concurrency_limit_blocks_total
+                    ),
+                    (1, 0),
+                    "recovery admitted another child while the first held its slot"
+                );
+                assert_eq!(probe.executions.lock().unwrap().len(), 1);
+                crate::runtime_async::sleep_with_cx(&observer_cx, Duration::from_millis(10))
+                    .await
+                    .unwrap();
+            }
+            assert!(locks.is_locked(78).is_none());
+
+            probe.recovery_released.store(true, Ordering::SeqCst);
+            probe.recovery_notify.notify_waiters();
+            wait_for_startup_executions(&storage, &probe, &[77, 78]).await;
+            drop(event_bus);
+            crate::runtime_async::timeout_with_cx(&observer_cx, Duration::from_secs(2), task)
+                .await
+                .expect("runner must observe bus closure after recovery")
+                .expect("runner task must settle");
+            assert_eq!(locks.active_count(), 0);
+            storage.shutdown().await.unwrap();
         });
     }
 
