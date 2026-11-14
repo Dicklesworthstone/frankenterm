@@ -125,55 +125,150 @@ pub(crate) fn crop_to_non_transparent<Container>(
 where
     Container: std::ops::Deref<Target = [u8]>,
 {
-    let width = image.width();
-    let height = image.height();
-
-    let mut first_line = None;
-    let mut first_col = None;
-    let mut last_col = None;
-    let mut last_line = None;
-
-    for (y, row) in image.rows().enumerate() {
-        for (x, pixel) in row.enumerate() {
-            let alpha = pixel[3];
-            if alpha != 0 {
-                if first_line.is_none() {
-                    first_line = Some(y);
+    let mut bounds: Option<(u32, u32, u32, u32)> = None;
+    for (x, y, pixel) in image.enumerate_pixels() {
+        if pixel[3] != 0 {
+            bounds = Some(match bounds {
+                Some((left, top, right, bottom)) => {
+                    (left.min(x), top.min(y), right.max(x), bottom.max(y))
                 }
-                first_col = match first_col.take() {
-                    Some(other) if x < other => Some(x),
-                    Some(other) => Some(other),
-                    None => Some(x),
-                };
-            }
-        }
-    }
-    for (y, row) in image.rows().enumerate().rev() {
-        for (x, pixel) in row.enumerate().rev() {
-            let alpha = pixel[3];
-            if alpha != 0 {
-                if last_line.is_none() {
-                    last_line = Some(y);
-                }
-                last_col = match last_col.take() {
-                    Some(other) if x > other => Some(x),
-                    Some(other) => Some(other),
-                    None => Some(x),
-                };
-            }
+                None => (x, y, x, y),
+            });
         }
     }
 
-    let first_col = first_col.unwrap_or(0) as u32;
-    let first_line = first_line.unwrap_or(0) as u32;
-    let last_col = last_col.unwrap_or(width as usize) as u32;
-    let last_line = last_line.unwrap_or(height as usize) as u32;
+    let (left, top, width, height) = match bounds {
+        // The extrema are occupied pixels, so both ends are inclusive.
+        // In particular, a one-pixel glyph must remain one pixel wide and tall.
+        Some((left, top, right, bottom)) => (left, top, right - left + 1, bottom - top + 1),
+        // Preserve the existing empty-image dimensions and origin.
+        None => (0, 0, image.width(), image.height()),
+    };
 
-    image::imageops::crop(
-        image,
-        first_col,
-        first_line,
-        last_col - first_col,
-        last_line - first_line,
-    )
+    image::imageops::crop(image, left, top, width, height)
+}
+
+/// Crop a FreeType color bitmap without changing its position relative to the
+/// glyph origin. Cropping translates the bitmap; it does not scale its metrics.
+/// Bitmap rows run downwards, while the top bearing measures up from the baseline.
+#[cfg(not(windows))]
+fn rasterize_bgra_image<Container>(
+    image: &mut ImageBuffer<Rgba<u8>, Container>,
+    bearing_x: f64,
+    bearing_y: f64,
+    has_color: bool,
+    is_scaled: bool,
+) -> RasterizedGlyph
+where
+    Container: std::ops::Deref<Target = [u8]> + 'static,
+{
+    let cropped = crop_to_non_transparent(image);
+    let (left, top) = cropped.offsets();
+    let mut pixels = cropped.to_image();
+    swap_red_and_blue(&mut pixels);
+
+    RasterizedGlyph {
+        height: pixels.height() as usize,
+        width: pixels.width() as usize,
+        data: pixels.into_vec(),
+        bearing_x: PixelLength::new(bearing_x + f64::from(left)),
+        bearing_y: PixelLength::new(bearing_y - f64::from(top)),
+        has_color,
+        is_scaled,
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bitmap_crop_preserves_single_pixels_and_occupied_edges() {
+        for (width, height) in [(1, 1), (1, 7), (9, 1), (5, 4)] {
+            let mut image = ImageBuffer::from_pixel(width, height, Rgba([7, 13, 29, 127]));
+            let glyph = rasterize_bgra_image(&mut image, -3.0, 9.0, true, false);
+            assert_eq!((glyph.width, glyph.height), (width as usize, height as usize));
+            assert_eq!(glyph.bearing_x.get(), -3.0);
+            assert_eq!(glyph.bearing_y.get(), 9.0);
+            assert!(glyph.data.chunks_exact(4).all(|p| p == [29, 13, 7, 127]));
+            assert!(glyph.has_color);
+            assert!(!glyph.is_scaled);
+        }
+    }
+
+    #[test]
+    fn padded_bitmap_crops_to_exact_ink_bounds_without_moving_the_glyph() {
+        let mut image = ImageBuffer::from_pixel(8, 7, Rgba([0, 0, 0, 0]));
+        image.put_pixel(2, 3, Rgba([5, 10, 20, 40]));
+        image.put_pixel(6, 5, Rgba([7, 14, 28, 56]));
+        let glyph = rasterize_bgra_image(&mut image, -4.0, 9.0, true, false);
+        assert_eq!((glyph.width, glyph.height), (5, 3));
+        assert_eq!(glyph.bearing_x.get(), -2.0);
+        assert_eq!(glyph.bearing_y.get(), 6.0);
+        assert_eq!(&glyph.data[..4], &[20, 10, 5, 40]);
+        assert_eq!(&glyph.data[glyph.data.len() - 4..], &[28, 14, 7, 56]);
+    }
+
+    #[test]
+    fn bitmap_crop_preserves_every_ink_pixel_in_baseline_coordinates() {
+        // Exhaust every ink placement in a small bitmap. This includes isolated
+        // pixels, disjoint extrema, one-row/column crops, and transparent images.
+        for mask in 0u32..64 {
+            let mut image = ImageBuffer::from_fn(3, 2, |x, y| {
+                if mask & (1 << (y * 3 + x)) == 0 {
+                    Rgba([0, 0, 0, 0])
+                } else {
+                    Rgba([11 + x as u8, 23 + y as u8, 47, 128])
+                }
+            });
+            let source = image.clone();
+            let glyph = rasterize_bgra_image(&mut image, -5.0, 7.0, true, true);
+            assert_eq!(image, source, "source pixels must remain immutable");
+            assert!(glyph.is_scaled);
+            assert_eq!(glyph.data.len(), glyph.width * glyph.height * 4);
+
+            let left = (glyph.bearing_x.get() + 5.0) as u32;
+            let top = (7.0 - glyph.bearing_y.get()) as u32;
+            for (x, y, pixel) in source.enumerate_pixels() {
+                if pixel[3] == 0 {
+                    continue;
+                }
+                assert!(x >= left && y >= top);
+                let local_x = (x - left) as usize;
+                let local_y = (y - top) as usize;
+                assert!(local_x < glyph.width && local_y < glyph.height);
+                let offset = (local_y * glyph.width + local_x) * 4;
+                assert_eq!(
+                    &glyph.data[offset..offset + 4],
+                    &[pixel[2], pixel[1], pixel[0], pixel[3]]
+                );
+                assert_eq!(glyph.bearing_x.get() + local_x as f64, -5.0 + f64::from(x));
+                assert_eq!(glyph.bearing_y.get() - local_y as f64, 7.0 - f64::from(y));
+            }
+
+            for y in 0..glyph.height {
+                for x in 0..glyph.width {
+                    let pixel = source.get_pixel(left + x as u32, top + y as u32);
+                    let offset = (y * glyph.width + x) * 4;
+                    assert_eq!(
+                        &glyph.data[offset..offset + 4],
+                        &[pixel[2], pixel[1], pixel[0], pixel[3]]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transparent_bitmap_keeps_its_dimensions_and_bearings() {
+        for (width, height) in [(0, 0), (0, 3), (4, 0), (4, 3)] {
+            let mut image = ImageBuffer::from_pixel(width, height, Rgba([0, 0, 0, 0]));
+            let glyph = rasterize_bgra_image(&mut image, 2.0, -4.0, false, true);
+            assert_eq!((glyph.width, glyph.height), (width as usize, height as usize));
+            assert_eq!(glyph.bearing_x.get(), 2.0);
+            assert_eq!(glyph.bearing_y.get(), -4.0);
+            assert_eq!(glyph.data, vec![0; width as usize * height as usize * 4]);
+            assert!(!glyph.has_color);
+        }
+    }
 }
