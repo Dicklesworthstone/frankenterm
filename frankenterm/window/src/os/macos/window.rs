@@ -222,9 +222,11 @@ impl BackendImpl {
 #[cfg(test)]
 mod tests {
     use super::{
-        backing_dimensions_from_rect, covered_windows, normalize_backing_dimension,
-        nswindow_level_to_window_level, retitle, window_level_to_nswindow_level, CoverFacts,
+        backing_dimensions_from_rect, caret_needs_announcing, covered_windows,
+        normalize_backing_dimension, nswindow_level_to_window_level, retitle,
+        window_level_to_nswindow_level, CoverFacts,
     };
+    use crate::{Point, Rect, Size};
     use cocoa::foundation::{NSPoint, NSRect, NSSize};
     use config::window::WindowLevel;
 
@@ -264,6 +266,36 @@ mod tests {
         assert!(retitle(&mut current, ""));
         assert!(!retitle(&mut current, ""));
         assert_eq!(current, "");
+    }
+
+    #[test]
+    fn only_a_moved_caret_is_announced_to_the_input_method() {
+        let caret = |x, y| Rect::new(Point::new(x, y), Size::new(18, 36));
+        let mut announced = None;
+        // The first frame tells the input method where the caret is.
+        assert!(caret_needs_announcing(&mut announced, caret(40, 72)));
+        // Paint reports the same caret on every later frame: nothing to tell.
+        for _ in 0..3 {
+            assert!(!caret_needs_announcing(&mut announced, caret(40, 72)));
+        }
+        // Typing moves it; so does a wide cell changing its width.
+        assert!(caret_needs_announcing(&mut announced, caret(58, 72)));
+        assert!(!caret_needs_announcing(&mut announced, caret(58, 72)));
+        assert!(caret_needs_announcing(
+            &mut announced,
+            Rect::new(Point::new(58, 72), Size::new(36, 36))
+        ));
+        // A move, resize or screen change clears what was announced, so the
+        // same caret is announced again at the window's new place.
+        announced = None;
+        assert!(caret_needs_announcing(
+            &mut announced,
+            Rect::new(Point::new(58, 72), Size::new(36, 36))
+        ));
+        assert_eq!(
+            announced,
+            Some(Rect::new(Point::new(58, 72), Size::new(36, 36)))
+        );
     }
 
     fn facts(rank: usize, x: f64, width: f64, opaque: bool) -> CoverFacts {
@@ -647,6 +679,19 @@ fn retitle(current: &mut String, title: &str) -> bool {
     true
 }
 
+/// Whether the input method has to be told the caret moved, recording it as
+/// told. Paint reports the caret on every frame; a caret where the input
+/// method last saw it has nothing to invalidate. `announced` is cleared when
+/// the window moves, resizes or changes screen, since the caret's screen
+/// position follows the window.
+fn caret_needs_announcing(announced: &mut Option<Rect>, caret: Rect) -> bool {
+    if *announced == Some(caret) {
+        return false;
+    }
+    *announced = Some(caret);
+    true
+}
+
 fn function_key_to_keycode(function_key: char) -> KeyCode {
     // FIXME: CTRL-C is 0x3, should it be normalized to C here
     // using the unmod string?  Or should be normalize the 0x3
@@ -782,6 +827,7 @@ impl Window {
                 invalidated: true,
                 gl_context_pair: None,
                 text_cursor_position: Rect::new(Point::new(0, 0), Size::new(0, 0)),
+                announced_text_cursor: None,
                 tracking_rect_tag: 0,
                 hscroll_remainder: 0.,
                 vscroll_remainder: 0.,
@@ -1648,10 +1694,18 @@ impl WindowInner {
     }
 
     fn set_text_cursor_position(&mut self, cursor: Rect) {
+        let mut moved = true;
         if let Some(window_view) = WindowView::get_this(unsafe { &**self.view }) {
-            window_view.inner.borrow_mut().text_cursor_position = cursor;
+            let mut inner = window_view.inner.borrow_mut();
+            inner.text_cursor_position = cursor;
+            if self.config.use_ime {
+                moved = caret_needs_announcing(&mut inner.announced_text_cursor, cursor);
+            }
         }
-        if self.config.use_ime {
+        // Paint reports the caret on every frame. The input method asks for
+        // it when it needs it (firstRectForCharacterRange), so it is told
+        // only that it moved: AppKit's invalidation is the costly part.
+        if self.config.use_ime && moved {
             unsafe {
                 let input_context: id = msg_send![&**self.view, inputContext];
                 let () = msg_send![input_context, invalidateCharacterCoordinates];
@@ -2037,6 +2091,10 @@ struct Inner {
     invalidated: bool,
     gl_context_pair: Option<GlContextPair>,
     text_cursor_position: Rect,
+    /// The caret the input method was last told about
+    /// (`caret_needs_announcing`). Cleared when the window moves, resizes or
+    /// changes screen: the caret's screen position follows the window.
+    announced_text_cursor: Option<Rect>,
     tracking_rect_tag: NSInteger,
     hscroll_remainder: f64,
     vscroll_remainder: f64,
@@ -3509,7 +3567,9 @@ impl WindowView {
             // as this even fires as part of a live move and the
             // resize flow may try to re-position the window to
             // the wrong place.
-            this.inner.borrow_mut().screen_changed = true;
+            let mut inner = this.inner.borrow_mut();
+            inner.screen_changed = true;
+            inner.announced_text_cursor = None;
         }
         schedule_window_cover_refresh();
     }
@@ -3539,6 +3599,7 @@ impl WindowView {
         let (pixel_width, pixel_height) = backing_dimensions_from_rect(backing_frame);
         if let Some(this) = Self::get_this(this) {
             let mut inner = this.inner.borrow_mut();
+            inner.announced_text_cursor = None;
 
             if let Some(gl_context_pair) = inner.gl_context_pair.as_ref() {
                 gl_context_pair.backend.resize((pixel_width, pixel_height));
@@ -3614,8 +3675,17 @@ impl WindowView {
         schedule_window_cover_refresh();
     }
 
-    /// Moving a window can cover or uncover others.
-    extern "C" fn did_move(_this: &mut Object, _sel: Sel, _notification: id) {
+    /// Moving a window can cover or uncover others, and moves its caret on
+    /// screen: the next frame tells the input method again.
+    extern "C" fn did_move(this: &mut Object, _sel: Sel, _notification: id) {
+        if let Some(this) = Self::get_this(this) {
+            // A move can be reported from inside an AppKit call made while
+            // the view state is borrowed; then the next resize or move
+            // clears it instead.
+            if let Ok(mut inner) = this.inner.try_borrow_mut() {
+                inner.announced_text_cursor = None;
+            }
+        }
         schedule_window_cover_refresh();
     }
 
