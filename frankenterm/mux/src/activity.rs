@@ -501,10 +501,14 @@ mod tests {
     use crate::MuxNotification;
     use std::sync::atomic::AtomicBool;
 
+    /// Bind the scheduler to this test's thread only. Installed process-wide,
+    /// a capturing or panicking scheduler also took the main-thread work of
+    /// tests running in parallel (localpane resize workers panicked here),
+    /// and a capture received their runnables as if they were its own.
     fn install_bounded_scheduler(
         high_priority: Box<dyn Fn(promise::spawn::Runnable) -> bool + Send + Sync>,
         low_priority: Box<dyn Fn(promise::spawn::Runnable) -> bool + Send + Sync>,
-    ) {
+    ) -> promise::spawn::CurrentThreadSchedulerBinding {
         const TASK_CAPACITY: usize = 4_096;
         const BYTE_CAPACITY: usize = 64 * 1024 * 1024;
 
@@ -545,24 +549,27 @@ mod tests {
             8 * 1024 * 1024,
         )
         .expect("bounded activity test scheduler limits");
-        promise::spawn::set_bounded_main_thread_scheduler(Arc::new(
+        promise::spawn::bind_main_thread_scheduler_on_current_thread(Arc::new(
             promise::spawn::MainThreadSchedulerBinding::new(
                 identity,
                 limits,
                 wrap(high_priority),
                 wrap(low_priority),
             ),
-        ));
+        ))
     }
 
-    fn capture_scheduler() -> std::sync::mpsc::Receiver<promise::spawn::Runnable> {
+    fn capture_scheduler() -> (
+        std::sync::mpsc::Receiver<promise::spawn::Runnable>,
+        promise::spawn::CurrentThreadSchedulerBinding,
+    ) {
         let (sender, receiver) = std::sync::mpsc::channel();
         let low_priority_sender = sender.clone();
-        install_bounded_scheduler(
+        let binding = install_bounded_scheduler(
             Box::new(move |runnable| sender.send(runnable).is_ok()),
             Box::new(move |runnable| low_priority_sender.send(runnable).is_ok()),
         );
-        receiver
+        (receiver, binding)
     }
 
     fn assert_prune_idle(state: &ActivityPruneState) {
@@ -638,7 +645,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         Mux::shutdown();
-        let receiver = capture_scheduler();
+        let (receiver, _scheduler) = capture_scheduler();
         let mux = Arc::new(Mux::new(None));
         let mut activities = (0..64)
             .map(|_| Activity::new_for_mux(&mux))
@@ -676,7 +683,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         Mux::shutdown();
-        let receiver = capture_scheduler();
+        let (receiver, _scheduler) = capture_scheduler();
         let mux = Arc::new(Mux::new(None));
 
         drop(Activity::new_for_mux(&mux));
@@ -705,7 +712,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         Mux::shutdown();
-        let receiver = capture_scheduler();
+        let (receiver, _scheduler) = capture_scheduler();
         let mux = Arc::new(Mux::new(None));
         let empty_events = Arc::new(AtomicUsize::new(0));
         let empty_events_for_subscriber = Arc::clone(&empty_events);
@@ -765,7 +772,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         Mux::shutdown();
-        let receiver = capture_scheduler();
+        let (receiver, _scheduler) = capture_scheduler();
         let mux = Arc::new(Mux::new(None));
         let empty_events = Arc::new(AtomicUsize::new(0));
         let empty_events_for_subscriber = Arc::clone(&empty_events);
@@ -813,7 +820,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         Mux::shutdown();
-        let receiver = capture_scheduler();
+        let (receiver, _scheduler) = capture_scheduler();
         let mux = Arc::new(Mux::new(None));
 
         drop(Activity::new_for_mux(&mux));
@@ -850,7 +857,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         Mux::shutdown();
-        let receiver = capture_scheduler();
+        let (receiver, _scheduler) = capture_scheduler();
         let mux = Arc::new(Mux::new(None));
 
         drop(Activity::new_for_mux(&mux));
@@ -900,7 +907,7 @@ mod tests {
         let mux = Arc::new(Mux::new(None));
         let attempts = Arc::new(AtomicUsize::new(0));
         let high_attempts = Arc::clone(&attempts);
-        install_bounded_scheduler(
+        let _panicking = install_bounded_scheduler(
             Box::new(move |_runnable| {
                 high_attempts.fetch_add(1, Ordering::SeqCst);
                 panic!("intentional activity prune scheduler panic");
@@ -924,7 +931,7 @@ mod tests {
         );
         assert_pending_without_dispatch(&mux.activity_prune_state);
 
-        let receiver = capture_scheduler();
+        let (receiver, _scheduler) = capture_scheduler();
         drop(Activity::new_for_mux(&mux));
         receiver
             .recv_timeout(std::time::Duration::from_secs(5))
@@ -947,7 +954,7 @@ mod tests {
         let high_attempts = Arc::clone(&attempts);
         let high_depth = Arc::clone(&depth);
         let high_max_depth = Arc::clone(&max_depth);
-        install_bounded_scheduler(
+        let _rejecting = install_bounded_scheduler(
             Box::new(move |runnable| {
                 high_attempts.fetch_add(1, Ordering::SeqCst);
                 let current_depth = high_depth.fetch_add(1, Ordering::SeqCst) + 1;
@@ -983,7 +990,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         Mux::shutdown();
-        let receiver = capture_scheduler();
+        let (receiver, _scheduler) = capture_scheduler();
         let mux = Arc::new(Mux::new(None));
         Mux::set_mux(&mux);
         let empty_events = Arc::new(AtomicUsize::new(0));
@@ -1026,7 +1033,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         Mux::shutdown();
-        let receiver = capture_scheduler();
+        let (receiver, _scheduler) = capture_scheduler();
         let origin = Arc::new(Mux::new(None));
         let replacement = Arc::new(Mux::new(None));
         Mux::set_mux(&origin);
@@ -1086,7 +1093,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         Mux::shutdown();
-        let receiver = capture_scheduler();
+        let (receiver, _scheduler) = capture_scheduler();
         let pre_mux = Activity::new();
         let mux = Arc::new(Mux::new(None));
         let empty_events = Arc::new(AtomicUsize::new(0));
@@ -1129,7 +1136,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         Mux::shutdown();
-        let executor = promise::spawn::SimpleExecutor::new();
+        let (receiver, _scheduler) = capture_scheduler();
         let origin = Arc::new(Mux::new(None));
         let replacement = Arc::new(Mux::new(None));
 
@@ -1158,9 +1165,10 @@ mod tests {
         let activity = Activity::new_for_mux(&origin);
         Mux::set_mux(&replacement);
         drop(activity);
-        executor
-            .tick()
-            .expect("activity drop should schedule exact-owner pruning");
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("activity drop should schedule exact-owner pruning")
+            .run();
 
         assert_eq!(origin_empty.load(Ordering::SeqCst), 1);
         assert_eq!(replacement_empty.load(Ordering::SeqCst), 0);
@@ -1173,7 +1181,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         Mux::shutdown();
-        let receiver = capture_scheduler();
+        let (receiver, _scheduler) = capture_scheduler();
         let origin = Arc::new(Mux::new(None));
         let unrelated = Arc::new(Mux::new(None));
         let unrelated_empty = Arc::new(AtomicUsize::new(0));
@@ -1210,7 +1218,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         Mux::shutdown();
-        let receiver = capture_scheduler();
+        let (receiver, _scheduler) = capture_scheduler();
         let mux = Arc::new(Mux::new(None));
         let owner = Arc::downgrade(&mux);
         let prune_state = Arc::downgrade(&mux.activity_prune_state);

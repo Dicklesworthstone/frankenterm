@@ -1382,6 +1382,12 @@ fn capture_scheduler(high_pri: bool) -> SharedScheduleFunc {
 }
 
 pub fn is_scheduler_configured() -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        if current_thread_scheduler_binding().is_some() {
+            return true;
+        }
+    }
     SCHEDULER_CONFIGURED.load(Ordering::Relaxed)
         || lock_or_recover(&SCOPED_EXECUTOR).executor.is_some()
         || lock_or_recover(&BOUND_MAIN_THREAD_SCHEDULER).is_some()
@@ -1403,6 +1409,12 @@ pub fn set_bounded_main_thread_scheduler(binding: Arc<MainThreadSchedulerBinding
 }
 
 fn capture_bounded_main_thread_scheduler() -> Option<Arc<MainThreadSchedulerBinding>> {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        if let Some(binding) = current_thread_scheduler_binding() {
+            return Some(binding);
+        }
+    }
     let scoped = lock_or_recover(&SCOPED_EXECUTOR)
         .binding
         .as_ref()
@@ -1424,6 +1436,68 @@ fn clear_bounded_main_thread_scheduler() {
         current.take()
     };
     drop(previous);
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static CURRENT_THREAD_SCHEDULER: std::cell::RefCell<Option<Arc<MainThreadSchedulerBinding>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn current_thread_scheduler_binding() -> Option<Arc<MainThreadSchedulerBinding>> {
+    CURRENT_THREAD_SCHEDULER
+        .try_with(|slot| slot.borrow().as_ref().map(Arc::clone))
+        .ok()
+        .flatten()
+}
+
+/// Route main-thread reservations made on the calling thread, and only
+/// those, to `binding` until the returned guard drops.
+///
+/// [`set_bounded_main_thread_scheduler`] is process-wide. A test that
+/// installs a capturing, rejecting or panicking scheduler there also
+/// captures, rejects or panics the main-thread work of every test running
+/// beside it, and its own capture receives theirs. A thread binding takes
+/// precedence over the scoped and global schedulers, but only for
+/// reservations made on this thread. Work it admitted keeps the binding when
+/// woken from another thread.
+#[cfg(any(test, feature = "test-support"))]
+pub fn bind_main_thread_scheduler_on_current_thread(
+    binding: Arc<MainThreadSchedulerBinding>,
+) -> CurrentThreadSchedulerBinding {
+    let previous = CURRENT_THREAD_SCHEDULER.with(|slot| slot.replace(Some(Arc::clone(&binding))));
+    CurrentThreadSchedulerBinding {
+        binding,
+        previous,
+        _owner_affinity: std::marker::PhantomData,
+    }
+}
+
+/// Retires its binding and restores the thread's previous one when dropped.
+#[cfg(any(test, feature = "test-support"))]
+#[must_use = "the thread binding ends when this guard drops"]
+pub struct CurrentThreadSchedulerBinding {
+    binding: Arc<MainThreadSchedulerBinding>,
+    previous: Option<Arc<MainThreadSchedulerBinding>>,
+    // The slot belongs to one thread. Dropping the guard on another would
+    // restore this thread's previous binding over that thread's own.
+    _owner_affinity: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for CurrentThreadSchedulerBinding {
+    fn drop(&mut self) {
+        self.binding.retire();
+        let previous = self.previous.take();
+        let replaced = CURRENT_THREAD_SCHEDULER.try_with(|slot| slot.replace(previous));
+        if !std::thread::panicking() {
+            assert!(
+                matches!(&replaced, Ok(Some(current)) if Arc::ptr_eq(current, &self.binding)),
+                "thread scheduler bindings must be released innermost first"
+            );
+        }
+    }
 }
 
 /// Install the retired unclassified scheduler harness for fault-injection
@@ -3581,6 +3655,63 @@ mod tests {
     #[test]
     fn sleep_zero_duration_completes() {
         block_on(sleep(Duration::ZERO));
+    }
+
+    /// ft-pmb68: a test's capturing or panicking scheduler, bound to its own
+    /// thread, must not receive another thread's reservations, and must give
+    /// its thread back to the previous scheduler when its guard drops.
+    #[test]
+    fn a_thread_binding_admits_only_its_own_threads_reservations() {
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        fn reservation_only_binding() -> Arc<MainThreadSchedulerBinding> {
+            let limits = MainThreadAdmissionLimits::new(4, 1024, 0, 0).unwrap();
+            let identity = try_allocate_main_thread_scheduler_identity().unwrap();
+            Arc::new(MainThreadSchedulerBinding::new(
+                identity,
+                limits,
+                Box::new(|_, _| unreachable!("this test only reserves")),
+                Box::new(|_, _| unreachable!("this test only reserves")),
+            ))
+        }
+        fn reserved_on() -> Option<MainThreadSchedulerIdentity> {
+            match try_reserve_main_thread(MainThreadServiceClass::Interactive, 8) {
+                MainThreadReservationOutcome::Reserved(reservation) => {
+                    let receipt = reservation.admission_receipt();
+                    Some(MainThreadSchedulerIdentity {
+                        queue_id: receipt.queue_id,
+                        scheduler_generation: receipt.scheduler_generation,
+                    })
+                }
+                _ => None,
+            }
+        }
+        fn reserved_on_another_thread() -> Option<MainThreadSchedulerIdentity> {
+            std::thread::spawn(reserved_on).join().unwrap()
+        }
+
+        let global = SimpleExecutor::new();
+        let global_identity = Some(global.scheduler_identity());
+        assert_eq!(reserved_on(), global_identity);
+
+        let outer = reservation_only_binding();
+        let outer_guard = bind_main_thread_scheduler_on_current_thread(Arc::clone(&outer));
+        assert_eq!(reserved_on(), Some(outer.identity()));
+        assert_eq!(reserved_on_another_thread(), global_identity);
+
+        let inner = reservation_only_binding();
+        let inner_guard = bind_main_thread_scheduler_on_current_thread(Arc::clone(&inner));
+        assert_eq!(reserved_on(), Some(inner.identity()));
+        assert_eq!(reserved_on_another_thread(), global_identity);
+
+        drop(inner_guard);
+        assert!(inner.is_retired());
+        assert!(!outer.is_retired());
+        assert_eq!(reserved_on(), Some(outer.identity()));
+
+        drop(outer_guard);
+        assert!(outer.is_retired());
+        assert!(!global.queue_snapshot().retired);
+        assert_eq!(reserved_on(), global_identity);
     }
 
     #[test]
