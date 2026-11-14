@@ -104,10 +104,10 @@ use crate::vendored::subscribe_pane_output_with_inherited_cx;
 use crate::vendored::{DirectMuxClient, DirectMuxClientConfig, PaneDelta, SubscriptionConfig};
 use crate::watchdog::HeartbeatRegistry;
 use crate::wezterm::{
-    MuxSemanticSnapshot, MuxSemanticZoneKind, PANE_TIERED_SCROLLBACK_BULK_MAX_PANES, PaneInfo,
-    PaneTextSource, PaneTieredScrollbackBatchEntry, PaneTieredScrollbackBatchOutcome,
-    PaneTieredScrollbackSummary, WeztermHandle, WeztermHandleSource, WeztermInterface,
-    wezterm_handle_with_timeout,
+    MuxSemanticSnapshot, MuxSemanticZoneKind, PANE_TIERED_SCROLLBACK_BULK_MAX_PANES,
+    PaneDiscoveryObservation, PaneInfo, PaneTextSource, PaneTieredScrollbackBatchEntry,
+    PaneTieredScrollbackBatchOutcome, PaneTieredScrollbackSummary, WeztermHandle,
+    WeztermHandleSource, WeztermInterface, wezterm_handle_with_timeout,
 };
 
 fn runtime_cx_error(operation: &'static str, cx: &crate::cx::Cx, fallback: &'static str) -> Error {
@@ -2668,23 +2668,27 @@ fn terminal_retired_pane_ids(
 /// I/O closes predecessor admission across that await.
 fn conservative_capture_view_before_storage(
     previous: &HashMap<u64, ObservedCapturePane>,
-    panes: &[PaneInfo],
+    panes: &[PaneDiscoveryObservation],
     pane_filter: &PaneFilterConfig,
 ) -> (Arc<HashMap<u64, ObservedCapturePane>>, Arc<HashSet<u64>>) {
-    let mut listed = HashMap::<u64, &PaneInfo>::with_capacity(panes.len());
+    let mut listed = HashMap::<u64, &PaneDiscoveryObservation>::with_capacity(panes.len());
     let mut duplicate_ids = HashSet::new();
-    for pane in panes {
-        if listed.insert(pane.pane_id, pane).is_some() {
-            duplicate_ids.insert(pane.pane_id);
+    for observation in panes {
+        if listed
+            .insert(observation.pane.pane_id, observation)
+            .is_some()
+        {
+            duplicate_ids.insert(observation.pane.pane_id);
         }
     }
 
     let mut retained = HashMap::with_capacity(previous.len().min(listed.len()));
     let mut transitioning = HashSet::new();
     for (&pane_id, observed) in previous {
-        let Some(listed_pane) = listed.get(&pane_id).copied() else {
+        let Some(observation) = listed.get(&pane_id).copied() else {
             continue;
         };
+        let listed_pane = &observation.pane;
         if duplicate_ids.contains(&pane_id) {
             transitioning.insert(pane_id);
             continue;
@@ -2703,7 +2707,7 @@ fn conservative_capture_view_before_storage(
             // do not manufacture a lifecycle transition or resync obligation.
             continue;
         }
-        let listed_identity = PaneLifecycleIdentity::from_pane_info(listed_pane);
+        let listed_identity = PaneLifecycleIdentity::from_observation(observation);
         match observed
             .lifecycle_identity
             .continuity_with(&listed_identity)
@@ -2716,9 +2720,9 @@ fn conservative_capture_view_before_storage(
             }
         }
     }
-    for pane in panes {
-        if !previous.contains_key(&pane.pane_id) {
-            transitioning.insert(pane.pane_id);
+    for observation in panes {
+        if !previous.contains_key(&observation.pane.pane_id) {
+            transitioning.insert(observation.pane.pane_id);
         }
     }
 
@@ -7145,7 +7149,7 @@ impl ObservationRuntime {
                     }
                 }
 
-                match wezterm.list_panes().await {
+                match wezterm.discover_panes_with_cx(&loop_cx).await {
                     Ok(panes) => {
                         heartbeats.record_discovery();
                         consecutive_discovery_failures = 0;
@@ -7191,8 +7195,10 @@ impl ObservationRuntime {
                             let reg = registry.read().await;
                             panes
                                 .iter()
-                                .filter(|pane| reg.get_entry(pane.pane_id).is_none())
-                                .map(|pane| pane.pane_id)
+                                .filter(|observation| {
+                                    reg.get_entry(observation.pane.pane_id).is_none()
+                                })
+                                .map(|observation| observation.pane.pane_id)
                                 .collect::<Vec<_>>()
                         };
                         let stable_pane_records = if candidate_new_panes.is_empty() {
@@ -7227,14 +7233,16 @@ impl ObservationRuntime {
                         // only alt-screen evidence its panes ever get.
                         let mux_alt_screen = panes
                             .iter()
-                            .filter_map(|pane| {
-                                pane.mux_alt_screen_active()
-                                    .map(|active| (pane.pane_id, active))
+                            .filter_map(|observation| {
+                                observation
+                                    .pane
+                                    .mux_alt_screen_active()
+                                    .map(|active| (observation.pane.pane_id, active))
                             })
                             .collect::<Vec<_>>();
                         let (diff, new_entries, metadata_entries, pending_capture_view) = {
                             let mut reg = registry.write().await;
-                            let diff = reg.discovery_tick(panes);
+                            let diff = reg.discovery_tick_with_observations(panes);
                             let (confirmed_terminal, forced_transitions) =
                                 classify_unresolved_barrier_predecessors(
                                     &unresolved_barrier_predecessors,
@@ -14932,6 +14940,7 @@ mod tests {
                 pane_id: 3,
                 domain_id: None,
                 tty_name: Some("tty-predecessor".to_string()),
+                native_registration: None,
             },
             lifecycle_revision: PaneLifecycleRevision::new(4),
             pane_uuid: "predecessor-uuid".to_string(),
@@ -14945,7 +14954,8 @@ mod tests {
         ]);
         let mut successor = make_pane(3, "successor");
         successor.tty_name = Some("tty-successor".to_string());
-        let panes = vec![make_pane(1, "retained"), successor, make_pane(4, "new")];
+        let panes = [make_pane(1, "retained"), successor, make_pane(4, "new")]
+            .map(PaneDiscoveryObservation::from);
 
         let (view, transitioning) = conservative_capture_view_before_storage(
             &previous,
@@ -14959,6 +14969,106 @@ mod tests {
         assert!(!view.contains_key(&2), "closed predecessor is revoked");
         assert!(!view.contains_key(&3), "changed predecessor is revoked");
         assert_eq!(transitioning, Arc::new(HashSet::from([3, 4])));
+    }
+
+    #[test]
+    fn native_registration_barrier_rejects_delayed_and_queued_predecessor_output() {
+        run_async_test(async {
+            use crate::wezterm::MuxPaneRegistration;
+
+            let original = MuxPaneRegistration::new([1; 16], [2; 16]);
+            for (before, after) in [
+                (original, MuxPaneRegistration::new([1; 16], [3; 16])),
+                (original, MuxPaneRegistration::new([4; 16], [2; 16])),
+                (original, None),
+                (None, original),
+            ] {
+                let pane_id = 7;
+                let revision = DiscoveryRevision(1);
+                let mut registry = PaneRegistry::new();
+                let observation = PaneDiscoveryObservation {
+                    pane: make_pane(pane_id, "same-looking agent"),
+                    registration: before,
+                };
+                registry.discovery_tick_with_observations(vec![observation.clone()]);
+                let view = capture_publication_view(
+                    &registry,
+                    &HashMap::from([(pane_id, revision)]),
+                    &HashMap::new(),
+                    &HashSet::new(),
+                );
+                let authority = CaptureAuthority::new();
+                let (tx, rx) = watch::channel(DiscoveryCapturePublication::default());
+                let mut last_epoch = 0;
+                let mut last_view = Arc::new(HashMap::new());
+                publish_discovery_capture_view(
+                    &tx,
+                    &authority,
+                    &mut last_epoch,
+                    &mut last_view,
+                    Arc::clone(&view),
+                    Arc::new(HashSet::new()),
+                    Arc::new(HashMap::new()),
+                    "native-registration-initial",
+                )
+                .unwrap();
+                let active = authority
+                    .activate_pane_for_revision(
+                        pane_id,
+                        CaptureRevision::new(revision.get()).unwrap(),
+                    )
+                    .unwrap();
+                let lease = authority
+                    .issue_source(active, CaptureSourceKind::Polling)
+                    .unwrap();
+                let queued = test_capture_event_for_lease(pane_id, 0, &lease);
+                let metadata = RwLock::new(HashMap::from([(
+                    active.pane_incarnation(),
+                    CapturePaneMetadata {
+                        pane_uuid: view[&pane_id].pane_uuid.clone(),
+                        discovery_generation: 0,
+                        discovery_revision: revision,
+                    },
+                )]));
+                drop(
+                    admit_capture_event_for_persistence(&authority, &metadata, &rx, &queued)
+                        .await
+                        .unwrap(),
+                );
+
+                let successor = PaneDiscoveryObservation {
+                    registration: after,
+                    ..observation
+                };
+                let (conservative, transitioning) = conservative_capture_view_before_storage(
+                    &view,
+                    &[successor],
+                    &PaneFilterConfig::default(),
+                );
+                assert!(conservative.is_empty());
+                assert_eq!(*transitioning, HashSet::from([pane_id]));
+                // This is the production barrier before registry, stable-UUID,
+                // cursor or storage awaits, while the predecessor still exists.
+                publish_discovery_capture_view(
+                    &tx,
+                    &authority,
+                    &mut last_epoch,
+                    &mut last_view,
+                    conservative,
+                    transitioning,
+                    Arc::new(HashMap::new()),
+                    "native-registration-post-list-barrier",
+                )
+                .unwrap();
+                assert!(lease.try_acquire_producer(lease.stamp(), pane_id).is_err());
+                assert!(
+                    admit_capture_event_for_persistence(&authority, &metadata, &rx, &queued)
+                        .await
+                        .is_err(),
+                    "queued output must not be attributed after native continuity changes"
+                );
+            }
+        });
     }
 
     #[test]
@@ -14984,7 +15094,10 @@ mod tests {
                 cwd: None,
             }],
         };
-        let listed = [make_pane(pane_id, "secret-agent")];
+        let listed = [PaneDiscoveryObservation::from(make_pane(
+            pane_id,
+            "secret-agent",
+        ))];
 
         let (view, transitioning) =
             conservative_capture_view_before_storage(&previous, &listed, &filter);
@@ -15202,7 +15315,7 @@ mod tests {
                     pane.rows = Some(80);
                     pane.cols = Some(240);
                     pane.is_zoomed = pane_id % 2 == 0;
-                    pane
+                    PaneDiscoveryObservation::from(pane)
                 })
                 .collect::<Vec<_>>();
             let (conservative, transitioning) = conservative_capture_view_before_storage(
@@ -15212,7 +15325,7 @@ mod tests {
             );
             assert_eq!(conservative.len(), usize::try_from(pane_count).unwrap());
             assert!(transitioning.is_empty());
-            let diff = registry.discovery_tick(changed);
+            let diff = registry.discovery_tick_with_observations(changed);
             assert_eq!(
                 diff.metadata_changes.len(),
                 usize::try_from(pane_count).unwrap()
@@ -15281,7 +15394,7 @@ mod tests {
         // registry.
         let (withheld_view, _) = conservative_capture_view_before_storage(
             &previous,
-            std::slice::from_ref(&unrelated_new_pane),
+            &[PaneDiscoveryObservation::from(unrelated_new_pane.clone())],
             &PaneFilterConfig::default(),
         );
         let mut unresolved = HashMap::new();
@@ -22405,6 +22518,7 @@ mod tests {
             pane_id,
             domain_id: None,
             tty_name: None,
+            native_registration: None,
         }
     }
 

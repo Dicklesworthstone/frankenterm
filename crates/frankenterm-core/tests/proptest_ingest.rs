@@ -282,6 +282,7 @@ proptest! {
             pane_id,
             domain_id: Some(first_domain),
             tty_name: Some("tty-a".to_string()),
+            native_registration: None,
         };
         let changed_domain = PaneLifecycleIdentity {
             domain_id: Some(first_domain.saturating_add(1)),

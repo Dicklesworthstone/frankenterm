@@ -115,6 +115,56 @@ impl MuxPaneIdentity {
             && self.durable_pane_id != [0; 16]
             && self.pane_registration != [0; 16]
     }
+
+    /// Project the live registration without inventing a durable pane UUID
+    /// for observation surfaces that do not carry one.
+    #[must_use]
+    pub fn registration(&self) -> Option<MuxPaneRegistration> {
+        self.is_valid().then_some(MuxPaneRegistration {
+            session_incarnation: self.session_incarnation,
+            pane_registration: self.pane_registration,
+        })
+    }
+}
+
+/// Exact live membership observed in a coherent native mux listing.
+///
+/// This is sufficient to invalidate capture after a mux restart or same-ID
+/// replacement. It is not a durable pane identity or mutation capability.
+/// The fields are private so reserved nil identities cannot be constructed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MuxPaneRegistration {
+    session_incarnation: [u8; 16],
+    pane_registration: [u8; 16],
+}
+
+impl MuxPaneRegistration {
+    #[must_use]
+    pub fn new(session_incarnation: [u8; 16], pane_registration: [u8; 16]) -> Option<Self> {
+        (session_incarnation != [0; 16] && pane_registration != [0; 16]).then_some(Self {
+            session_incarnation,
+            pane_registration,
+        })
+    }
+}
+
+/// Pane metadata and its native registration from the same observation.
+///
+/// Legacy and CLI observations have no native registration. In particular,
+/// arbitrary JSON fields in `PaneInfo::extra` cannot mint this authority.
+#[derive(Debug, Clone)]
+pub struct PaneDiscoveryObservation {
+    pub pane: PaneInfo,
+    pub registration: Option<MuxPaneRegistration>,
+}
+
+impl From<PaneInfo> for PaneDiscoveryObservation {
+    fn from(pane: PaneInfo) -> Self {
+        Self {
+            pane,
+            registration: None,
+        }
+    }
 }
 
 #[cfg(all(feature = "vendored", unix))]
@@ -246,6 +296,25 @@ pub trait MuxInterface: Send + Sync {
         _cx: &'a crate::cx::Cx,
     ) -> WeztermFuture<'a, Vec<PaneInfo>> {
         self.list_panes()
+    }
+
+    /// Discover panes while retaining any exact native registration evidence.
+    ///
+    /// The default deliberately marks legacy observations unidentified. A
+    /// native implementation must take metadata and registration from the
+    /// same coherent listing, never join independent per-pane identity reads.
+    fn discover_panes_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+    ) -> WeztermFuture<'a, Vec<PaneDiscoveryObservation>> {
+        Box::pin(async move {
+            self.list_panes_with_cx(cx).await.map(|panes| {
+                panes
+                    .into_iter()
+                    .map(PaneDiscoveryObservation::from)
+                    .collect()
+            })
+        })
     }
 
     /// Fill `domain_id`/`domain_name` on legacy listings from the mux that owns
@@ -1215,21 +1284,24 @@ pub fn pane_info_from_mux_response(response: &codec::ListPanesResponse) -> Vec<P
     panes
 }
 
-/// Project a validated coherent mux observation into ordinary pane metadata.
+/// Retain metadata and native registration from one validated mux observation.
 ///
 /// Domain fields are copied only from the same registration-bound entry as
-/// the pane fields. The raw snapshot API retains exact identity for consumers
-/// that need it; this projection is an observation, not process-custody or
+/// the pane fields. This projection is an observation, not process-custody or
 /// shutdown authority. A contended cut is never reported as an empty fleet.
 #[cfg(all(feature = "vendored", unix))]
-fn pane_info_from_domain_snapshot(
+fn pane_observations_from_domain_snapshot(
     response: &codec::ListPanesWithDomainsV1Response,
-) -> Result<Vec<PaneInfo>> {
+) -> Result<Vec<PaneDiscoveryObservation>> {
     response
         .validate()
         .map_err(|_| WeztermError::ParseError("invalid mux pane-domain snapshot".to_string()))?;
-    let entries = match &response.outcome {
-        codec::ListPanesWithDomainsOutcomeV1::Snapshot { panes, .. } => panes,
+    let (session_incarnation, entries) = match &response.outcome {
+        codec::ListPanesWithDomainsOutcomeV1::Snapshot {
+            session_incarnation,
+            panes,
+            ..
+        } => (session_incarnation.as_bytes(), panes),
         codec::ListPanesWithDomainsOutcomeV1::Contended { .. } => {
             return Err(WeztermError::CommandFailed(
                 "mux_pane_domain_snapshot_contended".to_string(),
@@ -1265,7 +1337,15 @@ fn pane_info_from_domain_snapshot(
                     .into());
                 }
             }
-            Ok(pane)
+            let registration =
+                MuxPaneRegistration::new(session_incarnation, entry.pane_registration.as_bytes())
+                    .ok_or_else(|| {
+                    WeztermError::ParseError("invalid mux pane registration".to_string())
+                })?;
+            Ok(PaneDiscoveryObservation {
+                pane,
+                registration: Some(registration),
+            })
         })
         .collect()
 }
@@ -2049,14 +2129,29 @@ impl WeztermClient {
     ///
     /// The legacy [`list_panes`](Self::list_panes) entry point is
     /// preserved for non-migrated callers; this is strictly additive.
-    #[cfg(all(feature = "vendored", unix))]
     pub async fn list_panes_with_cx(&self, cx: &crate::cx::Cx) -> Result<Vec<PaneInfo>> {
+        self.discover_panes_with_cx(cx).await.map(|panes| {
+            panes
+                .into_iter()
+                .map(|observation| observation.pane)
+                .collect()
+        })
+    }
+
+    /// Retain exact registrations from the coherent native listing. A
+    /// legacy capability refusal or CLI fallback remains explicitly without
+    /// registration evidence; it cannot preserve a known native incarnation.
+    #[cfg(all(feature = "vendored", unix))]
+    pub async fn discover_panes_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> Result<Vec<PaneDiscoveryObservation>> {
         if let Some(ref pool) = self.mux_pool {
             if self.mux_circuit_guard()? {
                 let legacy_response = match pool.list_panes_with_domains_with_cx(cx).await {
                     Ok(response) => {
                         self.mux_circuit_record_success();
-                        return pane_info_from_domain_snapshot(&response);
+                        return pane_observations_from_domain_snapshot(&response);
                     }
                     Err(crate::vendored::MuxPoolError::Mux(
                         crate::vendored::DirectMuxError::OutboundPduRequiresCodec {
@@ -2074,7 +2169,10 @@ impl WeztermClient {
                 match legacy_response {
                     Ok(response) => {
                         self.mux_circuit_record_success();
-                        return Ok(pane_info_from_mux_response(&response));
+                        return Ok(pane_info_from_mux_response(&response)
+                            .into_iter()
+                            .map(PaneDiscoveryObservation::from)
+                            .collect());
                     }
                     Err(e) => {
                         self.mux_circuit_record_error(&e);
@@ -2094,20 +2192,34 @@ impl WeztermClient {
             .run_cli_with_retry_with_cx(cx, &["cli", "list", "--format", "json"])
             .await?;
         Self::guard_metadata_output_size("cli list", &output)?;
-        serde_json::from_str(&output).map_err(|e| WeztermError::ParseError(e.to_string()).into())
+        serde_json::from_str::<Vec<PaneInfo>>(&output)
+            .map(|panes| {
+                panes
+                    .into_iter()
+                    .map(PaneDiscoveryObservation::from)
+                    .collect()
+            })
+            .map_err(|e| WeztermError::ParseError(e.to_string()).into())
     }
 
-    /// Cx-first `list_panes` fallback stub for configurations that do
-    /// NOT have the `vendored` + unix + asupersync combination. The
-    /// legacy `list_panes` is invoked so existing callers behave
-    /// identically.
+    /// CLI-only discovery has no native registration authority.
     #[cfg(not(all(feature = "vendored", unix)))]
-    pub async fn list_panes_with_cx(&self, cx: &crate::cx::Cx) -> Result<Vec<PaneInfo>> {
+    pub async fn discover_panes_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> Result<Vec<PaneDiscoveryObservation>> {
         let output = self
             .run_cli_with_retry_with_cx(cx, &["cli", "list", "--format", "json"])
             .await?;
         Self::guard_metadata_output_size("cli list", &output)?;
-        serde_json::from_str(&output).map_err(|e| WeztermError::ParseError(e.to_string()).into())
+        serde_json::from_str::<Vec<PaneInfo>>(&output)
+            .map(|panes| {
+                panes
+                    .into_iter()
+                    .map(PaneDiscoveryObservation::from)
+                    .collect()
+            })
+            .map_err(|e| WeztermError::ParseError(e.to_string()).into())
     }
 
     /// Enrich legacy listings from the vendored mux (codec 68, ft-pdawh), one
@@ -4881,6 +4993,13 @@ impl WeztermInterface for WeztermClient {
         Box::pin(async move { WeztermClient::list_panes_with_cx(self, cx).await })
     }
 
+    fn discover_panes_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+    ) -> WeztermFuture<'a, Vec<PaneDiscoveryObservation>> {
+        Box::pin(async move { WeztermClient::discover_panes_with_cx(self, cx).await })
+    }
+
     fn annotate_pane_domains_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -5379,6 +5498,13 @@ impl WeztermInterface for Arc<dyn WeztermInterface> {
 
     fn list_panes_with_cx<'a>(&'a self, cx: &'a crate::cx::Cx) -> WeztermFuture<'a, Vec<PaneInfo>> {
         self.as_ref().list_panes_with_cx(cx)
+    }
+
+    fn discover_panes_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+    ) -> WeztermFuture<'a, Vec<PaneDiscoveryObservation>> {
+        self.as_ref().discover_panes_with_cx(cx)
     }
 
     fn annotate_pane_domains_with_cx<'a>(
@@ -6527,6 +6653,10 @@ mod tests {
                     backend.pane_native_identity_with_cx(&cx, 7).await.unwrap(),
                     Some(identity)
                 );
+                let observations = backend.discover_panes_with_cx(&cx).await.unwrap();
+                assert_eq!(observations.len(), 1);
+                assert_eq!(observations[0].pane.pane_id, 7);
+                assert_eq!(observations[0].registration, identity.registration());
             }
 
             cx.cancel_with(
@@ -6535,8 +6665,28 @@ mod tests {
             );
             for backend in [&handle as &dyn MuxInterface, &unified as &dyn MuxInterface] {
                 assert!(backend.pane_native_identity_with_cx(&cx, 7).await.is_err());
+                assert!(backend.discover_panes_with_cx(&cx).await.is_err());
             }
         });
+    }
+
+    #[test]
+    fn cli_metadata_cannot_claim_native_discovery_registration() {
+        let session = [1u8; 16];
+        let registration = [2u8; 16];
+        let pane: PaneInfo = serde_json::from_value(serde_json::json!({
+            "pane_id": 7,
+            "tab_id": 1,
+            "window_id": 1,
+            "session_incarnation": session,
+            "pane_registration": registration,
+            "registration": { "session_incarnation": session, "pane_registration": registration }
+        }))
+        .unwrap();
+        assert!(pane.extra.contains_key("registration"));
+        assert!(PaneDiscoveryObservation::from(pane).registration.is_none());
+        assert!(MuxPaneRegistration::new([0; 16], [2; 16]).is_none());
+        assert!(MuxPaneRegistration::new([1; 16], [0; 16]).is_none());
     }
 
     #[cfg(all(feature = "vendored", unix))]
@@ -6648,7 +6798,17 @@ mod tests {
     #[test]
     fn coherent_pane_domains_keep_metadata_and_domains_in_one_projection() {
         let response = coherent_domain_test_response();
-        let panes = pane_info_from_domain_snapshot(&response).unwrap();
+        let observations = pane_observations_from_domain_snapshot(&response).unwrap();
+        for observation in &observations {
+            assert_eq!(
+                observation.registration,
+                MuxPaneRegistration::new([1; 16], [observation.pane.pane_id as u8; 16])
+            );
+        }
+        let panes = observations
+            .into_iter()
+            .map(|observation| observation.pane)
+            .collect::<Vec<_>>();
         assert_eq!(panes.len(), 3);
         assert_eq!(panes[0].pane_id, 1);
         assert_eq!(panes[0].title.as_deref(), Some("observed-pane-1"));
@@ -6706,7 +6866,11 @@ mod tests {
     #[cfg(all(feature = "vendored", unix))]
     #[test]
     fn later_domain_annotation_preserves_coherent_entries_in_a_mixed_inventory() {
-        let mut panes = pane_info_from_domain_snapshot(&coherent_domain_test_response()).unwrap();
+        let mut panes = pane_observations_from_domain_snapshot(&coherent_domain_test_response())
+            .unwrap()
+            .into_iter()
+            .map(|observation| observation.pane)
+            .collect::<Vec<_>>();
         let mut legacy_pane = panes[0].clone();
         legacy_pane.pane_id = 4;
         legacy_pane.domain_id = None;
@@ -6750,8 +6914,10 @@ mod tests {
             },
         ] {
             assert!(
-                pane_info_from_domain_snapshot(&codec::ListPanesWithDomainsV1Response { outcome })
-                    .is_err()
+                pane_observations_from_domain_snapshot(&codec::ListPanesWithDomainsV1Response {
+                    outcome
+                })
+                .is_err()
             );
         }
         let empty = codec::ListPanesWithDomainsV1Response {
@@ -6761,7 +6927,11 @@ mod tests {
                 panes: Vec::new(),
             },
         };
-        assert!(pane_info_from_domain_snapshot(&empty).unwrap().is_empty());
+        assert!(
+            pane_observations_from_domain_snapshot(&empty)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// Exercise the production WeztermClient -> MuxPool -> DirectMuxClient
@@ -6772,7 +6942,7 @@ mod tests {
         peer_codec: usize,
         response: codec::ListPanesWithDomainsV1Response,
         annotate: bool,
-    ) -> (Result<Vec<PaneInfo>>, Vec<&'static str>) {
+    ) -> (Result<Vec<PaneDiscoveryObservation>>, Vec<&'static str>) {
         use codec::{Pdu, UnitResponse};
         use std::io::{Read, Write};
         use std::os::unix::net::UnixListener;
@@ -6862,9 +7032,16 @@ mod tests {
             let client = isolated_cli_client_with_socket(socket_path.to_string_lossy())
                 .with_mux_pool(pool.clone());
             let cx = crate::cx::for_testing();
-            let mut listed = client.list_panes_with_cx(&cx).await;
-            if annotate && let Ok(panes) = listed.as_mut() {
-                client.annotate_pane_domains_with_cx(&cx, panes).await;
+            let mut listed = client.discover_panes_with_cx(&cx).await;
+            if annotate && let Ok(observations) = listed.as_mut() {
+                let mut panes = observations
+                    .iter()
+                    .map(|observation| observation.pane.clone())
+                    .collect::<Vec<_>>();
+                client.annotate_pane_domains_with_cx(&cx, &mut panes).await;
+                for (observation, pane) in observations.iter_mut().zip(panes) {
+                    observation.pane = pane;
+                }
             }
             result = Some(listed);
             let stats = pool.stats_with_cx(&cx).await.unwrap();
@@ -6890,10 +7067,16 @@ mod tests {
         assert_eq!(
             panes
                 .iter()
-                .map(PaneInfo::inferred_domain)
+                .map(|observation| observation.pane.inferred_domain())
                 .collect::<Vec<_>>(),
             vec!["remote-build", "local", "domain:9"]
         );
+        for observation in panes {
+            assert_eq!(
+                observation.registration,
+                MuxPaneRegistration::new([1; 16], [observation.pane.pane_id as u8; 16])
+            );
+        }
     }
 
     #[cfg(all(feature = "vendored", unix))]
@@ -6907,7 +7090,9 @@ mod tests {
         assert!(
             panes
                 .iter()
-                .all(|pane| pane.domain_id.is_none() && pane.domain_name.is_none())
+                .all(|observation| observation.pane.domain_id.is_none()
+                    && observation.pane.domain_name.is_none()
+                    && observation.registration.is_none())
         );
     }
 
@@ -12710,6 +12895,13 @@ impl WeztermInterface for UnifiedClient {
         self.inner.list_panes_with_cx(cx)
     }
 
+    fn discover_panes_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+    ) -> WeztermFuture<'a, Vec<PaneDiscoveryObservation>> {
+        self.inner.discover_panes_with_cx(cx)
+    }
+
     fn annotate_pane_domains_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -13740,6 +13932,38 @@ impl WeztermInterface for MockWezterm {
                 .map_err(|error| mock_lock_error(cx, "mock list panes", error))?;
             mock_checkpoint(cx, "mock list panes")?;
             Ok(panes.values().map(MockPane::to_pane_info).collect())
+        })
+    }
+
+    fn discover_panes_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+    ) -> WeztermFuture<'a, Vec<PaneDiscoveryObservation>> {
+        Box::pin(async move {
+            self.injected_list_panes_error()?;
+            let panes = self
+                .panes
+                .read_with_cx(cx)
+                .await
+                .map_err(|error| mock_lock_error(cx, "mock discover panes", error))?;
+            let identities = self
+                .native_identities
+                .read_with_cx(cx)
+                .await
+                .map_err(|error| mock_lock_error(cx, "mock discover panes", error))?;
+            mock_checkpoint(cx, "mock discover panes")?;
+            Ok(panes
+                .values()
+                .map(|pane| {
+                    let pane = pane.to_pane_info();
+                    PaneDiscoveryObservation {
+                        registration: identities
+                            .get(&pane.pane_id)
+                            .and_then(|identity| identity.registration()),
+                        pane,
+                    }
+                })
+                .collect())
         })
     }
 

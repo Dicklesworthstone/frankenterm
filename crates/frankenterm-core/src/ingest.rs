@@ -29,7 +29,7 @@ use crate::config::{PaneFilterConfig, TraumaGuardConfig};
 use crate::error::{Result, RuntimeOperationSource};
 use crate::storage::{Gap, PaneRecord, Segment, StorageHandle};
 use crate::trauma_guard::{TraumaDecision, TraumaState, hash_command};
-use crate::wezterm::{PaneInfo, stable_hash};
+use crate::wezterm::{MuxPaneRegistration, PaneDiscoveryObservation, PaneInfo, stable_hash};
 
 // =============================================================================
 // Time Utilities
@@ -225,15 +225,17 @@ impl PaneMetadataRevision {
 
 /// Authoritative pane membership evidence available from the current backend.
 ///
-/// Numeric pane ID is the mux's continuity authority while it remains present
-/// in consecutive coherent listings. Domain display name, title, cwd,
-/// workspace, geometry, cursor, focus, and zoom are intentionally absent.
-/// `domain_id` and `tty_name` strengthen replacement detection when supplied.
+/// Native listings retain the mux session and exact pane registration, so
+/// same-looking numeric IDs cannot inherit capture after replacement or
+/// reconnect. Legacy listings only have numeric ID, domain and tty evidence.
+/// Domain display name, title, cwd, workspace, geometry, cursor, focus, and
+/// zoom are intentionally absent.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PaneLifecycleIdentity {
     pub pane_id: u64,
     pub domain_id: Option<u64>,
     pub tty_name: Option<String>,
+    pub native_registration: Option<MuxPaneRegistration>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,6 +252,15 @@ impl PaneLifecycleIdentity {
             pane_id: info.pane_id,
             domain_id: info.domain_id,
             tty_name: info.tty_name.clone(),
+            native_registration: None,
+        }
+    }
+
+    #[must_use]
+    pub fn from_observation(observation: &PaneDiscoveryObservation) -> Self {
+        Self {
+            native_registration: observation.registration,
+            ..Self::from_pane_info(&observation.pane)
         }
     }
 
@@ -260,6 +271,16 @@ impl PaneLifecycleIdentity {
     pub fn continuity_with(&self, next: &Self) -> PaneLifecycleContinuity {
         if self.pane_id != next.pane_id {
             return PaneLifecycleContinuity::Replaced;
+        }
+        match (self.native_registration, next.native_registration) {
+            (Some(previous), Some(current)) if previous != current => {
+                return PaneLifecycleContinuity::Replaced;
+            }
+            (Some(_), None) => return PaneLifecycleContinuity::Ambiguous,
+            // Acquiring native evidence cannot retroactively bind output
+            // admitted under an unidentified legacy observation to that pane.
+            (None, Some(_)) => return PaneLifecycleContinuity::Replaced,
+            _ => {}
         }
         if (self.domain_id.is_some() && next.domain_id.is_none())
             || (self.tty_name.is_some() && next.tty_name.is_none())
@@ -1478,16 +1499,33 @@ impl PaneRegistry {
     ///
     /// Returns a diff describing what changed.
     pub fn discovery_tick(&mut self, panes: Vec<PaneInfo>) -> DiscoveryDiff {
+        self.discovery_tick_with_observations(
+            panes
+                .into_iter()
+                .map(PaneDiscoveryObservation::from)
+                .collect(),
+        )
+    }
+
+    /// Install metadata and native registration from the same discovery cut.
+    /// Losing a previously known native registration withholds observation;
+    /// it must never downgrade continuity to matching numeric IDs or tty names.
+    pub fn discovery_tick_with_observations(
+        &mut self,
+        panes: Vec<PaneDiscoveryObservation>,
+    ) -> DiscoveryDiff {
         let mut diff = DiscoveryDiff::default();
         let mut seen: HashSet<u64> = HashSet::with_capacity(panes.len());
         let mut duplicate_ids = HashSet::new();
         for pane in &panes {
-            if !seen.insert(pane.pane_id) {
-                duplicate_ids.insert(pane.pane_id);
+            if !seen.insert(pane.pane.pane_id) {
+                duplicate_ids.insert(pane.pane.pane_id);
             }
         }
 
-        for pane in panes {
+        for observation in panes {
+            let next_identity = PaneLifecycleIdentity::from_observation(&observation);
+            let pane = observation.pane;
             let pane_id = pane.pane_id;
             if duplicate_ids.contains(&pane_id) {
                 continue;
@@ -1507,7 +1545,6 @@ impl PaneRegistry {
                         let _ = self.pane_arenas.set_tracked_bytes(pane_id, tracked_bytes);
                         continue;
                     }
-                    let next_identity = PaneLifecycleIdentity::from_pane_info(&pane);
                     let mut metadata_diff = PaneMetadataDiff::between(&entry.info, &pane);
                     let was_observed = entry.should_observe();
                     let mut lifecycle_replaced = false;
@@ -1597,11 +1634,9 @@ impl PaneRegistry {
                 Entry::Vacant(vacant) => {
                     diff.new_panes.push(pane_id);
 
-                    let lifecycle_identity = PaneLifecycleIdentity::from_pane_info(&pane);
                     let pane_arena = self.pane_arenas.reserve(pane_id).arena();
 
-                    let entry =
-                        PaneEntry::new(pane, lifecycle_identity, new_observation, pane_arena);
+                    let entry = PaneEntry::new(pane, next_identity, new_observation, pane_arena);
                     let tracked_bytes = entry.estimated_bytes();
                     let should_observe = entry.should_observe();
                     self.uuid_index.insert(entry.pane_uuid.clone(), pane_id);
@@ -6355,6 +6390,78 @@ mod tests {
     }
 
     #[test]
+    fn native_discovery_rotates_capture_on_same_id_reuse_and_mux_restart() {
+        for (session, registration) in [([1; 16], [3; 16]), ([4; 16], [2; 16])] {
+            let mut registry = PaneRegistry::new();
+            let mut pane = make_pane(7, "agent", Some("/workspace"));
+            pane.domain_id = Some(11);
+            pane.tty_name = Some("/dev/pts/7".to_string());
+            let mut observation = PaneDiscoveryObservation {
+                pane,
+                registration: MuxPaneRegistration::new([1; 16], [2; 16]),
+            };
+            registry.discovery_tick_with_observations(vec![observation.clone()]);
+
+            observation.pane.title = Some("working".to_string());
+            let metadata = registry.discovery_tick_with_observations(vec![observation.clone()]);
+            assert!(metadata.lifecycle_replacements.is_empty());
+            assert_eq!(metadata.metadata_changes.len(), 1);
+            assert_eq!(registry.get_entry(7).unwrap().lifecycle_revision.get(), 0);
+
+            // Numeric ID, domain, tty, title and cwd all remain identical.
+            // Only the exact live registration proves that this is a new pane.
+            observation.registration = MuxPaneRegistration::new(session, registration);
+            let replacement = registry.discovery_tick_with_observations(vec![observation.clone()]);
+            assert_eq!(replacement.lifecycle_replacements, vec![7]);
+            let entry = registry.get_entry(7).unwrap();
+            assert_eq!(entry.lifecycle_revision.get(), 1);
+            assert_eq!(
+                entry.lifecycle_identity.native_registration,
+                observation.registration
+            );
+            assert!(entry.should_observe());
+
+            let stable = registry.discovery_tick_with_observations(vec![observation]);
+            assert!(stable.lifecycle_replacements.is_empty());
+            assert!(stable.metadata_changes.is_empty());
+            assert_eq!(registry.get_entry(7).unwrap().lifecycle_revision.get(), 1);
+        }
+    }
+
+    #[test]
+    fn native_discovery_never_blesses_or_downgrades_legacy_capture() {
+        let mut registry = PaneRegistry::new();
+        let pane = make_pane(7, "agent", Some("/workspace"));
+        registry.discovery_tick(vec![pane.clone()]);
+        let exact = PaneDiscoveryObservation {
+            pane: pane.clone(),
+            registration: MuxPaneRegistration::new([1; 16], [2; 16]),
+        };
+
+        let acquired = registry.discovery_tick_with_observations(vec![exact.clone()]);
+        assert_eq!(acquired.lifecycle_replacements, vec![7]);
+        assert_eq!(registry.get_entry(7).unwrap().lifecycle_revision.get(), 1);
+
+        let lost = registry.discovery_tick(vec![pane]);
+        assert_eq!(lost.ambiguous_lifecycle_panes, vec![7]);
+        assert!(lost.lifecycle_replacements.is_empty());
+        let withheld = registry.get_entry(7).unwrap();
+        assert!(!withheld.should_observe());
+        assert_eq!(withheld.lifecycle_revision.get(), 1);
+        assert_eq!(
+            withheld.lifecycle_identity.native_registration,
+            exact.registration
+        );
+        assert!(registry.get_cursor(7).is_none());
+
+        let restored = registry.discovery_tick_with_observations(vec![exact]);
+        assert_eq!(restored.re_observed_panes, vec![7]);
+        assert!(restored.lifecycle_replacements.is_empty());
+        assert!(registry.get_entry(7).unwrap().should_observe());
+        assert!(registry.get_cursor(7).is_some());
+    }
+
+    #[test]
     fn newly_available_exact_evidence_is_metadata_without_replacement() {
         let mut registry = PaneRegistry::new();
         let initial = make_pane(8, "shell", Some("/home"));
@@ -9626,6 +9733,7 @@ mod tests {
             pane_id: 7,
             domain_id: Some(2),
             tty_name: Some("/dev/pts/7".to_string()),
+            native_registration: None,
         };
         let cloned = identity.clone();
         assert_eq!(cloned.domain_id, Some(2));
@@ -9640,6 +9748,7 @@ mod tests {
             pane_id: 1,
             domain_id: Some(2),
             tty_name: Some("tty-a".into()),
+            native_registration: None,
         };
         let duplicate = first.clone();
         let replacement = PaneLifecycleIdentity {
@@ -9659,6 +9768,7 @@ mod tests {
             pane_id: 1,
             domain_id: Some(7),
             tty_name: None,
+            native_registration: None,
         };
         let replacement = PaneLifecycleIdentity {
             domain_id: Some(8),

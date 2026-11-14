@@ -23,9 +23,9 @@ use crate::error::{MuxObjectKind, MuxRejectionCode, StorageError, WeztermError};
 use crate::patterns::AgentType;
 use crate::watchdog::HealthStatus;
 use crate::wezterm::{
-    MoveDirection, MuxPaneIdentity, MuxPaneText, MuxSemanticSnapshot, PaneInfo,
-    PaneTieredScrollbackBatchEntry, PaneTieredScrollbackSummary, SpawnTarget, SplitDirection,
-    WeztermFuture, WeztermHandle, WeztermInterface,
+    MoveDirection, MuxPaneIdentity, MuxPaneText, MuxSemanticSnapshot, PaneDiscoveryObservation,
+    PaneInfo, PaneTieredScrollbackBatchEntry, PaneTieredScrollbackSummary, SpawnTarget,
+    SplitDirection, WeztermFuture, WeztermHandle, WeztermInterface,
 };
 
 // =============================================================================
@@ -1704,27 +1704,25 @@ impl ShardedWeztermClient {
         self.list_all_panes_with_cx(&cx).await
     }
 
-    /// Collect panes under the caller's cx. Uses each backend's
-    /// `list_panes_with_cx(cx)` (added to `WeztermInterface` trait in
-    /// tick 27 with a default impl that delegates to `list_panes` for
-    /// backends without a Cx-aware path, and overridden by
-    /// `WeztermClient` to propagate Cx through to
-    /// `MuxPool::list_panes_with_cx`).
+    /// Collect a coherent inventory from each backend under the caller's cx.
+    /// Preserve native registration evidence while translating numeric routes;
+    /// legacy backends explicitly contribute observations without that evidence.
     async fn collect_panes_with_cx(
         &self,
         cx: &crate::cx::Cx,
-    ) -> Result<(Vec<PaneInfo>, HashMap<u64, PaneRoute>)> {
+    ) -> Result<(Vec<PaneDiscoveryObservation>, HashMap<u64, PaneRoute>)> {
         let mut all = Vec::new();
         let mut routes = HashMap::new();
 
         for backend in &self.backends {
             let panes = backend
                 .handle
-                .list_panes_with_cx(cx)
+                .discover_panes_with_cx(cx)
                 .await
                 .map_err(|err| Self::backend_error(backend.id, "list_panes", None, err))?;
 
-            for mut pane in panes {
+            for mut observation in panes {
+                let pane = &mut observation.pane;
                 let local_pane_id = pane.pane_id;
                 let global_pane_id = try_encode_sharded_pane_id(backend.id, local_pane_id)?;
                 pane.pane_id = global_pane_id;
@@ -1740,7 +1738,7 @@ impl ShardedWeztermClient {
                         local_pane_id,
                     },
                 );
-                all.push(pane);
+                all.push(observation);
             }
         }
 
@@ -1751,14 +1749,25 @@ impl ShardedWeztermClient {
     /// asupersync capability context (ft-xbnl0.2.3 Cx-first entry
     /// point).
     ///
-    /// Uses `collect_panes_with_cx(cx)` so per-backend `list_panes`
-    /// calls flow through `WeztermInterface::list_panes_with_cx`
-    /// (tick 27 trait extension); the concrete `WeztermClient` impl
-    /// routes to `MuxPool::list_panes_with_cx` on the fast path. Snapshot
-    /// publication is synchronous, generation-fenced, and non-yielding, so a
-    /// cancellation observed after discovery cannot leave a half-refreshed
-    /// cache or overwrite a newer point update.
+    /// The metadata projection shares the same collection and route publication
+    /// as native discovery, so neither surface discards registration evidence
+    /// before a backend has completed its coherent snapshot.
     pub async fn list_all_panes_with_cx(&self, cx: &crate::cx::Cx) -> Result<Vec<PaneInfo>> {
+        self.discover_all_panes_with_cx(cx).await.map(|panes| {
+            panes
+                .into_iter()
+                .map(|observation| observation.pane)
+                .collect()
+        })
+    }
+
+    /// Aggregate registration-bearing discovery without weakening backend
+    /// identity. Route publication is synchronous and generation-fenced, so
+    /// an older snapshot cannot overwrite a newer point update.
+    pub async fn discover_all_panes_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> Result<Vec<PaneDiscoveryObservation>> {
         self.telemetry.pane_listings.fetch_add(1, Ordering::Relaxed);
         let route_generation = self.pane_route_generation();
         let (panes, routes) = self.collect_panes_with_cx(cx).await?;
@@ -2521,6 +2530,13 @@ impl WeztermInterface for ShardedWeztermClient {
 
     fn list_panes_with_cx<'a>(&'a self, cx: &'a crate::cx::Cx) -> WeztermFuture<'a, Vec<PaneInfo>> {
         Box::pin(async move { self.list_all_panes_with_cx(cx).await })
+    }
+
+    fn discover_panes_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+    ) -> WeztermFuture<'a, Vec<PaneDiscoveryObservation>> {
+        Box::pin(async move { self.discover_all_panes_with_cx(cx).await })
     }
 
     fn get_pane_with_cx<'a>(
@@ -3491,6 +3507,25 @@ mod tests {
             shard1.add_default_pane(7).await;
             shard1.inject_output(7, "beta").await.unwrap();
 
+            let cx = crate::cx::for_testing();
+            let identity0 = MuxPaneIdentity {
+                session_incarnation: [1; 16],
+                durable_pane_id: [2; 16],
+                pane_registration: [3; 16],
+            };
+            let identity1 = MuxPaneIdentity {
+                session_incarnation: [4; 16],
+                ..identity0
+            };
+            shard0
+                .set_pane_native_identity_with_cx(&cx, 7, Some(identity0))
+                .await
+                .unwrap();
+            shard1
+                .set_pane_native_identity_with_cx(&cx, 7, Some(identity1))
+                .await
+                .unwrap();
+
             let handle0: WeztermHandle = shard0.clone();
             let handle1: WeztermHandle = shard1.clone();
 
@@ -3535,6 +3570,24 @@ mod tests {
                 .unwrap();
             assert_eq!(text0, "alpha");
             assert_eq!(text1, "beta");
+
+            let observations = client.discover_panes_with_cx(&cx).await.unwrap();
+            assert_eq!(observations.len(), 2);
+            for (shard, identity) in [(ShardId(0), identity0), (ShardId(1), identity1)] {
+                let global_id = try_encode_sharded_pane_id(shard, 7).unwrap();
+                let observation = observations
+                    .iter()
+                    .find(|observation| observation.pane.pane_id == global_id)
+                    .unwrap();
+                assert_eq!(observation.registration, identity.registration());
+                assert_eq!(
+                    client
+                        .route_for_global_pane_id(global_id)
+                        .unwrap()
+                        .local_pane_id,
+                    7
+                );
+            }
         });
     }
 
