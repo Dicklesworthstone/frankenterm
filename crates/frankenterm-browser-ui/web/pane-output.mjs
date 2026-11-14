@@ -70,6 +70,10 @@ export function createPaneOutput({
   let suspended = false;
   let history = false;
   let received = null;
+  let receivedSequence = null;
+  let sequenceDiscontinuities = 0;
+  let sequenceRestarted = false;
+  let retainedPrefixMissing = false;
   let status = "closed";
   let error = null;
   let gaps = 0;
@@ -189,9 +193,11 @@ export function createPaneOutput({
         const data = value.data;
         if (message.type === "delta") {
           const segment = cursorFor(message.lastEventId, selectedPane);
+          const sequence = unsigned(exact.data.seq, U64_MAX);
           if (segment === null || typeof data.segment_id !== "number" || typeof data.pane_id !== "number"
               || unsigned(exact.data.segment_id, I64_MAX) !== segment
-              || unsigned(exact.data.pane_id, U64_MAX) !== selectedPane || typeof data.content !== "string") {
+              || unsigned(exact.data.pane_id, U64_MAX) !== selectedPane
+              || typeof data.seq !== "number" || sequence === null || typeof data.content !== "string") {
             throw new Error("invalid delta identity or content");
           }
           if (capture !== null) {
@@ -210,14 +216,32 @@ export function createPaneOutput({
             // any following segment can arrive, even for a reused pane ID.
             append(data.content);
             received = segment;
+            receivedSequence = sequence;
             settleCapture(null, true);
             return;
           }
           // Reconnect may overlap with already admitted rows. Do not regress
           // the received cursor, append duplicates, or interpret ids as floats.
           if (received !== null && BigInt(segment) <= BigInt(received)) return;
+          // Global segment ids interleave panes; only this pane's stored seq
+          // can reveal an omitted range. Keep the last admitted sequence over
+          // disconnect, pause and suspension: ephemeral bus gap notifications
+          // cannot reveal rows removed by retention while we were away.
+          if (receivedSequence !== null) {
+            const previous = BigInt(receivedSequence);
+            const current = BigInt(sequence);
+            if (current !== previous + 1n) {
+              sequenceDiscontinuities = Math.min(Number.MAX_SAFE_INTEGER, sequenceDiscontinuities + 1);
+              if (current <= previous) sequenceRestarted = true;
+            }
+          } else if (history && sequence !== "0") {
+            // Explicit retained-history reads start at the beginning of what
+            // remains, which is not necessarily the beginning of capture.
+            retainedPrefixMissing = true;
+          }
           append(data.content);
           received = segment;
+          receivedSequence = sequence;
           status = "connected";
           error = null;
           retryMs = 1000;
@@ -269,6 +293,7 @@ export function createPaneOutput({
     return {
       paneId: pane, status, paused, suspended, history, cursor: received,
       text, discardedChars, gapNotifications: gaps, unanchored, error, capture,
+      sequence: receivedSequence, sequenceDiscontinuities, sequenceRestarted, retainedPrefixMissing,
     };
   }
 
@@ -280,6 +305,9 @@ export function createPaneOutput({
     history = Boolean(retainedHistory);
     paused = false;
     received = null;
+    receivedSequence = null;
+    sequenceDiscontinuities = 0;
+    sequenceRestarted = retainedPrefixMissing = false;
     chunks = [];
     chars = 0;
     text = "";
@@ -355,6 +383,9 @@ export function createPaneOutput({
       capture = null;
       capturePending = false;
       received = null;
+      receivedSequence = null;
+      sequenceDiscontinuities = 0;
+      sequenceRestarted = retainedPrefixMissing = false;
       chunks = [];
       chars = 0;
       text = "";
@@ -440,6 +471,9 @@ export function mountPaneOutput({
       ? "This captured segment exceeds the view limit; only its bounded suffix is shown."
       : "Older text was discarded from this bounded view.");
     if (state.gapNotifications) notices.push(`${state.gapNotifications} capture-gap or bus-lag notifications; continuity is not guaranteed.`);
+    if (state.sequenceDiscontinuities) notices.push(`${state.sequenceDiscontinuities} stored capture sequence discontinuities detected; output between retained segments may be missing. Load retained history to recover what remains.`);
+    if (state.sequenceRestarted) notices.push("Capture sequence restarted or moved backwards; this view may span different capture histories.");
+    if (state.retainedPrefixMissing) notices.push("Retained history starts after the beginning of capture; earlier output is unavailable in this view.");
     if (state.unanchored) notices.push("Reconnected before a received cursor existed; earlier output may be missing. Load retained history to recover what remains.");
     if (state.error) notices.push(state.error);
     setText(warnings, notices.join(" "));
