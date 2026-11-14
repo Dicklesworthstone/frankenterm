@@ -1,11 +1,1 @@
-[
-  {
-    "rule_id": "wezterm.mux.connection_lost",
-    "agent_type": "wezterm",
-    "event_type": "mux.error",
-    "severity": "critical",
-    "confidence": 0.6,
-    "extracted": {},
-    "matched_text": "connection lost"
-  }
-]
+[]

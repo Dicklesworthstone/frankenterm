@@ -6,11 +6,16 @@ that demonstrates the behavior.
 
 ## False Positive Report
 
-Rules whose anchors fire on unrelated text from other programs.
+Rules whose anchors fire on unrelated text from other programs. None are
+open; the fixed ones are below.
 
-| Rule | Anchor | FP Trigger | Fixture | Severity |
-|------|--------|-----------|---------|----------|
-| `wezterm.mux.connection_lost` | `connection lost` | "SSH connection lost: remote host" | `connection_lost_fp_ssh` | High: fires on any disconnection |
+Fixed 2026-11-14: `wezterm.mux.connection_lost` fired on any "mux server",
+"connection lost" or "disconnected", in every pane: 449 of 461k Claude Code
+messages ("both mux servers intact", "the tmux server state"). Each was a
+Critical `mux.error` with a hazard snapshot and a cass search. It now needs
+a mux server losing its connection ("mux server disconnected", "mux server
+is unavailable"). `connection_lost_fp_ssh` and `connection_lost_fp_prose`
+must not match.
 
 Fixed 2026-11-14: `claude_code.error.network`, `.timeout` and `.overloaded`
 used to fire on any "timed out", "connection closed" or "overloaded" in prose
@@ -73,7 +78,7 @@ Recommended future work:
 
 | Symptom | Rule Affected | Detail | Fixture |
 |---------|--------------|--------|---------|
-| "connection lost" generic | `wezterm.mux.connection_lost` | Fires on any "connection lost" text (SSH, VPN, database) | `connection_lost_fp_ssh` |
+| Mux loss is reported outside the pane | `wezterm.mux.connection_lost` | FrankenTerm reports a lost mux connection in errors, logs and its UI; a search of the source found none written as pane output. ft also cannot read a pane once its mux is gone. The rule keeps only "mux server <lost>" phrases; generic "connection lost" (SSH, VPN, database) does not count. | `connection_lost`, `connection_lost_v2`, `connection_lost_fp_ssh`, `connection_lost_fp_prose` |
 | "process exited" generic | `wezterm.pane.exited` | Anchor could match non-WezTerm process exits | `pane_exited_near_miss` |
 
 ## Drift Log
@@ -88,12 +93,13 @@ Recommended future work:
 | 2026-11-14 | Live fleet scan + Claude Code session logs | `claude_code.error.network`, `.timeout`, `.overloaded` | Require the "API Error: " framing. Before: 0 of 9 real API errors detected, 7 of 7 prose samples fired. Synthetic positive fixtures replaced with real text; their old text now must not match. | `error_rules_fp_prose.txt`, `overloaded_fp_rate_limit.txt` |
 | 2026-11-14 | Claude Code session logs | `claude_code.usage.reached`, `.usage.warning` | Match the 5-hour, model and credit limit messages, which matched no rule, and keep a weekly reset's day. Before, "resets Nov 12 at 2pm" was read as the next 2pm, up to six days early. | `usage_reached_*_cli_2026_11.txt`, `usage_warning_5hour_cli_2026_11.txt` |
 | 2026-11-14 | Claude Code session logs + prose sweep | `claude_code.auth.api_key_error`, `.login_required` | api_key_error: only Claude Code's "Invalid API key ·" and "Use an Anthropic API key instead" (was any "API key"; 187 of 191 hits were prose). login_required: also "Failed to authenticate: OAuth" and "Failed to authenticate. API Error:", which matched no rule. | `api_key_error_fp_prose.txt`, `auth_failed_*_cli_2026_11.txt` |
+| 2026-11-14 | Prose sweep of Claude Code sessions | `wezterm.mux.connection_lost` | Require "mux server" followed by connection lost, disconnected or unavailable (was any "mux server", "connection lost" or "disconnected": 449 prose hits, no real one found). | `connection_lost_fp_prose.txt` |
 
 ## Coverage Summary
 
 - 37 rules across 5 packs
-- 158 corpus fixtures
+- 159 corpus fixtures
 - All 3 agents have quirks documented
-- 4 confirmed false positives cataloged with fixtures; 3 of them (the
-  Claude Code error and API-key rules) fixed 2026-11-14
+- 4 confirmed false positives cataloged with fixtures, all fixed
+  2026-11-14
 - Pack linter: 0 errors, 0 warnings

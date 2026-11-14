@@ -1,0 +1,4 @@
+Let me diagnose the tmux server state and recover.
+All 57 agents and both mux servers intact.
+So nothing was missing: the sidecar was disconnected before the pull could be asked for.
+An engine indicator shows connected, working, "Still working · 12 s", offline or connection lost.

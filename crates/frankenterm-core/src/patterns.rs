@@ -4434,12 +4434,17 @@ fn builtin_wezterm_pack() -> PatternPack {
                 agent_type: AgentType::Wezterm,
                 event_type: "mux.error".to_string(),
                 severity: Severity::Critical,
-                anchors: vec![
-                    "mux server".to_string(),
-                    "connection lost".to_string(),
-                    "disconnected".to_string(),
-                ],
-                regex: None,
+                // WezTerm rules run on every pane. Any "mux server",
+                // "connection lost" or "disconnected" used to raise this
+                // Critical mux.error (hazard snapshot, cass search): 449 of
+                // 461k Claude Code messages did, from "both mux servers
+                // intact" to "the tmux server state". Only a mux server
+                // losing its connection counts now.
+                anchors: vec!["mux server".to_string(), "Mux server".to_string()],
+                regex: Some(
+                    r"\b[Mm]ux server (?:connection lost|disconnected|is unavailable|unavailable)"
+                        .to_string(),
+                ),
                 description: "WezTerm mux server connection lost".to_string(),
                 remediation: Some("Check WezTerm mux server status".to_string()),
                 workflow: None,
@@ -8781,6 +8786,29 @@ rules:
             "Should match wezterm.mux.connection_lost"
         );
         assert_eq!(detection.unwrap().severity, Severity::Critical);
+    }
+
+    #[test]
+    fn wezterm_mux_connection_lost_ignores_prose() {
+        // WezTerm rules run on every pane; these lines are from Claude Code
+        // sessions (the last is the catalog's SSH false positive).
+        let engine = PatternEngine::new();
+        for text in [
+            "Let me diagnose the tmux server state and recover.",
+            "All 57 agents and both mux servers intact.",
+            "So nothing was missing: the sidecar was disconnected before the pull could be asked for.",
+            "An engine indicator shows connected, working, \"Still working · 12 s\", offline or connection lost.",
+            "SSH connection lost: remote host not responding",
+            "the tmux server disconnected",
+        ] {
+            assert!(
+                !engine
+                    .detect(text)
+                    .iter()
+                    .any(|d| d.rule_id == "wezterm.mux.connection_lost"),
+                "{text:?}"
+            );
+        }
     }
 
     #[test]

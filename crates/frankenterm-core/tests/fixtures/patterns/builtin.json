@@ -402,6 +402,12 @@
     "negative_for": "wezterm.mux.connection_lost"
   },
   {
+    "name": "wezterm_mux_connection_lost_negative_prose",
+    "text": "All 57 agents and both mux servers intact.",
+    "expected_rule_ids": [],
+    "negative_for": "wezterm.mux.connection_lost"
+  },
+  {
     "name": "wezterm_pane_exited_positive",
     "text": "pane exited with status 1",
     "expected_rule_ids": ["wezterm.pane.exited"],
