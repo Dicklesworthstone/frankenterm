@@ -35988,7 +35988,10 @@ fn validate_ipc_checkpoint_record(value: &serde_json::Value) -> Result<(), IpcRe
     const CHECKPOINT_KEYS: [&str; 4] = ["type", "cursor", "cursor_epoch", "reason"];
     let valid = json_object_has_exact_keys(value, &CHECKPOINT_KEYS)
         && value.get("type").and_then(serde_json::Value::as_str) == Some("cursor_checkpoint")
-        && value.get("reason").and_then(serde_json::Value::as_str) == Some("fresh_tail_baseline")
+        && matches!(
+            value.get("reason").and_then(serde_json::Value::as_str),
+            Some("fresh_tail_baseline" | "examined_through_page")
+        )
         && value
             .get("cursor")
             .and_then(serde_json::Value::as_i64)
@@ -36218,8 +36221,9 @@ async fn relay_ipc_event_line(
             {
                 return Ok(IpcRelayAction::ProtocolFault(fault));
             }
-            // A server's fresh-tail baseline is useful to direct clients, but
-            // cannot skip rows or advance this follower's independent cursor.
+            // Server baselines and filtered-page checkpoints are useful to
+            // direct clients, but cannot skip rows or advance this follower's
+            // independent cursor (including its output and claim boundaries).
             Ok(IpcRelayAction::DurableWakeup)
         }
     }
@@ -39204,47 +39208,49 @@ mod watch_events_tests {
             let mut last_event_emit = None;
             let mut last_emit = std::time::Instant::now();
             let before = last_emit;
-            let checkpoint = serde_json::json!({
-                "type": "cursor_checkpoint",
-                "cursor": 999,
-                "cursor_epoch": TEST_CURSOR_EPOCH,
-                "reason": "fresh_tail_baseline",
-            });
-            assert_eq!(validate_ipc_checkpoint_record(&checkpoint), Ok(()));
-            let action = relay_ipc_event_line(
-                &cx,
-                &stdout,
-                &checkpoint.to_string(),
-                cursor,
-                Some(TEST_CURSOR_EPOCH),
-                Some(TEST_CURSOR_SCOPE),
-                None,
-                &mut last_event_emit,
-                0,
-                std::time::Duration::ZERO,
-                &mut last_emit,
-            )
-            .await
-            .unwrap();
-            assert_eq!(action, IpcRelayAction::DurableWakeup);
-            assert_eq!(cursor, Some(7));
-            assert_eq!(last_event_emit, None);
-            assert_eq!(
-                last_emit, before,
-                "private baseline must emit no public row"
-            );
-
-            for (key, value) in [
-                ("cursor", serde_json::json!(-1)),
-                ("reason", serde_json::json!("unknown")),
-                ("extra", serde_json::json!(true)),
-            ] {
-                let mut invalid = checkpoint.clone();
-                invalid[key] = value;
+            for reason in ["fresh_tail_baseline", "examined_through_page"] {
+                let checkpoint = serde_json::json!({
+                    "type": "cursor_checkpoint",
+                    "cursor": 999,
+                    "cursor_epoch": TEST_CURSOR_EPOCH,
+                    "reason": reason,
+                });
+                assert_eq!(validate_ipc_checkpoint_record(&checkpoint), Ok(()));
+                let action = relay_ipc_event_line(
+                    &cx,
+                    &stdout,
+                    &checkpoint.to_string(),
+                    cursor,
+                    Some(TEST_CURSOR_EPOCH),
+                    Some(TEST_CURSOR_SCOPE),
+                    None,
+                    &mut last_event_emit,
+                    0,
+                    std::time::Duration::ZERO,
+                    &mut last_emit,
+                )
+                .await
+                .unwrap();
+                assert_eq!(action, IpcRelayAction::DurableWakeup);
+                assert_eq!(cursor, Some(7));
+                assert_eq!(last_event_emit, None);
                 assert_eq!(
-                    validate_ipc_checkpoint_record(&invalid),
-                    Err(IpcRelayProtocolFault::InvalidRecordShape)
+                    last_emit, before,
+                    "private checkpoints must emit no public row"
                 );
+
+                for (key, value) in [
+                    ("cursor", serde_json::json!(-1)),
+                    ("reason", serde_json::json!("unknown")),
+                    ("extra", serde_json::json!(true)),
+                ] {
+                    let mut invalid = checkpoint.clone();
+                    invalid[key] = value;
+                    assert_eq!(
+                        validate_ipc_checkpoint_record(&invalid),
+                        Err(IpcRelayProtocolFault::InvalidRecordShape)
+                    );
+                }
             }
         });
     }

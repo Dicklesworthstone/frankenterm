@@ -118,6 +118,20 @@ impl DurableFilteredEventStream {
         self.cursor.as_ref()
     }
 
+    /// The committed prefix at an acknowledged page boundary.
+    ///
+    /// Output adapters can coalesce checkpoints for deliberately filtered
+    /// rows here instead of writing one record per skipped row. Buffered or
+    /// unacknowledged rows never authorize a page checkpoint.
+    #[must_use]
+    pub fn acknowledged_page_cursor(&self) -> Option<&DurableStreamCursor> {
+        if self.pending_id.is_none() && self.rows.is_empty() {
+            self.cursor.as_ref()
+        } else {
+            None
+        }
+    }
+
     /// Commit exactly the delivered or deliberately filtered row.
     pub fn acknowledge(&mut self, event_id: i64) -> Result<(), DurableStreamError> {
         if self.pending_id != Some(event_id) {
@@ -1576,6 +1590,7 @@ mod tests {
             assert_eq!(row.detected_at, 1_700_000_000_001);
             assert_eq!(row.matched_text.as_deref(), Some("stored payload 1"));
             assert_eq!(stream.cursor(), Some(&start));
+            assert!(stream.acknowledged_page_cursor().is_none());
             assert!(matches!(
                 stream.acknowledge(second),
                 Err(DurableStreamError::InvalidAcknowledgement)
@@ -1593,9 +1608,21 @@ mod tests {
             assert_eq!(next_durable_row(&mut resumed, &cx).await.id, first);
             resumed.acknowledge(first).unwrap();
             assert_eq!(resumed.cursor().unwrap().after_id, first);
+            assert!(
+                resumed.acknowledged_page_cursor().is_none(),
+                "a buffered row keeps the page checkpoint pending"
+            );
             assert_eq!(next_durable_row(&mut resumed, &cx).await.id, second);
+            assert!(
+                resumed.acknowledged_page_cursor().is_none(),
+                "an empty buffer is not a checkpoint until output is acknowledged"
+            );
             resumed.acknowledge(second).unwrap();
             assert_eq!(resumed.cursor().unwrap().after_id, second);
+            assert_eq!(
+                resumed.acknowledged_page_cursor().unwrap().after_id,
+                second
+            );
             assert!(matches!(
                 resumed.acknowledge(first),
                 Err(DurableStreamError::InvalidAcknowledgement)

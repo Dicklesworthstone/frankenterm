@@ -2673,13 +2673,39 @@ async fn handle_client_with_context_with_cx(
     Ok(())
 }
 
-/// ft-7h5da.4.1 idle-heartbeat NDJSON record for the streaming subscribe
-/// path. Mirrors the DB-cursor path's heartbeat shape (`type`/`cursor`/`now`);
-/// `cursor` is null because the server doesn't track a global cursor — the
-/// follower advances its own cursor from the per-event records.
+/// Idle-heartbeat NDJSON record for the streaming subscribe path. Heartbeats
+/// carry no durable authority: direct clients retain the last flushed event
+/// or cursor checkpoint, while the CLI follower owns its separate DB cursor.
 #[cfg(unix)]
 fn watch_heartbeat_record(now: i64) -> serde_json::Value {
     serde_json::json!({ "type": "heartbeat", "cursor": serde_json::Value::Null, "now": now })
+}
+
+/// Publish a committed prefix without claiming delivery before write + flush.
+/// If either fails, terminal diagnostics and reconnect retain the prior cursor.
+#[cfg(unix)]
+async fn write_subscribe_cursor_checkpoint<W>(
+    cx: &crate::cx::Cx,
+    writer: &mut W,
+    io_timeout: Duration,
+    max_message_size: usize,
+    flushed_cursor: &mut Option<crate::event_stream::DurableStreamCursor>,
+    cursor: &crate::event_stream::DurableStreamCursor,
+    reason: &'static str,
+) -> std::io::Result<()>
+where
+    W: socket_transport::AsyncWrite + Unpin,
+{
+    let record = serde_json::json!({
+        "type": "cursor_checkpoint",
+        "cursor": cursor.after_id,
+        "cursor_epoch": cursor.epoch,
+        "reason": reason,
+    });
+    let encoded = serialize_ipc_json_bounded(&record, max_message_size)?;
+    write_ipc_line_with_deadline(cx, writer, io_timeout, max_message_size, &encoded).await?;
+    *flushed_cursor = Some(cursor.clone());
+    Ok(())
 }
 
 /// ft-7h5da.4.2 explicit gap record for the streaming subscribe path. When the
@@ -2905,7 +2931,9 @@ fn subscribe_stored_event_record(
 /// Version 2 binds resume IDs to a storage epoch. A fresh client receives the
 /// captured tail checkpoint before later rows. Persisted payloads come only
 /// from storage, and their cursor advances only after a successful flush or
-/// deliberate filtering. Heartbeats and writes keep their finite deadlines.
+/// deliberate filtering. A filtered page publishes its committed prefix even
+/// with heartbeats disabled, so reconnect need not rescan excluded history.
+/// Heartbeats and writes keep their finite deadlines.
 #[cfg(unix)]
 async fn stream_subscribe_events<W>(
     cx: &crate::cx::Cx,
@@ -2930,6 +2958,7 @@ where
             "event storage unavailable",
         )
     })?;
+    let mut flushed_cursor = cursor.clone();
     let mut stream = DurableFilteredEventStream::new(&ctx.event_bus, Arc::clone(storage), cursor);
     let heartbeat = Duration::from_millis(heartbeat_interval_ms.max(1));
     let mut last_emit = Instant::now();
@@ -2937,6 +2966,30 @@ where
     loop {
         if cx.checkpoint().is_err() {
             return Ok(());
+        }
+
+        // A matching event publishes the filtered prefix before it. A page
+        // ending in excluded rows has no such event, so checkpoint once at the
+        // page boundary before waiting or querying another page. The stream
+        // exposes no page checkpoint while any delivered row awaits its ack.
+        if let Some(cursor) = stream.acknowledged_page_cursor()
+            && flushed_cursor.as_ref() != Some(cursor)
+        {
+            if write_subscribe_cursor_checkpoint(
+                cx,
+                writer,
+                io_timeout,
+                max_message_size,
+                &mut flushed_cursor,
+                cursor,
+                "examined_through_page",
+            )
+            .await
+            .is_err()
+            {
+                return Ok(());
+            }
+            last_emit = Instant::now();
         }
 
         // Filtered traffic must not postpone heartbeat deadlines. At this
@@ -2990,12 +3043,24 @@ where
                 None => continue,
             },
             Ok(Some(DurableStreamItem::Gap { missed_count })) => watch_lag_gap_record(missed_count),
-            Ok(Some(DurableStreamItem::Checkpoint(cursor))) => serde_json::json!({
-                "type": "cursor_checkpoint",
-                "cursor": cursor.after_id,
-                "cursor_epoch": cursor.epoch,
-                "reason": "fresh_tail_baseline",
-            }),
+            Ok(Some(DurableStreamItem::Checkpoint(cursor))) => {
+                if write_subscribe_cursor_checkpoint(
+                    cx,
+                    writer,
+                    io_timeout,
+                    max_message_size,
+                    &mut flushed_cursor,
+                    &cursor,
+                    "fresh_tail_baseline",
+                )
+                .await
+                .is_err()
+                {
+                    return Ok(());
+                }
+                last_emit = Instant::now();
+                continue;
+            }
             Ok(Some(DurableStreamItem::Idle)) => {
                 if heartbeat_interval_ms == 0 || last_emit.elapsed() < heartbeat {
                     continue;
@@ -3018,8 +3083,8 @@ where
                     "type": "error",
                     "code": code,
                     "terminal": true,
-                    "cursor": stream.cursor().map(|cursor| cursor.after_id),
-                    "cursor_epoch": stream.cursor().map(|cursor| cursor.epoch.as_str()),
+                    "cursor": flushed_cursor.as_ref().map(|cursor| cursor.after_id),
+                    "cursor_epoch": flushed_cursor.as_ref().map(|cursor| cursor.epoch.as_str()),
                 })
             }
         };
@@ -3035,6 +3100,7 @@ where
             stream
                 .acknowledge(event_id)
                 .map_err(std::io::Error::other)?;
+            flushed_cursor = stream.cursor().cloned();
         }
         last_emit = Instant::now();
         if terminal {
@@ -4171,6 +4237,8 @@ impl IpcClient {
     ///
     /// A fresh subscription first emits a cursor_checkpoint baseline. Stored
     /// rows are emitted in ID order; bus notifications are only wake hints.
+    /// Filtered page suffixes emit an `examined_through_page` checkpoint so
+    /// direct clients can resume beyond deliberately excluded rows.
     /// An unavailable history terminates with an explicit cursor-expired error.
     pub async fn subscribe_events_from_cursor_with_cx(
         &self,
@@ -4622,6 +4690,111 @@ mod tests {
         ] {
             assert!(subscribe_stored_event_record(&event, epoch, pane, severity, rule).is_none());
         }
+    }
+
+    struct CheckpointFlushWriter {
+        pending: Vec<u8>,
+        flushed: Vec<u8>,
+        fail_flush: bool,
+    }
+
+    impl socket_transport::AsyncWrite for CheckpointFlushWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.get_mut().pending.extend_from_slice(bytes);
+            std::task::Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let writer = self.get_mut();
+            if writer.fail_flush {
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "checkpoint flush failed",
+                )));
+            }
+            writer.flushed.append(&mut writer.pending);
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn subscription_checkpoint_commits_cursor_only_after_successful_flush() {
+        use crate::event_stream::DurableStreamCursor;
+
+        run_async_test(async {
+            let cx = crate::cx::Cx::current().expect("runtime context");
+            let initial = DurableStreamCursor {
+                after_id: 7,
+                epoch: "0123456789abcdef0123456789abcdef".to_string(),
+            };
+            let examined = DurableStreamCursor {
+                after_id: 70,
+                epoch: initial.epoch.clone(),
+            };
+            let mut flushed_cursor = Some(initial.clone());
+            let mut failed = CheckpointFlushWriter {
+                pending: Vec::new(),
+                flushed: Vec::new(),
+                fail_flush: true,
+            };
+            let error = write_subscribe_cursor_checkpoint(
+                &cx,
+                &mut failed,
+                Duration::from_secs(1),
+                MAX_MESSAGE_SIZE,
+                &mut flushed_cursor,
+                &examined,
+                "examined_through_page",
+            )
+            .await
+            .expect_err("an accepted write is not a successful flush");
+            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+            assert!(!failed.pending.is_empty(), "write completed before failure");
+            assert!(failed.flushed.is_empty());
+            assert_eq!(
+                flushed_cursor,
+                Some(initial),
+                "failure must retain the terminal/reconnect cursor"
+            );
+
+            let mut successful = CheckpointFlushWriter {
+                pending: Vec::new(),
+                flushed: Vec::new(),
+                fail_flush: false,
+            };
+            write_subscribe_cursor_checkpoint(
+                &cx,
+                &mut successful,
+                Duration::from_secs(1),
+                MAX_MESSAGE_SIZE,
+                &mut flushed_cursor,
+                &examined,
+                "examined_through_page",
+            )
+            .await
+            .expect("checkpoint flush succeeds");
+            assert!(successful.pending.is_empty());
+            assert_eq!(successful.flushed.last(), Some(&b'\n'));
+            let record: serde_json::Value = serde_json::from_slice(&successful.flushed).unwrap();
+            assert_eq!(record["type"], "cursor_checkpoint");
+            assert_eq!(record["cursor"], 70);
+            assert_eq!(record["reason"], "examined_through_page");
+            assert_eq!(flushed_cursor, Some(examined));
+        });
     }
 
     #[cfg(unix)]

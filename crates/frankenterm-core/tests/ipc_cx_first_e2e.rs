@@ -580,3 +580,169 @@ fn durable_subscription_replays_and_polls_silent_commits_over_real_socket() {
         storage.shutdown().await.unwrap();
     });
 }
+
+#[test]
+fn durable_subscription_checkpoints_filtered_pages_and_resumes_after_reopen() {
+    use frankenterm_core::event_stream::DurableStreamCursor;
+    use frankenterm_core::ipc::{IpcClient, IpcHandlerContext};
+    use frankenterm_core::storage::{PaneRecord, StorageHandle};
+
+    run_async_test(async {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("filtered.sock");
+        let database_path = directory.path().join("events.db");
+        let cx = runtime_ipc_cx();
+        let storage = Arc::new(
+            StorageHandle::new(&database_path.to_string_lossy())
+                .await
+                .unwrap(),
+        );
+        storage
+            .upsert_pane(PaneRecord {
+                pane_id: 7,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 1_700_000_000_000,
+                last_seen_at: 1_700_000_000_000,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            })
+            .await
+            .unwrap();
+        let epoch = storage
+            .get_event_retention_snapshot()
+            .await
+            .unwrap()
+            .cursor_epoch;
+        let mut ids = Vec::new();
+        for sequence in 1..=70 {
+            let mut event = subscription_fixture_event(sequence);
+            if sequence == 68 {
+                event.severity = "critical".to_string();
+            }
+            ids.push(storage.record_event(event).await.unwrap());
+        }
+        let bus = Arc::new(EventBus::new(4));
+        let context = IpcHandlerContext::new(bus).with_event_storage(Arc::clone(&storage));
+        let server = IpcServer::bind_with_cx(&cx, &path).await.unwrap();
+        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
+        let run_cx = cx.clone();
+        let server_task = task::spawn(async move {
+            server
+                .run_with_handler_context_with_cx(&run_cx, context, shutdown_rx)
+                .await;
+        });
+        let client = IpcClient::new(&path);
+        // No bus notification or heartbeat can rescue this filtered backlog.
+        let mut stream = client
+            .subscribe_events_from_cursor_with_cx(
+                &cx,
+                Some(DurableStreamCursor {
+                    after_id: 0,
+                    epoch: epoch.clone(),
+                }),
+                Some(7),
+                Some("critical".to_string()),
+                Some("codex.*".to_string()),
+                0,
+            )
+            .await
+            .unwrap();
+        let first_page = read_subscription_record(&cx, &mut stream).await;
+        assert_eq!(first_page["type"], "cursor_checkpoint");
+        assert_eq!(first_page["reason"], "examined_through_page");
+        assert_eq!(first_page["cursor"], ids[63]);
+        assert_eq!(first_page["cursor_epoch"], epoch);
+        assert_eq!(first_page.as_object().unwrap().len(), 4);
+
+        let matched = read_subscription_record(&cx, &mut stream).await;
+        assert_eq!(matched["type"], "event");
+        assert_eq!(matched["id"], ids[67]);
+        assert_eq!(matched["cursor"], ids[67]);
+        assert_eq!(matched["matched_text"], "stored-68");
+
+        let checkpoint = read_subscription_record(&cx, &mut stream).await;
+        assert_eq!(checkpoint["type"], "cursor_checkpoint");
+        assert_eq!(checkpoint["reason"], "examined_through_page");
+        assert_eq!(checkpoint["cursor"], ids[69]);
+        assert_eq!(checkpoint["cursor_epoch"], epoch);
+        // Three records cover 70 examined rows, without exposing excluded text
+        // or checkpointing every row. The matching row preceded the final
+        // checkpoint, so it cannot be skipped by resuming that checkpoint.
+        let resume = DurableStreamCursor {
+            after_id: checkpoint["cursor"].as_i64().unwrap(),
+            epoch: checkpoint["cursor_epoch"].as_str().unwrap().to_string(),
+        };
+        drop(stream);
+        frankenterm_core::runtime_async::mpsc_send(&shutdown_tx, ())
+            .await
+            .unwrap();
+        frankenterm_core::runtime_async::timeout_with_cx(&cx, Duration::from_secs(2), server_task)
+            .await
+            .expect("first server shutdown deadline")
+            .expect("first server settles");
+        assert_eq!(
+            storage
+                .delete_events_by_retention_rule(i64::MAX, None, &[], 1_000)
+                .await
+                .unwrap(),
+            70
+        );
+        storage.shutdown().await.unwrap();
+        drop(storage);
+
+        // Reopen after retention removes the entire consumed prefix. Without
+        // a flushed filtered-page checkpoint the old resume cursor is expired.
+        let storage = Arc::new(
+            StorageHandle::new(&database_path.to_string_lossy())
+                .await
+                .unwrap(),
+        );
+        let mut next = subscription_fixture_event(71);
+        next.severity = "critical".to_string();
+        let next_id = storage.record_event(next).await.unwrap();
+        assert!(next_id > resume.after_id);
+        let context = IpcHandlerContext::new(Arc::new(EventBus::new(4)))
+            .with_event_storage(Arc::clone(&storage));
+        let server = IpcServer::bind_with_cx(&cx, &path).await.unwrap();
+        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
+        let run_cx = cx.clone();
+        let server_task = task::spawn(async move {
+            server
+                .run_with_handler_context_with_cx(&run_cx, context, shutdown_rx)
+                .await;
+        });
+        let mut resumed = client
+            .subscribe_events_from_cursor_with_cx(
+                &cx,
+                Some(resume),
+                Some(7),
+                Some("critical".to_string()),
+                Some("codex.*".to_string()),
+                0,
+            )
+            .await
+            .unwrap();
+        let row = read_subscription_record(&cx, &mut resumed).await;
+        assert_eq!(row["type"], "event");
+        assert_eq!(row["id"], next_id);
+        assert_eq!(row["cursor_epoch"], epoch);
+        assert_eq!(row["matched_text"], "stored-71");
+        drop(resumed);
+        frankenterm_core::runtime_async::mpsc_send(&shutdown_tx, ())
+            .await
+            .unwrap();
+        frankenterm_core::runtime_async::timeout_with_cx(&cx, Duration::from_secs(2), server_task)
+            .await
+            .expect("resumed server shutdown deadline")
+            .expect("resumed server settles");
+        assert!(!path.exists());
+        storage.shutdown().await.unwrap();
+    });
+}
