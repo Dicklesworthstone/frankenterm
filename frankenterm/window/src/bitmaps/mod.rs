@@ -495,6 +495,174 @@ pub trait BitmapImage {
     }
 }
 
+/// A failure to prepare or allocate an RGBA resize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ImageResizeError {
+    #[error("image dimensions and buffer length must be non-zero and consistent")]
+    InvalidDimensions,
+    #[error("image resize geometry exceeds the addressable representation")]
+    ArithmeticOverflow,
+    #[error("image resize allocation failed")]
+    AllocationFailed,
+}
+
+impl From<resize::Error> for ImageResizeError {
+    fn from(error: resize::Error) -> Self {
+        match error {
+            resize::Error::OutOfMemory => Self::AllocationFailed,
+            resize::Error::InvalidParameters => Self::InvalidDimensions,
+        }
+    }
+}
+
+fn checked_image_byte_len(width: usize, height: usize) -> Result<usize, ImageResizeError> {
+    if width == 0 || height == 0 {
+        return Err(ImageResizeError::InvalidDimensions);
+    }
+    width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .filter(|&bytes| bytes <= isize::MAX as usize)
+        .ok_or(ImageResizeError::ArithmeticOverflow)
+}
+
+/// Validate every size used by resize 0.8.9 before borrowing pixels or
+/// allocating. Atlas reservations can prepare this alongside their geometry,
+/// and defer all pixel access until the entire request has been validated.
+#[derive(Debug, Clone, Copy)]
+struct ImageResizeGeometry {
+    source_width: usize,
+    source_height: usize,
+    width: usize,
+    height: usize,
+    source_bytes: usize,
+    target_bytes: usize,
+}
+
+impl ImageResizeGeometry {
+    fn new(
+        source_width: usize,
+        source_height: usize,
+        width: usize,
+        height: usize,
+    ) -> Result<Self, ImageResizeError> {
+        let source_bytes = checked_image_byte_len(source_width, source_height)?;
+        let target_bytes = checked_image_byte_len(width, height)?;
+
+        // The separable RGBA8 resampler holds width * source_height
+        // floating-point RGBA accumulators, independently of output area.
+        width
+            .checked_mul(source_height)
+            .and_then(|pixels| pixels.checked_mul(std::mem::size_of::<rgb::RGBA<f32>>()))
+            .filter(|&bytes| bytes <= isize::MAX as usize)
+            .ok_or(ImageResizeError::ArithmeticOverflow)?;
+
+        // resize's Rayon work partitioning also multiplies by max(height,
+        // width). A very wide, short image can overflow these products even
+        // when its source, destination and intermediate buffers all fit.
+        width
+            .checked_mul(source_height.max(width))
+            .ok_or(ImageResizeError::ArithmeticOverflow)?;
+        width
+            .checked_mul(height.max(width))
+            .ok_or(ImageResizeError::ArithmeticOverflow)?;
+
+        Ok(Self {
+            source_width,
+            source_height,
+            width,
+            height,
+            source_bytes,
+            target_bytes,
+        })
+    }
+
+    fn resize(self, source: &dyn BitmapImage) -> Result<Image, ImageResizeError> {
+        if source.image_dimensions() != (self.source_width, self.source_height) {
+            return Err(ImageResizeError::InvalidDimensions);
+        }
+        let source_data = source.pixel_data_slice();
+        if source_data.len() != self.source_bytes {
+            return Err(ImageResizeError::InvalidDimensions);
+        }
+
+        #[cfg(test)]
+        resize_allocation_checkpoint(ResizeAllocationStage::Target)?;
+        let mut data = Vec::new();
+        data.try_reserve_exact(self.target_bytes)
+            .map_err(|_| ImageResizeError::AllocationFailed)?;
+        data.resize(self.target_bytes, 0);
+
+        // Preserve the existing filter and independent RGBA8 channel/alpha
+        // behavior, including the equal-area Mitchell case.
+        let algo = if self.target_bytes < self.source_bytes {
+            resize::Type::Lanczos3
+        } else {
+            resize::Type::Mitchell
+        };
+        #[cfg(test)]
+        resize_allocation_checkpoint(ResizeAllocationStage::Coefficients)?;
+        let mut resizer = resize::new(
+            self.source_width,
+            self.source_height,
+            self.width,
+            self.height,
+            resize::Pixel::RGBA8,
+            algo,
+        )
+        .map_err(ImageResizeError::from)?;
+        #[cfg(test)]
+        resize_allocation_checkpoint(ResizeAllocationStage::Intermediate)?;
+        resizer
+            .resize(source_data.as_rgba(), data.as_rgba_mut())
+            .map_err(ImageResizeError::from)?;
+
+        Ok(Image {
+            data,
+            width: self.width,
+            height: self.height,
+        })
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResizeAllocationStage {
+    Target,
+    Coefficients,
+    Intermediate,
+}
+
+#[cfg(test)]
+thread_local! {
+    static RESIZE_ALLOCATION_FAILURE: std::cell::Cell<Option<ResizeAllocationStage>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn resize_allocation_checkpoint(stage: ResizeAllocationStage) -> Result<(), ImageResizeError> {
+    if RESIZE_ALLOCATION_FAILURE.with(|failure| failure.get() == Some(stage)) {
+        Err(resize::Error::OutOfMemory.into())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn with_resize_allocation_failure<T>(
+    stage: ResizeAllocationStage,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<ResizeAllocationStage>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            RESIZE_ALLOCATION_FAILURE.with(|failure| failure.set(self.0));
+        }
+    }
+    let _restore = Restore(RESIZE_ALLOCATION_FAILURE.with(|failure| failure.replace(Some(stage))));
+    run()
+}
+
 /// A bitmap in big endian bgra32 color format, with storage
 /// in a Vec<u8>.
 #[derive(Clone)]
@@ -590,32 +758,27 @@ impl Image {
         image
     }
 
+    /// Resize an immutable bitmap without copying it into an owned source
+    /// image. Only the target image and the resampler's working buffers are
+    /// allocated. Geometry errors and allocation failures reported by the
+    /// resampler are returned to the caller.
+    ///
+    /// The pinned resampler still uses infallible allocations for some filter
+    /// coefficients; this API cannot turn those process-level OOMs into errors.
+    pub fn try_resize_from(
+        source: &dyn BitmapImage,
+        width: usize,
+        height: usize,
+    ) -> Result<Image, ImageResizeError> {
+        let (source_width, source_height) = source.image_dimensions();
+        ImageResizeGeometry::new(source_width, source_height, width, height)?.resize(source)
+    }
+
     /// Creates a new image with the contents of the current image, but
     /// resized to the specified dimensions.
     pub fn resize(&self, width: usize, height: usize) -> Image {
-        let target_pixels = checked_pixel_count(width, height);
-        let source_pixels = checked_pixel_count(self.width, self.height);
-        let mut dest = Image::new(width, height);
-        let algo = if target_pixels < source_pixels {
-            resize::Type::Lanczos3
-        } else {
-            resize::Type::Mitchell
-        };
-        let mut resizer = resize::new(
-            self.width,
-            self.height,
-            width,
-            height,
-            resize::Pixel::RGBA8,
-            algo,
-        )
-        .expect("valid RGBA resize dimensions");
-        let source_data = self.data.as_rgba();
-        let dest_data = dest.data.as_rgba_mut();
-        resizer
-            .resize(source_data, dest_data)
-            .expect("valid RGBA resize buffers");
-        dest
+        Self::try_resize_from(self, width, height)
+            .expect("valid RGBA resize dimensions and buffers")
     }
 
     pub fn scale_by(&self, scale: f64) -> Image {
@@ -693,10 +856,86 @@ impl Texture2d for ImageTexture {
 }
 
 #[cfg(test)]
+mod resize_test_support {
+    use super::*;
+    use std::cell::Cell;
+
+    pub(super) struct ReadOnlyResizeBitmap {
+        pub(super) image: Image,
+        pub(super) reads: Cell<usize>,
+    }
+
+    impl ReadOnlyResizeBitmap {
+        pub(super) fn new(width: usize, height: usize) -> Self {
+            let mut image = Image::new(width, height);
+            for (index, pixel) in image.data.chunks_exact_mut(4).enumerate() {
+                pixel.copy_from_slice(&[
+                    (index * 17 + 3) as u8,
+                    (index * 29 + 5) as u8,
+                    (index * 43 + 7) as u8,
+                    [0, 1, 64, 128, 254, 255][index % 6],
+                ]);
+            }
+            Self {
+                image,
+                reads: Cell::new(0),
+            }
+        }
+    }
+
+    impl BitmapImage for ReadOnlyResizeBitmap {
+        unsafe fn pixel_data(&self) -> *const u8 {
+            self.reads.set(self.reads.get() + 1);
+            self.image.data.as_ptr()
+        }
+
+        unsafe fn pixel_data_mut(&mut self) -> *mut u8 {
+            panic!("resizing must never request mutable source pixels");
+        }
+
+        fn is_mutable(&self) -> bool {
+            false
+        }
+
+        fn image_dimensions(&self) -> (usize, usize) {
+            self.image.image_dimensions()
+        }
+    }
+
+    /// Independent oracle for the former copy-then-resize atlas path.
+    /// Do not call Image::resize here: it delegates to the implementation
+    /// under test.
+    pub(super) fn legacy_resize(source: &dyn BitmapImage, width: usize, height: usize) -> Image {
+        let (source_width, source_height) = source.image_dimensions();
+        let mut copied = Image::new(source_width, source_height);
+        copied.draw_image(Point::new(0, 0), None, source);
+        let mut dest = Image::new(width, height);
+        let algo = if width * height < source_width * source_height {
+            resize::Type::Lanczos3
+        } else {
+            resize::Type::Mitchell
+        };
+        resize::new(
+            source_width,
+            source_height,
+            width,
+            height,
+            resize::Pixel::RGBA8,
+            algo,
+        )
+        .expect("oracle dimensions")
+        .resize(copied.data.as_rgba(), dest.data.as_rgba_mut())
+        .expect("oracle buffers");
+        dest
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use super::resize_test_support::{legacy_resize, ReadOnlyResizeBitmap};
     use super::{
         unsupported_texture_readback_error, validate_texture_readback_request, BitmapImage, Image,
-        ImageTexture, Texture2d,
+        ImageResizeError, ImageTexture, Texture2d,
     };
     use crate::{Point, Rect, Size};
 
@@ -730,6 +969,95 @@ mod tests {
             }
         }
         image
+    }
+
+    #[test]
+    fn borrowed_resize_matches_legacy_pixels_and_preserves_readonly_sources() {
+        for (width, height) in [(1, 1), (1, 2), (3, 5), (7, 9), (17, 13)] {
+            let source = ReadOnlyResizeBitmap::new(width, height);
+            let original = source.image.pixel_data_slice().to_vec();
+            let mut targets = vec![(width, height), (height, width), (width * 2, height * 2)];
+            for factor in [2, 4, 8] {
+                targets.push(((width / factor).max(1), (height / factor).max(1)));
+            }
+            for (target_width, target_height) in targets {
+                let expected = legacy_resize(&source, target_width, target_height);
+                source.reads.set(0);
+                let actual = Image::try_resize_from(&source, target_width, target_height)
+                    .expect("borrowed resize");
+                assert_eq!(source.reads.get(), 1, "borrow one contiguous source slice");
+                assert_eq!(actual.image_dimensions(), (target_width, target_height));
+                assert_eq!(
+                    actual.pixel_data_slice(),
+                    expected.pixel_data_slice(),
+                    "{}x{} -> {}x{}",
+                    width,
+                    height,
+                    target_width,
+                    target_height
+                );
+                assert_eq!(source.image.pixel_data_slice(), original.as_slice());
+            }
+        }
+    }
+
+    #[test]
+    fn borrowed_resize_rejects_geometry_before_reading_pixels() {
+        struct GeometryOnlyBitmap(usize, usize);
+        impl BitmapImage for GeometryOnlyBitmap {
+            unsafe fn pixel_data(&self) -> *const u8 {
+                panic!("invalid resize geometry must be rejected before pixel access");
+            }
+
+            unsafe fn pixel_data_mut(&mut self) -> *mut u8 {
+                panic!("invalid resize geometry must be rejected before mutable pixel access");
+            }
+
+            fn is_mutable(&self) -> bool {
+                false
+            }
+
+            fn image_dimensions(&self) -> (usize, usize) {
+                (self.0, self.1)
+            }
+        }
+
+        // Individually addressable source/target images whose cross-axis
+        // intermediate buffer overflows; no giant fixture allocation needed.
+        let cross_axis = 1usize << (usize::BITS / 2 - 2);
+        // A short destination whose bytes fit, but width * width in Rayon's
+        // work partitioning does not.
+        let wide = 1usize << (usize::BITS / 2);
+        let fixtures = [
+            ((0, 1), (1, 1), ImageResizeError::InvalidDimensions),
+            ((1, 0), (1, 1), ImageResizeError::InvalidDimensions),
+            ((1, 1), (0, 1), ImageResizeError::InvalidDimensions),
+            ((1, 1), (1, 0), ImageResizeError::InvalidDimensions),
+            ((usize::MAX, 2), (1, 1), ImageResizeError::ArithmeticOverflow),
+            (
+                (isize::MAX as usize / 4 + 1, 1),
+                (1, 1),
+                ImageResizeError::ArithmeticOverflow,
+            ),
+            (
+                (1, 1),
+                (isize::MAX as usize / 4 + 1, 1),
+                ImageResizeError::ArithmeticOverflow,
+            ),
+            (
+                (1, cross_axis),
+                (cross_axis, 1),
+                ImageResizeError::ArithmeticOverflow,
+            ),
+            ((1, 1), (wide, 1), ImageResizeError::ArithmeticOverflow),
+        ];
+        for ((source_width, source_height), (width, height), expected) in fixtures {
+            let source = GeometryOnlyBitmap(source_width, source_height);
+            assert_eq!(
+                Image::try_resize_from(&source, width, height).unwrap_err(),
+                expected
+            );
+        }
     }
 
     #[test]

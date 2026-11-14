@@ -1,4 +1,7 @@
-use crate::bitmaps::{BitmapImage, Texture2d, TextureRect};
+use crate::bitmaps::{
+    checked_image_byte_len, BitmapImage, ImageResizeError, ImageResizeGeometry, Texture2d,
+    TextureRect,
+};
 use crate::{Point, Rect, Size};
 use anyhow::{ensure, Result as Fallible};
 // br-ft-kxopr: layering inversion fixed. Atlas bin-packing types now
@@ -30,8 +33,42 @@ pub enum AtlasAllocationFailure {
     ArithmeticOverflow,
     #[error("texture allocation exceeds the configured memory budget")]
     MemoryBudget,
+    #[error("image resampling allocation failed")]
+    ResampleAllocation,
     #[error("atlas modification version space is exhausted")]
     VersionExhausted,
+}
+
+impl From<ImageResizeError> for AtlasAllocationFailure {
+    fn from(error: ImageResizeError) -> Self {
+        match error {
+            ImageResizeError::InvalidDimensions => Self::InvalidDimensions,
+            ImageResizeError::ArithmeticOverflow => Self::ArithmeticOverflow,
+            ImageResizeError::AllocationFailed => Self::ResampleAllocation,
+        }
+    }
+}
+
+impl AtlasAllocationFailure {
+    fn metric_label(self) -> &'static str {
+        match self {
+            Self::Capacity => "capacity",
+            Self::InvalidDimensions => "invalid_dimensions",
+            Self::InvalidScaleFactor => "invalid_scale_factor",
+            Self::ArithmeticOverflow => "arithmetic_overflow",
+            Self::MemoryBudget => "memory_budget",
+            Self::ResampleAllocation => "resample_allocation",
+            Self::VersionExhausted => "version_exhausted",
+        }
+    }
+}
+
+struct PreparedAllocation {
+    glyph: GlyphSize,
+    visible_size: Size,
+    bounds: Atlas2DSize,
+    resize: Option<ImageResizeGeometry>,
+    next_version: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -157,178 +194,162 @@ impl Atlas {
         padding: Option<usize>,
         scale_down: Option<usize>,
     ) -> Result<Sprite, OutOfTextureSpace> {
-        let (width, height) = im.image_dimensions();
-
-        if width == 0 || height == 0 {
-            return Err(OutOfTextureSpace {
-                size: None,
-                current_size: self.side,
-                failure: AtlasAllocationFailure::InvalidDimensions,
-            });
+        let start = std::time::Instant::now();
+        let result = self.allocate_with_padding_impl(im, padding, scale_down);
+        // Includes preparation, target allocation and resampling, even on
+        // failure. The former recursive path only measured the final upload.
+        metrics::histogram!("window.atlas.allocate.latency").record(start.elapsed());
+        if let Err(error) = &result {
+            metrics::counter!(
+                "window.atlas.allocate.errors.total",
+                "failure" => error.failure.metric_label()
+            )
+            .increment(1);
         }
+        result
+    }
 
-        if let Some(scale_down) = scale_down {
-            if scale_down == 0 {
-                return Err(OutOfTextureSpace {
-                    size: None,
-                    current_size: self.side,
-                    failure: AtlasAllocationFailure::InvalidScaleFactor,
-                });
-            }
-            if scale_down == 1 {
-                return self.allocate_with_padding(im, padding, None);
-            }
-
-            width
-                .checked_mul(height)
-                .and_then(|pixels| pixels.checked_mul(4))
-                .filter(|&bytes| bytes <= isize::MAX as usize)
-                .ok_or(OutOfTextureSpace {
-                    size: None,
-                    current_size: self.side,
-                    failure: AtlasAllocationFailure::ArithmeticOverflow,
-                })?;
-
-            let mut copied = crate::Image::new(width, height);
-            copied.draw_image(Point::new(0, 0), None, im);
-
-            let scaled = copied.resize((width / scale_down).max(1), (height / scale_down).max(1));
-
-            return self.allocate_with_padding(&scaled, padding, None);
+    fn allocation_error(&self, failure: AtlasAllocationFailure) -> OutOfTextureSpace {
+        OutOfTextureSpace {
+            size: None,
+            current_size: self.side,
+            failure,
         }
+    }
 
-        // If we can't convert the sizes to i32, then we'll never
-        // be able to store this image
-        let reserve_width: i32 = width.try_into().map_err(|_| OutOfTextureSpace {
-            size: None,
-            current_size: self.side,
-            failure: AtlasAllocationFailure::InvalidDimensions,
-        })?;
-        let reserve_height: i32 = height.try_into().map_err(|_| OutOfTextureSpace {
-            size: None,
-            current_size: self.side,
-            failure: AtlasAllocationFailure::InvalidDimensions,
-        })?;
+    /// Prepare all fallible geometry and the mutation witness without
+    /// accessing pixels, allocating resize buffers or changing the packer.
+    fn prepare_allocation(
+        &self,
+        source_dimensions: (usize, usize),
+        padding: Option<usize>,
+        scale_down: Option<usize>,
+    ) -> Result<PreparedAllocation, OutOfTextureSpace> {
+        let (source_width, source_height) = source_dimensions;
+        checked_image_byte_len(source_width, source_height)
+            .map_err(|error| self.allocation_error(error.into()))?;
+        let factor = scale_down.unwrap_or(1);
+        if factor == 0 {
+            return Err(self.allocation_error(AtlasAllocationFailure::InvalidScaleFactor));
+        }
+        let width = (source_width / factor).max(1);
+        let height = (source_height / factor).max(1);
 
-        // We pad each sprite reservation with blank space to avoid
-        // surprising and unexpected artifacts when the texture is
-        // interpolated on to the render surface.
-        let extra_padding: i32 =
-            padding
-                .unwrap_or(0)
-                .try_into()
-                .map_err(|_| OutOfTextureSpace {
-                    size: None,
-                    current_size: self.side,
-                    failure: AtlasAllocationFailure::ArithmeticOverflow,
-                })?;
-        let interpolation_padding = PADDING.checked_mul(2).ok_or(OutOfTextureSpace {
-            size: None,
-            current_size: self.side,
-            failure: AtlasAllocationFailure::ArithmeticOverflow,
-        })?;
+        let invalid = || self.allocation_error(AtlasAllocationFailure::InvalidDimensions);
+        let overflow = || self.allocation_error(AtlasAllocationFailure::ArithmeticOverflow);
+        let reserve_width = i32::try_from(width).map_err(|_| invalid())?;
+        let reserve_height = i32::try_from(height).map_err(|_| invalid())?;
+
+        // Preserve the existing one-pixel interpolation border and optional
+        // extra reservation space on the right and bottom.
+        let extra_padding = i32::try_from(padding.unwrap_or(0)).map_err(|_| overflow())?;
+        let interpolation_padding = PADDING.checked_mul(2).ok_or_else(overflow)?;
         let reserve_width = reserve_width
             .checked_add(extra_padding)
             .and_then(|value| value.checked_add(interpolation_padding))
-            .ok_or(OutOfTextureSpace {
-                size: None,
-                current_size: self.side,
-                failure: AtlasAllocationFailure::ArithmeticOverflow,
-            })?;
+            .ok_or_else(overflow)?;
         let reserve_height = reserve_height
             .checked_add(extra_padding)
             .and_then(|value| value.checked_add(interpolation_padding))
-            .ok_or(OutOfTextureSpace {
-                size: None,
-                current_size: self.side,
-                failure: AtlasAllocationFailure::ArithmeticOverflow,
-            })?;
-
-        let start = std::time::Instant::now();
+            .ok_or_else(overflow)?;
         let glyph = GlyphSize::try_new(
-            reserve_width.try_into().map_err(|_| OutOfTextureSpace {
-                size: None,
-                current_size: self.side,
-                failure: AtlasAllocationFailure::ArithmeticOverflow,
-            })?,
-            reserve_height.try_into().map_err(|_| OutOfTextureSpace {
-                size: None,
-                current_size: self.side,
-                failure: AtlasAllocationFailure::ArithmeticOverflow,
-            })?,
+            u32::try_from(reserve_width).map_err(|_| overflow())?,
+            u32::try_from(reserve_height).map_err(|_| overflow())?,
         )
-        .ok_or(OutOfTextureSpace {
-            size: None,
-            current_size: self.side,
-            failure: AtlasAllocationFailure::InvalidDimensions,
-        })?;
+        .ok_or_else(invalid)?;
+        let visible_size = Size::new(
+            isize::try_from(width).map_err(|_| invalid())?,
+            isize::try_from(height).map_err(|_| invalid())?,
+        );
 
-        // Preflight the mutation witness before either the packer or texture is
-        // changed. Once the terminal version has been published, mutating while
-        // retaining that version would make stale sprites indistinguishable
-        // from current ones.
-        let next_version = self.next_version().ok_or(OutOfTextureSpace {
-            size: None,
-            current_size: self.side,
-            failure: AtlasAllocationFailure::VersionExhausted,
-        })?;
+        // A placed rectangle is contained in these bounds. Check the whole
+        // coordinate domain now, so converting its origin and adding the
+        // reserved border cannot fail after try_alloc has consumed a slot.
+        let bounds = self.allocator.size();
+        isize::try_from(bounds.width).map_err(|_| overflow())?;
+        isize::try_from(bounds.height).map_err(|_| overflow())?;
 
-        let res = if let AllocationOutcome::Placed(allocation) = self.allocator.try_alloc(glyph) {
-            let left = isize::try_from(allocation.x).map_err(|_| OutOfTextureSpace {
-                size: None,
-                current_size: self.side,
-                failure: AtlasAllocationFailure::ArithmeticOverflow,
-            })?;
-            let top = isize::try_from(allocation.y).map_err(|_| OutOfTextureSpace {
-                size: None,
-                current_size: self.side,
-                failure: AtlasAllocationFailure::ArithmeticOverflow,
-            })?;
-            let sprite_left = left
-                .checked_add(PADDING as isize)
-                .ok_or(OutOfTextureSpace {
-                    size: None,
-                    current_size: self.side,
-                    failure: AtlasAllocationFailure::ArithmeticOverflow,
-                })?;
-            let sprite_top = top.checked_add(PADDING as isize).ok_or(OutOfTextureSpace {
-                size: None,
-                current_size: self.side,
-                failure: AtlasAllocationFailure::ArithmeticOverflow,
-            })?;
-            let visible_width = isize::try_from(width).map_err(|_| OutOfTextureSpace {
-                size: None,
-                current_size: self.side,
-                failure: AtlasAllocationFailure::InvalidDimensions,
-            })?;
-            let visible_height = isize::try_from(height).map_err(|_| OutOfTextureSpace {
-                size: None,
-                current_size: self.side,
-                failure: AtlasAllocationFailure::InvalidDimensions,
-            })?;
+        let resize = if factor > 1 {
+            Some(
+                ImageResizeGeometry::new(source_width, source_height, width, height)
+                    .map_err(|error| self.allocation_error(error.into()))?,
+            )
+        } else {
+            None
+        };
+        let next_version = self
+            .next_version()
+            .ok_or_else(|| self.allocation_error(AtlasAllocationFailure::VersionExhausted))?;
+
+        Ok(PreparedAllocation {
+            glyph,
+            visible_size,
+            bounds,
+            resize,
+            next_version,
+        })
+    }
+
+    fn allocate_with_padding_impl(
+        &mut self,
+        im: &dyn BitmapImage,
+        padding: Option<usize>,
+        scale_down: Option<usize>,
+    ) -> Result<Sprite, OutOfTextureSpace> {
+        let prepared = self.prepare_allocation(im.image_dimensions(), padding, scale_down)?;
+        let scaled = if let Some(geometry) = prepared.resize {
+            let start = std::time::Instant::now();
+            let result = geometry.resize(im);
+            let outcome = match &result {
+                Ok(_) => "success",
+                Err(error) => AtlasAllocationFailure::from(*error).metric_label(),
+            };
+            metrics::histogram!("window.atlas.scale.latency", "result" => outcome)
+                .record(start.elapsed());
+            metrics::histogram!("window.atlas.scale.source_bytes")
+                .record(geometry.source_bytes as f64);
+            metrics::histogram!("window.atlas.scale.target_bytes")
+                .record(geometry.target_bytes as f64);
+            Some(result.map_err(|error| self.allocation_error(error.into()))?)
+        } else {
+            None
+        };
+        let image: &dyn BitmapImage = match &scaled {
+            Some(image) => image,
+            None => im,
+        };
+
+        if let AllocationOutcome::Placed(allocation) = self.allocator.try_alloc(prepared.glyph) {
+            debug_assert_eq!(allocation.width, prepared.glyph.width);
+            debug_assert_eq!(allocation.height, prepared.glyph.height);
+            debug_assert!(allocation.right() <= u64::from(prepared.bounds.width));
+            debug_assert!(allocation.bottom() <= u64::from(prepared.bounds.height));
+            // The checked bounds contain the entire padded reservation, so
+            // these casts and additions are infallible on 32- and 64-bit hosts.
             let rect = Rect::new(
-                Point::new(sprite_left, sprite_top),
-                Size::new(visible_width, visible_height),
+                Point::new(
+                    allocation.x as isize + PADDING as isize,
+                    allocation.y as isize + PADDING as isize,
+                ),
+                prepared.visible_size,
             );
 
-            self.texture.write(rect, im);
+            self.texture.write(rect, image);
             self.packing_stats.record_placed(allocation);
             self.record_packing_metrics();
 
-            // Bump after the texture write so readers that observe the
-            // post-bump version always see the sprite's bytes.
-            self.publish_version(next_version);
-
+            // Publish only after the upload is visible.
+            self.publish_version(prepared.next_version);
             metrics::histogram!("window.atlas.allocate.success.rate").record(1.);
             metrics::counter!("window.atlas.uploads.total").increment(1);
             Ok(Sprite {
                 texture: Rc::clone(&self.texture),
                 coords: rect,
-                version: next_version,
+                version: prepared.next_version,
             })
         } else {
-            // It's not possible to satisfy that request
-            let size = (reserve_width.max(reserve_height) as usize).next_power_of_two();
+            let size =
+                (prepared.glyph.width.max(prepared.glyph.height) as usize).next_power_of_two();
             self.packing_stats.record_reject();
             self.record_packing_metrics();
             metrics::histogram!("window.atlas.allocate.failure.rate").record(1.);
@@ -342,10 +363,7 @@ impl Atlas {
                 current_size: self.side,
                 failure: AtlasAllocationFailure::Capacity,
             })
-        };
-        metrics::histogram!("window.atlas.allocate.latency").record(start.elapsed());
-
-        res
+        }
     }
 
     pub fn size(&self) -> usize {
@@ -533,7 +551,10 @@ impl Sprite {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bitmaps::ImageTexture;
+    use crate::bitmaps::resize_test_support::{legacy_resize, ReadOnlyResizeBitmap};
+    use crate::bitmaps::{
+        with_resize_allocation_failure, ImageTexture, ResizeAllocationStage,
+    };
     use crate::Image;
     use guillotiere::{SimpleAtlasAllocator, Size as LegacyAtlasSize};
     use std::cell::Cell;
@@ -603,6 +624,48 @@ mod tests {
         Atlas::new(&texture).expect("atlas construction")
     }
 
+    fn atlas_with_packer(kind: PackerKind) -> Atlas {
+        let mut atlas = fresh_atlas(64);
+        atlas.allocator = make_packer(kind, Atlas2DSize::try_new(64, 64).unwrap());
+        atlas
+    }
+
+    fn texture_bytes(atlas: &Atlas) -> Vec<u8> {
+        let mut image = Image::new(atlas.side, atlas.side);
+        atlas
+            .texture
+            .read(
+                Rect::from_size(Size::new(atlas.side as isize, atlas.side as isize)),
+                &mut image,
+            )
+            .expect("texture snapshot");
+        image.into()
+    }
+
+    fn assert_failed_allocation_is_atomic(
+        atlas: &mut Atlas,
+        source: &dyn BitmapImage,
+        padding: Option<usize>,
+        scale_down: Option<usize>,
+        failure: AtlasAllocationFailure,
+    ) {
+        let placements = atlas.allocator.placements().to_vec();
+        let stats = atlas.packing_stats.clone();
+        let bytes = texture_bytes(atlas);
+        let version = atlas.version();
+        let error = atlas
+            .allocate_with_padding(source, padding, scale_down)
+            .expect_err("request must fail before placement or upload");
+
+        assert_eq!(error.failure, failure);
+        assert_eq!(error.size, None, "non-capacity errors must not request growth");
+        assert_eq!(error.current_size, atlas.side);
+        assert_eq!(atlas.allocator.placements(), placements.as_slice());
+        assert_eq!(atlas.packing_stats, stats);
+        assert_eq!(texture_bytes(atlas), bytes);
+        assert_eq!(atlas.version(), version);
+    }
+
     fn legacy_simple_atlas_coords(side: i32, images: &[(usize, usize)]) -> Vec<Rect> {
         let mut allocator = SimpleAtlasAllocator::new(LegacyAtlasSize::new(side, side));
         images
@@ -666,6 +729,250 @@ mod tests {
                     padded_other
                 );
             }
+        }
+    }
+
+    #[test]
+    fn scaled_readonly_uploads_match_legacy_pixels_for_every_packer() {
+        for kind in [
+            PackerKind::Shelf,
+            PackerKind::Skyline,
+            PackerKind::MaximalRectangles,
+        ] {
+            for (width, height) in [(1, 1), (1, 2), (3, 5), (7, 9), (17, 13)] {
+                let source = ReadOnlyResizeBitmap::new(width, height);
+                let original = source.image.pixel_data_slice().to_vec();
+                for factor in [1, 2, 4, 8] {
+                    let target_width = (width / factor).max(1);
+                    let target_height = (height / factor).max(1);
+                    let expected = if factor == 1 {
+                        source.image.clone()
+                    } else {
+                        legacy_resize(&source, target_width, target_height)
+                    };
+                    source.reads.set(0);
+                    let mut atlas = atlas_with_packer(kind);
+                    let result = if factor == 1 {
+                        // Some(1) must remain a direct upload without a
+                        // resampler or target-image allocation.
+                        with_resize_allocation_failure(ResizeAllocationStage::Target, || {
+                            atlas.allocate_with_padding(&source, Some(3), Some(factor))
+                        })
+                    } else {
+                        atlas.allocate_with_padding(&source, Some(3), Some(factor))
+                    };
+                    let sprite = result.expect("readonly upload");
+                    if factor > 1 {
+                        assert_eq!(source.reads.get(), 1, "borrow the source once");
+                    }
+                    assert_eq!(
+                        sprite.coords.size,
+                        Size::new(target_width as isize, target_height as isize)
+                    );
+                    assert_eq!(sprite.version(), 1);
+                    assert_eq!(atlas.version(), 1);
+                    let mut actual = Image::new(target_width, target_height);
+                    atlas
+                        .texture
+                        .read(sprite.coords, &mut actual)
+                        .expect("sprite readback");
+                    assert_eq!(
+                        actual.pixel_data_slice(),
+                        expected.pixel_data_slice(),
+                        "{:?}: {}x{}, factor {}",
+                        kind,
+                        width,
+                        height,
+                        factor
+                    );
+
+                    // Verify all reserved borders and untouched texels, not
+                    // just the visible sprite pixels.
+                    let mut expected_texture = Image::new(64, 64);
+                    expected_texture.draw_image(sprite.coords.origin, None, &expected);
+                    assert_eq!(
+                        texture_bytes(&atlas).as_slice(),
+                        expected_texture.pixel_data_slice()
+                    );
+                    assert_eq!(source.image.pixel_data_slice(), original.as_slice());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resize_allocation_failures_leave_all_atlas_state_unchanged() {
+        for kind in [
+            PackerKind::Shelf,
+            PackerKind::Skyline,
+            PackerKind::MaximalRectangles,
+        ] {
+            for stage in [
+                ResizeAllocationStage::Target,
+                ResizeAllocationStage::Coefficients,
+                ResizeAllocationStage::Intermediate,
+            ] {
+                let mut atlas = atlas_with_packer(kind);
+                let mut control = atlas_with_packer(kind);
+                let seed = cell(6, 4, 0x55);
+                atlas.allocate(&seed).expect("seed actual atlas");
+                control.allocate(&seed).expect("seed control atlas");
+                let source = ReadOnlyResizeBitmap::new(17, 13);
+                let original = source.image.pixel_data_slice().to_vec();
+
+                with_resize_allocation_failure(stage, || {
+                    assert_failed_allocation_is_atomic(
+                        &mut atlas,
+                        &source,
+                        Some(3),
+                        Some(2),
+                        AtlasAllocationFailure::ResampleAllocation,
+                    );
+                });
+                assert_eq!(source.image.pixel_data_slice(), original.as_slice());
+
+                // A retry must choose the same slot as an atlas that never
+                // saw the failed request, including packer-internal state.
+                let retry = atlas
+                    .allocate_with_padding(&source, Some(3), Some(2))
+                    .expect("retry after allocation failure");
+                let expected = control
+                    .allocate_with_padding(&source, Some(3), Some(2))
+                    .expect("control allocation");
+                assert_eq!(retry.coords, expected.coords, "{:?}: {:?}", kind, stage);
+                assert_eq!(retry.version(), expected.version());
+                assert_eq!(atlas.packing_stats, control.packing_stats);
+                assert_eq!(texture_bytes(&atlas), texture_bytes(&control));
+            }
+        }
+    }
+
+    #[test]
+    fn preparation_failures_precede_source_access_and_all_atlas_mutations() {
+        for kind in [
+            PackerKind::Shelf,
+            PackerKind::Skyline,
+            PackerKind::MaximalRectangles,
+        ] {
+            let mut atlas = atlas_with_packer(kind);
+            let mut control = atlas_with_packer(kind);
+            let seed = cell(6, 4, 0x55);
+            atlas.allocate(&seed).expect("seed actual atlas");
+            control.allocate(&seed).expect("seed control atlas");
+            let fixtures = [
+                ((0, 4), None, Some(2), AtlasAllocationFailure::InvalidDimensions),
+                (
+                    (usize::MAX, 2),
+                    None,
+                    Some(2),
+                    AtlasAllocationFailure::ArithmeticOverflow,
+                ),
+                (
+                    (isize::MAX as usize / 4 + 1, 1),
+                    None,
+                    Some(2),
+                    AtlasAllocationFailure::ArithmeticOverflow,
+                ),
+                (
+                    (17, 13),
+                    Some(usize::MAX),
+                    Some(2),
+                    AtlasAllocationFailure::ArithmeticOverflow,
+                ),
+                (
+                    (17, 13),
+                    Some(i32::MAX as usize),
+                    Some(2),
+                    AtlasAllocationFailure::ArithmeticOverflow,
+                ),
+                (
+                    (i32::MAX as usize, 1),
+                    None,
+                    None,
+                    AtlasAllocationFailure::ArithmeticOverflow,
+                ),
+                (
+                    (17, 13),
+                    None,
+                    Some(0),
+                    AtlasAllocationFailure::InvalidScaleFactor,
+                ),
+            ];
+            for ((width, height), padding, factor, failure) in fixtures {
+                let source = DimensionsOnlyBitmap {
+                    width,
+                    height,
+                    pixel_accessed: Cell::new(false),
+                };
+                assert_failed_allocation_is_atomic(&mut atlas, &source, padding, factor, failure);
+                assert!(!source.pixel_accessed.get());
+            }
+
+            let next = atlas.allocate(&seed).expect("allocate after geometry errors");
+            let expected = control.allocate(&seed).expect("control allocation");
+            assert_eq!(next.coords, expected.coords);
+            assert_eq!(next.version(), expected.version());
+
+            atlas.version.store(u64::MAX, Ordering::Release);
+            let source = DimensionsOnlyBitmap {
+                width: 17,
+                height: 13,
+                pixel_accessed: Cell::new(false),
+            };
+            assert_failed_allocation_is_atomic(
+                &mut atlas,
+                &source,
+                None,
+                Some(2),
+                AtlasAllocationFailure::VersionExhausted,
+            );
+            assert!(!source.pixel_accessed.get());
+        }
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn unrepresentable_packer_bounds_fail_before_placement_on_32_bit_hosts() {
+        let side = isize::MAX as usize + 1;
+        for kind in [
+            PackerKind::Shelf,
+            PackerKind::Skyline,
+            PackerKind::MaximalRectangles,
+        ] {
+            // Build a metadata-only boundary fixture without allocating a
+            // texture whose bytes cannot be represented on this host.
+            let texture = Rc::new(DimensionsOnlyBitmap {
+                width: side,
+                height: side,
+                pixel_accessed: Cell::new(false),
+            });
+            let mut atlas = Atlas {
+                texture: texture.clone(),
+                allocator: make_packer(
+                    kind,
+                    Atlas2DSize::try_new(side as u32, side as u32).unwrap(),
+                ),
+                packing_stats: PackingStats::default(),
+                side,
+                version: AtomicU64::new(0),
+            };
+            let source = DimensionsOnlyBitmap {
+                width: 17,
+                height: 13,
+                pixel_accessed: Cell::new(false),
+            };
+            let stats = atlas.packing_stats.clone();
+            let error = atlas
+                .allocate_with_padding(&source, None, Some(2))
+                .expect_err("unrepresentable coordinate bounds");
+
+            assert_eq!(error.failure, AtlasAllocationFailure::ArithmeticOverflow);
+            assert_eq!(error.size, None);
+            assert!(atlas.allocator.placements().is_empty());
+            assert_eq!(atlas.packing_stats, stats);
+            assert_eq!(atlas.version(), 0);
+            assert!(!texture.pixel_accessed.get());
+            assert!(!source.pixel_accessed.get());
         }
     }
 
