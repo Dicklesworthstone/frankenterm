@@ -1619,10 +1619,7 @@ mod tests {
             );
             resumed.acknowledge(second).unwrap();
             assert_eq!(resumed.cursor().unwrap().after_id, second);
-            assert_eq!(
-                resumed.acknowledged_page_cursor().unwrap().after_id,
-                second
-            );
+            assert_eq!(resumed.acknowledged_page_cursor().unwrap().after_id, second);
             assert!(matches!(
                 resumed.acknowledge(first),
                 Err(DurableStreamError::InvalidAcknowledgement)
