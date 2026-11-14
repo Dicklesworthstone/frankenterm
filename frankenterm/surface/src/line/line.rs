@@ -197,6 +197,245 @@ pub struct Line {
     appdata: Mutex<Option<Weak<dyn Any + Send + Sync>>>,
 }
 
+/// The line representation in authenticated semantic scrollback schemas 1–4.
+///
+/// Those formats store cell text separately from the authoritative width
+/// sidecar. Keep their decoder independent of `Cell`'s live wire format: an
+/// older saved row must never derive geometry from the reader's Unicode
+/// policy, nor be mistaken for a current cell-bearing mux frame.
+#[cfg(feature = "use_serde")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyCellTextLine {
+    cells: LegacyCellTextStorage,
+    zones: Vec<ZoneRange>,
+    seqno: SequenceNo,
+    bits: LineBits,
+}
+
+#[cfg(feature = "use_serde")]
+#[derive(Deserialize)]
+enum LegacyCellTextStorage {
+    V(LegacyCellTextVec),
+    C(Arc<ClusteredLine>),
+}
+
+#[cfg(feature = "use_serde")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyCellTextVec {
+    cells: Vec<LegacyCellText>,
+}
+
+#[cfg(feature = "use_serde")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyCellText {
+    #[serde(deserialize_with = "deserialize_legacy_cell_text")]
+    text: zeroize::Zeroizing<String>,
+    attrs: CellAttributes,
+}
+
+#[cfg(feature = "use_serde")]
+fn deserialize_legacy_cell_text<'de, D>(
+    deserializer: D,
+) -> Result<zeroize::Zeroizing<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Guard ownership before any later field or sidecar can fail validation.
+    String::deserialize(deserializer).map(zeroize::Zeroizing::new)
+}
+
+#[cfg(feature = "use_serde")]
+impl LegacyCellTextLine {
+    /// Project a saved line using its authenticated width sidecar. The caller
+    /// must still validate the enclosing schema, decoded budget and image
+    /// sidecars. Clustered rows already encode their widths in their runs.
+    pub fn into_line_with_widths(self, widths: &[u8]) -> Result<Line, &'static str> {
+        if widths.iter().any(|width| !matches!(width, 1 | 2)) {
+            return Err("invalid legacy semantic scrollback cell width");
+        }
+        let cells = match self.cells {
+            LegacyCellTextStorage::V(legacy) => {
+                if legacy.cells.len() != widths.len() {
+                    return Err("legacy semantic scrollback width sidecar length mismatch");
+                }
+                if legacy
+                    .cells
+                    .iter()
+                    .any(|cell| kept_cell_text(&cell.text) != cell.text.as_str())
+                {
+                    return Err("invalid legacy semantic scrollback cell text");
+                }
+                // Reserve once: moving an inline Cell out of a reallocating
+                // buffer would leave old terminal text in freed allocations.
+                let mut cells = Vec::with_capacity(legacy.cells.len());
+                for (cell, width) in legacy.cells.into_iter().zip(widths) {
+                    let restored = Cell::new_grapheme_with_width(
+                        &cell.text,
+                        usize::from(*width),
+                        cell.attrs,
+                    );
+                    if restored.str() != cell.text.as_str() {
+                        return Err("legacy semantic scrollback cell text is not exact");
+                    }
+                    cells.push(restored);
+                }
+                CellStorage::V(VecStorage::new(cells))
+            }
+            LegacyCellTextStorage::C(clustered) => CellStorage::C(clustered),
+        };
+        Ok(Line {
+            cells,
+            zones: self.zones,
+            seqno: self.seqno,
+            bits: self.bits,
+            #[cfg(feature = "appdata")]
+            appdata: Mutex::new(None),
+        })
+    }
+}
+
+#[cfg(feature = "use_serde")]
+impl Line {
+    /// Serialize the explicitly versioned semantic-scrollback representation.
+    /// Only use this with schemas 1–4 and their exact width sidecar. Ordinary
+    /// `Line` serialization uses the current, width-bearing `Cell` schema.
+    pub fn serialize_legacy_cell_text<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[derive(Serialize)]
+        struct LegacyLineRef<'a> {
+            cells: LegacyStorageRef<'a>,
+            zones: &'a [ZoneRange],
+            seqno: SequenceNo,
+            bits: LineBits,
+        }
+        #[derive(Serialize)]
+        enum LegacyStorageRef<'a> {
+            V(LegacyVecRef<'a>),
+            C(&'a ClusteredLine),
+        }
+        #[derive(Serialize)]
+        struct LegacyVecRef<'a> {
+            cells: LegacyCellsRef<'a>,
+        }
+        struct LegacyCellsRef<'a>(&'a VecStorage);
+        impl Serialize for LegacyCellsRef<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeSeq;
+                #[derive(Serialize)]
+                struct LegacyCellRef<'a> {
+                    text: &'a str,
+                    attrs: &'a CellAttributes,
+                }
+                let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+                for cell in self.0.iter() {
+                    sequence.serialize_element(&LegacyCellRef {
+                        text: cell.str(),
+                        attrs: cell.attrs(),
+                    })?;
+                }
+                sequence.end()
+            }
+        }
+        let cells = match &self.cells {
+            CellStorage::V(cells) => LegacyStorageRef::V(LegacyVecRef {
+                cells: LegacyCellsRef(cells),
+            }),
+            CellStorage::C(cells) => LegacyStorageRef::C(cells),
+        };
+        LegacyLineRef {
+            cells,
+            zones: &self.zones,
+            seqno: self.seqno,
+            bits: self.bits,
+        }
+        .serialize(serializer)
+    }
+}
+
+#[cfg(all(test, feature = "use_serde"))]
+mod legacy_persisted_line_tests {
+    use super::*;
+
+    fn encoded(line: &Line) -> serde_json::Value {
+        struct PinnedLine<'a>(&'a Line);
+        impl Serialize for PinnedLine<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                self.0.serialize_legacy_cell_text(serializer)
+            }
+        }
+        serde_json::to_value(PinnedLine(line)).unwrap()
+    }
+
+    #[test]
+    fn legacy_sidecar_restores_exact_widths_and_hidden_spacer_attributes() {
+        let mut spacer = CellAttributes::blank();
+        spacer.set_italic(true);
+        let mut line = Line::from_cells(
+            vec![
+                Cell::new_grapheme_with_width("abcdefgh", 1, CellAttributes::blank()),
+                Cell::new_grapheme_with_width("x", 2, CellAttributes::blank()),
+                Cell::blank_with_attrs(spacer),
+            ],
+            17,
+        );
+        line.zones = vec![ZoneRange {
+            semantic_type: SemanticType::Output,
+            range: 0..3,
+        }];
+        line.bits = LineBits::DOUBLE_WIDTH | LineBits::BIDI_ENABLED;
+        let saved = encoded(&line);
+        assert_eq!(saved["cells"]["V"]["cells"][0]["text"], "abcdefgh");
+        assert_eq!(saved["cells"]["V"]["cells"].as_array().unwrap().len(), 3);
+        let legacy: LegacyCellTextLine = serde_json::from_value(saved.clone()).unwrap();
+        let mut restored = legacy.into_line_with_widths(&[1, 2, 1]).unwrap();
+        assert_eq!(restored.cells_mut()[0].width(), 1);
+        assert_eq!(restored.cells_mut()[1].width(), 2);
+        assert!(restored.cells_mut()[2].attrs().italic());
+        assert_eq!(restored.seqno, 17);
+        assert_eq!(restored.zones, line.zones);
+        assert_eq!(restored.bits, line.bits);
+        assert_eq!(encoded(&restored), saved);
+    }
+
+    #[test]
+    fn legacy_projection_refuses_missing_invalid_widths_and_rewritten_text() {
+        let line = Line::from_text("x", &CellAttributes::blank(), 1, None);
+        for widths in [&[][..], &[0][..], &[3][..], &[1, 1][..]] {
+            let legacy: LegacyCellTextLine = serde_json::from_value(encoded(&line)).unwrap();
+            assert!(legacy.into_line_with_widths(widths).is_err());
+        }
+        for text in ["", "\r\n", "\u{1b}", "A\0B"] {
+            let mut saved = encoded(&line);
+            saved["cells"]["V"]["cells"][0]["text"] = text.into();
+            let legacy: LegacyCellTextLine = serde_json::from_value(saved).unwrap();
+            assert!(legacy.into_line_with_widths(&[1]).is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_clustered_rows_keep_their_encoded_geometry_without_a_sidecar() {
+        let mut line = Line::from_text("a界z", &CellAttributes::blank(), 9, None);
+        line.compress_for_scrollback();
+        assert!(line.has_clustered_storage());
+        let saved = encoded(&line);
+        let legacy: LegacyCellTextLine = serde_json::from_value(saved.clone()).unwrap();
+        let restored = legacy.into_line_with_widths(&[]).unwrap();
+        assert!(restored.has_clustered_storage());
+        assert_eq!(encoded(&restored), saved);
+        assert_eq!(restored.len(), 4);
+        let geometry = restored
+            .visible_cells()
+            .map(|cell| (cell.cell_index(), cell.width()))
+            .collect::<Vec<_>>();
+        assert_eq!(geometry, vec![(0, 1), (1, 2), (3, 1)]);
+    }
+}
+
 impl core::fmt::Debug for Line {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Line")

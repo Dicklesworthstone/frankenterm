@@ -15157,12 +15157,39 @@ fn compact_scrollback_decoded_charge(
     (count == semantic.cell_widths.len()).then_some(charge)
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
 #[serde(deny_unknown_fields)]
 struct ExactSemanticScrollbackLineV1 {
     schema: u32,
+    #[serde(serialize_with = "wezterm_term::Line::serialize_legacy_cell_text")]
     line: wezterm_term::Line,
     cell_widths: Vec<u8>,
+}
+
+/// Decode the historical, authenticated representation explicitly. Its cell
+/// strings have no width until the sidecar has been validated; current `Cell`
+/// serde must not interpret these bytes using the reader's Unicode defaults.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacySemanticScrollbackLineV1 {
+    schema: u32,
+    line: termwiz::surface::line::LegacyCellTextLine,
+    cell_widths: Vec<u8>,
+}
+
+impl<'de> Deserialize<'de> for ExactSemanticScrollbackLineV1 {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let saved = LegacySemanticScrollbackLineV1::deserialize(deserializer)?;
+        let line = saved
+            .line
+            .into_line_with_widths(&saved.cell_widths)
+            .map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            schema: saved.schema,
+            line,
+            cell_widths: saved.cell_widths,
+        })
+    }
 }
 
 /// Schema 4's sidecar, after its `ExactSemanticScrollbackLineV1`: the image
@@ -15371,6 +15398,7 @@ fn attach_exact_scrollback_row_images(
 #[derive(Serialize)]
 struct ExactSemanticScrollbackLineRef<'a> {
     schema: u32,
+    #[serde(serialize_with = "wezterm_term::Line::serialize_legacy_cell_text")]
     line: &'a wezterm_term::Line,
     cell_widths: &'a [u8],
 }
