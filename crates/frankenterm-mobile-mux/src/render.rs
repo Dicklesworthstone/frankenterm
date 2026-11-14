@@ -307,7 +307,7 @@ pub fn continue_onto(out: &mut String, next: Option<&Line>) {
 /// wraps by itself where a row stopped early for it.
 pub fn carry_on(out: &mut String, next: Option<&Line>) {
     match first_cell(next).filter(|cell| cell.width() > 1) {
-        Some(cell) => out.push_str(cell.str()),
+        Some(cell) => out.extend(drawable(cell.str())),
         None => out.push(' '),
     }
 }
@@ -456,6 +456,26 @@ mod tests {
     fn control_characters_are_drawn_as_replacements() {
         let text: String = drawable("a\u{1b}[2J\u{7}b\u{9b}c\u{85}é").collect();
         assert_eq!(text, "a\u{fffd}[2J\u{fffd}b\u{fffd}c\u{fffd}é");
+    }
+
+    #[test]
+    fn a_wide_wrap_continuation_cannot_execute_embedded_controls() {
+        // Width-bearing cells can arrive from an untrusted mux peer. The
+        // carry character goes through the parser before its row is painted.
+        let mut line = Line::with_width(0, 0);
+        line.set_cell(
+            0,
+            Cell::new_grapheme_with_width(
+                "界\x1b]2;injected\x07\u{9b}2J",
+                2,
+                CellAttributes::default(),
+            ),
+            0,
+        );
+        let mut out = String::new();
+        carry_on(&mut out, Some(&line));
+        assert_eq!(out, "界\u{fffd}]2;injected\u{fffd}\u{fffd}2J");
+        assert!(!out.chars().any(is_control));
     }
 
     #[test]

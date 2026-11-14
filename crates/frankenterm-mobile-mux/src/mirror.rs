@@ -394,6 +394,9 @@ impl PaneMirror {
             });
         if self.visible {
             let viewport = target.viewport();
+            let retained = self.retained_rows(&target);
+            let retain_row =
+                |row: &StableRowIndex| retained.iter().any(|range| range.contains(row));
             if let Some(previous) = self.target.clone() {
                 if previous.alt != target.alt || !previous.dims.same_line_layout(&target.dims) {
                     self.epoch = self
@@ -414,6 +417,13 @@ impl PaneMirror {
                         .retain(|row, _| *row < unsettled || viewport.contains(row));
                 }
             }
+            // A slow row read or repeated metadata contention can hold up
+            // rendering while ordinary output continues scrolling. Keep the
+            // final rows of the shown screen and the bounded catch-up horizon,
+            // not every row that passed through an earlier viewport.
+            self.lines.retain(|row, _| retain_row(row));
+            self.absent.retain(retain_row);
+            self.dirty.retain(|row| viewport.contains(row));
             let dirty = match lines {
                 Some(_) => head.dirty_lines,
                 None => vec![viewport.clone()],
@@ -427,7 +437,12 @@ impl PaneMirror {
             }
             for (row, line) in lines.map(LineEntries::linked_lines).unwrap_or_default() {
                 self.invalidate_fetched_rows(row..row.saturating_add(1));
-                self.dirty.insert(row);
+                if !retain_row(&row) {
+                    continue;
+                }
+                if viewport.contains(&row) {
+                    self.dirty.insert(row);
+                }
                 self.absent.remove(&row);
                 self.lines.insert(row, line);
             }
@@ -445,10 +460,17 @@ impl PaneMirror {
             self.fetch_invalidated.clear();
             return;
         }
+        let retained = self
+            .target
+            .as_ref()
+            .map(|target| self.retained_rows(target))
+            .unwrap_or([0..0, 0..0]);
+        let retain_row = |row: &StableRowIndex| retained.iter().any(|range| range.contains(row));
         let mut returned = BTreeSet::new();
         for (row, line) in entries.linked_lines() {
             if self.fetch_invalidated.contains(&row)
                 || !requested.iter().any(|range| range.contains(&row))
+                || !retain_row(&row)
             {
                 continue;
             }
@@ -458,7 +480,8 @@ impl PaneMirror {
         }
         for range in requested {
             self.absent.extend(range.clone().filter(|row| {
-                !returned.contains(row)
+                retain_row(row)
+                    && !returned.contains(row)
                     && !self.fetch_invalidated.contains(row)
                     && !self.lines.contains_key(row)
             }));
@@ -552,6 +575,31 @@ impl PaneMirror {
                     all: returning,
                 }
             }
+        }
+    }
+
+    /// Rows that may contribute to the next publication. The second range
+    /// preserves the old shown screen until its final rows have scrolled out;
+    /// intermediate output beyond the phone's history budget is not retained.
+    /// Two fixed ranges avoid an allocation on every pushed update.
+    fn retained_rows(&self, target: &Target) -> [Range<StableRowIndex>; 2] {
+        let viewport = target.viewport();
+        match self.plan(target) {
+            Plan::Stream { from } => [from..viewport.end, 0..0],
+            Plan::Scroll {
+                old_top, entering, ..
+            } => {
+                let from = if entering == offset(old_top, target.rows()) {
+                    entering.saturating_sub(1)
+                } else {
+                    entering
+                };
+                [
+                    from.min(viewport.start)..viewport.end,
+                    old_top..viewport.start.min(offset(old_top, target.rows())),
+                ]
+            }
+            Plan::Full | Plan::Dirty => [viewport, 0..0],
         }
     }
 
@@ -847,5 +895,137 @@ impl PaneMirror {
             },
         });
         outputs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use termwiz::cell::{Cell, CellAttributes};
+    use termwiz::surface::CursorShape;
+
+    fn head(top: StableRowIndex) -> RenderHead {
+        RenderHead {
+            pane_id: 1,
+            mouse_grabbed: false,
+            alt_screen_active: false,
+            cursor_position: CursorPosition {
+                x: 0,
+                y: top + 1,
+                shape: CursorShape::Default,
+                visibility: CursorVisibility::Visible,
+            },
+            dimensions: Dimensions {
+                cols: 32,
+                viewport_rows: 2,
+                scrollback_rows: usize::try_from(top + 2).unwrap(),
+                physical_top: top,
+                scrollback_top: 0,
+                dpi: 96,
+                pixel_width: 320,
+                pixel_height: 40,
+                reverse_video: false,
+            },
+            tiered_scrollback_status: None,
+            dirty_lines: std::iter::once(top + 1..top + 2).collect(),
+            title: "busy pane".to_owned(),
+            working_dir: None,
+        }
+    }
+
+    fn entries(rows: impl IntoIterator<Item = StableRowIndex>) -> LineEntries {
+        let mut entries = LineEntries::default();
+        entries.lines = rows
+            .into_iter()
+            .map(|row| {
+                let mut line = Line::with_width(0, 0);
+                for (column, ch) in format!("row-{row}").chars().enumerate() {
+                    line.set_cell(column, Cell::new(ch, CellAttributes::default()), 0);
+                }
+                (row, line)
+            })
+            .collect();
+        entries
+    }
+
+    #[test]
+    fn scrolling_during_an_unanswered_initial_read_keeps_only_mobile_history() {
+        for late_row_exists in [false, true] {
+            let mut mirror = PaneMirror::new(true);
+            mirror.apply_changes(head(0), Some(entries([1]))).unwrap();
+            let requested = mirror.wanted();
+            assert_eq!(requested, vec![0..1]);
+            mirror.set_fetching(&requested);
+            for top in 1..=1024 {
+                mirror
+                    .apply_changes(head(top), Some(entries([top + 1])))
+                    .unwrap();
+                assert!(mirror.lines.len() <= PHONE_HISTORY_ROWS + 2);
+                assert!(mirror.dirty.len() <= 2);
+            }
+            // The original read remains valid for its old coordinates, but
+            // neither its late row nor its absence belongs to this horizon.
+            let reply = if late_row_exists {
+                entries([0])
+            } else {
+                LineEntries::default()
+            };
+            mirror.apply_lines(reply, &requested);
+            assert!(!mirror.lines.contains_key(&0));
+            assert!(mirror.absent.is_empty());
+            assert!(mirror.wanted().is_empty());
+            let outputs = mirror.render();
+            let final_output = outputs.last().expect("latest screen can be published");
+            assert!(final_output.complete);
+            assert!(String::from_utf8_lossy(&final_output.bytes).contains("row-1025"));
+        }
+    }
+
+    #[test]
+    fn stalled_scroll_catch_up_preserves_the_shown_screen_and_latest_history() {
+        let mut mirror = PaneMirror::new(true);
+        mirror
+            .apply_changes(head(0), Some(entries([0, 1])))
+            .unwrap();
+        assert!(!mirror.render().is_empty());
+        mirror.apply_changes(head(1), Some(entries([2]))).unwrap();
+        let requested = mirror.wanted();
+        assert_eq!(requested, vec![0..2]);
+        mirror.set_fetching(&requested);
+        for top in 2..=1024 {
+            mirror
+                .apply_changes(head(top), Some(entries([top + 1])))
+                .unwrap();
+            assert!(mirror.lines.len() <= PHONE_HISTORY_ROWS + 4);
+            assert!(mirror.dirty.len() <= 2);
+        }
+        // These are the final rows of the screen the phone still shows;
+        // pruning only against the latest viewport would discard them.
+        mirror.apply_lines(entries([0, 1]), &requested);
+        assert!(mirror.lines.contains_key(&0));
+        assert!(mirror.lines.contains_key(&1));
+        assert!(!mirror.lines.contains_key(&2));
+        assert!(mirror.wanted().is_empty());
+        let outputs = mirror.render();
+        let final_output = outputs.last().expect("scroll catch-up can be published");
+        assert!(final_output.complete);
+        let painted = String::from_utf8_lossy(&final_output.bytes);
+        assert!(painted.contains("row-0"));
+        assert!(painted.contains("row-1"));
+        assert!(painted.contains("row-1025"));
+        assert!(mirror.lines.is_empty());
+        assert!(mirror.dirty.is_empty());
+    }
+
+    #[test]
+    fn pushed_bonus_rows_outside_the_render_horizon_are_not_retained() {
+        let mut mirror = PaneMirror::new(true);
+        mirror
+            .apply_changes(head(0), Some(entries([-10, 0, 1, 2, 100_000])))
+            .unwrap();
+        assert_eq!(mirror.lines.len(), 2);
+        assert_eq!(mirror.dirty, BTreeSet::from([0, 1]));
+        assert!(mirror.wanted().is_empty());
+        assert!(!mirror.render().is_empty());
     }
 }
