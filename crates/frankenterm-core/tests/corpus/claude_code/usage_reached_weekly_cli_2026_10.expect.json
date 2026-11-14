@@ -6,7 +6,7 @@
     "severity": "critical",
     "confidence": 0.95,
     "extracted": {
-      "reset_time": "9am"
+      "reset_time": "Oct 12, 9am"
     },
     "matched_text": "resets Oct 12, 9am"
   }

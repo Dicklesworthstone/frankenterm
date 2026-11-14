@@ -3759,7 +3759,7 @@ fn builtin_claude_code_pack() -> PatternPack {
                     "Approaching Sonnet limit".to_string(),
                 ],
                 regex: Some(
-                    r"(?P<remaining>\d+)%?\s*(?:remaining|left|of limit)|used (?P<used_percent>\d+)% of your (?P<limit>\w+) limit|Approaching (?P<approaching>session|weekly|Opus|Sonnet) limit".to_string(),
+                    r"(?P<remaining>\d+)%?\s*(?:remaining|left|of limit)|used (?P<used_percent>\d+)% of your (?P<limit>[\w-]+) limit|Approaching (?P<approaching>session|weekly|Opus|Sonnet) limit".to_string(),
                 ),
                 description: "Claude Code usage warning".to_string(),
                 remediation: Some("Consider saving work soon".to_string()),
@@ -3787,9 +3787,26 @@ fn builtin_claude_code_pack() -> PatternPack {
                     "You've hit your weekly limit".to_string(),
                     "You've hit your Opus limit".to_string(),
                     "You've hit your Sonnet limit".to_string(),
+                    // Claude Code 2.1.312+: "You've hit your 5-hour limit ·
+                    // resets 7:40pm (America/New_York)".
+                    "You've hit your 5-hour limit".to_string(),
+                    // Model limits, which name no reset ("You've reached your
+                    // Fable 5 limit. Run /usage-credits to continue or switch
+                    // models with /model."), and exhausted credits. The
+                    // capitalized model name keeps Codex's "You've reached
+                    // your usage limit" out.
+                    "You've reached your Fable".to_string(),
+                    "You've reached your Opus".to_string(),
+                    "You've reached your Sonnet".to_string(),
+                    "You've reached your Haiku".to_string(),
+                    "You're out of usage credits".to_string(),
                 ],
+                // A weekly reset names its day ("resets Nov 12 at 2pm
+                // (America/New_York)", "resets Oct 12, 9am"); reset_time keeps
+                // the date so the limit-window ledger does not read it as the
+                // next 2pm.
                 regex: Some(
-                    r"(?:retry|reset(?:s)?|try again).*?(?P<reset_time>\d+\s*(?:seconds?|minutes?|hours?)|[\d:]+\s*(?:AM|PM|UTC)|\d+(?::\d+)?\s*(?:am|pm|AM|PM)(?:\s*\([^)]+\))?)".to_string()
+                    r"(?:retry|reset(?:s)?|try again).*?(?P<reset_time>[A-Z][a-z]{2} \d{1,2}(?:,| at) \d{1,2}(?::\d{2})?\s*(?:am|pm|AM|PM)(?:\s*\([^)]+\))?|\d+\s*(?:seconds?|minutes?|hours?)|[\d:]+\s*(?:AM|PM|UTC)|\d+(?::\d+)?\s*(?:am|pm|AM|PM)(?:\s*\([^)]+\))?)|You've reached your (?P<limit>[A-Z]\w*(?: \d+(?:\.\d+)?)?) limit|You're out of usage credits".to_string()
                 ),
                 description: "Claude Code usage limit reached".to_string(),
                 remediation: Some("Wait for limit reset or switch session".to_string()),
@@ -8498,6 +8515,81 @@ rules:
             Some("2pm (America/New_York)")
         );
         assert_eq!(d.severity, Severity::Critical);
+    }
+
+    #[test]
+    fn claude_code_usage_reached_follows_real_limit_messages() {
+        // Limit messages copied from Claude Code 2.1.x sessions. A weekly
+        // reset keeps its day: cut to "2pm", the limit-window ledger read it
+        // as the next 2pm, up to six days early.
+        let engine = PatternEngine::new();
+        let cases = [
+            (
+                "You've hit your session limit · resets 10:10pm (America/New_York)",
+                "reset_time",
+                "10:10pm (America/New_York)",
+            ),
+            (
+                "You've hit your 5-hour limit · resets 7:40pm (America/New_York)",
+                "reset_time",
+                "7:40pm (America/New_York)",
+            ),
+            (
+                "You've hit your weekly limit · resets 6am (America/New_York)",
+                "reset_time",
+                "6am (America/New_York)",
+            ),
+            (
+                "You've hit your weekly limit · resets Nov 12 at 2pm (America/New_York)",
+                "reset_time",
+                "Nov 12 at 2pm (America/New_York)",
+            ),
+            (
+                "You've hit your weekly limit · resets Nov 9, 8pm (America/New_York)",
+                "reset_time",
+                "Nov 9, 8pm (America/New_York)",
+            ),
+            (
+                "You've reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model.",
+                "limit",
+                "Fable 5",
+            ),
+            (
+                "You've reached your Fable limit. Switch to another model, or manage usage credits at https://claude.ai/settings/usage?from=cc_cli_limit_message, to continue.",
+                "limit",
+                "Fable",
+            ),
+        ];
+        for (text, key, value) in cases {
+            let detections = engine.detect(text);
+            let detection = detections
+                .iter()
+                .find(|d| d.rule_id == "claude_code.usage.reached")
+                .unwrap_or_else(|| panic!("no claude_code.usage.reached for {text:?}"));
+            assert_eq!(
+                detection.extracted.get(key).and_then(|v| v.as_str()),
+                Some(value),
+                "{text:?}"
+            );
+        }
+
+        let credits = "You're out of usage credits. Run /usage-credits to keep using Fable 5 or /model to switch models.";
+        assert!(
+            engine
+                .detect(credits)
+                .iter()
+                .any(|d| d.rule_id == "claude_code.usage.reached"),
+            "out-of-credits message must reach the limit workflow"
+        );
+
+        // Codex's message is Codex's alone.
+        let codex = "You've reached your usage limit. Please try again at 2026-02-15 08:00 UTC.";
+        let rule_ids: Vec<_> = engine
+            .detect(codex)
+            .into_iter()
+            .map(|d| d.rule_id)
+            .collect();
+        assert_eq!(rule_ids, vec!["codex.usage.reached".to_string()]);
     }
 
     #[test]

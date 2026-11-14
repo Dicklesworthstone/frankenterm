@@ -889,6 +889,15 @@ fn parse_reset_deadline_ms(text: &str, detected_at_ms: i64) -> Option<(&'static 
 
 fn parse_time_of_day_reset_ms(text: &str, detected_at_ms: i64) -> Option<i64> {
     let parsed = ParsedResetTimeOfDay::parse(text)?;
+    if let Some((month, day)) = parsed.month_day {
+        return parse_month_day_reset_ms(
+            parsed.zone.as_deref(),
+            month,
+            day,
+            &parsed.time_text,
+            detected_at_ms,
+        );
+    }
     match parsed.zone.as_deref() {
         Some("UTC" | "Etc/UTC" | "Z") => {
             parse_utc_time_of_day_reset_ms(&parsed.time_text, detected_at_ms)
@@ -901,9 +910,82 @@ fn parse_time_of_day_reset_ms(text: &str, detected_at_ms: i64) -> Option<i64> {
     }
 }
 
+/// Claude Code's weekly limit names its reset day but no year: "resets Nov
+/// 12 at 2pm (America/New_York)". Resolve it to the matching instant nearest
+/// the detection. A weekly reset lies days ahead; a message still on screen
+/// after its reset lies just behind, so it reads as expired instead of a
+/// year away.
+fn parse_month_day_reset_ms(
+    zone: Option<&str>,
+    month: u32,
+    day: u32,
+    time_text: &str,
+    detected_at_ms: i64,
+) -> Option<i64> {
+    let time = parse_naive_time_of_day(time_text)?;
+    let year = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(detected_at_ms)?.year();
+    (year - 1..=year + 1)
+        .filter_map(|year| chrono::NaiveDate::from_ymd_opt(year, month, day))
+        .filter_map(|date| match zone {
+            Some("UTC" | "Etc/UTC" | "Z") => Some(
+                chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                    date.and_time(time),
+                    chrono::Utc,
+                )
+                .timestamp_millis(),
+            ),
+            Some("America/New_York" | "US/Eastern" | "EST" | "EDT") => {
+                Some(new_york_local_datetime_ms(date, time))
+            }
+            Some(_) => None,
+            None => chrono::Local
+                .from_local_datetime(&date.and_time(time))
+                .earliest()
+                .map(|at| at.timestamp_millis()),
+        })
+        .min_by_key(|candidate| candidate.abs_diff(detected_at_ms))
+}
+
+/// Split a leading "Nov 12 at " or "Oct 12, " off a reset time.
+fn split_reset_month_day(text: &str) -> Option<(u32, u32, &str)> {
+    let (month_text, rest) = text.split_once(' ')?;
+    let month = match month_text.to_ascii_lowercase().as_str() {
+        "jan" => 1,
+        "feb" => 2,
+        "mar" => 3,
+        "apr" => 4,
+        "may" => 5,
+        "jun" => 6,
+        "jul" => 7,
+        "aug" => 8,
+        "sep" => 9,
+        "oct" => 10,
+        "nov" => 11,
+        "dec" => 12,
+        _ => return None,
+    };
+    let rest = rest.trim_start();
+    let digits = rest
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(rest.len());
+    if !(1..=2).contains(&digits) {
+        return None;
+    }
+    let day = rest[..digits].parse::<u32>().ok()?;
+    if !(1..=31).contains(&day) {
+        return None;
+    }
+    let rest = rest[digits..].trim_start();
+    let rest = rest
+        .strip_prefix(',')
+        .or_else(|| rest.strip_prefix("at "))?;
+    Some((month, day, rest.trim_start()))
+}
+
 struct ParsedResetTimeOfDay {
     time_text: String,
     zone: Option<String>,
+    month_day: Option<(u32, u32)>,
 }
 
 impl ParsedResetTimeOfDay {
@@ -932,7 +1014,18 @@ impl ParsedResetTimeOfDay {
             value = value.trim().to_string();
         }
 
-        normalize_time_of_day_text(&value).map(|time_text| Self { time_text, zone })
+        let mut month_day = None;
+        if let Some((month, day, rest)) = split_reset_month_day(&value) {
+            let rest = rest.to_string();
+            month_day = Some((month, day));
+            value = rest;
+        }
+
+        normalize_time_of_day_text(&value).map(|time_text| Self {
+            time_text,
+            zone,
+            month_day,
+        })
     }
 }
 
@@ -2444,6 +2537,100 @@ mod tests {
                     .timestamp_millis()
             )
         );
+    }
+
+    fn utc_ms(rfc3339: &str) -> i64 {
+        chrono::DateTime::parse_from_rfc3339(rfc3339)
+            .expect("valid timestamp")
+            .timestamp_millis()
+    }
+
+    fn reset_at_for(reset_time: &str, detected_at: &str) -> LimitWindowReset {
+        let trigger = serde_json::json!({
+            "event_type": "usage.reached",
+            "extracted": {"reset_time": reset_time}
+        });
+        limit_window_reset_from_trigger(&trigger, utc_ms(detected_at))
+    }
+
+    #[test]
+    fn limit_window_reset_keeps_weekly_reset_date() {
+        // Claude Code's weekly limit, seen on a Sunday: the reset is
+        // Thursday, not the next 2pm.
+        let reset = reset_at_for("Nov 12 at 2pm (America/New_York)", "2026-11-08T16:00:00Z");
+        assert_eq!(reset.reset_source, "absolute");
+        assert_eq!(reset.reset_at, Some(utc_ms("2026-11-12T19:00:00Z")));
+        assert_eq!(reset.conservative_ttl_ms, 0);
+
+        // Daylight time still applies to an October reset.
+        let reset = reset_at_for("Oct 12, 9am (America/New_York)", "2026-10-07T12:00:00Z");
+        assert_eq!(reset.reset_at, Some(utc_ms("2026-10-12T13:00:00Z")));
+
+        let reset = reset_at_for("Nov 12 at 2pm (UTC)", "2026-11-08T16:00:00Z");
+        assert_eq!(reset.reset_at, Some(utc_ms("2026-11-12T14:00:00Z")));
+    }
+
+    #[test]
+    fn limit_window_reset_dates_cross_the_year_and_expire() {
+        // A January reset seen in late December is next year's.
+        let reset = reset_at_for("Jan 2 at 9am (America/New_York)", "2026-12-30T12:00:00Z");
+        assert_eq!(reset.reset_at, Some(utc_ms("2027-01-02T14:00:00Z")));
+
+        // A message still on screen after its reset reads as expired, not
+        // as next year's reset.
+        let reset = reset_at_for("Nov 12 at 2pm (America/New_York)", "2026-11-14T12:00:00Z");
+        assert_eq!(reset.reset_at, Some(utc_ms("2026-11-12T19:00:00Z")));
+    }
+
+    #[test]
+    fn limit_window_reset_dated_local_time_uses_local_zone() {
+        use chrono::TimeZone as _;
+
+        // The October fixture names no zone; its wall clock is local.
+        let reset = reset_at_for("Oct 12, 9am", "2026-10-07T12:00:00Z");
+        let expected = chrono::Local
+            .from_local_datetime(
+                &chrono::NaiveDate::from_ymd_opt(2026, 10, 12)
+                    .expect("valid date")
+                    .and_hms_opt(9, 0, 0)
+                    .expect("valid time"),
+            )
+            .earliest()
+            .expect("unambiguous local time")
+            .timestamp_millis();
+        assert_eq!(reset.reset_source, "absolute");
+        assert_eq!(reset.reset_at, Some(expected));
+    }
+
+    #[test]
+    fn limit_window_reset_dated_unknown_zone_degrades() {
+        let reset = reset_at_for("Nov 12 at 2pm (Europe/Paris)", "2026-11-08T16:00:00Z");
+        assert_eq!(reset.reset_source, "unknown_ttl");
+        assert!(reset.reset_at.is_none());
+    }
+
+    #[test]
+    fn split_reset_month_day_takes_only_a_leading_date() {
+        assert_eq!(
+            split_reset_month_day("Nov 12 at 2pm"),
+            Some((11, 12, "2pm"))
+        );
+        assert_eq!(split_reset_month_day("Oct 12, 9am"), Some((10, 12, "9am")));
+        assert_eq!(
+            split_reset_month_day("sep 3, 4:30 PM"),
+            Some((9, 3, "4:30 PM"))
+        );
+        for text in [
+            "2pm",
+            "10:30 AM",
+            "Nov 12 2pm",
+            "Nov 32 at 2pm",
+            "Nov 123 at 2pm",
+            "Now 12, 9am",
+            "Oct 15th, 2026 9:00 AM",
+        ] {
+            assert_eq!(split_reset_month_day(text), None, "{text:?}");
+        }
     }
 
     #[test]

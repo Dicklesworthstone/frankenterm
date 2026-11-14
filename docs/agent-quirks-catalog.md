@@ -52,6 +52,8 @@ Recommended future work:
 | Compaction token format | `claude_code.compaction` | Expects numeric `[\d,]+` tokens; abbreviated "12.3K" won't match | `compaction_v2`, `compaction_v3` |
 | "Thinking" anchor generic | `claude_code.thinking` | "Thinking" is common English; FP risk in verbose logs | `thinking_near_miss`, `thinking_near_miss_v2` |
 | API failures framed as "API Error: <message>" | `claude_code.error.network`, `.timeout`, `.overloaded` | Claude Code 2.1.201..2.1.322 session logs: "Connection lost mid-response", "Connection refused — ... (ECONNREFUSED)", "Can't reach the API server — ... (ENOTFOUND)", "No response from API (waited 3m, ...)", "The response stopped arriving", "529 Overloaded". The TUI shows the same text under a `⎿` gutter. | `network_error`, `network_error_v2`, `timeout_error`, `timeout_error_v2`, `overloaded`, `overloaded_v2` |
+| Limit messages change wording | `claude_code.usage.reached`, `.usage.warning` | 2.1.312 renamed the session limit "5-hour limit". A weekly reset names its day ("resets Nov 12 at 2pm (America/New_York)", "resets Oct 12, 9am"), so `reset_time` keeps the date. Model limits ("You've reached your Fable 5 limit") and "You're out of usage credits" name no reset. | `usage_reached_5hour_cli_2026_11`, `usage_reached_weekly_date_cli_2026_11`, `usage_reached_model_cli_2026_11`, `usage_reached_model_v2_cli_2026_11`, `usage_reached_credits_cli_2026_11`, `usage_warning_5hour_cli_2026_11` |
+
 ## Gemini Quirks
 
 | Symptom | Rule Affected | Detail | Fixture |
@@ -77,11 +79,12 @@ Recommended future work:
 | 2026-01-30 | Corpus audit | `wezterm.mux.connection_lost` | Documented FP on "SSH connection lost" | `connection_lost_fp_ssh.txt` |
 | 2026-01-30 | Corpus audit | `claude_code.thinking` | Added second near-miss (natural language "thinking") | `thinking_near_miss_v2.txt` |
 | 2026-11-14 | Live fleet scan + Claude Code session logs | `claude_code.error.network`, `.timeout`, `.overloaded` | Require the "API Error: " framing. Before: 0 of 9 real API errors detected, 7 of 7 prose samples fired. Synthetic positive fixtures replaced with real text; their old text now must not match. | `error_rules_fp_prose.txt`, `overloaded_fp_rate_limit.txt` |
+| 2026-11-14 | Claude Code session logs | `claude_code.usage.reached`, `.usage.warning` | Match the 5-hour, model and credit limit messages, which matched no rule, and keep a weekly reset's day. Before, "resets Nov 12 at 2pm" was read as the next 2pm, up to six days early. | `usage_reached_*_cli_2026_11.txt`, `usage_warning_5hour_cli_2026_11.txt` |
 
 ## Coverage Summary
 
-- 30 rules across 4 packs
-- 98 corpus fixtures (up from 88)
+- 37 rules across 5 packs
+- 154 corpus fixtures
 - All 3 agents have quirks documented
 - 3 confirmed false positives cataloged with fixtures; 2 of them (the
   Claude Code error rules) fixed 2026-11-14
