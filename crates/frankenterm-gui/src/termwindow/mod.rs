@@ -705,6 +705,11 @@ impl RetainedMuxRefresh {
     }
 
     fn record(&self, notification: &MuxNotification, window_id: MuxWindowId) -> bool {
+        if title_alert_for_another_window(&self.owner, window_id, notification) {
+            // Neither a title refresh nor a wake: that pane's own window
+            // refreshes its tab bar.
+            return !self.wake.is_disconnected();
+        }
         if let MuxNotification::PaneOutput(pane_id) = notification {
             if self.metal.wake_for(*pane_id) {
                 // The render thread draws this pane and is awake now: no
@@ -1907,6 +1912,43 @@ fn prefilter_gui_alert_notification(
         Some((_, current_window, _)) if current_window != window_id => Some(true),
         _ => None,
     }
+}
+
+/// Whether `notification` is a pane's title, cwd, progress or unseen-output
+/// alert, from a pane that the mux places in another window.
+///
+/// Such an alert cannot change this window's title or tab bar:
+/// `update_title_impl` reads only this window's tabs and their panes. Agents
+/// animate their titles several times a second, so without this every GUI
+/// window recomputed its tab bar for every agent pane in every window.
+/// Unknown membership (an overlay, a pane mid-move, a removed pane) keeps the
+/// refresh. A pane that moves here later refreshes this window through the
+/// topology notification of the move.
+fn title_alert_for_another_window(
+    owner: &Weak<Mux>,
+    window_id: MuxWindowId,
+    notification: &MuxNotification,
+) -> bool {
+    let MuxNotification::Alert { pane_id, alert } = notification else {
+        return false;
+    };
+    if !matches!(
+        alert,
+        Alert::OutputSinceFocusLost
+            | Alert::CurrentWorkingDirectoryChanged
+            | Alert::WindowTitleChanged(_)
+            | Alert::TabTitleChanged(_)
+            | Alert::IconTitleChanged(_)
+            | Alert::Progress(_)
+    ) {
+        return false;
+    }
+    let Some(owner) = owner.upgrade() else {
+        return false;
+    };
+    owner
+        .resolve_pane_id(*pane_id)
+        .is_some_and(|(_, pane_window, _)| pane_window != window_id)
 }
 
 /// Fold telemetry before attempting any GUI admission. `None` means the
@@ -14367,6 +14409,86 @@ mod tests {
                 .iter()
                 .all(|slot| !slot.load(std::sync::atomic::Ordering::Acquire))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn title_alerts_from_another_windows_pane_take_no_title_refresh() {
+        use super::{Alert, Progress};
+        if run_scheduler_test_in_child(
+            "title_alerts_from_another_windows_pane_take_no_title_refresh",
+        ) {
+            return;
+        }
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Mutex};
+        let owner = Arc::new(mux::Mux::new(None));
+        mux::Mux::set_mux(&owner);
+        let _activity = mux::activity::Activity::new_for_mux(&owner);
+        let left = owner.new_empty_window(None, None);
+        let right = owner.new_empty_window(None, None);
+        let mut children = Vec::new();
+        for (pane_id, window_id, durable) in
+            [(998_411, *left, [0x51; 16]), (998_412, *right, [0x52; 16])]
+        {
+            let size = wezterm_term::TerminalSize::default();
+            let child = new_gui_test_pane(pane_id, durable);
+            let pane = Arc::clone(&child.0);
+            children.push(child);
+            let tab = Arc::new(mux::tab::Tab::new(&size));
+            tab.assign_pane(&pane);
+            owner.add_tab_and_active_pane(&tab).unwrap();
+            owner.add_tab_to_window(&tab, window_id).unwrap();
+        }
+        let target = *left;
+        let title = Arc::new(Mutex::new(None));
+        let (wake, woken) = flume::bounded(1);
+        let retained = super::RetainedMuxRefresh {
+            output: Arc::new(super::PendingMuxOutput::new()),
+            reconciliation: Arc::new(AtomicBool::new(false)),
+            geometry: Arc::new(Mutex::new(super::PendingMuxGeometry::default())),
+            owner: Arc::downgrade(&owner),
+            title_pending: Arc::new(AtomicBool::new(false)),
+            title: Arc::clone(&title),
+            wake,
+            metal: Arc::default(),
+        };
+        let title_alerts = || {
+            [
+                Alert::OutputSinceFocusLost,
+                Alert::CurrentWorkingDirectoryChanged,
+                Alert::WindowTitleChanged("agent working".to_owned()),
+                Alert::TabTitleChanged(Some("tab".to_owned())),
+                Alert::IconTitleChanged(Some("icon".to_owned())),
+                Alert::Progress(Progress::Indeterminate),
+            ]
+        };
+        // A pane of the other window: no title refresh and no wake here.
+        for alert in title_alerts() {
+            let notification = mux::MuxNotification::Alert {
+                pane_id: 998_412,
+                alert,
+            };
+            assert!(super::RetainedMuxRefresh::handles(&notification, target));
+            assert!(retained.record(&notification, target));
+            assert!(title.lock().unwrap().is_none(), "{notification:?}");
+            assert!(woken.try_recv().is_err(), "{notification:?}");
+        }
+        // This window's own pane, and a pane the mux cannot place (an overlay,
+        // or a pane mid-move), still refresh this window's title.
+        for pane_id in [998_411, 998_499] {
+            for alert in title_alerts() {
+                let notification = mux::MuxNotification::Alert { pane_id, alert };
+                assert!(retained.record(&notification, target));
+                let ticket = title.lock().unwrap().take();
+                assert!(ticket.is_some(), "{notification:?}");
+                drop(ticket);
+                assert!(woken.try_recv().is_ok(), "{notification:?}");
+            }
+        }
+        drop(retained);
+        drop(children);
+        mux::Mux::shutdown();
     }
 
     #[test]
