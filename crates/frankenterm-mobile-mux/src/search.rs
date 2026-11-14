@@ -457,6 +457,8 @@ mod tests {
     }
 
     #[test]
+    // rows() returns the row ranges to fetch; one whole range is the answer.
+    #[allow(clippy::single_range_in_vec_init)]
     fn extreme_row_coordinates_never_overflow_line_requests_or_match_text() {
         let maximum = StableRowIndex::MAX;
         let malformed = [

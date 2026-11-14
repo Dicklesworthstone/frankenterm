@@ -7189,7 +7189,7 @@ rules:
             &mut fast_context,
             Some(DetectionZone::Output),
         );
-        let (traced, traces) = engine.detect_with_context_and_trace_in_zone(
+        let (traced_in_zone, traces) = engine.detect_with_context_and_trace_in_zone(
             "ERROR 42",
             &mut trace_context,
             &opts,
@@ -7198,7 +7198,7 @@ rules:
         assert_eq!(fast[0].span, (7, 15));
         assert_eq!(
             serde_json::to_value(fast).unwrap(),
-            serde_json::to_value(traced).unwrap()
+            serde_json::to_value(traced_in_zone).unwrap()
         );
         assert!(
             traces[0]
