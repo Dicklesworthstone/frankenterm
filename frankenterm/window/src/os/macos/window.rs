@@ -223,12 +223,13 @@ impl BackendImpl {
 mod tests {
     use super::{
         backing_dimensions_from_rect, caret_needs_announcing, covered_windows,
-        normalize_backing_dimension, nswindow_level_to_window_level, retitle,
-        window_level_to_nswindow_level, CoverFacts,
+        normalize_backing_dimension, nswindow_level_to_window_level, retitle, title_apply_delay,
+        window_level_to_nswindow_level, CoverFacts, HIDDEN_TITLE_INTERVAL,
     };
     use crate::{Point, Rect, Size};
     use cocoa::foundation::{NSPoint, NSRect, NSSize};
     use config::window::WindowLevel;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn every_nswindow_level_maps_to_a_window_level() {
@@ -266,6 +267,37 @@ mod tests {
         assert!(retitle(&mut current, ""));
         assert!(!retitle(&mut current, ""));
         assert_eq!(current, "");
+    }
+
+    #[test]
+    fn a_hidden_title_bar_is_retitled_at_most_once_per_interval() {
+        let start = Instant::now();
+        let ms = Duration::from_millis;
+        // A title bar that shows the title is retitled at once, however
+        // recently it was retitled before.
+        assert_eq!(title_apply_delay(true, Some(start), start), None);
+        assert_eq!(title_apply_delay(true, Some(start), start + ms(10)), None);
+        // Hidden: a window not retitled yet takes its title at once.
+        assert_eq!(title_apply_delay(false, None, start), None);
+        // A spinner frame 300 ms after the last retitle waits out the rest
+        // of the interval; the newest title is applied then.
+        assert_eq!(
+            title_apply_delay(false, Some(start), start + ms(300)),
+            Some(HIDDEN_TITLE_INTERVAL - ms(300))
+        );
+        assert_eq!(
+            title_apply_delay(false, Some(start), start + ms(999)),
+            Some(ms(1))
+        );
+        // Once the interval has passed it applies at once.
+        assert_eq!(
+            title_apply_delay(false, Some(start), start + HIDDEN_TITLE_INTERVAL),
+            None
+        );
+        assert_eq!(
+            title_apply_delay(false, Some(start), start + ms(2500)),
+            None
+        );
     }
 
     #[test]
@@ -663,6 +695,38 @@ pub(crate) struct WindowInner {
     /// The title this window was last given: the creation name, then each
     /// `set_title`. Nothing else retitles the NSWindow.
     title: String,
+    /// The title AppKit holds and when `apply_title` gave it. Behind a
+    /// hidden title bar `title` can run ahead of it for up to
+    /// `HIDDEN_TITLE_INTERVAL`.
+    applied_title: String,
+    title_applied_at: Option<Instant>,
+    /// A deferred `apply_title` is scheduled for this window.
+    title_apply_scheduled: bool,
+    window_id: usize,
+}
+
+/// How often a window whose title bar is hidden is retitled at most (B20).
+/// AppKit lays out the whole title bar on every `setTitle:` (about 4 ms on
+/// the main thread), hidden or not, and an agent's spinner in a pane title
+/// changes the window title several times a second. Behind a hidden title
+/// bar only the Window menu, Mission Control and accessibility read it.
+const HIDDEN_TITLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long a new title waits before AppKit gets it: not at all when the
+/// title bar shows it or when the window has not been retitled within
+/// `HIDDEN_TITLE_INTERVAL`, else the rest of that interval. The newest title
+/// is the one applied when the wait ends.
+fn title_apply_delay(
+    shown: bool,
+    applied_at: Option<Instant>,
+    now: Instant,
+) -> Option<std::time::Duration> {
+    if shown {
+        return None;
+    }
+    let next = applied_at?.checked_add(HIDDEN_TITLE_INTERVAL)?;
+    let wait = next.saturating_duration_since(now);
+    (!wait.is_zero()).then_some(wait)
 }
 
 /// Records `title` as `current` and returns whether that changed it. Every
@@ -973,6 +1037,10 @@ impl Window {
                 view,
                 config: config.clone(),
                 title: name.to_owned(),
+                applied_title: name.to_owned(),
+                title_applied_at: None,
+                title_apply_scheduled: false,
+                window_id,
             }));
             {
                 let mut inner = inner.borrow_mut();
@@ -1658,10 +1726,64 @@ impl WindowInner {
         if !retitle(&mut self.title, title) {
             return;
         }
-        let title = nsstring(title);
+        self.apply_title();
+    }
+
+    /// Gives AppKit the newest title: at once when the title bar shows it,
+    /// else at most once per `HIDDEN_TITLE_INTERVAL` (`title_apply_delay`).
+    fn apply_title(&mut self) {
+        if self.applied_title == self.title {
+            return;
+        }
+        let now = Instant::now();
+        let shown = self
+            .config
+            .window_decorations
+            .contains(WindowDecorations::TITLE);
+        if let Some(wait) = title_apply_delay(shown, self.title_applied_at, now) {
+            if self.schedule_title_apply(wait) {
+                return;
+            }
+        }
+        let title = nsstring(&self.title);
         unsafe {
             NSWindow::setTitle_(*self.window, *title);
         }
+        self.applied_title.clone_from(&self.title);
+        self.title_applied_at = Some(now);
+    }
+
+    /// Runs `apply_title` again after `wait`, once per window. Returns false
+    /// when the main thread refuses the timer, so the caller applies now
+    /// rather than leave the title behind.
+    fn schedule_title_apply(&mut self, wait: std::time::Duration) -> bool {
+        if self.title_apply_scheduled {
+            return true;
+        }
+        let Ok(reservation) = crate::reserve_window_main_thread(
+            promise::spawn::MainThreadServiceClass::Render,
+            4 * 1024,
+            "macOS hidden title",
+        ) else {
+            return false;
+        };
+        self.title_apply_scheduled = true;
+        let window_id = self.window_id;
+        reservation
+            .spawn_local(async move {
+                promise::spawn::sleep(wait).await;
+                let Some(conn) = Connection::get() else {
+                    return;
+                };
+                let Some(handle) = conn.window_by_id(window_id) else {
+                    return;
+                };
+                let mut inner = handle.borrow_mut();
+                inner.title_apply_scheduled = false;
+                inner.apply_title();
+            })
+            .detach();
+        true
     }
 
     fn set_window_level(&mut self, level: WindowLevel) {
@@ -1780,6 +1902,8 @@ impl WindowInner {
         self.update_window_background_blur();
         self.update_titlebar_background();
         self.apply_decorations();
+        // A title bar that now shows its title shows the newest one.
+        self.apply_title();
         // Its opacity decides whether it covers the windows behind it.
         schedule_window_cover_refresh();
     }
