@@ -51,6 +51,7 @@ use wezterm_input_types::{
     ScreenPoint, WindowDecorations,
 };
 
+use super::keyboard::KeyboardTranslation;
 use crate::wayland::WaylandConnection;
 use crate::x11::{KeyboardWithFallback, WaylandRepeatSeed};
 use crate::{
@@ -304,7 +305,7 @@ async fn run_key_repeat(
                 };
                 let translation = {
                     let state = conn.wayland_state.borrow();
-                    let Some(mapper) = state.keyboard_mapper.as_ref() else {
+                    let Some(mapper) = state.keyboard_translation.mapper() else {
                         log::debug!(
                             "Stopping Wayland key repeat for window {window_id}: keyboard mapper unavailable"
                         );
@@ -1049,6 +1050,18 @@ pub struct WaylandWindowInner {
 impl WaylandWindowInner {
     pub(super) fn cancel_key_repeat(&mut self) {
         self.key_repeat.take();
+    }
+
+    pub(super) fn retire_keyboard_mapping(&mut self) {
+        self.cancel_key_repeat();
+        self.modifiers = Modifiers::NONE;
+        self.leds = KeyboardLedStatus::empty();
+        self.events.dispatch(WindowEvent::AdviseModifiersLedStatus(
+            self.modifiers,
+            self.leds,
+        ));
+        self.events
+            .dispatch(WindowEvent::AdviseDeadKeyStatus(crate::DeadKeyStatus::None));
     }
 
     fn replace_key_repeat(
@@ -1915,6 +1928,13 @@ impl WaylandWindowInner {
                     self.events
                         .dispatch(WindowEvent::AdviseModifiersLedStatus(modifiers, leds));
                 }
+            } else if !self.modifiers.is_empty() || !self.leds.is_empty() {
+                self.modifiers = Modifiers::NONE;
+                self.leds = KeyboardLedStatus::empty();
+                self.events.dispatch(WindowEvent::AdviseModifiersLedStatus(
+                    self.modifiers,
+                    self.leds,
+                ));
             }
         } else {
             // Clear state on focus loss so a chord that caused a focus change
@@ -1946,7 +1966,7 @@ impl WaylandWindowInner {
 
     pub(super) fn keyboard_event(
         &mut self,
-        mapper: Option<&mut KeyboardWithFallback>,
+        translation: &mut KeyboardTranslation,
         event: WlKeyboardEvent,
         window_id: usize,
         key_repeat_rate: i32,
@@ -1954,6 +1974,11 @@ impl WaylandWindowInner {
     ) {
         match &event {
             WlKeyboardEvent::Enter { keys, .. } => {
+                if let KeyboardTranslation::RawNoKeymap(raw) = translation {
+                    raw.enter(keys);
+                    self.emit_focus(None, true);
+                    return;
+                }
                 let key_codes = keys
                     .as_chunks::<4>()
                     .0
@@ -1961,21 +1986,29 @@ impl WaylandWindowInner {
                     .map(|chunk| u32::from_ne_bytes(*chunk))
                     .collect::<Vec<_>>();
                 log::trace!("keyboard event: Enter with keys: {:?}", key_codes);
-                self.emit_focus(mapper, true);
+                self.emit_focus(translation.mapper_mut(), true);
                 return;
             }
             WlKeyboardEvent::Leave { .. } => {
-                self.emit_focus(mapper, false);
+                translation.clear_raw_focus();
+                self.emit_focus(translation.mapper_mut(), false);
                 return;
             }
             _ => {}
         }
 
-        let Some(mapper) = mapper else {
-            log::debug!(
-                "Ignoring Wayland keyboard event before keymap initialization: {:?}",
-                event
-            );
+        if let KeyboardTranslation::RawNoKeymap(raw) = translation {
+            // NoKeymap gives no repeatability metadata. Only the compositor's
+            // explicit Repeated events can repeat a raw binding; no XKB seed,
+            // client timer, translated KeyEvent or compose state is reused.
+            self.cancel_key_repeat();
+            if let WlKeyboardEvent::Key { key, state, .. } = event {
+                raw.dispatch_key(key, state, &mut self.events);
+            }
+            return;
+        }
+
+        let Some(mapper) = translation.mapper_mut() else {
             return;
         };
         match event {
@@ -2481,10 +2514,12 @@ mod tests {
         key_repeat_first_due, key_repeat_timer_plan, key_repeat_timing, key_repeat_window_event,
         new_pending_first_configure, read_pipe_with_timeout, resolve_pending_first_configure,
         validate_resize_increments, CompositorRepeatTransition, KeyRepeatAbort, KeyRepeatTimerPlan,
+        WaylandWindow,
     };
+    use crate::wayland::keyboard::{KeyboardTranslation, RawKeyboardState};
     use crate::{
-        Handled, KeyCode, KeyEvent, Modifiers, RawKeyEvent, ResizeIncrement, WindowEvent,
-        WindowKeyEvent,
+        Handled, KeyCode, KeyEvent, Modifiers, RawKeyEvent, ResizeIncrement, Window, WindowEvent,
+        WindowEventSender, WindowKeyEvent,
     };
     use futures_util::future::Abortable;
     use promise::BrokenPromise;
@@ -2497,6 +2532,61 @@ mod tests {
     use std::pin::Pin;
     use std::task::{Context, Poll, Waker};
     use std::time::Duration;
+    use wayland_client::protocol::wl_keyboard::KeyState;
+    use wayland_client::WEnum;
+
+    #[test]
+    fn raw_no_keymap_dispatch_reaches_only_raw_bindings_with_fresh_handled_state() {
+        let received = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let output = std::rc::Rc::clone(&received);
+        let mut events = WindowEventSender::new(move |event, _| {
+            let WindowEvent::RawKeyEvent(raw) = event else {
+                panic!("raw keyboard must never synthesize a translated event");
+            };
+            assert!(!raw.handled.is_handled());
+            raw.set_handled();
+            output.borrow_mut().push(raw);
+        });
+        events.assign_window(Window::Wayland(WaylandWindow(1)));
+        let mut translation = KeyboardTranslation::RawNoKeymap(RawKeyboardState::default());
+
+        let KeyboardTranslation::RawNoKeymap(raw) = &mut translation else {
+            unreachable!();
+        };
+        raw.enter(&[]);
+        raw.dispatch_key(30, WEnum::Value(KeyState::Pressed), &mut events);
+        assert!(received.borrow().is_empty());
+
+        translation.update_modifiers(0, 0, 0, 0);
+        let KeyboardTranslation::RawNoKeymap(raw) = &mut translation else {
+            unreachable!();
+        };
+        for state in [KeyState::Pressed, KeyState::Repeated, KeyState::Released] {
+            raw.dispatch_key(30, WEnum::Value(state), &mut events);
+        }
+        raw.dispatch_key(30, WEnum::Value(KeyState::Repeated), &mut events);
+        assert_eq!(received.borrow().len(), 3);
+        for (index, raw) in received.borrow().iter().enumerate() {
+            assert_eq!(raw.key, KeyCode::RawCode(30));
+            assert_eq!(raw.raw_code, 30);
+            assert_eq!(raw.phys_code, None);
+            assert_eq!(raw.repeat_count, 1);
+            assert_eq!(raw.key_is_down, index < 2);
+        }
+
+        translation.update_modifiers(1, 0, 0, 0);
+        let KeyboardTranslation::RawNoKeymap(raw) = &mut translation else {
+            unreachable!();
+        };
+        raw.dispatch_key(31, WEnum::Value(KeyState::Pressed), &mut events);
+        assert_eq!(received.borrow().len(), 3);
+        translation.update_modifiers(0, 0, 0, 0);
+        let KeyboardTranslation::RawNoKeymap(raw) = &mut translation else {
+            unreachable!();
+        };
+        raw.dispatch_key(31, WEnum::Value(KeyState::Repeated), &mut events);
+        assert_eq!(received.borrow().len(), 4);
+    }
 
     #[test]
     fn wayland_dimensions_reject_values_outside_the_signed_protocol_range() {

@@ -34,10 +34,9 @@ use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_manager_v3::Z
 use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::ZwpTextInputV3;
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur_manager::OrgKdeKwinBlurManager;
 
-use crate::x11::KeyboardWithFallback;
-
 use super::fractional_scale::FractionalScaleGlobals;
 use super::inputhandler::{TextInputData, TextInputState};
+use super::keyboard::KeyboardTranslation;
 use super::pointer::{PendingMouse, PointerUserData};
 use super::{OutputManagerData, OutputManagerState, SurfaceUserData, WaylandWindowInner};
 
@@ -60,7 +59,7 @@ pub(super) struct WaylandState {
     pub(super) keyboard_active_surface_id: RefCell<Option<ObjectId>>,
     pub(super) last_serial: RefCell<u32>,
     pub(super) keyboard: Option<WlKeyboard>,
-    pub(super) keyboard_mapper: Option<KeyboardWithFallback>,
+    pub(super) keyboard_translation: KeyboardTranslation,
     pub(super) key_repeat_delay: i32,
     pub(super) key_repeat_rate: i32,
     pub(super) keyboard_window_id: Option<usize>,
@@ -129,7 +128,7 @@ impl WaylandState {
             keyboard_active_surface_id: RefCell::new(None),
             last_serial: RefCell::new(0),
             keyboard: None,
-            keyboard_mapper: None,
+            keyboard_translation: KeyboardTranslation::Unavailable,
             key_repeat_rate: 25,
             key_repeat_delay: 400,
             keyboard_window_id: None,
@@ -221,14 +220,18 @@ impl WaylandState {
         window_id: usize,
         surface_id: Option<&ObjectId>,
     ) -> DestroyedWindowAuthorityCleanup {
-        clear_destroyed_window_authorities(
+        let cleanup = clear_destroyed_window_authorities(
             self.keyboard_active_surface_id.get_mut(),
             &mut self.keyboard_window_id,
             self.pointer_active_surface_id.get_mut(),
             &mut self.pointer_window_id,
             window_id,
             surface_id,
-        )
+        );
+        if cleanup.keyboard {
+            self.keyboard_translation.clear_raw_focus();
+        }
+        cleanup
     }
 }
 

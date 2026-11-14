@@ -32,6 +32,7 @@ impl SeatHandler for WaylandState {
             Capability::Keyboard if self.keyboard.is_none() => {
                 log::trace!("Setting keyboard capability");
                 self.emit_keyboard_focus_lost();
+                self.keyboard_translation.retire();
                 let keyboard = seat.get_keyboard(qh, KeyboardData {});
                 self.seat_bindings.note_keyboard(seat.id());
                 self.keyboard = Some(keyboard.clone());
@@ -94,7 +95,7 @@ impl SeatHandler for WaylandState {
                         self.forget_text_input_keyboard(&keyboard);
                         keyboard.release();
                     }
-                    self.keyboard_mapper.take();
+                    self.keyboard_translation.retire();
                 }
             }
             Capability::Pointer => {
@@ -124,7 +125,7 @@ impl SeatHandler for WaylandState {
                 self.forget_text_input_keyboard(&keyboard);
                 keyboard.release();
             }
-            self.keyboard_mapper.take();
+            self.keyboard_translation.retire();
         }
 
         if cleanup.pointer {
@@ -158,6 +159,7 @@ impl WaylandState {
 
     fn emit_keyboard_focus_lost(&mut self) {
         self.keyboard_active_surface_id.get_mut().take();
+        self.keyboard_translation.clear_raw_focus();
         let Some(window_id) = self.keyboard_window_id.take() else {
             return;
         };
@@ -166,7 +168,7 @@ impl WaylandState {
         };
         window
             .borrow_mut()
-            .emit_focus(self.keyboard_mapper.as_mut(), false);
+            .emit_focus(self.keyboard_translation.mapper_mut(), false);
     }
 
     fn ensure_selection_devices_for_seat(&mut self, qh: &QueueHandle<Self>, seat: &WlSeat) {
