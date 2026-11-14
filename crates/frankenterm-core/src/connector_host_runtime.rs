@@ -351,6 +351,10 @@ impl FcpDeliverySession {
         Ok(())
     }
 
+    /// Persist the pending plan, or stop this admission batch while capacity or
+    /// another session's progress is reconciled. A refreshed cursor may pass
+    /// rows in the caller's already-read page, so the caller must fetch a new
+    /// page on its next tick instead of continuing that page.
     async fn flush_admission(&mut self, cx: &crate::cx::Cx) -> DeliveryResult<bool> {
         use crate::connector_reliability::{
             ConnectorStorageMutation as Mutation, ConnectorStorageOutcome as Outcome,
@@ -378,9 +382,63 @@ impl FcpDeliverySession {
                 self.pending_admission = None;
             }
             Outcome::Saturated => return Ok(false),
+            Outcome::Conflict => {
+                self.refresh_admission_cursor(cx).await?;
+                return Ok(false);
+            }
             _ => return Err(FcpDeliveryError::State("connector_admission_conflict")),
         }
         Ok(true)
+    }
+
+    /// A same-generation session may have committed this source event first.
+    /// Its cursor and plans are one durable transaction: observe that progress
+    /// without replacing its correlation identity or acquiring dispatch again.
+    /// No cursor rewind, epoch change, or uncommitted future position can
+    /// authorize dropping our pending plan.
+    async fn refresh_admission_cursor(&mut self, cx: &crate::cx::Cx) -> DeliveryResult<()> {
+        use crate::connector_reliability::{
+            ConnectorStorageMutation as Mutation, ConnectorStorageOutcome as Outcome,
+        };
+        let Outcome::Cursor {
+            after_event_id,
+            cursor_epoch,
+        } = self
+            .storage
+            .connector_mutation_with_cx(
+                cx,
+                Mutation::Initialize {
+                    generation: self.generation.clone(),
+                    now_ms: delivery_now_ms()?,
+                },
+            )
+            .await?
+        else {
+            return Err(FcpDeliveryError::State("connector_cursor_unavailable"));
+        };
+        let retention = self.storage.get_event_retention_snapshot_with_cx(cx).await?;
+        if cursor_epoch != self.cursor_epoch
+            || retention.cursor_epoch != self.cursor_epoch
+            || after_event_id <= self.cursor
+            || after_event_id > retention.max_event_id
+        {
+            return Err(FcpDeliveryError::State("connector_admission_cursor_invalid"));
+        }
+        let superseded = self
+            .pending_admission
+            .as_ref()
+            .is_some_and(|(event_id, _)| *event_id <= after_event_id);
+        tracing::debug!(
+            previous_cursor = self.cursor,
+            after_event_id,
+            pending_superseded = superseded,
+            "Reconciled connector admission with committed progress"
+        );
+        self.cursor = after_event_id;
+        if superseded {
+            self.pending_admission = None;
+        }
+        Ok(())
     }
 
     async fn transition(
@@ -2784,6 +2842,311 @@ mod tests {
             })
             .await
             .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delivery_sessions_reconcile_admission_conflicts_without_replacing_committed_plans() {
+        use crate::connector_reliability::ConnectorDeliveryState as State;
+
+        crate::storage::run_storage_async_test(async {
+            let (_temp, safety, storage, mut first) =
+                delivery_session_fixture("http://127.0.0.1:1/", 100).await;
+            let cx = crate::cx::for_request();
+            let mut second = FcpDeliverySession::open(
+                &cx,
+                &safety,
+                storage.clone(),
+                std::sync::Arc::clone(&first.event_bus),
+            )
+            .await
+            .unwrap();
+            let first_event = record_delivery_fixture_event(&storage).await;
+            let second_event = record_delivery_fixture_event(&storage).await;
+            first.admit_events(&cx).await.unwrap();
+            let original = storage
+                .get_connector_outbox_with_cx(&cx, &first.generation, false, 8)
+                .await
+                .unwrap();
+            assert_eq!(original.len(), 2);
+
+            // Both sessions read from the same initial boundary. The first
+            // owns both durable plans before the second attempts the first
+            // row. Reconciliation must also discard the second's stale page.
+            second.admit_events(&cx).await.unwrap();
+            assert_eq!(second.cursor, second_event);
+            assert!(second.pending_admission.is_none());
+            let reconciled = storage
+                .get_connector_outbox_with_cx(&cx, &second.generation, false, 8)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&reconciled).unwrap(),
+                serde_json::to_value(&original).unwrap(),
+                "the winning plans, correlation identities and revisions must remain unchanged",
+            );
+
+            let third_event = record_delivery_fixture_event(&storage).await;
+            second.admit_events(&cx).await.unwrap();
+            assert_eq!(second.cursor, third_event);
+            first.admit_events(&cx).await.unwrap();
+            assert_eq!(first.cursor, third_event);
+            assert!(first.pending_admission.is_none());
+            let rows = storage
+                .get_connector_outbox_with_cx(&cx, &first.generation, false, 8)
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 3);
+            for event_id in [first_event, second_event, third_event] {
+                assert_eq!(
+                    rows.iter()
+                        .filter(|row| row.source_event_id == event_id)
+                        .count(),
+                    1,
+                    "each source event must have only one route plan",
+                );
+            }
+            for prior in &original {
+                let current = rows.iter().find(|row| row.key == prior.key).unwrap();
+                assert_eq!(
+                    serde_json::to_value(current).unwrap(),
+                    serde_json::to_value(prior).unwrap(),
+                );
+            }
+
+            // Cursor reconciliation grants no second dispatch ownership.
+            // Neither session calls the provider in this storage-only test.
+            let dispatched = first
+                .transition(&cx, &rows[0], State::Dispatched, None, None)
+                .await
+                .unwrap();
+            assert!(
+                second
+                    .transition(&cx, &rows[0], State::Dispatched, None, None)
+                    .await
+                    .is_err(),
+            );
+            let after_dispatch = storage
+                .get_connector_outbox_with_cx(&cx, &first.generation, false, 8)
+                .await
+                .unwrap();
+            let stored = after_dispatch
+                .iter()
+                .find(|row| row.key == dispatched.key)
+                .unwrap();
+            assert_eq!(stored.state, State::Dispatched);
+            assert_eq!(stored.revision, dispatched.revision);
+            drop(first);
+            drop(second);
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delivery_session_conflict_preserves_a_plan_beyond_the_refreshed_cursor() {
+        crate::storage::run_storage_async_test(async {
+            let (_temp, safety, storage, mut first) =
+                delivery_session_fixture("http://127.0.0.1:1/", 100).await;
+            let cx = crate::cx::for_request();
+            let mut second = FcpDeliverySession::open(
+                &cx,
+                &safety,
+                storage.clone(),
+                std::sync::Arc::clone(&first.event_bus),
+            )
+            .await
+            .unwrap();
+            let first_event = record_delivery_fixture_event(&storage).await;
+            first.admit_events(&cx).await.unwrap();
+            let mut pending = storage
+                .get_connector_outbox_with_cx(&cx, &first.generation, false, 8)
+                .await
+                .unwrap()
+                .remove(0);
+            let second_event = record_delivery_fixture_event(&storage).await;
+            pending.source_event_id = second_event;
+            pending.key = fcp_identity_hash(
+                &serde_json::to_string(&(&second.generation, second_event, &pending.rule_id)).unwrap(),
+            );
+            pending.correlation_id = delivery_request_id();
+            let expected = serde_json::to_value(&pending).unwrap();
+            second.pending_admission = Some((second_event, vec![pending]));
+
+            assert!(!second.flush_admission(&cx).await.unwrap());
+            assert_eq!(second.cursor, first_event);
+            let (event_id, retained) = second.pending_admission.as_ref().unwrap();
+            assert_eq!(*event_id, second_event);
+            assert_eq!(serde_json::to_value(&retained[0]).unwrap(), expected);
+
+            // The next tick commits exactly the retained plan once its
+            // predecessor cursor is known, without re-running policy planning.
+            assert!(second.flush_admission(&cx).await.unwrap());
+            assert_eq!(second.cursor, second_event);
+            assert!(second.pending_admission.is_none());
+            let rows = storage
+                .get_connector_outbox_with_cx(&cx, &second.generation, false, 8)
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 2);
+            let retained = rows
+                .iter()
+                .find(|row| row.source_event_id == second_event)
+                .unwrap();
+            assert_eq!(serde_json::to_value(retained).unwrap(), expected);
+            drop(first);
+            drop(second);
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delivery_session_conflict_does_not_starve_inbound_polling() {
+        use crate::connector_reliability::ConnectorDeliveryState as State;
+
+        crate::storage::run_storage_async_test(async {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+            let (_temp, safety, storage, mut first) = delivery_session_fixture(&endpoint, 100).await;
+            let cx = crate::cx::for_request();
+            let mut second = FcpDeliverySession::open(
+                &cx,
+                &safety,
+                storage.clone(),
+                std::sync::Arc::clone(&first.event_bus),
+            )
+            .await
+            .unwrap();
+            let event_id = record_delivery_fixture_event(&storage).await;
+            first.admit_events(&cx).await.unwrap();
+            let entry = storage
+                .get_connector_outbox_with_cx(&cx, &first.generation, false, 8)
+                .await
+                .unwrap()
+                .remove(0);
+            first
+                .transition(&cx, &entry, State::Dispatched, None, None)
+                .await
+                .unwrap();
+
+            // Dispatch cannot retry that owned row. After reconciling the
+            // stale admission, this same tick must reach the due inbound poll.
+            // The local fixture never answers, so its bounded preflight fails.
+            let result = second.tick(&cx).await;
+            assert!(matches!(result, Err(FcpDeliveryError::Transport(_))));
+            assert_eq!(second.cursor, event_id);
+            assert!(second.pending_admission.is_none());
+            assert!(
+                listener.accept().is_ok(),
+                "the inbound poll must reach its endpoint",
+            );
+            let rows = storage
+                .get_connector_outbox_with_cx(&cx, &first.generation, false, 8)
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].state, State::Dispatched);
+            assert_eq!(rows[0].revision, 1);
+            drop(first);
+            drop(second);
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delivery_session_cursor_refresh_rejects_epoch_rewind_and_future_authority() {
+        use crate::storage_backend_trait::{StorageBackend as _, ToSqlValue};
+
+        crate::storage::run_storage_async_test(async {
+            for scenario in ["cursor_epoch", "source_epoch", "rewind", "unchanged", "future"] {
+                let (_temp, _safety, storage, mut session) =
+                    delivery_session_fixture("http://127.0.0.1:1/", 100).await;
+                let cx = crate::cx::for_request();
+                record_delivery_fixture_event(&storage).await;
+                session.admit_events(&cx).await.unwrap();
+                let original_cursor = session.cursor;
+                let next_event = record_delivery_fixture_event(&storage).await;
+                session.pending_admission = Some((next_event, Vec::new()));
+                let original_pending = serde_json::to_value(&session.pending_admission).unwrap();
+                let original_rows = serde_json::to_value(
+                    storage
+                        .get_connector_outbox_with_cx(&cx, &session.generation, false, 8)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                let backend = crate::storage_backend_trait::RusqliteBackend::open(
+                    storage.db_path(),
+                    &crate::storage_backend_trait::OpenConfig {
+                        wal_mode: false,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let after_id = match scenario {
+                    "rewind" => original_cursor - 1,
+                    "unchanged" => original_cursor,
+                    "future" => next_event + 1,
+                    _ => next_event,
+                };
+                let foreign_epoch = fcp_identity_hash("different-event-history");
+                let epoch = if scenario == "cursor_epoch" {
+                    &foreign_epoch
+                } else {
+                    &session.cursor_epoch
+                };
+                backend
+                    .query_row_cells(
+                        "UPDATE connector_outbox_cursors SET after_event_id = ?1, cursor_epoch = ?2
+                         WHERE generation = ?3 RETURNING generation",
+                        &[
+                            ToSqlValue::Integer(after_id),
+                            ToSqlValue::Text(epoch),
+                            ToSqlValue::Text(&session.generation),
+                        ],
+                    )
+                    .unwrap()
+                    .unwrap();
+                if scenario == "source_epoch" {
+                    backend
+                        .query_row_cells(
+                            "UPDATE event_retention_state SET cursor_epoch = ?1
+                             WHERE singleton = 1 RETURNING singleton",
+                            &[ToSqlValue::Text(&foreign_epoch)],
+                        )
+                        .unwrap()
+                        .unwrap();
+                }
+
+                let result = if scenario == "unchanged" {
+                    session.refresh_admission_cursor(&cx).await
+                } else {
+                    session.flush_admission(&cx).await.map(|_| ())
+                };
+                assert!(result.is_err(), "accepted {scenario} cursor authority");
+                assert_eq!(session.cursor, original_cursor);
+                assert_eq!(
+                    serde_json::to_value(&session.pending_admission).unwrap(),
+                    original_pending,
+                );
+                assert_eq!(
+                    serde_json::to_value(
+                        storage
+                            .get_connector_outbox_with_cx(&cx, &session.generation, false, 8)
+                            .await
+                            .unwrap(),
+                    )
+                    .unwrap(),
+                    original_rows,
+                );
+                drop(backend);
+                drop(session);
+                storage.shutdown().await.unwrap();
+            }
+        });
     }
 
     #[cfg(unix)]
