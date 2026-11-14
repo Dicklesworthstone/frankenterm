@@ -10863,9 +10863,9 @@ impl RecoveredTopologyPublication {
 struct RecoveryRootGuardianPanes {
     /// Oldest first, each with whether its root certainly committed.
     roots: VecDeque<(HashSet<uuid::Uuid>, bool)>,
-    /// Panes this mux's roots, or the root it was restored from, ever named
-    /// and not yet released. The guardian may serve other muxes, whose panes
-    /// this mux must leave alone.
+    /// Panes this mux's roots, or either authenticated root retained when it
+    /// reopened recovery, ever named and not yet released. The guardian may
+    /// serve other muxes, whose panes this mux must leave alone.
     owned: HashSet<uuid::Uuid>,
 }
 
@@ -22813,8 +22813,9 @@ impl Mux {
             .record(panes, committed);
     }
 
-    /// The recovery root this mux was restored from names these guardian
-    /// panes: this mux owns their release once no root of its own does.
+    /// Authenticated recovery roots or explicit adoption name these guardian
+    /// panes: this mux owns their release once no retained root of its own
+    /// does. Remembering ownership does not count as a newly committed root.
     pub fn note_restored_guardian_panes(&self, panes: impl IntoIterator<Item = uuid::Uuid>) {
         self.recovery_root_guardian_panes.lock().owned.extend(panes);
     }
@@ -26177,6 +26178,38 @@ mod tests {
         );
         roots.owned.remove(&uuid::Uuid::from_u128(1));
         assert_eq!(roots.releasable(&HashSet::new()), ids(&[9]));
+    }
+
+    #[test]
+    fn reopened_guardian_panes_wait_for_two_new_roots_before_release() {
+        let _serial = global_test_lock();
+        let mux = Mux::new(None);
+        let fallback_only = uuid::Uuid::from_u128(1);
+        let selected = uuid::Uuid::from_u128(2);
+        let selected_panes = || HashSet::from([selected]);
+
+        // The latest root omitted a closed pane, but its fallback still names
+        // it. Reopening must remember both without treating them as two new
+        // commits: either old slot can still be the only usable recovery root.
+        mux.note_restored_guardian_panes([fallback_only, selected]);
+        assert!(mux.guardian_panes_to_release().is_empty());
+        mux.note_recovery_root_guardian_panes(selected_panes(), true);
+        assert!(
+            mux.guardian_panes_to_release().is_empty(),
+            "one new root leaves the fallback slot protected"
+        );
+        mux.note_recovery_root_guardian_panes(selected_panes(), true);
+        assert_eq!(mux.guardian_panes_to_release(), vec![fallback_only]);
+
+        mux.note_guardian_pane_released(fallback_only);
+        assert!(mux.guardian_panes_to_release().is_empty());
+        mux.note_recovery_root_guardian_panes(HashSet::new(), true);
+        assert!(
+            mux.guardian_panes_to_release().is_empty(),
+            "the selected pane remains protected by the other retained root"
+        );
+        mux.note_recovery_root_guardian_panes(HashSet::new(), true);
+        assert_eq!(mux.guardian_panes_to_release(), vec![selected]);
     }
 
     #[test]
