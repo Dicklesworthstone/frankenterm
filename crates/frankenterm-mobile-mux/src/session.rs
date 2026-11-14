@@ -3733,21 +3733,52 @@ mod paste_routing_tests {
 
     #[test]
     fn hiding_a_pane_does_not_terminate_its_paste() {
-        let mut session = ready(Dialect::Legacy);
+        // Showing a pane ends a legacy session (it cannot carry cell
+        // widths), so this draws the pane on a current one and answers the
+        // identity query that showing it sends.
+        let mut session = ready(Dialect::Current);
         session.show(1);
+        let mut reader = FrameReader::default();
+        reader.push(&session.take_outgoing());
+        let query = reader
+            .next_frame()
+            .expect("valid encoded frame")
+            .expect("showing a pane asks for its identity");
+        assert_eq!(query.ident, ident::GET_PANE_IDENTITY);
+        let identity = codec::GetPaneIdentityV1Response {
+            pane_id: 1,
+            outcome: codec::PaneIdentityOutcomeV1::Available {
+                identity: codec::PaneIdentityV1 {
+                    session_incarnation: mux::MuxSessionIncarnation::from_bytes([0x1c; 16]),
+                    durable_pane_id: [0x2a; 16],
+                    pane_registration: codec::ReliablePaneRegistrationIdentityV1::from_bytes(
+                        [7; 16],
+                    ),
+                },
+                render_facts: None,
+            },
+        };
+        session.receive(&frame::encode(
+            ident::GET_PANE_IDENTITY_RESPONSE,
+            query.serial,
+            &wire::encode(&identity),
+        ));
         session.take_outgoing();
+        assert!(session.is_ready());
+
         session.write(1, b"\x1b[200~before ");
         session.hide(1);
         session.write(2, b"other");
         assert_eq!(
             writes(&mut session),
-            [(ident::WRITE_TO_PANE, 2, b"other".to_vec())]
+            [(ident::RELIABLE_PANE_WRITE, 2, b"other".to_vec())]
         );
         session.write(1, b"after\x1b[201~");
         assert_eq!(
             writes(&mut session),
-            [(ident::SEND_PASTE, 1, b"before after".to_vec())]
+            [(paste_ident(Dialect::Current), 1, b"before after".to_vec())]
         );
+        assert!(session.is_ready());
     }
 
     fn failed(session: &mut Session) -> bool {
