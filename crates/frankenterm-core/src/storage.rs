@@ -9974,6 +9974,32 @@ impl StorageHandle {
         .await
     }
 
+    /// Read a bounded recovery sweep by stable execution ID, without holding a
+    /// database transaction while workflows run. The upper ID bounds the sweep;
+    /// it is not a historical snapshot. Callers must reload execution identity,
+    /// acquire admission, and honor the durable attempt fence before executing.
+    pub(crate) async fn scan_incomplete_workflows_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        after_id: Option<String>,
+        through_id: Option<String>,
+        limit: usize,
+    ) -> Result<WorkflowRecoveryPage> {
+        Self::checkpoint_storage_operation(cx, "scan_incomplete_workflows")?;
+        let db_path = Arc::clone(&self.db_path);
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
+            pooled_backend(db_path.as_str(), |backend| {
+                query_incomplete_workflow_page_backend(
+                    backend,
+                    after_id.as_deref(),
+                    through_id.as_deref(),
+                    limit,
+                )
+            })
+        })
+        .await
+    }
+
     /// Check if the storage is writable (writer thread is alive and responsive).
     ///
     /// This is a lightweight channel-state check. It does not enqueue a ping,
@@ -11789,6 +11815,12 @@ pub struct ExportQuery {
     pub until: Option<i64>,
     /// Maximum number of results
     pub limit: Option<usize>,
+}
+
+/// A bounded reconciliation page, ordered by immutable execution ID.
+pub(crate) struct WorkflowRecoveryPage {
+    pub records: Vec<WorkflowRecord>,
+    pub through_id: Option<String>,
 }
 
 /// Query options for incremental segment scans.
@@ -35037,6 +35069,66 @@ fn query_incomplete_workflows_backend(backend: &dyn StorageBackend) -> Result<Ve
     rows.iter()
         .map(|row| workflow_record_from_backend_cells(row))
         .collect()
+}
+
+fn query_incomplete_workflow_page_backend(
+    backend: &dyn StorageBackend,
+    after_id: Option<&str>,
+    through_id: Option<&str>,
+    limit: usize,
+) -> Result<WorkflowRecoveryPage> {
+    let through_id = match through_id {
+        Some(id) => Some(id.to_string()),
+        None => backend
+            .query_row_cells(
+                "SELECT id FROM workflow_executions
+                 WHERE status IN ('running', 'waiting') ORDER BY id DESC LIMIT 1",
+                &[],
+            )
+            .map_err(|err| storage_backend_error("Query workflow recovery boundary", err))?
+            .as_deref()
+            .map(|row| {
+                CellRowReader::new(row)
+                    .string(0)
+                    .map_err(|err| storage_backend_error("Decode workflow recovery boundary", err))
+            })
+            .transpose()?,
+    };
+    let Some(upper) = through_id.as_deref() else {
+        return Ok(WorkflowRecoveryPage {
+            records: Vec::new(),
+            through_id,
+        });
+    };
+    // This is an internal admission queue, not an unbounded export surface.
+    let limit = usize_to_i64(limit.clamp(1, 256), "limit")?;
+    let mut params = vec![ToSqlValue::Text(upper), ToSqlValue::Integer(limit)];
+    let after_clause = if let Some(after_id) = after_id {
+        params.push(ToSqlValue::Text(after_id));
+        " AND id > ?3"
+    } else {
+        ""
+    };
+    let rows = backend
+        .query_map_cells(
+            &format!(
+                "SELECT id, workflow_name, pane_id, trigger_event_id, current_step, status,
+             wait_condition, context, result, error, started_at, updated_at, completed_at
+             FROM workflow_executions
+             WHERE status IN ('running', 'waiting')
+               AND id <= ?1{after_clause}
+             ORDER BY id ASC LIMIT ?2"
+            ),
+            &params,
+        )
+        .map_err(|err| storage_backend_error("Query workflow recovery page", err))?;
+    Ok(WorkflowRecoveryPage {
+        records: rows
+            .iter()
+            .map(|row| workflow_record_from_backend_cells(row))
+            .collect::<Result<Vec<_>>>()?,
+        through_id,
+    })
 }
 
 // =============================================================================

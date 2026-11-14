@@ -15,6 +15,168 @@ const WORKFLOW_INDEPENDENT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const WORKFLOW_RUNNER_CHILD_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const WORKFLOW_DETECTION_REPLAY_PAGE_SIZE: usize = 64;
 const WORKFLOW_DETECTION_REPLAY_INTERVAL: Duration = Duration::from_millis(250);
+const WORKFLOW_RECOVERY_PAGE_SIZE: usize = 64;
+const WORKFLOW_RECOVERY_MAX_CHILDREN: usize = 32;
+
+#[derive(Default)]
+struct WorkflowRecoveryTasks {
+    active: std::sync::atomic::AtomicUsize,
+    // Keep only the earliest deferred cursor, rather than an unbounded queue
+    // of blocked executions. None inside Some means retry from the beginning.
+    retry_after: Mutex<Option<Option<String>>>,
+}
+
+struct WorkflowRecoveryTaskGuard {
+    tasks: Arc<WorkflowRecoveryTasks>,
+    after_id: Option<String>,
+    retry: bool,
+}
+
+impl WorkflowRecoveryTaskGuard {
+    fn new(tasks: Arc<WorkflowRecoveryTasks>, after_id: Option<String>) -> Self {
+        tasks.active.fetch_add(1, Ordering::SeqCst);
+        Self {
+            tasks,
+            after_id,
+            // A panic or cancellation before an explicit disposition must not
+            // silently lose the durable record from this recovery sweep.
+            retry: true,
+        }
+    }
+}
+
+impl Drop for WorkflowRecoveryTaskGuard {
+    fn drop(&mut self) {
+        if self.retry {
+            let mut retry = self
+                .tasks
+                .retry_after
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if retry.as_ref().is_none_or(|old| self.after_id < *old) {
+                *retry = Some(self.after_id.clone());
+            }
+        }
+        self.tasks.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Bounded reconciliation of unfinished executions. This uses stable primary
+/// keys, not SQLite rowids (which can change during VACUUM or be reused).
+/// Membership is revalidated by the child before admission; a page is never
+/// itself authority to execute a workflow.
+struct WorkflowStartupRecovery {
+    after_id: Option<String>,
+    through_id: Option<String>,
+    retry_after: Option<Option<String>>,
+    rows: std::collections::VecDeque<crate::storage::WorkflowRecord>,
+    page_loaded: bool,
+    page_exhausted: bool,
+    finished: bool,
+    next_poll: Instant,
+    tasks: Arc<WorkflowRecoveryTasks>,
+    max_children: usize,
+}
+
+impl WorkflowStartupRecovery {
+    fn new(max_concurrent: usize) -> Self {
+        Self {
+            after_id: None,
+            through_id: None,
+            retry_after: None,
+            rows: std::collections::VecDeque::new(),
+            page_loaded: false,
+            page_exhausted: false,
+            finished: false,
+            next_poll: Instant::now(),
+            tasks: Arc::new(WorkflowRecoveryTasks::default()),
+            // Leave one global slot available to live detections whenever the
+            // configured limit permits it. A backlog of restored waiters must
+            // not occupy every slot indefinitely.
+            max_children: max_concurrent
+                .saturating_sub(1)
+                .max(usize::from(max_concurrent > 0))
+                .min(WORKFLOW_RECOVERY_MAX_CHILDREN),
+        }
+    }
+
+    fn collect_retries(&mut self) {
+        let retry = self
+            .tasks
+            .retry_after
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(after_id) = retry {
+            if self.finished {
+                self.after_id = after_id;
+                self.finished = false;
+                self.next_poll = Instant::now() + WORKFLOW_DETECTION_REPLAY_INTERVAL;
+            } else if self.retry_after.as_ref().is_none_or(|old| after_id < *old) {
+                self.retry_after = Some(after_id);
+            }
+        }
+    }
+
+    fn next_deadline(&self) -> Option<Instant> {
+        (!self.finished && self.tasks.active.load(Ordering::SeqCst) < self.max_children)
+            .then_some(self.next_poll)
+    }
+
+    async fn next_with_cx(
+        &mut self,
+        cx: &crate::cx::Cx,
+        storage: &crate::storage::StorageHandle,
+    ) -> crate::Result<Option<(Option<String>, crate::storage::WorkflowRecord)>> {
+        if self
+            .next_deadline()
+            .is_none_or(|next| Instant::now() < next)
+        {
+            return Ok(None);
+        }
+        if self.rows.is_empty() && self.page_loaded {
+            self.page_loaded = false;
+            if self.page_exhausted {
+                if let Some(after_id) = self.retry_after.take() {
+                    self.after_id = after_id;
+                    self.next_poll = Instant::now() + WORKFLOW_DETECTION_REPLAY_INTERVAL;
+                } else {
+                    self.finished = true;
+                }
+            }
+            // Never process an unlimited backlog in one event-loop turn.
+            crate::runtime_async::task::yield_now().await;
+            return Ok(None);
+        }
+        if self.rows.is_empty() {
+            let page = storage
+                .scan_incomplete_workflows_with_cx(
+                    cx,
+                    self.after_id.clone(),
+                    self.through_id.clone(),
+                    WORKFLOW_RECOVERY_PAGE_SIZE,
+                )
+                .await?;
+            self.through_id = page.through_id;
+            self.page_exhausted = page.records.len() < WORKFLOW_RECOVERY_PAGE_SIZE
+                || page
+                    .records
+                    .last()
+                    .is_some_and(|record| Some(record.id.as_str()) == self.through_id.as_deref());
+            self.page_loaded = true;
+            self.rows = page.records.into();
+        }
+        Ok(self.rows.pop_front().map(|record| {
+            let before = self.after_id.replace(record.id.clone());
+            (before, record)
+        }))
+    }
+}
+
+struct WorkflowResumeAttempt {
+    result: Option<WorkflowExecutionResult>,
+    retry: bool,
+}
 
 /// A detection subscription prepared before the observation runtime starts.
 ///
@@ -357,6 +519,55 @@ fn workflow_execution_error(
     WorkflowExecutionResult::Error {
         execution_id: Some(execution_id.to_string()),
         error: error.to_string(),
+    }
+}
+
+fn log_workflow_execution_result(result: &WorkflowExecutionResult) {
+    match result {
+        WorkflowExecutionResult::Completed {
+            execution_id,
+            steps_executed,
+            elapsed_ms,
+            ..
+        } => tracing::info!(
+            execution_id,
+            steps = steps_executed,
+            elapsed_ms,
+            explicit_cx = true,
+            "Workflow completed (cx)"
+        ),
+        WorkflowExecutionResult::Aborted {
+            execution_id,
+            reason,
+            step_index,
+            ..
+        } => tracing::warn!(
+            execution_id,
+            step = step_index,
+            reason,
+            explicit_cx = true,
+            "Workflow aborted (cx)"
+        ),
+        WorkflowExecutionResult::PolicyDenied {
+            execution_id,
+            step_index,
+            reason,
+        } => tracing::warn!(
+            execution_id,
+            step = step_index,
+            reason,
+            explicit_cx = true,
+            "Workflow denied by policy (cx)"
+        ),
+        WorkflowExecutionResult::Error {
+            execution_id,
+            error,
+        } => tracing::error!(
+            execution_id = execution_id.as_deref(),
+            error,
+            explicit_cx = true,
+            "Workflow error (cx)"
+        ),
     }
 }
 
@@ -3516,7 +3727,7 @@ impl WorkflowRunner {
     ///
     /// Threads the caller's cx through the entire event-loop
     /// driver:
-    /// - `resume_incomplete_with_cx(cx)` on startup (tick 222)
+    /// - Bounded recovery scans and restored execution children on startup
     /// - `subscriber.recv_cx(cx)` for detection reads (cancel-aware
     ///   instead of ambient `recv`)
     /// - Top-of-loop `cx.checkpoint()` lets a cx-cancelled caller
@@ -3607,6 +3818,17 @@ impl WorkflowRunner {
     /// spawning the runner or starting observation: subscribing inside an
     /// asynchronous task leaves a window where initial detections are lost.
     ///
+    /// Recovery is a bounded reconciliation campaign, not a historical
+    /// snapshot: Ready or RetryWaiting executions inserted within its fixed ID
+    /// range may be discovered while it runs. Every candidate is reloaded and
+    /// admitted through the shared local pane/global locks and durable attempt
+    /// CAS; an already-owned execution is skipped, and InFlight remains
+    /// indeterminate. This does not provide a lease across watcher processes.
+    /// Each turn inspects at most one candidate, and recovery leaves a slot for
+    /// live detections when the global limit exceeds one. Only temporary read
+    /// or admission failures cause another bounded sweep; once the range and
+    /// deferred candidates are exhausted, scanning ends.
+    ///
     /// With live incarnation authority, persisted notifications only wake an
     /// ordered storage scan. Periodic scans recover missed publications and
     /// bounded sweeps revisit temporary admission failures without blocking
@@ -3634,39 +3856,8 @@ impl WorkflowRunner {
             );
             return;
         }
-        let resumed = self.resume_incomplete_with_cx(cx).await;
-        if !resumed.is_empty() {
-            tracing::info!(
-                count = resumed.len(),
-                explicit_cx = true,
-                "Resumed incomplete workflows from previous run (cx)"
-            );
-            for result in &resumed {
-                match result {
-                    WorkflowExecutionResult::Completed { execution_id, .. } => {
-                        tracing::info!(
-                            execution_id,
-                            explicit_cx = true,
-                            "Resumed workflow completed (cx)"
-                        );
-                    }
-                    WorkflowExecutionResult::Error {
-                        execution_id,
-                        error,
-                    } => {
-                        tracing::warn!(
-                            ?execution_id,
-                            error,
-                            explicit_cx = true,
-                            "Resumed workflow errored (cx)"
-                        );
-                    }
-                    _ => {}
-                }
-            }
-        }
-
         let mut child_tasks = crate::runtime_async::task::JoinSet::new();
+        let mut recovery = WorkflowStartupRecovery::new(self.config.max_concurrent);
 
         loop {
             while let Some(join_result) = child_tasks.try_join_next() {
@@ -3677,6 +3868,7 @@ impl WorkflowRunner {
                     );
                 }
             }
+            recovery.collect_retries();
 
             if cx.checkpoint().is_err() {
                 tracing::info!(
@@ -3691,6 +3883,40 @@ impl WorkflowRunner {
                     "Workflow runner received shutdown signal"
                 );
                 break;
+            }
+
+            // Restored workflows are children of the same owner as fresh
+            // admissions. Their waits cannot prevent receiving detections or
+            // observing watchdog shutdown, and shutdown settles both kinds.
+            match recovery.next_with_cx(cx, &self.storage).await {
+                Ok(Some((after_id, record))) => {
+                    if let Some(workflow) = self.find_workflow_by_name(&record.workflow_name) {
+                        let runner = self.runner_for_workflow(workflow);
+                        let mut recovery_guard =
+                            WorkflowRecoveryTaskGuard::new(Arc::clone(&recovery.tasks), after_id);
+                        child_tasks.spawn_with_cx(cx, move |child_cx| async move {
+                            let attempt = runner.resume_record_with_cx(&child_cx, &record).await;
+                            recovery_guard.retry = attempt.retry;
+                            if let Some(result) = attempt.result {
+                                log_workflow_execution_result(&result);
+                            }
+                        });
+                    } else {
+                        tracing::warn!(
+                            workflow_name = %record.workflow_name,
+                            execution_id = %record.id,
+                            "Cannot resume: workflow not registered"
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "Workflow recovery storage unavailable; retaining cursor"
+                    );
+                    recovery.next_poll = Instant::now() + WORKFLOW_DETECTION_REPLAY_INTERVAL;
+                }
             }
 
             let recovered = if let Some(replay) = &mut replay {
@@ -3717,6 +3943,12 @@ impl WorkflowRunner {
             } else {
                 None
             };
+            let next_poll = replay
+                .as_ref()
+                .map(|replay| replay.next_poll)
+                .into_iter()
+                .chain(recovery.next_deadline())
+                .min();
             let mut recovered_source = None;
             let wake = if let Some(stored) = recovered {
                 if !crate::storage::workflow_trigger_recovery_is_fresh(stored.detected_at, now_ms())
@@ -3780,11 +4012,11 @@ impl WorkflowRunner {
                     detection,
                     event_id: Some(stored.id),
                 })))
-            } else if let Some(replay) = &mut replay {
+            } else if let Some(next_poll) = next_poll {
                 // A fixed deadline wins even under an uninterrupted stream of
                 // live notifications. Probe the bus between storage pages so
                 // lag and closure remain visible during a long catch-up.
-                if Instant::now() >= replay.next_poll {
+                if Instant::now() >= next_poll {
                     match subscriber.try_recv() {
                         Some(event) => WorkflowRunnerWake::Event(Box::new(event)),
                         None => continue,
@@ -3792,7 +4024,7 @@ impl WorkflowRunner {
                 } else {
                     match crate::runtime_async::timeout_with_cx(
                         cx,
-                        replay.next_poll.saturating_duration_since(Instant::now()),
+                        next_poll.saturating_duration_since(Instant::now()),
                         wait_for_workflow_runner_activity(
                             cx,
                             &mut subscriber,
@@ -3884,93 +4116,14 @@ impl WorkflowRunner {
                                 workflow_name,
                             } => {
                                 if let Some(workflow) = self.find_workflow_by_name(&workflow_name) {
-                                    let execution_id_clone = execution_id.clone();
-                                    let workflow_clone = Arc::clone(&workflow);
-                                    let storage = Arc::clone(&self.storage);
-                                    let lock_manager = Arc::clone(&self.lock_manager);
-                                    let config = self.config.clone();
-                                    let engine = WorkflowEngine::new(config.max_concurrent);
-
-                                    let runner = Self {
-                                        workflows: std::sync::RwLock::new(vec![
-                                            workflow_clone.clone(),
-                                        ]),
-                                        engine,
-                                        lock_manager,
-                                        storage,
-                                        source_registry: self.source_registry.clone(),
-                                        injector: self.injector.clone(),
-                                        config,
-                                        replay_capture: self.replay_capture.clone(),
-                                        external_signals: self.external_signals.clone(),
-                                    };
-
-                                    child_tasks.spawn_with_cx(cx, move |child_cx| async move {
-                                        let result = runner
-                                            .run_workflow_with_cx(
-                                                &child_cx,
-                                                pane_id,
-                                                workflow_clone,
-                                                &execution_id_clone,
-                                                0,
-                                            )
-                                            .await;
-
-                                        match &result {
-                                            WorkflowExecutionResult::Completed {
-                                                execution_id,
-                                                steps_executed,
-                                                elapsed_ms,
-                                                ..
-                                            } => {
-                                                tracing::info!(
-                                                    execution_id,
-                                                    steps = steps_executed,
-                                                    elapsed_ms,
-                                                    explicit_cx = true,
-                                                    "Workflow completed (cx)"
-                                                );
-                                            }
-                                            WorkflowExecutionResult::Aborted {
-                                                execution_id,
-                                                reason,
-                                                step_index,
-                                                ..
-                                            } => {
-                                                tracing::warn!(
-                                                    execution_id,
-                                                    step = step_index,
-                                                    reason,
-                                                    explicit_cx = true,
-                                                    "Workflow aborted (cx)"
-                                                );
-                                            }
-                                            WorkflowExecutionResult::PolicyDenied {
-                                                execution_id,
-                                                step_index,
-                                                reason,
-                                            } => {
-                                                tracing::warn!(
-                                                    execution_id,
-                                                    step = step_index,
-                                                    reason,
-                                                    explicit_cx = true,
-                                                    "Workflow denied by policy (cx)"
-                                                );
-                                            }
-                                            WorkflowExecutionResult::Error {
-                                                execution_id,
-                                                error,
-                                            } => {
-                                                tracing::error!(
-                                                    execution_id = execution_id.as_deref(),
-                                                    error,
-                                                    explicit_cx = true,
-                                                    "Workflow error (cx)"
-                                                );
-                                            }
-                                        }
-                                    });
+                                    child_tasks.spawn_with_cx(
+                                        cx,
+                                        self.workflow_execution_child(
+                                            pane_id,
+                                            workflow,
+                                            execution_id,
+                                        ),
+                                    );
                                 } else {
                                     // The workflow that
                                     // `handle_detection_with_cx` matched and
@@ -4180,144 +4333,190 @@ impl WorkflowRunner {
                 break;
             }
 
-            let Some(workflow) = self.find_workflow_by_name(&record.workflow_name) else {
-                tracing::warn!(
-                    workflow_name = %record.workflow_name,
-                    execution_id = %record.id,
-                    explicit_cx = true,
-                    "Cannot resume: workflow not registered (cx)"
-                );
-                continue;
-            };
-
-            let (execution, next_step) =
-                match self.engine.resume_cx(cx, &self.storage, &record.id).await {
-                    Ok(Some(resume)) => resume,
-                    Ok(None) => {
-                        tracing::debug!(
-                            execution_id = %record.id,
-                            explicit_cx = true,
-                            "Skipping resume for workflow already in a terminal state (cx)"
-                        );
-                        continue;
-                    }
-                    Err(error) => {
-                        // A temporary read failure or a cancelled request
-                        // proves nothing about the stored execution. Preserve
-                        // its state so the owner can retry the inspection.
-                        if !is_invalid_workflow_budget(&error) || cx.checkpoint().is_err() {
-                            results.push(workflow_execution_error(
-                                &record.id,
-                                "workflow_resume_unavailable",
-                            ));
-                            continue;
-                        }
-                        let release_guard = match self
-                            .lock_manager
-                            .try_acquire_with_limit_owned_full(
-                                record.pane_id,
-                                &record.workflow_name,
-                                &record.id,
-                                self.config.max_concurrent,
-                            ) {
-                            Ok(crate::workflows::lock::OwnedLockAcquisitionResult::Acquired(
-                                guard,
-                            )) => guard,
-                            _ => {
-                                results.push(workflow_execution_error(
-                                    &record.id,
-                                    "workflow_budget_resume_busy",
-                                ));
-                                continue;
-                            }
-                        };
-                        tracing::warn!(
-                            execution_id = %record.id,
-                            failure_class = "workflow_budget_invalid_resume_state",
-                            explicit_cx = true,
-                            "Failed to load workflow state for resume (cx)"
-                        );
-                        // A corrupt durable authority record must become a
-                        // visible terminal failure, not an endless invisible
-                        // skip on every watcher restart. Do not echo stored
-                        // payload contents through resume diagnostics.
-                        results.push(
-                            self.settle_budget_failure(
-                                &record.workflow_name,
-                                &record.id,
-                                record.pane_id,
-                                record.current_step,
-                                None,
-                                "workflow_budget_invalid_resume_state",
-                            )
-                            .await,
-                        );
-                        drop(release_guard);
-                        continue;
-                    }
-                };
-
-            // ft-j0ufc: re-enforce the source-pane trust scope on resume. The
-            // trigger-time check in `handle_detection_with_cx` is point-in-time;
-            // a restart must not blindly resume a workflow whose source pane is
-            // no longer in the (possibly tightened) trust scope and then run its
-            // remaining `SendText` steps. Gate before lock acquisition, exactly
-            // as the trigger path does. The source pane equals the acted-on pane
-            // at trigger time (`source_pane_id = pane_id`), so `execution.pane_id`
-            // is the correct re-check key.
-            if !workflow
-                .trigger_policy()
-                .allows_source_pane(execution.pane_id)
-            {
-                tracing::warn!(
-                    execution_id = %execution.id,
-                    pane_id = execution.pane_id,
-                    workflow = %execution.workflow_name,
-                    explicit_cx = true,
-                    "ft-j0ufc: refusing resume; source pane no longer in trust scope (cx)"
-                );
-                continue;
+            if let Some(result) = self.resume_record_with_cx(cx, &record).await.result {
+                results.push(result);
             }
-
-            let lock_result = self.lock_manager.try_acquire(
-                execution.pane_id,
-                &execution.workflow_name,
-                &execution.id,
-            );
-
-            match lock_result {
-                LockAcquisitionResult::AlreadyLocked { .. } => {
-                    tracing::warn!(
-                        execution_id = %execution.id,
-                        pane_id = execution.pane_id,
-                        explicit_cx = true,
-                        "Cannot resume: pane locked (cx)"
-                    );
-                    continue;
-                }
-                LockAcquisitionResult::Acquired => {}
-            }
-
-            tracing::info!(
-                execution_id = %execution.id,
-                workflow = %execution.workflow_name,
-                pane_id = execution.pane_id,
-                resume_step = next_step,
-                explicit_cx = true,
-                "Resuming workflow (cx)"
-            );
-
-            let result = self
-                .run_workflow_with_cx(cx, execution.pane_id, workflow, &execution.id, next_step)
-                .await;
-
-            results.push(result);
         }
 
         results
     }
 
     // --- Private helper methods ---
+
+    fn workflow_execution_child(
+        &self,
+        pane_id: u64,
+        workflow: Arc<dyn Workflow>,
+        execution_id: String,
+    ) -> impl FnOnce(crate::cx::Cx) -> BoxFuture<'static, ()> + Send + 'static + use<> {
+        let runner = self.runner_for_workflow(Arc::clone(&workflow));
+        // spawn_with_cx invokes its constructor on the child's first poll.
+        // Capture release ownership in that constructor, before submitting it,
+        // so an abort before that poll cannot leak the admission.
+        let release_guard = self
+            .lock_manager
+            .held_lock_release_guard(pane_id, &execution_id);
+        move |child_cx| -> BoxFuture<'static, ()> {
+            Box::pin(async move {
+                release_guard.defuse();
+                let result = runner
+                    .run_workflow_with_cx(&child_cx, pane_id, workflow, &execution_id, 0)
+                    .await;
+                log_workflow_execution_result(&result);
+            })
+        }
+    }
+
+    fn runner_for_workflow(&self, workflow: Arc<dyn Workflow>) -> Self {
+        Self {
+            workflows: std::sync::RwLock::new(vec![workflow]),
+            engine: WorkflowEngine::new(self.config.max_concurrent),
+            lock_manager: Arc::clone(&self.lock_manager),
+            storage: Arc::clone(&self.storage),
+            source_registry: self.source_registry.clone(),
+            injector: self.injector.clone(),
+            config: self.config.clone(),
+            replay_capture: self.replay_capture.clone(),
+            external_signals: self.external_signals.clone(),
+        }
+    }
+
+    async fn resume_record_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        candidate: &crate::storage::WorkflowRecord,
+    ) -> WorkflowResumeAttempt {
+        use crate::workflows::lock::OwnedLockAcquisitionResult;
+
+        let skipped = || WorkflowResumeAttempt {
+            result: None,
+            retry: false,
+        };
+        let unavailable = || WorkflowResumeAttempt {
+            result: Some(workflow_execution_error(
+                &candidate.id,
+                "workflow_resume_unavailable",
+            )),
+            retry: true,
+        };
+        let Some(workflow) = self.find_workflow_by_name(&candidate.workflow_name) else {
+            tracing::warn!(
+                workflow_name = %candidate.workflow_name,
+                execution_id = %candidate.id,
+                "Cannot resume: workflow not registered"
+            );
+            return skipped();
+        };
+        let record = match self.storage.get_workflow_with_cx(cx, &candidate.id).await {
+            Ok(Some(record)) => record,
+            Ok(None) => return skipped(),
+            Err(_) => return unavailable(),
+        };
+        // The bounded page is only a hint. A deleted/replaced row must never
+        // substitute a different pane, workflow, trigger, or execution epoch.
+        if record.workflow_name != candidate.workflow_name
+            || record.pane_id != candidate.pane_id
+            || record.started_at != candidate.started_at
+            || record.trigger_event_id != candidate.trigger_event_id
+            || !matches!(record.status.as_str(), "running" | "waiting")
+        {
+            return skipped();
+        }
+        // Trust can tighten while the watcher is down. Check before either
+        // executing a step or settling malformed durable state.
+        if !workflow.trigger_policy().allows_source_pane(record.pane_id) {
+            tracing::warn!(
+                execution_id = %record.id,
+                pane_id = record.pane_id,
+                "Refusing workflow resume outside source-pane trust scope"
+            );
+            return skipped();
+        }
+        let resume = self.engine.resume_cx(cx, &self.storage, &record.id).await;
+        let invalid_budget = matches!(&resume, Err(error) if is_invalid_workflow_budget(error));
+        let (execution, next_step) = match resume {
+            Ok(Some(resume)) => (Some(resume.0), resume.1),
+            Ok(None) => return skipped(),
+            Err(_) if !invalid_budget || cx.checkpoint().is_err() => return unavailable(),
+            Err(_) => (None, record.current_step),
+        };
+        if execution.as_ref().is_some_and(|execution| {
+            execution.pane_id != record.pane_id
+                || execution.workflow_name != record.workflow_name
+                || execution.started_at != record.started_at
+        }) {
+            return skipped();
+        }
+
+        let release_guard = match self.lock_manager.try_acquire_with_limit_owned_full(
+            record.pane_id,
+            &record.workflow_name,
+            &record.id,
+            self.config.max_concurrent,
+        ) {
+            Ok(OwnedLockAcquisitionResult::Acquired(guard)) => guard,
+            Ok(OwnedLockAcquisitionResult::AlreadyLocked {
+                held_by_execution, ..
+            }) if held_by_execution == record.id => {
+                // A live admission or earlier recovery child already owns
+                // this exact execution. Do not enqueue a second attempt when
+                // that owner finishes or leaves an indeterminate effect.
+                return skipped();
+            }
+            _ => {
+                return WorkflowResumeAttempt {
+                    result: invalid_budget.then(|| {
+                        workflow_execution_error(&record.id, "workflow_budget_resume_busy")
+                    }),
+                    retry: true,
+                };
+            }
+        };
+        if invalid_budget {
+            // Invalid authority becomes a visible failure under the same
+            // admission limits as a normal resumed workflow.
+            let result = self
+                .settle_budget_failure(
+                    &record.workflow_name,
+                    &record.id,
+                    record.pane_id,
+                    record.current_step,
+                    None,
+                    "workflow_budget_invalid_resume_state",
+                )
+                .await;
+            drop(release_guard);
+            return WorkflowResumeAttempt {
+                result: Some(result),
+                retry: false,
+            };
+        }
+        tracing::info!(
+            execution_id = %record.id,
+            workflow = %record.workflow_name,
+            pane_id = record.pane_id,
+            resume_step = next_step,
+            "Resuming workflow"
+        );
+        // run_workflow_inner takes release ownership on its first poll. There
+        // is no await between this handoff and polling that future.
+        release_guard.defuse();
+        let result = self
+            .run_workflow_with_cx(cx, record.pane_id, workflow, &record.id, next_step)
+            .await;
+        // This finite error is returned before durable attempt admission or
+        // workflow code. Other errors may follow an effect and must not cause
+        // another automatic attempt, especially an InFlight recovery fence.
+        let retry = matches!(
+            &result,
+            WorkflowExecutionResult::Error { error, .. }
+                if error == "workflow_budget_load_unavailable"
+        );
+        WorkflowResumeAttempt {
+            result: Some(result),
+            retry,
+        }
+    }
 
     async fn initialize_execution_budget_with_cx(
         &self,
@@ -7003,17 +7202,25 @@ mod tests {
     }
 
     async fn seed_startup_recovery(runner: &WorkflowRunner) {
+        seed_startup_recovery_record(runner, 77, "startup-recovery").await;
+    }
+
+    async fn seed_startup_recovery_record(
+        runner: &WorkflowRunner,
+        pane_id: u64,
+        execution_id: &str,
+    ) {
         let cx = crate::cx::for_testing();
-        seed_test_pane(&runner.storage, 77, now_ms()).await;
+        seed_test_pane(&runner.storage, pane_id, now_ms()).await;
         let execution = runner
             .engine
             .start_with_id_cx(
                 &cx,
                 &runner.storage,
                 super::super::engine::WorkflowStartInput {
-                    execution_id: "startup-recovery".to_string(),
+                    execution_id: execution_id.to_string(),
                     workflow_name: "startup_ingress_probe".to_string(),
-                    pane_id: 77,
+                    pane_id,
                     trigger_event_id: None,
                     context: None,
                 },
@@ -7070,6 +7277,371 @@ mod tests {
         })
         .await
         .expect("buffered detections must reach completed workflow records");
+    }
+
+    async fn wait_for_startup_pane_completion(
+        storage: &StorageHandle,
+        probe: &StartupIngressProbeWorkflow,
+        locks: &PaneWorkflowLockManager,
+        pane_id: u64,
+    ) {
+        let cx = crate::cx::for_testing();
+        crate::runtime_async::timeout_with_cx(&cx, Duration::from_secs(5), async {
+            loop {
+                let executions = probe.executions.lock().unwrap().clone();
+                let matches = executions
+                    .iter()
+                    .filter(|(executed_pane, _)| *executed_pane == pane_id)
+                    .collect::<Vec<_>>();
+                assert!(matches.len() <= 1, "a pane executed more than once");
+                if let Some((_, execution_id)) = matches.first()
+                    && storage
+                        .get_workflow_with_cx(&cx, execution_id)
+                        .await
+                        .unwrap()
+                        .is_some_and(|record| record.status == "completed")
+                    && locks.is_locked(pane_id).is_none()
+                {
+                    return;
+                }
+                crate::runtime_async::sleep_with_cx(&cx, Duration::from_millis(1))
+                    .await
+                    .unwrap();
+            }
+        })
+        .await
+        .expect("unrelated pane must complete while recovered work is blocked");
+    }
+
+    #[test]
+    fn workflow_runner_recovers_without_blocking_live_detections_or_shutdown() {
+        run_async_test(async {
+            for cancel in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("concurrent-recovery.db");
+                let (storage, mut runner, locks) =
+                    unlimited_gate_runner(path.to_str().unwrap()).await;
+                runner.config.max_concurrent = 2;
+                runner.config.step_timeout_ms = 60_000;
+                let probe = Arc::new(StartupIngressProbeWorkflow::new());
+                runner.register_workflow(probe.clone());
+                seed_startup_recovery(&runner).await;
+                seed_startup_recovery_record(&runner, 78, "startup-recovery-queued").await;
+                seed_test_pane(&storage, 79, now_ms()).await;
+                let event_bus = crate::events::EventBus::new(8);
+                let runner_cx = crate::cx::for_testing();
+                let child_cx = runner_cx.clone();
+                let subscription = runner
+                    .subscribe_with_cx(&runner_cx, &event_bus)
+                    .await
+                    .unwrap();
+                let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let child_stopped = Arc::clone(&stopped);
+                let notify = Arc::new(crate::runtime_async::notify::Notify::new());
+                let child_notify = Arc::clone(&notify);
+                let task = crate::runtime_async::task::spawn(async move {
+                    runner
+                        .run_subscribed_with_cx(
+                            &child_cx,
+                            subscription,
+                            Some((&child_stopped, &child_notify)),
+                        )
+                        .await;
+                });
+                let observer_cx = crate::cx::for_testing();
+                crate::runtime_async::timeout_with_cx(
+                    &observer_cx,
+                    Duration::from_secs(5),
+                    probe
+                        .recovery_notify
+                        .wait_until(|| probe.recovery_entered.load(Ordering::SeqCst)),
+                )
+                .await
+                .expect("restored execution must enter its real pending step");
+
+                assert_eq!(event_bus.publish(startup_ingress_event(79)), 1);
+                wait_for_startup_pane_completion(&storage, &probe, &locks, 79).await;
+                assert!(!probe.recovery_released.load(Ordering::SeqCst));
+                assert_eq!(probe.executions.lock().unwrap().len(), 2);
+                assert!(locks.is_locked(77).is_some());
+                assert!(locks.is_locked(78).is_none());
+                assert_eq!(
+                    storage
+                        .get_workflow("startup-recovery-queued")
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    "running",
+                    "recovery must reserve capacity for live detections"
+                );
+                assert_eq!(
+                    storage
+                        .get_workflow_budget_with_cx(&observer_cx, "startup-recovery")
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .phase,
+                    WorkflowAttemptPhase::InFlight,
+                    "the pending effect retains its durable attempt fence"
+                );
+
+                if cancel {
+                    runner_cx.cancel_with(
+                        crate::outcome::CancelKind::User,
+                        Some("cancel while restored step is pending"),
+                    );
+                } else {
+                    stopped.store(true, Ordering::SeqCst);
+                    notify.notify_waiters();
+                }
+                crate::runtime_async::timeout_with_cx(&observer_cx, Duration::from_secs(2), task)
+                    .await
+                    .expect("shutdown must not wait for the restored step to finish")
+                    .expect("runner and its owned children must settle");
+                assert_eq!(locks.active_count(), 0);
+                assert_eq!(event_bus.stats().detection_subscribers, 0);
+                assert_eq!(probe.executions.lock().unwrap().len(), 2);
+
+                storage.shutdown().await.unwrap();
+                drop(storage);
+                let (reopened, restarted, restarted_locks) =
+                    unlimited_gate_runner(path.to_str().unwrap()).await;
+                restarted.register_workflow(probe.clone());
+                crate::runtime_async::timeout_with_cx(
+                    &observer_cx,
+                    Duration::from_secs(5),
+                    restarted.resume_incomplete_with_cx(&observer_cx),
+                )
+                .await
+                .expect("restart must refuse the indeterminate attempt and finish queued work");
+                wait_for_startup_pane_completion(&reopened, &probe, &restarted_locks, 78).await;
+                assert_eq!(probe.executions.lock().unwrap().len(), 3);
+                assert_eq!(restarted_locks.active_count(), 0);
+                reopened.shutdown().await.unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn workflow_runner_revisits_deferred_recovery_without_blocking_other_panes() {
+        run_async_test(async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("deferred-recovery.db");
+            let (storage, mut runner, locks) = unlimited_gate_runner(path.to_str().unwrap()).await;
+            runner.config.max_concurrent = 3;
+            let probe = Arc::new(StartupIngressProbeWorkflow::new());
+            runner.register_workflow(probe.clone());
+            seed_startup_recovery(&runner).await;
+            seed_startup_recovery_record(&runner, 78, "startup-recovery-queued").await;
+            let held = locks
+                .try_acquire_owned_guarded(77, "other", "other-execution")
+                .unwrap();
+            let capacity_a = locks
+                .try_acquire_owned_guarded(80, "other", "capacity-a")
+                .unwrap();
+            let capacity_b = locks
+                .try_acquire_owned_guarded(81, "other", "capacity-b")
+                .unwrap();
+            let event_bus = crate::events::EventBus::new(8);
+            let cx = crate::cx::for_testing();
+            let subscription = runner.subscribe_with_cx(&cx, &event_bus).await.unwrap();
+            let task = crate::runtime_async::task::spawn(async move {
+                runner.run_subscribed_with_cx(&cx, subscription, None).await;
+            });
+            let observer_cx = crate::cx::for_testing();
+            crate::runtime_async::timeout_with_cx(&observer_cx, Duration::from_secs(5), async {
+                loop {
+                    let health = locks.health();
+                    if health.concurrency_limit_blocks_total > 0
+                        && health.pane_already_locked_total > 0
+                    {
+                        break;
+                    }
+                    crate::runtime_async::sleep_with_cx(&observer_cx, Duration::from_millis(1))
+                        .await
+                        .unwrap();
+                }
+            })
+            .await
+            .expect("recovery must honor both global capacity and the existing pane owner");
+            assert!(probe.executions.lock().unwrap().is_empty());
+            assert_eq!(locks.active_count(), 3);
+            drop(capacity_a);
+            wait_for_startup_pane_completion(&storage, &probe, &locks, 78).await;
+            assert!(!probe.recovery_entered.load(Ordering::SeqCst));
+            assert_eq!(locks.active_count(), 2);
+            assert_eq!(locks.is_locked(77).unwrap().execution_id, "other-execution");
+            drop(held);
+            crate::runtime_async::timeout_with_cx(
+                &observer_cx,
+                Duration::from_secs(5),
+                probe
+                    .recovery_notify
+                    .wait_until(|| probe.recovery_entered.load(Ordering::SeqCst)),
+            )
+            .await
+            .expect("deferred recovery must retry without another event publication");
+            probe.recovery_released.store(true, Ordering::SeqCst);
+            probe.recovery_notify.notify_waiters();
+            wait_for_startup_executions(&storage, &probe, &[77, 78]).await;
+            drop(capacity_b);
+            assert_eq!(event_bus.metrics().snapshot().events_published, 0);
+            drop(event_bus);
+            crate::runtime_async::timeout_with_cx(&observer_cx, Duration::from_secs(2), task)
+                .await
+                .expect("runner must observe bus closure after recovery")
+                .expect("runner task must settle");
+            assert_eq!(locks.active_count(), 0);
+            assert_eq!(probe.executions.lock().unwrap().len(), 2);
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn workflow_recovery_pages_cross_deleted_and_terminal_ids_with_a_fixed_upper_bound() {
+        run_async_test(async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("recovery-pages.db");
+            let (storage, runner, _) = unlimited_gate_runner(path.to_str().unwrap()).await;
+            for (pane_id, id) in [
+                (80, "scan-a"),
+                (81, "scan-b"),
+                (82, "scan-c"),
+                (83, "scan-d"),
+                (84, "scan-e"),
+            ] {
+                seed_startup_recovery_record(&runner, pane_id, id).await;
+            }
+            let cx = crate::cx::for_testing();
+            let first = storage
+                .scan_incomplete_workflows_with_cx(&cx, None, None, 2)
+                .await
+                .unwrap();
+            assert_eq!(first.through_id.as_deref(), Some("scan-e"));
+            assert_eq!(
+                first
+                    .records
+                    .iter()
+                    .map(|row| row.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["scan-a", "scan-b"]
+            );
+            let through = first.through_id;
+            let mut terminal = storage.get_workflow("scan-c").await.unwrap().unwrap();
+            terminal.status = "completed".to_string();
+            terminal.completed_at = Some(now_ms());
+            storage.upsert_workflow(terminal).await.unwrap();
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection
+                .execute_batch("PRAGMA foreign_keys = ON")
+                .unwrap();
+            connection
+                .execute("DELETE FROM workflow_executions WHERE id = 'scan-b'", [])
+                .unwrap();
+            connection.execute_batch("VACUUM").unwrap();
+            drop(connection);
+            seed_startup_recovery_record(&runner, 85, "scan-bb").await;
+            seed_startup_recovery_record(&runner, 86, "scan-z").await;
+
+            let second = storage
+                .scan_incomplete_workflows_with_cx(
+                    &cx,
+                    Some("scan-b".to_string()),
+                    through.clone(),
+                    2,
+                )
+                .await
+                .unwrap();
+            // This is reconciliation, not immutable snapshot membership: an
+            // in-range new identity is inspected, but never substitutes the
+            // removed cursor's identity or expands the fixed upper bound.
+            assert_eq!(
+                second
+                    .records
+                    .iter()
+                    .map(|row| row.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["scan-bb", "scan-d"]
+            );
+            assert_eq!(second.through_id, through);
+            let third = storage
+                .scan_incomplete_workflows_with_cx(
+                    &cx,
+                    Some("scan-d".to_string()),
+                    through.clone(),
+                    2,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                third
+                    .records
+                    .iter()
+                    .map(|row| row.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["scan-e"]
+            );
+            let last = storage
+                .scan_incomplete_workflows_with_cx(
+                    &cx,
+                    Some("scan-e".to_string()),
+                    through.clone(),
+                    2,
+                )
+                .await
+                .unwrap();
+            assert!(last.records.is_empty());
+            assert_eq!(last.through_id, through);
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn workflow_runner_unpolled_child_releases_its_durable_admission() {
+        run_async_test(async {
+            for construct_future in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("unpolled-workflow.db");
+                let (storage, runner, locks) = unlimited_gate_runner(path.to_str().unwrap()).await;
+                let probe = Arc::new(StartupIngressProbeWorkflow::new());
+                runner.register_workflow(probe.clone());
+                seed_test_pane(&storage, 78, now_ms()).await;
+                let crate::events::Event::PatternDetected { detection, .. } =
+                    startup_ingress_event(78)
+                else {
+                    unreachable!();
+                };
+                let cx = crate::cx::for_testing();
+                let start = runner
+                    .handle_detection_with_cx(&cx, 78, &detection, None)
+                    .await;
+                let id = start.execution_id().expect("durable admission").to_string();
+                assert!(locks.is_locked(78).is_some());
+                // Exercise the exact constructor submitted by the event loop.
+                // Neither dropping it nor its unpolled future may leak a lock.
+                let child = runner.workflow_execution_child(78, probe.clone(), id.clone());
+                if construct_future {
+                    drop(child(cx.clone()));
+                } else {
+                    drop(child);
+                }
+                assert_eq!(locks.active_count(), 0);
+                assert!(probe.executions.lock().unwrap().is_empty());
+                assert_eq!(
+                    storage.get_workflow(&id).await.unwrap().unwrap().status,
+                    "running"
+                );
+                let results = runner.resume_incomplete_with_cx(&cx).await;
+                assert!(matches!(
+                    results.as_slice(),
+                    [WorkflowExecutionResult::Completed { .. }]
+                ));
+                assert_eq!(probe.executions.lock().unwrap().len(), 1);
+                assert_eq!(locks.active_count(), 0);
+                storage.shutdown().await.unwrap();
+            }
+        });
     }
 
     #[derive(Clone, Copy)]
@@ -7142,7 +7714,12 @@ mod tests {
         )
         .await
         .expect("runner must enter the actual unfinished workflow");
-        assert_eq!(probe.detections.load(Ordering::SeqCst), 0);
+        // A pre-spawn detection may already have run concurrently with
+        // recovery; no additional publication has happened yet.
+        assert!(
+            probe.detections.load(Ordering::SeqCst)
+                <= usize::from(matches!(entry, StartupRunnerEntry::Subscribed))
+        );
         // This publication occurs while the durable recovery step is pending,
         // not merely before or after an artificial startup delay.
         assert_eq!(event_bus.publish(startup_ingress_event(79)), 1);
