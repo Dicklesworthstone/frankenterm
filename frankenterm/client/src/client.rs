@@ -4369,10 +4369,7 @@ impl CurrentClientDispatch {
             || !mux_owner
                 .upgrade()
                 .is_some_and(|owner| Arc::ptr_eq(&owner, &self.mux))
-            || !self
-                .mux
-                .get_domain(*local_domain_id)
-                .is_some_and(|current| current.same_registration(&self.domain))
+            || !self.mux.domain_operation_is_live(&self.domain)
         {
             return false;
         }
@@ -22425,6 +22422,44 @@ mod tests {
             .expect("captured mux owner should remain alive");
         assert!(Arc::ptr_eq(&captured, &origin_mux));
         assert!(!Arc::ptr_eq(&captured, &replacement_mux));
+    }
+
+    #[test]
+    fn a_held_dispatch_stops_being_current_when_its_domain_retires() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let domain_id = 91_430;
+        let config = ClientDomainConfig::Unix(UnixDomain::default());
+        let client = Client::new_test_client(Some(domain_id), config);
+        let authority = client.test_dispatch_authority(Arc::downgrade(&mux));
+        let inner = Arc::new(ClientInner::new(domain_id, client, None, None, false));
+        let domain = ClientDomain::register_attached_for_test(&mux, &inner);
+
+        let current = authority
+            .resolve_current()
+            .expect("resolve the attached dispatch")
+            .expect("a registered, attached client on its live generation is current");
+        assert!(current.is_current());
+        assert!(current.rpc_generation_is_live());
+
+        let registered = mux
+            .get_domain(domain_id)
+            .expect("admit the registered client domain");
+        assert!(mux.domain_was_detached_if_guard(&registered));
+        assert!(
+            !current.is_current(),
+            "retiring the domain ends a dispatch that still holds its guard"
+        );
+        assert!(!current.rpc_generation_is_live());
+        assert!(authority
+            .resolve_current()
+            .expect("resolve after retirement")
+            .is_none());
+
+        drop(registered);
+        drop(current);
+        drop(domain);
     }
 
     #[test]

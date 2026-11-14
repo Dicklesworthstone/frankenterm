@@ -3063,6 +3063,35 @@ impl ClientDomain {
         })
     }
 
+    /// Register a domain already attached through `inner` with `mux`.
+    #[cfg(test)]
+    pub(crate) fn register_attached_for_test(
+        mux: &Arc<Mux>,
+        inner: &Arc<ClientInner>,
+    ) -> Arc<Self> {
+        let config = ClientDomainConfig::Unix(UnixDomain {
+            name: format!("test-client-domain-{}", inner.local_domain_id),
+            ..UnixDomain::default()
+        });
+        let domain = Arc::new(ClientDomain {
+            label: config.label(),
+            policy: parking_lot::RwLock::new(ClientDomainPolicy::from_config(&config)),
+            durable_binding: Mutex::new(None),
+            config,
+            inner: Mutex::new(Some(Arc::clone(inner))),
+            background_attachment_ui: Mutex::new(None),
+            initial_attachment_pending: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
+            local_domain_id: inner.local_domain_id,
+            mux_owner: Arc::downgrade(mux),
+            mux_subscriber_id: None,
+        });
+        let registered: Arc<dyn Domain> = domain.clone();
+        mux.add_domain(&registered)
+            .expect("test client domain should register with its exact mux");
+        domain
+    }
+
     pub(crate) fn inner(&self) -> Option<Arc<ClientInner>> {
         lock_or_recover(&self.inner, "client_domain_inner")
             .as_ref()
@@ -7525,27 +7554,7 @@ mod tests {
     }
 
     fn register_test_client_domain(mux: &Arc<Mux>, inner: &Arc<ClientInner>) -> Arc<ClientDomain> {
-        let config = ClientDomainConfig::Unix(UnixDomain {
-            name: format!("test-client-domain-{}", inner.local_domain_id),
-            ..UnixDomain::default()
-        });
-        let domain = Arc::new(ClientDomain {
-            label: config.label(),
-            policy: parking_lot::RwLock::new(ClientDomainPolicy::from_config(&config)),
-            durable_binding: Mutex::new(None),
-            config,
-            inner: Mutex::new(Some(Arc::clone(inner))),
-            background_attachment_ui: Mutex::new(None),
-            initial_attachment_pending: AtomicBool::new(false),
-            retired: AtomicBool::new(false),
-            local_domain_id: inner.local_domain_id,
-            mux_owner: Arc::downgrade(mux),
-            mux_subscriber_id: None,
-        });
-        let registered: Arc<dyn Domain> = domain.clone();
-        mux.add_domain(&registered)
-            .expect("test client domain should register with its exact mux");
-        domain
+        ClientDomain::register_attached_for_test(mux, inner)
     }
 
     #[test]

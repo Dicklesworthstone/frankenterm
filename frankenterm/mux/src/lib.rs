@@ -17522,6 +17522,25 @@ impl Mux {
         self.acquire_domain_operation_locked(registration).ok()
     }
 
+    /// Whether an operation this mux admitted still names its live
+    /// registration. Takes no lock.
+    ///
+    /// For a guard this mux issued, the answer equals re-admitting the same
+    /// identifier through [`Mux::get_domain`] and comparing registrations:
+    /// - a live index entry is never replaced: add refuses an identifier or
+    ///   name that is in use, and recovery publishes only into empty indexes;
+    /// - indexes are removed only after retirement, once every admitted
+    ///   guard (this one included) has dropped;
+    /// - retirement is one-way and commits by setting the retired bit.
+    ///
+    /// So while the guard is held, its registration stays indexed until the
+    /// retired bit is set and is never current again afterwards. A guard from
+    /// another mux is never live here.
+    pub fn domain_operation_is_live(&self, guard: &DomainOperationGuard) -> bool {
+        Arc::ptr_eq(&self.domain_owner_identity, &guard.owner_identity)
+            && !guard.registration().generation.is_retired()
+    }
+
     pub fn get_domain_by_name(&self, name: &str) -> Option<DomainOperationGuard> {
         let _registration = self.domain_registration.lock();
         let registration = self
@@ -39930,6 +39949,45 @@ mod tests {
         wait_for_domain_retirement(&mux, 1);
         mux.add_domain(&successor)
             .expect("same ID becomes admissible after exact guard quiescence");
+    }
+
+    #[test]
+    fn an_admitted_operation_is_live_until_its_registration_retires() {
+        let _global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let second_mux = Arc::new(Mux::new(None));
+        let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::for_domain(1));
+        let guard = mux
+            .add_domain_and_acquire(&domain)
+            .expect("publish and admit one exact domain generation");
+        let peer = mux.get_domain(1).expect("re-admit the same registration");
+        let readmits = |guard: &DomainOperationGuard| {
+            mux.get_domain(guard.domain_id())
+                .is_some_and(|current| current.same_registration(guard))
+        };
+
+        for held in [&guard, &peer] {
+            assert!(mux.domain_operation_is_live(held));
+            assert!(readmits(held));
+            assert!(
+                !second_mux.domain_operation_is_live(held),
+                "another mux never vouches for this mux's operation"
+            );
+        }
+
+        assert!(mux.domain_was_detached_if_guard(&guard));
+        for held in [&guard, &peer] {
+            assert!(
+                !mux.domain_operation_is_live(held),
+                "retirement ends liveness while the guard is still held"
+            );
+            assert!(!readmits(held));
+        }
+
+        drop(peer);
+        drop(domain);
+        drop(guard);
+        wait_for_domain_retirement(&mux, 1);
     }
 
     #[test]
