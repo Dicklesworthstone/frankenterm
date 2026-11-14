@@ -7531,6 +7531,16 @@ mod tests {
 
     #[test]
     #[ignore = "requires actual sealed candidate identity; run explicitly in strict RCH/DSR"]
+    fn configured_genesis_service_retires_ended_panes_after_their_mux_disconnects() {
+        for close_first in [false, true] {
+            run_configured_genesis_service(GenesisServiceScenario::ReleaseAfterDisconnect {
+                close_first,
+            });
+        }
+    }
+
+    #[test]
+    #[ignore = "requires actual sealed candidate identity; run explicitly in strict RCH/DSR"]
     fn configured_genesis_service_rotates_two_panes_to_new_mux_process() {
         run_configured_genesis_service(GenesisServiceScenario::Rotate);
     }
@@ -8295,6 +8305,7 @@ mod tests {
     enum GenesisServiceScenario {
         Spawn,
         MissingBroker,
+        ReleaseAfterDisconnect { close_first: bool },
         Rotate,
         RepeatedRotation,
         DelayedOutput,
@@ -8324,8 +8335,9 @@ mod tests {
         };
         use crate::broker::{BrokerControlServiceConfigV1, BrokerControlServiceV1};
         use mux::guardian_protocol::{
-            GuardianCheckpointDescriptorV1, GuardianCheckpointOutputBoundaryV1,
-            GuardianReplayPageBodyDelivery, GuardianReplaySelectorV1,
+            GuardianCensusPaneStatus, GuardianCheckpointDescriptorV1,
+            GuardianCheckpointOutputBoundaryV1, GuardianReplayPageBodyDelivery,
+            GuardianReplaySelectorV1,
         };
 
         struct StopOnDrop<'a>(&'a AtomicBool);
@@ -8450,6 +8462,8 @@ mod tests {
             let (pending_result_tx, pending_result_rx) = std::sync::mpsc::sync_channel(1);
             let (diagnostic_tx, diagnostic_rx) = std::sync::mpsc::sync_channel(1);
             let (diagnostic_result_tx, diagnostic_result_rx) = std::sync::mpsc::sync_channel(1);
+            let (prune_tx, prune_rx) = std::sync::mpsc::sync_channel(1);
+            let (pruned_tx, pruned_rx) = std::sync::mpsc::sync_channel(1);
             let guardian_stop = &stop;
             let guardian = scope.spawn(move || {
                 let mut service = GuardianService::bind(guardian_config).unwrap();
@@ -8460,6 +8474,14 @@ mod tests {
                 let mut await_retirement = false;
                 while !guardian_stop.load(Ordering::Acquire) {
                     service.poll_once().unwrap();
+                    if let Ok(pane) = prune_rx.try_recv() {
+                        pruned_tx
+                            .send((
+                                service.runtime.prune_broker_retirement_for_test(mux, pane),
+                                service.runtime_counters(),
+                            ))
+                            .unwrap();
+                    }
                     if let Ok(panes) = diagnostic_rx.try_recv() {
                         diagnostic_result_tx
                             .send((
@@ -9016,6 +9038,133 @@ mod tests {
                     .unwrap(),
                 applied
             );
+            if let GenesisServiceScenario::ReleaseAfterDisconnect { close_first } = scenario {
+                let deadline = std::time::Instant::now() + CLIENT_IO_TIMEOUT;
+                loop {
+                    if leased.census_snapshot().unwrap().iter().any(|entry| {
+                        entry.pane_id == pane
+                            && entry.status == GuardianCensusPaneStatus::ExitedUnclaimed
+                            && entry.pending_input_effect.is_none()
+                    }) {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the real broker child did not exit and settle input"
+                    );
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                if close_first {
+                    assert!(matches!(
+                        leased
+                            .close(pane, generation, 0, Uuid::new_v4(), Uuid::new_v4())
+                            .unwrap(),
+                        GuardianReply::MutationApplied { sequence: 0, .. }
+                    ));
+                }
+                drop(leased);
+                drop(client);
+                retire_tx.send(()).unwrap();
+                retired_rx.recv_timeout(CLIENT_IO_TIMEOUT).unwrap();
+
+                // A later mux has only guardian service authentication here.
+                // It must neither Claim the dead child nor open a new broker
+                // session to release an eligible pane after root advancement.
+                let mut successor =
+                    GuardianClient::connect(&socket, &token, Uuid::new_v4()).unwrap();
+                let expected_status = if close_first {
+                    GuardianCensusPaneStatus::ClosedTerminal
+                } else {
+                    GuardianCensusPaneStatus::ExitedUnclaimed
+                };
+                assert!(
+                    successor
+                        .census_snapshot()
+                        .unwrap()
+                        .iter()
+                        .any(|entry| { entry.pane_id == pane && entry.status == expected_status })
+                );
+                let deadline = std::time::Instant::now() + CLIENT_IO_TIMEOUT;
+                loop {
+                    prune_tx.send(pane).unwrap();
+                    let (probe, counters) = pruned_rx.recv_timeout(CLIENT_IO_TIMEOUT).unwrap();
+                    if probe.ready {
+                        assert!(probe.connection_retained, "{probe:?}");
+                        assert!(probe.handle_retained, "{probe:?}");
+                        assert_eq!(probe.settled, close_first, "{probe:?}");
+                        assert!(!probe.release_due, "cleanup preceded authenticated Release");
+                        assert_eq!(counters.broker_panes_retired, 0);
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "ended pane lost retirement authority before Release: {probe:?}"
+                    );
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                assert_eq!(
+                    successor.release(pane).unwrap(),
+                    GuardianReply::Released { pane_id: pane }
+                );
+                let deadline = std::time::Instant::now() + CLIENT_IO_TIMEOUT;
+                loop {
+                    prune_tx.send(pane).unwrap();
+                    let (probe, counters) = pruned_rx.recv_timeout(CLIENT_IO_TIMEOUT).unwrap();
+                    if counters.broker_panes_retired == 1 {
+                        assert!(!probe.connection_retained, "{probe:?}");
+                        assert!(!probe.handle_retained, "{probe:?}");
+                        assert!(!probe.settled, "{probe:?}");
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the retained broker capability did not complete retirement: {probe:?}"
+                    );
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                assert!(
+                    successor
+                        .census_snapshot()
+                        .unwrap()
+                        .iter()
+                        .all(|entry| entry.pane_id != pane)
+                );
+                assert!(matches!(
+                    successor.release(pane),
+                    Err(GuardianClientError::Rejected(
+                        GuardianRejectionCode::PaneNotFound
+                    ))
+                ));
+                for catalog in ["spawn-catalog", "lease-catalog"] {
+                    assert_eq!(
+                        std::fs::read_dir(broker_directory.join(catalog))
+                            .unwrap()
+                            .count(),
+                        1,
+                        "retirement must leave only the catalog lock"
+                    );
+                }
+                let retired_ids = [pane.to_string(), effect.to_string()];
+                for root in [&directory, &broker_directory] {
+                    assert!(
+                        std::fs::read_dir(root.join("guardian-output-v3"))
+                            .unwrap()
+                            .all(|entry| {
+                                let filename = entry.unwrap().file_name();
+                                let name = filename.to_string_lossy();
+                                !retired_ids.iter().any(|id| name.contains(id.as_str()))
+                            }),
+                        "retirement left pane files in {}",
+                        root.display()
+                    );
+                }
+                assert_eq!(
+                    std::fs::read(&marker).unwrap(),
+                    b"C",
+                    "cleanup spawned another child"
+                );
+                println!("GENESIS_DISCONNECTED_MUX_RETIREMENT_SUCCESS closed={close_first}");
+            }
             drop(stop_guard);
             guardian.join().unwrap();
             broker.join().unwrap();

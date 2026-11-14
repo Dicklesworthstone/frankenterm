@@ -393,10 +393,11 @@ impl StartingBrokerPane {
         self.child_status_due_by(now);
     }
 
-    /// Whether this pane still has work on its mux's broker connection. A pane
-    /// whose child exited while its mux was away can never be claimed, so it
-    /// stays bound to that mux for good, and only its last output counts.
-    fn needs_broker_connection(&self) -> bool {
+    /// Whether this pane still needs its mux's authenticated broker connection.
+    /// Draining the last output does not retire the pane: its recovery roots
+    /// may still name it. Keep its admitted handle usable until a later mux
+    /// releases it, even when its original mux has disconnected (ft-rkn8v).
+    fn needs_broker_connection(&self, connected: bool) -> bool {
         let drained = self.child_exit_observed
             && self.terminal
             && self.pending_delivery.is_none()
@@ -405,7 +406,7 @@ impl StartingBrokerPane {
             && self.output.as_ref().is_none_or(|output| {
                 output.pending_plaintext.is_none() && output.in_flight_bytes == 0
             });
-        !self.failed_before_spawn && !drained
+        !self.failed_before_spawn && (!drained || (connected && self.handle.is_some()))
     }
 
     /// A ChildStatus after every Read was one more broker round trip per
@@ -447,6 +448,16 @@ struct RuntimeBrokerConnection {
     retired_outer_owner: bool,
     /// As `retired_outer_owner`, with every lease of it retired.
     fully_retired_outer_owner: bool,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct BrokerRetirementProbe {
+    pub ready: bool,
+    pub connection_retained: bool,
+    pub handle_retained: bool,
+    pub settled: bool,
+    pub release_due: bool,
 }
 
 fn activate_ready_broker_pane(
@@ -1955,6 +1966,48 @@ impl GuardianRuntime {
         self.pending_broker_control
             .as_ref()
             .is_some_and(|pending| pending.pane_id == pane_id && pending.rotation.is_some())
+    }
+
+    /// Exercise the same idle cleanup a mux rotation or full connection set
+    /// invokes, using a real admitted handle from the sealed service fixture.
+    #[cfg(test)]
+    pub(crate) fn prune_broker_retirement_for_test(
+        &mut self,
+        mux: Uuid,
+        pane: Uuid,
+    ) -> BrokerRetirementProbe {
+        let ready = self.broker_connections.get(&mux).is_some_and(|connection| {
+            connection.fully_retired_outer_owner
+                && !connection.failed
+                && connection.active_pane.is_none()
+        }) && (self
+            .starting_broker_panes
+            .get(&pane)
+            .is_some_and(|pane| pane.is_settled(true))
+            || self
+                .settled_broker_panes
+                .get(&pane)
+                .is_some_and(|pane| pane.handle.is_some()));
+        self.release_silent_closed_panes();
+        self.release_idle_broker_connections();
+        self.release_silent_closed_panes();
+        BrokerRetirementProbe {
+            ready,
+            connection_retained: self.broker_connections.contains_key(&mux),
+            handle_retained: self
+                .starting_broker_panes
+                .get(&pane)
+                .is_some_and(|pane| pane.handle.is_some())
+                || self
+                    .settled_broker_panes
+                    .get(&pane)
+                    .is_some_and(|pane| pane.handle.is_some()),
+            settled: self.settled_broker_panes.contains_key(&pane),
+            release_due: self
+                .settled_broker_panes
+                .get(&pane)
+                .is_some_and(|pane| pane.retire_due),
+        }
     }
 
     pub(crate) fn new(
@@ -4120,9 +4173,10 @@ impl GuardianRuntime {
             .is_some_and(|connection| connection.retired_outer_owner)
     }
 
-    /// Drop the connections of retired muxes that no pane needs. Every mux
-    /// replacement leaves one behind once its panes have rotated away, and the
-    /// guardian outlives every mux: kept, they would refuse a later successor.
+    /// Drop the connections of retired muxes that no pane needs. A settled
+    /// pane still needs its connection-bound handle until its recovery roots
+    /// stop naming it and a mux releases it. These owners retain capacity in
+    /// the existing bounded connection set; Release itself needs no new slot.
     /// An idle worker's join returns at once, as its job channel closes.
     fn release_idle_broker_connections(&mut self) {
         let panes = &self.starting_broker_panes;
@@ -4132,10 +4186,13 @@ impl GuardianRuntime {
                 !connection.fully_retired_outer_owner
                     || connection.active_pane.is_some()
                     || panes.values().any(|pane| {
-                        pane.mux_incarnation == *mux_incarnation && pane.needs_broker_connection()
+                        pane.mux_incarnation == *mux_incarnation
+                            && pane.needs_broker_connection(!connection.failed)
                     })
                     || settled.values().any(|settled| {
-                        settled.mux_incarnation == *mux_incarnation && settled.retire_due
+                        settled.mux_incarnation == *mux_incarnation
+                            && ((!connection.failed && settled.handle.is_some())
+                                || settled.retire_due)
                     })
             });
     }
@@ -6199,11 +6256,19 @@ mod tests {
         request_id: Uuid,
         pane_id: Uuid,
     ) -> AuthenticatedGuardianRequest {
+        authenticated_release_request_for_mux(request_id, pane_id, Uuid::from_u128(2))
+    }
+
+    fn authenticated_release_request_for_mux(
+        request_id: Uuid,
+        pane_id: Uuid,
+        mux_incarnation: Uuid,
+    ) -> AuthenticatedGuardianRequest {
         let request = GuardianRequestEnvelope::new(
             GuardianRequestHeader::new(
                 GuardianOperation::Release,
                 Uuid::from_u128(1),
-                Uuid::from_u128(2),
+                mux_incarnation,
                 request_id,
                 Some(pane_id),
                 0,
@@ -9071,6 +9136,54 @@ mod tests {
             .expect("connection");
         assert!(runtime.broker_connection_room(held));
         assert!(!runtime.broker_connection_room(Uuid::new_v4()));
+        assert_eq!(runtime.broker_connections.len(), MAX_BROKER_CONNECTIONS);
+    }
+
+    #[test]
+    fn an_authenticated_successor_can_release_with_every_broker_slot_held() {
+        let (_directory, _poll, mut runtime, pane_id) =
+            claimed_runtime_with_writer(Box::new(std::io::sink()));
+        runtime
+            .protocol
+            .as_mut()
+            .expect("protocol")
+            .mark_exited(pane_id, 0)
+            .expect("exit recorded");
+        let pane = runtime.panes.get_mut(&pane_id).expect("spawned pane");
+        pane.exit_observed = true;
+        pane.pty_eof_observed = true;
+        for _ in 0..MAX_BROKER_CONNECTIONS {
+            let mux = Uuid::new_v4();
+            runtime
+                .broker_connections
+                .insert(mux, broker_connection(true));
+            runtime
+                .starting_broker_panes
+                .insert(Uuid::new_v4(), broker_pane_of(mux));
+        }
+        let successor = Uuid::new_v4();
+        assert!(!runtime.broker_connection_room(successor));
+        let hello = runtime
+            .dispatch(&authenticated_hello_request(Uuid::new_v4(), successor))
+            .expect("guardian Hello does not reserve a broker slot");
+        assert_eq!(hello.header().status, GuardianResponseStatus::Success);
+        let release = runtime
+            .dispatch(&authenticated_release_request_for_mux(
+                Uuid::new_v4(),
+                pane_id,
+                successor,
+            ))
+            .expect("guardian Release does not reserve a broker slot");
+        assert_eq!(release.header().status, GuardianResponseStatus::Success);
+        assert!(
+            runtime
+                .protocol
+                .as_ref()
+                .unwrap()
+                .pane_state(pane_id)
+                .is_none()
+        );
+        assert!(!runtime.broker_connections.contains_key(&successor));
         assert_eq!(runtime.broker_connections.len(), MAX_BROKER_CONNECTIONS);
     }
 
