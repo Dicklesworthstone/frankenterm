@@ -182,7 +182,7 @@ test("manual output and real history search work before either WASM import settl
   f.openPane();
   const source = f.sources.at(-1);
   source.message("delta", { schema: "ft.stream.v1", stream: "deltas", kind: "delta", data: {
-    pane_id: 7, segment_id: 1, content: "<script>captured text</script>",
+    pane_id: 7, segment_id: 1, seq: 0, content: "<script>captured text</script>",
   } }, "delta-v1:pane:7:1");
   f.frame();
   assert.equal(f.get("pane-output-text").value, "<script>captured text</script>");
@@ -389,7 +389,7 @@ test("session disposal clears captured data and cannot resume on pageshow", asyn
   f.openPane();
   const outputSource = f.sources.at(-1);
   outputSource.message("delta", { schema: "ft.stream.v1", stream: "deltas", kind: "delta", data: {
-    pane_id: 7, segment_id: 1, content: "private captured session output",
+    pane_id: 7, segment_id: 1, seq: 0, content: "private captured session output",
   } }, "delta-v1:pane:7:1");
   f.frame();
   f.get("history-search-open").emit("click");

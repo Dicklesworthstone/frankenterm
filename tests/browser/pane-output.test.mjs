@@ -53,7 +53,7 @@ function control(source, kind, data = { pane_id: 7 }, inheritedId = "") {
 
 function delta(source, id, content, pane = "7", overrides = {}) {
   const payload = `{"schema":"ft.stream.v1","stream":"deltas","kind":"delta","data":` +
-    `{"pane_id":${pane},"segment_id":${id},"content":${JSON.stringify(content)}}}`;
+    `{"pane_id":${pane},"segment_id":${id},"seq":${overrides.sequence ?? id},"content":${JSON.stringify(content)}}}`;
   source.emit("delta", overrides.payload ?? payload, overrides.cursor ?? `delta-v1:pane:${pane}:${id}`);
 }
 
@@ -109,10 +109,156 @@ test("neighboring large numeric identities cannot masquerade as the selected pan
 
 test("duplicate and older replay rows cannot append twice or regress the cursor", () => {
   const f = fixture(); f.output.select("7");
-  delta(f.latest(), "10", "A"); delta(f.latest(), "10", "duplicate");
-  delta(f.latest(), "9", "older"); delta(f.latest(), "13", "B");
+  delta(f.latest(), "10", "A", "7", { sequence: "4" });
+  delta(f.latest(), "10", "duplicate", "7", { sequence: "99" });
+  delta(f.latest(), "9", "older", "7", { sequence: "0" });
+  delta(f.latest(), "13", "B", "7", { sequence: "5" });
   assert.equal(f.output.snapshot().text, "AB");
   assert.equal(f.output.snapshot().cursor, "13");
+  assert.equal(f.output.snapshot().sequence, "5");
+  assert.equal(f.output.snapshot().sequenceDiscontinuities, 0);
+  assert.equal(f.output.snapshot().sequenceRestarted, false);
+});
+
+test("other panes can consume global segment IDs without breaking this pane's sequence", () => {
+  const f = fixture(); f.output.select("7");
+  delta(f.latest(), "10", "A", "7", { sequence: "4" });
+  delta(f.latest(), "100", "B", "7", { sequence: "5" });
+  delta(f.latest(), "1000", "C", "7", { sequence: "6" });
+  const state = f.output.snapshot();
+  assert.equal(state.text, "ABC");
+  assert.equal(state.cursor, "1000");
+  assert.equal(state.sequence, "6");
+  assert.equal(state.sequenceDiscontinuities, 0);
+  assert.equal(state.retainedPrefixMissing, false);
+});
+
+test("retention omissions remain visible after native or replacement reconnects and later output", () => {
+  for (const permanent of [false, true]) {
+    const f = fixture(); f.output.select("7");
+    delta(f.latest(), "100", "before", "7", { sequence: "10" });
+    f.latest().fail(permanent);
+    if (permanent) {
+      f.retry();
+      assert.equal(f.latest().url.searchParams.get("since_id"), "100");
+    }
+    control(f.latest(), "ready");
+    // No gap event survives the disconnect; only retained rows can expose it.
+    delta(f.latest(), "200", "after", "7", { sequence: "13" });
+    assert.equal(f.output.snapshot().sequenceDiscontinuities, 1);
+    assert.equal(f.output.snapshot().gapNotifications, 0);
+    assert.equal(f.output.snapshot().text, "beforeafter");
+    f.output.pause(); f.output.resume();
+    assert.equal(f.latest().url.searchParams.get("since_id"), "200");
+    control(f.latest(), "ready");
+    assert.equal(f.output.snapshot().sequenceDiscontinuities, 1);
+    delta(f.latest(), "300", " next", "7", { sequence: "14" });
+    f.output.suspend(); f.output.restore();
+    assert.equal(f.latest().url.searchParams.get("since_id"), "300");
+    control(f.latest(), "ready");
+    delta(f.latest(), "400", " final", "7", { sequence: "15" });
+    const state = f.output.snapshot();
+    assert.equal(state.sequenceDiscontinuities, 1);
+    assert.equal(state.sequenceRestarted, false);
+    assert.equal(state.sequence, "15");
+    assert.equal(state.text, "beforeafter next final");
+    assert.equal(state.error, null);
+  }
+});
+
+test("pause and page suspension retain the sequence needed to detect pruning while away", () => {
+  for (const suspend of [false, true]) {
+    const f = fixture(); f.output.select("7");
+    delta(f.latest(), "100", "before", "7", { sequence: "10" });
+    const old = f.latest();
+    if (suspend) f.output.suspend();
+    else f.output.pause();
+    delta(old, "110", "late", "7", { sequence: "11" });
+    if (suspend) f.output.restore();
+    else f.output.resume();
+    assert.equal(f.latest().url.searchParams.get("since_id"), "100");
+    delta(f.latest(), "200", "after", "7", { sequence: "13" });
+    assert.equal(f.output.snapshot().text, "beforeafter");
+    assert.equal(f.output.snapshot().sequenceDiscontinuities, 1);
+  }
+});
+
+test("retained history reports a missing prefix but a fresh live tail has no invented baseline", () => {
+  for (const retainedHistory of [false, true]) {
+    for (const sequence of ["0", "37"]) {
+      const f = fixture(); f.output.select("7", { retainedHistory });
+      control(f.latest(), "ready");
+      assert.equal(f.output.snapshot().sequence, null);
+      assert.equal(f.output.snapshot().retainedPrefixMissing, false);
+      delta(f.latest(), "100", "first retained row", "7", { sequence });
+      const state = f.output.snapshot();
+      assert.equal(state.retainedPrefixMissing, retainedHistory && sequence !== "0");
+      assert.equal(state.sequenceDiscontinuities, 0);
+      assert.equal(state.unanchored, false);
+      f.latest().fail(); f.retry();
+      delta(f.latest(), "200", " next", "7", { sequence: (BigInt(sequence) + 1n).toString() });
+      assert.equal(f.output.snapshot().retainedPrefixMissing, state.retainedPrefixMissing);
+    }
+  }
+});
+
+test("new global rows with repeated or reset pane sequences expose a capture-history boundary", () => {
+  const f = fixture(); f.output.select("7");
+  delta(f.latest(), "100", "old", "7", { sequence: "9" });
+  delta(f.latest(), "110", "repeated sequence", "7", { sequence: "9" });
+  assert.equal(f.output.snapshot().sequenceDiscontinuities, 1);
+  assert.equal(f.output.snapshot().sequenceRestarted, true);
+  delta(f.latest(), "120", "reset", "7", { sequence: "0" });
+  delta(f.latest(), "130", "next", "7", { sequence: "1" });
+  const state = f.output.snapshot();
+  assert.equal(state.sequenceDiscontinuities, 2);
+  assert.equal(state.sequenceRestarted, true);
+  assert.equal(state.cursor, "130");
+  assert.equal(state.sequence, "1");
+  assert.equal(state.text, "oldrepeated sequenceresetnext");
+});
+
+test("sequence adjacency is exact beyond Number precision and through the u64 boundary", () => {
+  const f = fixture(); f.output.select("7");
+  delta(f.latest(), "1", "A", "7", { sequence: "9007199254740992" });
+  delta(f.latest(), "2", "B", "7", { sequence: "9007199254740993" });
+  assert.equal(f.output.snapshot().sequence, "9007199254740993");
+  assert.equal(f.output.snapshot().sequenceDiscontinuities, 0);
+  delta(f.latest(), "3", "C", "7", { sequence: "9007199254740995" });
+  assert.equal(f.output.snapshot().sequenceDiscontinuities, 1);
+
+  f.output.select("7");
+  delta(f.latest(), "4", "D", "7", { sequence: "18446744073709551614" });
+  delta(f.latest(), "5", "E", "7", { sequence: "18446744073709551615" });
+  assert.equal(f.output.snapshot().sequence, "18446744073709551615");
+  assert.equal(f.output.snapshot().sequenceDiscontinuities, 0);
+  delta(f.latest(), "6", "F", "7", { sequence: "0" });
+  assert.equal(f.output.snapshot().sequenceDiscontinuities, 1);
+  assert.equal(f.output.snapshot().sequenceRestarted, true);
+  assert.equal(f.output.snapshot().text, "DEF");
+});
+
+test("malformed sequence metadata cannot append, advance a cursor, or erase continuity evidence", () => {
+  for (const sequence of [undefined, '"11"', "-1", "-0", "1.5", "1e0", "null", "true", "{}", "[]", "18446744073709551616"]) {
+    const f = fixture(); f.output.select("7");
+    delta(f.latest(), "100", "A", "7", { sequence: "8" });
+    delta(f.latest(), "101", "B", "7", { sequence: "10" });
+    const metadata = sequence === undefined ? "" : `,"seq":${sequence}`;
+    const payload = '{"schema":"ft.stream.v1","stream":"deltas","kind":"delta","data":' +
+      '{"pane_id":7,"segment_id":102' + metadata + ',"content":"rejected"}}';
+    delta(f.latest(), "102", "", "7", { payload });
+    const state = f.output.snapshot();
+    assert.equal(state.text, "AB", String(sequence));
+    assert.equal(state.cursor, "101");
+    assert.equal(state.sequence, "10");
+    assert.equal(state.sequenceDiscontinuities, 1);
+    assert.equal(f.latest().closed, true);
+    f.retry();
+    assert.equal(f.latest().url.searchParams.get("since_id"), "101");
+    delta(f.latest(), "103", "C", "7", { sequence: "11" });
+    assert.equal(f.output.snapshot().sequenceDiscontinuities, 1);
+    assert.equal(f.output.snapshot().text, "ABC");
+  }
 });
 
 test("control frames preserve received cursor and capture-gap evidence", () => {
@@ -157,7 +303,7 @@ test("bad frame, wrong scope, and overflowing cursor fail closed before admissio
     { payload: '{"schema":"other","stream":"deltas","kind":"delta","data":{}}' },
     { payload: '{"schema":"ft.stream.v1","stream":"events","kind":"delta","data":{}}' },
     { payload: '{"schema":"ft.stream.v1","stream":"deltas","kind":"ready","data":{}}' },
-    { payload: '{"schema":"ft.stream.v1","stream":"deltas","kind":"delta","data":{"pane_id":7,"segment_id":2,"content":42}}' },
+    { payload: '{"schema":"ft.stream.v1","stream":"deltas","kind":"delta","data":{"pane_id":7,"segment_id":2,"seq":2,"content":42}}' },
   ];
   for (const invalid of cases) {
     const f = fixture(); f.output.select("7");
@@ -410,6 +556,46 @@ test("history button restarts only the pinned pane with explicit replay", () => 
   assert.match(f.nodes["pane-output-status"].textContent, /retained history/);
 });
 
+test("the panel keeps continuity warnings until explicit recovery and reports a pruned history prefix", () => {
+  const f = panelFixture(); f.panel.openSelected();
+  delta(f.latest(), "100", "before", "7", { sequence: "10" }); f.panel.render();
+  assert.equal(f.nodes["pane-output-warnings"].hidden, true);
+  f.nodes["pane-output-pause"].emit("click");
+  f.nodes["pane-output-pause"].emit("click");
+  delta(f.latest(), "200", "after", "7", { sequence: "13" }); f.panel.render();
+  assert.equal(f.nodes["pane-output-text"].value, "beforeafter");
+  assert.equal(f.nodes["pane-output-warnings"].hidden, false);
+  assert.match(f.nodes["pane-output-warnings"].textContent, /sequence discontinuities/);
+  assert.match(f.nodes["pane-output-warnings"].textContent, /Load retained history/);
+
+  delta(f.latest(), "300", "reset", "7", { sequence: "0" }); f.panel.render();
+  const warnings = f.nodes["pane-output-warnings"].textContent;
+  assert.match(warnings, /restarted or moved backwards/);
+  f.latest().fail(); f.retry(); control(f.latest(), "ready"); f.panel.render();
+  assert.ok(f.nodes["pane-output-warnings"].textContent.includes(warnings));
+  delta(f.latest(), "400", "next", "7", { sequence: "1" }); f.panel.render();
+  assert.equal(f.nodes["pane-output-warnings"].textContent, warnings);
+  f.panel.suspend(); f.panel.restore();
+  assert.equal(f.nodes["pane-output-warnings"].textContent, warnings);
+
+  f.nodes["pane-output-history"].emit("click");
+  assert.equal(f.nodes["pane-output-warnings"].hidden, true);
+  assert.equal(f.nodes["pane-output-text"].value, "");
+  assert.equal(f.output.snapshot().sequence, null);
+  delta(f.latest(), "500", "remaining history", "7", { sequence: "7" }); f.panel.render();
+  assert.match(f.nodes["pane-output-warnings"].textContent, /earlier output is unavailable/);
+  assert.doesNotMatch(f.nodes["pane-output-warnings"].textContent, /sequence discontinuities|restarted/);
+
+  f.panel.openSelected();
+  delta(f.latest(), "600", "fresh tail", "7", { sequence: "8" }); f.panel.render();
+  assert.equal(f.nodes["pane-output-warnings"].hidden, true);
+  f.nodes["pane-output-close"].emit("click");
+  assert.equal(f.output.snapshot().sequence, null);
+  assert.equal(f.output.snapshot().sequenceDiscontinuities, 0);
+  assert.equal(f.output.snapshot().sequenceRestarted, false);
+  assert.equal(f.output.snapshot().retainedPrefixMissing, false);
+});
+
 test("panel search freezes output, selects literal matches, wraps and resumes from its cursor", () => {
   const f = panelFixture(); f.panel.openSelected();
   delta(f.latest(), "9", "foo bar foo"); f.panel.render();
@@ -534,7 +720,7 @@ function captureHit(overrides = {}) {
 
 function capturedDelta(source, hit, content, overrides = {}) {
   const payload = '{"schema":"ft.stream.v1","stream":"deltas","kind":"delta","data":' +
-    '{"pane_id":' + hit.paneId + ',"segment_id":' + hit.segmentId +
+    '{"pane_id":' + hit.paneId + ',"segment_id":' + hit.segmentId + ',"seq":' + (overrides.sequence ?? '0') +
     ',"captured_at":' + hit.capturedAt + ',"content_len":' + hit.contentLength +
     ',"content":' + JSON.stringify(content) + '}}';
   source.emit("delta", overrides.payload ?? payload,
@@ -586,6 +772,27 @@ test("historical ready and gap frames preserve pending status until exact redact
   assert.equal(f.output.snapshot().gapNotifications, 2);
   assert.equal(f.output.snapshot().status, "historical");
   assert.equal(f.latest().closed, true);
+});
+
+test("a single historical capture validates sequence metadata without claiming a missing prefix", () => {
+  const f = fixture();
+  const hit = captureHit();
+  f.output.selectCapture(hit);
+  capturedDelta(f.latest(), hit, "one capture", { sequence: "9007199254740993" });
+  const state = f.output.snapshot();
+  assert.equal(state.status, "historical");
+  assert.equal(state.sequence, "9007199254740993");
+  assert.equal(state.retainedPrefixMissing, false);
+  assert.equal(state.sequenceDiscontinuities, 0);
+
+  f.output.selectCapture(hit);
+  capturedDelta(f.latest(), hit, "invalid", { sequence: '"9007199254740993"' });
+  assert.equal(f.output.snapshot().status, "unavailable");
+  assert.equal(f.output.snapshot().text, "");
+  assert.equal(f.output.snapshot().cursor, null);
+  assert.equal(f.output.snapshot().sequence, null);
+  assert.equal(f.latest().closed, true);
+  assert.equal(f.timers.size, 0);
 });
 
 test("deleted or out-of-order historical captures cannot fall forward or back to other output", () => {

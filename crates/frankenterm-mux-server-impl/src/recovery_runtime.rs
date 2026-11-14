@@ -8,9 +8,10 @@
 use anyhow::Context as _;
 use clap::Args;
 use frankenterm_core::cx::{self, Cx};
+use frankenterm_core::mux_recovery_image::CheckpointAuthority;
 use frankenterm_core::runtime_async;
 use frankenterm_core::session_restore::{
-    WholeMuxRecoveryVerifier, WholeMuxTrustedIdentityConfig,
+    ValidatedWholeMuxRecovery, WholeMuxRecoveryVerifier, WholeMuxTrustedIdentityConfig,
     select_newest_verified_recovery_root_with_cx, select_verified_recovery_roots_with_cx,
 };
 use frankenterm_core::snapshot_engine::{
@@ -19,7 +20,7 @@ use frankenterm_core::snapshot_engine::{
     reclaim_whole_mux_recovery_objects, reconcile_whole_mux_publication_authority,
 };
 use frankenterm_core::snapshot_publication::{
-    PredecessorBinding, PublicationLimits, SnapshotPublicationStore,
+    PredecessorBinding, PublicationLimits, SnapshotPublicationStore, VerifiedRootSelection,
 };
 use frankenterm_core::snapshot_representation::{RecoveryKey, RecoveryWrapContext};
 use std::future::Future;
@@ -331,11 +332,34 @@ impl CaptureState {
                 existing_guardian_custody: custody,
             },
         };
-        state
+        let selected = state
             .select_predecessor_with_restore(cx, None, restored, false)
             .inspect_err(|_| {
                 log::error!("mux recovery authority rejection stage=predecessor_selection");
             })?;
+        // A pane can have closed before the selected root but still be named
+        // by the fallback root. A successor must remember both authenticated
+        // roots' panes, or it loses that pane's release ownership forever
+        // (ft-rkn8v). This seeds only cleanup bookkeeping, after the selected
+        // predecessor's exact identity passed verification. It neither grants
+        // a lease nor counts either old root as a commit by this process:
+        // release still waits for two new roots that no longer name the pane.
+        let retained_guardian_panes = selected
+            .current
+            .iter()
+            .chain(selected.previous.iter())
+            .flat_map(|root| &root.image().panes)
+            .filter(|pane| {
+                matches!(
+                    &pane.checkpoint.authority,
+                    CheckpointAuthority::Guardian { .. }
+                )
+            })
+            .map(|pane| uuid::Uuid::parse_str(&pane.pane_uuid))
+            .collect::<Result<Vec<_>, _>>()
+            .context("verified recovery root has invalid guardian pane identity")?;
+        mux.note_restored_guardian_panes(retained_guardian_panes);
+        drop(selected);
         // Publication reclaims as it commits; this frees a store that filled
         // before it did, which would refuse the next generation's objects.
         match reclaim_whole_mux_recovery_objects(
@@ -362,6 +386,7 @@ impl CaptureState {
 
     fn select_predecessor(&mut self, cx: &Cx) -> anyhow::Result<()> {
         self.select_predecessor_with_restore(cx, None, None, false)
+            .map(|_| ())
     }
 
     /// After this mux's own publication, verify only the newest root, which
@@ -370,6 +395,7 @@ impl CaptureState {
     /// one again would only repeat that (ft-4wrv7).
     fn select_published(&mut self, cx: &Cx, receipt: (u64, &str)) -> anyhow::Result<()> {
         self.select_predecessor_with_restore(cx, Some(receipt), None, true)
+            .map(|_| ())
     }
 
     /// Verify both retained generations under the trusted key/root/session.
@@ -402,7 +428,7 @@ impl CaptureState {
         receipt: Option<(u64, &str)>,
         restored: Option<&RestoredPredecessor>,
         newest_only: bool,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<VerifiedRootSelection<ValidatedWholeMuxRecovery>> {
         let verifier = self.verifier();
         let selected = if newest_only {
             select_newest_verified_recovery_root_with_cx(cx, &self.store, &verifier)?
@@ -415,7 +441,7 @@ impl CaptureState {
             !selected.has_unresolved_authority(),
             "recovery root authority requires reconciliation"
         );
-        match selected.current {
+        match selected.current.as_ref() {
             Some(current) => {
                 let expected_incarnation = restored
                     .map(|source| &source.incarnation)
@@ -454,7 +480,7 @@ impl CaptureState {
                 "published or restored recovery root is missing"
             ),
         }
-        Ok(())
+        Ok(selected)
     }
 }
 
