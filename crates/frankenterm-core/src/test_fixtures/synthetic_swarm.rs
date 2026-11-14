@@ -125,7 +125,9 @@ impl SyntheticAgentScript {
                 "RESOURCE_EXHAUSTED: quota exceeded for gemini-1.5-pro. Please back off for 45 seconds."
             }
             Self::WeztermPaneExited => "pane exited with status 1",
-            Self::ClaudeOverloaded => "Error: API overloaded, retry in 30 seconds",
+            Self::ClaudeOverloaded => {
+                "API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment."
+            }
         }
     }
 

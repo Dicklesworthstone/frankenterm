@@ -5,9 +5,7 @@
     "event_type": "error.overloaded",
     "severity": "warning",
     "confidence": 0.95,
-    "extracted": {
-      "retry_after": "30"
-    },
-    "matched_text": "overloaded, retry in 30 seconds"
+    "extracted": {},
+    "matched_text": "API Error: 529 Overloaded"
   }
 ]

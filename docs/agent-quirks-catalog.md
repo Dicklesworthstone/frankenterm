@@ -10,16 +10,23 @@ Rules whose anchors fire on unrelated text from other programs.
 
 | Rule | Anchor | FP Trigger | Fixture | Severity |
 |------|--------|-----------|---------|----------|
-| `claude_code.error.overloaded` | `overloaded` | "Database overloaded: connection pool exhausted" | `overloaded_fp_database` | High: fires on any use of "overloaded" |
-| `claude_code.error.timeout` | `timed out` | "Test suite timed out after 30 seconds" | `timeout_error_fp_test_suite` | High: fires on any timeout message |
 | `wezterm.mux.connection_lost` | `connection lost` | "SSH connection lost: remote host" | `connection_lost_fp_ssh` | High: fires on any disconnection |
+
+Fixed 2026-11-14: `claude_code.error.network`, `.timeout` and `.overloaded`
+used to fire on any "timed out", "connection closed" or "overloaded" in prose
+and tool output. They also missed every real Claude Code API error, because
+their lowercase, case-sensitive regexes did not match Claude Code's wording.
+All three now require Claude Code's `API Error: ` framing. The old triggers
+are kept as fixtures that must not match: `overloaded_fp_database`,
+`timeout_error_fp_test_suite`, `error_rules_fp_prose` and
+`overloaded_fp_rate_limit`.
 
 ### Mitigation
 
-These rules use single-word or two-word anchors that are common in
-infrastructure logs. ft's domain filter (agent-scoped pane assignment) limits
-exposure: a pane assigned to `claude_code` won't run Codex rules. Still, for
-panes without an assigned agent type, all rules run and FPs are possible.
+ft's domain filter (agent-scoped pane assignment) limits exposure: a pane
+assigned to `claude_code` won't run Codex rules. Panes without an assigned
+agent type (shells, and agents ft does not recognize) run every rule, so a
+rule's own text must be specific to its agent.
 
 Recommended future work:
 - Add context-window requirements (e.g., require preceding Claude Code banner).
@@ -44,7 +51,7 @@ Recommended future work:
 | Tool name list static | `claude_code.tool_use` | Extraction regex enumerates known tools; new tools are unextracted | `tool_use_v2`, `tool_use_v3` |
 | Compaction token format | `claude_code.compaction` | Expects numeric `[\d,]+` tokens; abbreviated "12.3K" won't match | `compaction_v2`, `compaction_v3` |
 | "Thinking" anchor generic | `claude_code.thinking` | "Thinking" is common English; FP risk in verbose logs | `thinking_near_miss`, `thinking_near_miss_v2` |
-
+| API failures framed as "API Error: <message>" | `claude_code.error.network`, `.timeout`, `.overloaded` | Claude Code 2.1.201..2.1.322 session logs: "Connection lost mid-response", "Connection refused — ... (ECONNREFUSED)", "Can't reach the API server — ... (ENOTFOUND)", "No response from API (waited 3m, ...)", "The response stopped arriving", "529 Overloaded". The TUI shows the same text under a `⎿` gutter. | `network_error`, `network_error_v2`, `timeout_error`, `timeout_error_v2`, `overloaded`, `overloaded_v2` |
 ## Gemini Quirks
 
 | Symptom | Rule Affected | Detail | Fixture |
@@ -69,11 +76,13 @@ Recommended future work:
 | 2026-01-30 | Corpus audit | `claude_code.error.timeout` | Documented FP on "Test suite timed out" | `timeout_error_fp_test_suite.txt` |
 | 2026-01-30 | Corpus audit | `wezterm.mux.connection_lost` | Documented FP on "SSH connection lost" | `connection_lost_fp_ssh.txt` |
 | 2026-01-30 | Corpus audit | `claude_code.thinking` | Added second near-miss (natural language "thinking") | `thinking_near_miss_v2.txt` |
+| 2026-11-14 | Live fleet scan + Claude Code session logs | `claude_code.error.network`, `.timeout`, `.overloaded` | Require the "API Error: " framing. Before: 0 of 9 real API errors detected, 7 of 7 prose samples fired. Synthetic positive fixtures replaced with real text; their old text now must not match. | `error_rules_fp_prose.txt`, `overloaded_fp_rate_limit.txt` |
 
 ## Coverage Summary
 
 - 30 rules across 4 packs
 - 98 corpus fixtures (up from 88)
 - All 3 agents have quirks documented
-- 3 confirmed false positives cataloged with fixtures
+- 3 confirmed false positives cataloged with fixtures; 2 of them (the
+  Claude Code error rules) fixed 2026-11-14
 - Pack linter: 0 errors, 0 warnings

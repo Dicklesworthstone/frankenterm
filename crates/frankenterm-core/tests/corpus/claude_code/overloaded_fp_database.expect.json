@@ -1,11 +1,1 @@
-[
-  {
-    "rule_id": "claude_code.error.overloaded",
-    "agent_type": "claude_code",
-    "event_type": "error.overloaded",
-    "severity": "warning",
-    "confidence": 0.95,
-    "extracted": {},
-    "matched_text": "overloaded"
-  }
-]
+[]

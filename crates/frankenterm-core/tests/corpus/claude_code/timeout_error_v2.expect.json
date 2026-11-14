@@ -5,9 +5,7 @@
     "event_type": "error.timeout",
     "severity": "warning",
     "confidence": 0.95,
-    "extracted": {
-      "duration": "120"
-    },
-    "matched_text": "timed out after 120s"
+    "extracted": {},
+    "matched_text": "API Error: The response stopped arriving"
   }
 ]

@@ -6,8 +6,8 @@
     "severity": "warning",
     "confidence": 0.95,
     "extracted": {
-      "duration": "30"
+      "duration": "3m"
     },
-    "matched_text": "timed out after 30 seconds"
+    "matched_text": "API Error: No response from API (waited 3m"
   }
 ]

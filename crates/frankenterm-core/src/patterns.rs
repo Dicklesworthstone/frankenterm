@@ -3986,21 +3986,25 @@ fn builtin_claude_code_pack() -> PatternPack {
                 preview_command: None,
                 learn_more_url: None,
             },
-            // Network/connection error
+            // Network/connection error. Claude Code prints its API failures
+            // as "API Error: <message>" (Claude Code 2.1.201..2.1.322 session
+            // logs: "Connection lost mid-response", "Connection refused — a
+            // firewall or proxy may be blocking it (ECONNREFUSED)", "Can't
+            // reach the API server — ... (ENOTFOUND)", "Unable to connect to
+            // API (ConnectionRefused)", "Connection dropped (ECONNRESET)").
+            // The three error rules require that framing: bare words such as
+            // "timed out" or "connection closed" are common in agent prose and
+            // tool output, and panes of unknown agent type run every rule.
             RuleDef {
                 id: "claude_code.error.network".to_string(),
                 zone: None,
                 agent_type: AgentType::ClaudeCode,
                 event_type: "error.network".to_string(),
                 severity: Severity::Critical,
-                anchors: vec![
-                    "connection".to_string(),
-                    "network error".to_string(),
-                    "failed to connect".to_string(),
-                    "ECONNREFUSED".to_string(),
-                ],
+                anchors: vec!["API Error: ".to_string()],
                 regex: Some(
-                    r"(?:connection|network)\s+(?:error|failed|refused|timeout|closed)".to_string()
+                    r"API Error: (?:Connection \w+|Can['’]t reach the API server|Unable to connect to API)"
+                        .to_string(),
                 ),
                 description: "Claude Code network/connection error".to_string(),
                 remediation: Some("Check network connectivity and retry".to_string()),
@@ -4009,19 +4013,20 @@ fn builtin_claude_code_pack() -> PatternPack {
                 preview_command: None,
                 learn_more_url: None,
             },
-            // Timeout error
+            // Timeout error: "API Error: No response from API (waited 3m, then
+            // 10m on the retry). ..." and "API Error: The response stopped
+            // arriving. ..." in Claude Code's logs; "Request timed out" is the
+            // Anthropic SDK's timeout message under the same framing.
             RuleDef {
                 id: "claude_code.error.timeout".to_string(),
                 zone: None,
                 agent_type: AgentType::ClaudeCode,
                 event_type: "error.timeout".to_string(),
                 severity: Severity::Warning,
-                anchors: vec![
-                    "timed out".to_string(),
-                    "time out".to_string(),
-                ],
+                anchors: vec!["API Error: ".to_string()],
                 regex: Some(
-                    r"timed? out(?:\s+after\s+(?P<duration>\d+)\s*(?:seconds?|ms|s))?".to_string()
+                    r"API Error: (?:No response from API(?: \(waited (?P<duration>[^,)]+))?|The response stopped arriving|Request timed out)"
+                        .to_string(),
                 ),
                 description: "Claude Code timeout error".to_string(),
                 remediation: Some("Operation timed out - consider retrying".to_string()),
@@ -4097,21 +4102,18 @@ fn builtin_claude_code_pack() -> PatternPack {
                 preview_command: None,
                 learn_more_url: None,
             },
-            // Overloaded error (API busy)
+            // Overloaded error (API busy): "API Error: 529 Overloaded. This is
+            // a server-side issue, usually temporary — ..." in Claude Code's
+            // logs. A 529 is Anthropic's overloaded status, so any 529 under
+            // the API Error framing counts, including "Repeated 529".
             RuleDef {
                 id: "claude_code.error.overloaded".to_string(),
                 zone: None,
                 agent_type: AgentType::ClaudeCode,
                 event_type: "error.overloaded".to_string(),
                 severity: Severity::Warning,
-                anchors: vec![
-                    "overloaded".to_string(),
-                    "too many requests".to_string(),
-                    "server busy".to_string(),
-                ],
-                regex: Some(
-                    r"(?:overloaded|too many requests|server busy)(?:.*?retry\s+(?:in\s+)?(?P<retry_after>\d+)\s*(?:seconds?|s))?".to_string()
-                ),
+                anchors: vec!["API Error: ".to_string()],
+                regex: Some(r"API Error: (?:Repeated )?529\b(?: Overloaded)?".to_string()),
                 description: "Claude API is overloaded".to_string(),
                 remediation: Some("API is busy - wait and retry".to_string()),
                 workflow: None,
@@ -11625,12 +11627,89 @@ rules:
     #[test]
     fn detect_claude_code_overloaded() {
         let engine = PatternEngine::new();
-        let text = "Error: API overloaded, retry in 30 seconds";
+        let text = "API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment. If it persists, check https://status.claude.com.";
         let detections = engine.detect(text);
         let d = detections
             .iter()
             .find(|d| d.rule_id == "claude_code.error.overloaded");
         assert!(d.is_some(), "Should match claude_code.error.overloaded");
+    }
+
+    /// Claude Code's own API failures, as its session logs record them
+    /// (Claude Code 2.1.201..2.1.322) and as its TUI renders them under a
+    /// tool-result gutter, each raise exactly their error rule. Agent prose
+    /// and tool output that merely mention a timeout, a closed connection or
+    /// an overloaded server raise none of the three.
+    #[test]
+    fn claude_code_error_rules_follow_real_api_errors_not_prose() {
+        let engine = PatternEngine::new();
+        for (text, rule) in [
+            (
+                "API Error: Connection lost mid-response. The response above may be incomplete.",
+                "claude_code.error.network",
+            ),
+            (
+                "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)",
+                "claude_code.error.network",
+            ),
+            (
+                "API Error: Connection refused — a firewall or proxy may be blocking it (ECONNREFUSED)",
+                "claude_code.error.network",
+            ),
+            (
+                "API Error: Unable to connect to API (ConnectionRefused)",
+                "claude_code.error.network",
+            ),
+            (
+                "API Error: Connection dropped (ECONNRESET)",
+                "claude_code.error.network",
+            ),
+            (
+                "API Error: Connection closed mid-response. The response above may be incomplete.",
+                "claude_code.error.network",
+            ),
+            (
+                "API Error: No response from API (waited 3m, then 10m on the retry).",
+                "claude_code.error.timeout",
+            ),
+            (
+                "API Error: The response stopped arriving. The response above may be incomplete.",
+                "claude_code.error.timeout",
+            ),
+            (
+                "API Error: 529 Overloaded. This is a server-side issue, usually temporary.",
+                "claude_code.error.overloaded",
+            ),
+        ] {
+            for rendered in [text.to_string(), format!("  ⎿  {text}\n")] {
+                let ids: Vec<String> = engine
+                    .detect(&rendered)
+                    .into_iter()
+                    .map(|d| d.rule_id)
+                    .collect();
+                assert_eq!(ids, vec![rule.to_string()], "{rendered:?}");
+            }
+        }
+
+        for prose in [
+            "Prior historical CASS searches timed out in earlier block; no new historical-clean claim here.",
+            "The RCH lane timed out after 600 seconds, so I reran it on ts1.",
+            "ssh: connect to host 10.0.0.5 port 22: Connection timed out",
+            "Error: connection failed - ECONNREFUSED",
+            "Database overloaded: connection pool exhausted, try reducing concurrency",
+            "Test suite timed out after 30 seconds waiting for database response",
+            "The websocket connection closed before the handshake finished.",
+            "Server overloaded, please retry in 30 seconds",
+            "I grepped for API Error handling in the client.",
+        ] {
+            let errors: Vec<String> = engine
+                .detect(prose)
+                .into_iter()
+                .map(|d| d.rule_id)
+                .filter(|id| id.starts_with("claude_code.error."))
+                .collect();
+            assert!(errors.is_empty(), "{prose:?} raised {errors:?}");
+        }
     }
 
     #[test]

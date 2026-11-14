@@ -202,7 +202,12 @@
   },
   {
     "name": "claude_error_network_positive",
-    "text": "Error: connection failed to API server",
+    "text": "API Error: Connection lost mid-response. The response above may be incomplete.",
+    "expected_rule_ids": ["claude_code.error.network"]
+  },
+  {
+    "name": "claude_error_network_positive_dns",
+    "text": "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)",
     "expected_rule_ids": ["claude_code.error.network"]
   },
   {
@@ -212,10 +217,15 @@
     "negative_for": "claude_code.error.network"
   },
   {
+    "name": "claude_error_network_negative_prose",
+    "text": "Error: connection failed to API server",
+    "expected_rule_ids": [],
+    "negative_for": "claude_code.error.network"
+  },
+  {
     "name": "claude_error_overloaded_positive",
-    "text": "Server overloaded, please retry in 30 seconds",
-    "expected_rule_ids": ["claude_code.error.overloaded"],
-    "expected_extracted": { "retry_after": "30" }
+    "text": "API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment. If it persists, check https://status.claude.com.",
+    "expected_rule_ids": ["claude_code.error.overloaded"]
   },
   {
     "name": "claude_error_overloaded_negative",
@@ -224,14 +234,31 @@
     "negative_for": "claude_code.error.overloaded"
   },
   {
+    "name": "claude_error_overloaded_negative_prose",
+    "text": "Server overloaded, please retry in 30 seconds",
+    "expected_rule_ids": [],
+    "negative_for": "claude_code.error.overloaded"
+  },
+  {
     "name": "claude_error_timeout_positive",
-    "text": "Request timed out after 30 seconds",
+    "text": "API Error: No response from API (waited 3m, then 10m on the retry). If a proxy or gateway on your network holds responses until they complete, raise API_TIMEOUT_MS or CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS to wait longer.",
     "expected_rule_ids": ["claude_code.error.timeout"],
-    "expected_extracted": { "duration": "30" }
+    "expected_extracted": { "duration": "3m" }
+  },
+  {
+    "name": "claude_error_timeout_positive_stalled",
+    "text": "API Error: The response stopped arriving. The response above may be incomplete.",
+    "expected_rule_ids": ["claude_code.error.timeout"]
   },
   {
     "name": "claude_error_timeout_negative",
     "text": "Request failed with error code 500",
+    "expected_rule_ids": [],
+    "negative_for": "claude_code.error.timeout"
+  },
+  {
+    "name": "claude_error_timeout_negative_prose",
+    "text": "Request timed out after 30 seconds",
     "expected_rule_ids": [],
     "negative_for": "claude_code.error.timeout"
   },
