@@ -23,8 +23,8 @@ use crate::utilsprites::RenderMetrics;
 use config::ConfigHandle;
 use frankenterm_font::FontConfiguration;
 use frankenterm_gui::metal_scene::{
-    BlinkLevels, Compose, CursorSprite, MetalScene, SceneStyle, cursor_attr_colors, mix_linear,
-    reverse_video_cursor_applies,
+    BlinkLevels, Compose, CursorSprite, MetalScene, PaletteEpoch, SceneStyle, cursor_attr_colors,
+    mix_linear, reverse_video_cursor_applies,
 };
 use frankenterm_renderer_metal::{
     BackgroundUniforms, CursorShape as MetalCursorShape, CursorUniform, MetalRenderer, PixelRect,
@@ -94,6 +94,8 @@ pub(crate) struct MetalFrame {
     /// changed, which restarts the cursor's blink (WebGpu's `prev_cursor`).
     cursor_seen: Option<(StableCursorPosition, bool)>,
     cursor_moved: Instant,
+    /// The pane's palette as the scene style's generation sees it.
+    palette: PaletteEpoch,
 }
 
 impl MetalFrame {
@@ -328,6 +330,7 @@ impl MetalFrame {
                 ),
                 cursor_seen: None,
                 cursor_moved: Instant::now(),
+                palette: PaletteEpoch::default(),
             },
         };
         frame
@@ -352,6 +355,11 @@ impl MetalFrame {
         }
         let facts = pane.render_facts();
         let palette: &ColorPalette = &facts.palette;
+        // Not facts.palette_generation itself: a mux client pane's never
+        // repeats, which rebuilt every row on every frame (B20).
+        let palette_epoch = frame
+            .palette
+            .observe(facts.palette_generation, &facts.palette);
         let focused_and_active = inputs.focused;
         let cursor = frame.mirror.cursor();
         // As WebGpu's `prev_cursor`: a cursor that moved, or a focus change,
@@ -466,8 +474,7 @@ impl MetalFrame {
         };
         let style = SceneStyle {
             palette,
-            generation: ((config.generation() as u64) << 32)
-                | (facts.palette_generation & 0xffff_ffff),
+            generation: ((config.generation() as u64) << 32) | (palette_epoch & 0xffff_ffff),
             cell_width: metrics.cell_size.width as f32,
             grid_origin_x: inputs.grid_origin[0],
             cell_height: metrics.cell_size.height as f32,

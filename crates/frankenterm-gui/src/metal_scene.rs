@@ -268,6 +268,36 @@ pub struct SceneStyle<'a> {
     pub cursor_blink: Option<f32>,
 }
 
+/// A pane's palette as [`SceneStyle::generation`] should see it: a number
+/// that moves only when the palette's colors do (B20).
+///
+/// Panes that cannot track palette changes, mux client panes among them,
+/// publish a generation that never repeats with every render publication.
+/// Used directly, that rebuilt every row of every such pane on every frame.
+#[derive(Debug, Default)]
+pub struct PaletteEpoch {
+    last: Option<(u64, Arc<ColorPalette>)>,
+    epoch: u64,
+}
+
+impl PaletteEpoch {
+    /// The epoch of `palette`, published under `generation`. An equal
+    /// generation promises the same palette; under any other generation the
+    /// colors are compared.
+    pub fn observe(&mut self, generation: u64, palette: &Arc<ColorPalette>) -> u64 {
+        let same = match &self.last {
+            Some((seen, _)) if *seen == generation => true,
+            Some((_, seen)) => Arc::ptr_eq(seen, palette) || **seen == **palette,
+            None => false,
+        };
+        if !same {
+            self.epoch = self.epoch.wrapping_add(1);
+        }
+        self.last = Some((generation, Arc::clone(palette)));
+        self.epoch
+    }
+}
+
 /// The foreground and background of the cell at `col` of `row` as the
 /// WebGpu renderer resolves them for its cursor: from the attributes alone
 /// (bold brightening the eight ANSI colors when configured, but no reverse
@@ -3046,6 +3076,79 @@ mod tests {
         };
         let update = step(t, m, s, g, &selection, &restyled);
         assert_eq!((update.full, update.rows_rebuilt), (true, 10));
+    }
+
+    #[test]
+    fn an_untracked_palette_rebuilds_rows_only_when_its_colors_change() {
+        // A mux client pane publishes a palette generation that never
+        // repeats, and a fresh palette, with every render publication.
+        let mut next_generation = 1u64 << 63;
+        let mut publish = |palette: ColorPalette| {
+            next_generation += 1;
+            (next_generation, Arc::new(palette))
+        };
+        let recolor = |r: f32| {
+            let mut palette = ColorPalette::default();
+            palette.background = SrgbaTuple(r, 0.2, 0.3, 1.0);
+            palette
+        };
+        let mut epoch = PaletteEpoch::default();
+        let mut glyphs = SyntheticGlyphs::default();
+        let mut term = terminal(10, 30);
+        term.advance_bytes(b"one\r\ntwo\r\nthree");
+        let mut mirror = RenderMirror::new();
+        let mut scene = MetalScene::new();
+        let (t, m, s, g) = (&mut term, &mut mirror, &mut scene, &mut glyphs);
+        // As the Metal frame builds its style: the epoch stands in for the
+        // published generation.
+        let mut frame = |palette: ColorPalette, t: &mut Terminal, m: &mut RenderMirror| {
+            let (generation, palette) = publish(palette);
+            let at = epoch.observe(generation, &palette);
+            let style = SceneStyle {
+                generation: at,
+                ..plain_style(&palette)
+            };
+            (at, step(t, m, s, g, &no_selection, &style))
+        };
+
+        let (first, update) = frame(ColorPalette::default(), t, m);
+        assert_eq!((update.full, update.rows_rebuilt), (true, 10));
+        for _ in 0..3 {
+            let (at, update) = frame(ColorPalette::default(), t, m);
+            assert_eq!(at, first);
+            assert_eq!((update.full, update.rows_rebuilt), (false, 0));
+        }
+
+        // Content still rebuilds its own rows only.
+        t.advance_bytes(b"\x1b[6;3Hx");
+        let (_, update) = frame(ColorPalette::default(), t, m);
+        assert_eq!((update.full, update.rows_rebuilt), (false, 2));
+
+        // New colors rebuild everything, once.
+        let (second, update) = frame(recolor(0.5), t, m);
+        assert_ne!(second, first);
+        assert_eq!((update.full, update.rows_rebuilt), (true, 10));
+        let (at, update) = frame(recolor(0.5), t, m);
+        assert_eq!((at, update.rows_rebuilt), (second, 0));
+
+        // Going back to the first colors is a change too, never a return to
+        // an epoch the scene may still hold.
+        let (third, update) = frame(ColorPalette::default(), t, m);
+        assert!(third != first && third != second);
+        assert_eq!((update.full, update.rows_rebuilt), (true, 10));
+    }
+
+    #[test]
+    fn a_tracked_palette_generation_is_trusted_without_comparing_colors() {
+        let mut epoch = PaletteEpoch::default();
+        let palette = Arc::new(ColorPalette::default());
+        let first = epoch.observe(5, &palette);
+        assert_eq!(epoch.observe(5, &palette), first);
+        // The same Arc under a new generation is the same palette.
+        assert_eq!(epoch.observe(6, &palette), first);
+        let mut recolored = ColorPalette::default();
+        recolored.foreground = SrgbaTuple(0.9, 0.1, 0.1, 1.0);
+        assert_ne!(epoch.observe(7, &Arc::new(recolored)), first);
     }
 
     /// Scrollback navigation (ft-yccm0.4.2.4): moving the viewport back or
