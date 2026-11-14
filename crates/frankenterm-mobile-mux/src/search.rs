@@ -13,6 +13,8 @@
 use crate::session::RowText;
 use crate::wire::{Pattern, SearchResult, StableRowIndex};
 use serde::Serialize;
+use std::cmp::Reverse;
+use std::collections::BTreeSet;
 use std::ops::Range;
 
 /// What to look for in a pane's rows.
@@ -75,6 +77,27 @@ fn rows_between(start: StableRowIndex, end: StableRowIndex) -> usize {
     usize::try_from(end.saturating_sub(start)).unwrap_or(0)
 }
 
+fn match_key(hit: &SearchResult) -> (StableRowIndex, usize, StableRowIndex, usize) {
+    (hit.start_y, hit.start_x, hit.end_y, hit.end_x)
+}
+
+/// Only representable, ordered coordinates can become line requests. The
+/// exclusive end of a row at `MAX` is not representable, so it cannot be read.
+/// A match may still end there after starting on an earlier, readable row.
+fn text_rows(hit: &SearchResult) -> Option<Range<StableRowIndex>> {
+    if hit.start_y < 0
+        || hit.start_y == StableRowIndex::MAX
+        || (hit.end_y, hit.end_x) < (hit.start_y, hit.start_x)
+    {
+        return None;
+    }
+    let end = hit
+        .end_y
+        .saturating_add(1)
+        .min(hit.start_y.saturating_add(MATCH_ROWS));
+    Some(hit.start_y..end)
+}
+
 #[derive(Debug)]
 pub(crate) struct SearchJob {
     pub pane_id: usize,
@@ -88,6 +111,8 @@ pub(crate) struct SearchJob {
     rows_left: usize,
     block: usize,
     requests_left: u32,
+    /// At most `WANTED` distinct matches, newest first. Split responses may
+    /// repeat candidates, so they must not accumulate across the whole walk.
     found: Vec<SearchResult>,
     /// Matches in the rows searched to their end: always the newest rows.
     complete: usize,
@@ -153,11 +178,32 @@ impl SearchJob {
         // At the limit, the server stopped early: newer matches may follow
         // the ones it sent. Search the newer half first, then the older.
         let stopped = results.len() >= WANTED && rows > 1;
-        let hits = results
-            .iter()
-            .filter(|hit| range.contains(&hit.start_y))
-            .count();
-        self.found.extend(results);
+        let mut unique = BTreeSet::new();
+        for hit in results {
+            if text_rows(&hit).is_none()
+                || hit.start_y >= range.end
+                || hit.end_y < range.start
+                || (hit.start_y < range.start && hit.end_y == range.start && hit.end_x == 0)
+            {
+                continue;
+            }
+            // Legacy servers can repeat a match spanning a wrapped line at
+            // a request boundary. Preserve it, but count only unique starts
+            // inside this block toward the completed newest-match budget.
+            let key = match_key(&hit);
+            if range.contains(&hit.start_y) && unique.len() < WANTED {
+                unique.insert(key);
+            }
+            if let Err(index) = self
+                .found
+                .binary_search_by_key(&Reverse(key), |found| Reverse(match_key(found)))
+                && index < WANTED
+            {
+                self.found.insert(index, hit);
+                self.found.truncate(WANTED);
+            }
+        }
+        let hits = unique.len();
         if stopped {
             let middle = range.start + (range.end - range.start) / 2;
             self.queue.push(range.start..middle);
@@ -177,26 +223,19 @@ impl SearchJob {
     /// The newest `WANTED` matches, newest first, each once (the server
     /// searches a line that straddles two requests in both).
     pub fn best(&self) -> Vec<SearchResult> {
-        let mut best = self.found.clone();
-        best.sort_by_key(|hit| std::cmp::Reverse((hit.start_y, hit.start_x, hit.end_y, hit.end_x)));
-        best.dedup_by_key(|hit| (hit.start_y, hit.start_x, hit.end_y, hit.end_x));
-        best.truncate(WANTED);
-        best
+        self.found.clone()
     }
 
     /// The rows whose text the best matches need, as GetLines ranges.
     pub fn rows(best: &[SearchResult]) -> Vec<Range<StableRowIndex>> {
-        let mut rows: Vec<StableRowIndex> = best
-            .iter()
-            .flat_map(|hit| hit.start_y..=hit.end_y.min(hit.start_y + MATCH_ROWS - 1))
-            .collect();
+        let mut rows: Vec<StableRowIndex> = best.iter().filter_map(text_rows).flatten().collect();
         rows.sort_unstable();
         rows.dedup();
         let mut ranges: Vec<Range<StableRowIndex>> = Vec::new();
         for row in rows {
             match ranges.last_mut() {
-                Some(last) if last.end == row => last.end = row + 1,
-                _ => ranges.push(row..row + 1),
+                Some(last) if last.end == row => last.end = row.saturating_add(1),
+                _ => ranges.push(row..row.saturating_add(1)),
             }
         }
         ranges
@@ -208,11 +247,11 @@ impl SearchJob {
         text: &impl Fn(StableRowIndex) -> Option<&'a RowText>,
     ) -> Vec<SearchMatch> {
         best.iter()
-            .map(|hit| {
-                let last = hit.end_y.min(hit.start_y + MATCH_ROWS - 1);
+            .filter_map(|hit| {
+                let rows = text_rows(hit)?;
                 let mut joined = String::new();
                 let (mut text_start, mut text_end) = (None, None);
-                for row in hit.start_y..=last {
+                for row in rows {
                     let Some(line) = text(row) else { continue };
                     if !joined.is_empty() {
                         joined.push('\n');
@@ -229,7 +268,7 @@ impl SearchJob {
                 let text_end = text_end
                     .unwrap_or(joined.len())
                     .clamp(text_start, joined.len());
-                SearchMatch {
+                Some(SearchMatch {
                     row: hit.start_y,
                     start_column: hit.start_x,
                     end_row: hit.end_y,
@@ -237,7 +276,7 @@ impl SearchJob {
                     text: joined,
                     text_start,
                     text_end,
-                }
+                })
             })
             .collect()
     }
@@ -336,6 +375,135 @@ mod tests {
             "w 9"
         );
         assert_eq!((matches[2].row, matches[2].start_column), (5, 1));
+    }
+
+    #[test]
+    fn repeated_coordinates_do_not_complete_the_search_early() {
+        let mut job = walk(1_000_000);
+        let first = job.next_request().unwrap();
+        let repeated = hit(first.end - 1, 0);
+        job.answer(
+            (0..WANTED - 1)
+                .map(|match_id| SearchResult {
+                    match_id,
+                    ..repeated
+                })
+                .collect(),
+        );
+        assert_eq!(job.complete, 1);
+        assert_eq!(job.best(), [repeated]);
+        let second = job.next_request().unwrap();
+        job.answer(vec![hit(second.end - 1, 0)]);
+        assert_eq!(job.complete, 2);
+        assert!(job.next_request().is_some(), "198 distinct matches remain");
+    }
+
+    #[test]
+    fn only_matches_overlapping_the_requested_rows_are_retained() {
+        let mut job = walk(2000);
+        assert_eq!(job.next_request(), Some(1000..2000));
+        let straddling = SearchResult {
+            start_y: 999,
+            end_y: 1001,
+            ..hit(999, 0)
+        };
+        let ends_before_range = SearchResult {
+            end_y: 1000,
+            end_x: 0,
+            ..straddling
+        };
+        job.answer(vec![
+            hit(1999, 0),
+            straddling,
+            ends_before_range,
+            hit(998, 0),
+            hit(2000, 0),
+            hit(-1, 0),
+            SearchResult {
+                end_y: 1499,
+                ..hit(1500, 0)
+            },
+            SearchResult {
+                end_x: 1,
+                ..hit(1500, 2)
+            },
+        ]);
+        assert_eq!(job.best(), [hit(1999, 0), straddling]);
+        assert_eq!(job.complete, 1, "a straddling start belongs to older rows");
+        assert_eq!(SearchJob::rows(&job.best()), [999..1002, 1999..2000]);
+    }
+
+    #[test]
+    fn split_responses_retain_only_the_newest_bounded_candidates() {
+        let mut job = walk(50_000);
+        let mut requests = 0;
+        while let Some(range) = job.next_request() {
+            requests += 1;
+            job.answer(range.take(WANTED).map(|row| hit(row, 0)).collect());
+            assert!(job.found.len() <= WANTED, "response {requests}");
+        }
+        assert!(requests > 1, "a full block must be subdivided");
+        let best = job.best();
+        assert_eq!(best.len(), WANTED);
+        assert_eq!(best.first().unwrap().start_y, 49_999);
+        assert_eq!(best.last().unwrap().start_y, 49_800);
+
+        let mut one_row = walk(1);
+        one_row.next_request();
+        one_row.answer((0..WANTED * 10).map(|column| hit(0, column)).collect());
+        assert_eq!(one_row.found.len(), WANTED);
+        assert_eq!(one_row.complete, WANTED);
+        assert_eq!(one_row.best()[0].start_x, WANTED * 10 - 1);
+    }
+
+    #[test]
+    fn extreme_row_coordinates_never_overflow_line_requests_or_match_text() {
+        let maximum = StableRowIndex::MAX;
+        let malformed = [
+            SearchResult {
+                start_y: StableRowIndex::MIN,
+                end_y: maximum,
+                ..hit(0, 0)
+            },
+            hit(maximum, 0),
+            SearchResult {
+                end_y: 0,
+                ..hit(1, 0)
+            },
+            SearchResult {
+                end_x: 0,
+                ..hit(1, 1)
+            },
+        ];
+        assert!(SearchJob::rows(&malformed).is_empty());
+        assert!(SearchJob::matches(&malformed, &|_| None).is_empty());
+
+        let edge = SearchResult {
+            start_y: maximum - 2,
+            start_x: 0,
+            end_y: maximum,
+            end_x: 0,
+            match_id: 0,
+        };
+        let mut job = walk(maximum);
+        job.next_request();
+        job.answer(vec![edge, hit(maximum, 0)]);
+        assert_eq!(job.best(), [edge]);
+        assert_eq!(SearchJob::rows(&job.best()), [maximum - 2..maximum]);
+        let rows: std::collections::HashMap<_, _> = [
+            (maximum - 2, RowText::plain("first")),
+            (maximum - 1, RowText::plain("second")),
+        ]
+        .into();
+        let found = SearchJob::matches(&job.best(), &|row| rows.get(&row));
+        assert_eq!(found[0].text, "first\nsecond");
+        assert_eq!((found[0].text_start, found[0].text_end), (0, 12));
+
+        let long = SearchResult {
+            end_y: maximum,
+            ..hit(1, 0)
+        };
+        assert_eq!(SearchJob::rows(&[long]), [1..5]);
     }
 
     #[test]
