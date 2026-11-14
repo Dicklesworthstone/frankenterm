@@ -940,15 +940,49 @@ fn classify_verified_submit_with_baseline(
     }
 
     let Some(after_text) = input.after_text else {
-        return unavailable_with_profile(
-            profile,
-            agent_type,
-            attempts,
-            input.polls,
-            cursor_before,
-            cursor_after,
-            "capture_unavailable",
+        // The text and semantic mux RPCs are independent. A failed text
+        // capture must not discard a *fresh*, bounded semantic turn that
+        // already proves what happened to this exact command. No heuristic
+        // anchor matching is possible without the text capture.
+        let semantic = fresh_semantic_input(
+            baseline.semantic_zones.as_deref(),
+            input.after_semantic_snapshot,
+            input.command_text.trim(),
         );
+        return match semantic {
+            Some(FreshSemanticInput::CurrentCommand { has_output }) => {
+                let (state, evidence) = if has_output {
+                    (SubmitReceiptState::Submitted, "semantic_output_after_input")
+                } else {
+                    (
+                        SubmitReceiptState::StuckInComposer,
+                        "semantic_input_contains_command",
+                    )
+                };
+                report_with_profile(
+                    state,
+                    profile,
+                    attempts,
+                    input.polls,
+                    cursor_before,
+                    cursor_after,
+                    vec![format!("submit_profile:{}:{evidence}", profile.id)],
+                )
+            }
+            other => unavailable_with_profile(
+                profile,
+                agent_type,
+                attempts,
+                input.polls,
+                cursor_before,
+                cursor_after,
+                match other {
+                    Some(FreshSemanticInput::OtherCommand) => "latest_input_does_not_match",
+                    Some(FreshSemanticInput::UnprovenCurrentCommand) => "semantic_input_not_new",
+                    _ => "capture_unavailable",
+                },
+            ),
+        };
     };
 
     let after_tail = capture_tail(after_text).to_ascii_lowercase();
@@ -1696,6 +1730,53 @@ mod tests {
                 .collect(),
             last_exit_code: None,
         }
+    }
+
+    #[test]
+    fn fresh_semantic_turn_survives_independent_text_capture_failure() {
+        let profile = profile();
+        let before = semantic_snapshot(&[(MuxSemanticZoneKind::Output, "ready")]);
+        let after_submitted = semantic_snapshot(&[
+            (MuxSemanticZoneKind::Output, "ready"),
+            (MuxSemanticZoneKind::Input, "run tests"),
+            (MuxSemanticZoneKind::Output, "tests passed"),
+        ]);
+        let after_composer = semantic_snapshot(&[
+            (MuxSemanticZoneKind::Output, "ready"),
+            (MuxSemanticZoneKind::Input, "run tests"),
+        ]);
+        for (after, expected) in [
+            (&after_submitted, SubmitReceiptState::Submitted),
+            (&after_composer, SubmitReceiptState::StuckInComposer),
+        ] {
+            let evidence = VerifiedSubmitInput {
+                before_text: None,
+                before_semantic_snapshot: Some(&before),
+                after_text: None,
+                after_semantic_snapshot: Some(after),
+                ..input(Some(&profile), None)
+            };
+            assert_recovered_classification(evidence, expected);
+        }
+
+        // A matching but pre-existing input cannot be treated as a fresh
+        // submission just because the independent text RPC failed.
+        let prior = semantic_snapshot(&[
+            (MuxSemanticZoneKind::Input, "run tests"),
+            (MuxSemanticZoneKind::Output, "old result"),
+        ]);
+        let unchanged = classify_verified_submit(VerifiedSubmitInput {
+            before_text: None,
+            before_semantic_snapshot: Some(&prior),
+            after_text: None,
+            after_semantic_snapshot: Some(&prior),
+            ..input(Some(&profile), None)
+        });
+        assert_eq!(unchanged.state, SubmitReceiptState::VerificationUnavailable);
+        assert!(unchanged
+            .evidence_rule_ids
+            .iter()
+            .any(|rule| rule.ends_with(":semantic_input_not_new")));
     }
 
     fn assert_recovered_classification(
