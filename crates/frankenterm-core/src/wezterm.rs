@@ -18,7 +18,7 @@ use serde_json::Value;
 use crate::Result;
 use crate::circuit_breaker::{
     CircuitBreaker, CircuitBreakerConfig, CircuitBreakerStatus, CircuitStateKind,
-    get_or_register_circuit,
+    TransportCircuitKey, TransportCircuitKind, get_or_register_transport_circuit,
 };
 use crate::error::{
     MuxEffectCertainty, MuxObjectIdentity, MuxObjectKind, MuxOperation, MuxRejection,
@@ -1549,6 +1549,74 @@ enum CliMutationCircuitEvidence {
 struct CliMutationOutcome<T> {
     result: Result<T>,
     circuit_evidence: CliMutationCircuitEvidence,
+    // Keep the admitted transport alive through parsing and final settlement.
+    circuit: Option<Arc<Mutex<CircuitBreaker>>>,
+}
+
+struct CachedTransportCircuit {
+    key: TransportCircuitKey,
+    circuit: Arc<Mutex<CircuitBreaker>>,
+}
+
+/// Capture the selectors once, before circuit admission. Retries and result
+/// settlement use this same binding even if an override or environment changes
+/// while the subprocess is in flight. No Debug implementation exposes paths.
+struct CliTransportBinding {
+    binary: std::path::PathBuf,
+    socket: Option<std::path::PathBuf>,
+    path: Option<std::ffi::OsString>,
+    directory: std::path::PathBuf,
+}
+
+impl CliTransportBinding {
+    fn capture(socket: Option<&str>) -> Result<Self> {
+        let directory = std::env::current_dir().map_err(|_| {
+            WeztermError::CommandFailed("CLI transport directory unavailable".to_string())
+        })?;
+        let binary = std::path::PathBuf::from(wezterm_binary());
+        let binary = if !binary.is_absolute() && binary.components().count() > 1 {
+            directory.join(binary)
+        } else {
+            binary
+        };
+        let socket = socket
+            .map(std::ffi::OsString::from)
+            .or_else(|| std::env::var_os("WEZTERM_UNIX_SOCKET"))
+            .map(std::path::PathBuf::from)
+            .map(|path| {
+                if path.as_os_str().is_empty() || path.is_absolute() {
+                    path
+                } else {
+                    directory.join(path)
+                }
+            });
+        Ok(Self {
+            binary,
+            socket,
+            path: std::env::var_os("PATH"),
+            directory,
+        })
+    }
+
+    fn key(&self) -> TransportCircuitKey {
+        use std::ffi::OsStr;
+
+        let mut components = vec![
+            self.binary.as_os_str(),
+            OsStr::new(if self.socket.is_some() { "socket" } else { "implicit" }),
+            self.socket
+                .as_deref()
+                .map_or_else(|| OsStr::new(""), std::path::Path::as_os_str),
+        ];
+        // An absolute executable does not depend on PATH or the working
+        // directory. A bare command does, so retain both search selectors.
+        if !self.binary.is_absolute() {
+            components.push(OsStr::new(if self.path.is_some() { "path" } else { "no-path" }));
+            components.push(self.path.as_deref().unwrap_or_else(|| OsStr::new("")));
+            components.push(self.directory.as_os_str());
+        }
+        TransportCircuitKey::new(TransportCircuitKind::Cli, &components)
+    }
 }
 
 /// Mux transport-health evidence is distinct from operation retry authority.
@@ -1648,11 +1716,18 @@ pub struct WeztermClient {
     retry_attempts: u32,
     /// Delay between retries in milliseconds
     retry_delay_ms: u64,
-    /// Circuit breaker for CLI reliability
+    /// Private CLI fallback, or the exact lease on an operation-bound clone.
     circuit_breaker: Arc<Mutex<CircuitBreaker>>,
+    cli_circuit_cache: Arc<Mutex<Option<CachedTransportCircuit>>>,
+    cli_binding: Option<Arc<CliTransportBinding>>,
+    isolated_cli_circuit: bool,
     /// Circuit breaker for direct mux connection reliability.
     #[cfg(all(feature = "vendored", unix))]
     mux_circuit_breaker: Arc<Mutex<CircuitBreaker>>,
+    #[cfg(all(feature = "vendored", unix))]
+    mux_circuit_key: Option<TransportCircuitKey>,
+    #[cfg(all(feature = "vendored", unix))]
+    mux_circuit_cache: Arc<Mutex<Option<Arc<Mutex<CircuitBreaker>>>>>,
     /// Optional mux connection pool for direct socket communication.
     /// When present, operations try the pool first. Implicit-socket clients may
     /// use CLI failover only for canonically replayable transport failures;
@@ -1687,15 +1762,22 @@ impl WeztermClient {
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             retry_attempts: DEFAULT_RETRY_ATTEMPTS,
             retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
-            circuit_breaker: get_or_register_circuit(
-                "wezterm_cli",
+            circuit_breaker: Arc::new(Mutex::new(CircuitBreaker::with_name(
+                "wezterm_cli.private",
                 CircuitBreakerConfig::default(),
-            ),
+            ))),
+            cli_circuit_cache: Arc::new(Mutex::new(None)),
+            cli_binding: None,
+            isolated_cli_circuit: false,
             #[cfg(all(feature = "vendored", unix))]
-            mux_circuit_breaker: get_or_register_circuit(
-                "mux_connection",
+            mux_circuit_breaker: Arc::new(Mutex::new(CircuitBreaker::with_name(
+                "mux_connection.private",
                 CircuitBreakerConfig::default(),
-            ),
+            ))),
+            #[cfg(all(feature = "vendored", unix))]
+            mux_circuit_key: None,
+            #[cfg(all(feature = "vendored", unix))]
+            mux_circuit_cache: Arc::new(Mutex::new(None)),
             #[cfg(all(feature = "vendored", unix))]
             mux_pool: None,
             #[cfg(all(feature = "vendored", unix))]
@@ -1711,22 +1793,7 @@ impl WeztermClient {
     pub fn with_socket(socket_path: impl Into<String>) -> Self {
         Self {
             socket_path: Some(socket_path.into()),
-            timeout_secs: DEFAULT_TIMEOUT_SECS,
-            retry_attempts: DEFAULT_RETRY_ATTEMPTS,
-            retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
-            circuit_breaker: get_or_register_circuit(
-                "wezterm_cli",
-                CircuitBreakerConfig::default(),
-            ),
-            #[cfg(all(feature = "vendored", unix))]
-            mux_circuit_breaker: get_or_register_circuit(
-                "mux_connection",
-                CircuitBreakerConfig::default(),
-            ),
-            #[cfg(all(feature = "vendored", unix))]
-            mux_pool: None,
-            #[cfg(all(feature = "vendored", unix))]
-            stock_wezterm_peer: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ..Self::new()
         }
     }
 
@@ -1763,6 +1830,14 @@ impl WeztermClient {
     #[cfg(all(feature = "vendored", unix))]
     #[must_use]
     pub fn with_mux_pool(mut self, pool: Arc<crate::vendored::MuxPool>) -> Self {
+        // The pool's actual dial selector governs mux health, independently
+        // of the optional CLI socket override on this client.
+        self.mux_circuit_key = pool.circuit_socket_path().map(|path| {
+            TransportCircuitKey::new(TransportCircuitKind::Mux, &[path.as_os_str()])
+        });
+        self.mux_circuit_breaker = pool.private_circuit();
+        self.mux_circuit_cache = Arc::new(Mutex::new(None));
+        self.stock_wezterm_peer = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.mux_pool = Some(pool);
         self
     }
@@ -1853,14 +1928,79 @@ impl WeztermClient {
     #[must_use]
     pub fn with_circuit_breaker_config(mut self, config: CircuitBreakerConfig) -> Self {
         self.circuit_breaker =
-            Arc::new(Mutex::new(CircuitBreaker::with_name("wezterm_cli", config)));
+            Arc::new(Mutex::new(CircuitBreaker::with_name("wezterm_cli.private", config)));
+        self.cli_circuit_cache = Arc::new(Mutex::new(None));
+        self.cli_binding = None;
+        self.isolated_cli_circuit = true;
         self
     }
 
-    /// Get current circuit breaker status.
+    /// Bind a CLI invocation before admission. Unresolved auto-discovery stays
+    /// private to this client and its clones; it must not acquire a new circuit
+    /// on every invocation, or repeated failures would never open it.
+    fn for_cli_operation(&self) -> Result<Self> {
+        if self.cli_binding.is_some() {
+            return Ok(self.clone());
+        }
+        self.with_cli_binding(CliTransportBinding::capture(self.socket_path.as_deref())?)
+    }
+
+    fn with_cli_binding(&self, binding: CliTransportBinding) -> Result<Self> {
+        let binding = Arc::new(binding);
+        let key = binding.key();
+        let circuit = if self.isolated_cli_circuit {
+            Arc::clone(&self.circuit_breaker)
+        } else {
+            let mut cache = self
+                .cli_circuit_cache
+                .lock()
+                .unwrap_or_else(record_poison_and_recover);
+            if let Some(cached) = cache.as_ref().filter(|cached| cached.key == key) {
+                Arc::clone(&cached.circuit)
+            } else {
+                let resolved_socket = binding
+                    .socket
+                    .as_ref()
+                    .is_some_and(|path| !path.as_os_str().is_empty());
+                let circuit = if resolved_socket {
+                    get_or_register_transport_circuit(key).map_err(|error| {
+                        WeztermError::CommandFailed(error.as_str().to_string())
+                    })?
+                } else if cache.is_none() {
+                    Arc::clone(&self.circuit_breaker)
+                } else {
+                    Arc::new(Mutex::new(CircuitBreaker::with_name(
+                        "wezterm_cli.private",
+                        CircuitBreakerConfig::default(),
+                    )))
+                };
+                *cache = Some(CachedTransportCircuit {
+                    key,
+                    circuit: Arc::clone(&circuit),
+                });
+                circuit
+            }
+        };
+        let mut client = self.clone();
+        client.circuit_breaker = circuit;
+        client.cli_binding = Some(binding);
+        Ok(client)
+    }
+
+    /// Get the most recently selected CLI transport's circuit status.
     #[must_use]
     pub fn circuit_status(&self) -> CircuitBreakerStatus {
-        let guard = match self.circuit_breaker.lock() {
+        let circuit = if self.cli_binding.is_some() || self.isolated_cli_circuit {
+            Arc::clone(&self.circuit_breaker)
+        } else {
+            self.cli_circuit_cache
+                .lock()
+                .unwrap_or_else(record_poison_and_recover)
+                .as_ref()
+                .map(|cached| Arc::clone(&cached.circuit))
+                .unwrap_or_else(|| Arc::clone(&self.circuit_breaker))
+        };
+        let guard = match circuit.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
@@ -1903,7 +2043,7 @@ impl WeztermClient {
     #[cfg(all(feature = "vendored", unix))]
     pub async fn list_panes_with_cx(&self, cx: &crate::cx::Cx) -> Result<Vec<PaneInfo>> {
         if let Some(ref pool) = self.mux_pool {
-            if self.mux_circuit_guard() {
+            if self.mux_circuit_guard()? {
                 let legacy_response = match pool.list_panes_with_domains_with_cx(cx).await {
                     Ok(response) => {
                         self.mux_circuit_record_success();
@@ -1976,7 +2116,7 @@ impl WeztermClient {
         let Some(pool) = self.mux_pool.as_ref() else {
             return;
         };
-        if !self.mux_circuit_guard() {
+        if !self.mux_circuit_guard().unwrap_or(false) {
             return;
         }
         for chunk in panes.chunks_mut(codec::MAX_TIERED_SCROLLBACK_STATUS_BATCH_PANES) {
@@ -2057,7 +2197,7 @@ impl WeztermClient {
             )
             .into());
         };
-        if !self.mux_circuit_guard() {
+        if !self.mux_circuit_guard()? {
             return Err(WeztermError::CircuitOpen { retry_after_ms: 0 }.into());
         }
         match pool.get_pane_identity_with_cx(cx, pane_id).await {
@@ -2106,7 +2246,10 @@ impl WeztermClient {
             .mux_pool
             .as_ref()
             .ok_or(TerminalProjectionError::BackendUnavailable)?;
-        if !self.mux_circuit_guard() {
+        if !self
+            .mux_circuit_guard()
+            .map_err(|_| TerminalProjectionError::BackendUnavailable)?
+        {
             return Err(TerminalProjectionError::CircuitOpen);
         }
         match pool
@@ -2172,7 +2315,7 @@ impl WeztermClient {
                 tracing::debug!(
                     "mux pool get_text_tail_with_cx does not support escapes; falling back to CLI"
                 );
-            } else if self.mux_circuit_guard() {
+            } else if self.mux_circuit_guard()? {
                 use crate::vendored::MuxTextReadResult;
                 let capacity_timer = crate::runtime_telemetry::SwarmCapacityStageTimer::start(
                     crate::runtime_telemetry::SwarmCapacityStage::MuxIpc,
@@ -2289,7 +2432,7 @@ impl WeztermClient {
         pane_id: u64,
     ) -> Result<MuxSemanticSnapshot> {
         if let Some(ref pool) = self.mux_pool {
-            if !self.mux_circuit_guard() {
+            if !self.mux_circuit_guard()? {
                 return Err(WeztermError::CircuitOpen { retry_after_ms: 0 }.into());
             }
 
@@ -2383,7 +2526,7 @@ impl WeztermClient {
         pane_id: u64,
     ) -> Result<PaneTieredScrollbackSummary> {
         if let Some(ref pool) = self.mux_pool {
-            if self.mux_circuit_guard() {
+            if self.mux_circuit_guard()? {
                 match pool.get_pane_render_changes_with_cx(cx, pane_id).await {
                     Ok(changes) => {
                         return self.map_mux_tiered_scrollback_summary(
@@ -2436,7 +2579,7 @@ impl WeztermClient {
         let Some(pool) = self.mux_pool.as_ref() else {
             return Ok(None);
         };
-        if !self.mux_circuit_guard() {
+        if !self.mux_circuit_guard()? {
             return Err(WeztermError::CircuitOpen { retry_after_ms: 0 }.into());
         }
 
@@ -2485,7 +2628,7 @@ impl WeztermClient {
         let Some(pool) = self.mux_pool.as_ref() else {
             return Ok(None);
         };
-        if !self.mux_circuit_guard() {
+        if !self.mux_circuit_guard()? {
             return Err(WeztermError::CircuitOpen { retry_after_ms: 0 }.into());
         }
         let mux_pane_ids = pane_ids
@@ -2759,7 +2902,7 @@ impl WeztermClient {
             // the guard to transition Open -> HalfOpen. A local ID rejection
             // is not a backend probe and must not leave one unsettled.
             let spawn = Self::mux_spawn_request(cwd, domain_name, target)?;
-            if self.mux_circuit_guard() {
+            if self.mux_circuit_guard()? {
                 match pool.spawn_v2_with_cx(cx, spawn).await {
                     Ok(response) => {
                         self.mux_circuit_record_success();
@@ -2853,7 +2996,7 @@ impl WeztermClient {
             // As with spawn, local protocol conversion must settle before the
             // breaker admits a transport probe.
             let split = Self::mux_split_request(pane_id, direction, cwd, percent)?;
-            if self.mux_circuit_guard() {
+            if self.mux_circuit_guard()? {
                 match pool.split_pane_with_cx(cx, split).await {
                     Ok(response) => {
                         self.mux_circuit_record_success();
@@ -3059,7 +3202,7 @@ impl WeztermClient {
             "wezterm::WeztermClient::send_text_impl_with_cx",
         );
         if let Some(ref pool) = self.mux_pool {
-            if !self.mux_circuit_guard() {
+            if !self.mux_circuit_guard()? {
                 tracing::debug!("mux connection circuit open; CLI pane-input fallback disabled");
             } else {
                 let data = if no_newline {
@@ -3235,7 +3378,10 @@ impl WeztermClient {
                 id: pane_id,
             })
         );
-        self.circuit_record_mutation_evidence(outcome.circuit_evidence);
+        Self::record_cli_mutation_evidence(
+            outcome.circuit.as_ref().unwrap_or(&self.circuit_breaker),
+            outcome.circuit_evidence,
+        );
         outcome.result
     }
 
@@ -3252,7 +3398,8 @@ impl WeztermClient {
     /// check and post-execution error categorization are centralized in
     /// [`Self::finalize_cli_output`].
     async fn run_cli_with_cx(&self, cx: &crate::cx::Cx, args: &[&str]) -> Result<String> {
-        self.run_cli_effect_with_cx(
+        let client = self.for_cli_operation()?;
+        client.run_cli_effect_with_cx(
             cx,
             args,
             CliEffect::ReadOnly {
@@ -3289,15 +3436,27 @@ impl WeztermClient {
                     "capability checkpoint failed before circuit admission",
                 )),
                 circuit_evidence: CliMutationCircuitEvidence::Ignore,
+                circuit: None,
             };
         }
-        if let Err(error) = self.circuit_guard() {
+        let client = match self.for_cli_operation() {
+            Ok(client) => client,
+            Err(error) => {
+                return CliMutationOutcome {
+                    result: Err(error),
+                    circuit_evidence: CliMutationCircuitEvidence::Ignore,
+                    circuit: None,
+                };
+            }
+        };
+        if let Err(error) = client.circuit_guard() {
             return CliMutationOutcome {
                 result: Err(error),
                 circuit_evidence: CliMutationCircuitEvidence::Ignore,
+                circuit: None,
             };
         }
-        let (result, circuit_evidence) = self
+        let (result, circuit_evidence) = client
             .run_cli_effect_with_cx(
                 cx,
                 args,
@@ -3314,6 +3473,7 @@ impl WeztermClient {
             // instead of leaving a half-open probe unsettled.
             circuit_evidence: circuit_evidence
                 .unwrap_or(CliMutationCircuitEvidence::BackendFailure),
+            circuit: Some(Arc::clone(&client.circuit_breaker)),
         }
     }
 
@@ -3348,8 +3508,18 @@ impl WeztermClient {
             }
         };
 
+        let Some(binding) = self.cli_binding.as_ref() else {
+            return Self::cli_effect_result(
+                effect,
+                Err(WeztermError::CommandFailed(
+                    "CLI transport was not bound before admission".to_string(),
+                )
+                .into()),
+                CliMutationCircuitEvidence::Ignore,
+            );
+        };
         if let Some(ref socket) = self.socket_path {
-            if !std::path::Path::new(socket).exists() {
+            if socket.is_empty() || !binding.socket.as_ref().is_some_and(|path| path.exists()) {
                 return Self::cli_effect_result(
                     effect,
                     Err(WeztermError::SocketNotFound(socket.clone()).into()),
@@ -3357,8 +3527,7 @@ impl WeztermClient {
                 );
             }
         }
-
-        let mut cmd = Command::new(wezterm_binary());
+        let mut cmd = Command::new(&binding.binary);
         // `--no-auto-start` is a subcommand-level flag on `cli`, not a
         // top-level flag; insert it immediately after `cli` (ft-dvgzi.1.1).
         cmd.args(guarded_args);
@@ -3366,9 +3535,17 @@ impl WeztermClient {
         cmd.stdout_limit(capture_contract.stdout_limit);
         cmd.stderr_limit(MAX_CLI_ERROR_OUTPUT_BYTES);
 
-        if let Some(ref socket) = self.socket_path {
+        if let Some(socket) = binding.socket.as_ref() {
             cmd.env("WEZTERM_UNIX_SOCKET", socket);
+        } else {
+            cmd.env_remove("WEZTERM_UNIX_SOCKET");
         }
+        if let Some(path) = binding.path.as_ref() {
+            cmd.env("PATH", path);
+        } else {
+            cmd.env_remove("PATH");
+        }
+        cmd.current_dir(&binding.directory);
 
         let timeout_duration = Duration::from_secs(self.timeout_secs);
         // The deadline belongs to the process supervisor, not to an outer
@@ -3792,6 +3969,7 @@ impl WeztermClient {
         let CliMutationOutcome {
             result,
             mut circuit_evidence,
+            circuit,
         } = outcome;
         let parsed_result = match result {
             Ok(output) => {
@@ -3803,7 +3981,10 @@ impl WeztermClient {
             }
             Err(error) => Err(error),
         };
-        self.circuit_record_mutation_evidence(circuit_evidence);
+        Self::record_cli_mutation_evidence(
+            circuit.as_ref().unwrap_or(&self.circuit_breaker),
+            circuit_evidence,
+        );
         parsed_result
     }
 
@@ -3907,11 +4088,19 @@ impl WeztermClient {
         }
     }
 
+    #[cfg(test)]
     fn circuit_record_mutation_evidence(&self, evidence: CliMutationCircuitEvidence) {
+        Self::record_cli_mutation_evidence(&self.circuit_breaker, evidence);
+    }
+
+    fn record_cli_mutation_evidence(
+        circuit: &Arc<Mutex<CircuitBreaker>>,
+        evidence: CliMutationCircuitEvidence,
+    ) {
         if matches!(evidence, CliMutationCircuitEvidence::Ignore) {
             return;
         }
-        let mut guard = match self.circuit_breaker.lock() {
+        let mut guard = match circuit.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
@@ -4310,35 +4499,54 @@ impl WeztermClient {
     }
 
     #[cfg(all(feature = "vendored", unix))]
-    fn mux_circuit_guard(&self) -> bool {
+    fn mux_circuit_for_operation(&self) -> Result<Arc<Mutex<CircuitBreaker>>> {
+        let Some(key) = self.mux_circuit_key else {
+            return Ok(Arc::clone(&self.mux_circuit_breaker));
+        };
+        let mut cache = self
+            .mux_circuit_cache
+            .lock()
+            .unwrap_or_else(record_poison_and_recover);
+        if let Some(circuit) = cache.as_ref() {
+            return Ok(Arc::clone(circuit));
+        }
+        let circuit = get_or_register_transport_circuit(key)
+            .map_err(|error| WeztermError::CommandFailed(error.as_str().to_string()))?;
+        *cache = Some(Arc::clone(&circuit));
+        Ok(circuit)
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    fn mux_circuit_guard(&self) -> Result<bool> {
         if self.socket_path.is_none()
             && self
                 .stock_wezterm_peer
                 .load(std::sync::atomic::Ordering::Acquire)
         {
-            return false;
+            return Ok(false);
         }
-        let mut guard = match self.mux_circuit_breaker.lock() {
+        let circuit = self.mux_circuit_for_operation()?;
+        let mut guard = match circuit.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
 
         if guard.allow() {
-            true
+            Ok(true)
         } else if self.socket_path.is_some() {
             let status = guard.status();
             tracing::debug!(
                 retry_after_ms = status.cooldown_remaining_ms.unwrap_or(0),
                 "mux connection circuit breaker open; explicit socket has no CLI fallback"
             );
-            true
+            Ok(true)
         } else {
             let status = guard.status();
             tracing::debug!(
                 retry_after_ms = status.cooldown_remaining_ms.unwrap_or(0),
                 "mux connection circuit breaker open"
             );
-            false
+            Ok(false)
         }
     }
 
@@ -4358,7 +4566,13 @@ impl WeztermClient {
             return;
         }
 
-        let mut guard = match self.mux_circuit_breaker.lock() {
+        // Admission cached this exact immutable pool selector. Its Arc stays
+        // pinned across the await, and attaching a different pool detaches
+        // only that builder's cache.
+        let Ok(circuit) = self.mux_circuit_for_operation() else {
+            return;
+        };
+        let mut guard = match circuit.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
@@ -4404,13 +4618,14 @@ impl WeztermClient {
         args: &[&str],
         pane_id: u64,
     ) -> Result<String> {
-        self.circuit_guard()?;
-        let result = self
+        let client = self.for_cli_operation()?;
+        client.circuit_guard()?;
+        let result = client
             .retry_with_with_cx(cx, || {
-                self.run_cli_with_pane_check_with_cx(cx, args, pane_id)
+                client.run_cli_with_pane_check_with_cx(cx, args, pane_id)
             })
             .await;
-        self.circuit_record_result(&result);
+        client.circuit_record_result(&result);
         result
     }
 
@@ -4421,11 +4636,12 @@ impl WeztermClient {
         cx: &crate::cx::Cx,
         args: &[&str],
     ) -> Result<String> {
-        self.circuit_guard()?;
-        let result = self
-            .retry_with_with_cx(cx, || self.run_cli_with_cx(cx, args))
+        let client = self.for_cli_operation()?;
+        client.circuit_guard()?;
+        let result = client
+            .retry_with_with_cx(cx, || client.run_cli_with_cx(cx, args))
             .await;
-        self.circuit_record_result(&result);
+        client.circuit_record_result(&result);
         result
     }
 
@@ -6920,6 +7136,7 @@ mod tests {
             let mut circuit = CircuitBreaker::new(CircuitBreakerConfig::default());
             circuit.record_failure();
             client.mux_circuit_breaker = Arc::new(Mutex::new(circuit));
+            client.mux_circuit_key = None;
             let cx = crate::cx::for_testing();
             result = Some(
                 client
@@ -7112,6 +7329,235 @@ mod tests {
         );
         assert_eq!(trace.effects, trace.requests);
         assert_eq!(health.consecutive_failures, 0);
+    }
+
+    fn fixture_cli_binding(
+        directory: &std::path::Path,
+        binary: &str,
+        socket: Option<&str>,
+    ) -> CliTransportBinding {
+        CliTransportBinding {
+            binary: directory.join(binary),
+            socket: socket.map(|socket| directory.join(socket)),
+            path: Some(std::ffi::OsString::from("/captured/search/path")),
+            directory: directory.to_path_buf(),
+        }
+    }
+
+    #[test]
+    fn cli_transport_circuits_isolate_sockets_and_binaries_but_share_the_same_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let bind = |binary, socket| fixture_cli_binding(directory.path(), binary, Some(socket));
+        let a = WeztermClient::new()
+            .with_cli_binding(bind("wezterm-a", "mux-a"))
+            .unwrap();
+        let same = WeztermClient::new()
+            .with_cli_binding(bind("wezterm-a", "mux-a"))
+            .unwrap();
+        let other_socket = WeztermClient::new()
+            .with_cli_binding(bind("wezterm-a", "mux-b"))
+            .unwrap();
+        let other_binary = WeztermClient::new()
+            .with_cli_binding(bind("wezterm-b", "mux-a"))
+            .unwrap();
+        assert!(Arc::ptr_eq(&a.circuit_breaker, &same.circuit_breaker));
+        for _ in 0..3 {
+            a.circuit_record_mutation_evidence(CliMutationCircuitEvidence::BackendFailure);
+        }
+        assert!(same.circuit_guard().is_err());
+        assert!(other_socket.circuit_guard().is_ok());
+        assert!(other_binary.circuit_guard().is_ok());
+    }
+
+    #[test]
+    fn empty_cli_socket_selector_stays_empty_and_private() {
+        let captured = CliTransportBinding::capture(Some("")).unwrap();
+        assert_eq!(captured.socket.as_deref(), Some(std::path::Path::new("")));
+        let directory = tempfile::tempdir().unwrap();
+        let bind = || {
+            let mut binding = fixture_cli_binding(directory.path(), "wezterm", None);
+            binding.socket = Some(std::path::PathBuf::new());
+            binding
+        };
+        assert_ne!(
+            bind().key(),
+            fixture_cli_binding(directory.path(), "wezterm", None).key()
+        );
+        let a = WeztermClient::new().with_cli_binding(bind()).unwrap();
+        let b = WeztermClient::new().with_cli_binding(bind()).unwrap();
+        assert!(!Arc::ptr_eq(&a.circuit_breaker, &b.circuit_breaker));
+    }
+
+    #[test]
+    fn unresolved_cli_health_persists_for_clones_without_cross_client_contamination() {
+        let directory = tempfile::tempdir().unwrap();
+        let bind = || fixture_cli_binding(directory.path(), "wezterm", None);
+        let client = WeztermClient::new();
+        let first = client.with_cli_binding(bind()).unwrap();
+        for _ in 0..3 {
+            first.circuit_record_mutation_evidence(CliMutationCircuitEvidence::BackendFailure);
+        }
+        let later = client.clone().with_cli_binding(bind()).unwrap();
+        let unrelated = WeztermClient::new().with_cli_binding(bind()).unwrap();
+        assert!(Arc::ptr_eq(&first.circuit_breaker, &later.circuit_breaker));
+        assert!(!Arc::ptr_eq(
+            &first.circuit_breaker,
+            &unrelated.circuit_breaker
+        ));
+        assert!(later.circuit_guard().is_err());
+        assert!(unrelated.circuit_guard().is_ok());
+    }
+
+    #[test]
+    fn mutation_receipt_settles_its_original_transport_after_selector_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let client = WeztermClient::new();
+        let original = client
+            .with_cli_binding(fixture_cli_binding(directory.path(), "wezterm-a", Some("mux")))
+            .unwrap();
+        let replacement = client
+            .with_cli_binding(fixture_cli_binding(directory.path(), "wezterm-b", Some("mux")))
+            .unwrap();
+        original.circuit_record_mutation_evidence(CliMutationCircuitEvidence::BackendFailure);
+        replacement.circuit_record_mutation_evidence(CliMutationCircuitEvidence::BackendFailure);
+        let result = client.settle_cli_pane_id_mutation(
+            "spawn_targeted",
+            CliMutationOutcome {
+                result: Ok("malformed-pane-id".to_string()),
+                circuit_evidence: CliMutationCircuitEvidence::SuccessfulResponse,
+                circuit: Some(Arc::clone(&original.circuit_breaker)),
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(original.circuit_status().consecutive_failures, 2);
+        assert_eq!(replacement.circuit_status().consecutive_failures, 1);
+        assert_eq!(client.circuit_status().consecutive_failures, 1);
+        let configured = client.clone().with_circuit_breaker_config(
+            CircuitBreakerConfig::new(1, 1, Duration::from_secs(60)),
+        );
+        assert_eq!(configured.circuit_status().failure_threshold, 1);
+        assert_eq!(configured.circuit_status().consecutive_failures, 0);
+        assert_eq!(client.circuit_status().consecutive_failures, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_command_uses_the_binding_that_was_admitted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let working_directory = directory.path().canonicalize().unwrap();
+        let script = working_directory.join("wezterm-a");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' \"$WEZTERM_UNIX_SOCKET\" \"$PATH\" \"$PWD\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let client = WeztermClient::new().with_retries(1);
+        let admitted = client
+            .with_cli_binding(fixture_cli_binding(
+                &working_directory,
+                "wezterm-a",
+                Some("mux-a"),
+            ))
+            .unwrap();
+        // A later invocation selects another binary/socket before the older
+        // invocation runs. The older command and settlement retain their lease.
+        let replacement = client
+            .with_cli_binding(fixture_cli_binding(
+                &working_directory,
+                "wezterm-b",
+                Some("mux-b"),
+            ))
+            .unwrap();
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let output = admitted
+                .run_cli_with_retry_with_cx(&cx, &["cli", "list"])
+                .await
+                .unwrap();
+            assert_eq!(
+                output,
+                format!(
+                    "{}\n/captured/search/path\n{}\n",
+                    working_directory.join("mux-a").display(),
+                    working_directory.display(),
+                )
+            );
+        });
+        assert!(!Arc::ptr_eq(
+            &admitted.circuit_breaker,
+            &replacement.circuit_breaker
+        ));
+        assert_eq!(
+            admitted.circuit_breaker.lock().unwrap().telemetry().snapshot().successes_recorded,
+            1,
+        );
+        assert_eq!(
+            replacement.circuit_breaker.lock().unwrap().telemetry().snapshot().successes_recorded,
+            0,
+        );
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn mux_health_uses_the_pool_selector_and_detaches_when_the_pool_changes() {
+        use crate::vendored::{DirectMuxClientConfig, MuxPool, MuxPoolConfig};
+
+        let directory = tempfile::tempdir().unwrap();
+        let pool = |name| {
+            Arc::new(MuxPool::new(MuxPoolConfig {
+                mux: DirectMuxClientConfig::default()
+                    .with_socket_path(directory.path().join(name)),
+                ..MuxPoolConfig::default()
+            }))
+        };
+        let a = WeztermClient::new().with_mux_pool(pool("mux-a"));
+        // A different CLI socket override must not change the selected pool's
+        // transport identity.
+        let same = WeztermClient::with_socket("unrelated-cli-selector")
+            .with_mux_pool(pool("mux-a"));
+        let a_circuit = a.mux_circuit_for_operation().unwrap();
+        assert!(Arc::ptr_eq(
+            &a_circuit,
+            &same.mux_circuit_for_operation().unwrap()
+        ));
+        for _ in 0..3 {
+            a.mux_circuit_record_evidence(MuxCircuitEvidence::BackendFailure);
+        }
+        assert!(!a.mux_circuit_guard().unwrap());
+        a.stock_wezterm_peer.store(true, Ordering::Release);
+        let changed = a.clone().with_mux_pool(pool("mux-b"));
+        assert!(changed.mux_circuit_guard().unwrap());
+        assert!(!changed.stock_wezterm_peer.load(Ordering::Acquire));
+        assert!(a.stock_wezterm_peer.load(Ordering::Acquire));
+        assert!(!Arc::ptr_eq(
+            &a_circuit,
+            &changed.mux_circuit_for_operation().unwrap()
+        ));
+        assert_eq!(a_circuit.lock().unwrap().status().state, CircuitStateKind::Open);
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn implicit_mux_health_is_shared_only_by_clients_of_the_same_pool() {
+        use crate::vendored::{MuxPool, MuxPoolConfig};
+
+        let pool = Arc::new(MuxPool::new(MuxPoolConfig::default()));
+        let a = WeztermClient::new().with_mux_pool(Arc::clone(&pool));
+        let same = WeztermClient::new().with_mux_pool(pool);
+        let other = WeztermClient::new()
+            .with_mux_pool(Arc::new(MuxPool::new(MuxPoolConfig::default())));
+        assert!(Arc::ptr_eq(
+            &a.mux_circuit_for_operation().unwrap(),
+            &same.mux_circuit_for_operation().unwrap()
+        ));
+        for _ in 0..3 {
+            a.mux_circuit_record_evidence(MuxCircuitEvidence::BackendFailure);
+        }
+        assert!(!same.mux_circuit_guard().unwrap());
+        assert!(other.mux_circuit_guard().unwrap());
     }
 
     fn isolated_cli_client() -> WeztermClient {
@@ -9204,8 +9650,8 @@ mod tests {
         // Once the peer is known to be stock WezTerm, later operations go
         // straight to the CLI instead of re-dialing the handshake every
         // cooldown, and clones (which share the client state) agree.
-        assert!(!implicit.mux_circuit_guard());
-        assert!(!implicit.clone().mux_circuit_guard());
+        assert!(!implicit.mux_circuit_guard().unwrap());
+        assert!(!implicit.clone().mux_circuit_guard().unwrap());
         // A FrankenTerm skew never latches the CLI route.
         let frankenterm = WeztermClient::new();
         assert!(
@@ -9306,7 +9752,7 @@ mod tests {
         assert_eq!(open_status.state, CircuitStateKind::Open);
         // The guard observes the zero cooldown and transitions to HalfOpen
         // while admitting the probe.
-        assert!(client.mux_circuit_guard());
+        assert!(client.mux_circuit_guard().unwrap());
         client.mux_circuit_record_error(&remote);
         let status = match client.mux_circuit_breaker.lock() {
             Ok(guard) => guard.status(),
@@ -9524,7 +9970,7 @@ mod tests {
                 .expect("mux circuit lock");
             guard.record_failure();
         }
-        assert!(explicit.mux_circuit_guard());
+        assert!(explicit.mux_circuit_guard().unwrap());
 
         let mut implicit = WeztermClient::new();
         implicit.mux_circuit_breaker = Arc::new(Mutex::new(CircuitBreaker::with_name(
@@ -9538,7 +9984,7 @@ mod tests {
                 .expect("mux circuit lock");
             guard.record_failure();
         }
-        assert!(!implicit.mux_circuit_guard());
+        assert!(!implicit.mux_circuit_guard().unwrap());
     }
 
     #[cfg(all(feature = "vendored", unix))]
@@ -10259,6 +10705,7 @@ mod tests {
                 CliMutationOutcome {
                     result: Ok("not-a-pane-id".to_string()),
                     circuit_evidence: CliMutationCircuitEvidence::SuccessfulResponse,
+                    circuit: None,
                 },
             )
             .expect_err("the pane may exist even when its receipt is malformed");
@@ -10295,6 +10742,7 @@ mod tests {
                 CliMutationOutcome {
                     result: Ok("malformed-receipt".to_string()),
                     circuit_evidence: CliMutationCircuitEvidence::SuccessfulResponse,
+                    circuit: None,
                 },
             )
             .expect_err("malformed successful receipt must fail the full operation contract");
@@ -10335,6 +10783,7 @@ mod tests {
                 },
             ),
             circuit_evidence: CliMutationCircuitEvidence::SuccessfulResponse,
+            circuit: None,
         };
         client.circuit_record_mutation_evidence(pane_rejection.circuit_evidence);
 
@@ -10747,14 +11196,9 @@ mod tests {
 
     #[test]
     fn client_circuit_status_default_is_closed() {
-        // ft-0eby0: `new()` shares the process-global "wezterm_cli"
-        // circuit via get_or_register_circuit, so a bare client observes
-        // whatever state sibling tests left it in (a CLI-hammering test
-        // trips it Open). with_circuit_breaker_config constructs a
-        // PRIVATE breaker, which is what "default is closed" actually
-        // pins: a default-config breaker starts Closed.
-        let client =
-            WeztermClient::new().with_circuit_breaker_config(CircuitBreakerConfig::default());
+        // An unbound client starts with private health. Selecting an explicit
+        // transport later can acquire that endpoint's existing shared health.
+        let client = WeztermClient::new();
         let status = client.circuit_status();
         assert_eq!(status.state, CircuitStateKind::Closed);
     }

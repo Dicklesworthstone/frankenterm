@@ -32,6 +32,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use crate::cx::{self, Budget, Cx};
 use crate::outcome::CancelKind;
 use crate::pool::{Pool, PoolAcquireGuard, PoolConfig, PoolError, PoolStats};
@@ -202,6 +203,9 @@ pub struct MuxPoolStats {
 pub struct MuxPool {
     pool: Pool<DirectMuxClient>,
     mux_config: DirectMuxClientConfig,
+    // Pools with implicit discovery do not have a stable shared selector.
+    // Clients using this same pool still share its private transport health.
+    private_circuit: Arc<std::sync::Mutex<CircuitBreaker>>,
     outbound_budget: Arc<DirectMuxOutboundBudget>,
     recovery: MuxRecoveryConfig,
     connections_created: AtomicU64,
@@ -322,7 +326,15 @@ impl RenderExecutionError {
 impl MuxPool {
     /// Create a new mux connection pool.
     #[must_use]
-    pub fn new(config: MuxPoolConfig) -> Self {
+    pub fn new(mut config: MuxPoolConfig) -> Self {
+        // Bind a configured relative socket to the same directory for every
+        // connection and reconnect. Do not canonicalize: the socket may not
+        // exist yet, and an endpoint selector is not a server incarnation.
+        if let Some(path) = config.mux.socket_path.as_ref() {
+            if let Ok(absolute) = std::path::absolute(path) {
+                config.mux.socket_path = Some(absolute);
+            }
+        }
         let pipeline_depth = config.pipeline_depth.max(1);
         let pipeline_timeout = if config.pipeline_timeout.is_zero() {
             Duration::from_millis(1)
@@ -333,6 +345,10 @@ impl MuxPool {
         Self {
             pool: Pool::new(config.pool),
             mux_config: config.mux,
+            private_circuit: Arc::new(std::sync::Mutex::new(CircuitBreaker::with_name(
+                "mux_connection.private",
+                CircuitBreakerConfig::default(),
+            ))),
             outbound_budget,
             recovery: config.recovery,
             connections_created: AtomicU64::new(0),
@@ -347,6 +363,19 @@ impl MuxPool {
             #[cfg(test)]
             after_render_batch_success: std::sync::Mutex::new(None),
         }
+    }
+
+    /// The configured selector used by every dial. Implicit discovery stays
+    /// pool-private because a later reconnect can resolve a different socket.
+    pub(crate) fn circuit_socket_path(&self) -> Option<&std::path::Path> {
+        self.mux_config
+            .socket_path
+            .as_deref()
+            .filter(|path| path.is_absolute())
+    }
+
+    pub(crate) fn private_circuit(&self) -> Arc<std::sync::Mutex<CircuitBreaker>> {
+        Arc::clone(&self.private_circuit)
     }
 
     #[cfg(test)]
@@ -1652,6 +1681,19 @@ mod tests {
         CODEC_VERSION, GetCodecVersionResponse, GetPaneRenderChangesResponse, ListPanesResponse,
         Pdu, SpawnResponse, SpawnV2, SplitPane, StreamingPduBuffer, UnitResponse,
     };
+
+    #[test]
+    fn configured_relative_socket_is_bound_for_both_dials_and_circuit_identity() {
+        let relative = PathBuf::from("relative-circuit-fixture.sock");
+        let expected = std::path::absolute(&relative).unwrap();
+        let pool = MuxPool::new(MuxPoolConfig {
+            mux: DirectMuxClientConfig::default().with_socket_path(relative),
+            ..MuxPoolConfig::default()
+        });
+        assert_eq!(pool.circuit_socket_path(), Some(expected.as_path()));
+        assert_eq!(pool.mux_config.socket_path.as_deref(), Some(expected.as_path()));
+        assert!(MuxPool::new(MuxPoolConfig::default()).circuit_socket_path().is_none());
+    }
 
     /// Test-only maintenance helpers. The production pool deliberately exposes
     /// only explicit-Cx maintenance operations.

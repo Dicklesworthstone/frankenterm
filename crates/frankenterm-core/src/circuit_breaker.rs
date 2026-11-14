@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tracing::{error, info, warn};
 
 use crate::degradation::{DegradationManager, Subsystem};
@@ -257,6 +258,15 @@ fn subsystem_for_circuit(name: &str) -> Option<Subsystem> {
 }
 
 fn handle_circuit_opened(name: &str, failures: u32, threshold: u32) {
+    // Endpoint failures are reported in circuit snapshots. They must not
+    // degrade the whole transport subsystem or grow the global cascade
+    // tracker when a succession of independent endpoints fails.
+    if name.starts_with("wezterm_cli.transport-")
+        || name.starts_with("mux_connection.transport-")
+        || matches!(name, "wezterm_cli.private" | "mux_connection.private")
+    {
+        return;
+    }
     let subsystem = subsystem_for_circuit(name);
     if subsystem.is_some() {
         let _ = DegradationManager::init_global();
@@ -547,6 +557,141 @@ pub fn get_or_register_circuit(
         .clone()
 }
 
+/// Transport selectors are kept separate from human-readable circuit names.
+/// Only a length-framed digest is retained; paths and CLI selectors never
+/// appear in Debug output, logs, or status snapshots.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct TransportCircuitKey {
+    kind: TransportCircuitKind,
+    digest: [u8; 32],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum TransportCircuitKind {
+    Cli,
+    Mux,
+}
+
+impl TransportCircuitKey {
+    pub(crate) fn new(kind: TransportCircuitKind, components: &[&std::ffi::OsStr]) -> Self {
+        let mut digest = Sha256::new();
+        for component in components {
+            let bytes = component.as_encoded_bytes();
+            digest.update((bytes.len() as u64).to_le_bytes());
+            digest.update(bytes);
+        }
+        Self {
+            kind,
+            digest: digest.finalize().into(),
+        }
+    }
+}
+
+impl std::fmt::Debug for TransportCircuitKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransportCircuitKey")
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransportCircuitRegistryError {
+    CapacityExhausted,
+    IdentityExhausted,
+}
+
+impl TransportCircuitRegistryError {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::CapacityExhausted => "transport circuit registry capacity exhausted",
+            Self::IdentityExhausted => "transport circuit identity exhausted",
+        }
+    }
+}
+
+struct TransportCircuitEntry {
+    name: String,
+    breaker: Arc<Mutex<CircuitBreaker>>,
+    last_used: Instant,
+}
+
+/// Active callers pin their entry with an Arc. Only registry-owned idle
+/// entries can be recycled, so an outstanding result cannot settle a new
+/// endpoint's circuit after eviction. Idle health is retained until capacity
+/// is needed, rather than resetting every time a short-lived client exits.
+struct TransportCircuitRegistry {
+    entries: BTreeMap<TransportCircuitKey, TransportCircuitEntry>,
+    capacity: usize,
+    next_id: u64,
+}
+
+impl TransportCircuitRegistry {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            capacity,
+            next_id: 0,
+        }
+    }
+
+    fn get_or_register(
+        &mut self,
+        key: TransportCircuitKey,
+    ) -> std::result::Result<Arc<Mutex<CircuitBreaker>>, TransportCircuitRegistryError> {
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.last_used = Instant::now();
+            return Ok(Arc::clone(&entry.breaker));
+        }
+        let next_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or(TransportCircuitRegistryError::IdentityExhausted)?;
+        if self.entries.len() >= self.capacity {
+            let idle = self
+                .entries
+                .iter()
+                .filter(|(_, entry)| Arc::strong_count(&entry.breaker) == 1)
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| *key)
+                .ok_or(TransportCircuitRegistryError::CapacityExhausted)?;
+            self.entries.remove(&idle);
+        }
+        let prefix = match key.kind {
+            TransportCircuitKind::Cli => "wezterm_cli",
+            TransportCircuitKind::Mux => "mux_connection",
+        };
+        let name = format!("{prefix}.transport-{}", self.next_id);
+        self.next_id = next_id;
+        let breaker = Arc::new(Mutex::new(CircuitBreaker::with_name(
+            name.clone(),
+            CircuitBreakerConfig::default(),
+        )));
+        self.entries.insert(
+            key,
+            TransportCircuitEntry {
+                name,
+                breaker: Arc::clone(&breaker),
+                last_used: Instant::now(),
+            },
+        );
+        Ok(breaker)
+    }
+}
+
+const MAX_TRANSPORT_CIRCUITS: usize = 1024;
+static TRANSPORT_CIRCUIT_REGISTRY: OnceLock<Mutex<TransportCircuitRegistry>> = OnceLock::new();
+
+pub(crate) fn get_or_register_transport_circuit(
+    key: TransportCircuitKey,
+) -> std::result::Result<Arc<Mutex<CircuitBreaker>>, TransportCircuitRegistryError> {
+    TRANSPORT_CIRCUIT_REGISTRY
+        .get_or_init(|| Mutex::new(TransportCircuitRegistry::new(MAX_TRANSPORT_CIRCUITS)))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_or_register(key)
+}
+
 /// Ensure default circuits exist for status reporting.
 pub fn ensure_default_circuits() {
     let defaults = [
@@ -566,22 +711,32 @@ pub fn ensure_default_circuits() {
 #[must_use]
 pub fn circuit_snapshots() -> Vec<CircuitBreakerSnapshot> {
     let registry = CIRCUIT_REGISTRY.get_or_init(|| RwLock::new(BTreeMap::new()));
-    let read_guard = match registry.read() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-
-    read_guard
+    let mut circuits: Vec<_> = registry
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .iter()
+        .map(|(name, breaker)| (name.clone(), Arc::clone(breaker)))
+        .collect();
+    if let Some(registry) = TRANSPORT_CIRCUIT_REGISTRY.get() {
+        circuits.extend(
+            registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entries
+                .values()
+                .map(|entry| (entry.name.clone(), Arc::clone(&entry.breaker))),
+        );
+    }
+
+    // Release registry locks before taking any individual breaker lock.
+    circuits
+        .into_iter()
         .map(|(name, breaker)| {
-            let status = match breaker.lock() {
-                Ok(guard) => guard.status(),
-                Err(poisoned) => poisoned.into_inner().status(),
-            };
-            CircuitBreakerSnapshot {
-                name: name.clone(),
-                status,
-            }
+            let status = breaker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .status();
+            CircuitBreakerSnapshot { name, status }
         })
         .collect()
 }
@@ -590,6 +745,97 @@ pub fn circuit_snapshots() -> Vec<CircuitBreakerSnapshot> {
 mod tests {
     use super::*;
     use crate::degradation::{OverallStatus, active_degradations, recover};
+
+    fn transport_key(kind: TransportCircuitKind, components: &[&str]) -> TransportCircuitKey {
+        let components: Vec<_> = components.iter().map(std::ffi::OsStr::new).collect();
+        TransportCircuitKey::new(kind, &components)
+    }
+
+    #[test]
+    fn transport_circuits_share_only_the_same_framed_selector() {
+        let mut registry = TransportCircuitRegistry::new(8);
+        let a_key = transport_key(TransportCircuitKind::Cli, &["/bin/wezterm", "/mux/a"]);
+        let a = registry.get_or_register(a_key).unwrap();
+        let same = registry.get_or_register(a_key).unwrap();
+        let b = registry
+            .get_or_register(transport_key(
+                TransportCircuitKind::Cli,
+                &["/bin/wezterm", "/mux/b"],
+            ))
+            .unwrap();
+        let other_binary = registry
+            .get_or_register(transport_key(
+                TransportCircuitKind::Cli,
+                &["/other/wezterm", "/mux/a"],
+            ))
+            .unwrap();
+        let mux = registry
+            .get_or_register(transport_key(
+                TransportCircuitKind::Mux,
+                &["/bin/wezterm", "/mux/a"],
+            ))
+            .unwrap();
+        assert!(Arc::ptr_eq(&a, &same));
+        for _ in 0..3 {
+            a.lock().unwrap().record_failure();
+        }
+        assert!(!same.lock().unwrap().allow());
+        assert!(b.lock().unwrap().allow());
+        assert!(other_binary.lock().unwrap().allow());
+        assert!(mux.lock().unwrap().allow());
+        assert_ne!(
+            transport_key(TransportCircuitKind::Cli, &["ab", "c"]),
+            transport_key(TransportCircuitKind::Cli, &["a", "bc"]),
+        );
+    }
+
+    #[test]
+    fn transport_registry_keeps_live_leases_and_recycles_only_idle_entries() {
+        let mut registry = TransportCircuitRegistry::new(2);
+        let a_key = transport_key(TransportCircuitKind::Mux, &["a"]);
+        let b_key = transport_key(TransportCircuitKind::Mux, &["b"]);
+        let c_key = transport_key(TransportCircuitKind::Mux, &["c"]);
+        let a = registry.get_or_register(a_key).unwrap();
+        let b = registry.get_or_register(b_key).unwrap();
+        assert_eq!(
+            registry.get_or_register(c_key).unwrap_err(),
+            TransportCircuitRegistryError::CapacityExhausted,
+        );
+        assert!(Arc::ptr_eq(&a, &registry.get_or_register(a_key).unwrap()));
+        drop(b);
+        let c = registry.get_or_register(c_key).unwrap();
+        assert_eq!(registry.entries.len(), 2);
+        assert!(registry.entries.contains_key(&a_key));
+        assert!(!registry.entries.contains_key(&b_key));
+        assert!(!Arc::ptr_eq(&a, &c));
+    }
+
+    #[test]
+    fn transport_labels_are_content_free_and_never_wrap() {
+        let mut registry = TransportCircuitRegistry::new(2);
+        let key = transport_key(TransportCircuitKind::Cli, &["private/socket/secret"]);
+        let circuit = registry.get_or_register(key).unwrap();
+        let entry = registry.entries.get(&key).unwrap();
+        assert_eq!(entry.name, "wezterm_cli.transport-0");
+        assert!(!format!("{key:?} {circuit:?}").contains("secret"));
+        let snapshot = CircuitBreakerSnapshot {
+            name: entry.name.clone(),
+            status: circuit.lock().unwrap().status(),
+        };
+        assert!(!serde_json::to_string(&snapshot).unwrap().contains("secret"));
+        registry.next_id = u64::MAX;
+        assert!(Arc::ptr_eq(
+            &circuit,
+            &registry.get_or_register(key).unwrap()
+        ));
+        assert_eq!(
+            registry
+                .get_or_register(transport_key(TransportCircuitKind::Cli, &["another"]))
+                .unwrap_err(),
+            TransportCircuitRegistryError::IdentityExhausted,
+        );
+        assert_eq!(registry.entries.len(), 1);
+    }
 
     #[test]
     fn circuit_opens_after_threshold() {
