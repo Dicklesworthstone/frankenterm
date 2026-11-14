@@ -285,8 +285,13 @@ mod tests {
             title_apply_delay(false, Some(start), start + ms(300)),
             Some(HIDDEN_TITLE_INTERVAL - ms(300))
         );
+        // A once-a-second spinner is held back too: its next two frames wait.
         assert_eq!(
-            title_apply_delay(false, Some(start), start + ms(999)),
+            title_apply_delay(false, Some(start), start + ms(1000)),
+            Some(ms(2000))
+        );
+        assert_eq!(
+            title_apply_delay(false, Some(start), start + ms(2999)),
             Some(ms(1))
         );
         // Once the interval has passed it applies at once.
@@ -295,7 +300,7 @@ mod tests {
             None
         );
         assert_eq!(
-            title_apply_delay(false, Some(start), start + ms(2500)),
+            title_apply_delay(false, Some(start), start + ms(4500)),
             None
         );
     }
@@ -708,9 +713,10 @@ pub(crate) struct WindowInner {
 /// How often a window whose title bar is hidden is retitled at most (B20).
 /// AppKit lays out the whole title bar on every `setTitle:` (about 4 ms on
 /// the main thread), hidden or not, and an agent's spinner in a pane title
-/// changes the window title several times a second. Behind a hidden title
-/// bar only the Window menu, Mission Control and accessibility read it.
-const HIDDEN_TITLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// changes the window title about once a second or faster. Behind a hidden
+/// title bar only the Window menu, Mission Control and accessibility read
+/// it. One second would barely bind for a once-a-second spinner.
+const HIDDEN_TITLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// How long a new title waits before AppKit gets it: not at all when the
 /// title bar shows it or when the window has not been retitled within
