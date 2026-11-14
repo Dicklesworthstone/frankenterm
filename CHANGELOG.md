@@ -33,6 +33,10 @@ Compare against the latest tag: <https://github.com/Dicklesworthstone/frankenter
 
 Development since the `v0.15.21` tag (2026-10-14 → 2026-10-25; 723 non-merge commits). The headline work is a **native iOS / Apple FrankenTerm client** that attaches to the muxes running on a Mac, alongside air-gapped QR workspace transfer, guardian/recovery/checkpoint durability hardening, and a terminal-rendering performance pass. None of this is a published GitHub Release yet — the latest GitHub Release remains [`v0.15.1`](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.1).
 
+### Codec compatibility
+
+- Codec 75 raises the minimum supported current dialect from 61 to 75. Live terminal cells carry exact text and their authoritative width, preserving custom widths and Unicode-version differences through desktop and mobile rendering. The positional change affects PDUs 23/25/79/84/103; upgrade desktop clients, mux servers and mobile clients together. Former current versions 61–74 fail negotiation, and the explicit legacy 46/47 metadata/input lane refuses cell rendering before decoding its body. Existing authenticated semantic scrollback schemas 1–4 retain their binary layout and use their saved width sidecars. See `ft-interactive-systems-performance-4tenz.7.26` and [codec history](docs/codec-versions.md). Rust execution and native qualification remain pending.
+
 ### Native iOS / Apple client
 
 New workspace members `apps/ios`, `apps/apple`, `crates/frankenterm-mobile-mux`, and `crates/frankenterm-mobile-attach` bring a first-class iOS app that attaches to a FrankenTerm mux on a Mac. Machines exported from the desktop sign in on the phone in the background, an SSH PTY attaches to a single mux pane, and a hardware keyboard switches machines and panes. The mux protocol gained phone-facing delivery signals — marking output the phone has not yet shown and flagging sent input that is still unanswered — plus bounded output delivery that no longer drops parser state under backpressure.

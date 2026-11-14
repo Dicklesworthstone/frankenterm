@@ -9,8 +9,7 @@ use crate::search::{ContextLine, SearchJob, SearchMatch, SearchQuery};
 use crate::wire::{
     self, CodecVersion, CoherentOutcome, Dialect, GetCodecVersion, GetLines, GetPaneRenderChanges,
     LinesResponse, ListPanes, ListPanesCoherent, ListPanesCoherentResponse, LivenessResponse,
-    MouseButton, MouseEvent, MouseEventKind, PaneList, PaneRemoved, RenderChanges, RenderHead,
-    Resize, SearchResults, SearchScrollback, SendKeyDown, SendMouseEvent, SendPaste,
+    MouseButton, MouseEvent, MouseEventKind, PaneList, PaneRemoved, Resize, SearchResults, SearchScrollback, SendKeyDown, SendMouseEvent, SendPaste,
     StableRowIndex, TerminalSize, TopologyChange, TopologyEvent, WriteToPane, ident,
 };
 use serde::Deserialize;
@@ -862,6 +861,13 @@ impl Session {
             !matches!(request, Request::RenderMetadata { pane_id: old, .. } if *old == pane_id)
         });
         if !self.is_ready() {
+            return;
+        }
+        if self.dialect == Dialect::Legacy {
+            self.fail(
+                "legacy mux rendering cannot preserve cell widths; update the mux server to protocol 75"
+                    .to_owned(),
+            );
             return;
         }
         if let Some(mirror) = self.mirrors.get_mut(&pane_id) {
@@ -2169,6 +2175,21 @@ impl Session {
     }
 
     fn handle(&mut self, frame: Frame) -> Result<(), crate::Error> {
+        if self.dialect == Dialect::Legacy
+            && matches!(
+                frame.ident,
+                ident::GET_LINES_RESPONSE
+                    | ident::GET_PANE_RENDER_CHANGES_RESPONSE
+                    | ident::GET_LINES_AT_LAYOUT_RESPONSE
+            )
+        {
+            // Legacy Cell bodies contain text alone. Their display widths
+            // cannot be recovered from this host's Unicode policy, even when
+            // a prefix or a coincidentally valid current body would decode.
+            return Err(crate::Error::Frame(
+                "legacy mux rendering cannot preserve cell widths; update the mux server to protocol 75",
+            ));
+        }
         let request = if frame.serial == 0 {
             None
         } else {
@@ -2697,7 +2718,7 @@ impl Session {
                     _ => return Err(crate::Error::Schema),
                 };
                 if self.mirrors.contains_key(&pane_id) {
-                    let (head, lines) = if self.codec_version >= wire::OBSERVED_LINES_MIN_VERSION {
+                    let (head, lines) = {
                         let changes: wire::RenderObservation =
                             wire::decode_observation(&frame.body)?;
                         if changes.seqno == usize::MAX {
@@ -2719,13 +2740,6 @@ impl Session {
                             return Ok(());
                         }
                         (changes.head, Some(changes.bonus_lines.entries))
-                    } else {
-                        // Legacy image cells can lack a decodable line prefix.
-                        // Current observed reads never downgrade this way.
-                        match wire::decode::<RenderChanges>(&frame.body) {
-                            Ok(changes) => (changes.head, Some(changes.bonus_lines)),
-                            Err(_) => (wire::decode::<RenderHead>(&frame.body)?, None),
-                        }
                     };
                     // Only an accepted, correlated observation settles the
                     // repeated request. Unsolicited output must not clear a
@@ -3518,7 +3532,7 @@ mod shell_creation_tests {
         Session {
             ready: true,
             dialect: Dialect::Current,
-            codec_version: 74,
+            codec_version: *wire::CURRENT_VERSIONS.end(),
             incarnation: Some([0x1c; 16]),
             monotonic_ns: Some(0),
             ..Session::default()

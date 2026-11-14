@@ -25575,6 +25575,174 @@ mod tests {
     }
 
     #[test]
+    fn historical_cell_text_scrollback_keeps_exact_binary_layout_and_authenticated_widths() {
+        use mux::guardian_output_journal::GuardianScrollbackRowIdentity;
+
+        // An independent description of the historical positional bytes.
+        // It never invokes either current Cell serde or the pinned writer.
+        #[derive(Serialize)]
+        struct HistoricalCell<'a> {
+            text: &'a str,
+            attrs: CellAttributes,
+        }
+        #[derive(Serialize)]
+        struct HistoricalVector<'a> {
+            cells: Vec<HistoricalCell<'a>>,
+        }
+        #[derive(Serialize)]
+        enum HistoricalStorage<'a> {
+            V(HistoricalVector<'a>),
+        }
+        #[derive(Serialize)]
+        struct HistoricalLine<'a> {
+            cells: HistoricalStorage<'a>,
+            zones: Vec<()>,
+            seqno: usize,
+            bits: u16,
+        }
+        #[derive(Serialize)]
+        struct HistoricalRow<'a> {
+            schema: u32,
+            line: HistoricalLine<'a>,
+            cell_widths: Vec<u8>,
+        }
+
+        let mut spacer = CellAttributes::blank();
+        spacer.set_italic(true);
+        let historical = HistoricalRow {
+            schema: 1,
+            line: HistoricalLine {
+                cells: HistoricalStorage::V(HistoricalVector {
+                    cells: vec![
+                        HistoricalCell {
+                            text: "abcdefgh",
+                            attrs: CellAttributes::blank(),
+                        },
+                        HistoricalCell {
+                            text: "A",
+                            attrs: CellAttributes::blank(),
+                        },
+                        HistoricalCell {
+                            text: " ",
+                            attrs: spacer.clone(),
+                        },
+                    ],
+                }),
+                zones: Vec::new(),
+                seqno: 17,
+                bits: 0,
+            },
+            cell_widths: vec![1, 2, 1],
+        };
+        let original_bytes = Zeroizing::new(varbincode::serialize(&historical).unwrap());
+        let source = Line::from_cells(
+            vec![
+                termwiz::cell::Cell::new_grapheme_with_width(
+                    "abcdefgh",
+                    1,
+                    CellAttributes::blank(),
+                ),
+                termwiz::cell::Cell::new_grapheme_with_width("A", 2, CellAttributes::blank()),
+                termwiz::cell::Cell::blank_with_attrs(spacer),
+            ],
+            17,
+        );
+        assert_eq!(
+            serialize_cell_semantic_scrollback_line(&source).unwrap(),
+            original_bytes,
+            "changing live Cell serde must not change saved schemas 1-4",
+        );
+
+        let (_dir, backing, _deferred) = deferred_test_sink();
+        let state = *backing.lock_state("historical row identity").unwrap();
+        let mut keyring = backing.lock_keyring("historical row cipher").unwrap();
+        let identity = GuardianScrollbackRowIdentity::new(
+            backing.durable_pane_id,
+            state.content_epoch,
+            1,
+            0,
+            0,
+        )
+        .unwrap();
+        let record = keyring
+            .latest_active_cipher()
+            .unwrap()
+            .seal_scrollback_row(identity, &original_bytes)
+            .unwrap()
+            .encode()
+            .unwrap();
+        let mut cache = GuardianScrollbackCipherCache::new(&keyring, &state.row_segments);
+        let (mut restored, _, fidelity) = decode_persisted_scrollback_line_with_limit(
+            &record,
+            &mut cache,
+            backing.durable_pane_id,
+            state.content_epoch,
+            0,
+            0,
+            original_bytes.len(),
+        )
+        .unwrap();
+        assert_eq!(fidelity, DecodedScrollbackRecordFidelity::ExactSemantic);
+        let cells = restored.cells_mut();
+        assert_eq!(cells.len(), 3);
+        assert_eq!((cells[0].str(), cells[0].width()), ("abcdefgh", 1));
+        assert_eq!((cells[1].str(), cells[1].width()), ("A", 2));
+        assert!(cells[2].attrs().italic(), "hidden spacer attributes survive");
+        assert_eq!(
+            serialize_cell_semantic_scrollback_line(&restored).unwrap(),
+            original_bytes,
+        );
+        assert!(
+            decode_persisted_scrollback_line_with_limit(
+                &record,
+                &mut cache,
+                backing.durable_pane_id,
+                state.content_epoch,
+                1,
+                0,
+                original_bytes.len(),
+            )
+            .is_err(),
+            "width projection cannot weaken authenticated row-location binding",
+        );
+
+        for widths in [vec![], vec![1, 2], vec![1, 0, 1], vec![1, 3, 1]] {
+            let invalid = HistoricalRow {
+                cell_widths: widths,
+                ..historical_for_invalid_widths()
+            };
+            assert!(
+                decode_exact_semantic_scrollback_plaintext(
+                    Zeroizing::new(varbincode::serialize(&invalid).unwrap()),
+                    LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
+                )
+                .is_err(),
+            );
+        }
+
+        fn historical_for_invalid_widths() -> HistoricalRow<'static> {
+            HistoricalRow {
+                schema: 1,
+                line: HistoricalLine {
+                    cells: HistoricalStorage::V(HistoricalVector {
+                        cells: ["abcdefgh", "A", " "]
+                            .into_iter()
+                            .map(|text| HistoricalCell {
+                                text,
+                                attrs: CellAttributes::blank(),
+                            })
+                            .collect(),
+                    }),
+                    zones: Vec::new(),
+                    seqno: 17,
+                    bits: 0,
+                },
+                cell_widths: vec![1, 2, 1],
+            }
+        }
+    }
+
+    #[test]
     fn compact_scrollback_noise_record_does_not_grow_encrypted_storage() {
         use mux::guardian_output_journal::GuardianScrollbackRowIdentity;
         let (_dir, backing, _deferred) = deferred_test_sink();

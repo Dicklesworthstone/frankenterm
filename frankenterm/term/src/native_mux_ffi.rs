@@ -923,7 +923,7 @@ mod tests {
         unsafe {
             assert_eq!(ft_mux_v1_create(&mut session), 0);
             assert_eq!(take_outgoing(session), [2, 1, 26]);
-            let version = frankenterm_mobile_mux::frame::encode(27, 1, &[71, 1, b'x']);
+            let version = frankenterm_mobile_mux::frame::encode(27, 1, &[75, 1, b'x']);
             assert_eq!(
                 ft_mux_v1_receive(session, version.as_ptr(), version.len() as u32),
                 0
@@ -1171,8 +1171,8 @@ mod tests {
         assert_eq!(take_outgoing(session), [2, 1, 26]);
         assert!(take_outgoing(session).is_empty());
 
-        // A reply from a server newer than this client: codec_vers 75, version "x".
-        let reply = [5u8, 1, 27, 75, 1, b'x'];
+        // A reply from a server newer than this client: codec_vers 76, version "x".
+        let reply = [5u8, 1, 27, 76, 1, b'x'];
         // SAFETY: a live local buffer with its exact length.
         assert_eq!(
             unsafe { ft_mux_v1_receive(session, reply.as_ptr(), reply.len() as u32) },
@@ -1198,7 +1198,7 @@ mod tests {
             unsafe { ft_mux_v1_event_copy(session, 0, reason.as_mut_ptr(), length, &mut written) };
         assert_eq!((status, written), (0, length));
         let reason = String::from_utf8(reason).unwrap();
-        assert!(reason.contains("75"), "{}", reason);
+        assert!(reason.contains("76"), "{}", reason);
 
         // SAFETY: live local scalars.
         let status = unsafe {

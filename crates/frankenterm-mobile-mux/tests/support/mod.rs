@@ -1,14 +1,11 @@
-//! A v46 mux server over one real terminal, answering the way the v0.13
-//! `frankenterm-mux-server` does (sessionhandler `compute_changes`, GetLines,
-//! pushes with serial 0), and the phone's terminal it draws on.
+//! A negotiated mux server over one real terminal and the phone it draws on.
+//! Rendering fixtures use the current width-bearing cell protocol. Explicit
+//! legacy fixtures cover metadata and input without requesting cell-bearing
+//! replies that cannot preserve the sender's terminal widths.
 //!
-//! The server reads every phone request with the desktop codec's own
-//! Legacy46 decoder, so a request it understands is one a v46 server
-//! accepts; it writes replies from the desktop codec's structs, which v46
-//! encodes identically for PDUs 23, 25, 27, 30 and 37, and PDU 4 from
-//! copies of the v0.13 `mux::tab` types. Announcing a current codec, it
-//! answers the coherent pane list (PDU 82) as a current server does and
-//! then pushes topology changes as PDU 83.
+//! Every request uses the desktop codec's negotiated decoder. Current peers
+//! answer coherent pane lists and topology changes; legacy PDU 4 is built
+//! from copies of the v0.13 `mux::tab` types.
 #![allow(dead_code)]
 
 use codec::{
@@ -260,8 +257,8 @@ impl Server {
             term: terminal(rows, cols),
             pane_id: 7,
             tab_id: 3,
-            codec_vers: 46,
-            min_supported: 46,
+            codec_vers: codec::CODEC_VERSION,
+            min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
             compress: false,
             title: "agent".to_owned(),
             written: Vec::new(),
@@ -302,7 +299,7 @@ impl Server {
         self.to_phone.extend_from_slice(&frame);
     }
 
-    /// The layout this server reads: v46, or the current one from codec 61.
+    /// The negotiated layout: legacy metadata/input or current cell geometry.
     /// A server newer than this codec reads the newest layout this codec
     /// has, as a newer server keeps its PDUs within its accepted window.
     /// (A version outside both reads the protocol check, which is the same
@@ -571,8 +568,11 @@ impl Server {
                 assert_eq!(pane_id, self.pane_id);
                 if self.refuse_lines > 0 {
                     self.refuse_lines -= 1;
-                    // v46 PDU 0 is the error text alone.
-                    self.reply(0, serial, &"Error: no such pane".to_owned());
+                    if self.codec_vers <= 47 {
+                        self.reply(0, serial, &"Error: no such pane".to_owned());
+                    } else {
+                        self.reply(0, serial, &codec::ErrorResponse::pane_not_found(22, pane_id));
+                    }
                     return;
                 }
                 let mut entries = Vec::new();
@@ -755,11 +755,15 @@ impl Server {
                     Pattern::CaseSensitiveString(text) => (text, false),
                     Pattern::CaseInSensitiveString(text) => (text.to_lowercase(), true),
                     Pattern::Regex(text) if text == "(" => {
-                        self.reply(
-                            0,
-                            serial,
-                            &"Error: regex parse error: unclosed group".to_owned(),
-                        );
+                        if self.codec_vers <= 47 {
+                            self.reply(
+                                0,
+                                serial,
+                                &"Error: regex parse error: unclosed group".to_owned(),
+                            );
+                        } else {
+                            self.reply(0, serial, &codec::ErrorResponse::invalid_request(31));
+                        }
                         return;
                     }
                     Pattern::Regex(text) => (text, false),
@@ -986,9 +990,11 @@ pub struct Harness {
 
 impl Harness {
     pub fn new(rows: usize, cols: usize) -> Self {
+        let mut session = Session::new();
+        assert!(session.advance_time(0));
         Self {
             server: Server::new(rows, cols),
-            session: Session::new(),
+            session,
             phone: phone_terminal(rows, cols),
             events: Vec::new(),
             chunk: usize::MAX,
@@ -997,6 +1003,14 @@ impl Harness {
             hold_requests: false,
             held_requests: Vec::new(),
         }
+    }
+
+    /// A string-only legacy peer: metadata and input work without a view.
+    pub fn legacy(rows: usize, cols: usize) -> Self {
+        let mut harness = Self::new(rows, cols);
+        harness.server.codec_vers = 46;
+        harness.server.min_supported = 46;
+        harness
     }
 
     pub fn pump(&mut self) {

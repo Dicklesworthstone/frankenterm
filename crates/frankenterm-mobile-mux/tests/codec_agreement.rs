@@ -1,6 +1,6 @@
-//! Every frame the phone writes is byte for byte what the desktop codec
-//! writes for a v46 server, and every reply the phone reads decodes the same
-//! way in the desktop codec's v46 decoder.
+//! The phone and desktop agree on negotiated request and reply layouts.
+//! Legacy coverage is limited to metadata/input; cell-bearing replies require
+//! the current protocol so authoritative terminal widths survive transport.
 
 mod support;
 
@@ -1228,15 +1228,18 @@ fn render_changes(term: &mut frankenterm_term::Terminal) -> GetPaneRenderChanges
 }
 
 #[test]
-fn render_changes_decode_like_the_desktop_v46_decoder() {
+fn render_changes_decode_like_the_current_desktop_decoder() {
     for compress in [false, true] {
         let mut term = styled_terminal();
         let response = render_changes(&mut term);
         let body = varbincode::serialize(&response).expect("serialize");
         let bytes = server_frame(25, 0, &body, compress);
 
-        let decoded = Pdu::decode_for_dialect(bytes.as_slice(), MuxWireDialect::LEGACY46)
-            .expect("the desktop decodes it as v46");
+        let decoded = Pdu::decode_for_dialect(
+            bytes.as_slice(),
+            MuxWireDialect::current(codec::CODEC_VERSION).expect("current dialect"),
+        )
+        .expect("the desktop decodes exact-width cells");
         let MuxWireDecodedPayload::Pdu(Pdu::GetPaneRenderChangesResponse(desktop)) =
             decoded.payload()
         else {
@@ -1304,6 +1307,72 @@ fn render_changes_decode_like_the_desktop_v46_decoder() {
     }
 }
 
+#[test]
+fn line_replies_preserve_widths_that_differ_from_the_receivers_unicode_rules() {
+    use termwiz::cell::{Cell, CellAttributes};
+    use termwiz::surface::Line;
+
+    // Unicode-8 emoji width, ambiguous-wide punctuation and a custom ASCII
+    // width all disagree with widths reconstructed from text on another host.
+    let cases = [("✊", 1), ("¡", 2), ("A", 2)];
+    for compress in [false, true] {
+        let lines: Vec<_> = cases
+            .iter()
+            .enumerate()
+            .map(|(row, (text, width))| {
+                (
+                    row as isize,
+                    Line::from_cells(
+                        vec![Cell::new_grapheme_with_width(
+                            text,
+                            *width,
+                            CellAttributes::default(),
+                        )],
+                        0,
+                    ),
+                )
+            })
+            .collect();
+        let response = codec::GetLinesResponse {
+            pane_id: 12,
+            lines: lines.into(),
+        };
+        let body = varbincode::serialize(&response).expect("serialize exact cells");
+        let bytes = server_frame(23, 9, &body, compress);
+        let decoded = Pdu::decode_for_dialect(
+            bytes.as_slice(),
+            MuxWireDialect::current(codec::CODEC_VERSION).expect("current dialect"),
+        )
+        .expect("desktop accepts width-bearing line replies");
+        let MuxWireDecodedPayload::Pdu(Pdu::GetLinesResponse(desktop)) = decoded.payload()
+        else {
+            panic!("expected line response");
+        };
+        let mut reader = frame::FrameReader::default();
+        reader.push(&bytes);
+        let frame = reader.next_frame().unwrap().expect("complete frame");
+        let mobile: wire::LinesResponse = wire::decode(&frame.body).expect("mobile line reply");
+        assert_eq!(mobile.pane_id, desktop.pane_id);
+        assert_eq!(mobile.lines.lines.len(), cases.len());
+        for (((row, line), (_, desktop_line)), (text, width)) in mobile
+            .lines
+            .lines
+            .iter()
+            .zip(desktop.lines.lines())
+            .zip(cases)
+        {
+            let mobile_cell = line.visible_cells().next().expect("mobile cell");
+            let desktop_cell = desktop_line.visible_cells().next().expect("desktop cell");
+            assert_eq!((mobile_cell.str(), mobile_cell.width()), (text, width), "row {row}");
+            assert_eq!(
+                (desktop_cell.str(), desktop_cell.width()),
+                (text, width),
+                "row {row}"
+            );
+        }
+    }
+}
+
 /// Each cell's link address, in column order.
 fn link_addresses(line: &termwiz::surface::Line) -> Vec<Option<String>> {
     line.visible_cells()
@@ -1324,7 +1393,6 @@ fn links_come_back_on_the_cells_the_desktop_puts_them_on() {
     let body = varbincode::serialize(&response).expect("serialize");
     let bytes = server_frame(25, 0, &body, false);
     let dialects = [
-        MuxWireDialect::LEGACY46,
         MuxWireDialect::current(codec::CODEC_VERSION).expect("the current dialect"),
     ];
     for dialect in dialects {

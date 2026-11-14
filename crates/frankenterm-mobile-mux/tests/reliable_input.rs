@@ -14,15 +14,18 @@ use support::{Harness, server_frame};
 
 fn current(version: usize) -> Harness {
     let mut harness = Harness::new(4, 30);
+    // Input timing tests explicitly opt in to an owner clock. Keep this
+    // helper untimed even when the shared rendering fixture supplies one.
+    harness.session = Session::new();
     harness.server.codec_vers = version;
-    harness.server.min_supported = 61;
+    harness.server.min_supported = 75;
     harness.attach();
     assert!(harness.session.is_ready(), "{:?}", harness.events);
     harness
 }
 
 fn timed_current() -> Harness {
-    let mut harness = current(74);
+    let mut harness = current(75);
     assert!(harness.session.advance_time(0));
     harness
 }
@@ -188,11 +191,11 @@ fn registration_is_acknowledged_before_ready_and_unique_per_connection() {
         27,
         rpc,
         &codec::GetCodecVersionResponse {
-            codec_vers: 71,
+            codec_vers: 75,
             version_string: "current".to_owned(),
             executable_path: "/mux".into(),
             config_file_path: None,
-            min_supported: 61,
+            min_supported: 75,
         },
     );
     assert!(!first.is_ready());
@@ -207,7 +210,7 @@ fn registration_is_acknowledged_before_ready_and_unique_per_connection() {
     assert!(matches!(first.next_event(), Some(Event::Ready { .. })));
     assert!(matches!(take_one(&mut first).1, Pdu::ListPanesCoherent(_)));
 
-    let second = current(71);
+    let second = current(75);
     assert_ne!(registration.client_id, second.server.client_ids[0]);
     assert_eq!(
         &second.server.requests[..5],
@@ -223,7 +226,7 @@ fn registration_is_acknowledged_before_ready_and_unique_per_connection() {
 
 #[test]
 fn an_unobserved_pane_cannot_lazily_capture_new_input_authority() {
-    let mut harness = current(71);
+    let mut harness = current(75);
     let pane = harness.server.pane_id + 1;
     harness.session.write(pane, b"never redirect this");
     assert_stopped(&mut harness.session, pane);
@@ -231,7 +234,7 @@ fn an_unobserved_pane_cannot_lazily_capture_new_input_authority() {
 
 #[test]
 fn every_partial_suffix_precedes_later_keys_paste_and_mouse() {
-    let mut harness = current(74);
+    let mut harness = current(75);
     let pane = harness.server.pane_id;
     harness.session.write(pane, b"abc\x1b[A");
     harness.session.paste(pane, "later paste");
@@ -319,7 +322,7 @@ fn every_partial_suffix_precedes_later_keys_paste_and_mouse() {
 
 #[test]
 fn full_partial_writer_integration_keeps_content_and_effect_order() {
-    let mut harness = current(74);
+    let mut harness = current(75);
     harness.server.write_prefix = Some(1);
     let pane = harness.server.pane_id;
     harness.session.write(pane, b"abc\x1b[A");
@@ -360,49 +363,44 @@ fn full_partial_writer_integration_keeps_content_and_effect_order() {
 }
 
 #[test]
-fn older_current_servers_refuse_paste_and_mouse_without_losing_keys_or_output() {
-    for version in [61, 64, 71, 72, 73] {
-        let mut harness = current(version);
+fn incompatible_current_servers_are_rejected_before_input_authority_or_rendering() {
+    for version in 61..=74 {
+        let mut harness = Harness::new(4, 30);
+        harness.server.codec_vers = version;
+        harness.server.min_supported = 61;
+        harness.pump();
         let pane = harness.server.pane_id;
-        let requests_before = harness.server.requests.len();
-        for _ in 0..100 {
-            harness.session.paste(pane, "must not be sent");
-            harness.session.click(pane, 2, 1);
-            harness.session.wheel(pane, 1, 2, 1);
-        }
-        // Reject the entire decoded call: neither a prefix nor a trailing
-        // Return may run after its pasted middle was refused.
+        assert!(!harness.session.is_ready(), "v{version}");
+        assert!(
+            harness
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Failed { .. })),
+            "v{version} must report the incompatible cell layout",
+        );
+        harness.session.show(pane);
+        harness.session.paste(pane, "must not be sent");
+        harness.session.click(pane, 2, 1);
+        harness.session.wheel(pane, 1, 2, 1);
         harness
             .session
             .write(pane, b"prefix\x1b[200~secret\x1b[201~\r");
-        assert!(harness.session.is_ready());
         assert!(!harness.session.unanswered_input(pane));
         assert!(harness.session.take_outgoing().is_empty());
-        let notices: Vec<_> = std::iter::from_fn(|| harness.session.next_event()).collect();
-        assert_eq!(notices.len(), 1, "unsupported gestures coalesce");
-        assert!(
-            matches!(&notices[0], Event::InputRejected { pane_id, reason }
-                if *pane_id == pane && reason.contains("74") && !reason.contains("secret"))
-        );
-        assert_eq!(harness.server.requests.len(), requests_before);
+        assert_eq!(harness.server.requests, ["GetCodecVersion"]);
+        assert!(harness.server.written.is_empty());
+        assert!(harness.server.keys.is_empty());
         assert!(harness.server.pastes.is_empty());
         assert!(harness.server.mouse.is_empty());
-        harness.session.write(pane, b"\x1b[A");
-        harness.pump();
-        assert_eq!(harness.server.keys.len(), 1);
-        let output_before = harness.outputs;
-        harness.output(b"still connected");
-        assert!(harness.outputs > output_before);
-        assert!(harness.session.is_ready());
-        assert!(!harness.session.unanswered_input(pane));
+        assert_eq!(harness.outputs, 0);
     }
 }
 
 #[test]
 fn live_registration_without_incarnation_cannot_guess_conditional_authority() {
     let mut harness = Harness::new(4, 30);
-    harness.server.codec_vers = 74;
-    harness.server.min_supported = 61;
+    harness.server.codec_vers = 75;
+    harness.server.min_supported = 75;
     harness.server.unfenced = true;
     harness.server.durable_identity = false;
     harness.attach();
@@ -425,8 +423,8 @@ fn live_registration_without_incarnation_cannot_guess_conditional_authority() {
 #[test]
 fn delegated_panes_need_live_registration_but_not_a_durable_uuid_for_input() {
     let mut harness = Harness::new(4, 30);
-    harness.server.codec_vers = 74;
-    harness.server.min_supported = 61;
+    harness.server.codec_vers = 75;
+    harness.server.min_supported = 75;
     harness.server.durable_identity = false;
     harness.attach();
     let pane = harness.server.pane_id;
@@ -441,7 +439,7 @@ fn delegated_panes_need_live_registration_but_not_a_durable_uuid_for_input() {
 
 #[test]
 fn pointer_coordinates_are_checked_before_admission_without_closing_the_session() {
-    let mut harness = current(74);
+    let mut harness = current(75);
     let pane = harness.server.pane_id;
     for (column, row) in [(usize::MAX, 0), (0, usize::MAX), (65_536, 1)] {
         harness.session.click(pane, column, row);
@@ -466,7 +464,7 @@ fn explicit_legacy_sessions_keep_their_separate_paste_and_mouse_lane() {
         let mut harness = Harness::new(4, 30);
         harness.server.codec_vers = version;
         harness.server.min_supported = version;
-        harness.attach();
+        harness.pump();
         let pane = harness.server.pane_id;
         harness.session.paste(pane, "legacy");
         harness.session.click(pane, 2, 1);
@@ -490,7 +488,7 @@ fn explicit_legacy_sessions_keep_their_separate_paste_and_mouse_lane() {
 fn delayed_conditional_input_cannot_reach_a_replacement_with_the_same_pane_number() {
     for replace_incarnation in [false, true] {
         for effect in 0..3 {
-            let mut harness = current(74);
+            let mut harness = current(75);
             let pane = harness.server.pane_id;
             match effect {
                 0 => harness.session.paste(pane, "original pane only"),
@@ -604,7 +602,7 @@ fn only_a_bounded_exact_conditional_receipt_can_release_the_queue() {
 
 #[test]
 fn stale_registration_is_never_refreshed_or_downgraded() {
-    let mut harness = current(74);
+    let mut harness = current(75);
     let pane = harness.server.pane_id;
     harness.server.registration = [0x55; 16];
     harness.session.write(pane, b"old pane only");
@@ -642,7 +640,7 @@ fn missing_or_ambiguous_receipts_cannot_replay_or_release_later_input() {
             },
         )),
     ] {
-        let mut harness = current(74);
+        let mut harness = current(75);
         let pane = harness.server.pane_id;
         harness.session.write(pane, b"abc");
         harness.session.paste(pane, "later");
@@ -653,7 +651,7 @@ fn missing_or_ambiguous_receipts_cannot_replay_or_release_later_input() {
         write_reply(&mut harness.session, rpc, &request, outcome);
         assert_stopped(&mut harness.session, pane);
     }
-    let mut harness = current(74);
+    let mut harness = current(75);
     let pane = harness.server.pane_id;
     harness.session.write(pane, b"possibly applied");
     harness.session.click(pane, 0, 0);
@@ -667,7 +665,7 @@ fn missing_or_ambiguous_receipts_cannot_replay_or_release_later_input() {
 #[test]
 fn malformed_unrelated_or_invalid_prefix_receipts_leave_input_unsettled() {
     for fault in 0..7 {
-        let mut harness = current(74);
+        let mut harness = current(75);
         let pane = harness.server.pane_id;
         harness.session.write(pane, b"abc");
         harness.session.click(pane, 1, 1);
@@ -706,42 +704,10 @@ fn malformed_unrelated_or_invalid_prefix_receipts_leave_input_unsettled() {
 }
 
 #[test]
-fn older_current_peers_probe_without_effect_before_rendering() {
-    let mut harness = current(64);
-    assert_eq!(
-        &harness.server.requests[..5],
-        [
-            "GetCodecVersion",
-            "SetClientId",
-            "ListPanesCoherent",
-            "ReliableKeyEventV1",
-            "GetPaneRenderChanges",
-        ]
-    );
-    assert!(
-        harness.server.keys.is_empty(),
-        "authority probing must never type its sentinel"
-    );
-    let pane = harness.server.pane_id;
-    harness.session.write(pane, b"text\x1b[A");
-    harness.pump();
-    assert_eq!(harness.server.written, b"text");
-    assert_eq!(harness.server.keys.len(), 1);
-    assert!(!harness.server.requests.contains(&"WriteToPane"));
-
-    let mut oldest = current(61);
-    let pane = oldest.server.pane_id;
-    oldest
-        .session
-        .write(pane, b"requires reliable write capability");
-    assert_stopped(&mut oldest.session, pane);
-}
-
-#[test]
 fn current_remote_panes_without_durable_identity_keep_live_input_authority() {
     let mut harness = Harness::new(4, 30);
-    harness.server.codec_vers = 71;
-    harness.server.min_supported = 61;
+    harness.server.codec_vers = 75;
+    harness.server.min_supported = 75;
     harness.server.durable_identity = false;
     harness.attach();
     assert_eq!(
@@ -766,7 +732,7 @@ fn current_remote_panes_without_durable_identity_keep_live_input_authority() {
 
 #[test]
 fn removing_a_pane_cancels_the_queue_without_sending_to_a_reused_number() {
-    let mut harness = current(74);
+    let mut harness = current(75);
     let pane = harness.server.pane_id;
     harness.session.write(pane, b"pending");
     take_one(&mut harness.session);
@@ -784,7 +750,7 @@ fn removing_a_pane_cancels_the_queue_without_sending_to_a_reused_number() {
 
 #[test]
 fn writes_are_bounded_and_chunked_before_the_wire() {
-    let mut harness = current(74);
+    let mut harness = current(75);
     let pane = harness.server.pane_id;
     let bytes = vec![b'x'; 3 * wire::MAX_RELIABLE_WRITE_BYTES + 1];
     harness.session.write(pane, &bytes);
@@ -810,16 +776,22 @@ fn writes_are_bounded_and_chunked_before_the_wire() {
 
 #[test]
 fn inventory_removal_retires_the_mirror_and_delayed_display_replies() {
-    let mut harness = current(71);
+    let mut harness = timed_current();
     let pane = harness.server.pane_id;
     harness.session.resize(pane, 5, 30);
     let (resize_rpc, pdu) = take_one(&mut harness.session);
-    assert!(matches!(pdu, Pdu::Resize(_)));
+    let Pdu::ResizePaneConditionalV1(resize) = pdu else {
+        panic!("geometry requires the observed pane's exact identity")
+    };
     reply(
         &mut harness.session,
-        10,
+        120,
         resize_rpc,
-        &codec::UnitResponse {},
+        &codec::ResizePaneConditionalV1Response {
+            pane_id: resize.pane_id,
+            identity: resize.identity,
+            outcome: codec::ResizePaneConditionalOutcomeV1::Enqueued,
+        },
     );
     let (retired_poll, pdu) = take_one(&mut harness.session);
     assert!(matches!(pdu, Pdu::GetPaneRenderStateV1(_)));
@@ -885,26 +857,18 @@ fn inventory_removal_retires_the_mirror_and_delayed_display_replies() {
 }
 
 #[test]
-fn rendering_and_resize_polling_wait_for_the_observed_panes_authority() {
+fn rendering_waits_for_the_observed_panes_authority() {
     use mux::renderable::{
         terminal_get_cursor_position, terminal_get_dimensions, terminal_get_lines,
     };
     let mut harness = Harness::new(4, 30);
-    harness.server.codec_vers = 71;
-    harness.server.min_supported = 61;
+    harness.server.codec_vers = 75;
+    harness.server.min_supported = 75;
     harness.pump();
     let pane = harness.server.pane_id;
     harness.session.show(pane);
     let (identity_rpc, pdu) = take_one(&mut harness.session);
     assert!(matches!(pdu, Pdu::GetPaneIdentityV1(_)));
-    harness.session.resize(pane, 5, 30);
-    let (resize_rpc, _) = take_one(&mut harness.session);
-    reply(
-        &mut harness.session,
-        10,
-        resize_rpc,
-        &codec::UnitResponse {},
-    );
     harness.server.term.advance_bytes(b"before authority");
     let dims = terminal_get_dimensions(&mut harness.server.term);
     let (first, lines) = terminal_get_lines(
@@ -937,7 +901,7 @@ fn rendering_and_resize_polling_wait_for_the_observed_panes_authority() {
     );
     assert!(
         harness.session.take_outgoing().is_empty(),
-        "no render fetch or resize poll before authority"
+        "no render fetch before authority"
     );
     assert!(
         !std::iter::from_fn(|| harness.session.next_event())
@@ -968,11 +932,22 @@ fn an_authority_probe_cannot_claim_a_key_effect_or_reserved_registration() {
         }),
     ] {
         let mut harness = Harness::new(4, 30);
-        harness.server.codec_vers = 64;
-        harness.server.min_supported = 61;
+        harness.server.codec_vers = 75;
+        harness.server.min_supported = 75;
         harness.pump();
         let pane = harness.server.pane_id;
         harness.session.show(pane);
+        let (identity_rpc, pdu) = take_one(&mut harness.session);
+        assert!(matches!(pdu, Pdu::GetPaneIdentityV1(_)));
+        reply(
+            &mut harness.session,
+            118,
+            identity_rpc,
+            &codec::GetPaneIdentityV1Response {
+                pane_id: pane,
+                outcome: codec::PaneIdentityOutcomeV1::Unavailable,
+            },
+        );
         let (rpc, pdu) = take_one(&mut harness.session);
         let Pdu::ReliableKeyEventV1(probe) = pdu else {
             panic!("no-effect probe")
@@ -996,8 +971,8 @@ fn an_authority_probe_cannot_claim_a_key_effect_or_reserved_registration() {
 #[test]
 fn identity_replies_cannot_exceed_their_canonical_body_bound() {
     let mut harness = Harness::new(4, 30);
-    harness.server.codec_vers = 71;
-    harness.server.min_supported = 61;
+    harness.server.codec_vers = 75;
+    harness.server.min_supported = 75;
     harness.pump();
     let pane = harness.server.pane_id;
     harness.session.show(pane);
@@ -1620,7 +1595,7 @@ fn monotonic_regression_overflow_or_close_cannot_release_a_waiting_retry() {
 
 #[test]
 fn a_new_clock_cannot_extend_an_operation_that_lacked_one_at_admission() {
-    let mut harness = current(71);
+    let mut harness = current(75);
     let pane = harness.server.pane_id;
     harness
         .session

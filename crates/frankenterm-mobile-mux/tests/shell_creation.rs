@@ -71,7 +71,7 @@ fn registered(version: usize) -> Session {
             version_string: "creation-test".to_owned(),
             executable_path: "/mux".into(),
             config_file_path: None,
-            min_supported: 61,
+            min_supported: 75,
         },
     );
     let (rpc, pdu) = take_one(&mut session);
@@ -158,7 +158,7 @@ fn assert_unknown_before_failure(session: &mut Session, request: u64) {
 
 #[test]
 fn an_empty_current_mux_can_create_one_default_shell_without_selecting_it() {
-    for version in [61, 71, 74] {
+    for version in wire::CURRENT_VERSIONS {
         let mut session = empty_session(version, true);
         let request = session
             .create_shell("réparation", 24, 80, INCARNATION)
@@ -209,8 +209,8 @@ fn an_empty_current_mux_can_create_one_default_shell_without_selecting_it() {
 #[test]
 fn creation_does_not_retarget_or_settle_existing_pane_input() {
     let mut harness = Harness::new(4, 30);
-    harness.server.codec_vers = 74;
-    harness.server.min_supported = 61;
+    harness.server.codec_vers = 75;
+    harness.server.min_supported = 75;
     harness.attach();
     let pane = harness.server.pane_id;
     let original_panes = harness.session.panes().to_vec();
@@ -273,7 +273,7 @@ fn invalid_or_stale_admission_consumes_no_serial_or_wire_bytes() {
         ("default".to_owned(), 256, 129),
         ("default".to_owned(), usize::MAX, usize::MAX),
     ];
-    let mut session = empty_session(74, true);
+    let mut session = empty_session(75, true);
     for (workspace, rows, cols) in invalid {
         assert_eq!(
             session.create_shell(&workspace, rows, cols, INCARNATION),
@@ -309,7 +309,7 @@ fn missing_clock_incarnation_and_legacy_are_pre_admission_refusals() {
         Err(ShellCreationError::NotReady)
     );
     assert!(matches!(take_one(&mut session).1, Pdu::GetCodecVersion(_)));
-    let mut session = registered(74);
+    let mut session = registered(75);
     take_one(&mut session); // The outstanding inventory has not supplied an incarnation.
     assert!(session.advance_time(0));
     assert_eq!(
@@ -317,7 +317,7 @@ fn missing_clock_incarnation_and_legacy_are_pre_admission_refusals() {
         Err(ShellCreationError::Stale)
     );
     assert!(session.take_outgoing().is_empty());
-    let mut session = empty_session(74, false);
+    let mut session = empty_session(75, false);
     assert_eq!(
         session.create_shell("default", 24, 80, INCARNATION),
         Err(ShellCreationError::ClockUnavailable)
@@ -328,7 +328,8 @@ fn missing_clock_incarnation_and_legacy_are_pre_admission_refusals() {
     for version in [46, 47] {
         let mut harness = Harness::new(4, 30);
         harness.server.codec_vers = version;
-        harness.attach();
+        harness.server.min_supported = version;
+        harness.pump();
         assert!(harness.session.advance_time(0));
         assert_eq!(
             harness.session.create_shell("default", 24, 80, INCARNATION),
@@ -341,7 +342,7 @@ fn missing_clock_incarnation_and_legacy_are_pre_admission_refusals() {
 
 #[test]
 fn only_one_creation_or_undelivered_result_can_be_owned() {
-    let mut session = empty_session(74, true);
+    let mut session = empty_session(75, true);
     let first = session.create_shell("first", 24, 80, INCARNATION).unwrap();
     assert_eq!(
         session.create_shell("duplicate", 24, 80, INCARNATION),
@@ -367,7 +368,7 @@ fn only_one_creation_or_undelivered_result_can_be_owned() {
 fn malformed_creation_receipts_are_unknown_and_do_not_release_another_effect() {
     for fault in 0..10 {
         for compress in [false, true] {
-            let mut session = empty_session(74, true);
+            let mut session = empty_session(75, true);
             let request = session
                 .create_shell("default", 24, 80, INCARNATION)
                 .unwrap();
@@ -418,7 +419,7 @@ fn malformed_creation_receipts_are_unknown_and_do_not_release_another_effect() {
 #[test]
 fn only_validated_explicit_no_effect_authority_can_report_a_refusal() {
     for unknown in 0..8 {
-        let mut session = empty_session(74, true);
+        let mut session = empty_session(75, true);
         let request = session
             .create_shell("default", 24, 80, INCARNATION)
             .unwrap();
@@ -483,7 +484,7 @@ fn only_validated_explicit_no_effect_authority_can_report_a_refusal() {
 #[test]
 fn unsolicited_or_cross_request_spawn_receipts_cannot_settle_creation() {
     for unsolicited in [false, true] {
-        let mut session = empty_session(74, true);
+        let mut session = empty_session(75, true);
         let request = session
             .create_shell("default", 24, 80, INCARNATION)
             .unwrap();
@@ -505,7 +506,7 @@ fn unsolicited_or_cross_request_spawn_receipts_cannot_settle_creation() {
 #[test]
 fn original_deadline_and_disconnect_preserve_unknown_creation_without_replay() {
     for disconnect in [false, true] {
-        let mut session = empty_session(74, true);
+        let mut session = empty_session(75, true);
         let request = session
             .create_shell("default", 24, 80, INCARNATION)
             .unwrap();

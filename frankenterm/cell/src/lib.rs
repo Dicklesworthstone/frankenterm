@@ -1139,8 +1139,165 @@ fn deserialize_teenystring<'de, D>(deserializer: D) -> Result<TeenyString, D::Er
 where
     D: Deserializer<'de>,
 {
-    let text = Zeroizing::new(alloc::string::String::deserialize(deserializer)?);
-    Ok(TeenyString::from_str(&text, None, None))
+    // Geometry belongs to the producing terminal. Recomputing it from text
+    // here changes explicit widths and depends on the receiver's Unicode
+    // tables. The enclosing wire/persistence format must version this shape;
+    // a legacy string is deliberately not an accepted alternative.
+    struct CellTextVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for CellTextVisitor {
+        type Value = TeenyString;
+
+        fn expecting(&self, formatter: &mut core::fmt::Formatter) -> core::fmt::Result {
+            formatter.write_str("cell text with an authoritative width")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let text: SerializedCellText = seq
+                .next_element()?
+                .ok_or_else(|| serde::de::Error::missing_field("text"))?;
+            let width: u8 = seq
+                .next_element()?
+                .ok_or_else(|| serde::de::Error::missing_field("width"))?;
+            if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                return Err(serde::de::Error::custom("unexpected cell text field"));
+            }
+            TeenyString::from_serialized_text(&text.0, width).map_err(serde::de::Error::custom)
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let mut text: Option<SerializedCellText> = None;
+            let mut width: Option<u8> = None;
+            while let Some(field) = map.next_key::<SerializedCellTextField>()? {
+                match field {
+                    SerializedCellTextField::Text => {
+                        if text.is_some() {
+                            return Err(serde::de::Error::duplicate_field("text"));
+                        }
+                        text = Some(map.next_value()?);
+                    }
+                    SerializedCellTextField::Width => {
+                        if width.is_some() {
+                            return Err(serde::de::Error::duplicate_field("width"));
+                        }
+                        width = Some(map.next_value()?);
+                    }
+                }
+            }
+            let text = text.ok_or_else(|| serde::de::Error::missing_field("text"))?;
+            let width = width.ok_or_else(|| serde::de::Error::missing_field("width"))?;
+            TeenyString::from_serialized_text(&text.0, width).map_err(serde::de::Error::custom)
+        }
+
+        fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            // Do not let the default type error echo a pane's legacy text.
+            Err(E::custom("legacy cell text lacks an authoritative width"))
+        }
+
+        fn visit_string<E>(self, value: alloc::string::String) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            let _text = Zeroizing::new(value);
+            Err(E::custom("legacy cell text lacks an authoritative width"))
+        }
+    }
+
+    if deserializer.is_human_readable() {
+        // JSON's typed struct decoder rejects strings before calling the
+        // visitor, including their contents in its type error. Inspect the
+        // self-describing shape here so legacy text is refused without an
+        // accidental terminal-content disclosure.
+        deserializer.deserialize_any(CellTextVisitor)
+    } else {
+        deserializer.deserialize_struct("CellText", &["text", "width"], CellTextVisitor)
+    }
+}
+
+/// Own deserialized terminal text under a wiping guard immediately. Keeping
+/// the guard in the visitor's local state also wipes text when a subsequent
+/// width, duplicate field, or trailing field is rejected.
+#[cfg(feature = "use_serde")]
+struct SerializedCellText(Zeroizing<alloc::string::String>);
+
+#[cfg(feature = "use_serde")]
+impl<'de> Deserialize<'de> for SerializedCellText {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct TextVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for TextVisitor {
+            type Value = SerializedCellText;
+
+            fn expecting(&self, formatter: &mut core::fmt::Formatter) -> core::fmt::Result {
+                formatter.write_str("cell text")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(SerializedCellText(Zeroizing::new(value.to_string())))
+            }
+
+            fn visit_string<E>(self, value: alloc::string::String) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(SerializedCellText(Zeroizing::new(value)))
+            }
+        }
+
+        deserializer.deserialize_string(TextVisitor)
+    }
+}
+
+#[cfg(feature = "use_serde")]
+enum SerializedCellTextField {
+    Text,
+    Width,
+}
+
+#[cfg(feature = "use_serde")]
+impl<'de> Deserialize<'de> for SerializedCellTextField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for FieldVisitor {
+            type Value = SerializedCellTextField;
+
+            fn expecting(&self, formatter: &mut core::fmt::Formatter) -> core::fmt::Result {
+                formatter.write_str("text or width")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                match value {
+                    "text" => Ok(SerializedCellTextField::Text),
+                    "width" => Ok(SerializedCellTextField::Width),
+                    _ => Err(E::custom("unexpected cell text field")),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
 }
 
 #[cfg(feature = "use_serde")]
@@ -1148,10 +1305,18 @@ fn serialize_teenystring<S>(value: &TeenyString, serializer: S) -> Result<S::Ok,
 where
     S: Serializer,
 {
-    // unsafety: this is safe because the Cell constructor guarantees
-    // that the storage is valid utf8
-    let s = unsafe { core::str::from_utf8_unchecked(value.as_bytes()) };
-    s.serialize(serializer)
+    use serde::ser::SerializeStruct;
+
+    let width = u8::try_from(value.width())
+        .ok()
+        .filter(|width| *width <= 2)
+        .ok_or_else(|| {
+            <S::Error as serde::ser::Error>::custom("cell width exceeds terminal geometry")
+        })?;
+    let mut cell = serializer.serialize_struct("CellText", 2)?;
+    cell.serialize_field("text", value.str())?;
+    cell.serialize_field("width", &width)?;
+    cell.end()
 }
 
 /// TeenyString encodes string storage in a single u64.
@@ -1345,6 +1510,35 @@ impl TeenyString {
             });
             let ptr = Box::into_raw(vec);
             Self(ptr as u64)
+        }
+    }
+
+    #[cfg(feature = "use_serde")]
+    fn from_serialized_text(text: &str, width: u8) -> Result<Self, &'static str> {
+        if width > 2 {
+            return Err("cell width exceeds terminal geometry");
+        }
+        let bytes = text.as_bytes();
+        if text.is_empty()
+            || text == "\r\n"
+            || (bytes.len() == 1 && (bytes[0] < 0x20 || bytes[0] == 0x7f))
+        {
+            return Err("serialized cell text requires constructor normalization");
+        }
+        // The inline tags can represent only widths one and two. A zero-width
+        // grapheme must retain its exact zero in heap storage, even when its
+        // text fits inline. Embedded NUL also needs the length-bearing heap.
+        if width != 0 && bytes.len() < core::mem::size_of::<u64>() && !bytes.contains(&0) {
+            Ok(Self(Self::set_marker_bit(
+                Self::inline_word(bytes),
+                usize::from(width),
+            )))
+        } else {
+            let heap = Box::new(TeenyStringHeap {
+                bytes: Zeroizing::new(bytes.to_vec()),
+                width: usize::from(width),
+            });
+            Ok(Self(Box::into_raw(heap) as u64))
         }
     }
 
@@ -2954,6 +3148,143 @@ mod test {
         assert_eq!(restored, cloned);
         assert_eq!(restored.width(), 0);
         assert!(restored.attrs().italic());
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn serialized_cell_preserves_authoritative_width_and_attributes() {
+        let mut attrs = CellAttributes::blank();
+        attrs.set_italic(true);
+        attrs.set_foreground(ColorAttribute::PaletteIndex(9));
+        attrs.set_semantic_type(SemanticType::Input);
+        attrs.set_hyperlink(Some(Arc::new(Hyperlink::new("https://example.com"))));
+
+        for (text, width) in [("abcdefgh", 1), ("abcdefgh", 2), ("A", 2), ("界", 1)] {
+            let source = Cell::new_grapheme_with_width(text, width, attrs.clone());
+            let encoded = serde_json::to_value(&source).unwrap();
+            assert_eq!(
+                encoded["text"],
+                serde_json::json!({ "text": text, "width": width })
+            );
+            let restored: Cell = serde_json::from_value(encoded).unwrap();
+            assert_eq!(restored, source);
+            assert_eq!(restored.width(), width);
+            assert_eq!(restored.str(), text);
+        }
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn serialized_cell_keeps_the_producing_unicode_policy() {
+        let old_unicode = UnicodeVersion::new(8);
+        let mut ambiguous_wide = LATEST_UNICODE_VERSION.clone();
+        ambiguous_wide.ambiguous_are_wide = true;
+
+        for (text, version, expected_width) in [
+            ("\u{270a}", old_unicode, 1),
+            ("\u{00a1}", ambiguous_wide, 2),
+        ] {
+            let source = Cell::new_grapheme(text, CellAttributes::blank(), Some(&version));
+            assert_eq!(source.width(), expected_width);
+            assert_ne!(
+                source.width(),
+                Cell::new_grapheme(text, CellAttributes::blank(), None).width(),
+                "the fixture must distinguish producer geometry from receiver defaults"
+            );
+            let bytes = serde_json::to_vec(&source).unwrap();
+            let restored: Cell = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(restored, source);
+        }
+    }
+
+    #[cfg(all(feature = "use_serde", feature = "std"))]
+    #[test]
+    fn serialized_cell_keeps_custom_ascii_width() {
+        let mut version = LATEST_UNICODE_VERSION.clone();
+        version.cell_widths = Some(Arc::new(std::collections::HashMap::from([(
+            u32::from('A'),
+            2,
+        )])));
+        let source = Cell::new_grapheme("A", CellAttributes::blank(), Some(&version));
+        assert_eq!(source.width(), 2);
+        assert_eq!(Cell::new('A', CellAttributes::blank()).width(), 1);
+
+        let bytes = serde_json::to_vec(&source).unwrap();
+        let restored: Cell = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(restored, source);
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn serialized_zero_width_short_text_uses_exact_heap_geometry() {
+        // The inline tags cannot represent zero. The wire must nevertheless
+        // retain it, instead of applying the explicit constructor's 0 -> 1.
+        let mut wire = serde_json::to_value(Cell::blank()).unwrap();
+        wire["text"] = serde_json::json!({ "text": "\u{301}", "width": 0 });
+        let restored: Cell = serde_json::from_value(wire).unwrap();
+        assert_eq!(restored.width(), 0);
+        assert_eq!(restored.str(), "\u{301}");
+        assert!(!TeenyString::is_marker_bit_set(restored.text.0));
+        let restored_again: Cell =
+            serde_json::from_slice(&serde_json::to_vec(&restored).unwrap()).unwrap();
+        assert_eq!(restored_again, restored);
+        assert_eq!(restored.clone(), restored);
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn serialized_cell_rejects_missing_malformed_and_legacy_geometry() {
+        let cell = serde_json::to_value(Cell::blank()).unwrap();
+        for text in [
+            serde_json::json!("legacy terminal text"),
+            serde_json::json!({ "text": "A" }),
+            serde_json::json!({ "width": 1 }),
+            serde_json::json!({ "text": "A", "width": -1 }),
+            serde_json::json!({ "text": "A", "width": 3 }),
+            serde_json::json!({ "text": "A", "width": 256 }),
+            serde_json::json!({ "text": "A", "width": 1.5 }),
+            serde_json::json!({ "text": "A", "width": "1" }),
+            serde_json::json!({ "text": "A", "width": null }),
+            serde_json::json!({ "text": "A", "width": 1, "extra": true }),
+            serde_json::json!({ "text": "", "width": 1 }),
+            serde_json::json!({ "text": "\n", "width": 1 }),
+            serde_json::json!({ "text": "\r\n", "width": 1 }),
+            serde_json::json!(["A", 1, 2]),
+        ] {
+            let mut wire = cell.clone();
+            wire["text"] = text;
+            assert!(serde_json::from_value::<Cell>(wire).is_err());
+        }
+
+        let attrs = serde_json::to_string(&CellAttributes::blank()).unwrap();
+        for text in [
+            r#"{"text":"A","text":"B","width":1}"#,
+            r#"{"text":"A","width":1,"width":2}"#,
+        ] {
+            let wire = format!(r#"{{"text":{text},"attrs":{attrs}}}"#);
+            assert!(serde_json::from_str::<Cell>(&wire).is_err());
+        }
+
+        let secret = "terminal-text-must-not-appear-in-a-type-error";
+        let mut legacy = cell;
+        legacy["text"] = serde_json::json!(secret);
+        let error = serde_json::from_value::<Cell>(legacy)
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains(secret));
+        assert!(error.contains("authoritative width"));
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn serialized_cell_accepts_field_order_and_positional_geometry() {
+        let attrs = serde_json::to_string(&CellAttributes::blank()).unwrap();
+        for text in [r#"{"width":2,"text":"A"}"#, r#"["A",2]"#] {
+            let wire = format!(r#"{{"text":{text},"attrs":{attrs}}}"#);
+            let restored: Cell = serde_json::from_str(&wire).unwrap();
+            assert_eq!(restored.str(), "A");
+            assert_eq!(restored.width(), 2);
+        }
     }
 
     #[test]

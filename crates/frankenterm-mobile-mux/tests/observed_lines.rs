@@ -14,7 +14,7 @@ use support::{Harness, server_frame};
 fn connected(version: usize) -> Harness {
     let mut harness = Harness::new(4, 30);
     harness.server.codec_vers = version;
-    harness.server.min_supported = 61;
+    harness.server.min_supported = codec::CODEC_VERSION_MIN_SUPPORTED;
     harness.server.term.advance_bytes(b"ORIGINAL\r\nSECOND");
     harness.attach();
     assert!(harness.session.is_ready(), "{:?}", harness.events);
@@ -157,10 +157,10 @@ fn screen(harness: &mut Harness) -> String {
 
 #[test]
 fn negotiated_observations_and_row_fences_use_the_desktop_wire_contract() {
-    for version in [68, 69, 71] {
+    for version in wire::CURRENT_VERSIONS {
         let mut harness = Harness::new(4, 30);
         harness.server.codec_vers = version;
-        harness.server.min_supported = 61;
+        harness.server.min_supported = codec::CODEC_VERSION_MIN_SUPPORTED;
         for row in 0..20 {
             harness
                 .server
@@ -169,18 +169,10 @@ fn negotiated_observations_and_row_fences_use_the_desktop_wire_contract() {
         }
         harness.attach();
         assert!(harness.session.is_ready(), "{:?}", harness.events);
-        assert_eq!(
-            harness.server.requests.contains(&"GetPaneRenderStateV1"),
-            version >= 69
-        );
-        assert_eq!(
-            harness.server.requests.contains(&"GetLinesAtLayout"),
-            version >= 69
-        );
-        if version >= 69 {
-            assert!(!harness.server.requests.contains(&"GetPaneRenderChanges"));
-            assert!(!harness.server.requests.contains(&"GetLines"));
-        }
+        assert!(harness.server.requests.contains(&"GetPaneRenderStateV1"));
+        assert!(harness.server.requests.contains(&"GetLinesAtLayout"));
+        assert!(!harness.server.requests.contains(&"GetPaneRenderChanges"));
+        assert!(!harness.server.requests.contains(&"GetLines"));
         assert!(screen(&mut harness).contains("line 19"));
         assert!(harness.server.resizes.is_empty());
     }
@@ -188,7 +180,7 @@ fn negotiated_observations_and_row_fences_use_the_desktop_wire_contract() {
 
 #[test]
 fn delayed_rows_never_replace_a_newer_push_at_the_same_coordinates() {
-    let mut harness = connected(71);
+    let mut harness = connected(codec::CODEC_VERSION);
     let (serial, old) = pending_row(&mut harness);
     harness
         .server
@@ -209,7 +201,7 @@ fn delayed_rows_never_replace_a_newer_push_at_the_same_coordinates() {
 
 #[test]
 fn unrelated_output_does_not_starve_a_read_of_an_unchanged_row() {
-    let mut harness = connected(71);
+    let mut harness = connected(codec::CODEC_VERSION);
     let (serial, old) = pending_row(&mut harness);
     harness
         .server
@@ -237,7 +229,7 @@ fn unrelated_output_does_not_starve_a_read_of_an_unchanged_row() {
 #[test]
 fn resize_and_alternate_screen_retire_old_row_coordinates() {
     for alternate in [false, true] {
-        let mut harness = connected(71);
+        let mut harness = connected(codec::CODEC_VERSION);
         let (serial, old) = pending_row(&mut harness);
         if alternate {
             harness.server.term.advance_bytes(b"\x1b[?1049hNEW SCREEN");
@@ -271,7 +263,7 @@ fn resize_and_alternate_screen_retire_old_row_coordinates() {
 
 #[test]
 fn refused_fenced_rows_keep_the_last_display_until_a_fresh_observation() {
-    let mut harness = connected(71);
+    let mut harness = connected(codec::CODEC_VERSION);
     let before = screen(&mut harness);
     let (serial, _) = pending_row(&mut harness);
     deliver(
@@ -305,13 +297,12 @@ fn refused_fenced_rows_keep_the_last_display_until_a_fresh_observation() {
 
 #[test]
 fn an_unchanged_correlated_observation_settles_waiting_without_repainting() {
-    let mut harness = connected(71);
+    let mut harness = connected(codec::CODEC_VERSION);
     let pane = harness.server.pane_id;
     harness.session.resize(pane, 4, 30);
     let (resize, pdu) = take_one(&mut harness.session);
-    assert!(matches!(pdu, Pdu::Resize(_)));
     // No geometry actually changes; the observation still has its own reply.
-    deliver(&mut harness.session, 10, resize, &codec::UnitResponse {});
+    acknowledge_size(&mut harness.session, resize, pdu);
     let (mut poll, _) = take_one(&mut harness.session);
     for _ in 0..frankenterm_mobile_mux::session::WAITING_AFTER_REFUSALS {
         deliver(
@@ -349,7 +340,7 @@ fn an_unchanged_correlated_observation_settles_waiting_without_repainting() {
 
 #[test]
 fn a_new_size_retires_an_earlier_post_ack_render_observation() {
-    for version in [69, 71, 72] {
+    for version in wire::CURRENT_VERSIONS {
         let mut harness = connected(version);
         let pane = harness.server.pane_id;
         harness.session.resize(pane, 4, 22);
@@ -391,7 +382,7 @@ fn a_new_size_retires_an_earlier_post_ack_render_observation() {
 
 #[test]
 fn a_retry_or_new_visit_cannot_poll_a_size_effect_before_its_receipt() {
-    let mut harness = connected(72);
+    let mut harness = connected(codec::CODEC_VERSION);
     let pane = harness.server.pane_id;
     harness.session.resize(pane, 4, 22);
     let (serial, request) = take_one(&mut harness.session);
@@ -435,7 +426,7 @@ fn a_retry_or_new_visit_cannot_poll_a_size_effect_before_its_receipt() {
 
 #[test]
 fn a_queued_restore_releases_the_view_with_its_own_fresh_observation() {
-    let mut harness = connected(72);
+    let mut harness = connected(codec::CODEC_VERSION);
     let pane = harness.server.pane_id;
     harness.session.resize(pane, 4, 22);
     let (resize, request) = take_one(&mut harness.session);
@@ -480,7 +471,7 @@ fn a_queued_restore_releases_the_view_with_its_own_fresh_observation() {
 
 #[test]
 fn hidden_visit_and_overtaken_correlated_reply_cannot_rewind_the_view() {
-    let mut harness = connected(71);
+    let mut harness = connected(codec::CODEC_VERSION);
     let (read, stale) = pending_row(&mut harness);
     let pane = harness.server.pane_id;
     harness.session.hide(pane);
@@ -503,7 +494,7 @@ fn hidden_visit_and_overtaken_correlated_reply_cannot_rewind_the_view() {
 
 #[test]
 fn a_previous_visits_poll_cannot_open_a_new_visits_display_gate() {
-    let mut harness = connected(71);
+    let mut harness = connected(codec::CODEC_VERSION);
     let pane = harness.server.pane_id;
     harness.session.hide(pane);
     harness.session.show(pane);
@@ -531,7 +522,7 @@ fn a_previous_visits_poll_cannot_open_a_new_visits_display_gate() {
 #[test]
 fn malformed_or_downgraded_fenced_replies_cannot_publish_rows() {
     for fault in 0..7 {
-        let mut harness = connected(71);
+        let mut harness = connected(codec::CODEC_VERSION);
         let before = screen(&mut harness);
         let (serial, mut reply) = pending_row(&mut harness);
         match fault {
@@ -574,7 +565,7 @@ fn malformed_or_downgraded_fenced_replies_cannot_publish_rows() {
 
 #[test]
 fn full_observation_decodes_sequence_after_image_references_not_from_their_prefix() {
-    let mut harness = connected(71);
+    let mut harness = connected(codec::CODEC_VERSION);
     let mut change = observation(&mut harness, vec![], true);
     change.seqno = 12345;
     let tail = varbincode::serialize(&(change.input_serial, change.seqno)).unwrap();
@@ -601,8 +592,11 @@ fn full_observation_decodes_sequence_after_image_references_not_from_their_prefi
     );
     body.extend(tail);
     let frame = server_frame(25, 0, &body, false);
-    let decoded =
-        Pdu::decode_for_dialect(frame.as_slice(), MuxWireDialect::current(71).unwrap()).unwrap();
+    let decoded = Pdu::decode_for_dialect(
+        frame.as_slice(),
+        MuxWireDialect::current(codec::CODEC_VERSION).unwrap(),
+    )
+    .unwrap();
     let MuxWireDecodedPayload::Pdu(Pdu::GetPaneRenderChangesResponse(reference)) =
         decoded.into_parts().1
     else {

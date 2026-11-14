@@ -10,8 +10,10 @@ use support::{Harness, V46PaneEntry, V46PaneNode, server_frame, v46_pane_list};
 
 fn connected(version: usize) -> Harness {
     let mut harness = Harness::new(4, 30);
+    // Passive queries must prove that an owner clock was sampled explicitly.
+    harness.session = frankenterm_mobile_mux::Session::new();
     harness.server.codec_vers = version;
-    harness.server.min_supported = if version >= 61 { 61 } else { 46 };
+    harness.server.min_supported = if version >= 75 { 75 } else { 46 };
     harness.pump();
     assert!(harness.session.is_ready());
     harness.events.clear();
@@ -23,7 +25,7 @@ fn requests(bytes: &[u8]) -> Vec<(u64, Pdu)> {
     let mut result = Vec::new();
     while (cursor.position() as usize) < bytes.len() {
         let decoded =
-            Pdu::decode_for_dialect(&mut cursor, MuxWireDialect::current(71).unwrap()).unwrap();
+            Pdu::decode_for_dialect(&mut cursor, MuxWireDialect::current(75).unwrap()).unwrap();
         let (serial, payload) = decoded.into_parts();
         let MuxWireDecodedPayload::Pdu(pdu) = payload else {
             panic!("not a current PDU")
@@ -118,7 +120,7 @@ fn awaiting_coherent_confirmation() -> (Harness, u64) {
 }
 
 fn awaiting_coherent_confirmation_with_mouse(grabbed: bool) -> (Harness, u64) {
-    let mut harness = connected(71);
+    let mut harness = connected(75);
     harness.server.coherent_render = true;
     harness.server.mouse_grabbed = grabbed;
     harness
@@ -158,7 +160,7 @@ fn awaiting_coherent_confirmation_with_mouse(grabbed: bool) -> (Harness, u64) {
 
 #[test]
 fn coherent_publication_projects_palette_and_reverse_video_after_reset_before_readiness() {
-    let mut harness = connected(71);
+    let mut harness = connected(75);
     harness.server.coherent_render = true;
     harness.server.mouse_grabbed = true;
     let color = frankenterm_term::color::SrgbaTuple(1.0, 0.0, 0.5, 0.25);
@@ -415,7 +417,7 @@ fn hidden_visit_retires_its_confirmation_and_cannot_complete_a_new_visit() {
 
 #[test]
 fn coherent_metadata_decoder_rejects_trailing_truncated_nonfinite_and_oversized_bodies() {
-    let mut harness = connected(71);
+    let mut harness = connected(75);
     let mut facts = harness.server.render_metadata();
     let make = |facts| codec::GetPaneIdentityV1Response {
         pane_id: 7,
@@ -443,7 +445,7 @@ fn coherent_metadata_decoder_rejects_trailing_truncated_nonfinite_and_oversized_
 
 #[test]
 fn passive_preflight_retains_the_complete_witness_without_output_or_effects() {
-    let mut harness = connected(71);
+    let mut harness = connected(75);
     let pane = harness.server.pane_id;
     assert!(
         !harness.session.inspect_pane_identity(pane),
@@ -489,8 +491,8 @@ fn passive_preflight_retains_the_complete_witness_without_output_or_effects() {
 }
 
 #[test]
-fn older_peers_answer_without_an_unsupported_pdu_or_a_key_probe() {
-    for version in [46, 64, 70] {
+fn legacy_peers_answer_without_an_unsupported_pdu_or_a_key_probe() {
+    for version in [46, 47] {
         let mut harness = connected(version);
         let pane = harness.server.pane_id;
         let before = harness.server.requests.len();
@@ -500,7 +502,7 @@ fn older_peers_answer_without_an_unsupported_pdu_or_a_key_probe() {
         assert_eq!(harness.server.requests.len(), before);
         assert_eq!(harness.outputs, 0);
     }
-    let mut harness = connected(71);
+    let mut harness = connected(75);
     harness.server.durable_identity = false;
     assert!(harness.session.advance_time(0));
     assert!(
@@ -519,7 +521,7 @@ fn older_peers_answer_without_an_unsupported_pdu_or_a_key_probe() {
 
 #[test]
 fn lost_reply_expires_once_without_retry_and_late_identity_cannot_revive_it() {
-    let mut harness = connected(71);
+    let mut harness = connected(75);
     let pane = harness.server.pane_id;
     assert!(harness.session.advance_time(100));
     assert!(harness.session.inspect_pane_identity(pane));
@@ -562,7 +564,7 @@ fn lost_reply_expires_once_without_retry_and_late_identity_cannot_revive_it() {
 
 #[test]
 fn the_query_lane_is_bounded_and_retired_requests_release_capacity() {
-    let mut harness = connected(71);
+    let mut harness = connected(75);
     let panes: Vec<_> = (0..=MAX_IDENTITY_QUERIES).collect();
     inventory(&mut harness, &panes);
     assert!(harness.session.advance_time(0));
@@ -592,7 +594,7 @@ fn the_query_lane_is_bounded_and_retired_requests_release_capacity() {
 
 #[test]
 fn a_show_rechecks_preflight_identity_instead_of_inheriting_a_replaced_registration() {
-    let mut harness = connected(71);
+    let mut harness = connected(75);
     let pane = harness.server.pane_id;
     assert!(harness.session.advance_time(0));
     assert!(harness.session.inspect_pane_identity(pane));
@@ -615,7 +617,7 @@ fn a_show_rechecks_preflight_identity_instead_of_inheriting_a_replaced_registrat
 
 #[test]
 fn removed_inventory_retires_preflight_even_if_its_number_returns_before_the_reply() {
-    let mut harness = connected(71);
+    let mut harness = connected(75);
     let pane = harness.server.pane_id;
     assert!(harness.session.advance_time(0));
     assert!(harness.session.inspect_pane_identity(pane));

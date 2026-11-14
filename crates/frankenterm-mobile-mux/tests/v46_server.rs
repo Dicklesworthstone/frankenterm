@@ -1,5 +1,6 @@
-//! The phone's session against a v0.13 mux server: whatever the remote pane
-//! shows, the phone's terminal shows, and its scrollback keeps the history.
+//! Negotiated mux sessions preserve the remote screen and scrollback with
+//! current width-bearing cells. Legacy peers retain metadata/input coverage
+//! and explicitly refuse rendering that cannot carry exact cell geometry.
 
 mod support;
 
@@ -406,15 +407,15 @@ fn showing_a_pane_again_redraws_it_from_scratch() {
             .server
             .requests
             .iter()
-            .filter(|r| **r == "GetPaneRenderChanges")
+            .filter(|r| **r == "GetPaneRenderStateV1")
             .count(),
-        1,
-        "the server already pushes this pane's changes"
+        2,
+        "a new visit obtains a fresh correlated observation"
     );
 }
 
 #[test]
-fn a_refused_history_fetch_leaves_history_out_and_the_pane_carries_on() {
+fn a_refused_history_fetch_recovers_after_a_bounded_render_retry() {
     let mut harness = Harness::new(4, 20);
     harness.quiet_output(&numbered(0, 10));
     harness.server.refuse_lines = 1;
@@ -425,14 +426,13 @@ fn a_refused_history_fetch_leaves_history_out_and_the_pane_carries_on() {
             .iter()
             .all(|event| !matches!(event, Event::Failed { .. }))
     );
-    // The screen came with the first push; only the history fetch failed.
+    let due = harness.session.next_input_wake_ns().expect("bounded render retry");
+    assert!(harness.session.advance_time(due));
+    harness.pump();
+    assert!(harness.session.is_ready());
     assert_mirrored(&mut harness);
     let history = remote_rows(&mut harness, 0, 7);
-    assert!(
-        all_text(&mut harness.phone)
-            .iter()
-            .all(|row| !history.contains(row) || row.is_empty())
-    );
+    assert_eq!(all_text(&mut harness.phone)[..history.len()], history);
 
     harness.output(b"after\r\n");
     let phone = all_text(&mut harness.phone);
@@ -441,9 +441,9 @@ fn a_refused_history_fetch_leaves_history_out_and_the_pane_carries_on() {
 
 #[test]
 fn a_server_on_another_protocol_is_refused() {
-    // Between v0.13 and the current window, and past it with an oldest
-    // accepted version past this app's newest.
-    for version in [48, 75] {
+    // Every former current version carried string-only cells. A newer peer
+    // also needs an accepted window overlapping this client's exact layout.
+    for version in (61..=74).chain([48, codec::CODEC_VERSION + 1]) {
         let mut harness = Harness::new(4, 20);
         harness.server.codec_vers = version;
         harness.server.min_supported = version;
@@ -455,7 +455,9 @@ fn a_server_on_another_protocol_is_refused() {
         });
         let reason = reason.expect("a failure");
         assert!(
-            reason.contains(&version.to_string()) && reason.contains("46") && reason.contains("74"),
+            reason.contains(&version.to_string())
+                && reason.contains("46")
+                && reason.contains(&codec::CODEC_VERSION.to_string()),
             "{reason}"
         );
         assert_eq!(harness.server.requests, ["GetCodecVersion"]);
@@ -482,8 +484,8 @@ fn a_newer_server_that_still_accepts_this_apps_protocol_is_spoken_to() {
 }
 
 #[test]
-fn the_current_window_keeps_earlier_servers_and_accepts_its_new_upper_bound() {
-    for version in [61, 70, 71, 72, 73, 74] {
+fn every_accepted_current_version_preserves_cell_geometry() {
+    for version in frankenterm_mobile_mux::wire::CURRENT_VERSIONS {
         let mut harness = Harness::new(4, 20);
         harness.server.codec_vers = version;
         harness.attach();
@@ -496,7 +498,6 @@ fn the_current_window_keeps_earlier_servers_and_accepts_its_new_upper_bound() {
 fn a_current_mux_like_a_macs_gui_is_spoken_to_in_its_own_layout() {
     use termwiz::input::{KeyCode, Modifiers};
     let mut harness = Harness::new(5, 24);
-    harness.server.codec_vers = 74;
     harness.quiet_output(&numbered(0, 12));
     harness.attach();
     assert_mirrored(&mut harness);
@@ -557,7 +558,6 @@ fn lists(harness: &Harness) -> usize {
 #[test]
 fn a_current_mux_names_its_incarnation_before_its_first_pane_list() {
     let mut harness = Harness::new(4, 20);
-    harness.server.codec_vers = 71;
     harness.attach();
     let named = harness
         .events
@@ -579,9 +579,9 @@ fn a_current_mux_names_its_incarnation_before_its_first_pane_list() {
     assert_eq!(lists(&harness), 0, "the coherent list is the first list");
     assert_mirrored(&mut harness);
 
-    // A v0.13 server has no incarnation and is never asked for one.
-    let mut harness = Harness::new(4, 20);
-    harness.attach();
+    // A legacy metadata-only connection has no incarnation and never asks.
+    let mut harness = Harness::legacy(4, 20);
+    harness.pump();
     assert!(
         !harness
             .events
@@ -594,7 +594,6 @@ fn a_current_mux_names_its_incarnation_before_its_first_pane_list() {
 #[test]
 fn a_current_muxs_topology_changes_list_the_panes_again() {
     let mut harness = Harness::new(4, 20);
-    harness.server.codec_vers = 71;
     harness.attach();
     // A new title needs no list.
     harness.server.topology(TopologyEventKind::TabTitleChanged {
@@ -626,7 +625,6 @@ fn a_current_muxs_topology_changes_list_the_panes_again() {
 #[test]
 fn a_current_mux_without_a_coherent_list_is_listed_plainly() {
     let mut harness = Harness::new(4, 20);
-    harness.server.codec_vers = 71;
     harness.server.unfenced = true;
     // The unsupported coherent list must not invent a server incarnation.
     harness.pump();
@@ -792,7 +790,10 @@ fn a_refused_search_reports_why_and_context_reads_rows() {
     harness.pump();
     let (matches, _, error) = search_results(&harness, search);
     assert!(matches.is_empty());
-    assert_eq!(error.as_deref(), Some("regex parse error: unclosed group"));
+    assert_eq!(
+        error.as_deref(),
+        Some("The mux server refused the search (is the regular expression valid?).")
+    );
 
     let request = harness
         .session
@@ -910,19 +911,77 @@ fn the_first_paint_leaves_whatever_screen_the_phone_was_on() {
 }
 
 #[test]
-fn a_v0_13_0_server_on_protocol_47_is_spoken_to() {
-    let mut harness = Harness::new(4, 20);
-    harness.server.codec_vers = 47;
-    harness.quiet_output(b"hello");
-    harness.attach();
-    assert_mirrored(&mut harness);
+fn legacy_servers_keep_metadata_and_input_without_requesting_a_view() {
+    for version in [46, 47] {
+        let mut harness = Harness::legacy(4, 20);
+        harness.server.codec_vers = version;
+        harness.server.min_supported = version;
+        harness.pump();
+        assert!(harness.session.is_ready(), "{:?}", harness.events);
+        assert!(harness.events.iter().any(|event| matches!(event, Event::Panes(_))));
+        let pane = harness.server.pane_id;
+        harness.session.write(pane, b"hello\r");
+        harness.session.paste(pane, "legacy paste");
+        harness.pump();
+        assert_eq!(harness.server.written, b"hello\r");
+        assert_eq!(harness.server.pastes, ["legacy paste"]);
+        assert_eq!(render_reads(&harness), 0);
+        assert_eq!(harness.outputs, 0);
+        assert!(harness.session.is_ready());
+    }
+}
+
+#[test]
+fn legacy_viewing_is_refused_before_a_render_request() {
+    let mut harness = Harness::legacy(4, 20);
+    harness.pump();
+    assert!(harness.session.is_ready());
+    let requests = harness.server.requests.len();
+    harness.session.show(harness.server.pane_id);
+    harness.pump();
+    assert!(!harness.session.is_ready());
+    assert_eq!(harness.server.requests.len(), requests);
+    assert_eq!(harness.outputs, 0);
+    assert!(harness.events.iter().any(|event| matches!(
+        event,
+        Event::Failed { reason }
+            if reason.contains("legacy mux rendering cannot preserve cell widths")
+                && reason.contains("75")
+    )));
+}
+
+#[test]
+fn legacy_cell_bearing_frames_are_refused_before_their_body_is_decoded() {
+    for ident in [23, 25, 103] {
+        for compress in [false, true] {
+            let mut harness = Harness::legacy(4, 20);
+            harness.pump();
+            assert!(harness.session.is_ready());
+            harness.events.clear();
+            let private_body = b"not serialized cells: private terminal contents";
+            harness.session.receive(&server_frame(ident, 0, private_body, compress));
+            harness.pump();
+            assert!(!harness.session.is_ready(), "PDU {ident}");
+            assert_eq!(harness.outputs, 0);
+            let reason = harness.events.iter().find_map(|event| match event {
+                Event::Failed { reason } => Some(reason),
+                _ => None,
+            }).expect("an explicit legacy rendering refusal");
+            assert!(
+                reason.contains("legacy mux rendering cannot preserve cell widths")
+                    && reason.contains("75"),
+                "{reason}"
+            );
+            assert!(!reason.contains("private terminal contents"));
+        }
+    }
 }
 
 #[test]
 fn keys_go_as_key_presses_and_bracketed_pastes_as_pastes_in_order() {
     use termwiz::input::{KeyCode, Modifiers};
-    let mut harness = Harness::new(4, 20);
-    harness.attach();
+    let mut harness = Harness::legacy(4, 20);
+    harness.pump();
     let pane = harness.server.pane_id;
     harness
         .session
@@ -1039,8 +1098,8 @@ fn a_programs_hold_on_the_mouse_is_reported_and_a_click_reaches_it() {
 
 #[test]
 fn an_unfinished_paste_waits_on_its_pane_while_input_goes_to_another() {
-    let mut harness = Harness::new(4, 20);
-    harness.attach();
+    let mut harness = Harness::legacy(4, 20);
+    harness.pump();
     let pane = harness.server.pane_id;
     harness.session.write(pane, b"\x1b[200~half a paste");
     harness.pump();
@@ -1063,8 +1122,8 @@ fn an_unfinished_paste_waits_on_its_pane_while_input_goes_to_another() {
 
 #[test]
 fn the_rest_of_a_paste_into_a_pane_that_closed_ends_the_connection_unsent() {
-    let mut harness = Harness::new(4, 20);
-    harness.attach();
+    let mut harness = Harness::legacy(4, 20);
+    harness.pump();
     let pane = harness.server.pane_id;
     harness.session.write(pane, b"\x1b[200~make ");
     harness.pump();
@@ -1087,8 +1146,8 @@ fn the_rest_of_a_paste_into_a_pane_that_closed_ends_the_connection_unsent() {
 
 #[test]
 fn the_desktop_gets_its_own_size_back_after_lists_taken_at_the_phone_size() {
-    let mut harness = Harness::new(6, 20);
-    harness.attach();
+    let mut harness = Harness::legacy(6, 20);
+    harness.pump();
     let pane = harness.server.pane_id;
     for (rows, cols) in [(10, 32), (12, 30)] {
         harness.session.resize(pane, rows, cols);
@@ -1138,8 +1197,8 @@ fn queued_restore_serial(harness: &mut Harness) -> u64 {
 
 #[test]
 fn a_restore_is_restoring_until_the_server_answers_it() {
-    let mut harness = Harness::new(6, 20);
-    harness.attach();
+    let mut harness = Harness::legacy(6, 20);
+    harness.pump();
     let pane = harness.server.pane_id;
     assert!(!harness.session.restoring());
     harness.session.resize(pane, 10, 32);
@@ -1195,8 +1254,8 @@ fn a_restore_is_restoring_until_the_server_answers_it() {
 
 #[test]
 fn a_rejected_restore_and_a_later_list_preserve_the_original_desktop_size() {
-    let mut harness = Harness::new(6, 20);
-    harness.attach();
+    let mut harness = Harness::legacy(6, 20);
+    harness.pump();
     let pane = harness.server.pane_id;
     harness.session.resize(pane, 10, 32);
     harness.pump();
@@ -1237,8 +1296,8 @@ fn a_rejected_restore_and_a_later_list_preserve_the_original_desktop_size() {
 
 #[test]
 fn a_list_taken_before_restore_ack_cannot_rebase_desktop_after_it() {
-    let mut harness = Harness::new(6, 20);
-    harness.attach();
+    let mut harness = Harness::legacy(6, 20);
+    harness.pump();
     let pane = harness.server.pane_id;
     harness.session.resize(pane, 10, 32);
     harness.pump();
@@ -1290,8 +1349,8 @@ fn a_list_taken_before_restore_ack_cannot_rebase_desktop_after_it() {
 #[test]
 fn a_superseded_restore_reply_cannot_retire_a_newer_phone_size() {
     for reply in [0, 10] {
-        let mut harness = Harness::new(6, 20);
-        harness.attach();
+        let mut harness = Harness::legacy(6, 20);
+        harness.pump();
         let pane = harness.server.pane_id;
         harness.session.resize(pane, 10, 32);
         harness.pump();
@@ -1337,8 +1396,8 @@ fn a_superseded_restore_reply_cannot_retire_a_newer_phone_size() {
 
 #[test]
 fn a_malformed_restore_acknowledgement_never_retires_recovery() {
-    let mut harness = Harness::new(6, 20);
-    harness.attach();
+    let mut harness = Harness::legacy(6, 20);
+    harness.pump();
     let pane = harness.server.pane_id;
     harness.session.resize(pane, 10, 32);
     harness.pump();
@@ -1357,8 +1416,8 @@ fn a_malformed_restore_acknowledgement_never_retires_recovery() {
 /// connection ends first.
 #[test]
 fn input_is_unanswered_until_the_server_has_written_it() {
-    let mut harness = Harness::new(6, 20);
-    harness.attach();
+    let mut harness = Harness::legacy(6, 20);
+    harness.pump();
     let pane = harness.server.pane_id;
     assert!(!harness.session.unanswered_input(pane));
 
@@ -1435,8 +1494,8 @@ fn phone_sizes(harness: &Harness) -> Vec<PhoneSizeSeen> {
 
 #[test]
 fn a_size_left_by_a_dropped_connection_is_given_back_by_the_next() {
-    let mut harness = Harness::new(6, 20);
-    harness.attach();
+    let mut harness = Harness::legacy(6, 20);
+    harness.pump();
     let pane = harness.server.pane_id;
     harness.session.resize(pane, 10, 32);
     harness.pump();
@@ -1659,7 +1718,6 @@ fn closed_or_failed(harness: &Harness) -> bool {
 fn a_busy_current_mux_keeps_the_pane_and_draws_it_after_a_backoff() {
     use frankenterm_mobile_mux::session::MIN_RENDER_RETRY_DELAY_NS as DELAY;
     let mut harness = Harness::new(4, 20);
-    harness.server.codec_vers = 71;
     harness.quiet_output(&numbered(0, 6));
     // What a current server answers while the pane's render metadata is busy.
     let busy = codec::ErrorResponse::resource_busy(
@@ -1717,7 +1775,6 @@ fn waiting_reports(harness: &Harness) -> Vec<bool> {
 fn a_pane_refused_three_times_in_a_row_is_reported_waiting_until_a_read_is_answered() {
     use frankenterm_mobile_mux::session::WAITING_AFTER_REFUSALS;
     let mut harness = Harness::new(4, 20);
-    harness.server.codec_vers = 71;
     harness.quiet_output(&numbered(0, 6));
     let busy = codec::ErrorResponse::resource_busy(
         <codec::GetPaneRenderStateV1 as codec::PduWireIdent>::IDENT,
@@ -1759,15 +1816,14 @@ fn a_pane_refused_three_times_in_a_row_is_reported_waiting_until_a_read_is_answe
 #[test]
 fn a_refusal_the_server_does_not_allow_repeating_still_closes_the_pane() {
     let ident = <codec::GetPaneRenderStateV1 as codec::PduWireIdent>::IDENT;
-    for (version, refusal) in [
-        (71, Some(codec::ErrorResponse::pane_not_found(ident, 7))),
-        (71, Some(codec::ErrorResponse::invalid_request(ident))),
-        // A v46 server's text says nothing about repeating.
-        (46, None),
+    for refusal in [
+        codec::ErrorResponse::pane_not_found(ident, 7),
+        codec::ErrorResponse::invalid_request(ident),
     ] {
+        let version = codec::CODEC_VERSION;
         let mut harness = Harness::new(4, 20);
         harness.server.codec_vers = version;
-        harness.server.refuse_render.push_back(refusal);
+        harness.server.refuse_render.push_back(Some(refusal));
         assert!(harness.session.advance_time(0));
         harness.attach();
         assert!(

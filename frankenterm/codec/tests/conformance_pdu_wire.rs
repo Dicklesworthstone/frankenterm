@@ -943,7 +943,7 @@ fn legacy46_frame<T: Serialize>(serial: u64, ident: u64, payload: &T) -> Vec<u8>
 
 #[test]
 fn legacy46_dialect_is_closed_and_does_not_widen_global_minimum() {
-    assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 61);
+    assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 75);
     assert_eq!(MuxWireDialect::LEGACY46.codec_version(), 46);
     assert!(MuxWireDialect::LEGACY46.is_legacy46());
     assert!(MuxWireDialect::current(CODEC_VERSION_MIN_SUPPORTED).is_ok());
@@ -1350,60 +1350,72 @@ fn legacy46_pdu47_is_consumed_but_explicitly_unsupported() {
 }
 
 #[test]
-fn legacy46_text_only_pdu23_and_pdu25_remain_available() {
+fn legacy46_cell_bearing_pdus_are_refused_in_both_directions() {
     let text_lines = || {
         SerializedLines::from(vec![(
             5,
             Line::from_text("legacy text", &CellAttributes::default(), 1, None),
         )])
     };
-    let mut pdu23 = Vec::new();
-    Pdu::GetLinesResponse(GetLinesResponse {
-        pane_id: 3,
-        lines: text_lines(),
-    })
-    .encode_with_mode(&mut pdu23, 23, CompressionMode::Never)
-    .expect("encode text-only PDU23");
-    let decoded = Pdu::decode_for_dialect(pdu23.as_slice(), MuxWireDialect::LEGACY46)
-        .expect("decode text-only legacy PDU23");
-    assert!(matches!(
-        decoded.payload(),
-        MuxWireDecodedPayload::Pdu(Pdu::GetLinesResponse(_))
-    ));
+    for pdu in [
+        Pdu::GetLinesResponse(GetLinesResponse {
+            pane_id: 3,
+            lines: text_lines(),
+        }),
+        Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
+            pane_id: 3,
+            mouse_grabbed: false,
+            alt_screen_active: false,
+            cursor_position: StableCursorPosition::default(),
+            dimensions: RenderableDimensions {
+                cols: 80,
+                viewport_rows: 24,
+                scrollback_rows: 100,
+                physical_top: 0,
+                scrollback_top: 0,
+                dpi: 96,
+                pixel_width: 800,
+                pixel_height: 600,
+                reverse_video: false,
+            },
+            tiered_scrollback_status: None,
+            dirty_lines: std::iter::once(5..6).collect(),
+            title: "legacy".to_string(),
+            working_dir: None,
+            bonus_lines: text_lines(),
+            input_serial: None,
+            seqno: 1,
+        }),
+    ] {
+        for mode in [CompressionMode::Never, CompressionMode::Always] {
+            let mut wire = Vec::new();
+            pdu.encode_with_mode(&mut wire, 23, mode).unwrap();
+            let error = Pdu::decode_for_dialect(wire.as_slice(), MuxWireDialect::LEGACY46)
+                .expect_err("cell-bearing bodies cannot be interpreted in the legacy dialect");
+            assert!(error.downcast_ref::<codec::PduEncodedBodyLimitExceeded>().is_some());
 
-    let mut pdu25 = Vec::new();
-    Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
-        pane_id: 3,
-        mouse_grabbed: false,
-        alt_screen_active: false,
-        cursor_position: StableCursorPosition::default(),
-        dimensions: RenderableDimensions {
-            cols: 80,
-            viewport_rows: 24,
-            scrollback_rows: 100,
-            physical_top: 0,
-            scrollback_top: 0,
-            dpi: 96,
-            pixel_width: 800,
-            pixel_height: 600,
-            reverse_video: false,
-        },
-        tiered_scrollback_status: None,
-        dirty_lines: std::iter::once(5..6).collect(),
-        title: "legacy".to_string(),
-        working_dir: None,
-        bonus_lines: text_lines(),
-        input_serial: None,
-        seqno: 1,
-    })
-    .encode_with_mode(&mut pdu25, 25, CompressionMode::Never)
-    .expect("encode text-only PDU25");
-    let decoded = Pdu::decode_for_dialect(pdu25.as_slice(), MuxWireDialect::LEGACY46)
-        .expect("decode text-only legacy PDU25");
-    assert!(matches!(
-        decoded.payload(),
-        MuxWireDecodedPayload::Pdu(Pdu::GetPaneRenderChangesResponse(_))
-    ));
+            let mut stream = StreamingPduBuffer::from(wire);
+            let before = stream.as_slice().to_vec();
+            assert!(Pdu::stream_decode_for_dialect(&mut stream, MuxWireDialect::LEGACY46).is_err());
+            assert_eq!(stream.as_slice(), before.as_slice());
+        }
+        let error = pdu
+            .prepare_outbound_for_dialect(
+                MuxWireDialect::LEGACY46,
+                PduProducer::Server,
+                PduWireRole::CorrelatedReply,
+                None,
+                CompressionMode::Never,
+            )
+            .expect_err("current cell schema must never be emitted to a legacy peer");
+        assert!(matches!(
+            error,
+            codec::MuxWireOutboundPlanError::Unsupported {
+                reason: MuxWireUnsupportedReason::Legacy46CellWidthSchemaUnavailable,
+                ..
+            }
+        ));
+    }
 }
 
 #[test]

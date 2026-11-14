@@ -376,7 +376,7 @@ fn rolling_upgrade_out_of_window_peer_returns_compat_error() {
     );
 }
 
-/// Explicit v46 reconnect lane: the global v61 rolling window stays closed,
+/// Explicit v46 reconnect lane: the global v75 rolling window stays closed,
 /// while a caller-bound Legacy46 dialect can issue byte-safe pane writes and
 /// exact two-field pastes under every compression policy.
 #[test]

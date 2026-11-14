@@ -13,12 +13,12 @@ use support::{Harness, V46PaneEntry, V46PaneNode, server_frame, size, v46_pane_l
 fn connected(version: usize, identity: bool) -> Harness {
     let mut harness = Harness::new(6, 20);
     harness.server.codec_vers = version;
-    harness.server.min_supported = if version >= 61 { 61 } else { 46 };
+    harness.server.min_supported = if version >= 75 { 75 } else { 46 };
     harness.server.durable_identity = identity;
     assert!(harness.session.advance_time(100));
     harness.pump();
     assert!(harness.session.is_ready());
-    if version >= 71 {
+    if version >= 75 {
         assert!(
             harness
                 .session
@@ -42,7 +42,7 @@ fn conditional_request(harness: &mut Harness) -> (u64, codec::ResizePaneConditio
     let bytes = harness.session.take_outgoing();
     let mut cursor = std::io::Cursor::new(bytes.as_slice());
     let decoded =
-        Pdu::decode_for_dialect(&mut cursor, MuxWireDialect::current(72).unwrap()).unwrap();
+        Pdu::decode_for_dialect(&mut cursor, MuxWireDialect::current(75).unwrap()).unwrap();
     assert_eq!(
         cursor.position() as usize,
         bytes.len(),
@@ -57,7 +57,7 @@ fn conditional_request(harness: &mut Harness) -> (u64, codec::ResizePaneConditio
 
 #[test]
 fn current_resize_and_restore_carry_the_preflight_identity_while_old_peers_keep_their_dialect() {
-    for version in [46, 71, 72] {
+    for version in [46, 75] {
         let mut harness = connected(version, true);
         let pane = harness.server.pane_id;
         harness.session.resize(pane, 9, 37);
@@ -72,7 +72,7 @@ fn current_resize_and_restore_carry_the_preflight_identity_while_old_peers_keep_
         assert_eq!(harness.server.resizes, [size(9, 37), size(6, 20)]);
         assert_eq!(restored(&harness), 1);
         assert!(!harness.session.restoring());
-        if version == 72 {
+        if version == 75 {
             assert_eq!(
                 harness
                     .server
@@ -101,7 +101,7 @@ fn current_resize_and_restore_carry_the_preflight_identity_while_old_peers_keep_
 #[test]
 fn replacement_after_preflight_is_never_resized_or_retried_through_legacy_pdu() {
     for restoring in [false, true] {
-        let mut harness = connected(72, true);
+        let mut harness = connected(75, true);
         let pane = harness.server.pane_id;
         if restoring {
             harness.server.term.resize(size(9, 37));
@@ -139,8 +139,8 @@ fn replacement_after_preflight_is_never_resized_or_retried_through_legacy_pdu() 
 }
 
 #[test]
-fn a_v72_backend_without_exact_identity_cannot_silently_take_geometry() {
-    let mut harness = connected(72, false);
+fn a_current_backend_without_exact_identity_cannot_silently_take_geometry() {
+    let mut harness = connected(75, false);
     let pane = harness.server.pane_id;
     assert!(!harness.session.adopt_phone_size(
         pane,
@@ -170,7 +170,7 @@ fn a_v72_backend_without_exact_identity_cannot_silently_take_geometry() {
 
 #[test]
 fn geometry_coalesces_only_the_unsent_successor_and_restore_can_follow_an_unanswered_resize() {
-    let mut harness = connected(72, true);
+    let mut harness = connected(75, true);
     let pane = harness.server.pane_id;
     harness.hold = true;
     harness.session.resize(pane, 8, 30);
@@ -206,7 +206,7 @@ fn geometry_coalesces_only_the_unsent_successor_and_restore_can_follow_an_unansw
 
 #[test]
 fn enqueue_ack_does_not_clear_restoration_until_fresh_geometry_arrives() {
-    let mut harness = connected(72, true);
+    let mut harness = connected(75, true);
     let pane = harness.server.pane_id;
     harness.session.resize(pane, 9, 37);
     harness.pump();
@@ -235,7 +235,7 @@ fn enqueue_ack_does_not_clear_restoration_until_fresh_geometry_arrives() {
 
 #[test]
 fn an_unobserved_restore_keeps_the_original_desktop_target_when_its_read_deadline_ends() {
-    let mut harness = connected(72, true);
+    let mut harness = connected(75, true);
     let pane = harness.server.pane_id;
     harness.session.resize(pane, 9, 37);
     harness.pump();
@@ -275,7 +275,7 @@ fn an_unobserved_restore_keeps_the_original_desktop_target_when_its_read_deadlin
 
 #[test]
 fn lost_resize_reply_keeps_its_original_deadline_and_never_replays_an_effect_or_successor() {
-    let mut harness = connected(72, true);
+    let mut harness = connected(75, true);
     let pane = harness.server.pane_id;
     harness.hold = true;
     harness.session.resize(pane, 8, 30);
@@ -299,7 +299,7 @@ fn lost_resize_reply_keeps_its_original_deadline_and_never_replays_an_effect_or_
 #[test]
 fn malformed_or_mismatched_resize_receipts_cannot_settle_another_pane_or_release_a_successor() {
     for case in 0..6 {
-        let mut harness = connected(72, true);
+        let mut harness = connected(75, true);
         let pane = harness.server.pane_id;
         harness.session.resize(pane, 8, 30);
         let (serial, request) = conditional_request(&mut harness);
@@ -344,7 +344,7 @@ fn malformed_or_mismatched_resize_receipts_cannot_settle_another_pane_or_release
 
 #[test]
 fn the_wire_request_includes_every_identity_component_and_the_exact_desktop_restore() {
-    let mut harness = connected(72, true);
+    let mut harness = connected(75, true);
     let pane = harness.server.pane_id;
     harness.session.resize(pane, 9, 37);
     let (serial, request) = conditional_request(&mut harness);
@@ -378,7 +378,7 @@ fn the_wire_request_includes_every_identity_component_and_the_exact_desktop_rest
 
 #[test]
 fn unanswered_geometry_cannot_grow_beyond_the_per_connection_pane_budget() {
-    let mut harness = connected(72, true);
+    let mut harness = connected(75, true);
     harness.session.refresh_panes();
     let list = Pdu::decode(harness.session.take_outgoing().as_slice()).unwrap();
     assert!(matches!(list.pdu, Pdu::ListPanes(_)));

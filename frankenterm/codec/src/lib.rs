@@ -4384,7 +4384,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 74;
+pub const CODEC_VERSION: usize = 75;
 
 /// Lowest codec version this build can decode wire frames from.
 ///
@@ -4408,14 +4408,15 @@ pub const CODEC_VERSION: usize = 74;
 /// at handshake time for the full release cycle before the bump. The CI
 /// guard `scripts/check_codec_version_release_notes.sh` (ft-8smkj) blocks
 /// silent advances.
-pub const CODEC_VERSION_MIN_SUPPORTED: usize = 61;
+pub const CODEC_VERSION_MIN_SUPPORTED: usize = 75;
 
 /// Exact historical mux dialect supported for reconnecting to v0.13 servers.
 ///
 /// This is deliberately not folded into [`CODEC_VERSION_MIN_SUPPORTED`].  The
-/// normal rolling-upgrade window remains 61..=66; codec 46 is an explicitly
-/// selected, schema-by-schema compatibility dialect whose changed wire IDs are
-/// handled below without heuristic fallback.
+/// normal rolling-upgrade window remains 75..=75; codec 46 is an explicitly
+/// selected, schema-by-schema compatibility dialect for metadata and input.
+/// Its cell-bearing responses cannot preserve authoritative widths and are
+/// rejected before their bodies are read, without heuristic fallback.
 pub const LEGACY46_CODEC_VERSION: usize = 46;
 
 /// Closed wire dialect selected by a connection after its peer identity is
@@ -4763,11 +4764,11 @@ pdu! {
         interactive_state, bulk_data, interactive;
     GetLines: 22, 46, client_request, none,
         query, query, normal;
-    GetLinesResponse: 23, 55, server_reply, none,
+    GetLinesResponse: 23, 75, server_reply, none,
         bulk_data, bulk_data, bulk;
     GetPaneRenderChanges: 24, 46, client_request, none,
         render, render, normal;
-    GetPaneRenderChangesResponse: 25, 46, server_reply_or_unilateral, none,
+    GetPaneRenderChangesResponse: 25, 75, server_reply_or_unilateral, none,
         render, render, normal;
     GetCodecVersion: 26, 46, client_request, none,
         connection_control, control, control;
@@ -4877,7 +4878,7 @@ pdu! {
         query, query, normal;
     GetSemanticZonesResponse: 78, 47, server_reply, none,
         bulk_data, bulk_data, bulk;
-    RenderApplicationUpdateV1: 79, 48, server_unilateral, none,
+    RenderApplicationUpdateV1: 79, 75, server_unilateral, none,
         render, render, normal;
     RenderApplicationResultV1: 80, 48, client_request, none,
         render, render, normal;
@@ -4890,7 +4891,7 @@ pdu! {
     TopologyEvent: 83, 49, server_unilateral, requires_fenced,
         state_sync, state_sync, normal
         => deserialize_topology_event;
-    RenderApplicationUpdate: 84, 50, server_unilateral, requires_fenced,
+    RenderApplicationUpdate: 84, 75, server_unilateral, requires_fenced,
         render, render, normal;
     RenderApplicationResult: 85, 50, client_request, requires_fenced,
         render, render, normal;
@@ -4945,7 +4946,7 @@ pdu! {
     GetLinesAtLayout: 102, 65, client_request, none,
         query, query, normal
         => deserialize_get_lines_at_layout;
-    GetLinesAtLayoutResponse: 103, 65, server_reply, none,
+    GetLinesAtLayoutResponse: 103, 75, server_reply, none,
         bulk_data, bulk_data, bulk
         => deserialize_get_lines_at_layout_response;
     CaptureSelectionAnchorV1: 104, 66, client_request, none,
@@ -5131,6 +5132,7 @@ impl MuxWireDecodedPayload {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MuxWireUnsupportedReason {
     PduAbsentFromDialect,
+    Legacy46CellWidthSchemaUnavailable,
     Legacy46ImageContentSemanticsUnavailable,
     Legacy46ChangedOutboundSchemaUnsupported,
 }
@@ -5358,7 +5360,9 @@ impl Pdu {
             return Err(MuxWireOutboundPlanError::Unsupported {
                 dialect_version: dialect.codec_version(),
                 ident: spec.ident,
-                reason: if matches!(spec.ident, 23 | 25 | 46 | 47) {
+                reason: if matches!(spec.ident, 23 | 25) {
+                    MuxWireUnsupportedReason::Legacy46CellWidthSchemaUnavailable
+                } else if matches!(spec.ident, 46 | 47) {
                     MuxWireUnsupportedReason::Legacy46ImageContentSemanticsUnavailable
                 } else {
                     MuxWireUnsupportedReason::Legacy46ChangedOutboundSchemaUnsupported
@@ -5870,93 +5874,6 @@ fn deserialize_legacy46_list_panes_response(
     Ok(response)
 }
 
-fn legacy46_serialized_lines_are_text_only(lines: &SerializedLines) -> bool {
-    lines.images.is_empty()
-        && lines.lines.iter().all(|(_, line)| {
-            line.visible_cells()
-                .all(|cell| cell.attrs().images().is_none_or(|images| images.is_empty()))
-        })
-}
-
-/// Keep the text of codec-46 rows whose cells carry images, without the
-/// images. This client cannot read a codec-46 mux's image placements (their
-/// texture coordinates fail this client's checks), and refusing such a frame
-/// failed it and, with it, the connection: a pane that had shown an image
-/// dropped and reattached its domain whenever its rows were read
-/// (2026-11-12). The rows' text is still the pane's text. The images are
-/// not checked, since none is kept; the normalizer that follows still fails
-/// the frame on a malformed row or hyperlink reference.
-fn strip_legacy46_images(mut lines: SerializedLines) -> SerializedLines {
-    let mut dropped = lines.images.len();
-    lines.images.clear();
-    for (_, line) in &mut lines.lines {
-        for cell in line.cells_mut_for_attr_changes_only() {
-            if cell.attrs().images().is_some() {
-                cell.attrs_mut().clear_images();
-                dropped += 1;
-            }
-        }
-    }
-    metrics::counter!("mux.codec.legacy46.images_dropped.total").increment(dropped as u64);
-    lines
-}
-
-fn normalize_legacy46_text_lines(lines: SerializedLines) -> Result<SerializedLines, Error> {
-    match lines.validate_structure() {
-        Ok(_) => return Ok(lines),
-        Err(SerializedLinesStructureError::DuplicateStableRow) => {}
-        Err(error) => return Err(error.into()),
-    }
-    // Legacy GetLines clips each requested range independently, and legacy
-    // render pushes can append the cursor row after including it in the
-    // viewport. Both paths can therefore return the same row more than once.
-    // Validate every positional reference before hydration or deduplication;
-    // each range/cursor read takes a separate terminal lock. A row's content
-    // can therefore change between reads in one response. Keep its newest
-    // sequence, including that version's text, hyperlinks and display flags.
-    lines.validate_references(false)?;
-    let (hydrated, images) = lines.extract_data();
-    anyhow::ensure!(
-        images.is_empty(),
-        "legacy text normalization cannot hydrate images"
-    );
-    // Two different versions of a row at one sequence cannot be ordered, so
-    // neither is delivered: the reader sees the row as not returned, as it
-    // sees any row a response omits, and reads it again. Refusing the whole
-    // response instead failed the frame, and with it the connection, so a
-    // busy pane of a codec-46 mux dropped and reattached its domain every
-    // 30 s (2026-11-12). Check every version before selecting winners, so a
-    // row's fate never depends on the order of the response.
-    let mut ambiguous = HashSet::new();
-    {
-        let mut versions = HashMap::with_capacity(hydrated.len());
-        for (row, line) in &hydrated {
-            if let Some(previous) = versions.insert((*row, line.current_seqno()), line) {
-                if previous != line {
-                    ambiguous.insert(*row);
-                }
-            }
-        }
-    }
-    let mut indices = HashMap::with_capacity(hydrated.len());
-    let mut unique = Vec::with_capacity(hydrated.len());
-    for (row, line) in hydrated {
-        if ambiguous.contains(&row) {
-            continue;
-        }
-        if let Some(&index) = indices.get(&row) {
-            let (_, previous): &mut (StableRowIndex, Line) = &mut unique[index];
-            if line.current_seqno() > previous.current_seqno() {
-                *previous = line;
-            }
-        } else {
-            indices.insert(row, unique.len());
-            unique.push((row, line));
-        }
-    }
-    Ok(SerializedLines::from(unique))
-}
-
 fn unsupported_mux_wire_payload(
     ident: u64,
     reason: MuxWireUnsupportedReason,
@@ -6009,33 +5926,10 @@ fn decode_materialized_for_dialect(
                 "Legacy46SendPaste",
                 MAX_LEGACY46_SEND_PASTE_DECOMPRESSED_BYTES,
             )?),
-            23 => {
-                let mut response: GetLinesResponse = deserialize_exact_payload_with_limit(
-                    decoded.data.as_slice(),
-                    decoded.is_compressed,
-                    "Legacy46GetLinesResponse",
-                    MAX_LEGACY46_TEXT_RENDER_RESPONSE_DECOMPRESSED_BYTES,
-                )?;
-                if !legacy46_serialized_lines_are_text_only(&response.lines) {
-                    response.lines = strip_legacy46_images(response.lines);
-                }
-                response.lines = normalize_legacy46_text_lines(response.lines)?;
-                MuxWireDecodedPayload::Pdu(Pdu::GetLinesResponse(response))
-            }
-            25 => {
-                let mut response: GetPaneRenderChangesResponse =
-                    deserialize_exact_payload_with_limit(
-                        decoded.data.as_slice(),
-                        decoded.is_compressed,
-                        "Legacy46GetPaneRenderChangesResponse",
-                        MAX_LEGACY46_TEXT_RENDER_RESPONSE_DECOMPRESSED_BYTES,
-                    )?;
-                if !legacy46_serialized_lines_are_text_only(&response.bonus_lines) {
-                    response.bonus_lines = strip_legacy46_images(response.bonus_lines);
-                }
-                response.bonus_lines = normalize_legacy46_text_lines(response.bonus_lines)?;
-                MuxWireDecodedPayload::Pdu(Pdu::GetPaneRenderChangesResponse(response))
-            }
+            23 | 25 => unsupported_mux_wire_payload(
+                ident,
+                MuxWireUnsupportedReason::Legacy46CellWidthSchemaUnavailable,
+            ),
             47 => unsupported_mux_wire_payload(
                 ident,
                 MuxWireUnsupportedReason::Legacy46ImageContentSemanticsUnavailable,
@@ -6633,11 +6527,10 @@ pub const MAX_LEGACY46_SEND_PASTE_DECOMPRESSED_BYTES: usize =
 pub const MAX_LEGACY46_SEND_PASTE_ZSTD_ENCODED_BYTES: usize =
     MAX_SEND_PASTE_TRACED_V1_ZSTD_ENCODED_BYTES;
 
-/// v46 PDU23/PDU25 are exposed only after their decoded line collections are
-/// proven image-free.  A separate body ceiling prevents that compatibility
-/// probe from inheriting the generic 256 MiB allocation envelope.
-pub const MAX_LEGACY46_TEXT_RENDER_RESPONSE_DECOMPRESSED_BYTES: usize = 16 * 1024 * 1024;
-pub const MAX_LEGACY46_TEXT_RENDER_RESPONSE_ZSTD_ENCODED_BYTES: usize = 32 * 1024 * 1024;
+/// v46 PDU23/PDU25 lack authoritative cell widths. Their zero body ceilings
+/// reject payloads before allocation, decompression, or current Cell decoding.
+pub const MAX_LEGACY46_TEXT_RENDER_RESPONSE_DECOMPRESSED_BYTES: usize = 0;
+pub const MAX_LEGACY46_TEXT_RENDER_RESPONSE_ZSTD_ENCODED_BYTES: usize = 0;
 
 /// A v46 image-cell response can never become an authoritative current image.
 /// The compatibility lane admits only enough body bytes to consume and type a
@@ -24458,9 +24351,9 @@ mod test {
     }
 
     #[test]
-    fn codec_v65_additive_line_layout_preserves_the_v61_compatibility_floor() {
-        assert_eq!(CODEC_VERSION, 74);
-        assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 61);
+    fn codec_v75_cell_width_schema_advances_the_compatibility_floor() {
+        assert_eq!(CODEC_VERSION, 75);
+        assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 75);
         assert_eq!(ORDERED_WINDOW_V1_MIN_CODEC_VERSION, 54);
         assert!(!codec_version_supports_ordered_window_v1(50));
         assert!(!codec_version_supports_ordered_window_v1(51));
@@ -26351,7 +26244,7 @@ mod test {
 
     #[test]
     fn codec_version_is_current() {
-        assert_eq!(CODEC_VERSION, 74);
+        assert_eq!(CODEC_VERSION, 75);
     }
 
     #[test]
@@ -26605,27 +26498,11 @@ mod test {
             } else {
                 (PduProducer::Server, PduWireRole::CorrelatedReply)
             };
-            // Pdu is not Clone; the frame round trip asserted equal above
-            // yields an identical second copy for the codec-73 refusal.
-            let copy = Pdu::decode(
-                pdu.encode_frame_with_mode(31, CompressionMode::Never)
-                    .unwrap()
-                    .as_slice(),
-            )
-            .unwrap()
-            .pdu;
-            assert!(copy
-                .prepare_outbound_for_dialect(
-                    MuxWireDialect::current(73).unwrap(),
-                    producer,
-                    role,
-                    None,
-                    CompressionMode::Never,
-                )
-                .is_err());
+            assert!(MuxWireDialect::current(73).is_err());
+            assert!(MuxWireDialect::current(74).is_err());
             assert!(pdu
                 .prepare_outbound_for_dialect(
-                    MuxWireDialect::current(74).unwrap(),
+                    MuxWireDialect::current(CODEC_VERSION).unwrap(),
                     producer,
                     role,
                     None,
@@ -26636,7 +26513,7 @@ mod test {
         assert_eq!(SendPaneInputConditionalV1::IDENT, 123);
         assert_eq!(SendPaneInputConditionalV1Response::IDENT, 124);
         assert_eq!(CONDITIONAL_PANE_INPUT_V1_MIN_CODEC_VERSION, 74);
-        assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 61);
+        assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 75);
         assert!(!SendPaneInputConditionalV1Response::WIRE_SPEC
             .authorizes(PduProducer::Server, PduWireRole::Unilateral));
     }
@@ -26837,22 +26714,10 @@ mod test {
             } else {
                 (PduProducer::Server, PduWireRole::CorrelatedReply)
             };
-            let old_peer_frame = pdu
-                .encode_frame_with_mode(31, CompressionMode::Never)
-                .unwrap();
-            let old_peer_pdu = Pdu::decode(old_peer_frame.as_slice()).unwrap().pdu;
-            assert!(old_peer_pdu
-                .prepare_outbound_for_dialect(
-                    MuxWireDialect::current(71).unwrap(),
-                    producer,
-                    role,
-                    None,
-                    CompressionMode::Never
-                )
-                .is_err());
+            assert!(MuxWireDialect::current(71).is_err());
             assert!(pdu
                 .prepare_outbound_for_dialect(
-                    MuxWireDialect::current(72).unwrap(),
+                    MuxWireDialect::current(CODEC_VERSION).unwrap(),
                     producer,
                     role,
                     None,
@@ -27005,10 +26870,9 @@ mod test {
         assert_eq!(GET_PANE_USER_VARS_V1_MIN_CODEC_VERSION, 70);
         assert_eq!(GetPaneUserVarsV1::IDENT, 115);
         assert_eq!(GetPaneUserVarsV1Response::IDENT, 116);
-        assert_eq!(
-            check_compat(CODEC_VERSION, CODEC_VERSION_MIN_SUPPORTED, 69, 61),
-            Ok(CompatDecision::Compatible { agreed: 69 }),
-            "older peers remain compatible without receiving the new request"
+        assert!(
+            check_compat(CODEC_VERSION, CODEC_VERSION_MIN_SUPPORTED, 69, 61).is_err(),
+            "the later cell-width schema change closes the old compatibility window"
         );
         assert!(
             !GetPaneUserVarsV1Response::WIRE_SPEC
@@ -27248,10 +27112,7 @@ mod test {
         assert_eq!(ListPanesWithDomainsV1::IDENT, 121);
         assert_eq!(ListPanesWithDomainsV1Response::IDENT, 122);
         assert_eq!(LIST_PANES_WITH_DOMAINS_V1_MIN_CODEC_VERSION, 73);
-        assert_eq!(
-            check_compat(CODEC_VERSION, CODEC_VERSION_MIN_SUPPORTED, 72, 61),
-            Ok(CompatDecision::Compatible { agreed: 72 })
-        );
+        assert!(check_compat(CODEC_VERSION, CODEC_VERSION_MIN_SUPPORTED, 72, 61).is_err());
         assert!(!ListPanesWithDomainsV1Response::WIRE_SPEC
             .authorizes(PduProducer::Server, PduWireRole::Unilateral));
     }
@@ -27605,7 +27466,7 @@ mod test {
         }
         let prepared = request
             .prepare_outbound_for_dialect(
-                MuxWireDialect::current(66).unwrap(),
+                MuxWireDialect::current(CODEC_VERSION).unwrap(),
                 PduProducer::Client,
                 PduWireRole::Request,
                 None,
@@ -28063,12 +27924,13 @@ mod test {
                 0 => 61,
                 4 => 58,
                 13 => 56,
-                23 | 47 => 55,
-                1..=3 | 8..=12 | 14 | 20 | 22 | 24..=46 | 48..=74 => 46,
+                23 | 25 | 79 | 84 | 103 => 75,
+                47 => 55,
+                1..=3 | 8..=12 | 14 | 20 | 22 | 24 | 26..=46 | 48..=74 => 46,
                 75..=78 => 47,
-                79..=80 => 48,
+                80 => 48,
                 81..=83 => 49,
-                84..=85 => 50,
+                85 => 50,
                 86..=90 => 54,
                 91..=92 => 52,
                 93..=94 => 57,
@@ -28077,7 +27939,7 @@ mod test {
                 98 => 62,
                 99 => 63,
                 100..=101 => 64,
-                102..=103 => 65,
+                102 => 65,
                 104..=109 => 66,
                 110..=111 => 67,
                 112..=113 => 68,
@@ -28102,7 +27964,7 @@ mod test {
         assert_eq!(<SendPaste as PduWireIdent>::WIRE_SPEC.min_codec_version, 56);
         assert_eq!(
             <GetLinesResponse as PduWireIdent>::WIRE_SPEC.min_codec_version,
-            55
+            75
         );
         assert_eq!(
             <GetImageCellResponse as PduWireIdent>::WIRE_SPEC.min_codec_version,
@@ -29296,13 +29158,17 @@ mod test {
     // --- check_compat / CODEC_VERSION_MIN_SUPPORTED tests (ft-kuxho.B.1) ---
 
     #[test]
-    fn check_compat_current_build_keeps_v61_floor_after_additive_v65() {
-        assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 61);
-        assert_eq!(CODEC_VERSION, 74);
-        assert!(check_compat(62, 61, 60, 58).is_err());
+    fn check_compat_current_build_refuses_all_text_only_cell_versions() {
+        assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 75);
+        assert_eq!(CODEC_VERSION, 75);
+        for remote in 46..75 {
+            assert!(check_compat(CODEC_VERSION, CODEC_VERSION_MIN_SUPPORTED, remote, 46).is_err());
+            assert!(check_compat(remote, 46, CODEC_VERSION, CODEC_VERSION_MIN_SUPPORTED).is_err());
+            assert!(MuxWireDialect::current(remote).is_err());
+        }
         assert_eq!(
-            check_compat(62, 61, 61, 61),
-            Ok(CompatDecision::Compatible { agreed: 61 })
+            check_compat(75, 75, 75, 75),
+            Ok(CompatDecision::Compatible { agreed: 75 })
         );
     }
 
@@ -32427,396 +32293,189 @@ mod test {
     }
 
     #[test]
-    fn legacy46_clipped_ranges_collapse_identical_rows_and_preserve_links() {
-        let link = Arc::new(Hyperlink::new_implicit("https://example.com/legacy"));
-        let mut attrs = termwiz::cell::CellAttributes::default();
-        attrs.set_hyperlink(Some(Arc::clone(&link)));
-        let first = Line::from_text("first", &attrs, 1, None);
-        let second = Line::from_text("second", &attrs, 1, None);
-        let expected = vec![(1933, first.clone()), (1934, second.clone())];
-        let lines = SerializedLines::from(vec![
-            (1933, first.clone()),
-            (1934, second.clone()),
-            (1933, first),
-            (1934, second),
-        ]);
-        assert_eq!(
-            lines.validate_structure(),
-            Err(SerializedLinesStructureError::DuplicateStableRow),
-            "the current strict structure contract must still reject duplicates"
-        );
-        for mode in [CompressionMode::Never, CompressionMode::Always] {
-            let wire = Pdu::GetLinesResponse(GetLinesResponse {
-                pane_id: 17,
-                lines: lines.clone(),
-            })
-            .encode_frame_with_mode(4, mode)
-            .expect("encode legacy repeated-range response");
-            let decoded = Pdu::decode_for_dialect(wire.as_slice(), MuxWireDialect::LEGACY46)
-                .expect("legacy duplicate rows are identical after hyperlink hydration");
-            let (_, MuxWireDecodedPayload::Pdu(Pdu::GetLinesResponse(response))) =
-                decoded.into_parts()
-            else {
-                panic!("text response must remain available");
-            };
-            assert_eq!(response.pane_id, 17);
-            let (actual, images) = response.lines.extract_data_checked().unwrap();
-            assert_eq!(actual, expected);
-            assert!(images.is_empty());
-            let first_cell = actual[0].1.get_cell(0).unwrap();
-            let second_cell = actual[1].1.get_cell(0).unwrap();
-            let first_link = first_cell.attrs().hyperlink().unwrap();
-            let second_link = second_cell.attrs().hyperlink().unwrap();
-            assert!(Arc::ptr_eq(first_link, second_link));
-        }
-    }
+    fn legacy46_cell_bodies_are_rejected_before_sync_and_async_reads() {
+        for ident in [GetLinesResponse::IDENT, GetPaneRenderChangesResponse::IDENT] {
+            for is_compressed in [false, true] {
+                // Invalid as both varbincode and zstd: admission must refuse
+                // this body without invoking either decoder.
+                let body = [0xff; 128];
+                let mut wire = Vec::new();
+                encode_raw(ident, 19, &body, is_compressed, &mut wire).unwrap();
+                let header_len = wire.len() - body.len();
+                let mut reader = std::io::Cursor::new(wire.clone());
+                let error = Pdu::decode_for_dialect(&mut reader, MuxWireDialect::LEGACY46)
+                    .expect_err("legacy cell bodies have no authoritative width schema");
+                let limit = error.downcast_ref::<PduEncodedBodyLimitExceeded>().unwrap();
+                assert_eq!(limit.max_payload_bytes, 0);
+                assert_eq!(limit.ident, ident);
+                assert_eq!(usize::try_from(reader.position()).unwrap(), header_len);
 
-    #[test]
-    fn legacy46_bonus_lines_collapse_identical_cursor_row_and_preserve_snapshot() {
-        let mut attrs = termwiz::cell::CellAttributes::default();
-        attrs.set_hyperlink(Some(Arc::new(Hyperlink::new_implicit(
-            "https://example.com/legacy-cursor",
-        ))));
-        let first = Line::from_text("viewport", &attrs, 17, None);
-        let cursor = Line::from_text("cursor", &attrs, 17, None);
-        let mut response = sample_retention_metadata_render_change();
-        response.bonus_lines = SerializedLines::from(vec![
-            (1933, first.clone()),
-            (1934, cursor.clone()),
-            (1934, cursor.clone()),
-        ]);
-        assert_eq!(
-            response.bonus_lines.validate_structure(),
-            Err(SerializedLinesStructureError::DuplicateStableRow),
-        );
-        let mut expected = response.clone();
-        expected.bonus_lines = SerializedLines::from(vec![(1933, first), (1934, cursor.clone())]);
-
-        for mode in [CompressionMode::Never, CompressionMode::Always] {
-            let wire = Pdu::GetPaneRenderChangesResponse(response.clone())
-                .encode_frame_with_mode(0, mode)
-                .unwrap();
-            let decoded = Pdu::decode_for_dialect(wire.as_slice(), MuxWireDialect::LEGACY46)
-                .expect("legacy unsolicited render pushes must normalize identical cursor rows");
-            let (serial, MuxWireDecodedPayload::Pdu(Pdu::GetPaneRenderChangesResponse(actual))) =
-                decoded.into_parts()
-            else {
-                panic!("text render push must remain available");
-            };
-            assert_eq!(serial, 0);
-            assert_eq!(actual, expected, "all other snapshot metadata must survive");
-            actual.bonus_lines.validate_structure().unwrap();
-
-            let mut conflict = response.clone();
-            conflict.bonus_lines = SerializedLines::from(vec![
-                (1934, cursor.clone()),
-                (
-                    1934,
-                    Line::from_text("conflicting cursor", &attrs, 17, None),
-                ),
-            ]);
-            let wire = Pdu::GetPaneRenderChangesResponse(conflict.clone())
-                .encode_frame_with_mode(0, mode)
-                .unwrap();
-            let decoded = Pdu::decode_for_dialect(wire.as_slice(), MuxWireDialect::LEGACY46)
-                .expect("a conflicting legacy bonus row must not fail the connection");
-            let (_, MuxWireDecodedPayload::Pdu(Pdu::GetPaneRenderChangesResponse(actual))) =
-                decoded.into_parts()
-            else {
-                panic!("text render push must remain available");
-            };
-            let mut expected_conflict = conflict;
-            expected_conflict.bonus_lines = SerializedLines::default();
-            assert_eq!(
-                actual, expected_conflict,
-                "the unorderable row is dropped and the snapshot metadata survives"
-            );
-        }
-    }
-
-    #[test]
-    fn legacy46_duplicate_rows_keep_latest_sequence_when_rendered_content_matches() {
-        let mut attrs = termwiz::cell::CellAttributes::default();
-        attrs.set_hyperlink(Some(Arc::new(Hyperlink::new_implicit(
-            "https://example.com/sequence",
-        ))));
-        // The first pair reproduces a captured v46 cursor bonus row. The
-        // viewport and cursor reads held separate terminal locks: identical
-        // cells/flags were stamped 1_670_532 and 1_670_533.
-        for (first_seqno, second_seqno) in [
-            (1_670_532, 1_670_533),
-            (17, 9),
-            (usize::MAX - 1, usize::MAX),
-        ] {
-            let first = Line::from_text("same cursor row", &attrs, first_seqno, None);
-            let second = Line::from_text("same cursor row", &attrs, second_seqno, None);
-            assert_ne!(first, second, "Line equality includes sequence metadata");
-            let expected = Line::from_text(
-                "same cursor row",
-                &attrs,
-                first_seqno.max(second_seqno),
-                None,
-            );
-            let repeated = SerializedLines::from(vec![(29, first), (29, second)]);
-            assert_eq!(
-                repeated.validate_structure(),
-                Err(SerializedLinesStructureError::DuplicateStableRow),
-                "the strict current-peer structure contract is unchanged",
-            );
-            for mode in [CompressionMode::Never, CompressionMode::Always] {
-                let mut push = sample_retention_metadata_render_change();
-                push.bonus_lines = repeated.clone();
-                for pdu in [
-                    Pdu::GetLinesResponse(GetLinesResponse {
-                        pane_id: 17,
-                        lines: repeated.clone(),
-                    }),
-                    Pdu::GetPaneRenderChangesResponse(push.clone()),
-                ] {
-                    let serial = if matches!(&pdu, Pdu::GetLinesResponse(_)) {
-                        4
-                    } else {
-                        0
-                    };
-                    let wire = pdu.encode_frame_with_mode(serial, mode).unwrap();
-                    let decoded =
-                        Pdu::decode_for_dialect(wire.as_slice(), MuxWireDialect::LEGACY46)
-                            .expect("sequence-only drift is not a conflicting rendered row");
-                    let (actual_serial, payload) = decoded.into_parts();
-                    assert_eq!(actual_serial, serial);
-                    let lines = match payload {
-                        MuxWireDecodedPayload::Pdu(Pdu::GetLinesResponse(response)) => {
-                            response.lines
-                        }
-                        MuxWireDecodedPayload::Pdu(Pdu::GetPaneRenderChangesResponse(response)) => {
-                            assert_eq!(response.seqno, push.seqno);
-                            assert_eq!(response.cursor_position, push.cursor_position);
-                            response.bonus_lines
-                        }
-                        _ => panic!("expected a supported legacy text response"),
-                    };
-                    let (actual, images) = lines.extract_data_checked().unwrap();
-                    assert_eq!(actual, vec![(29, expected.clone())]);
-                    assert!(images.is_empty());
-                }
+                let (error, position) = runtime::block_on(async move {
+                    let mut reader = runtime::Cursor::new(wire);
+                    let error = Pdu::decode_async_for_dialect(
+                        &mut reader,
+                        Some(19),
+                        MuxWireDialect::LEGACY46,
+                    )
+                    .await
+                    .expect_err("async legacy admission must precede body reads");
+                    (error, reader.position())
+                });
+                let limit = error.downcast_ref::<PduEncodedBodyLimitExceeded>().unwrap();
+                assert_eq!(limit.max_payload_bytes, 0);
+                assert_eq!(usize::try_from(position).unwrap(), header_len);
             }
-        }
-    }
 
-    #[test]
-    fn legacy46_duplicate_rows_keep_latest_text_links_and_flags_in_either_order() {
-        let mut attrs = termwiz::cell::CellAttributes::default();
-        attrs.set_hyperlink(Some(Arc::new(Hyperlink::new_implicit(
-            "https://example.com/before",
-        ))));
-        // A captured GetLines response read these versions of the same rows
-        // under separate terminal locks while agent output changed the text.
-        let older = Line::from_text("before output", &attrs, 959_648, None);
-        attrs.set_hyperlink(Some(Arc::new(Hyperlink::new_implicit(
-            "https://example.com/after",
-        ))));
-        let mut newer = Line::from_text("after output", &attrs, 959_650, None);
-        newer.set_double_width(959_650);
-        let untouched = Line::from_text("other row", &attrs, 959_649, None);
-        for reverse in [false, true] {
-            let (first, second) = if reverse {
-                (newer.clone(), older.clone())
-            } else {
-                (older.clone(), newer.clone())
+            let mut wire = Vec::new();
+            encode_raw(ident, 19, &[], false, &mut wire).unwrap();
+            let decoded = Pdu::decode_for_dialect(wire.as_slice(), MuxWireDialect::LEGACY46)
+                .expect("an empty unsupported frame has no body to interpret");
+            let (_, MuxWireDecodedPayload::Unsupported(unsupported)) = decoded.into_parts()
+            else {
+                panic!("legacy cell-bearing PDU must not expose a current body");
             };
-            let repeated =
-                SerializedLines::from(vec![(39, first), (40, untouched.clone()), (39, second)]);
+            assert_eq!(unsupported.ident(), ident);
             assert_eq!(
-                repeated.validate_structure(),
-                Err(SerializedLinesStructureError::DuplicateStableRow),
-                "current-peer duplicate rejection is unchanged",
+                unsupported.reason(),
+                MuxWireUnsupportedReason::Legacy46CellWidthSchemaUnavailable
             );
-            for mode in [CompressionMode::Never, CompressionMode::Always] {
-                let mut push = sample_retention_metadata_render_change();
-                push.bonus_lines = repeated.clone();
-                for pdu in [
-                    Pdu::GetLinesResponse(GetLinesResponse {
-                        pane_id: 17,
-                        lines: repeated.clone(),
-                    }),
-                    Pdu::GetPaneRenderChangesResponse(push.clone()),
-                ] {
-                    let serial = if matches!(&pdu, Pdu::GetLinesResponse(_)) {
-                        362
-                    } else {
-                        0
-                    };
-                    let wire = pdu.encode_frame_with_mode(serial, mode).unwrap();
-                    let decoded =
-                        Pdu::decode_for_dialect(wire.as_slice(), MuxWireDialect::LEGACY46)
-                            .expect("separately read row versions must retain the latest content");
-                    let (actual_serial, payload) = decoded.into_parts();
-                    assert_eq!(actual_serial, serial);
-                    let lines = match payload {
-                        MuxWireDecodedPayload::Pdu(Pdu::GetLinesResponse(response)) => {
-                            response.lines
-                        }
-                        MuxWireDecodedPayload::Pdu(Pdu::GetPaneRenderChangesResponse(response)) => {
-                            assert_eq!(response.seqno, push.seqno);
-                            assert_eq!(response.cursor_position, push.cursor_position);
-                            response.bonus_lines
-                        }
-                        _ => panic!("expected a supported legacy text response"),
-                    };
-                    let (actual, images) = lines.extract_data_checked().unwrap();
-                    assert_eq!(actual, vec![(39, newer.clone()), (40, untouched.clone())]);
-                    assert!(images.is_empty());
-                }
-            }
         }
     }
 
-    /// A codec-46 frame whose row cannot be ordered still decodes, minus that
-    /// row. A decode error fails the connection, and a busy legacy pane sent
-    /// such a frame every 30 s (2026-11-12).
     #[test]
-    fn legacy46_frame_with_an_unorderable_row_decodes_without_it() {
-        let attrs = termwiz::cell::CellAttributes::default();
-        let repeated = SerializedLines::from(vec![
-            (39, Line::from_text("before scroll", &attrs, 77, None)),
-            (40, Line::from_text("other row", &attrs, 76, None)),
-            (39, Line::from_text("after scroll", &attrs, 77, None)),
-        ]);
-        let mut push = sample_retention_metadata_render_change();
-        push.bonus_lines = repeated.clone();
-        for pdu in [
-            Pdu::GetLinesResponse(GetLinesResponse {
-                pane_id: 17,
-                lines: repeated,
-            }),
-            Pdu::GetPaneRenderChangesResponse(push.clone()),
-        ] {
-            let serial = if matches!(&pdu, Pdu::GetLinesResponse(_)) {
-                5
-            } else {
-                0
-            };
-            let wire = pdu
-                .encode_frame_with_mode(serial, CompressionMode::Never)
-                .unwrap();
-            let (actual_serial, payload) =
-                Pdu::decode_for_dialect(wire.as_slice(), MuxWireDialect::LEGACY46)
-                    .expect("an unorderable row must not fail the frame")
-                    .into_parts();
-            assert_eq!(actual_serial, serial);
-            let lines = match payload {
-                MuxWireDecodedPayload::Pdu(Pdu::GetLinesResponse(response)) => response.lines,
-                MuxWireDecodedPayload::Pdu(Pdu::GetPaneRenderChangesResponse(response)) => {
-                    assert_eq!(response.seqno, push.seqno);
-                    assert_eq!(response.cursor_position, push.cursor_position);
-                    assert_eq!(response.dimensions, push.dimensions);
-                    response.bonus_lines
-                }
-                _ => panic!("expected a supported legacy text response"),
-            };
-            let (rows, images) = lines.extract_data_checked().unwrap();
-            assert!(images.is_empty());
-            let rows: Vec<_> = rows
-                .into_iter()
-                .map(|(row, line)| (row, line.as_str().into_owned()))
-                .collect();
-            assert_eq!(rows, vec![(40, "other row".to_string())]);
-        }
-    }
+    fn varbincode_cells_preserve_authoritative_widths_and_unicode_policy() {
+        use termwiz::cell::{Cell, CellAttributes, UnicodeVersion};
 
-    /// The rows a normalized legacy response delivers, as (row, text).
-    fn legacy46_normalized_rows(lines: SerializedLines) -> Vec<(StableRowIndex, String)> {
-        let (rows, images) = normalize_legacy46_text_lines(lines)
-            .expect("an ambiguous row is dropped, not the response")
-            .extract_data_checked()
-            .unwrap();
-        assert!(images.is_empty());
-        rows.into_iter()
-            .map(|(row, line)| (row, line.as_str().into_owned()))
-            .collect()
-    }
-
-    #[test]
-    fn legacy46_newer_rows_cannot_hide_an_ambiguous_older_version() {
-        let attrs = termwiz::cell::CellAttributes::default();
-        let versions = [
-            Line::from_text("older first", &attrs, 1, None),
-            Line::from_text("older conflict", &attrs, 1, None),
-            Line::from_text("newest", &attrs, 2, None),
+        let mut attrs = CellAttributes::blank();
+        attrs.set_italic(true);
+        attrs.set_hyperlink(Some(Arc::new(Hyperlink::new_implicit(
+            "https://example.com/exact-width",
+        ))));
+        let old_unicode = UnicodeVersion::new(8);
+        let mut ambiguous_wide = UnicodeVersion::new(14);
+        ambiguous_wide.ambiguous_are_wide = true;
+        let mut custom_width = UnicodeVersion::new(14);
+        custom_width.cell_widths = Some(Arc::new(HashMap::from([(u32::from('A'), 2)])));
+        let cells = vec![
+            Cell::new_grapheme_with_width("abcdefgh", 1, attrs.clone()),
+            Cell::new_grapheme_with_width("abcdefgh", 2, attrs.clone()),
+            Cell::new_grapheme_with_width("A", 2, attrs.clone()),
+            Cell::new_grapheme_with_width("界", 1, attrs.clone()),
+            Cell::new_grapheme("\u{301}\u{301}\u{301}\u{301}", attrs.clone(), None),
+            Cell::new_grapheme("\u{270a}", attrs.clone(), Some(&old_unicode)),
+            Cell::new_grapheme("\u{00a1}", attrs.clone(), Some(&ambiguous_wide)),
+            Cell::new_grapheme("A", attrs, Some(&custom_width)),
         ];
-        let other = Line::from_text("other row", &attrs, 1, None);
-        for order in [
-            [0, 1, 2],
-            [0, 2, 1],
-            [1, 0, 2],
-            [1, 2, 0],
-            [2, 0, 1],
-            [2, 1, 0],
-        ] {
-            let mut lines: Vec<_> = order.map(|index| (5, versions[index].clone())).to_vec();
-            lines.insert(1, (6, other.clone()));
-            assert_eq!(
-                legacy46_normalized_rows(SerializedLines::from(lines)),
-                vec![(6, "other row".to_string())],
-                "a same-version conflict drops its row in every response order {:?}",
-                order,
-            );
+        assert_eq!(
+            cells.iter().map(Cell::width).collect::<Vec<_>>(),
+            [1, 2, 2, 1, 0, 1, 2, 2]
+        );
+        for cell in cells {
+            for mode in [CompressionMode::Never, CompressionMode::Always] {
+                let (bytes, compressed) = serialize_with_mode(&cell, mode).unwrap();
+                let restored: Cell = deserialize_exact_payload_with_limit(
+                    &bytes,
+                    compressed,
+                    "ExactWidthCell",
+                    4096,
+                )
+                .unwrap();
+                assert_eq!(restored, cell);
+                assert_eq!(restored.width(), cell.width());
+            }
         }
     }
 
     #[test]
-    fn legacy46_equal_sequence_conflicts_drop_their_row_but_invalid_references_fail() {
-        let mut attrs = termwiz::cell::CellAttributes::default();
-        attrs.set_hyperlink(Some(Arc::new(Hyperlink::new_implicit(
-            "https://example.com/a",
-        ))));
-        let first = Line::from_text("first", &attrs, 1, None);
-        let kept = Line::from_text("kept", &attrs, 1, None);
-        attrs.set_hyperlink(Some(Arc::new(Hyperlink::new_implicit(
-            "https://example.com/b",
-        ))));
-        let mut different_flags = first.clone();
-        different_flags.set_double_width(1);
-        // Different text, a different link on the same text, and the same
-        // text with different display flags: none can be ordered by sequence.
-        for conflicting in [
-            Line::from_text("other", &attrs, 1, None),
-            Line::from_text("first", &attrs, 1, None),
-            different_flags,
-        ] {
-            let lines = SerializedLines::from(vec![
-                (5, first.clone()),
-                (4, kept.clone()),
-                (5, conflicting),
-            ]);
-            assert_eq!(
-                legacy46_normalized_rows(lines),
-                vec![(4, "kept".to_string())]
-            );
+    fn varbincode_cell_schema_rejects_invalid_width_missing_and_trailing_fields() {
+        use termwiz::cell::{Cell, CellAttributes};
+
+        #[derive(Serialize)]
+        struct RawText<'a> {
+            text: &'a str,
+            width: u8,
         }
-        // An identical repeat is no conflict.
-        assert_eq!(
-            legacy46_normalized_rows(SerializedLines::from(vec![
-                (5, first.clone()),
-                (5, first.clone()),
-            ])),
-            vec![(5, "first".to_string())]
-        );
-        let mut latest = first.clone();
-        latest.update_last_change_seqno(2);
-        let mut lines = SerializedLines::from(vec![(5, first), (5, latest)]);
-        lines.hyperlinks[0].coords[0].line_idx = 2;
-        let error = normalize_legacy46_text_lines(lines).unwrap_err();
-        assert_eq!(
-            error.downcast_ref::<SerializedLinesStructureError>(),
-            Some(&SerializedLinesStructureError::HyperlinkLineOutOfRange),
-            "deduplication must never erase a malformed positional reference"
-        );
+        #[derive(Serialize)]
+        struct RawCell<'a> {
+            text: RawText<'a>,
+            attrs: CellAttributes,
+        }
+        #[derive(Serialize)]
+        struct FrozenTextOnlyCell<'a> {
+            text: &'a str,
+            attrs: CellAttributes,
+        }
+
+        let decode = |bytes: &[u8], compressed| {
+            deserialize_exact_payload_with_limit::<Cell>(
+                bytes,
+                compressed,
+                "ExactWidthCell",
+                4096,
+            )
+        };
+        for width in [0, 1, 2] {
+            let raw = RawCell {
+                text: RawText {
+                    text: "\u{301}",
+                    width,
+                },
+                attrs: CellAttributes::blank(),
+            };
+            let (bytes, compressed) = serialize_with_mode(&raw, CompressionMode::Never).unwrap();
+            let cell = decode(&bytes, compressed).unwrap();
+            assert_eq!(cell.width(), usize::from(width));
+            assert_eq!(cell.str(), "\u{301}");
+        }
+        for width in [3, u8::MAX] {
+            let raw = RawCell {
+                text: RawText { text: "A", width },
+                attrs: CellAttributes::blank(),
+            };
+            for mode in [CompressionMode::Never, CompressionMode::Always] {
+                let (bytes, compressed) = serialize_with_mode(&raw, mode).unwrap();
+                assert!(decode(&bytes, compressed).is_err());
+            }
+        }
+        let old = FrozenTextOnlyCell {
+            text: "abcdefgh",
+            attrs: CellAttributes::blank(),
+        };
+        let (old_bytes, _) = serialize_with_mode(&old, CompressionMode::Never).unwrap();
+        assert!(decode(&old_bytes, false).is_err());
+
+        let cell = Cell::new_grapheme_with_width("abcdefgh", 1, CellAttributes::blank());
+        let (bytes, _) = serialize_with_mode(&cell, CompressionMode::Never).unwrap();
+        for length in 0..bytes.len() {
+            assert!(decode(&bytes[..length], false).is_err());
+        }
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(decode(&trailing, false).is_err());
     }
 
-    fn legacy46_image_cell(line_idx: StableRowIndex) -> SerializedImageCell {
-        SerializedImageCell {
-            line_idx,
+    #[test]
+    fn current_line_pdus_preserve_widths_links_images_and_row_flags() {
+        use termwiz::cell::{Cell, CellAttributes};
+
+        let mut attrs = CellAttributes::blank();
+        attrs.set_italic(true);
+        attrs.set_hyperlink(Some(Arc::new(Hyperlink::new_implicit(
+            "https://example.com/exact-line",
+        ))));
+        let mut line = Line::from_cells(
+            vec![
+                Cell::new_grapheme_with_width("abcdefgh", 1, attrs.clone()),
+                Cell::new_grapheme_with_width("A", 2, attrs.clone()),
+                Cell::new(' ', attrs.clone()),
+                Cell::new_grapheme_with_width("界", 1, attrs),
+            ],
+            9,
+        );
+        line.set_double_width(9);
+        let mut expected = SerializedLines::from(vec![(-3, line.clone())]);
+        expected.images.push(SerializedImageCell {
+            line_idx: -3,
             cell_idx: 0,
             top_left: TextureCoordinate::new_f32(0.0, 0.0),
             bottom_right: TextureCoordinate::new_f32(1.0, 1.0),
@@ -32828,95 +32487,42 @@ mod test {
             padding_bottom: 0,
             image_id: Some(1),
             placement_id: Some(2),
+        });
+        expected.validate_structure().unwrap();
+
+        for mode in [CompressionMode::Never, CompressionMode::Always] {
+            let mut push = sample_retention_metadata_render_change();
+            push.bonus_lines = expected.clone();
+            for pdu in [
+                Pdu::GetLinesResponse(GetLinesResponse {
+                    pane_id: 17,
+                    lines: expected.clone(),
+                }),
+                Pdu::GetPaneRenderChangesResponse(push),
+            ] {
+                let wire = pdu.encode_frame_with_mode(19, mode).unwrap();
+                let decoded = Pdu::decode_for_dialect(
+                    wire.as_slice(),
+                    MuxWireDialect::current(CODEC_VERSION).unwrap(),
+                )
+                .unwrap();
+                let (serial, payload) = decoded.into_parts();
+                assert_eq!(serial, 19);
+                let restored = match payload {
+                    MuxWireDecodedPayload::Pdu(Pdu::GetLinesResponse(response)) => response.lines,
+                    MuxWireDecodedPayload::Pdu(Pdu::GetPaneRenderChangesResponse(response)) => {
+                        response.bonus_lines
+                    }
+                    _ => panic!("expected a current cell-bearing response"),
+                };
+                assert_eq!(restored, expected);
+                let (rows, images) = restored.extract_data_checked().unwrap();
+                assert_eq!(images, expected.images);
+                assert_eq!(rows, vec![(-3, line.clone())]);
+                assert_eq!(rows[0].1.get_cell(0).unwrap().width(), 1);
+                assert_eq!(rows[0].1.get_cell(1).unwrap().width(), 2);
+                assert_eq!(rows[0].1.get_cell(3).unwrap().width(), 1);
+            }
         }
-    }
-
-    #[test]
-    fn legacy46_image_bearing_rows_keep_their_text_without_images() {
-        let attrs = termwiz::cell::CellAttributes::default();
-        let imaged = Line::from_text("x", &attrs, 1, None);
-        let plain = Line::from_text("y", &attrs, 1, None);
-        // Row 5 arrives twice, as from two clipped ranges of one request.
-        // With an image on it, that frame failed the connection live.
-        let lines = SerializedLines {
-            lines: vec![(5, imaged.clone()), (6, plain.clone()), (5, imaged.clone())],
-            hyperlinks: Vec::new(),
-            images: vec![legacy46_image_cell(5)],
-        };
-        assert!(!legacy46_serialized_lines_are_text_only(&lines));
-        let expected = SerializedLines::from(vec![(5, imaged.clone()), (6, plain)]);
-
-        let wire = Pdu::GetLinesResponse(GetLinesResponse {
-            pane_id: 3,
-            lines: lines.clone(),
-        })
-        .encode_frame_with_mode(23, CompressionMode::Never)
-        .expect("encode image-bearing PDU23 fixture");
-        let decoded = Pdu::decode_for_dialect(wire.as_slice(), MuxWireDialect::LEGACY46)
-            .expect("an image-bearing codec-46 GetLines reply must not fail the connection");
-        let (_, MuxWireDecodedPayload::Pdu(Pdu::GetLinesResponse(response))) = decoded.into_parts()
-        else {
-            panic!("an image-bearing codec-46 GetLines reply must deliver its text");
-        };
-        assert_eq!(response.pane_id, 3);
-        assert_eq!(response.lines, expected);
-        assert!(legacy46_serialized_lines_are_text_only(&response.lines));
-
-        let mut push = sample_retention_metadata_render_change();
-        push.bonus_lines = lines;
-        let wire = Pdu::GetPaneRenderChangesResponse(push.clone())
-            .encode_frame_with_mode(0, CompressionMode::Never)
-            .expect("encode image-bearing render push fixture");
-        let decoded = Pdu::decode_for_dialect(wire.as_slice(), MuxWireDialect::LEGACY46)
-            .expect("an image-bearing codec-46 render push must not fail the connection");
-        let (0, MuxWireDecodedPayload::Pdu(Pdu::GetPaneRenderChangesResponse(actual))) =
-            decoded.into_parts()
-        else {
-            panic!("an image-bearing codec-46 render push must stay routable");
-        };
-        push.bonus_lines = expected;
-        assert_eq!(actual, push, "only the image is dropped from the push");
-
-        // The live codec-46 mux sent texture coordinates this client's checks
-        // refuse. Such an image is dropped, not checked.
-        let mut outside = legacy46_image_cell(5);
-        outside.bottom_right = TextureCoordinate::new_f32(2.0, 3.0);
-        let lone = SerializedLines {
-            lines: vec![(5, imaged.clone())],
-            hyperlinks: Vec::new(),
-            images: vec![outside],
-        };
-        assert_eq!(
-            lone.validate_structure(),
-            Err(SerializedLinesStructureError::ImageTextureCoordinatesInvalid)
-        );
-        let wire = Pdu::GetLinesResponse(GetLinesResponse {
-            pane_id: 3,
-            lines: lone,
-        })
-        .encode_frame_with_mode(24, CompressionMode::Never)
-        .expect("encode PDU23 fixture with unplaceable image");
-        let decoded = Pdu::decode_for_dialect(wire.as_slice(), MuxWireDialect::LEGACY46)
-            .expect("a codec-46 image this client cannot place must not fail the frame");
-        let (_, MuxWireDecodedPayload::Pdu(Pdu::GetLinesResponse(response))) = decoded.into_parts()
-        else {
-            panic!("a codec-46 reply with an unplaceable image must deliver its text");
-        };
-        assert_eq!(response.lines, SerializedLines::from(vec![(5, imaged)]));
-
-        let mut linked = termwiz::cell::CellAttributes::default();
-        linked.set_hyperlink(Some(Arc::new(Hyperlink::new_implicit(
-            "https://example.com/legacy-image",
-        ))));
-        let mut malformed =
-            SerializedLines::from(vec![(5, Line::from_text("z", &linked, 1, None))]);
-        malformed.images = vec![legacy46_image_cell(5)];
-        malformed.hyperlinks[0].coords[0].line_idx = 2;
-        let error = normalize_legacy46_text_lines(strip_legacy46_images(malformed)).unwrap_err();
-        assert_eq!(
-            error.downcast_ref::<SerializedLinesStructureError>(),
-            Some(&SerializedLinesStructureError::HyperlinkLineOutOfRange),
-            "a malformed hyperlink reference still fails an image-bearing frame"
-        );
     }
 }

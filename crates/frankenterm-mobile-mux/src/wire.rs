@@ -26,12 +26,14 @@ pub const LEGACY_VERSIONS: RangeInclusive<usize> = 46..=47;
 /// CODEC_VERSION`. Additive reliable writes (v64) and pane identity (v71)
 /// are gated by the negotiated version; neither silently falls back to a
 /// numeric-pane legacy write on a current connection. v74 adds exact-pane
-/// paste and mouse requests; older current peers cannot accept those effects.
-pub const CURRENT_VERSIONS: RangeInclusive<usize> = 61..=74;
+/// paste and mouse requests. v75 changes the positional Cell schema to carry
+/// its authoritative width; older current bodies cannot be decoded safely.
+pub const CURRENT_VERSIONS: RangeInclusive<usize> = 75..=75;
 
 /// Which of the two layouts a server speaks. They differ, for this client,
 /// in SendPaste (an input serial follows the text) and ErrorResponse (a
-/// structured rejection rather than the error's text).
+/// structured rejection rather than the error's text). Legacy connections
+/// provide metadata and input only; their cell-bearing replies lack widths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Dialect {
     #[default]
@@ -942,17 +944,17 @@ pub struct RenderHead {
     pub working_dir: Option<String>,
 }
 
-/// Prefix of PDU 25, a reply to GetPaneRenderChanges or a pushed update.
-/// Varbincode writes a struct as its fields alone, so the nested head is
-/// byte for byte the flat v46 layout.
+/// Prefix of current PDU25, a reply or pushed update with explicit cell widths.
+/// Varbincode writes a struct as its fields alone, so the nested head matches
+/// the flat current layout. Legacy cell-bearing replies are refused before decoding.
 #[derive(Deserialize, Debug)]
 pub struct RenderChanges {
     pub head: RenderHead,
     pub bonus_lines: LineEntries,
 }
 
-/// Unlike the legacy prefix above, this consumes the complete line envelope
-/// before reading its sequence. Skipping image references would interpret
+/// This consumes the complete line envelope before reading its sequence.
+/// Skipping image references would interpret
 /// their bytes as input/sequence metadata. Images remain unsupported here.
 #[derive(Deserialize, Debug)]
 pub struct CompleteLineEntries {
@@ -1008,7 +1010,8 @@ struct ImageReference {
     placement_id: Option<u32>,
 }
 
-/// Full PDU25 on v69+; a correlated PDU114 reply uses this same schema.
+/// Full current PDU25; a correlated PDU114 reply uses this same schema.
+/// The v75 cell-width change applies to both reply routes.
 /// This is a line-coordinate fence, not a complete palette/mode snapshot.
 #[derive(Deserialize, Debug)]
 pub struct RenderObservation {
