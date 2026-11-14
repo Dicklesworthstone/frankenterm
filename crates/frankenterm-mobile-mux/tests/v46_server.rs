@@ -1178,7 +1178,7 @@ fn search_and_context_reject_line_text_from_another_pane() {
             assert!(reader.next_frame().unwrap().is_none());
             if frame.ident == 23 {
                 let mut reply: codec::GetLinesResponse =
-                    varbincode::deserialize(&frame.body).unwrap();
+                    varbincode::deserialize(frame.body.as_slice()).unwrap();
                 reply.pane_id = 8;
                 harness.server.to_phone = canonical_frame(23, frame.serial, &reply);
                 replaced = true;
