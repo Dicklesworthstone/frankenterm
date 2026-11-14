@@ -316,13 +316,14 @@ impl PaneActivityTimestamps {
             return AgentPaneState::Idle;
         }
 
-        // Input sent but output silent beyond stuck threshold → Stuck
-        if self.last_input_ms > self.last_output_ms && since_output >= config.stuck_silence_ms {
+        // Start the response grace period at the latest input. An old output
+        // timestamp must not make newly submitted work immediately look stuck.
+        if self.last_input_ms > self.last_output_ms && since_input >= config.stuck_silence_ms {
             return AgentPaneState::Stuck;
         }
 
         // Input sent but not yet stuck → Thinking
-        if self.last_input_ms > self.last_output_ms && since_output >= config.thinking_silence_ms {
+        if self.last_input_ms > self.last_output_ms && since_input >= config.thinking_silence_ms {
             return AgentPaneState::Thinking;
         }
 
@@ -531,8 +532,8 @@ mod tests {
             flagged_stuck: false,
         };
         let config = AgentDetectionConfig::default();
-        // 20s since output, input was at 92s (more recent than output)
-        // since_output=20000 > thinking_silence_ms=5000 but < stuck_silence_ms=30000
+        // Input has been waiting 8s for a response: past the thinking
+        // threshold, but not the stuck threshold.
         assert_eq!(ts.classify(100_000, &config), AgentPaneState::Thinking);
     }
 
@@ -545,9 +546,90 @@ mod tests {
             flagged_stuck: false,
         };
         let config = AgentDetectionConfig::default();
-        // since_output=4000 < thinking_silence_ms=5000, so the pane is still
-        // within the grace window before it should be considered thinking.
+        // Input was sent 1s ago, within the response grace window.
         assert_eq!(ts.classify(100_000, &config), AgentPaneState::Active);
+    }
+
+    #[test]
+    fn old_output_does_not_age_the_input_response_window() {
+        let config = AgentDetectionConfig::default();
+        // Zero also covers an agent that has not produced any output yet.
+        for last_output_ms in [0, 10_000] {
+            let ts = PaneActivityTimestamps {
+                last_output_ms,
+                last_input_ms: 100_000,
+                is_agent: true,
+                flagged_stuck: false,
+            };
+            for (now_ms, expected) in [
+                (99_999, AgentPaneState::Active),
+                (100_000, AgentPaneState::Active),
+                (104_999, AgentPaneState::Active),
+                (105_000, AgentPaneState::Thinking),
+                (129_999, AgentPaneState::Thinking),
+                (130_000, AgentPaneState::Stuck),
+                (159_999, AgentPaneState::Stuck),
+                (160_000, AgentPaneState::Idle),
+            ] {
+                assert_eq!(
+                    ts.classify(now_ms, &config),
+                    expected,
+                    "last output {last_output_ms}, now {now_ms}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn new_input_restarts_the_response_grace_period() {
+        let config = AgentDetectionConfig::default();
+        let mut ts = PaneActivityTimestamps {
+            last_output_ms: 10_000,
+            last_input_ms: 60_000,
+            is_agent: true,
+            flagged_stuck: false,
+        };
+        assert_eq!(ts.classify(100_000, &config), AgentPaneState::Stuck);
+
+        ts.last_input_ms = 99_000;
+        assert_eq!(ts.classify(100_000, &config), AgentPaneState::Active);
+        assert_eq!(ts.classify(104_000, &config), AgentPaneState::Thinking);
+
+        // Resumed output clears the response wait independently of input age.
+        ts.last_output_ms = 129_000;
+        assert_eq!(ts.classify(130_000, &config), AgentPaneState::Active);
+    }
+
+    #[test]
+    fn future_activity_timestamps_do_not_trigger_silence_states() {
+        let config = AgentDetectionConfig::default();
+        for (last_output_ms, last_input_ms) in [(10_000, u64::MAX), (u64::MAX, 99_000)] {
+            let ts = PaneActivityTimestamps {
+                last_output_ms,
+                last_input_ms,
+                is_agent: true,
+                flagged_stuck: false,
+            };
+            assert_eq!(ts.classify(100_000, &config), AgentPaneState::Active);
+        }
+    }
+
+    #[test]
+    fn idle_requires_both_input_and_output_to_cross_the_threshold() {
+        let config = AgentDetectionConfig::default();
+        for (last_output_ms, last_input_ms, expected) in [
+            (40_000, 40_000, AgentPaneState::Idle),
+            (40_001, 40_000, AgentPaneState::Active),
+            (40_000, 40_001, AgentPaneState::Stuck),
+        ] {
+            let ts = PaneActivityTimestamps {
+                last_output_ms,
+                last_input_ms,
+                is_agent: true,
+                flagged_stuck: false,
+            };
+            assert_eq!(ts.classify(100_000, &config), expected);
+        }
     }
 
     #[test]
@@ -559,7 +641,7 @@ mod tests {
             flagged_stuck: false,
         };
         let config = AgentDetectionConfig::default();
-        // 40s since output, input was more recent than output → Stuck
+        // Input has been waiting 35s for a response → Stuck.
         assert_eq!(ts.classify(100_000, &config), AgentPaneState::Stuck);
     }
 

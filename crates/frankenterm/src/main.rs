@@ -38313,6 +38313,32 @@ mod watch_events_tests {
 
         // Output 1 s ago: active.
         assert!(classify(&agent(99_000, None), AgentPaneState::Active));
+        // Fresh input into a long-quiet pane starts a new response window.
+        // Old output must not satisfy a stuck condition immediately.
+        assert!(classify(
+            &agent(10_000, Some(99_000)),
+            AgentPaneState::Active
+        ));
+        assert!(!classify(
+            &agent(10_000, Some(99_000)),
+            AgentPaneState::Stuck
+        ));
+        // A future input timestamp saturates its elapsed wait to zero.
+        assert!(classify(
+            &agent(10_000, Some(100_001)),
+            AgentPaneState::Active
+        ));
+        // Both boundaries are measured from input, even with very old output.
+        for (input_at, expected) in [
+            (95_001, AgentPaneState::Active),
+            (95_000, AgentPaneState::Thinking),
+            (70_001, AgentPaneState::Thinking),
+            (70_000, AgentPaneState::Stuck),
+            (40_001, AgentPaneState::Stuck),
+            (40_000, AgentPaneState::Idle),
+        ] {
+            assert!(classify(&agent(10_000, Some(input_at)), expected));
+        }
         // Input sent after the last output, 10 s of silence: thinking.
         assert!(classify(
             &agent(88_000, Some(90_000)),
@@ -38355,6 +38381,15 @@ mod watch_events_tests {
             &stuck,
             met,
             &agent(99_500, Some(60_000)),
+            now,
+            &config
+        ));
+        // A new policy-gated input also clears a previously met stuck state;
+        // the level-triggered await must wait for the new response window.
+        assert!(!refresh_await_condition_state(
+            &stuck,
+            met,
+            &agent(58_000, Some(99_000)),
             now,
             &config
         ));
