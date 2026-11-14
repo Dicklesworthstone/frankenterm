@@ -367,6 +367,7 @@ fn every_documented_rule_field_is_exercised_by_some_valid_fixture() {
         "severity",
         "anchors",
         "regex",
+        "zone",
         "description",
         "remediation",
         "workflow",

@@ -332,6 +332,7 @@ fn disjoint_rules() -> Vec<RuleDef> {
     vec![
         RuleDef {
             id: "codex.usage_reached".to_string(),
+            zone: None,
             agent_type: AgentType::Codex,
             event_type: "usage.reached".to_string(),
             severity: Severity::Critical,
@@ -346,6 +347,7 @@ fn disjoint_rules() -> Vec<RuleDef> {
         },
         RuleDef {
             id: "claude_code.compaction_done".to_string(),
+            zone: None,
             agent_type: AgentType::ClaudeCode,
             event_type: "compaction.done".to_string(),
             severity: Severity::Info,
@@ -360,6 +362,7 @@ fn disjoint_rules() -> Vec<RuleDef> {
         },
         RuleDef {
             id: "gemini.rate_limited".to_string(),
+            zone: None,
             agent_type: AgentType::Gemini,
             event_type: "rate.limited".to_string(),
             severity: Severity::Warning,

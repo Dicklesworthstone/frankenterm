@@ -653,6 +653,10 @@ pub struct DetectionContext {
     pub ttl: Duration,
     /// Tail buffer from previous detection (for cross-segment matching)
     pub tail_buffer: String,
+    /// A separately retained suffix whose semantic annotation is known. The
+    /// public unscoped tail must never lend an unknown prefix to a scoped rule.
+    zone_tail: String,
+    zone_tail_kind: Option<DetectionZone>,
 }
 
 /// Dedup entry: last-seen timestamp plus the recency generation that stamps
@@ -712,6 +716,8 @@ impl DetectionContext {
             fingerprint_tail: None,
             ttl: Self::DEFAULT_TTL,
             tail_buffer: String::new(),
+            zone_tail: String::new(),
+            zone_tail_kind: None,
         }
     }
 
@@ -739,6 +745,8 @@ impl DetectionContext {
             fingerprint_tail: None,
             ttl: Self::DEFAULT_TTL,
             tail_buffer: String::new(),
+            zone_tail: String::new(),
+            zone_tail_kind: None,
         }
     }
 
@@ -766,12 +774,48 @@ impl DetectionContext {
             fingerprint_tail: None,
             ttl: Self::DEFAULT_TTL,
             tail_buffer: String::new(),
+            zone_tail: String::new(),
+            zone_tail_kind: None,
         }
     }
 
     /// Set the deduplication TTL.
     pub fn set_ttl(&mut self, ttl: Duration) {
         self.ttl = ttl;
+    }
+
+    /// End semantic-zone continuity without changing unscoped matching or
+    /// deduplication. Use this for an unknown/mixed zone, a gap, or a new zone
+    /// of the same type whose exact continuity has not been established.
+    pub fn clear_zone_continuity(&mut self) {
+        self.zone_tail.clear();
+        self.zone_tail_kind = None;
+    }
+
+    fn advance_zone_tail(
+        &mut self,
+        input: &str,
+        overlap_len: usize,
+        zone: Option<DetectionZone>,
+    ) -> usize {
+        let Some(zone) = zone else {
+            self.clear_zone_continuity();
+            return input.len();
+        };
+        let prefix = &input[..overlap_len];
+        let continued = self.zone_tail_kind == Some(zone)
+            && !self.zone_tail.is_empty()
+            && prefix.ends_with(&self.zone_tail);
+        let start = if continued {
+            overlap_len - self.zone_tail.len()
+        } else {
+            overlap_len
+        };
+        let scoped = &input[start..];
+        let retained = PatternEngine::bounded_tail_start(scoped, Self::MAX_TAIL_SIZE);
+        self.zone_tail = scoped[retained..].to_string();
+        self.zone_tail_kind = Some(zone);
+        start
     }
 
     /// Mark a detection as seen, returning true if it was new (or expired)
@@ -1039,6 +1083,7 @@ impl DetectionContext {
             self.fingerprint_tail = None;
         }
         self.tail_buffer.clear();
+        self.clear_zone_continuity();
     }
 
     /// Get the number of seen detections
@@ -1055,6 +1100,18 @@ impl DetectionContext {
 
 /// Allowed rule ID prefixes for stable naming
 const ALLOWED_RULE_PREFIXES: [&str; 4] = ["codex.", "claude_code.", "gemini.", "wezterm."];
+
+/// OSC 133 semantic annotation accepted by an opt-in pattern rule.
+///
+/// This is a detection filter, not authorization or proof of command origin.
+/// In particular, an agent can quote an error inside a shell output zone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DetectionZone {
+    Prompt,
+    Input,
+    Output,
+}
 
 /// Rule definition for pattern detection
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1086,6 +1143,10 @@ pub struct RuleDef {
     /// URL for more information about this rule
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub learn_more_url: Option<String>,
+    /// Require this semantic zone. Missing or ambiguous annotations do not
+    /// match; omitted rules retain ordinary text and cross-segment behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone: Option<DetectionZone>,
 }
 
 impl RuleDef {
@@ -2428,6 +2489,7 @@ fn mphf_hash(anchor: &str, seed: u64) -> u64 {
 
 struct EngineIndex {
     compiled_rules: Vec<CompiledRule>,
+    has_scoped_rules: bool,
     anchor_list: Vec<String>,
     anchor_rule_buckets: Vec<Vec<usize>>,
     #[cfg(feature = "patterns-mphf-dispatch")]
@@ -2678,6 +2740,7 @@ where
 
     Ok(EngineIndex {
         compiled_rules,
+        has_scoped_rules: rules.iter().any(|rule| rule.zone.is_some()),
         anchor_list,
         anchor_rule_buckets,
         #[cfg(feature = "patterns-mphf-dispatch")]
@@ -3390,6 +3453,7 @@ fn builtin_codex_pack() -> PatternPack {
             // Usage warnings at different thresholds
             RuleDef {
                 id: "codex.usage.warning_25".to_string(),
+                zone: None,
                 agent_type: AgentType::Codex,
                 event_type: "usage.warning".to_string(),
                 severity: Severity::Info,
@@ -3404,6 +3468,7 @@ fn builtin_codex_pack() -> PatternPack {
             },
             RuleDef {
                 id: "codex.usage.warning_10".to_string(),
+                zone: None,
                 agent_type: AgentType::Codex,
                 event_type: "usage.warning".to_string(),
                 severity: Severity::Warning,
@@ -3418,6 +3483,7 @@ fn builtin_codex_pack() -> PatternPack {
             },
             RuleDef {
                 id: "codex.usage.warning_5".to_string(),
+                zone: None,
                 agent_type: AgentType::Codex,
                 event_type: "usage.warning".to_string(),
                 severity: Severity::Warning,
@@ -3433,6 +3499,7 @@ fn builtin_codex_pack() -> PatternPack {
             // Usage limit reached
             RuleDef {
                 id: "codex.usage.reached".to_string(),
+                zone: None,
                 agent_type: AgentType::Codex,
                 event_type: "usage.reached".to_string(),
                 severity: Severity::Critical,
@@ -3465,6 +3532,7 @@ fn builtin_codex_pack() -> PatternPack {
             // Session token usage summary
             RuleDef {
                 id: "codex.session.token_usage".to_string(),
+                zone: None,
                 agent_type: AgentType::Codex,
                 event_type: "session.summary".to_string(),
                 severity: Severity::Info,
@@ -3482,6 +3550,7 @@ fn builtin_codex_pack() -> PatternPack {
             // Resume session hint
             RuleDef {
                 id: "codex.session.resume_hint".to_string(),
+                zone: None,
                 agent_type: AgentType::Codex,
                 event_type: "session.resume_hint".to_string(),
                 severity: Severity::Info,
@@ -3499,6 +3568,7 @@ fn builtin_codex_pack() -> PatternPack {
             // Device auth code prompt
             RuleDef {
                 id: "codex.auth.device_code_prompt".to_string(),
+                zone: None,
                 agent_type: AgentType::Codex,
                 event_type: "auth.device_code".to_string(),
                 severity: Severity::Info,
@@ -3517,6 +3587,7 @@ fn builtin_codex_pack() -> PatternPack {
             // Rate limit detection (HTTP 429 / explicit rate limit messages)
             RuleDef {
                 id: "codex.rate_limit.detected".to_string(),
+                zone: None,
                 agent_type: AgentType::Codex,
                 event_type: "rate_limit.detected".to_string(),
                 severity: Severity::Critical,
@@ -3623,6 +3694,7 @@ fn builtin_claude_code_pack() -> PatternPack {
             // Context compaction (canonical ID: claude_code.compaction)
             RuleDef {
                 id: "claude_code.compaction".to_string(),
+                zone: None,
                 agent_type: AgentType::ClaudeCode,
                 event_type: "session.compaction".to_string(),
                 severity: Severity::Warning,
@@ -3652,6 +3724,7 @@ fn builtin_claude_code_pack() -> PatternPack {
             // Session banner with version and model info
             RuleDef {
                 id: "claude_code.banner".to_string(),
+                zone: None,
                 agent_type: AgentType::ClaudeCode,
                 event_type: "session.start".to_string(),
                 severity: Severity::Info,
@@ -3669,6 +3742,7 @@ fn builtin_claude_code_pack() -> PatternPack {
             // Usage warning (evolving patterns)
             RuleDef {
                 id: "claude_code.usage.warning".to_string(),
+                zone: None,
                 agent_type: AgentType::ClaudeCode,
                 event_type: "usage.warning".to_string(),
                 severity: Severity::Warning,
@@ -3697,6 +3771,7 @@ fn builtin_claude_code_pack() -> PatternPack {
             // Usage limit reached
             RuleDef {
                 id: "claude_code.usage.reached".to_string(),
+                zone: None,
                 agent_type: AgentType::ClaudeCode,
                 event_type: "usage.reached".to_string(),
                 severity: Severity::Critical,
@@ -3726,6 +3801,7 @@ fn builtin_claude_code_pack() -> PatternPack {
             // Session cost summary
             RuleDef {
                 id: "claude_code.session.cost_summary".to_string(),
+                zone: None,
                 agent_type: AgentType::ClaudeCode,
                 event_type: "session.summary".to_string(),
                 severity: Severity::Info,
@@ -3741,6 +3817,7 @@ fn builtin_claude_code_pack() -> PatternPack {
             // API key error
             RuleDef {
                 id: "claude_code.auth.api_key_error".to_string(),
+                zone: None,
                 agent_type: AgentType::ClaudeCode,
                 event_type: "auth.error".to_string(),
                 severity: Severity::Critical,
@@ -3760,6 +3837,7 @@ fn builtin_claude_code_pack() -> PatternPack {
             // Rate limit detection (HTTP 429 / Anthropic rate limits)
             RuleDef {
                 id: "claude_code.rate_limit.detected".to_string(),
+                zone: None,
                 agent_type: AgentType::ClaudeCode,
                 event_type: "rate_limit.detected".to_string(),
                 severity: Severity::Critical,
@@ -3787,6 +3865,7 @@ fn builtin_claude_code_pack() -> PatternPack {
             // Auth login required (browser auth flow)
             RuleDef {
                 id: "claude_code.auth.login_required".to_string(),
+                zone: None,
                 agent_type: AgentType::ClaudeCode,
                 event_type: "auth.login_required".to_string(),
                 severity: Severity::Warning,
@@ -3812,6 +3891,7 @@ fn builtin_claude_code_pack() -> PatternPack {
             // Tool use indicator
             RuleDef {
                 id: "claude_code.tool_use".to_string(),
+                zone: None,
                 agent_type: AgentType::ClaudeCode,
                 event_type: "session.tool_use".to_string(),
                 severity: Severity::Info,
@@ -3833,6 +3913,7 @@ fn builtin_claude_code_pack() -> PatternPack {
             // Approval/permission needed
             RuleDef {
                 id: "claude_code.approval_needed".to_string(),
+                zone: None,
                 agent_type: AgentType::ClaudeCode,
                 event_type: "session.approval_needed".to_string(),
                 severity: Severity::Warning,
@@ -3857,6 +3938,7 @@ fn builtin_claude_code_pack() -> PatternPack {
             // Context window warning
             RuleDef {
                 id: "claude_code.context.warning".to_string(),
+                zone: None,
                 agent_type: AgentType::ClaudeCode,
                 event_type: "context.warning".to_string(),
                 severity: Severity::Warning,
@@ -3883,6 +3965,7 @@ fn builtin_claude_code_pack() -> PatternPack {
             // Extended thinking indicator
             RuleDef {
                 id: "claude_code.thinking".to_string(),
+                zone: None,
                 agent_type: AgentType::ClaudeCode,
                 event_type: "session.thinking".to_string(),
                 severity: Severity::Info,
@@ -3906,6 +3989,7 @@ fn builtin_claude_code_pack() -> PatternPack {
             // Network/connection error
             RuleDef {
                 id: "claude_code.error.network".to_string(),
+                zone: None,
                 agent_type: AgentType::ClaudeCode,
                 event_type: "error.network".to_string(),
                 severity: Severity::Critical,
@@ -3928,6 +4012,7 @@ fn builtin_claude_code_pack() -> PatternPack {
             // Timeout error
             RuleDef {
                 id: "claude_code.error.timeout".to_string(),
+                zone: None,
                 agent_type: AgentType::ClaudeCode,
                 event_type: "error.timeout".to_string(),
                 severity: Severity::Warning,
@@ -3948,6 +4033,7 @@ fn builtin_claude_code_pack() -> PatternPack {
             // Session/conversation end
             RuleDef {
                 id: "claude_code.session.end".to_string(),
+                zone: None,
                 agent_type: AgentType::ClaudeCode,
                 event_type: "session.end".to_string(),
                 severity: Severity::Info,
@@ -3969,6 +4055,7 @@ fn builtin_claude_code_pack() -> PatternPack {
             // Model selection/change
             RuleDef {
                 id: "claude_code.model.selected".to_string(),
+                zone: None,
                 agent_type: AgentType::ClaudeCode,
                 event_type: "session.model".to_string(),
                 severity: Severity::Info,
@@ -3990,6 +4077,7 @@ fn builtin_claude_code_pack() -> PatternPack {
             // Auto-compaction completed
             RuleDef {
                 id: "claude_code.compaction.complete".to_string(),
+                zone: None,
                 agent_type: AgentType::ClaudeCode,
                 event_type: "session.compaction_complete".to_string(),
                 severity: Severity::Info,
@@ -4012,6 +4100,7 @@ fn builtin_claude_code_pack() -> PatternPack {
             // Overloaded error (API busy)
             RuleDef {
                 id: "claude_code.error.overloaded".to_string(),
+                zone: None,
                 agent_type: AgentType::ClaudeCode,
                 event_type: "error.overloaded".to_string(),
                 severity: Severity::Warning,
@@ -4090,6 +4179,7 @@ fn builtin_gemini_pack() -> PatternPack {
             // Usage warning (approaching limit)
             RuleDef {
                 id: "gemini.usage.warning".to_string(),
+                zone: None,
                 agent_type: AgentType::Gemini,
                 event_type: "usage.warning".to_string(),
                 severity: Severity::Warning,
@@ -4112,6 +4202,7 @@ fn builtin_gemini_pack() -> PatternPack {
             // Usage limit reached
             RuleDef {
                 id: "gemini.usage.reached".to_string(),
+                zone: None,
                 agent_type: AgentType::Gemini,
                 event_type: "usage.reached".to_string(),
                 severity: Severity::Critical,
@@ -4134,6 +4225,7 @@ fn builtin_gemini_pack() -> PatternPack {
             // Rate limit detection (Google API rate limits)
             RuleDef {
                 id: "gemini.rate_limit.detected".to_string(),
+                zone: None,
                 agent_type: AgentType::Gemini,
                 event_type: "rate_limit.detected".to_string(),
                 severity: Severity::Critical,
@@ -4161,6 +4253,7 @@ fn builtin_gemini_pack() -> PatternPack {
             // Session summary
             RuleDef {
                 id: "gemini.session.summary".to_string(),
+                zone: None,
                 agent_type: AgentType::Gemini,
                 event_type: "session.summary".to_string(),
                 severity: Severity::Info,
@@ -4182,6 +4275,7 @@ fn builtin_gemini_pack() -> PatternPack {
             // Session resume hint
             RuleDef {
                 id: "gemini.session.resume_hint".to_string(),
+                zone: None,
                 agent_type: AgentType::Gemini,
                 event_type: "session.resume_hint".to_string(),
                 severity: Severity::Info,
@@ -4200,6 +4294,7 @@ fn builtin_gemini_pack() -> PatternPack {
             // Model indicator
             RuleDef {
                 id: "gemini.model.used".to_string(),
+                zone: None,
                 agent_type: AgentType::Gemini,
                 event_type: "session.model".to_string(),
                 severity: Severity::Info,
@@ -4223,6 +4318,7 @@ fn builtin_gemini_pack() -> PatternPack {
             // OAuth required (browser auth flow)
             RuleDef {
                 id: "gemini.auth.oauth_required".to_string(),
+                zone: None,
                 agent_type: AgentType::Gemini,
                 event_type: "auth.oauth_required".to_string(),
                 severity: Severity::Warning,
@@ -4260,6 +4356,7 @@ fn builtin_wezterm_pack() -> PatternPack {
             // terminator, so a partial capture cannot manufacture an event.
             RuleDef {
                 id: "wezterm.build.cargo_failed".to_string(),
+                zone: None,
                 agent_type: AgentType::Wezterm,
                 event_type: "build.failed".to_string(),
                 severity: Severity::Warning,
@@ -4278,6 +4375,7 @@ fn builtin_wezterm_pack() -> PatternPack {
             },
             RuleDef {
                 id: "wezterm.test.cargo_failed".to_string(),
+                zone: None,
                 agent_type: AgentType::Wezterm,
                 event_type: "test.failed".to_string(),
                 severity: Severity::Warning,
@@ -4297,6 +4395,7 @@ fn builtin_wezterm_pack() -> PatternPack {
             // Mux server connection lost
             RuleDef {
                 id: "wezterm.mux.connection_lost".to_string(),
+                zone: None,
                 agent_type: AgentType::Wezterm,
                 event_type: "mux.error".to_string(),
                 severity: Severity::Critical,
@@ -4316,6 +4415,7 @@ fn builtin_wezterm_pack() -> PatternPack {
             // Pane exited
             RuleDef {
                 id: "wezterm.pane.exited".to_string(),
+                zone: None,
                 agent_type: AgentType::Wezterm,
                 event_type: "pane.exited".to_string(),
                 severity: Severity::Info,
@@ -4571,6 +4671,11 @@ impl PatternEngine {
         for idx in indices {
             let compiled = &index.compiled_rules[idx];
             let rule = &compiled.def;
+            // A context-free read has no semantic annotation. Do not silently
+            // turn a scoped rule into an ordinary text match.
+            if rule.zone.is_some() {
+                continue;
+            }
             let (fallback_anchor, fallback_span) = matched_anchor_by_rule[idx]
                 .map(|(anchor_idx, span)| (index.anchor_list[anchor_idx].as_str(), span))
                 .unwrap_or(("", (0, 0)));
@@ -4648,9 +4753,29 @@ impl PatternEngine {
         text: &str,
         context: &mut DetectionContext,
     ) -> Vec<Detection> {
+        self.detect_with_context_in_zone(text, context, None)
+    }
+
+    /// Detect with an optional semantic annotation for the complete segment.
+    /// Unknown or mixed annotations suppress scoped rules. Consecutive calls
+    /// with the same known zone may share a bounded suffix; callers must use
+    /// [`DetectionContext::clear_zone_continuity`] when that continuity is not
+    /// known. Unscoped rules retain their ordinary cross-segment buffer.
+    #[must_use]
+    pub fn detect_with_context_in_zone(
+        &self,
+        text: &str,
+        context: &mut DetectionContext,
+        zone: Option<DetectionZone>,
+    ) -> Vec<Detection> {
         saturating_atomic_add(&self.telemetry.scans_total, 1);
 
         if text.is_empty() {
+            // Even an empty unknown/boundary observation ends authority for
+            // the next scoped prefix without disturbing unscoped matching.
+            if zone.is_none() || zone != context.zone_tail_kind {
+                context.clear_zone_continuity();
+            }
             return Vec::new();
         }
 
@@ -4663,6 +4788,8 @@ impl PatternEngine {
             s.push_str(text);
             (std::borrow::Cow::Owned(s), context.tail_buffer.len())
         };
+
+        let zone_start = context.advance_zone_tail(&input_text, overlap_len, zone);
 
         // Update tail buffer for next time
         // We keep the last N chars
@@ -4721,14 +4848,41 @@ impl PatternEngine {
             u64::try_from(indices.len()).unwrap_or(u64::MAX),
         );
 
+        // Only opted-in packs pay for the second anchor pass. It isolates
+        // both anchors and regex lookarounds from an unknown/other-zone tail.
+        let scoped_anchors = if index.has_scoped_rules && zone.is_some() && zone_start > 0 {
+            index.anchor_matcher.as_ref().map(|matcher| {
+                Self::collect_candidate_rules(
+                    index,
+                    &input_text[zone_start..],
+                    matcher,
+                    overlap_len.saturating_sub(zone_start),
+                )
+                .1
+            })
+        } else {
+            None
+        };
+
         let mut result = Vec::new();
         let mut emitted_matches = 0u64;
         for idx in indices {
             let compiled = &index.compiled_rules[idx];
             let rule = &compiled.def;
-            let (fallback_anchor, fallback_span) = matched_anchor_by_rule[idx]
-                .map(|(anchor_idx, span)| (index.anchor_list[anchor_idx].as_str(), span))
-                .unwrap_or(("", (0, 0)));
+            if rule.zone.is_some() && rule.zone != zone {
+                continue;
+            }
+            let scan_start = if rule.zone.is_some() { zone_start } else { 0 };
+            let anchors = if rule.zone.is_some() {
+                scoped_anchors.as_ref().unwrap_or(&matched_anchor_by_rule)
+            } else {
+                &matched_anchor_by_rule
+            };
+            let Some((anchor_idx, anchor_span)) = anchors[idx] else {
+                continue;
+            };
+            let fallback_anchor = index.anchor_list[anchor_idx].as_str();
+            let fallback_span = (anchor_span.0 + scan_start, anchor_span.1 + scan_start);
 
             if let Some(expected_agent) = context.agent_type {
                 if !Self::rule_agent_type_applies(rule.agent_type, expected_agent) {
@@ -4739,7 +4893,7 @@ impl PatternEngine {
             if let Some(regex) = compiled.regex.as_ref() {
                 saturating_atomic_add(&self.telemetry.regex_evaluations, 1);
 
-                for capture_result in regex.captures_iter(&*input_text) {
+                for capture_result in regex.captures_iter(&input_text[scan_start..]) {
                     let captures = match capture_result {
                         Ok(captures) => captures,
                         Err(error) => {
@@ -4748,9 +4902,9 @@ impl PatternEngine {
                         }
                     };
 
-                    let span = captures
-                        .get(0)
-                        .map_or(fallback_span, |m| (m.start(), m.end()));
+                    let span = captures.get(0).map_or(fallback_span, |m| {
+                        (m.start() + scan_start, m.end() + scan_start)
+                    });
                     if overlap_len > 0 && span.1 <= overlap_len {
                         continue;
                     }
@@ -4971,9 +5125,26 @@ impl PatternEngine {
         context: &mut DetectionContext,
         opts: &TraceOptions,
     ) -> (Vec<Detection>, Vec<MatchTrace>) {
+        self.detect_with_context_and_trace_in_zone(text, context, opts, None)
+    }
+
+    /// Trace the same zone-filtered scan as [`Self::detect_with_context_in_zone`].
+    /// The caller owns zone continuity; call `clear_zone_continuity` before a
+    /// new semantic region even when it has the same zone type.
+    #[must_use]
+    pub fn detect_with_context_and_trace_in_zone(
+        &self,
+        text: &str,
+        context: &mut DetectionContext,
+        opts: &TraceOptions,
+        zone: Option<DetectionZone>,
+    ) -> (Vec<Detection>, Vec<MatchTrace>) {
         saturating_atomic_add(&self.telemetry.scans_total, 1);
 
         if text.is_empty() {
+            if zone.is_none() || context.zone_tail_kind != zone {
+                context.clear_zone_continuity();
+            }
             return (Vec::new(), Vec::new());
         }
 
@@ -4987,6 +5158,8 @@ impl PatternEngine {
             (std::borrow::Cow::Owned(s), context.tail_buffer.len())
         };
 
+        let zone_start = context.advance_zone_tail(&input_text, overlap_len, zone);
+
         // Update tail buffer for next time; keep last N chars.
         let full_len = input_text.len();
         if full_len > DetectionContext::MAX_TAIL_SIZE {
@@ -4996,7 +5169,14 @@ impl PatternEngine {
             context.tail_buffer = input_text.to_string();
         }
 
-        self.detect_with_context_and_trace_inner(&input_text, overlap_len, context, opts)
+        self.detect_with_context_and_trace_inner(
+            &input_text,
+            overlap_len,
+            context,
+            opts,
+            zone,
+            zone_start,
+        )
     }
 
     fn detect_with_context_and_trace_inner(
@@ -5005,6 +5185,8 @@ impl PatternEngine {
         overlap_len: usize,
         context: &mut DetectionContext,
         opts: &TraceOptions,
+        zone: Option<DetectionZone>,
+        zone_start: usize,
     ) -> (Vec<Detection>, Vec<MatchTrace>) {
         let index = self.index();
 
@@ -5039,6 +5221,15 @@ impl PatternEngine {
             u64::try_from(indices.len()).unwrap_or(u64::MAX),
         );
 
+        let scoped_anchors = if index.has_scoped_rules && zone.is_some() && zone_start > 0 {
+            Some(
+                Self::collect_candidate_rules_with_all_anchors(index, &text[zone_start..], matcher)
+                    .1,
+            )
+        } else {
+            None
+        };
+
         let mut detections: Vec<Detection> = Vec::new();
         let mut traces: Vec<MatchTrace> = Vec::new();
 
@@ -5046,15 +5237,55 @@ impl PatternEngine {
             let compiled = &index.compiled_rules[idx];
             let rule = &compiled.def;
 
-            let Some(anchors) = matched_anchors_by_rule.get(idx) else {
+            let pack_id = compiled.pack_id.as_ref();
+            if rule.zone.is_some() && rule.zone != zone {
+                if opts.include_non_matches {
+                    let mut gates = Self::trace_gates_skeleton();
+                    gates[3].passed = false;
+                    gates[3].reason = Some("zone_constraint_not_satisfied".to_string());
+                    gates.push(TraceGate {
+                        gate: "zone".to_string(),
+                        passed: false,
+                        reason: Some(
+                            "semantic zone is missing or does not match rule constraint"
+                                .to_string(),
+                        ),
+                    });
+                    traces.push(Self::build_match_trace_no_detection(
+                        text,
+                        &redactor,
+                        pack_id,
+                        rule.id.clone(),
+                        None,
+                        false,
+                        gates,
+                        None,
+                        opts,
+                    ));
+                }
+                continue;
+            }
+            let scan_start = if rule.zone.is_some() { zone_start } else { 0 };
+            let anchors_by_rule = if rule.zone.is_some() {
+                scoped_anchors.as_ref().unwrap_or(&matched_anchors_by_rule)
+            } else {
+                &matched_anchors_by_rule
+            };
+            let Some(anchors) = anchors_by_rule.get(idx) else {
                 continue;
             };
+            if anchors.is_empty() {
+                continue;
+            }
             let (fallback_anchor, fallback_span) = anchors
                 .first()
-                .map(|(anchor_idx, span)| (index.anchor_list[anchor_idx].as_str(), span))
+                .map(|(anchor_idx, span)| {
+                    (
+                        index.anchor_list[anchor_idx].as_str(),
+                        (span.0 + scan_start, span.1 + scan_start),
+                    )
+                })
                 .unwrap_or(("", (0, 0)));
-
-            let pack_id = compiled.pack_id.as_ref();
 
             let anchor_evidence =
                 Self::trace_anchor_evidence(text, &redactor, fallback_anchor, fallback_span, opts);
@@ -5064,7 +5295,7 @@ impl PatternEngine {
 
                 saturating_atomic_add(&self.telemetry.regex_evaluations, 1);
 
-                for capture_result in regex.captures_iter(text) {
+                for capture_result in regex.captures_iter(&text[scan_start..]) {
                     let captures = match capture_result {
                         Ok(captures) => captures,
                         Err(error) => {
@@ -5078,7 +5309,12 @@ impl PatternEngine {
 
                     let (raw_matched_text, span) = captures.get(0).map_or_else(
                         || (fallback_anchor.to_string(), fallback_span),
-                        |m| (m.as_str().to_string(), (m.start(), m.end())),
+                        |m| {
+                            (
+                                m.as_str().to_string(),
+                                (m.start() + scan_start, m.end() + scan_start),
+                            )
+                        },
                     );
 
                     let detection = Detection {
@@ -5092,8 +5328,15 @@ impl PatternEngine {
                         span,
                     };
 
-                    let (eligible, gates) =
+                    let (eligible, mut gates) =
                         Self::evaluate_trace_gates(&detection, overlap_len, context);
+                    if rule.zone.is_some() {
+                        gates.push(TraceGate {
+                            gate: "zone".to_string(),
+                            passed: true,
+                            reason: None,
+                        });
+                    }
 
                     if eligible {
                         if !is_command_failure_event(&detection.event_type, detection.severity) {
@@ -5112,7 +5355,7 @@ impl PatternEngine {
                             eligible,
                             gates,
                             anchor_evidence.as_ref(),
-                            Some((&captures, regex)),
+                            Some((&captures, regex, scan_start)),
                             opts,
                         );
                         traces.push(trace);
@@ -5137,6 +5380,13 @@ impl PatternEngine {
 
                     gates[3].passed = false;
                     gates[3].reason = Some("regex_no_match".to_string());
+                    if rule.zone.is_some() {
+                        gates.push(TraceGate {
+                            gate: "zone".to_string(),
+                            passed: true,
+                            reason: None,
+                        });
+                    }
 
                     let eligible = false;
 
@@ -5157,6 +5407,7 @@ impl PatternEngine {
                 // Anchor-only rule: ALL anchor hits imply matches.
                 for (anchor_idx, span) in anchors.iter() {
                     let anchor_text = &index.anchor_list[*anchor_idx];
+                    let span = (span.0 + scan_start, span.1 + scan_start);
                     let detection = Detection {
                         rule_id: rule.id.clone(),
                         agent_type: rule.agent_type,
@@ -5165,11 +5416,18 @@ impl PatternEngine {
                         confidence: 0.6,
                         extracted: serde_json::Value::Object(serde_json::Map::new()),
                         matched_text: anchor_text.clone(),
-                        span: *span,
+                        span,
                     };
 
-                    let (eligible, gates) =
+                    let (eligible, mut gates) =
                         Self::evaluate_trace_gates(&detection, overlap_len, context);
+                    if rule.zone.is_some() {
+                        gates.push(TraceGate {
+                            gate: "zone".to_string(),
+                            passed: true,
+                            reason: None,
+                        });
+                    }
 
                     if eligible {
                         if !is_command_failure_event(&detection.event_type, detection.severity) {
@@ -5182,7 +5440,7 @@ impl PatternEngine {
                         // For anchor-only rules, we trace each anchor occurrence.
                         // Re-generate evidence for this specific anchor occurrence.
                         let specific_evidence =
-                            Self::trace_anchor_evidence(text, &redactor, anchor_text, *span, opts);
+                            Self::trace_anchor_evidence(text, &redactor, anchor_text, span, opts);
 
                         let trace = Self::build_match_trace(
                             text,
@@ -5543,12 +5801,12 @@ impl PatternEngine {
         eligible: bool,
         mut gates: Vec<TraceGate>,
         anchor_evidence: Option<&TraceEvidence>,
-        regex_context: Option<(&fancy_regex::Captures<'_, str>, &Regex)>,
+        regex_context: Option<(&fancy_regex::Captures<'_, str>, &Regex, usize)>,
         opts: &TraceOptions,
     ) -> MatchTrace {
         // Ensure gate list includes "match" in stable position.
         // (evaluate_trace_gates always sets match=true; callers may override for non-detections.)
-        if gates.len() != 4 || gates[3].gate != "match" {
+        if gates.len() < 4 || gates[3].gate != "match" {
             gates = Self::trace_gates_skeleton();
         }
 
@@ -5596,7 +5854,7 @@ impl PatternEngine {
         });
 
         // Capture evidence (stable ordering by capture name).
-        if let Some((captures, regex)) = regex_context {
+        if let Some((captures, regex, offset)) = regex_context {
             let mut names: Vec<&str> = regex.capture_names().flatten().collect();
             names.sort_unstable();
 
@@ -5616,8 +5874,8 @@ impl PatternEngine {
                     kind: "capture".to_string(),
                     label: Some(name.to_string()),
                     span: Some(TraceSpan {
-                        start: value.start(),
-                        end: value.end(),
+                        start: value.start() + offset,
+                        end: value.end() + offset,
                     }),
                     excerpt: Some(cap_bounded),
                     truncated: cap_truncated,
@@ -5851,6 +6109,12 @@ impl PatternEngine {
     #[must_use]
     pub fn rules(&self) -> &[RuleDef] {
         self.library.rules()
+    }
+
+    /// Whether live capture needs a fresh semantic annotation for matching.
+    #[must_use]
+    pub fn has_zone_scoped_rules(&self) -> bool {
+        self.index().has_scoped_rules
     }
 
     /// Access merged submit verification profiles.
@@ -6595,6 +6859,7 @@ rules:
     fn sample_rule(id: &str) -> RuleDef {
         RuleDef {
             id: id.to_string(),
+            zone: None,
             agent_type: AgentType::Codex,
             event_type: "usage".to_string(),
             severity: Severity::Info,
@@ -6676,6 +6941,7 @@ rules:
     fn rule_with_anchor(id: &str, anchor: &str, regex: Option<&str>) -> RuleDef {
         RuleDef {
             id: id.to_string(),
+            zone: None,
             agent_type: AgentType::Codex,
             event_type: "test.event".to_string(),
             severity: Severity::Info,
@@ -6693,6 +6959,293 @@ rules:
     fn engine_with_rules(rules: Vec<RuleDef>) -> PatternEngine {
         let pack = PatternPack::new("pack", "0.1.0", rules);
         PatternEngine::with_packs(vec![pack]).expect("engine should build")
+    }
+
+    fn output_scoped_rule(regex: Option<&str>) -> RuleDef {
+        let mut rule = rule_with_anchor("codex.scoped", "ERROR", regex);
+        rule.zone = Some(DetectionZone::Output);
+        rule
+    }
+
+    #[test]
+    fn zone_rule_serialization_preserves_unscoped_packs_and_rejects_unknown_types() {
+        let mut value = serde_json::to_value(sample_rule("codex.zone")).unwrap();
+        assert!(value.get("zone").is_none());
+        assert!(
+            serde_json::from_value::<RuleDef>(value.clone())
+                .unwrap()
+                .zone
+                .is_none()
+        );
+        for (name, zone) in [
+            ("prompt", DetectionZone::Prompt),
+            ("input", DetectionZone::Input),
+            ("output", DetectionZone::Output),
+        ] {
+            value["zone"] = serde_json::json!(name);
+            let rule: RuleDef = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(rule.zone, Some(zone));
+            assert_eq!(serde_json::to_value(rule).unwrap()["zone"], name);
+        }
+        value["zone"] = serde_json::json!("unknown");
+        assert!(serde_json::from_value::<RuleDef>(value).is_err());
+    }
+
+    #[test]
+    fn scoped_rule_requires_zone_without_poisoning_deduplication() {
+        let engine = engine_with_rules(vec![output_scoped_rule(Some(r"ERROR (?P<code>\d+)"))]);
+        assert!(engine.has_zone_scoped_rules());
+        assert!(engine.detect("ERROR 42").is_empty());
+        let mut context = DetectionContext::new();
+        for zone in [
+            None,
+            Some(DetectionZone::Prompt),
+            Some(DetectionZone::Input),
+        ] {
+            assert!(
+                engine
+                    .detect_with_context_in_zone("ERROR 42", &mut context, zone)
+                    .is_empty()
+            );
+        }
+        let detections = engine.detect_with_context_in_zone(
+            "ERROR 42",
+            &mut context,
+            Some(DetectionZone::Output),
+        );
+        assert_eq!(detections.len(), 1);
+        assert_eq!(detections[0].extracted["code"], "42");
+        assert!(
+            engine
+                .detect_with_context_in_zone("ERROR 42", &mut context, Some(DetectionZone::Output))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn unscoped_rules_keep_cross_zone_matching() {
+        let engine = engine_with_rules(vec![
+            rule_with_anchor("codex.unscoped", "ERROR", Some(r"ERROR \d+")),
+            output_scoped_rule(Some(r"ERROR \d+")),
+        ]);
+        let mut context = DetectionContext::new();
+        assert!(
+            engine
+                .detect_with_context_in_zone("ERR", &mut context, Some(DetectionZone::Prompt))
+                .is_empty()
+        );
+        let detections =
+            engine.detect_with_context_in_zone("OR 42", &mut context, Some(DetectionZone::Output));
+        assert_eq!(detections.len(), 1);
+        assert_eq!(detections[0].rule_id, "codex.unscoped");
+    }
+
+    #[test]
+    fn scoped_cross_segment_matching_requires_known_continuity() {
+        let engine = engine_with_rules(vec![output_scoped_rule(None)]);
+        let mut contiguous = DetectionContext::new();
+        assert!(
+            engine
+                .detect_with_context_in_zone("ERR", &mut contiguous, Some(DetectionZone::Output))
+                .is_empty()
+        );
+        assert_eq!(
+            engine
+                .detect_with_context_in_zone("OR", &mut contiguous, Some(DetectionZone::Output))
+                .len(),
+            1
+        );
+
+        for boundary in [
+            None,
+            Some(DetectionZone::Prompt),
+            Some(DetectionZone::Output),
+        ] {
+            let mut context = DetectionContext::new();
+            assert!(
+                engine
+                    .detect_with_context_in_zone("ERR", &mut context, Some(DetectionZone::Output))
+                    .is_empty()
+            );
+            if boundary == Some(DetectionZone::Output) {
+                context.clear_zone_continuity();
+            } else {
+                assert!(
+                    engine
+                        .detect_with_context_in_zone("", &mut context, boundary)
+                        .is_empty()
+                );
+            }
+            assert!(
+                engine
+                    .detect_with_context_in_zone("OR", &mut context, Some(DetectionZone::Output))
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_regex_cannot_use_lookbehind_in_another_zone() {
+        let engine = engine_with_rules(vec![output_scoped_rule(Some(r"(?<=prefix )ERROR"))]);
+        let mut context = DetectionContext::new();
+        assert!(
+            engine
+                .detect_with_context_in_zone("prefix ", &mut context, Some(DetectionZone::Input))
+                .is_empty()
+        );
+        assert!(
+            engine
+                .detect_with_context_in_zone("ERROR", &mut context, Some(DetectionZone::Output))
+                .is_empty()
+        );
+        assert_eq!(
+            engine
+                .detect_with_context_in_zone(
+                    " prefix ERROR",
+                    &mut context,
+                    Some(DetectionZone::Output)
+                )
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn scoped_anchor_after_crossing_anchor_is_still_detected() {
+        let engine = engine_with_rules(vec![output_scoped_rule(None)]);
+        let mut fast_context = DetectionContext::new();
+        let mut trace_context = DetectionContext::new();
+        let opts = TraceOptions {
+            include_non_matches: true,
+            ..TraceOptions::default()
+        };
+        assert!(
+            engine
+                .detect_with_context_in_zone("ERR", &mut fast_context, Some(DetectionZone::Prompt))
+                .is_empty()
+        );
+        assert!(
+            engine
+                .detect_with_context_and_trace_in_zone(
+                    "ERR",
+                    &mut trace_context,
+                    &opts,
+                    Some(DetectionZone::Prompt)
+                )
+                .0
+                .is_empty()
+        );
+        let fast = engine.detect_with_context_in_zone(
+            "OR ERROR",
+            &mut fast_context,
+            Some(DetectionZone::Output),
+        );
+        let (traced, _) = engine.detect_with_context_and_trace_in_zone(
+            "OR ERROR",
+            &mut trace_context,
+            &opts,
+            Some(DetectionZone::Output),
+        );
+        assert_eq!(fast.len(), 1);
+        assert_eq!(fast[0].span, (6, 11));
+        assert_eq!(
+            serde_json::to_value(fast).unwrap(),
+            serde_json::to_value(traced).unwrap()
+        );
+    }
+
+    #[test]
+    fn scoped_trace_reports_zone_denial_and_absolute_capture_spans() {
+        let engine = engine_with_rules(vec![output_scoped_rule(Some(r"ERROR (?P<code>\d+)"))]);
+        let opts = TraceOptions {
+            include_non_matches: true,
+            ..TraceOptions::default()
+        };
+        let (denied, traces) =
+            engine.detect_with_context_and_trace("ERROR 42", &mut DetectionContext::new(), &opts);
+        assert!(denied.is_empty());
+        assert!(
+            traces[0]
+                .gates
+                .iter()
+                .any(|gate| gate.gate == "zone" && !gate.passed)
+        );
+
+        let mut fast_context = DetectionContext::new();
+        let mut trace_context = DetectionContext::new();
+        assert!(
+            engine
+                .detect_with_context("quoted ", &mut fast_context)
+                .is_empty()
+        );
+        assert!(
+            engine
+                .detect_with_context_and_trace("quoted ", &mut trace_context, &opts)
+                .0
+                .is_empty()
+        );
+        let fast = engine.detect_with_context_in_zone(
+            "ERROR 42",
+            &mut fast_context,
+            Some(DetectionZone::Output),
+        );
+        let (traced, traces) = engine.detect_with_context_and_trace_in_zone(
+            "ERROR 42",
+            &mut trace_context,
+            &opts,
+            Some(DetectionZone::Output),
+        );
+        assert_eq!(fast[0].span, (7, 15));
+        assert_eq!(
+            serde_json::to_value(fast).unwrap(),
+            serde_json::to_value(traced).unwrap()
+        );
+        assert!(
+            traces[0]
+                .gates
+                .iter()
+                .any(|gate| gate.gate == "zone" && gate.passed)
+        );
+        let evidence = traces[0]
+            .evidence
+            .iter()
+            .find(|item| item.kind == "capture")
+            .unwrap();
+        let span = evidence.span.as_ref().unwrap();
+        assert_eq!((span.start, span.end), (13, 15));
+        assert_eq!(evidence.excerpt.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn scoped_unicode_tail_stays_bounded_and_respects_external_tail_reset() {
+        let engine = engine_with_rules(vec![output_scoped_rule(None)]);
+        let mut context = DetectionContext::new();
+        let text = format!("{} ERR", "é".repeat(DetectionContext::MAX_TAIL_SIZE));
+        assert!(
+            engine
+                .detect_with_context_in_zone(&text, &mut context, Some(DetectionZone::Output))
+                .is_empty()
+        );
+        assert!(context.zone_tail.len() <= DetectionContext::MAX_TAIL_SIZE);
+        assert_eq!(
+            engine
+                .detect_with_context_in_zone("OR", &mut context, Some(DetectionZone::Output))
+                .len(),
+            1
+        );
+
+        context.clear_seen();
+        assert!(
+            engine
+                .detect_with_context_in_zone("ERR", &mut context, Some(DetectionZone::Output))
+                .is_empty()
+        );
+        context.tail_buffer.clear();
+        assert!(
+            engine
+                .detect_with_context_in_zone("OR", &mut context, Some(DetectionZone::Output))
+                .is_empty()
+        );
     }
 
     #[test]
@@ -9204,6 +9757,7 @@ description = "Custom config alert"
             "1.0.0",
             vec![RuleDef {
                 id: "myorg.custom_rule".to_string(),
+                zone: None,
                 agent_type: AgentType::Codex,
                 event_type: "custom.event".to_string(),
                 severity: Severity::Warning,
@@ -9228,6 +9782,7 @@ description = "Custom config alert"
             "1.0.0",
             vec![RuleDef {
                 id: "noruleid".to_string(),
+                zone: None,
                 agent_type: AgentType::Codex,
                 event_type: "custom.event".to_string(),
                 severity: Severity::Warning,
@@ -9251,6 +9806,7 @@ description = "Custom config alert"
             "1.0.0",
             vec![RuleDef {
                 id: "myorg.backref".to_string(),
+                zone: None,
                 agent_type: AgentType::Codex,
                 event_type: "custom.event".to_string(),
                 severity: Severity::Warning,
@@ -9283,6 +9839,7 @@ description = "Custom config alert"
             "1.0.0",
             vec![RuleDef {
                 id: "myorg.escaped_backref".to_string(),
+                zone: None,
                 agent_type: AgentType::Codex,
                 event_type: "custom.event".to_string(),
                 severity: Severity::Warning,
@@ -10089,6 +10646,7 @@ description = "Project lint warning"
     fn get_preview_command_with_template() {
         let rule = RuleDef {
             id: "codex.test".into(),
+            zone: None,
             agent_type: AgentType::Codex,
             event_type: "test".into(),
             severity: Severity::Info,
@@ -10984,6 +11542,7 @@ rules:
     fn rule_def_serde_round_trip() {
         let rule = RuleDef {
             id: "codex.serde_test".into(),
+            zone: None,
             agent_type: AgentType::Codex,
             event_type: "test".into(),
             severity: Severity::Warning,

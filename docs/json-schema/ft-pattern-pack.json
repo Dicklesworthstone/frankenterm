@@ -68,6 +68,10 @@
           "type": ["string", "null"],
           "description": "Optional extraction regex. Named captures (`(?P<name>...)`) are preferred."
         },
+        "zone": {
+          "enum": ["prompt", "input", "output", null],
+          "description": "Optional semantic-zone filter. Requires an explicit matching annotation; unknown or ambiguous zones do not match. Omitted or null preserves unscoped matching."
+        },
         "description": {
           "type": "string",
           "minLength": 1,

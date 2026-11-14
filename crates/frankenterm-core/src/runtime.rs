@@ -80,7 +80,9 @@ use crate::memory_budget::BudgetLevel;
 use crate::memory_pressure::{MemoryPressureConfig, MemoryPressureMonitor, MemoryPressureTier};
 #[cfg(feature = "native-wezterm")]
 use crate::native_events::{NativeEvent, NativeEventListener};
-use crate::patterns::{AgentType, Detection, DetectionContext, PatternEngine, Severity};
+use crate::patterns::{
+    AgentType, Detection, DetectionContext, DetectionZone, PatternEngine, Severity,
+};
 use crate::policy::Redactor;
 use crate::recording::RecordingManager;
 use crate::resize_scheduler::{ResizeSchedulerDebugSnapshot, ResizeStalledTransaction};
@@ -1131,7 +1133,7 @@ async fn semantic_zone_type_for_captured_segment(
     cache_ttl: Duration,
     captured: &CapturedSegment,
     pane_incarnation: PaneIncarnation,
-    allow_live_lookup: bool,
+    require_fresh: bool,
 ) -> Option<String> {
     if !matches!(&captured.kind, CapturedSegmentKind::Delta) || captured.content.trim().is_empty() {
         return None;
@@ -1139,7 +1141,8 @@ async fn semantic_zone_type_for_captured_segment(
 
     let now = Instant::now();
     let cache_key = (captured.pane_id, pane_incarnation);
-    if let Some(cached) = cache.get(&cache_key)
+    if !require_fresh
+        && let Some(cached) = cache.get(&cache_key)
         && now.saturating_duration_since(cached.refreshed_at) <= cache_ttl
     {
         return cached
@@ -1149,13 +1152,8 @@ async fn semantic_zone_type_for_captured_segment(
             .map(str::to_string);
     }
 
-    // Once discovery has published different metadata for a numeric pane ID,
-    // a live mux query can only describe the successor. Existing snapshots are
-    // incarnation-keyed and safe to reuse, but a cache miss must fail closed.
-    if !allow_live_lookup {
-        return None;
-    }
-
+    // Scoped detection never replays a cached annotation. The caller admits
+    // capture authority before this query and revalidates it afterwards.
     let snapshot = match wezterm_handle
         .get_semantic_zones_with_cx(runtime_cx, captured.pane_id)
         .await
@@ -1190,29 +1188,36 @@ fn infer_semantic_zone_type_for_segment(
     if !matches!(&captured.kind, CapturedSegmentKind::Delta) {
         return None;
     }
-    let content = captured.content.trim();
+    // Rendered zone text can omit the newline added by capture. Preserve all
+    // other whitespace: trimming it can disguise a prompt/output boundary.
+    let content = captured.content.trim_end_matches(['\r', '\n']);
     if content.is_empty() {
         return None;
     }
 
-    snapshot
-        .zones
-        .iter()
-        .filter(|zone| !zone.text.trim().is_empty())
-        .filter(|zone| {
-            let zone_text = zone.text.trim();
-            content.contains(zone_text) || zone_text.contains(content)
-        })
-        .max_by_key(|zone| (zone.start_y, zone.start_x))
-        .map(|zone| semantic_zone_type_label(zone.semantic_type))
-        .or_else(|| {
-            snapshot
-                .zones
-                .iter()
-                .filter(|zone| zone.semantic_type == MuxSemanticZoneKind::Output)
-                .max_by_key(|zone| (zone.start_y, zone.start_x))
-                .map(|zone| semantic_zone_type_label(zone.semantic_type))
-        })
+    // This is deliberately content correlation, not render-coordinate proof.
+    // Require the whole segment inside one unambiguous type. Partial matches,
+    // mixed zones and identical text in different types stay unclassified.
+    let mut matched_kind = None;
+    for zone in &snapshot.zones {
+        if !zone.text.contains(content) {
+            continue;
+        }
+        if matched_kind.is_some_and(|kind| kind != zone.semantic_type) {
+            return None;
+        }
+        matched_kind = Some(zone.semantic_type);
+    }
+    matched_kind.map(semantic_zone_type_label)
+}
+
+fn detection_zone_from_label(label: Option<&str>) -> Option<DetectionZone> {
+    match label? {
+        "prompt" => Some(DetectionZone::Prompt),
+        "input" => Some(DetectionZone::Input),
+        "output" => Some(DetectionZone::Output),
+        _ => None,
+    }
 }
 
 const fn semantic_zone_type_label(kind: MuxSemanticZoneKind) -> &'static str {
@@ -3514,24 +3519,7 @@ async fn admit_capture_event_for_persistence(
                 ),
             )
         })?;
-    let is_current = {
-        let publication = publication_rx.borrow();
-        publication
-            .observed_panes
-            .get(&event.segment.pane_id)
-            .is_some_and(|pane| {
-                (
-                    pane.pane_uuid.as_str(),
-                    pane.lifecycle_revision.get(),
-                    pane.revision,
-                ) == (
-                    metadata.pane_uuid.as_str(),
-                    metadata.discovery_generation,
-                    metadata.discovery_revision,
-                )
-            })
-    };
-    if !is_current {
+    if !capture_metadata_is_current(publication_rx, event.segment.pane_id, &metadata) {
         return Err(runtime_backend_error(
             "capture.persistence.admission",
             format!(
@@ -3543,6 +3531,28 @@ async fn admit_capture_event_for_persistence(
         ));
     }
     Ok((guard, metadata))
+}
+
+fn capture_metadata_is_current(
+    publication_rx: &watch::Receiver<DiscoveryCapturePublication>,
+    pane_id: u64,
+    metadata: &CapturePaneMetadata,
+) -> bool {
+    let publication = publication_rx.borrow();
+    publication
+        .observed_panes
+        .get(&pane_id)
+        .is_some_and(|pane| {
+            (
+                pane.pane_uuid.as_str(),
+                pane.lifecycle_revision.get(),
+                pane.revision,
+            ) == (
+                metadata.pane_uuid.as_str(),
+                metadata.discovery_generation,
+                metadata.discovery_revision,
+            )
+        })
 }
 
 const CAPTURE_AUTHORITY_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -10080,16 +10090,40 @@ impl ObservationRuntime {
                     incarnation_state.prepare_event_incarnation(pane_id, pane_incarnation);
                     let bounded_segment =
                         bounded_segment_for_persistence(&event.segment, max_persist_segment_bytes);
-                    let zone_type = semantic_zone_type_for_captured_segment(
+                    let scoped_detection_enabled =
+                        pattern_engine.read().await.has_zone_scoped_rules();
+                    let mut zone_type = semantic_zone_type_for_captured_segment(
                         &loop_cx,
                         &wezterm_handle,
                         &mut incarnation_state.semantic_zone_cache,
                         semantic_zone_cache_ttl,
                         &bounded_segment,
                         pane_incarnation,
-                        true,
+                        scoped_detection_enabled,
                     )
                     .await;
+                    let detection_zone = if scoped_detection_enabled {
+                        if capture_metadata_is_current(
+                            &discovery_publication_rx,
+                            pane_id,
+                            &capture_pane_metadata,
+                        ) && capture_authority
+                            .try_acquire_persistence(stamp, pane_id)
+                            .is_ok()
+                        {
+                            detection_zone_from_label(zone_type.as_deref())
+                        } else {
+                            // A live numeric pane lookup may now describe a
+                            // successor. Discard both the fresh stamp and cache.
+                            zone_type = None;
+                            incarnation_state
+                                .semantic_zone_cache
+                                .remove(&(pane_id, pane_incarnation));
+                            None
+                        }
+                    } else {
+                        None
+                    };
                     let recorder_delivery = match recorder_persistence.as_ref() {
                         Some(recorder) => match prepare_runtime_recorder_delivery(
                             recorder,
@@ -10130,6 +10164,7 @@ impl ObservationRuntime {
                         checkpoint_write,
                         resync_decision,
                         pane_incarnation,
+                        detection_zone,
                     ));
                 }
 
@@ -10177,6 +10212,7 @@ impl ObservationRuntime {
                         checkpoint_write,
                         mut resync_decision,
                         pane_incarnation,
+                        detection_zone,
                     ),
                     result,
                 ) in settled
@@ -10381,11 +10417,29 @@ impl ObservationRuntime {
                                     ctx.tail_buffer.clear();
                                 }
 
+                                // Content correlation has no stable zone ID
+                                // or render sequence. It cannot establish that
+                                // two deltas belong to the same semantic region.
+                                ctx.clear_zone_continuity();
+
                                 let detections = {
                                     let engine = pattern_engine.read().await;
-                                    engine.detect_with_context(
+                                    let detection_zone = detection_zone.filter(|_| {
+                                        capture_metadata_is_current(
+                                            &discovery_publication_rx,
+                                            pane_id,
+                                            &capture_pane_metadata,
+                                        ) && capture_authority
+                                            .try_acquire_persistence(
+                                                persistence_guard.stamp(),
+                                                pane_id,
+                                            )
+                                            .is_ok()
+                                    });
+                                    engine.detect_with_context_in_zone(
                                         bounded_segment.content.as_str(),
                                         &mut ctx,
+                                        detection_zone,
                                     )
                                 };
 
@@ -19056,6 +19110,78 @@ mod tests {
             infer_semantic_zone_type_for_segment(&captured, &snapshot),
             Some("output")
         );
+    }
+
+    #[test]
+    fn semantic_zone_inference_rejects_partial_mixed_ambiguous_and_unrelated_text() {
+        let mut captured = CapturedSegment {
+            pane_id: 9,
+            seq: 1,
+            seq_correction: 0,
+            content: String::new(),
+            kind: CapturedSegmentKind::Delta,
+            captured_at: 1_700_000_000_000,
+        };
+        let snapshot = MuxSemanticSnapshot {
+            zones: vec![
+                crate::wezterm::MuxSemanticZone {
+                    start_y: 0,
+                    start_x: 0,
+                    end_y: 0,
+                    end_x: 2,
+                    semantic_type: MuxSemanticZoneKind::Prompt,
+                    text: "$ ".to_string(),
+                },
+                crate::wezterm::MuxSemanticZone {
+                    start_y: 0,
+                    start_x: 2,
+                    end_y: 0,
+                    end_x: 12,
+                    semantic_type: MuxSemanticZoneKind::Input,
+                    text: "cargo test".to_string(),
+                },
+                crate::wezterm::MuxSemanticZone {
+                    start_y: 1,
+                    start_x: 0,
+                    end_y: 1,
+                    end_x: 17,
+                    semantic_type: MuxSemanticZoneKind::Output,
+                    text: "cargo test failed".to_string(),
+                },
+            ],
+            last_exit_code: Some(101),
+        };
+        for (text, expected) in [
+            ("cargo test failed\n", Some("output")),
+            ("$ ", Some("prompt")),
+            ("cargo test", None),
+            ("$ cargo test\ncargo test failed", None),
+            ("prefix cargo test failed", None),
+            (" cargo test failed", None),
+            ("unrelated error", None),
+            ("\n", None),
+        ] {
+            captured.content = text.to_string();
+            assert_eq!(
+                infer_semantic_zone_type_for_segment(&captured, &snapshot),
+                expected,
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_zone_detection_mapping_never_defaults_to_output() {
+        for (label, expected) in [
+            (Some("prompt"), Some(DetectionZone::Prompt)),
+            (Some("input"), Some(DetectionZone::Input)),
+            (Some("output"), Some(DetectionZone::Output)),
+            (Some("unknown"), None),
+            (Some(""), None),
+            (None, None),
+        ] {
+            assert_eq!(detection_zone_from_label(label), expected);
+        }
     }
 
     #[test]

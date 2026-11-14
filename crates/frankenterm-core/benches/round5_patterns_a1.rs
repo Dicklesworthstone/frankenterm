@@ -37,6 +37,7 @@ const M5_REPETITIONS: usize = 24;
 fn rule(id: String, event_type: &str, anchor: String, regex: Option<String>) -> RuleDef {
     RuleDef {
         id,
+        zone: None,
         agent_type: AgentType::Codex,
         event_type: event_type.to_string(),
         severity: Severity::Info,

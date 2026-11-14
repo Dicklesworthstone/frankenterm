@@ -8,6 +8,7 @@ mod tests {
     fn split_pattern_detection_fails_without_overlap() {
         // Define a rule that matches "Hello World"
         let rule = RuleDef {
+            zone: None,
             id: "codex.test.split_pattern".to_string(),
             agent_type: AgentType::Codex,
             event_type: "test".to_string(),

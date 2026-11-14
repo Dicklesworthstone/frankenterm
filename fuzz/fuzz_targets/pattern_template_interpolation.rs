@@ -137,6 +137,7 @@ fuzz_target!(|case: FuzzCase| {
     );
 
     let rule = RuleDef {
+        zone: None,
         id: case.rule_id,
         agent_type: case.agent_type,
         event_type: "fuzz.template".to_string(),

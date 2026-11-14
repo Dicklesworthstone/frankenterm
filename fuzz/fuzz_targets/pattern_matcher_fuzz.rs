@@ -177,6 +177,7 @@ fn build_rules(raw_rules: &[RawRule]) -> Vec<RuleDef> {
             let anchor = sanitize_anchor(&raw.anchor, "ANCHOR");
             let alt = sanitize_anchor(&raw.alt_anchor, &anchor);
             RuleDef {
+                zone: None,
                 id: format!("codex.matcher_fuzz_{idx}"),
                 agent_type: AgentType::Codex,
                 event_type: "usage.warning".to_string(),

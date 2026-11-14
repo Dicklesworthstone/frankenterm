@@ -1767,6 +1767,7 @@ mod tests {
             // ones.
             let rule = RuleDef {
                 id: "wezterm.workspace.ready".to_string(),
+                zone: None,
                 agent_type: AgentType::Wezterm,
                 event_type: "ready".to_string(),
                 severity: Severity::Info,
@@ -2088,6 +2089,7 @@ mod tests {
         let rt = test_runtime();
         let rule = RuleDef {
             id: "wezterm.error_detect".to_string(),
+            zone: None,
             agent_type: AgentType::Wezterm,
             event_type: "error".to_string(),
             severity: Severity::Warning,
@@ -2847,6 +2849,7 @@ mod tests {
         // Create a pattern engine with a test rule that matches "ERROR"
         let rule = RuleDef {
             id: "wezterm.error_detect".to_string(),
+            zone: None,
             agent_type: AgentType::Wezterm,
             event_type: "error".to_string(),
             severity: Severity::Warning,
@@ -3120,6 +3123,7 @@ mod tests {
                 let cx = crate::cx::Cx::current().expect("LabRuntime task should expose Cx");
                 let rule = RuleDef {
                     id: "wezterm.error_detect".to_string(),
+                    zone: None,
                     agent_type: AgentType::Wezterm,
                     event_type: "error".to_string(),
                     severity: Severity::Warning,

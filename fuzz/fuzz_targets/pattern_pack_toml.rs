@@ -166,6 +166,7 @@ impl RawRule {
 
         RuleDef {
             id: format!("{prefix}.generated_{index}"),
+            zone: None,
             agent_type,
             event_type: limited_text(self.event_type.clone(), "usage.warning"),
             severity: self.severity.to_severity(),

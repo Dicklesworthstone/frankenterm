@@ -128530,6 +128530,7 @@ printf x > "$MINISIGN_MARKER"
     fn make_rule_def(id: &str, workflow: Option<&str>) -> frankenterm_core::patterns::RuleDef {
         frankenterm_core::patterns::RuleDef {
             id: id.to_string(),
+            zone: None,
             agent_type: frankenterm_core::patterns::AgentType::Codex,
             event_type: "usage.warning".to_string(),
             severity: frankenterm_core::patterns::Severity::Warning,

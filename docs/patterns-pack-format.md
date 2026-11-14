@@ -70,6 +70,7 @@ A rule (Rust: `RuleDef`) has the following fields. `MUST` /
 | `severity` | enum | **MUST** | One of `info`, `warning`, `critical`. Serde rename is `snake_case`. |
 | `anchors` | array of string | **MUST** | Literal substrings used by the Aho-Corasick quick-reject pass. MUST include at least one non-empty anchor. |
 | `regex` | string | MAY | Optional extraction regex. Named captures (`(?P<name>...)`) are preferred; unnamed groups MAY be used but are not surfaced as `extracted` fields. |
+| `zone` | enum | MAY | Require `prompt`, `input`, or `output` semantic annotation. Missing, ambiguous, or different annotations suppress the rule. Omitted or null preserves unscoped matching. |
 | `description` | string | **MUST** | Human-readable description shown in `ft why <rule_id>` and the doctor pack listing. MUST be non-empty after trimming. |
 | `remediation` | string | MAY | Suggested remediation text. Surfaced in the rendered event template. If present, MUST be non-empty after trimming. |
 | `workflow` | string | MAY | Suggested workflow name to invoke (e.g. `handle_usage_limits`). If present, MUST be non-empty after trimming. |
@@ -82,6 +83,52 @@ the conformance gate enforces the JSON Schema `additionalProperties`
 contract: pack files MUST NOT carry unknown rule fields. CI treats
 unknown rule fields as a build failure even though the lower-level
 serde parser can still deserialize them.
+
+### Semantic-zone filters
+
+A rule can opt into OSC 133 zone filtering, for example:
+
+```yaml
+name: local:build
+version: "1.0.0"
+rules:
+  - id: wezterm.local_build_failure
+    agent_type: wezterm
+    event_type: build.failed
+    severity: critical
+    anchors: ["error: could not compile"]
+    zone: output
+    description: A compiler failure inside a shell output region.
+```
+
+Unscoped rules retain their existing matching, overlap, and deduplication
+behavior. Built-in rules remain unscoped. An output-scoped rule cannot match
+text annotated as prompt or input, or text without an annotation. A rejected
+zone does not consume the rule's deduplication key. Regex lookarounds and
+anchors are evaluated inside the annotated region, so they cannot borrow a
+prefix from a different or unknown zone.
+
+The live capture path currently correlates the **entire captured segment**
+with a fresh semantic-zone snapshot. It accepts a type only when a zone
+contains the whole segment and matching zones agree on the type. It strips
+only trailing CR/LF for that comparison. Partial or mixed segments, ambiguous
+types, unavailable snapshots, and failed capture-authority revalidation stay
+unclassified. Cached snapshots are never used to enable scoped detection.
+
+This correlation does not provide exact render-coordinate or command-origin
+proof. An agent's quoted error can itself appear inside shell output; this
+filter does not remove that false positive. It is an opt-in matching filter,
+not action authorization. Current snapshots also lack a stable zone identity,
+so the live path deliberately does not join scoped matches across captured
+segments. Rules spanning two live deltas may therefore be missed.
+
+Embedding callers can use `PatternEngine::detect_with_context_in_zone` and
+`detect_with_context_and_trace_in_zone` to supply a known zone. They must call
+`DetectionContext::clear_zone_continuity` at each new zone, discontinuity, or
+uncertain boundary, including a new zone with the same type. Contiguous input
+inside the same known zone can then match across segments. Context-free
+`detect` and the existing unannotated context/trace APIs suppress scoped
+rules; they never assume that arbitrary input is output.
 
 ## Submit profile fields
 

@@ -171,6 +171,7 @@ fn arb_rule_def() -> impl Strategy<Value = RuleDef> {
             };
             RuleDef {
                 id: format!("{}.test_rule", prefix),
+                zone: None,
                 agent_type,
                 event_type,
                 severity,
@@ -698,6 +699,7 @@ proptest! {
     fn prop_preview_command_interpolated(pane_id in 0u64..10000) {
         let rule = RuleDef {
             id: "codex.test_cmd".to_string(),
+            zone: None,
             agent_type: AgentType::Codex,
             event_type: "error".to_string(),
             severity: Severity::Warning,
@@ -731,6 +733,7 @@ proptest! {
     ) {
         let rule = RuleDef {
             id: rule_id.clone(),
+            zone: None,
             agent_type: AgentType::Codex,
             event_type: "error".to_string(),
             severity: Severity::Warning,
@@ -874,6 +877,7 @@ proptest! {
         let pack1 = PatternPack::new("builtin:core", "1.0.0", vec![
             RuleDef {
                 id: "codex.rule_a".to_string(),
+                zone: None,
                 agent_type: AgentType::Codex,
                 event_type: "error".to_string(),
                 severity: Severity::Warning,
@@ -890,6 +894,7 @@ proptest! {
         let pack2 = PatternPack::new("builtin:codex", "1.0.0", vec![
             RuleDef {
                 id: "codex.rule_b".to_string(),
+                zone: None,
                 agent_type: AgentType::Codex,
                 event_type: "warning".to_string(),
                 severity: Severity::Info,
@@ -915,6 +920,7 @@ proptest! {
         let pack = PatternPack::new("builtin:core", "1.0.0", vec![
             RuleDef {
                 id: "codex.zzz".to_string(),
+                zone: None,
                 agent_type: AgentType::Codex,
                 event_type: "error".to_string(),
                 severity: Severity::Warning,
@@ -929,6 +935,7 @@ proptest! {
             },
             RuleDef {
                 id: "codex.aaa".to_string(),
+                zone: None,
                 agent_type: AgentType::Codex,
                 event_type: "error".to_string(),
                 severity: Severity::Warning,
@@ -957,6 +964,7 @@ proptest! {
         let pack = PatternPack::new("builtin:core", "1.0.0", vec![
             RuleDef {
                 id: "codex.test_lookup".to_string(),
+                zone: None,
                 agent_type: AgentType::Codex,
                 event_type: "error".to_string(),
                 severity: Severity::Warning,
@@ -982,6 +990,7 @@ proptest! {
         let pack1 = PatternPack::new("builtin:core", "1.0.0", vec![
             RuleDef {
                 id: "codex.override_test".to_string(),
+                zone: None,
                 agent_type: AgentType::Codex,
                 event_type: "error".to_string(),
                 severity: Severity::Warning,
@@ -998,6 +1007,7 @@ proptest! {
         let pack2 = PatternPack::new("builtin:codex", "1.0.0", vec![
             RuleDef {
                 id: "codex.override_test".to_string(),
+                zone: None,
                 agent_type: AgentType::Codex,
                 event_type: "error".to_string(),
                 severity: Severity::Critical,
@@ -1314,6 +1324,7 @@ proptest! {
 fn make_anchor_only_rule(id: &str, anchor: &str) -> RuleDef {
     RuleDef {
         id: format!("codex.{}", id),
+        zone: None,
         agent_type: AgentType::Codex,
         event_type: "test.event".to_string(),
         severity: Severity::Info,

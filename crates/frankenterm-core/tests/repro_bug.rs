@@ -5,6 +5,7 @@ mod tests {
     #[test]
     fn detect_finds_multiple_occurrences() {
         let rule = RuleDef {
+            zone: None,
             id: "codex.test.multiple".to_string(),
             agent_type: AgentType::Codex,
             event_type: "test".to_string(),

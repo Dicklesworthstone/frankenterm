@@ -111,6 +111,7 @@ impl RawRule {
 
         RuleDef {
             id: format!("{}.streaming_{idx}", self.agent_type.rule_prefix()),
+            zone: None,
             agent_type,
             event_type: limit_text(&self.event_type, "usage.warning"),
             severity: self.severity.into_severity(),

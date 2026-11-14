@@ -13,6 +13,7 @@ rules:
       - "usage limit"
       - "Please try again"
     regex: 'usage limit for the (?P<window_hours>\d+)h window'
+    zone: output
     description: Codex hit its rolling-window quota.
     remediation: Wait for the quota to reset or rotate accounts.
     workflow: handle_usage_limits
