@@ -416,13 +416,18 @@ impl FcpDeliverySession {
         else {
             return Err(FcpDeliveryError::State("connector_cursor_unavailable"));
         };
-        let retention = self.storage.get_event_retention_snapshot_with_cx(cx).await?;
+        let retention = self
+            .storage
+            .get_event_retention_snapshot_with_cx(cx)
+            .await?;
         if cursor_epoch != self.cursor_epoch
             || retention.cursor_epoch != self.cursor_epoch
             || after_event_id <= self.cursor
             || after_event_id > retention.max_event_id
         {
-            return Err(FcpDeliveryError::State("connector_admission_cursor_invalid"));
+            return Err(FcpDeliveryError::State(
+                "connector_admission_cursor_invalid",
+            ));
         }
         let superseded = self
             .pending_admission
@@ -2967,7 +2972,8 @@ mod tests {
             let second_event = record_delivery_fixture_event(&storage).await;
             pending.source_event_id = second_event;
             pending.key = fcp_identity_hash(
-                &serde_json::to_string(&(&second.generation, second_event, &pending.rule_id)).unwrap(),
+                &serde_json::to_string(&(&second.generation, second_event, &pending.rule_id))
+                    .unwrap(),
             );
             pending.correlation_id = delivery_request_id();
             let expected = serde_json::to_value(&pending).unwrap();
@@ -3009,7 +3015,8 @@ mod tests {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let endpoint = format!("http://{}/", listener.local_addr().unwrap());
-            let (_temp, safety, storage, mut first) = delivery_session_fixture(&endpoint, 100).await;
+            let (_temp, safety, storage, mut first) =
+                delivery_session_fixture(&endpoint, 100).await;
             let cx = crate::cx::for_request();
             let mut second = FcpDeliverySession::open(
                 &cx,
@@ -3061,7 +3068,13 @@ mod tests {
         use crate::storage_backend_trait::{StorageBackend as _, ToSqlValue};
 
         crate::storage::run_storage_async_test(async {
-            for scenario in ["cursor_epoch", "source_epoch", "rewind", "unchanged", "future"] {
+            for scenario in [
+                "cursor_epoch",
+                "source_epoch",
+                "rewind",
+                "unchanged",
+                "future",
+            ] {
                 let (_temp, _safety, storage, mut session) =
                     delivery_session_fixture("http://127.0.0.1:1/", 100).await;
                 let cx = crate::cx::for_request();

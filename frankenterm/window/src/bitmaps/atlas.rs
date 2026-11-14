@@ -552,9 +552,7 @@ impl Sprite {
 mod tests {
     use super::*;
     use crate::bitmaps::resize_test_support::{legacy_resize, ReadOnlyResizeBitmap};
-    use crate::bitmaps::{
-        with_resize_allocation_failure, ImageTexture, ResizeAllocationStage,
-    };
+    use crate::bitmaps::{with_resize_allocation_failure, ImageTexture, ResizeAllocationStage};
     use crate::Image;
     use guillotiere::{SimpleAtlasAllocator, Size as LegacyAtlasSize};
     use std::cell::Cell;
@@ -658,7 +656,10 @@ mod tests {
             .expect_err("request must fail before placement or upload");
 
         assert_eq!(error.failure, failure);
-        assert_eq!(error.size, None, "non-capacity errors must not request growth");
+        assert_eq!(
+            error.size, None,
+            "non-capacity errors must not request growth"
+        );
         assert_eq!(error.current_size, atlas.side);
         assert_eq!(atlas.allocator.placements(), placements.as_slice());
         assert_eq!(atlas.packing_stats, stats);
@@ -860,7 +861,12 @@ mod tests {
             atlas.allocate(&seed).expect("seed actual atlas");
             control.allocate(&seed).expect("seed control atlas");
             let fixtures = [
-                ((0, 4), None, Some(2), AtlasAllocationFailure::InvalidDimensions),
+                (
+                    (0, 4),
+                    None,
+                    Some(2),
+                    AtlasAllocationFailure::InvalidDimensions,
+                ),
                 (
                     (usize::MAX, 2),
                     None,
@@ -908,7 +914,9 @@ mod tests {
                 assert!(!source.pixel_accessed.get());
             }
 
-            let next = atlas.allocate(&seed).expect("allocate after geometry errors");
+            let next = atlas
+                .allocate(&seed)
+                .expect("allocate after geometry errors");
             let expected = control.allocate(&seed).expect("control allocation");
             assert_eq!(next.coords, expected.coords);
             assert_eq!(next.version(), expected.version());

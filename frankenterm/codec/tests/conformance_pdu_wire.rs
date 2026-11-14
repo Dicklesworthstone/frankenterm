@@ -1392,7 +1392,9 @@ fn legacy46_cell_bearing_pdus_are_refused_in_both_directions() {
             pdu.encode_with_mode(&mut wire, 23, mode).unwrap();
             let error = Pdu::decode_for_dialect(wire.as_slice(), MuxWireDialect::LEGACY46)
                 .expect_err("cell-bearing bodies cannot be interpreted in the legacy dialect");
-            assert!(error.downcast_ref::<codec::PduEncodedBodyLimitExceeded>().is_some());
+            assert!(error
+                .downcast_ref::<codec::PduEncodedBodyLimitExceeded>()
+                .is_some());
 
             let mut stream = StreamingPduBuffer::from(wire);
             let before = stream.as_slice().to_vec();

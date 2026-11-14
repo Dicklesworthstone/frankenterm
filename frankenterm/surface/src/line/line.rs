@@ -272,11 +272,8 @@ impl LegacyCellTextLine {
                 // buffer would leave old terminal text in freed allocations.
                 let mut cells = Vec::with_capacity(legacy.cells.len());
                 for (cell, width) in legacy.cells.into_iter().zip(widths) {
-                    let restored = Cell::new_grapheme_with_width(
-                        &cell.text,
-                        usize::from(*width),
-                        cell.attrs,
-                    );
+                    let restored =
+                        Cell::new_grapheme_with_width(&cell.text, usize::from(*width), cell.attrs);
                     if restored.str() != cell.text.as_str() {
                         return Err("legacy semantic scrollback cell text is not exact");
                     }

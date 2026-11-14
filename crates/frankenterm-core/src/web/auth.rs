@@ -324,7 +324,7 @@ fn status(auth: Option<&WebSessionAuth>, grant: Option<&SessionGrant>) -> Respon
 /// public status, login and verified static assets. Generated OpenAPI routes
 /// pass through this same middleware in the pinned framework.
 #[derive(Clone)]
-pub(crate) struct SessionAuthMiddleware {
+pub struct SessionAuthMiddleware {
     auth: Option<WebSessionAuth>,
     public_assets: HashSet<String>,
     listener_port: Arc<AtomicU16>,
@@ -353,7 +353,7 @@ impl SessionAuthMiddleware {
                 || self.public_assets.contains(req.path()))
     }
 
-    fn login(&self, req: &Request) -> bool {
+    fn login(req: &Request) -> bool {
         req.method() == Method::Post && req.path() == "/auth/session"
     }
 
@@ -366,14 +366,14 @@ impl SessionAuthMiddleware {
             self.listener_port.load(Ordering::Acquire),
             self.public_read(req),
         )?;
-        if self.login(req) {
+        if Self::login(req) {
             check_login_body_size(req)?;
         }
         let digest = cookie_digest(req)?;
         let grant = auth
             .lookup(digest)?
             .filter(|grant| grant.0.origin == origin);
-        if grant.is_none() && !self.public_read(req) && !self.login(req) {
+        if grant.is_none() && !self.public_read(req) && !Self::login(req) {
             return Err(unauthorized());
         }
         if let Some(grant) = grant.as_ref() {
@@ -395,7 +395,7 @@ impl SessionAuthMiddleware {
         // A storage query can outlive logout or expiry. Never hand its result
         // to the transport based only on the admission-time decision.
         let response = if !self.public_read(req)
-            && !self.login(req)
+            && !Self::login(req)
             && !(req.method() == Method::Delete && req.path() == "/auth/session")
             && req
                 .get_extension::<SessionGrant>()
@@ -755,6 +755,14 @@ mod tests {
         }
     }
 
+    fn header<'a>(response: &'a Response, name: &str) -> Option<&'a [u8]> {
+        response
+            .headers()
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_slice())
+    }
+
     #[test]
     fn credential_and_limit_validation_fail_closed_without_secret_diagnostics() {
         for credential in [
@@ -1045,7 +1053,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert!(!body(&response).to_string().contains("private-query-result"));
         assert_eq!(
-            response.headers().get("cache-control"),
+            header(&response, "cache-control"),
             Some(b"no-store".as_slice())
         );
     }
@@ -1083,7 +1091,7 @@ mod tests {
         ));
         let response = handle_login(&mut req);
         assert_eq!(response.status(), StatusCode::OK);
-        let cookie = std::str::from_utf8(response.headers().get("set-cookie").unwrap()).unwrap();
+        let cookie = std::str::from_utf8(header(&response, "set-cookie").unwrap()).unwrap();
         assert!(cookie.contains("; Path=/; HttpOnly; SameSite=Strict; Max-Age=3600"));
         assert!(!cookie.contains("Domain="));
         assert!(!cookie.contains(SECRET));

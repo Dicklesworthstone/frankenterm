@@ -1691,8 +1691,15 @@ mod tests {
             ..MuxPoolConfig::default()
         });
         assert_eq!(pool.circuit_socket_path(), Some(expected.as_path()));
-        assert_eq!(pool.mux_config.socket_path.as_deref(), Some(expected.as_path()));
-        assert!(MuxPool::new(MuxPoolConfig::default()).circuit_socket_path().is_none());
+        assert_eq!(
+            pool.mux_config.socket_path.as_deref(),
+            Some(expected.as_path())
+        );
+        assert!(
+            MuxPool::new(MuxPoolConfig::default())
+                .circuit_socket_path()
+                .is_none()
+        );
     }
 
     /// Test-only maintenance helpers. The production pool deliberately exposes

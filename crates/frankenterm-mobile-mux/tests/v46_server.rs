@@ -426,7 +426,10 @@ fn a_refused_history_fetch_recovers_after_a_bounded_render_retry() {
             .iter()
             .all(|event| !matches!(event, Event::Failed { .. }))
     );
-    let due = harness.session.next_input_wake_ns().expect("bounded render retry");
+    let due = harness
+        .session
+        .next_input_wake_ns()
+        .expect("bounded render retry");
     assert!(harness.session.advance_time(due));
     harness.pump();
     assert!(harness.session.is_ready());
@@ -918,7 +921,12 @@ fn legacy_servers_keep_metadata_and_input_without_requesting_a_view() {
         harness.server.min_supported = version;
         harness.pump();
         assert!(harness.session.is_ready(), "{:?}", harness.events);
-        assert!(harness.events.iter().any(|event| matches!(event, Event::Panes(_))));
+        assert!(
+            harness
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Panes(_)))
+        );
         let pane = harness.server.pane_id;
         harness.session.write(pane, b"hello\r");
         harness.session.paste(pane, "legacy paste");
@@ -959,14 +967,20 @@ fn legacy_cell_bearing_frames_are_refused_before_their_body_is_decoded() {
             assert!(harness.session.is_ready());
             harness.events.clear();
             let private_body = b"not serialized cells: private terminal contents";
-            harness.session.receive(&server_frame(ident, 0, private_body, compress));
+            harness
+                .session
+                .receive(&server_frame(ident, 0, private_body, compress));
             harness.pump();
             assert!(!harness.session.is_ready(), "PDU {ident}");
             assert_eq!(harness.outputs, 0);
-            let reason = harness.events.iter().find_map(|event| match event {
-                Event::Failed { reason } => Some(reason),
-                _ => None,
-            }).expect("an explicit legacy rendering refusal");
+            let reason = harness
+                .events
+                .iter()
+                .find_map(|event| match event {
+                    Event::Failed { reason } => Some(reason),
+                    _ => None,
+                })
+                .expect("an explicit legacy rendering refusal");
             assert!(
                 reason.contains("legacy mux rendering cannot preserve cell widths")
                     && reason.contains("75"),

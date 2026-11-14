@@ -32330,8 +32330,7 @@ mod test {
             encode_raw(ident, 19, &[], false, &mut wire).unwrap();
             let decoded = Pdu::decode_for_dialect(wire.as_slice(), MuxWireDialect::LEGACY46)
                 .expect("an empty unsupported frame has no body to interpret");
-            let (_, MuxWireDecodedPayload::Unsupported(unsupported)) = decoded.into_parts()
-            else {
+            let (_, MuxWireDecodedPayload::Unsupported(unsupported)) = decoded.into_parts() else {
                 panic!("legacy cell-bearing PDU must not expose a current body");
             };
             assert_eq!(unsupported.ident(), ident);
@@ -32407,12 +32406,7 @@ mod test {
         }
 
         let decode = |bytes: &[u8], compressed| {
-            deserialize_exact_payload_with_limit::<Cell>(
-                bytes,
-                compressed,
-                "ExactWidthCell",
-                4096,
-            )
+            deserialize_exact_payload_with_limit::<Cell>(bytes, compressed, "ExactWidthCell", 4096)
         };
         for width in [0, 1, 2] {
             let raw = RawCell {

@@ -711,6 +711,9 @@ pub fn ensure_default_circuits() {
 #[must_use]
 pub fn circuit_snapshots() -> Vec<CircuitBreakerSnapshot> {
     let registry = CIRCUIT_REGISTRY.get_or_init(|| RwLock::new(BTreeMap::new()));
+    // Collected so both registry locks are released before any breaker lock
+    // is taken below; chaining the iterators would hold them across it.
+    #[allow(clippy::needless_collect)]
     let mut circuits: Vec<_> = registry
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

@@ -1344,8 +1344,7 @@ fn line_replies_preserve_widths_that_differ_from_the_receivers_unicode_rules() {
             MuxWireDialect::current(codec::CODEC_VERSION).expect("current dialect"),
         )
         .expect("desktop accepts width-bearing line replies");
-        let MuxWireDecodedPayload::Pdu(Pdu::GetLinesResponse(desktop)) = decoded.payload()
-        else {
+        let MuxWireDecodedPayload::Pdu(Pdu::GetLinesResponse(desktop)) = decoded.payload() else {
             panic!("expected line response");
         };
         let mut reader = frame::FrameReader::default();
@@ -1363,7 +1362,11 @@ fn line_replies_preserve_widths_that_differ_from_the_receivers_unicode_rules() {
         {
             let mobile_cell = line.visible_cells().next().expect("mobile cell");
             let desktop_cell = desktop_line.visible_cells().next().expect("desktop cell");
-            assert_eq!((mobile_cell.str(), mobile_cell.width()), (text, width), "row {row}");
+            assert_eq!(
+                (mobile_cell.str(), mobile_cell.width()),
+                (text, width),
+                "row {row}"
+            );
             assert_eq!(
                 (desktop_cell.str(), desktop_cell.width()),
                 (text, width),
@@ -1392,9 +1395,7 @@ fn links_come_back_on_the_cells_the_desktop_puts_them_on() {
     let response = render_changes(&mut term);
     let body = varbincode::serialize(&response).expect("serialize");
     let bytes = server_frame(25, 0, &body, false);
-    let dialects = [
-        MuxWireDialect::current(codec::CODEC_VERSION).expect("the current dialect"),
-    ];
+    let dialects = [MuxWireDialect::current(codec::CODEC_VERSION).expect("the current dialect")];
     for dialect in dialects {
         let decoded =
             Pdu::decode_for_dialect(bytes.as_slice(), dialect).expect("the desktop decodes it");

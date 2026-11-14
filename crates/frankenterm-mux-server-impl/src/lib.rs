@@ -25687,7 +25687,10 @@ mod tests {
         assert_eq!(cells.len(), 3);
         assert_eq!((cells[0].str(), cells[0].width()), ("abcdefgh", 1));
         assert_eq!((cells[1].str(), cells[1].width()), ("A", 2));
-        assert!(cells[2].attrs().italic(), "hidden spacer attributes survive");
+        assert!(
+            cells[2].attrs().italic(),
+            "hidden spacer attributes survive"
+        );
         assert_eq!(
             serialize_cell_semantic_scrollback_line(&restored).unwrap(),
             original_bytes,

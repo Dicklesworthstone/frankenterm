@@ -571,7 +571,11 @@ impl Server {
                     if self.codec_vers <= 47 {
                         self.reply(0, serial, &"Error: no such pane".to_owned());
                     } else {
-                        self.reply(0, serial, &codec::ErrorResponse::pane_not_found(22, pane_id));
+                        self.reply(
+                            0,
+                            serial,
+                            &codec::ErrorResponse::pane_not_found(22, pane_id as u64),
+                        );
                     }
                     return;
                 }

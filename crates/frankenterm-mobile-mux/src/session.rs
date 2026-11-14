@@ -9,8 +9,9 @@ use crate::search::{ContextLine, SearchJob, SearchMatch, SearchQuery};
 use crate::wire::{
     self, CodecVersion, CoherentOutcome, Dialect, GetCodecVersion, GetLines, GetPaneRenderChanges,
     LinesResponse, ListPanes, ListPanesCoherent, ListPanesCoherentResponse, LivenessResponse,
-    MouseButton, MouseEvent, MouseEventKind, PaneList, PaneRemoved, Resize, SearchResults, SearchScrollback, SendKeyDown, SendMouseEvent, SendPaste,
-    StableRowIndex, TerminalSize, TopologyChange, TopologyEvent, WriteToPane, ident,
+    MouseButton, MouseEvent, MouseEventKind, PaneList, PaneRemoved, Resize, SearchResults,
+    SearchScrollback, SendKeyDown, SendMouseEvent, SendPaste, StableRowIndex, TerminalSize,
+    TopologyChange, TopologyEvent, WriteToPane, ident,
 };
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet, VecDeque};

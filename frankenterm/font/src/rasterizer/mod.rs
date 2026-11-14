@@ -187,10 +187,18 @@ mod tests {
         for (width, height) in [(1, 1), (1, 7), (9, 1), (5, 4)] {
             let mut image = ImageBuffer::from_pixel(width, height, Rgba([7, 13, 29, 127]));
             let glyph = rasterize_bgra_image(&mut image, -3.0, 9.0, true, false);
-            assert_eq!((glyph.width, glyph.height), (width as usize, height as usize));
+            assert_eq!(
+                (glyph.width, glyph.height),
+                (width as usize, height as usize)
+            );
             assert_eq!(glyph.bearing_x.get(), -3.0);
             assert_eq!(glyph.bearing_y.get(), 9.0);
-            assert!(glyph.data.chunks_exact(4).all(|p| p == [29, 13, 7, 127]));
+            assert!(glyph
+                .data
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| *p == [29, 13, 7, 127]));
             assert!(glyph.has_color);
             assert!(!glyph.is_scaled);
         }
@@ -264,7 +272,10 @@ mod tests {
         for (width, height) in [(0, 0), (0, 3), (4, 0), (4, 3)] {
             let mut image = ImageBuffer::from_pixel(width, height, Rgba([0, 0, 0, 0]));
             let glyph = rasterize_bgra_image(&mut image, 2.0, -4.0, false, true);
-            assert_eq!((glyph.width, glyph.height), (width as usize, height as usize));
+            assert_eq!(
+                (glyph.width, glyph.height),
+                (width as usize, height as usize)
+            );
             assert_eq!(glyph.bearing_x.get(), 2.0);
             assert_eq!(glyph.bearing_y.get(), -4.0);
             assert_eq!(glyph.data, vec![0; width as usize * height as usize * 4]);

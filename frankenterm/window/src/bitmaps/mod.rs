@@ -649,10 +649,7 @@ fn resize_allocation_checkpoint(stage: ResizeAllocationStage) -> Result<(), Imag
 }
 
 #[cfg(test)]
-fn with_resize_allocation_failure<T>(
-    stage: ResizeAllocationStage,
-    run: impl FnOnce() -> T,
-) -> T {
+fn with_resize_allocation_failure<T>(stage: ResizeAllocationStage, run: impl FnOnce() -> T) -> T {
     struct Restore(Option<ResizeAllocationStage>);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -868,7 +865,7 @@ mod resize_test_support {
     impl ReadOnlyResizeBitmap {
         pub(super) fn new(width: usize, height: usize) -> Self {
             let mut image = Image::new(width, height);
-            for (index, pixel) in image.data.chunks_exact_mut(4).enumerate() {
+            for (index, pixel) in image.data.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 pixel.copy_from_slice(&[
                     (index * 17 + 3) as u8,
                     (index * 29 + 5) as u8,
@@ -1033,7 +1030,11 @@ mod tests {
             ((1, 0), (1, 1), ImageResizeError::InvalidDimensions),
             ((1, 1), (0, 1), ImageResizeError::InvalidDimensions),
             ((1, 1), (1, 0), ImageResizeError::InvalidDimensions),
-            ((usize::MAX, 2), (1, 1), ImageResizeError::ArithmeticOverflow),
+            (
+                (usize::MAX, 2),
+                (1, 1),
+                ImageResizeError::ArithmeticOverflow,
+            ),
             (
                 (isize::MAX as usize / 4 + 1, 1),
                 (1, 1),

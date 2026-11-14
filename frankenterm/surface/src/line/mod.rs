@@ -7,10 +7,10 @@ mod test;
 mod vecstorage;
 
 pub use cellref::CellRef;
-#[cfg(feature = "use_serde")]
-pub use line::LegacyCellTextLine;
 #[doc(hidden)]
 pub use clusterline::clustered_append_breaks;
+#[cfg(feature = "use_serde")]
+pub use line::LegacyCellTextLine;
 pub use line::{
     DoubleClickRange, Line, LineWrapGeometry, LineWrapGeometryJoinError, LineWrapLayout,
     LineWrapReport, LineWrapScorecard, LineWrapWidthPrefixScratch, MonospaceKpCostModel,

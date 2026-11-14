@@ -433,7 +433,7 @@ mod web_tests {
             .await
             .unwrap();
             let addr = server.bound_addr();
-            let scenario = timeout(Duration::from_secs(12), async {
+            let scenario = Box::pin(timeout(Duration::from_secs(12), async {
                 for path in [
                     "/panes",
                     "/events",
@@ -533,7 +533,7 @@ mod web_tests {
                 let response = fetch_raw(addr, stale.as_bytes()).await?;
                 ensure!(extract_status(&response) == 401, "logged-out token revoked");
                 Ok::<_, anyhow::Error>(())
-            })
+            }))
             .await;
             server.shutdown().await.unwrap();
             storage.shutdown().await.unwrap();
@@ -604,7 +604,7 @@ mod web_tests {
             .await
             .unwrap();
             let addr = server.bound_addr();
-            let scenario = timeout(Duration::from_secs(8), async {
+            let scenario = Box::pin(timeout(Duration::from_secs(8), async {
                 let cookie = login_viewer(addr, None).await?;
                 let epoch = viewer_session_epoch(addr, &cookie).await?;
                 let mut streams = Vec::new();
@@ -652,7 +652,7 @@ mod web_tests {
                     "old stream cookie cannot reconnect"
                 );
                 Ok::<_, anyhow::Error>(())
-            })
+            }))
             .await;
             server.shutdown().await.unwrap();
             storage.shutdown().await.unwrap();
