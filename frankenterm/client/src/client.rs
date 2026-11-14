@@ -4325,6 +4325,26 @@ impl ClientDispatchAuthority {
         };
         Ok(current.is_current().then_some(current))
     }
+
+    /// Resolve authority afresh at every wait/dial boundary. Retaining a
+    /// dispatch across a backoff or a blocking dial would keep its Client
+    /// sender alive and hide the owner's destruction from the receiver.
+    fn reconnect_is_current(
+        &self,
+        receiver: &Receiver<ReaderMessage>,
+        authorized: &AtomicBool,
+    ) -> bool {
+        if receiver.is_closed() || !authorized.load(AtomicOrdering::Acquire) {
+            return false;
+        }
+        match self.resolve_current() {
+            Ok(current) => current.is_some(),
+            Err(err) => {
+                log::error!("cannot resolve mux client reconnect authority: {err:#}");
+                false
+            }
+        }
+    }
 }
 
 impl CurrentClientDispatch {
@@ -10440,24 +10460,66 @@ fn reconnect_ui_for_outage(
     slot.get_or_insert_with(open)
 }
 
-/// Enforce reconnect cadence independently of the optional rendering UI.
+enum ReconnectBackoff {
+    Elapsed(Option<anyhow::Error>),
+    Retired,
+}
+
+const RECONNECT_RETIREMENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Enforce reconnect cadence independently of the optional rendering UI,
+/// while allowing a detached or replaced owner to retire during that wait.
 ///
 /// A connection window can be closed by the operator or can lose its render
 /// task.  In that case `ConnectionUI::sleep_with_reason` fails immediately;
 /// treating the UI as the timer would turn the default unbounded retry policy
-/// into a tight dial loop.  Measure the UI attempt and park the reconnect OS
-/// thread for any remaining interval on both success and failure.
+/// into a tight dial loop. Measure the UI attempt and park the reconnect OS
+/// thread for any remaining interval on both success and failure, checking
+/// retirement between bounded waits. The UI wait must also poll `is_current`
+/// rather than depending on its renderer to answer before it can retire.
 fn wait_for_reconnect_backoff(
     duration: Duration,
-    ui_sleep: impl FnOnce(Duration) -> anyhow::Result<()>,
-) -> Option<anyhow::Error> {
-    let started = std::time::Instant::now();
-    let result = ui_sleep(duration);
-    let remaining = duration.saturating_sub(started.elapsed());
-    if !remaining.is_zero() {
-        std::thread::sleep(remaining);
+    mut is_current: impl FnMut() -> bool,
+    ui_sleep: impl FnOnce(Duration, &mut dyn FnMut() -> bool) -> anyhow::Result<bool>,
+) -> ReconnectBackoff {
+    if !is_current() {
+        return ReconnectBackoff::Retired;
     }
-    result.err()
+    let started = std::time::Instant::now();
+    let ui_error = match ui_sleep(duration, &mut is_current) {
+        Ok(false) => return ReconnectBackoff::Retired,
+        result => result.err(),
+    };
+    loop {
+        if !is_current() {
+            return ReconnectBackoff::Retired;
+        }
+        let remaining = duration.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return ReconnectBackoff::Elapsed(ui_error);
+        }
+        std::thread::sleep(remaining.min(RECONNECT_RETIREMENT_POLL_INTERVAL));
+    }
+}
+
+/// A synchronous dial cannot be interrupted once it starts. Fence both
+/// boundaries instead: never start another attempt for a retired owner, and
+/// discard even a successful connection if retirement won during the dial.
+/// In particular, it must never reach RPC activation or topology reattach.
+fn reconnect_if_current(
+    reconnectable: &mut Reconnectable,
+    mut is_current: impl FnMut() -> bool,
+    connect: impl FnOnce(&mut Reconnectable) -> anyhow::Result<()>,
+) -> Option<anyhow::Result<()>> {
+    if !is_current() {
+        return None;
+    }
+    let result = connect(reconnectable);
+    if !is_current() {
+        drop(reconnectable.take_stream());
+        return None;
+    }
+    Some(result)
 }
 
 impl Client {
@@ -10548,6 +10610,7 @@ impl Client {
                 // When the current outage began; it bounds a plain local
                 // socket's redialing to local_mux_restart_grace.
                 let mut outage_started: Option<std::time::Instant> = None;
+                let mut reconnect_retired = false;
                 loop {
                     let session_started = std::time::Instant::now();
                     let (thread_result, returned_reconnectable, returned_receiver) = client_thread(
@@ -10707,22 +10770,43 @@ impl Client {
                         let mut ui_backoff_failure_reported = false;
                         loop {
                             let reason = format!("client disconnected {}; will reconnect", e);
-                            if let Some(ui_error) =
-                                wait_for_reconnect_backoff(backoff, |delay| {
-                                    ui.sleep_with_reason(&reason, delay)
-                                })
-                            {
-                                if !ui_backoff_failure_reported {
+                            let is_current = || {
+                                reconnect_dispatch_authority
+                                    .reconnect_is_current(&receiver, &reconnect_authorization)
+                            };
+                            match wait_for_reconnect_backoff(
+                                backoff,
+                                is_current,
+                                |delay, keep_waiting| {
+                                    ui.sleep_with_reason_while(&reason, delay, keep_waiting)
+                                },
+                            ) {
+                                ReconnectBackoff::Retired => {
+                                    reconnect_retired = true;
+                                    break;
+                                }
+                                ReconnectBackoff::Elapsed(Some(ui_error))
+                                    if !ui_backoff_failure_reported =>
+                                {
                                     ui_backoff_failure_reported = true;
                                     log::warn!(
                                         "reconnect UI is unavailable for domain {local_domain_id}; \
                                          continuing with mandatory non-UI backoff: {ui_error:#}"
                                     );
                                 }
+                                ReconnectBackoff::Elapsed(_) => {}
                             }
                             let initial = false;
                             let no_auto_start = true; // Don't auto-start on a reconnect
-                            match reconnectable.connect(initial, ui, no_auto_start) {
+                            let Some(result) = reconnect_if_current(
+                                &mut reconnectable,
+                                is_current,
+                                |connection| connection.connect(initial, ui, no_auto_start),
+                            ) else {
+                                reconnect_retired = true;
+                                break;
+                            };
+                            match result {
                                 Ok(_) => {
                                     if let Err(err) =
                                         reconnect_dispatch_authority.activate_rpc_transport()
@@ -10888,7 +10972,12 @@ impl Client {
                             }
                         }
                         if !reconnected {
-                            if restart_grace_exhausted {
+                            if reconnect_retired {
+                                log::debug!(
+                                    "reconnect owner retired for domain {local_domain_id}; \
+                                     closing its reconnect worker"
+                                );
+                            } else if restart_grace_exhausted {
                                 log::error!(
                                     "giving up on domain {local_domain_id}: its local mux did \
                                      not come back within {restart_grace:?} \
@@ -10915,7 +11004,16 @@ impl Client {
                 // session. That window's pane keeps the GUI up to show it, and
                 // for the auto-connect supervisor to reopen the domain.
                 if let Some(ui) = &reconnect_ui {
-                    ui.show_held_text(RECONNECT_UI_SHOW_WAIT);
+                    if reconnect_retired
+                        || !reconnect_dispatch_authority
+                            .reconnect_is_current(&receiver, &reconnect_authorization)
+                    {
+                        // Detach/reconfiguration is an intentional end. Do not
+                        // turn a retired outage into a new connection window.
+                        ui.close();
+                    } else {
+                        ui.show_held_text(RECONNECT_UI_SHOW_WAIT);
+                    }
                 }
                 reconnect_dispatch_authority
                     .close_rpc_transport(&receiver, "mux client reconnect loop terminated");
@@ -12516,10 +12614,13 @@ mod tests {
     fn reconnect_backoff_cannot_be_bypassed_by_a_closed_ui() {
         let delay = Duration::from_millis(20);
         let started = std::time::Instant::now();
-        let error = wait_for_reconnect_backoff(delay, |_| {
-            anyhow::bail!("planted disconnected connection UI")
-        })
-        .expect("the planted UI failure is retained for diagnostics");
+        let ReconnectBackoff::Elapsed(Some(error)) = wait_for_reconnect_backoff(
+            delay,
+            || true,
+            |_, _| anyhow::bail!("planted disconnected connection UI"),
+        ) else {
+            panic!("the planted UI failure is retained for diagnostics");
+        };
 
         assert!(error.to_string().contains("disconnected connection UI"));
         assert!(
@@ -12532,11 +12633,111 @@ mod tests {
     fn reconnect_backoff_does_not_trust_an_early_successful_ui_reply() {
         let delay = Duration::from_millis(20);
         let started = std::time::Instant::now();
-        assert!(wait_for_reconnect_backoff(delay, |_| Ok(())).is_none());
+        assert!(matches!(
+            wait_for_reconnect_backoff(delay, || true, |_, _| Ok(true)),
+            ReconnectBackoff::Elapsed(None)
+        ));
         assert!(
             started.elapsed() >= delay,
             "the reconnect worker owns the minimum delay even if a UI replies early"
         );
+    }
+
+    #[test]
+    fn retired_reconnect_does_not_start_a_countdown_or_a_dial() {
+        assert!(matches!(
+            wait_for_reconnect_backoff(
+                Duration::from_secs(600),
+                || false,
+                |_, _| panic!("a retired owner must not contact its connection UI"),
+            ),
+            ReconnectBackoff::Retired
+        ));
+        let mut reconnectable =
+            Reconnectable::new(ClientDomainConfig::Unix(UnixDomain::default()), None);
+        assert!(reconnect_if_current(
+            &mut reconnectable,
+            || false,
+            |_| panic!("a retired owner must not dial or spawn a proxy command"),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn dropping_the_last_client_sender_interrupts_non_ui_backoff() {
+        let (sender, receiver) = unbounded::<ReaderMessage>();
+        let (entered, waiting) = std::sync::mpsc::channel();
+        let (finished, result) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let backoff = wait_for_reconnect_backoff(
+                Duration::from_secs(600),
+                || !receiver.is_closed(),
+                |_, _| {
+                    entered.send(()).expect("announce the fallback wait");
+                    anyhow::bail!("the operator closed the connection window")
+                },
+            );
+            finished
+                .send(matches!(backoff, ReconnectBackoff::Retired))
+                .expect("report worker retirement");
+        });
+        waiting
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the worker enters its long retry backoff");
+        drop(sender);
+        assert!(result
+            .recv_timeout(Duration::from_secs(2))
+            .expect("dropping the client must not wait for the 10-minute backoff"));
+        worker.join().expect("the retired worker exits");
+    }
+
+    #[test]
+    fn a_successful_dial_after_retirement_drops_its_transport() {
+        let authorized = AtomicBool::new(true);
+        let state = ScriptedTransportState::new();
+        let mut reconnectable =
+            Reconnectable::new(ClientDomainConfig::Unix(UnixDomain::default()), None);
+        let result = reconnect_if_current(
+            &mut reconnectable,
+            || authorized.load(Ordering::Acquire),
+            |connection| {
+                connection.stream = Some(Box::new(ScriptedTransport {
+                    boundary: ScriptedFailureBoundary::AwaitingResponseEof,
+                    state: Arc::clone(&state),
+                }));
+                // A synchronous dial can finish after detach has revoked its
+                // owner. It must never expose that success to RPC activation.
+                authorized.store(false, Ordering::Release);
+                Ok(())
+            },
+        );
+
+        assert!(result.is_none());
+        assert!(reconnectable.stream.is_none());
+        assert_eq!(Arc::strong_count(&state), 1, "the new stream was dropped");
+        assert!(state.transcript().is_empty(), "no successor RPC was sent");
+    }
+
+    #[test]
+    fn a_current_reconnect_keeps_its_successful_transport() {
+        let state = ScriptedTransportState::new();
+        let mut reconnectable =
+            Reconnectable::new(ClientDomainConfig::Unix(UnixDomain::default()), None);
+        reconnect_if_current(
+            &mut reconnectable,
+            || true,
+            |connection| {
+                connection.stream = Some(Box::new(ScriptedTransport {
+                    boundary: ScriptedFailureBoundary::AwaitingResponseEof,
+                    state: Arc::clone(&state),
+                }));
+                Ok(())
+            },
+        )
+        .expect("the exact owner still authorizes the result")
+        .expect("the connection succeeded");
+        assert!(reconnectable.stream.is_some());
+        assert_eq!(Arc::strong_count(&state), 2);
     }
 
     #[test]
@@ -22422,6 +22623,56 @@ mod tests {
             .expect("captured mux owner should remain alive");
         assert!(Arc::ptr_eq(&captured, &origin_mux));
         assert!(!Arc::ptr_eq(&captured, &replacement_mux));
+    }
+
+    #[test]
+    fn reconnect_requires_the_exact_authorized_owner_and_successor_generation() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let domain_id = 91_431;
+        let config = ClientDomainConfig::Unix(UnixDomain::default());
+        let (client, peer) = Client::new_test_client_with_rpc_peer(Some(domain_id), config);
+        let authority = client.test_dispatch_authority(Arc::downgrade(&mux));
+        let authorized = Arc::clone(&client.domain_reconnect_authorized);
+        let inner = Arc::new(ClientInner::new(domain_id, client, None, None, false));
+        let domain = ClientDomain::register_attached_for_test(&mux, &inner);
+
+        assert!(!authority.reconnect_is_current(&peer.receiver, &authorized));
+        inner.client.authorize_domain_reconnect();
+        assert!(authority.reconnect_is_current(&peer.receiver, &authorized));
+
+        let successor = authority
+            .advance_generation(&peer.receiver)
+            .expect("retire the failed transport and publish its exact successor");
+        assert!(!authority.reconnect_is_current(&peer.receiver, &authorized));
+        assert!(successor.reconnect_is_current(&peer.receiver, &authorized));
+        assert!(
+            !successor.rpc_generation_is_live(),
+            "the successor can redial without prematurely activating RPCs"
+        );
+
+        inner.client.revoke_domain_reconnect();
+        assert!(!successor.reconnect_is_current(&peer.receiver, &authorized));
+        inner.client.authorize_domain_reconnect();
+        assert!(successor.reconnect_is_current(&peer.receiver, &authorized));
+
+        let replacement_mux = Arc::new(Mux::new(None));
+        scope.set_mux(&replacement_mux);
+        assert!(
+            successor.reconnect_is_current(&peer.receiver, &authorized),
+            "reconnect resolves its captured mux rather than the process-global replacement"
+        );
+        let registered = mux
+            .get_domain(domain_id)
+            .expect("the exact owner remains registered");
+        assert!(mux.domain_was_detached_if_guard(&registered));
+        assert!(
+            !successor.reconnect_is_current(&peer.receiver, &authorized),
+            "a retired registration cannot redial even while its client and sender are retained"
+        );
+        drop(registered);
+        drop(domain);
     }
 
     #[test]

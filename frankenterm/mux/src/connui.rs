@@ -620,7 +620,27 @@ impl ConnectionUI {
     /// entering the shared asupersync runtime once per disconnected domain
     /// turns an otherwise idle retry fleet into a yield-heavy CPU loop.
     pub fn sleep_with_reason(&self, reason: &str, duration: Duration) -> anyhow::Result<()> {
+        self.sleep_with_reason_while(reason, duration, || true)
+            .map(|_| ())
+    }
+
+    /// Wait for the countdown only while its owner still authorizes it.
+    ///
+    /// A reconnect worker must be able to retire even when the window's
+    /// renderer is parked and cannot answer or observe a close request. The
+    /// callback is checked at most 50ms apart while waiting for that answer.
+    /// `false` means the caller retired; it should close its UI rather than
+    /// treating this as a completed backoff or a rendering failure.
+    pub fn sleep_with_reason_while(
+        &self,
+        reason: &str,
+        duration: Duration,
+        mut keep_waiting: impl FnMut() -> bool,
+    ) -> anyhow::Result<bool> {
         self.ensure_blocking_response_is_safe("sleep_with_reason")?;
+        if !keep_waiting() {
+            return Ok(false);
+        }
         let (respond, response) = bounded(1);
 
         self.tx
@@ -631,9 +651,21 @@ impl ConnectionUI {
             })
             .context("send to ConnectionUI failed")?;
 
-        response
-            .recv()
-            .context("ConnectionUI closed before completing sleep")?
+        loop {
+            if !keep_waiting() {
+                return Ok(false);
+            }
+            match response.recv_timeout(Duration::from_millis(50)) {
+                Ok(result) => {
+                    result?;
+                    return Ok(keep_waiting());
+                }
+                Err(err) if err.is_timeout() => {}
+                Err(err) => {
+                    return Err(err).context("ConnectionUI closed before completing sleep");
+                }
+            }
+        }
     }
 
     /// Crack a multi-line prompt into an optional preamble and the prompt
@@ -971,6 +1003,62 @@ mod tests {
         ui.sleep_with_reason("headless", Duration::ZERO)
             .expect("the headless worker owns its reply progress");
         ui.close();
+    }
+
+    #[test]
+    fn a_retired_countdown_does_not_enqueue_ui_work() {
+        let (tx, rx) = unbounded();
+        let ui = ConnectionUI {
+            tx,
+            response_requires_main_thread: false,
+            window_shown: Arc::new(AtomicBool::new(false)),
+        };
+        assert!(!ui
+            .sleep_with_reason_while("retired", Duration::from_secs(600), || false)
+            .expect("retirement is not a UI failure"));
+        assert!(rx.is_empty(), "retirement must not start a new countdown");
+    }
+
+    #[test]
+    fn retiring_a_countdown_does_not_wait_for_its_renderer() {
+        let (tx, rx) = unbounded();
+        let ui = ConnectionUI {
+            tx,
+            response_requires_main_thread: false,
+            window_shown: Arc::new(AtomicBool::new(false)),
+        };
+        let authorized = Arc::new(AtomicBool::new(true));
+        let worker_authorized = Arc::clone(&authorized);
+        let (finished, result) = bounded(1);
+        let worker = std::thread::spawn(move || {
+            let waited = ui.sleep_with_reason_while(
+                "waiting for an unavailable mux",
+                Duration::from_secs(600),
+                || worker_authorized.load(Ordering::Acquire),
+            );
+            ui.close();
+            finished.send(waited).expect("report countdown retirement");
+        });
+        let UIRequest::Sleep { respond, .. } = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the worker starts a countdown")
+        else {
+            panic!("expected a countdown request");
+        };
+        // Keep the renderer's reply sender alive but never answer it: even
+        // a paused GUI cannot hold the retired reconnect worker indefinitely.
+        authorized.store(false, Ordering::Release);
+        assert!(!result
+            .recv_timeout(Duration::from_secs(2))
+            .expect("retirement must interrupt the unanswered countdown")
+            .expect("retirement is distinct from a rendering error"));
+        assert!(respond.send(Ok(())).is_err());
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(2))
+                .expect("the owner closes its retired outage UI"),
+            UIRequest::Close
+        ));
+        worker.join().expect("the countdown owner exits");
     }
 
     /// An opener for a deferred UI whose "window" is a channel the test
