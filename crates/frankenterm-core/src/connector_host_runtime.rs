@@ -3105,7 +3105,9 @@ mod tests {
                     "future" => next_event + 1,
                     _ => next_event,
                 };
-                let foreign_epoch = fcp_identity_hash("different-event-history");
+                // An epoch is 16 random bytes in lowercase hex, and both the
+                // cursor and the retention tables CHECK that length.
+                let foreign_epoch = fcp_identity_hash("different-event-history")[..32].to_owned();
                 let epoch = if scenario == "cursor_epoch" {
                     &foreign_epoch
                 } else {
@@ -3124,13 +3126,27 @@ mod tests {
                     .unwrap()
                     .unwrap();
                 if scenario == "source_epoch" {
+                    // Rotate the retention epoch the one way its rotation
+                    // guard admits: authorized, with legacy history marked
+                    // incomplete and evidence restarting after the newest event.
+                    backend
+                        .execute(
+                            "INSERT INTO event_retention_rotation_authorizations (singleton)
+                             VALUES (1)",
+                        )
+                        .unwrap();
                     backend
                         .query_row_cells(
-                            "UPDATE event_retention_state SET cursor_epoch = ?1
+                            "UPDATE event_retention_state SET cursor_epoch = ?1,
+                                 legacy_history_complete = 0,
+                                 evidence_from_event_id = max_event_id + 1
                              WHERE singleton = 1 RETURNING singleton",
                             &[ToSqlValue::Text(&foreign_epoch)],
                         )
                         .unwrap()
+                        .unwrap();
+                    backend
+                        .execute("DELETE FROM event_retention_rotation_authorizations")
                         .unwrap();
                 }
 
