@@ -3838,10 +3838,18 @@ fn builtin_claude_code_pack() -> PatternPack {
                 agent_type: AgentType::ClaudeCode,
                 event_type: "auth.error".to_string(),
                 severity: Severity::Critical,
+                // Claude Code frames its API-key failures with a "·": "Your
+                // organization has disabled Claude subscription access for
+                // Claude Code · Use an Anthropic API key instead, or ask your
+                // admin to enable access" (2.1.281), and "Invalid API key ·
+                // Fix external API key" (claude -p, API status 401). A bare
+                // "API key" or "ANTHROPIC_API_KEY" is ordinary coding prose:
+                // 187 of the 191 hits in 461k Claude Code messages were
+                // prose, and handle_auth_required types a recovery prompt
+                // into the pane.
                 anchors: vec![
-                    "ANTHROPIC_API_KEY".to_string(),
-                    "API key".to_string(),
-                    "invalid api key".to_string(),
+                    "Invalid API key ·".to_string(),
+                    "Use an Anthropic API key instead".to_string(),
                 ],
                 regex: None,
                 description: "Claude Code API key authentication error".to_string(),
@@ -3896,6 +3904,14 @@ fn builtin_claude_code_pack() -> PatternPack {
                     // required · Sign in again to continue".
                     "Please run /login".to_string(),
                     "Sign in again to continue".to_string(),
+                    // Claude Code 2.1.296+: "Failed to authenticate: OAuth
+                    // session expired and could not be refreshed", "Failed to
+                    // authenticate. API Error: 401 OAuth access token has
+                    // expired. Re-authenticate to continue." and "... API
+                    // Error: 403 Attention Required! | Cloudflare". Framed
+                    // only: other tools print "Failed to authenticate <what>".
+                    "Failed to authenticate: OAuth".to_string(),
+                    "Failed to authenticate. API Error:".to_string(),
                 ],
                 regex: None,
                 description: "Claude Code login/authentication required via browser".to_string(),
@@ -8469,7 +8485,7 @@ rules:
     #[test]
     fn detect_claude_code_api_key_error() {
         let engine = PatternEngine::new();
-        let text = "Error: invalid api key - please check your ANTHROPIC_API_KEY";
+        let text = "Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic API key instead, or ask your admin to enable access";
         let detections = engine.detect(text);
         let detection = detections
             .iter()
@@ -8479,6 +8495,55 @@ rules:
             "Should match claude_code.auth.api_key_error"
         );
         assert_eq!(detection.unwrap().severity, Severity::Critical);
+    }
+
+    #[test]
+    fn claude_code_auth_rules_follow_real_failures_not_prose() {
+        // handle_auth_required types a recovery prompt into the pane on
+        // auth.error, so prose must not reach it.
+        let engine = PatternEngine::new();
+        let rule_ids = |text: &str| -> Vec<String> {
+            engine
+                .detect(text)
+                .into_iter()
+                .map(|d| d.rule_id)
+                .filter(|id| id.starts_with("claude_code.auth."))
+                .collect()
+        };
+        for (text, rule) in [
+            (
+                "Invalid API key · Fix external API key",
+                "claude_code.auth.api_key_error",
+            ),
+            (
+                "Failed to authenticate: OAuth session expired and could not be refreshed",
+                "claude_code.auth.login_required",
+            ),
+            (
+                "Failed to authenticate. API Error: 401 OAuth access token has expired. Re-authenticate to continue.",
+                "claude_code.auth.login_required",
+            ),
+            (
+                "Failed to authenticate. API Error: 403 Attention Required! | Cloudflare",
+                "claude_code.auth.login_required",
+            ),
+            (
+                "Login expired · Please run /login",
+                "claude_code.auth.login_required",
+            ),
+        ] {
+            assert_eq!(rule_ids(text), vec![rule.to_string()], "{text:?}");
+        }
+        for text in [
+            "Retry case: the provider is called only once, no stored API key gets rotated in.",
+            "`ANTHROPIC_API_KEY` isn't set, so something else satisfies the credential.",
+            "Error: invalid api key - please check your ANTHROPIC_API_KEY",
+            "ANTHROPIC_API_KEY is not set",
+            "API key authentication failed. Please set ANTHROPIC_API_KEY.",
+            "Failed to authenticate telemetry request",
+        ] {
+            assert!(rule_ids(text).is_empty(), "{text:?}");
+        }
     }
 
     #[test]

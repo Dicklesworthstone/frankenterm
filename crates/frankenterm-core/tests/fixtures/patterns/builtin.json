@@ -179,8 +179,14 @@
   },
   {
     "name": "claude_api_key_error_positive",
-    "text": "Error: invalid api key - please check your ANTHROPIC_API_KEY",
+    "text": "Invalid API key · Fix external API key",
     "expected_rule_ids": ["claude_code.auth.api_key_error"]
+  },
+  {
+    "name": "claude_api_key_error_negative_prose",
+    "text": "Error: invalid api key - please check your ANTHROPIC_API_KEY",
+    "expected_rule_ids": [],
+    "negative_for": "claude_code.auth.api_key_error"
   },
   {
     "name": "claude_api_key_error_negative",

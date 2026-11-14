@@ -1,1 +1,1 @@
-API key authentication failed. Please set ANTHROPIC_API_KEY.
+Invalid API key · Fix external API key
