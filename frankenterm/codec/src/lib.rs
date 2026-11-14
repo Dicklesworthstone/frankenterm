@@ -32440,6 +32440,17 @@ mod test {
 
         let cell = Cell::new_grapheme_with_width("abcdefgh", 1, CellAttributes::blank());
         let (bytes, _) = serialize_with_mode(&cell, CompressionMode::Never).unwrap();
+        // The cell's text encodes positionally; on this wire that is the
+        // keyed layout above byte for byte, so codec-75 peers agree on it.
+        let keyed = RawCell {
+            text: RawText {
+                text: "abcdefgh",
+                width: 1,
+            },
+            attrs: CellAttributes::blank(),
+        };
+        let (keyed_bytes, _) = serialize_with_mode(&keyed, CompressionMode::Never).unwrap();
+        assert_eq!(keyed_bytes, bytes);
         for length in 0..bytes.len() {
             assert!(decode(&bytes[..length], false).is_err());
         }

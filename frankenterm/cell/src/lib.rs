@@ -1219,7 +1219,7 @@ where
         // accidental terminal-content disclosure.
         deserializer.deserialize_any(CellTextVisitor)
     } else {
-        deserializer.deserialize_struct("CellText", &["text", "width"], CellTextVisitor)
+        deserializer.deserialize_tuple(2, CellTextVisitor)
     }
 }
 
@@ -1305,7 +1305,7 @@ fn serialize_teenystring<S>(value: &TeenyString, serializer: S) -> Result<S::Ok,
 where
     S: Serializer,
 {
-    use serde::ser::SerializeStruct;
+    use serde::ser::SerializeTuple;
 
     let width = u8::try_from(value.width())
         .ok()
@@ -1313,9 +1313,14 @@ where
         .ok_or_else(|| {
             <S::Error as serde::ser::Error>::custom("cell width exceeds terminal geometry")
         })?;
-    let mut cell = serializer.serialize_struct("CellText", 2)?;
-    cell.serialize_field("text", value.str())?;
-    cell.serialize_field("width", &width)?;
+    // Positional, not keyed. The binary wires encode a 2-tuple and a 2-field
+    // struct identically (no header, no names), but JSON spells the keys
+    // into every cell: {"text":"a","width":1} cost a cold scrollback read 19
+    // bytes a cell over the old "a", which pushed a 2,000-row reply of a
+    // 173-column pane past ScreenLineRead::MAX_PAYLOAD_BYTES. ["a",1] costs 4.
+    let mut cell = serializer.serialize_tuple(2)?;
+    cell.serialize_element(value.str())?;
+    cell.serialize_element(&width)?;
     cell.end()
 }
 
@@ -3162,10 +3167,7 @@ mod test {
         for (text, width) in [("abcdefgh", 1), ("abcdefgh", 2), ("A", 2), ("界", 1)] {
             let source = Cell::new_grapheme_with_width(text, width, attrs.clone());
             let encoded = serde_json::to_value(&source).unwrap();
-            assert_eq!(
-                encoded["text"],
-                serde_json::json!({ "text": text, "width": width })
-            );
+            assert_eq!(encoded["text"], serde_json::json!([text, width]));
             let restored: Cell = serde_json::from_value(encoded).unwrap();
             assert_eq!(restored, source);
             assert_eq!(restored.width(), width);
