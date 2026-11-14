@@ -957,6 +957,14 @@ mod tests {
     fn osc52_bounded_render_stalled_reader_settles_without_waiting_for_peer() {
         let (read, mut write) = filedescriptor::socketpair().unwrap();
         write.set_non_blocking(true).unwrap();
+        // The host's default send buffer decides when the fill backpressures:
+        // 208 KiB on one Linux worker, 16 MiB on another
+        // (net.core.wmem_default), past this fixture's 8 MiB bound. Ask for
+        // the smallest buffer instead; the kernel rounds it up to its floor.
+        #[cfg(unix)]
+        {
+            rustix::net::sockopt::set_socket_send_buffer_size(&write, 4096).unwrap();
+        }
         let fill = [b'x'; 4096];
         let mut filled = 0;
         let mut backpressured = false;

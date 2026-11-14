@@ -115,6 +115,10 @@ proptest = "1.8.0"
 syn = { workspace = true, features = ["extra-traits", "full", "visit"] }
 tempfile.workspace = true
 
+[target."cfg(unix)".dev-dependencies]
+# net: pin a test socket's send buffer (termwiztermtab OSC 52 backpressure).
+rustix = { workspace = true, features = ["net"] }
+
 [[bench]]
 name = "event_bus"
 harness = false
