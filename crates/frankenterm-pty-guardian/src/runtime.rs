@@ -270,8 +270,9 @@ struct SettledBrokerPane {
     mux_incarnation: Uuid,
     /// `None` while its Retire is with the pane I/O worker.
     handle: Option<BrokerPaneOutputHandleV1>,
-    /// The mux released it: ask the broker, up to [`BROKER_RETIRE_ASKS`]
-    /// times, then forget it.
+    /// The mux released it. Definitive declines stop after
+    /// [`BROKER_RETIRE_ASKS`]; uncertain retirement or pending cleanup keeps
+    /// retry authority until completion or physical connection fencing.
     retire_due: bool,
     retire_asks: u8,
     /// The next ask waits until then.
@@ -280,9 +281,13 @@ struct SettledBrokerPane {
 
 impl SettledBrokerPane {
     /// Count a Retire answer and say whether to ask again, after
-    /// [`BROKER_RETIRE_RETRY_AFTER`]: a decline, or an ask that ran out of
-    /// time while the broker was still retiring the pane, asks again until
-    /// [`BROKER_RETIRE_ASKS`] asks. A retirement or any other error ends it.
+    /// [`BROKER_RETIRE_RETRY_AFTER`]. A definitive decline stops after
+    /// [`BROKER_RETIRE_ASKS`] asks. A deadline may conceal an admitted worker,
+    /// so it retains retry authority until an outcome or connection fencing.
+    /// Once retirement is confirmed, guardian cleanup keeps its retry
+    /// authority until cleanup and receipt ACK finish;
+    /// abandoning it would strand one of the broker's bounded receipt slots.
+    /// A completed cleanup or any other error ends it.
     fn retire_again(
         &mut self,
         result: &Result<bool, BrokerControlClientError>,
@@ -290,10 +295,11 @@ impl SettledBrokerPane {
     ) -> bool {
         self.retire_asks = self.retire_asks.saturating_add(1);
         let again = match result {
-            Ok(false) => true,
+            Err(BrokerControlClientError::RetirementCleanupPending) => true,
+            Ok(false) => self.retire_asks < BROKER_RETIRE_ASKS,
             Err(BrokerControlClientError::Io(error)) => error.kind() == ErrorKind::TimedOut,
             Ok(true) | Err(_) => false,
-        } && self.retire_asks < BROKER_RETIRE_ASKS;
+        };
         if again {
             self.retire_after = Some(now + BROKER_RETIRE_RETRY_AFTER);
         }
@@ -4665,7 +4671,7 @@ impl GuardianRuntime {
                         if settled.retire_again(&result, Instant::now()) {
                             settled.handle = Some(handle);
                             log::info!(
-                                "guardian: broker has not retired released pane {pane_id} yet; \
+                                "guardian: retirement of released pane {pane_id} is not fully settled; \
                                  asking again in {} s",
                                 BROKER_RETIRE_RETRY_AFTER.as_secs()
                             );
@@ -4688,8 +4694,8 @@ impl GuardianRuntime {
                                  its files stay"
                             ),
                             Err(error) => log::info!(
-                                "guardian: retiring released pane {pane_id} failed: {error}; \
-                                 its files stay"
+                                "guardian: retirement cleanup for released pane {pane_id} \
+                                 did not complete: {error}"
                             ),
                         }
                         continue;
@@ -4734,6 +4740,7 @@ impl GuardianRuntime {
                                         BrokerControlClientError::SpawnPtyAvailable => "spawn-pty-available",
                                         BrokerControlClientError::ConnectionPoisoned => "connection-poisoned",
                                         BrokerControlClientError::InputRefused => "input-refused",
+                                        BrokerControlClientError::RetirementCleanupPending => "retirement-cleanup-pending",
                                     };
                                     eprintln!("GENESIS_OPEN_INITIAL_FAILED class={label}");
                                 }
@@ -9182,7 +9189,7 @@ mod tests {
     }
 
     #[test]
-    fn a_declined_or_timed_out_retire_asks_again_until_its_asks_run_out() {
+    fn a_declined_retire_asks_again_until_its_asks_run_out() {
         let released = || SettledBrokerPane {
             mux_incarnation: Uuid::from_u128(2),
             handle: None,
@@ -9215,6 +9222,34 @@ mod tests {
             let mut settled = released();
             assert!(!settled.retire_again(&ended, now));
             assert_eq!(settled.retire_after, None);
+        }
+    }
+
+    #[test]
+    fn uncertain_retirement_and_cleanup_keep_receipt_authority_past_the_ask_limit() {
+        let now = Instant::now();
+        for pending in [
+            Err(BrokerControlClientError::RetirementCleanupPending),
+            Err(BrokerControlClientError::Io(ErrorKind::TimedOut.into())),
+        ] {
+            let mut settled = SettledBrokerPane {
+                mux_incarnation: Uuid::from_u128(2),
+                handle: None,
+                retire_due: true,
+                retire_asks: BROKER_RETIRE_ASKS,
+                retire_after: None,
+            };
+            for _ in 0..=u8::MAX {
+                assert!(settled.retire_again(&pending, now));
+                assert_eq!(settled.retire_after, Some(now + BROKER_RETIRE_RETRY_AFTER));
+                assert_eq!(settled.retire_deadline(), BROKER_RETIRE_RETRY_DEADLINE);
+            }
+            assert_eq!(settled.retire_asks, u8::MAX);
+            assert!(!settled.retire_again(&Ok(true), now));
+            assert!(!settled.retire_again(
+                &Err(BrokerControlClientError::ConnectionPoisoned),
+                now,
+            ));
         }
     }
 

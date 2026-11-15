@@ -55,6 +55,18 @@
 //! Recovered WAL state reconstructs the protocol Spawn fence before listening,
 //! and generic Spawn dispatch consults that fence. Recovered catalog admission
 //! and census do not reconstruct a live PTY or an ordinary successor mux.
+//!
+//! Live guardian-to-broker control version 5 requires explicit retirement
+//! acknowledgement. At most 64 completed retirements await guardian cleanup;
+//! their exact owner, lease, pane, birth, and physical connection retain replay
+//! authority without eviction. New retirement effects wait when those slots
+//! are full. Guardian cleanup acknowledges disposal only after its files are
+//! deleted; failed cleanup retries, and an unsuccessful ACK closes the stream.
+//! EOF releases that physical connection's receipts and fences any failed
+//! in-flight retirement before restoring its pane. Receipts are process-local,
+//! not broker-restart recovery authority. Broker and guardian binaries must
+//! upgrade together; earlier live control versions fail closed. Persisted BSP1
+//! Spawn custody remains version 4, and the mux-to-guardian wire is unchanged.
 
 #![allow(dead_code)] // Activation is intentionally held for the cross-process tranche.
 
@@ -217,7 +229,10 @@ const BROKER_LEASE_CATALOG_MAX_PHYSICAL_BYTES: u64 = GUARDIAN_MAX_PANES as u64
         + BROKER_LEASE_CREATION_MARKER_BYTES);
 const BROKER_CONTROL_REQUEST_MAGIC: [u8; 4] = *b"FTBQ";
 const BROKER_CONTROL_RESPONSE_MAGIC: [u8; 4] = *b"FTBP";
-const BROKER_CONTROL_VERSION: u16 = 4;
+// Version 5 adds acknowledged retirement receipts. A version-4 guardian
+// cannot release these bounded receipts, so it must fail the handshake rather
+// than silently exhausting retirement admission on a newer broker.
+const BROKER_CONTROL_VERSION: u16 = 5;
 const BROKER_SUCCESSOR_CLAIM_PAYLOAD_BYTES: usize = 3 * 16 + 2 * 32 + 32;
 const BROKER_CONTROL_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 const BROKER_CONTROL_REQUEST_FIXED_BYTES: usize = 240;
@@ -264,6 +279,9 @@ const BROKER_REPEATED_EXCHANGE_MIN: Duration = Duration::from_secs(1);
 const BROKER_RETIRE_POLL_MAX: Duration = Duration::from_millis(25);
 const BROKER_GENESIS_BINDING_BYTES: usize = 256;
 const BROKER_SPAWN_CONTROL_MAGIC: [u8; 4] = *b"BSP1";
+// Persisted Spawn custody uses this payload independently of the live control
+// transport. A retirement protocol upgrade must not invalidate prior births.
+const BROKER_SPAWN_CONTROL_VERSION: u16 = 4;
 const BROKER_SPAWN_CONTROL_FIXED_BYTES: usize = 332;
 const BROKER_EXEC_BOOTSTRAP_MAGIC: [u8; 8] = *b"FTBEB001";
 const BROKER_EXEC_BOOTSTRAP_VERSION: u16 = 1;
@@ -1405,6 +1423,9 @@ pub(crate) enum BrokerControlOperationV1 {
     /// every output byte. The broker deletes the pane's files and frees its
     /// slot of the pane bound (ft-9ojeh).
     RetirePane = 18,
+    /// Release a retirement receipt only after the guardian deleted its own
+    /// pane files. Repeating this acknowledgement has no further effect.
+    AcknowledgeRetirement = 19,
 }
 
 impl BrokerControlOperationV1 {
@@ -1428,6 +1449,7 @@ impl BrokerControlOperationV1 {
             16 => Ok(Self::FenceMuxOwner),
             17 => Ok(Self::ClaimMuxSuccessor),
             18 => Ok(Self::RetirePane),
+            19 => Ok(Self::AcknowledgeRetirement),
             _ => Err(BrokerControlProtocolError::InvalidOperation),
         }
     }
@@ -1661,7 +1683,8 @@ impl BrokerControlRequestHeaderV1 {
             BrokerControlOperationV1::ClosePane
             | BrokerControlOperationV1::QueryChildStatus
             | BrokerControlOperationV1::SignalTerminate
-            | BrokerControlOperationV1::RetirePane => {
+            | BrokerControlOperationV1::RetirePane
+            | BrokerControlOperationV1::AcknowledgeRetirement => {
                 !self.broker_incarnation.is_nil()
                     && !self.durable_pane_id.is_nil()
                     && self.lease_generation > 0
@@ -1889,7 +1912,8 @@ impl BrokerControlResponseHeaderV1 {
             BrokerControlOperationV1::Resize
             | BrokerControlOperationV1::SignalTerminate
             | BrokerControlOperationV1::AcknowledgeOutput
-            | BrokerControlOperationV1::RetirePane => {
+            | BrokerControlOperationV1::RetirePane
+            | BrokerControlOperationV1::AcknowledgeRetirement => {
                 pane_scoped
                     && self.lease_generation > 0
                     && empty_effect
@@ -2424,6 +2448,8 @@ pub enum BrokerControlClientError {
     ConnectionPoisoned,
     #[error("broker refused the input before writing any byte")]
     InputRefused,
+    #[error("guardian cleanup of a retired pane is still pending")]
+    RetirementCleanupPending,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4002,8 +4028,39 @@ enum BrokerOutputDrainFailureV1 {
 /// How long drains pause after one found the disk full.
 const BROKER_OUTPUT_STORAGE_FULL_RETRY: Duration = Duration::from_millis(250);
 
-/// How many recent retirements answer a repeated RetirePane with Applied.
+/// Bound on unacknowledged retirement receipts. Admission stops at this
+/// bound; no other pane's activity may evict an outstanding receipt.
 const BROKER_RETIRED_PANE_RECEIPTS: usize = 64;
+
+/// A completed retirement belongs to one exact attachment and physical
+/// connection. A recovered Hello may reuse its logical connection ID, but
+/// cannot revive authority after that connection's EOF.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BrokerRetirementReceiptV1 {
+    attachment: BrokerAttachmentIdentityV1,
+    connection: (Token, u64),
+}
+
+impl BrokerRetirementReceiptV1 {
+    fn matches(
+        self,
+        owner: BrokerGuardianOwnerIdentity,
+        connection: (Token, u64),
+        request: BrokerControlRequestHeaderV1,
+    ) -> bool {
+        self.connection == connection
+            && self.attachment.owner == owner
+            && self.attachment.broker_incarnation == request.broker_incarnation
+            && self.attachment.durable_pane_id == request.durable_pane_id
+            && self.attachment.spawn_effect_id == request.operation_id
+            && self.attachment.lease_generation == request.lease_generation
+    }
+}
+
+struct BrokerRetiringSpawnV1 {
+    live: BrokerLiveSpawnV1,
+    receipt: BrokerRetirementReceiptV1,
+}
 
 /// What one drain job read from its pane's PTY.
 #[derive(Debug, Eq, PartialEq)]
@@ -4711,10 +4768,10 @@ pub struct BrokerControlServiceV1 {
     retained_spawns: HashMap<Uuid, BrokerSpawnWorkerCompletionV1>,
     live_spawns: HashMap<Uuid, BrokerLiveSpawnV1>,
     /// The pane the worker is retiring, out of the census meanwhile.
-    retiring_spawn: Option<BrokerLiveSpawnV1>,
-    /// Recent retirements by pane and birth, so a retried request whose
-    /// answer was lost still hears Applied.
-    retired_panes: VecDeque<(Uuid, Uuid)>,
+    retiring_spawn: Option<BrokerRetiringSpawnV1>,
+    /// Exact completed retirements remain replayable until guardian cleanup
+    /// is acknowledged or their physical connection ends.
+    retired_panes: Vec<BrokerRetirementReceiptV1>,
     retained_spawn_by_effect: HashMap<Uuid, Uuid>,
     retained_spawn_by_journal: HashMap<Uuid, Uuid>,
     retained_spawn_by_origin_request: HashMap<Uuid, Uuid>,
@@ -4995,7 +5052,7 @@ impl BrokerControlServiceV1 {
         }
         let spawn_worker =
             BrokerSpawnWorkerV1::start(spawn_worker_state, Arc::clone(&spawn_completion_waker))?;
-        let mut retired_panes = VecDeque::new();
+        let mut retired_panes = Vec::new();
         retired_panes
             .try_reserve_exact(BROKER_RETIRED_PANE_RECEIPTS)
             .map_err(|_| {
@@ -5897,7 +5954,10 @@ impl BrokerControlServiceV1 {
                 return self.dispatch_termination(owner, request);
             }
             BrokerControlOperationV1::RetirePane => {
-                return self.dispatch_retire(owner, request);
+                return self.dispatch_retire(owner, (token, generation), request);
+            }
+            BrokerControlOperationV1::AcknowledgeRetirement => {
+                return self.dispatch_retirement_ack(owner, (token, generation), request);
             }
             _ => {}
         }
@@ -5943,6 +6003,7 @@ impl BrokerControlServiceV1 {
     fn dispatch_retire(
         &mut self,
         owner: BrokerGuardianOwnerIdentity,
+        connection: (Token, u64),
         request: &BrokerControlRequestV1,
     ) -> Result<BrokerControlResponseV1, ()> {
         let pane_id = request.header.durable_pane_id;
@@ -5952,21 +6013,36 @@ impl BrokerControlServiceV1 {
             .output_worker
             .active
             .is_some_and(|(active_pane, _)| active_pane == pane_id);
-        let status = if self.retired_panes.contains(&(pane_id, effect_id)) {
-            BrokerControlResponseStatusV1::Applied
-        } else if self
+        let status = if let Some(receipt) = self
+            .retired_panes
+            .iter()
+            .find(|receipt| receipt.attachment.durable_pane_id == pane_id)
+        {
+            if receipt.matches(owner, connection, request.header) {
+                BrokerControlResponseStatusV1::Applied
+            } else {
+                BrokerControlResponseStatusV1::Rejected
+            }
+        } else if let Some(retiring) = self
             .retiring_spawn
             .as_ref()
-            .is_some_and(|live| live.fingerprint.binding.durable_pane_id == pane_id)
+            .filter(|retiring| retiring.receipt.attachment.durable_pane_id == pane_id)
         {
-            BrokerControlResponseStatusV1::Retryable
+            if retiring.receipt.matches(owner, connection, request.header) {
+                BrokerControlResponseStatusV1::Retryable
+            } else {
+                BrokerControlResponseStatusV1::Rejected
+            }
         } else if let Some(live) = self.live_spawns.get_mut(&pane_id).filter(|live| {
             live.fingerprint.binding.spawn_effect_id == effect_id
                 && live.observes_owner(owner).is_some_and(|identity| {
                     identity.lease_generation == request.header.lease_generation
                 })
         }) {
-            if draining || self.retiring_spawn.is_some() {
+            if draining
+                || self.retiring_spawn.is_some()
+                || self.retired_panes.len() >= BROKER_RETIRED_PANE_RECEIPTS
+            {
                 BrokerControlResponseStatusV1::Retryable
             } else if self.spawn_worker_unavailable
                 || live.lease_journal.is_none()
@@ -5976,6 +6052,10 @@ impl BrokerControlServiceV1 {
             {
                 BrokerControlResponseStatusV1::Rejected
             } else if let Ok(token_effect_lease) = self.token_authority.acquire_effect_lease() {
+                let receipt = BrokerRetirementReceiptV1 {
+                    attachment: live.observes_owner(owner).ok_or(())?,
+                    connection,
+                };
                 let job = BrokerRetireWorkerJobV1 {
                     fingerprint: live.fingerprint,
                     identity: live.journal.identity(),
@@ -5983,7 +6063,10 @@ impl BrokerControlServiceV1 {
                 };
                 match self.spawn_worker.try_submit_retire(job) {
                     Ok(()) => {
-                        self.retiring_spawn = self.live_spawns.remove(&pane_id);
+                        self.retiring_spawn = self
+                            .live_spawns
+                            .remove(&pane_id)
+                            .map(|live| BrokerRetiringSpawnV1 { live, receipt });
                         BrokerControlResponseStatusV1::Retryable
                     }
                     Err(
@@ -6006,17 +6089,43 @@ impl BrokerControlServiceV1 {
     }
 
     fn retain_retire_completion(&mut self, completion: BrokerRetireWorkerCompletionV1) {
-        let Some(live) = self
+        let Some(retiring) = self
             .retiring_spawn
-            .take_if(|live| live.fingerprint == completion.fingerprint)
+            .take_if(|retiring| retiring.live.fingerprint == completion.fingerprint)
         else {
             self.blocked_worker_events
                 .push(BrokerSpawnWorkerEventV1::Retire(completion));
             self.spawn_worker_unavailable = true;
             return;
         };
+        let BrokerRetiringSpawnV1 { mut live, receipt } = retiring;
         let binding = live.fingerprint.binding;
+        let owner_connected = self
+            .connections
+            .get(&receipt.connection.0)
+            .is_some_and(|connection| connection.generation == receipt.connection.1);
         if !completion.committed {
+            // The pane was outside live_spawns while its worker ran, so EOF
+            // could not fence its attachment in finish_connection. A failed
+            // retirement must not restore authority for that ended stream.
+            if !owner_connected {
+                match live.observe_owner_eof(receipt.attachment.owner) {
+                    Ok(Some(BrokerControlEofOutcomeV1::AwaitingSuccessor { .. })) => {
+                        self.fenced_live_leases = self.fenced_live_leases.saturating_add(1);
+                    }
+                    Ok(Some(BrokerControlEofOutcomeV1::AlreadyObserved) | None) => {}
+                    Err(_) => {
+                        if !matches!(
+                            live.adoption.pane.status().lifecycle,
+                            BrokerPaneLifecycleV1::Quarantined(_)
+                        ) {
+                            live.quarantine_lease_journal();
+                        }
+                        self.quarantined_live_leases =
+                            self.quarantined_live_leases.saturating_add(1);
+                    }
+                }
+            }
             self.live_spawns.insert(binding.durable_pane_id, live);
             return;
         }
@@ -6035,11 +6144,37 @@ impl BrokerControlServiceV1 {
                 index.remove(&key);
             }
         }
-        if self.retired_panes.len() == BROKER_RETIRED_PANE_RECEIPTS {
-            self.retired_panes.pop_front();
+        // Admission reserved this slot before submitting the sole retirement
+        // job. An EOF may have fenced its connection while the worker ran;
+        // never resurrect receipt authority for that ended physical stream.
+        if owner_connected {
+            self.retired_panes.push(receipt);
         }
-        self.retired_panes
-            .push_back((binding.durable_pane_id, binding.spawn_effect_id));
+    }
+
+    fn dispatch_retirement_ack(
+        &mut self,
+        owner: BrokerGuardianOwnerIdentity,
+        connection: (Token, u64),
+        request: &BrokerControlRequestV1,
+    ) -> Result<BrokerControlResponseV1, ()> {
+        let status = if let Some(index) = self.retired_panes.iter().position(|receipt| {
+            receipt.attachment.durable_pane_id == request.header.durable_pane_id
+        }) {
+            if self.retired_panes[index].matches(owner, connection, request.header) {
+                self.retired_panes.swap_remove(index);
+                BrokerControlResponseStatusV1::Applied
+            } else {
+                BrokerControlResponseStatusV1::Rejected
+            }
+        } else {
+            // This operation acknowledges only receipt disposal, not pane
+            // retirement. Repeating it after a lost reply is a harmless no-op;
+            // it cannot delete files or grant a RetirePane success receipt.
+            BrokerControlResponseStatusV1::Applied
+        };
+        BrokerControlResponseV1::new(self.response_header(request.header, status), &[])
+            .map_err(|_| ())
     }
 
     fn dispatch_write(
@@ -7983,6 +8118,8 @@ impl BrokerControlServiceV1 {
             self.connections.insert(token, connection);
             return;
         }
+        self.retired_panes
+            .retain(|receipt| receipt.connection != (token, generation));
         let _ = self.poll.registry().deregister(&mut connection.stream);
         if let Some(hello) = connection.hello {
             let owner = BrokerGuardianOwnerIdentity {
@@ -8351,7 +8488,16 @@ impl BrokerPaneIoWorkerV1 {
                                                 "guardian could not delete retired pane {}'s files: {error:?}",
                                                 handle.pane_id
                                             );
+                                            // Keep the broker's receipt and
+                                            // the runtime's existing retry
+                                            // authority until cleanup succeeds.
+                                            return Err(
+                                                BrokerControlClientError::RetirementCleanupPending,
+                                            );
                                         }
+                                        session
+                                            .client
+                                            .acknowledge_retirement(&handle, deadline)?;
                                     }
                                     Ok(retired)
                                 }),
@@ -8363,6 +8509,12 @@ impl BrokerPaneIoWorkerV1 {
                                     Err(BrokerControlClientError::ConnectionPoisoned)
                                 }
                             };
+                            if session.client.poisoned {
+                                // A timed-out Retire may already have committed
+                                // a receipt. End its transport authority even
+                                // if the runtime retains the failed worker.
+                                let _ = session.client.stream.shutdown(std::net::Shutdown::Both);
+                            }
                             BrokerPaneIoCompletionV1::Retire { handle, result }
                         }
                     };
@@ -9364,6 +9516,61 @@ impl BrokerControlClientV1 {
                 }
             }
         }
+    }
+
+    /// Release the broker's bounded replay receipt after guardian cleanup.
+    /// Acknowledgement is idempotent and never performs pane-file deletion.
+    /// Call only after `retire_pane` succeeds and guardian custody files have
+    /// been deleted. An error closes this connection so its receipts cannot
+    /// permanently consume the broker's bounded retirement capacity.
+    pub fn acknowledge_retirement(
+        &mut self,
+        handle: &BrokerPaneOutputHandleV1,
+        deadline: Instant,
+    ) -> Result<(), BrokerControlClientError> {
+        let result = (|| {
+            if handle.broker_incarnation != self.broker_incarnation
+                || handle.connection_id != self.connection_id
+            {
+                return Err(BrokerControlClientError::AuthenticationAuthority);
+            }
+            let request = BrokerControlRequestV1::new(
+                BrokerControlRequestHeaderV1 {
+                    operation: BrokerControlOperationV1::AcknowledgeRetirement,
+                    request_id: Uuid::new_v4(),
+                    broker_incarnation: self.broker_incarnation,
+                    guardian_incarnation: self.identity.guardian_incarnation,
+                    connection_id: self.connection_id,
+                    mux_incarnation: self.identity.mux_incarnation,
+                    guardian_build_identity_digest: self.identity.guardian_build_identity.into_bytes(),
+                    mux_build_identity_digest: self.identity.mux_build_identity.into_bytes(),
+                    durable_pane_id: handle.pane_id,
+                    lease_generation: handle.lease_generation,
+                    operation_id: handle.spawn_effect_id,
+                },
+                &[],
+            )
+            .map_err(|_| BrokerControlClientError::Protocol)?;
+            let response = self.exchange_with_deadline(
+                &request,
+                Some(Instant::now() + repeated_exchange_budget(deadline)),
+            )?;
+            match response.header.status {
+                BrokerControlResponseStatusV1::Applied => Ok(()),
+                BrokerControlResponseStatusV1::Rejected => {
+                    Err(BrokerControlClientError::AuthenticationAuthority)
+                }
+                _ => Err(BrokerControlClientError::UnexpectedResponse),
+            }
+        })();
+        if result.is_err() {
+            // Cleanup already succeeded. Fence any unsuccessful ACK, including
+            // a non-I/O rejection, so EOF releases its receipts even if the
+            // runtime retains this client for diagnosis.
+            self.poisoned = true;
+            let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        }
+        result
     }
 
     fn terminate_once(
@@ -19275,7 +19482,7 @@ impl BrokerSpawnControlRequestV1 {
             .map_err(|_| BrokerControlProtocolError::CapacityExhausted)?;
         bytes.resize(BROKER_SPAWN_CONTROL_FIXED_BYTES, 0);
         bytes[0..4].copy_from_slice(&BROKER_SPAWN_CONTROL_MAGIC);
-        bytes[4..6].copy_from_slice(&BROKER_CONTROL_VERSION.to_be_bytes());
+        bytes[4..6].copy_from_slice(&BROKER_SPAWN_CONTROL_VERSION.to_be_bytes());
         bytes[6..8].fill(0);
         bytes[8..24].copy_from_slice(self.journal_id.as_bytes());
         bytes[24..40].copy_from_slice(self.attempt_id.as_bytes());
@@ -19292,7 +19499,7 @@ impl BrokerSpawnControlRequestV1 {
         if bytes.len() < BROKER_SPAWN_CONTROL_FIXED_BYTES
             || bytes.len() > BROKER_CONTROL_MAX_PAYLOAD_BYTES
             || bytes[0..4] != BROKER_SPAWN_CONTROL_MAGIC
-            || read_broker_be_u16(&bytes[4..6]) != BROKER_CONTROL_VERSION
+            || read_broker_be_u16(&bytes[4..6]) != BROKER_SPAWN_CONTROL_VERSION
             || bytes[6..8] != [0, 0]
         {
             return Err(BrokerControlProtocolError::InvalidLength);
@@ -23381,6 +23588,175 @@ mod tests {
     }
 
     #[test]
+    fn retirement_receipts_survive_other_panes_until_exact_owner_cleanup_acknowledges() {
+        let root = tempfile::tempdir_in(crate::canonical_test_temp_root()).unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let spawn_catalog = root.path().join("spawn-catalog");
+        fs::create_dir(&spawn_catalog).unwrap();
+        fs::set_permissions(&spawn_catalog, fs::Permissions::from_mode(0o700)).unwrap();
+        let lease_catalog = create_private_lease_catalog(root.path());
+        let socket_path = root.path().join("broker.sock");
+        let token_path = root.path().join("guardian.token");
+        crate::transport::provision_guardian_token(&token_path).unwrap();
+        let mut service = BrokerControlServiceV1::bind(
+            BrokerControlServiceConfigV1::new(
+                socket_path.clone(),
+                token_path,
+                spawn_catalog,
+                lease_catalog,
+                sealed(0x91),
+                2,
+                Duration::from_millis(5),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let client = BlockingUnixStream::connect(&socket_path).unwrap();
+        service.accept_connections().unwrap();
+        let (&token, connection) = service.connections.iter().next().unwrap();
+        let connection = (token, connection.generation);
+        let owner = BrokerGuardianOwnerIdentity {
+            guardian_incarnation: id(91_001),
+            connection_id: id(91_002),
+            mux_incarnation: id(91_003),
+            mux_build_identity_digest: sealed(0x92).into_bytes(),
+            guardian_build_identity_digest: sealed(0x93).into_bytes(),
+        };
+        let first = BrokerRetirementReceiptV1 {
+            attachment: BrokerAttachmentIdentityV1 {
+                broker_incarnation: service.broker_incarnation,
+                durable_pane_id: id(91_004),
+                spawn_effect_id: id(91_005),
+                attachment_id: id(91_006),
+                owner,
+                lease_generation: 3,
+            },
+            connection,
+        };
+        let request = |receipt: BrokerRetirementReceiptV1, operation| {
+            BrokerControlRequestV1::new(
+                BrokerControlRequestHeaderV1 {
+                    operation,
+                    request_id: id(91_007),
+                    broker_incarnation: receipt.attachment.broker_incarnation,
+                    guardian_incarnation: receipt.attachment.owner.guardian_incarnation,
+                    connection_id: receipt.attachment.owner.connection_id,
+                    mux_incarnation: receipt.attachment.owner.mux_incarnation,
+                    guardian_build_identity_digest: receipt
+                        .attachment
+                        .owner
+                        .guardian_build_identity_digest,
+                    mux_build_identity_digest: receipt.attachment.owner.mux_build_identity_digest,
+                    durable_pane_id: receipt.attachment.durable_pane_id,
+                    lease_generation: receipt.attachment.lease_generation,
+                    operation_id: receipt.attachment.spawn_effect_id,
+                },
+                &[],
+            )
+            .unwrap()
+        };
+        service.retired_panes.push(first);
+        // The first caller timed out before its retirement completed. More
+        // than the former cache's capacity of other panes finish and clean up
+        // before that caller's ten-second retry; none owns its receipt slot.
+        for ordinal in 0..128_u128 {
+            let mut later = first;
+            later.attachment.durable_pane_id = id(92_000 + ordinal);
+            later.attachment.spawn_effect_id = id(93_000 + ordinal);
+            service.retired_panes.push(later);
+            let ack = request(later, BrokerControlOperationV1::AcknowledgeRetirement);
+            assert_eq!(
+                service
+                    .dispatch_retirement_ack(owner, connection, &ack)
+                    .unwrap()
+                    .header
+                    .status,
+                BrokerControlResponseStatusV1::Applied
+            );
+        }
+        let retry = request(first, BrokerControlOperationV1::RetirePane);
+        assert_eq!(
+            service
+                .dispatch_retire(owner, connection, &retry)
+                .unwrap()
+                .header
+                .status,
+            BrokerControlResponseStatusV1::Applied
+        );
+        let mutations: [fn(&mut BrokerRetirementReceiptV1); 7] = [
+            |receipt| receipt.attachment.owner.guardian_incarnation = id(94_001),
+            |receipt| receipt.attachment.owner.mux_incarnation = id(94_002),
+            |receipt| receipt.attachment.owner.connection_id = id(94_003),
+            |receipt| receipt.attachment.owner.mux_build_identity_digest[0] ^= 1,
+            |receipt| receipt.attachment.lease_generation += 1,
+            |receipt| receipt.attachment.spawn_effect_id = id(94_004),
+            |receipt| receipt.connection.1 += 1,
+        ];
+        for mutate in mutations {
+            let mut foreign = first;
+            mutate(&mut foreign);
+            for operation in [
+                BrokerControlOperationV1::RetirePane,
+                BrokerControlOperationV1::AcknowledgeRetirement,
+            ] {
+                let forged = request(foreign, operation);
+                let response = if operation == BrokerControlOperationV1::RetirePane {
+                    service.dispatch_retire(foreign.attachment.owner, foreign.connection, &forged)
+                } else {
+                    service.dispatch_retirement_ack(
+                        foreign.attachment.owner,
+                        foreign.connection,
+                        &forged,
+                    )
+                };
+                assert_eq!(
+                    response.unwrap().header.status,
+                    BrokerControlResponseStatusV1::Rejected
+                );
+                assert_eq!(service.retired_panes, vec![first]);
+            }
+        }
+        let ack = request(first, BrokerControlOperationV1::AcknowledgeRetirement);
+        for _ in 0..2 {
+            assert_eq!(
+                service
+                    .dispatch_retirement_ack(owner, connection, &ack)
+                    .unwrap()
+                    .header
+                    .status,
+                BrokerControlResponseStatusV1::Applied
+            );
+            assert!(service.retired_panes.is_empty());
+        }
+        assert_eq!(
+            service
+                .dispatch_retire(owner, connection, &retry)
+                .unwrap()
+                .header
+                .status,
+            BrokerControlResponseStatusV1::Rejected,
+            "an ACK retry cannot manufacture a new retirement receipt"
+        );
+
+        service.retired_panes.push(first);
+        let mut other_connection = first;
+        other_connection.connection.1 += 1;
+        service.retired_panes.push(other_connection);
+        service.finish_connection(connection.0, connection.1);
+        assert_eq!(service.retired_panes, vec![other_connection]);
+        assert_eq!(
+            service
+                .dispatch_retire(owner, connection, &retry)
+                .unwrap()
+                .header
+                .status,
+            BrokerControlResponseStatusV1::Rejected,
+            "reusing a logical owner cannot revive an ended physical stream"
+        );
+        drop(client);
+    }
+
+    #[test]
     fn control_codec_is_bounded_direction_separated_and_mutation_sensitive() {
         fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
         assert_zeroize_on_drop::<BrokerControlWireFrameV1>();
@@ -23404,12 +23780,14 @@ mod tests {
         )
         .expect("canonical Hello request");
         let encoded = encode_broker_control_request(&authority, &request).expect("encode request");
-        let mut obsolete = encoded.as_slice().to_vec();
-        obsolete[8..10].copy_from_slice(&1_u16.to_be_bytes());
-        assert!(matches!(
-            decode_broker_control_request(&authority, &obsolete),
-            Err(BrokerControlProtocolError::InvalidVersion)
-        ));
+        for old_version in [1_u16, 4] {
+            let mut obsolete = encoded.as_slice().to_vec();
+            obsolete[8..10].copy_from_slice(&old_version.to_be_bytes());
+            assert!(matches!(
+                decode_broker_control_request(&authority, &obsolete),
+                Err(BrokerControlProtocolError::InvalidVersion)
+            ));
+        }
         assert_eq!(encoded.as_slice().len(), BROKER_CONTROL_REQUEST_FIXED_BYTES);
         let decoded =
             decode_broker_control_request(&authority, encoded.as_slice()).expect("decode request");
@@ -23544,7 +23922,7 @@ mod tests {
             Err(BrokerControlProtocolError::InvalidShape)
         ));
 
-        let leased_operations: [(BrokerControlOperationV1, &[u8]); 6] = [
+        let leased_operations: [(BrokerControlOperationV1, &[u8]); 8] = [
             (BrokerControlOperationV1::Write, b"must-be-fenced"),
             (BrokerControlOperationV1::Resize, &[0; 8]),
             (BrokerControlOperationV1::ReadOutput, &[0; 4]),
@@ -23554,6 +23932,8 @@ mod tests {
                 &[0x75; BROKER_PANE_RECOVERY_SECRET_BYTES],
             ),
             (BrokerControlOperationV1::ClosePane, &[]),
+            (BrokerControlOperationV1::RetirePane, &[]),
+            (BrokerControlOperationV1::AcknowledgeRetirement, &[]),
         ];
         for (operation, payload) in leased_operations {
             let zero_generation_request = BrokerControlRequestV1::new(
@@ -26326,6 +26706,94 @@ mod tests {
         server.join().expect("join delayed-response broker fixture");
     }
 
+    #[test]
+    fn failed_retirement_ack_closes_the_stream_before_retaining_the_client() {
+        for rejected in [true, false] {
+            let (client_stream, mut server_stream) = BlockingUnixStream::pair().unwrap();
+            server_stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let identity = BrokerGuardianConnectionIdentityV1::new(
+                id(6_230),
+                id(6_231),
+                sealed(0xbd),
+                sealed(0xbe),
+            )
+            .unwrap();
+            let mut client = BrokerControlClientV1 {
+                stream: client_stream,
+                control_authenticator: control_authenticator(0xbc),
+                identity,
+                connection_id: id(6_232),
+                broker_incarnation: id(6_233),
+                broker_lineage: wal_authenticator(0xbc).lineage_id(),
+                broker_build: sealed(0xbf),
+                recovered_hello: false,
+                poisoned: false,
+            };
+            let handle = BrokerPaneOutputHandleV1 {
+                broker_incarnation: client.broker_incarnation,
+                connection_id: client.connection_id,
+                pane_id: id(6_234),
+                spawn_effect_id: id(6_235),
+                spawn_ack_id: id(6_236),
+                lease_generation: 3,
+                child_identity: test_kernel_child(6_237),
+            };
+            let server = thread::spawn(move || {
+                let authority = control_authenticator(0xbc);
+                let frame = read_blocking_broker_control_frame(
+                    &mut server_stream,
+                    BROKER_CONTROL_REQUEST_FIXED_BYTES,
+                )
+                .unwrap();
+                let request = decode_broker_control_request(&authority, &frame).unwrap();
+                assert_eq!(
+                    request.header.operation,
+                    BrokerControlOperationV1::AcknowledgeRetirement
+                );
+                if rejected {
+                    let response = BrokerControlResponseV1::new(
+                        BrokerControlResponseHeaderV1 {
+                            operation: request.header.operation,
+                            status: BrokerControlResponseStatusV1::Rejected,
+                            request_id: request.header.request_id,
+                            broker_incarnation: request.header.broker_incarnation,
+                            guardian_incarnation: request.header.guardian_incarnation,
+                            connection_id: request.header.connection_id,
+                            durable_pane_id: request.header.durable_pane_id,
+                            lease_generation: request.header.lease_generation,
+                            operation_id: request.header.operation_id,
+                            child_identity: None,
+                            output_sequence_start: 0,
+                            output_sequence_end: 0,
+                        },
+                        &[],
+                    )
+                    .unwrap();
+                    let frame = encode_broker_control_response(&authority, &response).unwrap();
+                    server_stream.write_all(frame.as_slice()).unwrap();
+                } else {
+                    // An invalid frame makes the exchange ambiguous without
+                    // depending on scheduler timing or sleeping past a timeout.
+                    server_stream.write_all(&0_u32.to_be_bytes()).unwrap();
+                }
+                assert_eq!(
+                    server_stream.read(&mut [0_u8; 1]).unwrap(),
+                    0,
+                    "an unsuccessful ACK must expose EOF while the client is retained"
+                );
+            });
+            assert!(
+                client
+                    .acknowledge_retirement(&handle, Instant::now() + Duration::from_secs(2))
+                    .is_err()
+            );
+            assert!(client.poisoned);
+            server.join().unwrap();
+        }
+    }
+
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub enum BrokerInputTestReply {
         Full,
@@ -26478,12 +26946,26 @@ mod tests {
         )
         .expect("canonical Spawn control request");
         let encoded = request.encode().expect("encode Spawn control request");
+        assert_eq!(
+            &encoded[4..6],
+            &4_u16.to_be_bytes(),
+            "persisted BSP1 Spawn custody retains its pre-ACK version"
+        );
+        assert_eq!(BROKER_CONTROL_VERSION, 5);
         let decoded =
             BrokerSpawnControlRequestV1::decode(&encoded).expect("decode Spawn control request");
         assert_eq!(decoded.journal_id, id(725));
         assert_eq!(decoded.attempt_id, id(726));
         assert_eq!(decoded.binding, binding);
         assert_eq!(decoded.payload, request.payload);
+
+        let mut live_version_in_durable_payload = encoded.to_vec();
+        live_version_in_durable_payload[4..6]
+            .copy_from_slice(&BROKER_CONTROL_VERSION.to_be_bytes());
+        assert!(
+            BrokerSpawnControlRequestV1::decode(&live_version_in_durable_payload).is_err(),
+            "live transport version must not become a durable Spawn version"
+        );
 
         let header = BrokerControlRequestHeaderV1 {
             operation: BrokerControlOperationV1::Spawn,
@@ -27304,6 +27786,30 @@ mod tests {
             BrokerPaneLeaseWalPhaseV1,
             Option<BrokerPaneLeaseWalInjectedFaultV1>,
         )>,
+    ) {
+        broker_control_spawn_with_retirement_scenario(
+            real_genesis,
+            terminal_probe,
+            termination,
+            lease_scenario,
+            false,
+        );
+    }
+
+    #[test]
+    fn failed_retirement_after_connection_eof_cannot_restore_the_old_owner() {
+        broker_control_spawn_with_retirement_scenario(false, true, None, None, true);
+    }
+
+    fn broker_control_spawn_with_retirement_scenario(
+        real_genesis: bool,
+        terminal_probe: bool,
+        termination: Option<BrokerControlOperationV1>,
+        lease_scenario: Option<(
+            BrokerPaneLeaseWalPhaseV1,
+            Option<BrokerPaneLeaseWalInjectedFaultV1>,
+        )>,
+        retirement_rollback_eof: bool,
     ) {
         let root = private_catalog_directory().keep();
         let spawn_catalog_path = root.join("spawn-catalog");
@@ -28568,6 +29074,141 @@ mod tests {
                     }
                 }
             }
+            if retirement_rollback_eof {
+                service.inspect(move |service| {
+                    let live = service.live_spawns.remove(&binding.durable_pane_id).unwrap();
+                    let attachment = live.adoption.pane.active_attachment_identity().unwrap();
+                    let connection = service
+                        .connections
+                        .iter()
+                        .find(|(_, connection)| {
+                            connection.hello.is_some_and(|hello| {
+                                hello.connection_id == attachment.owner.connection_id
+                            })
+                        })
+                        .map(|(token, connection)| (*token, connection.generation))
+                        .unwrap();
+                    let fingerprint = live.fingerprint;
+                    service.retiring_spawn = Some(BrokerRetiringSpawnV1 {
+                        live,
+                        receipt: BrokerRetirementReceiptV1 {
+                            attachment,
+                            connection,
+                        },
+                    });
+                    service.finish_connection(connection.0, connection.1);
+                    service.retain_retire_completion(BrokerRetireWorkerCompletionV1 {
+                        fingerprint,
+                        committed: false,
+                    });
+                    let restored = service.live_spawns.get(&binding.durable_pane_id).unwrap();
+                    assert!(restored.observes_owner(attachment.owner).is_none());
+                    assert!(restored.adoption.pane.active_attachment_identity().is_none());
+                    assert!(service.retired_panes.is_empty());
+                    let retry = BrokerControlRequestV1::new(
+                        BrokerControlRequestHeaderV1 {
+                            operation: BrokerControlOperationV1::RetirePane,
+                            request_id: Uuid::new_v4(),
+                            broker_incarnation: attachment.broker_incarnation,
+                            guardian_incarnation: attachment.owner.guardian_incarnation,
+                            connection_id: attachment.owner.connection_id,
+                            mux_incarnation: attachment.owner.mux_incarnation,
+                            guardian_build_identity_digest: attachment
+                                .owner
+                                .guardian_build_identity_digest,
+                            mux_build_identity_digest: attachment.owner.mux_build_identity_digest,
+                            durable_pane_id: attachment.durable_pane_id,
+                            lease_generation: attachment.lease_generation,
+                            operation_id: attachment.spawn_effect_id,
+                        },
+                        &[],
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        service
+                            .dispatch_retire(attachment.owner, connection, &retry)
+                            .unwrap()
+                            .header
+                            .status,
+                        BrokerControlResponseStatusV1::Rejected
+                    );
+                });
+                drop(session);
+                service.finish();
+                return;
+            }
+
+            // Fill receipt capacity with other completed panes. The settled
+            // real child must remain admitted and its catalogs untouched;
+            // pressure may delay retirement but cannot discard another
+            // caller's replay authority (ft-rkn8v).
+            service.inspect(move |service| {
+                let attachment = service.live_spawns[&binding.durable_pane_id]
+                    .adoption
+                    .pane
+                    .active_attachment_identity()
+                    .unwrap();
+                let (&token, connection) = service
+                    .connections
+                    .iter()
+                    .find(|(_, connection)| {
+                        connection.hello.is_some_and(|hello| {
+                            hello.connection_id == attachment.owner.connection_id
+                        })
+                    })
+                    .unwrap();
+                let connection = (token, connection.generation);
+                for ordinal in 0..BROKER_RETIRED_PANE_RECEIPTS {
+                    let mut receipt = BrokerRetirementReceiptV1 {
+                        attachment,
+                        connection,
+                    };
+                    receipt.attachment.durable_pane_id = id(95_000 + ordinal as u128);
+                    receipt.attachment.spawn_effect_id = id(96_000 + ordinal as u128);
+                    service.retired_panes.push(receipt);
+                }
+            });
+            assert!(matches!(
+                session.client.retire_pane(&handle, Instant::now()),
+                Err(BrokerControlClientError::Io(error))
+                    if error.kind() == ErrorKind::TimedOut
+            ));
+            assert!(!session.client.poisoned);
+            service.inspect(move |service| {
+                assert!(service.live_spawns.contains_key(&binding.durable_pane_id));
+                assert!(service.retiring_spawn.is_none());
+                assert_eq!(service.retired_panes.len(), BROKER_RETIRED_PANE_RECEIPTS);
+                // Model successful guardian cleanup of the other panes and
+                // release their slots through the production ACK route.
+                for receipt in service.retired_panes.clone() {
+                    let owner = receipt.attachment.owner;
+                    let ack = BrokerControlRequestV1::new(
+                        BrokerControlRequestHeaderV1 {
+                            operation: BrokerControlOperationV1::AcknowledgeRetirement,
+                            request_id: Uuid::new_v4(),
+                            broker_incarnation: receipt.attachment.broker_incarnation,
+                            guardian_incarnation: owner.guardian_incarnation,
+                            connection_id: owner.connection_id,
+                            mux_incarnation: owner.mux_incarnation,
+                            guardian_build_identity_digest: owner.guardian_build_identity_digest,
+                            mux_build_identity_digest: owner.mux_build_identity_digest,
+                            durable_pane_id: receipt.attachment.durable_pane_id,
+                            lease_generation: receipt.attachment.lease_generation,
+                            operation_id: receipt.attachment.spawn_effect_id,
+                        },
+                        &[],
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        service
+                            .dispatch_retirement_ack(owner, receipt.connection, &ack)
+                            .unwrap()
+                            .header
+                            .status,
+                        BrokerControlResponseStatusV1::Applied
+                    );
+                }
+            });
             assert!(
                 session
                     .client
@@ -28581,6 +29222,17 @@ mod tests {
                     .unwrap(),
                 "a repeated request whose answer was lost still hears Applied"
             );
+            custody_store
+                .delete_retired_pane_files(handle.pane_id, handle.spawn_effect_id)
+                .unwrap();
+            session
+                .client
+                .acknowledge_retirement(&handle, output_deadline)
+                .unwrap();
+            session
+                .client
+                .acknowledge_retirement(&handle, output_deadline)
+                .unwrap();
             assert!(matches!(
                 session.client.child_status(&handle, output_deadline),
                 Err(BrokerControlClientError::AuthenticationAuthority)
@@ -28588,6 +29240,7 @@ mod tests {
             service.inspect(|service| {
                 assert!(service.live_spawns.is_empty());
                 assert!(service.retiring_spawn.is_none());
+                assert!(service.retired_panes.is_empty());
             });
             for catalog in [&spawn_catalog_path, &lease_catalog_path] {
                 assert_eq!(
