@@ -11521,6 +11521,9 @@ impl TermWindow {
         }
         if let Some(overlay) = overlay {
             Self::retire_overlay_registration(OverlaySlot::Tab(tab_id), overlay);
+            // The title showed the overlay; show the pane's again now, not
+            // on the next user action.
+            self.update_title();
         }
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
@@ -11600,6 +11603,7 @@ impl TermWindow {
         }
         if let Some(overlay) = overlay {
             Self::retire_overlay_registration(OverlaySlot::Pane(pane_id), overlay);
+            self.update_title();
         }
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
