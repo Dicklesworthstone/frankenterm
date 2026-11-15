@@ -3844,7 +3844,7 @@ fn builtin_claude_code_pack() -> PatternPack {
                 // admin to enable access" (2.1.281), and "Invalid API key ·
                 // Fix external API key" (claude -p, API status 401). A bare
                 // "API key" or "ANTHROPIC_API_KEY" is ordinary coding prose:
-                // 187 of the 191 hits in 461k Claude Code messages were
+                // 186 of the 190 hits in 461k Claude Code messages were
                 // prose, and handle_auth_required types a recovery prompt
                 // into the pane.
                 anchors: vec![
@@ -4154,6 +4154,29 @@ fn builtin_claude_code_pack() -> PatternPack {
                 preview_command: None,
                 learn_more_url: None,
             },
+            // Server error: "API Error: 500 Internal server error. This is a
+            // server-side issue, usually temporary — ..." and "API Error:
+            // Server error mid-response. The response above may be
+            // incomplete." in Claude Code's logs (2.1.201 to 2.1.319). The
+            // turn stops either way. 529 stays with the overloaded rule.
+            RuleDef {
+                id: "claude_code.error.server".to_string(),
+                zone: None,
+                agent_type: AgentType::ClaudeCode,
+                event_type: "error.server".to_string(),
+                severity: Severity::Warning,
+                anchors: vec!["API Error: ".to_string()],
+                regex: Some(
+                    r"API Error: (?:(?P<status>50[0-4])\b(?: Internal server error)?|Server error mid-response)"
+                        .to_string(),
+                ),
+                description: "Claude API server error".to_string(),
+                remediation: Some("Server-side error - wait and retry".to_string()),
+                workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
         ],
     )
     .with_submit_profiles(vec![builtin_claude_code_submit_profile()])
@@ -4436,7 +4459,7 @@ fn builtin_wezterm_pack() -> PatternPack {
                 severity: Severity::Critical,
                 // WezTerm rules run on every pane. Any "mux server",
                 // "connection lost" or "disconnected" used to raise this
-                // Critical mux.error (hazard snapshot, cass search): 449 of
+                // Critical mux.error (hazard snapshot, cass search): 433 of
                 // 461k Claude Code messages did, from "both mux servers
                 // intact" to "the tmux server state". Only a mux server
                 // losing its connection counts now.
@@ -11823,8 +11846,8 @@ rules:
     /// Claude Code's own API failures, as its session logs record them
     /// (Claude Code 2.1.201..2.1.322) and as its TUI renders them under a
     /// tool-result gutter, each raise exactly their error rule. Agent prose
-    /// and tool output that merely mention a timeout, a closed connection or
-    /// an overloaded server raise none of the three.
+    /// and tool output that merely mention a timeout, a closed connection, an
+    /// overloaded server or a server error raise none of the error rules.
     #[test]
     fn claude_code_error_rules_follow_real_api_errors_not_prose() {
         let engine = PatternEngine::new();
@@ -11865,6 +11888,14 @@ rules:
                 "API Error: 529 Overloaded. This is a server-side issue, usually temporary.",
                 "claude_code.error.overloaded",
             ),
+            (
+                "API Error: 500 Internal server error. This is a server-side issue, usually temporary — try again in a moment. If it persists, check https://status.claude.com.",
+                "claude_code.error.server",
+            ),
+            (
+                "API Error: Server error mid-response. The response above may be incomplete.",
+                "claude_code.error.server",
+            ),
         ] {
             for rendered in [text.to_string(), format!("  ⎿  {text}\n")] {
                 let ids: Vec<String> = engine
@@ -11886,6 +11917,10 @@ rules:
             "The websocket connection closed before the handshake finished.",
             "Server overloaded, please retry in 30 seconds",
             "I grepped for API Error handling in the client.",
+            "The upstream returned HTTP 500 Internal Server Error twice.",
+            "curl: (22) The requested URL returned error: 500",
+            "Hit a server error mid-run, so I restarted the lane.",
+            "Error: 500 Internal server error from the registry.",
         ] {
             let errors: Vec<String> = engine
                 .detect(prose)

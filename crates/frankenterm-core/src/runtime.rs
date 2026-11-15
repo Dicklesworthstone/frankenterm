@@ -13894,6 +13894,7 @@ fn snapshot_trigger_from_detection(
                 | "error.network"
                 | "error.timeout"
                 | "error.overloaded"
+                | "error.server"
                 | "mux.error"
                 | "auth.error"
                 | "auth.login_required"
@@ -20695,12 +20696,15 @@ mod tests {
 
     #[test]
     fn snapshot_trigger_from_detection_maps_hazard() {
-        let detection = test_detection("error.timeout", Severity::Warning);
-        let trigger = snapshot_trigger_from_detection(&detection);
-        assert_eq!(
-            trigger,
-            Some(crate::snapshot_engine::SnapshotTrigger::HazardThreshold)
-        );
+        for event_type in ["error.timeout", "error.server"] {
+            let detection = test_detection(event_type, Severity::Warning);
+            let trigger = snapshot_trigger_from_detection(&detection);
+            assert_eq!(
+                trigger,
+                Some(crate::snapshot_engine::SnapshotTrigger::HazardThreshold),
+                "{event_type}"
+            );
+        }
     }
 
     #[test]

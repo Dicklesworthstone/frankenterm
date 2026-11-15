@@ -246,6 +246,22 @@
     "negative_for": "claude_code.error.overloaded"
   },
   {
+    "name": "claude_error_server_positive",
+    "text": "API Error: 500 Internal server error. This is a server-side issue, usually temporary — try again in a moment. If it persists, check https://status.claude.com.",
+    "expected_rule_ids": ["claude_code.error.server"]
+  },
+  {
+    "name": "claude_error_server_mid_response_positive",
+    "text": "API Error: Server error mid-response. The response above may be incomplete.",
+    "expected_rule_ids": ["claude_code.error.server"]
+  },
+  {
+    "name": "claude_error_server_negative_prose",
+    "text": "The upstream returned HTTP 500 Internal Server Error twice.",
+    "expected_rule_ids": [],
+    "negative_for": "claude_code.error.server"
+  },
+  {
     "name": "claude_error_timeout_positive",
     "text": "API Error: No response from API (waited 3m, then 10m on the retry). If a proxy or gateway on your network holds responses until they complete, raise API_TIMEOUT_MS or CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS to wait longer.",
     "expected_rule_ids": ["claude_code.error.timeout"],

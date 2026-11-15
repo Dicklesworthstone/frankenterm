@@ -10,7 +10,7 @@ Rules whose anchors fire on unrelated text from other programs. None are
 open; the fixed ones are below.
 
 Fixed 2026-11-14: `wezterm.mux.connection_lost` fired on any "mux server",
-"connection lost" or "disconnected", in every pane: 449 of 461k Claude Code
+"connection lost" or "disconnected", in every pane: 433 of 461k Claude Code
 messages ("both mux servers intact", "the tmux server state"). Each was a
 Critical `mux.error` with a hazard snapshot and a cass search. It now needs
 a mux server losing its connection ("mux server disconnected", "mux server
@@ -27,7 +27,7 @@ are kept as fixtures that must not match: `overloaded_fp_database`,
 `overloaded_fp_rate_limit`.
 
 Fixed 2026-11-14: `claude_code.auth.api_key_error` fired on any "API key" or
-"ANTHROPIC_API_KEY": 187 of its 191 hits in 461k Claude Code messages were
+"ANTHROPIC_API_KEY": 186 of its 190 hits in 461k Claude Code messages were
 prose. It drives `handle_auth_required`, which types a recovery prompt into
 the pane. It now needs Claude Code's own wording, and the old triggers are
 kept in `api_key_error_fp_prose`.
@@ -62,7 +62,7 @@ Recommended future work:
 | Tool name list static | `claude_code.tool_use` | Extraction regex enumerates known tools; new tools are unextracted | `tool_use_v2`, `tool_use_v3` |
 | Compaction token format | `claude_code.compaction` | Expects numeric `[\d,]+` tokens; abbreviated "12.3K" won't match | `compaction_v2`, `compaction_v3` |
 | "Thinking" anchor generic | `claude_code.thinking` | "Thinking" is common English; FP risk in verbose logs | `thinking_near_miss`, `thinking_near_miss_v2` |
-| API failures framed as "API Error: <message>" | `claude_code.error.network`, `.timeout`, `.overloaded` | Claude Code 2.1.201..2.1.322 session logs: "Connection lost mid-response", "Connection refused — ... (ECONNREFUSED)", "Can't reach the API server — ... (ENOTFOUND)", "No response from API (waited 3m, ...)", "The response stopped arriving", "529 Overloaded". The TUI shows the same text under a `⎿` gutter. | `network_error`, `network_error_v2`, `timeout_error`, `timeout_error_v2`, `overloaded`, `overloaded_v2` |
+| API failures framed as "API Error: <message>" | `claude_code.error.network`, `.timeout`, `.overloaded`, `.server` | Claude Code 2.1.201..2.1.322 session logs: "Connection lost mid-response", "Connection refused — ... (ECONNREFUSED)", "Can't reach the API server — ... (ENOTFOUND)", "No response from API (waited 3m, ...)", "The response stopped arriving", "529 Overloaded", "500 Internal server error", "Server error mid-response". The TUI shows the same text under a `⎿` gutter. | `network_error`, `network_error_v2`, `timeout_error`, `timeout_error_v2`, `overloaded`, `overloaded_v2`, `server_error_500_cli_2026_11`, `server_error_mid_response_cli_2026_11` |
 | Limit messages change wording | `claude_code.usage.reached`, `.usage.warning` | 2.1.312 renamed the session limit "5-hour limit". A weekly reset names its day ("resets Nov 12 at 2pm (America/New_York)", "resets Oct 12, 9am"), so `reset_time` keeps the date. Model limits ("You've reached your Fable 5 limit") and "You're out of usage credits" name no reset. | `usage_reached_5hour_cli_2026_11`, `usage_reached_weekly_date_cli_2026_11`, `usage_reached_model_cli_2026_11`, `usage_reached_model_v2_cli_2026_11`, `usage_reached_credits_cli_2026_11`, `usage_warning_5hour_cli_2026_11` |
 | Auth failures framed by Claude Code | `claude_code.auth.api_key_error`, `.login_required` | "Invalid API key · Fix external API key", "... for Claude Code · Use an Anthropic API key instead ...", "Failed to authenticate: OAuth session expired and could not be refreshed", "Failed to authenticate. API Error: 401 OAuth access token has expired ..." and "... 403 Attention Required! \| Cloudflare". Other tools also print "Failed to authenticate <what>", so only these framings count. | `api_key_error`, `api_key_error_v2`, `auth_failed_oauth_expired_cli_2026_11`, `auth_failed_401_cli_2026_11`, `auth_failed_403_cli_2026_11` |
 
@@ -92,13 +92,14 @@ Recommended future work:
 | 2026-01-30 | Corpus audit | `claude_code.thinking` | Added second near-miss (natural language "thinking") | `thinking_near_miss_v2.txt` |
 | 2026-11-14 | Live fleet scan + Claude Code session logs | `claude_code.error.network`, `.timeout`, `.overloaded` | Require the "API Error: " framing. Before: 0 of 9 real API errors detected, 7 of 7 prose samples fired. Synthetic positive fixtures replaced with real text; their old text now must not match. | `error_rules_fp_prose.txt`, `overloaded_fp_rate_limit.txt` |
 | 2026-11-14 | Claude Code session logs | `claude_code.usage.reached`, `.usage.warning` | Match the 5-hour, model and credit limit messages, which matched no rule, and keep a weekly reset's day. Before, "resets Nov 12 at 2pm" was read as the next 2pm, up to six days early. | `usage_reached_*_cli_2026_11.txt`, `usage_warning_5hour_cli_2026_11.txt` |
-| 2026-11-14 | Claude Code session logs + prose sweep | `claude_code.auth.api_key_error`, `.login_required` | api_key_error: only Claude Code's "Invalid API key ·" and "Use an Anthropic API key instead" (was any "API key"; 187 of 191 hits were prose). login_required: also "Failed to authenticate: OAuth" and "Failed to authenticate. API Error:", which matched no rule. | `api_key_error_fp_prose.txt`, `auth_failed_*_cli_2026_11.txt` |
-| 2026-11-14 | Prose sweep of Claude Code sessions | `wezterm.mux.connection_lost` | Require "mux server" followed by connection lost, disconnected or unavailable (was any "mux server", "connection lost" or "disconnected": 449 prose hits, no real one found). | `connection_lost_fp_prose.txt` |
+| 2026-11-14 | Claude Code session logs + prose sweep | `claude_code.auth.api_key_error`, `.login_required` | api_key_error: only Claude Code's "Invalid API key ·" and "Use an Anthropic API key instead" (was any "API key"; 186 of 190 hits were prose). login_required: also "Failed to authenticate: OAuth" and "Failed to authenticate. API Error:", which matched no rule. | `api_key_error_fp_prose.txt`, `auth_failed_*_cli_2026_11.txt` |
+| 2026-11-14 | Prose sweep of Claude Code sessions | `wezterm.mux.connection_lost` | Require "mux server" followed by connection lost, disconnected or unavailable (was any "mux server", "connection lost" or "disconnected": 433 prose hits, no real one found). | `connection_lost_fp_prose.txt` |
+| 2026-11-14 | Claude Code session logs | `claude_code.error.server` (new) | "API Error: 500 Internal server error" (21) and "API Error: Server error mid-response" (11) matched no rule, so a turn that stopped on a server error raised no error event. | `server_error_*_cli_2026_11.txt`, `server_error_fp_prose.txt` |
 
 ## Coverage Summary
 
-- 37 rules across 5 packs
-- 159 corpus fixtures
+- 38 rules across 5 packs
+- 162 corpus fixtures
 - All 3 agents have quirks documented
 - 4 confirmed false positives cataloged with fixtures, all fixed
   2026-11-14

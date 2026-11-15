@@ -2604,6 +2604,7 @@ impl Workflow for HandleOnErrorCassSearch {
             "error.network",
             "error.timeout",
             "error.overloaded",
+            "error.server",
             "mux.error",
         ]
     }
@@ -8640,6 +8641,15 @@ mod tests {
             ..base.clone()
         };
         assert!(workflow.handles(&overloaded));
+
+        // A real Claude Code 500, as the pattern engine detects it.
+        let server = crate::patterns::PatternEngine::new()
+            .detect("API Error: 500 Internal server error. This is a server-side issue, usually temporary.")
+            .into_iter()
+            .find(|d| d.rule_id == "claude_code.error.server")
+            .expect("a Claude Code 500 raises claude_code.error.server");
+        assert_eq!(server.event_type, "error.server");
+        assert!(workflow.handles(&server));
 
         let mux_error = Detection {
             event_type: "mux.error".to_string(),
