@@ -45,6 +45,26 @@ pub enum FleetMsg {
     Input(Event),
 }
 
+/// An empty initial list may select its first arriving row. Losing an existing
+/// selection is different: only deliberate navigation may select another pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Selection {
+    Pending,
+    Row(usize),
+    Removed,
+}
+
+#[derive(Debug)]
+enum SelectionAnchor {
+    Pane {
+        id: u64,
+        uuid: Option<String>,
+        first_seen_at: Option<i64>,
+    },
+    PersistedDetection { id: i64, pane_id: u64 },
+    UnstoredDetection(Detection),
+}
+
 impl From<Event> for FleetMsg {
     fn from(event: Event) -> Self {
         Self::Input(event)
@@ -64,7 +84,7 @@ pub struct FleetModel {
     last_frame_at_ms: Option<i64>,
     lag_frames: u64,
     gap_panes: Vec<u64>,
-    selected: usize,
+    selection: Selection,
     now_ms: i64,
     last_error: Option<String>,
     refresh_requested: bool,
@@ -90,7 +110,7 @@ impl FleetModel {
             last_frame_at_ms: None,
             lag_frames: 0,
             gap_panes: Vec::new(),
-            selected: 0,
+            selection: Selection::Pending,
             now_ms: 0,
             last_error: None,
             refresh_requested: false,
@@ -106,6 +126,11 @@ impl FleetModel {
     pub fn ingest_panes(&mut self, body: &str) -> Result<usize, wire::WireError> {
         match wire::decode_panes(body) {
             Ok(mut panes) => {
+                let selected = if self.view == View::Panes {
+                    self.selection_anchor()
+                } else {
+                    None
+                };
                 panes.sort_by_key(|p| p.pane_id);
                 self.panes_truncated = panes.len().saturating_sub(MAX_PANES);
                 panes.truncate(MAX_PANES);
@@ -113,7 +138,7 @@ impl FleetModel {
                 self.panes = panes;
                 self.panes_loaded_at_ms = Some(self.now_ms);
                 self.last_error = None;
-                self.clamp_selection();
+                self.reconcile_selection(selected);
                 Ok(count)
             }
             Err(err) => {
@@ -127,13 +152,18 @@ impl FleetModel {
     pub fn ingest_events(&mut self, body: &str) -> Result<usize, wire::WireError> {
         match wire::decode_events(body) {
             Ok(mut events) => {
+                let selected = if self.view == View::Events {
+                    self.selection_anchor()
+                } else {
+                    None
+                };
                 events.sort_by_key(|e| std::cmp::Reverse(e.detected_at_ms));
                 events.truncate(MAX_EVENTS);
                 let count = events.len();
                 self.events = events.into();
                 self.events_loaded_at_ms = Some(self.now_ms);
                 self.last_error = None;
-                self.clamp_selection();
+                self.reconcile_selection(selected);
                 Ok(count)
             }
             Err(err) => {
@@ -152,6 +182,14 @@ impl FleetModel {
                 return Err(err);
             }
         };
+        let selected = match (&update, self.view) {
+            (StreamUpdate::Detection(_), View::Events)
+            | (
+                StreamUpdate::PaneDiscovered { .. } | StreamUpdate::PaneDisappeared { .. },
+                View::Panes,
+            ) => self.selection_anchor(),
+            _ => None,
+        };
         self.last_frame_at_ms = Some(self.now_ms);
         match update {
             StreamUpdate::Ready => self.stream = StreamState::Live,
@@ -168,6 +206,8 @@ impl FleetModel {
                 } else if self.panes.len() < MAX_PANES {
                     self.panes.push(Pane {
                         pane_id,
+                        pane_uuid: None,
+                        first_seen_at: None,
                         domain,
                         title: Some(title),
                         cwd: None,
@@ -180,7 +220,6 @@ impl FleetModel {
             }
             StreamUpdate::PaneDisappeared { pane_id } => {
                 self.panes.retain(|p| p.pane_id != pane_id);
-                self.clamp_selection();
             }
             StreamUpdate::Gap { pane_id } => {
                 if !self.gap_panes.contains(&pane_id) {
@@ -190,6 +229,7 @@ impl FleetModel {
             StreamUpdate::Lag => self.lag_frames = self.lag_frames.saturating_add(1),
             StreamUpdate::Other => {}
         }
+        self.reconcile_selection(selected);
         Ok(())
     }
 
@@ -224,8 +264,42 @@ impl FleetModel {
     }
 
     #[must_use]
-    pub fn selected(&self) -> usize {
-        self.selected
+    pub fn selected(&self) -> Option<usize> {
+        match self.selection {
+            Selection::Row(index) => Some(index),
+            Selection::Pending | Selection::Removed => None,
+        }
+    }
+
+    /// The pane selected by an actual row, never by a stale display offset.
+    #[must_use]
+    pub fn selected_pane_id(&self) -> Option<u64> {
+        let index = self.selected()?;
+        match self.view {
+            View::Panes => self.panes.get(index).map(|pane| pane.pane_id),
+            View::Events => self.events.get(index).map(|event| event.pane_id),
+        }
+    }
+
+    fn selection_anchor(&self) -> Option<SelectionAnchor> {
+        let index = self.selected()?;
+        match self.view {
+            View::Panes => self
+                .panes
+                .get(index)
+                .map(|pane| SelectionAnchor::Pane {
+                    id: pane.pane_id,
+                    uuid: pane.pane_uuid.clone(),
+                    first_seen_at: pane.first_seen_at,
+                }),
+            View::Events => self.events.get(index).map(|event| match event.id {
+                Some(id) => SelectionAnchor::PersistedDetection {
+                    id,
+                    pane_id: event.pane_id,
+                },
+                None => SelectionAnchor::UnstoredDetection(event.clone()),
+            }),
+        }
     }
 
     fn push_detection(&mut self, detection: Detection) {
@@ -244,42 +318,74 @@ impl FleetModel {
         }
     }
 
-    fn clamp_selection(&mut self) {
+    fn reconcile_selection(&mut self, anchor: Option<SelectionAnchor>) {
+        let selected = match anchor {
+            Some(SelectionAnchor::Pane {
+                id,
+                uuid,
+                first_seen_at,
+            }) => self.panes.iter().position(|pane| {
+                pane.pane_id == id && pane.pane_uuid == uuid && pane.first_seen_at == first_seen_at
+            }),
+            Some(SelectionAnchor::PersistedDetection { id, pane_id }) => self
+                .events
+                .iter()
+                .position(|event| event.id == Some(id) && event.pane_id == pane_id),
+            Some(SelectionAnchor::UnstoredDetection(selected)) => {
+                self.events.iter().position(|event| event == &selected)
+            }
+            None => {
+                if self.selection == Selection::Pending && self.rows_in_view() > 0 {
+                    self.selection = Selection::Row(0);
+                }
+                return;
+            }
+        };
+        self.selection = selected.map_or(Selection::Removed, Selection::Row);
+    }
+
+    fn select_row(&mut self, index: usize) {
         let rows = self.rows_in_view();
-        if self.selected >= rows {
-            self.selected = rows.saturating_sub(1);
-        }
+        self.selection = if rows == 0 {
+            Selection::Pending
+        } else {
+            Selection::Row(index.min(rows - 1))
+        };
+    }
+
+    fn change_view(&mut self, view: View) {
+        self.view = view;
+        self.select_row(0);
+    }
+
+    fn move_selection(&mut self, forward: bool) {
+        let index = match self.selected() {
+            Some(index) if forward => index.saturating_add(1),
+            Some(index) => index.saturating_sub(1),
+            None => 0,
+        };
+        self.select_row(index);
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
         if key.kind == KeyEventKind::Release {
             return;
         }
-        let rows = self.rows_in_view();
         match key.code {
             KeyCode::Tab | KeyCode::BackTab => {
-                self.view = match self.view {
+                self.change_view(match self.view {
                     View::Panes => View::Events,
                     View::Events => View::Panes,
-                };
-                self.selected = 0;
+                });
             }
-            KeyCode::Char('1') => {
-                self.view = View::Panes;
-                self.selected = 0;
+            KeyCode::Char('1') => self.change_view(View::Panes),
+            KeyCode::Char('2') => self.change_view(View::Events),
+            KeyCode::Down | KeyCode::Char('j') => self.move_selection(true),
+            KeyCode::Up | KeyCode::Char('k') => self.move_selection(false),
+            KeyCode::Home | KeyCode::Char('g') => self.select_row(0),
+            KeyCode::End | KeyCode::Char('G') => {
+                self.select_row(self.rows_in_view().saturating_sub(1));
             }
-            KeyCode::Char('2') => {
-                self.view = View::Events;
-                self.selected = 0;
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.selected + 1 < rows {
-                    self.selected += 1;
-                }
-            }
-            KeyCode::Up | KeyCode::Char('k') => self.selected = self.selected.saturating_sub(1),
-            KeyCode::Home | KeyCode::Char('g') => self.selected = 0,
-            KeyCode::End | KeyCode::Char('G') => self.selected = rows.saturating_sub(1),
             KeyCode::Char('r') => self.refresh_requested = true,
             _ => {}
         }
@@ -468,7 +574,11 @@ impl FleetModel {
                 Style::fg(RED).bg(BAR_BG),
             );
         } else {
-            let hint = "1/2 switch view · j/k move · g/G top/bottom · r refresh";
+            let hint = if self.selection == Selection::Removed {
+                "Selected row disappeared. Choose a row before inspecting a pane."
+            } else {
+                "1/2 switch view · j/k move · g/G top/bottom · r refresh"
+            };
             put(
                 frame,
                 1,
@@ -507,7 +617,10 @@ impl FleetModel {
             return;
         }
         let visible = usize::from(rows.saturating_sub(1));
-        let first = self.selected.saturating_sub(visible.saturating_sub(1));
+        let first = self
+            .selected()
+            .unwrap_or(0)
+            .saturating_sub(visible.saturating_sub(1));
         for (i, pane) in self.panes.iter().enumerate().skip(first).take(visible) {
             let row = top + 1 + (i - first) as u16;
             let gap = if self.gap_panes.contains(&pane.pane_id) {
@@ -525,7 +638,7 @@ impl FleetModel {
                     .as_deref()
                     .map_or_else(|| "-".to_string(), display_cwd),
             );
-            let style = if i == self.selected {
+            let style = if self.selected() == Some(i) {
                 Style::fg(FG).selected()
             } else {
                 Style::fg(FG)
@@ -572,7 +685,10 @@ impl FleetModel {
             return;
         }
         let visible = usize::from(rows.saturating_sub(1));
-        let first = self.selected.saturating_sub(visible.saturating_sub(1));
+        let first = self
+            .selected()
+            .unwrap_or(0)
+            .saturating_sub(visible.saturating_sub(1));
         for (i, event) in self.events.iter().enumerate().skip(first).take(visible) {
             let row = top + 1 + (i - first) as u16;
             let line = format!(
@@ -583,7 +699,7 @@ impl FleetModel {
                 event.rule_id,
             );
             let mut style = Style::fg(severity_color(&event.severity));
-            if i == self.selected {
+            if self.selected() == Some(i) {
                 style = style.selected();
             }
             put(frame, 0, row, &line, width, style);
@@ -779,9 +895,9 @@ mod tests {
         model.ingest_panes(PANES).expect("panes");
         model.update(key(KeyCode::Char('j')));
         model.update(key(KeyCode::Char('j')));
-        assert_eq!(model.selected(), 1, "selection stops at the last row");
+        assert_eq!(model.selected(), Some(1), "selection stops at the last row");
         model.update(key(KeyCode::Char('g')));
-        assert_eq!(model.selected(), 0);
+        assert_eq!(model.selected(), Some(0));
         model.update(key(KeyCode::Char('r')));
         assert!(model.take_refresh_request());
         assert!(!model.take_refresh_request());
@@ -789,7 +905,189 @@ mod tests {
         model.update(key(KeyCode::Char('G')));
         model.ingest_stream_frame(gone).expect("disappeared");
         assert_eq!(model.panes().len(), 1);
-        assert_eq!(model.selected(), 0, "selection follows the shrunken list");
+        assert_eq!(
+            model.selected(),
+            None,
+            "a vanished pane cannot select its neighbor"
+        );
+        assert_eq!(model.selected_pane_id(), None);
+        assert!(render(&model, 100, 8)[7].contains("Selected row disappeared"));
+        model.update(key(KeyCode::Char('j')));
+        assert_eq!(model.selected_pane_id(), Some(2));
+    }
+
+    fn panes_body(ids: &[u64]) -> String {
+        serde_json::json!({"ok": true, "data": {"panes": ids.iter().map(|id| {
+            serde_json::json!({"pane_id": id, "domain": "local", "last_seen_at": 1})
+        }).collect::<Vec<_>>()}})
+        .to_string()
+    }
+
+    fn detection_frame(id: i64, pane: u64, time: i64) -> String {
+        serde_json::json!({"schema": "ft.stream.v1", "kind": "event", "ts_ms": time,
+            "data": {"event": {"type": "pattern_detected", "pane_id": pane, "event_id": id,
+                "detection": {"rule_id": "test.rule", "severity": "warning"}}}})
+        .to_string()
+    }
+
+    #[test]
+    fn pane_selection_follows_identity_across_refresh_and_live_reordering() {
+        let mut model = FleetModel::new();
+        model.ingest_panes(&panes_body(&[20, 30])).unwrap();
+        model.update(key(KeyCode::Down));
+        assert_eq!(model.selected_pane_id(), Some(30));
+        model.ingest_panes(&panes_body(&[30, 10, 20])).unwrap();
+        assert_eq!(model.selected(), Some(2));
+        assert_eq!(model.selected_pane_id(), Some(30));
+        model
+            .ingest_stream_frame(
+                r#"{"schema":"ft.stream.v1","kind":"event","data":{"event":{"type":"pane_discovered","pane_id":5,"domain":"local","title":"new"}}}"#,
+            )
+            .unwrap();
+        assert_eq!(model.selected(), Some(3));
+        assert_eq!(model.selected_pane_id(), Some(30));
+        model
+            .ingest_stream_frame(
+                r#"{"schema":"ft.stream.v1","kind":"event","data":{"event":{"type":"pane_disappeared","pane_id":20}}}"#,
+            )
+            .unwrap();
+        assert_eq!(model.selected(), Some(2));
+        assert_eq!(model.selected_pane_id(), Some(30));
+    }
+
+    #[test]
+    fn removed_selection_never_reappears_without_operator_navigation() {
+        let mut model = FleetModel::new();
+        model.ingest_panes(&panes_body(&[20, 30])).unwrap();
+        model.ingest_panes(&panes_body(&[30])).unwrap();
+        assert_eq!(model.selected_pane_id(), None);
+        // Even the same numeric id returning is not consent to inspect it.
+        model.ingest_panes(&panes_body(&[20, 30, 40])).unwrap();
+        model.ingest_events(EVENTS).unwrap();
+        model
+            .ingest_stream_frame(r#"{"schema":"ft.stream.v1","kind":"ready"}"#)
+            .unwrap();
+        assert_eq!(model.selected_pane_id(), None);
+        model.update(key(KeyCode::Char('r')));
+        assert_eq!(
+            model.selected_pane_id(),
+            None,
+            "refresh is not row navigation"
+        );
+        model.update(key(KeyCode::End));
+        assert_eq!(model.selected_pane_id(), Some(40));
+    }
+
+    #[test]
+    fn empty_initial_view_selects_first_data_but_empty_replacement_does_not() {
+        let mut model = FleetModel::new();
+        model.ingest_panes(&panes_body(&[])).unwrap();
+        assert_eq!(model.selected(), None);
+        model.ingest_panes(&panes_body(&[30])).unwrap();
+        assert_eq!(model.selected_pane_id(), Some(30));
+        model.ingest_panes(&panes_body(&[])).unwrap();
+        model.ingest_panes(&panes_body(&[40])).unwrap();
+        assert_eq!(model.selected(), None);
+        model.update(key(KeyCode::Home));
+        assert_eq!(model.selected_pane_id(), Some(40));
+    }
+
+    #[test]
+    fn replaced_pane_registration_requires_explicit_reselection() {
+        for field in ["pane_uuid", "first_seen_at"] {
+            let mut model = FleetModel::new();
+            let mut pane = serde_json::json!({"pane_id": 7, "pane_uuid": "registration-a",
+                "first_seen_at": 10, "last_seen_at": 20, "domain": "local"});
+            let initial = serde_json::json!({"ok": true, "data": {"panes": [&pane]}});
+            model.ingest_panes(&initial.to_string()).unwrap();
+            assert_eq!(model.selected_pane_id(), Some(7));
+            if field == "pane_uuid" {
+                pane[field] = serde_json::json!("registration-b");
+            } else {
+                pane[field] = serde_json::json!(30);
+            }
+            let replacement = serde_json::json!({"ok": true, "data": {"panes": [&pane]}});
+            model.ingest_panes(&replacement.to_string()).unwrap();
+            assert_eq!(model.selected_pane_id(), None, "changed {field}");
+            model.update(key(KeyCode::Home));
+            assert_eq!(model.selected_pane_id(), Some(7));
+        }
+    }
+
+    #[test]
+    fn detection_selection_survives_prepend_and_reordered_snapshot() {
+        let mut model = FleetModel::new();
+        model.ingest_events(EVENTS).unwrap();
+        model.update(key(KeyCode::Char('2')));
+        assert_eq!(model.selected_pane_id(), Some(7));
+        model
+            .ingest_stream_frame(&detection_frame(6, 2, 10_000))
+            .unwrap();
+        assert_eq!(model.selected(), Some(1));
+        assert_eq!(model.selected_pane_id(), Some(7));
+        // Stored timestamps may differ from replay envelope timestamps. The
+        // persisted identity, not display content or position, owns selection.
+        model
+            .ingest_events(
+                r#"{"ok":true,"data":{"events":[
+                    {"id":5,"pane_id":7,"rule_id":"updated.rule","severity":"critical","detected_at":12000},
+                    {"id":6,"pane_id":2,"rule_id":"test.rule","severity":"warning","detected_at":10000}]}}"#,
+            )
+            .unwrap();
+        assert_eq!(model.selected(), Some(0));
+        assert_eq!(model.selected_pane_id(), Some(7));
+        model
+            .ingest_stream_frame(&detection_frame(5, 7, 99_000))
+            .unwrap();
+        assert_eq!(
+            model.selected_pane_id(),
+            Some(7),
+            "deduplicated replay is inert"
+        );
+        model.ingest_panes(&panes_body(&[])).unwrap();
+        assert_eq!(
+            model.selected_pane_id(),
+            Some(7),
+            "unrelated inventory is inert"
+        );
+    }
+
+    #[test]
+    fn detection_removal_and_eviction_clear_actionable_selection() {
+        let mut model = FleetModel::new();
+        model.ingest_events(EVENTS).unwrap();
+        model.update(key(KeyCode::Char('2')));
+        for id in 6..(6 + MAX_EVENTS as i64) {
+            model
+                .ingest_stream_frame(&detection_frame(id, 2, id))
+                .unwrap();
+        }
+        assert_eq!(model.events().len(), MAX_EVENTS);
+        assert_eq!(
+            model.selected_pane_id(),
+            None,
+            "eviction cannot retarget inspection"
+        );
+        model.update(key(KeyCode::Home));
+        assert_eq!(model.selected_pane_id(), Some(2));
+        model.ingest_events(EVENTS).unwrap();
+        assert_eq!(
+            model.selected_pane_id(),
+            None,
+            "refresh cannot retarget inspection"
+        );
+        model.update(key(KeyCode::Up));
+        assert_eq!(model.selected_pane_id(), Some(7));
+        model
+            .ingest_events(
+                r#"{"ok":true,"data":{"events":[{"id":5,"pane_id":99,"rule_id":"test.rule","severity":"warning","detected_at":9500}]}}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            model.selected_pane_id(),
+            None,
+            "event ids cannot change their pane target"
+        );
     }
 
     #[test]

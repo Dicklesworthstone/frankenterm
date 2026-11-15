@@ -51,6 +51,10 @@ fn decode_envelope<T: for<'de> Deserialize<'de>>(body: &str) -> Result<T, WireEr
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Pane {
     pub pane_id: u64,
+    #[serde(default)]
+    pub pane_uuid: Option<String>,
+    #[serde(default)]
+    pub first_seen_at: Option<i64>,
     pub domain: String,
     #[serde(default)]
     pub title: Option<String>,

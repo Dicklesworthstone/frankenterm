@@ -3,7 +3,7 @@
 use js_sys::{Object, Reflect, Uint8Array, Uint32Array};
 use wasm_bindgen::prelude::*;
 
-use crate::model::{StreamState, View};
+use crate::model::StreamState;
 use crate::runner::FleetRunner;
 
 #[wasm_bindgen]
@@ -83,15 +83,7 @@ impl FleetViewer {
     /// Return exact decimal identity, never a JavaScript Number.
     #[wasm_bindgen(js_name = selectedPaneId)]
     pub fn selected_pane_id(&self) -> Option<String> {
-        let model = self.inner.model();
-        let pane_id = match model.active_view() {
-            View::Panes => model.panes().get(model.selected()).map(|pane| pane.pane_id),
-            View::Events => model
-                .events()
-                .get(model.selected())
-                .map(|event| event.pane_id),
-        };
-        pane_id.map(|id| id.to_string())
+        self.inner.model().selected_pane_id().map(|id| id.to_string())
     }
 
     #[wasm_bindgen(js_name = takeFlatPatches)]

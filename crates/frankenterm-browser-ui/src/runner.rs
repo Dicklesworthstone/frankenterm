@@ -272,6 +272,51 @@ mod tests {
     }
 
     #[test]
+    fn inspection_target_survives_live_frames_and_requires_selection_after_removal() {
+        let mut runner = FleetRunner::new(100, 12);
+        runner.init().expect("init");
+        runner
+            .ingest_panes(
+                r#"{"ok":true,"data":{"panes":[
+                    {"pane_id":3,"domain":"local","title":"first","last_seen_at":1},
+                    {"pane_id":18446744073709551615,"domain":"remote","title":"selected","last_seen_at":1}]}}"#,
+            )
+            .expect("inventory");
+        assert!(runner.push_encoded_input(
+            r#"{"kind":"key","phase":"down","key":"ArrowDown","code":"ArrowDown","mods":0,"repeat":false}"#,
+        ));
+        runner.step().expect("navigation");
+        assert_eq!(runner.model().selected_pane_id(), Some(u64::MAX));
+        runner
+            .ingest_stream_frame(
+                r#"{"schema":"ft.stream.v1","kind":"event","data":{"event":{"type":"pane_discovered","pane_id":1,"domain":"local","title":"arriving"}}}"#,
+            )
+            .expect("discovery");
+        runner.step().expect("repaint");
+        runner.prepare_flat_patches();
+        assert_eq!(runner.model().selected_pane_id(), Some(u64::MAX));
+        assert_eq!(runner.model().selected(), Some(2));
+        runner
+            .ingest_stream_frame(
+                r#"{"schema":"ft.stream.v1","kind":"event","data":{"event":{"type":"pane_disappeared","pane_id":18446744073709551615}}}"#,
+            )
+            .expect("departure");
+        runner.step().expect("selection removal");
+        assert_eq!(runner.model().selected_pane_id(), None);
+        assert!(
+            runner
+                .screen_text()
+                .iter()
+                .any(|row| row.contains("Selected row disappeared"))
+        );
+        assert!(runner.push_encoded_input(
+            r#"{"kind":"key","phase":"down","key":"Home","code":"Home","mods":0,"repeat":false}"#,
+        ));
+        runner.step().expect("explicit reselection");
+        assert_eq!(runner.model().selected_pane_id(), Some(1));
+    }
+
+    #[test]
     fn sizes_are_clamped() {
         assert_eq!(FleetRunner::new(0, 0).size(), (MIN_COLS, MIN_ROWS));
         assert_eq!(
