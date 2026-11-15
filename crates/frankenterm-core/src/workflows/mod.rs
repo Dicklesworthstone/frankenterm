@@ -10178,6 +10178,135 @@ Try again at 3:00 PM UTC.
         });
     }
 
+    /// ft-frujlz: each builtin rule's `workflow` label names the workflow the
+    /// runner would start for it without the label gate, and none where none
+    /// would. So gating dispatch on the label leaves builtin behaviour as it
+    /// was, and the label that `ft robot events` reports is true.
+    #[test]
+    fn builtin_rule_workflow_labels_match_dispatch() {
+        let workflows: Vec<Arc<dyn Workflow>> = vec![
+            Arc::new(HandleCompaction::new()),
+            Arc::new(HandleUsageLimits::new()),
+            Arc::new(HandleSessionEnd::new()),
+            Arc::new(HandleSessionStartContext::new()),
+            Arc::new(HandleAuthRequired::new()),
+            Arc::new(HandleClaudeCodeLimits::new()),
+            Arc::new(HandleGeminiQuota::new()),
+            Arc::new(HandleProcessTriageLifecycle::new()),
+            Arc::new(HandleOnErrorCassSearch::new()),
+            Arc::new(HandleSwarmLearningIndex::new()),
+        ];
+        let engine = PatternEngine::new();
+        let mut labelled = 0_usize;
+        for rule in engine.rules() {
+            let detection = make_session_detection(
+                &rule.id,
+                rule.agent_type,
+                &rule.event_type,
+                serde_json::json!({}),
+            );
+            let dispatched = workflows
+                .iter()
+                .find(|w| w.is_enabled() && w.handles(&detection))
+                .map(|w| w.name());
+            assert_eq!(
+                rule.workflow.as_deref(),
+                dispatched,
+                "{}: workflow label vs the workflow the runner starts",
+                rule.id
+            );
+            assert_eq!(engine.rule_workflow(&rule.id), rule.workflow.as_deref());
+            labelled += usize::from(dispatched.is_some());
+        }
+        assert!(
+            labelled >= 20,
+            "only {labelled} builtin rules start a workflow"
+        );
+    }
+
+    /// ft-frujlz: an unsigned user pack loads observe-only (ft-yjfke strips
+    /// its rules' workflow labels), but the runner picked workflows by event
+    /// type alone, so such a rule emitting auth.error still started
+    /// handle_auth_required. With the label gate it starts nothing, and a
+    /// builtin rule still starts the workflow it declares.
+    #[test]
+    fn rule_workflow_gate_keeps_observe_only_packs_from_starting_workflows() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("evil.toml"),
+            r#"
+name = "user:evil"
+version = "1.0.0"
+[[rules]]
+id = "myorg.fake_auth"
+agent_type = "codex"
+event_type = "auth.error"
+severity = "warning"
+anchors = ["[FAKE-AUTH-ANCHOR]"]
+description = "unsigned pack rule emitting a builtin workflow's event type"
+workflow = "handle_auth_required"
+"#,
+        )
+        .unwrap();
+        let config = crate::config::PatternsConfig {
+            user_packs_enabled: true,
+            user_packs_dir: Some(dir.path().to_str().unwrap().to_string()),
+            ..crate::config::PatternsConfig::default()
+        };
+        let engine = PatternEngine::from_config_with_root(&config, None).unwrap();
+        assert_eq!(engine.rule_workflow("myorg.fake_auth"), None);
+        let fake = engine
+            .detect("[FAKE-AUTH-ANCHOR]")
+            .into_iter()
+            .find(|d| d.rule_id == "myorg.fake_auth")
+            .expect("the observe-only rule still detects");
+        assert_eq!(fake.event_type, "auth.error");
+        let server = engine
+            .detect("API Error: 500 Internal server error. This is a server-side issue.")
+            .into_iter()
+            .find(|d| d.rule_id == "claude_code.error.server")
+            .expect("builtin rules load beside the user pack");
+        let patterns = Arc::new(crate::runtime_async::RwLock::new(engine));
+
+        let db_path = std::env::temp_dir()
+            .join(format!("wa_test_rule_gate_{}.db", std::process::id()))
+            .to_string_lossy()
+            .to_string();
+        run_async_test(async move {
+            let (runner, _storage, _lock) = create_test_runner(&db_path).await;
+            runner.register_workflow(Arc::new(HandleAuthRequired::new()));
+            runner.register_workflow(Arc::new(HandleOnErrorCassSearch::new()));
+
+            // Without the gate the event type alone picks a workflow.
+            assert_eq!(
+                runner.find_matching_workflow(&fake).map(|w| w.name()),
+                Some("handle_auth_required")
+            );
+
+            let runner = runner.with_rule_workflow_gate(Arc::clone(&patterns));
+            let declared = patterns
+                .read()
+                .await
+                .rule_workflow(&server.rule_id)
+                .map(str::to_owned);
+            assert_eq!(
+                runner
+                    .find_declared_workflow(&server, declared.as_deref())
+                    .map(|w| w.name()),
+                Some("handle_on_error_cass_search")
+            );
+            let result = runner.handle_detection(7, &fake, None).await;
+            assert!(
+                matches!(
+                    &result,
+                    WorkflowStartResult::NoMatchingWorkflow { rule_id }
+                        if rule_id == "myorg.fake_auth"
+                ),
+                "{result:?}"
+            );
+        });
+    }
+
     #[test]
     fn regression_session_end_full_execution() {
         run_async_test(async {

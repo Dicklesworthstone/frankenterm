@@ -3491,9 +3491,11 @@ fn builtin_codex_pack() -> PatternPack {
                 regex: Some(CODEX_USAGE_WARNING_REGEX.to_string()),
                 description: "Codex usage below 5% remaining - critical threshold".to_string(),
                 remediation: Some("Save work and prepare for limit".to_string()),
-                workflow: Some("handle_usage_warning".to_string()),
+                // No builtin workflow handles Codex usage warnings (there is
+                // no handle_usage_warning).
+                workflow: None,
                 manual_fix: Some("Finish current task quickly and prepare to switch accounts or wait for reset".to_string()),
-                preview_command: Some("ft workflow run handle_usage_warning --pane {pane} --dry-run".to_string()),
+                preview_command: None,
                 learn_more_url: None,
             },
             // Usage limit reached
@@ -3763,7 +3765,7 @@ fn builtin_claude_code_pack() -> PatternPack {
                 ),
                 description: "Claude Code usage warning".to_string(),
                 remediation: Some("Consider saving work soon".to_string()),
-                workflow: None,
+                workflow: Some("handle_claude_code_limits".to_string()),
                 manual_fix: None,
                 preview_command: None,
                 learn_more_url: None,
@@ -3916,7 +3918,9 @@ fn builtin_claude_code_pack() -> PatternPack {
                 regex: None,
                 description: "Claude Code login/authentication required via browser".to_string(),
                 remediation: Some("Complete authentication in the browser window".to_string()),
-                workflow: Some("handle_auth_required".to_string()),
+                // handle_auth_required takes only auth.device_code and
+                // auth.error; a browser login needs a person.
+                workflow: None,
                 manual_fix: Some("Open the provided URL in a browser and complete the login flow".to_string()),
                 preview_command: None,
                 learn_more_url: None,
@@ -4041,7 +4045,7 @@ fn builtin_claude_code_pack() -> PatternPack {
                 ),
                 description: "Claude Code network/connection error".to_string(),
                 remediation: Some("Check network connectivity and retry".to_string()),
-                workflow: None,
+                workflow: Some("handle_on_error_cass_search".to_string()),
                 manual_fix: None,
                 preview_command: None,
                 learn_more_url: None,
@@ -4063,7 +4067,7 @@ fn builtin_claude_code_pack() -> PatternPack {
                 ),
                 description: "Claude Code timeout error".to_string(),
                 remediation: Some("Operation timed out - consider retrying".to_string()),
-                workflow: None,
+                workflow: Some("handle_on_error_cass_search".to_string()),
                 manual_fix: None,
                 preview_command: None,
                 learn_more_url: None,
@@ -4130,7 +4134,7 @@ fn builtin_claude_code_pack() -> PatternPack {
                 ),
                 description: "Claude Code compaction completed".to_string(),
                 remediation: None,
-                workflow: None,
+                workflow: Some("handle_compaction".to_string()),
                 manual_fix: None,
                 preview_command: None,
                 learn_more_url: None,
@@ -4149,7 +4153,7 @@ fn builtin_claude_code_pack() -> PatternPack {
                 regex: Some(r"API Error: (?:Repeated )?529\b(?: Overloaded)?".to_string()),
                 description: "Claude API is overloaded".to_string(),
                 remediation: Some("API is busy - wait and retry".to_string()),
-                workflow: None,
+                workflow: Some("handle_on_error_cass_search".to_string()),
                 manual_fix: None,
                 preview_command: None,
                 learn_more_url: None,
@@ -4172,7 +4176,7 @@ fn builtin_claude_code_pack() -> PatternPack {
                 ),
                 description: "Claude API server error".to_string(),
                 remediation: Some("Server-side error - wait and retry".to_string()),
-                workflow: None,
+                workflow: Some("handle_on_error_cass_search".to_string()),
                 manual_fix: None,
                 preview_command: None,
                 learn_more_url: None,
@@ -4252,7 +4256,7 @@ fn builtin_gemini_pack() -> PatternPack {
                 ),
                 description: "Gemini usage limit approaching".to_string(),
                 remediation: Some("Consider switching models or accounts soon".to_string()),
-                workflow: None,
+                workflow: Some("handle_gemini_quota".to_string()),
                 manual_fix: None,
                 preview_command: None,
                 learn_more_url: None,
@@ -4393,7 +4397,9 @@ fn builtin_gemini_pack() -> PatternPack {
                 regex: None,
                 description: "Gemini CLI OAuth authentication required via browser".to_string(),
                 remediation: Some("Complete Google OAuth in the browser window".to_string()),
-                workflow: Some("handle_auth_required".to_string()),
+                // handle_auth_required takes only auth.device_code and
+                // auth.error; a browser sign-in needs a person.
+                workflow: None,
                 manual_fix: Some("Open the provided Google OAuth URL in a browser and complete sign-in".to_string()),
                 preview_command: None,
                 learn_more_url: None,
@@ -4470,7 +4476,7 @@ fn builtin_wezterm_pack() -> PatternPack {
                 ),
                 description: "WezTerm mux server connection lost".to_string(),
                 remediation: Some("Check WezTerm mux server status".to_string()),
-                workflow: None,
+                workflow: Some("handle_on_error_cass_search".to_string()),
                 manual_fix: None,
                 preview_command: None,
                 learn_more_url: None,
@@ -6202,6 +6208,18 @@ impl PatternEngine {
     #[must_use]
     pub fn pack_for_rule(&self, rule_id: &str) -> Option<&str> {
         self.library.pack_for_rule(rule_id)
+    }
+
+    /// The workflow a rule declares as its trigger, if any. Packs downgraded
+    /// to observe-only have this stripped, so their rules declare none.
+    #[must_use]
+    pub fn rule_workflow(&self, rule_id: &str) -> Option<&str> {
+        // merge_rules keeps one rule per id, sorted by id.
+        let rules = self.rules();
+        rules
+            .binary_search_by(|rule| rule.id.as_str().cmp(rule_id))
+            .ok()
+            .and_then(|index| rules[index].workflow.as_deref())
     }
 
     /// Return a canonical JSON representation of the rule definition for hashing.

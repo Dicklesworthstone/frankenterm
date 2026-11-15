@@ -1218,6 +1218,13 @@ pub struct WorkflowRunner {
     /// When unset, External waits return an explicit `WorkflowError::Aborted`
     /// instead of the legacy timeout-sleep mock.
     external_signals: Option<Arc<ExternalSignalRegistry>>,
+    /// Live pattern engine whose rule `workflow` labels gate detection
+    /// dispatch (ft-frujlz). When set, a detection starts only the workflow
+    /// its rule declares, and only if that workflow also accepts it. Packs
+    /// downgraded to observe-only declare no workflow, so they start none.
+    /// When unset, the first workflow whose `handles` accepts the detection
+    /// runs.
+    rule_workflows: Option<Arc<crate::runtime_async::RwLock<crate::patterns::PatternEngine>>>,
     /// Configuration
     config: WorkflowRunnerConfig,
 }
@@ -1253,8 +1260,21 @@ impl WorkflowRunner {
             source_registry: None,
             replay_capture: None,
             external_signals: None,
+            rule_workflows: None,
             config,
         }
+    }
+
+    /// Start a detection's workflow only if its rule declares it (ft-frujlz).
+    /// Pass the engine the observation runtime detects with, so pack reloads
+    /// apply here too.
+    #[must_use]
+    pub fn with_rule_workflow_gate(
+        mut self,
+        patterns: Arc<crate::runtime_async::RwLock<crate::patterns::PatternEngine>>,
+    ) -> Self {
+        self.rule_workflows = Some(patterns);
+        self
     }
 
     /// Use the workspace watcher for live shell and capture-continuity evidence.
@@ -1368,6 +1388,25 @@ impl WorkflowRunner {
             .cloned()
     }
 
+    /// Find the workflow a detection starts when its rule declares
+    /// `declared`: that workflow, if it is registered, enabled and accepts
+    /// the detection. A rule that declares nothing starts nothing.
+    pub fn find_declared_workflow(
+        &self,
+        detection: &crate::patterns::Detection,
+        declared: Option<&str>,
+    ) -> Option<Arc<dyn Workflow>> {
+        let declared = declared?;
+        let workflows = self
+            .workflows
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        workflows
+            .iter()
+            .find(|w| w.name() == declared && w.is_enabled() && w.handles(detection))
+            .cloned()
+    }
+
     /// Find a workflow by name.
     ///
     /// Recovers from a poisoned `workflows` RwLock.
@@ -1435,7 +1474,29 @@ impl WorkflowRunner {
             };
         }
 
-        let Some(workflow) = self.find_matching_workflow(detection) else {
+        let matched = match &self.rule_workflows {
+            Some(patterns) => {
+                let declared = patterns
+                    .read()
+                    .await
+                    .rule_workflow(&detection.rule_id)
+                    .map(str::to_owned);
+                let declared_workflow = self.find_declared_workflow(detection, declared.as_deref());
+                if declared_workflow.is_none() {
+                    if let Some(undeclared) = self.find_matching_workflow(detection) {
+                        tracing::debug!(
+                            rule_id = %detection.rule_id,
+                            workflow = %undeclared.name(),
+                            declared = ?declared,
+                            "workflow not started: the rule does not declare it (ft-frujlz)"
+                        );
+                    }
+                }
+                declared_workflow
+            }
+            None => self.find_matching_workflow(detection),
+        };
+        let Some(workflow) = matched else {
             return WorkflowStartResult::NoMatchingWorkflow {
                 rule_id: detection.rule_id.clone(),
             };
@@ -4391,6 +4452,7 @@ impl WorkflowRunner {
             config: self.config.clone(),
             replay_capture: self.replay_capture.clone(),
             external_signals: self.external_signals.clone(),
+            rule_workflows: self.rule_workflows.clone(),
         }
     }
 

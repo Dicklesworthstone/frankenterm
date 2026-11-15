@@ -73,7 +73,7 @@ A rule (Rust: `RuleDef`) has the following fields. `MUST` /
 | `zone` | enum | MAY | Require `prompt`, `input`, or `output` semantic annotation. Missing, ambiguous, or different annotations suppress the rule. Omitted or null preserves unscoped matching. |
 | `description` | string | **MUST** | Human-readable description shown in `ft why <rule_id>` and the doctor pack listing. MUST be non-empty after trimming. |
 | `remediation` | string | MAY | Suggested remediation text. Surfaced in the rendered event template. If present, MUST be non-empty after trimming. |
-| `workflow` | string | MAY | Suggested workflow name to invoke (e.g. `handle_usage_limits`). If present, MUST be non-empty after trimming. |
+| `workflow` | string | MAY | Workflow this rule starts (e.g. `handle_usage_limits`). `ft watch --auto-handle` starts a detection's workflow only if its rule names it here and that workflow accepts the detection; a rule without one starts nothing. Packs downgraded to observe-only have it removed. If present, MUST be non-empty after trimming. |
 | `manual_fix` | string | MAY | Manual fix instructions for environments where workflow execution is unavailable. Stored as `Option<String>`; absent in the serialized form when null. If present, MUST be non-empty after trimming. |
 | `preview_command` | string | MAY | Preview command template supporting `{pane}`, `{event_id}`, `{agent}` interpolation. If present, MUST be non-empty after trimming. |
 | `learn_more_url` | string | MAY | URL for additional documentation about this rule. If present, MUST be non-empty after trimming. |

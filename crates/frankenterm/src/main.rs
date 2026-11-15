@@ -48244,6 +48244,10 @@ async fn run_watcher(
             .map_err(|e| anyhow::anyhow!("Failed to load pattern packs: {e}"))?
     };
     let pattern_engine = Arc::new(frankenterm_core::runtime_async::RwLock::new(pattern_engine));
+    // The workflow runner reads each rule's declared workflow from the same
+    // engine the runtime detects with (and reloads), so observe-only packs
+    // cannot start workflows (ft-frujlz).
+    let workflow_rule_gate = Arc::clone(&pattern_engine);
 
     // Create event bus for publishing detections to workflow runners
     let event_bus = Arc::new(EventBus::new(1000));
@@ -48577,7 +48581,8 @@ async fn run_watcher(
             injector,
             runner_config,
         )
-        .with_watcher_registry_and_mux(runtime.pane_registry(), wezterm_handle.clone());
+        .with_watcher_registry_and_mux(runtime.pane_registry(), wezterm_handle.clone())
+        .with_rule_workflow_gate(workflow_rule_gate);
 
         register_builtin_workflows(&workflow_runner, &config.workflows);
         let enabled_names = enabled_builtin_workflows(&config.workflows)
