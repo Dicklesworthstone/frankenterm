@@ -585,9 +585,10 @@ fn parse_event_resume(
 }
 
 /// The scan position may include deliberately filtered rows. The admitted
-/// position changes only after a durable frame enters the owned response
-/// queue. Neither is persisted on the server: reconnect starts at the client's
-/// last parsed SSE id, so a dropped socket cannot acknowledge buffered rows.
+/// position changes only after a durable event or explicit page checkpoint
+/// enters the owned response queue. Neither is persisted on the server:
+/// reconnect starts at the client's last parsed SSE id, so a dropped socket
+/// cannot acknowledge buffered rows or an undelivered checkpoint.
 struct EventReplayCursor {
     epoch: String,
     scan_after_id: i64,
@@ -883,7 +884,37 @@ where
         }
         // An empty/short filtered page proves the entire scanned interval;
         // all its missing rows were deliberately excluded by the SQL filter.
-        // This does not manufacture an SSE id for a live-only frame.
+        // Publish that prefix explicitly, after all matching events. Without
+        // this checkpoint a quiet pane retains an arbitrarily old SSE id as
+        // other panes produce events, then needlessly loses continuity when
+        // global retention prunes that already-examined history.
+        //
+        // Queue admission is not client acknowledgment: only a checkpoint
+        // parsed by the client becomes its Last-Event-ID. Never put this id on
+        // a live-only event or keepalive, which proves no storage prefix.
+        if checked_through > cursor.admitted_after_id {
+            if !advance_stream_sequence(seq) {
+                return EventReplayProgress::Stopped;
+            }
+            let token = cursor.token_at(pane_filter, checked_through);
+            let frame = make_stream_frame(
+                "events",
+                "checkpoint",
+                *seq,
+                json!({
+                    "cursor": token,
+                    "pane_id": pane_filter,
+                    "reason": "examined_through_page",
+                }),
+            );
+            let Some(event) = frame_to_sse_with_event_id("checkpoint", Some(token), frame) else {
+                return EventReplayProgress::Stopped;
+            };
+            if !send_replay_sse(cx, tx, event, next_emit_at, min_interval).await {
+                return EventReplayProgress::Stopped;
+            }
+            cursor.admitted_after_id = checked_through;
+        }
         cursor.scan_after_id = checked_through;
         tracing::debug!(
             target: "wa.web",
@@ -1712,11 +1743,11 @@ mod tests {
     }
 
     #[test]
-    fn event_replay_filtered_scan_does_not_acknowledge_unemitted_rows() {
+    fn event_replay_filtered_pages_emit_scoped_checkpoints_after_matching_events() {
         run_async_test_isolated(|| async {
             let cx = crate::cx::for_request();
             let redactor = crate::policy::Redactor::new();
-            let (tx, rx) = mpsc::channel(1);
+            let (tx, rx) = mpsc::channel(3);
             let mut cursor = replay_cursor(10);
             let mut seq = 0;
             let mut next_emit_at = std::time::Instant::now();
@@ -1738,8 +1769,8 @@ mod tests {
             .await;
             assert_eq!(first, super::EventReplayProgress::CaughtUp);
             assert_eq!(cursor.scan_after_id, 90);
-            assert_eq!(cursor.admitted_after_id, 10);
-            assert_eq!(seq, 0, "filtered rows must not manufacture SSE checkpoints");
+            assert_eq!(cursor.admitted_after_id, 90);
+            assert_eq!(seq, 1);
             let second = super::replay_event_frames(
                 &cx,
                 |query| {
@@ -1761,11 +1792,166 @@ mod tests {
             .await;
             assert_eq!(second, super::EventReplayProgress::CaughtUp);
             assert_eq!(cursor.scan_after_id, 100);
-            assert_eq!(cursor.admitted_after_id, 95);
+            assert_eq!(cursor.admitted_after_id, 100);
             drop(tx);
             let frames = drain_replay_frames(rx);
-            assert_eq!(frames.len(), 1);
-            assert_eq!(frames[0].id, Some(replay_token(95, Some(7))));
+            assert_eq!(frames.len(), 3);
+            for (frame, expected_id, expected_kind) in [
+                (&frames[0], 90, "checkpoint"),
+                (&frames[1], 95, "event"),
+                (&frames[2], 100, "checkpoint"),
+            ] {
+                assert_eq!(frame.id, Some(replay_token(expected_id, Some(7))));
+                assert_eq!(frame.event_type.as_deref(), Some(expected_kind));
+                if expected_kind == "checkpoint" {
+                    let payload: serde_json::Value =
+                        serde_json::from_str(frame.data.as_deref().unwrap()).unwrap();
+                    assert_eq!(payload["kind"], "checkpoint");
+                    assert_eq!(payload["data"]["cursor"], replay_token(expected_id, Some(7)));
+                    assert_eq!(payload["data"]["pane_id"], 7);
+                    assert_eq!(payload["data"]["reason"], "examined_through_page");
+                    assert!(payload["data"].get("event").is_none());
+                }
+            }
+
+            // Reconnection starts at the actually received checkpoint. A
+            // filtered high-water mark never fabricates a matching event.
+            let resumed = super::parse_event_resume(
+                frames[2].id.as_deref().map(str::as_bytes),
+                Some(&replay_token(10, Some(7))),
+                None,
+                Some(7),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(resumed.after_id, 100);
+            assert_eq!(resumed.epoch, TEST_EVENT_EPOCH);
+        });
+    }
+
+    #[test]
+    fn event_replay_undeliverable_filtered_checkpoint_preserves_resume_boundary() {
+        run_async_test_isolated(|| async {
+            use std::future::Future;
+            use std::task::{Context, Poll, Waker};
+
+            let cx = crate::cx::for_request();
+            let redactor = crate::policy::Redactor::new();
+            let (tx, rx) = mpsc::channel(1);
+            tx.try_send(SseEvent::comment("occupied")).unwrap();
+            let mut cursor = replay_cursor(10);
+            let mut seq = 0;
+            let mut next_emit_at = std::time::Instant::now();
+            let mut replay = Box::pin(super::replay_event_frames(
+                &cx,
+                |_| std::future::ready(Ok(checked_fixture_page(Vec::new(), 10, 90))),
+                Some(7),
+                &mut cursor,
+                &redactor,
+                &tx,
+                &mut seq,
+                &mut next_emit_at,
+                std::time::Duration::ZERO,
+            ));
+            let mut poll_cx = Context::from_waker(Waker::noop());
+            assert!(replay.as_mut().poll(&mut poll_cx).is_pending());
+            // The checkpoint is still owned by the blocked producer. Losing
+            // its receiver must not turn a failed send into a committed scan.
+            drop(rx);
+            assert_eq!(
+                replay.as_mut().poll(&mut poll_cx),
+                Poll::Ready(super::EventReplayProgress::Stopped)
+            );
+            drop(replay);
+            assert_eq!(cursor.scan_after_id, 10);
+            assert_eq!(cursor.admitted_after_id, 10);
+        });
+    }
+
+    #[test]
+    fn event_replay_queued_checkpoint_dropped_with_socket_does_not_skip_reconnect() {
+        run_async_test_isolated(|| async {
+            use std::task::{Context, Poll, Waker};
+
+            let cx = crate::cx::for_request();
+            let redactor = crate::policy::Redactor::new();
+            let (tx, mut rx) = mpsc::channel(3);
+            let mut cursor = replay_cursor(10);
+            let mut seq = 0;
+            let mut next_emit_at = std::time::Instant::now();
+            assert_eq!(
+                super::replay_event_frames(
+                    &cx,
+                    |_| {
+                        std::future::ready(Ok(checked_fixture_page(
+                            vec![replay_fixture(11), replay_fixture(12)],
+                            10,
+                            90,
+                        )))
+                    },
+                    Some(7),
+                    &mut cursor,
+                    &redactor,
+                    &tx,
+                    &mut seq,
+                    &mut next_emit_at,
+                    std::time::Duration::ZERO,
+                )
+                .await,
+                super::EventReplayProgress::CaughtUp
+            );
+            assert_eq!(cursor.admitted_after_id, 90);
+
+            // Only event 11 crosses the response boundary. Event 12 and the
+            // checkpoint are queued when the socket disappears; neither may
+            // change the next request's replay authority.
+            let mut poll_cx = Context::from_waker(Waker::noop());
+            let Poll::Ready(Ok(delivered)) = rx.poll_recv(&cx, &mut poll_cx) else {
+                panic!("first event must be available");
+            };
+            assert_eq!(delivered.id, Some(replay_token(11, Some(7))));
+            drop(rx);
+            drop(tx);
+            let resumed = super::parse_event_resume(
+                delivered.id.as_deref().map(str::as_bytes),
+                Some(&replay_token(10, Some(7))),
+                None,
+                Some(7),
+            )
+            .unwrap()
+            .unwrap();
+            let mut cursor = super::EventReplayCursor::new(resumed);
+            assert_eq!(cursor.admitted_after_id, 11);
+            let (tx, rx) = mpsc::channel(2);
+            assert_eq!(
+                super::replay_event_frames(
+                    &cx,
+                    |query| {
+                        assert_eq!(query.after_id, Some(11));
+                        std::future::ready(Ok(checked_fixture_page(
+                            vec![replay_fixture(12)],
+                            11,
+                            90,
+                        )))
+                    },
+                    Some(7),
+                    &mut cursor,
+                    &redactor,
+                    &tx,
+                    &mut seq,
+                    &mut next_emit_at,
+                    std::time::Duration::ZERO,
+                )
+                .await,
+                super::EventReplayProgress::CaughtUp
+            );
+            drop(tx);
+            let frames = drain_replay_frames(rx);
+            assert_eq!(frames.len(), 2);
+            assert_eq!(frames[0].id, Some(replay_token(12, Some(7))));
+            assert_eq!(frames[0].event_type.as_deref(), Some("event"));
+            assert_eq!(frames[1].id, Some(replay_token(90, Some(7))));
+            assert_eq!(frames[1].event_type.as_deref(), Some("checkpoint"));
         });
     }
 

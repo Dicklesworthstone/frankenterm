@@ -251,6 +251,39 @@ Streaming endpoints return `text/event-stream` with schema `ft.stream.v1`.
 - `channel=<all|deltas|detections|signals>` to select the live bus lane
 - `pane_id=<id>` to filter to one pane
 - `max_hz=<n>` to cap event delivery rate
+- `cursor=<opaque token>` to resume retained detections on `all` or `detections`
+
+The `all` and `detections` channels replay stored detections in event ID order.
+A fresh subscription starts at the current durable high-water mark, delivered
+as the `ready` frame's SSE `id` and `data.cursor`. Reconnect using the last
+received durable ID in `Last-Event-ID`; a valid header takes precedence over
+the URL's bootstrap `cursor`. Tokens bind the database epoch and pane scope,
+so changing `pane_id` requires a fresh subscription. Retention loss or an
+epoch change emits a terminal `cursor_discontinuity` instead of silently
+skipping history. Live-only events and keepalive comments carry no new ID.
+
+When a checked storage page ends after the last matching detection, the
+server emits a `checkpoint` frame after all matching events from that page.
+This advances a quiet pane's resume position across deliberately excluded
+rows, avoiding repeated scans and unnecessary expiry as other panes produce
+events. It does not represent a new detection or require refreshing panes.
+The checkpoint contains only the scoped cursor, selected pane (or `null` for
+all panes), and a fixed reason; it includes no captured output or event text:
+
+```text
+event: checkpoint
+id: event-v1:0123456789abcdef0123456789abcdef:pane:7:90
+data: {"schema":"ft.stream.v1","stream":"events","kind":"checkpoint","seq":3,"ts_ms":123,"data":{"cursor":"event-v1:0123456789abcdef0123456789abcdef:pane:7:90","pane_id":7,"reason":"examined_through_page"}}
+```
+
+Browser `EventSource` retains a parsed checkpoint's `id` for automatic
+reconnect, even without a `checkpoint` listener. Clients that manage their
+own reconnect cursor should validate the frame and preserve its token
+exactly; JavaScript numbers cannot represent every supported event ID.
+Queueing a frame on the server does not acknowledge it for the client. If
+the connection drops before a checkpoint is received, reconnect from the
+last received ID so buffered detections are replayed. The frame's `seq` is
+connection-local and must never be used as a durable cursor.
 
 `/stream/deltas` query parameters:
 - `pane_id=<id>` to stream one pane's captured output

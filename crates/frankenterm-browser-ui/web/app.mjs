@@ -56,7 +56,7 @@ function streamErrorMessage(payload) {
 
 // One owner for the EventSource and its replacement timer. Native transient
 // reconnects retain their own Last-Event-ID; a replacement source carries the
-// last accepted ready/event checkpoint in ?cursor. EventSource inherits that
+// last accepted ready/event/page checkpoint in ?cursor. EventSource inherits that
 // ID on live-only and control messages, which cannot advance this boundary.
 // Retire a rejected source before its private cursor can skip the rejected
 // frame on reconnect. A discontinuity requires an explicit new live view.
@@ -174,6 +174,19 @@ export function createFleetStream(viewer, {
       } else if (!ready) {
         rejectFrame("stream: frame arrived before a ready checkpoint");
         return;
+      } else if (message.type === "checkpoint") {
+        nextCursor = eventCursor(frame.data.cursor);
+        if (nextCursor === null || message.lastEventId !== nextCursor.token
+            || frame.data.pane_id !== null || frame.data.reason !== "examined_through_page"
+            || frame.data.event !== undefined) {
+          rejectFrame("stream: invalid page checkpoint");
+          return;
+        }
+        if (nextCursor.epoch !== cursor.epoch) {
+          halt("stream: event history changed");
+          return;
+        }
+        if (nextCursor.id <= cursor.id) return;
       } else if (message.type === "event" && frame.data.delivery === "durable") {
         nextCursor = eventCursor(message.lastEventId);
         const event = frame.data.event;
@@ -215,7 +228,7 @@ export function createFleetStream(viewer, {
       }
       if (message.type === "ready" || message.type === "lag") resync();
     };
-    for (const type of ["ready", "event", "lag"]) candidate.addEventListener(type, onFrame);
+    for (const type of ["ready", "event", "checkpoint", "lag"]) candidate.addEventListener(type, onFrame);
     candidate.addEventListener("cursor_discontinuity", (message) => {
       if (!current()) return;
       let reason = "invalid cursor discontinuity";
@@ -434,7 +447,7 @@ export function createFleetRefresh(viewer, {
       if (stopped) throw new Error("snapshot owner stopped");
       viewer.ingestStreamFrame(payload);
       const frame = JSON.parse(payload);
-      if (frame.kind === "ready" || frame.kind === "event") streamError = null;
+      if (["ready", "event", "checkpoint"].includes(frame.kind)) streamError = null;
       if (!flight || frame.kind !== "event") return;
       const type = frame.data?.event?.type;
       const surface = type === "pattern_detected" ? "events"

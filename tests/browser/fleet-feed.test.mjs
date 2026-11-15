@@ -123,6 +123,16 @@ function event(source, id, label = "accepted", epoch = EPOCH) {
   source.emit("event", { data: durablePayload(id, label), lastEventId: cursor(id, epoch) });
 }
 
+function checkpoint(source, id, fields = {}, lastEventId = cursor(id)) {
+  source.emit("checkpoint", {
+    data: JSON.stringify({
+      schema: "ft.stream.v1", stream: "events", kind: "checkpoint", seq: 2, ts_ms: 1,
+      data: { cursor: cursor(id), pane_id: null, reason: "examined_through_page", ...fields },
+    }),
+    lastEventId,
+  });
+}
+
 test("start is idempotent and waits for the server's fresh durable checkpoint", () => {
   const f = fixture();
   f.feed.start();
@@ -145,6 +155,75 @@ test("closed-source replacement resumes with the complete accepted epoch and i64
   assert.equal(f.sources[1].url.searchParams.has("since_id"), false);
   assert.ok(f.frames.at(-1).includes('"event_id":9223372036854775807'), "original exact JSON reaches WASM");
   assert.equal(f.sources[0].closeCalls, 1);
+});
+
+test("an explicit admitted page checkpoint advances reconnect without inventing a detection", () => {
+  const f = fixture();
+  const source = startReady(f, "10");
+  checkpoint(source, "9223372036854775807");
+  closed(source);
+  f.runTimer();
+  assert.equal(f.sources[1].url.searchParams.get("cursor"), cursor("9223372036854775807"));
+  assert.deepEqual(eventLabels(f), []);
+  assert.equal(f.resyncs, 1, "a checked page does not require another snapshot");
+  assert.equal(JSON.parse(f.frames.at(-1)).kind, "checkpoint");
+});
+
+test("rejected page checkpoints cannot advance the application resume cursor", () => {
+  const f = fixture({ reject: (data) => JSON.parse(data).kind === "checkpoint" });
+  const source = startReady(f, "10");
+  checkpoint(source, "90");
+  f.runTimer();
+  assert.equal(f.sources[1].url.searchParams.get("cursor"), cursor("10"));
+  assert.equal(source.closeCalls, 1, "retire the source whose private Last-Event-ID changed");
+});
+
+test("page checkpoints require the exact id, scope and checked-prefix contract", () => {
+  for (const [fields, id] of [
+    [{}, cursor("89")],
+    [{ pane_id: 7 }, cursor("90")],
+    [{ cursor: `event-v1:${EPOCH}:pane:7:90` }, `event-v1:${EPOCH}:pane:7:90`],
+    [{ reason: "keepalive" }, cursor("90")],
+    [{ event: { type: "pattern_detected", event_id: 90 } }, cursor("90")],
+    [{ cursor: cursor("9223372036854775808") }, cursor("9223372036854775808")],
+  ]) {
+    const f = fixture();
+    const source = startReady(f, "10");
+    checkpoint(source, "90", fields, id);
+    f.runTimer();
+    assert.equal(f.sources[1].url.searchParams.get("cursor"), cursor("10"));
+    assert.equal(f.frames.length, 1, "only the initial ready frame was admitted");
+  }
+});
+
+test("page checkpoints cannot establish a baseline or cross a storage epoch", () => {
+  const beforeReady = fixture();
+  beforeReady.feed.start();
+  checkpoint(beforeReady.sources[0], "90");
+  assert.equal(beforeReady.timers.size, 0);
+  assert.equal(beforeReady.sources[0].closeCalls, 1);
+  assert.deepEqual(beforeReady.frames, []);
+
+  const changed = fixture();
+  const source = startReady(changed, "10");
+  checkpoint(source, "90", { cursor: cursor("90", OTHER_EPOCH) }, cursor("90", OTHER_EPOCH));
+  assert.equal(changed.timers.size, 0);
+  assert.equal(source.closeCalls, 1);
+  assert.match(changed.errors.at(-1), /event history changed/);
+});
+
+test("duplicate and older page checkpoints do not rewind the accepted prefix", () => {
+  const f = fixture();
+  const source = startReady(f, "10");
+  event(source, "95");
+  checkpoint(source, "100");
+  checkpoint(source, "100");
+  checkpoint(source, "90");
+  closed(source);
+  f.runTimer();
+  assert.equal(f.sources[1].url.searchParams.get("cursor"), cursor("100"));
+  assert.deepEqual(eventLabels(f), ["accepted"]);
+  assert.equal(f.frames.filter((frame) => JSON.parse(frame).kind === "checkpoint").length, 1);
 });
 
 test("native transient reconnect retains one source and creates no replacement timer", () => {
