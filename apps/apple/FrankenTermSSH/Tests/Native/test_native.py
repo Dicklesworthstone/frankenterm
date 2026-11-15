@@ -8,6 +8,7 @@ import base64
 import array
 import ctypes as C
 import ctypes.util
+import errno
 import fcntl
 from functools import lru_cache
 import json
@@ -112,6 +113,11 @@ for name, result, args in [
     ("ftssh_get_stats", I, [P, C.POINTER(Stats)]), ("ftssh_close", I, [P]), ("ftssh_destroy", I, [C.POINTER(P)]),
 ]:
     bind(DRIVER, name, result, *args)
+
+TRANSPORT_FAULTS = hasattr(DRIVER, "ftssh_test_set_transport_faults")
+if TRANSPORT_FAULTS:
+    bind(DRIVER, "ftssh_test_set_transport_faults", None, I, C.c_uint, I, C.c_uint)
+    bind(DRIVER, "ftssh_test_queued_ciphertext", Z, P)
 
 
 def ssh_string(value):
@@ -662,8 +668,12 @@ class LoopbackServer:
 class NativeSSHTests(unittest.TestCase):
     def setUp(self):
         self.handles, self.servers = [], []
+        if TRANSPORT_FAULTS:
+            DRIVER.ftssh_test_set_transport_faults(0, 0, 0, 0)
 
     def tearDown(self):
+        if TRANSPORT_FAULTS:
+            DRIVER.ftssh_test_set_transport_faults(0, 0, 0, 0)
         for handle in self.handles:
             if not handle.value:
                 continue
@@ -1791,6 +1801,113 @@ class NativeSSHTests(unittest.TestCase):
         self.assertEqual(DRIVER.ftssh_keepalive(handle), 1)
         time.sleep(3)
         self.assertEqual(DRIVER.ftssh_keepalive(handle), 0)
+
+    def await_queued_keepalive(self, handle):
+        # An empty userspace queue does not imply SO_NWRITE/SIOCOUTQ admission
+        # is ready. Leave the fault armed until an actual probe reaches it.
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            self.assertEqual(DRIVER.ftssh_keepalive(handle), 1)
+            queued = DRIVER.ftssh_test_queued_ciphertext(handle)
+            if queued:
+                return queued
+            time.sleep(0.01)
+        self.fail("keepalive never reached the injected syscall failure")
+
+    def assert_transport_fault_echo(self, handle, server, admitted_prefix=b""):
+        payload = ("after temporary pressure: naïve 界\r\n" * 40).encode() + b"END-SESSION\r"
+        if admitted_prefix:
+            self.advance(handle, DRIVER.ftssh_flush_write)
+        self.assertEqual(DRIVER.ftssh_admit_write(handle, payload, len(payload)), 0)
+        received, eof = bytearray(), False
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            self.assertIn(DRIVER.ftssh_flush_write(handle), (0, 1))
+            out, count = C.create_string_buffer(257), Z()
+            result = DRIVER.ftssh_read(handle, out, len(out), C.byref(count))
+            self.assertIn(result, (0, 1, 3))
+            received += out.raw[:count.value]
+            if result == 3:
+                eof = True
+                break
+            self.wait(handle)
+        self.assertTrue(eof, "temporary syscall failure must not strand the terminal")
+        expected = admitted_prefix + payload
+        self.assertEqual(received, b"ready\r\nstderr\r\n" + expected)
+        self.assertEqual(server.received, expected)
+        stats = Stats()
+        self.assertEqual(DRIVER.ftssh_get_stats(handle, C.byref(stats)), 0)
+        self.assertEqual((stats.error, stats.pending, stats.accepted, stats.written),
+                         (0, 0, len(expected), len(expected)))
+
+    @unittest.skipUnless(TRANSPORT_FAULTS, "requires test_transport_faults.c fixture library")
+    def test_keepalive_backpressure_retains_one_probe_and_session(self):
+        handle, server, key = self.start()
+        self.assertEqual(self.authenticate(handle, server, key), 0)
+        self.assertEqual(DRIVER.ftssh_begin_shell(handle, 80, 24, 0, 0), 0)
+        self.advance(handle, DRIVER.ftssh_shell_step)
+        self.assertEqual(DRIVER.ftssh_test_queued_ciphertext(handle), 0)
+        DRIVER.ftssh_test_set_transport_faults(errno.EAGAIN, 8, 0, 0)
+        queued = self.await_queued_keepalive(handle)
+        self.assertGreater(queued, 0, "the keepalive was queued, not merely held back")
+        for _ in range(3):
+            self.assertEqual(DRIVER.ftssh_keepalive(handle), 1)
+            self.assertEqual(DRIVER.ftssh_test_queued_ciphertext(handle), queued,
+                             "retry must not enqueue another keepalive")
+            stats = Stats()
+            self.assertEqual(DRIVER.ftssh_get_stats(handle, C.byref(stats)), 0)
+            self.assertEqual(stats.error, 0)
+        DRIVER.ftssh_test_set_transport_faults(0, 0, 0, 0)
+        self.advance(handle, DRIVER.ftssh_keepalive)
+        self.assertEqual(DRIVER.ftssh_test_queued_ciphertext(handle), 0)
+        self.assert_transport_fault_echo(handle, server)
+
+    @unittest.skipUnless(TRANSPORT_FAULTS, "requires test_transport_faults.c fixture library")
+    def test_keepalive_receipt_survives_service_drain_and_new_input(self):
+        handle, server, key = self.start()
+        self.assertEqual(self.authenticate(handle, server, key), 0)
+        self.assertEqual(DRIVER.ftssh_begin_shell(handle, 80, 24, 0, 0), 0)
+        self.advance(handle, DRIVER.ftssh_shell_step)
+        self.assertEqual(DRIVER.ftssh_test_queued_ciphertext(handle), 0)
+        DRIVER.ftssh_test_set_transport_faults(errno.EAGAIN, 1, 0, 0)
+        self.assertGreater(self.await_queued_keepalive(handle), 0)
+        DRIVER.ftssh_test_set_transport_faults(0, 0, 0, 0)
+        # Ordinary service work may drain the probe before its caller returns
+        # for the receipt. New input must not hide that receipt.
+        self.advance(handle, DRIVER.ftssh_flush_write)
+        self.assertEqual(DRIVER.ftssh_test_queued_ciphertext(handle), 0)
+        prefix = b"input admitted while the probe receipt is pending\r\n"
+        self.assertEqual(DRIVER.ftssh_admit_write(handle, prefix, len(prefix)), 0)
+        self.assertEqual(DRIVER.ftssh_keepalive(handle), 0)
+        self.assertEqual(DRIVER.ftssh_keepalive(handle), 1,
+                         "the receipt is consumed once; new input now defers a new probe")
+        self.assert_transport_fault_echo(handle, server, admitted_prefix=prefix)
+
+    @unittest.skipUnless(TRANSPORT_FAULTS, "requires test_transport_faults.c fixture library")
+    def test_interrupted_socket_reads_and_writes_preserve_exact_terminal_bytes(self):
+        for send_count, receive_count in [(1, 0), (12, 0), (0, 1), (0, 12), (12, 12)]:
+            with self.subTest(send_interruptions=send_count, receive_interruptions=receive_count):
+                handle, server, key = self.start()
+                self.assertEqual(self.authenticate(handle, server, key), 0)
+                self.assertEqual(DRIVER.ftssh_begin_shell(handle, 80, 24, 0, 0), 0)
+                self.advance(handle, DRIVER.ftssh_shell_step)
+                DRIVER.ftssh_test_set_transport_faults(errno.EINTR, send_count, errno.EINTR, receive_count)
+                self.assert_transport_fault_echo(handle, server)
+
+    @unittest.skipUnless(TRANSPORT_FAULTS, "requires test_transport_faults.c fixture library")
+    def test_keepalive_permanent_socket_failure_still_retires_session(self):
+        handle, server, key = self.start()
+        self.assertEqual(self.authenticate(handle, server, key), 0)
+        self.assertEqual(DRIVER.ftssh_begin_shell(handle, 80, 24, 0, 0), 0)
+        self.advance(handle, DRIVER.ftssh_shell_step)
+        self.assertEqual(DRIVER.ftssh_test_queued_ciphertext(handle), 0)
+        DRIVER.ftssh_test_set_transport_faults(errno.ECONNRESET, 1, 0, 0)
+        self.assertEqual(self.advance(handle, DRIVER.ftssh_keepalive, terminal=(-1003,)), -1003)
+        self.assertEqual(DRIVER.ftssh_admit_write(handle, b"not sent", 8), -1003)
+        stats = Stats()
+        self.assertEqual(DRIVER.ftssh_get_stats(handle, C.byref(stats)), 0)
+        self.assertEqual(stats.accepted, 0)
+        self.assertEqual(stats.error, -1003)
 
     def handshake_against(self, serve):
         """The handshake's result against a raw server running serve(peer, finished)."""

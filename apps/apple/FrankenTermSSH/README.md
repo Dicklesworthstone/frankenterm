@@ -500,21 +500,32 @@ shared readiness queue serves all sessions. Concurrent close calls await the sam
 cleanup. The application still owns foreground/network permission, route policy,
 reconnect decisions, durable uncertainty markers, and terminal binding.
 
-`keepalive` sends one liveness probe, a keepalive request that asks the server to
-reply; `receivedBytes` counts every byte read from the server, replies included.
-libssh2 binds a partly sent packet to its caller's buffer and refuses all other
-packets until that buffer is resent, and its keepalive buffer is a stack frame.
-So the probe is sent only when no write, resize or library packet is pending and
-the socket buffer has room for the whole packet (`SO_NWRITE`, or `SIOCOUTQ` on
-Linux); otherwise it is deferred. libssh2 also reports success for a keepalive
-it skips because the last one left under 2 seconds before, so the session counts
-the bytes handed to the socket and reports a probe that sent nothing as deferred;
-no reply is then due. If a packet is still pending afterward, the
-session fails rather than block later input. `WorkspaceSSHLiveness` is the
-connection policy: after each quiet interval (10 s standard) it probes, and after
-two further silent intervals it closes the connection and the session ends as
-disconnected. A socket failure that precedes any owner's close also ends as
-disconnected, not as a local close.
+`keepalive` requests a reply from the server; `receivedBytes` counts every
+received byte, including replies. New probes require no pending write, resize
+or library send and enough reported socket/window room. Those checks are
+admission hints: socket backpressure can still arise afterward. The driver
+copies complete ciphertext into its owned output queue, retains one pending
+probe through temporary backpressure, and reports its local handoff once the
+whole transport chain drains. Retrying that pending probe never creates another
+request. A deferred result does not start a missing-reply interval.
+
+libssh2 can also hold back a new probe within two seconds of the previous one.
+The existing send-callback evidence distinguishes a no-send result; it does not
+provide a stronger independent proof of keepalive delivery during rekey.
+A library operation that retains its stack-backed request still fails safely.
+Real socket failures remain terminal; interrupted POSIX sends and receives use
+bounded retries without poisoning an otherwise live connection.
+`WorkspaceSSHLiveness` retains its existing policy: after each quiet interval
+(10 s standard) it probes, and after two further silent intervals it closes the
+connection as disconnected. A socket failure preceding any owner's close is
+also disconnected, rather than a local close.
+
+`Tests/Native/test_transport_faults.c` builds a test-only version of the actual
+driver with syscall fault injection. Run it through `test_native.py` to exercise
+queued keepalives, repeated send/receive interruptions, exact terminal bytes,
+and permanent-error refusal against the independent SSH server. The production
+library has no fault-injection API. These new regressions still require native
+execution; earlier test totals below do not qualify this change.
 
 ## Imported workspace authentication and connection ownership
 

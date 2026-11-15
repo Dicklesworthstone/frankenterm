@@ -333,9 +333,10 @@ public struct NativeSSHAccounting: Sendable, Equatable {
 }
 
 public enum NativeSSHWriteAdmission: Sendable, Equatable { case accepted(Int), wouldBlock }
-/// The result of one liveness probe. A deferred probe sent nothing because
-/// output or a library packet is still pending; unavailable means this
-/// platform cannot prove a probe would not be left half sent.
+/// The result of one liveness probe. Deferred means there is no completed
+/// local handoff receipt: admission may be held back or owned ciphertext may
+/// still be draining. Retry to settle the same pending probe. Unavailable
+/// means this platform cannot supply the socket-queue admission information.
 public enum NativeSSHKeepalive: Sendable, Equatable { case sent, deferred, unavailable }
 /// Negotiation is chosen from current trust for each distinct jump/destination
 /// peer. It never substitutes for certificate or pin verification after KEX.
@@ -1352,7 +1353,8 @@ public actor NativeSSHSession {
 
     /// One liveness probe between service turns: a keepalive request that asks
     /// the server to reply, which advances `receivedBytes`. The owner decides
-    /// how many silent intervals mean the server is gone. Call at least 2 s apart.
+    /// how many silent intervals mean the server is gone. Start new probes at
+    /// least 2 s apart; a deferred call may retry the existing pending handoff.
     package func keepalive(driver: NativeSSHDriver) throws -> NativeSSHKeepalive {
         guard phase == .live, completion == nil else { throw NativeSSHError.closed }
         try requireDriver(.driver(driver))

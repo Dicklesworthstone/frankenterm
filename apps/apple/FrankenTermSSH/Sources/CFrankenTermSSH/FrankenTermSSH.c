@@ -75,7 +75,7 @@ struct ftssh_session {
     int password_authentication, password_supplied, user_certificate;
     int publickey_interactive, partial_ready;
     uint64_t authentication_deadline, publickey_attempt_baseline;
-    int signature_consumed, resize_pending;
+    int signature_consumed, resize_pending, keepalive_pending;
     int auth_methods_checked, sign_callback_entered, sign_error, socket_failed;
     /* The server sent a disconnect message: it answered, unlike a transport
      * that failed or closed without a word. */
@@ -207,7 +207,13 @@ static ssize_t socket_receive(libssh2_socket_t fd, void *data, size_t length, in
             s->socket_failed = 1; return -ECONNRESET;
         }
     } else {
-        result = recv(fd, data, length, flags);
+        /* Signals do not retire a healthy transport. Bound retries so a signal
+         * storm cannot monopolize the serialized native owner. */
+        unsigned int attempts = 0;
+        do {
+            result = recv(fd, data, length, flags);
+        } while(result < 0 && errno == EINTR && ++attempts < 4);
+        if(result < 0 && errno == EINTR) return -EAGAIN;
     }
     if((result < 0 && errno != EAGAIN && errno != EWOULDBLOCK) || (!result && length)) s->socket_failed = 1;
     if(result > 0) {
@@ -247,6 +253,8 @@ static int drain_egress(ftssh_session *s, int *progress) {
             flags = MSG_NOSIGNAL;
 #endif
             count = send(s->fd, s->egress + s->egress_head, contiguous, flags);
+            /* Retry the same owned span within this turn's existing budget. */
+            if(count < 0 && errno == EINTR) continue;
             if(count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
             if(count <= 0 || (size_t)count > contiguous) { s->socket_failed = 1; return FTSSH_IO; }
         }
@@ -271,7 +279,7 @@ static void clear_password(ftssh_session *s) {
 }
 static int fail(ftssh_session *s, int code) {
     clear_password(s);
-    s->partial_ready = 0;
+    s->partial_ready = 0; s->keepalive_pending = 0;
     s->phase = FAILED; s->terminal_error = code; return code;
 }
 static int publickey_deadline(ftssh_session *s) {
@@ -1865,12 +1873,22 @@ static int unsent_socket_bytes(int fd) {
 }
 int ftssh_keepalive(ftssh_session *s) {
     int rc = check(s, LIVE); if(rc) return rc;
+    /* socket_send owns every accepted ciphertext byte. A probe may therefore
+     * outlive the call that queued it without retaining libssh2's stack buffer.
+     * Settle that exact probe before considering a new request, even if a later
+     * write or resize now occupies its own admission slot. */
+    if(s->keepalive_pending) {
+        int progress = 0;
+        if(drain_egress(s, &progress) < 0) return fail(s, FTSSH_IO);
+        if(!egress_empty(s)) return FTSSH_AGAIN;
+        s->keepalive_pending = 0;
+        return FTSSH_OK;
+    }
     rc = prepare_egress(s); if(rc) return rc;
     if(!egress_empty(s)) return FTSSH_AGAIN;
-    /* libssh2 binds a partly sent packet to the caller's buffer and refuses any
-     * other packet until that exact buffer is resent; its keepalive buffer is
-     * its own stack frame. Send only when nothing is pending and the whole
-     * packet fits in the socket buffer, so it cannot be left half sent. */
+    /* Do not enter libssh2 while another packet still owns its send state.
+     * Socket/window room is only an admission hint; a later EAGAIN can still
+     * occur and must retain the queued probe instead of failing the session. */
     if(s->write_length || s->resize_pending ||
        (libssh2_session_block_directions(s->ssh) & LIBSSH2_SESSION_BLOCK_OUTBOUND)) return FTSSH_AGAIN;
     for(ftssh_session *p = s->parent; p; p = p->parent) {
@@ -1885,15 +1903,18 @@ int ftssh_keepalive(ftssh_session *s) {
     int next = 0;
     uint64_t sent = s->sent;
     if(libssh2_keepalive_send(s->ssh, &next)) return fail(s, FTSSH_IO);
-    int progress = 0;
-    if(drain_egress(s, &progress) < 0 || !egress_empty(s)) return fail(s, FTSSH_IO);
-    /* Still pending despite the room checked above: fail rather than block input. */
-    for(ftssh_session *p = s; p; p = p->parent) {
-        if(libssh2_session_block_directions(p->ssh) & LIBSSH2_SESSION_BLOCK_OUTBOUND) return fail(s, FTSSH_IO);
-    }
-    /* libssh2 skips a keepalive within 2 s of its last (by whole seconds of
-     * wall time) and still reports success: nothing left, no reply is due. */
+    /* The owned egress queue can wait; a library operation retaining its
+     * stack-backed request cannot. Preserve that existing refusal, including
+     * libssh2's masked EAGAIN during key exchange. */
+    if(libssh2_session_block_directions(s->ssh) & LIBSSH2_SESSION_BLOCK_OUTBOUND) return fail(s, FTSSH_IO);
+    /* libssh2 may hold back a probe within its whole-second 2 s interval.
+     * Preserve the existing callback evidence; no send means no receipt. */
     if(s->sent == sent) return FTSSH_AGAIN;
+    s->keepalive_pending = 1;
+    int progress = 0;
+    if(drain_egress(s, &progress) < 0) return fail(s, FTSSH_IO);
+    if(!egress_empty(s)) return FTSSH_AGAIN;
+    s->keepalive_pending = 0;
     return FTSSH_OK;
 }
 static int transport_directions(ftssh_session *s) {
@@ -1946,6 +1967,7 @@ int ftssh_close(ftssh_session *s) {
      * can wait for peer cooperation and no stale fd can be used after close. */
     s->closing = 1;
     clear_password(s);
+    s->keepalive_pending = 0;
     s->egress_head = 0; s->egress_count = 0; s->egress_flight = 0; s->write_receipt = 0;
     if(s->parent) {
         int rc = ftssh_close(s->parent);

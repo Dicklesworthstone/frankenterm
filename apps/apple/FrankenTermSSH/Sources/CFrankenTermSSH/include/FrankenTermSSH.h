@@ -316,12 +316,13 @@ int ftssh_completion_step(ftssh_session *session, ftssh_completion *completion);
 int ftssh_resize(ftssh_session *session, uint32_t columns, uint32_t rows,
                   uint32_t pixel_width, uint32_t pixel_height);
 /* Liveness probe for a live shell: one keepalive request that asks the server
- * to reply, so a responsive server's bytes advance received_bytes. Call at
- * least 2 s apart. AGAIN means nothing was sent (a write, resize or library
- * packet is pending, the socket buffer is nearly full, or libssh2 held back a
- * probe within 2 s of its last); UNSUPPORTED means
- * the platform cannot report queued socket bytes. Never leaves a half-sent
- * packet that would block later writes: if one remains, the session fails. */
+ * to reply, so a responsive server's bytes advance received_bytes. Start probes
+ * at least 2 s apart. AGAIN means no completed local handoff receipt: admission
+ * may be deferred, libssh2 may hold back a new probe, or owned ciphertext may
+ * still be draining. Retry to settle that same queued probe; do not count it
+ * as a missing reply yet. OK consumes its local handoff receipt exactly once,
+ * not a server acknowledgement. UNSUPPORTED means the platform cannot report
+ * queued socket bytes. Temporary socket backpressure preserves the session. */
 int ftssh_keepalive(ftssh_session *session);
 /* Advances one bounded encrypted-output turn. RETRY requests a cooperative
  * yield, then another turn without waiting for new socket bytes (queued output
