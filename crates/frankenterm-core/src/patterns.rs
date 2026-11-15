@@ -4181,6 +4181,54 @@ fn builtin_claude_code_pack() -> PatternPack {
                 preview_command: None,
                 learn_more_url: None,
             },
+            // Safeguards refusal: "API Error: Opus 5.5's safeguards flagged
+            // this session (...). ... Claude Code can't respond to your last
+            // message with Opus 5.5." and "API Error: Opus 4.8's safeguards
+            // flagged this message." in Claude Code's logs (2.1.308 to
+            // 2.1.319). Retrying does not help: the turn needs rephrasing in
+            // a new session or another model.
+            RuleDef {
+                id: "claude_code.error.safeguards".to_string(),
+                zone: None,
+                agent_type: AgentType::ClaudeCode,
+                event_type: "error.safeguards".to_string(),
+                severity: Severity::Warning,
+                anchors: vec!["API Error: ".to_string()],
+                regex: Some(
+                    r"API Error: (?P<model>[A-Z][A-Za-z]*(?: [0-9.]+)?)['’]s safeguards flagged this (?P<scope>message|session)"
+                        .to_string(),
+                ),
+                description: "Claude model safeguards refused the turn".to_string(),
+                remediation: Some(
+                    "Rephrase in a new session or switch models with /model".to_string(),
+                ),
+                workflow: Some("handle_on_error_cass_search".to_string()),
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
+            // Unusable model: "There's an issue with the selected model
+            // (opus-5.5). It may not exist or you may not have access to it.
+            // Run /model to pick a different model." in Claude Code's logs
+            // (2.1.232 to 2.1.317). Every turn fails until the model changes.
+            RuleDef {
+                id: "claude_code.error.model_unavailable".to_string(),
+                zone: None,
+                agent_type: AgentType::ClaudeCode,
+                event_type: "error.model_unavailable".to_string(),
+                severity: Severity::Warning,
+                anchors: vec!["issue with the selected model (".to_string()],
+                regex: Some(
+                    r"There['’]s an issue with the selected model \((?P<model>[^)\n]+)\)"
+                        .to_string(),
+                ),
+                description: "Claude Code's selected model is unavailable".to_string(),
+                remediation: Some("Run /model to pick a model this account can use".to_string()),
+                workflow: Some("handle_on_error_cass_search".to_string()),
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
         ],
     )
     .with_submit_profiles(vec![builtin_claude_code_submit_profile()])
@@ -11865,7 +11913,8 @@ rules:
     /// (Claude Code 2.1.201..2.1.322) and as its TUI renders them under a
     /// tool-result gutter, each raise exactly their error rule. Agent prose
     /// and tool output that merely mention a timeout, a closed connection, an
-    /// overloaded server or a server error raise none of the error rules.
+    /// overloaded server, a server error, safeguards or a selected model raise
+    /// none of the error rules.
     #[test]
     fn claude_code_error_rules_follow_real_api_errors_not_prose() {
         let engine = PatternEngine::new();
@@ -11914,6 +11963,22 @@ rules:
                 "API Error: Server error mid-response. The response above may be incomplete.",
                 "claude_code.error.server",
             ),
+            (
+                "API Error: Opus 5.5's safeguards flagged this session (https://www.anthropic.com/legal/aup). You may be seeing this for the first time: Opus 5.5 is more capable and has stronger safeguards as a result, which can sometimes flag non-cybersecurity work. We're improving these safeguards to reduce the amount of incorrectly flagged messages. Claude Code can't respond to your last message with Opus 5.5.\n\nTry rephrasing the request in a new session or change your model.",
+                "claude_code.error.safeguards",
+            ),
+            (
+                "API Error: Sonnet 5.5's safeguards flagged this session (https://www.anthropic.com/legal/aup). You may be seeing this for the first time on a Sonnet model.",
+                "claude_code.error.safeguards",
+            ),
+            (
+                "API Error: Opus 4.8's safeguards flagged this message. Our intentionally broad safeguards allow us to deliver more capabilities faster, but can sometimes flag legitimate cybersecurity work. Send feedback with /feedback or learn more: https://support.claude.com/en/articles/14604842-real-time-cyber-safeguards-on-claude",
+                "claude_code.error.safeguards",
+            ),
+            (
+                "There's an issue with the selected model (opus-5.5). It may not exist or you may not have access to it. Run /model to pick a different model.",
+                "claude_code.error.model_unavailable",
+            ),
         ] {
             for rendered in [text.to_string(), format!("  ⎿  {text}\n")] {
                 let ids: Vec<String> = engine
@@ -11922,6 +11987,38 @@ rules:
                     .map(|d| d.rule_id)
                     .collect();
                 assert_eq!(ids, vec![rule.to_string()], "{rendered:?}");
+            }
+        }
+
+        // The refused model and the model to replace are extracted.
+        for (text, rule, model, scope) in [
+            (
+                "API Error: Opus 5.5's safeguards flagged this session (https://www.anthropic.com/legal/aup).",
+                "claude_code.error.safeguards",
+                "Opus 5.5",
+                Some("session"),
+            ),
+            (
+                "API Error: Opus 4.8's safeguards flagged this message. Our intentionally broad safeguards",
+                "claude_code.error.safeguards",
+                "Opus 4.8",
+                Some("message"),
+            ),
+            (
+                "There's an issue with the selected model (opus-5). It may not exist or you may not have access to it.",
+                "claude_code.error.model_unavailable",
+                "opus-5",
+                None,
+            ),
+        ] {
+            let detection = engine
+                .detect(text)
+                .into_iter()
+                .find(|d| d.rule_id == rule)
+                .unwrap_or_else(|| panic!("{text:?} raised no {rule}"));
+            assert_eq!(detection.extracted["model"], model, "{text:?}");
+            if let Some(scope) = scope {
+                assert_eq!(detection.extracted["scope"], scope, "{text:?}");
             }
         }
 
@@ -11939,6 +12036,10 @@ rules:
             "curl: (22) The requested URL returned error: 500",
             "Hit a server error mid-run, so I restarted the lane.",
             "Error: 500 Internal server error from the registry.",
+            "The new safeguards flagged this message as spam, so the mail bounced.",
+            "Opus 5.5's safeguards flagged this session last week; I switched models.",
+            "There is an issue with the selected model in the config loader.",
+            "Check the selected model (opus-5.5) in settings.json before the run.",
         ] {
             let errors: Vec<String> = engine
                 .detect(prose)

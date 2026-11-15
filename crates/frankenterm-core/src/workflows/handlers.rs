@@ -2605,6 +2605,8 @@ impl Workflow for HandleOnErrorCassSearch {
             "error.timeout",
             "error.overloaded",
             "error.server",
+            "error.safeguards",
+            "error.model_unavailable",
             "mux.error",
         ]
     }
@@ -8650,6 +8652,31 @@ mod tests {
             .expect("a Claude Code 500 raises claude_code.error.server");
         assert_eq!(server.event_type, "error.server");
         assert!(workflow.handles(&server));
+
+        // A safeguards refusal and an unusable model, as Claude Code prints them.
+        for (text, rule) in [
+            (
+                "API Error: Opus 5.5's safeguards flagged this session (https://www.anthropic.com/legal/aup).",
+                "claude_code.error.safeguards",
+            ),
+            (
+                "There's an issue with the selected model (opus-5.5). It may not exist or you may not have access to it.",
+                "claude_code.error.model_unavailable",
+            ),
+        ] {
+            let detection = crate::patterns::PatternEngine::new()
+                .detect(text)
+                .into_iter()
+                .find(|d| d.rule_id == rule)
+                .unwrap_or_else(|| panic!("{text:?} raised no {rule}"));
+            assert!(workflow.handles(&detection), "{rule}");
+            assert!(
+                workflow
+                    .trigger_event_types()
+                    .contains(&detection.event_type.as_str()),
+                "{rule}"
+            );
+        }
 
         let mux_error = Detection {
             event_type: "mux.error".to_string(),

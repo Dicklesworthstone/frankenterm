@@ -1,0 +1,14 @@
+[
+  {
+    "rule_id": "claude_code.error.safeguards",
+    "agent_type": "claude_code",
+    "event_type": "error.safeguards",
+    "severity": "warning",
+    "confidence": 0.95,
+    "extracted": {
+      "model": "Opus 5.5",
+      "scope": "session"
+    },
+    "matched_text": "API Error: Opus 5.5's safeguards flagged this session"
+  }
+]

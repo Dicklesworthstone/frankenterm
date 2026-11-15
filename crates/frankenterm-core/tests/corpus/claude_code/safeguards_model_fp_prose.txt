@@ -1,0 +1,4 @@
+The new safeguards flagged this message as spam, so the mail bounced.
+Opus 5.5's safeguards flagged this session last week; I switched models.
+There is an issue with the selected model in the config loader.
+Check the selected model (opus-5.5) in settings.json before the run.

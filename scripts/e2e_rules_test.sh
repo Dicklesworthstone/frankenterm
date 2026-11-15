@@ -273,6 +273,8 @@ test_rules_match_fixtures() {
         ["claude_code.compaction"]="Auto-compact: context compacted 12,345 tokens to 3,210"
         ["claude_code.error.timeout"]="API Error: The response stopped arriving. The response above may be incomplete."
         ["claude_code.error.server"]="API Error: 500 Internal server error. This is a server-side issue, usually temporary."
+        ["claude_code.error.safeguards"]="API Error: Opus 5.5's safeguards flagged this session (https://www.anthropic.com/legal/aup)."
+        ["claude_code.error.model_unavailable"]="There's an issue with the selected model (opus-5.5). It may not exist or you may not have access to it."
         ["claude_code.session.cost_summary"]="Session cost: \$2.50"
         ["gemini.usage.reached"]="Usage limit reached for all Pro models"
         ["wezterm.mux.connection_lost"]="mux server is unavailable"

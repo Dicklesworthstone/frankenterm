@@ -13895,6 +13895,8 @@ fn snapshot_trigger_from_detection(
                 | "error.timeout"
                 | "error.overloaded"
                 | "error.server"
+                | "error.safeguards"
+                | "error.model_unavailable"
                 | "mux.error"
                 | "auth.error"
                 | "auth.login_required"
@@ -20696,7 +20698,12 @@ mod tests {
 
     #[test]
     fn snapshot_trigger_from_detection_maps_hazard() {
-        for event_type in ["error.timeout", "error.server"] {
+        for event_type in [
+            "error.timeout",
+            "error.server",
+            "error.safeguards",
+            "error.model_unavailable",
+        ] {
             let detection = test_detection(event_type, Severity::Warning);
             let trigger = snapshot_trigger_from_detection(&detection);
             assert_eq!(
