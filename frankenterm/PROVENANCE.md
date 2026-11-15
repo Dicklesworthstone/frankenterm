@@ -48,6 +48,26 @@ compatibility is explicitly not maintained.
 | `76b606ec5` | skipped | shell integration: our script does not reference `ZSH_NAME`. |
 | remainder | skipped | docs, CI, nix/flatpak packaging, upstream dependency cooldown bumps, winapi -> windows-sys refactors, lint-only cleanups, and new features (smart-case search, fancy tab bar, command-palette line height, ClearLine, dictation) that are not fixes. |
 
+### Batch 2026-11-14: upstream `cab251610..e1eae81a5` (13 commits)
+
+Proof: RCH clean-overlay lanes at the push tip for frankenterm-term
+(`--features native-ffi --all-targets`), the mux `localpane::` tests,
+frankenterm-blob-leases (`--features simple_tempdir --lib`) and
+frankenterm-escape-parser (`--lib`, default no_std shape), clippy
+`-D warnings` on those crates, and the workspace format proof; native
+macOS `cargo check` and clippy for frankenterm-gui. A planted negative
+(old term and blob code, new tests) must fail both new tests.
+
+| Upstream SHA | Disposition | Notes |
+| ------------ | ----------- | ----- |
+| `aa0d91a49` | accepted | term: enabling focus tracking (DECSET 1004) reports the current focus at once (vim resumed with fg notices changed files). The mux input-order test expects the leading report. |
+| `eb8df995d` | accepted | blob-leases: storing still-referenced content reuses the stored file instead of replacing it (Windows refused the replacement under an open reader and the reference count came up short). Test also checks the inode on Unix. Not run on Windows. |
+| `ce8e6b140` | accepted | gui: closing a tab or pane overlay refreshes the window title at once. |
+| `e7280b8c8` | already-equivalent | client panes already receive `alt_screen_active` from the server (codec and ClientPane). |
+| `e2a98e1b8` | already-equivalent | escape-parser already imports alloc's macros crate-wide under no_std (`#[cfg_attr(not(feature = "std"), macro_use)] extern crate alloc`), so test modules need no `alloc::format` import. |
+| `9b919222c` | skipped | ssh e2e tests skip themselves when the sshd fixture cannot run; test harness only, and a silent skip would hide a fixture failure in our lanes. |
+| remainder | skipped | nix flake (3), CI workflow regeneration, a docs typo, the ALT Linux get-deps branch, and comment spelling in mux. |
+
 ## Per-crate classification (ft-zoxxq.5)
 
 Columns:
