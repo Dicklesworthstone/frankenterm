@@ -31,6 +31,8 @@
 # Management operations on one FTG_BASE are serialized. A competing operation
 # fails with exit 75; FTG_OPERATION_LOCK_TIMEOUT sets a bounded wait (0-60
 # seconds, default 0). Status and the run-* service entry points remain usable.
+# Mux inventory reads are limited to 16 MiB and FTG_INVENTORY_TIMEOUT seconds
+# (1-60, default 10). An unreadable inventory is never an empty-pane receipt.
 #
 # Invariants:
 #   * The broker owns every pane's child process. It is never restarted by this
@@ -849,12 +851,165 @@ broker_children() {  # sorted pids of pane processes
 }
 
 mux_pane_ids() {  # sorted pane ids reported by the running mux
-  local ft=$BASE/mux-current/ft
-  (cd "$STATE" && WEZTERM_UNIX_SOCKET=$(mux_socket) "$ft" robot state 2>/dev/null) \
-    | python3 -c 'import json,sys
-d=json.load(sys.stdin)
-data=d.get("data") or []
-print(" ".join(str(p["pane_id"]) for p in sorted(data, key=lambda p: p["pane_id"])))' 2>/dev/null || true
+  # Empty is a successful, explicitly empty inventory, never an RPC failure
+  # or error envelope. Do not let malformed identities authorize a swap or
+  # make a restoration look verified. Python preserves exact u64 identities.
+  python3 - "$STATE" "$(mux_socket)" "$BASE/mux-current/ft" "${FTG_INVENTORY_TIMEOUT:-10}" <<'PY'
+import json
+import os
+import re
+import selectors
+import signal
+import subprocess
+import sys
+import time
+
+state, socket_path, executable, timeout_text = sys.argv[1:]
+def fail(code, reason, status):
+    print(f"ERROR: {code}: {reason}", file=sys.stderr)
+    sys.exit(status)
+if re.fullmatch(r"[0-9]{1,2}", timeout_text) is None or not 1 <= int(timeout_text) <= 60:
+    fail("mux_inventory_invalid", "FTG_INVENTORY_TIMEOUT must be whole seconds from 1 to 60", 65)
+
+process = None
+reader = None
+finished = False
+def interrupted(signum, _frame):
+    # Default TERM/HUP handlers bypass finally and would leave the detached
+    # probe group alive after its management command has been cancelled.
+    raise SystemExit(128 + signum)
+for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+    signal.signal(signum, interrupted)
+try:
+    process = subprocess.Popen([executable, "robot", "state"], cwd=state,
+        env=dict(os.environ, WEZTERM_UNIX_SOCKET=socket_path),
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True)
+    reader = selectors.DefaultSelector()
+    reader.register(process.stdout, selectors.EVENT_READ)
+    deadline = time.monotonic() + int(timeout_text)
+    reply = bytearray()
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not reader.select(remaining):
+            fail("mux_inventory_unavailable", "ft robot state exceeded its deadline", 69)
+        chunk = os.read(process.stdout.fileno(), 65536)
+        if not chunk:
+            break
+        if len(reply) + len(chunk) > 16 * 1024 * 1024:
+            fail("mux_inventory_invalid", "ft robot state exceeded the response size limit", 65)
+        reply.extend(chunk)
+    result = process.wait(timeout=max(0, deadline - time.monotonic()))
+    finished = True
+    if result != 0:
+        fail("mux_inventory_unavailable", "ft robot state did not complete successfully", 69)
+except subprocess.TimeoutExpired:
+    fail("mux_inventory_unavailable", "ft robot state exceeded its deadline", 69)
+except OSError:
+    fail("mux_inventory_unavailable", "ft robot state could not be read", 69)
+finally:
+    if reader is not None:
+        reader.close()
+    if process is not None:
+        if not finished:
+            # Kill only the probe group created above, including a child that
+            # inherited its stdout after the CLI exited. Do not wait forever
+            # on pipe EOF or let a stalled read retain management ownership.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+        process.stdout.close()
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate property")
+        result[key] = value
+    return result
+def invalid_constant(value):
+    raise ValueError("non-JSON constant")
+try:
+    response = json.loads(reply.decode("utf-8"), object_pairs_hook=unique_object, parse_constant=invalid_constant)
+    if not isinstance(response, dict) or response.get("ok") is not True:
+        raise ValueError("unsuccessful envelope")
+    panes = response.get("data")
+    if not isinstance(panes, list):
+        raise ValueError("missing pane list")
+    identities = set()
+    for pane in panes:
+        if not isinstance(pane, dict):
+            raise ValueError("invalid pane")
+        identity = pane.get("pane_id")
+        if type(identity) is not int or not 0 <= identity <= 18446744073709551615:
+            raise ValueError("invalid pane identity")
+        if identity in identities:
+            raise ValueError("duplicate pane identity")
+        identities.add(identity)
+    print(" ".join(str(identity) for identity in sorted(identities)))
+except (ValueError, TypeError, RecursionError):
+    print("ERROR: mux_inventory_invalid: expected a successful pane list with unique u64 identities", file=sys.stderr)
+    sys.exit(65)
+PY
+}
+
+mux_service_is_stopped() {  # positive manager evidence; query failure is not stopped
+  local description state pid line key value domain label result
+  case "$MANAGER" in
+    systemd)
+      description=$(systemctl --user show -p ActiveState -p MainPID "$(unit mux-server)" 2>/dev/null) \
+        || return 1
+      state=""; pid=""
+      while IFS='=' read -r key value; do
+        case "$key" in
+          ActiveState) [ -z "$state" ] || return 1; state=$value ;;
+          MainPID) [ -z "$pid" ] || return 1; pid=$value ;;
+          *) return 1 ;;
+        esac
+      done <<< "$description"
+      case "$state" in inactive|failed) [ "$pid" = 0 ] ;; *) return 1 ;; esac
+      ;;
+    launchd)
+      # Older installs can still live in gui/<uid>; neither domain may have
+      # a running mux. Refuse unfamiliar/debug-output shapes and transport
+      # errors rather than treating a failed launchctl invocation as absence.
+      label=$(unit mux-server)
+      for domain in "user/$(id -u)" "gui/$(id -u)"; do
+        if description=$(launchctl print "$domain/$label" 2>&1); then
+          state=$(printf '%s\n' "$description" | sed -nE 's/^[[:space:]]*state = (.*)$/\1/p')
+          pid=$(printf '%s\n' "$description" | sed -nE 's/^[[:space:]]*pid = (.*)$/\1/p')
+          case "$state" in "not running"|waiting) ;; *) return 1 ;; esac
+          [ -z "$pid" ] || [ "$pid" = 0 ] || return 1
+        else
+          result=$?
+          [ "$result" = 113 ] || return 1
+          case "$description" in
+            *"Could not find service \"$label\" in domain"*) ;;
+            *) return 1 ;;
+          esac
+        fi
+      done
+      ;;
+    direct)
+      # A stale PID file is normal after exit/reboot. A missing/invalid file,
+      # failed process census or still-live PID cannot establish a stopped
+      # service. Do not mistake permission/probe errors for an empty host.
+      pid=$(cat "$STATE/run.mux-server.pid" 2>/dev/null) || return 1
+      [[ "$pid" =~ ^[1-9][0-9]{0,9}$ ]] && [ "$pid" -le 2147483647 ] || return 1
+      description=$(ps -e -o pid= 2>/dev/null) || return 1
+      [ -n "$description" ] || return 1
+      while IFS= read -r line; do
+        value=${line//[[:space:]]/}
+        case "$value" in ''|*[!0-9]*) return 1 ;; esac
+        [ "$value" != "$pid" ] || return 1
+      done <<< "$description"
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 newest_publication() {  # mtime (epoch) of the newest committed recovery root, or 0
@@ -892,7 +1047,7 @@ verify_mux() {  # <expected family dir> <expected panes> <expected pane ids> <ex
     else exe=$(lsof -a -p "$pid" -d txt -Fn 2>/dev/null | sed -n 's/^n//p' | head -1 || true); fi
     case "$exe" in "$fam"/*|"$(cd "$fam" && pwd -P)"/*) ;; *) continue ;; esac
     panes=$(guardian_probe | awk '{print $2}')
-    ids=$(mux_pane_ids)
+    ids=$(mux_pane_ids) || continue
     children=$(broker_children) || continue
     # "*": no mux reported ids before, so any ids, one for each pane.
     local ids_match=0
@@ -1011,8 +1166,7 @@ cmd_install() {
   # A mux restoring panes with long history takes seconds for each.
   local deadline=$(( $(date +%s) + 60 + 5 * panes )) ids=""
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    ids=$(mux_pane_ids)
-    [ -n "$ids" ] && break
+    if ids=$(mux_pane_ids) && [ -n "$ids" ]; then break; fi
     sleep 2
   done
   [ -n "$ids" ] || die "mux did not come up with a pane; see $STATE/logs or the service journal"
@@ -1038,8 +1192,13 @@ recover_mux() {  # <from dir> <to dir> <timeout>: start <to> to serve the panes 
   case "$probe" in ready\ [0-9]*) ;; *) die "guardian is not ready; refusing" ;; esac
   panes=$(echo "$probe" | awk '{print $2}')
   [ "${panes:-0}" -gt 0 ] || die "guardian holds no panes; nothing to recover (use install for a fresh start)"
-  ids=$(mux_pane_ids)
-  [ -z "$ids" ] || die "the mux serves panes [$ids]; --recover is for a mux that serves none (use upgrade)"
+  if ids=$(mux_pane_ids); then
+    [ -z "$ids" ] || die "the mux serves panes [$ids]; --recover is for a mux that serves none (use upgrade)"
+  elif mux_service_is_stopped; then
+    log "mux service is confirmed stopped; recovering its guardian panes without an inventory RPC"
+  else
+    die "mux_inventory_unavailable: cannot verify an empty or stopped mux; refusing recovery (inspect the service and retry)"
+  fi
   children=$(broker_children) || die "cannot verify the running broker's pane processes; refusing to recover"
   log "recover: no mux serves the guardian's $panes pane(s), pane processes [$children]"
   [ -e "$(family_script "$from")" ] \
@@ -1068,7 +1227,7 @@ swap_mux() {  # <from dir> <to dir> <timeout> <verb>
   probe=$(wait_guardian_ready 60) || die "guardian is not ready; refusing"
   case "$probe" in ready\ [0-9]*) ;; *) die "guardian is not ready; refusing" ;; esac
   panes=$(echo "$probe" | awk '{print $2}')
-  ids=$(mux_pane_ids)
+  ids=$(mux_pane_ids) || die "mux_inventory_unavailable: cannot verify the running mux pane ids; refusing to $verb"
   children=$(broker_children) || die "cannot verify the running broker's pane processes; refusing to $verb"
   [ "${panes:-0}" -gt 0 ] || die "guardian holds no panes; nothing to preserve (use install for a fresh start)"
   [ -n "$ids" ] || die "cannot read the running mux's pane ids"
@@ -1164,8 +1323,12 @@ cmd_status() {
   done
   echo "guardian probe:  $(guardian_probe)"
   local ids children p age stale_after
-  ids=$(mux_pane_ids)
-  echo "pane ids:        [$ids]"
+  if ids=$(mux_pane_ids); then
+    echo "pane ids:        [$ids]"
+  else
+    ids=""
+    echo "pane ids:        unavailable (mux inventory could not be verified)"
+  fi
   if children=$(broker_children); then
     echo "pane processes:  [$children]"
   else

@@ -453,6 +453,223 @@ class GuardianHostOperations(unittest.TestCase):
         self.assertFalse(service["inherited"], "service entry must not retain descriptor 9")
         self.assert_lock_released()
 
+    def install_inventory_fixture(self, reply='{"ok":true,"data":[]}'):
+        self.inventory = self.directory / "inventory-response"
+        self.inventory.write_text(reply)
+        self.env.update(FTG_TEST_INVENTORY=str(self.inventory),
+                        FTG_TEST_INVENTORY_STATUS="0", FTG_INVENTORY_TIMEOUT="2",
+                        FTG_TEST_MANAGER_RESPONSE="ActiveState=active\nMainPID=123\n",
+                        FTG_TEST_MANAGER_STATUS="0", FTG_TEST_BROKER_PID=str(os.getpid()))
+        self.executable(self.source / "frankenterm-mux-server",
+            '#!/bin/sh\n[ "${1-}" = --version ] || exit 64\n'
+            f'printf "%s\\n" {shlex.quote(GuardianHostFamily.version("frankenterm-mux-server"))}\n')
+        self.executable(self.installed / "ft",
+            '#!/usr/bin/env python3\nimport os, pathlib, sys\n'
+            'assert sys.argv[1:] == ["robot", "state"]\n'
+            'sys.stdout.buffer.write(pathlib.Path(os.environ["FTG_TEST_INVENTORY"]).read_bytes())\n'
+            'sys.exit(int(os.environ["FTG_TEST_INVENTORY_STATUS"]))\n')
+        self.executable(self.installed / "frankenterm-pty-guardian",
+            '#!/bin/sh\n[ "${1-}" = probe ] || exit 64\nprintf "ready panes=2\\n"\n')
+        self.executable(self.bin / "systemctl",
+            '#!/usr/bin/env python3\nimport os, pathlib, sys\n'
+            'args = sys.argv[1:]\n'
+            'with pathlib.Path(os.environ["FTG_TEST_SERVICES"]).open("a") as f:\n'
+            '    f.write(" ".join(args) + "\\n")\n'
+            'if args[:6] == ["--user", "show", "-p", "ActiveState", "-p", "MainPID"]:\n'
+            '    print(os.environ["FTG_TEST_MANAGER_RESPONSE"], end="")\n'
+            '    sys.exit(int(os.environ["FTG_TEST_MANAGER_STATUS"]))\n'
+            'if args[:5] == ["--user", "show", "-p", "MainPID", "--value"]:\n'
+            '    print(os.environ["FTG_TEST_BROKER_PID"])\n    sys.exit(0)\n'
+            'if args[:3] == ["--user", "is-active", "--quiet"]: sys.exit(0)\n'
+            'sys.exit(1)\n')
+        self.executable(self.bin / "pgrep", '#!/bin/sh\n[ "$1" = -P ] || exit 2\nprintf "101\\n102\\n"\n')
+
+    def call_host_function(self, function, env=None):
+        # Exercise the production functions with real subprocess I/O. Only
+        # their external binaries and manager responses are controlled.
+        functions = SCRIPT.read_text().rsplit('case "${1:-}" in', 1)[0]
+        return subprocess.run(["bash", "-c", functions + "\n" + function + "\n", str(SCRIPT)],
+                              cwd=self.directory, env=env or self.env,
+                              capture_output=True, text=True, timeout=5)
+
+    def test_inventory_preserves_empty_and_exact_u64_identities(self):
+        self.install_inventory_fixture()
+        result = self.call_host_function("mux_pane_ids")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "\n")
+        self.inventory.write_text('{"ok":true,"data":[{"pane_id":18446744073709551615},{"pane_id":0},{"pane_id":7}]}')
+        result = self.call_host_function("mux_pane_ids")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "0 7 18446744073709551615\n")
+
+    def test_inventory_rejects_error_malformed_and_ambiguous_identity_data(self):
+        self.install_inventory_fixture()
+        cases = ("", "{", "[]", "{}", '{"ok":false,"data":[]}',
+                 '{"ok":true,"data":null}', '{"ok":true,"data":{}}',
+                 '{"ok":true,"data":[null]}', '{"ok":true,"data":[{}]}',
+                 '{"ok":true,"data":[{"pane_id":true}]}',
+                 '{"ok":true,"data":[{"pane_id":1.0}]}',
+                 '{"ok":true,"data":[{"pane_id":"1"}]}',
+                 '{"ok":true,"data":[{"pane_id":-1}]}',
+                 '{"ok":true,"data":[{"pane_id":18446744073709551616}]}',
+                 '{"ok":true,"data":[{"pane_id":1},{"pane_id":1}]}',
+                 '{"ok":false,"ok":true,"data":[]}',
+                 '{"ok":true,"data":[{"pane_id":NaN}]}')
+        for reply in cases:
+            with self.subTest(reply=reply):
+                self.inventory.write_text(reply)
+                result = self.call_host_function("mux_pane_ids")
+                self.assertEqual(result.returncode, 65, result.stderr)
+                self.assertIn("mux_inventory_invalid", result.stderr)
+                self.assertEqual(result.stdout, "")
+
+    def test_failed_inventory_command_cannot_supply_a_plausible_empty_receipt(self):
+        self.install_inventory_fixture()
+        self.env["FTG_TEST_INVENTORY_STATUS"] = "17"
+        result = self.call_host_function("mux_pane_ids")
+        self.assertEqual(result.returncode, 69, result.stderr)
+        self.assertIn("mux_inventory_unavailable", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_running_mux_with_unknown_inventory_is_never_recovered_or_restarted(self):
+        self.install_inventory_fixture()
+        for reply, status in (('{"ok":false,"error":"private-failure-detail"}', "0"),
+                              ("malformed-private-output", "0"),
+                              ('{"ok":true,"data":[]}', "17")):
+            with self.subTest(reply=reply, status=status):
+                self.inventory.write_text(reply)
+                self.env["FTG_TEST_INVENTORY_STATUS"] = status
+                result = self.run_host("upgrade", "--family", str(self.source), "--recover")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("cannot verify an empty or stopped mux", result.stderr)
+                self.assertNotIn("private-", result.stderr)
+                calls = self.services.read_text()
+                self.assertNotIn("--user restart", calls)
+                self.assertNotIn("--user reset-failed", calls)
+                for name in ("mux-current", "mux-previous", "guardian-family"):
+                    self.assertEqual((self.base / name).readlink(), self.installed)
+                self.assertEqual((self.base / "bin/mux-guardian-host.sh").read_text(), "original launcher\n")
+                self.assert_lock_released()
+
+    def test_upgrade_rejects_failed_inventory_before_waiting_or_changing_services(self):
+        self.install_inventory_fixture('{"ok":true,"data":[{"pane_id":7}]}')
+        self.env["FTG_TEST_INVENTORY_STATUS"] = "17"
+        result = self.run_host("upgrade", "--family", str(self.source))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot verify the running mux pane ids", result.stderr)
+        self.assertNotIn("--user restart", self.services.read_text())
+        self.assertEqual((self.base / "mux-current").readlink(), self.installed)
+
+    def test_successfully_empty_inventory_allows_recovery_admission(self):
+        self.install_inventory_fixture()
+        result = self.run_host("upgrade", "--family", str(self.source), "--recover")
+        # The controlled restart fails. Its invocation proves admission, not
+        # a native restoration; the production failure path restores links.
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("starting mux", result.stderr)
+        self.assertIn("--user restart", self.services.read_text())
+        self.assertEqual((self.base / "mux-current").readlink(), self.installed)
+
+    def test_confirmed_stopped_service_can_recover_without_a_mux_rpc(self):
+        self.install_inventory_fixture()
+        self.env.update(FTG_TEST_INVENTORY_STATUS="17",
+                        FTG_TEST_MANAGER_RESPONSE="ActiveState=inactive\nMainPID=0\n")
+        result = self.run_host("upgrade", "--family", str(self.source), "--recover")
+        self.assertIn("service is confirmed stopped", result.stderr)
+        self.assertIn("--user restart", self.services.read_text())
+        self.assertEqual((self.base / "mux-current").readlink(), self.installed)
+
+    def test_manager_errors_and_live_pid_are_not_positive_stopped_evidence(self):
+        self.install_inventory_fixture()
+        cases = (("ActiveState=inactive\nMainPID=0\n", "1"),
+                 ("ActiveState=failed\nMainPID=123\n", "0"),
+                 ("ActiveState=activating\nMainPID=0\n", "0"),
+                 ("ActiveState=inactive\n", "0"), ("", "0"))
+        for reply, status in cases:
+            with self.subTest(reply=reply, status=status):
+                self.env.update(FTG_TEST_MANAGER_RESPONSE=reply, FTG_TEST_MANAGER_STATUS=status)
+                self.assertNotEqual(self.call_host_function("mux_service_is_stopped").returncode, 0)
+        self.env.update(FTG_TEST_MANAGER_RESPONSE="MainPID=0\nActiveState=failed\n", FTG_TEST_MANAGER_STATUS="0")
+        result = self.call_host_function("mux_service_is_stopped")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_direct_stopped_evidence_requires_an_exited_recorded_process(self):
+        env = dict(self.env, FTG_MANAGER="direct")
+        self.assertNotEqual(self.call_host_function("mux_service_is_stopped", env=env).returncode, 0)
+        pid_file = self.state / "run.mux-server.pid"
+        for value in (str(os.getpid()), "0" + str(os.getpid()), "invalid", "0"):
+            with self.subTest(pid=value):
+                pid_file.write_text(value)
+                self.assertNotEqual(self.call_host_function("mux_service_is_stopped", env=env).returncode, 0)
+        child = subprocess.Popen(["bash", "-c", "exit 0"])
+        child.wait(timeout=5)
+        pid_file.write_text(str(child.pid))
+        result = self.call_host_function("mux_service_is_stopped", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_inventory_probe_deadline_kills_its_owned_descendants(self):
+        self.install_inventory_fixture()
+        child_pid = self.directory / "probe-descendant"
+        self.executable(self.installed / "ft",
+            '#!/usr/bin/env python3\nimport pathlib, subprocess, sys, time\n'
+            'child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])\n'
+            f'pathlib.Path({str(child_pid)!r}).write_text(str(child.pid))\n'
+            'print("private-output-must-not-be-logged", flush=True)\n')
+        started = time.monotonic()
+        result = self.call_host_function("mux_pane_ids", env=dict(self.env, FTG_INVENTORY_TIMEOUT="1"))
+        self.assertEqual(result.returncode, 69, result.stderr)
+        self.assertIn("exceeded its deadline", result.stderr)
+        self.assertNotIn("private-output", result.stderr)
+        self.assertLess(time.monotonic() - started, 4)
+        self.assertTrue(child_pid.exists())
+        # A killed orphan can remain a zombie until the host's PID 1 reaps it.
+        observed = subprocess.run(["ps", "-o", "stat=", "-p", child_pid.read_text()],
+                                  capture_output=True, text=True, timeout=2)
+        self.assertTrue(observed.returncode != 0 or observed.stdout.strip().startswith("Z"), observed.stdout)
+
+    def test_inventory_response_budget_is_enforced_without_logging_content(self):
+        self.install_inventory_fixture()
+        self.executable(self.installed / "ft",
+            '#!/usr/bin/env python3\nimport sys\nsys.stdout.buffer.write(b"x" * (16 * 1024 * 1024 + 1))\n')
+        result = self.call_host_function("mux_pane_ids")
+        self.assertEqual(result.returncode, 65, result.stderr)
+        self.assertIn("response size limit", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_cancelled_inventory_owner_reaps_its_separate_probe_group(self):
+        self.install_inventory_fixture()
+        probe_pid = self.directory / "cancelled-probe"
+        self.executable(self.installed / "ft",
+            '#!/usr/bin/env python3\nimport os, pathlib, time\n'
+            f'pathlib.Path({str(probe_pid)!r}).write_text(str(os.getpid()))\n'
+            'time.sleep(30)\n')
+        functions = SCRIPT.read_text().rsplit('case "${1:-}" in', 1)[0]
+        owner = subprocess.Popen(["bash", "-c", functions + "\nmux_pane_ids\n", str(SCRIPT)],
+                                 cwd=self.directory, env=self.env, start_new_session=True,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            deadline = time.monotonic() + 5
+            while not probe_pid.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(probe_pid.exists())
+            os.killpg(owner.pid, signal.SIGTERM)
+            owner.communicate(timeout=5)
+            self.assertNotEqual(owner.returncode, 0)
+            # The detached probe is outside the owner's group. Only the
+            # inventory reader's cancellation cleanup can terminate it.
+            observed = subprocess.run(["ps", "-o", "stat=", "-p", probe_pid.read_text()],
+                                      capture_output=True, text=True, timeout=2)
+            self.assertTrue(observed.returncode != 0 or observed.stdout.strip().startswith("Z"), observed.stdout)
+        finally:
+            if owner.poll() is None:
+                os.killpg(owner.pid, signal.SIGKILL)
+                owner.communicate(timeout=5)
+            if probe_pid.exists():
+                try:
+                    os.killpg(int(probe_pid.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
