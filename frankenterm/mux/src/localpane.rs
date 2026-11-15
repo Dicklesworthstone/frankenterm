@@ -19203,7 +19203,8 @@ mod tests {
         pane.mouse_event(mouse_at(K::Press, B::Left, 2, 1)).unwrap();
         drop(held);
         pane.wait_for_queued_input();
-        writes.expect(b"\x1b[O\x1b[I\x1b[<0;3;2M");
+        // The leading focus-in is the terminal's answer to ?1004h itself.
+        writes.expect(b"\x1b[I\x1b[O\x1b[I\x1b[<0;3;2M");
     }
 
     #[test]

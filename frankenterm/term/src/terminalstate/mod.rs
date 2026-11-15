@@ -3229,6 +3229,12 @@ impl TerminalState {
             Mode::SetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::FocusTracking)) => {
                 self.focus_tracking = true;
                 self.last_mouse_move.take();
+                // Report the current focus at once, as other terminals do.
+                // vim re-enables focus tracking when resumed with fg and
+                // checks for changed files on that focus event.
+                let report = if self.focused { "\x1b[I" } else { "\x1b[O" };
+                write!(self.writer, "{report}").ok();
+                self.writer.flush().ok();
             }
             Mode::ResetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::FocusTracking)) => {
                 self.focus_tracking = false;

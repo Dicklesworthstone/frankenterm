@@ -619,6 +619,50 @@ fn primary_device_attributes_do_not_advertise_selective_erase_without_support() 
     assert_eq!(output, "\x1b[?65;4;18;22;52c");
 }
 
+/// Enabling focus tracking reports the current focus at once (upstream
+/// aa0d91a49), so a program resumed with fg learns it has focus.
+#[test]
+fn enabling_focus_tracking_reports_the_current_focus() {
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let writer = SharedWriter {
+        output: Arc::clone(&output),
+    };
+    let mut term = Terminal::new(
+        TerminalSize {
+            rows: 5,
+            cols: 10,
+            pixel_width: 80,
+            pixel_height: 80,
+            dpi: 0,
+        },
+        Arc::new(TestTermConfig {
+            scrollback: 0,
+            scrollback_tier: crate::config::ScrollbackTierConfig::default(),
+        }),
+        "WezTerm",
+        "O_o",
+        Box::new(writer),
+    );
+
+    term.advance_bytes("\x1b[?1004h");
+    drain_writer(&mut term);
+    assert_eq!(
+        String::from_utf8(output.lock().unwrap().clone()).unwrap(),
+        "\x1b[I"
+    );
+
+    // Focus out is reported while tracking; re-enabling reports the
+    // unfocused state, and disabling reports nothing.
+    term.focus_changed(false);
+    term.advance_bytes("\x1b[?1004l\x1b[?1004h\x1b[?1004l");
+    term.focus_changed(true);
+    drain_writer(&mut term);
+    assert_eq!(
+        String::from_utf8(output.lock().unwrap().clone()).unwrap(),
+        "\x1b[I\x1b[O\x1b[O"
+    );
+}
+
 mod osc52_policy {
     use super::assert_eq;
     use super::*;
