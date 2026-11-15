@@ -9,7 +9,10 @@
 #   1. >= 20 panes live, spawned by profile apply, each actually running its command
 #   2. detections from >= 3 rule families: codex.usage.reached, claude_code.compaction,
 #      gemini.usage.reached
-#   3. ft watch --auto-handle runs handle_compaction and its prompt reaches a claude pane
+#   3. ft watch --auto-handle runs handle_compaction and its prompt reaches a claude pane;
+#      an unsigned workspace pack (.ft/patterns, as a cloned repo ships it) whose rule
+#      emits session.compaction and names handle_compaction is detected but starts no
+#      workflow, because unsigned packs load observe-only (ft-frujlz)
 #   4. a robot send into a full-screen pane is denied (policy.alt_screen) and audited
 #   5. FTS search finds the usage-limit text in >= 2 panes
 #   6. `ft robot state` latency p95 < 500 ms (asserted on every build profile)
@@ -39,14 +42,14 @@ mkdir -p "$OUT"
 PROFILE=$(basename "$BIN")
 TIER=${LIVE_LOOP_TIER:-2}
 if [[ "$TIER" == 3 ]]; then
-  SPECS=${LIVE_LOOP_SPECS:-codex:14 claude:14 gemini:10 fullscreen:2}
+  SPECS=${LIVE_LOOP_SPECS:-codex:14 claude:14 gemini:10 fullscreen:2 unsigned:1}
   SHELLS=${LIVE_LOOP_SHELLS:-10}
   MIN_PANES=50
   # Shells flood past the hot tier so warm spill (and budget pressure) is real.
   SHELL_CMD="/bin/sh -c 'seq 1 150000; exec /bin/zsh -f'"
   FIRE_STAGGER=6
 else
-  SPECS=${LIVE_LOOP_SPECS:-codex:6 claude:6 gemini:4 fullscreen:1}
+  SPECS=${LIVE_LOOP_SPECS:-codex:6 claude:6 gemini:4 fullscreen:1 unsigned:1}
   SHELLS=${LIVE_LOOP_SHELLS:-3}
   MIN_PANES=20
   SHELL_CMD="/bin/zsh -f"
@@ -75,6 +78,22 @@ if [[ "$TIER" == 3 ]]; then
   printf '[fleet_scrollback]\nenabled = true\nper_pane_budget_bytes = 262144\n' >> "$D/ft.toml"
 fi
 chmod 600 "$D/ft.toml"
+# ft watch loads workspace packs from .ft/patterns beside its config. This one is
+# unsigned, so it loads observe-only: its rule detects, but it must not start the
+# workflow it names.
+mkdir -p "$D/.ft/patterns"
+cat > "$D/.ft/patterns/unsigned.toml" <<'EOF'
+name = "ws:unsigned"
+version = "1.0.0"
+[[rules]]
+id = "myorg.unsigned_compaction"
+agent_type = "claude_code"
+event_type = "session.compaction"
+severity = "info"
+anchors = ["LIVELOOP-UNSIGNED-TRIGGER"]
+description = "unsigned workspace pack rule naming a builtin workflow"
+workflow = "handle_compaction"
+EOF
 
 cat > "$D/agent-pane.py" <<'PY'
 # Scripted agent pane: title, OSC 133 prompt, real detection text on "fire".
@@ -86,8 +105,11 @@ lines = {
     "codex": b"You've reached your usage limit. try again at 3:00 PM.",
     "claude": b"Conversation compacted: 91234 tokens to 4512",
     "gemini": b"Usage limit reached for all Pro models.",
+    # Matches only the unsigned workspace pack's rule.
+    "unsigned": b"LIVELOOP-UNSIGNED-TRIGGER",
 }
-title = {"codex": b"codex", "claude": b"claude", "gemini": b"gemini", "fullscreen": b"htop"}[kind]
+title = {"codex": b"codex", "claude": b"claude", "gemini": b"gemini", "fullscreen": b"htop",
+         "unsigned": b"claude"}[kind]
 os.write(1, b"\x1b]2;" + title + b"\x07")
 if kind == "fullscreen":
     os.write(1, b"\x1b[?1049h\x1b[HFULLSCREEN")
@@ -228,7 +250,28 @@ grep -l "TIER2_CONTEXT_REFRESH" "$D"/inputs/*.claude.in > "$OUT/workflow-deliver
 [[ -s "$OUT/workflow-delivered.txt" ]]
 check "auto_handle_compaction_prompt_reaches_a_claude_pane" $? "$(wc -l < "$OUT/workflow-delivered.txt" | tr -d ' ') pane(s)"
 
-for kind in codex claude gemini fullscreen shell; do
+# The unsigned pack's pane fires only now, once the claude panes' workflows are done,
+# so a free runner would start handle_compaction for it if dispatch went by event
+# type alone (it did before ft-frujlz). It is left out of fire-times: its rule is not
+# an agent rule the latency check counts.
+UNSIGNED_PANES=$(spawned unsigned)
+if [[ -n "$UNSIGNED_PANES" ]]; then
+  for pane in $UNSIGNED_PANES; do ft send --no-paste "$pane" "fire" > /dev/null 2>&1; done
+  sleep 20
+  ft robot --format json events --limit 1000 > "$OUT/events-unsigned.json" 2> /dev/null
+  python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));ev=d["data"]["events"];sys.exit(0 if any(e["rule_id"]==sys.argv[2] for e in ev) else 1)' \
+    "$OUT/events-unsigned.json" "myorg.unsigned_compaction"
+  check "detects_unsigned_workspace_pack_rule" $? ""
+  # Every unsigned pane must have received its fire, or "no prompt" proves nothing.
+  UNSIGNED_FIRED=$(grep -l "fire" "$D"/inputs/*.unsigned.in 2> /dev/null | wc -l | tr -d ' ')
+  UNSIGNED_COUNT=$(echo $UNSIGNED_PANES | wc -w | tr -d ' ')
+  grep -l "TIER2_CONTEXT_REFRESH" "$D"/inputs/*.unsigned.in > "$OUT/unsigned-delivered.txt" 2> /dev/null
+  (( UNSIGNED_FIRED == UNSIGNED_COUNT )) && [[ ! -s "$OUT/unsigned-delivered.txt" ]]
+  check "unsigned_workspace_pack_rule_starts_no_workflow" $? \
+    "$(wc -l < "$OUT/unsigned-delivered.txt" | tr -d ' ') of $UNSIGNED_COUNT pane(s) got the workflow's prompt; $UNSIGNED_FIRED fired"
+fi
+
+for kind in codex claude gemini fullscreen unsigned shell; do
   for pane in $(spawned "$kind"); do ft get-text "$pane" --tail 60 > "$OUT/screen-$kind-$pane.txt" 2>&1; done
 done
 DENIED=0; AUDITED=0; FULL_PANES=$(spawned fullscreen)
