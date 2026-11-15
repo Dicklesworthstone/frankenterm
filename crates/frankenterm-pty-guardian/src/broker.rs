@@ -29106,6 +29106,7 @@ mod tests {
                     service.retain_retire_completion(BrokerRetireWorkerCompletionV1 {
                         fingerprint,
                         committed: false,
+                        token_authority_failed: false,
                     });
                     let restored = service.live_spawns.get(&binding.durable_pane_id).unwrap();
                     assert!(restored.observes_owner(attachment.owner).is_none());
