@@ -4195,7 +4195,7 @@ fn builtin_claude_code_pack() -> PatternPack {
                 severity: Severity::Warning,
                 anchors: vec!["API Error: ".to_string()],
                 regex: Some(
-                    r"API Error: (?P<model>[A-Z][A-Za-z]*(?: [0-9.]+)?)['’]s safeguards flagged this (?P<scope>message|session)"
+                    r"API Error: (?P<model>[^'’\n]{1,40}?)['’]s safeguards flagged this (?P<scope>message|session)"
                         .to_string(),
                 ),
                 description: "Claude model safeguards refused the turn".to_string(),
@@ -12003,6 +12003,13 @@ rules:
                 "claude_code.error.safeguards",
                 "Opus 4.8",
                 Some("message"),
+            ),
+            // A model named differently, with a typographic apostrophe.
+            (
+                "API Error: Claude Opus 6’s safeguards flagged this session.",
+                "claude_code.error.safeguards",
+                "Claude Opus 6",
+                Some("session"),
             ),
             (
                 "There's an issue with the selected model (opus-5). It may not exist or you may not have access to it.",
