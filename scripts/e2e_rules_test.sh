@@ -5,8 +5,8 @@
 #
 # Purpose:
 #   Validate the rules toolchain end-to-end:
-#   - wa robot rules list returns stable rule IDs + metadata
-#   - wa robot rules test matches known fixtures correctly
+#   - ft robot rules list returns stable rule IDs + metadata
+#   - ft robot rules test matches known fixtures correctly
 #   - Negative fixtures produce no matches
 #   - Output schemas are stable and parseable
 #
@@ -94,7 +94,7 @@ log_info() {
 # Helpers
 # ==============================================================================
 
-# Run wa robot command, extracting JSON from output (strips log lines)
+# Run ft robot command, extracting JSON from output (strips log lines)
 run_robot() {
     local raw_output
     raw_output=$("$FT_BIN" "$@" 2>/dev/null) || true
@@ -191,11 +191,11 @@ check_prerequisites() {
 }
 
 # ==============================================================================
-# Scenario 1: wa robot rules list — schema + stability
+# Scenario 1: ft robot rules list — schema + stability
 # ==============================================================================
 
 test_rules_list() {
-    log_test "Scenario 1: wa robot rules list"
+    log_test "Scenario 1: ft robot rules list"
 
     local json
     json=$(run_robot robot rules list)
@@ -260,11 +260,11 @@ test_rules_list() {
 }
 
 # ==============================================================================
-# Scenario 2: wa robot rules test — known fixtures
+# Scenario 2: ft robot rules test — known fixtures
 # ==============================================================================
 
 test_rules_match_fixtures() {
-    log_test "Scenario 2: wa robot rules test — fixture matching"
+    log_test "Scenario 2: ft robot rules test — fixture matching"
 
     # Test known fixtures that should trigger specific rules
     local -A fixtures=(
@@ -327,11 +327,11 @@ test_rules_match_fixtures() {
 }
 
 # ==============================================================================
-# Scenario 3: wa robot rules test — extraction
+# Scenario 3: ft robot rules test — extraction
 # ==============================================================================
 
 test_rules_extraction() {
-    log_test "Scenario 3: wa robot rules test — field extraction"
+    log_test "Scenario 3: ft robot rules test — field extraction"
 
     # Test that extracted fields are correct
     local json
@@ -378,11 +378,11 @@ test_rules_extraction() {
 }
 
 # ==============================================================================
-# Scenario 4: wa robot rules test — negative fixtures
+# Scenario 4: ft robot rules test — negative fixtures
 # ==============================================================================
 
 test_rules_negative() {
-    log_test "Scenario 4: wa robot rules test — negative fixtures (no false positives)"
+    log_test "Scenario 4: ft robot rules test — negative fixtures (no false positives)"
 
     local -a negatives=(
         "Hello, world!"
