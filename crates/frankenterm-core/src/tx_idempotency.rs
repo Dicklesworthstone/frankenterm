@@ -2348,6 +2348,15 @@ struct DurableSpool {
     display_path: PathBuf,
 }
 
+/// Observed durable spool occupancy before admitting a new ledger.
+/// The catalog lock serializes creators; existing executions may still append
+/// records under their own locks, so byte occupancy is a bounded scan result.
+#[derive(Debug, Clone, Copy)]
+struct DurableSpoolUsage {
+    files: usize,
+    bytes: u64,
+}
+
 /// Cross-instance idempotency store that tracks execution across multiple tx runs.
 ///
 /// Provides the core dedup + resume API surface.
@@ -3545,100 +3554,10 @@ impl IdempotencyStore {
             #[cfg(test)]
             durable_refresh_scan_count: 0,
         };
-        let spool = store.durable_spool()?;
-
-        // Filename order is used only to make validation/error reporting
-        // deterministic. Dedup recency is determined by authenticated record
-        // timestamps below, never by an execution-id naming convention.
-        let mut candidates: Vec<(String, PathBuf)> = Vec::new();
-        let entries = spool
-            .dir
-            .entries()
-            .map_err(|err| IdempotencyError::LedgerPersist {
-                reason: format!(
-                    "list pinned tx_ledgers directory {}: {err}",
-                    spool.display_path.display()
-                ),
-            })?;
-        for entry in entries {
-            let entry = entry.map_err(|err| IdempotencyError::LedgerPersist {
-                reason: format!(
-                    "read entry in pinned tx_ledgers directory {}: {err}",
-                    spool.display_path.display()
-                ),
-            })?;
-            let name = PathBuf::from(entry.file_name());
-            if name.extension().and_then(|extension| extension.to_str()) == Some("json")
-                && let Some(stem) = name.file_stem().and_then(|stem| stem.to_str())
-                && is_valid_execution_id(stem)
-            {
-                candidates.push((stem.to_string(), name));
-            }
-        }
-        candidates.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-        if candidates.len() > store.policy.max_spool_files {
-            return Err(IdempotencyError::SpoolFileCountExceeded {
-                actual: candidates.len(),
-                maximum: store.policy.max_spool_files,
-            });
-        }
-        let mut verified_ledgers = Vec::with_capacity(candidates.len());
-        let mut total_spool_bytes: u64 = 0;
-        let mut total_records: usize = 0;
-
-        for (stem, name) in candidates {
-            let display_path = spool.display(&name);
-            let contents = read_regular_nofollow_bounded(
-                &spool.dir,
-                &name,
-                &display_path,
-                store.policy.max_ledger_bytes,
-            )
-            .map_err(|error| IdempotencyError::LedgerPersist {
-                reason: format!("read ledger {}: {error}", display_path.display()),
-            })?;
-            let file_bytes = u64::try_from(contents.len()).unwrap_or(u64::MAX);
-            total_spool_bytes = total_spool_bytes.saturating_add(file_bytes);
-            if total_spool_bytes > store.policy.max_spool_total_bytes {
-                return Err(IdempotencyError::SpoolByteLimitExceeded {
-                    actual: total_spool_bytes,
-                    maximum: store.policy.max_spool_total_bytes,
-                });
-            }
-            let ledger = serde_json::from_slice::<TxExecutionLedger>(&contents).map_err(|err| {
-                IdempotencyError::LedgerPersist {
-                    reason: format!("deserialize ledger {}: {err}", display_path.display()),
-                }
-            })?;
-            if ledger.execution_id() != stem {
-                return Err(IdempotencyError::LedgerPersist {
-                    reason: format!(
-                        "ledger identity mismatch for {}: filename execution_id {stem:?}, payload execution_id {:?}",
-                        display_path.display(),
-                        ledger.execution_id()
-                    ),
-                });
-            }
-            let verification = ledger.verify_chain();
-            if !verification.chain_intact {
-                return Err(IdempotencyError::LedgerPersist {
-                    reason: format!(
-                        "verify ledger hash chain for {}: first_break_at={:?}, missing_ordinals={:?}",
-                        display_path.display(),
-                        verification.first_break_at,
-                        verification.missing_ordinals
-                    ),
-                });
-            }
-            total_records = total_records.saturating_add(ledger.records().len());
-            if total_records > store.policy.max_spool_records {
-                return Err(IdempotencyError::SpoolRecordCountExceeded {
-                    actual: total_records,
-                    maximum: store.policy.max_spool_records,
-                });
-            }
-            verified_ledgers.push((stem, ledger));
-        }
+        let mut verified_ledgers = Vec::new();
+        store.visit_verified_spool_ledgers(|execution_id, ledger| {
+            verified_ledgers.push((execution_id, ledger));
+        })?;
 
         let active_count = verified_ledgers
             .iter()
@@ -3755,60 +3674,118 @@ impl IdempotencyStore {
         })
     }
 
-    fn rescan_all_active_ledgers(&mut self) -> Result<usize, IdempotencyError> {
-        let (spool_dir, spool_display_path) = {
-            let spool = self.durable_spool()?;
-            (Arc::clone(&spool.dir), spool.display_path.clone())
-        };
-        let max_ledger_bytes = self.policy.max_ledger_bytes;
-        let entries = spool_dir
+    fn rescan_all_active_ledgers(&mut self) -> Result<DurableSpoolUsage, IdempotencyError> {
+        let mut on_disk_active = HashMap::new();
+        let usage = self.visit_verified_spool_ledgers(|execution_id, ledger| {
+            if !ledger.phase().is_terminal() {
+                on_disk_active.insert(execution_id, ledger);
+            }
+        })?;
+        // Publish the refreshed catalog only after every durable entry has
+        // passed validation. A partial scan must not make uncertain effects
+        // disappear or manufacture capacity for another execution.
+        self.ledgers = on_disk_active;
+        Ok(usage)
+    }
+
+    /// Read the complete spool with startup's per-file validation and bounds.
+    /// Visitors must stage their changes until this returns: a later file can
+    /// still invalidate the scan. Terminal ledgers are verified too, since
+    /// their records remain authoritative replay evidence.
+    fn visit_verified_spool_ledgers(
+        &self,
+        mut visit: impl FnMut(String, TxExecutionLedger),
+    ) -> Result<DurableSpoolUsage, IdempotencyError> {
+        let spool = self.durable_spool()?;
+        let entries = spool
+            .dir
             .entries()
             .map_err(|err| IdempotencyError::LedgerPersist {
                 reason: format!(
                     "list pinned tx_ledgers directory {}: {err}",
-                    spool_display_path.display()
+                    spool.display_path.display()
                 ),
             })?;
-        let mut on_disk_active: HashMap<String, TxExecutionLedger> = HashMap::new();
+        let mut candidates = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|err| IdempotencyError::LedgerPersist {
                 reason: format!(
                     "read entry in pinned tx_ledgers directory {}: {err}",
-                    spool_display_path.display()
+                    spool.display_path.display()
                 ),
             })?;
             let name = PathBuf::from(entry.file_name());
-            if name.extension().and_then(|ext| ext.to_str()) == Some("json")
-                && let Some(stem) = name.file_stem().and_then(|s| s.to_str())
+            if name.extension().and_then(|extension| extension.to_str()) == Some("json")
+                && let Some(stem) = name.file_stem().and_then(|stem| stem.to_str())
                 && is_valid_execution_id(stem)
             {
-                let ledger_display = spool_display_path.join(&name);
-                let options = nofollow_open_options(true, false);
-                if let Ok(mut file) = spool_dir.open_with(&name, &options) {
-                    if let Ok(metadata) = file.metadata() {
-                        if validate_open_regular_file(&metadata, &ledger_display).is_ok() {
-                            if let Ok(contents) = read_bounded_ledger_with_limit(
-                                &mut file,
-                                &ledger_display,
-                                max_ledger_bytes,
-                            ) {
-                                if let Ok(ledger) =
-                                    serde_json::from_slice::<TxExecutionLedger>(&contents)
-                                {
-                                    if ledger.verify_chain().chain_intact
-                                        && !ledger.phase().is_terminal()
-                                    {
-                                        on_disk_active.insert(stem.to_string(), ledger);
-                                    }
-                                }
-                            }
-                        }
-                    }
+                candidates.push((stem.to_string(), name));
+                if candidates.len() > self.policy.max_spool_files {
+                    return Err(IdempotencyError::SpoolFileCountExceeded {
+                        actual: candidates.len(),
+                        maximum: self.policy.max_spool_files,
+                    });
                 }
             }
         }
-        self.ledgers = on_disk_active;
-        Ok(self.ledgers.len())
+        candidates.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let mut usage = DurableSpoolUsage {
+            files: candidates.len(),
+            bytes: 0,
+        };
+        let mut total_records = 0_usize;
+        for (execution_id, name) in candidates {
+            let display_path = spool.display(&name);
+            let contents = read_regular_nofollow_bounded(
+                &spool.dir,
+                &name,
+                &display_path,
+                self.policy.max_ledger_bytes,
+            )?;
+            usage.bytes = usage
+                .bytes
+                .saturating_add(u64::try_from(contents.len()).unwrap_or(u64::MAX));
+            if usage.bytes > self.policy.max_spool_total_bytes {
+                return Err(IdempotencyError::SpoolByteLimitExceeded {
+                    actual: usage.bytes,
+                    maximum: self.policy.max_spool_total_bytes,
+                });
+            }
+            let ledger = serde_json::from_slice::<TxExecutionLedger>(&contents).map_err(|err| {
+                IdempotencyError::LedgerPersist {
+                    reason: format!("deserialize ledger {}: {err}", display_path.display()),
+                }
+            })?;
+            if ledger.execution_id() != execution_id {
+                return Err(IdempotencyError::LedgerPersist {
+                    reason: format!(
+                        "ledger identity mismatch for {}: filename execution_id {execution_id:?}, payload execution_id {:?}",
+                        display_path.display(),
+                        ledger.execution_id()
+                    ),
+                });
+            }
+            let verification = ledger.verify_chain();
+            if !verification.chain_intact {
+                return Err(IdempotencyError::LedgerPersist {
+                    reason: format!(
+                        "verify ledger hash chain for {}: first_break_at={:?}, missing_ordinals={:?}",
+                        display_path.display(),
+                        verification.first_break_at,
+                        verification.missing_ordinals
+                    ),
+                });
+            }
+            total_records = total_records.saturating_add(ledger.records().len());
+            if total_records > self.policy.max_spool_records {
+                return Err(IdempotencyError::SpoolRecordCountExceeded {
+                    actual: total_records,
+                    maximum: self.policy.max_spool_records,
+                });
+            }
+            visit(execution_id, ledger);
+        }
+        Ok(usage)
     }
 
     fn acquire_plan_catalog_lock(
@@ -3870,63 +3847,20 @@ impl IdempotencyStore {
         plan_id: &str,
         plan_hash: u64,
     ) -> Result<(), IdempotencyError> {
-        // Clone the pinned directory capability before applying scan results
-        // to the in-memory catalog. Keeping `&self.durable_spool` alive for
-        // the loop would alias the later, intentional `self.ledgers`
-        // mutations even though those mutations do not affect the capability.
-        let (spool_dir, spool_display_path) = {
-            let spool = self.durable_spool()?;
-            (Arc::clone(&spool.dir), spool.display_path.clone())
-        };
-        let max_ledger_bytes = self.policy.max_ledger_bytes;
-        let entries = spool_dir
-            .entries()
-            .map_err(|err| IdempotencyError::LedgerPersist {
-                reason: format!(
-                    "list pinned tx_ledgers directory {}: {err}",
-                    spool_display_path.display()
-                ),
-            })?;
-        for entry in entries {
-            let entry = entry.map_err(|err| IdempotencyError::LedgerPersist {
-                reason: format!(
-                    "read entry in pinned tx_ledgers directory {}: {err}",
-                    spool_display_path.display()
-                ),
-            })?;
-            let name = PathBuf::from(entry.file_name());
-            if name.extension().and_then(|ext| ext.to_str()) == Some("json")
-                && let Some(stem) = name.file_stem().and_then(|s| s.to_str())
-                && is_valid_execution_id(stem)
-            {
-                let ledger_display = spool_display_path.join(&name);
-                let options = nofollow_open_options(true, false);
-                if let Ok(mut file) = spool_dir.open_with(&name, &options) {
-                    if let Ok(metadata) = file.metadata() {
-                        if validate_open_regular_file(&metadata, &ledger_display).is_ok() {
-                            if let Ok(contents) = read_bounded_ledger_with_limit(
-                                &mut file,
-                                &ledger_display,
-                                max_ledger_bytes,
-                            ) {
-                                if let Ok(ledger) =
-                                    serde_json::from_slice::<TxExecutionLedger>(&contents)
-                                {
-                                    if ledger.verify_chain().chain_intact
-                                        && ledger.plan_id() == plan_id
-                                        && ledger.plan_hash() == plan_hash
-                                    {
-                                        if !ledger.phase().is_terminal() {
-                                            self.ledgers.insert(stem.to_string(), ledger);
-                                        } else {
-                                            self.ledgers.remove(stem);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+        let mut matching_ledgers = Vec::new();
+        self.visit_verified_spool_ledgers(|execution_id, ledger| {
+            if ledger.plan_id() == plan_id && ledger.plan_hash() == plan_hash {
+                matching_ledgers.push((execution_id, ledger));
+            }
+        })?;
+        // Validate the whole scan before changing the catalog or retiring any
+        // predecessor. Otherwise an unreadable matching ledger can be omitted
+        // and a superseding execution admitted beside its unresolved effects.
+        for (execution_id, ledger) in matching_ledgers {
+            if ledger.phase().is_terminal() {
+                self.ledgers.remove(&execution_id);
+            } else {
+                self.ledgers.insert(execution_id, ledger);
             }
         }
         Ok(())
@@ -4562,6 +4496,7 @@ impl IdempotencyStore {
     fn persist_new_ledger_snapshot(
         &self,
         ledger: &TxExecutionLedger,
+        existing_spool: DurableSpoolUsage,
     ) -> Result<(), IdempotencyError> {
         let spool = self.durable_spool_for_write()?;
         let execution_id = ledger.execution_id();
@@ -4580,6 +4515,23 @@ impl IdempotencyStore {
                 execution_id: execution_id.to_string(),
                 actual,
                 maximum: self.policy.max_ledger_bytes,
+            });
+        }
+        // Count the candidate before creating any publication/recovery file.
+        // A valid current spool at its limit does not authorize one extra
+        // ledger that would make the next reopen reject the entire store.
+        let files = existing_spool.files.saturating_add(1);
+        if files > self.policy.max_spool_files {
+            return Err(IdempotencyError::SpoolFileCountExceeded {
+                actual: files,
+                maximum: self.policy.max_spool_files,
+            });
+        }
+        let bytes = existing_spool.bytes.saturating_add(actual);
+        if bytes > self.policy.max_spool_total_bytes {
+            return Err(IdempotencyError::SpoolByteLimitExceeded {
+                actual: bytes,
+                maximum: self.policy.max_spool_total_bytes,
             });
         }
         persist_ledger_bytes(
@@ -4606,22 +4558,22 @@ impl IdempotencyStore {
         } else {
             None
         };
-        let execution_lock = if self.is_durable() {
+        let _execution_lock = if self.is_durable() {
             Some(self.acquire_execution_lock(execution_id)?)
         } else {
             None
         };
-        let active_count = if self.is_durable() {
-            self.rescan_all_active_ledgers()?
+        let existing_spool = if self.is_durable() {
+            Some(self.rescan_all_active_ledgers()?)
         } else {
-            self.ledgers.len()
+            None
         };
         if self.ledgers.contains_key(execution_id) {
             return Err(IdempotencyError::DuplicateExecution {
                 key: execution_id.to_string(),
             });
         }
-        if active_count >= self.policy.max_active_ledgers {
+        if self.ledgers.len() >= self.policy.max_active_ledgers {
             return Err(IdempotencyError::ActiveLedgerLimitExceeded {
                 max_active_ledgers: self.policy.max_active_ledgers,
             });
@@ -4631,8 +4583,8 @@ impl IdempotencyStore {
         // before the first step still leaves a recoverable execution record.
         // Publish before installing the active value so a persistence failure
         // leaves no half-created in-memory execution behind.
-        if execution_lock.is_some() {
-            self.persist_new_ledger_snapshot(&ledger)?;
+        if let Some(existing_spool) = existing_spool {
+            self.persist_new_ledger_snapshot(&ledger, existing_spool)?;
         } else {
             self.persist_ledger_snapshot(&ledger, None)?;
         }
@@ -8283,7 +8235,10 @@ mod tests {
                 )
                 .expect("append historical skipped fixture");
             store
-                .persist_new_ledger_snapshot(&source)
+                .persist_new_ledger_snapshot(
+                    &source,
+                    store.visit_verified_spool_ledgers(|_, _| {}).unwrap(),
+                )
                 .expect("persist skipped fixture");
         }
 
@@ -8362,7 +8317,10 @@ mod tests {
             )
             .expect("append skipped compensation fixture");
         store
-            .persist_new_ledger_snapshot(&skipped_source)
+            .persist_new_ledger_snapshot(
+                &skipped_source,
+                store.visit_verified_spool_ledgers(|_, _| {}).unwrap(),
+            )
             .expect("persist skipped compensation fixture");
         record_durable_outcome(
             &mut store,
@@ -9866,6 +9824,279 @@ mod tests {
         assert!(store_3.get_ledger("exec-cap-2").is_none());
 
         let _ = std::fs::remove_dir_all(&ft_dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn durable_catalog_mutations_refuse_invalid_ledgers_without_partial_changes() {
+        let plan = make_plan(1);
+        let wrong_identity = TxExecutionLedger::new("exec-other", &plan.plan_id, plan.plan_hash);
+        let mut broken_chain =
+            TxExecutionLedger::new("exec-z-invalid", &plan.plan_id, plan.plan_hash);
+        broken_chain.transition_phase(TxPhase::Preparing).unwrap();
+        broken_chain
+            .append(
+                make_key("test-plan", &plan.steps[0].id),
+                StepOutcome::Success { result: None },
+                StepRisk::Low,
+                "original-agent",
+                1_000,
+            )
+            .unwrap();
+        let mut broken_terminal = broken_chain.clone();
+        broken_terminal.transition_phase(TxPhase::Aborted).unwrap();
+        broken_chain.records[0].agent_id = "unproven-agent".to_string();
+        broken_terminal.records[0].agent_id = "unproven-agent".to_string();
+        let cases = [
+            ("malformed", b"{truncated ledger".to_vec()),
+            ("identity", serde_json::to_vec(&wrong_identity).unwrap()),
+            ("chain", serde_json::to_vec(&broken_chain).unwrap()),
+            ("terminal", serde_json::to_vec(&broken_terminal).unwrap()),
+        ];
+
+        for (case, invalid_bytes) in cases {
+            let ft_dir = tempfile::tempdir().unwrap();
+            let mut store =
+                IdempotencyStore::open(ft_dir.path(), IdempotencyPolicy::default()).unwrap();
+            store.create_ledger("exec-a-retained", &plan).unwrap();
+            let spool = ft_dir.path().join("tx_ledgers");
+            let retained_path = spool.join("exec-a-retained.json");
+            let retained_bytes = std::fs::read(&retained_path).unwrap();
+
+            // These entries appear after the store opened. A valid unseen
+            // predecessor is visited before the invalid one, so retirement
+            // must stage catalog updates until the entire scan succeeds.
+            let unseen = TxExecutionLedger::new("exec-b-unseen", &plan.plan_id, plan.plan_hash);
+            let unseen_path = spool.join("exec-b-unseen.json");
+            let unseen_bytes = serde_json::to_vec(&unseen).unwrap();
+            std::fs::write(&unseen_path, &unseen_bytes).unwrap();
+            let invalid_path = spool.join("exec-z-invalid.json");
+            std::fs::write(&invalid_path, &invalid_bytes).unwrap();
+
+            for retire in [false, true] {
+                let error = if retire {
+                    store
+                        .abort_and_archive_matching_ledgers(&plan.plan_id, plan.plan_hash)
+                        .expect_err("an invalid predecessor cannot be skipped during retirement")
+                } else {
+                    store
+                        .create_ledger("exec-c-successor", &plan)
+                        .expect_err("an invalid predecessor cannot free active capacity")
+                };
+                assert!(
+                    matches!(error, IdempotencyError::LedgerPersist { .. }),
+                    "{case}, retire={retire}: {error:?}"
+                );
+                assert_eq!(store.active_count(), 1, "{case}, retire={retire}");
+                assert_eq!(
+                    store.get_ledger("exec-a-retained").unwrap().phase(),
+                    TxPhase::Planned
+                );
+                assert!(store.get_ledger("exec-b-unseen").is_none());
+                assert!(store.get_ledger("exec-c-successor").is_none());
+                assert!(!spool.join("exec-c-successor.json").exists());
+                assert_eq!(std::fs::read(&retained_path).unwrap(), retained_bytes);
+                assert_eq!(std::fs::read(&unseen_path).unwrap(), unseen_bytes);
+                assert_eq!(std::fs::read(&invalid_path).unwrap(), invalid_bytes);
+            }
+            assert!(IdempotencyStore::open(ft_dir.path(), IdempotencyPolicy::default()).is_err());
+
+            // Repairing the evidence permits an ordinary retry; refusal must
+            // neither poison the store nor strand any catalog/execution lock.
+            let repaired =
+                TxExecutionLedger::new("exec-z-invalid", &plan.plan_id, plan.plan_hash);
+            std::fs::write(&invalid_path, serde_json::to_vec(&repaired).unwrap()).unwrap();
+            store.create_ledger("exec-c-successor", &plan).unwrap();
+            assert_eq!(store.active_count(), 4);
+            let retired = store
+                .abort_and_archive_matching_ledgers(&plan.plan_id, plan.plan_hash)
+                .unwrap();
+            assert_eq!(retired.len(), 4);
+            assert_eq!(
+                IdempotencyStore::open(ft_dir.path(), IdempotencyPolicy::default())
+                    .unwrap()
+                    .active_count(),
+                0
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_catalog_mutations_refuse_non_authoritative_ledger_leaves() {
+        let plan = make_plan(1);
+        for leaf_kind in ["symlink", "hardlink", "directory"] {
+            let ft_dir = tempfile::tempdir().unwrap();
+            let mut store =
+                IdempotencyStore::open(ft_dir.path(), IdempotencyPolicy::default()).unwrap();
+            store.create_ledger("exec-retained", &plan).unwrap();
+            let spool = ft_dir.path().join("tx_ledgers");
+            let retained_path = spool.join("exec-retained.json");
+            let retained_bytes = std::fs::read(&retained_path).unwrap();
+            let target = ft_dir.path().join("external-ledger.json");
+            let target_bytes = serde_json::to_vec(&TxExecutionLedger::new(
+                "exec-z-invalid",
+                &plan.plan_id,
+                plan.plan_hash,
+            ))
+            .unwrap();
+            std::fs::write(&target, &target_bytes).unwrap();
+            let leaf = spool.join("exec-z-invalid.json");
+            match leaf_kind {
+                "symlink" => std::os::unix::fs::symlink(&target, &leaf).unwrap(),
+                "hardlink" => std::fs::hard_link(&target, &leaf).unwrap(),
+                "directory" => std::fs::create_dir(&leaf).unwrap(),
+                _ => unreachable!(),
+            }
+
+            assert!(matches!(
+                store.create_ledger("exec-successor", &plan),
+                Err(IdempotencyError::LedgerPersist { .. })
+            ));
+            assert!(matches!(
+                store.abort_and_archive_matching_ledgers(&plan.plan_id, plan.plan_hash),
+                Err(IdempotencyError::LedgerPersist { .. })
+            ));
+            assert_eq!(store.active_count(), 1, "{leaf_kind}");
+            assert!(!spool.join("exec-successor.json").exists());
+            assert_eq!(std::fs::read(&retained_path).unwrap(), retained_bytes);
+            assert_eq!(std::fs::read(&target).unwrap(), target_bytes);
+            assert!(std::fs::symlink_metadata(&leaf).is_ok());
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn durable_catalog_rescans_enforce_spool_bounds_before_mutation() {
+        let plan = make_plan(1);
+        let ft_dir = tempfile::tempdir().unwrap();
+        let mut store =
+            IdempotencyStore::open(ft_dir.path(), IdempotencyPolicy::default()).unwrap();
+        store.create_ledger("exec-retained", &plan).unwrap();
+        store
+            .transition_phase("exec-retained", TxPhase::Preparing)
+            .unwrap();
+        record_durable_outcome(
+            &mut store,
+            "exec-retained",
+            make_key("test-plan", &plan.steps[0].id),
+            StepOutcome::Success { result: None },
+            StepRisk::Low,
+            "agent",
+            1_000,
+        );
+        let spool = ft_dir.path().join("tx_ledgers");
+        let retained_path = spool.join("exec-retained.json");
+        let retained_bytes = std::fs::read(&retained_path).unwrap();
+
+        for bound in ["files", "bytes", "records", "ledger"] {
+            store.policy = IdempotencyPolicy::default();
+            match bound {
+                "files" => store.policy.max_spool_files = 0,
+                "bytes" => store.policy.max_spool_total_bytes = 0,
+                "records" => store.policy.max_spool_records = 0,
+                "ledger" => store.policy.max_ledger_bytes = 1,
+                _ => unreachable!(),
+            }
+            for retire in [false, true] {
+                let error = if retire {
+                    store
+                        .abort_and_archive_matching_ledgers(&plan.plan_id, plan.plan_hash)
+                        .expect_err("an over-budget spool cannot authorize retirement")
+                } else {
+                    store
+                        .create_ledger("exec-successor", &plan)
+                        .expect_err("an over-budget spool cannot admit new work")
+                };
+                match (bound, error) {
+                    ("files", IdempotencyError::SpoolFileCountExceeded { .. })
+                    | ("bytes", IdempotencyError::SpoolByteLimitExceeded { .. })
+                    | ("records", IdempotencyError::SpoolRecordCountExceeded { .. })
+                    | ("ledger", IdempotencyError::LedgerOversized { .. }) => {}
+                    (_, error) => panic!("{bound}, retire={retire}: {error:?}"),
+                }
+                assert_eq!(store.active_count(), 1);
+                assert_eq!(
+                    store.get_ledger("exec-retained").unwrap().phase(),
+                    TxPhase::Preparing
+                );
+                assert!(!spool.join("exec-successor.json").exists());
+                assert_eq!(std::fs::read(&retained_path).unwrap(), retained_bytes);
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn durable_create_counts_candidate_against_spool_limits_before_publication() {
+        let plan = make_plan(1);
+        for bound in ["files", "bytes"] {
+            let ft_dir = tempfile::tempdir().unwrap();
+            let mut store =
+                IdempotencyStore::open(ft_dir.path(), IdempotencyPolicy::default()).unwrap();
+            store.create_ledger("exec-first", &plan).unwrap();
+            store
+                .transition_phase("exec-first", TxPhase::Aborted)
+                .unwrap();
+            store.archive_ledger("exec-first").unwrap();
+            let spool = ft_dir.path().join("tx_ledgers");
+            let first_path = spool.join("exec-first.json");
+            let first_bytes = std::fs::read(&first_path).unwrap();
+            let candidate = TxExecutionLedger::new("exec-second", &plan.plan_id, plan.plan_hash);
+            let candidate_bytes = serde_json::to_vec_pretty(&candidate).unwrap();
+            let required_bytes = u64::try_from(first_bytes.len() + candidate_bytes.len()).unwrap();
+            match bound {
+                "files" => store.policy.max_spool_files = 1,
+                "bytes" => store.policy.max_spool_total_bytes = required_bytes - 1,
+                _ => unreachable!(),
+            }
+            let error = store
+                .create_ledger("exec-second", &plan)
+                .expect_err("the candidate must fit before its publication starts");
+            match (bound, error) {
+                (
+                    "files",
+                    IdempotencyError::SpoolFileCountExceeded {
+                        actual: 2,
+                        maximum: 1,
+                    },
+                ) => {}
+                ("bytes", IdempotencyError::SpoolByteLimitExceeded { actual, maximum }) => {
+                    assert_eq!(actual, required_bytes);
+                    assert_eq!(maximum, required_bytes - 1);
+                }
+                (_, error) => panic!("{bound}: {error:?}"),
+            }
+            assert_eq!(
+                store.active_count(),
+                0,
+                "terminal proof occupies the spool, not active capacity"
+            );
+            assert!(store.get_ledger("exec-second").is_none());
+            assert!(!spool.join("exec-second.json").exists());
+            assert_eq!(std::fs::read(&first_path).unwrap(), first_bytes);
+            assert_eq!(
+                IdempotencyStore::open(ft_dir.path(), store.policy.clone())
+                    .unwrap()
+                    .active_count(),
+                0
+            );
+
+            // The exact boundary is admitted and remains readable on restart.
+            store.policy.max_spool_files = 2;
+            store.policy.max_spool_total_bytes = required_bytes;
+            store.create_ledger("exec-second", &plan).unwrap();
+            assert_eq!(
+                std::fs::read(spool.join("exec-second.json")).unwrap(),
+                candidate_bytes
+            );
+            assert_eq!(
+                IdempotencyStore::open(ft_dir.path(), store.policy.clone())
+                    .unwrap()
+                    .active_count(),
+                1
+            );
+        }
     }
 
     #[cfg(not(windows))]
