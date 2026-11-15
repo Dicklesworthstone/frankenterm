@@ -262,7 +262,7 @@ final class OpticalRecordingTests: XCTestCase {
     }
 
     #if canImport(AVFoundation) && canImport(ImageIO) && canImport(Vision) && canImport(CryptoKit) && canImport(Darwin)
-    func testNativeMP4AndAPNGRoundTripIntoTheActualOfflineRestore() async throws {
+    func testNativeMP4AndAPNGRoundTripPinsTheSelectedRecordingAcrossCallbacks() async throws {
         try skipIfSimulatorLacksVisionBarcodeInference()
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("ft-recording-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
@@ -278,7 +278,13 @@ final class OpticalRecordingTests: XCTestCase {
             let (restore, store, vault, _) = environment()
             try await restore.enterOfflineMode()
             let generation = await restore.status().generation
-            let read = try await NativeOpticalRecording().read(url) { texts, _ in
+            let read = try await NativeOpticalRecording().read(url) { texts, progress in
+                if progress.framesRead == 1 {
+                    // File providers can replace a selection during an awaited
+                    // callback. The decoder must finish from its admitted copy,
+                    // including subsequent metadata checks and lazy reads.
+                    try Data().write(to: url, options: .atomic)
+                }
                 let status = try await restore.observeRecordingFrame(texts, generation: generation)
                 return status.phase != .locked
             }
@@ -286,6 +292,11 @@ final class OpticalRecordingTests: XCTestCase {
             XCTAssertGreaterThan(read.framesRead, 0); XCTAssertFalse(read.reachedEnd)
             XCTAssertEqual(status.phase, .locked)
             XCTAssertEqual(status.identity?.envelopeDigest, crypto.sha256(exported.envelope))
+            let savedScan = try await restore.scanCheckpoint(generation: status.generation)
+            let checkpoint = try XCTUnwrap(savedScan)
+            let recovered = try OpticalReceiver(resuming: checkpoint, using: crypto)
+            XCTAssertEqual(try recovered.envelope(using: crypto), exported.envelope)
+            XCTAssertEqual(try Data(contentsOf: url), Data(), "the provider's replacement is never overwritten or removed")
             XCTAssertEqual(vault.creates, 0)
             let saved = try await store.load(); XCTAssertTrue(saved.isEmpty)
         }

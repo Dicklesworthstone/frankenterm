@@ -62,8 +62,9 @@ import ImageIO
 import Vision
 
 /// One serial reader owns the native codec and lends only bounded QR text to
-/// its awaited consumer. No camera images, movie copies, codes or plaintext are
-/// retained. A selected cloud placeholder is refused without requesting it.
+/// its awaited consumer. A protected temporary copy pins the selected recording
+/// until native cleanup; no camera capture or decoded plaintext is saved.
+/// A selected cloud placeholder is refused without requesting it.
 public actor NativeOpticalRecording {
     private var operation: UUID?
     private var expired = false
@@ -89,16 +90,26 @@ public actor NativeOpticalRecording {
             catch { return }
             await self?.expire(id)
         }
+        var snapshot: OpticalRecordingSnapshot?
         defer {
             watchdog.cancel(); cancelNativeWork()
-            activeReader = nil; activeAsset = nil; operation = nil
+            // Release lazy native readers before retiring their owned input.
+            activeReader = nil; activeAsset = nil
+            snapshot?.discard(); operation = nil
         }
         do {
+            var copying = OpticalRecordingSnapshot.Operations.system
+            copying.checkCancellation = {
+                try Task.checkCancellation()
+                guard ContinuousClock.now < deadline else { throw FTError.limit("recording.processing_time") }
+            }
+            let input = try OpticalRecordingSnapshot.capture(url, operations: copying)
+            snapshot = input
             return try await withTaskCancellationHandler {
-                if ["png", "apng"].contains(url.pathExtension.lowercased()) {
-                    return try await readImages(url, deadline: deadline, onFrame: onFrame)
+                if ["png", "apng"].contains(input.url.pathExtension.lowercased()) {
+                    return try await readImages(input.url, deadline: deadline, onFrame: onFrame)
                 }
-                return try await readMovie(url, deadline: deadline, onFrame: onFrame)
+                return try await readMovie(input.url, deadline: deadline, onFrame: onFrame)
             } onCancel: { Task { await self.cancel(id) } }
         } catch {
             if Task.isCancelled { throw FTError.cancelled }
