@@ -11,7 +11,7 @@
 #   - Output schemas are stable and parseable
 #
 # Requirements:
-#   - wa/ft binary present (build via rch; script checks target/debug/wa or target/release-interactive/ft)
+#   - ft binary: FT_BIN, else target/debug/ft or target/release-interactive/ft
 #   - jq for JSON manipulation
 # =============================================================================
 
@@ -42,7 +42,7 @@ TESTS_FAILED=0
 TESTS_SKIPPED=0
 
 # Configuration
-FT_BIN=""
+FT_BIN="${FT_BIN:-}"
 VERBOSE=false
 CORPUS_DIR=""
 
@@ -160,15 +160,20 @@ assert_json_has() {
 check_prerequisites() {
     log_test "Prerequisites"
 
-    if [[ -x "$PROJECT_ROOT/target/debug/wa" ]]; then
-        FT_BIN="$PROJECT_ROOT/target/debug/wa"
+    if [[ -n "$FT_BIN" ]]; then
+        if [[ ! -x "$FT_BIN" ]]; then
+            echo -e "${RED}ERROR:${NC} FT_BIN is not executable: $FT_BIN" >&2
+            exit 5
+        fi
+    elif [[ -x "$PROJECT_ROOT/target/debug/ft" ]]; then
+        FT_BIN="$PROJECT_ROOT/target/debug/ft"
     elif [[ -x "$PROJECT_ROOT/target/release-interactive/ft" ]]; then
         FT_BIN="$PROJECT_ROOT/target/release-interactive/ft"
     else
-        echo -e "${RED}ERROR:${NC} wa binary not found. Build via rch first; this script checks target/debug/wa or target/release-interactive/ft." >&2
+        echo -e "${RED}ERROR:${NC} ft binary not found. Set FT_BIN, or build target/debug/ft or target/release-interactive/ft." >&2
         exit 5
     fi
-    log_pass "wa binary found: $FT_BIN"
+    log_pass "ft binary found: $FT_BIN"
 
     if ! command -v jq &>/dev/null; then
         echo -e "${RED}ERROR:${NC} jq not found. Install: sudo apt install jq" >&2
@@ -339,14 +344,14 @@ test_rules_extraction() {
         log_fail "3.1: expected code='ABCD-12345', got='$code'"
     fi
 
-    # 3.2: Claude timeout duration extraction
-    json=$(run_robot robot rules test "Request timed out after 30 seconds")
+    # 3.2: Claude timeout duration extraction (Claude Code's own wording)
+    json=$(run_robot robot rules test "API Error: No response from API (waited 3m, then 10m on the retry).")
     local duration
     duration=$(echo "$json" | jq -r '.data.matches[0].extracted.duration // empty' 2>/dev/null)
-    if [[ "$duration" == "30" ]]; then
-        log_pass "3.2: extracted timeout duration = '30'"
+    if [[ "$duration" == "3m" ]]; then
+        log_pass "3.2: extracted timeout duration = '3m'"
     else
-        log_fail "3.2: expected duration='30', got='$duration'"
+        log_fail "3.2: expected duration='3m', got='$duration'"
     fi
 
     # 3.3: Claude cost extraction
