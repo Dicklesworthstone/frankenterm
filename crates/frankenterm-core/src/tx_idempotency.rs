@@ -9108,8 +9108,9 @@ mod tests {
             IdempotencyError::LedgerPersist { reason } => reason,
             other => panic!("unexpected error: {other:?}"),
         };
+        // The spool scan refuses the non-regular leaf before reading it.
         assert!(
-            reason.contains("read ledger"),
+            reason.contains("is not a regular file") && reason.contains("txe-unreadable.json"),
             "unexpected reason: {reason}"
         );
 
