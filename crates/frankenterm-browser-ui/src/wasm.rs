@@ -83,7 +83,10 @@ impl FleetViewer {
     /// Return exact decimal identity, never a JavaScript Number.
     #[wasm_bindgen(js_name = selectedPaneId)]
     pub fn selected_pane_id(&self) -> Option<String> {
-        self.inner.model().selected_pane_id().map(|id| id.to_string())
+        self.inner
+            .model()
+            .selected_pane_id()
+            .map(|id| id.to_string())
     }
 
     #[wasm_bindgen(js_name = takeFlatPatches)]

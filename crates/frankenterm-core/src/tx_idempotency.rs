@@ -9903,8 +9903,7 @@ mod tests {
 
             // Repairing the evidence permits an ordinary retry; refusal must
             // neither poison the store nor strand any catalog/execution lock.
-            let repaired =
-                TxExecutionLedger::new("exec-z-invalid", &plan.plan_id, plan.plan_hash);
+            let repaired = TxExecutionLedger::new("exec-z-invalid", &plan.plan_id, plan.plan_hash);
             std::fs::write(&invalid_path, serde_json::to_vec(&repaired).unwrap()).unwrap();
             store.create_ledger("exec-c-successor", &plan).unwrap();
             assert_eq!(store.active_count(), 4);

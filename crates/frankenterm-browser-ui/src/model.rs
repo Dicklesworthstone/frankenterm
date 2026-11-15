@@ -61,7 +61,10 @@ enum SelectionAnchor {
         uuid: Option<String>,
         first_seen_at: Option<i64>,
     },
-    PersistedDetection { id: i64, pane_id: u64 },
+    PersistedDetection {
+        id: i64,
+        pane_id: u64,
+    },
     UnstoredDetection(Detection),
 }
 
@@ -284,14 +287,11 @@ impl FleetModel {
     fn selection_anchor(&self) -> Option<SelectionAnchor> {
         let index = self.selected()?;
         match self.view {
-            View::Panes => self
-                .panes
-                .get(index)
-                .map(|pane| SelectionAnchor::Pane {
-                    id: pane.pane_id,
-                    uuid: pane.pane_uuid.clone(),
-                    first_seen_at: pane.first_seen_at,
-                }),
+            View::Panes => self.panes.get(index).map(|pane| SelectionAnchor::Pane {
+                id: pane.pane_id,
+                uuid: pane.pane_uuid.clone(),
+                first_seen_at: pane.first_seen_at,
+            }),
             View::Events => self.events.get(index).map(|event| match event.id {
                 Some(id) => SelectionAnchor::PersistedDetection {
                     id,
