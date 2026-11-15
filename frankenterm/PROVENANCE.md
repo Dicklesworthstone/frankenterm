@@ -1,7 +1,7 @@
 # FrankenTerm Provenance
 
 Source: <https://github.com/wezterm/wezterm>
-Reference commit: `577474d89ee61aef4a48145cdec82a638d874751`
+Reference commit: `e1eae81a56be8b5487dc77a29616afa568fb57b7`
 Initial import reference: `05343b387085842b434d267f91b6b0ec157e4331`
 Date imported: 2026-02-10
 License: MIT (see `../LICENSE`)
