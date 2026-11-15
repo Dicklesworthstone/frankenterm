@@ -61,7 +61,9 @@ impl SimpleTempDir {
         match refs.get(&content_id).copied() {
             Some(1) => {
                 refs.remove(&content_id);
-                drop(refs);
+                // Unlink before releasing the lock: a store() that ran in
+                // between would write this content-addressed path again and
+                // the unlink would then delete its fresh file.
                 if let Ok(path) = self.path_for_content(content_id) {
                     if let Err(err) = std::fs::remove_file(&path) {
                         eprintln!("Failed to remove {}: {err:#}", path.display());
@@ -83,19 +85,20 @@ impl SimpleTempDir {
 impl BlobStorage for SimpleTempDir {
     fn store(&self, content_id: ContentId, data: &[u8], _lease_id: LeaseId) -> Result<(), Error> {
         let mut refs = self.lock_refs();
+        let path = self.path_for_content(content_id)?;
 
         // A live reference means this content-addressed file is already
         // stored: reuse it. Replacing it fails on Windows
         // (ERROR_ACCESS_DENIED) while a reader holds it open, which also
-        // left the reference count short.
+        // left the reference count short. A file removed behind live
+        // references (a temp-dir cleaner) is written again below.
         if let Some(count) = refs.get_mut(&content_id) {
-            if *count > 0 {
+            if *count > 0 && path.exists() {
                 *count += 1;
                 return Ok(());
             }
         }
 
-        let path = self.path_for_content(content_id)?;
         let mut file = tempfile::Builder::new()
             .prefix("new-")
             .rand_bytes(5)
@@ -460,5 +463,23 @@ mod tests {
         assert_eq!(store.get_data(content_id, second).unwrap(), data);
         store.advise_lease_dropped(second, content_id).unwrap();
         assert!(!path.exists());
+    }
+
+    /// Reuse needs the stored file: one removed behind live references (a
+    /// temp-dir cleaner) is written again instead of staying missing.
+    #[test]
+    fn storing_live_content_whose_file_vanished_writes_it_again() {
+        let store = SimpleTempDir::new().unwrap();
+        let data = b"removed behind live references";
+        let content_id = ContentId::for_bytes(data);
+        let first = LeaseId::new();
+        let second = LeaseId::new();
+        store.store(content_id, data, first).unwrap();
+        let path = store.path_for_content(content_id).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        store.store(content_id, data, second).unwrap();
+        assert_eq!(store.get_data(content_id, second).unwrap(), data);
+        assert_eq!(store.lock_refs().get(&content_id), Some(&2));
     }
 }
