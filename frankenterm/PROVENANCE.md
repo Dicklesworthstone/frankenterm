@@ -61,7 +61,7 @@ macOS `cargo check` and clippy for frankenterm-gui. A planted negative
 | Upstream SHA | Disposition | Notes |
 | ------------ | ----------- | ----- |
 | `aa0d91a49` | accepted | term: enabling focus tracking (DECSET 1004) reports the current focus at once (vim resumed with fg notices changed files). The mux input-order test expects the leading report. |
-| `eb8df995d` | accepted | blob-leases: storing still-referenced content reuses the stored file instead of replacing it (Windows refused the replacement under an open reader and the reference count came up short). Test also checks the inode on Unix. Not run on Windows. |
+| `eb8df995d` | accepted | blob-leases: storing still-referenced content reuses the stored file instead of replacing it (Windows refused the replacement under an open reader and the reference count came up short). Test also checks the inode on Unix. Not run on Windows. Diverges from upstream since eb1e2d242: reuse also requires the stored file to exist, and `del_ref` unlinks under the lock. |
 | `ce8e6b140` | accepted | gui: closing a tab or pane overlay refreshes the window title at once. |
 | `e7280b8c8` | already-equivalent | client panes already receive `alt_screen_active` from the server (codec and ClientPane). |
 | `e2a98e1b8` | already-equivalent | escape-parser already imports alloc's macros crate-wide under no_std (`#[cfg_attr(not(feature = "std"), macro_use)] extern crate alloc`), so test modules need no `alloc::format` import. |
