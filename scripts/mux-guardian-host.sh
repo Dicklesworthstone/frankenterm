@@ -28,6 +28,9 @@
 # `upgrade --recover` is for a mux that serves none of the panes the guardian
 # still holds, as after an upgrade and its rollback both failed: it starts
 # DIR's mux to restore them, where a stop-all would end them.
+# Management operations on one FTG_BASE are serialized. A competing operation
+# fails with exit 75; FTG_OPERATION_LOCK_TIMEOUT sets a bounded wait (0-60
+# seconds, default 0). Status and the run-* service entry points remain usable.
 #
 # Invariants:
 #   * The broker owns every pane's child process. It is never restarted by this
@@ -72,6 +75,83 @@ default_manager() {
   esac
 }
 MANAGER=${FTG_MANAGER:-}
+
+# ------------------------------------------------------- operation ownership ---
+acquire_operation_lock() {  # <operation>; the calling shell owns descriptor 9
+  # Family links, recorded launchers and service changes form one operation.
+  # Lock their shared authority, BASE, even if callers choose different STATE
+  # paths. Keep the lock inode permanently: unlinking a held lock lets a second
+  # caller lock a different inode and enter the same critical section.
+  local operation=$1 lock=$BASE/host-operation.lock saved_umask status
+  command -v python3 >/dev/null 2>&1 \
+    || die "operation_lock_unavailable: python3 with fcntl is required"
+  mkdir -p "$BASE" || die "operation_lock_unavailable: cannot create $BASE"
+  if [ -L "$lock" ] || { [ -e "$lock" ] && [ ! -f "$lock" ]; }; then
+    die "operation_lock_invalid: $lock must be a regular file, not a symlink"
+  fi
+  saved_umask=$(umask)
+  umask 077
+  exec 9>> "$lock" || die "operation_lock_unavailable: cannot open $lock"
+  umask "$saved_umask"
+  # flock is attached to the shared open-file description on Linux/macOS.
+  # Python acquires it; this shell keeps descriptor 9 open until the entire
+  # operation exits. There is no PID file to go stale and no trap that can
+  # release ownership before a synchronous child has finished mutating state.
+  if python3 - "$operation" "$lock" "${FTG_OPERATION_LOCK_TIMEOUT:-0}" <<'PY'
+import errno
+import fcntl
+import os
+import re
+import stat
+import sys
+import time
+
+operation, path, timeout_text = sys.argv[1:]
+
+def fail(code, message, status=73):
+    print(f"ERROR: {code}: {message}", file=sys.stderr)
+    sys.exit(status)
+
+if re.fullmatch(r"[0-9]{1,2}", timeout_text) is None or int(timeout_text) > 60:
+    fail("operation_lock_invalid", "FTG_OPERATION_LOCK_TIMEOUT must be whole seconds from 0 to 60")
+
+def validate_lock():
+    opened = os.fstat(9)
+    named = os.stat(path, follow_symlinks=False)
+    if (not stat.S_ISREG(opened.st_mode) or not stat.S_ISREG(named.st_mode)
+            or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+            or opened.st_uid != os.geteuid() or opened.st_nlink != 1
+            or opened.st_mode & 0o022):
+        fail("operation_lock_invalid", "host lock must remain an owned regular file with one link and no group/other write access")
+
+try:
+    validate_lock()
+    deadline = time.monotonic() + int(timeout_text)
+    while True:
+        try:
+            fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError as error:
+            if error.errno not in (errno.EACCES, errno.EAGAIN):
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                fail("operation_lock_busy",
+                     f"{operation} refused: another host operation owns {path}; "
+                     f"waited {timeout_text}s", 75)
+            time.sleep(min(0.1, remaining))
+    validate_lock()
+except OSError as error:
+    fail("operation_lock_unavailable", f"cannot acquire host operation lock: {error}")
+PY
+  then
+    return 0
+  else
+    status=$?
+    exec 9>&-
+    return "$status"
+  fi
+}
 
 # ---------------------------------------------------------------- families ---
 family_component_version() {  # <dir> <binary> -> <package version> <revision or unknown>
@@ -633,7 +713,7 @@ svc_start() {  # <logical name>
       case $1 in pty-broker) sub=run-broker ;; pty-guardian) sub=run-guardian ;; mux-server) sub=run-mux ;; esac
       while IFS= read -r -d '' pair; do envs+=("$pair"); done < <(service_env)
       env "${envs[@]}" nohup "$BASE/bin/mux-guardian-host.sh" "$sub" \
-        >> "$STATE/logs/$1.log" 2>&1 < /dev/null &
+        >> "$STATE/logs/$1.log" 2>&1 < /dev/null 9>&- &
       echo $! > "$STATE/run.$1.pid"
       ;;
   esac
@@ -844,6 +924,7 @@ cmd_install() {
   [ -n "$family" ] || die "install: --family DIR required"
   MANAGER=${MANAGER:-$(default_manager)}
   check_install_settings
+  acquire_operation_lock install
   mkdir -p "$BASE/bin" "$STATE"
   chmod 0700 "$STATE"
   echo "$MANAGER" > "$STATE/manager"
@@ -1041,6 +1122,7 @@ cmd_upgrade() {
   done
   [ -n "$family" ] || die "upgrade: --family DIR required"
   case $timeout in ''|*[!0-9]*) die "upgrade: --timeout takes whole seconds, not '$timeout'" ;; esac
+  acquire_operation_lock upgrade
   load_manager
   [ -L "$BASE/mux-current" ] || die "not installed (no $BASE/mux-current); run install first"
 
@@ -1061,6 +1143,7 @@ cmd_upgrade() {
 }
 
 cmd_rollback() {
+  acquire_operation_lock rollback
   load_manager
   local prev cur
   prev=$(link_target "$BASE/mux-previous")
@@ -1108,6 +1191,7 @@ cmd_status() {
 
 cmd_stop_all() {
   [ "${1:-}" = --i-accept-pane-loss ] || die "stop-all ends every pane; pass --i-accept-pane-loss"
+  acquire_operation_lock stop-all
   load_manager
   svc_stop mux-server || true
   svc_stop pty-guardian || true
@@ -1116,6 +1200,7 @@ cmd_stop_all() {
 }
 
 cmd_load_units() {  # launchd's login loader: start whatever is not running
+  acquire_operation_lock load-units
   load_manager
   [ "$MANAGER" = launchd ] || return 0
   local n

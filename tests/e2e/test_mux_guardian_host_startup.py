@@ -5,6 +5,7 @@ These tests prove host startup admission, not native guardian recovery. They
 retain their scratch directories and never start or stop a user service.
 """
 
+import fcntl
 import json
 import os
 import pathlib
@@ -236,6 +237,15 @@ class GuardianHostStartup(unittest.TestCase):
         self.assertNotIn("--recovery-restore", json.loads(self.args_path.read_text()))
         self.assertFalse(self.prepared_path.exists())
         self.assertTrue((self.store / "retained-object").exists())
+
+    def test_mux_service_start_does_not_wait_for_its_management_operation(self):
+        # Upgrade/install hold this lease while waiting for the service to
+        # become ready. The service must not try to reacquire the same lease.
+        with (self.base / "host-operation.lock").open("w") as descriptor:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = self.launch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.args_path.exists())
 
     def test_confirmed_empty_host_preserves_old_store_before_fresh_start(self):
         self.add_root()
