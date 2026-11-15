@@ -9542,7 +9542,10 @@ impl BrokerControlClientV1 {
                     guardian_incarnation: self.identity.guardian_incarnation,
                     connection_id: self.connection_id,
                     mux_incarnation: self.identity.mux_incarnation,
-                    guardian_build_identity_digest: self.identity.guardian_build_identity.into_bytes(),
+                    guardian_build_identity_digest: self
+                        .identity
+                        .guardian_build_identity
+                        .into_bytes(),
                     mux_build_identity_digest: self.identity.mux_build_identity.into_bytes(),
                     durable_pane_id: handle.pane_id,
                     lease_generation: handle.lease_generation,
@@ -29076,7 +29079,10 @@ mod tests {
             }
             if retirement_rollback_eof {
                 service.inspect(move |service| {
-                    let live = service.live_spawns.remove(&binding.durable_pane_id).unwrap();
+                    let live = service
+                        .live_spawns
+                        .remove(&binding.durable_pane_id)
+                        .unwrap();
                     let attachment = live.adoption.pane.active_attachment_identity().unwrap();
                     let connection = service
                         .connections
@@ -29103,7 +29109,13 @@ mod tests {
                     });
                     let restored = service.live_spawns.get(&binding.durable_pane_id).unwrap();
                     assert!(restored.observes_owner(attachment.owner).is_none());
-                    assert!(restored.adoption.pane.active_attachment_identity().is_none());
+                    assert!(
+                        restored
+                            .adoption
+                            .pane
+                            .active_attachment_identity()
+                            .is_none()
+                    );
                     assert!(service.retired_panes.is_empty());
                     let retry = BrokerControlRequestV1::new(
                         BrokerControlRequestHeaderV1 {

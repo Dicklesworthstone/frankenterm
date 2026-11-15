@@ -9246,10 +9246,9 @@ mod tests {
             }
             assert_eq!(settled.retire_asks, u8::MAX);
             assert!(!settled.retire_again(&Ok(true), now));
-            assert!(!settled.retire_again(
-                &Err(BrokerControlClientError::ConnectionPoisoned),
-                now,
-            ));
+            assert!(
+                !settled.retire_again(&Err(BrokerControlClientError::ConnectionPoisoned), now,)
+            );
         }
     }
 

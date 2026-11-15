@@ -1807,7 +1807,10 @@ mod tests {
                     let payload: serde_json::Value =
                         serde_json::from_str(frame.data.as_deref().unwrap()).unwrap();
                     assert_eq!(payload["kind"], "checkpoint");
-                    assert_eq!(payload["data"]["cursor"], replay_token(expected_id, Some(7)));
+                    assert_eq!(
+                        payload["data"]["cursor"],
+                        replay_token(expected_id, Some(7))
+                    );
                     assert_eq!(payload["data"]["pane_id"], 7);
                     assert_eq!(payload["data"]["reason"], "examined_through_page");
                     assert!(payload["data"].get("event").is_none());
