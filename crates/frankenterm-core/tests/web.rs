@@ -699,9 +699,8 @@ mod web_tests {
                         ..frankenterm_core::web::resolve_runtime_limits(None)
                     });
                 if authenticated {
-                    config = config.with_session_auth(
-                        WebSessionAuth::new(VIEWER_TEST_CREDENTIAL).unwrap(),
-                    );
+                    config = config
+                        .with_session_auth(WebSessionAuth::new(VIEWER_TEST_CREDENTIAL).unwrap());
                 }
                 let server = start_web_server(config).await.unwrap();
                 let addr = server.bound_addr();
@@ -741,13 +740,22 @@ mod web_tests {
                         let body: serde_json::Value =
                             serde_json::from_str(extract_body(&response))?;
                         ensure!(body["error_code"] == "web_viewer_stream_capacity");
-                        ensure!(event_bus.subscriber_count() == 8, "denial creates no producer");
+                        ensure!(
+                            event_bus.subscriber_count() == 8,
+                            "denial creates no producer"
+                        );
                     }
 
                     let request = session_request(addr, "GET", "/panes", cookie.as_deref(), None);
                     let response = fetch_raw(addr, request.as_bytes()).await?;
-                    ensure!(extract_status(&response) == 200, "finite reads remain available");
-                    ensure!(response.contains("test-pane"), "real stored data remains readable");
+                    ensure!(
+                        extract_status(&response) == 200,
+                        "finite reads remain available"
+                    );
+                    ensure!(
+                        response.contains("test-pane"),
+                        "real stored data remains readable"
+                    );
                     let other_viewer_stream = if authenticated {
                         // Saturating one lease cannot consume another viewer's
                         // budget or prevent a fresh authenticated login.
@@ -770,7 +778,10 @@ mod web_tests {
                     streams.push(
                         open_stream(addr, paths[1], cookie.as_deref(), epoch.as_deref()).await?,
                     );
-                    ensure!(event_bus.subscriber_count() == active, "disconnected slot reused");
+                    ensure!(
+                        event_bus.subscriber_count() == active,
+                        "disconnected slot reused"
+                    );
                     drop(other_viewer_stream);
                     drop(streams);
                     Ok::<_, anyhow::Error>(())

@@ -1472,7 +1472,10 @@ mod tests {
             let replacement = admission.reserve_stream(None).expect(outcome);
             assert!(admission.reserve_stream(None).is_err(), "{outcome}");
             drop(stream);
-            assert!(admission.reserve_stream(None).is_err(), "no double release: {outcome}");
+            assert!(
+                admission.reserve_stream(None).is_err(),
+                "no double release: {outcome}"
+            );
             drop(replacement);
             assert!(admission.reserve_stream(None).is_ok(), "{outcome}");
         }
