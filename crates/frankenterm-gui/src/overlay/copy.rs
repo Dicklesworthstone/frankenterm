@@ -1,3 +1,4 @@
+use super::{PaneUiMetadata, pane_dimensions, pane_sequence};
 use crate::selection::{SelectionCoordinate, SelectionRange, SelectionX};
 use crate::termwindow::keyevent::KeyTableArgs;
 use crate::termwindow::{TermWindow, TermWindowNotif};
@@ -2581,11 +2582,11 @@ impl CopyRenderable {
     }
 
     fn compute_search_row(&self) -> StableRowIndex {
-        compute_search_row_from_viewport(self.viewport, self.delegate.get_dimensions())
+        compute_search_row_from_viewport(self.viewport, pane_dimensions(&*self.delegate))
     }
 
     fn update_dimensions(&mut self) -> bool {
-        let dims = self.delegate.get_dimensions();
+        let dims = pane_dimensions(&*self.delegate);
         if dims.cols == self.width && dims.viewport_rows == self.height {
             return false;
         }
@@ -2596,11 +2597,13 @@ impl CopyRenderable {
     }
 
     fn mark_search_ui_dirty(&mut self) {
+        let dims = pane_dimensions(&*self.delegate);
         if let Some(last) = self.last_bar_pos {
             self.dirty_results.add(last);
         }
-        self.dirty_results.add(self.compute_search_row());
-        let retained = retained_row_range(self.delegate.get_dimensions());
+        self.dirty_results
+            .add(compute_search_row_from_viewport(self.viewport, dims));
+        let retained = retained_row_range(dims);
         prune_dirty_results(&mut self.dirty_results, retained);
         self.window.invalidate();
     }
@@ -2777,15 +2780,18 @@ impl CopyRenderable {
 
         SAVED_PATTERN.lock().insert(self.tab_id, self.get_pattern());
 
-        let dims = self.delegate.get_dimensions();
+        let (dims, source_seqno) = {
+            let metadata = PaneUiMetadata::capture(&*self.delegate);
+            (metadata.dimensions(), metadata.sequence())
+        };
         self.width = dims.cols;
         self.height = dims.viewport_rows;
-        let bar_pos = self.compute_search_row();
+        let bar_pos = compute_search_row_from_viewport(self.viewport, dims);
         self.dirty_results.add(bar_pos);
         let retained = retained_row_range(dims);
         prune_dirty_results(&mut self.dirty_results, retained);
         let Some(run_id) = allocate_search_run_id(&mut self.next_search_run_id) else {
-            self.last_result_seqno = self.delegate.get_current_seqno();
+            self.last_result_seqno = source_seqno;
             self.searching.take();
             self.clear_selection();
             self.window.invalidate();
@@ -2796,7 +2802,6 @@ impl CopyRenderable {
         if !pattern.is_empty() {
             let pane: Arc<dyn Pane> = self.delegate.clone();
             let window = self.window.clone();
-            let source_seqno = pane.get_current_seqno();
             let run = search_run_identity(run_id, source_seqno, dims);
             self.last_result_seqno = source_seqno;
 
@@ -2819,7 +2824,7 @@ impl CopyRenderable {
             });
             self.spawn_search_chunk(pane, window, run, pattern, range, end);
         } else {
-            self.last_result_seqno = self.delegate.get_current_seqno();
+            self.last_result_seqno = source_seqno;
             self.searching.take();
             self.clear_selection();
         }
@@ -3227,7 +3232,7 @@ impl CopyRenderable {
     }
 
     fn clamp_cursor_to_scrollback(&mut self) {
-        let dims = self.delegate.get_dimensions();
+        let dims = pane_dimensions(&*self.delegate);
         if dims.cols == 0 {
             self.cursor.x = 0;
         } else if self.cursor.x >= dims.cols {
@@ -3311,7 +3316,7 @@ impl CopyRenderable {
 
     fn dimensions(&self) -> Dimensions {
         const VERTICAL_GAP: isize = 5;
-        let dims = self.delegate.get_dimensions();
+        let dims = pane_dimensions(&*self.delegate);
         let vertical_gap = if dims.physical_top <= VERTICAL_GAP {
             1
         } else {
@@ -3361,7 +3366,7 @@ impl CopyRenderable {
     }
 
     fn set_viewport(&self, row: Option<StableRowIndex>) {
-        let dims = self.delegate.get_dimensions();
+        let dims = pane_dimensions(&*self.delegate);
         let pane_id = self.delegate.pane_id();
         self.window
             .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
@@ -3423,7 +3428,7 @@ impl CopyRenderable {
     /// Skip this page of matches and move down to the first match from
     /// the next page.
     fn next_match_page(&mut self) {
-        let dims = self.delegate.get_dimensions();
+        let dims = pane_dimensions(&*self.delegate);
         if let Some(cur) = self.result_pos {
             let top = self.viewport.unwrap_or(dims.physical_top);
             let Some(prior) = checked_page_up_boundary(top, dims.viewport_rows) else {
@@ -3444,7 +3449,7 @@ impl CopyRenderable {
     /// Skip this page of matches and move up to the first match from
     /// the prior page.
     fn prior_match_page(&mut self) {
-        let dims = self.delegate.get_dimensions();
+        let dims = pane_dimensions(&*self.delegate);
         if let Some(cur) = self.result_pos {
             let top = self.viewport.unwrap_or(dims.physical_top);
             let Some(bottom) = checked_page_down_boundary(top, dims.viewport_rows) else {
@@ -3591,7 +3596,7 @@ impl CopyRenderable {
     }
 
     fn move_to_top(&mut self) {
-        self.cursor.y = self.delegate.get_dimensions().scrollback_top;
+        self.cursor.y = pane_dimensions(&*self.delegate).scrollback_top;
         self.select_to_cursor_pos();
     }
 
@@ -3902,7 +3907,7 @@ impl CopyRenderable {
     }
 
     fn move_backward_one_word(&mut self) {
-        let scrollback_top = self.delegate.get_dimensions().scrollback_top;
+        let scrollback_top = pane_dimensions(&*self.delegate).scrollback_top;
         let y = if self.cursor.x == 0 {
             if let Some(previous_row) =
                 previous_row_within_scrollback(self.cursor.y, scrollback_top)
@@ -4002,7 +4007,7 @@ impl CopyRenderable {
             }
 
             if self.cursor.x >= width {
-                let dims = self.delegate.get_dimensions();
+                let dims = pane_dimensions(&*self.delegate);
                 let next_row = self.cursor.y.checked_add(1);
                 let max_row = checked_stable_row_end(dims.scrollback_top, dims.scrollback_rows);
                 if let (Some(next_row), Some(max_row)) = (next_row, max_row) {
@@ -4030,7 +4035,7 @@ impl CopyRenderable {
             let mut words = s.split_word_bounds();
 
             if self.cursor.x >= width.saturating_sub(1) {
-                let dims = self.delegate.get_dimensions();
+                let dims = pane_dimensions(&*self.delegate);
                 let next_row = self.cursor.y.checked_add(1);
                 let max_row = checked_stable_row_end(dims.scrollback_top, dims.scrollback_rows);
                 if let (Some(next_row), Some(max_row)) = (next_row, max_row) {
@@ -4660,7 +4665,7 @@ impl Pane for CopyOverlay {
     }
 
     fn get_current_seqno(&self) -> SequenceNo {
-        self.delegate.get_current_seqno()
+        pane_sequence(&*self.delegate)
     }
 
     fn get_render_cache_generation(&self) -> u64 {
@@ -4812,7 +4817,7 @@ impl Pane for CopyOverlay {
     }
 
     fn get_dimensions(&self) -> RenderableDimensions {
-        self.delegate.get_dimensions()
+        pane_dimensions(&*self.delegate)
     }
 }
 

@@ -1,3 +1,4 @@
+use super::{PaneUiMetadata, pane_dimensions, pane_sequence};
 use crate::selection::{SelectionCoordinate, SelectionRange};
 use crate::termwindow::{TermWindow, TermWindowNotif};
 use config::ConfigHandle;
@@ -3069,7 +3070,7 @@ impl QuickSelectOverlay {
         args: &QuickSelectArguments,
     ) -> anyhow::Result<Arc<dyn Pane>> {
         let viewport = term_window.get_viewport(pane.pane_id());
-        let dims = pane.get_dimensions();
+        let dims = pane_dimensions(&**pane);
 
         let config = term_window.config.clone();
 
@@ -3387,7 +3388,7 @@ impl Pane for QuickSelectOverlay {
             (KeyCode::PageUp, KeyModifiers::NONE) => {
                 // Skip this page of matches and move up to the first match from
                 // the prior page.
-                let dims = self.delegate.get_dimensions();
+                let dims = pane_dimensions(&*self.delegate);
                 let mut r = self.renderer.lock();
                 if let Some(cur) = r.result_pos {
                     let top = r.viewport.unwrap_or(dims.physical_top);
@@ -3408,7 +3409,7 @@ impl Pane for QuickSelectOverlay {
             (KeyCode::PageDown, KeyModifiers::NONE) => {
                 // Skip this page of matches and move down to the first match from
                 // the next page.
-                let dims = self.delegate.get_dimensions();
+                let dims = pane_dimensions(&*self.delegate);
                 let mut r = self.renderer.lock();
                 if let Some(cur) = r.result_pos {
                     let top = r.viewport.unwrap_or(dims.physical_top);
@@ -3525,7 +3526,7 @@ impl Pane for QuickSelectOverlay {
     }
 
     fn get_current_seqno(&self) -> SequenceNo {
-        self.delegate.get_current_seqno()
+        pane_sequence(&*self.delegate)
     }
 
     fn get_render_cache_generation(&self) -> u64 {
@@ -3682,13 +3683,13 @@ impl Pane for QuickSelectOverlay {
     }
 
     fn get_dimensions(&self) -> RenderableDimensions {
-        self.delegate.get_dimensions()
+        pane_dimensions(&*self.delegate)
     }
 }
 
 impl QuickSelectRenderable {
     fn compute_search_row(&self) -> StableRowIndex {
-        compute_search_row_from_viewport(self.viewport, self.delegate.get_dimensions())
+        compute_search_row_from_viewport(self.viewport, pane_dimensions(&*self.delegate))
     }
 
     fn close(&self) {
@@ -3701,7 +3702,7 @@ impl QuickSelectRenderable {
     }
 
     fn set_viewport(&self, row: Option<StableRowIndex>) {
-        let dims = self.delegate.get_dimensions();
+        let dims = pane_dimensions(&*self.delegate);
         let pane_id = self.delegate.pane_id();
         self.window
             .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
@@ -3710,7 +3711,7 @@ impl QuickSelectRenderable {
     }
 
     fn update_dimensions(&mut self) -> bool {
-        let dims = self.delegate.get_dimensions();
+        let dims = pane_dimensions(&*self.delegate);
         if dims.cols == self.width && dims.viewport_rows == self.height {
             return false;
         }
@@ -3721,11 +3722,13 @@ impl QuickSelectRenderable {
     }
 
     fn mark_search_ui_dirty(&mut self) {
+        let dims = pane_dimensions(&*self.delegate);
         if let Some(last) = self.last_bar_pos {
             self.dirty_results.add(last);
         }
-        self.dirty_results.add(self.compute_search_row());
-        let retained = retained_row_range(self.delegate.get_dimensions());
+        self.dirty_results
+            .add(compute_search_row_from_viewport(self.viewport, dims));
+        let retained = retained_row_range(dims);
         prune_dirty_results(&mut self.dirty_results, retained);
         self.window.invalidate();
     }
@@ -3803,7 +3806,11 @@ impl QuickSelectRenderable {
             self.desired_result.take();
             self.desired_result_ordinal.take();
         }
-        let bar_pos = self.compute_search_row();
+        let (dims, source_seqno) = {
+            let metadata = PaneUiMetadata::capture(&*self.delegate);
+            (metadata.dimensions(), metadata.sequence())
+        };
+        let bar_pos = compute_search_row_from_viewport(self.viewport, dims);
         let dirty_rows =
             dirty_rows_for_search_refresh(self.by_line.keys().copied(), self.last_bar_pos, bar_pos);
         self.dirty_results.add_set(&dirty_rows);
@@ -3817,7 +3824,6 @@ impl QuickSelectRenderable {
         self.accepted_range.take();
         self.accepted_run_id.take();
 
-        let dims = self.delegate.get_dimensions();
         self.width = dims.cols;
         self.height = dims.viewport_rows;
 
@@ -3861,7 +3867,7 @@ impl QuickSelectRenderable {
                 self.mark_search_ui_dirty();
                 return;
             };
-            let run = search_run_identity(run_id, pane.get_current_seqno(), dims, top);
+            let run = search_run_identity(run_id, source_seqno, dims, top);
             let reservation = match super::reserve_overlay_main_thread(
                 promise::spawn::MainThreadServiceClass::Interactive,
                 32 * 1024,
