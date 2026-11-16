@@ -616,94 +616,60 @@ fn prepare_runtime_recorder_delivery(
 }
 
 fn append_log_contains_exact_recorder_event(
+    cx: &crate::cx::Cx,
     path: &std::path::Path,
     expected: &crate::recording::RecorderEvent,
 ) -> std::result::Result<bool, String> {
-    use std::io::{Read as _, Seek as _, SeekFrom};
+    use crate::recorder_storage::{
+        AppendLogEventReader, AppendLogReadLimits, RecorderEventReader as _,
+    };
 
-    #[derive(serde::Deserialize)]
-    struct EventIdentity {
-        event_id: String,
-    }
-
-    let mut file = std::fs::File::open(path)
-        .map_err(|error| format!("open append log {}: {error}", path.display()))?;
-    let file_len = file
-        .metadata()
-        .map_err(|error| format!("stat append log {}: {error}", path.display()))?
-        .len();
-    let mut offset = 0u64;
+    // A committed append can roll into a sealed segment before its primary
+    // delivery-ledger acknowledgement. Reopening only the active pathname
+    // would mistake that already-delivered event for an absent one. Pin one
+    // bounded, coherent cut of every retained segment instead; malformed,
+    // changing, or over-budget sources cannot authorize another append.
+    let reader = AppendLogEventReader::open_with_cx(cx, path, AppendLogReadLimits::default())
+        .map_err(|error| format!("open recorder recovery snapshot: {error}"))?;
+    let first = reader.first_offset();
+    let prefix_pruned = first.segment_id != 0 || first.ordinal != 0;
+    let mut cursor = reader
+        .open_cursor(first)
+        .map_err(|error| format!("open recorder recovery cursor: {error}"))?;
     let mut exact_matches = 0usize;
-    while offset < file_len {
-        let header_end = offset.checked_add(4).ok_or_else(|| {
-            format!(
-                "append-log offset overflow while scanning {}",
-                path.display()
-            )
-        })?;
-        if header_end > file_len {
-            return Err(format!(
-                "append log {} has a truncated length prefix at byte {offset}",
-                path.display()
-            ));
+    loop {
+        // The reader checks the caller's capability per directory entry,
+        // frame, and seek; no ambient context replaces that authority
+        // when this scan runs on the owned blocking worker.
+        let batch = cursor
+            .next_batch(64)
+            .map_err(|error| format!("read recorder recovery snapshot: {error}"))?;
+        if batch.is_empty() {
+            break;
         }
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|error| format!("seek append log {}: {error}", path.display()))?;
-        let mut length = [0u8; 4];
-        file.read_exact(&mut length)
-            .map_err(|error| format!("read append-log prefix {}: {error}", path.display()))?;
-        let payload_len = u64::from(u32::from_le_bytes(length));
-        let next_offset = header_end
-            .checked_add(payload_len)
-            .ok_or_else(|| format!("append-log record length overflow at byte {offset}"))?;
-        if next_offset > file_len {
-            return Err(format!(
-                "append log {} has a truncated record at byte {offset}: payload_bytes={payload_len}, file_bytes={file_len}",
-                path.display()
-            ));
-        }
-
-        let identity = serde_json::from_reader::<_, EventIdentity>(std::io::Read::take(
-            &mut file,
-            payload_len,
-        ))
-        .map_err(|error| {
-            format!(
-                "decode append-log event identity at byte {offset} in {}: {error}",
-                path.display()
-            )
-        })?;
-        if identity.event_id == expected.event_id {
-            file.seek(SeekFrom::Start(header_end)).map_err(|error| {
-                format!("seek matching append-log event {}: {error}", path.display())
-            })?;
-            let actual = serde_json::from_reader::<_, crate::recording::RecorderEvent>(
-                std::io::Read::take(&mut file, payload_len),
-            )
-            .map_err(|error| {
-                format!(
-                    "decode matching append-log event at byte {offset} in {}: {error}",
-                    path.display()
-                )
-            })?;
-            if actual != *expected {
+        for record in batch {
+            if record.event.event_id != expected.event_id {
+                continue;
+            }
+            if record.event != *expected {
                 return Err(format!(
-                    "append log {} contains event_id {} with non-canonical payload",
-                    path.display(),
+                    "append log contains event_id {} with non-canonical payload",
                     expected.event_id
                 ));
             }
             exact_matches = exact_matches.saturating_add(1);
         }
-        offset = next_offset;
     }
 
     match exact_matches {
+        // A retained suffix can prove presence but not historical absence.
+        // Keep the ledger pending rather than duplicate an event whose prior
+        // delivery may have been pruned before this process recovered it.
+        0 if prefix_pruned => Err("append_log_recovery_prefix_pruned".to_string()),
         0 => Ok(false),
         1 => Ok(true),
         count => Err(format!(
-            "append log {} contains {count} exact copies of recorder event {}",
-            path.display(),
+            "append log contains {count} exact copies of recorder event {}",
             expected.event_id
         )),
     }
@@ -714,8 +680,9 @@ async fn append_log_contains_exact_recorder_event_with_cx(
     path: PathBuf,
     expected: crate::recording::RecorderEvent,
 ) -> Result<bool> {
+    let scan_cx = cx.clone();
     crate::runtime_async::spawn_blocking_with_cx(cx, move || {
-        append_log_contains_exact_recorder_event(&path, &expected)
+        append_log_contains_exact_recorder_event(&scan_cx, &path, &expected)
     })
     .await
     .map_err(|error| {
@@ -18805,7 +18772,9 @@ mod tests {
     #[test]
     fn recorder_delivery_restart_after_append_before_ack_never_duplicates() {
         run_async_test_isolated(|| async {
-            use crate::recorder_storage::{RecorderBackendKind, bootstrap_recorder_storage};
+            use crate::recorder_storage::{
+                AppendLogRetention, RecorderBackendKind, bootstrap_recorder_storage,
+            };
 
             for target_backend in [
                 RecorderBackendKind::AppendLog,
@@ -18839,9 +18808,16 @@ mod tests {
                 let recorder_dir = tempfile::tempdir().expect("selected recorder tempdir");
                 let recorder_config =
                     recorder_delivery_config_for_test(target_backend, recorder_dir.path());
+                // Every append rolls on Unix, exactly between the recorder
+                // commit and the injected loss of the primary ledger ACK.
+                let retention = AppendLogRetention {
+                    roll_at_bytes: 1,
+                    max_total_bytes: 1024 * 1024,
+                };
                 let recorder = RuntimeRecorderPersistence::new(Arc::new(
                     bootstrap_recorder_storage(recorder_config.clone())
-                        .expect("open selected recorder"),
+                        .expect("open selected recorder")
+                        .with_append_log_retention(retention),
                 ))
                 .expect("valid capture configuration");
                 let cx = crate::cx::for_testing();
@@ -18855,15 +18831,29 @@ mod tests {
                 .expect_err("plant crash after recorder append before ledger ack");
                 assert!(error.to_string().contains("injected process loss"));
                 assert_eq!(recorder_delivery_latest_ordinal(&recorder).await, Some(0));
+                #[cfg(unix)]
+                if let crate::recorder_storage::RecorderStorageInstance::AppendLog(storage) =
+                    recorder.storage.as_ref()
+                {
+                    assert_eq!(storage.sealed_segments().unwrap().len(), 1);
+                    assert_eq!(
+                        std::fs::metadata(&recorder_config.append_log.data_path)
+                            .unwrap()
+                            .len(),
+                        0,
+                        "committed event must be sealed, not in the active log"
+                    );
+                }
+                let pending = primary
+                    .pending_recorder_deliveries_with_cx(&cx)
+                    .await
+                    .expect("crash must leave ledger row pending");
                 assert_eq!(
-                    primary
-                        .pending_recorder_deliveries_with_cx(&cx)
-                        .await
-                        .expect("crash must leave ledger row pending")
-                        .len(),
+                    pending.len(),
                     1,
                     "recorder append alone must never acknowledge primary ledger"
                 );
+                let expected_event = pending[0].event.clone();
 
                 primary
                     .shutdown()
@@ -18874,8 +18864,9 @@ mod tests {
                     .await
                     .expect("reopen primary after planted crash");
                 let recorder = RuntimeRecorderPersistence::new(Arc::new(
-                    bootstrap_recorder_storage(recorder_config)
-                        .expect("reopen selected recorder after planted crash"),
+                    bootstrap_recorder_storage(recorder_config.clone())
+                        .expect("reopen selected recorder after planted crash")
+                        .with_append_log_retention(retention),
                 ))
                 .expect("valid capture configuration");
                 let cx = crate::cx::for_testing();
@@ -18902,7 +18893,193 @@ mod tests {
                     Some(0),
                     "recovery must retain exactly one selected-recorder event"
                 );
+                // Independently decode the physical frames in every sealed
+                // file and the active log. Do not let a stale ordinal counter
+                // or the recovery reader itself stand in for actual delivery.
+                let mut events = Vec::new();
+                if let crate::recorder_storage::RecorderStorageInstance::AppendLog(storage) =
+                    recorder.storage.as_ref()
+                {
+                    let directory = recorder_config
+                        .append_log
+                        .data_path
+                        .parent()
+                        .expect("append-log parent");
+                    for segment in storage.sealed_segments().unwrap() {
+                        let mut sealed_config = recorder_config.clone();
+                        sealed_config.append_log.data_path = directory.join(segment.file_name);
+                        events.extend(recorder_delivery_events_for_test(
+                            target_backend,
+                            &sealed_config,
+                        ));
+                    }
+                }
+                events.extend(recorder_delivery_events_for_test(
+                    target_backend,
+                    &recorder_config,
+                ));
+                assert_eq!(events, vec![expected_event]);
                 primary.shutdown().await.expect("stop reopened primary");
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorder_delivery_recovery_fences_conflicts_duplicates_and_pruned_absence() {
+        run_async_test_isolated(|| async {
+            use crate::recorder_storage::{
+                AppendLogEventReader, AppendLogReadLimits, AppendLogRetention, AppendRequest,
+                DurabilityLevel, RecorderBackendKind, RecorderStorage as _,
+                bootstrap_recorder_storage,
+            };
+
+            for (case, expected_error) in [
+                ("collision", Some("non-canonical payload")),
+                ("duplicate", Some("2 exact copies")),
+                ("pruned", Some("append_log_recovery_prefix_pruned")),
+                ("retained", None),
+            ] {
+                let dir = tempfile::tempdir().expect("recorder history fixture");
+                let primary_path = dir.path().join("primary.sqlite3");
+                let primary = StorageHandle::new(&primary_path.to_string_lossy())
+                    .await
+                    .unwrap();
+                let cx = crate::cx::for_testing();
+                primary.upsert_pane(test_pane_record(405)).await.unwrap();
+                primary
+                    .append_segment_with_recorder_delivery_for_test(
+                        &cx,
+                        405,
+                        "authoritative ledger text",
+                        recorder_delivery_seed_for_test(
+                            RecorderBackendKind::AppendLog,
+                            405,
+                            0,
+                            "authoritative ledger text",
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                let expected = primary
+                    .pending_recorder_deliveries_with_cx(&cx)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .next()
+                    .unwrap()
+                    .event;
+                let mut other = expected.clone();
+                let replacement = if other.event_id.starts_with('0') {
+                    "1"
+                } else {
+                    "0"
+                };
+                other.event_id.replace_range(..1, replacement);
+                let retention = AppendLogRetention {
+                    roll_at_bytes: 1,
+                    // The writer always keeps its newest sealed recovery
+                    // anchor. A zero budget evicts the first of two records.
+                    max_total_bytes: if matches!(case, "pruned" | "retained") {
+                        0
+                    } else {
+                        1024 * 1024
+                    },
+                };
+                let config = recorder_delivery_config_for_test(
+                    RecorderBackendKind::AppendLog,
+                    dir.path(),
+                );
+                let recorder = RuntimeRecorderPersistence::new(Arc::new(
+                    bootstrap_recorder_storage(config.clone())
+                        .unwrap()
+                        .with_append_log_retention(retention),
+                ))
+                .unwrap();
+                let mut first = if case == "retained" {
+                    other.clone()
+                } else {
+                    expected.clone()
+                };
+                if case == "collision" {
+                    let crate::recording::RecorderEventPayload::EgressOutput { text, .. } =
+                        &mut first.payload
+                    else {
+                        panic!("delivery fixture must contain egress text");
+                    };
+                    *text = "different payload under the same event ID".to_string();
+                }
+                let mut records = vec![first];
+                if case != "collision" {
+                    records.push(if case == "pruned" { other } else { expected });
+                }
+                for (index, event) in records.into_iter().enumerate() {
+                    // Distinct batch IDs deliberately plant a duplicate or a
+                    // collision; the delivery recovery must not acknowledge it.
+                    recorder
+                        .storage
+                        .append_batch_with_cx(
+                            &cx,
+                            AppendRequest {
+                                batch_id: format!("recovery-fixture-{index}"),
+                                producer_ts_ms: event.recorded_at_ms,
+                                events: vec![event],
+                                required_durability: DurabilityLevel::Fsync,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                }
+                let before = recorder_delivery_latest_ordinal(&recorder).await;
+                if matches!(case, "pruned" | "retained") {
+                    let snapshot = AppendLogEventReader::open(
+                        &config.append_log.data_path,
+                        AppendLogReadLimits::default(),
+                    )
+                    .unwrap();
+                    assert_eq!(snapshot.first_offset().ordinal, 1);
+                }
+                primary.shutdown().await.unwrap();
+                drop(recorder);
+
+                let primary = StorageHandle::new(&primary_path.to_string_lossy())
+                    .await
+                    .unwrap();
+                let recorder = RuntimeRecorderPersistence::new(Arc::new(
+                    bootstrap_recorder_storage(config)
+                        .unwrap()
+                        .with_append_log_retention(retention),
+                ))
+                .unwrap();
+                let result = drain_runtime_recorder_deliveries_with_cx(
+                    &cx,
+                    &primary,
+                    &recorder,
+                    RecorderDeliveryDrainMode::Recovery,
+                )
+                .await;
+                match expected_error {
+                    Some(reason) => assert!(
+                        result.expect_err(case).to_string().contains(reason),
+                        "{case} must preserve the specific recovery refusal"
+                    ),
+                    None => assert_eq!(result.expect("retained exact presence is sufficient"), 1),
+                }
+                assert_eq!(
+                    recorder_delivery_latest_ordinal(&recorder).await,
+                    before,
+                    "{case} must never append another event"
+                );
+                assert_eq!(
+                    primary
+                        .pending_recorder_deliveries_with_cx(&cx)
+                        .await
+                        .unwrap()
+                        .len(),
+                    usize::from(expected_error.is_some()),
+                    "only unambiguous retained presence can acknowledge the ledger"
+                );
+                primary.shutdown().await.unwrap();
             }
         });
     }

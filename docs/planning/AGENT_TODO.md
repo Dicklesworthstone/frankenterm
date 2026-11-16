@@ -1469,3 +1469,33 @@ unavailable (exit 127). The local execution service later became unavailable;
 manual changes were reconstructed against verified unchanged GitHub source.
 The earlier local diff passed git diff --check; reconstructed source has not
 been compiled, executed, or formatted by Rust tooling. No Bead is closed.
+
+## 2026-11-15 — Recorder delivery across log rotation
+
+The recovery scan inspected only the active append log even though a committed
+append can roll into a sealed segment before the primary SQLite delivery ledger
+acknowledges it. A crash at that boundary therefore allowed a duplicate replay.
+
+- [x] Trace the append, rotation, lost-acknowledgement, reopen, and recovery path.
+- [x] Reuse the existing bounded, pinned retained-segment reader with the caller's
+  Cx for recovery. Preserve exact-content collision and duplicate detection.
+- [x] Refuse ambiguous absence after prefix retention; retain the pending ledger
+  obligation. An exact retained event remains sufficient for acknowledgement.
+- [x] Add real-file and primary-SQLite regressions for rotation before ACK,
+  cross-segment duplicates, conflicting content, and retained-prefix pruning.
+  Independently decode sealed and active files to check actual event contents.
+- [x] Independently review the reader's limits, writer startup ordering, retained
+  recovery anchor, cancellation, and unchanged-ledger failure behavior.
+- [ ] Run strict RCH tests runtime::tests::recorder_delivery_restart_after_append_before_ack_never_duplicates
+  and runtime::tests::recorder_delivery_recovery_fences_conflicts_duplicates_and_pruned_absence,
+  then the adjacent recorder delivery tests, affected check and Clippy gates,
+  and exact committed-source formatting proof.
+- [ ] Create/link the new recorder recovery Bead and retain the remote results
+  before marking implementation verified.
+
+Validation limit: RCH doctor and worker probe could not run (rch: command not
+found). The local execution service subsequently became unavailable; reviewed
+manual edits were reconstructed and rebased onto the current GitHub source.
+The original local diff passed git diff --check; reconstruction checks are
+source diagnostics, not Rust execution. No compilation, Rust test, Clippy, or
+formatting proof is claimed, and no Bead is closed on these changes.
