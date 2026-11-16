@@ -1437,3 +1437,35 @@ power loss nor migration of those live sessions has been demonstrated.
   ordinary startup admission, durable tab/window identities and atomic topology
   restoration. The first successor fixture drafts failed source review and
   were not integrated; successful round-trip tests alone do not close this gap.
+
+## 2026-11-15 — Guardian startup refuses empty recovery (ft-upal7)
+
+Rootless adoption previously returned success with zero attached panes even when
+live guardian panes remained held, ineligible, or failed restoration. Startup
+could then announce readiness while every surviving pane remained inaccessible.
+
+- [x] Count attached panes and unresolved live panes separately. Refuse rootless
+  startup when none were attached and unresolved live panes remain.
+- [x] Preserve partial recovery, report unresolved counts, and exclude panes
+  already named by a recovery root or owned by the current mux.
+- [x] Apply cancellation before and after the bounded census exchange. Keep
+  held classifications within the existing finite retry budget.
+- [x] Add seven focused regressions, including the public startup entrypoint
+  over authenticated Unix-socket census frames for ineligible and failed panes.
+  The fixture rejects Claim, Spawn, and extra guardian connections.
+- [x] Independently review production admission, visibility accounting, and
+  custody-preserving retirement. This is source review, not runtime proof.
+- [ ] Execute the adoption regressions and adjacent guardian recovery tests
+  through strict RCH, then affected check, Clippy, and exact-source formatting.
+- [ ] Complete broader late adoption and native custody-survival acceptance
+  before closing ft-upal7. This change adds no background adoption retry.
+
+Current wire validation rejects unsettled LiveUnclaimed census entries; tests
+for that classification are defensive. The live defect fixed here is successful
+empty startup despite unresolved panes, not a newly reachable protocol state.
+
+Validation limit: the strict RCH test command could not start because rch is
+unavailable (exit 127). The local execution service later became unavailable;
+manual changes were reconstructed against verified unchanged GitHub source.
+The earlier local diff passed git diff --check; reconstructed source has not
+been compiled, executed, or formatted by Rust tooling. No Bead is closed.

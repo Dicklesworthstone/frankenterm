@@ -7882,6 +7882,72 @@ impl UnnamedGuardianPane {
     }
 }
 
+/// Wait for every foreign held pane, including an unclaimed pane whose
+/// last owner's input or checkpoint effect has not settled yet. Cancellation
+/// applies to the census itself and to admission of the returned snapshot.
+fn census_for_unnamed_guardian_adoption(
+    target: Uuid,
+    named: &std::collections::HashSet<Uuid>,
+    cx: &frankenterm_core::cx::Cx,
+    started: Instant,
+    retry_budget: Duration,
+    mut census: impl FnMut() -> Result<Vec<GuardianCensusEntry>, GuardianClientError>,
+) -> anyhow::Result<Vec<GuardianCensusEntry>> {
+    loop {
+        cx.checkpoint()
+            .map_err(|_| anyhow::anyhow!("guardian pane adoption cancelled"))?;
+        let entries = census()
+            .context("guardian census before adopting the panes no recovery root names")?;
+        cx.checkpoint()
+            .map_err(|_| anyhow::anyhow!("guardian pane adoption cancelled"))?;
+        let held = entries.iter().any(|entry| {
+            !named.contains(&entry.pane_id)
+                && entry.mux_incarnation != Some(target)
+                && UnnamedGuardianPane::of(entry) == UnnamedGuardianPane::Held
+        });
+        if !held || !wait_for_claim_retry(started, retry_budget) {
+            return Ok(entries);
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct GuardianAdoptionOutcome {
+    adopted: usize,
+    held: usize,
+    ineligible: usize,
+    failed: usize,
+}
+
+impl GuardianAdoptionOutcome {
+    fn remaining_live(&self) -> usize {
+        self.held + self.ineligible + self.failed
+    }
+
+    fn report_partial(&self) {
+        if self.remaining_live() > 0 {
+            log::warn!(
+                "guardian adoption is partial: {} adopted, {} held, {} ineligible, {} failed",
+                self.adopted,
+                self.held,
+                self.ineligible,
+                self.failed
+            );
+        }
+    }
+
+    fn require_rootless_startup(self) -> anyhow::Result<usize> {
+        anyhow::ensure!(
+            self.adopted > 0 || self.remaining_live() == 0,
+            "guardian adoption recovered no panes: {} held, {} ineligible, {} failed; refusing an empty mux start while live panes remain in guardian custody; inspect adoption diagnostics before retrying",
+            self.held,
+            self.ineligible,
+            self.failed
+        );
+        Ok(self.adopted)
+    }
+}
+
 /// Adopt the live guardian panes that no recovery root names, as tabs of one
 /// new window, before this mux accepts clients (ft-upal7). A mux that ends
 /// before its first root commits, or after it spawned panes its newest root
@@ -7892,8 +7958,8 @@ impl UnnamedGuardianPane {
 /// has none), at that checkpoint's size. A pane that fails stays running
 /// unclaimed, as before, and costs no other pane. Ended panes no root names
 /// join this mux's own, so the guardian releases them once its roots settle.
-/// `named` holds the panes a restored root names. Returns how many were
-/// adopted.
+/// `named` holds the panes a restored root names. The outcome distinguishes
+/// published tabs from live panes that still need recovery.
 fn adopt_unnamed_guardian_panes(
     owner: &Arc<mux::Mux>,
     socket: &Path,
@@ -7901,7 +7967,9 @@ fn adopt_unnamed_guardian_panes(
     named: &std::collections::HashSet<Uuid>,
     limits: TerminalCheckpointLimits,
     cx: &frankenterm_core::cx::Cx,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<GuardianAdoptionOutcome> {
+    cx.checkpoint()
+        .map_err(|_| anyhow::anyhow!("guardian pane adoption cancelled"))?;
     let started = Instant::now();
     let domain_id = owner
         .iter_domains()
@@ -7917,34 +7985,36 @@ fn adopt_unnamed_guardian_panes(
     let target = Uuid::from_bytes(session.as_bytes());
     let mut client = GuardianClient::connect(socket, token, target)
         .context("connect to the guardian to adopt the panes no recovery root names")?;
-    // A mux that ended a moment ago holds its panes until its guardian sees
-    // its connections close: wait for that, briefly, rather than leave them.
-    let entries = loop {
-        let entries = client
-            .census_snapshot()
-            .context("guardian census before adopting the panes no recovery root names")?;
-        let released = entries.iter().all(|entry| {
-            named.contains(&entry.pane_id)
-                || entry.status != GuardianCensusPaneStatus::LiveClaimed
-                || entry.mux_incarnation == Some(target)
-        });
-        if released || !wait_for_claim_retry(started, GUARDIAN_RECOVERY_CLAIM_RETRY_BUDGET) {
-            break entries;
-        }
-    };
+    // A disconnected mux can leave either a live claim or unsettled effects.
+    // Both keep a pane held until the guardian finishes releasing custody.
+    let entries = census_for_unnamed_guardian_adoption(
+        target,
+        named,
+        cx,
+        started,
+        GUARDIAN_RECOVERY_CLAIM_RETRY_BUDGET,
+        || client.census_snapshot(),
+    )?;
     let guardian = client.guardian_incarnation();
     drop(client);
     let mut adopt = Vec::new();
     let mut ended = Vec::new();
     let mut left = Vec::new();
-    for entry in entries
-        .iter()
-        .filter(|entry| !named.contains(&entry.pane_id))
-    {
+    let mut outcome = GuardianAdoptionOutcome::default();
+    for entry in entries.iter().filter(|entry| {
+        !named.contains(&entry.pane_id) && entry.mux_incarnation != Some(target)
+    }) {
         match UnnamedGuardianPane::of(entry) {
             UnnamedGuardianPane::Adopt => adopt.push(entry.pane_id),
             UnnamedGuardianPane::Ended => ended.push(entry.pane_id),
-            other => left.push((entry.pane_id, other)),
+            UnnamedGuardianPane::Held => {
+                outcome.held += 1;
+                left.push((entry.pane_id, UnnamedGuardianPane::Held));
+            }
+            other => {
+                outcome.ineligible += 1;
+                left.push((entry.pane_id, other));
+            }
         }
     }
     for (pane, why) in &left {
@@ -7952,7 +8022,8 @@ fn adopt_unnamed_guardian_panes(
     }
     owner.note_restored_guardian_panes(ended);
     if adopt.is_empty() {
-        return Ok(0);
+        outcome.report_partial();
+        return Ok(outcome);
     }
     let census = Arc::new(GuardianCensusCoordinator::connect(
         socket, token, guardian, target,
@@ -7971,6 +8042,7 @@ fn adopt_unnamed_guardian_panes(
         ) {
             Ok(adopted) => adopted,
             Err(error) => {
+                outcome.failed += 1;
                 log::warn!(
                     "guardian pane {pane} that no recovery root names stays unadopted: {error:#}"
                 );
@@ -7982,6 +8054,7 @@ fn adopt_unnamed_guardian_panes(
         let unpublished = match UnpublishedPane::from_guardian_proxy(local) {
             Ok(unpublished) => unpublished,
             Err(error) => {
+                outcome.failed += 1;
                 log::warn!("adopted guardian pane {pane} cannot be published: {error:#}");
                 continue;
             }
@@ -7996,6 +8069,7 @@ fn adopt_unnamed_guardian_panes(
         let tab = match unpublished.publish_in_new_tab(owner, &tab_size) {
             Ok((tab, _pane)) => tab,
             Err(error) => {
+                outcome.failed += 1;
                 log::warn!("adopted guardian pane {pane} cannot be registered: {error:#}");
                 continue;
             }
@@ -8003,20 +8077,26 @@ fn adopt_unnamed_guardian_panes(
         adopted.push(pane);
         let window = window.get_or_insert_with(|| owner.new_empty_window(None, None));
         if let Err(error) = owner.add_tab_to_window(&tab, **window) {
+            outcome.failed += 1;
             log::error!("adopted guardian pane {pane} has no window: {error:#}");
+        } else {
+            outcome.adopted += 1;
         }
     }
-    let count = adopted.len();
     owner.note_restored_guardian_panes(adopted);
     log::info!(
-        "adopted {count} guardian panes that no recovery root names in {} ms",
+        "adopted {} guardian panes that no recovery root names in {} ms",
+        outcome.adopted,
         started.elapsed().as_millis()
     );
-    Ok(count)
+    outcome.report_partial();
+    Ok(outcome)
 }
 
 /// [`adopt_unnamed_guardian_panes`] for a mux that starts with no recovery
-/// root to restore: no root names any of its guardian's panes.
+/// root to restore: no root names any of its guardian's panes. Refuse an empty
+/// start while unresolved live panes remain; a partial recovery preserves its
+/// published tabs and reports the panes that still need recovery.
 pub fn adopt_without_recovery_root(
     owner: &Arc<mux::Mux>,
     socket: &Path,
@@ -8031,7 +8111,8 @@ pub fn adopt_without_recovery_root(
         &std::collections::HashSet::new(),
         limits,
         &cx,
-    )
+    )?
+    .require_rootless_startup()
 }
 
 /// Claim `pane` as the successor of the mux that spawned it, and restore its
@@ -14976,6 +15057,370 @@ mod tests {
         assert_eq!(of(LiveClaimed, 1, false, false), UnnamedGuardianPane::Held);
         for status in [ExitedUnclaimed, ClosedTerminal, Quarantined] {
             assert_eq!(of(status, 1, false, false), UnnamedGuardianPane::Ended);
+        }
+    }
+
+    fn adoption_census_entry() -> GuardianCensusEntry {
+        GuardianCensusEntry {
+            pane_id: id(0x910),
+            status: GuardianCensusPaneStatus::LiveUnclaimed,
+            generation: 1,
+            mux_incarnation: None,
+            next_sequence: None,
+            pending_input_effect: None,
+            indeterminate_checkpoint_effect: None,
+            exit_status: None,
+            quarantine_reason: None,
+        }
+    }
+
+    #[test]
+    fn adoption_census_waits_for_unclaimed_effects_to_settle() {
+        // Cover every Held classification, including defensive unclaimed
+        // effect markers that current authenticated census frames reject.
+        for pending_input in [true, false] {
+            let settled = adoption_census_entry();
+            let mut claimed = settled.clone();
+            claimed.status = GuardianCensusPaneStatus::LiveClaimed;
+            claimed.mux_incarnation = Some(id(0x911));
+            claimed.next_sequence = Some(1);
+            let mut unsettled = settled.clone();
+            if pending_input {
+                unsettled.pending_input_effect = Some(id(0x912));
+            } else {
+                unsettled.indeterminate_checkpoint_effect = Some(id(0x913));
+            }
+            let mut snapshots =
+                VecDeque::from([vec![claimed], vec![unsettled], vec![settled.clone()]]);
+            let mut reads = 0;
+            let entries = census_for_unnamed_guardian_adoption(
+                id(0x914),
+                &std::collections::HashSet::new(),
+                &frankenterm_core::cx::Cx::for_testing(),
+                Instant::now(),
+                Duration::from_secs(60),
+                || {
+                    reads += 1;
+                    Ok(snapshots.pop_front().expect("the settled census must finish"))
+                },
+            )
+            .unwrap();
+            assert_eq!(reads, 3, "an unclaimed pending effect still holds custody");
+            assert!(snapshots.is_empty());
+            assert_eq!(entries, vec![settled]);
+            assert_eq!(
+                UnnamedGuardianPane::of(&entries[0]),
+                UnnamedGuardianPane::Adopt
+            );
+        }
+    }
+
+    #[test]
+    fn adoption_census_does_not_wait_for_named_or_already_owned_panes() {
+        let target = id(0x914);
+        let mut named = adoption_census_entry();
+        named.status = GuardianCensusPaneStatus::LiveClaimed;
+        named.mux_incarnation = Some(id(0x911));
+        named.next_sequence = Some(1);
+        let mut owned = adoption_census_entry();
+        owned.pane_id = id(0x915);
+        owned.status = GuardianCensusPaneStatus::LiveClaimed;
+        owned.mux_incarnation = Some(target);
+        owned.next_sequence = Some(1);
+        owned.pending_input_effect = Some(id(0x912));
+        let entries = vec![named.clone(), owned];
+        let mut reads = 0;
+        let result = census_for_unnamed_guardian_adoption(
+            target,
+            &std::collections::HashSet::from([named.pane_id]),
+            &frankenterm_core::cx::Cx::for_testing(),
+            Instant::now(),
+            Duration::from_secs(60),
+            || {
+                reads += 1;
+                assert_eq!(reads, 1, "existing custody must not become a foreign hold");
+                Ok(entries.clone())
+            },
+        )
+        .unwrap();
+        assert_eq!(reads, 1);
+        assert_eq!(result, entries);
+    }
+
+    #[test]
+    fn adoption_census_exhaustion_preserves_held_panes_without_claiming_readiness() {
+        for pending_input in [true, false] {
+            let mut held = adoption_census_entry();
+            if pending_input {
+                held.pending_input_effect = Some(id(0x912));
+            } else {
+                held.indeterminate_checkpoint_effect = Some(id(0x913));
+            }
+            let mut reads = 0;
+            let entries = census_for_unnamed_guardian_adoption(
+                id(0x914),
+                &std::collections::HashSet::new(),
+                &frankenterm_core::cx::Cx::for_testing(),
+                Instant::now(),
+                Duration::ZERO,
+                || {
+                    reads += 1;
+                    Ok(vec![held.clone()])
+                },
+            )
+            .unwrap();
+            assert_eq!(reads, 1);
+            assert_eq!(entries, vec![held]);
+            assert_eq!(
+                UnnamedGuardianPane::of(&entries[0]),
+                UnnamedGuardianPane::Held
+            );
+            let outcome = GuardianAdoptionOutcome {
+                held: entries.len(),
+                ..Default::default()
+            };
+            assert!(
+                outcome
+                    .require_rootless_startup()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("refusing an empty mux start")
+            );
+        }
+    }
+
+    #[test]
+    fn adoption_census_cancellation_prevents_reads_and_post_read_admission() {
+        let cx = frankenterm_core::cx::Cx::for_testing();
+        cx.cancel_with(frankenterm_core::outcome::CancelKind::User, None);
+        let mut reads = 0;
+        let error = census_for_unnamed_guardian_adoption(
+            id(0x914),
+            &std::collections::HashSet::new(),
+            &cx,
+            Instant::now(),
+            Duration::from_secs(60),
+            || {
+                reads += 1;
+                Ok(Vec::new())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(reads, 0);
+        assert!(error.to_string().contains("adoption cancelled"));
+
+        let cx = frankenterm_core::cx::Cx::for_testing();
+        let error = census_for_unnamed_guardian_adoption(
+            id(0x914),
+            &std::collections::HashSet::new(),
+            &cx,
+            Instant::now(),
+            Duration::from_secs(60),
+            || {
+                reads += 1;
+                cx.cancel_with(frankenterm_core::outcome::CancelKind::User, None);
+                Ok(Vec::new())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(reads, 1);
+        assert!(error.to_string().contains("adoption cancelled"));
+    }
+
+    #[test]
+    fn adoption_census_failure_is_not_an_empty_success() {
+        let mut reads = 0;
+        let error = census_for_unnamed_guardian_adoption(
+            id(0x914),
+            &std::collections::HashSet::new(),
+            &frankenterm_core::cx::Cx::for_testing(),
+            Instant::now(),
+            Duration::from_secs(60),
+            || {
+                reads += 1;
+                Err(GuardianClientError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "census disconnected",
+                )))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(reads, 1);
+        assert!(format!("{error:#}").contains("census disconnected"));
+    }
+
+    #[test]
+    fn rootless_adoption_preserves_partial_success_without_claiming_full_recovery() {
+        assert_eq!(
+            GuardianAdoptionOutcome::default()
+                .require_rootless_startup()
+                .unwrap(),
+            0
+        );
+        for outcome in [
+            GuardianAdoptionOutcome {
+                held: 1,
+                ..Default::default()
+            },
+            GuardianAdoptionOutcome {
+                ineligible: 1,
+                ..Default::default()
+            },
+            GuardianAdoptionOutcome {
+                failed: 1,
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                outcome
+                    .require_rootless_startup()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("refusing an empty mux start")
+            );
+        }
+        let partial = GuardianAdoptionOutcome {
+            adopted: 1,
+            held: 2,
+            ineligible: 1,
+            failed: 1,
+        };
+        assert_eq!(partial.remaining_live(), 4);
+        assert_eq!(partial.require_rootless_startup().unwrap(), 1);
+    }
+
+    #[test]
+    fn rootless_adoption_refuses_empty_startup_after_ineligible_or_failed_live_panes() {
+        use mux::guardian_protocol::{
+            GUARDIAN_MAX_FRAME_BYTES, GuardianOperation, GuardianResponseEnvelope, GuardianSecret,
+            decode_guardian_request, encode_guardian_response,
+        };
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        fn receive(stream: &mut UnixStream) -> Vec<u8> {
+            let mut prefix = [0; 4];
+            stream.read_exact(&mut prefix).expect("adoption request prefix");
+            let length = u32::from_be_bytes(prefix) as usize;
+            assert!(length + 4 <= GUARDIAN_MAX_FRAME_BYTES);
+            let mut frame = vec![0; length + 4];
+            frame[..4].copy_from_slice(&prefix);
+            stream
+                .read_exact(&mut frame[4..])
+                .expect("adoption request body");
+            frame
+        }
+
+        // Exercise the public rootless startup seam over authenticated census
+        // frames. No PTY or replacement child is created by this fixture.
+        for (generation, expected_reason) in [(0, "1 ineligible"), (1, "1 failed")] {
+            let directory = tempfile::Builder::new()
+                .prefix("ft-adoption-refusal-")
+                .permissions(std::fs::Permissions::from_mode(0o700))
+                .tempdir_in(std::fs::canonicalize("/tmp").unwrap())
+                .unwrap()
+                .keep();
+            let socket = directory.join("guardian.sock");
+            let token = directory.join("token");
+            frankenterm_pty_guardian::provision_guardian_token(&token).unwrap();
+            let secret =
+                GuardianSecret::from_bytes(std::fs::read(&token).unwrap().try_into().unwrap())
+                    .unwrap();
+            let listener = UnixListener::bind(&socket).unwrap();
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let guardian = Uuid::new_v4();
+            let owner = Arc::new(Mux::new(None));
+            let domain: Arc<dyn Domain> =
+                Arc::new(GuardianDomain::new(&owner, socket.clone(), token.clone()).unwrap());
+            owner.add_domain(&domain).unwrap();
+            let target =
+                Uuid::from_bytes(owner.topology_snapshot_authority().unwrap().0.as_bytes());
+            let mut entry = adoption_census_entry();
+            entry.generation = generation;
+            let server = thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                // An eligible pane opens its coordinator, then fails to find
+                // authenticated spawn custody before it can issue any Claim.
+                let connections = if generation == 0 { 1 } else { 2 };
+                for connection in 0..connections {
+                    let mut stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                assert!(Instant::now() < deadline, "bounded adoption accept");
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(error) => panic!("adoption accept: {error}"),
+                        }
+                    };
+                    // macOS accepted sockets can inherit the listener's O_NONBLOCK.
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let hello = decode_guardian_request(&secret, &receive(&mut stream)).unwrap();
+                    assert_eq!(hello.header().operation, GuardianOperation::Hello);
+                    assert_eq!(hello.header().mux_incarnation, target);
+                    let response = GuardianResponseEnvelope::reply(
+                        &hello,
+                        &GuardianReply::Hello {
+                            guardian_incarnation: guardian,
+                        },
+                    )
+                    .unwrap();
+                    stream
+                        .write_all(&encode_guardian_response(&secret, &response).unwrap())
+                        .unwrap();
+                    if connection == 0 {
+                        let request =
+                            decode_guardian_request(&secret, &receive(&mut stream)).unwrap();
+                        assert_eq!(request.header().operation, GuardianOperation::Census);
+                        assert_eq!(request.header().mux_incarnation, target);
+                        let response = GuardianResponseEnvelope::reply(
+                            &request,
+                            &GuardianReply::CensusPage {
+                                snapshot_id: id(0x916),
+                                entries: vec![entry.clone()],
+                                next_cursor: None,
+                                total_panes: 1,
+                            },
+                        )
+                        .unwrap();
+                        stream
+                            .write_all(&encode_guardian_response(&secret, &response).unwrap())
+                            .unwrap();
+                    }
+                    let mut unexpected = [0; 1];
+                    assert_eq!(
+                        stream.read(&mut unexpected).unwrap(),
+                        0,
+                        "refused startup must not issue a Claim or Spawn"
+                    );
+                }
+                assert!(
+                    matches!(
+                        listener.accept(),
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock
+                    ),
+                    "refused startup must not open another guardian connection"
+                );
+            });
+            let result = adopt_without_recovery_root(
+                &owner,
+                &socket,
+                &token,
+                TerminalCheckpointLimits::default(),
+            );
+            server.join().unwrap();
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("refusing an empty mux start"), "{error}");
+            assert!(error.contains(expected_reason), "{error}");
+            assert!(owner.iter_panes().is_empty());
+            assert!(owner.iter_windows().is_empty());
         }
     }
 
