@@ -74,6 +74,7 @@ use crate::ingest::{
     PaneRegistry, PersistedCapture, bounded_segment_for_persistence,
     persist_authorized_captured_segment_with_zone_and_recorder_delivery_with_cx,
     persist_authorized_captured_segment_with_zone_with_cx,
+    persist_identified_captured_segment_with_zone_with_cx,
 };
 use crate::lru_cache::LruCache;
 use crate::memory_budget::BudgetLevel;
@@ -384,7 +385,21 @@ async fn persist_captured_segment_for_runtime(
     zone_type: Option<&str>,
     recorder_delivery: Option<crate::storage::RecorderDeliverySeed>,
     persistence_guard: &CapturePersistenceGuard,
+    capture_uuid: Option<&str>,
 ) -> Result<PersistedCapture> {
+    if let Some(capture_uuid) = capture_uuid {
+        return persist_identified_captured_segment_with_zone_with_cx(
+            runtime_cx,
+            storage,
+            captured,
+            max_segment_bytes,
+            zone_type,
+            recorder_delivery,
+            persistence_guard,
+            capture_uuid,
+        )
+        .await;
+    }
     match recorder_delivery {
         Some(recorder_delivery) => {
             persist_authorized_captured_segment_with_zone_and_recorder_delivery_with_cx(
@@ -7196,47 +7211,9 @@ impl ObservationRuntime {
                             &previous_capture_view,
                             &pre_storage_view,
                         );
-                        // Resolve stored UUIDs before the first ready publication. Capture
-                        // snapshots the UUID and generation under the registry
-                        // lock; publishing a generated UUID and adopting the
-                        // stable one after an await lets a producer advance its
-                        // cursor under metadata that persistence must reject.
-                        let candidate_new_panes = {
-                            let reg = registry.read().await;
-                            panes
-                                .iter()
-                                .filter(|observation| {
-                                    reg.get_entry(observation.pane.pane_id).is_none()
-                                })
-                                .map(|observation| observation.pane.pane_id)
-                                .collect::<Vec<_>>()
-                        };
-                        let stable_pane_records = if candidate_new_panes.is_empty() {
-                            Vec::new()
-                        } else {
-                            match storage
-                                .get_panes_by_ids_with_cx(&loop_cx, &candidate_new_panes)
-                                .await
-                            {
-                                Ok(records) => records,
-                                Err(error) => {
-                                    warn!(
-                                        candidate_count = candidate_new_panes.len(),
-                                        error = %error,
-                                        "Discovery remains pending because stable pane UUID recovery failed"
-                                    );
-                                    continue;
-                                }
-                            }
-                        };
-                        let mut stable_uuids = stable_pane_records
-                            .into_iter()
-                            .filter_map(|record| {
-                                record
-                                    .pane_uuid
-                                    .map(|pane_uuid| (record.pane_id, pane_uuid))
-                            })
-                            .collect::<HashMap<_, _>>();
+                        // A numeric pane ID cannot recover capture identity. New
+                        // lifetimes stay unpublished until setup below verifies
+                        // the native registration and commits its binding.
                         metadata_writes.age_one_tick();
                         // Direct-mux listings report alternate-screen state.
                         // Vendored capture stores rendered rows, so this is the
@@ -7261,32 +7238,6 @@ impl ObservationRuntime {
                             for pane_id in confirmed_terminal {
                                 unresolved_barrier_predecessors.remove(&pane_id);
                             }
-                            for pane_id in &diff.new_panes {
-                                let Some(stable_uuid) = stable_uuids.remove(pane_id) else {
-                                    continue;
-                                };
-                                let Some(generated_uuid) =
-                                    reg.get_entry(*pane_id).map(|entry| entry.pane_uuid.clone())
-                                else {
-                                    continue;
-                                };
-                                if stable_uuid == generated_uuid {
-                                    continue;
-                                }
-                                debug!(
-                                    pane_id,
-                                    old_uuid = %generated_uuid,
-                                    new_uuid = %stable_uuid,
-                                    "Adopting stable UUID before registry publication"
-                                );
-                                if !reg.adopt_uuid(*pane_id, stable_uuid.clone()) {
-                                    warn!(
-                                        pane_id,
-                                        rejected_uuid = %stable_uuid,
-                                        "Rejected stable UUID adoption due to registry collision"
-                                    );
-                                }
-                            }
                             // Observation can end without a numeric pane close.
                             // Retire active capture bookkeeping while retaining
                             // only the typed lifecycle witness needed to resume
@@ -7297,6 +7248,36 @@ impl ObservationRuntime {
                                 &discovery_revisions,
                                 &mut suspended_capture_continuity,
                             );
+                            // Only a validated policy-pause witness can keep an
+                            // unidentified in-process capture lifetime. A reused
+                            // numeric pane or uncertain re-admission gets a fresh
+                            // capture UUID; output sequence numbers stay monotone.
+                            let capture_uuid_replacements = diff
+                                .lifecycle_replacements
+                                .iter()
+                                .chain(diff.re_observed_panes.iter().filter(|pane_id| {
+                                    !durable_anchor_predecessors.contains_key(*pane_id)
+                                }))
+                                .copied()
+                                .collect::<HashSet<_>>();
+                            for pane_id in capture_uuid_replacements {
+                                let Some(entry) = reg.get_entry(pane_id) else {
+                                    continue;
+                                };
+                                let capture_uuid = crate::ingest::generate_pane_uuid(
+                                    &entry.info.inferred_domain(),
+                                    pane_id,
+                                    entry.last_seen_at,
+                                );
+                                if !reg.adopt_uuid(pane_id, capture_uuid) {
+                                    error!(
+                                        pane_id,
+                                        "Cannot rotate replacement capture identity; stopping the runtime"
+                                    );
+                                    shutdown_flag.store(true, Ordering::SeqCst);
+                                    break 'discovery;
+                                }
+                            }
                             retain_observed_capture_bookkeeping(
                                 &reg,
                                 &mut discovery_revisions,
@@ -7567,18 +7548,6 @@ impl ObservationRuntime {
                                 continue;
                             };
 
-                            if let Err(error) = storage
-                                .upsert_pane_with_cx(&loop_cx, entry.to_pane_record())
-                                .await
-                            {
-                                error!(
-                                    pane_id,
-                                    error = %error,
-                                    "Capture setup remains pending because pane upsert failed"
-                                );
-                                continue;
-                            }
-                            metadata_writes.remove(pane_id);
                             if !entry.should_observe() {
                                 capture_setup_pending.remove(&pane_id);
                                 continue;
@@ -7590,6 +7559,120 @@ impl ObservationRuntime {
                                 );
                                 continue;
                             };
+                            let native_identity =
+                                match entry.lifecycle_identity.native_registration {
+                                    Some(expected_registration) => {
+                                        match wezterm
+                                            .pane_native_identity_with_cx(&loop_cx, pane_id)
+                                            .await
+                                        {
+                                            Ok(Some(identity))
+                                                if identity.is_valid()
+                                                    && identity.registration()
+                                                        == Some(expected_registration) =>
+                                            {
+                                                Some(identity)
+                                            }
+                                            Ok(_) => {
+                                                warn!(
+                                                    pane_id,
+                                                    "Capture setup remains pending because native identity no longer matches discovery"
+                                                );
+                                                continue;
+                                            }
+                                            Err(error) => {
+                                                warn!(
+                                                    pane_id,
+                                                    error = %error,
+                                                    "Capture setup remains pending because native identity could not be verified"
+                                                );
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    // Legacy backends explicitly remain unknown.
+                                    // They cannot recover a prior capture merely
+                                    // by finding the same numeric pane ID.
+                                    None => None,
+                                };
+                            let binding = match storage
+                                .prepare_pane_capture_with_cx(
+                                    &loop_cx,
+                                    entry.to_pane_record(),
+                                    native_identity,
+                                    reason == "observation_started",
+                                )
+                                .await
+                            {
+                                Ok(binding) => binding,
+                                Err(error) => {
+                                    let indeterminate = matches!(
+                                        &error,
+                                        crate::Error::Storage(
+                                            crate::error::StorageError::WriterSettlementIndeterminate {
+                                                ..
+                                            } | crate::error::StorageError::WriterBackendEpochPoisoned
+                                        )
+                                    );
+                                    error!(
+                                        pane_id,
+                                        error = %error,
+                                        indeterminate,
+                                        "Capture setup could not establish durable identity"
+                                    );
+                                    if indeterminate {
+                                        // Preparation may already have committed.
+                                        // Retrying an unidentified UUID must not
+                                        // manufacture proof of restart continuity.
+                                        shutdown_flag.store(true, Ordering::SeqCst);
+                                        break 'discovery;
+                                    }
+                                    continue;
+                                }
+                            };
+                            let (adopted, refreshed_metadata) = {
+                                let mut reg = registry.write().await;
+                                let still_current = reg.get_entry(pane_id).is_some_and(|current| {
+                                    current.should_observe()
+                                        && current.lifecycle_revision == entry.lifecycle_revision
+                                        && current.pane_uuid == entry.pane_uuid
+                                        && current.lifecycle_identity == entry.lifecycle_identity
+                                });
+                                if still_current && reg.adopt_uuid(pane_id, binding.capture_uuid) {
+                                    // Display metadata is not lifecycle evidence.
+                                    // Keep newer metadata without abandoning an
+                                    // acknowledged capture binding: a legacy
+                                    // retry cannot recover an existing UUID.
+                                    let refreshed = reg.get_entry(pane_id).and_then(|current| {
+                                        (current.metadata_revision != entry.metadata_revision)
+                                            .then(|| {
+                                                (
+                                                    PaneMetadataChange {
+                                                        pane_id,
+                                                        lifecycle_revision: current.lifecycle_revision,
+                                                        metadata_revision: current.metadata_revision,
+                                                        diff: Default::default(),
+                                                    },
+                                                    current.to_pane_record(),
+                                                )
+                                            })
+                                    });
+                                    (true, refreshed)
+                                } else {
+                                    (false, None)
+                                }
+                            };
+                            if !adopted {
+                                warn!(
+                                    pane_id,
+                                    "Capture setup remains pending because its registry lifetime changed"
+                                );
+                                continue;
+                            }
+                            metadata_writes.remove(pane_id);
+                            if let Some((change, record)) = refreshed_metadata {
+                                metadata_writes.stage(change, record);
+                            }
                             capture_setup_pending.remove(&pane_id);
                             info!(
                                 pane_id,
@@ -7611,6 +7694,12 @@ impl ObservationRuntime {
 
                         let mut metadata_committed_this_tick = 0_usize;
                         for (pane_id, write) in metadata_writes.take_due() {
+                            if capture_setup_pending.contains_key(&pane_id) {
+                                // Preserve the prior durable UUID until capture
+                                // setup has made its exact continuity decision.
+                                metadata_writes.retry(pane_id, write);
+                                continue;
+                            }
                             let still_current = {
                                 let reg = registry.read().await;
                                 reg.get_entry(pane_id).is_some_and(|entry| {
@@ -10190,6 +10279,7 @@ impl ObservationRuntime {
                             prepared.1.as_deref(),
                             prepared.2.clone(),
                             &prepared.3,
+                            Some(&prepared.4.pane_uuid),
                         )
                         .await;
                         (prepared, result)
@@ -16453,10 +16543,7 @@ mod tests {
             let successor_revision = DiscoveryRevision(11);
             let (_dir, db_path) = temp_db_path();
             let storage = StorageHandle::new(&db_path).await.expect("test storage");
-            storage
-                .upsert_pane(test_pane_record(pane_id))
-                .await
-                .expect("persist test pane");
+            let predecessor_uuid = prepare_runtime_test_capture(&storage, pane_id).await;
 
             let event_bus = Arc::new(EventBus::new(16));
             let mut event_subscriber = event_bus.subscribe();
@@ -16489,7 +16576,7 @@ mod tests {
             runtime.capture_metadata.write().await.insert(
                 predecessor.pane_incarnation(),
                 CapturePaneMetadata {
-                    pane_uuid: "predecessor-uuid".to_string(),
+                    pane_uuid: predecessor_uuid.clone(),
                     discovery_generation: 0,
                     discovery_revision: predecessor_revision,
                 },
@@ -16503,7 +16590,7 @@ mod tests {
                         info: make_pane(pane_id, "predecessor"),
                         lifecycle_identity: test_lifecycle_identity(pane_id),
                         lifecycle_revision: PaneLifecycleRevision::new(0),
-                        pane_uuid: "predecessor-uuid".to_string(),
+                        pane_uuid: predecessor_uuid,
                         revision: predecessor_revision,
                         requires_storage_resync: false,
                     },
@@ -16521,6 +16608,7 @@ mod tests {
                 test_capture_event_for_lease(pane_id, 1, &predecessor_lease)
                     .with_resync_decision(spsc_decision);
 
+            let successor_uuid = prepare_runtime_test_capture(&storage, pane_id).await;
             publication_tx
                 .send(DiscoveryCapturePublication {
                     epoch: 2,
@@ -16530,7 +16618,7 @@ mod tests {
                             info: make_pane(pane_id, "successor"),
                             lifecycle_identity: test_lifecycle_identity(pane_id),
                             lifecycle_revision: PaneLifecycleRevision::new(1),
-                            pane_uuid: "successor-uuid".to_string(),
+                            pane_uuid: successor_uuid.clone(),
                             revision: successor_revision,
                             requires_storage_resync: true,
                         },
@@ -16558,7 +16646,7 @@ mod tests {
             runtime.capture_metadata.write().await.insert(
                 successor.pane_incarnation(),
                 CapturePaneMetadata {
-                    pane_uuid: "successor-uuid".to_string(),
+                    pane_uuid: successor_uuid,
                     discovery_generation: 1,
                     discovery_revision: successor_revision,
                 },
@@ -17549,6 +17637,17 @@ mod tests {
         );
     }
 
+    async fn prepare_runtime_test_capture(storage: &StorageHandle, pane_id: u64) -> String {
+        let capture_uuid = crate::ingest::generate_pane_uuid("test", pane_id, 0);
+        let mut pane = test_pane_record(pane_id);
+        pane.pane_uuid = Some(capture_uuid.clone());
+        storage
+            .prepare_pane_capture_with_cx(&crate::cx::for_testing(), pane, None, false)
+            .await
+            .expect("prepare immutable test capture");
+        capture_uuid
+    }
+
     #[test]
     fn all_capture_source_kinds_share_one_authorized_replay_egress_boundary() {
         run_async_test_isolated(|| async {
@@ -17556,10 +17655,7 @@ mod tests {
             let revision = DiscoveryRevision(30);
             let (_dir, db_path) = temp_db_path();
             let storage = StorageHandle::new(&db_path).await.expect("test storage");
-            storage
-                .upsert_pane(test_pane_record(pane_id))
-                .await
-                .expect("persist test pane");
+            let capture_uuid = prepare_runtime_test_capture(&storage, pane_id).await;
 
             let replay_sink = Arc::new(crate::replay_capture::CollectingCaptureSink::new());
             let replay_adapter = Arc::new(
@@ -17597,7 +17693,7 @@ mod tests {
             runtime.capture_metadata.write().await.insert(
                 pane.pane_incarnation(),
                 CapturePaneMetadata {
-                    pane_uuid: "all-source-kinds".to_string(),
+                    pane_uuid: capture_uuid.clone(),
                     discovery_generation: 4,
                     discovery_revision: revision,
                 },
@@ -17610,7 +17706,7 @@ mod tests {
                         info: make_pane(pane_id, "all-source-kinds"),
                         lifecycle_identity: test_lifecycle_identity(pane_id),
                         lifecycle_revision: PaneLifecycleRevision::new(4),
-                        pane_uuid: "all-source-kinds".to_string(),
+                        pane_uuid: capture_uuid.clone(),
                         revision,
                         requires_storage_resync: false,
                     },
@@ -17750,10 +17846,7 @@ mod tests {
             let revision = DiscoveryRevision(31);
             let (_storage_dir, db_path) = temp_db_path();
             let storage = StorageHandle::new(&db_path).await.expect("test storage");
-            storage
-                .upsert_pane(test_pane_record(pane_id))
-                .await
-                .expect("persist test pane");
+            let capture_uuid = prepare_runtime_test_capture(&storage, pane_id).await;
 
             let recorder_dir = tempfile::tempdir().expect("recorder backend tempdir");
             let selected_data_path = recorder_dir.path().join("selected/events.log");
@@ -17813,7 +17906,7 @@ mod tests {
             runtime.capture_metadata.write().await.insert(
                 pane.pane_incarnation(),
                 CapturePaneMetadata {
-                    pane_uuid: "selected-recorder-pane".to_string(),
+                    pane_uuid: capture_uuid.clone(),
                     discovery_generation: 5,
                     discovery_revision: revision,
                 },
@@ -17826,7 +17919,7 @@ mod tests {
                         info: make_pane(pane_id, "selected-recorder-pane"),
                         lifecycle_identity: test_lifecycle_identity(pane_id),
                         lifecycle_revision: PaneLifecycleRevision::new(5),
-                        pane_uuid: "selected-recorder-pane".to_string(),
+                        pane_uuid: capture_uuid.clone(),
                         revision,
                         requires_storage_resync: false,
                     },
@@ -18101,11 +18194,12 @@ mod tests {
                     .with_subscriber(subscriber)
                     .await
                     .unwrap();
+                let mut capture_uuids = HashMap::new();
                 for pane_id in [501, 502] {
-                    storage
-                        .upsert_pane(test_pane_record(pane_id))
-                        .await
-                        .unwrap();
+                    capture_uuids.insert(
+                        pane_id,
+                        prepare_runtime_test_capture(&storage, pane_id).await,
+                    );
                 }
                 if fail_ack {
                     let db = rusqlite::Connection::open(&db_path).unwrap();
@@ -18151,7 +18245,7 @@ mod tests {
                     runtime.capture_metadata.write().await.insert(
                         identity.pane_incarnation(),
                         CapturePaneMetadata {
-                            pane_uuid: format!("batch-{pane_id}"),
+                            pane_uuid: capture_uuids[&pane_id].clone(),
                             discovery_generation: 1,
                             discovery_revision: revision,
                         },
@@ -18167,7 +18261,7 @@ mod tests {
                             info: make_pane(pane_id, &format!("batch-{pane_id}")),
                             lifecycle_identity: test_lifecycle_identity(pane_id),
                             lifecycle_revision: PaneLifecycleRevision::new(1),
-                            pane_uuid: format!("batch-{pane_id}"),
+                            pane_uuid: capture_uuids[&pane_id].clone(),
                             revision,
                             requires_storage_resync: false,
                         },
@@ -19779,6 +19873,7 @@ mod tests {
                             None,
                             None,
                             &guard,
+                            None,
                         )
                         .await
                         .unwrap();
@@ -19828,6 +19923,7 @@ mod tests {
                     None,
                     None,
                     &guard,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -26319,12 +26415,8 @@ mod tests {
 
             let (_dir, db_path) = temp_db_path();
             let storage = StorageHandle::new(&db_path).await.expect("test storage");
-            for pane_id in [global_zero, global_one] {
-                storage
-                    .upsert_pane(test_pane_record(pane_id))
-                    .await
-                    .expect("persist sharded test pane");
-            }
+            let capture_zero = prepare_runtime_test_capture(&storage, global_zero).await;
+            let capture_one = prepare_runtime_test_capture(&storage, global_one).await;
             let wezterm: WeztermHandle = Arc::new(crate::wezterm::MockWezterm::new());
             let runtime = ObservationRuntime::new(
                 RuntimeConfig::default(),
@@ -26371,7 +26463,7 @@ mod tests {
                 (
                     pane_zero.pane_incarnation(),
                     CapturePaneMetadata {
-                        pane_uuid: "shard-zero-uuid".to_string(),
+                        pane_uuid: capture_zero.clone(),
                         discovery_generation: 2,
                         discovery_revision: revision_zero,
                     },
@@ -26379,7 +26471,7 @@ mod tests {
                 (
                     pane_one.pane_incarnation(),
                     CapturePaneMetadata {
-                        pane_uuid: "shard-one-uuid".to_string(),
+                        pane_uuid: capture_one.clone(),
                         discovery_generation: 4,
                         discovery_revision: revision_one,
                     },
@@ -26394,7 +26486,7 @@ mod tests {
                             info: make_pane(global_zero, "shard-zero"),
                             lifecycle_identity: test_lifecycle_identity(global_zero),
                             lifecycle_revision: PaneLifecycleRevision::new(2),
-                            pane_uuid: "shard-zero-uuid".to_string(),
+                            pane_uuid: capture_zero.clone(),
                             revision: revision_zero,
                             requires_storage_resync: false,
                         },
@@ -26405,7 +26497,7 @@ mod tests {
                             info: make_pane(global_one, "shard-one"),
                             lifecycle_identity: test_lifecycle_identity(global_one),
                             lifecycle_revision: PaneLifecycleRevision::new(4),
-                            pane_uuid: "shard-one-uuid".to_string(),
+                            pane_uuid: capture_one.clone(),
                             revision: revision_one,
                             requires_storage_resync: false,
                         },

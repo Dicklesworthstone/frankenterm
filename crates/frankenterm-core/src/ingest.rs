@@ -2354,6 +2354,7 @@ pub async fn persist_captured_segment_with_zone_with_cx(
         zone_type,
         None,
         None,
+        None,
     )
     .await
 }
@@ -2376,6 +2377,7 @@ pub(crate) async fn persist_authorized_captured_segment_with_zone_with_cx(
         zone_type,
         None,
         Some(guard),
+        None,
     )
     .await
 }
@@ -2399,6 +2401,33 @@ pub(crate) async fn persist_authorized_captured_segment_with_zone_and_recorder_d
         zone_type,
         Some(recorder_delivery),
         Some(guard),
+        None,
+    )
+    .await
+}
+
+/// Persist an admitted capture with the producer identity fixed before queueing.
+/// The segment, its provenance and any selected-recorder obligation commit
+/// together; storage never infers this identity from the current numeric pane.
+pub(crate) async fn persist_identified_captured_segment_with_zone_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    captured: &CapturedSegment,
+    max_segment_bytes: usize,
+    zone_type: Option<&str>,
+    recorder_delivery: Option<crate::storage::RecorderDeliverySeed>,
+    guard: &crate::capture_authority::CapturePersistenceGuard,
+    capture_uuid: &str,
+) -> Result<PersistedCapture> {
+    persist_captured_segment_with_zone_and_guard_with_cx(
+        cx,
+        storage,
+        captured,
+        max_segment_bytes,
+        zone_type,
+        recorder_delivery,
+        Some(guard),
+        Some(capture_uuid),
     )
     .await
 }
@@ -2411,9 +2440,18 @@ async fn persist_captured_segment_with_zone_and_guard_with_cx(
     zone_type: Option<&str>,
     recorder_delivery: Option<crate::storage::RecorderDeliverySeed>,
     guard: Option<&crate::capture_authority::CapturePersistenceGuard>,
+    capture_uuid: Option<&str>,
 ) -> Result<PersistedCapture> {
     cx.checkpoint()
         .map_err(|err| ingest_cancelled_error("persist_captured_segment", err))?;
+
+    if capture_uuid.is_some() && guard.is_none() {
+        // Reject before even the pre-append gap write. An identity alone is
+        // not authority to persist a capture from a retired producer.
+        return Err(crate::Error::Storage(crate::error::StorageError::Database(
+            "capture identity requires capture persistence authority".to_string(),
+        )));
+    }
 
     let (bounded_segment, truncation) =
         enforce_segment_size_for_persistence(captured, max_segment_bytes);
@@ -2461,6 +2499,7 @@ async fn persist_captured_segment_with_zone_and_guard_with_cx(
         stored_zone_type,
         recorder_delivery,
         guard,
+        capture_uuid,
     )
     .await?;
 
@@ -2581,12 +2620,28 @@ async fn append_segment_with_optional_capture_hold(
     zone_type: Option<&str>,
     recorder_delivery: Option<crate::storage::RecorderDeliverySeed>,
     guard: Option<&crate::capture_authority::CapturePersistenceGuard>,
+    capture_uuid: Option<&str>,
 ) -> Result<Segment> {
     retry_capture_append(cx, || async {
         // Each admitted attempt consumes its own delegated hold. Keep the
-        // parent authority and immutable recorder identity across safe retries.
-        match (guard, recorder_delivery.clone()) {
-            (Some(guard), Some(recorder_delivery)) => {
+        // parent authority and immutable producer/recorder identities across
+        // safe retries, including after mutable pane metadata has changed.
+        match (guard, recorder_delivery.clone(), capture_uuid) {
+            (Some(guard), recorder_delivery, Some(capture_uuid)) => {
+                storage
+                    .append_captured_segment_with_identity_with_cx(
+                        cx,
+                        pane_id,
+                        content,
+                        None,
+                        zone_type,
+                        recorder_delivery,
+                        guard.delegate_storage()?,
+                        capture_uuid,
+                    )
+                    .await
+            }
+            (Some(guard), Some(recorder_delivery), None) => {
                 storage
                     .append_captured_segment_with_recorder_delivery_with_cx(
                         cx,
@@ -2599,7 +2654,7 @@ async fn append_segment_with_optional_capture_hold(
                     )
                     .await
             }
-            (Some(guard), None) => {
+            (Some(guard), None, None) => {
                 storage
                     .append_captured_segment_with_zone_with_cx(
                         cx,
@@ -2611,12 +2666,15 @@ async fn append_segment_with_optional_capture_hold(
                     )
                     .await
             }
-            (None, None) => {
+            (None, None, None) => {
                 storage
                     .append_segment_with_zone_with_cx(cx, pane_id, content, None, zone_type)
                     .await
             }
-            (None, Some(_)) => Err(crate::Error::Storage(crate::error::StorageError::Database(
+            (None, _, Some(_)) => Err(crate::Error::Storage(crate::error::StorageError::Database(
+                "capture identity requires capture persistence authority".to_string(),
+            ))),
+            (None, Some(_), None) => Err(crate::Error::Storage(crate::error::StorageError::Database(
                 "recorder delivery seed requires capture persistence authority".to_string(),
             ))),
         }
@@ -5450,6 +5508,164 @@ mod tests {
                 )
                 .expect("read stamped zone_type");
             assert_eq!(zone_type.as_deref(), Some("output"));
+            cleanup_db(&db_path);
+        });
+    }
+
+    #[test]
+    fn queued_capture_keeps_its_producer_identity_after_numeric_pane_replacement() {
+        use crate::capture_authority::{CaptureAuthority, CaptureSourceKind};
+
+        run_async_test(async {
+            let db_path = temp_db_path();
+            let handle = StorageHandle::new(&db_path).await.unwrap();
+            let cx = crate::cx::for_request();
+            let mut pane = test_pane_record(1);
+            pane.pane_uuid = Some("11111111111111111111111111111111".to_string());
+            let original = handle
+                .prepare_pane_capture_with_cx(&cx, pane, None, false)
+                .await
+                .unwrap();
+            let authority = CaptureAuthority::new();
+            let pane_identity = authority.activate_pane(1).unwrap();
+            let lease = authority
+                .issue_source(pane_identity, CaptureSourceKind::Polling)
+                .unwrap();
+            let guard = lease.try_acquire_persistence(lease.stamp(), 1).unwrap();
+            let mut cursor = PaneCursor::new(1);
+            let queued = cursor
+                .capture_snapshot("queued original output\n", 1024, None)
+                .unwrap();
+
+            // Discovery can update the row while previously admitted output
+            // still awaits the storage writer. Numeric pane equality must not
+            // relabel that output as belonging to the replacement producer.
+            let mut successor = test_pane_record(1);
+            successor.pane_uuid = Some("22222222222222222222222222222222".to_string());
+            let replacement = handle
+                .prepare_pane_capture_with_cx(&cx, successor, None, false)
+                .await
+                .unwrap();
+            assert_ne!(original.capture_uuid, replacement.capture_uuid);
+            let stored = persist_identified_captured_segment_with_zone_with_cx(
+                &cx,
+                &handle,
+                &queued,
+                TEST_MAX_PERSIST_SEGMENT_BYTES,
+                Some("output"),
+                None,
+                &guard,
+                &original.capture_uuid,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                handle
+                    .get_segment_capture_identity_with_cx(&cx, stored.segment.id)
+                    .await
+                    .unwrap(),
+                Some(original)
+            );
+
+            let legacy = cursor
+                .capture_snapshot("queued original output\nlegacy output\n", 1024, None)
+                .unwrap();
+            let legacy = persist_captured_segment_with_cx(
+                &cx,
+                &handle,
+                &legacy,
+                TEST_MAX_PERSIST_SEGMENT_BYTES,
+            )
+            .await
+            .unwrap();
+            assert!(
+                handle
+                    .get_segment_capture_identity_with_cx(&cx, legacy.segment.id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "legacy callers must not invent provenance from the current pane"
+            );
+            drop(guard);
+            handle.shutdown().await.unwrap();
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let current_uuid: String = conn
+                .query_row(
+                    "SELECT pane_uuid FROM panes WHERE pane_id = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(current_uuid, replacement.capture_uuid);
+            let zone: String = conn
+                .query_row(
+                    "SELECT zone_type FROM output_segments WHERE id = ?1",
+                    [stored.segment.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(zone, "output");
+            drop(conn);
+            cleanup_db(&db_path);
+        });
+    }
+
+    #[test]
+    fn capture_identity_without_authority_is_rejected_before_any_gap_write() {
+        run_async_test(async {
+            let db_path = temp_db_path();
+            let handle = StorageHandle::new(&db_path).await.unwrap();
+            handle.upsert_pane(test_pane_record(1)).await.unwrap();
+            let cx = crate::cx::for_request();
+            let mut cursor = PaneCursor::new(1);
+            let initial = cursor.capture_snapshot("prior output\n", 1024, None).unwrap();
+            persist_captured_segment_with_cx(
+                &cx,
+                &handle,
+                &initial,
+                TEST_MAX_PERSIST_SEGMENT_BYTES,
+            )
+            .await
+            .unwrap();
+            let rejected = CapturedSegment {
+                pane_id: 1,
+                seq: 1,
+                seq_correction: 0,
+                content: "unadmitted output\n".to_string(),
+                kind: CapturedSegmentKind::Gap {
+                    reason: "unadmitted discontinuity".to_string(),
+                },
+                captured_at: epoch_ms(),
+            };
+            let error = persist_captured_segment_with_zone_and_guard_with_cx(
+                &cx,
+                &handle,
+                &rejected,
+                TEST_MAX_PERSIST_SEGMENT_BYTES,
+                None,
+                None,
+                None,
+                Some("11111111111111111111111111111111"),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                crate::Error::Storage(crate::error::StorageError::Database(message))
+                    if message == "capture identity requires capture persistence authority"
+            ));
+            assert_eq!(handle.get_segments(1, 10).await.unwrap().len(), 1);
+            handle.shutdown().await.unwrap();
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let gap_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM output_gaps WHERE pane_id = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(gap_count, 0, "rejection must precede the pre-append gap effect");
+            drop(conn);
             cleanup_db(&db_path);
         });
     }
