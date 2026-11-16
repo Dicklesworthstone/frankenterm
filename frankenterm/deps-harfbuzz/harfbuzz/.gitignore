@@ -1,9 +1,0 @@
-# Only track src/ (needed for build) — exclude test data, docs, CI
-/.ci/
-/.circleci/
-/.github/
-/docs/
-/perf/
-/subprojects/
-/test/
-/util/

@@ -1,1 +1,0 @@
-pipe-pane -o -t %1 "cat > /tmp/ft-pane.log"

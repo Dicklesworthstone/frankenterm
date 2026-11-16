@@ -1,7 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc af048988f62f682f15b85c1fe192e54fad5bfc6deb8cf0e489536d75df3a1889 # shrinks to entries = [(ChangeDetection, 1, "0AaA ", {"aa": Number(242.88605265753458)}, Support)]

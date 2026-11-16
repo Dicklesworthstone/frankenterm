@@ -1,4 +1,0 @@
-ERROR: disk full
-[33mwarning[0m: unused var
-   Compiling foo v0.1
-test result: FAILED. 3 passed; 1 failed

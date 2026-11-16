@@ -1,8 +1,0 @@
-[[artifacts]]
-path = "trace.ftreplay"
-
-[config]
-concurrency = 1
-
-[config.deep.unknown.nested.table]
-ignored = true

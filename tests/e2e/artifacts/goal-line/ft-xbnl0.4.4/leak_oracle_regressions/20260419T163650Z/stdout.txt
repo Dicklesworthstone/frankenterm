@@ -1,3 +1,0 @@
-=== ft-xbnl0.4.4 deterministic leak-oracle regressions ===
-PASS source_audit
-PASS rustfmt_check

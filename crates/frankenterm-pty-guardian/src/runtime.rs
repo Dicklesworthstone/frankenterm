@@ -8091,6 +8091,11 @@ mod tests {
                 b"br".as_slice(),
             ),
             (
+                BrokerInputTestReply::AlreadyPoisoned,
+                Some(GuardianInputDisposition::KnownNotApplied),
+                b"".as_slice(),
+            ),
+            (
                 BrokerInputTestReply::LostAfterApply,
                 None,
                 payload.as_slice(),
@@ -8172,6 +8177,16 @@ mod tests {
                             .unwrap(),
                         GuardianRejectionCode::InputKnownNotApplied,
                         "{reply:?}"
+                    );
+                    assert!(
+                        matches!(
+                            job.protocol.pane_state(pane_id),
+                            Some(GuardianPaneState::LiveClaimed {
+                                pending_input_effect: None,
+                                ..
+                            })
+                        ),
+                        "a known-zero input must not fence the pane: {reply:?}"
                     );
                 }
                 Some(disposition) => {

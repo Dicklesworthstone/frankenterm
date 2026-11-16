@@ -1,6 +1,0 @@
-{
-  "timestamp": "[TIMESTAMP]",
-  "source": "bridge.scalar",
-  "data": 42,
-  "degraded": false
-}

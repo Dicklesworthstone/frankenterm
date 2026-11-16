@@ -1,1 +1,0 @@
-The database connection pool is configured for 10 connections

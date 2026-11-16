@@ -1,1 +1,0 @@
-Compaction complete, saved 5,000 tokens

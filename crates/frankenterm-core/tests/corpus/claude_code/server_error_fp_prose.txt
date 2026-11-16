@@ -1,5 +1,0 @@
-The upstream returned HTTP 500 Internal Server Error twice.
-curl: (22) The requested URL returned error: 500
-Hit a server error mid-run, so I restarted the lane.
-Error: 500 Internal server error from the registry.
-The 503 from the status page cleared after a minute.

@@ -1,3 +1,0 @@
-#!/usr/bin/env bash
-# Stub `df` for swarm-tick tests. Always emits the fixture; ignores args.
-cat "$FIXTURE_DIR/df_h.txt"

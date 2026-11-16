@@ -1,1 +1,0 @@
-send-keys -t %1 "bad\xescape"

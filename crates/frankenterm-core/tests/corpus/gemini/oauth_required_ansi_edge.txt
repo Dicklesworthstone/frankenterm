@@ -1,1 +1,0 @@
-authorize [1mthis[0m app in your browser

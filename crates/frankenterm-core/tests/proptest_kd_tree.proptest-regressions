@@ -1,8 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc 4ba3abe5b75a813d5f4ad5c58d4a93d70a058c704c288e91b6754ab53486e623 # shrinks to items = [(VecPoint { coords: [0.0, 0.0] }, 0), (VecPoint { coords: [0.0, -69.0707221001208] }, 0)], query = VecPoint { coords: [0.0, 0.0] }
-cc f2cc99435667ed66dfc9f51acebdf935bd710671dd41c13e9608303a6bbd5de6 # shrinks to items = [(VecPoint { coords: [0.0, 0.0] }, 0), (VecPoint { coords: [0.0, -9.294372443461658] }, 0)], query = VecPoint { coords: [0.0, 0.0] }

@@ -8273,6 +8273,13 @@ impl BrokerPaneInputWriterV1 {
             return GuardianInputWriteResult::Indeterminate;
         }
         self.attempted = true;
+        // Poison from an earlier exchange belongs to that earlier effect.
+        // This connection is shared by every pane of its mux, and exchange
+        // refuses a poisoned session before sending a byte. Do not turn a
+        // fresh pane's known-zero input into another unresolved WAL entry.
+        if self.session.client.poisoned {
+            return GuardianInputWriteResult::KnownNotApplied;
+        }
         // A short count is the exact prefix the PTY took (ft-twwf2), which the
         // input WAL records as such; the mux sends the rest as new input.
         match self
@@ -26801,6 +26808,7 @@ mod tests {
     pub enum BrokerInputTestReply {
         Full,
         Prefix,
+        AlreadyPoisoned,
         LostAfterApply,
         InvalidCountAfterApply,
         WrongIdentityAfterApply,
@@ -26839,7 +26847,7 @@ mod tests {
             broker_lineage: wal_authenticator(0xb3).lineage_id(),
             broker_build: sealed(0xb4),
             recovered_hello: false,
-            poisoned: false,
+            poisoned: reply == BrokerInputTestReply::AlreadyPoisoned,
         };
         let handle = BrokerPaneOutputHandleV1 {
             broker_incarnation,
@@ -26851,6 +26859,11 @@ mod tests {
             child_identity: test_kernel_child(6_405),
         };
         let server = thread::spawn(move || {
+            if reply == BrokerInputTestReply::AlreadyPoisoned {
+                // No new exchange can begin on this session. Dropping its peer
+                // also makes an accidental send fail rather than hang the test.
+                return Vec::new();
+            }
             let authority = control_authenticator(0xb3);
             let frame = read_blocking_broker_control_frame(
                 &mut server_stream,
@@ -26932,6 +26945,35 @@ mod tests {
             ),
             server,
         )
+    }
+
+    #[test]
+    fn a_poisoned_session_does_not_make_a_fresh_input_indeterminate() {
+        let (mut writer, sink) =
+            broker_input_test_writer(id(6_410), BrokerInputTestReply::LostAfterApply);
+        assert_eq!(
+            writer.write_once(b"earlier-input"),
+            GuardianInputWriteResult::Indeterminate
+        );
+        assert_eq!(sink.join().unwrap().as_slice(), b"earlier-input");
+        let (session, mut handle) = writer.into_parts();
+        assert!(session.client.poisoned);
+
+        // Another pane shares the session but has a distinct input effect.
+        // The old ambiguous write must stay fenced; it does not make this
+        // never-sent write ambiguous as well.
+        handle.pane_id = id(6_411);
+        let mut fresh_writer =
+            BrokerPaneInputWriterV1::new(session, handle, Instant::now() + Duration::from_secs(1));
+        assert_eq!(
+            fresh_writer.write_once(b"new-input"),
+            GuardianInputWriteResult::KnownNotApplied
+        );
+        let (session, _) = fresh_writer.into_parts();
+        assert!(
+            session.client.poisoned,
+            "known-zero refusal must not revive the stream"
+        );
     }
 
     #[test]

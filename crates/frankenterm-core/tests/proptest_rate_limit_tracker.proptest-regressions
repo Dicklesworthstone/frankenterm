@@ -1,9 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc 0d4ea733e6cf4cd4901061d67a8ccd0bdd75fbc27cff932da619ad02c085a7d1 # shrinks to events = [(0, ClaudeCode)]
-cc a739de7ea101ee1dd3a053e7c3ddeebb179d9ba8a11db1e740634534fcaff6ea # shrinks to events = [(438, Gemini), (438, Codex)]
-cc 26e1a3ce09b5aad393696510dd70999c1e1ed4960fbd2d52268b0237f3ad5077 # shrinks to events = [(68, Gemini), (68, Codex)]

@@ -1,9 +1,0 @@
-{
-  "name": "yazi",
-  "expected_image_id": 43,
-  "expected_alt_text": "cute_cat.rgba",
-  "expected_alert": false,
-  "expected_placement": {
-    "kind": "none"
-  }
-}

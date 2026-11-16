@@ -1,1 +1,0 @@
-Using tool: Bash to run git status

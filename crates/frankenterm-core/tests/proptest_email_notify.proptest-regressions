@@ -1,7 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc d6f26858206c4edea51b6dadf41192e8b85a19428b99fdb32942874c690fa58e # shrinks to config = EmailNotifyConfig { enabled: true, smtp_host: "aaa.aa", smtp_port: 1, username: None, password: None, from: "aaa@aaa.aa", to: ["aaa@aaa.aa"], subject_prefix: "aaa", tls: None, timeout_secs: 1 }

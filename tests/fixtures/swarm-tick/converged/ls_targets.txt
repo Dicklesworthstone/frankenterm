@@ -1,2 +1,0 @@
-/tmp/ft-cc-1-target
-/tmp/ft-cc-2-target

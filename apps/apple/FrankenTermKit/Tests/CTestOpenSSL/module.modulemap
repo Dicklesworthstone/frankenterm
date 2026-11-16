@@ -1,5 +1,0 @@
-module CTestOpenSSL [system] {
-    header "shim.h"
-    link "crypto"
-    export *
-}

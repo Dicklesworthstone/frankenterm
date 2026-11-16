@@ -1,6 +1,0 @@
-[extension]
-name = "minimal-wasm"
-
-[engine]
-type = "wasm"
-entry = "main.wasm"

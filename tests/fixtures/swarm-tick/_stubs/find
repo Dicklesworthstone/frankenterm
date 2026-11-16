@@ -1,3 +1,0 @@
-#!/usr/bin/env bash
-# Stub `find` for swarm-tick tests. Always emits the fixture (one path per line).
-cat "$FIXTURE_DIR/find_stale.txt"

@@ -1,4 +1,0 @@
-# Only track src/ include/ builds/ (needed for build)
-/docs/
-/tests/
-/objs/

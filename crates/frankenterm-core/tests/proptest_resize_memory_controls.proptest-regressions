@@ -1,7 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc 806b5e64028941f16c731f577c8eec956085a4d71de34b1a8fefdff613d3184e # shrinks to config = ResizeMemoryConfig { enabled: true, normal_batch_size: 1, yellow_batch_size: 1, orange_batch_size: 1, red_pause_cold_reflow: false, normal_overscan_cap: 1, yellow_overscan_cap: 1, pressure_overscan_cap: 1, normal_backlog_cap: 1, yellow_backlog_cap: 1, orange_backlog_cap: 2, pre_resize_compaction_enabled: false, compaction_batch_size: 1, max_scratch_buffer_bytes: 1 }

@@ -1,5 +1,0 @@
-.build/
-.swiftpm/
-.DS_Store
-# Built locally by scripts/build-apple-terminal-xcframework.sh
-Artifacts/

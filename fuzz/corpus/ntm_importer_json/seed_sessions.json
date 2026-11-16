@@ -1,8 +1,0 @@
-[
-  {
-    "name": "main",
-    "windows": [
-      { "name": "dev", "panes": [{ "command": "bash", "cwd": "/home/user", "active": true }] }
-    ]
-  }
-]
