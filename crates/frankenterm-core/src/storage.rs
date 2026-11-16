@@ -9719,6 +9719,10 @@ impl StorageHandle {
     }
 
     /// Fetch only the requested pane rows in bounded SQL batches.
+    ///
+    /// Test-only since f4458a89a: discovery no longer recovers capture
+    /// identity from numeric pane IDs, which was its only production use.
+    #[cfg(test)]
     pub(crate) async fn get_panes_by_ids_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -19434,7 +19438,10 @@ fn dispatch_write_command_raw(
         } => {
             let respond = WriterResultResponder::new(respond);
             let result = capture_identity::prepare_pane_capture_backend(
-                backend, pane, native_identity, resume_previous,
+                backend,
+                pane,
+                native_identity,
+                resume_previous,
             );
             respond_oneshot_best_effort(respond, result);
         }
@@ -21205,8 +21212,14 @@ fn append_segment_commit_backend(
     segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
 ) -> Result<CommittedAppendSegment> {
     append_segment_commit_with_capture_backend(
-        backend, pane_id, content, content_hash, zone_type, recorder_delivery,
-        segment_redactors, None,
+        backend,
+        pane_id,
+        content,
+        content_hash,
+        zone_type,
+        recorder_delivery,
+        segment_redactors,
+        None,
     )
 }
 
@@ -21376,7 +21389,9 @@ fn append_segment_group_commit_inner(
             insert_recorder_delivery_backend(backend, &segment, delivery, now)?;
         }
         capture_identity::record_segment_capture_backend(
-            backend, &segment, write.capture_uuid.as_deref(),
+            backend,
+            &segment,
+            write.capture_uuid.as_deref(),
         )?;
         committed_segments.push(CommittedAppendSegment {
             segment,
@@ -34830,9 +34845,11 @@ fn query_panes_backend(backend: &dyn StorageBackend) -> Result<Vec<PaneRecord>> 
 }
 
 /// Maximum number of pane IDs admitted to one SQLite `IN` query.
+#[cfg(test)]
 const PANE_IDS_PER_QUERY: usize = 256;
 
 /// Query a bounded pane-ID set without scanning all historical pane rows.
+#[cfg(test)]
 fn query_panes_by_ids_backend(
     backend: &dyn StorageBackend,
     mut pane_ids: Vec<u64>,

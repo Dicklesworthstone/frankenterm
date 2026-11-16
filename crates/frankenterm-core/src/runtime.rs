@@ -7559,42 +7559,42 @@ impl ObservationRuntime {
                                 );
                                 continue;
                             };
-                            let native_identity =
-                                match entry.lifecycle_identity.native_registration {
-                                    Some(expected_registration) => {
-                                        match wezterm
-                                            .pane_native_identity_with_cx(&loop_cx, pane_id)
-                                            .await
+                            let native_identity = match entry.lifecycle_identity.native_registration
+                            {
+                                Some(expected_registration) => {
+                                    match wezterm
+                                        .pane_native_identity_with_cx(&loop_cx, pane_id)
+                                        .await
+                                    {
+                                        Ok(Some(identity))
+                                            if identity.is_valid()
+                                                && identity.registration()
+                                                    == Some(expected_registration) =>
                                         {
-                                            Ok(Some(identity))
-                                                if identity.is_valid()
-                                                    && identity.registration()
-                                                        == Some(expected_registration) =>
-                                            {
-                                                Some(identity)
-                                            }
-                                            Ok(_) => {
-                                                warn!(
-                                                    pane_id,
-                                                    "Capture setup remains pending because native identity no longer matches discovery"
-                                                );
-                                                continue;
-                                            }
-                                            Err(error) => {
-                                                warn!(
-                                                    pane_id,
-                                                    error = %error,
-                                                    "Capture setup remains pending because native identity could not be verified"
-                                                );
-                                                continue;
-                                            }
+                                            Some(identity)
+                                        }
+                                        Ok(_) => {
+                                            warn!(
+                                                pane_id,
+                                                "Capture setup remains pending because native identity no longer matches discovery"
+                                            );
+                                            continue;
+                                        }
+                                        Err(error) => {
+                                            warn!(
+                                                pane_id,
+                                                error = %error,
+                                                "Capture setup remains pending because native identity could not be verified"
+                                            );
+                                            continue;
                                         }
                                     }
-                                    // Legacy backends explicitly remain unknown.
-                                    // They cannot recover a prior capture merely
-                                    // by finding the same numeric pane ID.
-                                    None => None,
-                                };
+                                }
+                                // Legacy backends explicitly remain unknown.
+                                // They cannot recover a prior capture merely
+                                // by finding the same numeric pane ID.
+                                None => None,
+                            };
                             let binding = match storage
                                 .prepare_pane_capture_with_cx(
                                     &loop_cx,
@@ -7644,18 +7644,21 @@ impl ObservationRuntime {
                                     // acknowledged capture binding: a legacy
                                     // retry cannot recover an existing UUID.
                                     let refreshed = reg.get_entry(pane_id).and_then(|current| {
-                                        (current.metadata_revision != entry.metadata_revision)
-                                            .then(|| {
+                                        (current.metadata_revision != entry.metadata_revision).then(
+                                            || {
                                                 (
                                                     PaneMetadataChange {
                                                         pane_id,
-                                                        lifecycle_revision: current.lifecycle_revision,
-                                                        metadata_revision: current.metadata_revision,
+                                                        lifecycle_revision: current
+                                                            .lifecycle_revision,
+                                                        metadata_revision: current
+                                                            .metadata_revision,
                                                         diff: Default::default(),
                                                     },
                                                     current.to_pane_record(),
                                                 )
-                                            })
+                                            },
+                                        )
                                     });
                                     (true, refreshed)
                                 } else {

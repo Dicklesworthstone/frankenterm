@@ -2448,14 +2448,21 @@ fn validate_fleet_mutation_claims_schema(conn: &Connection) -> Result<()> {
 fn validate_capture_identity_schema(conn: &Connection) -> Result<()> {
     for (kind, name, marker) in [
         ("table", "pane_capture_bindings", "pane_capture_bindings ("),
-        ("table", "output_segment_captures", "output_segment_captures ("),
-        ("index", "idx_output_segment_capture", "idx_output_segment_capture"),
+        (
+            "table",
+            "output_segment_captures",
+            "output_segment_captures (",
+        ),
+        (
+            "index",
+            "idx_output_segment_capture",
+            "idx_output_segment_capture",
+        ),
     ] {
-        let actual = load_schema_object_sql(conn, kind, name)?.ok_or_else(|| {
-            StorageError::Corruption {
+        let actual =
+            load_schema_object_sql(conn, kind, name)?.ok_or_else(|| StorageError::Corruption {
                 details: format!("schema v51 is missing capture provenance {name}"),
-            }
-        })?;
+            })?;
         let expected = super::capture_identity::CAPTURE_IDENTITY_SCHEMA_SQL
             .split(';')
             .find(|statement| statement.contains(marker))
@@ -7089,7 +7096,10 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(legacy, ("legacy-capture".into(), "historical output".into()));
+        assert_eq!(
+            legacy,
+            ("legacy-capture".into(), "historical output".into())
+        );
         initialize_schema(&conn).expect("reopen migrated capture schema");
         assert!(build_migration_plan(51, 50).is_err());
     }
@@ -7125,9 +7135,11 @@ mod tests {
             assert!(error.to_string().contains("pane_capture_bindings"));
             assert_eq!(get_user_version(&conn).unwrap(), version);
             assert_eq!(
-                conn.query_row("SELECT capture_uuid FROM pane_capture_bindings", [], |row| {
-                    row.get::<_, String>(0)
-                })
+                conn.query_row(
+                    "SELECT capture_uuid FROM pane_capture_bindings",
+                    [],
+                    |row| { row.get::<_, String>(0) }
+                )
                 .unwrap(),
                 "retained"
             );

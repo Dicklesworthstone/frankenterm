@@ -2674,9 +2674,11 @@ async fn append_segment_with_optional_capture_hold(
             (None, _, Some(_)) => Err(crate::Error::Storage(crate::error::StorageError::Database(
                 "capture identity requires capture persistence authority".to_string(),
             ))),
-            (None, Some(_), None) => Err(crate::Error::Storage(crate::error::StorageError::Database(
-                "recorder delivery seed requires capture persistence authority".to_string(),
-            ))),
+            (None, Some(_), None) => {
+                Err(crate::Error::Storage(crate::error::StorageError::Database(
+                    "recorder delivery seed requires capture persistence authority".to_string(),
+                )))
+            }
         }
     })
     .await
@@ -5590,11 +5592,9 @@ mod tests {
             handle.shutdown().await.unwrap();
             let conn = rusqlite::Connection::open(&db_path).unwrap();
             let current_uuid: String = conn
-                .query_row(
-                    "SELECT pane_uuid FROM panes WHERE pane_id = 1",
-                    [],
-                    |row| row.get(0),
-                )
+                .query_row("SELECT pane_uuid FROM panes WHERE pane_id = 1", [], |row| {
+                    row.get(0)
+                })
                 .unwrap();
             assert_eq!(current_uuid, replacement.capture_uuid);
             let zone: String = conn
@@ -5618,7 +5618,9 @@ mod tests {
             handle.upsert_pane(test_pane_record(1)).await.unwrap();
             let cx = crate::cx::for_request();
             let mut cursor = PaneCursor::new(1);
-            let initial = cursor.capture_snapshot("prior output\n", 1024, None).unwrap();
+            let initial = cursor
+                .capture_snapshot("prior output\n", 1024, None)
+                .unwrap();
             persist_captured_segment_with_cx(
                 &cx,
                 &handle,
@@ -5664,7 +5666,10 @@ mod tests {
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(gap_count, 0, "rejection must precede the pre-append gap effect");
+            assert_eq!(
+                gap_count, 0,
+                "rejection must precede the pre-append gap effect"
+            );
             drop(conn);
             cleanup_db(&db_path);
         });

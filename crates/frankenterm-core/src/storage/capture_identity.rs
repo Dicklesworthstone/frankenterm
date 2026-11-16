@@ -13,7 +13,7 @@ use super::{
 };
 use crate::wezterm::MuxPaneIdentity;
 
-pub(crate) const CAPTURE_IDENTITY_SCHEMA_SQL: &str = r"
+pub const CAPTURE_IDENTITY_SCHEMA_SQL: &str = r"
 CREATE TABLE IF NOT EXISTS pane_capture_bindings (
     capture_uuid TEXT PRIMARY KEY NOT NULL
         CHECK(typeof(capture_uuid) = 'text' AND length(capture_uuid) = 32
@@ -64,13 +64,12 @@ impl PaneCaptureIdentity {
     #[must_use]
     pub fn matches_native(&self, pane_id: u64, live: Option<&MuxPaneIdentity>) -> bool {
         self.pane_id == pane_id
-            && live.is_some_and(|live| {
-                live.is_valid() && self.native_identity.as_ref() == Some(live)
-            })
+            && live
+                .is_some_and(|live| live.is_valid() && self.native_identity.as_ref() == Some(live))
     }
 }
 
-pub(crate) fn validate_capture_uuid(capture_uuid: &str) -> Result<()> {
+pub fn validate_capture_uuid(capture_uuid: &str) -> Result<()> {
     if capture_uuid.len() != 32
         || !capture_uuid
             .bytes()
@@ -109,7 +108,7 @@ fn from_row(row: &[SqlCell]) -> Result<PaneCaptureIdentity> {
     Ok(identity)
 }
 
-pub(crate) fn query_capture_identity_backend(
+pub fn query_capture_identity_backend(
     backend: &dyn StorageBackend,
     capture_uuid: &str,
 ) -> Result<Option<PaneCaptureIdentity>> {
@@ -123,7 +122,7 @@ pub(crate) fn query_capture_identity_backend(
     row.as_deref().map(from_row).transpose()
 }
 
-pub(crate) fn query_segment_capture_identity_backend(
+pub fn query_segment_capture_identity_backend(
     backend: &dyn StorageBackend,
     segment_id: i64,
 ) -> Result<Option<PaneCaptureIdentity>> {
@@ -181,10 +180,9 @@ fn insert_binding_backend(
     // Never promote an unidentified capture or rebind an existing UUID to a
     // replacement. This comparison runs under the same writer transaction.
     if query_capture_identity_backend(backend, &identity.capture_uuid)?.as_ref() != Some(identity) {
-        return Err(StorageError::Database(
-            "capture UUID already has different provenance".into(),
-        )
-        .into());
+        return Err(
+            StorageError::Database("capture UUID already has different provenance".into()).into(),
+        );
     }
     Ok(())
 }
@@ -193,7 +191,7 @@ fn insert_binding_backend(
 /// can recover a previous UUID. With resume_previous=false, the caller owns
 /// the proposed in-process lifetime and must already have checked continuity.
 /// That mode also allows an idempotent retry of the same prepared lifetime.
-pub(crate) fn prepare_pane_capture_backend(
+pub fn prepare_pane_capture_backend(
     backend: &dyn StorageBackend,
     mut pane: PaneRecord,
     native_identity: Option<MuxPaneIdentity>,
@@ -214,16 +212,17 @@ pub(crate) fn prepare_pane_capture_backend(
         || {
             let previous = query_pane_backend(backend, pane.pane_id)?;
             let previous_uuid = previous.as_ref().and_then(|row| row.pane_uuid.as_deref());
-            let mut recovered_native = false;
-            if resume_previous
+            let recovered_native = if resume_previous
                 && let Some(previous_uuid) = previous_uuid
                 && let Some(previous_identity) =
                     query_capture_identity_backend(backend, previous_uuid)?
                 && previous_identity.matches_native(pane.pane_id, native_identity.as_ref())
             {
                 pane.pane_uuid = Some(previous_identity.capture_uuid);
-                recovered_native = true;
-            }
+                true
+            } else {
+                false
+            };
             if resume_previous && !recovered_native {
                 let candidate_uuid = pane
                     .pane_uuid
@@ -257,7 +256,7 @@ pub(crate) fn prepare_pane_capture_backend(
 }
 
 /// Called inside the segment's owning append transaction, before its reply.
-pub(crate) fn record_segment_capture_backend(
+pub fn record_segment_capture_backend(
     backend: &dyn StorageBackend,
     segment: &Segment,
     capture_uuid: Option<&str>,
@@ -292,12 +291,12 @@ pub(crate) fn record_segment_capture_backend(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::{
         PendingAppendSegmentWrite, RusqliteBackend, WriterResultResponder,
         append_segment_commit_with_capture_backend, append_segment_group_commit_backend,
         initialize_schema, pending_append_segment_from_command,
     };
+    use super::*;
     use crate::runtime_async::oneshot;
     use std::collections::HashMap;
 
@@ -380,15 +379,20 @@ mod tests {
     #[test]
     fn exact_native_identity_resumes_the_independent_capture_uuid() {
         let backend = backend();
-        let first = prepare_pane_capture_backend(&backend, pane(7, CAPTURE_A), Some(native()), true)
-            .expect("prepare first capture");
+        let first =
+            prepare_pane_capture_backend(&backend, pane(7, CAPTURE_A), Some(native()), true)
+                .expect("prepare first capture");
         let resumed =
             prepare_pane_capture_backend(&backend, pane(7, CAPTURE_B), Some(native()), true)
                 .expect("resume authenticated registration");
         assert_eq!(resumed, first);
         assert_eq!(resumed.capture_uuid, CAPTURE_A);
         assert_eq!(resumed.native_identity, Some(native()));
-        assert!(query_capture_identity_backend(&backend, CAPTURE_B).unwrap().is_none());
+        assert!(
+            query_capture_identity_backend(&backend, CAPTURE_B)
+                .unwrap()
+                .is_none()
+        );
         assert!(!resumed.matches_native(8, Some(&native())));
         assert!(!resumed.matches_native(7, None));
     }
@@ -418,10 +422,7 @@ mod tests {
                     .expect("start replacement capture");
             assert_eq!(replacement.capture_uuid, CAPTURE_B);
             let row = backend
-                .query_row_cells(
-                    "SELECT reason FROM output_gaps WHERE pane_id = 7",
-                    &[],
-                )
+                .query_row_cells("SELECT reason FROM output_gaps WHERE pane_id = 7", &[])
                 .unwrap()
                 .expect("capture lifetime discontinuity");
             assert_eq!(
@@ -448,8 +449,16 @@ mod tests {
         assert_eq!(first.capture_uuid, CAPTURE_B);
         assert_eq!(first.native_identity, None);
         assert!(!first.matches_native(7, None));
-        assert!(query_segment_capture_identity_backend(&backend, historical.id).unwrap().is_none());
-        assert!(query_capture_identity_backend(&backend, CAPTURE_A).unwrap().is_none());
+        assert!(
+            query_segment_capture_identity_backend(&backend, historical.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            query_capture_identity_backend(&backend, CAPTURE_A)
+                .unwrap()
+                .is_none()
+        );
         let restarted =
             prepare_pane_capture_backend(&backend, pane(7, CAPTURE_C), None, true).unwrap();
         assert_eq!(restarted.capture_uuid, CAPTURE_C);
@@ -459,15 +468,11 @@ mod tests {
     fn restart_cannot_reuse_an_unidentified_candidate_uuid() {
         let backend = backend();
         prepare_pane_capture_backend(&backend, pane(7, CAPTURE_A), None, true).unwrap();
-        assert!(
-            prepare_pane_capture_backend(&backend, pane(7, CAPTURE_A), None, true).is_err()
-        );
+        assert!(prepare_pane_capture_backend(&backend, pane(7, CAPTURE_A), None, true).is_err());
         // A caller that still owns the same in-process lifetime may retry.
         prepare_pane_capture_backend(&backend, pane(7, CAPTURE_A), None, false).unwrap();
         prepare_pane_capture_backend(&backend, pane(7, CAPTURE_B), None, true).unwrap();
-        assert!(
-            prepare_pane_capture_backend(&backend, pane(7, CAPTURE_A), None, true).is_err()
-        );
+        assert!(prepare_pane_capture_backend(&backend, pane(7, CAPTURE_A), None, true).is_err());
     }
 
     #[test]
@@ -486,7 +491,11 @@ mod tests {
         );
         assert!(query_pane_backend(&backend, 8).unwrap().is_none());
         assert_eq!(
-            query_pane_backend(&backend, 7).unwrap().unwrap().pane_uuid.as_deref(),
+            query_pane_backend(&backend, 7)
+                .unwrap()
+                .unwrap()
+                .pane_uuid
+                .as_deref(),
             Some(CAPTURE_A)
         );
     }
@@ -507,9 +516,8 @@ mod tests {
 
         let singleton = append(&backend, 7, Some(CAPTURE_A)).unwrap();
         let writes = [queued, pending(7, CAPTURE_B)];
-        let grouped =
-            append_segment_group_commit_backend(&backend, &writes, &mut HashMap::new())
-                .unwrap_or_else(|error| panic!("commit queued captures: {error}"));
+        let grouped = append_segment_group_commit_backend(&backend, &writes, &mut HashMap::new())
+            .unwrap_or_else(|error| panic!("commit queued captures: {error}"));
 
         for (segment, expected) in [
             (&singleton, CAPTURE_A),
@@ -525,7 +533,11 @@ mod tests {
             );
         }
         assert_eq!(
-            query_pane_backend(&backend, 7).unwrap().unwrap().pane_uuid.as_deref(),
+            query_pane_backend(&backend, 7)
+                .unwrap()
+                .unwrap()
+                .pane_uuid
+                .as_deref(),
             Some(CAPTURE_B)
         );
     }
@@ -545,7 +557,10 @@ mod tests {
         );
         assert_eq!(segment_count(&backend), 0);
         let valid = append(&backend, 7, Some(CAPTURE_A)).unwrap();
-        assert_eq!(valid.seq, 0, "rejected provenance consumes no output sequence");
+        assert_eq!(
+            valid.seq, 0,
+            "rejected provenance consumes no output sequence"
+        );
     }
 
     #[test]
@@ -560,6 +575,10 @@ mod tests {
                 .is_err()
         );
         assert!(query_pane_backend(&backend, 7).unwrap().is_none());
-        assert!(query_capture_identity_backend(&backend, CAPTURE_A).unwrap().is_none());
+        assert!(
+            query_capture_identity_backend(&backend, CAPTURE_A)
+                .unwrap()
+                .is_none()
+        );
     }
 }
