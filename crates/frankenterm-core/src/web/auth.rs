@@ -296,7 +296,7 @@ impl StreamCapacity {
 
     fn try_acquire(self: &Arc<Self>) -> Option<StreamReservation> {
         self.active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < self.limit).then(|| active + 1)
             })
             .ok()
