@@ -18986,10 +18986,8 @@ mod tests {
                         1024 * 1024
                     },
                 };
-                let config = recorder_delivery_config_for_test(
-                    RecorderBackendKind::AppendLog,
-                    dir.path(),
-                );
+                let config =
+                    recorder_delivery_config_for_test(RecorderBackendKind::AppendLog, dir.path());
                 let recorder = RuntimeRecorderPersistence::new(Arc::new(
                     bootstrap_recorder_storage(config.clone())
                         .unwrap()

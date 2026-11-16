@@ -7896,8 +7896,8 @@ fn census_for_unnamed_guardian_adoption(
     loop {
         cx.checkpoint()
             .map_err(|_| anyhow::anyhow!("guardian pane adoption cancelled"))?;
-        let entries = census()
-            .context("guardian census before adopting the panes no recovery root names")?;
+        let entries =
+            census().context("guardian census before adopting the panes no recovery root names")?;
         cx.checkpoint()
             .map_err(|_| anyhow::anyhow!("guardian pane adoption cancelled"))?;
         let held = entries.iter().any(|entry| {
@@ -8001,9 +8001,10 @@ fn adopt_unnamed_guardian_panes(
     let mut ended = Vec::new();
     let mut left = Vec::new();
     let mut outcome = GuardianAdoptionOutcome::default();
-    for entry in entries.iter().filter(|entry| {
-        !named.contains(&entry.pane_id) && entry.mux_incarnation != Some(target)
-    }) {
+    for entry in entries
+        .iter()
+        .filter(|entry| !named.contains(&entry.pane_id) && entry.mux_incarnation != Some(target))
+    {
         match UnnamedGuardianPane::of(entry) {
             UnnamedGuardianPane::Adopt => adopt.push(entry.pane_id),
             UnnamedGuardianPane::Ended => ended.push(entry.pane_id),
@@ -15101,7 +15102,9 @@ mod tests {
                 Duration::from_secs(60),
                 || {
                     reads += 1;
-                    Ok(snapshots.pop_front().expect("the settled census must finish"))
+                    Ok(snapshots
+                        .pop_front()
+                        .expect("the settled census must finish"))
                 },
             )
             .unwrap();
@@ -15300,7 +15303,9 @@ mod tests {
 
         fn receive(stream: &mut UnixStream) -> Vec<u8> {
             let mut prefix = [0; 4];
-            stream.read_exact(&mut prefix).expect("adoption request prefix");
+            stream
+                .read_exact(&mut prefix)
+                .expect("adoption request prefix");
             let length = u32::from_be_bytes(prefix) as usize;
             assert!(length + 4 <= GUARDIAN_MAX_FRAME_BYTES);
             let mut frame = vec![0; length + 4];
