@@ -52,10 +52,6 @@ impl SimpleTempDir {
         }
     }
 
-    fn add_ref(&self, content_id: ContentId) {
-        *self.lock_refs().entry(content_id).or_insert(0) += 1;
-    }
-
     fn del_ref(&self, content_id: ContentId) {
         let mut refs = self.lock_refs();
         match refs.get(&content_id).copied() {
@@ -114,9 +110,12 @@ impl BlobStorage for SimpleTempDir {
     }
 
     fn lease_by_content(&self, content_id: ContentId, _lease_id: LeaseId) -> Result<(), Error> {
+        // Check and count under one lock: del_ref unlinks under it, so a
+        // release cannot delete the file between the check and the count.
+        let mut refs = self.lock_refs();
         let path = self.path_for_content(content_id)?;
         if path.exists() {
-            self.add_ref(content_id);
+            *refs.entry(content_id).or_insert(0) += 1;
             Ok(())
         } else {
             Err(Error::ContentNotFound(content_id))
@@ -168,9 +167,12 @@ impl BlobStorage for SimpleTempDir {
             }
         }
 
+        // Open and count under one lock, as in lease_by_content.
+        let mut refs = self.lock_refs();
         let path = self.path_for_content(content_id)?;
         let file = BufReader::new(std::fs::File::open(&path)?);
-        self.add_ref(content_id);
+        *refs.entry(content_id).or_insert(0) += 1;
+        drop(refs);
 
         Ok(Box::new(Reader {
             file,
