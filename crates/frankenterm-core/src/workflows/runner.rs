@@ -13,6 +13,10 @@ use tracing::{debug, warn};
 
 const WORKFLOW_INDEPENDENT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const WORKFLOW_RUNNER_CHILD_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long the agent gate waits for a pane's screen (ft-2ko47y). A slow mux
+/// read lets the workflow start as an unreadable screen does, instead of
+/// holding the detection for the mux client's per-attempt read timeouts.
+const WORKFLOW_AGENT_GATE_SCREEN_TIMEOUT: Duration = Duration::from_secs(2);
 const WORKFLOW_DETECTION_REPLAY_PAGE_SIZE: usize = 64;
 const WORKFLOW_DETECTION_REPLAY_INTERVAL: Duration = Duration::from_millis(250);
 const WORKFLOW_RECOVERY_PAGE_SIZE: usize = 64;
@@ -1437,7 +1441,7 @@ impl WorkflowRunner {
 
     /// The agent on `pane_id`'s screen, when it is a known agent other than
     /// the one `detection`'s rule belongs to (ft-2ko47y). `None` for rules of
-    /// no particular agent and for unreadable or unrecognised screens.
+    /// no particular agent and for unreadable, unrecognised or slow screens.
     async fn pane_shows_other_agent(
         &self,
         cx: &crate::cx::Cx,
@@ -1451,12 +1455,24 @@ impl WorkflowRunner {
         ) {
             return None;
         }
-        let screen = crate::pane_capability_resolution::agent_type_from_screen(
+        let read = crate::pane_capability_resolution::agent_type_from_screen(
             cx,
             self.injector.client(),
             pane_id,
+        );
+        let screen = match crate::runtime_async::timeout_with_cx(
+            cx,
+            WORKFLOW_AGENT_GATE_SCREEN_TIMEOUT,
+            read,
         )
-        .await;
+        .await
+        {
+            Ok(screen) => screen,
+            Err(error) => {
+                debug!(pane_id, %error, "agent gate: screen read did not finish");
+                AgentType::Unknown
+            }
+        };
         (screen != AgentType::Unknown && screen != detection.agent_type).then_some(screen)
     }
 

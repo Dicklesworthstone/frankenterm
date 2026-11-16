@@ -7663,6 +7663,175 @@ steps:
         });
     }
 
+    /// The plain mock, except that a pane's text never arrives.
+    #[derive(Default)]
+    struct StalledTextWezterm {
+        inner: MockWezterm,
+        text_reads: AtomicUsize,
+    }
+
+    impl crate::wezterm::WeztermInterface for StalledTextWezterm {
+        fn list_panes(&self) -> crate::wezterm::WeztermFuture<'_, Vec<crate::wezterm::PaneInfo>> {
+            self.inner.list_panes()
+        }
+
+        fn get_pane(
+            &self,
+            pane_id: u64,
+        ) -> crate::wezterm::WeztermFuture<'_, crate::wezterm::PaneInfo> {
+            self.inner.get_pane(pane_id)
+        }
+
+        fn get_text(
+            &self,
+            _pane_id: u64,
+            _escapes: bool,
+        ) -> crate::wezterm::WeztermFuture<'_, String> {
+            self.text_reads.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        }
+
+        fn send_text(&self, pane_id: u64, text: &str) -> crate::wezterm::WeztermFuture<'_, ()> {
+            self.inner.send_text(pane_id, text)
+        }
+
+        fn send_text_no_paste(
+            &self,
+            pane_id: u64,
+            text: &str,
+        ) -> crate::wezterm::WeztermFuture<'_, ()> {
+            self.inner.send_text_no_paste(pane_id, text)
+        }
+
+        fn send_text_with_options(
+            &self,
+            pane_id: u64,
+            text: &str,
+            no_paste: bool,
+            no_newline: bool,
+        ) -> crate::wezterm::WeztermFuture<'_, ()> {
+            self.inner
+                .send_text_with_options(pane_id, text, no_paste, no_newline)
+        }
+
+        fn send_control(
+            &self,
+            pane_id: u64,
+            control_char: &str,
+        ) -> crate::wezterm::WeztermFuture<'_, ()> {
+            self.inner.send_control(pane_id, control_char)
+        }
+
+        fn send_ctrl_c(&self, pane_id: u64) -> crate::wezterm::WeztermFuture<'_, ()> {
+            self.inner.send_ctrl_c(pane_id)
+        }
+
+        fn send_ctrl_d(&self, pane_id: u64) -> crate::wezterm::WeztermFuture<'_, ()> {
+            self.inner.send_ctrl_d(pane_id)
+        }
+
+        fn spawn(
+            &self,
+            cwd: Option<&str>,
+            domain_name: Option<&str>,
+        ) -> crate::wezterm::WeztermFuture<'_, u64> {
+            self.inner.spawn(cwd, domain_name)
+        }
+
+        fn spawn_targeted(
+            &self,
+            cwd: Option<&str>,
+            domain_name: Option<&str>,
+            target: crate::wezterm::SpawnTarget,
+        ) -> crate::wezterm::WeztermFuture<'_, u64> {
+            self.inner.spawn_targeted(cwd, domain_name, target)
+        }
+
+        fn split_pane(
+            &self,
+            pane_id: u64,
+            direction: crate::wezterm::SplitDirection,
+            cwd: Option<&str>,
+            percent: Option<u8>,
+        ) -> crate::wezterm::WeztermFuture<'_, u64> {
+            self.inner.split_pane(pane_id, direction, cwd, percent)
+        }
+
+        fn activate_pane(&self, pane_id: u64) -> crate::wezterm::WeztermFuture<'_, ()> {
+            self.inner.activate_pane(pane_id)
+        }
+
+        fn get_pane_direction(
+            &self,
+            pane_id: u64,
+            direction: crate::wezterm::MoveDirection,
+        ) -> crate::wezterm::WeztermFuture<'_, Option<u64>> {
+            self.inner.get_pane_direction(pane_id, direction)
+        }
+
+        fn kill_pane(&self, pane_id: u64) -> crate::wezterm::WeztermFuture<'_, ()> {
+            self.inner.kill_pane(pane_id)
+        }
+
+        fn zoom_pane(&self, pane_id: u64, zoom: bool) -> crate::wezterm::WeztermFuture<'_, ()> {
+            self.inner.zoom_pane(pane_id, zoom)
+        }
+
+        fn circuit_status(&self) -> crate::circuit_breaker::CircuitBreakerStatus {
+            self.inner.circuit_status()
+        }
+    }
+
+    /// ft-2ko47y: a pane whose screen never arrives must not hold the
+    /// detection; the gate gives up and the workflow starts, as it does for
+    /// an unreadable screen.
+    #[test]
+    fn a_stalled_screen_read_lets_the_workflow_start() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("agent-gate-stall.db");
+            let storage = Arc::new(
+                crate::storage::StorageHandle::new(&path.to_string_lossy())
+                    .await
+                    .unwrap(),
+            );
+            create_test_pane(&storage, 45).await;
+            let mux = Arc::new(StalledTextWezterm::default());
+            let handle: crate::wezterm::WeztermHandle = mux.clone();
+            let runner = WorkflowRunner::new(
+                WorkflowEngine::default(),
+                Arc::new(PaneWorkflowLockManager::new()),
+                Arc::clone(&storage),
+                CxPolicyInjector::new(crate::policy::PolicyGatedInjector::new(
+                    crate::policy::PolicyEngine::permissive(),
+                    handle,
+                )),
+                WorkflowRunnerConfig::default(),
+            );
+            runner.register_workflow(Arc::new(HandleUsageLimits::new()));
+            let detection = Detection {
+                rule_id: "codex.usage.reached".to_string(),
+                agent_type: AgentType::Codex,
+                event_type: "usage.reached".to_string(),
+                severity: Severity::Critical,
+                confidence: 1.0,
+                extracted: serde_json::Value::Null,
+                matched_text: "You've hit your usage limit.".to_string(),
+                span: (0, 0),
+            };
+
+            let started = crate::runtime_async::timeout(
+                Duration::from_secs(30),
+                Box::pin(runner.handle_detection(45, &detection, None)),
+            )
+            .await
+            .expect("the agent gate held the detection on a stalled screen read");
+            assert!(started.is_started(), "{started:?}");
+            assert_eq!(mux.text_reads.load(Ordering::SeqCst), 1);
+            storage.shutdown().await.unwrap();
+        });
+    }
+
     #[test]
     fn external_abort_inspection_preserves_terminal_missing_and_cancelled_outcomes() {
         run_async_test(async {
