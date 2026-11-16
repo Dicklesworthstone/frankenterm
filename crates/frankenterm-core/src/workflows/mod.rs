@@ -7403,8 +7403,11 @@ steps:
             let path = dir.path().join("live-abort-refusal.db");
             let db_path = path.to_string_lossy().to_string();
             let (runner, storage, locks) = create_test_runner(&db_path).await;
-            let one_shot_storage =
-                Arc::new(StorageHandle::new(&db_path).await.expect("one-shot storage"));
+            let one_shot_storage = Arc::new(
+                StorageHandle::new(&db_path)
+                    .await
+                    .expect("one-shot storage"),
+            );
             let pane_id = 62;
             create_test_pane(&storage, pane_id).await;
             let conn = rusqlite::Connection::open(&path).unwrap();
@@ -7423,10 +7426,13 @@ steps:
             let started = runner
                 .handle_detection(pane_id, &make_test_detection("abort.live_owner"), Some(1))
                 .await;
-            let execution = started.execution_id().expect("workflow admitted").to_string();
+            let execution = started
+                .execution_id()
+                .expect("workflow admitted")
+                .to_string();
             let workflow = runner.find_workflow_by_name("paused_abort_effect").unwrap();
             let cx = crate::cx::for_testing();
-            let (completed, ()) = crate::runtime_async::timeout_with_cx(
+            let (completed, ()) = Box::pin(crate::runtime_async::timeout_with_cx(
                 &cx,
                 Duration::from_secs(5),
                 async {
@@ -7544,14 +7550,19 @@ steps:
                         }
                     )
                 },
-            )
+            ))
             .await
             .expect("workflow and refusal checks must settle");
             assert!(completed.is_completed(), "{completed:?}");
             assert_eq!(effects.load(Ordering::SeqCst), 1);
             assert!(locks.is_locked(pane_id).is_none());
             assert_eq!(
-                storage.get_workflow(&execution).await.unwrap().unwrap().status,
+                storage
+                    .get_workflow(&execution)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
                 "completed"
             );
             one_shot_storage.shutdown().await.unwrap();
@@ -7568,7 +7579,11 @@ steps:
             create_test_pane(&storage, 62).await;
             runner.register_workflow(Arc::new(SimpleCompletingWorkflow));
             let started = runner
-                .handle_detection(62, &make_test_detection("simple_complete.abort_inspection"), None)
+                .handle_detection(
+                    62,
+                    &make_test_detection("simple_complete.abort_inspection"),
+                    None,
+                )
                 .await;
             let execution = started.execution_id().unwrap();
             let admitted = storage.get_workflow(execution).await.unwrap().unwrap();
@@ -7616,10 +7631,9 @@ steps:
                 crate::outcome::CancelKind::User,
                 Some("abort inspection cancellation"),
             );
-            let cancelled =
-                inspect_workflow_abort_with_cx(&cancelled_cx, &storage, execution)
-                    .await
-                    .unwrap_err();
+            let cancelled = inspect_workflow_abort_with_cx(&cancelled_cx, &storage, execution)
+                .await
+                .unwrap_err();
             assert!(matches!(
                 cancelled,
                 crate::Error::RuntimeOperation {
@@ -7952,9 +7966,13 @@ steps:
                     };
                     conn.execute_batch(sql).unwrap();
                 }
-                let result =
-                    commit_abort_record_for_test(&storage, &locks, execution, Some("operator stop"))
-                        .await;
+                let result = commit_abort_record_for_test(
+                    &storage,
+                    &locks,
+                    execution,
+                    Some("operator stop"),
+                )
+                .await;
                 if fail_audit {
                     let error = result
                         .expect_err("audit failure cannot be reported as complete")

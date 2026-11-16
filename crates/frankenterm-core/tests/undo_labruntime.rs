@@ -164,14 +164,12 @@ fn undo_workflow_abort_without_live_owner_preserves_workflow_and_action() {
             ))
             .await
             .expect("undo metadata");
-        let workflow_before = serde_json::to_value(
-            storage.get_workflow(execution_id).await.unwrap().unwrap(),
-        )
-        .unwrap();
-        let undo_before = serde_json::to_value(
-            storage.get_action_undo(action_id).await.unwrap().unwrap(),
-        )
-        .unwrap();
+        let workflow_before =
+            serde_json::to_value(storage.get_workflow(execution_id).await.unwrap().unwrap())
+                .unwrap();
+        let undo_before =
+            serde_json::to_value(storage.get_action_undo(action_id).await.unwrap().unwrap())
+                .unwrap();
 
         let mock = Arc::new(MockWezterm::new());
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
@@ -185,7 +183,11 @@ fn undo_workflow_abort_without_live_owner_preserves_workflow_and_action() {
         assert_eq!(result.target_workflow_id.as_deref(), Some(execution_id));
         assert_eq!(result.target_pane_id, Some(pane_id));
         assert!(result.undone_at.is_none());
-        assert!(result.message.contains("error_class=live_abort_unavailable"));
+        assert!(
+            result
+                .message
+                .contains("error_class=live_abort_unavailable")
+        );
         assert!(
             result
                 .guidance
@@ -864,10 +866,9 @@ fn undo_workflow_abort_waiting_requires_live_owner() {
             ))
             .await
             .expect("undo metadata");
-        let workflow_before = serde_json::to_value(
-            storage.get_workflow(execution_id).await.unwrap().unwrap(),
-        )
-        .unwrap();
+        let workflow_before =
+            serde_json::to_value(storage.get_workflow(execution_id).await.unwrap().unwrap())
+                .unwrap();
 
         let mock = Arc::new(MockWezterm::new());
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
@@ -881,7 +882,11 @@ fn undo_workflow_abort_waiting_requires_live_owner() {
         assert_eq!(result.target_workflow_id.as_deref(), Some(execution_id));
         assert_eq!(result.target_pane_id, Some(pane_id));
         assert!(result.undone_at.is_none());
-        assert!(result.message.contains("error_class=live_abort_unavailable"));
+        assert!(
+            result
+                .message
+                .contains("error_class=live_abort_unavailable")
+        );
 
         let wf = storage
             .get_workflow(execution_id)
@@ -1163,7 +1168,11 @@ fn undo_workflow_abort_refusal_identifies_execution_without_marking_undo() {
 
         assert_eq!(result.outcome, UndoOutcome::Failed);
         assert!(result.message.contains(execution_id));
-        assert!(result.message.contains("error_class=live_abort_unavailable"));
+        assert!(
+            result
+                .message
+                .contains("error_class=live_abort_unavailable")
+        );
         assert_eq!(result.target_workflow_id.as_deref(), Some(execution_id));
         assert_eq!(result.target_pane_id, Some(pane_id));
         assert!(result.undone_at.is_none());
@@ -1214,10 +1223,9 @@ fn undo_request_reason_cannot_authorize_ownerless_workflow_abort() {
             ))
             .await
             .expect("undo metadata");
-        let workflow_before = serde_json::to_value(
-            storage.get_workflow(execution_id).await.unwrap().unwrap(),
-        )
-        .unwrap();
+        let workflow_before =
+            serde_json::to_value(storage.get_workflow(execution_id).await.unwrap().unwrap())
+                .unwrap();
 
         let mock = Arc::new(MockWezterm::new());
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
@@ -1231,7 +1239,11 @@ fn undo_request_reason_cannot_authorize_ownerless_workflow_abort() {
             .expect("result");
 
         assert_eq!(result.outcome, UndoOutcome::Failed);
-        assert!(result.message.contains("error_class=live_abort_unavailable"));
+        assert!(
+            result
+                .message
+                .contains("error_class=live_abort_unavailable")
+        );
         assert_eq!(result.target_workflow_id.as_deref(), Some(execution_id));
         assert_eq!(result.target_pane_id, Some(pane_id));
         assert!(result.undone_at.is_none());

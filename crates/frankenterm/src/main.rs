@@ -15272,7 +15272,9 @@ struct RobotWorkflowAbortData {
     error_reason: Option<String>,
 }
 
-fn undo_json_response(results: &[frankenterm_core::undo::UndoExecutionResult]) -> serde_json::Value {
+fn undo_json_response(
+    results: &[frankenterm_core::undo::UndoExecutionResult],
+) -> serde_json::Value {
     use frankenterm_core::undo::UndoOutcome;
 
     let accepted = results.iter().all(|result| {
@@ -57677,18 +57679,19 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     let cx = frankenterm_core::cx::Cx::current()
                                         .unwrap_or_else(frankenterm_core::cx::for_request);
                                     let db_path = &ctx.effective.paths.db_path;
-                                    let storage =
-                                        match StorageHandle::new_with_cx(&cx, db_path).await {
-                                            Ok(storage) => storage,
-                                            Err(error) => {
-                                                let response = robot_workflow_abort_failure_response(
-                                                    &error,
-                                                    elapsed_ms(start),
-                                                );
-                                                print_robot_response(&response, format, stats)?;
-                                                return Ok(());
-                                            }
-                                        };
+                                    let storage = match StorageHandle::new_with_cx(&cx, db_path)
+                                        .await
+                                    {
+                                        Ok(storage) => storage,
+                                        Err(error) => {
+                                            let response = robot_workflow_abort_failure_response(
+                                                &error,
+                                                elapsed_ms(start),
+                                            );
+                                            print_robot_response(&response, format, stats)?;
+                                            return Ok(());
+                                        }
+                                    };
 
                                     // A one-shot command has no live task ownership. Inspect
                                     // without fabricating a runner, lock or settled cancellation.
@@ -133548,7 +133551,10 @@ printf x > "$MINISIGN_MARKER"
         let json = undo_json_response(&results);
         assert_eq!(json["ok"], true);
         assert_eq!(json["data"]["count"], 3);
-        assert_eq!(json["data"]["results"][1]["outcome"], "applied_with_warning");
+        assert_eq!(
+            json["data"]["results"][1]["outcome"],
+            "applied_with_warning"
+        );
         assert_eq!(json["data"]["results"][2]["outcome"], "not_applicable");
         assert_eq!(undo_json_response(&[])["ok"], true);
     }
@@ -133622,7 +133628,8 @@ printf x > "$MINISIGN_MARKER"
                 aborted_at: None,
                 error_reason: Some(format!("already_{status}")),
             };
-            let json = serde_json::to_value(robot_workflow_abort_response(result, true, 7)).unwrap();
+            let json =
+                serde_json::to_value(robot_workflow_abort_response(result, true, 7)).unwrap();
             assert_eq!(json["ok"], true);
             assert_eq!(json["data"]["aborted"], false);
             assert_eq!(json["data"]["forced"], false);
