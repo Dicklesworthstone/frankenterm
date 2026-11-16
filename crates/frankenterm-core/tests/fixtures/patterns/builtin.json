@@ -289,6 +289,28 @@
     "negative_for": "claude_code.error.model_unavailable"
   },
   {
+    "name": "claude_error_prompt_too_long_positive",
+    "text": "  ⎿  Prompt is too long\n",
+    "expected_rule_ids": ["claude_code.error.prompt_too_long"]
+  },
+  {
+    "name": "claude_error_prompt_too_long_negative_prose",
+    "text": "Prompt is too long for the summarizer, so I split it in two.\n",
+    "expected_rule_ids": [],
+    "negative_for": "claude_code.error.prompt_too_long"
+  },
+  {
+    "name": "claude_error_credit_balance_positive",
+    "text": "  ⎿  Credit balance is too low\n",
+    "expected_rule_ids": ["claude_code.error.credit_balance"]
+  },
+  {
+    "name": "claude_error_credit_balance_negative_prose",
+    "text": "Credit balance is too low to run the nightly batch, per the billing page.\n",
+    "expected_rule_ids": [],
+    "negative_for": "claude_code.error.credit_balance"
+  },
+  {
     "name": "claude_error_timeout_positive",
     "text": "API Error: No response from API (waited 3m, then 10m on the retry). If a proxy or gateway on your network holds responses until they complete, raise API_TIMEOUT_MS or CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS to wait longer.",
     "expected_rule_ids": ["claude_code.error.timeout"],

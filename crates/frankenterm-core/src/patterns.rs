@@ -4229,6 +4229,66 @@ fn builtin_claude_code_pack() -> PatternPack {
                 preview_command: None,
                 learn_more_url: None,
             },
+            // Context overflow: "Prompt is too long" as the whole error
+            // message in Claude Code's logs (2.1.232, API status 400).
+            // code.claude.com/docs/en/errors also lists "Input is too long
+            // for requested model", "Prompt is too long · automatic
+            // compaction failed: ..." and "Context limit reached · /compact
+            // or /clear to continue". Every turn fails until the context
+            // shrinks. The message must be its own complete line (bare or
+            // under the TUI's ⎿ gutter, with an optional "· ..." hint), so
+            // prose that mentions it and a partial capture do not count.
+            RuleDef {
+                id: "claude_code.error.prompt_too_long".to_string(),
+                zone: None,
+                agent_type: AgentType::ClaudeCode,
+                event_type: "error.prompt_too_long".to_string(),
+                severity: Severity::Warning,
+                anchors: vec![
+                    "Prompt is too long".to_string(),
+                    "Input is too long for requested model".to_string(),
+                    "Context limit reached".to_string(),
+                ],
+                regex: Some(
+                    r"(?m)^[ \t]*(?:⎿[ \t]*)?(?:Prompt is too long|Input is too long for requested model\.?|Context limit reached)(?:[ \t]+·[^\r\n]*)?[ \t]*\r?\n"
+                        .to_string(),
+                ),
+                description: "Claude Code's conversation no longer fits the model's context"
+                    .to_string(),
+                remediation: Some(
+                    "Run /compact to summarize the conversation, or /clear to start over"
+                        .to_string(),
+                ),
+                workflow: Some("handle_on_error_cass_search".to_string()),
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
+            // Exhausted API credits: "Credit balance is too low" as the
+            // whole error message in Claude Code's logs (2.1.219, API status
+            // 400). Every turn fails until the account has credits again.
+            // Its own complete line only, as for prompt_too_long.
+            RuleDef {
+                id: "claude_code.error.credit_balance".to_string(),
+                zone: None,
+                agent_type: AgentType::ClaudeCode,
+                event_type: "error.credit_balance".to_string(),
+                severity: Severity::Critical,
+                anchors: vec!["Credit balance is too low".to_string()],
+                regex: Some(
+                    r"(?m)^[ \t]*(?:⎿[ \t]*)?Credit balance is too low(?:[ \t]+·[^\r\n]*)?[ \t]*\r?\n"
+                        .to_string(),
+                ),
+                description: "The account behind Claude Code is out of API credits".to_string(),
+                remediation: Some(
+                    "Add credits to the account's API billing or switch Claude Code to another account"
+                        .to_string(),
+                ),
+                workflow: Some("handle_on_error_cass_search".to_string()),
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
         ],
     )
     .with_submit_profiles(vec![builtin_claude_code_submit_profile()])
@@ -12047,6 +12107,72 @@ rules:
             "Opus 5.5's safeguards flagged this session last week; I switched models.",
             "There is an issue with the selected model in the config loader.",
             "Check the selected model (opus-5.5) in settings.json before the run.",
+        ] {
+            let errors: Vec<String> = engine
+                .detect(prose)
+                .into_iter()
+                .map(|d| d.rule_id)
+                .filter(|id| id.starts_with("claude_code.error."))
+                .collect();
+            assert!(errors.is_empty(), "{prose:?} raised {errors:?}");
+        }
+    }
+
+    /// "Prompt is too long" and "Credit balance is too low" are the whole
+    /// error message, so they count only as their own complete line.
+    #[test]
+    fn claude_code_whole_line_errors_need_their_own_complete_line() {
+        let engine = PatternEngine::new();
+        for (text, rule) in [
+            // Claude Code's logs (2.1.232 and 2.1.219, API status 400).
+            ("Prompt is too long", "claude_code.error.prompt_too_long"),
+            (
+                "Credit balance is too low",
+                "claude_code.error.credit_balance",
+            ),
+            // Variants listed at code.claude.com/docs/en/errors.
+            (
+                "Prompt is too long · automatic compaction failed: the summary did not fit",
+                "claude_code.error.prompt_too_long",
+            ),
+            (
+                "Input is too long for requested model.",
+                "claude_code.error.prompt_too_long",
+            ),
+            (
+                "Context limit reached · /compact or /clear to continue",
+                "claude_code.error.prompt_too_long",
+            ),
+        ] {
+            for rendered in [
+                format!("{text}\n"),
+                format!("  ⎿  {text}\n"),
+                format!("earlier output\n  ⎿  {text}  \r\n\n"),
+            ] {
+                let ids: Vec<String> = engine
+                    .detect(&rendered)
+                    .into_iter()
+                    .map(|d| d.rule_id)
+                    .collect();
+                assert_eq!(ids, vec![rule.to_string()], "{rendered:?}");
+            }
+            // Without its line end the line may still be arriving.
+            assert!(
+                engine.detect(text).iter().all(|d| d.rule_id != rule),
+                "{text:?}"
+            );
+        }
+
+        for prose in [
+            // Claude Code's docs, quoted in a session's tool output (excerpt).
+            "For runtime API errors such as `429`, or `Prompt is too long`, see the [Error reference](/docs/en/errors).\n",
+            "Prompt is too long for the summarizer, so I split it in two.\n",
+            "The prompt is too long\n",
+            // Typed into the composer.
+            "> Prompt is too long\n",
+            "Credit balance is too low to run the nightly batch, per the billing page.\n",
+            "If the credit balance is too low, every turn fails.\n",
+            "Context limit reached at 200k tokens, so I ran /compact.\n",
         ] {
             let errors: Vec<String> = engine
                 .detect(prose)

@@ -275,6 +275,9 @@ test_rules_match_fixtures() {
         ["claude_code.error.server"]="API Error: 500 Internal server error. This is a server-side issue, usually temporary."
         ["claude_code.error.safeguards"]="API Error: Opus 5.5's safeguards flagged this session (https://www.anthropic.com/legal/aup)."
         ["claude_code.error.model_unavailable"]="There's an issue with the selected model (opus-5.5). It may not exist or you may not have access to it."
+        # Whole-line errors count only with their line end.
+        ["claude_code.error.prompt_too_long"]=$'Prompt is too long\n'
+        ["claude_code.error.credit_balance"]=$'Credit balance is too low\n'
         ["claude_code.session.cost_summary"]="Session cost: \$2.50"
         ["gemini.usage.reached"]="Usage limit reached for all Pro models"
         ["wezterm.mux.connection_lost"]="mux server is unavailable"

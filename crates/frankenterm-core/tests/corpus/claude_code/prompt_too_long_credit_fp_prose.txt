@@ -1,0 +1,5 @@
+The troubleshooting page says that if you see `Prompt is too long`, run /compact.
+Prompt is too long for the summarizer, so I split it in two.
+> Prompt is too long
+Credit balance is too low to run the nightly batch, per the billing page.
+Context limit reached at 200k tokens, so I compacted.

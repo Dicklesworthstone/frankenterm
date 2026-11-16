@@ -2607,6 +2607,8 @@ impl Workflow for HandleOnErrorCassSearch {
             "error.server",
             "error.safeguards",
             "error.model_unavailable",
+            "error.prompt_too_long",
+            "error.credit_balance",
             "mux.error",
         ]
     }
@@ -8653,7 +8655,7 @@ mod tests {
         assert_eq!(server.event_type, "error.server");
         assert!(workflow.handles(&server));
 
-        // A safeguards refusal and an unusable model, as Claude Code prints them.
+        // Errors retrying cannot fix, as Claude Code prints them.
         for (text, rule) in [
             (
                 "API Error: Opus 5.5's safeguards flagged this session (https://www.anthropic.com/legal/aup).",
@@ -8662,6 +8664,14 @@ mod tests {
             (
                 "There's an issue with the selected model (opus-5.5). It may not exist or you may not have access to it.",
                 "claude_code.error.model_unavailable",
+            ),
+            (
+                "  ⎿  Prompt is too long\n",
+                "claude_code.error.prompt_too_long",
+            ),
+            (
+                "  ⎿  Credit balance is too low\n",
+                "claude_code.error.credit_balance",
             ),
         ] {
             let detection = crate::patterns::PatternEngine::new()

@@ -13897,6 +13897,8 @@ fn snapshot_trigger_from_detection(
                 | "error.server"
                 | "error.safeguards"
                 | "error.model_unavailable"
+                | "error.prompt_too_long"
+                | "error.credit_balance"
                 | "mux.error"
                 | "auth.error"
                 | "auth.login_required"
@@ -20703,6 +20705,8 @@ mod tests {
             "error.server",
             "error.safeguards",
             "error.model_unavailable",
+            "error.prompt_too_long",
+            "error.credit_balance",
         ] {
             let detection = test_detection(event_type, Severity::Warning);
             let trigger = snapshot_trigger_from_detection(&detection);
