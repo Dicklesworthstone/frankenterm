@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::{Future, poll_fn};
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::Poll;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -28,6 +28,11 @@ use zeroize::{ZeroizeOnDrop, Zeroizing};
 const COOKIE_NAME: &str = "ft_viewer_session";
 const LOGIN_BODY_LIMIT: usize = 1024;
 const CREDENTIAL_DOMAIN: &[u8] = b"frankenterm.local-web-bootstrap.v1";
+// Both SSE routes share these budgets. Eight streams allow four viewer tabs
+// (events + deltas each) without letting one session occupy the whole server.
+// Legacy loopback mode is one local operator and shares the same viewer cap.
+const MAX_SERVER_STREAMS: usize = 64;
+const MAX_VIEWER_STREAMS: usize = 8;
 type CredentialMac = Hmac<Sha256>;
 
 /// Finite configuration failures that never include a credential.
@@ -171,6 +176,7 @@ impl WebSessionAuth {
             authority: Arc::downgrade(&self.sessions),
             origin,
             session_epoch,
+            streams: Arc::new(StreamCapacity::new(MAX_VIEWER_STREAMS)),
         }));
         let mut sessions = self.sessions.lock().map_err(|_| unavailable())?;
         sessions.retain(|_, session| {
@@ -240,6 +246,7 @@ struct SessionLease {
     authority: Weak<Mutex<HashMap<[u8; 32], SessionGrant>>>,
     origin: String,
     session_epoch: String,
+    streams: Arc<StreamCapacity>,
 }
 
 /// An admitted request retains this exact lease, never a newly issued session
@@ -268,6 +275,80 @@ impl std::fmt::Debug for SessionGrant {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionGrant").finish_non_exhaustive()
     }
+}
+
+/// Non-waiting admission: a full stream budget never parks a request or creates
+/// another producer. The response body owns each reservation until its queued
+/// output and producer are disposed, including unpolled-body cancellation.
+#[derive(Debug)]
+struct StreamCapacity {
+    active: AtomicUsize,
+    limit: usize,
+}
+
+impl StreamCapacity {
+    fn new(limit: usize) -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+            limit,
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<StreamReservation> {
+        self.active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < self.limit).then(|| active + 1)
+            })
+            .ok()
+            .map(|_| StreamReservation(Arc::clone(self)))
+    }
+}
+
+#[derive(Debug)]
+struct StreamReservation(Arc<StreamCapacity>);
+
+impl Drop for StreamReservation {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Intentionally not Clone: one response owns one server slot and one viewer
+/// slot. Releasing either on admission failure rolls back the other as well.
+#[derive(Debug)]
+pub(super) struct StreamPermit {
+    _server: StreamReservation,
+    _viewer: StreamReservation,
+}
+
+fn stream_capacity_response(server_full: bool) -> Response {
+    let (status, code, message) = if server_full {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "web_stream_capacity",
+            "All viewer stream slots are in use; retry after a stream closes",
+        )
+    } else {
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            "web_viewer_stream_capacity",
+            "Too many streams for this viewer; close a stream and retry",
+        )
+    };
+    private_response(json_err(status, code, message)).header("retry-after", b"1".to_vec())
+}
+
+pub(super) fn reserve_stream(req: &Request) -> Result<StreamPermit, Response> {
+    let admission = req
+        .get_extension::<SessionAuthMiddleware>()
+        .ok_or_else(|| {
+            json_err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "stream_admission_unavailable",
+                "Stream admission is unavailable",
+            )
+        })?;
+    admission.reserve_stream(req.get_extension::<SessionGrant>())
 }
 
 /// Race the server's stop signal with revocation and the monotonic session
@@ -328,6 +409,8 @@ pub struct SessionAuthMiddleware {
     auth: Option<WebSessionAuth>,
     public_assets: HashSet<String>,
     listener_port: Arc<AtomicU16>,
+    streams: Arc<StreamCapacity>,
+    anonymous_streams: Arc<StreamCapacity>,
 }
 
 impl SessionAuthMiddleware {
@@ -336,7 +419,45 @@ impl SessionAuthMiddleware {
             auth,
             public_assets: assets.collect(),
             listener_port: Arc::new(AtomicU16::new(0)),
+            streams: Arc::new(StreamCapacity::new(MAX_SERVER_STREAMS)),
+            anonymous_streams: Arc::new(StreamCapacity::new(MAX_VIEWER_STREAMS)),
         }
+    }
+
+    pub(super) fn reserve_stream(
+        &self,
+        session: Option<&SessionGrant>,
+    ) -> Result<StreamPermit, Response> {
+        let viewer = if let Some(auth) = self.auth.as_ref() {
+            let grant = session.filter(|grant| {
+                grant.is_valid()
+                    && grant
+                        .0
+                        .authority
+                        .upgrade()
+                        .is_some_and(|authority| Arc::ptr_eq(&authority, &auth.sessions))
+            });
+            &grant.ok_or_else(unauthorized)?.0.streams
+        } else {
+            &self.anonymous_streams
+        };
+        let viewer = viewer
+            .try_acquire()
+            .ok_or_else(|| stream_capacity_response(false))?;
+        let server = self
+            .streams
+            .try_acquire()
+            .ok_or_else(|| stream_capacity_response(true))?;
+        // Logout/expiry may race the reservations. A revoked lease cannot
+        // acquire a fresh producer; the body also checks revocation before
+        // producing and before exposing any queued output.
+        if self.auth.is_some() && session.is_none_or(|grant| !grant.is_valid()) {
+            return Err(unauthorized());
+        }
+        Ok(StreamPermit {
+            _server: server,
+            _viewer: viewer,
+        })
     }
 
     /// Set from the actual validated listener before it accepts requests.
@@ -810,6 +931,132 @@ mod tests {
         assert!(second.is_valid());
         assert!(auth.lookup(Some(session_digest(&token))).unwrap().is_none());
         assert_eq!(auth.sessions.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn both_stream_routes_share_the_legacy_viewer_budget_and_cloned_admission() {
+        let guard = SessionAuthMiddleware::new(None, std::iter::empty());
+        let mut requests = [
+            request(Method::Get, "/stream/events"),
+            request(Method::Get, "/stream/deltas"),
+        ];
+        for req in &mut requests {
+            guard.clone().admit(req).unwrap();
+        }
+        let mut permits = Vec::new();
+        for index in 0..MAX_VIEWER_STREAMS {
+            permits.push(reserve_stream(&requests[index % requests.len()]).unwrap());
+        }
+        for req in &requests {
+            let denied = reserve_stream(req).unwrap_err();
+            assert_eq!(denied.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(body(&denied)["error_code"], "web_viewer_stream_capacity");
+            assert_eq!(header(&denied, "retry-after"), Some(b"1".as_slice()));
+        }
+        assert_eq!(
+            guard.streams.active.load(Ordering::Acquire),
+            MAX_VIEWER_STREAMS
+        );
+        drop(permits.pop());
+        let replacement = reserve_stream(&requests[1]).unwrap();
+        assert!(reserve_stream(&requests[0]).is_err());
+        drop(replacement);
+        drop(permits);
+        assert_eq!(guard.streams.active.load(Ordering::Acquire), 0);
+        assert_eq!(guard.anonymous_streams.active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn all_sessions_share_server_capacity_and_denial_rolls_back_viewer_reservation() {
+        let auth = authority();
+        let guard = middleware(auth.clone());
+        let mut sessions = Vec::new();
+        let mut permits = Vec::new();
+        for _ in 0..MAX_SERVER_STREAMS.div_ceil(MAX_VIEWER_STREAMS) {
+            let (_, grant) = issue(&auth);
+            for _ in 0..MAX_VIEWER_STREAMS {
+                permits.push(guard.reserve_stream(Some(&grant)).unwrap());
+            }
+            sessions.push(grant);
+        }
+        let (_, next) = issue(&auth);
+        let denied = guard.reserve_stream(Some(&next)).unwrap_err();
+        assert_eq!(denied.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body(&denied)["error_code"], "web_stream_capacity");
+        assert_eq!(header(&denied, "retry-after"), Some(b"1".as_slice()));
+        assert_eq!(next.0.streams.active.load(Ordering::Acquire), 0);
+        assert_eq!(
+            guard.streams.active.load(Ordering::Acquire),
+            MAX_SERVER_STREAMS
+        );
+
+        drop(permits.pop());
+        let replacement = guard.reserve_stream(Some(&next)).unwrap();
+        assert_eq!(next.0.streams.active.load(Ordering::Acquire), 1);
+        assert!(guard.reserve_stream(Some(&next)).is_err());
+        assert_eq!(next.0.streams.active.load(Ordering::Acquire), 1);
+        drop(replacement);
+        drop(permits);
+        assert_eq!(guard.streams.active.load(Ordering::Acquire), 0);
+        assert!(
+            sessions
+                .iter()
+                .all(|grant| grant.0.streams.active.load(Ordering::Acquire) == 0)
+        );
+    }
+
+    #[test]
+    fn stream_admission_refuses_missing_revoked_and_foreign_session_authority() {
+        let auth = authority();
+        let guard = middleware(auth.clone());
+        let (_, live) = issue(&auth);
+        let foreign_auth = authority();
+        let (_, foreign) = issue(&foreign_auth);
+        for session in [None, Some(&foreign)] {
+            assert_eq!(
+                guard.reserve_stream(session).unwrap_err().status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        live.revoke();
+        assert_eq!(
+            guard.reserve_stream(Some(&live)).unwrap_err().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(guard.streams.active.load(Ordering::Acquire), 0);
+        assert_eq!(live.0.streams.active.load(Ordering::Acquire), 0);
+        assert_eq!(foreign.0.streams.active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn concurrent_stream_admission_never_exceeds_a_viewers_budget() {
+        let auth = authority();
+        let guard = middleware(auth.clone());
+        let (_, grant) = issue(&auth);
+        let attempted = Arc::new(std::sync::Barrier::new(17));
+        let release = Arc::new(std::sync::Barrier::new(17));
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                let guard = guard.clone();
+                let grant = grant.clone();
+                let attempted = Arc::clone(&attempted);
+                let release = Arc::clone(&release);
+                scope.spawn(move || {
+                    let permit = guard.reserve_stream(Some(&grant));
+                    attempted.wait();
+                    release.wait();
+                    drop(permit);
+                });
+            }
+            attempted.wait();
+            let viewer_active = grant.0.streams.active.load(Ordering::Acquire);
+            let server_active = guard.streams.active.load(Ordering::Acquire);
+            release.wait();
+            assert_eq!(viewer_active, MAX_VIEWER_STREAMS);
+            assert_eq!(server_active, MAX_VIEWER_STREAMS);
+        });
+        assert_eq!(grant.0.streams.active.load(Ordering::Acquire), 0);
+        assert_eq!(guard.streams.active.load(Ordering::Acquire), 0);
     }
 
     #[test]

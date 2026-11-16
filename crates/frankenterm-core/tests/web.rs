@@ -662,6 +662,129 @@ mod web_tests {
         });
     }
 
+    #[test]
+    fn web_stream_budget_is_shared_across_routes_and_released_after_disconnect() {
+        use anyhow::ensure;
+
+        async fn open_stream(
+            addr: SocketAddr,
+            path: &str,
+            cookie: Option<&str>,
+            epoch: Option<&str>,
+        ) -> anyhow::Result<TcpStream> {
+            let path = match epoch {
+                Some(epoch) => format!("{path}?pane_id=7&session_epoch={epoch}"),
+                None => format!("{path}?pane_id=7"),
+            };
+            let request = session_request(addr, "GET", &path, cookie, None);
+            let mut stream = TcpStream::connect(addr).await?;
+            stream.write_all(request.as_bytes()).await?;
+            let mut response = Vec::new();
+            let ready = read_event_stream_until(&mut stream, &mut response, "ready", 1).await?;
+            ensure!(extract_status(&ready) == 200, "authorized stream starts");
+            Ok(stream)
+        }
+
+        run_async_test(async {
+            for authenticated in [false, true] {
+                let (storage, _tmp) = create_test_storage_with_pane(7).await.unwrap();
+                let event_bus = Arc::new(EventBus::new(16));
+                let mut config = WebServerConfig::default()
+                    .with_port(0)
+                    .with_storage(storage.clone())
+                    .with_storage_event_tail(false)
+                    .with_event_bus(Arc::clone(&event_bus))
+                    .with_runtime_limits(WebRuntimeLimits {
+                        stream_keepalive_secs: 1,
+                        ..frankenterm_core::web::resolve_runtime_limits(None)
+                    });
+                if authenticated {
+                    config = config.with_session_auth(
+                        WebSessionAuth::new(VIEWER_TEST_CREDENTIAL).unwrap(),
+                    );
+                }
+                let server = start_web_server(config).await.unwrap();
+                let addr = server.bound_addr();
+                let scenario = Box::pin(timeout(Duration::from_secs(20), async {
+                    let cookie = if authenticated {
+                        Some(login_viewer(addr, None).await?)
+                    } else {
+                        None
+                    };
+                    let epoch = match cookie.as_deref() {
+                        Some(cookie) => Some(viewer_session_epoch(addr, cookie).await?),
+                        None => None,
+                    };
+                    let paths = ["/stream/events", "/stream/deltas"];
+                    let mut streams = Vec::new();
+                    for index in 0..8 {
+                        streams.push(
+                            open_stream(
+                                addr,
+                                paths[index % paths.len()],
+                                cookie.as_deref(),
+                                epoch.as_deref(),
+                            )
+                            .await?,
+                        );
+                    }
+                    ensure!(event_bus.subscriber_count() == 8, "eight actual producers");
+                    for path in paths {
+                        let path = match epoch.as_deref() {
+                            Some(epoch) => format!("{path}?session_epoch={epoch}"),
+                            None => path.to_owned(),
+                        };
+                        let request = session_request(addr, "GET", &path, cookie.as_deref(), None);
+                        let response = fetch_raw(addr, request.as_bytes()).await?;
+                        ensure!(extract_status(&response) == 429, "shared viewer limit");
+                        ensure!(header_value(&response, "retry-after") == Some("1"));
+                        let body: serde_json::Value =
+                            serde_json::from_str(extract_body(&response))?;
+                        ensure!(body["error_code"] == "web_viewer_stream_capacity");
+                        ensure!(event_bus.subscriber_count() == 8, "denial creates no producer");
+                    }
+
+                    let request = session_request(addr, "GET", "/panes", cookie.as_deref(), None);
+                    let response = fetch_raw(addr, request.as_bytes()).await?;
+                    ensure!(extract_status(&response) == 200, "finite reads remain available");
+                    ensure!(response.contains("test-pane"), "real stored data remains readable");
+                    let other_viewer_stream = if authenticated {
+                        // Saturating one lease cannot consume another viewer's
+                        // budget or prevent a fresh authenticated login.
+                        let other = login_viewer(addr, None).await?;
+                        let other_epoch = viewer_session_epoch(addr, &other).await?;
+                        Some(open_stream(addr, paths[0], Some(&other), Some(&other_epoch)).await?)
+                    } else {
+                        None
+                    };
+                    let active = if authenticated { 9 } else { 8 };
+                    ensure!(event_bus.subscriber_count() == active);
+                    drop(streams.pop());
+                    timeout(Duration::from_secs(4), async {
+                        while event_bus.subscriber_count() != active - 1 {
+                            sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+                    streams.push(
+                        open_stream(addr, paths[1], cookie.as_deref(), epoch.as_deref()).await?,
+                    );
+                    ensure!(event_bus.subscriber_count() == active, "disconnected slot reused");
+                    drop(other_viewer_stream);
+                    drop(streams);
+                    Ok::<_, anyhow::Error>(())
+                }))
+                .await;
+                server.shutdown().await.unwrap();
+                storage.shutdown().await.unwrap();
+                scenario
+                    .expect("stream admission scenario deadline")
+                    .expect("stream admission assertions");
+            }
+        });
+    }
+
     /// An invalid pane selection must be rejected before either data access
     /// or SSE subscription. No backend is attached, so 400 rather than 503
     /// also proves that validation owns the admission decision.

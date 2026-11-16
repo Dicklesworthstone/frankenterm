@@ -328,6 +328,9 @@ struct SseByteStream {
     // receiver-closed polling, or unobserved JoinHandle survives body Drop.
     producer: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
     shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
+    // Kept after the producer and queue so body Drop disposes their resources
+    // before returning admission capacity to a replacement stream.
+    permit: Option<super::auth::StreamPermit>,
 }
 
 struct SseRecvState {
@@ -366,18 +369,21 @@ impl SseByteStream {
         rx: mpsc::Receiver<SseEvent>,
         producer: Pin<Box<dyn Future<Output = ()> + Send>>,
         shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
+        permit: super::auth::StreamPermit,
     ) -> Self {
         Self {
             rx: Some(rx),
             recv_state: SseRecvState::new(cx),
             producer: Some(producer),
             shutdown,
+            permit: Some(permit),
         }
     }
 
     fn finish(&mut self) -> Poll<Option<Vec<u8>>> {
         self.producer = None;
         self.rx = None;
+        self.permit = None;
         Poll::Ready(None)
     }
 }
@@ -1024,6 +1030,7 @@ pub(super) fn handle_stream_events(
         channel,
         EventStreamChannel::All | EventStreamChannel::Detections
     );
+    let admission = super::auth::reserve_stream(req);
 
     Box::pin(async move {
         let (event_bus, redactor) = match result {
@@ -1058,6 +1065,10 @@ pub(super) fn handle_stream_events(
                 "stream_context_unavailable",
                 "Stream runtime context is unavailable",
             );
+        };
+        let permit = match admission {
+            Ok(permit) => permit,
+            Err(response) => return response,
         };
         let shutdown = super::auth::stream_shutdown(
             lifecycle.shutdown_waiter(&stream_cx),
@@ -1373,6 +1384,7 @@ pub(super) fn handle_stream_events(
             rx,
             Box::pin(producer),
             shutdown,
+            permit,
         ))
         .into_response()
     })
@@ -1389,11 +1401,80 @@ mod tests {
     use crate::web_framework::QueryString;
     use serde_json::json;
 
+    pub(super) fn stream_permit() -> super::super::auth::StreamPermit {
+        super::super::auth::SessionAuthMiddleware::new(None, std::iter::empty())
+            .reserve_stream(None)
+            .expect("fresh fixture stream capacity")
+    }
+
     struct ProducerDropProbe(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 
     impl Drop for ProducerDropProbe {
         fn drop(&mut self) {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn stream_admission_returns_exactly_one_slot_on_eof_shutdown_and_body_drop() {
+        use crate::runtime_async::stream::Stream;
+        use std::future::{Future, pending, ready};
+        use std::pin::Pin;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Context, Poll, Waker};
+
+        for outcome in ["eof", "shutdown", "unpolled_drop", "parked_drop"] {
+            let admission =
+                super::super::auth::SessionAuthMiddleware::new(None, std::iter::empty());
+            let permit = admission.reserve_stream(None).unwrap();
+            // Retain the other seven viewer slots. Exactly one replacement
+            // must be admitted when this body ends, even before body Drop.
+            let _other_streams = (0..7)
+                .map(|_| admission.reserve_stream(None).unwrap())
+                .collect::<Vec<_>>();
+            assert!(admission.reserve_stream(None).is_err());
+            let (tx, rx) = mpsc::channel(2);
+            let drops = Arc::new(AtomicUsize::new(0));
+            let probe = ProducerDropProbe(Arc::clone(&drops));
+            let producer = Box::pin(async move {
+                let _owned = (tx, probe);
+                if outcome != "eof" {
+                    pending::<()>().await;
+                }
+            });
+            let shutdown: Pin<Box<dyn Future<Output = ()> + Send>> = if outcome == "shutdown" {
+                Box::pin(ready(()))
+            } else {
+                Box::pin(pending())
+            };
+            let mut stream = Some(super::SseByteStream::new(
+                crate::cx::for_request(),
+                rx,
+                producer,
+                shutdown,
+                permit,
+            ));
+            let mut poll = Context::from_waker(Waker::noop());
+            if outcome == "unpolled_drop" {
+                drop(stream.take());
+            } else {
+                let body = stream.as_mut().unwrap();
+                if outcome == "parked_drop" {
+                    assert!(Pin::new(body).poll_next(&mut poll).is_pending());
+                    drop(stream.take());
+                } else {
+                    assert_eq!(Pin::new(&mut *body).poll_next(&mut poll), Poll::Ready(None));
+                    assert_eq!(Pin::new(body).poll_next(&mut poll), Poll::Ready(None));
+                }
+            }
+            assert_eq!(drops.load(Ordering::SeqCst), 1, "{outcome}");
+            let replacement = admission.reserve_stream(None).expect(outcome);
+            assert!(admission.reserve_stream(None).is_err(), "{outcome}");
+            drop(stream);
+            assert!(admission.reserve_stream(None).is_err(), "no double release: {outcome}");
+            drop(replacement);
+            assert!(admission.reserve_stream(None).is_ok(), "{outcome}");
         }
     }
 
@@ -1413,7 +1494,13 @@ mod tests {
             std::future::pending::<()>().await;
         });
         (
-            super::SseByteStream::new(crate::cx::for_request(), rx, producer, shutdown),
+            super::SseByteStream::new(
+                crate::cx::for_request(),
+                rx,
+                producer,
+                shutdown,
+                stream_permit(),
+            ),
             drops,
         )
     }
@@ -1515,7 +1602,7 @@ mod tests {
             lifecycle.signal_shutdown();
             std::future::pending::<()>().await;
         });
-        let mut stream = super::SseByteStream::new(cx, rx, producer, waiter);
+        let mut stream = super::SseByteStream::new(cx, rx, producer, waiter, stream_permit());
         let mut poll_cx = Context::from_waker(Waker::noop());
         assert_eq!(
             Pin::new(&mut stream).poll_next(&mut poll_cx),
@@ -2482,6 +2569,7 @@ mod tests {
                 rx,
                 producer,
                 Box::pin(std::future::pending()),
+                stream_permit(),
             );
             let frames = crate::runtime_async::timeout_with_cx(
                 &cx,
@@ -2546,7 +2634,7 @@ mod tests {
                 .await;
                 producer_completed.store(result, Ordering::SeqCst);
             });
-            let mut stream = super::SseByteStream::new(cx, rx, producer, waiter);
+            let mut stream = super::SseByteStream::new(cx, rx, producer, waiter, stream_permit());
             let mut poll_cx = Context::from_waker(Waker::noop());
             let Poll::Ready(Some(first)) = Pin::new(&mut stream).poll_next(&mut poll_cx) else {
                 panic!("the first frame should be queued before the producer parks");
@@ -2650,7 +2738,7 @@ mod tests {
                 .await;
                 producer_sent.store(did_send, Ordering::SeqCst);
             });
-            let mut stream = super::SseByteStream::new(cx, rx, producer, waiter);
+            let mut stream = super::SseByteStream::new(cx, rx, producer, waiter, stream_permit());
             let mut poll_cx = Context::from_waker(Waker::noop());
             assert!(Pin::new(&mut stream).poll_next(&mut poll_cx).is_pending());
             assert_eq!(drops.load(Ordering::SeqCst), 0);

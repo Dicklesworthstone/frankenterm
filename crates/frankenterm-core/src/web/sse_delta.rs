@@ -291,6 +291,7 @@ pub fn handle_stream_deltas(
     let session = req
         .get_extension::<super::super::auth::SessionGrant>()
         .cloned();
+    let admission = super::super::auth::reserve_stream(req);
 
     Box::pin(async move {
         let (storage, event_bus, redactor) = match result {
@@ -310,6 +311,10 @@ pub fn handle_stream_deltas(
                 "stream_context_unavailable",
                 "Stream runtime context is unavailable",
             );
+        };
+        let permit = match admission {
+            Ok(permit) => permit,
+            Err(response) => return response,
         };
         let shutdown = super::super::auth::stream_shutdown(
             lifecycle.shutdown_waiter(&stream_cx),
@@ -496,6 +501,7 @@ pub fn handle_stream_deltas(
             rx,
             Box::pin(producer),
             shutdown,
+            permit,
         ))
         .into_response()
     })
@@ -503,6 +509,7 @@ pub fn handle_stream_deltas(
 
 #[cfg(test)]
 mod tests {
+    use super::super::tests::stream_permit;
     use super::*;
     use crate::runtime_async::CompatRuntime;
 
@@ -767,8 +774,13 @@ mod tests {
                 );
                 producer_cursor.store(state.after_id.unwrap(), Ordering::SeqCst);
             });
-            let mut stream =
-                SseByteStream::new(cx.clone(), rx, producer, Box::pin(std::future::pending()));
+            let mut stream = SseByteStream::new(
+                cx.clone(),
+                rx,
+                producer,
+                Box::pin(std::future::pending()),
+                stream_permit(),
+            );
             let frames =
                 crate::runtime_async::timeout_with_cx(&cx, Duration::from_secs(5), async {
                     let mut frames = Vec::new();
@@ -826,7 +838,7 @@ mod tests {
                     )
                     .await;
             });
-            let mut stream = SseByteStream::new(cx, rx, producer, shutdown);
+            let mut stream = SseByteStream::new(cx, rx, producer, shutdown, stream_permit());
             let mut poll = Context::from_waker(Waker::noop());
             assert!(matches!(
                 Pin::new(&mut stream).poll_next(&mut poll),
@@ -1124,8 +1136,13 @@ mod tests {
                 );
                 producer_admitted.store(initial.after_id.unwrap(), Ordering::SeqCst);
             });
-            let mut stream =
-                SseByteStream::new(cx.clone(), rx, producer, Box::pin(std::future::pending()));
+            let mut stream = SseByteStream::new(
+                cx.clone(),
+                rx,
+                producer,
+                Box::pin(std::future::pending()),
+                stream_permit(),
+            );
             let first = crate::runtime_async::timeout_with_cx(
                 &cx,
                 Duration::from_secs(5),
