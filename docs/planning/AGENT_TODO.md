@@ -1486,12 +1486,16 @@ acknowledges it. A crash at that boundary therefore allowed a duplicate replay.
   Independently decode sealed and active files to check actual event contents.
 - [x] Independently review the reader's limits, writer startup ordering, retained
   recovery anchor, cancellation, and unchanged-ledger failure behavior.
-- [ ] Run strict RCH tests runtime::tests::recorder_delivery_restart_after_append_before_ack_never_duplicates
+- [x] Run strict RCH tests runtime::tests::recorder_delivery_restart_after_append_before_ack_never_duplicates
   and runtime::tests::recorder_delivery_recovery_fences_conflicts_duplicates_and_pruned_absence,
   then the adjacent recorder delivery tests, affected check and Clippy gates,
-  and exact committed-source formatting proof.
-- [ ] Create/link the new recorder recovery Bead and retain the remote results
-  before marking implementation verified.
+  and exact committed-source formatting proof. Done 2026-11-15 at e219959de
+  (ts1, clean overlay): core clippy all targets clean; core runtime:: 451
+  passed, 0 failed, both tests and the adjacent recorder_delivery tests
+  included; RuntimeProof coverage gate passes. The format proof failed on one
+  hunk here, fixed by hand in efcc0659a, where it passes.
+- [x] Create/link the new recorder recovery Bead and retain the remote results
+  before marking implementation verified: ft-agjmbu.
 
 Validation limit: RCH doctor and worker probe could not run (rch: command not
 found). The local execution service subsequently became unavailable; reviewed
