@@ -185,6 +185,27 @@ fn workflow_start_pane_rate_limited_matches_golden() {
 }
 
 #[test]
+fn workflow_start_pane_shows_other_agent_matches_golden() {
+    let result = WorkflowStartResult::PaneShowsOtherAgent {
+        pane_id: 7,
+        workflow_name: "handle_usage_limits".into(),
+        rule_id: "codex.usage.reached".into(),
+        rule_agent: "codex".into(),
+        screen_agent: "claude_code".into(),
+    };
+    assert_json_snapshot!(result, @r###"
+    {
+      "type": "pane_shows_other_agent",
+      "pane_id": 7,
+      "workflow_name": "handle_usage_limits",
+      "rule_id": "codex.usage.reached",
+      "rule_agent": "codex",
+      "screen_agent": "claude_code"
+    }
+    "###);
+}
+
+#[test]
 fn workflow_start_error_matches_golden() {
     assert_json_snapshot!(start_error_result(), @r###"
     {
@@ -304,6 +325,13 @@ fn workflow_start_all_variants_roundtrip_through_json() {
             rule_id: "codex.usage_limit".into(),
             reset_at_ms: 1_700_000_000_000,
             reset_known: false,
+        },
+        WorkflowStartResult::PaneShowsOtherAgent {
+            pane_id: 7,
+            workflow_name: "handle_usage_limits".into(),
+            rule_id: "codex.usage.reached".into(),
+            rule_agent: "codex".into(),
+            screen_agent: "claude_code".into(),
         },
         start_error_result(),
     ] {

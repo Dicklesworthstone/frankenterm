@@ -7570,6 +7570,99 @@ steps:
         });
     }
 
+    /// ft-2ko47y: every agent's rules run on every pane. A Claude pane whose
+    /// tender reports a Codex lane's limit message raises codex.usage.reached,
+    /// and handle_usage_limits would send Codex's two Ctrl-C into it; the
+    /// second exits Claude Code. The runner declines before the pane lock.
+    #[test]
+    fn a_codex_rule_on_a_claude_screen_starts_no_workflow() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("agent-gate.db");
+            let storage = Arc::new(
+                crate::storage::StorageHandle::new(&path.to_string_lossy())
+                    .await
+                    .unwrap(),
+            );
+            let screen = |name: &str| {
+                let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/agent_screens");
+                std::fs::read_to_string(fixtures.join(name)).unwrap()
+            };
+            let claude = screen("claude_code_2_1_idle.txt");
+            let (banner, composer) = claude.split_at(claude.find('─').unwrap());
+            let reporting = format!(
+                "{banner}⏺ All eleven OpenAI Codex panes show \"You've hit your usage \
+                 limit. Try again at Nov 18th, 2026 11:44 AM.\"\n{composer}"
+            );
+            // Pane 41 is Claude reporting its Codex lanes, 42 is Codex, 43 is a
+            // shell, and 44 is not in the mux, so its screen cannot be read.
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            for (pane_id, text) in [
+                (41, reporting.clone()),
+                (42, screen("codex_0157_idle.txt")),
+                (43, "$ ls\nfoo bar\n$ ".to_string()),
+            ] {
+                mock.add_default_pane(pane_id).await;
+                mock.inject_output(pane_id, &text).await.unwrap();
+            }
+            for pane_id in [41, 42, 43, 44] {
+                create_test_pane(&storage, pane_id).await;
+            }
+            let handle: crate::wezterm::WeztermHandle = mock.clone();
+            let locks = Arc::new(PaneWorkflowLockManager::new());
+            let runner = WorkflowRunner::new(
+                WorkflowEngine::default(),
+                Arc::clone(&locks),
+                Arc::clone(&storage),
+                CxPolicyInjector::new(crate::policy::PolicyGatedInjector::new(
+                    crate::policy::PolicyEngine::permissive(),
+                    handle,
+                )),
+                WorkflowRunnerConfig {
+                    max_concurrent: 8,
+                    ..WorkflowRunnerConfig::default()
+                },
+            );
+            runner.register_workflow(Arc::new(HandleUsageLimits::new()));
+            let detection = Detection {
+                rule_id: "codex.usage.reached".to_string(),
+                agent_type: AgentType::Codex,
+                event_type: "usage.reached".to_string(),
+                severity: Severity::Critical,
+                confidence: 1.0,
+                extracted: serde_json::Value::Null,
+                matched_text: "You've hit your usage limit.".to_string(),
+                span: (0, 0),
+            };
+
+            let declined = runner.handle_detection(41, &detection, None).await;
+            assert!(
+                matches!(
+                    &declined,
+                    WorkflowStartResult::PaneShowsOtherAgent {
+                        pane_id: 41,
+                        workflow_name,
+                        rule_agent,
+                        screen_agent,
+                        ..
+                    } if workflow_name == "handle_usage_limits"
+                        && rule_agent == "codex"
+                        && screen_agent == "claude_code"
+                ),
+                "{declined:?}"
+            );
+            assert!(locks.is_locked(41).is_none());
+            assert_eq!(mock.pane_state(41).await.unwrap().content, reporting);
+
+            for pane_id in [42, 43, 44] {
+                let started = runner.handle_detection(pane_id, &detection, None).await;
+                assert!(started.is_started(), "pane {pane_id}: {started:?}");
+            }
+            storage.shutdown().await.unwrap();
+        });
+    }
+
     #[test]
     fn external_abort_inspection_preserves_terminal_missing_and_cancelled_outcomes() {
         run_async_test(async {

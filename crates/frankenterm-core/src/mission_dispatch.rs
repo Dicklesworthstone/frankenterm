@@ -307,6 +307,23 @@ impl MissionDispatcher {
                 )),
                 dispatch_ms,
             },
+            WorkflowStartResult::PaneShowsOtherAgent {
+                pane_id,
+                workflow_name,
+                rule_id,
+                rule_agent,
+                screen_agent,
+            } => DispatchResult {
+                assignment_id: assignment_id.to_string(),
+                target_agent: target_agent.to_string(),
+                accepted: false,
+                execution_id: None,
+                reason: Some(format!(
+                    "ft-2ko47y: workflow '{workflow_name}' declined; pane {pane_id} shows \
+                     {screen_agent}, not {rule_agent} (rule_id={rule_id})"
+                )),
+                dispatch_ms,
+            },
             WorkflowStartResult::Error { error } => DispatchResult {
                 assignment_id: assignment_id.to_string(),
                 target_agent: target_agent.to_string(),

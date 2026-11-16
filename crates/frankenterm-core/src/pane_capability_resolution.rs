@@ -170,25 +170,34 @@ pub fn classify_agent_screen(tail: &str) -> Option<(&'static str, AgentScreenSta
     // The idle composer shows a placeholder ("› Ask Codex to do anything") or,
     // once it has been used, a bare "›"; the footer may show warnings instead
     // of the shortcut hint, so the banner also identifies it.
-    let codex_composer = lines
+    let codex_composer_row = lines
         .iter()
-        .any(|line| *line == "›" || line.starts_with("› "))
-        && any(&["? for shortcuts", "openai codex"]);
-    let claude_composer = lines.windows(3).any(|window| {
-        window[0].trim_start().starts_with('─')
-            && window[1].starts_with('❯')
-            && window[2].trim_start().starts_with('─')
-    });
-    let agent =
-        if codex_composer || any(&["openai codex", "codex can read", "agent command center"]) {
-            "codex"
-        } else if claude_composer || any(&["claude code"]) {
-            "claude_code"
-        } else if any(&["gemini cli", "gemini code assist"]) {
-            "gemini"
-        } else {
-            return None;
-        };
+        .rposition(|line| *line == "›" || line.starts_with("› "))
+        .filter(|_| any(&["? for shortcuts", "openai codex"]));
+    // The row of the "❯" line between the composer's two rules.
+    let claude_composer_row = lines
+        .windows(3)
+        .rposition(|window| {
+            window[0].trim_start().starts_with('─')
+                && window[1].starts_with('❯')
+                && window[2].trim_start().starts_with('─')
+        })
+        .map(|row| row + 1);
+    let codex_composer = codex_composer_row.is_some();
+    let claude_composer = claude_composer_row.is_some();
+    // An agent's composer outranks agent names anywhere in the tail, which
+    // its own output quotes freely: a Claude pane reporting what an OpenAI
+    // Codex pane printed is still Claude (ft-2ko47y). Its own composer is the
+    // lowest one; a composer quoted in its output sits above it.
+    let agent = match (codex_composer_row, claude_composer_row) {
+        (Some(codex), Some(claude)) if codex > claude => "codex",
+        (_, Some(_)) => "claude_code",
+        (Some(_), None) => "codex",
+        (None, None) if any(&["openai codex", "codex can read", "agent command center"]) => "codex",
+        (None, None) if any(&["claude code"]) => "claude_code",
+        (None, None) if any(&["gemini cli", "gemini code assist"]) => "gemini",
+        (None, None) => return None,
+    };
 
     if selected_menu_item
         || any(&[
@@ -1202,6 +1211,33 @@ mod tests {
         // placeholder and a warnings footer instead of the shortcut hint.
         assert_eq!(
             classify_agent_screen(&agent_screen("codex_0157_idle_empty_composer.txt")),
+            Some(("codex", AgentScreenState::Ready))
+        );
+    }
+
+    /// ft-2ko47y: an agent's output may name another agent and even quote its
+    /// composer, as a swarm tender does when it reports its lanes. The pane's
+    /// own composer, the lowest one on screen, decides.
+    #[test]
+    fn an_agents_own_composer_outranks_another_agent_quoted_above_it() {
+        let claude = agent_screen("claude_code_2_1_idle.txt");
+        let (banner, composer) = claude.split_at(claude.find('─').unwrap());
+        let named = "⏺ All eleven OpenAI Codex panes show \"You've hit your usage limit. \
+                     Try again at Nov 18th, 2026 11:44 AM.\"\n";
+        let quoted = "› Ask Codex to do anything\n  ? for shortcuts\n";
+        for report in [named.to_string(), format!("{named}{quoted}")] {
+            assert_eq!(
+                classify_agent_screen(&format!("{banner}{report}{composer}")),
+                Some(("claude_code", AgentScreenState::Ready)),
+                "{report:?}"
+            );
+        }
+
+        let codex = agent_screen("codex_0157_idle.txt");
+        let (top, composer) = codex.split_at(codex.find("› Ask Codex").unwrap());
+        let quoted = "────────\n❯ Try \"fix the build\"\n────────\nClaude Code v2.1.282\n";
+        assert_eq!(
+            classify_agent_screen(&format!("{top}{quoted}{composer}")),
             Some(("codex", AgentScreenState::Ready))
         );
     }

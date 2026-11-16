@@ -983,6 +983,23 @@ pub enum WorkflowStartResult {
         /// window had no parseable reset, `reset_source == "unknown_ttl"`).
         reset_known: bool,
     },
+    /// The detection came from one agent's rule, but the pane's screen shows
+    /// another agent (ft-2ko47y). Every agent's rules run on every pane, so a
+    /// Claude pane quoting a Codex limit message raises Codex's rule, whose
+    /// workflow would type Codex input into Claude. Declined before any lock,
+    /// engine state, or audit row is created.
+    PaneShowsOtherAgent {
+        /// The pane whose screen was read.
+        pane_id: u64,
+        /// The matched workflow's name.
+        workflow_name: String,
+        /// The detection rule_id that would have fired.
+        rule_id: String,
+        /// The agent the rule belongs to.
+        rule_agent: String,
+        /// The agent the pane's screen shows.
+        screen_agent: String,
+    },
     /// An error occurred
     Error {
         /// Error message
@@ -1418,6 +1435,31 @@ impl WorkflowRunner {
         workflows.iter().find(|w| w.name() == name).cloned()
     }
 
+    /// The agent on `pane_id`'s screen, when it is a known agent other than
+    /// the one `detection`'s rule belongs to (ft-2ko47y). `None` for rules of
+    /// no particular agent and for unreadable or unrecognised screens.
+    async fn pane_shows_other_agent(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        detection: &crate::patterns::Detection,
+    ) -> Option<crate::patterns::AgentType> {
+        use crate::patterns::AgentType;
+        if !matches!(
+            detection.agent_type,
+            AgentType::Codex | AgentType::ClaudeCode | AgentType::Gemini
+        ) {
+            return None;
+        }
+        let screen = crate::pane_capability_resolution::agent_type_from_screen(
+            cx,
+            self.injector.client(),
+            pane_id,
+        )
+        .await;
+        (screen != AgentType::Unknown && screen != detection.agent_type).then_some(screen)
+    }
+
     /// Handle a detection event, potentially starting a workflow.
     ///
     /// Returns immediately with `WorkflowStartResult`. The actual workflow
@@ -1522,6 +1564,31 @@ impl WorkflowRunner {
                 source_pane_id,
                 workflow_name,
                 rule_id: detection.rule_id.clone(),
+            };
+        }
+
+        // ft-2ko47y: every agent's rules run on every pane, so a detection
+        // names its rule's agent, not the pane's. A Claude pane quoting a
+        // Codex limit message raises codex.usage.reached, whose workflow sends
+        // Codex's two Ctrl-C, and the second one exits Claude Code. Decline
+        // when the screen positively shows another agent; an unreadable or
+        // unrecognised screen keeps the detection's word. Runs before lock
+        // acquisition, like the checks around it.
+        if let Some(screen_agent) = self.pane_shows_other_agent(cx, pane_id, detection).await {
+            tracing::warn!(
+                pane_id,
+                workflow = %workflow_name,
+                rule_id = %detection.rule_id,
+                rule_agent = %detection.agent_type,
+                screen_agent = %screen_agent,
+                "workflow trigger declined: the pane shows another agent (ft-2ko47y)"
+            );
+            return WorkflowStartResult::PaneShowsOtherAgent {
+                pane_id,
+                workflow_name,
+                rule_id: detection.rule_id.clone(),
+                rule_agent: detection.agent_type.to_string(),
+                screen_agent: screen_agent.to_string(),
             };
         }
 
@@ -4283,6 +4350,19 @@ impl WorkflowRunner {
                                     reset_known,
                                     explicit_cx = true,
                                     "ft-7h5da.8.3: trigger declined (target pane rate-limited) (cx)"
+                                );
+                            }
+                            // Logged at warn where it was declined.
+                            WorkflowStartResult::PaneShowsOtherAgent {
+                                pane_id,
+                                workflow_name,
+                                ..
+                            } => {
+                                tracing::debug!(
+                                    pane_id,
+                                    workflow = %workflow_name,
+                                    explicit_cx = true,
+                                    "ft-2ko47y: trigger declined (pane shows another agent) (cx)"
                                 );
                             }
                             WorkflowStartResult::Error { error } => {

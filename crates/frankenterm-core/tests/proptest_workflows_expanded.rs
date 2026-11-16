@@ -202,6 +202,24 @@ fn arb_workflow_start_result() -> impl Strategy<Value = WorkflowStartResult> {
                     }
                 },
             ),
+        (
+            any::<u64>(),
+            arb_short_text(),
+            arb_step_id(),
+            arb_short_text(),
+            arb_short_text(),
+        )
+            .prop_map(
+                |(pane_id, workflow_name, rule_id, rule_agent, screen_agent)| {
+                    WorkflowStartResult::PaneShowsOtherAgent {
+                        pane_id,
+                        workflow_name,
+                        rule_id,
+                        rule_agent,
+                        screen_agent,
+                    }
+                },
+            ),
         arb_short_text().prop_map(|error| WorkflowStartResult::Error { error }),
     ]
 }
@@ -560,6 +578,9 @@ proptest! {
             }
             WorkflowStartResult::PaneRateLimited { .. } => {
                 prop_assert_eq!(ty, "pane_rate_limited");
+            }
+            WorkflowStartResult::PaneShowsOtherAgent { .. } => {
+                prop_assert_eq!(ty, "pane_shows_other_agent");
             }
             WorkflowStartResult::Error { .. } => prop_assert_eq!(ty, "error"),
         }
