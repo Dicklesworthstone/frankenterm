@@ -7356,6 +7356,315 @@ steps:
     }
 
     #[test]
+    fn live_workflow_abort_refusal_preserves_owner_until_effect_settles() {
+        struct PausedEffectWorkflow {
+            entered: Mutex<Option<futures::channel::oneshot::Sender<()>>>,
+            release: Mutex<Option<futures::channel::oneshot::Receiver<()>>>,
+            effects: Arc<AtomicUsize>,
+        }
+
+        impl Workflow for PausedEffectWorkflow {
+            fn name(&self) -> &'static str {
+                "paused_abort_effect"
+            }
+
+            fn description(&self) -> &'static str {
+                "Pause a real execution before its observable effect"
+            }
+
+            fn handles(&self, detection: &Detection) -> bool {
+                detection.rule_id == "abort.live_owner"
+            }
+
+            fn steps(&self) -> Vec<WorkflowStep> {
+                vec![WorkflowStep::new("effect", "Await release before effect")]
+            }
+
+            fn execute_step(
+                &self,
+                _ctx: &mut WorkflowContext,
+                step_idx: usize,
+            ) -> BoxFuture<'_, StepResult> {
+                assert_eq!(step_idx, 0);
+                let entered = self.entered.lock().unwrap().take().unwrap();
+                let release = self.release.lock().unwrap().take().unwrap();
+                let effects = Arc::clone(&self.effects);
+                Box::pin(async move {
+                    entered.send(()).unwrap();
+                    release.await.unwrap();
+                    effects.fetch_add(1, Ordering::SeqCst);
+                    StepResult::done_empty()
+                })
+            }
+        }
+
+        run_async_test(async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("live-abort-refusal.db");
+            let db_path = path.to_string_lossy().to_string();
+            let (runner, storage, locks) = create_test_runner(&db_path).await;
+            let one_shot_storage =
+                Arc::new(StorageHandle::new(&db_path).await.expect("one-shot storage"));
+            let pane_id = 62;
+            create_test_pane(&storage, pane_id).await;
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "INSERT INTO events (id, pane_id, rule_id, agent_type, event_type, severity, confidence, detected_at) VALUES (1, 62, 'abort.live_owner', 'unknown', 'test', 'info', 1.0, 1);",
+            )
+            .unwrap();
+            let (entered_tx, entered_rx) = futures::channel::oneshot::channel();
+            let (release_tx, release_rx) = futures::channel::oneshot::channel();
+            let effects = Arc::new(AtomicUsize::new(0));
+            runner.register_workflow(Arc::new(PausedEffectWorkflow {
+                entered: Mutex::new(Some(entered_tx)),
+                release: Mutex::new(Some(release_rx)),
+                effects: Arc::clone(&effects),
+            }));
+            let started = runner
+                .handle_detection(pane_id, &make_test_detection("abort.live_owner"), Some(1))
+                .await;
+            let execution = started.execution_id().expect("workflow admitted").to_string();
+            let workflow = runner.find_workflow_by_name("paused_abort_effect").unwrap();
+            let cx = crate::cx::for_testing();
+            let (completed, ()) = crate::runtime_async::timeout_with_cx(
+                &cx,
+                Duration::from_secs(5),
+                async {
+                    futures::join!(
+                        runner.run_workflow_with_cx(&cx, pane_id, workflow, &execution, 0),
+                        async {
+                            entered_rx.await.expect("effect barrier reached");
+                            assert_eq!(effects.load(Ordering::SeqCst), 0);
+                            let before = storage.get_workflow(&execution).await.unwrap().unwrap();
+                            assert_eq!(before.status, "running");
+                            let lock_before = locks.is_locked(pane_id).expect("live owner lock");
+                            let start_actions = storage
+                                .get_action_history(crate::storage::ActionHistoryQuery {
+                                    actor_id: Some(execution.clone()),
+                                    action_kind: Some("workflow_start".to_string()),
+                                    limit: Some(1),
+                                    ..Default::default()
+                                })
+                                .await
+                                .unwrap();
+                            let action_id = start_actions.first().expect("start audit").id;
+                            let undo_before =
+                                storage.get_action_undo(action_id).await.unwrap().unwrap();
+                            assert!(undo_before.undoable);
+                            let read_trigger = || {
+                                conn.query_row(
+                                    "SELECT handled_at, handled_by_workflow_id, handled_status, delivery_lease_token FROM events WHERE id=1",
+                                    [],
+                                    |row| {
+                                        Ok((
+                                            row.get::<_, Option<i64>>(0)?,
+                                            row.get::<_, Option<String>>(1)?,
+                                            row.get::<_, Option<String>>(2)?,
+                                            row.get::<_, Option<String>>(3)?,
+                                        ))
+                                    },
+                                )
+                                .unwrap()
+                            };
+                            let trigger_before = read_trigger();
+                            let read_audit_count = || {
+                                conn.query_row(
+                                    "SELECT COUNT(*) FROM audit_actions WHERE actor_id=?1",
+                                    [&execution],
+                                    |row| row.get::<_, i64>(0),
+                                )
+                                .unwrap()
+                            };
+                            let audit_count_before = read_audit_count();
+
+                            // The CLI's independent storage handle has no owner channel.
+                            let external = inspect_workflow_abort_with_cx(
+                                &cx,
+                                &one_shot_storage,
+                                &execution,
+                            )
+                            .await
+                            .unwrap();
+                            // Even the original runner's lock is not a settlement receipt.
+                            let same_runner = runner
+                                .abort_execution_with_cx(
+                                    &cx,
+                                    &execution,
+                                    Some("operator stop"),
+                                    true,
+                                )
+                                .await
+                                .unwrap();
+                            for result in [external, same_runner] {
+                                assert!(!result.aborted);
+                                assert_eq!(
+                                    result.error_reason.as_deref(),
+                                    Some(LIVE_WORKFLOW_ABORT_UNAVAILABLE)
+                                );
+                                assert!(result.aborted_at.is_none());
+                                assert!(result.reason.is_none());
+                            }
+
+                            let undo_executor = crate::undo::UndoExecutor::new(
+                                Arc::clone(&one_shot_storage),
+                                Arc::new(crate::wezterm::MockWezterm::new()),
+                            );
+                            let undo_result = undo_executor
+                                .execute_with_cx(
+                                    &cx,
+                                    crate::undo::UndoRequest::new(action_id)
+                                        .with_actor("abort-test-operator"),
+                                )
+                                .await
+                                .unwrap();
+                            assert_eq!(undo_result.outcome, crate::undo::UndoOutcome::Failed);
+                            assert!(undo_result.message.contains(LIVE_WORKFLOW_ABORT_UNAVAILABLE));
+                            assert!(undo_result.undone_at.is_none());
+                            assert_eq!(effects.load(Ordering::SeqCst), 0);
+
+                            let after = storage.get_workflow(&execution).await.unwrap().unwrap();
+                            assert_eq!(
+                                serde_json::to_value(&after).unwrap(),
+                                serde_json::to_value(&before).unwrap()
+                            );
+                            assert_eq!(
+                                serde_json::to_value(locks.is_locked(pane_id).unwrap()).unwrap(),
+                                serde_json::to_value(lock_before).unwrap()
+                            );
+                            let undo_after =
+                                storage.get_action_undo(action_id).await.unwrap().unwrap();
+                            assert_eq!(undo_after.undoable, undo_before.undoable);
+                            assert_eq!(undo_after.undone_at, undo_before.undone_at);
+                            assert_eq!(undo_after.undone_by, undo_before.undone_by);
+                            assert_eq!(undo_after.undo_payload, undo_before.undo_payload);
+                            assert_eq!(read_trigger(), trigger_before);
+                            assert_eq!(read_audit_count(), audit_count_before);
+
+                            release_tx.send(()).expect("release live effect");
+                        }
+                    )
+                },
+            )
+            .await
+            .expect("workflow and refusal checks must settle");
+            assert!(completed.is_completed(), "{completed:?}");
+            assert_eq!(effects.load(Ordering::SeqCst), 1);
+            assert!(locks.is_locked(pane_id).is_none());
+            assert_eq!(
+                storage.get_workflow(&execution).await.unwrap().unwrap().status,
+                "completed"
+            );
+            one_shot_storage.shutdown().await.unwrap();
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn external_abort_inspection_preserves_terminal_missing_and_cancelled_outcomes() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("abort-inspection-outcomes.db");
+            let (runner, storage, locks) = create_test_runner(&path.to_string_lossy()).await;
+            create_test_pane(&storage, 62).await;
+            runner.register_workflow(Arc::new(SimpleCompletingWorkflow));
+            let started = runner
+                .handle_detection(62, &make_test_detection("simple_complete.abort_inspection"), None)
+                .await;
+            let execution = started.execution_id().unwrap();
+            let admitted = storage.get_workflow(execution).await.unwrap().unwrap();
+            let cx = crate::cx::for_testing();
+
+            for (status, expected_reason) in [
+                ("running", LIVE_WORKFLOW_ABORT_UNAVAILABLE),
+                ("waiting", LIVE_WORKFLOW_ABORT_UNAVAILABLE),
+                ("completed", "already_completed"),
+                ("failed", "already_failed"),
+                ("aborted", "already_aborted"),
+            ] {
+                let mut row = admitted.clone();
+                row.id = format!("inspect-abort-{status}");
+                row.status = status.to_string();
+                if matches!(status, "completed" | "failed" | "aborted") {
+                    row.completed_at = Some(now_ms());
+                }
+                storage.upsert_workflow(row.clone()).await.unwrap();
+                let result = inspect_workflow_abort_with_cx(&cx, &storage, &row.id)
+                    .await
+                    .unwrap();
+                assert!(!result.aborted);
+                assert_eq!(result.error_reason.as_deref(), Some(expected_reason));
+                assert_eq!(result.previous_status, status);
+                assert!(result.aborted_at.is_none());
+                assert!(result.reason.is_none());
+                let unchanged = storage.get_workflow(&row.id).await.unwrap().unwrap();
+                assert_eq!(
+                    serde_json::to_value(&unchanged).unwrap(),
+                    serde_json::to_value(&row).unwrap()
+                );
+            }
+
+            let missing = inspect_workflow_abort_with_cx(&cx, &storage, "missing-abort-target")
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                missing,
+                crate::Error::Workflow(crate::error::WorkflowError::NotFound(ref id))
+                    if id == "missing-abort-target"
+            ));
+            let cancelled_cx = crate::cx::for_testing();
+            cancelled_cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("abort inspection cancellation"),
+            );
+            let cancelled =
+                inspect_workflow_abort_with_cx(&cancelled_cx, &storage, execution)
+                    .await
+                    .unwrap_err();
+            assert!(matches!(
+                cancelled,
+                crate::Error::RuntimeOperation {
+                    source: crate::error::RuntimeOperationSource::Cancelled(_),
+                    ..
+                }
+            ));
+            assert_eq!(
+                serde_json::to_value(storage.get_workflow(execution).await.unwrap().unwrap())
+                    .unwrap(),
+                serde_json::to_value(admitted).unwrap()
+            );
+            assert_eq!(locks.is_locked(62).unwrap().execution_id, execution);
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    /// Exercise the storage transaction on admitted fixtures with no live task.
+    /// This proves atomic persistence and commit cleanup, not live cancellation.
+    async fn commit_abort_record_for_test(
+        storage: &StorageHandle,
+        locks: &Arc<PaneWorkflowLockManager>,
+        execution_id: &str,
+        reason: Option<&str>,
+    ) -> crate::Result<bool> {
+        let cx = crate::cx::for_testing();
+        let record = storage
+            .get_workflow_with_cx(&cx, execution_id)
+            .await?
+            .expect("admitted workflow fixture");
+        if matches!(record.status.as_str(), "completed" | "failed" | "aborted") {
+            return Ok(false);
+        }
+        let action = super::engine::build_explicit_abort_action(&record, reason)?;
+        let owned_locks = Arc::clone(locks);
+        let pane_id = record.pane_id;
+        let owned_execution = execution_id.to_string();
+        storage
+            .abort_workflow_with_cx(&cx, record, action, None, move || {
+                owned_locks.release(pane_id, &owned_execution);
+            })
+            .await
+    }
+
+    #[test]
     fn explicit_abort_rejects_trigger_ownership_mismatches_atomically() {
         run_async_test(async {
             for fault in ["missing", "owner", "lease"] {
@@ -7397,8 +7706,7 @@ steps:
                         conn.execute_batch("UPDATE events SET delivery_lease_token='another-owner', delivery_lease_acquired_at=1, delivery_lease_expires_at=9223372036854775807 WHERE id=1").unwrap();
                     }
                 }
-                let error = runner
-                    .abort_execution(execution, None, false)
+                let error = commit_abort_record_for_test(&storage, &locks, execution, None)
                     .await
                     .unwrap_err();
                 assert!(error.to_string().contains("no abort committed"), "{error}");
@@ -7542,10 +7850,10 @@ steps:
             let execution = started.execution_id().unwrap();
             let active = storage.get_workflow(execution).await.unwrap().unwrap();
             let (first, second) = futures::join!(
-                runner.abort_execution(execution, Some("first"), false),
-                runner.abort_execution(execution, Some("second"), false),
+                commit_abort_record_for_test(&storage, &locks, execution, Some("first")),
+                commit_abort_record_for_test(&storage, &locks, execution, Some("second")),
             );
-            assert_ne!(first.unwrap().aborted, second.unwrap().aborted);
+            assert_ne!(first.unwrap(), second.unwrap());
             assert!(locks.is_locked(62).is_none());
             let conn = rusqlite::Connection::open(&path).unwrap();
             let count: i64 = conn.query_row(
@@ -7644,16 +7952,16 @@ steps:
                     };
                     conn.execute_batch(sql).unwrap();
                 }
-                let result = runner
-                    .abort_execution(execution, Some("operator stop"), false)
-                    .await;
+                let result =
+                    commit_abort_record_for_test(&storage, &locks, execution, Some("operator stop"))
+                        .await;
                 if fail_audit {
                     let error = result
                         .expect_err("audit failure cannot be reported as complete")
                         .to_string();
                     assert!(error.contains("injected abort failure"), "{error}");
                 } else {
-                    assert!(result.unwrap().aborted);
+                    assert!(result.unwrap());
                 }
                 let record = storage.get_workflow(execution).await.unwrap().unwrap();
                 assert_eq!(
@@ -7682,13 +7990,14 @@ steps:
                 );
                 let count: i64 = conn.query_row("SELECT COUNT(*) FROM audit_actions WHERE action_kind = 'workflow_aborted' AND actor_id = ?1", [execution], |row| row.get(0)).unwrap();
                 assert_eq!(count, i64::from(!fail_audit));
-                let repeated = runner.abort_execution(execution, None, false).await;
+                let repeated =
+                    commit_abort_record_for_test(&storage, &locks, execution, None).await;
                 if fail_audit {
                     assert!(repeated.is_err());
                 } else {
                     assert!(
-                        !repeated.unwrap().aborted,
-                        "repeat abort is a terminal-state no-op"
+                        !repeated.unwrap(),
+                        "repeat storage abort is a terminal-state no-op"
                     );
                 }
                 let repeated_count: i64 = conn.query_row("SELECT COUNT(*) FROM audit_actions WHERE action_kind = 'workflow_aborted' AND actor_id = ?1", [execution], |row| row.get(0)).unwrap();

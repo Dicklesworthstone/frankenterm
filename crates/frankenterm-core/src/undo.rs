@@ -9,12 +9,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{RuntimeOperationSource, WeztermError};
-use crate::policy::{PolicyEngine, PolicyGatedInjector};
 use crate::storage::{ActionHistoryQuery, ActionUndoRecord, StorageHandle};
 use crate::wezterm::WeztermHandle;
-use crate::workflows::{
-    CxPolicyInjector, PaneWorkflowLockManager, WorkflowEngine, WorkflowRunner, WorkflowRunnerConfig,
-};
+use crate::workflows::{LIVE_WORKFLOW_ABORT_UNAVAILABLE, inspect_workflow_abort_with_cx};
 use crate::{Error, Result};
 
 fn undo_cancelled_error(operation: &'static str) -> Error {
@@ -352,13 +349,12 @@ impl UndoExecutor {
         }
     }
 
-    /// Submit workflow abort and this undo attempt as one writer transaction.
-    /// Its committed receipt already includes the exact undo timestamp/actor;
-    /// no caller continuation is responsible for marking the action undone.
+    /// Refuse active workflow undo until a live owner can cancel and settle it.
+    /// Inspection never marks an action undone or releases execution ownership.
     async fn execute_workflow_abort_with_cx(
         &self,
         cx: &crate::cx::Cx,
-        request: UndoRequest,
+        _request: UndoRequest,
         action: &crate::storage::ActionHistoryRecord,
         undo: &ActionUndoRecord,
     ) -> Result<UndoExecutionResult> {
@@ -388,28 +384,23 @@ impl UndoExecutor {
             }
         };
 
-        let runner = self.build_workflow_runner();
-        match runner
-            .abort_execution_for_undo_with_cx(
-                cx,
-                &execution_id,
-                request.reason.as_deref(),
-                action.id,
-                &request.actor,
-            )
-            .await
-        {
-            Ok(result) if result.aborted => {
-                // The abort writer transaction records this action's exact
-                // undone timestamp/actor before retiring its undo authority.
-                let undone_at = result.aborted_at.map(|value| value as i64);
-                Ok(UndoExecutionResult::success(
+        match inspect_workflow_abort_with_cx(cx, &self.storage, &execution_id).await {
+            Ok(result)
+                if result.error_reason.as_deref() == Some(LIVE_WORKFLOW_ABORT_UNAVAILABLE) =>
+            {
+                Ok(UndoExecutionResult::failed(
                     action.id,
                     undo.undo_strategy.clone(),
-                    format!("Aborted workflow {}", result.execution_id),
+                    format!(
+                        "Workflow {} cannot be aborted without its live task owner (error_class={LIVE_WORKFLOW_ABORT_UNAVAILABLE})",
+                        result.execution_id
+                    ),
+                    Some(
+                        "No abort was dispatched. Stop the owning workflow through its runtime lifecycle and verify it has settled; stored status alone does not prove cancellation."
+                            .to_string(),
+                    ),
                     Some(result.execution_id),
                     Some(result.pane_id),
-                    undone_at,
                 ))
             }
             Ok(result) => {
@@ -432,108 +423,41 @@ impl UndoExecutor {
             Err(err) if is_undo_cancellation(&err) => {
                 Err(undo_cancelled_error("undo.workflow_abort"))
             }
-            Err(err) => Ok(self
-                .reconcile_workflow_abort_error(cx, &request, action, undo, &execution_id, &err)
-                .await),
+            Err(err) => Ok(Self::workflow_abort_lookup_failure(
+                action,
+                undo,
+                &execution_id,
+                &err,
+            )),
         }
     }
 
-    /// Reconcile an abort call that returned an error against durable state.
-    ///
-    /// The writer may commit the complete abort/trigger/audit/undo transaction
-    /// and then fail owner cleanup. Recognize only this request's exact durable
-    /// undo receipt. An aborted workflow alone does not authorize manufacturing
-    /// an undo timestamp or assigning another operator's effect to this actor.
-    async fn reconcile_workflow_abort_error(
-        &self,
-        cx: &crate::cx::Cx,
-        request: &UndoRequest,
+    /// A failed read never dispatched an effect and cannot claim another
+    /// operator's abort or undo receipt as this request's successful undo.
+    fn workflow_abort_lookup_failure(
         action: &crate::storage::ActionHistoryRecord,
         undo: &ActionUndoRecord,
         execution_id: &str,
-        _abort_error: &Error,
+        error: &Error,
     ) -> UndoExecutionResult {
-        match self
-            .storage
-            .get_workflow_with_cx(cx, execution_id)
-            .await
-        {
-            Ok(Some(workflow)) if workflow.status == "aborted" => {
-                match self
-                    .storage.get_action_undo_with_cx(cx, action.id)
-                    .await
-                {
-                    Ok(Some(receipt)) if !receipt.undoable
-                        && receipt.undo_strategy == "workflow_abort"
-                        && receipt.undone_by.as_deref() == Some(request.actor.as_str())
-                        && receipt.undone_at.is_some()
-                        && receipt.undone_at == workflow.completed_at => UndoExecutionResult::applied_with_warning(
-                        action.id,
-                        undo.undo_strategy.clone(),
-                        format!(
-                            "Workflow {execution_id} and this undo attempt are durably complete; owner cleanup was not acknowledged (error_class=workflow_abort_owner_cleanup_unverified)"
-                        ),
-                        Some(
-                            "Do not retry the abort. Verify pane ownership cleanup; the workflow, trigger, audit and undo transaction already committed."
-                                .to_string(),
-                        ),
-                        Some(execution_id.to_string()),
-                        Some(workflow.pane_id),
-                        receipt.undone_at,
-                    ),
-                    _ => UndoExecutionResult::applied_with_warning(
-                        action.id,
-                        undo.undo_strategy.clone(),
-                        format!(
-                            "Workflow {execution_id} is durably aborted, but this request's exact undo receipt is unverified (error_class=workflow_abort_undo_authority_unverified)"
-                        ),
-                        Some(
-                            "Do not retry automatically or reassign the undo actor. Inspect the workflow and action audit history; reconciliation did not modify them."
-                                .to_string(),
-                        ),
-                        Some(execution_id.to_string()),
-                        Some(workflow.pane_id),
-                        None,
-                    ),
-                }
-            }
-            Ok(Some(workflow)) => UndoExecutionResult::failed(
-                action.id,
-                undo.undo_strategy.clone(),
-                format!(
-                    "Failed to abort workflow {execution_id}; durable state does not prove the abort committed, so the undo audit was not marked complete (error_class=workflow_abort_unverified)"
-                ),
-                undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
-                Some(execution_id.to_string()),
-                Some(workflow.pane_id),
+        let error_class = if matches!(
+            error,
+            Error::Workflow(crate::error::WorkflowError::NotFound(_))
+        ) {
+            "workflow_abort_target_missing"
+        } else {
+            "workflow_abort_lookup_failed"
+        };
+        UndoExecutionResult::failed(
+            action.id,
+            undo.undo_strategy.clone(),
+            format!(
+                "Could not inspect workflow {execution_id}; no abort was dispatched and the undo audit was not changed (error_class={error_class})"
             ),
-            Ok(None) => UndoExecutionResult::indeterminate(
-                action.id,
-                undo.undo_strategy.clone(),
-                format!(
-                    "Failed to abort workflow {execution_id}; the durable workflow row is missing, so effect state cannot be verified and the undo audit was not marked complete (error_class=workflow_abort_target_missing)"
-                ),
-                Some(
-                    "Verify the workflow execution and audit history before retrying; the target row is missing."
-                        .to_string(),
-                ),
-                Some(execution_id.to_string()),
-                action.pane_id,
-            ),
-            Err(_verification_error) => UndoExecutionResult::indeterminate(
-                action.id,
-                undo.undo_strategy.clone(),
-                format!(
-                    "Abort returned an error for workflow {execution_id}, and durable state verification failed; the undo audit was not marked complete (error_class=workflow_abort_verification_failed)"
-                ),
-                Some(
-                    "Verify the durable workflow state before retrying; the abort result could not be reconciled."
-                        .to_string(),
-                ),
-                Some(execution_id.to_string()),
-                action.pane_id,
-            ),
-        }
+            Some("Inspect the workflow execution and storage health before retrying.".to_string()),
+            Some(execution_id.to_string()),
+            action.pane_id,
+        )
     }
 
     /// Cx-first pane-close strategy (ft-xbnl0.2.3).
@@ -678,28 +602,10 @@ impl UndoExecutor {
         }
     }
 
-    fn build_workflow_runner(&self) -> WorkflowRunner {
-        let engine = WorkflowEngine::new(10);
-        let lock_manager = Arc::new(PaneWorkflowLockManager::new());
-        let policy = PolicyEngine::permissive();
-        let injector = CxPolicyInjector::new(PolicyGatedInjector::with_storage(
-            policy,
-            Arc::clone(&self.wezterm),
-            self.storage.as_ref().clone(),
-        ));
-        WorkflowRunner::new(
-            engine,
-            lock_manager,
-            Arc::clone(&self.storage),
-            injector,
-            WorkflowRunnerConfig::default(),
-        )
-    }
-
     /// Persist the audit half of an undo whose external effect has already
     /// committed. Caller cancellation is no longer a safe reason to abandon
-    /// this write: doing so would make a successful pane close or workflow
-    /// abort appear eligible for a duplicate undo attempt.
+    /// this write: doing so would make a successful pane close appear eligible
+    /// for a duplicate undo attempt.
     async fn mark_undone_after_effect(&self, action_id: i64, actor: &str) -> Result<Option<i64>> {
         let cleanup_cx = crate::cx::for_request();
         self.mark_undone_with_cx(&cleanup_cx, action_id, actor)
@@ -1049,14 +955,14 @@ mod tests {
     }
 
     #[test]
-    fn workflow_abort_undo_succeeds_and_marks_action_undone() {
+    fn workflow_abort_undo_refuses_without_mutating_running_workflow() {
         run_async_test(async {
             let temp = tempfile::TempDir::new().expect("tempdir");
-            let db_path = temp.path().join("undo-workflow-success.db");
+            let db_path = temp.path().join("undo-workflow-unavailable.db");
             let db_path = db_path.to_string_lossy().to_string();
             let storage = Arc::new(StorageHandle::new(&db_path).await.expect("storage"));
             let pane_id = 42_u64;
-            let execution_id = "wf-undo-success-1";
+            let execution_id = "wf-undo-unavailable-1";
 
             seed_pane(storage.as_ref(), pane_id).await;
             let action_id = seed_action(
@@ -1092,26 +998,37 @@ mod tests {
                 .await
                 .expect("undo result");
 
-            assert_eq!(result.outcome, UndoOutcome::Success);
+            assert_eq!(result.outcome, UndoOutcome::Failed);
+            assert!(result.message.contains(LIVE_WORKFLOW_ABORT_UNAVAILABLE));
             assert_eq!(result.strategy, "workflow_abort");
             assert_eq!(result.target_workflow_id.as_deref(), Some(execution_id));
+            assert!(result.undone_at.is_none());
 
             let workflow = storage
                 .get_workflow(execution_id)
                 .await
                 .expect("workflow query")
                 .expect("workflow should exist");
-            assert_eq!(workflow.status, "aborted");
+            assert_eq!(workflow.status, "running");
+            assert!(workflow.completed_at.is_none());
 
             let undo = storage
                 .get_action_undo(action_id)
                 .await
                 .expect("undo query")
                 .expect("undo exists");
-            assert!(undo.undone_at.is_some());
-            assert_eq!(undo.undone_by.as_deref(), Some("test-user"));
-            assert!(!undo.undoable);
-            assert_eq!(undo.undone_at, result.undone_at);
+            assert!(undo.undone_at.is_none());
+            assert!(undo.undone_by.is_none());
+            assert!(undo.undoable);
+            let conn = rusqlite::Connection::open(&db_path).expect("inspection connection");
+            let abort_actions: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM audit_actions WHERE actor_id=?1 AND action_kind='workflow_aborted'",
+                    [execution_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(abort_actions, 0);
 
             storage.shutdown().await.expect("shutdown");
         });
@@ -1144,12 +1061,37 @@ mod tests {
                 .unwrap();
             let conn = rusqlite::Connection::open(&path).unwrap();
             conn.execute_batch("CREATE TRIGGER reject_undo_attempt BEFORE UPDATE ON action_undo WHEN NEW.undone_at IS NOT NULL BEGIN SELECT RAISE(FAIL, 'injected undo receipt failure'); END;").unwrap();
-            let executor = UndoExecutor::new(Arc::clone(&storage), Arc::new(MockWezterm::new()));
-            let result = executor
-                .execute(UndoRequest::new(action_id).with_actor("operator"))
+            // Test the atomic storage primitive directly. This fixture has no
+            // live task and does not prove cancellation of a running workflow.
+            let expected = storage.get_workflow(execution).await.unwrap().unwrap();
+            let terminal_action = crate::storage::AuditActionRecord {
+                id: 0,
+                ts: now_ms(),
+                actor_kind: "workflow".into(),
+                actor_id: Some(execution.into()),
+                correlation_id: None,
+                pane_id: Some(42),
+                domain: None,
+                action_kind: "workflow_aborted".into(),
+                policy_decision: "allow".into(),
+                decision_reason: None,
+                rule_id: None,
+                input_summary: None,
+                verification_summary: None,
+                decision_context: None,
+                result: "aborted".into(),
+            };
+            let error = storage
+                .abort_workflow_with_cx(
+                    &crate::cx::for_testing(),
+                    expected,
+                    terminal_action,
+                    Some((action_id, "operator".into())),
+                    || {},
+                )
                 .await
-                .unwrap();
-            assert_eq!(result.outcome, UndoOutcome::Failed);
+                .unwrap_err();
+            assert!(error.to_string().contains("injected undo receipt failure"));
             assert_eq!(
                 storage
                     .get_workflow(execution)
@@ -1169,7 +1111,7 @@ mod tests {
     }
 
     #[test]
-    fn workflow_abort_error_reconciliation_requires_exact_committed_undo_receipt() {
+    fn workflow_abort_lookup_failure_does_not_claim_another_abort_receipt() {
         run_async_test(async {
             for committed in [false, true] {
                 let temp = tempfile::TempDir::new().expect("tempdir");
@@ -1226,8 +1168,6 @@ mod tests {
                     .await
                     .expect("undo query")
                     .expect("undo exists");
-                let executor =
-                    UndoExecutor::new(Arc::clone(&storage), Arc::new(MockWezterm::new()));
                 let request = UndoRequest::new(action_id).with_actor("post-effect-operator");
                 let cx = crate::cx::for_request();
                 let abort_error = if committed {
@@ -1267,26 +1207,18 @@ mod tests {
                     ))
                 };
 
-                let result = executor
-                    .reconcile_workflow_abort_error(
-                        &cx,
-                        &request,
-                        &action,
-                        &undo,
-                        execution_id,
-                        &abort_error,
-                    )
-                    .await;
+                let result = UndoExecutor::workflow_abort_lookup_failure(
+                    &action,
+                    &undo,
+                    execution_id,
+                    &abort_error,
+                );
 
-                assert_eq!(result.outcome, UndoOutcome::AppliedWithWarning);
+                assert_eq!(result.outcome, UndoOutcome::Failed);
                 assert_eq!(result.target_workflow_id.as_deref(), Some(execution_id));
                 assert_eq!(result.target_pane_id, Some(pane_id));
-                assert_eq!(result.undone_at.is_some(), committed);
-                assert!(result.message.contains(if committed {
-                    "workflow_abort_owner_cleanup_unverified"
-                } else {
-                    "workflow_abort_undo_authority_unverified"
-                }));
+                assert!(result.undone_at.is_none());
+                assert!(result.message.contains("workflow_abort_lookup_failed"));
                 assert!(!result.message.contains("SECRET"));
 
                 let durable_undo = storage
@@ -1294,7 +1226,7 @@ mod tests {
                     .await
                     .expect("undo query")
                     .expect("undo exists");
-                assert_eq!(durable_undo.undone_at, result.undone_at);
+                assert_eq!(durable_undo.undone_at.is_some(), committed);
                 assert_eq!(
                     durable_undo.undone_by.as_deref(),
                     if committed {
@@ -1304,29 +1236,19 @@ mod tests {
                     }
                 );
                 assert_eq!(durable_undo.undoable, !committed);
-                if committed {
-                    let other_request =
-                        UndoRequest::new(action_id).with_actor("different-operator");
-                    let other_result = executor
-                        .reconcile_workflow_abort_error(
-                            &cx,
-                            &other_request,
-                            &action,
-                            &undo,
-                            execution_id,
-                            &abort_error,
-                        )
-                        .await;
-                    assert!(other_result.undone_at.is_none());
-                    assert!(
-                        other_result
-                            .message
-                            .contains("workflow_abort_undo_authority_unverified")
-                    );
-                    let unchanged = storage.get_action_undo(action_id).await.unwrap().unwrap();
-                    assert_eq!(unchanged.undone_by, durable_undo.undone_by);
-                    assert_eq!(unchanged.undone_at, durable_undo.undone_at);
-                }
+                let missing = UndoExecutor::workflow_abort_lookup_failure(
+                    &action,
+                    &undo,
+                    execution_id,
+                    &Error::Workflow(crate::error::WorkflowError::NotFound(execution_id.into())),
+                );
+                assert_eq!(missing.outcome, UndoOutcome::Failed);
+                assert!(missing.message.contains("workflow_abort_target_missing"));
+                assert!(missing.undone_at.is_none());
+                let unchanged = storage.get_action_undo(action_id).await.unwrap().unwrap();
+                assert_eq!(unchanged.undone_by, durable_undo.undone_by);
+                assert_eq!(unchanged.undone_at, durable_undo.undone_at);
+                assert_eq!(unchanged.undoable, durable_undo.undoable);
 
                 storage.shutdown().await.expect("shutdown");
             }

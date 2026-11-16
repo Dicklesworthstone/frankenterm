@@ -127,18 +127,18 @@ fn make_undo(
 // ===========================================================================
 
 #[test]
-fn undo_workflow_abort_succeeds_and_marks_action_undone() {
+fn undo_workflow_abort_without_live_owner_preserves_workflow_and_action() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let temp = tempfile::TempDir::new().expect("tempdir");
-        let db_path = temp.path().join("undo-wf-success.db");
+        let db_path = temp.path().join("undo-wf-refused.db");
         let storage = Arc::new(
             StorageHandle::new(&db_path.to_string_lossy())
                 .await
                 .expect("storage"),
         );
         let pane_id = 42_u64;
-        let execution_id = "wf-undo-success-1";
+        let execution_id = "wf-undo-refused-1";
 
         seed_pane(storage.as_ref(), pane_id).await;
         let action_id = seed_action(
@@ -164,6 +164,14 @@ fn undo_workflow_abort_succeeds_and_marks_action_undone() {
             ))
             .await
             .expect("undo metadata");
+        let workflow_before = serde_json::to_value(
+            storage.get_workflow(execution_id).await.unwrap().unwrap(),
+        )
+        .unwrap();
+        let undo_before = serde_json::to_value(
+            storage.get_action_undo(action_id).await.unwrap().unwrap(),
+        )
+        .unwrap();
 
         let mock = Arc::new(MockWezterm::new());
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
@@ -172,24 +180,48 @@ fn undo_workflow_abort_succeeds_and_marks_action_undone() {
             .await
             .expect("undo result");
 
-        assert_eq!(result.outcome, UndoOutcome::Success);
+        assert_eq!(result.outcome, UndoOutcome::Failed);
         assert_eq!(result.strategy, "workflow_abort");
         assert_eq!(result.target_workflow_id.as_deref(), Some(execution_id));
+        assert_eq!(result.target_pane_id, Some(pane_id));
+        assert!(result.undone_at.is_none());
+        assert!(result.message.contains("error_class=live_abort_unavailable"));
+        assert!(
+            result
+                .guidance
+                .as_deref()
+                .is_some_and(|guidance| guidance.contains("No abort was dispatched"))
+        );
+
+        let cx = frankenterm_core::cx::for_testing();
+        cx.cancel_with(frankenterm_core::outcome::CancelKind::User, None);
+        let cancelled = executor
+            .execute_with_cx(&cx, UndoRequest::new(action_id))
+            .await
+            .expect_err("caller cancellation must remain a structured error");
+        assert!(matches!(
+            cancelled,
+            frankenterm_core::Error::RuntimeOperation {
+                source: frankenterm_core::error::RuntimeOperationSource::Cancelled(_),
+                ..
+            }
+        ));
 
         let workflow = storage
             .get_workflow(execution_id)
             .await
             .expect("wf query")
             .expect("wf exists");
-        assert_eq!(workflow.status, "aborted");
+        assert_eq!(serde_json::to_value(workflow).unwrap(), workflow_before);
 
         let undo = storage
             .get_action_undo(action_id)
             .await
             .expect("undo query")
             .expect("undo exists");
-        assert!(undo.undone_at.is_some());
-        assert_eq!(undo.undone_by.as_deref(), Some("test-user"));
+        assert!(undo.undone_at.is_none());
+        assert!(undo.undone_by.is_none());
+        assert_eq!(serde_json::to_value(undo).unwrap(), undo_before);
 
         storage.shutdown().await.expect("shutdown");
     });
@@ -798,7 +830,7 @@ fn undo_pane_close_falls_back_to_action_pane_id() {
 }
 
 #[test]
-fn undo_workflow_abort_waiting_succeeds() {
+fn undo_workflow_abort_waiting_requires_live_owner() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let temp = tempfile::TempDir::new().expect("tempdir");
@@ -832,6 +864,10 @@ fn undo_workflow_abort_waiting_succeeds() {
             ))
             .await
             .expect("undo metadata");
+        let workflow_before = serde_json::to_value(
+            storage.get_workflow(execution_id).await.unwrap().unwrap(),
+        )
+        .unwrap();
 
         let mock = Arc::new(MockWezterm::new());
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
@@ -840,15 +876,23 @@ fn undo_workflow_abort_waiting_succeeds() {
             .await
             .expect("result");
 
-        assert_eq!(result.outcome, UndoOutcome::Success);
+        assert_eq!(result.outcome, UndoOutcome::Failed);
         assert_eq!(result.strategy, "workflow_abort");
+        assert_eq!(result.target_workflow_id.as_deref(), Some(execution_id));
+        assert_eq!(result.target_pane_id, Some(pane_id));
+        assert!(result.undone_at.is_none());
+        assert!(result.message.contains("error_class=live_abort_unavailable"));
 
         let wf = storage
             .get_workflow(execution_id)
             .await
             .expect("wf query")
             .expect("wf exists");
-        assert_eq!(wf.status, "aborted");
+        assert_eq!(wf.status, "waiting");
+        assert_eq!(serde_json::to_value(wf).unwrap(), workflow_before);
+        let undo = storage.get_action_undo(action_id).await.unwrap().unwrap();
+        assert!(undo.undone_at.is_none());
+        assert!(undo.undone_by.is_none());
 
         storage.shutdown().await.expect("shutdown");
     });
@@ -1075,7 +1119,7 @@ fn undo_pane_close_success_message_contains_pane_id() {
 }
 
 #[test]
-fn undo_workflow_abort_success_message_contains_execution_id() {
+fn undo_workflow_abort_refusal_identifies_execution_without_marking_undo() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let temp = tempfile::TempDir::new().expect("tempdir");
@@ -1117,15 +1161,26 @@ fn undo_workflow_abort_success_message_contains_execution_id() {
             .await
             .expect("result");
 
-        assert_eq!(result.outcome, UndoOutcome::Success);
+        assert_eq!(result.outcome, UndoOutcome::Failed);
         assert!(result.message.contains(execution_id));
+        assert!(result.message.contains("error_class=live_abort_unavailable"));
+        assert_eq!(result.target_workflow_id.as_deref(), Some(execution_id));
+        assert_eq!(result.target_pane_id, Some(pane_id));
+        assert!(result.undone_at.is_none());
+        let workflow = storage.get_workflow(execution_id).await.unwrap().unwrap();
+        assert_eq!(workflow.status, "running");
+        assert!(workflow.completed_at.is_none());
+        assert!(workflow.error.is_none());
+        let undo = storage.get_action_undo(action_id).await.unwrap().unwrap();
+        assert!(undo.undone_at.is_none());
+        assert!(undo.undone_by.is_none());
 
         storage.shutdown().await.expect("shutdown");
     });
 }
 
 #[test]
-fn undo_request_with_reason_propagates() {
+fn undo_request_reason_cannot_authorize_ownerless_workflow_abort() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let temp = tempfile::TempDir::new().expect("tempdir");
@@ -1159,6 +1214,10 @@ fn undo_request_with_reason_propagates() {
             ))
             .await
             .expect("undo metadata");
+        let workflow_before = serde_json::to_value(
+            storage.get_workflow(execution_id).await.unwrap().unwrap(),
+        )
+        .unwrap();
 
         let mock = Arc::new(MockWezterm::new());
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
@@ -1171,13 +1230,21 @@ fn undo_request_with_reason_propagates() {
             .await
             .expect("result");
 
-        assert_eq!(result.outcome, UndoOutcome::Success);
+        assert_eq!(result.outcome, UndoOutcome::Failed);
+        assert!(result.message.contains("error_class=live_abort_unavailable"));
+        assert_eq!(result.target_workflow_id.as_deref(), Some(execution_id));
+        assert_eq!(result.target_pane_id, Some(pane_id));
+        assert!(result.undone_at.is_none());
         let wf = storage
             .get_workflow(execution_id)
             .await
             .expect("wf query")
             .expect("wf exists");
-        assert_eq!(wf.status, "aborted");
+        assert_eq!(wf.status, "running");
+        assert_eq!(serde_json::to_value(wf).unwrap(), workflow_before);
+        let undo = storage.get_action_undo(action_id).await.unwrap().unwrap();
+        assert!(undo.undone_at.is_none());
+        assert!(undo.undone_by.is_none());
 
         storage.shutdown().await.expect("shutdown");
     });

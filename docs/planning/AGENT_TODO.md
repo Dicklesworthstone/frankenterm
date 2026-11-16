@@ -1499,3 +1499,42 @@ manual edits were reconstructed and rebased onto the current GitHub source.
 The original local diff passed git diff --check; reconstruction checks are
 source diagnostics, not Rust execution. No compilation, Rust test, Clippy, or
 formatting proof is claimed, and no Bead is closed on these changes.
+
+## 2026-11-15 — Workflow abort requires live owner settlement
+
+Related Bead: ft-interactive-systems-performance-4tenz.35. A fresh runner used by
+CLI/undo could previously mark an execution aborted and settle its durable state
+without cancelling its running task. Even the original runner has no keyed task
+cancellation and settlement channel; its pane lock is not that authority.
+
+- [x] Replace external abort mutation with shared Cx-aware inspection. Active
+  executions refuse with live_abort_unavailable; terminal no-ops, missing
+  targets, and typed cancellation remain distinct. Force cannot bypass this.
+- [x] Remove synthetic runners from undo and Robot abort. Preserve workflow,
+  trigger, abort audit, undo metadata, and actual execution locks on refusal.
+- [x] Return Robot ok=false / robot.workflow_live_abort_unavailable, with
+  aborted=false and forced=false. Preserve the existing workflow error family.
+- [x] Make human undo JSON ok=false for any Failed or Indeterminate result;
+  retain successful, warning, and inapplicable outcomes and current exit policy.
+- [x] Add a real paused-step runner regression using independent SQLite access.
+  Compare workflow, lock, trigger, audit and undo state after refused requests;
+  release the step and observe its one actual effect and normal completion.
+- [x] Preserve existing transaction, ownership, rollback, concurrent-CAS and
+  dropped-response cleanup coverage by testing the storage primitive directly.
+- [x] Reconcile four undo_labruntime tests and the history_undo_workflow E2E
+  scenario with explicit refusal and unchanged durable records.
+- [x] Review the production and regression changes independently and preserve
+  concurrent main changes. No Bead closure or runtime proof is claimed.
+- [ ] Run strict RCH live_workflow_abort_refusal_preserves_owner_until_effect_settles,
+  external_abort_inspection_preserves_terminal_missing_and_cancelled_outcomes,
+  affected workflow/undo library suites, undo_labruntime, Robot envelope tests,
+  and the history_undo_workflow E2E scenario.
+- [ ] Complete affected/workspace check, Clippy and exact-source format proof.
+- [ ] Implement live execution registration, owner-directed cancellation across
+  process boundaries, task drain and acknowledged settlement before enabling
+  active abort or closing ft-interactive-systems-performance-4tenz.35.
+
+Validation limit: RCH is absent; the local execution service repeatedly became
+unavailable. These exact manual source edits were reconstructed against verified
+GitHub blobs and reviewed, but no Rust compile/test/Clippy/format or E2E result
+is claimed. Existing Beads were not closed; evidence remains to be attached.

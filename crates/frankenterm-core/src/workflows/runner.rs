@@ -5080,219 +5080,98 @@ impl WorkflowRunner {
         .await
     }
 
-    /// Abort a running workflow execution.
+    /// Inspect an external abort request without claiming live cancellation.
     ///
-    /// This is the external API for aborting workflows (e.g., from robot mode).
-    /// It differs from internal abort handling in that:
-    /// 1. It validates the execution state before aborting
-    /// 2. It releases the pane lock if held
-    /// 3. It returns detailed abort information
+    /// A stored terminal state is an idempotent no-op. Active executions require
+    /// cancellation and settlement by their live task owner. The runner does not
+    /// yet expose that authority, even when this instance holds the pane lock;
+    /// refusing leaves workflow, trigger, audit, undo and lock state unchanged.
     ///
     /// # Arguments
-    /// * `execution_id` - The workflow execution ID to abort
-    /// * `reason` - Optional reason for the abort (recorded in audit)
-    /// * `force` - If true, skip cleanup steps
+    /// * `execution_id` - The workflow execution ID to inspect
+    /// * `reason` - Requested abort reason, reserved for live owner dispatch
+    /// * `force` - Requested force mode; cannot replace owner settlement
     ///
     /// # Returns
-    /// * `Ok(AbortResult)` - Details about the aborted workflow
-    /// * `Err` - If the workflow doesn't exist or is in invalid state
+    /// * `Ok(AbortResult)` - A terminal no-op or `live_abort_unavailable`
+    /// * `Err` - If lookup fails, the target is missing, or the request is cancelled
     pub async fn abort_execution(
         &self,
         execution_id: &str,
         reason: Option<&str>,
         force: bool,
     ) -> crate::Result<AbortResult> {
-        // ft-dit9w: ergonomic wrapper around `abort_execution_with_cx`.
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         self.abort_execution_with_cx(&cx, execution_id, reason, force)
             .await
     }
 
-    /// Cx-first variant of [`WorkflowRunner::abort_execution`]
-    /// (ft-xbnl0.2.2).
+    /// Cx-first variant of [`WorkflowRunner::abort_execution`].
     ///
-    /// Short-circuits with a cancelled-error when the caller's
-    /// asupersync capability context is already cancelled on entry,
-    /// before issuing any storage reads or lock releases. This matches
-    /// the `handle_detection_with_cx` contract so a cancelled operator
-    /// request cannot accidentally mutate workflow state during
-    /// teardown.
+    /// Inspection honors caller cancellation and never dispatches an abort or
+    /// changes durable state. A pane lock alone cannot prove task settlement.
     pub async fn abort_execution_with_cx(
         &self,
         cx: &crate::cx::Cx,
         execution_id: &str,
-        reason: Option<&str>,
+        _reason: Option<&str>,
         _force: bool,
     ) -> crate::Result<AbortResult> {
-        self.abort_execution_inner_with_cx(cx, execution_id, reason, None)
-            .await
+        inspect_workflow_abort_with_cx(cx, &self.storage, execution_id).await
     }
+}
 
-    pub(crate) async fn abort_execution_for_undo_with_cx(
-        &self,
-        cx: &crate::cx::Cx,
-        execution_id: &str,
-        reason: Option<&str>,
-        action_id: i64,
-        actor: &str,
-    ) -> crate::Result<AbortResult> {
-        self.abort_execution_inner_with_cx(
-            cx,
-            execution_id,
-            reason,
-            Some((action_id, actor.to_string())),
+/// Stable refusal when an abort cannot reach and settle the live task owner.
+pub const LIVE_WORKFLOW_ABORT_UNAVAILABLE: &str = "live_abort_unavailable";
+
+/// Inspect an abort target without manufacturing execution ownership.
+///
+/// One-shot CLI and undo callers share this admission boundary. A stored
+/// terminal state is an idempotent no-op; every other state requires an owner
+/// cancellation channel and a matching task/lock settlement receipt that the
+/// current runner does not expose. No mutation or cancellation is dispatched.
+pub async fn inspect_workflow_abort_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &crate::storage::StorageHandle,
+    execution_id: &str,
+) -> crate::Result<AbortResult> {
+    cx.checkpoint().map_err(|_| {
+        workflow_runner_cancelled(
+            "workflow.abort_execution",
+            "capability context already cancelled; abort_execution refused",
         )
-        .await
-    }
-
-    async fn abort_execution_inner_with_cx(
-        &self,
-        cx: &crate::cx::Cx,
-        execution_id: &str,
-        reason: Option<&str>,
-        undo_attempt: Option<(i64, String)>,
-    ) -> crate::Result<AbortResult> {
-        if cx.is_cancel_requested() {
-            return Err(workflow_runner_cancelled(
-                "workflow.abort_execution",
-                "capability context already cancelled; abort_execution refused",
-            ));
-        }
-
-        // ft-xbnl0.2.3 tick 131: deepened from pre-flight delegate
-        // to fully cx-threaded body. Routes both internal storage
-        // calls through cx-first siblings so caller cancellation
-        // propagates into storage's pre-flight checkpoints.
-
-        let record = self
-            .storage
-            .get_workflow_with_cx(cx, execution_id)
-            .await?
-            .ok_or_else(|| {
-                crate::Error::Workflow(crate::error::WorkflowError::NotFound(
-                    execution_id.to_string(),
-                ))
-            })?;
-
-        // Check if already in terminal state
-        match record.status.as_str() {
-            "completed" => {
-                return Ok(AbortResult {
-                    aborted: false,
-                    execution_id: execution_id.to_string(),
-                    workflow_name: record.workflow_name,
-                    pane_id: record.pane_id,
-                    previous_status: record.status.clone(),
-                    aborted_at_step: record.current_step,
-                    reason: None,
-                    aborted_at: None,
-                    error_reason: Some("already_completed".to_string()),
-                });
-            }
-            "aborted" => {
-                return Ok(AbortResult {
-                    aborted: false,
-                    execution_id: execution_id.to_string(),
-                    workflow_name: record.workflow_name,
-                    pane_id: record.pane_id,
-                    previous_status: record.status.clone(),
-                    aborted_at_step: record.current_step,
-                    reason: None,
-                    aborted_at: None,
-                    error_reason: Some("already_aborted".to_string()),
-                });
-            }
-            "failed" => {
-                return Ok(AbortResult {
-                    aborted: false,
-                    execution_id: execution_id.to_string(),
-                    workflow_name: record.workflow_name,
-                    pane_id: record.pane_id,
-                    previous_status: record.status.clone(),
-                    aborted_at_step: record.current_step,
-                    reason: None,
-                    aborted_at: None,
-                    error_reason: Some("already_failed".to_string()),
-                });
-            }
-            _ => {}
-        }
-
-        cx.checkpoint().map_err(|err| {
-            let detail = format!(
-                "abort_execution cancelled before atomic abort admission (exec_id={execution_id}): {err}"
-            );
-            workflow_runner_cancelled("workflow.abort_execution", detail)
+    })?;
+    let record = storage
+        .get_workflow_with_cx(cx, execution_id)
+        .await?
+        .ok_or_else(|| {
+            crate::Error::Workflow(crate::error::WorkflowError::NotFound(
+                execution_id.to_string(),
+            ))
         })?;
-
-        let previous_status = record.status.clone();
-        let workflow_name = record.workflow_name.clone();
-        let pane_id = record.pane_id;
-        let aborted_at_step = record.current_step;
-        let action = super::engine::build_explicit_abort_action(&record, reason)?;
-        let now = action.ts;
-        let lock_manager = Arc::clone(&self.lock_manager);
-        let owned_execution_id = execution_id.to_string();
-        if !self
-            .storage
-            .abort_workflow_with_cx(cx, record, action, undo_attempt, move || {
-                lock_manager.release(pane_id, &owned_execution_id);
-            })
-            .await?
-        {
-            let current = self
-                .storage
-                .get_workflow_with_cx(&crate::cx::for_request(), execution_id)
-                .await?
-                .ok_or_else(|| {
-                    crate::Error::Workflow(crate::error::WorkflowError::NotFound(
-                        execution_id.to_string(),
-                    ))
-                })?;
-            if !matches!(current.status.as_str(), "aborted" | "completed" | "failed") {
-                return Err(crate::Error::Workflow(crate::error::WorkflowError::Aborted(
-                    "workflow changed during abort; no abort committed; retry against current state".into()
-                )));
-            }
-            return Ok(AbortResult {
-                aborted: false,
-                execution_id: execution_id.to_string(),
-                workflow_name: current.workflow_name,
-                pane_id: current.pane_id,
-                previous_status: current.status.clone(),
-                aborted_at_step: current.current_step,
-                reason: None,
-                aborted_at: None,
-                error_reason: Some(format!("already_{}", current.status)),
-            });
-        }
-
-        // The writer owns commit-only lock cleanup, including when this future
-        // is dropped after admission and never observes its response.
-
-        // Trigger settlement is part of the same durable writer transaction;
-        // no caller continuation owns post-commit database work.
-
-        tracing::info!(
-            execution_id,
-            workflow_name,
-            pane_id,
-            reason_present = reason.is_some(),
-            "Workflow aborted (cx-first)"
-        );
-
-        Ok(AbortResult {
-            aborted: true,
-            execution_id: execution_id.to_string(),
-            workflow_name,
-            pane_id,
-            previous_status,
-            aborted_at_step,
-            reason: reason.map(std::string::ToString::to_string),
-            aborted_at: Some(now as u64),
-            error_reason: None,
-        })
-    }
+    cx.checkpoint().map_err(|_| {
+        workflow_runner_cancelled(
+            "workflow.abort_execution",
+            "capability context cancelled while inspecting abort target",
+        )
+    })?;
+    let error_reason = match record.status.as_str() {
+        "completed" => "already_completed",
+        "aborted" => "already_aborted",
+        "failed" => "already_failed",
+        _ => LIVE_WORKFLOW_ABORT_UNAVAILABLE,
+    };
+    Ok(AbortResult {
+        aborted: false,
+        execution_id: record.id,
+        workflow_name: record.workflow_name,
+        pane_id: record.pane_id,
+        previous_status: record.status,
+        aborted_at_step: record.current_step,
+        reason: None,
+        aborted_at: None,
+        error_reason: Some(error_reason.to_string()),
+    })
 }
 
 /// Result of an abort operation
@@ -5306,9 +5185,9 @@ pub struct AbortResult {
     pub workflow_name: String,
     /// Pane ID
     pub pane_id: u64,
-    /// Status before abort
+    /// Observed status before the abort decision
     pub previous_status: String,
-    /// Step index where abort occurred
+    /// Observed step index at the abort decision
     pub aborted_at_step: usize,
     /// Reason for abort (if provided)
     #[serde(skip_serializing_if = "Option::is_none")]

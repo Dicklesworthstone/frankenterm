@@ -5157,16 +5157,16 @@ enum RobotWorkflowCommands {
         verbose: u8,
     },
 
-    /// Abort a running workflow
+    /// Request workflow abort; active work requires live owner settlement
     Abort {
         /// Execution ID
         execution_id: String,
 
-        /// Reason for aborting
+        /// Requested reason; no abort is dispatched until live owner authority is available
         #[arg(long)]
         reason: Option<String>,
 
-        /// Force abort (skip cleanup steps)
+        /// Request forced abort; still requires live owner cancellation and settlement
         #[arg(long)]
         force: bool,
     },
@@ -9364,6 +9364,8 @@ const ROBOT_ERR_POLICY_DENIED: &str = "robot.policy_denied";
 const ROBOT_ERR_ADMISSION_SHED: &str = "robot.admission_shed";
 const ROBOT_ERR_TIMEOUT: &str = "robot.timeout";
 const ROBOT_ERR_WORKFLOW_ABORTED: &str = "robot.workflow_aborted";
+const ROBOT_ERR_WORKFLOW_ABORT_UNAVAILABLE: &str = "robot.workflow_live_abort_unavailable";
+const ROBOT_ERR_WORKFLOW_CANCELLED: &str = "robot.workflow_cancelled";
 const ROBOT_ERR_WORKFLOW_ERROR: &str = "robot.workflow_error";
 const ROBOT_ERR_WORKFLOW_NOT_FOUND: &str = "robot.workflow_not_found";
 #[cfg(test)]
@@ -15268,6 +15270,99 @@ struct RobotWorkflowAbortData {
     aborted_at: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error_reason: Option<String>,
+}
+
+fn undo_json_response(results: &[frankenterm_core::undo::UndoExecutionResult]) -> serde_json::Value {
+    use frankenterm_core::undo::UndoOutcome;
+
+    let accepted = results.iter().all(|result| {
+        !matches!(
+            result.outcome,
+            UndoOutcome::Failed | UndoOutcome::Indeterminate
+        )
+    });
+    serde_json::json!({
+        "ok": accepted,
+        "data": {
+            "results": results,
+            "count": results.len(),
+        },
+        "version": frankenterm_core::VERSION,
+    })
+}
+
+fn robot_workflow_abort_response(
+    result: frankenterm_core::workflows::AbortResult,
+    force: bool,
+    elapsed: u64,
+) -> RobotResponse<RobotWorkflowAbortData> {
+    if result.error_reason.as_deref()
+        == Some(frankenterm_core::workflows::LIVE_WORKFLOW_ABORT_UNAVAILABLE)
+    {
+        return RobotResponse::error_with_code_and_data(
+            ROBOT_ERR_WORKFLOW_ABORT_UNAVAILABLE,
+            "The live workflow owner cannot acknowledge cancellation; no abort was dispatched.",
+            Some(
+                "Stop the owning workflow through its runtime lifecycle and verify it has settled. --force cannot replace live cancellation and settlement authority."
+                    .to_string(),
+            ),
+            serde_json::json!({
+                "execution_id": result.execution_id,
+                "workflow_name": result.workflow_name,
+                "previous_status": result.previous_status,
+                "aborted": false,
+                "forced": false,
+                "error_reason": frankenterm_core::workflows::LIVE_WORKFLOW_ABORT_UNAVAILABLE,
+            }),
+            elapsed,
+        );
+    }
+    RobotResponse::success(
+        RobotWorkflowAbortData {
+            execution_id: result.execution_id,
+            aborted: result.aborted,
+            forced: force && result.aborted,
+            workflow_name: Some(result.workflow_name),
+            previous_status: Some(result.previous_status),
+            reason: result.reason,
+            aborted_at: result.aborted_at,
+            error_reason: result.error_reason,
+        },
+        elapsed,
+    )
+}
+
+fn robot_workflow_abort_failure_response(
+    error: &frankenterm_core::Error,
+    elapsed: u64,
+) -> RobotResponse<RobotWorkflowAbortData> {
+    use frankenterm_core::Error;
+    use frankenterm_core::error::{RuntimeOperationSource, WorkflowError};
+
+    let (code, hint) = match error {
+        Error::Workflow(WorkflowError::NotFound(_)) => (
+            "E_EXECUTION_NOT_FOUND",
+            "Check the execution ID is correct. Use 'ft robot workflow status --active' to list running workflows.",
+        ),
+        Error::Cancelled(_)
+        | Error::RuntimeOperation {
+            source: RuntimeOperationSource::Cancelled(_),
+            ..
+        } => (
+            ROBOT_ERR_WORKFLOW_CANCELLED,
+            "The request was cancelled before dispatch; no abort was attempted.",
+        ),
+        _ => (
+            ROBOT_ERR_STORAGE,
+            "Check database path, permissions and storage health before retrying.",
+        ),
+    };
+    RobotResponse::error_with_code(
+        code,
+        format!("Failed to inspect workflow abort target: {error}"),
+        Some(hint.to_string()),
+        elapsed,
+    )
 }
 
 /// Account info for robot accounts list
@@ -57573,143 +57668,49 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                 }
                                 RobotWorkflowCommands::Abort {
                                     execution_id,
-                                    reason,
+                                    reason: _,
                                     force,
                                 } => {
-                                    use frankenterm_core::policy::{
-                                        PolicyEngine, PolicyGatedInjector,
-                                    };
                                     use frankenterm_core::storage::StorageHandle;
-                                    use frankenterm_core::workflows::{
-                                        CxPolicyInjector, PaneWorkflowLockManager, WorkflowEngine,
-                                        WorkflowRunner, WorkflowRunnerConfig,
-                                    };
+                                    use frankenterm_core::workflows::inspect_workflow_abort_with_cx;
 
-                                    // Set up storage
+                                    let cx = frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request);
                                     let db_path = &ctx.effective.paths.db_path;
-                                    // ft-xbnl0.2.3 tick 302: cx-first storage open.
-                                    let storage = match StorageHandle::new_with_cx(
-                                        &frankenterm_core::cx::Cx::current()
-                                            .unwrap_or_else(frankenterm_core::cx::for_request),
-                                        db_path,
+                                    let storage =
+                                        match StorageHandle::new_with_cx(&cx, db_path).await {
+                                            Ok(storage) => storage,
+                                            Err(error) => {
+                                                let response = robot_workflow_abort_failure_response(
+                                                    &error,
+                                                    elapsed_ms(start),
+                                                );
+                                                print_robot_response(&response, format, stats)?;
+                                                return Ok(());
+                                            }
+                                        };
+
+                                    // A one-shot command has no live task ownership. Inspect
+                                    // without fabricating a runner, lock or settled cancellation.
+                                    let response = match inspect_workflow_abort_with_cx(
+                                        &cx,
+                                        &storage,
+                                        &execution_id,
                                     )
                                     .await
                                     {
-                                        Ok(s) => Arc::new(s),
-                                        Err(e) => {
-                                            let response =
-                                                RobotResponse::<RobotWorkflowAbortData>::error_with_code(
-                                                    ROBOT_ERR_STORAGE,
-                                                    format!("Failed to open storage: {e}"),
-                                                    Some(
-                                                        "Check database path and permissions."
-                                                            .to_string(),
-                                                    ),
-                                                    elapsed_ms(start),
-                                                );
-                                            print_robot_response(&response, format, stats)?;
-                                            return Ok(());
-                                        }
-                                    };
-
-                                    // Set up minimal workflow infrastructure for abort
-                                    let engine = WorkflowEngine::new(10);
-                                    let lock_manager = Arc::new(PaneWorkflowLockManager::new());
-                                    // [ft-4z7vh] Full policy surface — see the
-                                    // sibling fix in RobotCommands::Workflow::Run above.
-                                    // Explicit abort settles durable workflow state
-                                    // and audit evidence; it does not run terminal
-                                    // compensation. Keep this runner's injector
-                                    // policy-configured for its execution contract.
-                                    let policy_engine = PolicyEngine::new(
-                                        config.safety.rate_limit_per_pane,
-                                        config.safety.rate_limit_global,
-                                        config.safety.require_prompt_active,
-                                    )
-                                    .with_tuning(&config.tuning)
-                                    .with_command_gate_config(config.safety.command_gate.clone())
-                                    .with_policy_rules(config.safety.rules.clone());
-                                    let policy_engine = with_persisted_kill_switch(
-                                        policy_engine,
-                                        &storage,
-                                        "robot workflow abort",
-                                    )
-                                    .await;
-                                    let wezterm_handle =
-                                        frankenterm_core::wezterm::wezterm_handle_from_config(
-                                            &config,
-                                        );
-                                    let injector =
-                                        CxPolicyInjector::new(PolicyGatedInjector::with_storage(
-                                            policy_engine,
-                                            wezterm_handle,
-                                            storage.as_ref().clone(),
-                                        ));
-                                    let runner_config = WorkflowRunnerConfig::default();
-                                    let runner = WorkflowRunner::new(
-                                        engine,
-                                        lock_manager,
-                                        Arc::clone(&storage),
-                                        injector,
-                                        runner_config,
-                                    )
-                                    .with_watcher_socket(layout.ipc_socket_path.clone());
-
-                                    // Execute the abort (ft-xbnl0.2.3 tick 226:
-                                    // cross-crate cx-first migration).
-                                    let cx = frankenterm_core::cx::Cx::current()
-                                        .unwrap_or_else(frankenterm_core::cx::for_request);
-                                    match runner
-                                        .abort_execution_with_cx(
-                                            &cx,
-                                            &execution_id,
-                                            reason.as_deref(),
+                                        Ok(result) => robot_workflow_abort_response(
+                                            result,
                                             force,
-                                        )
-                                        .await
-                                    {
-                                        Ok(result) => {
-                                            let data = RobotWorkflowAbortData {
-                                                execution_id: result.execution_id,
-                                                aborted: result.aborted,
-                                                forced: force,
-                                                workflow_name: Some(result.workflow_name),
-                                                previous_status: Some(result.previous_status),
-                                                reason: result.reason,
-                                                aborted_at: result.aborted_at,
-                                                error_reason: result.error_reason,
-                                            };
-                                            let response =
-                                                RobotResponse::success(data, elapsed_ms(start));
-                                            print_robot_response(&response, format, stats)?;
-                                        }
-                                        Err(e) => {
-                                            let (code, hint) = match &e {
-                                                frankenterm_core::Error::Workflow(
-                                                    frankenterm_core::error::WorkflowError::NotFound(_),
-                                                ) => (
-                                                    "E_EXECUTION_NOT_FOUND",
-                                                    Some(
-                                                        "Check the execution ID is correct. Use \
-                                                         'ft robot workflow status --active' to \
-                                                         list running workflows."
-                                                            .to_string(),
-                                                    ),
-                                                ),
-                                                _ => (ROBOT_ERR_STORAGE, None),
-                                            };
-                                            let response =
-                                                RobotResponse::<RobotWorkflowAbortData>::error_with_code(
-                                                    code,
-                                                    format!("Failed to abort workflow: {e}"),
-                                                    hint,
-                                                    elapsed_ms(start),
-                                                );
-                                            print_robot_response(&response, format, stats)?;
-                                        }
-                                    }
+                                            elapsed_ms(start),
+                                        ),
+                                        Err(error) => robot_workflow_abort_failure_response(
+                                            &error,
+                                            elapsed_ms(start),
+                                        ),
+                                    };
+                                    print_robot_response(&response, format, stats)?;
 
-                                    // Clean shutdown of storage
                                     if let Err(e) = storage.shutdown().await {
                                         tracing::warn!("Failed to shutdown storage cleanly: {e}");
                                     }
@@ -69044,15 +69045,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             if output_format.is_json() {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "ok": true,
-                        "data": {
-                            "results": results,
-                            "count": results.len(),
-                        },
-                        "version": frankenterm_core::VERSION,
-                    }))
-                    .unwrap_or_else(|_| "{}".to_string())
+                    serde_json::to_string_pretty(&undo_json_response(&results))
+                        .unwrap_or_else(|_| "{}".to_string())
                 );
             } else {
                 for result in &results {
@@ -133524,6 +133518,151 @@ printf x > "$MINISIGN_MARKER"
         assert!(json.get("previous_status").is_none());
         assert!(json.get("reason").is_none());
         assert!(json.get("aborted_at").is_none());
+    }
+
+    fn undo_result_for_envelope_test(
+        outcome: frankenterm_core::undo::UndoOutcome,
+    ) -> frankenterm_core::undo::UndoExecutionResult {
+        frankenterm_core::undo::UndoExecutionResult {
+            action_id: 42,
+            strategy: "workflow_abort".to_string(),
+            outcome,
+            message: "undo result".to_string(),
+            guidance: None,
+            target_workflow_id: Some("exec-42".to_string()),
+            target_pane_id: Some(7),
+            undone_at: None,
+        }
+    }
+
+    #[test]
+    fn undo_json_response_accepts_success_warning_and_noop() {
+        use frankenterm_core::undo::UndoOutcome;
+
+        let results = [
+            UndoOutcome::Success,
+            UndoOutcome::AppliedWithWarning,
+            UndoOutcome::NotApplicable,
+        ]
+        .map(undo_result_for_envelope_test);
+        let json = undo_json_response(&results);
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["data"]["count"], 3);
+        assert_eq!(json["data"]["results"][1]["outcome"], "applied_with_warning");
+        assert_eq!(json["data"]["results"][2]["outcome"], "not_applicable");
+        assert_eq!(undo_json_response(&[])["ok"], true);
+    }
+
+    #[test]
+    fn undo_json_response_rejects_mixed_failed_or_indeterminate_batches() {
+        use frankenterm_core::undo::UndoOutcome;
+
+        for failure in [UndoOutcome::Failed, UndoOutcome::Indeterminate] {
+            let results = [
+                UndoOutcome::Success,
+                failure,
+                UndoOutcome::AppliedWithWarning,
+                UndoOutcome::NotApplicable,
+            ]
+            .map(undo_result_for_envelope_test);
+            let json = undo_json_response(&results);
+            assert_eq!(json["ok"], false);
+            assert_eq!(json["data"]["count"], 4);
+            assert_eq!(
+                json["data"]["results"][1]["outcome"],
+                serde_json::to_value(failure).unwrap()
+            );
+            assert_eq!(json["data"]["results"][1]["target_workflow_id"], "exec-42");
+            assert_eq!(json["data"]["results"][0]["outcome"], "success");
+        }
+    }
+
+    #[test]
+    fn robot_workflow_abort_unavailable_is_an_error_even_with_force() {
+        for force in [false, true] {
+            let result = frankenterm_core::workflows::AbortResult {
+                aborted: false,
+                execution_id: "exec-live".to_string(),
+                workflow_name: "live_workflow".to_string(),
+                pane_id: 42,
+                previous_status: "running".to_string(),
+                aborted_at_step: 1,
+                reason: None,
+                aborted_at: None,
+                error_reason: Some(
+                    frankenterm_core::workflows::LIVE_WORKFLOW_ABORT_UNAVAILABLE.to_string(),
+                ),
+            };
+            let response = robot_workflow_abort_response(result, force, 7);
+            assert!(response.data.is_none());
+            let json = serde_json::to_value(response).unwrap();
+            assert_eq!(json["ok"], false);
+            assert_eq!(json["error_code"], ROBOT_ERR_WORKFLOW_ABORT_UNAVAILABLE);
+            assert_eq!(json["data"]["execution_id"], "exec-live");
+            assert_eq!(json["data"]["previous_status"], "running");
+            assert_eq!(json["data"]["aborted"], false);
+            assert_eq!(json["data"]["forced"], false);
+            assert_eq!(json["data"]["error_reason"], "live_abort_unavailable");
+            assert!(json["data"].get("aborted_at").is_none());
+            assert!(json["hint"].as_str().unwrap().contains("settled"));
+        }
+    }
+
+    #[test]
+    fn robot_workflow_abort_terminal_noop_never_claims_force() {
+        for status in ["completed", "failed", "aborted"] {
+            let result = frankenterm_core::workflows::AbortResult {
+                aborted: false,
+                execution_id: "exec-terminal".to_string(),
+                workflow_name: "terminal_workflow".to_string(),
+                pane_id: 42,
+                previous_status: status.to_string(),
+                aborted_at_step: 1,
+                reason: None,
+                aborted_at: None,
+                error_reason: Some(format!("already_{status}")),
+            };
+            let json = serde_json::to_value(robot_workflow_abort_response(result, true, 7)).unwrap();
+            assert_eq!(json["ok"], true);
+            assert_eq!(json["data"]["aborted"], false);
+            assert_eq!(json["data"]["forced"], false);
+            assert_eq!(json["data"]["error_reason"], format!("already_{status}"));
+            assert!(json["data"].get("aborted_at").is_none());
+            assert!(json.get("error_code").is_none());
+        }
+    }
+
+    #[test]
+    fn robot_workflow_abort_lookup_errors_preserve_missing_and_cancellation() {
+        use frankenterm_core::Error;
+        use frankenterm_core::error::WorkflowError;
+
+        for (error, expected_code) in [
+            (
+                Error::Workflow(WorkflowError::NotFound("exec-missing".to_string())),
+                "E_EXECUTION_NOT_FOUND",
+            ),
+            (
+                Error::Cancelled("request cancelled".to_string()),
+                ROBOT_ERR_WORKFLOW_CANCELLED,
+            ),
+            (
+                Error::runtime_cancelled("workflow.abort_execution", "request cancelled"),
+                ROBOT_ERR_WORKFLOW_CANCELLED,
+            ),
+            (
+                Error::runtime_backend("storage.get_workflow", "read failed"),
+                ROBOT_ERR_STORAGE,
+            ),
+        ] {
+            let response = robot_workflow_abort_failure_response(&error, 7);
+            assert!(response.data.is_none());
+            assert!(response.error_data.is_none());
+            let json = serde_json::to_value(response).unwrap();
+            assert_eq!(json["ok"], false);
+            assert_eq!(json["error_code"], expected_code);
+            assert!(json.get("data").is_none());
+        }
     }
 
     #[test]

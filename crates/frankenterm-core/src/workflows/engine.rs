@@ -996,6 +996,7 @@ fn build_workflow_audit_action(
     Ok(action)
 }
 
+#[cfg(test)]
 pub(super) fn build_explicit_abort_action(
     record: &crate::storage::WorkflowRecord,
     reason: Option<&str>,

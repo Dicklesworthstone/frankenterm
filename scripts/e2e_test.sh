@@ -8646,8 +8646,8 @@ SQL
 # Validates that:
 # 1) ft history --workflow renders expected workflow action tree lines
 # 2) wa undo --list surfaces currently undoable workflow action
-# 3) wa undo <action-id> succeeds for workflow_abort and marks action undone
-# 4) workflow execution transitions to aborted and remains auditable
+# 3) wa undo <action-id> refuses workflow_abort without its live task owner
+# 4) workflow execution and undo metadata remain unchanged and auditable
 # ==============================================================================
 
 run_scenario_history_undo_workflow() {
@@ -8806,41 +8806,59 @@ SQL
     fi
 
     if [[ $result -eq 0 ]]; then
-        # Step 4: Execute undo and validate lifecycle transition
-        log_info "Step 4: Executing undo and validating state transitions..."
+        # Step 4: A durable row cannot authorize cancellation of a live task.
+        log_info "Step 4: Verifying ownerless undo refusal preserves stored state..."
+        local workflow_before
+        local undo_before
+        workflow_before=$(sqlite3 -quote "$db_path" \
+            "SELECT * FROM workflow_executions WHERE id = '$workflow_id';")
+        undo_before=$(sqlite3 -quote "$db_path" \
+            "SELECT * FROM action_undo WHERE audit_action_id = $start_action_id;")
         "$FT_BINARY" undo "$start_action_id" --yes --format json \
             > "$scenario_dir/undo_execute.json" 2> "$scenario_dir/undo_execute.stderr" || true
         "$FT_BINARY" audit -f json -l 20 > "$scenario_dir/audit_after_undo.json" \
             2> "$scenario_dir/audit_after_undo.stderr" || true
 
         if jq -e \
-            '.ok == true
+            --arg workflow_id "$workflow_id" \
+            --argjson pane_id "$pane_id" \
+            '.ok == false
              and (.data.results | length) == 1
-             and .data.results[0].outcome == "success"' \
+             and .data.results[0].outcome == "failed"
+             and (.data.results[0].message | contains("error_class=live_abort_unavailable"))
+             and .data.results[0].target_workflow_id == $workflow_id
+             and .data.results[0].target_pane_id == $pane_id
+             and .data.results[0].undone_at == null' \
             "$scenario_dir/undo_execute.json" >/dev/null 2>&1; then
-            log_pass "wa undo executed successfully"
+            log_pass "wa undo explicitly refused an abort without the live owner"
         else
-            log_fail "wa undo execution did not return success"
+            log_fail "wa undo did not report the expected live-owner refusal"
             result=1
         fi
 
         local workflow_status
+        local workflow_after
         workflow_status=$(sqlite3 "$db_path" \
             "SELECT status FROM workflow_executions WHERE id = '$workflow_id' LIMIT 1;")
-        if [[ "$workflow_status" == "aborted" ]]; then
-            log_pass "Workflow status transitioned to aborted"
+        workflow_after=$(sqlite3 -quote "$db_path" \
+            "SELECT * FROM workflow_executions WHERE id = '$workflow_id';")
+        if [[ "$workflow_status" == "running" && "$workflow_after" == "$workflow_before" ]]; then
+            log_pass "Workflow remains running with its complete stored row unchanged"
         else
-            log_fail "Workflow status expected 'aborted', got '$workflow_status'"
+            log_fail "Refused undo changed the workflow row or reported status '$workflow_status'"
             result=1
         fi
 
         local undo_state
+        local undo_after
         undo_state=$(sqlite3 "$db_path" \
-            "SELECT CASE WHEN undone_at IS NOT NULL AND undone_by = 'human-cli' THEN 'ok' ELSE 'bad' END FROM action_undo WHERE audit_action_id = $start_action_id;")
-        if [[ "$undo_state" == "ok" ]]; then
-            log_pass "Undo metadata marked with undone_at + undone_by"
+            "SELECT CASE WHEN undone_at IS NULL AND undone_by IS NULL THEN 'pending' ELSE 'changed' END FROM action_undo WHERE audit_action_id = $start_action_id;")
+        undo_after=$(sqlite3 -quote "$db_path" \
+            "SELECT * FROM action_undo WHERE audit_action_id = $start_action_id;")
+        if [[ "$undo_state" == "pending" && "$undo_after" == "$undo_before" ]]; then
+            log_pass "Refused undo preserved all metadata and left undo timestamps unset"
         else
-            log_fail "Undo metadata did not record expected undone state"
+            log_fail "Refused undo changed metadata or marked the action undone"
             result=1
         fi
     fi
