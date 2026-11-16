@@ -27301,7 +27301,7 @@ exit 17",
             }
         }
 
-        fn unexpected<T: Send + 'static>(&self) -> crate::wezterm::WeztermFuture<'_, T> {
+        fn unexpected<T: Send + 'static>() -> crate::wezterm::WeztermFuture<'static, T> {
             Box::pin(async {
                 Err(crate::Error::Wezterm(
                     crate::error::WeztermError::CommandFailed(
@@ -27333,7 +27333,7 @@ exit 17",
         }
 
         fn get_text(&self, _: u64, _: bool) -> crate::wezterm::WeztermFuture<'_, String> {
-            self.unexpected()
+            Self::unexpected()
         }
 
         fn get_text_tail_with_cx<'a>(
@@ -27356,11 +27356,11 @@ exit 17",
         }
 
         fn send_text(&self, _: u64, _: &str) -> crate::wezterm::WeztermFuture<'_, ()> {
-            self.unexpected()
+            Self::unexpected()
         }
 
         fn send_text_no_paste(&self, _: u64, _: &str) -> crate::wezterm::WeztermFuture<'_, ()> {
-            self.unexpected()
+            Self::unexpected()
         }
 
         fn send_text_with_options(
@@ -27370,19 +27370,19 @@ exit 17",
             _: bool,
             _: bool,
         ) -> crate::wezterm::WeztermFuture<'_, ()> {
-            self.unexpected()
+            Self::unexpected()
         }
 
         fn send_control(&self, _: u64, _: &str) -> crate::wezterm::WeztermFuture<'_, ()> {
-            self.unexpected()
+            Self::unexpected()
         }
 
         fn send_ctrl_c(&self, _: u64) -> crate::wezterm::WeztermFuture<'_, ()> {
-            self.unexpected()
+            Self::unexpected()
         }
 
         fn send_ctrl_d(&self, _: u64) -> crate::wezterm::WeztermFuture<'_, ()> {
-            self.unexpected()
+            Self::unexpected()
         }
 
         fn spawn(
@@ -27390,7 +27390,7 @@ exit 17",
             _: Option<&str>,
             _: Option<&str>,
         ) -> crate::wezterm::WeztermFuture<'_, u64> {
-            self.unexpected()
+            Self::unexpected()
         }
 
         fn spawn_targeted(
@@ -27399,7 +27399,7 @@ exit 17",
             _: Option<&str>,
             _: crate::wezterm::SpawnTarget,
         ) -> crate::wezterm::WeztermFuture<'_, u64> {
-            self.unexpected()
+            Self::unexpected()
         }
 
         fn split_pane(
@@ -27409,11 +27409,11 @@ exit 17",
             _: Option<&str>,
             _: Option<u8>,
         ) -> crate::wezterm::WeztermFuture<'_, u64> {
-            self.unexpected()
+            Self::unexpected()
         }
 
         fn activate_pane(&self, _: u64) -> crate::wezterm::WeztermFuture<'_, ()> {
-            self.unexpected()
+            Self::unexpected()
         }
 
         fn get_pane_direction(
@@ -27421,15 +27421,15 @@ exit 17",
             _: u64,
             _: crate::wezterm::MoveDirection,
         ) -> crate::wezterm::WeztermFuture<'_, Option<u64>> {
-            self.unexpected()
+            Self::unexpected()
         }
 
         fn kill_pane(&self, _: u64) -> crate::wezterm::WeztermFuture<'_, ()> {
-            self.unexpected()
+            Self::unexpected()
         }
 
         fn zoom_pane(&self, _: u64, _: bool) -> crate::wezterm::WeztermFuture<'_, ()> {
-            self.unexpected()
+            Self::unexpected()
         }
 
         fn circuit_status(&self) -> crate::circuit_breaker::CircuitBreakerStatus {
