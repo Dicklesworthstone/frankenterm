@@ -43,26 +43,46 @@ export function mountHistorySearch({
   const results = element("history-results");
   const cancel = element("history-cancel");
   const closeButton = element("history-close");
+  const openerLabel = opener.textContent;
   let opened = false;
+  let returningToResults = false;
+  let viewVersion = 0;
   let inputError = null;
 
-  function reset() {
+  function hideResults() {
     opened = false;
-    inputError = null;
-    search.clear();
+    viewVersion += 1;
     results.replaceChildren();
     status.textContent = "";
-    query.value = pane.value = since.value = until.value = "";
     cancel.disabled = true;
     form.setAttribute("aria-busy", "false");
+  }
+  function reset() {
+    hideResults();
+    returningToResults = false;
+    inputError = null;
+    search.clear();
+    query.value = pane.value = since.value = until.value = "";
+    opener.textContent = openerLabel;
   }
   function close() {
     reset();
     if (dialog.open) dialog.close();
     opener.focus();
   }
+  function leaveForResult() {
+    // Retain one bounded search in memory while inspecting a hit. Reopening
+    // restores the same ranking and exact capture identities without issuing
+    // a new query. Explicit dismissal and page/session retirement still erase it.
+    hideResults();
+    returningToResults = true;
+    opener.textContent = "Return to search results";
+    if (dialog.open) dialog.close();
+    opener.focus();
+  }
   function render() {
     if (!opened) return;
+    const renderedVersion = ++viewVersion;
     const state = search.snapshot();
     results.replaceChildren();
     form.setAttribute("aria-busy", String(state.status === "loading"));
@@ -84,11 +104,11 @@ export function mountHistorySearch({
       historical.type = "button";
       historical.textContent = "Open captured segment";
       historical.addEventListener("click", () => {
-        const selected = opened && search.hit(index, state.version);
+        const selected = opened && viewVersion === renderedVersion && search.hit(index, state.version);
         if (!selected) return;
         const capture = { segmentId: selected.segmentId, paneId: selected.paneId,
           capturedAt: selected.capturedAt, contentLength: selected.contentLength };
-        close();
+        leaveForResult();
         inspectCapture(capture);
       });
       const inspect = doc.createElement("button");
@@ -96,11 +116,11 @@ export function mountHistorySearch({
       inspect.textContent = `Open current output for pane ${hit.paneId}`;
       inspect.title = "This pane ID may belong to another session now. Opens new captured output only.";
       inspect.addEventListener("click", () => {
-        const selected = opened && search.hit(index, state.version);
+        const selected = opened && viewVersion === renderedVersion && search.hit(index, state.version);
         if (!selected) return;
         // End the modal before moving focus into the output inspector.
         const exactPaneId = selected.paneId;
-        close();
+        leaveForResult();
         inspectPane(exactPaneId);
       });
       item.append(heading, snippet, historical, inspect);
@@ -111,6 +131,7 @@ export function mountHistorySearch({
     if (opened) { query.focus(); return; }
     dialog.showModal();
     opened = true;
+    returningToResults = false;
     render();
     query.focus();
   }
@@ -135,9 +156,9 @@ export function mountHistorySearch({
   cancel.addEventListener("click", () => { search.cancel(); render(); });
   closeButton.addEventListener("click", close);
   dialog.addEventListener("cancel", (event) => { event.preventDefault(); close(); });
-  // Also cover dialog.close() from outside this controller. Do not let an old
-  // queued close event reset a dialog that has already been reopened.
-  dialog.addEventListener("close", () => { if (!dialog.open) reset(); });
+  // A result action hides the modal intentionally; external close() clears it.
+  // Ignore queued close events once a newer dialog view has already opened.
+  dialog.addEventListener("close", () => { if (!dialog.open && !returningToResults) reset(); });
   opener.addEventListener("click", open);
   opener.disabled = false;
   cancel.disabled = true;

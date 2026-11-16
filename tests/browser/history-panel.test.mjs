@@ -203,3 +203,85 @@ test("historical actions from prior queries or closed dialogs cannot open anothe
   assert.equal(f.captures.length, 1);
   assert.deepEqual(f.inspected, []);
 });
+
+test("opening a capture preserves the search for returning to another ranked result", async () => {
+  const f = fixture();
+  f.get("history-pane").value = "7";
+  f.get("history-limit").value = "25";
+  await f.submit("two retained errors");
+  f.calls[0].resolve(envelope([hit(8), hit(3)])); await flush();
+  const firstAction = f.get("history-results").children[0].children[2];
+  firstAction.emit("click");
+  assert.deepEqual(f.captures, [{ segmentId: "8", paneId: "7", capturedAt: "1000", contentLength: "24" }]);
+  assert.equal(f.get("history-search").open, false);
+  assert.equal(f.get("history-results").children.length, 0, "hide the rendered capture text during navigation");
+  assert.equal(f.get("history-search-open").textContent, "Return to search results");
+  firstAction.emit("click");
+  assert.equal(f.captures.length, 1, "hidden result actions cannot navigate again");
+
+  f.panel.open();
+  assert.equal(f.get("history-query").value, "two retained errors");
+  assert.equal(f.get("history-pane").value, "7");
+  assert.equal(f.get("history-limit").value, "25");
+  assert.equal(f.calls.length, 1, "returning does not repeat or reorder the search");
+  assert.equal(f.get("history-results").children.length, 2);
+  firstAction.emit("click");
+  assert.equal(f.captures.length, 1, "a previous dialog view cannot reuse a detached result action");
+  f.get("history-results").children[1].children[2].emit("click");
+  assert.deepEqual(f.captures[1], { segmentId: "3", paneId: "7", capturedAt: "1000", contentLength: "24" });
+  f.panel.close();
+});
+
+test("current-output navigation also retains search, while explicit close clears it", async () => {
+  const f = fixture(); await f.submit("retained query");
+  f.calls[0].resolve(envelope([hit(6)])); await flush();
+  f.get("history-results").children[0].children[3].emit("click");
+  assert.deepEqual(f.inspected, ["7"]);
+  f.get("history-search-open").emit("click");
+  assert.equal(f.get("history-query").value, "retained query");
+  assert.equal(f.get("history-results").children.length, 1);
+  assert.equal(f.calls.length, 1);
+  f.get("history-close").emit("click");
+  f.panel.open();
+  assert.equal(f.get("history-query").value, "");
+  assert.equal(f.get("history-results").children.length, 0);
+  f.panel.close();
+});
+
+test("suspension, Escape and native close purge retained navigation state and stale actions", async () => {
+  for (const finish of ["suspend", "escape", "native-close"]) {
+    const f = fixture(); await f.submit("private retained query");
+    f.calls[0].resolve(envelope([hit(6)])); await flush();
+    const action = f.get("history-results").children[0].children[2];
+    action.emit("click");
+    if (finish === "suspend") f.panel.suspend();
+    else {
+      f.panel.open();
+      if (finish === "escape") f.get("history-search").emit("cancel");
+      else f.get("history-search").close();
+    }
+    f.panel.open();
+    assert.equal(f.get("history-query").value, "");
+    assert.equal(f.get("history-results").children.length, 0);
+    action.emit("click");
+    assert.equal(f.captures.length, 1);
+    f.panel.close();
+  }
+});
+
+test("queued navigation-close events cannot clear reopened results or a replacement search", async () => {
+  const f = fixture(); await f.submit("old");
+  f.calls[0].resolve(envelope([hit(1)])); await flush();
+  const old = f.get("history-results").children[0].children[2];
+  old.emit("click");
+  f.panel.open();
+  f.get("history-search").emit("close");
+  assert.equal(f.get("history-results").children.length, 1);
+  await f.submit("new");
+  f.get("history-search").emit("close");
+  old.emit("click");
+  assert.equal(f.captures.length, 1);
+  f.calls[1].resolve(envelope([hit(2)])); await flush();
+  assert.match(f.get("history-results").children[0].children[0].textContent, /segment 2/);
+  f.panel.close();
+});
