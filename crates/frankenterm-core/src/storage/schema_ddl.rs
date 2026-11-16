@@ -112,7 +112,9 @@
 /// Bumped 49 -> 50 to reserve durable fleet execution before side effects and
 /// bind completed results to immutable caller intent across inventory changes.
 /// Legacy receipts deliberately receive no inferred request binding.
-pub const SCHEMA_VERSION: i32 = 50;
+/// Bumped 50 -> 51 to preserve immutable native capture identity and exact
+/// segment provenance. Historical segments remain explicitly unattributed.
+pub const SCHEMA_VERSION: i32 = 51;
 
 /// [ft-ih4tm] Idempotent re-creation of the three `output_segments` FTS
 /// triggers. Called when a database is opened with

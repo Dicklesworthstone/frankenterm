@@ -2275,6 +2275,14 @@ pub(crate) static MIGRATIONS: &[Migration] = &[
         // ownership on downgrade and thereby authorize duplicate effects.
         down_sql: None,
     },
+    Migration {
+        version: 51,
+        description: "Persist independent capture identities and immutable segment provenance",
+        up_sql: super::capture_identity::CAPTURE_IDENTITY_SCHEMA_SQL,
+        // Historical output has no verified native identity. Never infer a
+        // binding from the mutable pane row or erase established provenance.
+        down_sql: None,
+    },
 ];
 
 // =============================================================================
@@ -2356,6 +2364,7 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
         validate_session_retained_size_schema(conn)?;
         validate_session_recovery_usability_schema(conn)?;
         validate_fleet_mutation_claims_schema(conn)?;
+        validate_capture_identity_schema(conn)?;
         check_ft_version_compatibility(conn)?;
         // The overwhelmingly common reopen path is read-only and must not
         // acquire SQLite's singleton writer lock. If the optimistic probe
@@ -2432,6 +2441,31 @@ fn validate_fleet_mutation_claims_schema(conn: &Connection) -> Result<()> {
                 .to_string(),
         }
         .into());
+    }
+    Ok(())
+}
+
+fn validate_capture_identity_schema(conn: &Connection) -> Result<()> {
+    for (kind, name, marker) in [
+        ("table", "pane_capture_bindings", "pane_capture_bindings ("),
+        ("table", "output_segment_captures", "output_segment_captures ("),
+        ("index", "idx_output_segment_capture", "idx_output_segment_capture"),
+    ] {
+        let actual = load_schema_object_sql(conn, kind, name)?.ok_or_else(|| {
+            StorageError::Corruption {
+                details: format!("schema v51 is missing capture provenance {name}"),
+            }
+        })?;
+        let expected = super::capture_identity::CAPTURE_IDENTITY_SCHEMA_SQL
+            .split(';')
+            .find(|statement| statement.contains(marker))
+            .expect("canonical capture identity schema object");
+        if compact_schema_sql(&actual) != compact_schema_sql(expected) {
+            return Err(StorageError::Corruption {
+                details: format!("schema v51 has non-canonical capture provenance {name}"),
+            }
+            .into());
+        }
     }
     Ok(())
 }
@@ -6492,6 +6526,10 @@ fn apply_migration_mutation(
             if migration.version == 50 {
                 validate_fleet_mutation_claims_schema(conn)?;
             }
+            if migration.version == 51 {
+                validate_capture_identity_schema(conn)?;
+                ensure_no_foreign_key_violations(conn, "migration v51")?;
+            }
             set_user_version(conn, migration.version)?;
             record_migration(conn, migration.version, migration.description)?;
             Ok(())
@@ -6990,6 +7028,114 @@ mod tests {
     use super::*;
 
     #[test]
+    fn capture_identity_v51_upgrade_is_atomic_and_leaves_legacy_output_unattributed() {
+        let conn = Connection::open_in_memory().expect("open capture migration fixture");
+        initialize_schema(&conn).expect("initialize fresh schema");
+        validate_capture_identity_schema(&conn).expect("fresh capture schema");
+        let fresh_ddl = load_schema_object_sql(&conn, "table", "pane_capture_bindings")
+            .unwrap()
+            .unwrap();
+        conn.execute_batch(
+            "DROP TABLE output_segment_captures;
+             DROP TABLE pane_capture_bindings;
+             DELETE FROM schema_version WHERE version >= 51;
+             PRAGMA user_version = 50;
+             INSERT INTO panes
+                 (pane_id, pane_uuid, domain, first_seen_at, last_seen_at, observed)
+                 VALUES (7, 'legacy-capture', 'local', 1, 2, 1);
+             INSERT INTO output_segments
+                 (pane_id, seq, content, content_len, captured_at)
+                 VALUES (7, 0, 'historical output', 17, 1);
+             CREATE TRIGGER reject_capture_identity_migration
+                 BEFORE INSERT ON schema_version WHEN new.version = 51 BEGIN
+                     SELECT RAISE(ABORT, 'fixture rejects capture migration');
+                 END;",
+        )
+        .expect("prepare populated v50 fixture");
+        ensure_ft_meta(&conn, 50).unwrap();
+        assert!(initialize_schema(&conn).is_err());
+        assert_eq!(get_user_version(&conn).unwrap(), 50);
+        assert!(!table_exists(&conn, "pane_capture_bindings").unwrap());
+        assert!(!table_exists(&conn, "output_segment_captures").unwrap());
+        assert!(conn.is_autocommit());
+
+        conn.execute_batch("DROP TRIGGER reject_capture_identity_migration;")
+            .unwrap();
+        initialize_schema(&conn).expect("upgrade v50 capture storage");
+        assert_eq!(get_user_version(&conn).unwrap(), SCHEMA_VERSION);
+        validate_capture_identity_schema(&conn).expect("upgraded capture schema");
+        let upgraded_ddl = load_schema_object_sql(&conn, "table", "pane_capture_bindings")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            compact_schema_sql(&fresh_ddl),
+            compact_schema_sql(&upgraded_ddl)
+        );
+        for table in ["pane_capture_bindings", "output_segment_captures"] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+                0,
+                "legacy output cannot be assigned invented native provenance"
+            );
+        }
+        let legacy: (String, String) = conn
+            .query_row(
+                "SELECT panes.pane_uuid, output_segments.content FROM panes
+                 JOIN output_segments USING (pane_id) WHERE panes.pane_id = 7",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(legacy, ("legacy-capture".into(), "historical output".into()));
+        initialize_schema(&conn).expect("reopen migrated capture schema");
+        assert!(build_migration_plan(51, 50).is_err());
+    }
+
+    #[test]
+    fn capture_identity_schema_loss_and_drift_refuse_reopen_or_upgrade() {
+        for version in [50, SCHEMA_VERSION] {
+            let conn = Connection::open_in_memory().unwrap();
+            initialize_schema(&conn).unwrap();
+            conn.execute_batch(
+                "DROP TABLE output_segment_captures;
+                 DROP TABLE pane_capture_bindings;",
+            )
+            .unwrap();
+            if version == SCHEMA_VERSION {
+                let error = initialize_schema(&conn)
+                    .expect_err("missing capture provenance cannot be recreated");
+                assert!(error.to_string().contains("pane_capture_bindings"));
+                assert!(!table_exists(&conn, "pane_capture_bindings").unwrap());
+            } else {
+                conn.execute("DELETE FROM schema_version WHERE version >= 51", [])
+                    .unwrap();
+                set_user_version(&conn, 50).unwrap();
+                ensure_ft_meta(&conn, 50).unwrap();
+            }
+            conn.execute_batch(
+                "CREATE TABLE pane_capture_bindings (capture_uuid TEXT);
+                 INSERT INTO pane_capture_bindings VALUES ('retained');",
+            )
+            .unwrap();
+            let error = initialize_schema(&conn)
+                .expect_err("non-canonical capture provenance must be rejected");
+            assert!(error.to_string().contains("pane_capture_bindings"));
+            assert_eq!(get_user_version(&conn).unwrap(), version);
+            assert_eq!(
+                conn.query_row("SELECT capture_uuid FROM pane_capture_bindings", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+                "retained"
+            );
+            assert!(conn.is_autocommit());
+        }
+    }
+
+    #[test]
     fn fleet_claim_v50_upgrade_is_atomic_and_preserves_legacy_and_unresolved_authority() {
         let conn = Connection::open_in_memory().expect("open fleet migration fixture");
         initialize_schema(&conn).expect("initialize fresh schema");
@@ -7021,7 +7167,7 @@ mod tests {
             .expect("release injected failure");
 
         initialize_schema(&conn).expect("upgrade existing database");
-        assert_eq!(get_user_version(&conn).unwrap(), 50);
+        assert_eq!(get_user_version(&conn).unwrap(), SCHEMA_VERSION);
         let upgraded_ddl = load_schema_object_sql(&conn, "table", "fleet_mutation_claims")
             .unwrap()
             .unwrap();
@@ -7083,12 +7229,12 @@ mod tests {
 
     #[test]
     fn fleet_claim_schema_loss_and_drift_refuse_reopen_or_upgrade() {
-        for version in [49, 50] {
+        for version in [49, SCHEMA_VERSION] {
             let conn = Connection::open_in_memory().unwrap();
             initialize_schema(&conn).unwrap();
             conn.execute_batch("DROP TABLE fleet_mutation_claims;")
                 .unwrap();
-            if version == 50 {
+            if version == SCHEMA_VERSION {
                 let error = initialize_schema(&conn)
                     .expect_err("lost execution authority must not be recreated");
                 assert!(error.to_string().contains("fleet_mutation_claims"));

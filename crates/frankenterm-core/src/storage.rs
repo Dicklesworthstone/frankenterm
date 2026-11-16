@@ -316,6 +316,9 @@ pub use health::{
 pub mod schema_ddl;
 pub use schema_ddl::{SCHEMA_SQL, SCHEMA_VERSION};
 
+mod capture_identity;
+pub use capture_identity::PaneCaptureIdentity;
+
 // [ft-nsb8c / ft-dn2tu Phase 5] Export query helpers — read-only,
 // no writer-thread interaction. Internal-only (not re-exported); called
 // from `StorageHandle::export_*` methods within this crate via
@@ -919,6 +922,8 @@ enum WriteCommand {
         content: String,
         content_hash: Option<String>,
         zone_type: Option<String>,
+        /// Immutable producer capture UUID; never resolved from mutable panes metadata.
+        capture_uuid: Option<String>,
         /// Selected-recorder event to enqueue atomically with this segment.
         recorder_delivery: Option<RecorderDeliverySeed>,
         /// Delegated capture hold retained through durable writer completion.
@@ -1039,6 +1044,13 @@ enum WriteCommand {
     UpsertPane {
         pane: PaneRecord,
         respond: oneshot::Sender<Result<()>>,
+    },
+    /// Persist a capture binding and its pane metadata in one transaction.
+    PreparePaneCapture {
+        pane: PaneRecord,
+        native_identity: Option<crate::wezterm::MuxPaneIdentity>,
+        resume_previous: bool,
+        respond: oneshot::Sender<Result<PaneCaptureIdentity>>,
     },
     /// Insert or update a workflow execution
     UpsertWorkflow {
@@ -1491,6 +1503,7 @@ impl std::fmt::Debug for WriteCommand {
             Self::UpsertEventMute { .. } => "UpsertEventMute",
             Self::DeleteEventMute { .. } => "DeleteEventMute",
             Self::UpsertPane { .. } => "UpsertPane",
+            Self::PreparePaneCapture { .. } => "PreparePaneCapture",
             Self::UpsertWorkflow { .. } => "UpsertWorkflow",
             Self::SettleWorkflowTerminal { .. } => "SettleWorkflowTerminal",
             Self::CreateWorkflow { .. } => "CreateWorkflow",
@@ -4126,6 +4139,7 @@ impl StorageHandle {
             zone_type,
             None,
             None,
+            None,
         )
         .await
     }
@@ -4148,6 +4162,7 @@ impl StorageHandle {
             zone_type,
             None,
             Some(capture_hold),
+            None,
         )
         .await
     }
@@ -4172,6 +4187,33 @@ impl StorageHandle {
             zone_type,
             Some(recorder_delivery),
             Some(capture_hold),
+            None,
+        )
+        .await
+    }
+
+    /// Persist the admitted producer's capture UUID in the segment transaction.
+    /// The current `panes` row may already describe a replacement producer.
+    pub(crate) async fn append_captured_segment_with_identity_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        content: &str,
+        content_hash: Option<String>,
+        zone_type: Option<&str>,
+        recorder_delivery: Option<RecorderDeliverySeed>,
+        capture_hold: CapturePersistenceHold,
+        capture_uuid: &str,
+    ) -> Result<Segment> {
+        self.append_segment_with_zone_and_capture_hold_with_cx(
+            cx,
+            pane_id,
+            content,
+            content_hash,
+            zone_type,
+            recorder_delivery,
+            Some(capture_hold),
+            Some(capture_uuid),
         )
         .await
     }
@@ -4192,6 +4234,7 @@ impl StorageHandle {
             None,
             Some(recorder_delivery),
             None,
+            None,
         )
         .await
     }
@@ -4205,8 +4248,18 @@ impl StorageHandle {
         zone_type: Option<&str>,
         recorder_delivery: Option<RecorderDeliverySeed>,
         capture_hold: Option<CapturePersistenceHold>,
+        capture_uuid: Option<&str>,
     ) -> Result<Segment> {
         Self::checkpoint_storage_operation(cx, "append_segment")?;
+        if let Some(capture_uuid) = capture_uuid {
+            capture_identity::validate_capture_uuid(capture_uuid)?;
+            if capture_hold.is_none() {
+                return Err(StorageError::Database(
+                    "capture provenance requires persistence authority".into(),
+                )
+                .into());
+            }
+        }
         let timer = SwarmCapacityStageTimer::start(SwarmCapacityStage::StorageWrite, 0);
         let (tx, rx) = oneshot::channel();
         self.write_tx
@@ -4217,6 +4270,7 @@ impl StorageHandle {
                     content: content.to_string(),
                     content_hash,
                     zone_type: zone_type.map(str::to_string),
+                    capture_uuid: capture_uuid.map(str::to_string),
                     recorder_delivery,
                     capture_hold,
                     respond: tx,
@@ -7733,6 +7787,53 @@ impl StorageHandle {
             .await
             .map_err(|error| Self::writer_send_error("upsert_pane", error))?;
         Self::recv_writer_response(rx).await
+    }
+
+    /// Prepare capture provenance before publishing capture admission.
+    ///
+    /// Restart recovery requires exact native identity and a fresh proposed
+    /// UUID. With resume_previous=false, the caller must own a fresh or
+    /// independently validated in-process lifetime; identical retries are safe.
+    pub(crate) async fn prepare_pane_capture_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane: PaneRecord,
+        native_identity: Option<crate::wezterm::MuxPaneIdentity>,
+        resume_previous: bool,
+    ) -> Result<PaneCaptureIdentity> {
+        Self::checkpoint_storage_operation(cx, "prepare_pane_capture")?;
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::PreparePaneCapture {
+                    pane,
+                    native_identity,
+                    resume_previous,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|error| Self::writer_send_error("prepare_pane_capture", error))?;
+        Self::recv_writer_response(rx).await
+    }
+
+    /// Read the immutable provenance stamped by a captured segment's producer.
+    /// Missing provenance remains unknown; this never consults the current
+    /// numeric pane's metadata or creates host/attachment authorization.
+    pub async fn get_segment_capture_identity_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        segment_id: i64,
+    ) -> Result<Option<PaneCaptureIdentity>> {
+        Self::checkpoint_storage_operation(cx, "get_segment_capture_identity")?;
+        let db_path = Arc::clone(&self.db_path);
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
+            pooled_backend(db_path.as_str(), |backend| {
+                capture_identity::query_segment_capture_identity_backend(backend, segment_id)
+            })
+        })
+        .await
     }
 
     /// Upsert a workflow execution record
@@ -13547,6 +13648,7 @@ struct PendingAppendSegmentWrite {
     content: String,
     content_hash: Option<String>,
     zone_type: Option<String>,
+    capture_uuid: Option<String>,
     recorder_delivery: Option<RecorderDeliverySeed>,
     capture_hold: Option<CapturePersistenceHold>,
     respond: WriterResultResponder<Segment>,
@@ -13559,6 +13661,7 @@ impl PendingAppendSegmentWrite {
             content: self.content,
             content_hash: self.content_hash,
             zone_type: self.zone_type,
+            capture_uuid: self.capture_uuid,
             recorder_delivery: self.recorder_delivery,
             capture_hold: self.capture_hold,
             respond: self.respond.into_sender(),
@@ -13575,6 +13678,7 @@ fn pending_append_segment_from_command(
             content,
             content_hash,
             zone_type,
+            capture_uuid,
             recorder_delivery,
             capture_hold,
             respond,
@@ -13583,6 +13687,7 @@ fn pending_append_segment_from_command(
             content,
             content_hash,
             zone_type,
+            capture_uuid,
             recorder_delivery,
             capture_hold,
             respond: WriterResultResponder::new(respond),
@@ -13794,6 +13899,9 @@ fn fail_undispatched_write_command(cmd: WriteCommand, failure: &WriterFailure) -
             drop_capture_persistence_hold_recovering(capture_hold);
         }
         WriteCommand::ReserveEventDelivery { respond, .. } => {
+            respond_oneshot_best_effort(respond, failure.result());
+        }
+        WriteCommand::PreparePaneCapture { respond, .. } => {
             respond_oneshot_best_effort(respond, failure.result());
         }
         WriteCommand::MarkEventHandled { respond, .. }
@@ -15936,6 +16044,7 @@ mod writer_io_scheduler_tests {
             content: content.to_string(),
             content_hash: None,
             zone_type: None,
+            capture_uuid: None,
             recorder_delivery: None,
             capture_hold: None,
             respond: tx,
@@ -16450,6 +16559,7 @@ mod writer_io_scheduler_tests {
                     content: format!("capture for {pane_id}"),
                     content_hash: None,
                     zone_type: None,
+                    capture_uuid: None,
                     recorder_delivery: None,
                     capture_hold: None,
                     respond: WriterResultResponder::new(send),
@@ -16580,6 +16690,7 @@ mod writer_io_scheduler_tests {
                 content: "abcdefghijklmnopqrstuvwxyz first".to_string(),
                 content_hash: None,
                 zone_type: None,
+                capture_uuid: None,
                 recorder_delivery: None,
                 capture_hold: None,
                 respond: WriterResultResponder::new(first_tx),
@@ -16589,6 +16700,7 @@ mod writer_io_scheduler_tests {
                 content: "abcdefghijklmnopqrstuvwxyz second".to_string(),
                 content_hash: None,
                 zone_type: None,
+                capture_uuid: None,
                 recorder_delivery: None,
                 capture_hold: None,
                 respond: WriterResultResponder::new(second_tx),
@@ -16918,6 +17030,7 @@ mod writer_io_scheduler_tests {
                 content: "first group append".to_string(),
                 content_hash: Some("hash-first".to_string()),
                 zone_type: None,
+                capture_uuid: None,
                 recorder_delivery: None,
                 capture_hold: None,
                 respond: first_tx,
@@ -16927,6 +17040,7 @@ mod writer_io_scheduler_tests {
                 content: "second group append".to_string(),
                 content_hash: None,
                 zone_type: None,
+                capture_uuid: None,
                 recorder_delivery: None,
                 capture_hold: None,
                 respond: second_tx,
@@ -17002,6 +17116,7 @@ mod writer_io_scheduler_tests {
                     content: "first mismatched group append".to_string(),
                     content_hash: None,
                     zone_type: None,
+                    capture_uuid: None,
                     recorder_delivery: None,
                     capture_hold: None,
                     respond: WriterResultResponder::new(first_tx),
@@ -17011,6 +17126,7 @@ mod writer_io_scheduler_tests {
                     content: "second mismatched group append".to_string(),
                     content_hash: None,
                     zone_type: None,
+                    capture_uuid: None,
                     recorder_delivery: None,
                     capture_hold: None,
                     respond: WriterResultResponder::new(second_tx),
@@ -17291,6 +17407,7 @@ mod writer_io_scheduler_tests {
                 content: "first panic group append".to_string(),
                 content_hash: None,
                 zone_type: None,
+                capture_uuid: None,
                 recorder_delivery: None,
                 capture_hold: None,
                 respond: first_tx,
@@ -17300,6 +17417,7 @@ mod writer_io_scheduler_tests {
                 content: "second panic group append".to_string(),
                 content_hash: None,
                 zone_type: None,
+                capture_uuid: None,
                 recorder_delivery: None,
                 capture_hold: None,
                 respond: second_tx,
@@ -18682,6 +18800,7 @@ mod writer_io_scheduler_tests {
             content: "x".to_string(),
             content_hash: None,
             zone_type: None,
+            capture_uuid: None,
             recorder_delivery: None,
             capture_hold: None,
             respond: tx,
@@ -19102,12 +19221,13 @@ fn dispatch_write_command_raw(
             content,
             content_hash,
             zone_type,
+            capture_uuid,
             recorder_delivery,
             capture_hold,
             respond,
         } => {
             let respond = WriterResultResponder::new(respond);
-            let result = append_segment_commit_backend(
+            let result = append_segment_commit_with_capture_backend(
                 backend,
                 pane_id,
                 &content,
@@ -19115,6 +19235,7 @@ fn dispatch_write_command_raw(
                 zone_type.as_deref(),
                 recorder_delivery.as_ref(),
                 segment_redactors,
+                capture_uuid.as_deref(),
             );
             let reply_trace = result
                 .as_ref()
@@ -19303,6 +19424,18 @@ fn dispatch_write_command_raw(
         WriteCommand::UpsertPane { pane, respond } => {
             let respond = WriterResultResponder::new(respond);
             let result = upsert_pane_backend(backend, &pane);
+            respond_oneshot_best_effort(respond, result);
+        }
+        WriteCommand::PreparePaneCapture {
+            pane,
+            native_identity,
+            resume_previous,
+            respond,
+        } => {
+            let respond = WriterResultResponder::new(respond);
+            let result = capture_identity::prepare_pane_capture_backend(
+                backend, pane, native_identity, resume_previous,
+            );
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::UpsertWorkflow { workflow, respond } => {
@@ -21061,6 +21194,7 @@ fn restore_segment_redactor_for_pane(
     }
 }
 
+#[cfg(test)]
 fn append_segment_commit_backend(
     backend: &dyn StorageBackend,
     pane_id: u64,
@@ -21069,6 +21203,22 @@ fn append_segment_commit_backend(
     zone_type: Option<&str>,
     recorder_delivery: Option<&RecorderDeliverySeed>,
     segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
+) -> Result<CommittedAppendSegment> {
+    append_segment_commit_with_capture_backend(
+        backend, pane_id, content, content_hash, zone_type, recorder_delivery,
+        segment_redactors, None,
+    )
+}
+
+fn append_segment_commit_with_capture_backend(
+    backend: &dyn StorageBackend,
+    pane_id: u64,
+    content: &str,
+    content_hash: Option<&str>,
+    zone_type: Option<&str>,
+    recorder_delivery: Option<&RecorderDeliverySeed>,
+    segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
+    capture_uuid: Option<&str>,
 ) -> Result<CommittedAppendSegment> {
     let snapshot = segment_redactors.get(&pane_id).cloned();
     let transaction_trace = AppendTransactionTrace::start(1);
@@ -21096,6 +21246,7 @@ fn append_segment_commit_backend(
                 zone_type,
                 recorder_delivery,
             )?;
+            capture_identity::record_segment_capture_backend(backend, &segment, capture_uuid)?;
             Ok(CommittedAppendSegment {
                 segment,
                 retained_tail_moved,
@@ -21224,6 +21375,9 @@ fn append_segment_group_commit_inner(
         if let Some(delivery) = write.recorder_delivery.as_ref() {
             insert_recorder_delivery_backend(backend, &segment, delivery, now)?;
         }
+        capture_identity::record_segment_capture_backend(
+            backend, &segment, write.capture_uuid.as_deref(),
+        )?;
         committed_segments.push(CommittedAppendSegment {
             segment,
             retained_tail_moved,
