@@ -169,11 +169,21 @@ pub fn classify_agent_screen(tail: &str) -> Option<(&'static str, AgentScreenSta
 
     // The idle composer shows a placeholder ("› Ask Codex to do anything") or,
     // once it has been used, a bare "›"; the footer may show warnings instead
-    // of the shortcut hint, so the banner also identifies it.
+    // of the shortcut hint, so the banner also identifies it. Later releases
+    // replace the hint with a status line that ends "← for agents" when the
+    // pane is wide enough, and a long session scrolls the banner away, so the
+    // placeholder identifies it too.
     let codex_composer_row = lines
         .iter()
         .rposition(|line| *line == "›" || line.starts_with("› "))
-        .filter(|_| any(&["? for shortcuts", "openai codex"]));
+        .filter(|_| {
+            any(&[
+                "? for shortcuts",
+                "openai codex",
+                "← for agents",
+                "› ask codex to do anything",
+            ])
+        });
     // The row of the "❯" line between the composer's two rules.
     let claude_composer_row = lines
         .windows(3)
@@ -1239,6 +1249,31 @@ mod tests {
         assert_eq!(
             classify_agent_screen(&format!("{top}{quoted}{composer}")),
             Some(("codex", AgentScreenState::Ready))
+        );
+    }
+
+    /// Later Codex releases replace the shortcut hint with a status line,
+    /// which ends "← for agents" only when the pane is wide enough, and a long
+    /// session scrolls the banner off the tail. In the layout of live panes
+    /// seen 2026-11-14, without their text.
+    #[test]
+    fn codex_status_line_or_placeholder_identifies_its_composer_without_the_banner() {
+        let wide = "  GPT-6.1-Sol xhigh · ~/projects/frankenterm · Main [default] · ← for agents";
+        let idle = format!("• Done: the build is green.\n\n›\n\n{wide}\n");
+        assert_eq!(
+            classify_agent_screen(&idle),
+            Some(("codex", AgentScreenState::Ready))
+        );
+        let cut =
+            "  GPT-6.1-Sol xhigh · ~/projects/frankenterm · GPT-6.1-Sol · main · Working · Conte";
+        let busy = format!(
+            "• Working (35m 42s • esc to interrupt) · 2 background terminals running\n\n\
+             • Queued follow-up inputs\n    shift+← edit last queued message\n\n\
+             › Ask Codex to do anything\n\n{cut}\n"
+        );
+        assert_eq!(
+            classify_agent_screen(&busy),
+            Some(("codex", AgentScreenState::Busy))
         );
     }
 
