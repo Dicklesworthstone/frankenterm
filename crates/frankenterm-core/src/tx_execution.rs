@@ -15147,6 +15147,7 @@ mod tests {
         let database = directory.path().join("approvals.db");
         let mut proof = None;
         on_approval_runtime(async {
+            let cx = crate::cx::for_testing();
             let storage = crate::storage::StorageHandle::new(database.to_str().unwrap())
                 .await
                 .unwrap();
@@ -15156,13 +15157,13 @@ mod tests {
                 "workspace",
             );
             let code = pending
-                .issue_approval(&approvals)
+                .issue_approval(&cx, &approvals)
                 .await
                 .unwrap()
                 .allow_once_code;
             proof = Some(
                 pending
-                    .prove_with_approval(&approvals, &code)
+                    .prove_with_approval(&cx, &approvals, &code)
                     .await
                     .unwrap(),
             );
@@ -15378,6 +15379,7 @@ mod tests {
         // A code that was never issued, one issued for another claim, and one
         // that is spent.
         on_approval_runtime(async {
+            let cx = crate::cx::for_testing();
             let database = directory.path().join("approvals.db");
             let storage = crate::storage::StorageHandle::new(database.to_str().unwrap())
                 .await
@@ -15389,29 +15391,29 @@ mod tests {
             );
             let other = claim_s2(&original, &mut store, success, "other evidence").unwrap();
             let other_code = other
-                .issue_approval(&approvals)
+                .issue_approval(&cx, &approvals)
                 .await
                 .unwrap()
                 .allow_once_code;
             drop(other);
             let pending = claim_s2(&original, &mut store, success, "evidence").unwrap();
             let code = pending
-                .issue_approval(&approvals)
+                .issue_approval(&cx, &approvals)
                 .await
                 .unwrap()
                 .allow_once_code;
             for wrong in ["NOTACODE", other_code.as_str()] {
                 assert!(matches!(
-                    pending.prove_with_approval(&approvals, wrong).await,
+                    pending.prove_with_approval(&cx, &approvals, wrong).await,
                     Err(IdempotencyError::ReconciliationNotProven { .. })
                 ));
             }
             pending
-                .prove_with_approval(&approvals, &code)
+                .prove_with_approval(&cx, &approvals, &code)
                 .await
                 .unwrap();
             assert!(matches!(
-                pending.prove_with_approval(&approvals, &code).await,
+                pending.prove_with_approval(&cx, &approvals, &code).await,
                 Err(IdempotencyError::ReconciliationNotProven { .. })
             ));
             storage.shutdown().await.unwrap();

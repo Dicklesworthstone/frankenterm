@@ -81505,7 +81505,7 @@ async fn run_tx_reconcile(
     );
 
     let Some(code) = approval_code else {
-        let issued = pending.issue_approval(&approvals).await;
+        let issued = pending.issue_approval(&storage_cx, &approvals).await;
         storage.shutdown().await.ok();
         let request = issued.map_err(|err| {
             failed(
@@ -81530,7 +81530,9 @@ async fn run_tx_reconcile(
         return Ok((data, plain_lines));
     };
 
-    let proven = pending.prove_with_approval(&approvals, code).await;
+    let proven = pending
+        .prove_with_approval(&storage_cx, &approvals, code)
+        .await;
     storage.shutdown().await.ok();
     let proof = proven.map_err(|err| MissionCommandError {
         exit_code: MISSION_EXIT_VALIDATION,

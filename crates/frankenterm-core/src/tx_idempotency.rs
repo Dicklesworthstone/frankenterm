@@ -2054,19 +2054,24 @@ impl PendingReconciliation {
 
     /// Issue the allow-once approval that can prove this reconciliation, and
     /// nothing else: changing the record, the outcome or the evidence makes it
-    /// useless.
+    /// useless. `cx` bounds the approval store's storage calls.
     pub async fn issue_approval(
         &self,
+        cx: &crate::cx::Cx,
         approvals: &ApprovalStore<'_>,
     ) -> crate::Result<ApprovalRequest> {
-        approvals.issue(&self.approval_input(), None).await
+        approvals
+            .issue_with_cx(cx, &self.approval_input(), None)
+            .await
     }
 
     /// Consume the approval issued for this reconciliation. A failure afterwards
     /// leaves the record `Pending` with the approval spent, so the operator asks
-    /// for another.
+    /// for another. `cx` bounds the approval store's storage calls; a cancel
+    /// between its consume and its audit write still spends the approval.
     pub async fn prove_with_approval(
         &self,
+        cx: &crate::cx::Cx,
         approvals: &ApprovalStore<'_>,
         allow_once_code: &str,
     ) -> Result<ReconciliationProof, IdempotencyError> {
@@ -2075,7 +2080,7 @@ impl PendingReconciliation {
             reason,
         };
         let record = approvals
-            .consume(allow_once_code, &self.approval_input())
+            .consume_with_cx(cx, allow_once_code, &self.approval_input())
             .await
             .map_err(|error| not_proven(format!("approval could not be consumed: {error}")))?
             .ok_or_else(|| {
